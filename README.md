@@ -182,9 +182,14 @@ print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape 
 { "mcpServers": { "kern": { "command": "kern-mcp" } } }
 ```
 
-Tools: `run_code` (python/bash/node), `write_file`, `read_file`, `list_files`. Each call is a fresh
-network-off box; files persist across calls in a workspace on disk. Setup command, image and the
-other options: [bindings/python/README.md](bindings/python/README.md).
+Tools: `run_code` (python/bash/sh, and node on an image that carries it), `write_file`, `read_file`,
+`list_files`. Each call is a fresh network-off box; files persist across calls in a workspace on disk.
+
+**The server is stdio, so it travels.** Nothing in MCP cares what carries the pipe, so the same one
+line points a client at a box on another machine: `"command": "ssh", "args": ["pi@board", "kern-mcp"]`
+runs the agent where you are and the sandbox where the board is. Measured on loopback, the ssh
+handshake is paid once per session and the marginal cost per call is 15 ms.
+[docs/MCP.md](docs/MCP.md) has the tools, every `KERN_MCP_*` variable, and what the remote form costs.
 
 Full API, Python and Node: [bindings/python/README.md](bindings/python/README.md) ·
 [bindings/node/README.md](bindings/node/README.md).
@@ -377,6 +382,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | Document | What is in it |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | install on Linux, WSL2 and ARM boards, from source |
+| [docs/MCP.md](docs/MCP.md) | the MCP server: tools, every `KERN_MCP_*` variable, and running it over ssh or WSL so the sandbox sits on another machine |
 | [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) | what of Docker works, what does not, and where it differs |
 | [docs/RESOURCES.md](docs/RESOURCES.md) · [docs/CONFIG.md](docs/CONFIG.md) · [docs/EGRESS.md](docs/EGRESS.md) | the two-verb model with volumes and vdisks, the `kern.toml` schema, and egress |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) | the threat model (structured, then per-mechanism), and why a userspace VRAM cap is not a boundary |
@@ -387,7 +393,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done and the CLI is frozen.** 1042 Rust, 348 Python and 67 Node tests, clippy-clean and
+**The core is done and the CLI is frozen.** 1053 Rust, 415 Python and 89 Node tests, clippy-clean and
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning

@@ -28,7 +28,9 @@ unsetting it still sends the 1024 default and shadows the profile), ``KERN_MCP_T
 in-memory state persists across calls and each call is sub-ms instead of a ~10 ms interpreter boot; still
 NEVER-NET; a runaway cell that times out respawns the kernel, it never dooms the session),
 ``KERN_MCP_QUIET`` (default on: suppress kern's non-fatal notes so a tools/call returns only the cell's
-own output; set to ``0`` to restore them), ``KERN_BIN``.
+own output; set to ``0`` to restore them), ``KERN_MCP_TMPFS_MB`` (default 64: scratch at ``/tmp``,
+charged to the box's own memory cap; ``0`` removes it and puts /tmp back inside the read-only root),
+``KERN_BIN``.
 """
 from __future__ import annotations
 
@@ -58,6 +60,10 @@ _MAX_FRAME = 8 * 1024 * 1024      # max chars of one inbound JSON-RPC line; boun
 # tools/call - 250x the budget every other tool respects, enough to blow a model's context and stall the
 # client's stdio transport. The host cap stays large so a legitimate big file still reads and reports.
 _MAX_FILE_TEXT = _MAX_TOTAL_TEXT
+# The image this server runs unless the operator names another. Its CONTENTS are a fact we hold and
+# state in the tool schema (python, bash and sh; no node); for any other image we can only name it,
+# because guessing interpreters from a tag would be inventing a measurement.
+_DEFAULT_MCP_IMAGE = "python:3.12-slim"
 _MAX_NAME = 200                   # chars of a client-supplied method/tool name echoed back in an error
 
 
@@ -77,15 +83,19 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_cap(name: str, default: int) -> int | None:
-    """Like ``_env_int``, plus ``0`` as an explicit "let the profile decide": it returns ``None``, which
-    the SDK passes as no ``--memory`` flag at all, so a ``vcpu:`` profile's own ``memory=`` applies.
+    """Like ``_env_int``, plus ``0`` as an explicit "none": it returns ``None`` rather than the default.
+
+    Used by two knobs, and both need the sentinel for the same reason: without it every path here
+    produces an int, so "off" is unreachable and an operator who typed ``0`` silently gets the default.
+    For ``KERN_MCP_MEMORY_MB`` that means no ``--memory`` flag at all, so a ``vcpu:`` profile's own
+    ``memory=`` applies; for ``KERN_MCP_TMPFS_MB`` it means no scratch.
 
     Unsetting the variable is NOT that: it yields ``default``, an explicit flag, and kern's "explicit
-    flag wins over profile" rule then shadows the profile's value. Without this sentinel a profile's
-    memory is unreachable from MCP, since every path here produces an int.
+    flag wins over profile" rule then shadows the profile's value.
 
     ``0`` with no profile attached means uncapped, which is the same thing the SDK does for
-    ``memory_mb=None``. Garbage and negatives still fall back to ``default``."""
+    ``memory_mb=None``. Garbage and negatives still fall back to ``default``, because a typo is not a
+    decision."""
     raw = os.environ.get(name)
     if raw is not None and raw.strip() == "0":
         return None
@@ -95,8 +105,8 @@ _TOOLS = [
     {
         "name": "run_code",
         "description": (
-            "Run Python (default), bash, or node code in a fast, LOCAL, isolated kern sandbox on the "
-            "user's own machine and return stdout/stderr plus any rich results. A matplotlib figure, "
+            "Run Python (default), bash or POSIX-sh code in a fast, LOCAL, isolated kern sandbox on "
+            "the user's own machine and return stdout/stderr plus any rich results. A matplotlib figure, "
             "the last bare expression, and every display() call are captured; charts come back as "
             "images you can see. The network is OFF and a mandatory timeout applies. FILE state in the "
             "workspace persists across calls (write a file, read it next call); in-memory state does "
@@ -106,10 +116,22 @@ _TOOLS = [
             "type": "object",
             "properties": {
                 "code": {"type": "string", "description": "The code to run."},
+                # The enum is what the RUNNER accepts, not what the image contains, and those are two
+                # different facts. A model that reads only the enum concludes node works and tells the
+                # user so; the description is the only place that can stop it, because this server
+                # cannot narrow the list without probing an image it may not have pulled yet.
+                # `_tools_view` appends the configured image name so the sentence is about THIS server.
                 "language": {
                     "type": "string",
-                    "enum": ["python", "bash", "node"],
-                    "description": "Language of the snippet (default python).",
+                    "enum": ["python", "bash", "sh", "node"],
+                    "description": (
+                        "Language of the snippet (default python). The interpreter must exist IN THE "
+                        "IMAGE this server runs: the enum lists what the runner accepts, not what the "
+                        "image ships. Asking for a missing one fails immediately and names it. "
+                        "'bash' runs bash and 'sh' runs the POSIX shell, which are different shells: "
+                        "use 'bash' for [[ ]], arrays or pipefail, and 'sh' where the image may not "
+                        "carry bash."
+                    ),
                 },
                 "timeout_s": {
                     "type": "number",
@@ -170,11 +192,15 @@ class _Server:
         # boot). Still NEVER-NET: the kernel box inherits the session's network=False, so an agent's code
         # cannot reach the network in kernel mode either.
         self._use_kernel = os.environ.get("KERN_MCP_KERNEL", "").strip().lower() in ("1", "true", "yes")
+        # Read ONCE, like _use_kernel, because two readers is one too many: `_tools_view` tells the
+        # model which image this is and `_session` starts it, and those two must not be able to
+        # disagree about which image "this server" means.
+        self._image = os.environ.get("KERN_MCP_IMAGE", _DEFAULT_MCP_IMAGE)
 
     # -- lifecycle ---------------------------------------------------------------------------------
     def _session(self) -> Sandbox:
         if self._sbx is None:
-            image = os.environ.get("KERN_MCP_IMAGE", "python:3.12-slim")
+            image = self._image
             setup = os.environ.get("KERN_MCP_SETUP") or None
             workspace = os.environ.get("KERN_MCP_WORKSPACE") or None
             memory_mb = _env_cap("KERN_MCP_MEMORY_MB", 1024)
@@ -185,13 +211,38 @@ class _Server:
             # Each token is validated by the SDK (prefix:alphanumeric), so it can't smuggle another flag.
             prof = os.environ.get("KERN_MCP_PROFILES")
             profiles = [t.strip() for t in prof.split(",") if t.strip()] if prof else None
+            # Scratch for the read-only box. This is what makes `MPLCONFIGDIR=/tmp` below TRUE: until
+            # the SDK mounted a tmpfs there, /tmp was part of the read-only root, so the cache dir this
+            # server hands matplotlib was not writable. `0` turns it off for an operator who wants the
+            # old shape back; anything else is a MiB size charged to the box's own memory cap.
+            # `_env_cap` and not `_env_int`: `0` has to mean "none at all" rather than fall back to the
+            # default, and it is the same sentinel (and the same garbage handling) the memory knob uses.
+            tmpfs_mb = _env_cap("KERN_MCP_TMPFS_MB", 64)
+            tmpfs = {"/tmp": f"{tmpfs_mb}m"} if tmpfs_mb is not None else {}
             env = {"MPLCONFIGDIR": "/tmp"}  # matplotlib needs a writable cache in the read-only box
+            # Prewarming is ON by default HERE, and off in the SDK, because this server is the case where
+            # the trade is already decided: an MCP session holds one box's worth of memory for its whole
+            # life anyway, calls arrive seconds apart (the model is thinking in between, so the pool is
+            # always refilled), and the cost it removes is the one the operator actually feels. Measured
+            # on this path: 40.9 ms per call without it, 1.3 ms with it, with the fresh-box guarantee
+            # untouched - each prewarmed box serves exactly one cell and is destroyed.
+            # `_env_cap`, not `_env_int`: `_env_int` maps any non-positive value back to the default, so
+            # `KERN_MCP_PREWARM=0` would silently mean 1 and "off" would be unreachable from the
+            # environment. This is the same sentinel the memory and tmpfs knobs need, for the same
+            # reason, and it is the THIRD one - the table in docs/MCP.md says so.
+            prewarm_cap = _env_cap("KERN_MCP_PREWARM", 1)
+            prewarm = 0 if prewarm_cap is None else prewarm_cap
             sbx = Sandbox(
                 image=image, setup=setup, workspace=workspace, memory_mb=memory_mb,
-                timeout_s=timeout_s, env=env, profiles=profiles,
+                timeout_s=timeout_s, env=env, profiles=profiles, tmpfs=tmpfs,
                 # the MCP layer never surfaces result.files (it has a dedicated list_files tool), so skip
                 # the per-call O(N) workspace diff: run_code stays O(1) even as a session accretes files.
                 track_files=False,
+                # A warm KERNEL and a warm POOL solve the same cost twice and would fight over it: the
+                # kernel path never reaches `run_code`, so a pool behind it would hold boxes nothing
+                # claims. The kernel wins when it is asked for, because it is the stronger promise (state
+                # persists); prewarming serves the default, where state must NOT persist.
+                prewarm=0 if self._use_kernel else max(0, prewarm),
             )
             try:
                 sbx.__enter__()
@@ -297,17 +348,32 @@ class _Server:
             self._error(mid, -32601, f"method not found: {shown!r}")
 
     def _tools_view(self) -> list:
-        """The tool list. In warm-kernel mode, tell the client the truth: python state now PERSISTS
-        across run_code calls (otherwise a model told "fresh box per call" would be misled)."""
-        if not self._use_kernel:
-            return _TOOLS
+        """The tool list, adapted to what THIS server actually is. Two things the static table cannot
+        know: whether a warm kernel makes python state persist, and which image the operator pointed it
+        at. Both are cases where a model reading the static text would be told something untrue, so
+        both are appended here rather than left to the caller to discover from a failure."""
         import copy
         tools = copy.deepcopy(_TOOLS)
+        image = self._image
         for t in tools:
-            if t.get("name") == "run_code":
+            if t.get("name") != "run_code":
+                continue
+            if self._use_kernel:
                 t["description"] += (
                     " NOTE: this server runs a persistent WARM interpreter, so Python in-memory state"
                     " (variables, imports) PERSISTS across run_code calls within this session."
+                )
+            lang = t["inputSchema"]["properties"]["language"]
+            # Only the DEFAULT image's contents are a fact we hold. For any other image, say which one
+            # it is and stop: guessing its interpreters from the tag would be inventing a measurement.
+            if image == _DEFAULT_MCP_IMAGE:
+                lang["description"] += (
+                    " This server runs python:3.12-slim, which provides python, bash and sh but NOT"
+                    " node: do not offer node here."
+                )
+            else:
+                lang["description"] += (
+                    f" This server runs {image!r}; use a language you know that image provides."
                 )
         return tools
 

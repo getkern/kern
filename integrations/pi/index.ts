@@ -57,7 +57,7 @@ import {
 	type ReadOperations,
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { Sandbox } from "kern-sandbox";
+import { DEFAULT_TMPFS_MB, Sandbox, type SandboxOptions } from "kern-sandbox";
 
 /** Where the kern SDK mounts the workspace inside every box (`kern-sandbox`'s own constant). */
 const GUEST_WORKSPACE = "/workspace";
@@ -76,6 +76,67 @@ const TIMEOUT_S = intFromEnv("KERN_PI_TIMEOUT", 120);
  * this are spent rendering something nobody reads. Measured: the timeout does kill the process in the
  * box rather than merely stop reading it, so the cap bounds the burst and the deadline ends it. */
 const MAX_OUTPUT = intFromEnv("KERN_PI_MAX_OUTPUT", 1024 * 1024);
+/** Scratch at `/tmp`, in MiB. The box root is read-only, so a toolchain gets exactly two writable
+ * places: the workspace, and this. 256 rather than the SDK's 64 because the agent here installs
+ * things: `npm install express` on `node:22` fits in 64 MiB, a real dependency tree does not, and the
+ * failure it produces is not legible (see `HOME` below). It is a MULTIPLE of the SDK's own default
+ * rather than a second independent number, so the two cannot drift apart: if the SDK moves, this
+ * moves with it and the 4x relationship stays the thing that was decided. It is charged to the box's
+ * own memory cgroup,
+ * so it costs nothing until it is used and overrunning it is the box's OOM, never the host's disk.
+ * `0` means none at all, the same sentinel `KERN_MCP_TMPFS_MB` uses. */
+const TMPFS_MB = scratchFromEnv("KERN_PI_TMPFS_MB", DEFAULT_TMPFS_MB * 4);
+/** Where the box's `$HOME` points. Every modern toolchain caches under it, and in a read-only root
+ * that cache cannot be created. What the user sees is NOT a permission error: npm renders a failed
+ * `mkdir /root/.npm` as `Invalid response body while trying to fetch https://registry.npmjs.org/...`,
+ * which sends them to check egress, which was already correct. Measured on `node:22`, and both halves
+ * are load-bearing: with neither, `npm install express` exits 2; with `HOME` alone and no writable
+ * `/tmp`, it still exits 2; with both, it exits 0.
+ *
+ * It points at the WORKSPACE, and a reviewer argued it should point at the scratch instead: a cache
+ * is not a project artifact, and `npm install express` leaves **7.7 MB in `/workspace/.npm` on the
+ * host**, where nothing bounds it, plus a `.npm` directory in the user's project. Both facts are
+ * true and measured. The recommendation was still tried and REFUTED, by measuring the premise
+ * underneath it rather than the recommendation itself:
+ *
+ *     command 1: mkdir -p /tmp/home && echo > /tmp/home/marker   -> SCRITTO
+ *     command 2: cat /tmp/home/marker                            -> SPARITO
+ *     control:   the same two commands against /workspace        -> survives
+ *
+ * Every command is a FRESH BOX, so the scratch is fresh too. `HOME` on the scratch means `$HOME` does
+ * not exist when a command starts and the package cache is rebuilt from the network on EVERY command,
+ * which is worse for the agent this extension exists to serve than an unbounded cache is. The only
+ * persistent writable path is the workspace, so with per-command boxes, persistence and boundedness
+ * cannot both hold here. `KERN_PI_HOME=/tmp/home` remains available for anyone who wants the
+ * ephemeral, bounded side of that trade. */
+const HOME = process.env.KERN_PI_HOME ?? GUEST_WORKSPACE;
+
+/** Like `intFromEnv`, plus `0` meaning "none at all" rather than falling back to the default.
+ *
+ * `KERN_MCP_TMPFS_MB=0` already means that in the MCP server, and two knobs with the same name and
+ * opposite behaviour is the defect this whole round has been about: an operator who typed 0 got 256
+ * and nothing said so. Garbage and negatives still fall back, because those are typos rather than
+ * decisions. */
+export function scratchFromEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw !== undefined && raw.trim() === "0") return 0;
+	return intFromEnv(name, fallback);
+}
+
+/** `$HOME` must be an ABSOLUTE path in the box. An empty string turns `$HOME/.npm` into `/.npm`,
+ * which is inside the read-only root, so the defect this knob exists to fix comes straight back with
+ * no message; a relative one resolves against whatever the command's cwd happens to be. Both are
+ * refused here rather than discovered as an npm error about the network. */
+export function guestHome(home: string = HOME): string {
+	if (!home.startsWith("/")) {
+		throw refuse(
+			"gate",
+			`KERN_PI_HOME must be an absolute path in the box, got ${JSON.stringify(home)}. ` +
+				"An empty or relative value puts the toolchain cache back inside the read-only root.",
+		);
+	}
+	return home;
+}
 /** Comma-separated hosts the box may reach, e.g. "registry.npmjs.org,pypi.org". Empty = no network.
  * NOT a boolean: `network: true` would share the host's whole network on every command, and an agent
  * that needs one registry does not need that. */
@@ -111,6 +172,44 @@ type Side = "gate" | "box" | "host";
 
 function refuse(side: Side, message: string): Error {
 	return new Error(`kern[${side}]: ${message}`);
+}
+
+/** An SDK too old to honour `tmpfs` would IGNORE it: an unknown constructor option is not an error in
+ * either binding, so the box would come up with a read-only `/tmp` and the first `npm install` would
+ * fail with a message about the network. Ask the installed SDK what it did with the option rather
+ * than what version it says it is, and fail here, once, naming the fix.
+ *
+ * Exported so a test can call it: the whole point is that it fires before a box exists. */
+export function requireScratchSupport(): void {
+	const probe = new Sandbox({ tmpfs: {} }) as unknown as { tmpfs?: unknown };
+	if (probe.tmpfs === undefined) {
+		throw refuse(
+			"host",
+			"the installed kern-sandbox ignores `tmpfs`, so the box would get a read-only /tmp and a " +
+				"toolchain would fail with a message about the network. Upgrade: npm install kern-sandbox@^0.1.36",
+		);
+	}
+}
+
+/** Every option the box is opened with, in one place a test can read without starting one.
+ *
+ * It lives here and not inline in `ensureBox` because the two lines that matter most are the two that
+ * were MISSING: with no `tmpfs` and no `HOME`, the box has exactly one writable path, and every
+ * toolchain that caches (npm, Go, .NET, Maven, pip's wheel cache) fails somewhere far from the cause.
+ * A default nobody can see is a default nobody checks. */
+export function boxOptions(hostWorkspace: string): SandboxOptions {
+	return {
+		image: IMAGE,
+		workspace: hostWorkspace, // NOT deleted on close: the SDK only removes what it created
+		memoryMb: MEMORY_MB,
+		pids: PIDS,
+		timeoutS: TIMEOUT_S,
+		maxOutputBytes: MAX_OUTPUT,
+		...(TMPFS_MB > 0 ? { tmpfs: { "/tmp": `${TMPFS_MB}m` } } : { tmpfs: {} }),
+		env: { HOME: guestHome() },
+		...(EGRESS.length > 0 ? { egressAllow: EGRESS } : {}),
+		trackFiles: false, // pi reports its own file changes; skip the per-call workspace diff
+	};
 }
 
 /** Wrap an SDK or syscall failure so the host side is named, keeping the original text. */
@@ -646,7 +745,7 @@ function matchOneSegment(pat: string, s: string): boolean {
  * non-zero exit rather than thrown: pi renders a failed command, and an agent that sees "killed by
  * the sandbox" can react, where an exception would abort the turn.
  */
-export function kernBashOps(box: Sandbox): BashOperations {
+export function kernBashOps(box: Sandbox, shell: Shell = "bash"): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
 			if (signal?.aborted) throw new Error("aborted");
@@ -703,7 +802,9 @@ export function kernBashOps(box: Sandbox): BashOperations {
 			};
 
 			const run = box.runCode(script, {
-				language: "bash",
+				// The shell was MEASURED at open, not assumed. `language: "bash"` now runs bash, and an
+				// image without it (alpine) would answer `exec_failed` on every command the agent ran.
+				language: shell,
 				timeoutS,
 				onStdout: forward,
 				onStderr: forward,
@@ -731,6 +832,26 @@ export function kernBashOps(box: Sandbox): BashOperations {
 	};
 }
 
+/** Which shell the box actually has. pi's tool is called `bash` and a model writes bash by reflex, so
+ * bash is what we want; `sh` is the fallback that every image has. */
+export type Shell = "bash" | "sh";
+
+/** Ask the box which shell it has, once, at open. Not a guess from the image tag: `python:3.12-slim`
+ * carries bash, alpine does not, and the tag says neither. Costs one box (~90 ms) per session.
+ *
+ * This exists because the SDK's `language: "bash"` used to run `sh`, which on a Debian image is dash:
+ * the agent's `[[ -f x ]]` answered `sh: 1: [[: not found` with bash sitting unused in the same image.
+ * Now that `bash` means bash, asking for it on an image without one would fail EVERY command, so the
+ * choice has to be measured rather than hardcoded either way. */
+export async function detectShell(box: Sandbox): Promise<Shell> {
+	try {
+		const r = await box.runCode('command -v bash >/dev/null 2>&1 && echo bash || echo sh', { language: "sh" });
+		return r.stdout.trim().endsWith("bash") ? "bash" : "sh";
+	} catch {
+		return "sh"; // a probe that cannot run is not a reason to pick the shell that may not exist
+	}
+}
+
 /** Single-quote for `sh`. Only ever applied to a path this file produced, never to agent text. */
 function shellQuote(s: string): string {
 	return `'${s.replace(/'/g, `'\\''`)}'`;
@@ -756,6 +877,7 @@ export default function (pi: ExtensionAPI) {
 
 	let box: Sandbox | undefined;
 	let opening: Promise<Sandbox> | undefined;
+	let shell: Shell = "sh"; // until the probe answers; `sh` is the one every image has
 
 	/** Opened on the first tool call, not at activation: a user who loads the extension and then
 	 * asks a question that needs no tool should not pay an image pull. */
@@ -764,19 +886,16 @@ export default function (pi: ExtensionAPI) {
 		if (!opening) {
 			opening = (async () => {
 				ctx?.ui.setStatus("kern", ctx.ui.theme.fg("accent", `kern: opening ${IMAGE}`));
-				const sbx = new Sandbox({
-					image: IMAGE,
-					workspace: hostWorkspace, // NOT deleted on close: the SDK only removes what it created
-					memoryMb: MEMORY_MB,
-					pids: PIDS,
-					timeoutS: TIMEOUT_S,
-					maxOutputBytes: MAX_OUTPUT,
-					...(EGRESS.length > 0 ? { egressAllow: EGRESS } : {}),
-					trackFiles: false, // pi reports its own file changes; skip the per-call workspace diff
-				});
+				requireScratchSupport();
+				const sbx = new Sandbox(boxOptions(hostWorkspace));
 				await sbx.open();
+				shell = await detectShell(sbx);
 				box = sbx;
-				ctx?.ui.setStatus("kern", ctx.ui.theme.fg("muted", `kern: ${IMAGE}`));
+				// The shell is in the status line because it changes what the agent may write: on an
+				// image without bash the tool pi calls `bash` is running the POSIX shell, and `[[ ]]`,
+				// arrays and `pipefail` are not available. Better said once here than discovered by a
+				// syntax error in the middle of a task.
+				ctx?.ui.setStatus("kern", ctx.ui.theme.fg("muted", `kern: ${IMAGE} (${shell})`));
 				return sbx;
 			})().catch((e) => {
 				opening = undefined; // a failed open must not poison every later call
@@ -790,7 +909,7 @@ export default function (pi: ExtensionAPI) {
 		...localBash,
 		async execute(id, params, signal, onUpdate, ctx) {
 			const b = await ensureBox(ctx);
-			const tool = createBashTool(GUEST_WORKSPACE, { operations: kernBashOps(b) });
+			const tool = createBashTool(GUEST_WORKSPACE, { operations: kernBashOps(b, shell) });
 			return tool.execute(id, params, signal, onUpdate);
 		},
 	});

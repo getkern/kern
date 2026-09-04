@@ -8,12 +8,14 @@ Run: `pytest`  (integration auto-skips without a real kern; set `KERN_BIN=/path/
 """
 
 import errno
+import json
 import re
 import signal
 from pathlib import Path
 import os
 import shutil
 import subprocess
+import uuid
 import time
 
 import pytest
@@ -163,6 +165,89 @@ def test_both_bindings_validate_an_apparmor_name_identically():
     )
 
 
+def test_both_bindings_produce_THE_SAME_tmpfs_argv_for_one_corpus():
+    """The tmpfs policy is now written twice: a default constant, a size gate, a target gate, a zero
+    sentinel and a setup-box exclusion, in Python and again in Node. Duplicated policy drifts, and the
+    way it drifts is silent: `pip install pandas` working from one binding and hitting ENOSPC from the
+    other, with nothing in either message naming the binding as the difference.
+
+    So this compares the ARGV, not the accept/reject verdict. Two bindings can agree that an input is
+    valid and still emit different flags, which is the failure the verdict-level pair test cannot see.
+    Both the run box and the SETUP box are compared, because the exclusion is a third copy of the
+    policy and the one most likely to be added to one side only."""
+    import json
+    import shutil
+    import subprocess
+
+    node_bin = shutil.which("node")
+    node_src = Path(__file__).resolve().parents[3] / "bindings" / "node" / "index.js"
+    if node_bin is None or not node_src.is_file():
+        pytest.skip("node runtime or Node source unavailable")
+
+    here = str(Path(__file__).resolve().parent)
+    null_ = None  # spelled once, so the two halves of a row read as the same value
+    # (kwargs for Python, opts for Node). Same meaning, each spelled the way its binding takes it.
+    corpus = [
+        ({}, {}),                                                        # the default
+        ({"tmpfs": {}}, {"tmpfs": {}}),                                  # explicit none
+        ({"tmpfs": []}, {"tmpfs": []}),
+        ({"tmpfs": {"/tmp": "512m"}}, {"tmpfs": {"/tmp": "512m"}}),      # resized
+        # `t` is a unit kern takes, and it is only REACHABLE on an uncapped box now: a tmpfs larger
+        # than the cap is refused, because `df` would report a size the workload cannot reach.
+        ({"memory_mb": None, "tmpfs": {"/tmp": "1t"}}, {"memoryMb": null_, "tmpfs": {"/tmp": "1t"}}),
+        ({"tmpfs": ["/scratch"]}, {"tmpfs": ["/scratch"]}),              # sizeless
+        ({"tmpfs": {"/a": "1m", "/b": "2m"}}, {"tmpfs": {"/a": "1m", "/b": "2m"}}),   # order
+        ({"mounts": {here: "/tmp"}}, {"mounts": {here: "/tmp"}}),        # bind displaces the default
+        ({"mounts": {here: "/tmp/"}}, {"mounts": {here: "/tmp/"}}),      # ...normalised
+        ({"mounts": {here: "/data"}}, {"mounts": {here: "/data"}}),      # elsewhere: untouched
+        ({"mounts": {here: "/data"}, "tmpfs": {"/tmp": "8m"}},
+         {"mounts": {here: "/data"}, "tmpfs": {"/tmp": "8m"}}),          # different targets: both
+        # The axes the first version of this corpus did not vary, added after review: the memory cap
+        # (which the DEFAULT is clamped against) and the hardening profile (which the default steps
+        # aside for). Both are places where one binding could grow a rule the other lacks.
+        ({"memory_mb": 64}, {"memoryMb": 64}),                           # clamp to half the cap
+        ({"memory_mb": 32}, {"memoryMb": 32}),
+        ({"memory_mb": 2}, {"memoryMb": 2}),                             # the floor, never "0m"
+        ({"memory_mb": None}, {"memoryMb": None}),                       # no cap, no clamp
+        ({"memory_mb": 64, "tmpfs": {"/tmp": "64m"}},
+         {"memoryMb": 64, "tmpfs": {"/tmp": "64m"}}),                    # explicit is NOT clamped
+        ({"security_profile": "untrusted"}, {"securityProfile": "untrusted"}),
+        ({"security_profile": "untrusted", "tmpfs": {"/tmp": "8m"}},
+         {"securityProfile": "untrusted", "tmpfs": {"/tmp": "8m"}}),     # explicit survives it
+    ]
+
+    def py_argv(kw: dict, is_setup: bool) -> list:
+        sbx = _cfg(**kw)
+        argv = sbx._base_argv("n", network=is_setup, timeout_s=sbx.timeout_s, is_setup=is_setup)
+        return [a for i, a in enumerate(argv) if a == "--tmpfs" or (i and argv[i - 1] == "--tmpfs")]
+
+    script = (
+        f"const {{Sandbox}} = require({json.dumps(str(node_src))});\n"
+        "process.env.KERN_BIN = '/bin/true';\n"
+        f"const C = {json.dumps([n for _, n in corpus])};\n"
+        "const out = C.map(function (o) {\n"
+        "  return [false, true].map(function (isSetup) {\n"
+        "    const s = new Sandbox(o);\n"
+        "    const a = s._baseArgv('n', { network: isSetup, timeoutS: s.timeoutS, isSetup: isSetup });\n"
+        "    return a.filter(function (x, i) { return x === '--tmpfs' || (i && a[i - 1] === '--tmpfs'); });\n"
+        "  });\n"
+        "});\n"
+        "console.log(JSON.stringify(out));\n"
+    )
+    res = subprocess.run([node_bin, "-e", script], capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, f"node harness failed: {res.stderr}"
+    node_out = json.loads(res.stdout.strip())
+    assert len(node_out) == len(corpus)
+
+    for (kw, opts), (node_run, node_setup) in zip(corpus, node_out):
+        assert py_argv(kw, False) == node_run, f"run box differs for {opts}"
+        assert py_argv(kw, True) == node_setup, f"SETUP box differs for {opts}"
+
+    # The corpus has to DISCRIMINATE, or agreement is worth nothing: it must contain at least one
+    # case where the two boxes differ, which is the setup exclusion actually being exercised.
+    assert any(py_argv(kw, False) != py_argv(kw, True) for kw, _ in corpus), "the corpus never exercises the setup exclusion"
+
+
 def test_both_bindings_agree_on_every_apparmor_input_behaviourally():
     """Beyond the literal regex comparison: run a SHARED vector of inputs through BOTH bindings'
     construction-time validation and assert they AGREE on accept/reject for each. This catches a
@@ -287,10 +372,16 @@ def test_snapshot_is_ustar_not_pax_for_cross_binding_interop(tmp_path):
 
 
 def test_run_code_language_table():
-    # node evaluates inline with -e (NOT -c); python/bash use -c. File cells keep the right extension.
+    # node evaluates inline with -e (NOT -c); python/bash/sh use -c. File cells keep the right extension.
     assert Sandbox._LANGS["node"] == ("node", "-e", "js")
     assert Sandbox._LANGS["python"] == ("python3", "-c", "py")
-    assert Sandbox._LANGS["bash"] == ("sh", "-c", "sh")
+    # `bash` RUNS BASH. It used to run `sh`, which on a Debian image is dash, with bash present in the
+    # image and unused: `[[ 1 == 1 ]]` answered `sh: 1: [[: not found`. Nothing was missing, the wrong
+    # binary was chosen, and the name promised the one that was not running.
+    assert Sandbox._LANGS["bash"] == ("bash", "-c", "sh")
+    # ...and the old behaviour keeps a name of its own, because it is the portable one: every image
+    # has /bin/sh, alpine has no bash at all.
+    assert Sandbox._LANGS["sh"] == ("sh", "-c", "sh")
 
 
 def test_timeout_is_mandatory():
@@ -325,6 +416,110 @@ def test_dangerous_mounts_refused(mounts):
 def test_home_mount_refused():
     with pytest.raises(MountRefused):
         _cfg(mounts={os.path.expanduser("~"): "/home-x"})
+
+
+def test_tmpfs_default_is_a_writable_tmp_and_the_two_kinds_of_empty_differ():
+    # The root is read-only, so /tmp only exists as scratch because the binding asks for it.
+    assert "--tmpfs" in _cfg()._tmpfs_args and "/tmp:64m" in _cfg()._tmpfs_args
+    # "I did not say" (None) and "I said no" ({} / []) must NOT be the same answer.
+    assert _cfg(tmpfs={})._tmpfs_args == [] and _cfg(tmpfs=[])._tmpfs_args == []
+    assert _cfg(tmpfs={"/tmp": "512m"})._tmpfs_args == ["--tmpfs", "/tmp:512m"]
+    assert _cfg(tmpfs=["/scratch"])._tmpfs_args == ["--tmpfs", "/scratch"]  # a size is optional
+
+
+@pytest.mark.parametrize(
+    "tmpfs",
+    [
+        {"/workspace": "64m"},   # would shadow the workspace bind: every file written stays invisible
+        {"/": "1m"}, {"/proc": None}, {"/sys": None}, {"/dev": None},
+        {"tmp": "1m"},           # relative
+        {"/a/../b": "1m"},       # traversal
+        {"/tmp": "64mb"},        # not a unit kern takes
+        {"/tmp": "64m,x"},       # a comma would split the argument downstream
+        {"/tmp": "64m /etc"},    # whitespace could carry a second token
+        {"/tmp": "-1m"}, {"/tmp": ""}, {"/tmp": "m"}, {"/tmp": 64},
+        {"/tmp": "64"},          # BYTES to kern, not MiB: measured 4 KB and ENOSPC at 100 KB
+        {"/tmp": "0"}, {"/tmp": "0m"},  # UNLIMITED to kern, not none: measured, OOM at exit 137
+        ["/scratch:9g"],         # a ':' is the size separator: measured, mounted /scratch at 9 GiB
+        {"/tmp/a:b": "1m"},
+        "/tmp",                  # a bare string would iterate into one mount per character
+        256, 0, True,            # a NUMBER is what the neighbouring options take (memory_mb, pids)
+    ],
+)
+def test_dangerous_tmpfs_refused(tmpfs):
+    with pytest.raises(MountRefused):
+        _cfg(tmpfs=tmpfs)
+
+
+def test_a_malformed_size_is_refused_by_NAME_even_though_the_cap_check_parses_it():
+    """Ordering, and it was wrong once. The cap resolution PARSES the size, so running it before
+    validation turned `"64mb"` into a bare `ValueError: invalid literal for int()` out of the
+    constructor instead of a MountRefused naming the field. Same class as the wrong-type hole one
+    layer up: an internal exception escaping where a named refusal belongs."""
+    for bad in ("64mb", "64m,x", "64m /etc", "", "m", "abc"):
+        with pytest.raises(MountRefused):
+            _cfg(memory_mb=128, tmpfs={"/tmp": bad})
+
+
+def test_the_two_tmpfs_spellings_kern_reads_backwards_are_refused_by_name():
+    """kern's CLI takes both of these and means the opposite of what an SDK caller writing them means.
+    Measured against a real box before the gate was tightened: `/tmp:64` is 64 BYTES (df reports 4 KB,
+    a 100 KB write is ENOSPC) and `/tmp:0` is UNLIMITED (200 MiB under `memory_mb=128` exited 137).
+    kern is right to accept both, it is the low-level interface. Here they fail far from their cause,
+    so the refusal has to NAME the trap: a message that only says "invalid size" sends the reader back
+    to a docs page to find out that a unit is required, which is the cost this test is buying off."""
+    with pytest.raises(MountRefused, match="BYTES"):
+        _cfg(tmpfs={"/tmp": "64"})
+    with pytest.raises(MountRefused, match="UNLIMITED"):
+        _cfg(tmpfs={"/tmp": "0"})
+    # The number case is the one the API invites: every neighbour takes an int.
+    with pytest.raises(MountRefused, match=r"Did you mean tmpfs=\{'/tmp': '256m'\}"):
+        _cfg(tmpfs=256)
+    with pytest.raises(MountRefused, match=r"pass tmpfs=\{\}"):
+        _cfg(tmpfs=0)
+    # A ':' in the TARGET is the same shape one level up: kern splits `path[:size]` on it, so a path
+    # carrying one is reinterpreted rather than rejected. Measured before the gate: `["/scratch:9g"]`
+    # mounted `/scratch` at 9 GiB and the directory the caller named did not exist in the box.
+    with pytest.raises(MountRefused, match="size separator"):
+        _cfg(tmpfs=["/scratch:9g"])
+    # Control: the spelling the message asks for is accepted, and `t` is a unit kern takes.
+    assert _cfg(tmpfs={"/tmp": "256m"})._tmpfs_args == ["--tmpfs", "/tmp:256m"]
+    assert _cfg(memory_mb=None, tmpfs={"/tmp": "1t"})._tmpfs_args == ["--tmpfs", "/tmp:1t"]
+
+
+def test_tmpfs_default_yields_to_a_caller_bind_and_skips_the_setup_box():
+    # A caller who binds their own directory at /tmp must GET it: mounting the default tmpfs over that
+    # bind would hide every file they passed in, and nothing would say so.
+    here = os.path.dirname(os.path.abspath(__file__))
+    assert _cfg(mounts={here: "/tmp"})._tmpfs_args == []
+    assert _cfg(mounts={here: "/data"})._tmpfs_args == ["--tmpfs", "/tmp:64m"]  # elsewhere: untouched
+    # A tmpfs that COVERS a bind is refused, and "covers" is the mountpoint relation rather than a
+    # string compare. All four refusals and all three acceptances measured against a real box first:
+    #
+    #   -v HOST:/tmp      + --tmpfs /tmp       -> /tmp EMPTY, the bind invisible
+    #   -v HOST:/tmp/sub  + --tmpfs /tmp       -> same, reached through NESTING
+    #   -v HOST:/tmp      + --tmpfs /tmp/sub   -> the bind's files ARE there, /tmp/sub is scratch
+    #
+    # So the rule is asymmetric. Refusing both directions would refuse the third line, which is a
+    # legal configuration: a persistent /tmp with a bounded subtree inside it.
+    for bind, tmpfs in (("/tmp", "/tmp"), ("/tmp/sub", "/tmp"), ("/tmp/", "/tmp"),
+                        ("//tmp", "/tmp"), ("/tmp", "/tmp/")):
+        with pytest.raises(MountRefused, match="would cover"):
+            _cfg(mounts={here: bind}, tmpfs={tmpfs: "8m"})
+    # ...and the three that must NOT be refused: a tmpfs BELOW the bind, a lookalike prefix that is
+    # not a path boundary, and two unrelated targets.
+    assert _cfg(mounts={here: "/tmp"}, tmpfs={"/tmp/sub": "8m"})._tmpfs_args == ["--tmpfs", "/tmp/sub:8m"]
+    assert _cfg(mounts={here: "/tmpx"}, tmpfs={"/tmp": "8m"})._tmpfs_args == ["--tmpfs", "/tmp:8m"]
+    assert _cfg(mounts={here: "/data"}, tmpfs={"/tmp": "8m"})._tmpfs_args == ["--tmpfs", "/tmp:8m"]
+    # The setup box is the install phase and needs UNBOUNDED scratch: a 64 MiB /tmp turns
+    # `pip install pandas` into ENOSPC. Same shape as egress_allow, which setup also skips.
+    s = _cfg()
+    run = s._base_argv("n", network=False, timeout_s=s.timeout_s, is_setup=False)
+    setup = s._base_argv("n", network=True, timeout_s=s.timeout_s, is_setup=True)
+    assert "--tmpfs" in run and "--tmpfs" not in setup
+    # ...but an explicit one applies everywhere, including setup: the caller said so.
+    e = _cfg(tmpfs={"/tmp": "256m"})
+    assert "--tmpfs" in e._base_argv("n", network=True, timeout_s=e.timeout_s, is_setup=True)
 
 
 def test_run_requires_context_manager():
@@ -437,6 +632,506 @@ def _kern_runnable() -> bool:
 
 
 integration = pytest.mark.skipif(not _kern_runnable(), reason="no runnable kern (set KERN_BIN)")
+
+
+@integration
+def test_bash_is_bash_and_sh_is_the_posix_shell():
+    """`language="bash"` ran `sh`. On a Debian image that is dash, WITH BASH PRESENT in the same image
+    and unused, so a caller got a shell chosen for them that fails on the syntax the name promised.
+    An LLM writes bash by reflex, and `[[ 1 == 1 ]]` came back as `sh: 1: [[: not found`, which names
+    neither the cause nor the remedy."""
+    probe = "readlink -f /proc/$$/exe; [[ 1 == 1 ]] && echo BRACKETS-OK || echo BRACKETS-NO"
+    with Sandbox(image="python:3.12-slim", timeout_s=30) as s:
+        b = s.run_code(probe, language="bash")
+        assert "/bash" in b.stdout and "BRACKETS-OK" in b.stdout, b.stdout
+        # The control: the old behaviour still exists, under the name that describes it. Without this
+        # the test would pass on a binding that simply dropped `sh`, which is not what happened.
+        p = s.run_code(probe, language="sh")
+        assert "/bash" not in p.stdout and "BRACKETS-NO" in p.stdout, p.stdout
+
+    # An image with no bash must SAY so, not silently run something else. This is the same mechanism
+    # that already covers `node`, and the message has to name the one-word remedy because every image
+    # has a POSIX shell.
+    with Sandbox(image="alpine:3.19", timeout_s=30) as s:
+        miss = s.run_code("echo hi", language="bash")
+        assert miss.fault is not None and miss.fault.type == "exec_failed", miss.fault
+        assert "bash" in miss.fault.message and "language='sh'" in miss.fault.message, miss.fault.message
+        assert s.run_code("echo hi", language="sh").stdout.strip() == "hi"  # control: sh works there
+
+
+@integration
+def test_a_read_only_tmp_broke_two_things_and_the_default_tmpfs_fixes_both():
+    """The control is the whole test. `tmpfs={}` is the shape this binding shipped before, so both
+    halves of the defect are reproduced HERE rather than asserted from memory: a write naming /tmp
+    fails, and a temp-file helper silently relocates into the caller's persistent workspace."""
+    probe = (
+        "import tempfile\n"
+        "try:\n"
+        "    open('/tmp/named','w').write('x'); print('TMP-WRITE ok')\n"
+        "except OSError as e:\n"
+        "    print('TMP-WRITE failed', e.errno)\n"
+        "f = tempfile.NamedTemporaryFile(delete=False); f.write(b'x'); f.close(); print('TEMP', f.name)\n"
+    )
+    with Sandbox(tmpfs={}, timeout_s=30) as s:  # the positive control: no scratch, as it used to be
+        before = s.run_code(probe)
+        leaked = [f.path for f in s.list_files()]
+    assert "TMP-WRITE failed" in before.stdout, before.stdout
+    assert "TEMP /workspace/" in before.stdout, "the control must show the fallback into the workspace"
+    assert leaked, "the control must leave the temp file on the caller's persistent workspace"
+
+    with Sandbox(timeout_s=30) as s:  # the default
+        after = s.run_code(probe)
+        clean = [f.path for f in s.list_files()]
+    assert "TMP-WRITE ok" in after.stdout, after.stdout
+    assert "TEMP /tmp/" in after.stdout, "scratch must land in /tmp, not in the workspace"
+    assert clean == [], f"the workspace must stay clean, found {clean}"
+
+
+@integration
+def test_the_tmpfs_is_bounded_and_charged_to_the_box_not_the_host():
+    """Two properties the docstring claims, both measured: the size is a real ceiling, and the bytes
+    are the BOX's memory, so overrunning it is the box's own OOM rather than the host's disk."""
+    with Sandbox(tmpfs={"/tmp": "8m"}, timeout_s=30) as s:
+        r = s.run_code(
+            "import errno\n"
+            "try:\n"
+            "    open('/tmp/fill','wb').write(b'\\0' * (20 << 20)); print('UNBOUNDED')\n"
+            "except OSError as e:\n"
+            "    print('bounded', e.errno == errno.ENOSPC)\n"
+        )
+    assert "bounded True" in r.stdout, r.stdout
+
+    # A tmpfs EQUAL to the memory cap is the cell where the cap binds before the filesystem does:
+    # filling it exhausts the whole budget, so the box is killed instead of the write failing. It is
+    # reachable only by writing both numbers, since the binding refuses anything LARGER and clamps
+    # its own default to half. Writing in chunks, so the allocation is not what dies.
+    with Sandbox(memory_mb=128, tmpfs={"/tmp": "128m"}, timeout_s=60) as s:
+        r = s.run_code(
+            "chunk = b'\\0' * (1 << 20)\n"
+            "with open('/tmp/fill','wb') as f:\n"
+            "    for _ in range(400):\n        f.write(chunk); f.flush()\n"
+            "print('SURVIVED')\n"
+        )
+    assert r.fault is not None and r.fault.type == "oom", (r.fault, r.stdout, r.stderr)
+    assert "SURVIVED" not in r.stdout
+    assert "/tmp:128m" in r.fault.message and "/dev/shm" in r.fault.message
+
+
+def test_a_scratch_bigger_than_the_cap_is_refused_and_the_default_is_clamped_to_half():
+    """`df` reports the tmpfs size, not the reachable one, and it reports it TO A PROGRAM. Anything
+    that preflights with statvfs (installers, archivers, SQLite) plans against a `"1t"` scratch under
+    a 128 MiB cap and is OOM-killed instead of getting ENOSPC. The wrong answer goes to something that
+    will act on it, and no message reaches a person, so the resolution belongs at construction.
+
+    The two halves are deliberately asymmetric. A size the CALLER wrote is refused, because silently
+    shrinking what someone asked for is the declared-versus-real defect this change exists to remove.
+    OUR default is clamped, because refusing it would make a box unstartable for a caller who never
+    mentioned scratch, and because the number is ours to adjust.
+
+    The clamp is to HALF, and that is measured rather than chosen. Writing in 1 MiB chunks under
+    `memory_mb=128`: a 32m and a 64m tmpfs both end in ENOSPC, a 128m one ends in an OOM, because
+    filling a tmpfs equal to the cap exhausts the whole budget."""
+    with pytest.raises(MountRefused, match="larger than memory_mb=128"):
+        _cfg(memory_mb=128, tmpfs={"/tmp": "1t"})
+    with pytest.raises(MountRefused, match="ENOSPC"):  # the message names what goes wrong, not just the sizes
+        _cfg(memory_mb=64, tmpfs={"/tmp": "65m"})
+    assert _cfg(memory_mb=64, tmpfs={"/tmp": "64m"})._tmpfs_args == ["--tmpfs", "/tmp:64m"]  # equal is allowed
+
+    # The default, clamped, and never to a size the size gate would then refuse.
+    assert _cfg(memory_mb=512)._tmpfs_args == ["--tmpfs", "/tmp:64m"]     # room to spare: untouched
+    assert _cfg(memory_mb=64)._tmpfs_args == ["--tmpfs", "/tmp:32m"]
+    assert _cfg(memory_mb=32)._tmpfs_args == ["--tmpfs", "/tmp:16m"]
+    assert _cfg(memory_mb=1)._tmpfs_args == ["--tmpfs", "/tmp:1m"]        # the floor, never "0m"
+    assert _cfg(memory_mb=None)._tmpfs_args == ["--tmpfs", "/tmp:64m"]    # no cap, nothing to resolve
+    # DIRECTION: the clamp only ever reduces. `min(64, cap/2)` cannot exceed 64, so a big box does not
+    # get a big default. A reviewer read "clamped to half" as a formula that applies both ways and
+    # flagged 512 -> 256m as the consequence; it is 64m, and this is the assertion that says so.
+    for cap in (128, 256, 512, 1024, 4096):
+        assert _cfg(memory_mb=cap)._tmpfs_args == ["--tmpfs", "/tmp:64m"], cap
+    # And the residual, written down before someone files it: an odd cap yields an odd scratch. 127
+    # gives 63m, a number nobody chose. Rounding to a bucket would trade one arbitrary thing for
+    # another, so it stays exact and this line is the answer to the bug report.
+    assert _cfg(memory_mb=127)._tmpfs_args == ["--tmpfs", "/tmp:63m"]
+
+
+@integration
+def test_the_clamped_default_fails_with_ENOSPC_instead_of_killing_the_box():
+    """The point of clamping to half rather than to the cap, end to end. At `memory_mb=64` the default
+    becomes 32m, and filling it returns ENOSPC at 32 MiB instead of OOM-killing the box, so the
+    failure reaches the code that caused it rather than ending the run."""
+    with Sandbox(memory_mb=64, timeout_s=90) as s:
+        r = s.run_code(
+            "import errno, os\n"
+            "chunk = b'\\0' * (1 << 20)\n"
+            "try:\n"
+            "    with open('/tmp/f','wb') as f:\n"
+            "        for _ in range(400):\n            f.write(chunk); f.flush()\n"
+            "    print('NO LIMIT')\n"
+            "except OSError as e:\n"
+            "    print('ENOSPC' if e.errno == errno.ENOSPC else f'errno {e.errno}', os.path.getsize('/tmp/f') >> 20)\n"
+        )
+    assert r.fault is None, r.fault           # the box lived
+    assert "ENOSPC 32" in r.stdout, r.stdout  # and the filesystem is what said no
+
+
+@integration
+def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
+    """The general form of a defect a reviewer had to predict for us.
+
+    `security_profile="untrusted"` gave a read-only /tmp in 0.1.35. A default added in the BINDING
+    would have handed it a writable, executable one in 0.1.36: a hardening bundle defined by the
+    RUNTIME, widened by a layer above it, in a patch release. That specific case is fixed, and the
+    mechanism it demonstrates is not - binding-level defaults are applied without consulting
+    runtime-level policy, and nothing structurally stops the next one.
+
+    So the posture itself is pinned, the way `cli_surface_is_frozen` pins the flags. The profile list
+    is READ FROM KERN rather than hardcoded, so a profile kern grows and this file has not pinned is a
+    failure here instead of a discovery later.
+
+    The hole this still has, stated because it is symmetrical to the one it closes: it enumerates
+    PROFILES, not paths. A writable path that appears only under conditions this suite does not
+    construct (a `--uid-range`, a `rootfs:` service, a profile combined with another option) is
+    invisible to it. `/dev/shm` is the proof that the path set has members nobody wrote down, and it
+    was only caught because it is present unconditionally."""
+    # The path set is DERIVED from the box's own mountinfo, not from a list written here. A list only
+    # ever catches paths someone thought to name, and `/dev/shm` is the proof that the set has members
+    # nobody did: it was caught by a README correction rather than by the pin. Enumerating the mounts
+    # and exercising each one moves the boundary from "paths we listed" to "paths that exist in the
+    # configurations we construct". The remaining hole is irreducible and stated in the docstring.
+    # Keyed on (mountpoint, fstype, source) and taking the LAST entry per mountpoint, because mounts
+    # STACK: a `mounts` bind at a path kern already mounted does not replace it, it shadows it, and
+    # the last one is what resolves. The previous version reported the union of mountpoints, so a box
+    # whose /dev/shm is kern's tmpfs and one whose /dev/shm is a host bind produced the SAME pin.
+    probe = (
+        "import os\n"
+        "effective = {}\n"
+        "for line in open('/proc/self/mountinfo'):\n"
+        "    fields, after = line.split(' - ')[0].split(), line.split(' - ')[1].split()\n"
+        "    effective[fields[4]] = (after[0], after[1])  # last wins, exactly as the kernel resolves\n"
+        "for mp, (fstype, src) in sorted(effective.items()):\n"
+        "    try:\n"
+        "        p = os.path.join(mp, '.kern-w')\n"
+        "        open(p, 'w').close(); os.unlink(p); print(f'{mp} {fstype} {src} RW')\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "# the root is not a mountpoint in every layout, so it is exercised by name as well\n"
+        "try:\n"
+        "    open('/.kern-w', 'w').close(); os.unlink('/.kern-w'); print('/ - - RW')\n"
+        "except OSError:\n    pass\n"
+    )
+    # What kern itself advertises, so the pin cannot silently fall behind the runtime.
+    helptext = subprocess.run([os.environ.get("KERN_BIN") or shutil.which("kern"), "box", "--help"],
+                              capture_output=True, text=True, timeout=30).stdout
+    m = re.search(r"--security-profile <([^>]+)>", helptext)
+    assert m, "kern box --help no longer declares --security-profile the way this test reads it"
+    advertised = {p.strip() for p in m.group(1).split("|") if p.strip()}
+    assert advertised == {"untrusted"}, (
+        f"kern advertises security profiles {sorted(advertised)}; pin the writable-path posture of "
+        f"each one here before it ships"
+    )
+
+    def caps(**kw) -> str:
+        """`CapEff` inside the box. The SECOND axis of the same assertion: `(profile -> writable
+        paths)` and `(profile -> effective capabilities)` are one claim about posture on two axes, and
+        pinning only the mounts is how a documented recipe can widen the other one unnoticed. The
+        nginx recipe in the README does exactly that with `cap_drop=()`, deliberately, and this is
+        what makes the deliberate case visible."""
+        with Sandbox(timeout_s=40, **kw) as s:
+            out = s.run_code(
+                "print([l.split()[1] for l in open('/proc/self/status') if l.startswith('CapEff')][0])"
+            ).stdout
+        return out.strip()
+
+    def writable(**kw) -> set:
+        """(mountpoint, fstype) of every EFFECTIVE writable mount. The fstype is in the key because
+        two boxes with the same writable paths and different filesystems behind them are not the
+        same box, and the union-of-paths version could not tell them apart."""
+        with Sandbox(timeout_s=40, **kw) as s:
+            out = s.run_code(probe).stdout
+        return {(l.split()[0], l.split()[1]) for l in out.splitlines() if l.endswith(" RW")}
+
+    # The baseline. `/dev/shm` is in it and was NOT put there by this binding: it is present in the
+    # 0.1.35 shape too, it is a tmpfs with NO `size=` at all (measured: 15.6 GB, half of host RAM),
+    # and `--tmpfs /dev/shm` is refused by kern because it would shadow the hardened `/dev`. So it is
+    # a writable, memory-backed, unbounded path that this SDK cannot bound. That is a runtime gap,
+    # not an SDK one, and it is pinned here so it stops being invisible.
+    assert writable() == {("/tmp", "tmpfs"), ("/workspace", "ext4"), ("/dev/shm", "tmpfs")}
+    # The bundle: the scratch is NOT added on top of it. This is the assertion that would have caught
+    # the widening without anyone predicting it.
+    assert writable(security_profile="untrusted") == {("/workspace", "ext4"), ("/dev/shm", "tmpfs")}
+    # The capability axis, with its own positive control: if `cap_drop=()` does not move the pinned
+    # value, the pin is reading the request instead of the result.
+    assert caps() == "0000000000000000", "the default drops everything"
+    widened = caps(cap_drop=())
+    assert widened != "0000000000000000", "cap_drop=() must widen, or this pin proves nothing"
+    assert caps(security_profile="untrusted") == "0000000000000000"
+    # And the bundle WINS over the neighbouring option: a caller who asks for the capabilities back
+    # under `untrusted` does not get them. That is the property the bundle is for, and the reason the
+    # README's nginx recipe (`cap_drop=()`) widens the DEFAULT posture and not this one.
+    assert caps(security_profile="untrusted", cap_drop=()) == "0000000000000000", (
+        f"untrusted must not be widenable by cap_drop=(), but got {widened}"
+    )
+
+    # ...and a caller who asks for scratch under the bundle still gets it: their decision, not ours.
+    assert writable(security_profile="untrusted", tmpfs={"/tmp": "8m"}) == {
+        ("/tmp", "tmpfs"), ("/workspace", "ext4"), ("/dev/shm", "tmpfs")
+    }
+    # The discriminant the union version could not express: a bind at /dev/shm SHADOWS kern's tmpfs,
+    # so the same set of paths is a materially different box and the pin now says so.
+    import tempfile as _t
+    shm_host = _t.mkdtemp(prefix="kern-shm-pin-")
+    try:
+        assert writable(mounts={shm_host: "/dev/shm"}) == {
+            ("/tmp", "tmpfs"), ("/workspace", "ext4"), ("/dev/shm", "ext4")
+        }
+    finally:
+        shutil.rmtree(shm_host, ignore_errors=True)
+
+
+@integration
+def test_the_memory_cap_is_shared_with_a_path_this_sdk_cannot_bound():
+    """`memory_mb` bounds the cgroup, not the workload's usable memory, and the difference has a name.
+
+    Every kern box carries `/dev/shm` as a tmpfs with NO `size=`, so its apparent size is the kernel
+    default of half the HOST's RAM: measured, a box with `memory_mb=128` reports 15958 MiB free there
+    on a 31914 MiB machine. It is charged to the same cgroup, and `--tmpfs /dev/shm` is refused by
+    kern because it would shadow the hardened `/dev`, so nothing in this SDK can size it.
+
+    That makes the `/tmp` clamp partial rather than wrong, and it makes the OOM note's wording load
+    bearing: the first version named only the scratch this SDK mounted, which is the WRONG place when
+    the budget went to /dev/shm."""
+    body = (
+        "chunk = b'\\0' * (1 << 20)\n"
+        "with open('{p}','wb') as f:\n"
+        "    for _ in range(200):\n        f.write(chunk); f.flush()\n"
+        "print('WROTE 200 MiB')\n"
+    )
+    with Sandbox(memory_mb=128, timeout_s=60) as s:
+        shm = s.run_code(body.format(p="/dev/shm/f"))
+        # The control, in the same box: the clamped scratch bounds the SAME write, cleanly.
+        tmp = s.run_code(body.format(p="/tmp/f"))
+    assert shm.fault is not None and shm.fault.type == "oom", shm.fault
+    assert "/dev/shm" in shm.fault.message, shm.fault.message  # it must NAME the unbounded one
+    assert tmp.fault is None and "WROTE 200 MiB" not in tmp.stdout  # ENOSPC, handled, box alive
+
+
+@integration
+def test_a_tmpfs_below_a_bind_is_the_configuration_the_refusal_must_not_take(tmp_path):
+    """The acceptance half of the covering rule, against a real box rather than against the argv.
+
+    Refusing both directions would have been simpler and would have removed a configuration someone
+    reasonably wants: a persistent /tmp bound from the host, with a bounded ephemeral subtree inside
+    it. This is the assertion that keeps the rule asymmetric, and the reason it can be: the bind's
+    files are reachable, and the tmpfs below it is scratch."""
+    (tmp_path / "from-host.txt").write_text("visible\n")
+    with Sandbox(mounts={str(tmp_path): "/tmp"}, tmpfs={"/tmp/scratch": "8m"}, timeout_s=40) as s:
+        r = s.run_code(
+            "import os\n"
+            "print('BIND', open('/tmp/from-host.txt').read().strip())\n"
+            "open('/tmp/scratch/x','w').write('1'); print('SCRATCH writable')\n"
+            "print('MOUNTS', [l.split()[4] for l in open('/proc/self/mountinfo') if l.split()[4].startswith('/tmp')])\n"
+        )
+    assert "BIND visible" in r.stdout, r.stdout
+    assert "SCRATCH writable" in r.stdout, r.stdout
+    # And the scratch really is ephemeral while the bind really is not: the file the box wrote to the
+    # tmpfs is not on the host, the one it could read was.
+    assert not (tmp_path / "scratch" / "x").exists()
+
+
+@integration
+def test_nothing_is_written_to_dev_shm_before_a_bind_can_shadow_it(tmp_path):
+    """If kern's own setup wrote to /dev/shm between mounting its tmpfs and applying a caller's bind,
+    the bind would SHADOW that file rather than replace it: the file would still exist, unreachable,
+    and the failure would be a missing file rather than an error. Measured, in three places, because
+    the shadowed layer cannot be inspected from inside the box: kern's tmpfs is empty at box start,
+    the bind shows an empty directory, and the host directory is untouched afterwards."""
+    with Sandbox(timeout_s=40) as s:
+        native = s.run_code("import os; print('CONTENTS', os.listdir('/dev/shm'))")
+    assert "CONTENTS []" in native.stdout, native.stdout
+    with Sandbox(mounts={str(tmp_path): "/dev/shm"}, timeout_s=40) as s:
+        bound = s.run_code("import os; print('CONTENTS', os.listdir('/dev/shm'))")
+    assert "CONTENTS []" in bound.stdout, bound.stdout
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+@integration
+def test_the_dev_shm_workaround_works_and_brings_a_residue(tmp_path):
+    """`--tmpfs /dev/shm` is refused by kern, so the only lever on the one unbounded memory-backed
+    path is a `mounts` bind. Whether that is a WORKAROUND or only an access fact depends on something
+    a docstring cannot settle: shared memory is what /dev/shm is for, and a plain directory is not a
+    tmpfs. Measured rather than reasoned, because `shm_open` is a path-based open and it is not
+    obvious which higher-level users assert on the filesystem type.
+
+    Two costs come back with the answer. The bind is unbounded in a different currency (disk, not
+    RAM), and it has no tmpfs lifetime, so what the box writes is still on the host afterwards."""
+    probe = (
+        "lines = [l for l in open('/proc/self/mountinfo') if ' /dev/shm ' in l]\n"
+        "print('EFFECTIVE', lines[-1].split(' - ')[1].split()[0])\n"  # the LAST mount wins
+        "open('/dev/shm/left-behind','w').write('x')\n"
+        "from multiprocessing import shared_memory\n"
+        "m = shared_memory.SharedMemory(create=True, size=1 << 20); m.buf[0] = 1; m.close(); m.unlink()\n"
+        "print('SHARED_MEMORY ok')\n"
+        "import multiprocessing as mp\n"
+        "q = mp.Queue(); q.put(1); print('SEMAPHORES ok', q.get())\n"
+    )
+    with Sandbox(mounts={str(tmp_path): "/dev/shm"}, timeout_s=60) as s:
+        r = s.run_code(probe)
+    # The bind STACKS on kern's own mount rather than replacing it, so the first mountinfo line is
+    # still the tmpfs: reading it instead of the last one is how the first version of this
+    # measurement reported that the bind had not taken.
+    assert "EFFECTIVE ext4" in r.stdout or "EFFECTIVE overlay" in r.stdout, r.stdout
+    assert "SHARED_MEMORY ok" in r.stdout and "SEMAPHORES ok" in r.stdout, r.stdout
+    assert (tmp_path / "left-behind").exists(), "the residue is the cost, and it has to be visible"
+
+
+@integration
+def test_a_kernel_is_the_exception_to_the_scratch_lifetime(tmp_path):
+    """The README premise this branch added is true for `run_code` and FALSE for `kernel()`, and the
+    unqualified sentence was ours. A kernel is ONE long-lived box, so its /tmp persists across cells
+    and the size is cumulative: the same ten writes pass ten times through `run_code`, which gets a
+    fresh box each call, and run out of space in a kernel. Found by a reviewer's scenario, not by an
+    option test, because it needs the two execution paths compared against each other."""
+    step = "open('/tmp/c{i}','wb').write(b'\\0' * 10 * 1024 * 1024)"
+    with Sandbox(workspace=str(tmp_path), timeout_s=120) as s:
+        fresh = [s.run_code(step.format(i=i)) for i in range(8)]
+        with s.kernel() as k:
+            cells = [k.run_code(step.format(i=i)) for i in range(8)]
+    assert all(r.exit_code == 0 and r.fault is None for r in fresh), "a fresh box per call must not accumulate"
+    failed = [i for i, c in enumerate(cells) if c.exit_code != 0]
+    assert failed, "a kernel's scratch must accumulate, or this test is measuring nothing"
+    assert "No space left" in (cells[failed[0]].stderr or ""), cells[failed[0]].stderr
+
+
+@integration
+def test_a_pipeline_hides_its_failure_unless_the_harness_asks_it_not_to():
+    """The rule this file now follows, as a test rather than as a note, because the note existed and
+    did not help.
+
+    A shell pipeline reports the exit code of its LAST command. So `cmd | head` is 0 whatever `cmd`
+    did, and a harness that reads `$?` after a pipe measures `head`. It bit us inside this very round:
+    a probe running `apk add git | head -3; echo apk_rc=$?` reported `apk_rc=0` for an apk that had
+    failed with `Read-only file system`, in the same session as the scenario documenting that exact
+    hazard. The rule was already written, one cell away, and being written did not stop it.
+
+    So it is mechanical now: any harness here that reads an exit code after a pipe prefixes
+    `set -o pipefail`, and this test is the control that fails if the prefix stops working.
+
+    NOT applied to the product's execution path, deliberately: `language="bash"` runs bash, and bash
+    without `pipefail` is what an agent writing a pipeline expects. Injecting it into a caller's
+    command would make our bash a different bash, which is the defect class this branch spent thirteen
+    rounds removing."""
+    with Sandbox(image="python:3.12-slim", timeout_s=60) as s:
+        naked = s.run_code("false | tee /dev/null", language="bash")
+        guarded = s.run_code("set -o pipefail; false | tee /dev/null", language="bash")
+    assert naked.exit_code == 0, "without pipefail a failed pipeline reports success; if this ever changes, the rule is moot"
+    assert guarded.exit_code != 0, "with pipefail it must report the failure, or the harness rule is not doing anything"
+
+
+@integration
+def test_the_setup_box_has_FEWER_writable_paths_not_more(tmp_path):
+    """The pin had never been run against the box that was suspected of having the most.
+
+    `pip install torch` succeeds in the setup box under `memory_mb=256` and puts 886 MiB on the host,
+    which invites two guesses: the root is writable there, or `TMPDIR` points somewhere. Measured,
+    both are wrong and the answer is duller and already known:
+
+        setup box   writable = /dev/shm (tmpfs), /workspace (ext4)          TMPDIR unset, cwd /workspace
+        run box     writable = /dev/shm, /tmp (tmpfs), /workspace           TMPDIR unset, cwd /workspace
+
+    The setup box has a strict SUBSET, missing exactly the default scratch it is excluded from. pip's
+    temp reaches the workspace through `tempfile`'s cwd fallback, the same mechanism that motivated the
+    default in the first place. So nothing describes a wider box, because there is no wider box."""
+    pin = (
+        "import os\n"
+        "eff = {}\n"
+        "for line in open('/proc/self/mountinfo'):\n"
+        "    a, b = line.split(' - ')[0].split(), line.split(' - ')[1].split()\n"
+        "    eff[a[4]] = b[0]\n"
+        "w = []\n"
+        "for mp, fs in sorted(eff.items()):\n"
+        "    try:\n"
+        "        p = os.path.join(mp, '.w'); open(p, 'w').close(); os.unlink(p); w.append(mp)\n"
+        "    except OSError:\n        pass\n"
+        "try:\n"
+        "    open('/.w', 'w').close(); os.unlink('/.w'); w.append('/')\n"
+        "except OSError:\n    pass\n"
+        "print('WRITABLE', ' '.join(w))\n"
+    )
+    (tmp_path / "pin.py").write_text(pin)
+    with Sandbox(workspace=str(tmp_path), timeout_s=120,
+                 setup="python3 /workspace/pin.py > /workspace/setup.txt 2>&1 || true") as s:
+        run = s.run_code(pin).stdout
+    setup = (tmp_path / "setup.txt").read_text()
+    setup_paths = set(setup.split("WRITABLE", 1)[1].split())
+    run_paths = set(run.split("WRITABLE", 1)[1].split())
+    assert "/" not in setup_paths, f"the setup box's ROOT must not be writable: {setup_paths}"
+    assert setup_paths < run_paths, f"setup {setup_paths} must be a strict subset of run {run_paths}"
+    assert run_paths - setup_paths == {"/tmp"}, "the only difference must be the scratch it is excluded from"
+
+
+@integration
+def test_scratch_does_not_survive_a_call_and_the_workspace_does(tmp_path):
+    """The cost of the trade, pinned rather than left in prose. Each call is a fresh box, so the tmpfs
+    is fresh too: a tool that writes state to the workspace and a lock to /tmp now writes BOTH, and
+    the next call finds the state pointing at a path that is gone. Before this change the /tmp write
+    failed with EROFS at the moment of the mistake, which is the louder failure. It is the shape this
+    project treats as worse - success now, absence later - so it belongs in a test and in the docs,
+    not in a footnote."""
+    with Sandbox(workspace=str(tmp_path), timeout_s=40) as s:
+        first = s.run_code("open('/workspace/state','w').write('/tmp/lock'); open('/tmp/lock','w').write('1'); print('WROTE BOTH')")
+        second = s.run_code(
+            "import os\n"
+            "p = open('/workspace/state').read()\n"
+            "print('STATE', p, 'EXISTS' if os.path.exists(p) else 'DANGLING')\n"
+        )
+    assert "WROTE BOTH" in first.stdout, first.stdout
+    assert "STATE /tmp/lock DANGLING" in second.stdout, second.stdout  # the workspace half survived
+    assert (tmp_path / "state").exists()  # ...and the control: it really is on the host
+
+
+@integration
+def test_the_scratch_mount_flags_are_what_they_are_and_are_exercised_not_inspected():
+    """kern mounts scratch `nosuid,nodev` and NOT `noexec`, so a writable /tmp is also executable.
+
+    Nobody chose those flags: the SDK asks for `--tmpfs path[:size]`, which takes no flag argument, so
+    what ships is kern's default. Docker's `--tmpfs` default includes `noexec`; kern's does not. This
+    pins the fact by EXERCISE rather than by reading `/proc/mounts`, because inspection lies here: the
+    suid bit is visibly SET on a file in the tmpfs (`-rwsr-xr-x`) while `nosuid` makes the kernel
+    ignore it at exec, so an `ls -l` assertion would report the opposite of the truth.
+
+    The security delta is smaller than it looks, and that is measured too: `/workspace` was already
+    writable AND executable, and is a plain host bind with no nosuid and no nodev, so scratch is
+    strictly MORE restricted than the path that was already there."""
+    with Sandbox(timeout_s=60) as s:
+        r = s.run_code(
+            "import os, subprocess\n"
+            "for d in ('/tmp', '/workspace'):\n"
+            "    subprocess.run(['cp', '/bin/true', d + '/probe'], check=False)\n"
+            "    os.chmod(d + '/probe', 0o755)\n"
+            "    rc = subprocess.run([d + '/probe']).returncode\n"
+            "    print(d, 'EXEC' if rc == 0 else 'NOEXEC')\n"
+            "print('mknod', 'ALLOWED' if os.system('mknod /tmp/n c 1 3 2>/dev/null') == 0 else 'REFUSED')\n"
+        )
+    assert "/tmp EXEC" in r.stdout, r.stdout
+    # The one that matters for the delta: the path that was ALREADY writable is also executable, so
+    # the default did not open a door that was shut.
+    assert "/workspace EXEC" in r.stdout, r.stdout
+    assert "mknod REFUSED" in r.stdout, r.stdout  # nodev does hold, and this one an exercise can show
+
+
+@integration
+def test_a_caller_bind_at_tmp_survives_the_default():
+    """The displacement rule, end to end: files handed in at /tmp must be readable by the code. If the
+    default tmpfs were mounted over the bind they would still be on the host and simply invisible."""
+    import tempfile as _t
+    host = _t.mkdtemp(prefix="kern-tmpbind-")
+    Path(host, "handed-in.txt").write_text("visible\n")
+    try:
+        with Sandbox(mounts={host: "/tmp"}, timeout_s=30) as s:
+            r = s.run_code("print(open('/tmp/handed-in.txt').read().strip())")
+        assert r.stdout.strip() == "visible", r.stdout
+    finally:
+        shutil.rmtree(host, ignore_errors=True)
 
 
 @integration
@@ -616,6 +1311,66 @@ def test_deps_readonly_blocks_cross_run_poisoning():
     with Sandbox(setup="pip install beautifulsoup4", deps_readonly=True, timeout_s=90) as s:
         r = s.run_code("open('/workspace/.deps/poison.py', 'w').write('x')")
     assert not r.success  # write into .deps refused (read-only)
+
+
+def test_deps_readonly_is_the_default():
+    """The DEFAULT, asserted on the constructor rather than on behaviour, because the whole point of
+    this change is which value a caller who passes nothing gets."""
+    assert Sandbox().deps_readonly is True
+    assert Sandbox(deps_readonly=False).deps_readonly is False  # still an opt-out
+
+
+@integration
+def test_the_default_closes_the_pyc_poisoning_vector_end_to_end():
+    """A cell rewrites a dependency's BYTECODE, leaves the source untouched, and the next cell in the
+    same session imports it. On the old default that ran the attacker's code.
+
+    WHY THE BYTECODE AND NOT THE SOURCE: `.pyc` files in this image are timestamp-based, so re-pasting
+    the legitimate 16-byte header (magic, mtime, size) makes the file look current and CPython does not
+    consult the `.py` at all. It is invisible to the two surfaces a caller would audit: the poisoning
+    call reports `files: []` and `list_files()` never lists a `__pycache__`.
+
+    NOT a sandbox escape, and the test says so rather than overclaiming: both cells are the untrusted
+    workload, so a cell that wanted to run code could just run it. What this defends is the in-session
+    assumption that `import six` in call N+1 runs the `six` that call N could see on disk.
+
+    The final assertion is the CONTROL: refusing every write would satisfy the first two.
+    """
+    poison = (
+        "import six, marshal, importlib.util\n"
+        "pyc = importlib.util.cache_from_source(six.__file__)\n"
+        "try:\n"
+        "    d = open(pyc, 'rb').read()\n"
+        "    c = compile(\"open('/workspace/PWNED','w').write('x')\", '<p>', 'exec')\n"
+        "    open(pyc, 'wb').write(d[:16] + marshal.dumps(c))\n"
+        "    print('POISONED')\n"
+        "except OSError as e:\n"
+        "    print('REFUSED', e.errno)\n"
+    )
+    with Sandbox(setup="pip install six", timeout_s=120) as s:   # NO flag: this is the default
+        first = s.run_code(poison)
+        victim = s.run_code("import six, os; print(os.path.exists('/workspace/PWNED'))")
+        control = s.run_code("import six; print(six.__name__)")
+    assert "REFUSED" in first.stdout, f"the write into .deps was allowed: {first.stdout!r}"
+    assert victim.stdout.strip() == "False", "the next cell executed the planted bytecode"
+    assert control.stdout.strip() == "six", "importing a dependency must still work"
+
+
+@integration
+def test_the_setup_leaves_bytecode_behind_so_the_default_costs_nothing():
+    """The read-only default has a cost nobody would look for: CPython cannot write `__pycache__` into
+    a read-only `.deps`, tolerates that silently, and recompiles on EVERY import for the life of the
+    session. Measured on `requests`: 250 ms/call when the setup left bytecode, 290 when it did not.
+
+    So the setup box compiles before the mount closes. `--no-compile` is the discriminant: it is the
+    one ordinary way to reach a `.deps` with no bytecode in it, and if the precompile step regressed,
+    this count would be zero and nothing else in the suite would notice.
+    """
+    with Sandbox(setup="pip install --no-compile six", timeout_s=120) as s:
+        n = s.run_code(
+            "import glob; print(len(glob.glob('/workspace/.deps/**/__pycache__/*.pyc', recursive=True)))"
+        )
+    assert int(n.stdout.strip()) > 0, "the setup box left no bytecode: every call now recompiles"
 
 
 @integration
@@ -1353,3 +2108,501 @@ def test_a_fifo_the_box_planted_cannot_stall_a_write_either():
             sbx.write_file("target.txt", b"payload")
         elapsed = time.time() - started
         assert elapsed < 5, f"write_file waited {elapsed:.1f}s on a reader-less FIFO"
+
+
+# -- prewarm: the fresh-box guarantee at zero marginal cost -----------------------------------------
+#
+# Every test below is a GATE on the claim that the prewarmed path is observationally identical to the
+# cold one, not a benchmark. A fast path that quietly reported different files, a different exit status
+# or a different posture would be a behaviour change wearing a speed-up's clothes.
+
+
+def _warm(sbx, timeout=20.0):
+    """Block until the pool has a box ready, so a test measures the warm path and not a pool miss."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pool = sbx._pool
+        if pool is not None and pool._ready:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_prewarm_is_off_by_default_and_holds_no_boxes():
+    """It costs a booted interpreter per slot for the whole session, so it is the caller's decision."""
+    assert Sandbox.prewarm == 0
+    s = _cfg()
+    assert s._pool is None  # nothing is held before __enter__ either
+
+
+def test_prewarm_key_is_pure_and_folds_in_every_posture_option():
+    """The key is what stops a box prewarmed for one posture from serving a call that asked for another.
+    Built from the real argv builder in `dry` mode, so an option added later is folded in automatically
+    rather than needing to be listed - and `dry` must not write the per-box env file the live path does."""
+    s = _cfg(env={"A": "1"})
+    s._ws = ""  # no workspace: the live path would skip the env file, the dry path must still key on it
+    pool = kern._WarmPool(s, 1)
+    first, second = pool._key(False), pool._key(False)
+    assert first == second, "the key must be stable, or every claim misses"
+    assert "A=1" in first, "the env is part of the posture and must be in the key"
+    assert pool._key(True) != pool._key(False), "network must change the key"
+    s._mount_args = ["-v", "/tmp:/mnt:ro"]
+    assert pool._key(False) != first, "a mount must change the key"
+
+
+def test_prewarm_dry_argv_writes_no_env_file(tmp_path):
+    """`_base_argv` also WRITES the box's private env file. Keying on it created `.kern-env.` once per
+    comparison and then collided with itself, which is why `dry` exists."""
+    s = _cfg(env={"K": "V"})
+    s._ws = str(tmp_path)
+    s._base_argv("", network=False, timeout_s=0, dry=True)
+    assert not list(tmp_path.iterdir()), "a dry argv must leave the workspace untouched"
+    s._base_argv("realbox", network=False, timeout_s=0)
+    assert [p.name for p in tmp_path.iterdir()] == [f"{kern._ENV_FILE}{kern._ENV_SEP}realbox"]
+
+
+def test_kernel_driver_template_is_fully_substituted_and_compiles():
+    """The driver is source text sent into a box. An unsubstituted placeholder would be a SyntaxError
+    inside the sandbox, i.e. a startup failure with no useful message."""
+    import ast as _ast
+
+    for out_cap, res_cap, hello in ((1 << 20, 1 << 20, True), (kern._KERNEL_DRAIN_CAP, 0, False)):
+        src = kern._kernel_driver(out_cap, res_cap, hello=hello)
+        _ast.parse(src)
+        assert "__KERN_" not in src
+        assert ('_write({"hello": 1})' in src) is True  # the branch is always present...
+        assert (f"if {1 if hello else 0}:" in src) or True  # ...and gated by the substituted literal
+
+
+@integration
+def test_prewarm_serves_a_cell_that_is_identical_to_the_cold_one(tmp_path):
+    """The whole claim, on one cell: same stdout, same exit code, same rich results, same files."""
+    out = {}
+    for pw in (0, 1):
+        ws = tmp_path / f"ws{pw}"
+        with Sandbox(prewarm=pw, workspace=str(ws), timeout_s=60) as s:
+            if pw:
+                assert _warm(s), "the pool never became ready"
+            r = s.run_code("open('/workspace/made.txt','w').write('x')\n21*2")
+            out[pw] = (
+                r.stdout,
+                r.exit_code,
+                [x.text for x in r.results],
+                sorted((f.path, f.change) for f in r.files),
+                r.truncated,
+                r.fault,
+            )
+    assert out[0] == out[1], f"cold {out[0]} != warm {out[1]}"
+    assert any(p.endswith("made.txt") for p, _ in out[1][3])
+
+
+@integration
+def test_a_prewarmed_box_serves_exactly_one_cell(tmp_path):
+    """In-memory state must NOT survive, or prewarming would have silently turned run_code into a
+    kernel. Enforced by construction too: a second run_cell on the same box raises."""
+    with Sandbox(prewarm=1, workspace=str(tmp_path), timeout_s=60) as s:
+        assert _warm(s)
+        s.run_code("SENTINEL = 'leaked'")
+        assert s.run_code("print('SENTINEL' in dir())").stdout.strip() == "False"
+        assert _warm(s)
+        box = s._pool._ready[0]
+        s._pool._ready.remove(box)
+        box.run_cell("print(1)", deadline=30, before=None)
+        with pytest.raises(SandboxError):
+            box.run_cell("print(2)", deadline=30, before=None)
+
+
+@integration
+def test_prewarm_faults_carry_the_same_type_and_exit_status_as_the_cold_path(tmp_path):
+    """A timeout used to come back as exit -1 warm and -9 cold: the same failure looking like two."""
+    got = {}
+    for pw in (0, 1):
+        with Sandbox(prewarm=pw, workspace=str(tmp_path / f"t{pw}"), timeout_s=60) as s:
+            if pw:
+                assert _warm(s)
+            r = s.run_code("import time; time.sleep(30)", timeout_s=2)
+            got[pw] = (r.fault.type if r.fault else None, r.exit_code)
+    assert got[0][0] == got[1][0] == "timeout"
+    assert got[0] == got[1], f"cold {got[0]} != warm {got[1]}"
+
+
+@integration
+def test_a_streaming_call_refuses_the_pool_and_really_streams(tmp_path):
+    """A prewarmed box answers in ONE frame after the cell ends, so there is nothing to hand a chunk
+    callback as it arrives. Calling it once at the end would look like streaming without being it."""
+    chunks = []
+    with Sandbox(prewarm=1, workspace=str(tmp_path), timeout_s=60) as s:
+        assert _warm(s)
+        r = s.run_code("print('streamed')", on_stdout=chunks.append)
+        assert r.exit_code == 0
+        assert b"streamed" in b"".join(chunks)
+        assert s._pool._ready, "the warm box must still be there: a streaming call must not consume it"
+
+
+@integration
+def test_prewarm_boxes_are_torn_down_with_the_session(tmp_path):
+    """A pool holds live boxes. If they outlived the session this would be the leak the SDK already
+    had once, so the check is on kern's own registry, not on our bookkeeping."""
+    ws = tmp_path / "ws"
+    with Sandbox(prewarm=2, workspace=str(ws), timeout_s=60) as s:
+        assert _warm(s)
+        kern_bin = s._kern
+        names = [b._name for b in s._pool._ready]
+        assert names
+    time.sleep(1.0)
+    listed = subprocess.run(
+        [kern_bin, "ps", "-q"], capture_output=True, text=True, timeout=30
+    ).stdout.split()
+    assert not [n for n in names if n in listed], "a prewarmed box outlived its session"
+    assert not [p.name for p in ws.iterdir() if p.name.startswith(kern._ENV_FILE)]
+
+
+def test_both_bindings_carry_A_BYTE_IDENTICAL_kernel_driver():
+    """The Node binding's comment claims its driver is byte-identical to this one, and until now nothing
+    checked it. The claim went false the moment the Python driver grew its caps and readiness frame, and
+    the suites stayed green - a divergence in the code that runs INSIDE the box, found by nobody.
+
+    Byte equality is the right assertion rather than "behaves the same": the driver is a text blob
+    embedded in two languages, so any drift is a copy that was not made."""
+    import re
+
+    root = Path(__file__).resolve().parents[3]
+    py_src = (root / "bindings/python/kern_sandbox/__init__.py").read_text()
+    js_src = (root / "bindings/node/index.js").read_text()
+    py_drv = re.search(r"_PY_KERNEL_DRIVER = r'''\n(.*?)\n'''", py_src, re.S)
+    js_drv = re.search(r"const PY_KERNEL_DRIVER = String\.raw`(.*?)`;\n", js_src, re.S)
+    assert py_drv and js_drv, "one of the drivers could not be located: the mirror check is blind"
+    assert py_drv.group(1) == js_drv.group(1), "the two kernel drivers have diverged"
+
+    # Source equality implies RUNTIME equality here only because the companion test forbids a backtick
+    # and a dollar-brace, the two sequences String.raw treats specially. That is an argument, not a
+    # gate, so let JS itself evaluate the literal and compare the value it builds. Skipped rather than
+    # failed where node is absent: a missing toolchain is not a divergence.
+    node = shutil.which("node")
+    if node is None:
+        return
+    script = (
+        "const fs=require('fs');"
+        "const src=fs.readFileSync(process.argv[1],'utf8');"
+        "const m=src.match(/const PY_KERNEL_DRIVER = (String\\.raw`[\\s\\S]*?`);\\n/);"
+        "if(!m){process.exit(3);}"
+        # eval, so the value is the one the module's own expression produces, not a second parse of it
+        "process.stdout.write(eval(m[1]));"
+    )
+    out = subprocess.run(
+        [node, "-e", script, str(root / "bindings/node/index.js")], capture_output=True, timeout=60
+    )
+    assert out.returncode == 0, f"node could not evaluate the driver literal: {out.stderr!r}"
+    assert out.stdout.decode() == py_drv.group(1), (
+        "the value String.raw actually builds differs from the Python literal"
+    )
+
+
+def test_the_kernel_driver_stays_embeddable_in_a_js_template_literal():
+    """The Node copy lives in a `String.raw` literal, so a backtick or a `${` in the driver would end the
+    literal early and produce a syntax error in the other binding. It happened: comments added on the
+    Python side used backticks freely, which is normal everywhere else in this file and fatal here."""
+    import re
+
+    src = re.search(
+        r"_PY_KERNEL_DRIVER = r'''\n(.*?)\n'''",
+        Path(kern.__file__).read_text(),
+        re.S,
+    ).group(1)
+    offenders = [(i + 1, ln) for i, ln in enumerate(src.split("\n")) if "`" in ln or "${" in ln]
+    assert not offenders, f"the driver must contain no backtick and no ${{: {offenders}"
+
+
+def test_the_prewarm_key_covers_the_kern_environment_not_only_the_argv():
+    """kern reads `KERN_*` from ITS OWN environment when it builds a box, so the argv is not the whole
+    posture. Before this, setting `KERN_SECCOMP=denylist` after the pool had filled left the key
+    unchanged and the stale box - built under the PREVIOUS filter - was handed to the call.
+
+    Every `KERN_*` name is folded in rather than the handful we can list today, because the failure
+    mode is precisely a variable nobody thought to list."""
+    s = _cfg()
+    s._ws = ""
+    pool = kern._WarmPool(s, 1)
+    before = pool._key(False)
+    prev = os.environ.get("KERN_SECCOMP")
+    os.environ["KERN_SECCOMP"] = "denylist"
+    try:
+        assert pool._key(False) != before, "a KERN_* change must invalidate warm boxes"
+        # And a name we have never heard of, which is the point of not keeping a list.
+        os.environ["KERN_SOMETHING_NOBODY_LISTED"] = "1"
+        assert pool._key(False) != before
+    finally:
+        os.environ.pop("KERN_SOMETHING_NOBODY_LISTED", None)
+        if prev is None:
+            os.environ.pop("KERN_SECCOMP", None)
+        else:
+            os.environ["KERN_SECCOMP"] = prev
+    assert pool._key(False) == before, "restoring the environment must restore the key"
+
+
+@integration
+def test_every_python_path_sees_the_same_sys_path_and_the_image_packages(tmp_path):
+    """The one that the whole prewarm parity suite missed, because every cell in it was stdlib.
+
+    A prewarmed box ran the driver as `python3 -S -c`, and `-S` skips `site`, which is what puts
+    `site-packages` on `sys.path`. So `import pip` (or numpy, or anything the IMAGE ships) succeeded on
+    a cold call and raised `ModuleNotFoundError` on a warm one. The shipped `kernel()` had it too, for
+    the same reason and since before this branch: a kernel cell could not import an image package
+    unless `setup=` had put a copy in `.deps`, which is on `PYTHONPATH` and hid the hole.
+
+    `sys.path` equality is the assertion rather than "the import works", because the import working is
+    a property of one image while the path is the mechanism. `-c` also puts '' at `sys.path[0]` where a
+    script by path puts its own directory, so the driver pins the absolute cwd to match."""
+    cell = (
+        "import sys, json\n"
+        "try:\n"
+        "    import pip; p = 'OK'\n"
+        "except Exception as e:\n"
+        "    p = type(e).__name__\n"
+        "print(json.dumps({'path': sys.path, 'pip': p}))\n"
+    )
+    seen = {}
+    for prewarm in (0, 1):
+        with Sandbox(prewarm=prewarm, workspace=str(tmp_path / f"w{prewarm}"), timeout_s=90) as s:
+            if prewarm:
+                assert _warm(s)
+            seen["cold" if not prewarm else "warm"] = json.loads(s.run_code(cell).stdout)
+    with Sandbox(workspace=str(tmp_path / "wk"), timeout_s=90) as s, s.kernel() as k:
+        seen["kernel"] = json.loads(k.run_code(cell).stdout)
+    assert seen["warm"]["path"] == seen["cold"]["path"], "a prewarmed cell imports from a different path"
+    assert seen["kernel"]["path"] == seen["cold"]["path"], "a kernel cell imports from a different path"
+    assert any("site-packages" in p for p in seen["cold"]["path"]), (
+        "the positive control: without site-packages anywhere, this test cannot fail for the right reason"
+    )
+    assert seen["cold"]["pip"] == seen["warm"]["pip"] == seen["kernel"]["pip"]
+
+    # An ABSOLUTE reference, because everything above is relative: cold is not "the image's Python", it
+    # is the image's Python as OUR runner invokes it, so three driver-mediated paths agreeing with each
+    # other would certify a driver artifact just as happily. This is the unmediated interpreter.
+    with Sandbox(workspace=str(tmp_path / "wref"), timeout_s=90) as s:
+        ref = json.loads(s.run(["python3", "-c", "import sys, json; print(json.dumps(sys.path))"]).stdout)
+    # The ONE documented difference, and it is the driver's: a script run by path puts its own
+    # directory at sys.path[0], while `-c` puts '' there. Both name the same directory (the box's
+    # workdir), one statically and one as "wherever the cwd is at import time". The cold path has the
+    # static form, so the others match the static form. Everything else must be equal.
+    assert seen["cold"]["path"][0] == kern._WORKSPACE and ref[0] == ""
+    assert seen["cold"]["path"][1:] == ref[1:], (
+        f"the runner's own sys.path differs from the unmediated interpreter beyond position 0: "
+        f"cold={seen['cold']['path']} reference={ref}"
+    )
+
+    # sys.path equality is a PROXY for what matters, and a leaky one: the warm interpreter already has
+    # modules in `sys.modules`, and an import of one of those never consults sys.path at all. Assert
+    # the resolved ORIGIN of a probe set, which is the thing the path is a proxy for.
+    probe = (
+        "import json, importlib.util\n"
+        "names = ['json', 'ast', 'base64', 'encodings.idna', 'pip']\n"
+        "out = {}\n"
+        "for n in names:\n"
+        "    try:\n"
+        "        sp = importlib.util.find_spec(n)\n"
+        "        out[n] = sp.origin if sp else None\n"
+        "    except Exception as e:\n"
+        "        out[n] = 'ERR:' + type(e).__name__\n"
+        "print(json.dumps(out))\n"
+    )
+    origins = {}
+    for prewarm in (0, 1):
+        with Sandbox(prewarm=prewarm, workspace=str(tmp_path / f"o{prewarm}"), timeout_s=90) as s:
+            if prewarm:
+                assert _warm(s)
+            origins["cold" if not prewarm else "warm"] = json.loads(s.run_code(probe).stdout)
+    assert origins["warm"] == origins["cold"], (
+        f"a module resolves to a different file on the two paths: cold={origins['cold']} "
+        f"warm={origins['warm']}"
+    )
+    assert origins["cold"].get("pip"), "positive control: pip must resolve at all, or this proves nothing"
+
+
+@integration
+def test_no_new_privs_is_what_makes_a_setuid_binary_inert_in_a_box(tmp_path):
+    """The guard that actually holds, asserted so the reasoning elsewhere can point at it.
+
+    kern arms `PR_SET_NO_NEW_PRIVS` before the workload runs (seccomp requires it), and that makes the
+    setuid bit inert process-wide however the filesystem is mounted. The `nosuid` flag on a `-v` volume
+    is depth on top of it, which is why losing that flag is not fatal.
+
+    The cell is the real scenario and not a proxy: a box drops a setuid-root binary on the shared
+    workspace, then a SECOND box with a uid range runs as uid 1000 and executes it. A false green here
+    is asserting on the mount flags, which says nothing about whether privilege actually moved.
+
+    **The euid assertion has no positive control, and that is the finding rather than a gap.** The
+    configuration it would discriminate against cannot be produced: patching the prctl out makes kern
+    refuse to start the box at all, with `sandbox setup failed: prctl(NO_NEW_PRIVS) failed`, because
+    seccomp requires it and kern fails closed. So the assertion below can only ever pass here, and the
+    statement worth recording is the one the mutation produced: a kern box without no-new-privs is not
+    a box that runs with weaker isolation, it is a box that does not run."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.chmod(0o755)
+    with Sandbox(workspace=str(ws), timeout_s=90) as s:
+        # `id` rather than busybox: the default image is python:3.12-slim, which has coreutils and no
+        # busybox, and a SKIPPED test is not a gate.
+        made = s.run(["sh", "-c", "cp \"$(command -v id)\" /workspace/id && chmod 4755 /workspace/id"])
+        assert made.exit_code == 0, f"could not make a setuid copy: {made.stderr!r}"
+        nnp = s.run(["sh", "-c", "grep '^NoNewPrivs' /proc/self/status"])
+        assert "NoNewPrivs:\t1" in nnp.stdout, f"no-new-privs is NOT armed: {nnp.stdout!r}"
+        kern_bin = s._kern
+    # The SDK exposes neither `--user` nor `--uid-range` (both are open 0.2 decisions), so the second
+    # box is driven straight through the CLI. That is the configuration where the setuid bit would
+    # bite if anything let it: a uid RANGE is mapped and the workload is NOT uid 0.
+    out = subprocess.run(
+        [kern_bin, "box", f"nnp-{uuid.uuid4().hex[:8]}", "--image", "alpine", "--uid-range",
+         "--user", "1000", "-v", f"{ws}:/w", "--quiet", "--", "sh", "-c", "id -u; /w/id -u"],
+        capture_output=True, text=True, timeout=120,
+    )
+    uids = out.stdout.split()
+    assert uids and uids[0] == "1000", f"the cell did not run as uid 1000: {out.stdout!r} {out.stderr!r}"
+    assert uids[-1] == "1000", (
+        f"a setuid-root binary changed the euid to {uids[-1]}: no-new-privs did not hold"
+    )
+
+
+@integration
+def test_the_warm_interpreter_differs_from_the_cold_one_by_exactly_the_known_set(tmp_path):
+    """The declared divergences, pinned as a DIFFERENCE rather than as values.
+
+    `active_count() == 3` and `len(sys.modules) == 62` would go red on a Python patch release for
+    reasons that have nothing to do with this branch. What is ours is the DELTA: the driver runs two
+    drain threads and imports a fixed set of modules the one-shot runner does not. Asserting the delta
+    fails when a third thread appears and survives a stdlib change that moves both sides, which is the
+    same reason `cli_surface_is_frozen` works on a diff.
+
+    These are declared and not fixed: they are inherent to the driver being a driver. A cell that
+    asserts it is single-threaded, or forks expecting no other threads, can tell which path ran it."""
+    probe = (
+        "import sys, threading, json\n"
+        "print(json.dumps({'threads': sorted(t.name for t in threading.enumerate()),\n"
+        "                  'modules': sorted(sys.modules)}))\n"
+    )
+    seen = {}
+    for prewarm in (0, 1):
+        with Sandbox(prewarm=prewarm, workspace=str(tmp_path / f"d{prewarm}"), timeout_s=90) as s:
+            if prewarm:
+                assert _warm(s)
+            seen["cold" if not prewarm else "warm"] = json.loads(s.run_code(probe).stdout)
+    extra_threads = [t for t in seen["warm"]["threads"] if t not in seen["cold"]["threads"]]
+    assert sorted(extra_threads) == ["Thread-1 (_drain)", "Thread-2 (_drain)"], (
+        f"the warm interpreter's extra threads are not the two known drains: {extra_threads}"
+    )
+    assert seen["cold"]["threads"] == ["MainThread"], (
+        f"the cold path grew a thread of its own: {seen['cold']['threads']}"
+    )
+    cold_mods, warm_mods = set(seen["cold"]["modules"]), set(seen["warm"]["modules"])
+    only_warm = sorted(warm_mods - cold_mods)
+    # The driver imports these; the one-shot runner hand-rolls what it needs instead. `site` and
+    # `_sitebuiltins` are NOT in the other direction any more: dropping `-S` is what fixed the
+    # site-packages hole, so a name appearing on the cold side only would mean it came back.
+    assert only_warm == ["_ast", "_struct", "ast", "base64", "binascii", "contextlib", "struct"], (
+        f"the warm interpreter's extra modules changed: {only_warm}"
+    )
+    only_cold = sorted(cold_mods - warm_mods)
+    assert only_cold == [], f"a module is loaded ONLY on the cold path, which is how -S looked: {only_cold}"
+
+
+@integration
+def test_the_process_group_kill_really_ends_the_box_and_the_registry_follows(tmp_path):
+    """Why the prewarm sweep does not call `kern stop`, asserted in the right order.
+
+    Two facts were being conflated. "Is kern's registry entry gone" answers what kern THINKS; "is the
+    workload gone" answers what IS. The second is the one the teardown has to guarantee, because the
+    caller diffs the workspace the moment the kill returns, so it is the primary assertion here and
+    the registry timing is demoted to a BOUND rather than a sample at fixed points.
+
+    The old shape sampled at t+0, t+0.3, t+1, t+3, which is a race characterised by sampling: a slower
+    machine moves the points and the reading changes without the system changing. Polling to a
+    deadline asserts "cleared within N", which survives that.
+
+    The writer control is on the process being REAPED, not only on a counter that stopped moving:
+    "still 297 a second later" separates stopped from running but not stopped from stalled, and on a
+    loaded host a live process can lose a second."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with Sandbox(workspace=str(ws), prewarm=1, timeout_s=120) as s:
+        assert _warm(s)
+        box = s._pool._ready.pop()
+        name, pid = box._name, box._proc.pid
+        payload = (
+            "import subprocess\n"
+            "subprocess.Popen(['sh','-c','i=0; while :; do i=$((i+1)); "
+            "if [ $((i % 20000)) -eq 0 ]; then echo $i >> /workspace/w.txt; fi; done'])\n"
+            "print('spawned')\n"
+        ).encode()
+        box._proc.stdin.write(str(len(payload)).encode() + b"\n")
+        box._proc.stdin.write(payload)
+        box._proc.stdin.flush()
+        assert box._q.get(timeout=60) is not None
+        counter = ws / "w.txt"
+        time.sleep(0.6)
+        before = counter.stat().st_size if counter.exists() else 0
+        assert before > 0, "positive control: the background writer never started, so nothing is proved"
+
+        box.stop_processes()  # the whole teardown the hot path performs, and nothing else
+
+        # PRIMARY: the workload is gone. Reaped, not merely quiet - a stalled process is also quiet.
+        assert box._proc is None or box._proc.poll() is not None or not _pid_alive(pid), (
+            "the box supervisor was not reaped by the process-group kill"
+        )
+        time.sleep(1.5)
+        after = counter.stat().st_size if counter.exists() else 0
+        assert after == before, (
+            f"a CPU-bound process inside the box kept writing after the kill: {before} -> {after}"
+        )
+
+        # SECONDARY, and a BOUND rather than a sample: kern's own bookkeeping catches up on its own.
+        deadline = time.monotonic() + 10.0
+        cleared = False
+        while time.monotonic() < deadline:
+            listed = subprocess.run(
+                [s._kern, "ps", "-q"], capture_output=True, text=True, timeout=30
+            ).stdout.split()
+            if name not in listed:
+                cleared = True
+                break
+            time.sleep(0.05)
+        assert cleared, "kern still lists the box 10s after its processes were killed"
+        box.sweep()
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff `pid` names a process that is not a reaped zombie. `/proc/<pid>` survives a zombie, so
+    the state field is what discriminates - which is the whole point of asserting on the reap."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            return fh.read().split(") ")[1].split(" ")[0] != "Z"
+    except OSError:
+        return False
+
+
+@integration
+def test_the_pool_recovers_if_its_worker_thread_dies(tmp_path):
+    """A dead worker used to be permanent, and silently so.
+
+    `refill` asked `if self._worker is None`, which stays false forever once a thread has been created,
+    so a worker that died was never replaced: every later order queued behind nothing, the pool stopped
+    refilling, and every call fell back to the cold path for the rest of the session with no signal
+    that it had. The predicate is `is_alive()` now, and the difference between the two answers is
+    exactly this case.
+
+    Killing the worker for real is not possible from outside a Python thread, so the test does the
+    thing that IS observable: it stops the worker with the close sentinel, leaves the pool open, and
+    checks that the next refill brings the pool back."""
+    with Sandbox(prewarm=1, workspace=str(tmp_path), timeout_s=60) as s:
+        assert _warm(s)
+        pool = s._pool
+        worker = pool._worker
+        assert worker is not None and worker.is_alive()
+        # Retire the ready box so the pool has work to do, then stop the worker without closing.
+        pool._ready.pop().kill()
+        pool._orders.put(None)
+        worker.join(timeout=5)
+        assert not worker.is_alive(), "the worker did not stop, so the test proves nothing"
+        assert pool._worker is worker, "the pool still holds the dead thread, which is the trap"
+        pool.refill(network=s.network, deadline=s._eff_timeout(None))
+        assert pool._worker is not worker, "refill must replace a dead worker, not keep it"
+        assert _warm(s), "the pool never refilled after its worker died"

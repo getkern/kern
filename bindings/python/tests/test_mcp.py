@@ -243,6 +243,39 @@ def test_warm_kernel_mode_tells_the_client_state_persists(monkeypatch):
     assert "PERSISTS" in w and "PERSISTS" not in p
 
 
+def test_the_language_enum_says_which_image_it_is_talking_about(monkeypatch):
+    """The enum lists what the RUNNER accepts; the image decides what exists. A model that reads only
+    the enum concludes node works on python:3.12-slim, says so to the user, and is wrong. The schema
+    is the only surface it reads, so the correction has to live there and not in a README."""
+    default = _one(_server(), _req("tools/list"), monkeypatch)["result"]["tools"]
+    lang = next(t for t in default if t["name"] == "run_code")["inputSchema"]["properties"]["language"]
+    assert lang["enum"] == ["python", "bash", "sh", "node"]  # the runner accepts all four
+    # bash and sh are DIFFERENT shells and the schema has to say so: a model that reads "bash" and
+    # gets dash writes `[[ ]]` and is told `[[: not found`, which names neither cause nor remedy.
+    assert "'bash' runs bash" in lang["description"] and "POSIX shell" in lang["description"]
+    assert "python:3.12-slim" in lang["description"] and "NOT node" in lang["description"]
+    # The top-level description must not advertise node either: that sentence is what got copied into
+    # a "Node.js supported" table in a real report.
+    desc = next(t for t in default if t["name"] == "run_code")["description"]
+    assert "node" not in desc.split(".")[0]
+
+    # For any OTHER image we do not know the contents, so we name the image and stop. Guessing the
+    # interpreters from a tag would be inventing a measurement.
+    other = _one(_server(KERN_MCP_IMAGE="node:20-slim"), _req("tools/list"), monkeypatch)["result"]["tools"]
+    lang2 = next(t for t in other if t["name"] == "run_code")["inputSchema"]["properties"]["language"]
+    assert "node:20-slim" in lang2["description"] and "NOT node" not in lang2["description"]
+
+
+def test_the_language_note_does_not_mutate_the_module_table(monkeypatch):
+    """Same failure mode as the warm-kernel note: an in-place edit would append the image sentence once
+    per tools/list and leak into every later connection in the same process."""
+    before = M._TOOLS[0]["inputSchema"]["properties"]["language"]["description"]
+    s = _server()
+    for _ in range(3):
+        _one(s, _req("tools/list"), monkeypatch)
+    assert M._TOOLS[0]["inputSchema"]["properties"]["language"]["description"] == before
+
+
 def test_warm_kernel_view_does_not_mutate_the_module_table(monkeypatch):
     """_tools_view deep-copies; if it ever mutated _TOOLS in place the note would accumulate once per
     tools/list call and leak into every later connection in the same process."""
@@ -1289,12 +1322,20 @@ def test_a_newline_free_flood_does_not_grow_the_server(tmp_path):
     reading the code, because TextIOWrapper.readline(size) bounds the string it RETURNS and says
     nothing about what it buffers while scanning for the newline.
 
-    128 MB and 400 MB both sit on the plateau, so a healthy server answers with the same number twice
+    256 MB and 800 MB both sit on the plateau, so a healthy server answers with the same number twice
     and a reader that accumulates fails by hundreds of megabytes, not by a rounding error. Measured
     both ways: 55.1 against 55.4 as it stands, and 150 against 423 with a deliberate leak in the drain
-    loop."""
-    small, served_small = _peak_rss_mb_for_flood(tmp_path, 128)
-    large, served_large = _peak_rss_mb_for_flood(tmp_path, 400)
+    loop.
+
+    The pair was 128 and 400 and had to move, which is worth recording because the reason is the trap
+    this docstring already names. The RAMP POINT is not fixed: it moved from below 128 MB to between
+    128 and 192 MB, and the old pair then straddled it and reported +7.6 MB of "growth" four times out
+    of four while the server was bounded. What proves bounded is the far end, not the threshold:
+    measured 47.7 at 128, then 55.4 at 192, 55.4 at 256, 56.0 at 400 and 55.4 at 800. A leak does not
+    flatten across a 4x flood. Why the ramp moved is NOT established here; that it is a ramp and not a
+    leak is."""
+    small, served_small = _peak_rss_mb_for_flood(tmp_path, 256)
+    large, served_large = _peak_rss_mb_for_flood(tmp_path, 800)
     assert served_small and served_large, "the ping after the flood must still be answered"
     assert small is not None and large is not None
     assert large - small < 8, f"RSS grew {large - small:.1f} MB when the flood grew 3.1x"
@@ -1312,6 +1353,21 @@ def test_memory_zero_is_the_only_way_to_reach_the_profiles_own_memory(monkeypatc
 
     monkeypatch.delenv("KERN_MCP_MEMORY_MB")
     assert M._env_cap("KERN_MCP_MEMORY_MB", 1024) == 1024  # control: unset != 0
+
+
+def test_the_scratch_knob_is_a_size_and_zero_removes_it(monkeypatch):
+    """`MPLCONFIGDIR=/tmp` in this server was a claim about a path inside the READ-ONLY root until the
+    SDK mounted scratch there. The knob resizes that scratch; `0` puts the old shape back, and it has
+    to be distinguishable from "unset", which is the default size."""
+    monkeypatch.delenv("KERN_MCP_TMPFS_MB", raising=False)
+    assert M._env_cap("KERN_MCP_TMPFS_MB", 64) == 64
+    monkeypatch.setenv("KERN_MCP_TMPFS_MB", "0")
+    assert M._env_cap("KERN_MCP_TMPFS_MB", 64) is None   # explicit "none", not the default
+    monkeypatch.setenv("KERN_MCP_TMPFS_MB", "512")
+    assert M._env_cap("KERN_MCP_TMPFS_MB", 64) == 512
+    for bad in ("-1", "abc", "", "1.5"):                 # garbage must not silently remove the scratch
+        monkeypatch.setenv("KERN_MCP_TMPFS_MB", bad)
+        assert M._env_cap("KERN_MCP_TMPFS_MB", 64) == 64, bad
 
 
 def test_memory_cap_still_rejects_garbage_and_negatives(monkeypatch):

@@ -103,8 +103,18 @@ under a 1 GB cap.
 
 **No live pi session.** We exercised every operation the extension provides, which is the half that
 can be wrong against kern. We did not exercise pi's half: `registerTool` with an overridden
-`execute`, the `user_bash` hook, session shutdown, the `/kern` command. That needs pi installed and a
-provider key.
+`execute`, the `user_bash` hook, session shutdown, the `/kern` command.
+
+An earlier version of this paragraph said that needs "a provider key". It does not, and the
+correction is someone else's measurement: pi runs against a local OpenAI-compatible endpoint with a
+provider declared in `~/.pi/agent/models.json` as `api: "openai-completions"`, no key involved, and
+`pi auth check` reports ready. So the barrier is lower than we wrote. It is still not cleared here.
+
+What IS pinned is the half of that gap which belongs to this file: **activation touches nothing.**
+The suite runs the extension's entry point with `KERN_BIN` pointed at a path that does not exist, and
+registration still completes, because `new Sandbox(...)` resolves the binary in its constructor and
+would throw. Measured at 1 ms. So a pi that hangs at startup is not hanging on a box this extension
+opened, and nobody has to run pi twice to establish that.
 
 **The file tools do not cross the kernel boundary.** `bash` and `!` run in the box. `read`, `write`,
 `edit`, `ls`, `grep` and `find` are host I/O confined by a path check plus `O_NOFOLLOW`, where

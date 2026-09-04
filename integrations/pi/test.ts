@@ -11,10 +11,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Sandbox } from "kern-sandbox";
+import { Sandbox, type SandboxOptions } from "kern-sandbox";
 import { fatal, ok, report, throws } from "./harness.ts";
 import {
+	boxOptions,
 	detectImageMimeType,
+	guestHome,
 	globMatches,
 	kernBashOps,
 	kernEditOps,
@@ -24,6 +26,9 @@ import {
 	kernReadOps,
 	kernWriteOps,
 	refuseOutsideWorkspace,
+	detectShell,
+	requireScratchSupport,
+	scratchFromEnv,
 } from "./index.ts";
 
 const IMAGE = process.env.KERN_PI_IMAGE ?? "python:3.12-slim";
@@ -41,6 +46,103 @@ async function main() {
 	await throws("deep dotdot escape is refused", () => refuseOutsideWorkspace("/workspace/a/b/../../../etc"), /outside/);
 	await throws("a relative path is refused", () => refuseOutsideWorkspace("src/main.rs"), /relative/);
 	await throws("a lookalike prefix is refused", () => refuseOutsideWorkspace("/workspace-evil/x"), /outside/);
+
+	// ---- the box a toolchain actually lands in, before any box is opened ----
+	console.log("\nthe two writable places");
+	const opts = boxOptions("/some/host/workspace");
+	// Both were MISSING, and the documented README example (`KERN_PI_IMAGE=node:22`, then an agent
+	// running `npm install`) could not work without them. Measured on node:22: neither -> exit 2,
+	// HOME alone with a read-only /tmp -> still exit 2, both -> exit 0 and the cache moves to
+	// /workspace/.npm. So both are asserted, not just the one that is easier to remember.
+	ok("the box gets scratch at /tmp", JSON.stringify(opts.tmpfs) === JSON.stringify({ "/tmp": "256m" }), JSON.stringify(opts.tmpfs));
+	ok("the box gets a writable HOME", JSON.stringify(opts.env) === JSON.stringify({ HOME: "/workspace" }), JSON.stringify(opts.env));
+	ok("no network unless KERN_PI_EGRESS names a host", !("egressAllow" in opts));
+	// The knobs, at their edges, through the functions that decide. `0` had to mean "none" here
+	// because `KERN_MCP_TMPFS_MB=0` already means that: two knobs with the same name and opposite
+	// behaviour is the defect this whole round has been about, and before this it silently gave 256.
+	// Garbage still falls back, because a typo is not a decision.
+	for (const [raw, expected] of [["0", 0], ["-5", 256], ["abc", 256], ["512", 512], [undefined, 256]] as [string | undefined, number][]) {
+		const saved = process.env.KERN_PI_SCRATCH_PROBE;
+		if (raw === undefined) delete process.env.KERN_PI_SCRATCH_PROBE;
+		else process.env.KERN_PI_SCRATCH_PROBE = raw;
+		const seen = scratchFromEnv("KERN_PI_SCRATCH_PROBE", 256);
+		if (saved === undefined) delete process.env.KERN_PI_SCRATCH_PROBE;
+		else process.env.KERN_PI_SCRATCH_PROBE = saved;
+		ok(`scratch knob ${JSON.stringify(raw)} -> ${seen}`, seen === expected, `atteso ${expected}`);
+	}
+	// The premise under the HOME default, because a reviewer argued for pointing it at the scratch and
+	// the argument stands or falls on this: EVERY COMMAND IS A FRESH BOX, so the scratch is fresh too.
+	// A cache under $HOME on the scratch would be rebuilt from the network on every single command.
+	// Asserted here rather than in prose because it is the reason the default is what it is.
+	{
+		const ws2 = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pi-fresh-"));
+		const fb = new Sandbox({ image: IMAGE, workspace: ws2, timeoutS: 30, tmpfs: { "/tmp": "8m" } });
+		await fb.open();
+		let a = "", b2 = "", c2 = "";
+		try {
+			const ops = kernBashOps(fb, "sh");
+			await ops.exec("echo x > /tmp/marker && echo WRITTEN", "/workspace", { onData: (c) => { a += c.toString(); } });
+			await ops.exec("cat /tmp/marker 2>/dev/null && echo SURVIVED || echo GONE", "/workspace", { onData: (c) => { b2 += c.toString(); } });
+			await ops.exec("echo y > /workspace/marker; cat /workspace/marker && echo WS-SURVIVED", "/workspace", { onData: (c) => { c2 += c.toString(); } });
+		} finally {
+			await fb.close();
+			fs.rmSync(ws2, { recursive: true, force: true });
+		}
+		ok("scratch does NOT survive between two commands", a.includes("WRITTEN") && b2.includes("GONE"), `${a.trim()} | ${b2.trim()}`);
+		ok("the workspace does, which is why HOME points there", c2.includes("WS-SURVIVED"), c2.trim());
+	}
+
+	// An empty or relative $HOME puts the toolchain cache back inside the read-only root, which is
+	// the defect the knob exists to fix, arriving again with no message.
+	ok("an absolute HOME passes", guestHome("/tmp/home") === "/tmp/home");
+	await throws("an empty HOME is refused", () => guestHome(""), /absolute path/);
+	await throws("a relative HOME is refused", () => guestHome("workspace"), /absolute path/);
+
+	// An SDK that silently ignores `tmpfs` is the failure this guards: an unknown constructor option
+	// throws in neither binding, so the box would come up with a read-only /tmp and the first install
+	// would blame the network. It must pass HERE, against the SDK this checkout resolves.
+	requireScratchSupport();
+	ok("the installed kern-sandbox honours tmpfs", true);
+
+	// ---- activation must touch NOTHING ----------------------------------------------------------
+	console.log("\nactivation");
+	// A reviewer spent an afternoon on a pi startup hang and cleared this extension by running pi
+	// with and without `-e`. That clearing should be a PROPERTY we hold, not a result they had to go
+	// and measure: registering tools must not open a box, spawn kern, or pull an image.
+	//
+	// The discriminant is a KERN_BIN that does not exist. `new Sandbox(...)` resolves the binary in
+	// its CONSTRUCTOR and throws when it cannot, so if activation built one, this throws. It also
+	// covers the weaker shape: a box opened at activation would cost an image pull before the user
+	// has asked for anything.
+	const savedBin = process.env.KERN_BIN;
+	process.env.KERN_BIN = "/nonexistent/kern-that-is-not-there";
+	let registered = 0;
+	let commands = 0;
+	let hooks = 0;
+	const tAct = Date.now();
+	try {
+		const stub = {
+			registerTool: () => {
+				registered++;
+			},
+			registerCommand: () => {
+				commands++;
+			},
+			on: () => {
+				hooks++;
+			},
+		};
+		(await import("./index.ts")).default(stub as never);
+		ok("activation registers the tools without a kern binary present", registered >= 7 && commands >= 1 && hooks >= 2, `${registered} tools, ${commands} commands, ${hooks} hooks`);
+	} catch (e) {
+		ok("activation registers the tools without a kern binary present", false, e instanceof Error ? e.message : String(e));
+	} finally {
+		if (savedBin === undefined) delete process.env.KERN_BIN;
+		else process.env.KERN_BIN = savedBin;
+	}
+	const activateMs = Date.now() - tAct;
+	// A box open is ~90 ms on a warm image and unbounded on a cold one. Activation is arithmetic.
+	ok(`activation is instant (${activateMs} ms), so no box and no pull`, activateMs < 200, `${activateMs} ms`);
 
 	// ---- the glob, also pure ----
 	console.log("\nglob");
@@ -178,6 +280,48 @@ async function main() {
 		await throws("an aborted call rejects with 'aborted'", () => b.exec("sleep 20", "/workspace", { onData, signal: ac.signal }), /^aborted$/);
 
 		await throws("bash refuses a cwd outside the workspace", () => b.exec("pwd", "/etc", { onData }), /outside/);
+
+		// ---- the option set, against a real box, with the old shape as the control ----------------
+		// ---- the shell the agent actually gets -----------------------------------------------------
+		console.log("\nthe shell behind pi's `bash` tool");
+		// pi's tool is called `bash` and a model writes bash by reflex. This used to hand the command
+		// to `sh`, which on a Debian image is dash, WITH BASH PRESENT AND UNUSED: `[[ 1 == 1 ]]`
+		// answered `sh: 1: [[: not found`, arrays and process substitution answered `Syntax error:
+		// "(" unexpected`. Nothing was missing; the wrong binary was chosen. Found by a reviewer.
+		ok("the shell is measured, not assumed", (await detectShell(box)) === "bash");
+		out = "";
+		await b.exec("readlink -f /proc/$$/exe; [[ 1 == 1 ]] && echo BRACKETS-OK || echo BRACKETS-NO", "/workspace", { onData });
+		ok("pi's `bash` tool really runs bash", out.includes("/bash") && out.includes("BRACKETS-OK"), out.trim().replace(/\n/g, " | "));
+		out = "";
+		await b.exec("a=(1 2 3); echo ${#a[@]}", "/workspace", { onData });
+		ok("an array, which dash cannot parse, works", out.includes("3"), out.trim());
+
+		console.log("\nboth writable places, in a box opened the way the extension opens one");
+		const probe =
+			'touch /tmp/p 2>/dev/null && echo TMP-OK || echo TMP-RO; ' +
+			'touch "$HOME/.p" 2>/dev/null && echo HOME-OK || echo HOME-RO; echo HOME=$HOME';
+		const cases: [string, SandboxOptions, boolean][] = [
+			["as the extension opens one", boxOptions(ws), true],
+			// The control is the shape that shipped: no tmpfs, no HOME. If it does NOT fail, this test
+			// is proving nothing and the two lines above it are decoration.
+			["the control, as it shipped", { image: IMAGE, workspace: ws, timeoutS: 30, tmpfs: {} }, false],
+		];
+		for (const [label, options, shouldWork] of cases) {
+			const probeBox = new Sandbox(options);
+			await probeBox.open();
+			let seen = "";
+			try {
+				await kernBashOps(probeBox).exec(probe, "/workspace", {
+					onData: (c: Buffer) => {
+						seen += c.toString();
+					},
+				});
+			} finally {
+				await probeBox.close();
+			}
+			const writable = seen.includes("TMP-OK") && seen.includes("HOME-OK");
+			ok(`${label}: /tmp and $HOME writable = ${writable}`, writable === shouldWork, seen.trim().replace(/\n/g, " | "));
+		}
 	} finally {
 		await box.close();
 		fs.rmSync(ws, { recursive: true, force: true });

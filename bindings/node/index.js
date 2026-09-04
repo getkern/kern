@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.35";
+const VERSION = "0.1.36";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -236,6 +236,12 @@ builtins.display = display
 # to close-on-exec control fds; then point fd 0 at /dev/null and fd 1/2 at pipes drained in the
 # background, so raw/subprocess output is CAPTURED (and >64 KiB never deadlocks) instead of hitting the
 # control channel. Uses only fds 0/1 (which always survive kern's box setup) and re-plumbs inside the box.
+# Running the driver with -c puts '' (the current directory, resolved at import time) at sys.path[0],
+# while a script run by path puts the script's DIRECTORY there. The one-shot runner is a file in the
+# workspace, so its cells see an absolute /workspace; pin the same absolute entry here so an import
+# behaves identically whichever way the driver was started. Started BY PATH this is a no-op.
+if sys.path and sys.path[0] == "":
+    sys.path[0] = os.getcwd()
 _ctrl_in = os.dup(0)
 _ctrl_out = os.dup(1)
 os.set_inheritable(_ctrl_in, False)
@@ -249,11 +255,15 @@ os.close(_u1w)
 _u2r, _u2w = os.pipe()
 os.dup2(_u2w, 2)
 os.close(_u2w)
-_CAP = 64 * 1024 * 1024
+_CAP = __KERN_OUTCAP__
+_RESCAP = __KERN_RESCAP__
 _MARK = b"\x00\x01KRNCELLDONE\x01\x00"  # per-cell barrier sentinel written to user fd 1/2 after exec
 _ulock = threading.Lock()
 _ubuf = {1: bytearray(), 2: bytearray()}
 _mevt = {1: threading.Event(), 2: threading.Event()}
+# Set by the drain threads when they cut a buffer at _CAP, read+reset by the cell loop under _ulock. A
+# list (not a bare name) because the drainers rebind nothing: they mutate this one shared cell.
+_tcut = [False]
 def _drain(fd, key):
     while True:
         try:
@@ -271,6 +281,7 @@ def _drain(fd, key):
                 _mevt[key].set()
             if len(_b) > _CAP:
                 del _b[_CAP:]
+                _tcut[0] = True
 threading.Thread(target=_drain, args=(_u1r, 1), daemon=True).start()
 threading.Thread(target=_drain, args=(_u2r, 2), daemon=True).start()
 _MAIN_PID = os.getpid()  # a cell that raw os.fork()s copies this whole process; the child must NOT re-enter
@@ -292,6 +303,14 @@ def _write(obj):
     _data = memoryview(str(len(b)).encode() + b"\n" + b)
     while _data:
         _data = _data[os.write(_ctrl_out, _data):]
+# Readiness. Popen returns when the FORK happens, not when kern has built the box and CPython has
+# booted inside it, so a pool that published a box on Popen alone would hand out boxes that are still
+# starting - and the caller would pay the remainder of that start on its own clock, which is the exact
+# cost prewarming exists to remove. This frame is the only signal that the interpreter is actually at the
+# prompt. Emitted only when the host asked for it (see __KERN_HELLO__): a persistent Kernel does not
+# read one, and an unexpected frame there would be consumed as the first cell's reply.
+if __KERN_HELLO__:
+    _write({"hello": 1})
 while True:
     _code = _read()
     if _code is None:
@@ -299,6 +318,7 @@ while True:
     _out.clear()
     with _ulock:
         _m1, _m2 = len(_ubuf[1]), len(_ubuf[2])
+        _tcut[0] = False  # a cut belongs to the cell it happens in, so clear it at the cell boundary
     _so, _se = io.StringIO(), io.StringIO()
     _rc = 0
     _oo, _oe, _oi = sys.stdout, sys.stderr, sys.stdin
@@ -356,13 +376,40 @@ while True:
     with _ulock:
         _r1 = bytes(_ubuf[1][_m1:])
         _r2 = bytes(_ubuf[2][_m2:])
-    _write({
-        "stdout": _so.getvalue() + _r1.decode("utf-8", "replace"),
-        "stderr": _se.getvalue() + _r2.decode("utf-8", "replace"),
-        "rc": _rc,
-        "results": list(_out),
-    })
-`;
+        _tr = _tcut[0]
+    # sys.stdout is a StringIO, so _CAP (which bounds only the raw-fd drain) never bounded a cell that
+    # printed through it: printing a gigabyte built the whole string into the reply. Cut BOTH streams at
+    # the same cap and say so, which is what the cold path's capped reader does.
+    _o1 = _so.getvalue() + _r1.decode("utf-8", "replace")
+    _o2 = _se.getvalue() + _r2.decode("utf-8", "replace")
+    if len(_o1) > _CAP:
+        _o1 = _o1[:_CAP]
+        _tr = True
+    if len(_o2) > _CAP:
+        _o2 = _o2[:_CAP]
+        _tr = True
+    # Results are bounded bundle by bundle rather than by serializing the whole list and measuring it: a
+    # single json.dumps of an oversized list would build the entire payload in the box before anything
+    # could reject it. A bundle that alone exceeds the budget is dropped, not truncated mid-JSON.
+    # A _RESCAP of 0 or less means unbounded and skips the measuring entirely: a persistent Kernel keeps
+    # its historical contract (the host's frame cap is the only bound) AND does not pay a second
+    # json.dumps per bundle, which measuring every bundle would cost it on a large figure.
+    if _RESCAP <= 0:
+        _res = list(_out)
+    else:
+        _res = []
+        _rsz = 0
+        for _bnd in _out:
+            try:
+                _bl = len(json.dumps(_bnd))
+            except Exception:
+                continue
+            if _rsz + _bl > _RESCAP:
+                _tr = True
+                break
+            _res.append(_bnd)
+            _rsz += _bl
+    _write({"stdout": _o1, "stderr": _o2, "rc": _rc, "results": _res, "trunc": _tr})`;
 
 // Signal-derived exit codes (128 + signum) we classify.
 const EXIT_SIGKILL = 137; // SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
@@ -513,6 +560,134 @@ function findKern() {
     "the `kern` binary was not found on PATH - install it " +
       "(https://github.com/getkern/kern) or set $KERN_BIN",
   );
+}
+
+// The box root is read-only (`--ro`, always), so every path a workload can write is one we granted.
+// `/tmp` was not granted, and both halves of what that cost were measured rather than assumed:
+//   * anything NAMING /tmp fails with EROFS, which is how a toolchain reaches it. Measured on
+//     `golang:1.23-alpine`: `go build` reported "failed to initialize build cache at /root/.cache:
+//     read-only file system" and printed nothing else useful;
+//   * anything using a temp-dir helper silently moves into the WORKSPACE, because the last-resort
+//     candidate is the current directory, so temp files land on the caller's persistent host
+//     directory and then show up in `listFiles`.
+// A tmpfs and not a host bind ON PURPOSE: tmpfs pages are charged to the box's memory cgroup, so a
+// runaway writer hits a cap the caller already set; a bound host directory is bounded by nothing.
+const DEFAULT_TMPFS_MB = 64;
+const DEFAULT_TMPFS = { "/tmp": `${DEFAULT_TMPFS_MB}m` };
+
+// A tmpfs size as kern's `--tmpfs path[:size]` takes it. ANCHORED and unit-restricted: the value is
+// concatenated after a colon into one argv element, so anything carrying a comma, a space or a second
+// flag is refused here rather than reinterpreted downstream.
+//
+// THE UNIT IS MANDATORY, and a leading zero is refused, because kern's CLI accepts two spellings that
+// mean the opposite of what an SDK caller writing them means. Both measured:
+//   * `"64"` is 64 BYTES, not 64 MiB: `df` reports 4 KB and a 100 KB write is ENOSPC.
+//   * `"0"` is UNLIMITED, not none: 200 MiB written under `memoryMb: 128` OOM-killed the box (137).
+// kern is right to take both, it is the low-level interface; here they fail far from their cause.
+const TMPFS_SIZE_RE = /^[1-9][0-9]*[kmgtKMGT]$/;
+
+// A tmpfs over these hides something the box needs, and silently: one at /workspace would shadow the
+// workspace bind, so every file the caller wrote would stay on the host and none would be visible.
+const REFUSED_TMPFS_TARGETS = new Set(["/", "/proc", "/sys", "/dev", WORKSPACE]);
+
+/** Validate one in-box tmpfs; returns the normalised `[target, size]`. The caller composes the
+ * argument, because the size still has to be resolved against the memory cap and that resolution
+ * PARSES it, so it may only run on a value this function has already accepted. */
+function validateTmpfs(target, size) {
+  if (typeof target !== "string" || !target.startsWith("/"))
+    throw new MountRefused(`tmpfs target must be an absolute path in the box, got ${JSON.stringify(target)}`);
+  if (target.split("/").some((c) => c === ".."))
+    throw new MountRefused(`tmpfs target must not contain '..': ${JSON.stringify(target)}`);
+  // A colon is the SEPARATOR in `--tmpfs path[:size]`, so a path carrying one is reinterpreted
+  // rather than rejected. Measured: `tmpfs: ["/scratch:9g"]` mounted `/scratch` at 9 GiB and the
+  // directory the caller actually named did not exist in the box. kern cannot fix this without
+  // breaking its own syntax; the SDK can refuse.
+  if (target.includes(":"))
+    throw new MountRefused(
+      `tmpfs target must not contain ':': ${JSON.stringify(target)}. It is the size separator in ` +
+        "kern's `--tmpfs path[:size]`, so this path would be read as a size and a different " +
+        "directory would be mounted.",
+    );
+  const norm = "/" + target.split("/").filter((c) => c && c !== ".").join("/");
+  if (REFUSED_TMPFS_TARGETS.has(norm))
+    throw new MountRefused(
+      `cannot mount a tmpfs over ${JSON.stringify(norm)}: it would hide the box's own mount there ` +
+        "(the workspace bind, or an essential filesystem)",
+    );
+  if (size === null || size === undefined) return [norm, null];
+  if (typeof size !== "string" || !TMPFS_SIZE_RE.test(size)) {
+    let hint = "";
+    if (typeof size === "string" && /^[0-9]+$/.test(size))
+      hint = Number(size) === 0
+        ? " A zero size means UNLIMITED to kern, not none: for none, pass tmpfs: {}."
+        : " A bare number is BYTES to kern, not MiB: '64' gives a 4 KB filesystem and the first real write is ENOSPC.";
+    throw new MountRefused(
+      `invalid tmpfs size ${JSON.stringify(size)} for ${JSON.stringify(norm)}: expected a number ` +
+        `with a k/m/g/t unit, e.g. '64m'.${hint}`,
+    );
+  }
+  return [norm, size];
+}
+
+const TMPFS_UNIT_MIB = { k: 1 / 1024, m: 1, g: 1024, t: 1024 * 1024 };
+
+/** A validated `64m`/`1g` size as MiB. Only ever called after `TMPFS_SIZE_RE` matched. */
+function tmpfsMib(size) {
+  return parseInt(size.slice(0, -1), 10) * TMPFS_UNIT_MIB[size.slice(-1).toLowerCase()];
+}
+
+/** Resolve a scratch size against the memory cap AT CONSTRUCTION, not at the first write.
+ *
+ * A tmpfs larger than the cap is a number the KERNEL then tells the workload: `df` reports the tmpfs
+ * size, so a `"1t"` scratch shows 1.0T free under a 128 MiB cap. Anything that preflights with
+ * `statvfs` plans against that and is OOM-killed instead of getting a clean ENOSPC. The wrong answer
+ * goes to a PROGRAM, which acts on it, and no message reaches a person.
+ *
+ * A size the CALLER wrote is refused, naming both numbers; OUR default is clamped, because adjusting
+ * a number we chose is not overriding anyone and refusing it would make a box unstartable for someone
+ * who never mentioned scratch. The clamp is `min(64 MiB, memoryMb / 2)` and it is a HEURISTIC, not a
+ * derivation: it only ever REDUCES our own 64 MiB, so `memoryMb: 512` still gets 64 and not 256.
+ * There is no safe fraction to derive, because the safe one depends on the workload's own peak, which
+ * is what `memoryMb` was meant to bound and now shares. Half is where the measurement stops being
+ * fatal: writing in 1 MiB chunks under `memoryMb: 128`, a 32m and a 64m tmpfs both end in ENOSPC, a
+ * 128m one ends in an OOM, because filling a tmpfs equal to the cap exhausts the whole budget. */
+function tmpfsSizeVsCap(target, size, memoryMb, ours) {
+  if (size === null || size === undefined || memoryMb === null || memoryMb === undefined) return size;
+  if (ours) {
+    const capped = Math.max(1, Math.min(Math.trunc(tmpfsMib(size)), Math.floor(memoryMb / 2)));
+    return capped >= tmpfsMib(size) ? size : `${capped}m`;
+  }
+  if (tmpfsMib(size) <= memoryMb) return size;
+  throw new MountRefused(
+    `tmpfs ${JSON.stringify(size)} at ${JSON.stringify(target)} is larger than memoryMb=${memoryMb}, ` +
+      `and a tmpfs is charged to that same cap. \`df\` inside the box would report ${size} free while ` +
+      `only ${memoryMb}m is reachable, so a program that checks free space before writing plans ` +
+      "against a number that OOM-kills it instead of returning ENOSPC. Lower the tmpfs or raise memoryMb.",
+  );
+}
+
+/** Normalise `tmpfs` to [target, size|null] pairs. `undefined`/`null` = the binding default. */
+function tmpfsItems(spec) {
+  if (spec === undefined || spec === null) return Object.entries(DEFAULT_TMPFS);
+  if (typeof spec === "string")
+    throw new MountRefused(
+      `tmpfs must be an object or an array of paths, not a bare string: write ` +
+        `tmpfs: { ${JSON.stringify(spec)}: "64m" } or tmpfs: [${JSON.stringify(spec)}]`,
+    );
+  if (Array.isArray(spec)) return spec.map((t) => [t, null]);
+  // A NUMBER is the mistake this API invites: every neighbour takes one (`memoryMb: 512`,
+  // `pids: 256`), so `tmpfs: 256` is the natural thing to type. `Object.entries(256)` is `[]`, so it
+  // used to mean SILENTLY NO SCRATCH: a read-only /tmp, no error, and the defect back in full.
+  if (typeof spec !== "object")
+    throw new MountRefused(
+      `tmpfs must be an object of path -> size or an array of paths, got ${typeof spec}.` +
+        (typeof spec !== "number"
+          ? ""
+          : spec === 0
+            ? " For no scratch at all, pass tmpfs: {}."
+            : ` Did you mean tmpfs: { "/tmp": "${spec}m" }?`),
+    );
+  return Object.entries(spec);
 }
 
 /** Validate one host->box mount; refuse unsafe sources/targets. Returns [absRealSource, target]. */
@@ -819,11 +994,12 @@ class Sandbox {
    * @param {boolean} [opts.network]         RELAXES ISOLATION. true shares the host network. Default false.
    * @param {string[]} [opts.egressAllow]    restrict runCode/run to a DOMAIN ALLOWLIST, e.g. ["pypi.org"]; isolated netns + kern's filtering proxy. Mutually exclusive with network:true.
    * @param {Object<string, string|[string,string]>} [opts.mounts] extra host->box binds. Sensitive refused.
+   * @param {Object<string,string>|string[]} [opts.tmpfs] fresh in-box scratch filesystems (kern --tmpfs). Default: a 64 MiB tmpfs at /tmp, because the root is read-only. `{}` for none; a `mounts` bind at the same target wins.
    * @param {string[]} [opts.profiles] kern resource profiles to attach, e.g. ["vcpu:heavy","vgpio:leds","vdisk:scratch"]; each names a block in your kern.toml. Strictly validated.
    * @param {Object<string,string>} [opts.env] extra environment for the workload.
    * @param {number} [opts.maxOutputBytes]   cap on captured stdout/stderr EACH. Default 64 MiB.
    * @param {boolean} [opts.enforceLimits]   true (default) hard-enforces caps via a systemd scope.
-   * @param {boolean} [opts.depsReadonly]    mount setup= deps read-only for runCode (block poisoning).
+   * @param {boolean} [opts.depsReadonly]    mount setup= deps read-only for runCode (default true).
    */
   constructor(opts = {}) {
     this.image = opts.image ?? DEFAULT_IMAGE;
@@ -836,6 +1012,10 @@ class Sandbox {
     this.network = opts.network ?? false;
     this.egressAllow = opts.egressAllow ?? null;
     this.mounts = opts.mounts ?? null;
+    // `undefined` means the binding's default (a 64 MiB tmpfs at /tmp); `{}` or `[]` means none at
+    // all. The two are distinct on purpose: "I did not say" and "I said no" are different answers,
+    // and only the second should leave a box without a writable /tmp.
+    this.tmpfs = opts.tmpfs === undefined ? null : opts.tmpfs;
     this.profiles = opts.profiles ?? null;
     this.env = opts.env ?? null;
     this.maxOutputBytes = opts.maxOutputBytes ?? 64 * 1024 * 1024;
@@ -843,6 +1023,17 @@ class Sandbox {
     // still captured in the result, so you can stream AND read result.stdout.
     this.onStdout = opts.onStdout ?? null;
     this.onStderr = opts.onStderr ?? null;
+    // prewarm=N keeps N boxes started in advance, each holding a booted interpreter that has run
+    // nothing. A python runCode then claims one instead of starting its own, which takes the box start
+    // and the interpreter boot OFF the call and leaves a marginal cost near zero. Each prewarmed box
+    // serves exactly one cell and is destroyed, so "a fresh box per call" is unchanged - see WarmBox.
+    //
+    // Default 0, because it is a RESOURCE decision the caller owns: N warm boxes hold N booted
+    // interpreters and N kern supervisors for the life of the session, whether or not a call arrives.
+    // 1 is the right number for an interactive agent; raise it only for bursts.
+    this.prewarm = opts.prewarm ?? 0;
+    /** @type {WarmPool|null} */
+    this._pool = null;
     this.enforceLimits = opts.enforceLimits ?? true;
     // `--require-limits`: refuse to start unless the memory/pids caps are ACTUALLY enforced (read back
     // from the cgroup), rather than running best-effort uncapped - the fail-closed OOM / fork-bomb
@@ -857,7 +1048,7 @@ class Sandbox {
     // `--security-opt apparmor=`), a kernel-enforced LSM layer over namespaces + seccomp. The profile
     // must be loaded on the host; kern fails the box CLOSED if it is not. null (default) applies none.
     this.apparmor = opts.apparmor ?? null;
-    this.depsReadonly = opts.depsReadonly ?? false;
+    this.depsReadonly = opts.depsReadonly ?? true;
     // Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
     // The default drops the lot: kern already drops 14 dangerous capabilities unconditionally, but the
     // rest were still held over the box's own user namespace, on the one code path whose purpose is
@@ -873,6 +1064,7 @@ class Sandbox {
     if (!(this.maxOutputBytes > 0)) throw new SandboxError("maxOutputBytes must be positive");
 
     this._mountArgs = [];
+    const boundTargets = new Set();
     if (this.mounts) {
       for (const [source, spec] of Object.entries(this.mounts)) {
         let target, ro;
@@ -888,7 +1080,48 @@ class Sandbox {
         }
         const [real, tgt] = validateMount(source, target);
         this._mountArgs.push("-v", ro ? `${real}:${tgt}:ro` : `${real}:${tgt}`);
+        boundTargets.add("/" + tgt.split("/").filter((c) => c && c !== ".").join("/"));
       }
+    }
+    // A caller who binds their own directory at /tmp gets it: the default tmpfs would be mounted OVER
+    // their bind, so the files they passed would be invisible to the code they are running. An
+    // explicit `tmpfs` wins too; both are the caller saying what that path is.
+    this._tmpfsArgs = [];
+    this._tmpfsDefault = this.tmpfs === null;
+    for (const [target, size] of tmpfsItems(this.tmpfs)) {
+      // OUR default steps aside wherever the caller has already said something about this area: a
+      // bind at the same target, because mounting over it would hide their files, and a
+      // `securityProfile`, because that is a HARDENING BUNDLE and 0.1.35 gave `untrusted` a
+      // read-only /tmp. A default added by a different layer must not widen a posture in a patch
+      // release.
+      const normTarget = "/" + String(target).split("/").filter((c) => c && c !== ".").join("/");
+      if (this._tmpfsDefault && (boundTargets.has(normTarget) || this.securityProfile !== null)) continue;
+      // A tmpfs that COVERS a bind. Equality was the first version and it is only half the shape:
+      // mounts stack, the tmpfs goes on top, and "on top" reaches every path underneath. Measured:
+      //   -v HOST:/tmp     + --tmpfs /tmp      -> /tmp EMPTY, the bind invisible
+      //   -v HOST:/tmp/sub + --tmpfs /tmp      -> same, through NESTING
+      //   -v HOST:/tmp     + --tmpfs /tmp/sub  -> the bind's files are there, /tmp/sub is scratch
+      // So the rule is asymmetric: refusing both directions would refuse the third, which is a legal
+      // configuration (a persistent /tmp with a bounded subtree).
+      if (!this._tmpfsDefault) {
+        const swallowed = [...boundTargets].filter(
+          (b) => b === normTarget || b.startsWith(normTarget.replace(/\/+$/, "") + "/"),
+        );
+        if (swallowed.length)
+          throw new MountRefused(
+            `tmpfs ${JSON.stringify(normTarget)} would cover the mounts bind at ` +
+              `${swallowed.sort().join(", ")}. Mounts STACK: kern puts the tmpfs on top whatever ` +
+              "order the arguments arrive in, so those files stay on the host and are invisible in " +
+              "the box. Keep the bind (for host files) or the tmpfs (for ephemeral scratch) at that " +
+              'path, not both. A tmpfs BELOW a bind is fine: mounts {host: "/tmp"} with ' +
+              'tmpfs {"/tmp/scratch": "8m"} works.',
+          );
+      }
+      // Validate FIRST: `tmpfsSizeVsCap` parses the size, and parsing an unvalidated one threw out
+      // of the constructor instead of a named MountRefused. Same class as the wrong-type hole.
+      const [norm, validSize] = validateTmpfs(target, size);
+      const resolved = tmpfsSizeVsCap(norm, validSize, this.memoryMb, this._tmpfsDefault);
+      this._tmpfsArgs.push("--tmpfs", resolved === null || resolved === undefined ? norm : `${norm}:${resolved}`);
     }
     // A bare string has a .map-less shape here, but Array.from("ALL") would yield ["A","L","L"] and
     // three bogus flags, so refuse the string by name and say what to write instead.
@@ -934,11 +1167,24 @@ class Sandbox {
     }
     this._entered = true;
     if (this.setup) await this._runSetup(this.setup);
+    // AFTER the setup, deliberately. _baseArgv adds the .deps read-only remount only once that
+    // directory exists, so a pool filled before the setup ran would hold boxes whose argv no longer
+    // matches the one runCode builds: every claim would miss and the prewarming would be pure cost.
+    if (this.prewarm > 0) {
+      this._pool = new WarmPool(this, this.prewarm);
+      this._pool.refill({ network: this.network, deadlineS: this._effTimeout(undefined) });
+    }
     return this;
   }
 
-  /** Close the session: delete the workspace iff we created it. Idempotent. */
+  /** Close the session: tear down any prewarmed boxes, then delete the workspace iff we created it.
+   * Idempotent. */
   async close() {
+    // Boxes first: they are live processes holding the workspace we are about to delete, and a box
+    // still writing into a directory being removed is how a teardown turns into a stale mount.
+    const pool = this._pool;
+    this._pool = null;
+    if (pool) await pool.close();
     if (this._ownWs && this._ws) {
       try {
         fs.rmSync(this._ws, { recursive: true, force: true });
@@ -979,7 +1225,35 @@ class Sandbox {
     }
   }
 
-  _baseArgv(name, { network, timeoutS, isSetup = false }) {
+  /** The clause an OOM message owes when this box has scratch mounted.
+   *
+   * A tmpfs is charged to the box's memory cgroup and its pages are NOT reclaimable: measured, 56 MiB
+   * written to /tmp then 90 MiB allocated under `memoryMb: 128` is an OOM, while the SAME 56 MiB
+   * written to the workspace and synced leaves room, because file-backed pages can be written back and
+   * dropped. An OOM message naming only "memory cap" sends the reader to look at their allocation.
+   * It states the mechanism and does NOT claim scratch caused this kill: that is not knowable here. */
+  _scratchNote() {
+    const ours = this._tmpfsArgs.filter((a) => a !== "--tmpfs").join(", ");
+    // `/dev/shm` is named even when we mounted nothing: writing 200 MiB there under `memoryMb: 128`
+    // OOMs the box, and the first version of this note said `/tmp:64m`, which is the wrong place.
+    // Every kern box has a /dev/shm tmpfs with NO size, and this SDK cannot bound it.
+    return (
+      ". NOTE: memory-backed filesystems in this box are charged to that same cap, and their pages " +
+      "are freed only by DELETING the files: " +
+      (ours ? `the scratch this SDK mounted (${ours}), and ` : "") +
+      "/dev/shm, which every kern box has as a tmpfs with NO size limit (its apparent size is half " +
+      "the HOST's RAM) and which no option here can bound. Check both before the workload"
+    );
+  }
+
+  /** Build the `kern box` argv for one call. NOT a pure function: it also WRITES the private
+   * `--env-file` this box will read, so it must be called once per box that is actually started.
+   *
+   * `dry: true` suppresses that write and folds the env CONTENT into the argv instead, which is what the
+   * prewarm pool needs: it compares postures, and a comparison that created a file named after a box
+   * that will never exist would both litter the workspace and collide with itself. A dry argv is for
+   * COMPARING, never for running. */
+  _baseArgv(name, { network, timeoutS, isSetup = false, dry = false }) {
     const argv = [
       this._kern, "box", name, "--image", this.image, "--ro",
       "-v", `${this._ws}:${WORKSPACE}`, "--workdir", WORKSPACE,
@@ -1010,6 +1284,13 @@ class Sandbox {
     // user's kern.toml. Validated at construction, so nothing here can be a smuggled flag.
     argv.push(...this._profileArgs);
     argv.push(...this._mountArgs);
+    // Scratch for THIS box. The DEFAULT tmpfs is deliberately skipped on the setup box, for the same
+    // reason the egress allowlist is: setup is the install phase, and an install needs unbounded
+    // scratch. A package manager puts its build tree in TMPDIR, so a 64 MiB /tmp turns a working
+    // install into ENOSPC (measured on the Python side, same shape here). With no tmpfs, setup's temp
+    // falls back to the workspace on the host disk, where a large short-lived build tree belongs. An
+    // EXPLICIT `tmpfs` is the caller's decision and applies to every box, setup included.
+    if (!(isSetup && this._tmpfsDefault)) argv.push(...this._tmpfsArgs);
 
     const mergedEnv = { ...(this.env || {}) };
     if (mergedEnv.PYTHONPATH === undefined) mergedEnv.PYTHONPATH = `${WORKSPACE}/${DEPS_DIR}`;
@@ -1020,7 +1301,20 @@ class Sandbox {
     // RELATIVE path, so the env file was written into the current directory. Same as the Python side:
     // it had been landing in the repository, hidden by a `.gitignore` line that stopped matching when
     // the name became per-call. No workspace means nowhere to put it.
-    if (Object.keys(mergedEnv).length > 0 && this._ws) {
+    if (Object.keys(mergedEnv).length > 0 && dry) {
+      // The path is per-box by construction, so it can never be part of a posture comparison; a constant
+      // stands in for it. The env CONTENT is still compared, because a session that changes `env` must
+      // invalidate warm boxes: it is folded in here rather than left out.
+      // Sorted BY KEY, not by the joined string, so this matches the Python binding exactly: sorting
+      // "A=1" against "A1=2" as strings puts them in the other order, because '1' sorts before '='.
+      argv.push(
+        "--env-file",
+        Object.entries(mergedEnv)
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          .map(([k, v]) => `${k}=${String(v)}`)
+          .join("\0"),
+      );
+    } else if (Object.keys(mergedEnv).length > 0 && this._ws) {
       const envPath = this._envPath(name);
       const lines = [];
       for (const [k, v] of Object.entries(mergedEnv)) {
@@ -1137,7 +1431,10 @@ class Sandbox {
           if (reason.includes("No such file or directory")) {
             detail =
               `No such file or directory. The image '${this.image}' does not provide it, or its ` +
-              `interpreter line names something the image lacks.`;
+              `interpreter line names something the image lacks.` +
+              // The one case where the remedy is not "a different image": every image has a POSIX
+              // shell, so a caller who asked for bash and does not need bash has a one-word fix.
+              (what === "bash" ? " This image has no bash; use language:'sh' if the script is POSIX." : "");
           } else if (reason.includes("Permission denied")) {
             detail = "Permission denied: it is present in the box but not executable there.";
           } else {
@@ -1236,7 +1533,10 @@ class Sandbox {
       // certain cgroup OOM, undetermined (0) keeps the pre-signal heuristic. When kern reports the cap did
       // not bind (2), a SIGKILL cannot be attributed to the box's cgroup - keep the honest `killed`.
       if (this.memoryMb !== null && capSignal !== 2)
-        return sandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL, exit 137)");
+        return sandboxFault(
+          "oom",
+          "the box exceeded its memory cap and was OOM-killed (SIGKILL, exit 137)" + this._scratchNote(),
+        );
       if (capSignal === 2)
         return sandboxFault(
           "killed",
@@ -1409,7 +1709,11 @@ class Sandbox {
         );
       // maxBytes caps the read so a file a not-fully-trusted box wrote can't OOM the host.
       if (maxBytes !== null && st.size > maxBytes)
-        throw new SandboxError(`${JSON.stringify(rel)} exceeds maxBytes=${maxBytes}`);
+        throw new SandboxError(
+          `${JSON.stringify(rel)} is ${st.size} bytes, larger than maxBytes=${maxBytes}, so the ` +
+            "read was REFUSED. maxBytes is a ceiling on what may be read at all, not a request " +
+            "for the first bytes: nothing was returned. Raise it, or drop it and slice the result.",
+        );
       return fs.readFileSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -1542,6 +1846,25 @@ class Sandbox {
     });
     if (!r.success)
       throw new SandboxError(`setup failed (exit ${r.exitCode}): ${(r.stderr || r.stdout).trim().slice(0, 400)}`);
+    // PRECOMPILE HERE, because this is the last moment `.deps` is writable.
+    //
+    // `depsReadonly` defaults to true, so every runCode box mounts `.deps` read-only and CPython cannot
+    // write a `__pycache__` into it. It tolerates that silently and recompiles on every import instead,
+    // which is correct and is not free. Measured on `requests`, seven calls each: a setup that leaves
+    // bytecode behind (pip's default) reads 250 ms/call writable and 252 read-only, while one that does
+    // not (`pip install --no-compile`) reads 250 writable and 290 read-only. So the read-only default
+    // would cost +40 ms on EVERY call of such a session, for as long as it lives. One `compileall` here
+    // removes it: that case comes back to 250, and it is a no-op when the bytecode already exists.
+    //
+    // `|| true` because bytecode is an optimisation: a file that will not compile must not fail an
+    // install that succeeded. The user's command ran first and separately, so it keeps the exit code.
+    if (this.depsReadonly && fs.existsSync(path.join(this._ws, DEPS_DIR))) {
+      await this._spawn(["sh", "-c", `python3 -m compileall -q ${WORKSPACE}/${DEPS_DIR} || true`], {
+        network: false,
+        timeoutS: Math.max(this.timeoutS, 120),
+        isSetup: true,
+      });
+    }
   }
 
   // -- files diff (created/modified; excludes .deps and our env file) ------------------------------
@@ -1598,7 +1921,8 @@ class Sandbox {
   // -- the two ways to run code --------------------------------------------------------------------
 
   /** Run a snippet of `code` on the workspace in a fresh, network-off box. File state persists to the
-   * next call; in-memory state does NOT. `language` is "python" (default), "bash", or "node". Large
+   * next call; in-memory state does NOT. `language` is "python" (default), "bash", "sh" or "node", and
+   * the image must provide it: "bash" runs bash, not the POSIX shell. Large
    * code is written to a workspace file and run by path (no argv-size limit). */
   /** Resolve a per-call `timeoutS` override against the constructor default: undefined/null inherits
    * the session's, any override must be a positive number of seconds. */
@@ -1613,14 +1937,21 @@ class Sandbox {
     this._requireEntered();
     // Each runner: [binary, inline-eval-flag, file-extension]. Note node evaluates with `-e`, NOT `-c`
     // (which is node's syntax-CHECK flag and would run nothing); python/sh use `-c`.
+    // `bash` runs BASH. It used to run `sh`, and on a Debian image that is `dash`, with bash sitting
+    // right there in the image unused: `[[ 1 == 1 ]]` answered `sh: 1: [[: not found`. Nothing was
+    // missing, the wrong binary was picked, and an LLM writes bash by reflex. `sh` is the honest name
+    // for the old behaviour and is now reachable: POSIX, present in every image, alpine included.
     const runners = {
       python: ["python3", "-c", "py"],
-      bash: ["sh", "-c", "sh"],
+      bash: ["bash", "-c", "sh"],
+      sh: ["sh", "-c", "sh"],
       node: ["node", "-e", "js"],
     };
     const spec = runners[language];
     if (!spec)
-      throw new SandboxError(`unsupported language ${JSON.stringify(language)} (v1: 'python' | 'bash' | 'node')`);
+      throw new SandboxError(
+        `unsupported language ${JSON.stringify(language)} (v1: 'python' | 'bash' | 'sh' | 'node')`,
+      );
     const [runner, evalFlag, ext] = spec;
     const eff = this._effTimeout(timeoutS);
     if (language === "python")
@@ -1641,6 +1972,22 @@ class Sandbox {
    * are identical to a plain run; capture is best-effort. Internal cell/runner/results files are
    * removed and hidden from `result.files`. */
   async _runPythonCell(code, { timeoutS, onStdout = UNSET, onStderr = UNSET } = {}) {
+    const eff = this._effTimeout(timeoutS);
+    // Prewarmed fast path, taken ONLY where it is observationally identical to the cold one below.
+    // The streaming callback is the gate that is easy to get wrong: a prewarmed box answers with one
+    // length-prefixed frame after the cell has finished, so there is no chunk to hand a callback as it
+    // arrives. Calling it once at the end would look like streaming without being it, so a streaming
+    // call takes the cold path and streams for real.
+    const streaming =
+      (onStdout === UNSET ? this.onStdout : onStdout) !== null ||
+      (onStderr === UNSET ? this.onStderr : onStderr) !== null;
+    if (this._pool && !streaming && !code.includes("\0")) {
+      const warm = this._pool.claim({ network: this.network, deadlineS: eff });
+      if (warm) {
+        const before = this.trackFiles ? this._snapshot() : null;
+        return warm.runCell(code, { deadlineS: eff, before });
+      }
+    }
     const uid = crypto.randomBytes(4).toString("hex");
     const cell = `.cell-${uid}.py`;
     const resf = `.res-${uid}.json`;
@@ -1653,7 +2000,7 @@ class Sandbox {
     await this.writeFile(runf, shim);
     const result = await this._spawn(["python3", `${WORKSPACE}/${runf}`], {
       network: this.network,
-      timeoutS: this._effTimeout(timeoutS),
+      timeoutS: eff,
       onStdout,
       onStderr,
     });
@@ -1714,6 +2061,27 @@ const KERNEL_TIMEOUT = Symbol("kernel-timeout");
 // one-shot path's RESULTS_MAX guard.
 const KERNEL_OVERSIZE = Symbol("kernel-oversize");
 
+// The raw-fd drain cap a PERSISTENT kernel has always used. Named rather than repeated so the one place
+// that must not drift from the shipped behaviour says which number it is and why.
+const KERNEL_DRAIN_CAP = 64 * 1024 * 1024;
+
+/** Materialize PY_KERNEL_DRIVER for one caller's output budget and handshake.
+ *
+ * The driver text is byte-identical to the Python binding's, so it carries the same three placeholders
+ * and they have to be filled in here too. Substitution and not a runtime read, because the driver runs
+ * INSIDE the box where an environment variable is workload-writable: a cap the box can set is not a cap.
+ * The values are stringified ints and a literal 0/1 from our own call sites, never from box input.
+ *
+ * @param {number} outCap  bytes of stdout/stderr kept per stream before the reply says it truncated
+ * @param {number} resCap  byte budget for rich results; 0 or less means unbounded (the Kernel contract)
+ * @param {boolean} hello  emit a readiness frame before the cell loop
+ * @returns {string} */
+function kernelDriver(outCap, resCap, hello = false) {
+  return PY_KERNEL_DRIVER.replaceAll("__KERN_OUTCAP__", String(Math.trunc(outCap)))
+    .replaceAll("__KERN_RESCAP__", String(Math.trunc(resCap)))
+    .replaceAll("__KERN_HELLO__", hello ? "1" : "0");
+}
+
 /** A warm, persistent Python interpreter living in one long-lived box (see `Sandbox.kernel`). `runCode`
  * sends a cell over a length-prefixed pipe to the resident driver and resolves to an ExecutionResult with
  * captured stdout/stderr, exit code and rich `results`. In-memory state persists across cells; the box
@@ -1747,14 +2115,17 @@ class Kernel {
     this._cap = sbx.maxOutputBytes;
     const uid = crypto.randomBytes(4).toString("hex");
     this._driver = `.kernel-${uid}.py`;
-    await sbx.writeFile(this._driver, PY_KERNEL_DRIVER);
+    // The historical constants, restated at the one call site that must not change: 64 MiB of raw drain
+    // and no results budget (the host's frame cap stays the only bound), and no readiness frame, which a
+    // persistent Kernel does not read and would consume as its first cell's reply.
+    await sbx.writeFile(this._driver, kernelDriver(KERNEL_DRAIN_CAP, 0, false));
     this._name = uniqueName();
     this._childEnv = { ...process.env };
     if (!sbx.enforceLimits) this._childEnv.KERN_NO_SCOPE = "1";
     this._childEnv.KERN_STARTED_FD = "3"; // same unforgeable channel; here for the enforcement byte only
     const argv = [
       ...sbx._baseArgv(this._name, { network: sbx.network, timeoutS: KERNEL_BACKSTOP_S }),
-      "--", "python3", "-S", `${WORKSPACE}/${this._driver}`,
+      "--", "python3", `${WORKSPACE}/${this._driver}`,
     ];
     // detached: own process group so we can killpg the box + kern as a unit, like _spawn. fd 3 carries
     // the started/enforcement bytes; the workload never holds it.
@@ -2026,6 +2397,530 @@ class Kernel {
   }
 }
 
+// -- prewarm: the fresh-box guarantee at zero marginal cost ------------------------------------------
+
+// How long a prewarmed box may sit unclaimed before it is stale. It bounds the ORPHAN window: every warm
+// box carries kern's own --timeout set to this plus the session deadline it was started for, so a host
+// process that dies without running close() leaves boxes that expire by themselves rather than living to
+// a 24 h backstop. The pool refills continuously, so this is the failure bound, not the working lifetime.
+const PREWARM_TTL_S = 300;
+// How long a prewarmed box gets to reach its prompt before the pool gives up on it. Generous on purpose:
+// it covers a first-run image pull and an aarch64 board. Nothing waits on it, so a large value is free.
+const PREWARM_READY_MS = 120_000;
+
+// Every live prewarmed box in this process, so an exit that skips close() still tears the boxes down.
+// Best-effort by nature - a SIGKILL runs nothing - which is exactly why the TTL above is the mechanism.
+const LIVE_WARM = new Set();
+let warmExitHooked = false;
+
+function hookWarmExit() {
+  if (warmExitHooked) return;
+  warmExitHooked = true;
+  process.on("exit", () => {
+    for (const b of [...LIVE_WARM]) {
+      try {
+        b.stopProcesses();
+      } catch {
+        /* an exit handler must never throw */
+      }
+    }
+  });
+}
+
+/** One box that is already started and already holds a booted CPython which has run NO user code.
+ *
+ * A cold runCode pays two costs on the CALLER's clock: starting the box and booting the interpreter
+ * inside it. Neither depends on the cell, so neither has to happen while the caller waits. This starts
+ * them in advance and then serves EXACTLY ONE cell before the box is destroyed.
+ *
+ * The guarantee runCode documents is therefore unchanged. A cell still gets a private box that has
+ * executed nothing else, and a virgin interpreter whose only prior action was importing this driver -
+ * which is what a cold cell gets once its own boot finishes.
+ *
+ * One observable DOES differ, stated because "identical" was too broad a word for it: the interpreter
+ * is older than the call. A cell that reads its own start time out of /proc/self/stat sees ~0 s cold
+ * and up to PREWARM_TTL_S warm (measured: 0.0 s against 3.1 s). Nothing the SDK reports changes and no
+ * boundary moves, but code that times itself from process start can tell. */
+class WarmBox {
+  constructor(sbx, key, budgetS, sweeper) {
+    this._sbx = sbx;
+    this.key = key;
+    this._budgetS = budgetS;
+    this._sweeper = sweeper || null;
+    this._child = null;
+    this._name = "";
+    this._born = Date.now();
+    this._spent = false;
+    this._rc = null;
+    this._capSignal = 0;
+    this._stderr = Buffer.alloc(0);
+    this._chunks = [];
+    this._total = 0;
+    this._need = -1;
+    this._headerBytes = -1;
+    this._cap = 0;
+    this._waiters = [];
+    this._dead = false;
+  }
+
+  async start() {
+    const sbx = this._sbx;
+    // The frame cap has to admit a reply the driver considers legal, or a cell that legitimately
+    // truncates at maxOutputBytes would come back as an oversize FAULT instead. Two capped streams plus
+    // the results budget plus JSON overhead is the largest well-formed reply, so that is the cap.
+    this._cap = 2 * sbx.maxOutputBytes + RESULTS_MAX + 65536;
+    this._name = uniqueName();
+    // The driver goes in ARGV, not into a workspace file. A pooled box is started BEFORE the cell that
+    // will use it, so a driver FILE would sit in the box-writable workspace across the whole inter-call
+    // gap and any cell could rewrite it to hijack the next prewarmed box. In argv the source is fixed at
+    // exec time and never exists as a path the sandbox can reach.
+    const driver = kernelDriver(sbx.maxOutputBytes, RESULTS_MAX, true);
+    const argv = [
+      ...sbx._baseArgv(this._name, {
+        network: sbx.network,
+        timeoutS: PREWARM_TTL_S + this._budgetS,
+      }),
+      "--", "python3", "-c", driver,
+    ];
+    const childEnv = { ...process.env };
+    if (!sbx.enforceLimits) childEnv.KERN_NO_SCOPE = "1";
+    childEnv.KERN_STARTED_FD = "3";
+    try {
+      this._child = spawn(argv[0], argv.slice(1), {
+        env: childEnv, detached: true, stdio: ["pipe", "pipe", "pipe", "pipe"],
+      });
+    } catch {
+      return false;
+    }
+    const startedCh = this._child.stdio[3];
+    if (startedCh) {
+      startedCh.on("data", (b) => { if (b.length >= 2) this._capSignal = b[1]; });
+      startedCh.on("error", () => {});
+    }
+    this._child.on("error", () => { this._dead = true; this._flush(null); });
+    this._child.on("close", (code, signal) => {
+      this._dead = true;
+      // `toRc` is THE mapping this binding's cold path uses (128 + signum, not Python's negative
+      // convention). Each binding has to match its OWN cold path: reporting -9 here made a Node timeout
+      // come back as -9 warm and 137 cold, which is the same failure wearing two different faces.
+      if (this._rc === null) this._rc = toRc(code, signal);
+      this._flush(null);
+    });
+    this._child.stdout.on("data", (d) => this._onData(d));
+    this._child.stderr.on("data", (d) => {
+      this._stderr = Buffer.concat([this._stderr, d]);
+      if (this._stderr.length > sbx.maxOutputBytes)
+        this._stderr = this._stderr.subarray(0, sbx.maxOutputBytes);
+    });
+    hookWarmExit();
+    LIVE_WARM.add(this);
+    return true;
+  }
+
+  /** Block until the driver says it is at the prompt. This is what makes the box PREWARMED rather than
+   * merely SPAWNED: `spawn` resolves at the fork, not when kern has built the box and CPython has
+   * booted, so a pool that published on spawn alone hands out boxes that are still starting and the
+   * caller pays the rest of the start itself. */
+  async waitReady(ms = PREWARM_READY_MS) {
+    const body = await this._await(ms);
+    if (typeof body !== "string") return false;
+    try {
+      const o = JSON.parse(body);
+      return !!o && o.hello === 1;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether this box may serve a call. Every term is a correctness gate, not an optimization:
+   * `key` is the EXACT argv the call would otherwise produce, which is what stops a box prewarmed with
+   * one posture from serving a call that asked for another; `deadlineS` must fit inside the backstop
+   * this box was started with, or kern could kill a legal cell mid-run; and past the TTL the same race
+   * opens anyway. */
+  usableFor(key, deadlineS) {
+    return (
+      !this._spent && !this._dead && this._child !== null && this.key === key &&
+      deadlineS <= this._budgetS && Date.now() - this._born < PREWARM_TTL_S * 1000
+    );
+  }
+
+  // -- framing (same shape as Kernel's, which is the reader this protocol was written for) -----------
+
+  _onData(d) {
+    this._chunks.push(d);
+    this._total += d.length;
+    if (this._total > this._cap + 64) return this._flush(KERNEL_OVERSIZE);
+    this._tryParse();
+  }
+
+  _coalesce() {
+    if (this._chunks.length > 1) this._chunks = [Buffer.concat(this._chunks, this._total)];
+    return this._chunks.length ? this._chunks[0] : Buffer.alloc(0);
+  }
+
+  _tryParse() {
+    for (;;) {
+      if (this._need < 0) {
+        const buf = this._coalesce();
+        const nl = buf.indexOf(0x0a);
+        if (nl < 0) {
+          if (buf.length > 64) return this._flush(KERNEL_OVERSIZE);
+          return;
+        }
+        const n = parseInt(buf.subarray(0, nl).toString("ascii").trim(), 10);
+        if (!Number.isInteger(n) || n < 0) return this._flush(null);
+        if (n > this._cap) return this._flush(KERNEL_OVERSIZE);
+        this._headerBytes = nl + 1;
+        this._need = n;
+      }
+      if (this._total < this._headerBytes + this._need) return;
+      const buf = this._coalesce();
+      const body = buf.subarray(this._headerBytes, this._headerBytes + this._need).toString("utf8");
+      const rest = buf.subarray(this._headerBytes + this._need);
+      this._chunks = rest.length ? [rest] : [];
+      this._total = rest.length;
+      this._need = -1;
+      this._headerBytes = -1;
+      const w = this._waiters.shift();
+      if (w) {
+        clearTimeout(w.timer);
+        w.resolve(body);
+      }
+    }
+  }
+
+  _flush(val) {
+    if (val === KERNEL_OVERSIZE || val === null) this._dead = true;
+    while (this._waiters.length) {
+      const w = this._waiters.shift();
+      clearTimeout(w.timer);
+      w.resolve(val);
+    }
+  }
+
+  _await(ms) {
+    if (this._dead) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const w = { resolve, timer: null };
+      w.timer = setTimeout(() => {
+        const i = this._waiters.indexOf(w);
+        if (i >= 0) this._waiters.splice(i, 1);
+        resolve(KERNEL_TIMEOUT);
+      }, ms);
+      if (w.timer.unref) w.timer.unref();
+      this._waiters.push(w);
+    });
+  }
+
+  // -- the one cell ----------------------------------------------------------------------------------
+
+  /** Run `code` in this box, then destroy it. Callable once; a second call throws rather than quietly
+   * reusing a box that has already executed user code. */
+  async runCell(code, { deadlineS, before }) {
+    if (this._spent) throw new SandboxError("a prewarmed box serves exactly one cell");
+    this._spent = true;
+    if (this._child === null) throw new SandboxError("prewarmed box was never started");
+    const started = Date.now();
+    const payload = Buffer.from(code, "utf8");
+    let body;
+    try {
+      this._child.stdin.write(`${payload.length}\n`);
+      this._child.stdin.write(payload);
+      body = await this._await(deadlineS * 1000);
+    } catch {
+      return this._faultResult("died", started, before);
+    }
+    if (body === KERNEL_TIMEOUT)
+      return this._faultResult("timeout", started, before, `code exceeded ${deadlineS}s`);
+    // Every branch below that rejects the reply produces the same shape, so it is written once. The
+    // repetition was three copies of the same call differing only in a string, which is the form where
+    // one copy quietly drifts from the others.
+    const rejected = (message, truncated = false) =>
+      this._result("", "", this._exitCode(), started, before, {
+        truncated,
+        fault: { type: "killed", message },
+      });
+    if (body === KERNEL_OVERSIZE) {
+      this.retire();
+      return rejected(
+        `the box sent a reply larger than the ${this._sbx.maxOutputBytes}-byte output cap ` +
+          "allows even after truncation",
+        true,
+      );
+    }
+    if (body === null) return this._faultResult("died", started, before);
+    this.retire();
+    let obj = null;
+    try {
+      obj = JSON.parse(body);
+    } catch {
+      /* handled below */
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj))
+      return rejected("the box sent a malformed reply");
+    // `rc` is the one field whose absence cannot be defaulted: defaulting it to 0 would let a cell
+    // declare its own failed run successful. Same rule as Kernel's reply parser.
+    if (typeof obj.rc !== "number" || !Number.isInteger(obj.rc))
+      return rejected("the box reply carried no usable exit code");
+    const results = Array.isArray(obj.results)
+      ? obj.results.filter((r) => r && typeof r === "object").map((r) => new Result(r))
+      : [];
+    return this._result(String(obj.stdout ?? ""), String(obj.stderr ?? ""), obj.rc, started, before, {
+      truncated: !!obj.trunc,
+      results,
+    });
+  }
+
+  _faultResult(kind, started, before, msg) {
+    const err = this._stderr.toString("utf8");
+    if (kind === "timeout") {
+      this.retire();
+      return this._result("", "", this._exitCode(), started, before, {
+        fault: { type: "timeout", message: msg || "the code exceeded its deadline" },
+      });
+    }
+    const capSignal = this._capSignal;
+    this.retire();
+    if (looksLikeStartupFailure(err)) throw new SandboxError(err.trim() || "the box failed to start");
+    let type = "killed";
+    let dflt = "the box exited before the code finished";
+    if (this._sbx.memoryMb !== null && this._sbx.memoryMb !== undefined && capSignal !== 2) {
+      type = "oom";
+      dflt = "the box was OOM-killed (it exceeded its memory cap)";
+    } else if (capSignal === 2) {
+      dflt =
+        "the box was SIGKILLed, but its memory cap was not enforced here (no cgroup delegation), " +
+        "so it is not attributed to a cgroup OOM";
+    }
+    return this._result("", "", this._exitCode(), started, before, {
+      fault: { type, message: err.trim() || dflt },
+    });
+  }
+
+  /** The exit status a FAULT reports. The cold path hands back the box process's real wait status - a
+   * SIGKILLed box is -9 - so a constant here would make one failure look like two different ones
+   * depending on which path served it. */
+  _exitCode() {
+    return typeof this._rc === "number" ? this._rc : -1;
+  }
+
+  /** Assemble the result with the SAME shape the cold path returns, including the workspace diff.
+   * `files` is computed here rather than left empty because a fast path that silently stopped reporting
+   * created files would be a behaviour change disguised as a speed-up. */
+  _result(stdout, stderr, exitCode, started, before, { truncated = false, fault = null, results = [] } = {}) {
+    return new ExecutionResult({
+      stdout,
+      stderr,
+      exitCode,
+      durationMs: Date.now() - started,
+      fault,
+      files: before ? this._sbx._diff(before) : [],
+      truncated,
+      results,
+    });
+  }
+
+  // -- teardown, split so the slow half never lands on a caller's clock ------------------------------
+
+  /** End the box's workload NOW. Fast, idempotent, never throws.
+   *
+   * SIGKILLing the supervisor's process group ends everything inside the box: kern arms
+   * PR_SET_PDEATHSIG(SIGKILL) on a foreground box, so the supervisor's death takes box PID 1, and PID 1
+   * leaving its PID namespace takes every other process in it. Measured on the Python side with a cell
+   * that leaves a background writer: it stops at the exact byte it had reached. That is what lets the
+   * caller diff the workspace the moment this returns. */
+  stopProcesses() {
+    LIVE_WARM.delete(this);
+    this._spent = true;
+    const child = this._child;
+    if (child === null) return;
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    if (this._rc === null) this._rc = toRc(null, "SIGKILL");
+  }
+
+  /** The bookkeeping after the workload is dead: the pipes and the private env file.
+   *
+   * It deliberately does NOT run `kern stop`, because it is unnecessary: stopProcesses ends every
+   * process in the box (measured against a CPU-bound background writer: it stops at the byte it had
+   * reached, while the same cell with no kill runs on), and kern's registry entry clears by itself
+   * within ~300 ms.
+   *
+   * A second reason was written here and was WRONG, kept because this binding is where it came from:
+   * that `kern stop` does not return once the supervisor is dead. It does, in 2 to 5 ms. The
+   * multi-second stalls were OURS - `spawnSync` blocks the single event loop that Node needs in order
+   * to REAP the child just SIGKILLed, so the pid was still present from `kern stop`'s point of view and
+   * it waited for it, correctly. Alternating sync and async calls shows it: 5, 6009, 4, 5 ms. */
+  sweep() {
+    const child = this._child;
+    this._child = null;
+    if (child) {
+      for (const s of [child.stdin, child.stdout, child.stderr]) {
+        try {
+          s?.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    // The private --env-file _baseArgv wrote for THIS box. _spawn removes its own; a prewarmed box has
+    // no _spawn, so without this every warm box leaves one behind in a workspace the caller may persist.
+    if (this._name) {
+      try {
+        fs.unlinkSync(this._sbx._envPath(this._name));
+      } catch {
+        /* ENOENT is fine */
+      }
+      this._name = "";
+    }
+  }
+
+  /** Destroy the box completely and synchronously. Used from the pool's close and the start-failure
+   * paths, where there is no worker to hand the sweep to. */
+  kill() {
+    this.stopProcesses();
+    this.sweep();
+  }
+
+  /** End the workload on the caller's clock and hand the sweep to the pool. This is the hot path: it is
+   * what turns a teardown measured in tens of milliseconds into a sub-millisecond one without
+   * dropping any of it. */
+  retire() {
+    this.stopProcesses();
+    if (this._sweeper) {
+      try {
+        this._sweeper(this);
+        return;
+      } catch {
+        /* the pool refused it: fall through and do it here rather than not at all */
+      }
+    }
+    this.sweep();
+  }
+}
+
+/** Keeps up to `size` WarmBox instances ready for one Sandbox.
+ *
+ * A claim that finds nothing usable returns null and the caller takes the ordinary cold path: the pool
+ * is an accelerator with no authority to change what runs. */
+class WarmPool {
+  constructor(sbx, size) {
+    this._sbx = sbx;
+    this._size = Math.max(0, Math.trunc(size) || 0);
+    this._ready = [];
+    this._starting = 0;
+    this._closed = false;
+    this._pending = new Set(); // in-flight sweeps, so close() can wait for them
+  }
+
+  /** The identity a warm box must match. Built from the REAL argv builder in `dry` mode, so an option
+   * this session grows later is folded in automatically instead of needing to be listed here.
+   *
+   * The argv is not the whole posture, and that was a real hole: kern reads `KERN_*` variables from ITS
+   * OWN environment when it builds the box, so a caller who sets `KERN_SECCOMP=denylist` after the pool
+   * filled would have been served a box built under the previous filter. Every `KERN_*` variable is
+   * folded in, rather than the handful we can name today, because the failure mode is a variable nobody
+   * thought to list. */
+  _key(network) {
+    const argv = this._sbx._baseArgv("", { network, timeoutS: 0, dry: true }).join("\0");
+    const env = Object.entries(process.env)
+      .filter(([k]) => k.startsWith("KERN_"))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\0");
+    return `${argv}\0\0${env}`;
+  }
+
+  claim({ network, deadlineS }) {
+    if (this._closed || this._size <= 0) return null;
+    const key = this._key(network);
+    let picked = null;
+    const keep = [];
+    const stale = [];
+    for (const b of this._ready) {
+      if (picked === null && b.usableFor(key, deadlineS)) picked = b;
+      else if (b.key !== key || Date.now() - b._born >= PREWARM_TTL_S * 1000 || b._dead) stale.push(b);
+      else keep.push(b);
+    }
+    this._ready = keep;
+    for (const b of stale) b.kill();
+    this.refill({ network, deadlineS });
+    return picked;
+  }
+
+  /** Top the pool up in the background. Bounded by `size` counting ready AND starting boxes, so a burst
+   * of claims cannot spawn an unbounded number of boxes. */
+  refill({ network, deadlineS }) {
+    if (this._closed || this._size <= 0) return;
+    const want = this._size - this._ready.length - this._starting;
+    if (want <= 0) return;
+    this._starting += want;
+    for (let i = 0; i < want; i++) {
+      const p = this._startOne(network, deadlineS).catch(() => {});
+      this._pending.add(p);
+      p.finally(() => this._pending.delete(p));
+    }
+  }
+
+  /** Start one box and publish it, releasing the reserved slot on EVERY path.
+   *
+   * The slot release is in a `finally` and the box is built inside the `try`, which is not tidiness:
+   * `_key()` calls the real argv builder and that CAN throw (an env value containing a newline is
+   * refused there). Thrown before the decrement, the slot stayed reserved forever, `want` went
+   * negative, and the pool never refilled again for the rest of the session, silently, with `refill`'s
+   * own `.catch(() => {})` swallowing the reason. Same shape as the Python binding's dead-worker
+   * case: a permanent stop with no signal. */
+  async _startOne(network, deadlineS) {
+    let box = null;
+    let ok = false;
+    try {
+      box = new WarmBox(this._sbx, this._key(network), deadlineS, (b) => this._sweep(b));
+      ok = (await box.start()) && (await box.waitReady());
+    } catch {
+      ok = false;
+    } finally {
+      this._starting -= 1;
+    }
+    if (box === null) return; // never constructed: there is nothing to publish and nothing to kill
+    if (ok && !this._closed) {
+      this._ready.push(box);
+      return;
+    }
+    // Three ways to land here and all of them must destroy the box: the start failed, the box came up
+    // but never signalled readiness, or the session closed while it was still building.
+    box.kill();
+  }
+
+  _sweep(box) {
+    if (this._closed) {
+      box.sweep();
+      return;
+    }
+    // Off the caller's microtask turn: `kern stop` is a synchronous subprocess and must not be awaited
+    // by whoever just got their result.
+    setImmediate(() => {
+      try {
+        box.sweep();
+      } catch {
+        /* best-effort */
+      }
+    });
+  }
+
+  async close() {
+    this._closed = true;
+    const boxes = this._ready;
+    this._ready = [];
+    for (const b of boxes) b.kill();
+    // Wait for boxes still starting, or close() would return while a `kern box` is being forked and the
+    // session's workspace is about to be deleted underneath it.
+    if (this._pending.size) await Promise.allSettled([...this._pending]);
+  }
+}
+
 /** Open a Sandbox, run `fn(sandbox)`, and close it (deleting a temp workspace) even if `fn` throws.
  * The idiomatic session helper - the equivalent of Python's `with Sandbox() as s:`. */
 async function withSandbox(opts, fn) {
@@ -2050,6 +2945,9 @@ async function runCode(code, opts = {}) {
 }
 
 module.exports = {
+  // Exported so a consumer that wants a DIFFERENT default can express it as a multiple of this
+  // one rather than declaring a second independent number that drifts from it.
+  DEFAULT_TMPFS_MB,
   Sandbox,
   Kernel,
   withSandbox,

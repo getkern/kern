@@ -34,6 +34,7 @@ pass security_profile="untrusted" (or KERN_SECCOMP=allowlist).
 
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import os
@@ -65,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.35"
+__version__ = "0.1.36"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -220,8 +221,16 @@ sys.exit(_rc)
 # Protocol on the box's stdin/stdout (length-prefixed frames): host writes `<n>\n` + n UTF-8 bytes of
 # cell source; the driver execs it (capturing stdout/stderr into buffers, the trailing expression, every
 # display(), and matplotlib figures) and writes back `<m>\n` + m UTF-8 bytes of a JSON reply
-# {stdout, stderr, rc, results:[mime-bundle,...]}. User prints go to a buffer, never the real stdout, so
-# the control channel stays clean. Any per-cell error is confined; the driver keeps serving.
+# {stdout, stderr, rc, results:[mime-bundle,...], trunc:bool}. User prints go to a buffer, never the real
+# stdout, so the control channel stays clean. Any per-cell error is confined; the driver keeps serving.
+#
+# `__KERN_OUTCAP__` / `__KERN_RESCAP__` are substituted by the HOST before the driver is written into the
+# workspace (see `_kernel_driver`). They exist because this one template serves two callers with different
+# contracts. A persistent `Kernel` keeps the historical 64 MiB drain cap and an effectively unbounded
+# results budget, so its behaviour is unchanged. A PREWARMED one-shot box (`_WarmBox`) substitutes the
+# session's own `max_output_bytes` / results cap, because that path has to be observationally identical to
+# the cold `run_code` it replaces: the cold path TRUNCATES oversized output and reports `truncated=True`,
+# and a fast path that instead faulted on the same cell would be a silent semantic change.
 _PY_KERNEL_DRIVER = r'''
 import sys, io, json, base64, builtins, ast, os, threading
 _g = {"__name__": "__main__"}
@@ -271,6 +280,12 @@ builtins.display = display
 # to close-on-exec control fds; then point fd 0 at /dev/null and fd 1/2 at pipes drained in the
 # background, so raw/subprocess output is CAPTURED (and >64 KiB never deadlocks) instead of hitting the
 # control channel. Uses only fds 0/1 (which always survive kern's box setup) and re-plumbs inside the box.
+# Running the driver with -c puts '' (the current directory, resolved at import time) at sys.path[0],
+# while a script run by path puts the script's DIRECTORY there. The one-shot runner is a file in the
+# workspace, so its cells see an absolute /workspace; pin the same absolute entry here so an import
+# behaves identically whichever way the driver was started. Started BY PATH this is a no-op.
+if sys.path and sys.path[0] == "":
+    sys.path[0] = os.getcwd()
 _ctrl_in = os.dup(0)
 _ctrl_out = os.dup(1)
 os.set_inheritable(_ctrl_in, False)
@@ -284,11 +299,15 @@ os.close(_u1w)
 _u2r, _u2w = os.pipe()
 os.dup2(_u2w, 2)
 os.close(_u2w)
-_CAP = 64 * 1024 * 1024
+_CAP = __KERN_OUTCAP__
+_RESCAP = __KERN_RESCAP__
 _MARK = b"\x00\x01KRNCELLDONE\x01\x00"  # per-cell barrier sentinel written to user fd 1/2 after exec
 _ulock = threading.Lock()
 _ubuf = {1: bytearray(), 2: bytearray()}
 _mevt = {1: threading.Event(), 2: threading.Event()}
+# Set by the drain threads when they cut a buffer at _CAP, read+reset by the cell loop under _ulock. A
+# list (not a bare name) because the drainers rebind nothing: they mutate this one shared cell.
+_tcut = [False]
 def _drain(fd, key):
     while True:
         try:
@@ -306,6 +325,7 @@ def _drain(fd, key):
                 _mevt[key].set()
             if len(_b) > _CAP:
                 del _b[_CAP:]
+                _tcut[0] = True
 threading.Thread(target=_drain, args=(_u1r, 1), daemon=True).start()
 threading.Thread(target=_drain, args=(_u2r, 2), daemon=True).start()
 _MAIN_PID = os.getpid()  # a cell that raw os.fork()s copies this whole process; the child must NOT re-enter
@@ -327,6 +347,14 @@ def _write(obj):
     _data = memoryview(str(len(b)).encode() + b"\n" + b)
     while _data:
         _data = _data[os.write(_ctrl_out, _data):]
+# Readiness. Popen returns when the FORK happens, not when kern has built the box and CPython has
+# booted inside it, so a pool that published a box on Popen alone would hand out boxes that are still
+# starting - and the caller would pay the remainder of that start on its own clock, which is the exact
+# cost prewarming exists to remove. This frame is the only signal that the interpreter is actually at the
+# prompt. Emitted only when the host asked for it (see __KERN_HELLO__): a persistent Kernel does not
+# read one, and an unexpected frame there would be consumed as the first cell's reply.
+if __KERN_HELLO__:
+    _write({"hello": 1})
 while True:
     _code = _read()
     if _code is None:
@@ -334,6 +362,7 @@ while True:
     _out.clear()
     with _ulock:
         _m1, _m2 = len(_ubuf[1]), len(_ubuf[2])
+        _tcut[0] = False  # a cut belongs to the cell it happens in, so clear it at the cell boundary
     _so, _se = io.StringIO(), io.StringIO()
     _rc = 0
     _oo, _oe, _oi = sys.stdout, sys.stderr, sys.stdin
@@ -391,13 +420,61 @@ while True:
     with _ulock:
         _r1 = bytes(_ubuf[1][_m1:])
         _r2 = bytes(_ubuf[2][_m2:])
-    _write({
-        "stdout": _so.getvalue() + _r1.decode("utf-8", "replace"),
-        "stderr": _se.getvalue() + _r2.decode("utf-8", "replace"),
-        "rc": _rc,
-        "results": list(_out),
-    })
+        _tr = _tcut[0]
+    # sys.stdout is a StringIO, so _CAP (which bounds only the raw-fd drain) never bounded a cell that
+    # printed through it: printing a gigabyte built the whole string into the reply. Cut BOTH streams at
+    # the same cap and say so, which is what the cold path's capped reader does.
+    _o1 = _so.getvalue() + _r1.decode("utf-8", "replace")
+    _o2 = _se.getvalue() + _r2.decode("utf-8", "replace")
+    if len(_o1) > _CAP:
+        _o1 = _o1[:_CAP]
+        _tr = True
+    if len(_o2) > _CAP:
+        _o2 = _o2[:_CAP]
+        _tr = True
+    # Results are bounded bundle by bundle rather than by serializing the whole list and measuring it: a
+    # single json.dumps of an oversized list would build the entire payload in the box before anything
+    # could reject it. A bundle that alone exceeds the budget is dropped, not truncated mid-JSON.
+    # A _RESCAP of 0 or less means unbounded and skips the measuring entirely: a persistent Kernel keeps
+    # its historical contract (the host's frame cap is the only bound) AND does not pay a second
+    # json.dumps per bundle, which measuring every bundle would cost it on a large figure.
+    if _RESCAP <= 0:
+        _res = list(_out)
+    else:
+        _res = []
+        _rsz = 0
+        for _bnd in _out:
+            try:
+                _bl = len(json.dumps(_bnd))
+            except Exception:
+                continue
+            if _rsz + _bl > _RESCAP:
+                _tr = True
+                break
+            _res.append(_bnd)
+            _rsz += _bl
+    _write({"stdout": _o1, "stderr": _o2, "rc": _rc, "results": _res, "trunc": _tr})
 '''
+
+
+# The raw-fd drain cap a PERSISTENT kernel has always used. Named rather than repeated so the one place
+# that must not drift from the shipped behaviour says which number it is and why.
+_KERNEL_DRAIN_CAP = 64 * 1024 * 1024
+
+
+def _kernel_driver(out_cap: int, res_cap: int, *, hello: bool = False) -> str:
+    """Materialize :data:`_PY_KERNEL_DRIVER` for one caller's output budget and handshake.
+
+    Two callers, two contracts, one template. Substitution (not a runtime read) because the driver runs
+    INSIDE the box, where an environment variable is workload-writable: the caps have to be baked in by
+    the host or they are not caps. The values are stringified ints and a literal ``0``/``1`` from our own
+    call sites, never from box input, so the generated source cannot be influenced from inside the
+    sandbox."""
+    return (
+        _PY_KERNEL_DRIVER.replace("__KERN_OUTCAP__", str(int(out_cap)))
+        .replace("__KERN_RESCAP__", str(int(res_cap)))
+        .replace("__KERN_HELLO__", "1" if hello else "0")
+    )
 
 # Host paths a `-v` mount must never target - mounting the host's real root/config/secrets into a
 # sandbox defeats the point; the docker socket is the classic escape. A footgun guard: refused even
@@ -686,6 +763,171 @@ def _validate_mount(source: str, target: str) -> tuple[str, str]:
     return real, target
 
 
+# The box root is read-only (`--ro`, always), so every path a workload can write is one we granted.
+# `/tmp` was not granted, and both halves of what that cost were measured rather than assumed:
+#   * anything NAMING /tmp fails: `open("/tmp/x", "w")` raises OSError(EROFS). That is how a toolchain
+#     reaches it. Measured on `golang:1.23-alpine`: `go build` reported "failed to initialize build
+#     cache at /root/.cache: read-only file system" and printed nothing else useful.
+#   * anything using `tempfile` SILENTLY MOVES INTO THE WORKSPACE. tempfile's last-resort candidate is
+#     the current directory, which is /workspace, so `NamedTemporaryFile()` landed on the caller's
+#     persistent host directory and showed up in `list_files` as a file the model then has to explain.
+# 64 MiB is enough for scratch and small enough that filling it hits the box's own memory cap rather
+# than the host. A tmpfs and not a host bind ON PURPOSE: tmpfs pages are charged to the box's memory
+# cgroup, so the fill is bounded by a cap the caller already set; a bound host directory is bounded by
+# nothing, and that is the one thing this SDK's own README already warns about for the workspace.
+_DEFAULT_TMPFS = {"/tmp": "64m"}
+
+# A tmpfs size as kern's `--tmpfs path[:size]` takes it. ANCHORED and unit-restricted: the value is
+# concatenated after a colon into one argv element, so anything that could carry a comma, a space or a
+# second flag has to be refused here rather than reinterpreted by the parser downstream.
+#
+# THE UNIT IS MANDATORY, and a leading zero is refused, because kern's CLI accepts two spellings that
+# mean the opposite of what an SDK caller writing them means. Both measured:
+#   * `"64"` is 64 BYTES, not 64 MiB. `df` reports 4 KB (one page) and a 100 KB write is ENOSPC.
+#   * `"0"` is UNLIMITED, not none. `df` reports 0 blocks and 200 MiB written under `memory_mb=128`
+#     OOM-killed the box at exit 137, so nothing but the memory cap stopped it.
+# kern is right to take both: it is the low-level interface. Here they are foot-guns that fail far
+# from their cause, so the gate demands `64m` and points at `tmpfs={}` for "none".
+_TMPFS_SIZE_RE = re.compile(r"^[1-9][0-9]*[kmgtKMGT]$")
+
+# Mounting a tmpfs over these hides something the box needs, and silently: a tmpfs at /workspace would
+# shadow the workspace bind, so every file the caller wrote would still be on the host and none of it
+# would be visible to the code. Refuse rather than let a caller build that.
+_REFUSED_TMPFS_TARGETS = ("/", "/proc", "/sys", "/dev", _WORKSPACE)
+
+
+def _validate_tmpfs(target: str, size: "str | None") -> "tuple[str, str | None]":
+    """Validate one in-box tmpfs; return the normalised (target, size). The caller composes the
+    argument, because the size still has to be resolved against the memory cap and that resolution
+    PARSES it, so it may only run on a value this function has already accepted."""
+    if not isinstance(target, str) or not target.startswith("/"):
+        raise MountRefused(f"tmpfs target must be an absolute path in the box, got {target!r}")
+    if any(c == ".." for c in target.split("/")):
+        raise MountRefused(f"tmpfs target must not contain '..': {target!r}")
+    # A colon is the SEPARATOR in `--tmpfs path[:size]`, so a path carrying one is reinterpreted
+    # rather than rejected. Measured: `tmpfs=["/scratch:9g"]` mounted `/scratch` at 9 GiB and the
+    # directory the caller actually named did not exist in the box. Silent, and the caller's own path
+    # became a number. kern cannot fix this without breaking its own syntax; the SDK can refuse.
+    if ":" in target:
+        raise MountRefused(
+            f"tmpfs target must not contain ':': {target!r}. It is the size separator in kern's "
+            f"`--tmpfs path[:size]`, so this path would be read as a size and a different directory "
+            f"would be mounted."
+        )
+    norm = "/" + "/".join(c for c in target.split("/") if c and c != ".")
+    if norm in _REFUSED_TMPFS_TARGETS:
+        raise MountRefused(
+            f"cannot mount a tmpfs over {norm!r}: it would hide the box's own mount there "
+            f"(the workspace bind, or an essential filesystem)"
+        )
+    if size is None:
+        return norm, None
+    if not isinstance(size, str) or not _TMPFS_SIZE_RE.fullmatch(size):
+        hint = ""
+        if isinstance(size, str) and size.isdigit():
+            hint = (
+                " A bare number is BYTES to kern, not MiB: '64' gives a 4 KB filesystem and the first"
+                " real write is ENOSPC."
+                if size.strip("0")
+                else " A zero size means UNLIMITED to kern, not none: for none, pass tmpfs={}."
+            )
+        raise MountRefused(
+            f"invalid tmpfs size {size!r} for {norm!r}: expected a number with a k/m/g/t unit, e.g."
+            f" '64m'.{hint}"
+        )
+    return norm, size
+
+
+_TMPFS_UNIT_MIB = {"k": 1 / 1024, "m": 1.0, "g": 1024.0, "t": 1024.0 * 1024.0}
+
+
+def _tmpfs_mib(size: str) -> float:
+    """A validated ``64m``/``1g`` size as MiB. Only ever called after ``_TMPFS_SIZE_RE`` matched."""
+    return int(size[:-1]) * _TMPFS_UNIT_MIB[size[-1].lower()]
+
+
+def _tmpfs_size_vs_cap(target: str, size: "str | None", memory_mb: "int | None", ours: bool) -> "str | None":
+    """Resolve a scratch size against the memory cap AT CONSTRUCTION, not at the first write.
+
+    A tmpfs larger than the cap is a number the KERNEL then tells the workload: ``df`` reports the
+    tmpfs size, so a ``"1t"`` scratch shows 1.0T free under a 128 MiB cap. Anything that preflights
+    with ``statvfs`` (installers, archivers, encoders, SQLite) plans against that and is OOM-killed
+    instead of getting a clean ENOSPC. The wrong answer is delivered to a PROGRAM, which will act on
+    it, and no message reaches a person at all.
+
+    The two cases are not symmetric, on purpose:
+      * a size the CALLER wrote is refused, naming both numbers. Silently shrinking what someone
+        asked for is the declared-versus-real defect this whole change exists to remove.
+      * OUR default is clamped instead, because adjusting a number we chose ourselves is not
+        overriding anyone, and refusing it would make a box unstartable for a caller who never
+        mentioned scratch at all (``memory_mb=32`` with a 64 MiB default).
+    An uncapped box (``memory_mb=None``) has no ceiling to resolve against, so nothing happens.
+
+    The clamp is ``min(64 MiB, memory_mb / 2)``, and it is a HEURISTIC, not a derivation. It only ever
+    REDUCES our own 64 MiB: at ``memory_mb=512`` the default is still 64, not 256. There is no safe
+    fraction to derive, because the safe fraction depends on the workload's own peak, which is the
+    thing ``memory_mb`` was meant to bound and now shares. Half is where the measurement below stops
+    being fatal; it is not a formula that says what is right for a given workload.
+
+    Writing in 1 MiB chunks under ``memory_mb=128``:
+
+        tmpfs  32m  ->  ENOSPC after 32 MiB      the filesystem bound, cleanly
+        tmpfs  64m  ->  ENOSPC after 64 MiB
+        tmpfs 128m  ->  OOM                      the cap bound first, and the box died
+
+    A tmpfs EQUAL to the cap lands exactly on the cell this function exists to avoid: filling it
+    exhausts the whole budget, so the box is killed instead of the write failing. Half leaves the
+    workload as much room as the scratch."""
+    if size is None or memory_mb is None:
+        return size
+    if ours:
+        # Never grow the default, only shrink it, and never to zero: `"0m"` is refused downstream and
+        # a box a caller never asked scratch for must still start.
+        capped = max(1, min(int(_tmpfs_mib(size)), memory_mb // 2))
+        return size if capped >= _tmpfs_mib(size) else f"{capped}m"
+    if _tmpfs_mib(size) <= memory_mb:
+        return size
+    if not ours:
+        raise MountRefused(
+            f"tmpfs {size!r} at {target!r} is larger than memory_mb={memory_mb}, and a tmpfs is "
+            f"charged to that same cap. `df` inside the box would report {size} free while only "
+            f"{memory_mb}m is reachable, so a program that checks free space before writing plans "
+            f"against a number that OOM-kills it instead of returning ENOSPC. Lower the tmpfs or "
+            f"raise memory_mb."
+        )
+    return f"{memory_mb}m"
+
+
+def _tmpfs_items(spec: object) -> "list[tuple[str, str | None]]":
+    """Normalise the `tmpfs=` argument to (target, size|None) pairs. A mapping carries sizes, a plain
+    sequence does not; a bare string is refused by name, because iterating it would produce one bogus
+    mount per character instead of the one the caller meant."""
+    if spec is None:
+        return list(_DEFAULT_TMPFS.items())
+    if isinstance(spec, str):
+        raise MountRefused(
+            f"tmpfs must be a mapping or a sequence of paths, not a bare string: write "
+            f"tmpfs={{{spec!r}: '64m'}} or tmpfs=[{spec!r}]"
+        )
+    if isinstance(spec, Mapping):
+        return list(spec.items())
+    # A NUMBER is the mistake this API invites: every neighbour takes one (`memory_mb=512`,
+    # `pids=256`), so `tmpfs=256` is the natural thing to type. Iterating it raised a bare TypeError
+    # from inside the constructor that never said the word "tmpfs". Name it, and guess the intent.
+    if not isinstance(spec, (list, tuple, set, frozenset)):
+        if isinstance(spec, bool) or not isinstance(spec, int):
+            extra = ""
+        elif spec == 0:
+            extra = " For no scratch at all, pass tmpfs={}."
+        else:
+            extra = f" Did you mean tmpfs={{'/tmp': '{spec}m'}}?"
+        raise MountRefused(
+            f"tmpfs must be a mapping of path -> size or a sequence of paths, got "
+            f"{type(spec).__name__}.{extra}"
+        )
+    return [(t, None) for t in spec]
+
+
 # A resource-profile token (`vcpu:`/`vgpio:`/`vdisk:` + a named profile from the user's kern.toml).
 # ANCHORED and charset-restricted: the token is passed as a POSITIONAL arg to `kern box`, so it must be
 # EXACTLY a known prefix plus a safe name. This is what stops a caller (or agent-chosen value) from
@@ -804,6 +1046,28 @@ class Sandbox:
             deps; the allowlist governs the untrusted run phase.
         mounts: extra host paths to bind, ``{host_src: box_target}`` (or ``{src: (target, "ro")}``).
             Sensitive sources are refused. The workspace is mounted automatically; this is for extras.
+        tmpfs: fresh in-box scratch filesystems, ``{"/path": "64m"}`` or ``["/path"]`` (kern
+            ``--tmpfs``). **A 64 MiB tmpfs is mounted at ``/tmp`` by default.** The box root is
+            read-only, so without it ``open("/tmp/x", "w")`` fails and ``tempfile`` falls back to the
+            current directory, quietly writing temp files into your persistent workspace. Pass
+            ``{"/tmp": "512m"}`` to resize it (**the unit is required**: a bare ``"64"`` is 64 BYTES to
+            kern and ``"0"`` is UNLIMITED, so both are refused), ``tmpfs={}`` for none, or bind your own directory at
+            ``/tmp`` via ``mounts`` and the default steps aside. The bytes are charged to the box's own
+            memory cgroup, so a runaway writer is OOM-killed instead of filling the host disk.
+
+            **Scratch does not survive a command, EXCEPT in a kernel().** Each ``run_code``/``run`` is
+            a fresh box, so the tmpfs is fresh too, while the workspace persists. A ``kernel()`` is one
+            long-lived box, so the opposite holds there: its ``/tmp`` persists across cells and the
+            size is CUMULATIVE. Measured, writing 10 MiB per step under the 64 MiB default: ten
+            ``run_code`` calls all succeed and each sees an empty ``/tmp``, while the same ten cells in
+            a kernel fail from the seventh with ``OSError: [Errno 28] No space left on device``. That is a trade, not a free win: a
+            read-only ``/tmp`` used to fail LOUDLY at the moment of the mistake, and a tool that
+            writes state to the workspace and a lock or pidfile to ``/tmp`` now writes both, and the
+            second call finds workspace state pointing at a ``/tmp`` path that is gone. Put anything
+            another call has to find in the workspace. The
+            EFFECTIVE ceiling is therefore ``min(size, memory_mb)``, and ``df`` inside the box does
+            not know that: it reports the tmpfs size, so a ``"1t"`` scratch shows 1.0T free and the
+            first write past the cap is an OOM, not ``ENOSPC``. The ``oom`` fault names the scratch.
         profiles: reusable kern resource profiles to attach, as ``["vcpu:NAME", "vgpio:NAME",
             "vdisk:NAME"]``. Each names a ``[[vcpu]]``/``[[vgpio]]``/``[[vdisk]]`` block in your
             ``~/.config/kern/kern.toml``: a CPU+memory slice, a specific GPIO/I2C/SPI device set (the
@@ -831,6 +1095,10 @@ class Sandbox:
     network: bool = False
     egress_allow: Sequence[str] | None = None
     mounts: Mapping[str, "str | tuple[str, str]"] | None = None
+    # `None` means the binding's default (a 64 MiB tmpfs at /tmp, see `_DEFAULT_TMPFS`); an empty
+    # mapping or sequence means none at all. The two are distinct on purpose: "I did not say" and "I
+    # said no" are different answers, and only the second should leave a box without a writable /tmp.
+    tmpfs: "Mapping[str, str | None] | Sequence[str] | None" = None
     profiles: Sequence[str] | None = None
     env: Mapping[str, str] | None = None
     max_output_bytes: int = 64 * 1024 * 1024
@@ -863,7 +1131,7 @@ class Sandbox:
     # and will get PermissionError. Pass `cap_drop=()` to keep the previous behaviour, or drop a
     # narrower set, e.g. `cap_drop=("SYS_ADMIN", "NET_RAW")`.
     cap_drop: Sequence[str] = ("ALL",)
-    deps_readonly: bool = False  # mount setup= deps read-only for run_code (block cross-run poisoning)
+    deps_readonly: bool = True  # mount setup= deps read-only for run_code (block cross-run poisoning)
     # track_files=True populates result.files by walking the workspace before AND after each call, which
     # is O(workspace file count): a long session that accumulates thousands of files makes every run_code
     # slower. Set False (result.files always []) when you don't need the per-call file diff - O(1) then.
@@ -872,15 +1140,28 @@ class Sandbox:
     # full capped output is still captured in the result, so you can stream AND read result.stdout.
     on_stdout: "Callable[[bytes], None] | None" = None
     on_stderr: "Callable[[bytes], None] | None" = None
+    # prewarm=N keeps N boxes started in advance, each holding a booted interpreter that has run nothing.
+    # A python `run_code` then claims one instead of starting its own, which takes the ~15 ms of box start
+    # + interpreter boot OFF the call and leaves a marginal cost near zero. Each prewarmed box serves
+    # exactly one cell and is destroyed, so "a fresh box per call" is unchanged - see :class:`_WarmBox`.
+    #
+    # Default 0, because it is a RESOURCE decision the caller owns: N warm boxes hold N booted
+    # interpreters (tens of MB of RSS) and N kern supervisors for the life of the session, whether or not
+    # a call ever arrives. 1 is the right number for an interactive agent (calls are separated by model
+    # thinking time, so the pool always refills between them); raise it only for bursts.
+    prewarm: int = 0
 
     _kern: str = field(default="", repr=False)
     _mount_args: list = field(default_factory=list, init=False, repr=False)
+    _tmpfs_args: list = field(default_factory=list, init=False, repr=False)
+    _tmpfs_default: bool = field(default=True, init=False, repr=False)
     _profile_args: list = field(default_factory=list, init=False, repr=False)
     _egress_allow: list = field(default_factory=list, init=False, repr=False)
     _cap_drop_args: list = field(default_factory=list, init=False, repr=False)
     _ws: str = field(default="", init=False, repr=False)
     _own_ws: bool = field(default=False, init=False, repr=False)  # we created it → we delete it
     _entered: bool = field(default=False, init=False, repr=False)
+    _pool: object = field(default=None, init=False, repr=False)
     # The workspace files this binding put there itself, by exact name. See `_claim`.
     _ours: set = field(default_factory=set, init=False, repr=False)
 
@@ -890,6 +1171,7 @@ class Sandbox:
         if self.max_output_bytes <= 0:
             raise SandboxError("max_output_bytes must be positive")
         self._mount_args = []
+        bound_targets = set()
         if self.mounts:
             for source, spec in self.mounts.items():
                 if isinstance(spec, tuple):
@@ -901,6 +1183,53 @@ class Sandbox:
                     target, ro = spec, False
                 real, tgt = _validate_mount(source, target)
                 self._mount_args += ["-v", f"{real}:{tgt}:ro" if ro else f"{real}:{tgt}"]
+                bound_targets.add("/" + "/".join(c for c in tgt.split("/") if c and c != "."))
+        # A caller who binds their own directory at /tmp gets it: the default tmpfs would be mounted
+        # over their bind, so the files they passed would be invisible to the code they are running.
+        # An explicit `tmpfs=` wins too - both are the caller saying what /tmp is.
+        self._tmpfs_args = []
+        self._tmpfs_default = self.tmpfs is None
+        for target, size in _tmpfs_items(self.tmpfs):
+            norm_target = "/" + "/".join(c for c in str(target).split("/") if c and c != ".")
+            if self._tmpfs_default:
+                # OUR default steps aside wherever the caller has already said something about this
+                # area. A bind at the same target, because mounting over it would hide their files.
+                # A `security_profile`, because that is a HARDENING BUNDLE: 0.1.35 gave `untrusted` a
+                # read-only /tmp, and a default added by a different layer must not quietly widen a
+                # posture in a patch release. An explicit `tmpfs=` is the caller's own decision.
+                if norm_target in bound_targets or self.security_profile is not None:
+                    continue
+            else:
+                # A tmpfs that COVERS a bind. Equality was the first version of this check and it is
+                # only half the shape: mounts stack, the tmpfs goes on top, and "on top" reaches every
+                # path underneath it. Measured, both directions:
+                #
+                #   -v HOST:/tmp      + --tmpfs /tmp       -> /tmp is EMPTY, the bind is invisible
+                #   -v HOST:/tmp/sub  + --tmpfs /tmp       -> same, reached through NESTING
+                #   -v HOST:/tmp      + --tmpfs /tmp/sub   -> the bind's files are THERE, /tmp/sub is
+                #                                             writable scratch inside it
+                #
+                # So the rule is asymmetric, and refusing both directions would refuse the third line,
+                # which is a legal configuration someone would reasonably want: a persistent /tmp with
+                # a bounded subtree. Refuse only when the tmpfs is the ancestor, because that is the
+                # one where the caller's files exist and cannot be reached.
+                swallowed = [b for b in bound_targets
+                             if b == norm_target or b.startswith(norm_target.rstrip("/") + "/")]
+                if swallowed:
+                    raise MountRefused(
+                        f"tmpfs {norm_target!r} would cover the mounts bind at "
+                        f"{', '.join(sorted(swallowed))}. Mounts STACK: kern puts the tmpfs on top "
+                        f"whatever order the arguments arrive in, so those files stay on the host and "
+                        f"are invisible in the box. Keep the bind (for host files) or the tmpfs (for "
+                        f"ephemeral scratch) at that path, not both. A tmpfs BELOW a bind is fine: "
+                        f"mounts={{host: '/tmp'}} with tmpfs={{'/tmp/scratch': '8m'}} works."
+                    )
+            # Validate FIRST: `_tmpfs_size_vs_cap` parses the size, and parsing an unvalidated one
+            # raised a ValueError out of the constructor instead of a named MountRefused. Same class
+            # as the wrong-type hole, one layer down.
+            norm, valid_size = _validate_tmpfs(target, size)
+            resolved = _tmpfs_size_vs_cap(norm, valid_size, self.memory_mb, self._tmpfs_default)
+            self._tmpfs_args += ["--tmpfs", norm if resolved is None else f"{norm}:{resolved}"]
         self._profile_args = [_validate_profile(p) for p in (self.profiles or [])]
         self._egress_allow = [_validate_domain(d) for d in (self.egress_allow or [])]
         if self.apparmor is not None:
@@ -950,9 +1279,23 @@ class Sandbox:
             except BaseException:
                 self.__exit__()
                 raise
+        # AFTER the setup, deliberately. `_base_argv` adds the `.deps` read-only remount only once that
+        # directory exists, so a pool filled before the setup ran would hold boxes whose argv no longer
+        # matches the one `run_code` builds - every claim would miss, and the prewarming would be pure
+        # cost. Filling here means the first box is already warm by the time the caller's first cell
+        # arrives, which is the whole point.
+        if self.prewarm > 0:
+            pool = _WarmPool(self, self.prewarm)
+            self._pool = pool
+            pool.refill(network=self.network, deadline=self._eff_timeout(None))
         return self
 
     def __exit__(self, *exc: object) -> None:
+        # Boxes first: they are live processes holding the workspace we are about to delete, and a box
+        # still writing into a directory being removed is how a teardown turns into a stale mount.
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.close()  # type: ignore[attr-defined]
         if self._own_ws and self._ws:
             shutil.rmtree(self._ws, ignore_errors=True)
         self._entered = False
@@ -963,7 +1306,16 @@ class Sandbox:
 
     # -- the box invocation --------------------------------------------------------------------------
 
-    def _base_argv(self, name: str, *, network: bool, timeout_s: int, is_setup: bool = False) -> list[str]:
+    def _base_argv(
+        self, name: str, *, network: bool, timeout_s: int, is_setup: bool = False, dry: bool = False
+    ) -> list[str]:
+        """Build the `kern box` argv for one call. NOT a pure function: it also WRITES the private
+        `--env-file` this box will read, so it must be called once per box that is actually started.
+
+        ``dry=True`` suppresses that write and substitutes a fixed placeholder for the env-file path,
+        which is what the prewarm pool needs: it compares postures, and a comparison that created a file
+        named after a box that will never exist would both litter the workspace and collide with itself.
+        A dry argv is for COMPARING, never for running."""
         argv = [self._kern, "box", name, "--image", self.image, "--ro", "-v", f"{self._ws}:{_WORKSPACE}",
                 "--workdir", _WORKSPACE]
         # deps_readonly: mount <workspace>/.deps read-only OVER the writable workspace for run_code boxes
@@ -1002,6 +1354,15 @@ class Sandbox:
         # user's kern.toml. Validated at construction, so nothing here can be a smuggled flag.
         argv += self._profile_args
         argv += self._mount_args
+        # Scratch for THIS box. The DEFAULT tmpfs is deliberately skipped on the setup box, for the same
+        # reason the egress allowlist is: setup is the install phase, and an install needs unbounded
+        # scratch. `pip install pandas` puts its build tree in TMPDIR, so a 64 MiB /tmp turns a working
+        # install into `OSError [Errno 28] No space left on device` (measured, and it is why this
+        # condition exists). With no tmpfs, setup's temp falls back to the workspace on the host disk,
+        # which is exactly where a large, short-lived build tree belongs. An EXPLICIT `tmpfs=` is the
+        # caller's decision and applies to every box, setup included.
+        if not (is_setup and self._tmpfs_default):
+            argv += self._tmpfs_args
         merged_env = dict(self.env or {})
         # Deps installed by `setup` live in <workspace>/.deps - put them on PYTHONPATH for run_code.
         merged_env.setdefault("PYTHONPATH", f"{_WORKSPACE}/{_DEPS_DIR}")
@@ -1016,7 +1377,12 @@ class Sandbox:
         # the current directory. It has been landing in the repository for as long as those tests have
         # existed, hidden by a `.kern-env` line in `.gitignore` that stopped matching when the name
         # became per-call. No workspace means nowhere to put it, so there is nothing to write.
-        if merged_env and self._ws:
+        if merged_env and dry:
+            # The path is per-box by construction, so it can never be part of a posture comparison; a
+            # constant stands in for it. The env CONTENT is still compared, because a session that changes
+            # `env=` must invalidate warm boxes: it is folded in here rather than left out.
+            argv += ["--env-file", "\0".join(f"{k}={v}" for k, v in sorted(merged_env.items()))]
+        elif merged_env and self._ws:
             env_path = self._claim_path(self._env_path(name))
             # SECURITY: the box has rw access to the workspace and could plant `.kern-env` as a symlink
             # to a host file (e.g. ~/.ssh/authorized_keys); a follow-through open would O_TRUNC-clobber
@@ -1044,6 +1410,38 @@ class Sandbox:
                 os.close(fd)
             argv += ["--env-file", env_path]
         return argv
+
+    def _scratch_note(self) -> str:
+        """The clause an OOM message owes when this box has scratch mounted.
+
+        A tmpfs is charged to the box's memory cgroup and its pages are NOT reclaimable: measured,
+        56 MiB written to /tmp and then 90 MiB allocated under `memory_mb=128` is an OOM, while the
+        SAME 56 MiB written to the workspace and synced leaves the allocation room, because file-backed
+        pages can be written back and dropped. So a file left in scratch is a hard subtraction from the
+        budget, and an OOM message that names only "memory cap" sends the reader to look at their
+        allocation. This states the mechanism, and does NOT claim scratch caused this particular kill:
+        that is not knowable from here."""
+        ours = ", ".join(a for a in self._tmpfs_args if a != "--tmpfs")
+        # `/dev/shm` is named even when we mounted nothing, and it is named SECOND, because the first
+        # version of this note pointed only at our own scratch: writing 200 MiB to /dev/shm under
+        # `memory_mb=128` OOMs the box, and the message said `/tmp:64m`, which is the wrong place.
+        # The fix for a misattributing message had misattributed, and for the reason it exists to
+        # prevent: it named what the author had in mind rather than what the kernel acted on.
+        #
+        # It lists CANDIDATES rather than naming the one that took the budget, and that is a measured
+        # limit rather than laziness. The evidence is destroyed by the kill: read post mortem, the
+        # box's own cgroup reports `shmem=978944 anon=0` after 200 MiB went through /dev/shm, because
+        # the mount died with the box and the pages went with it. `memory.events` still says
+        # `oom_kill 3 oom_group_kill 1`, which confirms the kill and attributes nothing. Naming one
+        # path would mean sampling `memory.stat` while the box is alive, on every run, for a message
+        # that is only ever read after a failure.
+        return (
+            ". NOTE: memory-backed filesystems in this box are charged to that same cap, and their "
+            "pages are freed only by DELETING the files: "
+            + (f"the scratch this SDK mounted ({ours}), and " if ours else "")
+            + "/dev/shm, which every kern box has as a tmpfs with NO size limit (its apparent size is "
+            "half the HOST's RAM) and which no option here can bound. Check both before the workload"
+        )
 
     def _spawn(
         self,
@@ -1160,6 +1558,10 @@ class Sandbox:
                 detail = (
                     f"No such file or directory. The image {self.image!r} does not provide it, or its "
                     f"interpreter line names something the image lacks."
+                    # The one case where the remedy is not "a different image": every image has a POSIX
+                    # shell, so a caller who asked for bash and does not need bash has a one-word fix.
+                    + (" This image has no bash; use language='sh' if the script is POSIX."
+                       if what == "bash" else "")
                 )
             elif "Permission denied" in reason:
                 detail = "Permission denied: it is present in the box but not executable there."
@@ -1248,7 +1650,8 @@ class Sandbox:
             # did NOT bind (2), a SIGKILL cannot be attributed to the box's cgroup - it is host memory
             # pressure or an external kill - so we do not overclaim `oom` and keep the honest `killed`.
             if self.memory_mb is not None and cap_signal != 2:
-                return SandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL)")
+                return SandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL)"
+                                    + self._scratch_note())
             if cap_signal == 2:
                 return SandboxFault(
                     "killed",
@@ -1432,9 +1835,15 @@ class Sandbox:
     def read_file(self, path: str, *, max_bytes: "int | None" = None) -> bytes:
         """Read ``path`` (workspace-relative) from the workspace - host-direct. Every path component is
         opened O_NOFOLLOW (via ``openat`` descent), so a symlink the box planted in the final OR an
-        intermediate component can't redirect the read outside the workspace. ``max_bytes`` caps the read:
-        if the file is larger, ``SandboxError`` is raised rather than loading it all into host RAM (use it
-        when reading a file a box you don't fully trust may have written)."""
+        intermediate component can't redirect the read outside the workspace.
+
+        ``max_bytes`` is a **REFUSAL threshold, not a partial read**. A file larger than it raises
+        ``SandboxError``; it never returns the first ``max_bytes`` bytes. That is the safer default for
+        a boundary (a silent truncation is how a caller ends up parsing half a file), and it is not what
+        the name suggests, so it is spelled out here and in the error: a caller who asked for 16 bytes to
+        sniff a magic number and wrapped the call in ``try`` turned every image in their project into
+        "not an image", in silence. For a sniff, read the head yourself with a bounded ``os.read`` on a
+        descriptor you opened, or read the file and slice it."""
         self._require_entered()
         full = self._ws_path(path)
         try:
@@ -1446,7 +1855,12 @@ class Sandbox:
                 return f.read()
             data = f.read(max_bytes + 1)  # one past the cap so we can tell "exactly at" from "over"
             if len(data) > max_bytes:
-                raise SandboxError(f"{path!r} exceeds max_bytes={max_bytes}")
+                raise SandboxError(
+                    f"{path!r} is larger than max_bytes={max_bytes}, so the read was REFUSED. "
+                    f"max_bytes is a ceiling on what may be read at all, not a request for the "
+                    f"first {max_bytes} bytes: nothing was returned. Raise it, or drop it and "
+                    f"slice the result."
+                )
             return data
 
     def list_files(self, subdir: str = "") -> list[FileInfo]:
@@ -1524,6 +1938,26 @@ class Sandbox:
         r = self._spawn(["sh", "-c", shell_cmd], network=True, timeout_s=max(self.timeout_s, 120), is_setup=True)
         if not r.success:
             raise SandboxError(f"setup failed (exit {r.exit_code}): {(r.stderr or r.stdout).strip()[:400]}")
+        # PRECOMPILE HERE, because this is the last moment `.deps` is writable.
+        #
+        # `deps_readonly` defaults to True, so every run_code box mounts `.deps` read-only and CPython
+        # cannot write a `__pycache__` into it. It tolerates that silently and recompiles on every
+        # import instead, which is correct and is not free. Measured on `requests`, seven calls each:
+        #
+        #   setup leaves .pyc behind (pip's default)        250 ms/call writable, 252 read-only
+        #   setup leaves none (`pip install --no-compile`)  250 ms/call writable, 290 read-only
+        #
+        # so the read-only default would cost +40 ms on EVERY call of a session whose setup did not
+        # compile, for as long as that session lives. One `compileall` in this box removes it: the same
+        # case comes back to 250. It is a no-op when the bytecode is already there, which is pip's
+        # default, and a full session measured 1976 ms with it against 2018 without, the same number
+        # twice.
+        #
+        # `|| true` because bytecode is an optimisation: a file that will not compile must not fail an
+        # install that succeeded. The user's command runs first and separately, so it keeps the exit code.
+        if self.deps_readonly and os.path.isdir(os.path.join(self._ws, _DEPS_DIR)):
+            self._spawn(["sh", "-c", f"python3 -m compileall -q {_WORKSPACE}/{_DEPS_DIR} || true"],
+                        network=False, timeout_s=max(self.timeout_s, 120), is_setup=True)
 
     # -- files diff (created/modified; excludes .deps) -----------------------------------------------
 
@@ -1595,9 +2029,22 @@ class Sandbox:
     _INLINE_CODE_MAX = 128 * 1024
 
     # runner binary, inline-eval flag, and cell-file extension per language (node evals with -e, not -c).
+    #
+    # `bash` runs BASH. It used to run `sh`, and on a Debian image that is `dash`, with bash sitting
+    # right there in the image unused. What a caller got was a shell chosen for them, failing on the
+    # syntax the name promised: `[[ 1 == 1 ]]` -> `sh: 1: [[: not found`, arrays and process
+    # substitution -> `Syntax error: "(" unexpected`, `set -o pipefail` -> `Illegal option`. That is
+    # worse than the missing-interpreter case, because nothing was missing: the right binary was
+    # present and the wrong one was picked. An LLM writing a shell command writes bash by reflex.
+    #
+    # `sh` is the honest name for the old behaviour and is now reachable: it is the POSIX shell, it is
+    # in EVERY image (alpine has no bash at all), and it is what to ask for when portability matters.
+    # An image without bash now answers `exec_failed` naming it, which is the same mechanism that
+    # already covers `node`, and the message points at `language="sh"`.
     _LANGS = {
         "python": ("python3", "-c", "py"),
-        "bash": ("sh", "-c", "sh"),
+        "bash": ("bash", "-c", "sh"),
+        "sh": ("sh", "-c", "sh"),
         "node": ("node", "-e", "js"),
     }
 
@@ -1614,15 +2061,17 @@ class Sandbox:
         self,
         code: str,
         *,
-        language: Literal["python", "bash", "node"] = "python",
+        language: Literal["python", "bash", "sh", "node"] = "python",
         timeout_s: "int | float | None" = None,
         on_stdout: object = _UNSET,
         on_stderr: object = _UNSET,
     ) -> ExecutionResult:
         """Run a snippet of ``code`` on the workspace in a fresh, network-off box. File state written to
         the workspace persists to the next call; in-memory state does NOT (fresh process each time).
-        ``language`` is ``"python"`` (default), ``"bash"``, or ``"node"`` (the image must provide the
-        interpreter). Large code is written to a workspace file and executed from there (transparent to
+        ``language`` is ``"python"`` (default), ``"bash"``, ``"sh"`` or ``"node"``, and **the image must
+        provide the interpreter**: ``"bash"`` runs bash, not the POSIX shell, so an image without it
+        (alpine) answers an ``exec_failed`` fault naming it. Ask for ``"sh"`` where portability matters,
+        and for ``"bash"`` where the code uses ``[[ ]]``, arrays or ``pipefail``. Large code is written to a workspace file and executed from there (transparent to
         the caller), so an arbitrarily large script works instead of hitting the argv length limit.
 
         ``timeout_s``, ``on_stdout`` and ``on_stderr`` override the session defaults for THIS call only:
@@ -1631,7 +2080,9 @@ class Sandbox:
         self._require_entered()
         spec = self._LANGS.get(language)
         if spec is None:
-            raise SandboxError(f"unsupported language {language!r} (v1: 'python' | 'bash' | 'node')")
+            raise SandboxError(
+                f"unsupported language {language!r} (v1: 'python' | 'bash' | 'sh' | 'node')"
+            )
         runner, inline_flag, ext = spec
         eff = self._eff_timeout(timeout_s)
         if language == "python":
@@ -1671,6 +2122,22 @@ class Sandbox:
         figures are captured as rich mime-typed ``result.results`` (Jupyter/E2B-style). stdout/stderr/exit
         are identical to a plain run; result capture is best-effort and never alters them. The cell,
         runner and results files are internal and are removed and hidden from ``result.files``."""
+        eff = self._eff_timeout(timeout_s)
+        # Prewarmed fast path, taken ONLY where it is observationally identical to the cold one below.
+        # The streaming callback is the gate that is easy to get wrong: a prewarmed box answers with one
+        # length-prefixed frame after the cell has finished, so there is no chunk to hand a callback as it
+        # arrives. Calling it once at the end would look like streaming without being it, so a streaming
+        # call takes the cold path and streams for real. A NUL in the code is refused by `_spawn` below,
+        # and refusing it there keeps ONE place that decides what a rejected cell looks like.
+        pool = self._pool
+        streaming = (self.on_stdout if on_stdout is _UNSET else on_stdout) is not None or (
+            self.on_stderr if on_stderr is _UNSET else on_stderr
+        ) is not None
+        if pool is not None and not streaming and "\0" not in code:
+            warm = pool.claim(network=self.network, deadline=eff)  # type: ignore[attr-defined]
+            if warm is not None:
+                before = self._snapshot() if self.track_files else None
+                return warm.run_cell(code, deadline=eff, before=before)
         uid = uuid.uuid4().hex[:8]
         # `.res-` is written by the BOX, not by us, so it has to be claimed here too or it surfaces
         # as a user file the moment the cell creates it.
@@ -1685,7 +2152,7 @@ class Sandbox:
             result = self._spawn(
                 ["python3", f"{_WORKSPACE}/{runf}"],
                 network=self.network,
-                timeout_s=self._eff_timeout(timeout_s),
+                timeout_s=eff,
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
             )
@@ -1834,12 +2301,14 @@ class Kernel:
         sbx._require_entered()
         uid = uuid.uuid4().hex[:8]
         self._driver = sbx._claim(f".kernel-{uid}.py")
-        sbx.write_file(self._driver, _PY_KERNEL_DRIVER)
+        # The historical constants, restated at the one call site that must not change: 64 MiB of raw
+        # drain and no results budget (the host's frame cap stays the only bound). A persistent Kernel
+        # is a REPL, not a replacement for `run_code`, so it keeps the contract it shipped with.
+        sbx.write_file(self._driver, _kernel_driver(_KERNEL_DRAIN_CAP, 0))
         self._name = _unique_name()
         argv = sbx._base_argv(self._name, network=sbx.network, timeout_s=self._BACKSTOP_S) + [
             "--",
             "python3",
-            "-S",
             f"{_WORKSPACE}/{self._driver}",
         ]
         child_env = dict(os.environ)
@@ -2062,6 +2531,577 @@ class Kernel:
             pass
 
 
+# How long a prewarmed box may sit unclaimed before it is stale. It bounds the ORPHAN window: every warm
+# box carries kern's own `--timeout` set to this plus the session deadline it was started for, so a host
+# process that dies without running `__exit__` leaves boxes that expire by themselves instead of living
+# to a 24 h backstop. The pool refills continuously, so a box is normally claimed within seconds; this is
+# the failure bound, not the working lifetime.
+_PREWARM_TTL_S = 300
+
+# How long a prewarmed box gets to reach its prompt before the pool gives up on it. Generous on purpose:
+# it covers a first-run image pull and an aarch64 board, where a box start is worth several x86 ones. It
+# is a background thread's deadline, never a caller's, so a large value costs nothing on any hot path.
+_PREWARM_READY_S = 120.0
+
+# Every live prewarmed box in this process, so an interpreter exit that skips `Sandbox.__exit__` (an
+# unhandled exception, `sys.exit` inside the `with`) still tears the boxes down. `atexit` is best-effort by
+# nature - a SIGKILL runs nothing - which is exactly why the TTL above exists as the mechanical backstop.
+_LIVE_WARM: "set[_WarmBox]" = set()
+_LIVE_WARM_LOCK = threading.Lock()
+
+
+def _kill_live_warm_boxes() -> None:
+    with _LIVE_WARM_LOCK:
+        boxes = list(_LIVE_WARM)
+    for b in boxes:
+        try:
+            b.kill()
+        except Exception:
+            pass
+
+
+atexit.register(_kill_live_warm_boxes)
+
+
+class _WarmBox:
+    """One box that is already started and already holds a booted CPython which has run NO user code.
+
+    A cold ``run_code`` pays two costs on the CALLER's clock: starting the box (~4 ms) and booting the
+    interpreter inside it (~11 ms). Neither depends on the cell, so neither has to happen while the caller
+    waits. This starts them in advance and then serves EXACTLY ONE cell before the box is destroyed.
+
+    The guarantee ``run_code`` documents is therefore unchanged. A cell still gets a private box that has
+    executed nothing else, and a virgin interpreter whose only prior action was importing this driver -
+    which is precisely what a cold cell gets after its own boot finishes. The one-cell rule is enforced by
+    construction: the pool pops a box out of its list before handing it over and never puts one back, and
+    :meth:`run_cell` refuses a second call.
+
+    **One observable DOES differ, stated because "identical" was too broad a word for it.** The
+    interpreter is older than the call. A cell that reads its own start time out of ``/proc/self/stat``
+    sees ~0 s cold and up to ``_PREWARM_TTL_S`` warm (measured: 0.0 s against 3.1 s). Nothing the SDK
+    reports changes, and no boundary moves - the box's mounts, capabilities, network posture, memory
+    cgroup and one-cell lifetime are the same either way - but code that times itself from process start,
+    or asserts it is the first thing its interpreter ever did, can tell. That is why the claim in the
+    tests is the specific one: same stdout, exit status, results, file diff, truncation, faults and
+    posture, not "indistinguishable".
+    """
+
+    __slots__ = (
+        "_sbx", "_proc", "_name", "_q", "_err", "_started_r", "key", "_budget", "_born", "_spent",
+        "_sweeper", "_rc",
+    )
+
+    def __init__(
+        self, sbx: "Sandbox", key: str, budget: int, sweeper: "Callable[[_WarmBox], None] | None" = None
+    ) -> None:
+        self._sbx = sbx
+        self.key = key
+        self._budget = budget
+        self._sweeper = sweeper
+        self._proc: "subprocess.Popen | None" = None
+        self._name = ""
+        self._q: "queue.Queue" = queue.Queue()
+        self._err: "_CappedReader | None" = None
+        self._started_r = -1
+        self._born = time.monotonic()
+        self._spent = False
+        # The box process's real wait status, captured at the kill. Kept as a field because `sweep()`
+        # drops `_proc` on the WORKER thread while the caller is still assembling its result, so reading
+        # the status off the Popen object at that point is a race.
+        self._rc: "int | None" = None
+
+    # -- lifecycle -----------------------------------------------------------------------------------
+
+    def start(self) -> bool:
+        """Bring the box up. Returns False on any failure: a pool that cannot prewarm must degrade to the
+        cold path silently, never raise into a caller who did not ask for prewarming."""
+        sbx = self._sbx
+        self._name = _unique_name()
+        # The driver goes in ARGV, not into a workspace file. A pooled box is started BEFORE the cell that
+        # will use it, so a driver FILE would sit in the box-writable workspace across the whole inter-call
+        # gap, and any cell could rewrite it to hijack the next prewarmed box. In argv the source is fixed
+        # at exec time and never exists as a path the sandbox can reach. (`-S`: skip site, like Kernel.)
+        driver = _kernel_driver(sbx.max_output_bytes, _RESULTS_MAX, hello=True)
+        argv = sbx._base_argv(
+            self._name, network=sbx.network, timeout_s=_PREWARM_TTL_S + self._budget
+        ) + ["--", "python3", "-c", driver]
+        child_env = dict(os.environ)
+        if not sbx.enforce_limits:
+            child_env["KERN_NO_SCOPE"] = "1"
+        started_r, started_w = os.pipe()
+        child_env["KERN_STARTED_FD"] = str(started_w)
+        try:
+            try:
+                self._proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
+                    argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=child_env,
+                    start_new_session=True,
+                    pass_fds=(started_w,),
+                )
+            finally:
+                os.close(started_w)
+        except Exception:
+            try:
+                os.close(started_r)
+            except OSError:
+                pass
+            return False
+        self._started_r = started_r
+        # The frame cap has to admit a reply the driver considers legal, or a cell that legitimately
+        # truncates at `max_output_bytes` would come back as an oversize FAULT instead. Two capped streams
+        # plus the results budget plus JSON overhead is the largest well-formed reply, so that is the cap.
+        frame_cap = 2 * self._sbx.max_output_bytes + _RESULTS_MAX + 65536
+        _FrameReader(self._proc.stdout, self._q, frame_cap).start()
+        self._err = _CappedReader(self._proc.stderr, self._sbx.max_output_bytes)
+        self._err.start()
+        with _LIVE_WARM_LOCK:
+            _LIVE_WARM.add(self)
+        return True
+
+    def wait_ready(self, timeout_s: float) -> bool:
+        """Block until the driver says it is at the prompt. This is what makes the box PREWARMED rather
+        than merely SPAWNED: without it the pool publishes boxes that are still building, and the caller
+        pays the rest of the start itself.
+
+        A box that fails to signal in time is not usable and is not kept: the pool must not hold a slot
+        for something that never came up, or one bad start would suppress prewarming for the session."""
+        try:
+            frame = self._q.get(timeout=timeout_s)
+        except queue.Empty:
+            return False
+        if not isinstance(frame, bytes):
+            return False  # the box died, or the driver's first frame was already oversize
+        try:
+            obj = json.loads(frame.decode("utf-8", "replace"))
+        except Exception:
+            return False
+        return isinstance(obj, dict) and obj.get("hello") == 1
+
+    def usable_for(self, key: str, deadline: int) -> bool:
+        """Whether this box may serve a call. Every term is a correctness gate, not an optimization:
+
+        - ``key``: the EXACT argv the call would otherwise produce. This is what stops a box prewarmed
+          with one posture from serving a call that asked for another - most importantly a network-on box
+          answering a network-off call, which would be a real breach rather than a slow path.
+        - ``deadline``: kern's timeout on this box was fixed at start. A cell allowed to run longer than
+          the box's remaining budget could be killed by that backstop mid-run and reported as ``killed``,
+          so a call with a longer deadline takes the cold path instead.
+        - age: past the TTL the box is close enough to its own backstop that the same race opens.
+        """
+        return (
+            not self._spent
+            and self._proc is not None
+            and self.key == key
+            and deadline <= self._budget
+            and (time.monotonic() - self._born) < _PREWARM_TTL_S
+        )
+
+    # -- the one cell --------------------------------------------------------------------------------
+
+    def run_cell(self, code: str, *, deadline: int, before: "dict[str, tuple[int, int]] | None") -> ExecutionResult:
+        """Run ``code`` in this box, then destroy it. Callable once; a second call raises rather than
+        quietly reusing a box that has already executed user code."""
+        if self._spent:
+            raise SandboxError("a prewarmed box serves exactly one cell")
+        self._spent = True
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise SandboxError("prewarmed box was never started")
+        started = time.monotonic()
+        payload = code.encode("utf-8")
+        try:
+            proc.stdin.write(str(len(payload)).encode() + b"\n")
+            proc.stdin.write(payload)
+            proc.stdin.flush()
+            reply: object = self._q.get(timeout=deadline)
+        except (BrokenPipeError, OSError):
+            return self._fault_result("died", started, before)
+        except queue.Empty:
+            return self._fault_result("timeout", started, before, f"code exceeded {deadline}s")
+        # Every branch below that rejects the reply produces the same shape, so it is written once. The
+        # repetition was five copies of an eight-line call differing only in a string, which is the
+        # form where one copy quietly drifts from the others.
+        def rejected(message: str, *, truncated: bool = False) -> ExecutionResult:
+            return self._result(
+                "", "", self._exit_code(), started, before, truncated=truncated,
+                fault=SandboxFault(type="killed", message=message),
+            )
+
+        if reply is _KERNEL_OVERSIZE:
+            self.retire()
+            return rejected(
+                f"the box sent a reply larger than the {self._sbx.max_output_bytes}-byte output cap "
+                "allows even after truncation",
+                truncated=True,
+            )
+        if reply is None:
+            return self._fault_result("died", started, before)
+        self.retire()
+        try:
+            obj = json.loads(bytes(reply).decode("utf-8", "replace"))  # type: ignore[arg-type]
+        except Exception:
+            obj = None
+        if not isinstance(obj, dict):
+            return rejected("the box sent a malformed reply")
+        # Same rule as `Kernel._result_from_reply`: `rc` is the one field whose absence cannot be
+        # defaulted, because defaulting it to 0 would let a cell declare its own failed run successful.
+        rc = obj.get("rc")
+        if isinstance(rc, bool) or not isinstance(rc, int):
+            return rejected("the box reply carried no usable exit code")
+        results = [Result(data=d) for d in obj.get("results", []) if isinstance(d, dict)]
+        return self._result(
+            str(obj.get("stdout", "")),
+            str(obj.get("stderr", "")),
+            rc,
+            started,
+            before,
+            truncated=bool(obj.get("trunc", False)),
+            results=results,
+        )
+
+    def _fault_result(
+        self,
+        kind: str,
+        started: float,
+        before: "dict[str, tuple[int, int]] | None",
+        msg: str = "",
+    ) -> ExecutionResult:
+        """A box that died or overran. The stderr text and kern's unforgeable cap byte are read BEFORE the
+        kill, then classified exactly as the persistent kernel's death path does, so a prewarmed OOM is
+        reported as ``oom`` and not as a bare ``killed``."""
+        err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
+        if kind == "timeout":
+            self.retire()
+            return self._result(
+                "", "", self._exit_code(), started, before,
+                fault=SandboxFault(type="timeout", message=msg or "the code exceeded its deadline"),
+            )
+        cap_signal = self._read_cap_signal()
+        self.retire()
+        if _looks_like_startup_failure(err):
+            raise SandboxError(err.strip() or "the box failed to start")
+        if self._sbx.memory_mb is not None and cap_signal != 2:
+            fault, default = "oom", "the box was OOM-killed (it exceeded its memory cap)"
+        elif cap_signal == 2:
+            fault, default = (
+                "killed",
+                "the box was SIGKILLed, but its memory cap was not enforced here (no cgroup "
+                "delegation), so it is not attributed to a cgroup OOM",
+            )
+        else:
+            fault, default = "killed", "the box exited before the code finished"
+        return self._result(
+            "", "", self._exit_code(), started, before,
+            fault=SandboxFault(type=fault, message=err.strip() or default),  # type: ignore[arg-type]
+        )
+
+    def _read_cap_signal(self) -> int:
+        """kern's memory-cap enforcement byte, read once on death. Bounded by a 2 s select and returns 0
+        (undetermined) on EOF, timeout or error, so a missing signal only ever falls back."""
+        if self._started_r < 0:
+            return 0
+        try:
+            ready, _, _ = select.select([self._started_r], [], [], 2.0)
+            if not ready:
+                return 0
+            sig = os.read(self._started_r, 2)
+        except OSError:
+            return 0
+        return sig[1] if len(sig) >= 2 else 0
+
+    def _result(
+        self,
+        stdout: str,
+        stderr: str,
+        exit_code: int,
+        started: float,
+        before: "dict[str, tuple[int, int]] | None",
+        *,
+        truncated: bool = False,
+        fault: "SandboxFault | None" = None,
+        results: "list[Result] | None" = None,
+    ) -> ExecutionResult:
+        """Assemble the result with the SAME shape the cold path returns, including the workspace diff.
+        `files` is computed here rather than left empty because a fast path that silently stopped
+        reporting created files would be a behaviour change disguised as a speed-up."""
+        return ExecutionResult(
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=exit_code,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            fault=fault,
+            files=self._sbx._diff(before) if before is not None else [],
+            truncated=truncated,
+            results=results or [],
+        )
+
+    def stop_processes(self) -> None:
+        """End the box's workload NOW. Fast, idempotent, never raises.
+
+        SIGKILLing the supervisor's process group is enough to end everything inside the box: kern arms
+        ``PR_SET_PDEATHSIG(SIGKILL)`` on a foreground box, so the supervisor's death takes box PID 1, and
+        PID 1 leaving its PID namespace takes every other process in it.
+
+        MEASURED rather than reasoned: a cell that leaves a background process appending to the workspace
+        stops at the exact byte it had reached (134 bytes, still 134 a second later) while the identical
+        cell with no kill runs on (131 to 458 over the same second). That positive control is what lets a
+        caller diff the workspace the moment this returns - the guarantee the cold path gets by waiting
+        for the whole box to exit."""
+        with _LIVE_WARM_LOCK:
+            _LIVE_WARM.discard(self)
+        self._spent = True
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            _wait_for_exit(proc, 5)
+        except Exception:
+            pass  # the process is already signalled; a failed WAIT must not turn a kill into a raise
+        if isinstance(proc.returncode, int):
+            self._rc = proc.returncode
+
+    def _exit_code(self) -> int:
+        """The exit status a FAULT reports. The cold path hands back the box process's real wait status -
+        a SIGKILLed box is ``-9`` - so a constant here would make one failure look like two different
+        ones depending on which path served it. That is the divergence prewarming must not introduce, and
+        the parity suite caught it: cold timeouts reported ``-9`` while warm ones reported ``-1``."""
+        return self._rc if isinstance(self._rc, int) else -1
+
+    def sweep(self) -> None:
+        """The bookkeeping after the workload is dead: our pipes, the started-fd and the private env
+        file. Idempotent, never raises.
+
+        **It deliberately does NOT run `kern stop`, because it is not needed.** `stop_processes` ends
+        every process in the box, and kern's registry entry then clears **by itself** within ~300 ms. An
+        earlier note here claimed `killpg` alone left the box in `kern ps` "4 runs out of 6", which was
+        the instrument and not the system: that check ran immediately after the kill, inside the reaping
+        window. Sampling at t+0, t+0.3, t+1 and t+3 shows at most one PRESENT reading at t+0 and none
+        after, and a CPU-bound background writer inside the box stops at the byte it had reached.
+
+        A second reason was written here and was WRONG, so it is recorded rather than deleted: that
+        `kern stop` does not return once the supervisor is dead. It does, in 2 to 5 ms. The multi-second
+        stalls behind that claim were the Node binding's, and they were ours: it called `spawnSync`,
+        which blocks the single event loop that Node needs in order to REAP the child just SIGKILLed, so
+        the pid was still present from `kern stop`'s point of view and it waited for it, correctly. The
+        tell that it was a race and not a hang is that the same call sometimes returned in 5 ms.
+
+        Separating it from :meth:`stop_processes` is still right: the pipes and the env file are not
+        needed before the caller's result is correct."""
+        proc, self._proc = self._proc, None
+        if self._started_r >= 0:
+            try:
+                os.close(self._started_r)
+            except OSError:
+                pass
+            self._started_r = -1
+        if proc is None and not self._name:
+            return
+        if proc is not None:
+            for closer in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if closer is not None:
+                        closer.close()
+                except Exception:
+                    pass  # a pipe whose peer is gone can raise on close; there is nothing to recover
+        # The private `--env-file` `_base_argv` wrote for THIS box. `_spawn` removes its own in a
+        # `finally`; a prewarmed box has no `_spawn`, so without this every warm box would leave one
+        # behind - a file the caller never created, in a workspace they may have asked to persist.
+        # `_release` runs after the unlink so `_walk` never reports a file that is still on disk as
+        # user state.
+        if self._name:
+            try:
+                os.unlink(self._sbx._env_path(self._name))
+            except OSError:
+                pass
+            try:
+                self._sbx._release(os.path.basename(self._sbx._env_path(self._name)))
+            except Exception:
+                pass  # the claim registry is ours and best-effort; failing to un-claim leaks a name,
+                # not a file, and the file above is already gone
+            self._name = ""
+
+    def kill(self) -> None:
+        """Destroy the box completely and synchronously. Used from `atexit`, from the pool's close and
+        from the start-failure paths, where there is no worker to hand the sweep to."""
+        self.stop_processes()
+        self.sweep()
+
+    def retire(self) -> None:
+        """End the workload on the caller's clock and hand the sweep to the pool's worker. This is the
+        hot path: it is what turns a ~16 ms teardown into a ~0.2 ms one without dropping any of it."""
+        self.stop_processes()
+        sweeper = self._sweeper
+        if sweeper is None:
+            self.sweep()
+            return
+        try:
+            sweeper(self)
+        except Exception:
+            self.sweep()  # the pool is gone or refused the order: do it here rather than not at all
+
+
+class _WarmPool:
+    """Keeps up to ``size`` :class:`_WarmBox` instances ready for one :class:`Sandbox`.
+
+    Refilling happens on a daemon thread, so the cost a claim removes from the caller's clock is not
+    quietly added back at the end of the call. A claim that finds nothing usable returns ``None`` and the
+    caller takes the ordinary cold path: the pool is an accelerator with no authority to change what runs.
+    """
+
+    # ONE long-lived worker starts every box, and this is a correctness requirement rather than a
+    # tidiness one. A foreground `kern box` arms `PR_SET_PDEATHSIG(SIGKILL)` so a hard-killed launcher
+    # takes its box down instead of orphaning it - and on Linux that signal fires when the creating
+    # THREAD exits, not when the process does. Starting boxes on throwaway threads therefore killed every
+    # box the moment its starter returned (measured: the supervisor reaped with rc=-9 about 80 ms in,
+    # exactly as the box reached its prompt). A worker that lives as long as the pool never triggers it,
+    # and the guarantee kern is making stays intact: when this process really dies, the worker dies with
+    # it and the boxes still go.
+    def __init__(self, sbx: "Sandbox", size: int) -> None:
+        self._sbx = sbx
+        self._size = max(0, int(size))
+        self._lock = threading.Lock()
+        self._ready: "list[_WarmBox]" = []
+        self._starting = 0
+        self._closed = False
+        self._orders: "queue.Queue" = queue.Queue()
+        self._worker: "threading.Thread | None" = None
+
+    def _key(self, network: bool) -> str:
+        """The identity a warm box must match. Built from the REAL argv builder with placeholder values
+        for the two fields a warm box legitimately differs in (its unique name, and the kern backstop that
+        the TTL governs), so any other option this session adds - a profile, a cap, a deps remount that
+        appears mid-session - changes the key automatically instead of needing to be listed here.
+
+        The argv is not the whole posture, which is the second half of this and was a real hole: kern
+        reads `KERN_*` variables from ITS OWN environment when it builds the box, so a caller who sets
+        `KERN_SECCOMP=denylist` after the pool filled would have been served a box built under the
+        previous filter. Measured before it was closed: the key did not move and the stale box was
+        handed over. Every `KERN_*` variable is folded in, rather than the handful we can name today,
+        because the failure mode is a variable nobody thought to list."""
+        argv = self._sbx._base_argv("", network=network, timeout_s=0, dry=True)
+        env = sorted((k, v) for k, v in os.environ.items() if k.startswith("KERN_"))
+        return "\0".join(argv) + "\0\0" + "\0".join(f"{k}={v}" for k, v in env)
+
+    def claim(self, *, network: bool, deadline: int) -> "_WarmBox | None":
+        if self._closed or self._size <= 0:
+            return None
+        key = self._key(network)
+        stale: "list[_WarmBox]" = []
+        picked: "_WarmBox | None" = None
+        with self._lock:
+            keep: "list[_WarmBox]" = []
+            for b in self._ready:
+                if picked is None and b.usable_for(key, deadline):
+                    picked = b
+                elif (time.monotonic() - b._born) >= _PREWARM_TTL_S or b.key != key:
+                    stale.append(b)  # expired, or prewarmed for a posture this session has left behind
+                else:
+                    keep.append(b)
+            self._ready = keep
+        for b in stale:  # kill OUTSIDE the lock: `kern stop` is a subprocess, not a memory operation
+            b.kill()
+        self.refill(network=network, deadline=deadline)
+        return picked
+
+    def refill(self, *, network: bool, deadline: int) -> None:
+        """Top the pool up in the background. Bounded by ``size`` counting boxes that are ready AND boxes
+        currently starting, so a burst of claims cannot spawn an unbounded number of boxes."""
+        if self._closed or self._size <= 0:
+            return
+        with self._lock:
+            want = self._size - len(self._ready) - self._starting
+            if want <= 0:
+                return
+            self._starting += want
+            # `is_alive()`, not `is None`: the question is whether a worker is RUNNING, and those two
+            # answers differ exactly once, in the case that matters. A worker that died leaves a Thread
+            # object behind, so `is None` stays false forever, no replacement is ever started, and every
+            # later order queues behind nothing. The pool would stop refilling for the rest of the
+            # session, silently, with every call falling back to the cold path and no signal that it
+            # had. Asking whether it is alive costs nothing and makes that self-healing.
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(target=self._serve, daemon=True)
+                self._worker.start()
+        for _ in range(want):
+            self._orders.put(("start", network, deadline))
+
+    def sweep(self, box: "_WarmBox") -> None:
+        """Queue a spent box's bookkeeping. Called from `_WarmBox.retire` on the caller's thread, which
+        must not wait for a `kern stop`."""
+        if self._closed:
+            box.sweep()  # no worker will drain the queue any more: do it inline rather than never
+            return
+        self._orders.put(("sweep", box))
+
+    def _serve(self) -> None:
+        """The single starter thread. It outlives every box it creates, which is what keeps kern's
+        parent-death signal from firing on a box that is perfectly healthy. It also disposes of spent
+        boxes, so a `kern stop` never lands on a caller's clock."""
+        while True:
+            order = self._orders.get()
+            if order is None:  # the close sentinel
+                return
+            kind = order[0]
+            if kind == "sweep":
+                try:
+                    order[1].sweep()
+                except Exception:
+                    # A sweep is bookkeeping for a box whose workload is ALREADY dead, so nothing is
+                    # leaked by giving up on it; letting it out would kill this thread and stop the
+                    # pool refilling for the rest of the session.
+                    pass
+                continue
+            _, network, deadline = order
+            try:
+                self._start_one(network, deadline)
+            except Exception:
+                # A start that raises must still release its slot, or the pool would count a box that
+                # does not exist forever and stop refilling for the rest of the session.
+                with self._lock:
+                    self._starting = max(0, self._starting - 1)
+
+    def _start_one(self, network: bool, deadline: int) -> None:
+        box = _WarmBox(self._sbx, self._key(network), deadline, sweeper=self.sweep)
+        ok = False
+        try:
+            ok = box.start() and box.wait_ready(_PREWARM_READY_S)
+        except Exception:
+            ok = False
+        with self._lock:
+            self._starting -= 1
+            keep = ok and not self._closed
+            if keep:
+                self._ready.append(box)
+        if not keep:
+            # Three ways to land here and all of them must destroy the box, not just the first: the
+            # start failed, the box came up but never signalled readiness (a started box - killing it
+            # is the whole point), or the session closed while it was still building. `kill` is
+            # idempotent and safe on a box that never got a process.
+            box.kill()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            boxes, self._ready = self._ready, []
+            worker = self._worker
+        for b in boxes:
+            b.kill()
+        if worker is not None:
+            # Stop the worker only AFTER the boxes are down. It is the thread they are parented to, so
+            # letting it exit first would hand their teardown to the parent-death signal - which does
+            # work, but leaves `kern stop` unrun and the cgroup kill to a race. Bounded join: a daemon
+            # thread must never be able to hold up a caller's `with` block.
+            self._orders.put(None)
+            worker.join(timeout=5)
+
+
 def _unique_name() -> str:
     return "pysbx-" + uuid.uuid4().hex[:12]
 
@@ -2121,7 +3161,7 @@ def _looks_like_startup_failure(stderr: str) -> bool:
 
 
 def run_code(
-    code: str, *, language: Literal["python", "bash", "node"] = "python", **kwargs: object
+    code: str, *, language: Literal["python", "bash", "sh", "node"] = "python", **kwargs: object
 ) -> ExecutionResult:
     """One-shot convenience: run ``code`` in a throwaway session (workspace created and deleted). This is
     literally ``with Sandbox(**kwargs) as s: return s.run_code(code)`` - one tested code path, no state

@@ -72,8 +72,18 @@ need a config file.
 | `KERN_PI_PIDS` | `512` | task ceiling per command |
 | `KERN_PI_TIMEOUT` | `120` | seconds per command, unless pi passes its own |
 | `KERN_PI_MAX_OUTPUT` | `1048576` | cap on captured stdout and stderr, each, per command. The SDK's own default is 64 MiB; this is lower because every chunk is forwarded into pi's single-threaded renderer and the agent picks the command |
+| `KERN_PI_TMPFS_MB` | `256` | scratch at `/tmp`, charged to the box's own memory cap, thrown away with the box |
+| `KERN_PI_HOME` | `/workspace` | where `$HOME` points, so a toolchain's cache has somewhere to go. `/tmp/home` keeps the cache out of your project and loses it with the box |
 
 **Two of these will bite you, so set them first.**
+
+**Node 22 or newer is required on the HOST**, and the failure without it is not obvious. `pi`'s own
+package manager imports `globSync` from `node:fs`, which landed in Node 22, so on Node 20 (still LTS
+at the time of writing) the extension dies at import with `SyntaxError: The requested module 'node:fs'
+does not provide an export named 'globSync'`, naming a file inside `pi-coding-agent` rather than
+anything of yours. Measured on a clean aarch64 board: Node 20.18.1 fails that way, Node 22.11.0 runs
+all 165 assertions. `package.json` now declares `engines: node >= 22`, so npm says it before the import
+does.
 
 **The image must carry your project's toolchain.** The default has Python and no `node`, so on a
 TypeScript project the agent's `bash` fails at the first `npm`. Point `KERN_PI_IMAGE` at an image
@@ -88,6 +98,68 @@ KERN_PI_IMAGE=node:22 KERN_PI_EGRESS=registry.npmjs.org pi -e /path/to/kern/inte
 
 `KERN_PI_EGRESS` is a host allowlist and not a boolean on purpose: an agent that needs one registry
 does not need your whole network, and the SDK's `network: true` would hand it over on every command.
+
+## One fact everything below inherits
+
+**Every command is a fresh box, so the workspace is the only path that survives one.** Not a caveat:
+it is the architectural fact of this extension, and three things follow from it that would otherwise
+look like separate quirks.
+
+- **A package cache re-downloads per command** unless it lives in the workspace. That is why
+  `KERN_PI_HOME` points at `/workspace` and not at the scratch: it is load-bearing, not convenient.
+- **Anything with a lockfile, a daemon socket or a resume file in `TMPDIR` is broken across
+  commands** by construction. The state written on one call is gone on the next, while whatever
+  referenced it from the workspace is still there pointing at nothing.
+- **`KERN_PI_MEMORY_MB` bounds the cgroup, not the agent's usable memory.** `/dev/shm` is a
+  memory-backed filesystem in every box with no size at all (the kernel default, half of host RAM),
+  charged to the same cap and not sizeable through this extension or the SDK. An agent that runs
+  anything using `multiprocessing` is using it.
+- **Every BOUNDED path in the system is memory.** The scratch is a tmpfs charged to the box's memory
+  cap; a `vdisk:` profile is also a RAM-backed tmpfs when rootless (kern uses a disk-backed
+  ext4-on-loop only when privileged). So the only unbounded-but-persistent path is the host workspace,
+  and every bounded one is memory. That is the whole trade in a sentence.
+
+Measured, not reasoned: writing a marker to `/tmp` in one command and reading it in the next returns
+GONE, and the same pair against `/workspace` survives. The suite asserts both.
+
+This is also a real difference from a gVisor-backed runner, and the reason is privilege rather than
+design: gVisor's root overlay is memory-backed for the same reason, and they added a **disk** backing
+precisely because memory-backed file data bloats container memory. Rootless, that escape is closed
+here.
+
+**The shell is measured, not assumed.** pi's tool is called `bash` and a model writes bash by reflex,
+so the extension asks the box once at open which shell it has and uses that. On `python:3.12-slim` it
+is bash; on an image without one it is `sh`, and the status line says which. This mattered: the SDK's
+`language: "bash"` used to run `sh`, which on a Debian image is dash, with bash present in the same
+image and unused, so `[[ -f x ]]` answered `sh: 1: [[: not found`.
+
+**Why `$HOME` and `/tmp` are set for you.** The box root is read-only, so a toolchain gets exactly two
+writable places and it needs both. With neither, `npm install express` on `node:22` exits 2; with
+`HOME` alone and a read-only `/tmp` it still exits 2; with both it exits 0 and the cache moves to
+`/workspace/.npm`. All three measured. The reason this is a default and not a knob you discover is
+the error it produces: npm renders a failed `mkdir /root/.npm` as
+
+```
+npm error enoent Invalid response body while trying to fetch https://registry.npmjs.org/express
+```
+
+which sends you to check `KERN_PI_EGRESS`, the one thing that was already right. Go is no better:
+`failed to initialize build cache at /root/.cache` is true and says nothing about `HOME`.
+
+## Running it non-interactively
+
+```sh
+pi --mode json -p "your prompt"        # events on stdout, one JSON object per line
+```
+
+**Use `--mode json`, not the default `--mode text`.** `--mode` takes `text` (default), `json` or
+`rpc`, and only `json` emits anything before the answer: a `{"type":"session"}` line arrives at once,
+so you can see that a run started. A `--mode text -p` run that stalls prints **nothing at all**, on
+stdout or stderr, `--verbose` included, which turns a stall into a stare. That is pi's behaviour and
+not this extension's, and it is worth knowing before you script a run.
+
+If you are scripting it, read pi's own exit code. Reading the exit code of the last command in a
+pipe (`pi ... | tail`) reports `tail` succeeding and makes a timeout look like a clean no-op.
 
 ## Tests
 

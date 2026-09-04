@@ -11,6 +11,462 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## Unreleased
+
+Two things ship, and they are released by different mechanisms. **`kern-sandbox` 0.1.36** goes to PyPI
+and npm, together with the `integrations/pi` extension that now requires it. The **runtime** has
+changed too, so this one does need a tag: two mount-posture fixes in `kern-isolation`, and one new
+`kern box` flag. The CLI change is additive (`--shm-size`), which the stability policy above allows on
+a patch; the snapshot in `crates/kern-cli/tests/cli-surface.snapshot` was regenerated for it.
+
+### Fixed (runtime)
+
+- **A `-v` volume is now mounted `nosuid`, `/workspace` included.** A first bind ignores per-mount
+  flags, so every volume was mounted honouring the setuid bit on anything sitting in it. The remount
+  preserves the flags already in force rather than replacing them, which is not a detail: a bind
+  remount SETS the per-mount flags, and a user namespace refuses one that would clear a locked flag, so
+  "add nosuid" spelled as "nosuid only" fails with `EPERM` on any source that is already `nosuid,nodev`
+  (`/tmp` and `/run` on most systems).
+
+  **This is defence in depth and the entry first written here claimed more than that, wrongly.** It
+  said a setuid-root file on a volume let an in-box user become box-root under `--uid-range`. It does
+  not: kern arms `PR_SET_NO_NEW_PRIVS` before the workload runs, because seccomp requires it, and
+  no-new-privs makes the setuid bit inert process-wide however the filesystem is mounted. Measured, on
+  the real cell rather than on the mount flags: a box drops a setuid-root binary on the shared
+  workspace, a second box with `--uid-range` runs as uid 1000 and executes it, and the euid stays 1000
+  with the remount removed as well as with it. Patching the prctl out to get a positive control does
+  not produce a weaker box, it produces a box that refuses to start (`sandbox setup failed:
+  prctl(NO_NEW_PRIVS) failed`), which is the stronger statement and is now a test.
+
+  So a failed `nosuid` remount is **never** fatal. Making it fatal, as the first version did under
+  `--uid-range`, would have refused to start a box for a property something else already guarantees,
+  on exactly the kernels that reject bind remounts outright and that we cannot test here. A `:ro`
+  volume still fails hard: read-only is a contract the caller asked for and nothing else provides it.
+
+- **`/dev/shm` now reports the size the box actually has.** It was mounted with no `size=`, so
+  `statvfs` reported half the HOST's RAM: a box held at 512 MiB by its cgroup was telling every
+  workload it had 15.6 GB. That is both a host fact leaking into the box and a wrong answer to the
+  question Postgres' dynamic shared memory, Chromium and a PyTorch DataLoader all ask before sizing a
+  buffer. The mount now carries the cap that is already enforced - `--memory` when set, kern's 512 MiB
+  default when not - so what the box is told matches what its cgroup holds it to. The charge to the
+  memory cgroup is still the real bound; nothing about enforcement changed. This is deliberately NOT
+  Docker's fixed 64 MB default, which has no relationship to the box and is what breaks Postgres under
+  load. A box with no cap enforced anywhere keeps the previous unsized mount, because there is no
+  honest number to put there.
+
+### Added (runtime)
+
+- **`kern box --shm-size SIZE`** overrides that derived cap, for a workload that needs `/dev/shm` to
+  read differently from `--memory`.
+
+### Fixed (kern-sandbox)
+
+- **A warm interpreter could not import anything the IMAGE ships, and the shipped `kernel()` has had
+  that defect since it landed.** Both the persistent kernel and (briefly) the prewarm pool started the
+  driver as `python3 -S`. `-S` skips `site`, and `site` is what puts `site-packages` on `sys.path`, so
+  `import pip` (or numpy, or pandas) succeeded on a cold `run_code` and raised `ModuleNotFoundError`
+  in a kernel cell. `setup=` installs into `.deps`, which is on `PYTHONPATH` either way, and that is
+  what hid it: the only cells that could not import were the ones relying on the image.
+
+  `-S` is dropped in both paths and both bindings, and the driver now pins `sys.path[0]` to the
+  absolute cwd, because `-c` puts `''` there where a script run by path puts its own directory.
+  `sys.path` is byte-identical across cold, warm and `kernel()`, each resolves the same probe modules
+  to the same files, and the cold path is itself checked against the UNMEDIATED interpreter so three
+  driver-mediated paths cannot agree on a driver artifact. Per-call latency is unchanged (1.06 ms);
+  the pool refill goes from 70 to 74 ms, which is off the critical path.
+
+  **Nobody recorded why `-S` was there, and the silence is the answer rather than the absence of
+  one.** `git log -S` finds exactly one commit, the one that introduced the warm kernel, and its
+  message does not mention the flag. An unexplained detail in a feature commit is almost certainly an
+  invocation someone copied, not a decision, which makes this entry "we removed something nobody
+  decided" rather than "we reversed a decision".
+
+  Either way the risk is the same and was measured rather than argued: dropping `-S` re-enables
+  `site`, which executes `import` lines from `.pth` files at interpreter start, and for a prewarmed
+  box that now happens at pool-fill time rather than during a call. The default image
+  (`python:3.12-slim`) ships no `.pth` file and zero such lines. A custom image that has them will run
+  them earlier than before.
+
+### Fixed (runtime)
+
+- **The OOM message never printed when kern runs as root**, which is where the cap is most likely to
+  be enforced. v0.9.0 reads the kernel's `oom_kill` counter by walking THIS process's cgroup
+  ancestors, and that answers for the box only when the two share one. Measured on a root VPS: kern
+  sat in `/user.slice/user-0.slice/session-N.scope` while the box landed in
+  `/system.slice/kern-box-N.scope`. Their only common ancestor is the cgroup root, which never exposes
+  `memory.events`, so the count was `None` and nothing was said. The kill was real: `system.slice`
+  went from 6 to 8 while the workload exited 137 with an empty screen.
+
+  The counter is now read from where the BOX is. `systemd-run --scope` puts its child inside the
+  scope, so the child's cgroup is the box's and the parent of that is the slice that outlives it. The
+  directory is resolved once, while that pid is alive, and both the before and the after are read from
+  it: re-deriving it after the reap would find the pid gone and silently read somewhere else.
+
+  Verified on three hosts, because the defect appears on only one of the three shapes. Root VPS: no
+  message before, message after. A non-root Jetson and this desktop, where it already worked: message
+  before and after, so the fix does not regress the case that was fine. On all three a box that exits
+  cleanly still says nothing, and a SIGKILL that is NOT an OOM is still not reported as one.
+
+  The test that covers it decides whether to SKIP **without calling the function under test**. The
+  first version skipped on `None`, so a sabotaged `oom_kill_dir_for_pid` returning `None` for every
+  pid still passed: a test whose skip condition is the defect cannot fail.
+
+  **The direct-cap path is closed too, and it needed a topology change rather than a message.** With no
+  systemd there is no scope, so `scope_reexec_proxy` never runs and this message did not exist there.
+  Adding one was not enough: measured on WSL2, the supervisor never reached its reporting branch,
+  because `apply_limits` put it INSIDE the box's cgroup and `memory.oom.group` kills that cgroup as a
+  unit. The same binary with a workload exiting 7 reached the branch and printed, which is what
+  identified the reporter as dead rather than the branch as wrong.
+
+  So the supervisor now sits in a SIBLING leaf and the workload joins the capped cgroup itself after
+  the fork. A sibling and not a child, because cgroup v2 forbids a cgroup with children from holding
+  processes, and nesting the workload one level deeper would change the path every other subsystem
+  records, reaps and identifies a box by. `prepare_delegated_scope` has done the same thing on the
+  scope path for the same reason; its comment claimed to mirror the direct path, which was not true of
+  it until now.
+
+  Two things that had to be right for this to work, and were measured wrong first:
+
+  - **Only where a child joins the cgroup.** `kern run` `exec()`s in place, so THIS process is the
+    workload: parking it outside would have run it in the uncapped sibling. Caught on the VPS, where
+    `kern run` stopped being killed by its own cgroup and was only caught by the outer scope. The
+    placement is now gated on the caller forking a child that joins.
+  - **The verdict is latched right after the reap**, while the box's cgroup still exists. Reading it
+    when the message is printed finds the directory already removed by the guard. An earlier attempt
+    that resolved the directory from `/proc/<pid1>/cgroup` was worse still: it returned the
+    SUPERVISOR's leaf, because a freshly forked child inherits it and only moves itself afterwards.
+
+  Verified on four hosts: WSL2 (no systemd) went from silent to reporting; this desktop, a root VPS
+  and a Jetson kept working; on all four a clean exit still says nothing, a non-OOM SIGKILL is still
+  not blamed on the cap, and `--memory` still binds on both `box` and `run`.
+
+  **The intermittency on `kern run` as root was a third defect, and it was mine.** The scope proxy read
+  the BEFORE from the box's slice and the AFTER with the old ancestors-of-kern walk: two unrelated
+  counters compared against each other, so the verdict was decided by whichever subtree happened to be
+  busier. On a root VPS those are different branches entirely, which is why the same binary printed
+  once and stayed silent twice. Both ends now read the directory resolved once, and it is not a kernel
+  race: 6 runs out of 6 on that VPS, 5 of 5 on this desktop, 3 of 3 on a Jetson.
+
+  Final state, measured on four hosts rather than argued: `kern run` and `kern box` both report, on
+  WSL2 with no systemd, on a root VPS, on a non-root Jetson and on this desktop. A clean exit still
+  says nothing, a SIGKILL that is not the cap is still not blamed on it, and `--memory` still binds
+  (`memory.max` read from inside the workload's own cgroup on every one of them).
+
+### Changed (extension)
+
+- **`integrations/pi` declares `engines: node >= 22`.** `pi`'s own package manager imports `globSync`
+  from `node:fs`, which landed in Node 22, so on Node 20 (still LTS) the extension died at import with
+  a `SyntaxError` naming a file inside `pi-coding-agent` rather than anything of the caller's.
+  Measured on a clean aarch64 board: 20.18.1 fails that way, 22.11.0 runs all 165 assertions.
+
+### Changed (SDK, a default)
+
+- **`deps_readonly` now defaults to TRUE**, in both bindings, so `run_code` mounts what `setup=`
+  installed read-only. A cell can no longer change what the next cell in the same session imports.
+
+  The reason is narrower than "a sandbox hole" and worth stating exactly, because both cells are your
+  untrusted workload and one that wanted to run code could simply run it. What the old default gave
+  away is the assumption that `import x` in call N+1 runs the `x` that call N could see on disk. The
+  route is bytecode: a `.pyc` is validated against the source's timestamp and size, so a cell rewrote
+  `.deps/.../mylib.pyc` with a payload, re-pasted the legitimate 16-byte header, left the `.py`
+  untouched, and the next `import mylib` ran it. Invisible to both surfaces a caller would audit: the
+  poisoning call reported `files: []`, and `list_files()` never lists a `__pycache__`. Measured on the
+  shipped default, and closed by this one.
+
+  **It costs nothing, and that took a second change to be true.** A read-only `.deps` means CPython
+  cannot write `__pycache__` there; it tolerates that silently and recompiles on every import instead.
+  Measured on `requests`, seven calls each: 250 ms/call when the setup left bytecode behind (pip writes
+  it by default), 290 ms when it did not (`pip install --no-compile`). That is +40 ms on EVERY call for
+  the life of such a session. The setup box now runs `compileall` before the mount closes, which brings
+  that case back to 250 and is a no-op when the bytecode already exists: a full session measured
+  1976 ms with the step against 2018 ms without it, the same number twice.
+
+  **What breaks:** a workload that writes into `.deps` at RUN time now gets `EROFS`. Nothing legitimate
+  should, since `.deps` is the dependency directory and `setup=` is the install phase, and anything
+  that did was already producing undefined behaviour: the workspace is shared across calls, so a
+  package caching state next to itself had a cache with no defined lifetime. `deps_readonly=False`
+  restores the old behaviour explicitly. A run-time `pip install` fails first for the network, which is
+  off outside `setup=`, not for the mount.
+
+### Added
+
+- **`kern-sandbox` (Python and Node): `prewarm=N` keeps N boxes started in advance, so a `run_code`
+  costs ~1 ms instead of ~39 ms without giving up the fresh-box guarantee.** A cold call pays two costs on
+  the caller's clock that have nothing to do with the cell: starting the box (~4 ms) and booting the
+  interpreter inside it (~11 ms, and more in wall-clock once kern's own setup is counted). Neither
+  depends on the code, so neither has to happen while the caller waits. A prewarmed box serves
+  **exactly one cell** and is then destroyed, which is why this is a speed-up and not a semantic
+  change: the cell still gets a private box that has executed nothing else, and an interpreter whose
+  only prior act was importing the driver. Over ssh, interactively: 37.8 ms per call before, 1.6 ms
+  after, against 0.9 ms for `KERN_MCP_KERNEL=1` - which is faster still and does NOT keep the
+  guarantee, because a kernel's state persists between cells.
+  The fast path is taken only where it matches the cold one, and there is a test for each gate: same
+  stdout, exit status, rich results, `files` diff, `truncated` flag, fault types and network posture.
+  One observable does differ and the claim says so rather than rounding up to "identical": the
+  interpreter is older than the call, so a cell reading its own start time from `/proc/self/stat` sees
+  ~0 s cold and up to five minutes warm. No boundary moves with it. A streaming `on_stdout`/`on_stderr` call falls back to the cold path and streams
+  for real, since a prewarmed box answers in one frame after the cell has ended. A call whose posture
+  differs from the pooled box's - a different network setting, mount, env, profile or a deadline
+  longer than the box's remaining backstop - is never served from the pool.
+  Default `0` in the SDK, because holding a booted interpreter per slot is the caller's resource
+  decision. Default `1` in `kern-mcp` (`KERN_MCP_PREWARM`), where the session already holds a box for
+  its whole life and calls arrive seconds apart. A slot refills in ~70 ms, so `N` is a burst budget:
+  `N` back-to-back calls run at ~1 ms and the rest fall back until the pool catches up.
+  Two defects found while building it, both worth stating because neither is visible in the code.
+  **A box started from a short-lived thread is killed when that thread exits**: kern arms
+  `PR_SET_PDEATHSIG(SIGKILL)` on a foreground box, and Linux fires that on the death of the creating
+  THREAD, not the process, so the first pool reaped every box about 80 ms in, exactly as it reached
+  its prompt. One long-lived worker thread starts every box now, which keeps kern's guarantee intact.
+  And **`_base_argv` is not a pure function** - it also writes the box's private env file - so
+  comparing postures with it created a file per comparison and then collided with itself; it grew a
+  `dry` mode for that, with a test that the dry path leaves the workspace untouched.
+
+- **Both bindings now end a prewarmed box with the process-group kill alone, because `kern stop` is
+  not needed there.** The reason it was being called was our own instrument: a note claimed `killpg`
+  alone left the box listed in `kern ps` "4 runs out of 6", and that check ran immediately after the
+  kill, inside the reaping window. Sampling at t+0, t+0.3, t+1 and t+3 gives at most one PRESENT
+  reading at t+0 and none after, and the processes really are gone by then, a CPU-bound background
+  writer included (it stops at the byte it had reached, 297 and still 297 a second later, against a
+  positive control that runs on to 1171).
+
+  **A second reason was written down, reported as a kern bug, and was wrong.** It said `kern stop` does
+  not return once the supervisor is dead, measured at 8 s three times. It does return, in 2 to 5 ms.
+  Those stalls were the Node binding's and they were ours: it called `spawnSync`, which blocks the
+  single event loop Node needs in order to REAP the child it had just SIGKILLed, so the pid was still
+  present from `kern stop`'s point of view and it waited for it, correctly. Alternating synchronous and
+  asynchronous calls is what shows it, because the synchronous one sometimes returns at once: 5, 6009,
+  4, 5 ms. A hang would not do that. Nothing in the runtime needed fixing for this.
+
+### Changed (Node)
+
+- **The Node binding's kernel driver is once again byte-identical to the Python one, and now a test
+  says so.** The comment above it has always claimed byte-identity; nothing checked it, and the claim
+  went false the moment the Python driver grew its output caps and readiness frame. Two gates now hold
+  it: the drivers must be byte-equal, and the driver must contain no backtick or `${`, because the Node
+  copy lives in a `String.raw` literal that either one would terminate early.
+
+### Changed
+
+- **`kern-sandbox` (Python and Node): every box now gets a writable `/tmp`, 64 MiB of tmpfs.** The
+  root has always been read-only, and `/tmp` was inside it, which cost two things that were both
+  quiet. A write naming `/tmp` failed with `EROFS`, which is how a compiler hits it: `go build` on
+  `golang:1.23-alpine` reported `failed to initialize build cache at /root/.cache: read-only file
+  system` and nothing pointed at the fix. Worse, code that used `tempfile` did not fail at all: its
+  last-resort candidate is the current directory, so a `NamedTemporaryFile()` landed in `/workspace`,
+  on the caller's persistent host directory, and `list_files` then reported it as a file the model has
+  to explain. Both are measured, and the tests reproduce them with `tmpfs={}`, which is the old shape.
+  Scratch is a tmpfs and not a bound host directory on purpose: the bytes are charged to the box's own
+  memory cgroup, so filling it is an OOM of the box (measured: 200 MiB written to a 256 MiB tmpfs
+  under `memory_mb=128` exits 137), while a host bind is bounded by nothing.
+  A new `tmpfs=` / `tmpfs:` argument resizes it (`{"/tmp": "512m"}`), removes it (`{}`), or adds
+  scratch elsewhere; a `mounts` bind at the same target wins, because mounting the default over it
+  would have hidden the caller's own files. The `setup=` box does NOT get the default, for the same
+  reason it keeps full network: an install needs unbounded scratch, and a 64 MiB `/tmp` turned
+  `pip install pandas` into `OSError [Errno 28] No space left on device`. `kern-mcp` takes
+  `KERN_MCP_TMPFS_MB` (default 64, `0` for none), which is also what makes its own `MPLCONFIGDIR=/tmp`
+  true rather than a path inside the read-only root.
+- **The pi extension gave a toolchain one writable path, and its own documented example could not
+  work.** `integrations/pi` opened its box with no `tmpfs` and no `env`, so `$HOME` was `/root` inside
+  the read-only root. The README tells the user to run `KERN_PI_IMAGE=node:22
+  KERN_PI_EGRESS=registry.npmjs.org`, and on that image `npm install express` **exits 2**, reporting
+  `enoent Invalid response body while trying to fetch https://registry.npmjs.org/express`. That is
+  npm rendering a failed `mkdir /root/.npm`, so the message sends the user to check egress, which was
+  the one thing already correct. Both halves are load-bearing and all three cases were measured:
+  neither -> exit 2, `HOME=/workspace` with a read-only `/tmp` -> still exit 2, both -> exit 0 with
+  the cache at `/workspace/.npm`. The extension now passes `tmpfs` (`KERN_PI_TMPFS_MB`, default 256)
+  and `HOME` (`KERN_PI_HOME`, default `/workspace`), and the option set moved into an exported
+  `boxOptions()` so a test reads it without opening a box: a default nobody can see is a default
+  nobody checks. An SDK too old to honour `tmpfs` would IGNORE the option rather than fail, so
+  `requireScratchSupport()` asks the installed binding what it did with it and refuses at startup,
+  naming the version, instead of letting the first install blame the network.
+- **A scratch larger than the memory cap is refused, and the binding's own default is clamped to
+  half of it.** `df` reports the tmpfs size, and it reports it TO A PROGRAM: a `"1t"` scratch under a
+  128 MiB cap shows 1.0T free, so anything that preflights with `statvfs` plans against a number that
+  OOM-kills it instead of returning ENOSPC. The wrong answer goes to something that will act on it and
+  no message reaches a person, so the two options now resolve against each other at CONSTRUCTION
+  rather than at the first write. The halves are asymmetric on purpose: a size the caller wrote is
+  refused, because silently shrinking what someone asked for is the defect this change exists to
+  remove; ours is clamped, because refusing it would make a box unstartable for a caller who never
+  mentioned scratch. Half rather than the cap is measured: writing 1 MiB chunks under
+  `memory_mb=128`, a 32m and a 64m tmpfs both end in **ENOSPC**, a 128m one ends in an **OOM**,
+  because filling a tmpfs equal to the cap exhausts the whole budget. End to end, `memory_mb=64` now
+  yields a 32 MiB scratch that returns `ENOSPC at 32 MiB` instead of killing the box. The clamp is
+  `min(64 MiB, memory_mb / 2)` and it is documented as a HEURISTIC rather than a derivation: it only
+  ever reduces our own number, so a 512 MiB box still gets 64 and not 256, and there is no safe
+  fraction to derive because the safe one depends on the workload's own peak.
+- **A `tmpfs` that would COVER a `mounts` bind is refused, and "cover" is the mountpoint relation
+  rather than a string compare.** It was allowed, and documented as
+  "an explicit tmpfs beats the bind", which described the ARGV and not the outcome. Measured: mounts
+  STACK, kern puts the tmpfs on top whatever order the arguments arrive in, so `/tmp` comes up
+  **EMPTY** while the caller's file sits on the host, invisible to the code meant to read it. That is
+  the exact failure the default steps aside to avoid, reachable by writing both options. One of the
+  two is a mistake and the binding cannot tell which, so it refuses and says which is which.
+  Equality was only half the shape, and the other half is reached through NESTING: measured,
+  `-v HOST:/tmp/sub` with `--tmpfs /tmp` hides the bind exactly as equality does, and a string compare
+  misses it entirely. The rule is asymmetric on purpose, because the opposite direction is legal and
+  measured to work: `-v HOST:/tmp` with `--tmpfs /tmp/sub` leaves the bind's files readable and gives
+  a bounded ephemeral subtree inside them, a configuration someone reasonably wants, so refusing both
+  directions would have cost it. Trailing slashes and doubled separators normalise.
+  The same stacking is why the posture pin is now keyed on `(mountpoint, fstype)` and takes the LAST
+  entry per mountpoint: the union-of-paths version reported the same set for a box whose `/dev/shm`
+  is kern's tmpfs and one whose `/dev/shm` is a host bind, which are materially different boxes.
+- **The posture pin gained its second axis: `CapEff` per security profile.** The path set and the
+  capability set are one claim on two axes, and pinning only the mounts is how a documented recipe can
+  widen the other unnoticed: the nginx recipe added in this round does exactly that, deliberately,
+  with `cap_drop=()` moving `CapEff` from `0000000000000000` to `00000110bd84efff`. The recipe is its
+  own positive control. It also settled something nobody asked: **`security_profile="untrusted"` wins
+  over `cap_drop=()`**, `CapEff` stays zero, so a server image and that bundle are mutually exclusive
+  today.
+- **The setup box was the one box the writable-path pin had never been run against**, and it was the
+  one suspected of having the most. Measured: `writable = /dev/shm, /workspace`, root NOT writable,
+  `TMPDIR` unset. It is a strict SUBSET of the run box, missing exactly the scratch it is excluded
+  from, and `pip install torch` reaches the workspace (886 MiB of it) through `tempfile`'s cwd
+  fallback, the same mechanism that motivated the default. Asserted as a subset now.
+- **`set -o pipefail` is a mechanical rule in the harnesses, not a note.** A probe in this repo ran
+  `apk add git | head -3; echo rc=$?` and reported `rc=0` for an apk that had failed with
+  `Read-only file system`, in the same session as the scenario documenting that hazard: the rule was
+  already written one cell away and being written did not stop it. A test now pins that a pipeline
+  hides its failure without the prefix and reports it with. Deliberately NOT injected into the
+  product's execution path, because `language="bash"` runs bash and bash without pipefail is what
+  someone writing a pipeline expects.
+- **`memory_mb` bounds the cgroup, not the workload's usable memory, and the docs now say so.**
+  `/dev/shm` is a memory-backed filesystem in every box with **no `size=` at all**, so its apparent
+  size is the kernel's tmpfs default: half of the HOST's RAM. Measured, a box with `memory_mb=128`
+  reports **15958 MiB free** there on a 31914 MiB machine, which is a number about the machine and not
+  about the box. 200 MiB written to it OOM-kills that box whatever `/tmp` is clamped to, while the
+  same 200 MiB to `/tmp` returns ENOSPC and the box lives. So the clamp is partial rather than wrong,
+  and `require_limits` asserts the cap BINDS rather than that it is the workload's to spend.
+  The `oom` note was pointing at the wrong place because of it: the first version named only the
+  scratch this SDK mounted, so a box killed by `/dev/shm` was told `/tmp:64m`. It now names both, and
+  names `/dev/shm` even when no scratch was mounted. `--tmpfs /dev/shm` is refused by kern (it would
+  shadow the hardened `/dev`); a `mounts` bind at the same target IS accepted, which is the only lever
+  there is. It is a real workaround and not only an access fact, which took a measurement to settle
+  because `shm_open` is a path-based open and it is not obvious which higher-level users assert on the
+  filesystem type: through the bind, `multiprocessing.shared_memory` and a `multiprocessing.Queue`
+  (POSIX semaphores) both still work. Two costs come with it, both measured and both documented: a
+  plain directory is unbounded in a different currency, disk rather than RAM, so bounding it means
+  binding a host directory that is itself a sized tmpfs; and it has no tmpfs lifetime, so a file the
+  box writes to `/dev/shm` is **still on the host after the box dies**.
+- **Every security profile now has a PINNED set of writable paths**, with the profile list read from
+  `kern box --help` and **the path set derived from the box's own `/proc/self/mountinfo`** rather than
+  from a list written by hand. A list only catches paths someone thought to name, which is how
+  `/dev/shm` reached a README correction instead of a failing test; enumerating the mounts and
+  exercising each one catches a writable path nobody named, as long as the suite constructs the
+  configuration it appears in. Positive control: a `mounts` bind at `/data` shows up in the derived
+  set without anyone adding it. The remaining hole is irreducible and stated in the test. It is the general form of the defect below: binding-level defaults are applied without
+  consulting runtime-level policy, and fixing the one case does not stop the next. Within a minute of
+  existing it found that this branch's own README was wrong: the writable set is `/workspace`, `/tmp`
+  and **`/dev/shm`**, not "nothing else". `/dev/shm` was already there in 0.1.35, it is a tmpfs with
+  **no `size=` at all** (measured at 15.6 GB, half of host RAM), it is charged to the memory cap like
+  any tmpfs, and `--tmpfs /dev/shm` is refused by kern because it would shadow the hardened `/dev`.
+  Docker sizes this with `--shm-size`; kern has no equivalent, so it is a runtime gap this SDK cannot
+  close, now documented instead of invisible.
+- **`security_profile="untrusted"` gets no default scratch.** 0.1.35 gave that bundle a read-only
+  `/tmp`, and the binding's new default would have handed it a writable, executable one: a hardening
+  posture widened in a patch release because a different layer added a default. It now steps aside
+  for a `security_profile` exactly as it does for a `mounts` bind at the same target, and an explicit
+  `tmpfs=` still applies under both.
+- **The cap check parsed a size before the size gate had validated it**, so `"64mb"` came out of the
+  constructor as `ValueError: invalid literal for int()` instead of a `MountRefused` naming the field.
+  Found by the suite within minutes of the check landing. Validation runs first now.
+- **Scratch does not survive a call, and the docs say so.** Each call is a fresh box, so the tmpfs is
+  fresh while the workspace persists. A tool that writes state to the workspace and a lock to `/tmp`
+  now writes both, and the next call finds the state pointing at a path that is gone: measured, and
+  pinned by a test. The read-only `/tmp` this replaced failed loudly at the moment of the mistake,
+  which is the better shape; the trap it removed is more common, which is why the trade stands, but
+  the cost is the caller's to know.
+- **Scratch is charged to the memory cap, and the OOM message now says so.** A constant subtracted
+  from a caller's variable, raised in review and confirmed with the control that isolates the
+  mechanism. At `memory_mb=128`, writing 56 MiB and then allocating 90: on the tmpfs it OOMs, on the
+  workspace **it survives**, because file-backed pages can be written back and dropped while tmpfs
+  pages are freed only by deleting the file. So the default is a hard floor under the budget that the
+  behaviour it replaced was not, and `the box exceeded its memory cap` alone sent the reader to look
+  at their allocation. The `oom` fault now names the scratch and states the mechanism, without
+  claiming it caused that particular kill. The same message answers a second question: an oversized
+  scratch has an effective ceiling of `min(size, memory_mb)`, `df` inside the box reports 1.0T free
+  for a `"1t"` tmpfs, and the first write past the cap is an OOM rather than ENOSPC.
+- **The scratch mount flags are `nosuid,nodev` and NOT `noexec`, and nobody chose them.** `--tmpfs`
+  takes `path[:size]` and no flags, so what ships is kern's default; Docker's `--tmpfs` default
+  includes `noexec`. Pinned by EXERCISE, not by reading `/proc/mounts`, because inspection lies here:
+  a file in the tmpfs shows `-rwsr-xr-x` while `nosuid` makes the kernel ignore the bit at exec. The
+  security delta is smaller than it looks and that is measured too: `/workspace` was already writable
+  AND executable and is a plain host bind with no nosuid and no nodev, so scratch is strictly more
+  restricted than the path that was already there.
+- **Both bindings are now asserted to produce THE SAME tmpfs argv** over one corpus, for the run box
+  and the setup box. Five policies were duplicated across Python and Node, and the way that drifts is
+  silent: `pip install pandas` working from one binding and hitting ENOSPC from the other. The
+  corpus is required to contain a case where the two boxes differ, so agreement means something.
+- **The `tmpfs` gate accepted three spellings that kern reads backwards.** An audit of the option
+  against a real box, not against its own docstring, and all three were measured before the fix:
+  a bare `"64"` is 64 **BYTES** to kern (`df` reports 4 KB and a 100 KB write is ENOSPC), `"0"` is
+  **UNLIMITED** rather than none (200 MiB written under `memory_mb=128` OOM-killed the box at 137),
+  and a `:` in the TARGET is the size separator, so `tmpfs=["/scratch:9g"]` mounted `/scratch` at
+  9 GiB while the directory the caller named did not exist in the box. kern is right to take all
+  three: it is the low-level interface. Here each one fails far from its cause, so the unit is now
+  mandatory, a zero is refused pointing at `tmpfs={}`, a `:` in the target is refused, and each
+  message names the trap instead of saying "invalid size". `t` was also added, because kern accepts
+  it and a gate narrower than the thing it guards is its own kind of wrong. A NUMBER is refused by
+  name too: `Object.entries(256)` is `[]`, so `tmpfs: 256` used to mean **silently no scratch** in
+  the Node binding, which is the mistake this API invites, since every neighbouring option
+  (`memoryMb`, `pids`) takes one.
+- **`KERN_PI_TMPFS_MB=0` silently meant 256.** `KERN_MCP_TMPFS_MB=0` already meant "none", and two
+  knobs with the same name and opposite behaviour is the defect this whole round has been about.
+  `0` now means none in both. `KERN_PI_HOME` is validated too: an empty or relative value put the
+  toolchain cache back inside the read-only root, with no message, which is the exact defect the
+  knob exists to fix.
+- **`language="bash"` ran `sh`, and on a Debian image that is `dash`.** The image had `/usr/bin/bash`
+  and it was not the one running, so a caller got a shell chosen for them that fails on the syntax the
+  name promised: `[[ 1 == 1 ]]` -> `sh: 1: [[: not found`, `a=(1 2 3)` -> `Syntax error: "(" unexpected`,
+  `set -o pipefail` -> `Illegal option`. Worse than the missing-interpreter case, because nothing was
+  missing. `bash` now runs bash, and `sh` is a language of its own for the old behaviour: it is the
+  POSIX shell, it is in every image (alpine has no bash at all), and an image without bash now answers
+  an `exec_failed` fault naming it and pointing at `language='sh'`. Found by an outside reviewer, who
+  also found what it cost one of our own tests: the fork-bomb assertion in `integrations/pi` ran
+  `:(){ :|:& };:`, which is bash syntax, so dash refused it in 0.02 s with `Bad function name` and
+  exited 2 WITHOUT FORKING, and the check was `typeof exitCode === "number"`, which a syntax error
+  satisfies. It had never tested a fork bomb. It now starts 150 background processes and compares the
+  live count under `pids=256` against `pids=24`, because a count without the second cap measures the
+  loop bound and not a ceiling. The pi extension asks the box which shell it has, once, at open.
+- **`integrations/pi` now pins that activation touches nothing.** A reviewer lost an afternoon to a pi
+  startup hang and cleared this extension the expensive way, by running pi with and without `-e`.
+  That clearing is a property, not a result someone has to go and measure: the suite runs the entry
+  point with `KERN_BIN` pointed at a path that does not exist and registration still completes, since
+  `new Sandbox(...)` resolves the binary in its constructor and would throw. 1 ms, no box, no pull.
+  The README also says to script pi with `--mode json`: `--mode text -p` prints nothing at all,
+  stdout and stderr, `--verbose` included, while `json` emits a `session` line at once. And the
+  report's claim that a live session needs a provider key was WRONG, corrected on someone else's
+  measurement: pi runs against a local OpenAI-compatible endpoint with no key.
+- **A slow command in `integrations/pi`'s edge suite ate 31 of 88 assertions and reported no tally.**
+  `exec` throws on a timeout fault, one call site had no `try`, and a cold-cache run on a reviewer's
+  machine went straight to `fatal()`. Every exec there now goes through a wrapper that turns a throw
+  into ONE failed assertion (the three whose throw is the expected result keep their own `catch`), and
+  `fatal()` prints the tally before it exits, so an incomplete run says how far it got.
+- **`max_bytes` / `maxBytes` on `read_file` says what it does now.** It is a refusal threshold and
+  reads as a ceiling, and the gap between those two is a real defect: a caller asking for 16 bytes to
+  sniff a magic number got a throw, and a `catch` around it turned every image in a project into "not
+  an image", silently. The behaviour is unchanged, because refusing is the safer semantic on a
+  boundary and a truncation is how a caller ends up parsing half a file, and the name is unchanged,
+  because renaming a published option breaks callers for a cosmetic gain. What changed is that the
+  error now says the read was REFUSED and nothing was returned, and both docstrings say the same.
+- **`docs/MCP.md`**, because a capability that ships and is documented nowhere is not shipped. The
+  server is stdio, and nothing in MCP cares what carries the pipe, so
+  `"command": "ssh", "args": ["pi@board", "kern-mcp"]` puts the agent where you are and the sandbox
+  where the board is. Measured here against a user-owned `sshd` with key auth and no sudo, medians of
+  five: the handshake costs **164 ms once per session**, the marginal cost is **15 ms per call**
+  (the box and the interpreter, not ssh), and a hundred calls cost the handshake plus 1.5 s. Loopback,
+  so no network latency and the same CPU at both ends, and not measured on a board: both stated on the
+  page. The `wsl -d Ubuntu -- kern-mcp` form is there too, which is how a Windows host reaches a Linux
+  kern. The page also holds every `KERN_MCP_*` variable and the two `0` sentinels, including the one
+  that lets a `vcpu:` profile's own `memory=` apply, which was written down in the binding README and
+  nowhere a reader of `docs/` would look.
+- **The MCP `run_code` schema stopped advertising an interpreter the image does not have.** The
+  `language` enum lists `python`, `bash` and `node`, and a model that reads only the enum concludes
+  node works: one did, and told its user "Node.js supported" in a table. The enum is what the RUNNER
+  accepts; the image decides what exists. The tool description no longer names node, and the
+  `language` description now names the configured image and says what it provides, so the correction
+  is on the surface the model actually reads instead of in a README it does not. The enum itself is
+  unchanged, because an image that ships node is a legitimate configuration.
+
 ## v0.9.0 - 2026-09-04
 
 A minor bump because one exit code changes: see the first entry. Everything else is a defect fix.

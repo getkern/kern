@@ -60,10 +60,16 @@ pub use cgroup::apply_limits as apply_cgroup_limits;
 /// alive and `rmdir` it after the SIGKILL, so the empty dir is gone at once instead of waiting for `gc`
 /// or the next box start. See [`cgroup::box_cgroup_dir`].
 pub use cgroup::box_cgroup_dir;
+/// Did the box this process supervised die to its own memory cap? See [`cgroup::box_was_oom_killed`].
+pub use cgroup::box_was_oom_killed;
 pub use cgroup::env_flag;
 /// Reap orphaned `kern-box-*` cgroup dirs under kern.slice (the direct-cap path leaves an empty one
 /// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].
 pub use cgroup::gc_orphan_box_cgroups;
+/// How many processes the kernel's OOM killer has killed in this cgroup subtree.
+/// See [`cgroup::oom_kill_count`].
+/// Put the calling process into the box's capped cgroup. See [`cgroup::join_box_cgroup`].
+pub use cgroup::join_box_cgroup;
 /// Whether a `--memory` cap can actually be ENFORCED here (the `memory` controller is available in
 /// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
 /// default WSL2 kernel - where a `memory.max` write is accepted but never bites. Used only to warn.
@@ -74,9 +80,12 @@ pub use cgroup::memory_cap_in_force_at_or_below;
 /// Why no systemd user manager is reachable on THIS host, for the uncapped warning's middle clause.
 /// See [`cgroup::missing_manager_clause`].
 pub use cgroup::missing_manager_clause;
-/// How many processes the kernel's OOM killer has killed in this cgroup subtree.
-/// See [`cgroup::oom_kill_count`].
 pub use cgroup::oom_kill_count;
+/// `oom_kill` read from a directory already resolved. See [`cgroup::oom_kill_count_at`].
+pub use cgroup::oom_kill_count_at;
+/// The cgroup directory whose `oom_kill` counter covers the box a pid runs in, resolved while that
+/// pid is alive. See [`cgroup::oom_kill_dir_for_pid`].
+pub use cgroup::oom_kill_dir_for_pid;
 /// Move kern's own processes out of the box's scope root, so the box's whole-box OOM kill takes the
 /// workload and not the supervisor that records its exit code. Call once, at process entry, before any
 /// fork. See [`cgroup::prepare_delegated_scope`].
@@ -92,6 +101,8 @@ pub use cgroup::sweep_orphans_off_hot_path;
 /// The systemd manager kern drives for its scope/slice: `--system` as real root, else `--user`. See
 /// [`cgroup::systemd_scope_mode`].
 pub use cgroup::systemd_scope_mode;
+/// The capped cgroup this process created for its box. See [`cgroup::this_box_cgroup_dir`].
+pub use cgroup::this_box_cgroup_dir;
 /// Is the systemd manager kern would use present? (root → the system manager `/run/systemd/system`,
 /// else a per-user `systemd` dir under `$XDG_RUNTIME_DIR`). See [`cgroup::user_systemd_present`].
 pub use cgroup::user_systemd_present;

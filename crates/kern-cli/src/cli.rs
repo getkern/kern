@@ -131,6 +131,9 @@ pub enum Command {
         pids_limit: Option<u64>,
         /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
         tmpfs: Vec<String>,
+        /// `--shm-size SIZE`: cap `/dev/shm`. `None` derives the cap from `--memory`, which is the
+        /// bound the cgroup already enforces; this only overrides what the box is TOLD it has.
+        shm_size: Option<u64>,
         /// `--ulimit NAME=SOFT[:HARD]` (repeatable), pre-resolved to `(RLIMIT_*, soft, hard)` so the
         /// sandbox layer does no parsing. `unlimited`/`-1` map to `RLIM_INFINITY`.
         ulimits: Vec<(i32, u64, u64)>,
@@ -1580,6 +1583,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut init = false;
     let mut pids_limit: Option<u64> = None;
     let mut tmpfs: Vec<String> = Vec::new();
+    let mut shm_size: Option<u64> = None;
     let mut ulimits: Vec<(i32, u64, u64)> = Vec::new();
     let mut sysctls: Vec<(String, String)> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
@@ -1775,6 +1779,14 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     }
                 }
                 // `--tmpfs PATH[:size]`: mount a fresh tmpfs inside the box (repeatable).
+                // `--shm-size SIZE`: cap `/dev/shm`. Without it the cap comes from `--memory`.
+                "--shm-size" => {
+                    i += 1;
+                    match rest.get(i).and_then(|v| parse_size(v)) {
+                        Some(b) => shm_size = Some(b),
+                        None => return Err(Error::Usage("--shm-size SIZE (e.g. 64m, 1g)")),
+                    }
+                }
                 "--tmpfs" => {
                     i += 1;
                     match rest.get(i) {
@@ -2302,6 +2314,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             init,
             pids_limit,
             tmpfs,
+            shm_size,
             ulimits,
             sysctls,
             labels,
@@ -2377,6 +2390,7 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--security-profile",
     "--secret",
     "--tmpfs",
+    "--shm-size",
     "--pids-limit",
     "--restart",
     "--health-cmd",
@@ -2902,6 +2916,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             init,
             pids_limit,
             tmpfs,
+            shm_size,
             ulimits,
             sysctls,
             labels,
@@ -2968,6 +2983,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             init,
             pids_limit,
             tmpfs: &tmpfs,
+            shm_size,
             ulimits: &ulimits,
             sysctls: &sysctls,
             labels: &labels,

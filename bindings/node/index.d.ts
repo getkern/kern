@@ -1,5 +1,20 @@
 // Type definitions for kern-sandbox
 // Run LLM/agent-generated code in a fast, local, daemonless kernel sandbox.
+//
+// `Buffer` is in this file's public surface (chunk callbacks, readFile, decoded images), so a
+// TypeScript consumer needs `@types/node`. Deliberately NOT declared with a
+// `/// <reference types="node" />`: that was tried and measured, and it made things worse. Without
+// Node's types the reference adds `TS2688: Cannot find type definition file for 'node'` on TOP of the
+// six `Buffer` errors, and those six already carry TypeScript's own remedy, verbatim: "Do you need to
+// install type definitions for node? Try `npm i --save-dev @types/node`". Seven errors that name the
+// fix are not better than six that name it. The README says it in prose instead.
+//
+// There is a THIRD option, and it is a decision rather than a fix, so it is written down and not
+// taken on a delivery day: type this surface as `Uint8Array` instead of `Buffer`. `Buffer extends
+// Uint8Array`, so a caller's Buffers still satisfy it, the package stops needing `@types/node` at
+// all, and it becomes typable outside Node. That is a change to the published surface, which is a
+// 0.2 conversation. Until then the requirement is a consequence of a type choice we made, not a
+// law of the platform, and the README should not imply otherwise.
 
 /** What stopped the code at the SANDBOX level. Reported as data on a result, never thrown. */
 export type SandboxFaultType = "timeout" | "oom" | "escape_blocked" | "killed" | "startup_failed" | "exec_failed";
@@ -94,6 +109,31 @@ export interface SandboxOptions {
   /** Extra host->box binds: { hostSrc: boxTarget } or { src: [target, "ro"] }. Sensitive sources refused. */
   mounts?: Record<string, MountSpec>;
   /**
+   * Fresh in-box scratch filesystems (kern `--tmpfs`), as `{ "/path": "64m" }` or `["/path"]`.
+   *
+   * **A 64 MiB tmpfs is mounted at `/tmp` by default.** The box root is read-only, so without it a
+   * write naming `/tmp` fails and temp-file helpers fall back to the current directory, quietly
+   * putting scratch into your persistent workspace. Pass `{ "/tmp": "512m" }` to resize, `{}` for
+   * none, or bind your own directory at `/tmp` through `mounts` and the default steps aside. The
+   * bytes are charged to the box's memory cgroup, so a runaway writer is OOM-killed rather than
+   * filling the host disk.
+   *
+   * **Scratch does not survive a command, EXCEPT in a kernel().** Each `runCode`/`run` is a fresh
+   * box, so the tmpfs is fresh too, while the workspace persists. A `kernel()` is one long-lived box,
+   * so its `/tmp` persists across cells and the size is CUMULATIVE: measured at 10 MiB per step under
+   * the 64 MiB default, ten `runCode` calls all pass while the same ten cells in a kernel fail from
+   * the seventh with ENOSPC.
+   *
+   * A read-only `/tmp` used to fail LOUDLY at the moment of the mistake; now a tool that writes state
+   * to the workspace and a lock to `/tmp` writes both, and the next call finds workspace state
+   * pointing at a `/tmp` path that is gone. Put anything another call has to find in the workspace.
+   *
+   * The EFFECTIVE ceiling is `min(size, memoryMb)`, and `df` inside the box
+   * does not know that: a `"1t"` scratch shows 1.0T free and the first write past the cap is an OOM,
+   * not `ENOSPC`. The `oom` fault names the scratch so the reader is not sent to their allocation.
+   */
+  tmpfs?: Record<string, string | null> | string[];
+  /**
    * kern resource profiles to attach, e.g. ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]. Each names a
    * [[vcpu]]/[[vgpio]]/[[vdisk]] block in your ~/.config/kern/kern.toml: a CPU+memory slice, a specific
    * GPIO/I2C/SPI device set (the only way to grant the box hardware), or a size-capped scratch disk.
@@ -116,9 +156,24 @@ export interface SandboxOptions {
   onStdout?: (chunk: Buffer) => void;
   /** Called with each stderr Buffer chunk as it arrives. */
   onStderr?: (chunk: Buffer) => void;
+  /** Keep N boxes started in advance, each holding a booted interpreter that has run nothing, so a
+   * python `runCode` claims one instead of starting its own: ~41 ms per call becomes ~2 ms.
+   *
+   * It does NOT change what a call gets. Each prewarmed box serves exactly one cell and is then
+   * destroyed, so the cell still runs in a private box that has executed nothing else; what moves is
+   * when the box and interpreter started. A call that streams (`onStdout`/`onStderr`), asks for a
+   * non-python language, or differs in posture from the pooled box takes the ordinary path.
+   *
+   * Default 0: N warm boxes hold N booted interpreters for the life of the session whether or not a
+   * call arrives, which is a resource decision the caller owns. A slot refills in ~70 ms, so N is a
+   * burst budget - N back-to-back calls run warm and the rest fall back until the pool catches up. */
+  prewarm?: number;
 }
 
-export type Language = "python" | "bash" | "node";
+/** `bash` runs bash and `sh` runs the POSIX shell: they are different shells, and the image must
+ * provide the one you ask for. On alpine there is no bash, and asking for it yields an
+ * `exec_failed` fault naming it rather than a shell you did not choose. */
+export type Language = "python" | "bash" | "sh" | "node";
 
 /** Per-call overrides for runCode()/run(): each defaults to the Sandbox's constructor value; an explicit
  * value applies to this call only (a `null` callback disables streaming for the call). */
@@ -148,6 +203,15 @@ export class Sandbox {
   /** Write data to a workspace-relative path (host-direct, O_NOFOLLOW on the final component). */
   writeFile(path: string, data: Buffer | string): Promise<void>;
   /** Read a workspace-relative path (host-direct, O_NOFOLLOW). */
+  /**
+   * Read a workspace file, host-direct, every path component opened `O_NOFOLLOW`.
+   *
+   * `maxBytes` is a **REFUSAL threshold, not a partial read**: a larger file throws and nothing is
+   * returned, it never yields the first `maxBytes` bytes. Safer for a boundary (a silent truncation is
+   * how a caller ends up parsing half a file) and not what the name suggests, which is why it is
+   * spelled out: asking for 16 bytes to sniff a magic number and wrapping the call in `catch` turns
+   * every image in a project into "not an image", in silence.
+   */
   readFile(path: string, opts?: { maxBytes?: number }): Promise<Buffer>;
   /** Write a gzip tar of the whole workspace to `dest`, a portable filesystem checkpoint (NOT memory). */
   snapshot(dest: string): void;
@@ -184,3 +248,10 @@ export function withSandbox<T>(opts: SandboxOptions, fn: (sandbox: Sandbox) => P
 export function runCode(code: string, opts?: SandboxOptions & { language?: Language }): Promise<ExecutionResult>;
 
 export const version: string;
+
+/** The size, in MiB, of the tmpfs this binding mounts at `/tmp` by default.
+ *
+ * Exported so a consumer that wants a different default can express it as a multiple of this one
+ * rather than declaring a second independent number that drifts from it.
+ */
+export const DEFAULT_TMPFS_MB: number;

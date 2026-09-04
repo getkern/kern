@@ -72,8 +72,10 @@ model can see.
 }
 ```
 
-Tools: `run_code` (python/bash/node), `write_file`, `read_file`, `list_files`. File state persists
-across calls; each call is a fresh, network-off box.
+Tools: `run_code` (python/bash, and node on an image that has it), `write_file`, `read_file`,
+`list_files`. File state persists across calls; each call is a fresh, network-off box. The tool
+schema names the configured image and says which interpreters it provides, so the model is not left
+to infer that from the enum.
 
 | Env var | Default | What it does |
 |---|---|---|
@@ -85,6 +87,7 @@ across calls; each call is a fresh, network-off box.
 | `KERN_MCP_PROFILES` | (none) | attach `kern.toml` profiles, e.g. `vcpu:heavy,vgpio:sensors`: the only way to grant an edge agent a hardware device |
 | `KERN_MCP_KERNEL` | off | `1` routes Python through one warm interpreter: state persists, each call is sub-millisecond. The one case where "a fresh box per call" stops being true, and the tool description says so to the model |
 | `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes |
+| `KERN_MCP_TMPFS_MB` | `64` | scratch at `/tmp`, charged to the box's own memory cap; `0` removes it and puts `/tmp` back inside the read-only root |
 
 **Why local rather than hosted.** E2B, Modal and Daytona need an account, an API key and a network
 round-trip, and the model's code runs on someone else's machine. This runs on yours: no account, no
@@ -147,9 +150,10 @@ Sandbox(
     timeout_s=30,               # MANDATORY per-call wall-clock limit
     network=False,              # RELAXES ISOLATION: True shares the host network for every run
     mounts=None,                # {host_src: box_target}; sensitive sources refused even if asked
+    tmpfs=None,                 # None -> 64 MiB of scratch at /tmp; {} -> none; {"/tmp": "512m"}
     profiles=None,              # kern.toml profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]
     max_output_bytes=64 << 20,  # cap on captured stdout/stderr EACH; result.truncated on overflow
-    deps_readonly=False,        # True -> run_code cannot modify setup= deps
+    deps_readonly=True,         # run_code cannot modify setup= deps; False re-opens it
     security_profile=None,      # "untrusted" = seccomp allowlist + cap-drop ALL + read-only root
     apparmor=None,              # a pre-loaded AppArmor profile; kern fails CLOSED if it is not loaded
     require_limits=False,       # True = refuse to start unless memory/pids caps are enforced
@@ -158,7 +162,25 @@ Sandbox(
 ```
 
 Mounts over sensitive sources (`/`, `/etc`, `$HOME`, the docker socket) are **refused even if you ask
-for them**. Captured output is bounded, so a flooding box cannot OOM the host.
+for them**, and so is a `tmpfs` that would COVER a `mounts` bind: mounts stack, kern puts the
+tmpfs on top whatever the argument order, and the bind's files would be present on the host and
+invisible in the box. "Cover" is the mountpoint relation, not a string compare, so a tmpfs at `/tmp`
+is refused against a bind at `/tmp` **and** at `/tmp/sub`. The other direction is legal and is not
+refused: `mounts={host: "/tmp"}` with `tmpfs={"/tmp/scratch": "8m"}` gives a persistent `/tmp` with a
+bounded ephemeral subtree, and both halves work. Captured output is bounded, so a flooding box cannot OOM the host.
+
+**`setup=` output is read-only to your code, by default.** `.deps` is what `setup=` installed, so
+`run_code` mounts it read-only and a cell cannot change what the next cell imports. This closes a
+cross-call vector that is not obvious: `.pyc` files are validated on the source's timestamp and size,
+so a cell could rewrite a dependency's BYTECODE, re-paste the legitimate 16-byte header, leave the
+`.py` untouched, and the next `import` would run it, invisibly to both `result.files` and
+`list_files()`. Not a sandbox escape, since both cells are your untrusted workload; what it protects
+is the assumption that `import x` in call N+1 runs the `x` call N could see.
+
+The setup box compiles the bytecode before the mount closes, so the default costs nothing: without
+that step a session whose setup skipped compilation paid +40 ms on every call, forever
+(250 ms against 290, measured on `requests`). Pass `deps_readonly=False` if a workload legitimately
+writes into `.deps` at run time, and note that it will get `EROFS` rather than a silent failure.
 
 **Network policy:** the network is on **only** during `setup=`, in a separate box that dies when
 setup ends. There is no per-call override; `network=True` is a session-level, explicit choice.
@@ -173,10 +195,144 @@ point. A cell writing in chunks put 400 MB on the host under `memory_mb=128`, be
 only stops the version that builds the payload in RAM first. Where that matters, point `workspace=`
 at a filesystem you have already bounded.
 
+**Writable paths: `/workspace`, `/tmp` and `/dev/shm`.** The box root is read-only, so `/tmp` is a
+64 MiB tmpfs the binding mounts for you. Two things break without it, and both are quiet: a write
+naming `/tmp` fails with `EROFS`, and `tempfile` falls back to the current directory, putting scratch
+into your persistent workspace where `list_files` then reports it. The bytes are charged to the box's
+own memory cgroup, so filling `/tmp` is an OOM of the box and never the host disk. Resize it with
+`tmpfs={"/tmp": "512m"}`, remove it with `tmpfs={}`, or bind your own directory at `/tmp` through
+`mounts` and the default steps aside (including a `:ro` bind, which leaves `/tmp` read-only: that is
+your call, not an accident). **The unit is required and the target may not contain a `:`.** kern's CLI
+takes both spellings and means the opposite of what you do: a bare `"64"` is 64 BYTES, `"0"` is
+UNLIMITED, and `["/scratch:9g"]` mounts `/scratch` at 9 GiB rather than a directory by that name. All
+three measured, all three refused here with the reason. A size larger than `memory_mb` is refused
+for the same family of reason: `df` would report it to a program that preflights, which then plans
+against a number that OOM-kills it. The binding's own default is clamped to half the cap instead.
+
+**`memory_mb` bounds the cgroup, not the workload's usable memory.** The cap is shared with
+memory-backed filesystems in the same box, and one of them is not bounded at all, so a box sized for
+a job can still be killed by a path the caller never mentioned. Measured: 200 MiB written to
+`/dev/shm` under `memory_mb=128` OOM-kills the box no matter what `/tmp` is clamped to, while the
+same 200 MiB to `/tmp` returns ENOSPC and the box lives.
+
+`/dev/shm` is the one this SDK does not control: it is present in every box, it is a tmpfs with **no
+size at all** (measured at 15.6 GB, half of host RAM), and `tmpfs={"/dev/shm": ...}` is refused by
+kern because it would shadow the hardened `/dev`. It is charged to `memory_mb` like any tmpfs, so the
+memory cap is the only thing bounding it. Docker sizes this with `--shm-size`; kern has no equivalent
+yet. Its apparent size is a fact about the HOST rather than about your box: no `size=` means the
+kernel's tmpfs default, half of host RAM, so the same code sees 2 GB on a 4 GB board and 64 GB on a
+128 GB server while `memory_mb` says 128. `mounts={host_dir: "/dev/shm"}` IS accepted and STACKS on top
+of kern's own mount rather than replacing it (the last mount is the one that resolves), and it is a real workaround rather than only an access fact: measured through the
+bind, `multiprocessing.shared_memory` and a `multiprocessing.Queue` (POSIX semaphores) both still
+work, because `shm_open` is a path-based open and neither asserts on the filesystem type. Two costs
+come with it. A plain directory swaps an unbounded RAM path for an unbounded DISK one, so to bound it
+you bind a host directory that is itself a sized tmpfs. And it has no tmpfs lifetime: a file written
+to `/dev/shm` in the box is **still on the host after the box dies**, which is a residue class the
+real mount does not have. And Python's
+`multiprocessing` uses `/dev/shm` by default, so this is not a corner. The first sentence of this
+paragraph said "and nothing else" until a test that pins the writable set per security profile said
+otherwise.
+
+**Scratch does not survive a call, except in a `kernel()`.** Each `run_code` is a fresh box, so `/tmp`
+is fresh too while the workspace persists. A `kernel()` is one long-lived box and the opposite holds:
+its `/tmp` accumulates. Measured at 10 MiB per step under the 64 MiB default, ten `run_code` calls all
+pass and ten kernel cells fail from the seventh with `OSError: [Errno 28]`. A read-only `/tmp` failed loudly at the moment of the mistake; now a tool that
+writes state to the workspace and a lock to `/tmp` writes both, and the next call finds the state
+pointing at a path that is gone. Put anything a later call must find in the workspace. The `setup=` box is the exception: an install needs unbounded
+scratch, so the default is not applied there (an explicit `tmpfs=` still is).
+
+**Toolchains in the box.** npm, Go, Rust and .NET cache under `$HOME`, and `$HOME` is inside the
+read-only root. The scratch at `/tmp` is half the answer; `HOME` is the other half, and no error says
+so. Go reports `failed to initialize build cache at /root/.cache`, which is true and does not mention
+`HOME`. npm is worse: a failed `mkdir /root/.npm` reaches the user as
+`Invalid response body while trying to fetch https://registry.npmjs.org/express`, which reads as a
+network fault and is not one. Measured on `node:22`: neither -> exit 2, `HOME` alone with a read-only
+`/tmp` -> still exit 2, both -> exit 0.
+
+```python
+Sandbox(
+    image="golang:1.23-alpine",
+    env={"HOME": "/workspace"},   # npm's ~/.npm, Go's ~/.cache, Rust's CARGO_HOME, .NET's NuGet
+    tmpfs={"/tmp": "512m"},       # scratch; 64 MiB fits a small install, a real one needs more
+)
+```
+
+That message is verbatim from a box, and the recipe above is what makes the same build print its
+output. **Point `HOME` at the workspace, not at the scratch**: `npm install webpack webpack-cli
+typescript eslint` needs 81 MiB of cache, so `HOME=/tmp` fails with `ENOSPC` against the 64 MiB
+default while `HOME=/workspace` succeeds. One small package fits either way, which is why testing
+with `express` proves nothing.
+
+**Two numbers inside a box describe the host, not your box, and a program will act on them.** `df`
+reports a tmpfs's own size, and `nproc` reports the host's CPU count: measured under `cpus=0.5`,
+`nproc` says 28 while `cpu.max` says `50000 100000`, so `make -j$(nproc)` starts 28 jobs against half
+a core and a `pids` ceiling. The same shape reaches SQLite, which spills `CREATE INDEX` into `/tmp`:
+a 309 MB database on the workspace fails with `database or disk is full` while `df /workspace` shows
+202 GB free, and by the time you look, `/tmp` is empty again because SQLite cleaned up. Point
+`TMPDIR` at the workspace, or raise the scratch, when the job sorts more than it can hold.
+
+**`setup=` installs Python packages into the workspace, not system packages into the image.** The root
+is read-only, so a package manager cannot run at all: `apk add git` answers `ERROR: Unable to lock
+database: Read-only file system`, and `apt-get install` fails the same way. If the job needs `git`,
+`make` or a compiler, that is a choice of `image=`, not something `setup=` can add.
+
+**`max_output_bytes` limits what you RECEIVE, not what the job costs.** Measured: past the cap the
+output is discarded and the process keeps running to the end, so a marker file written after the noisy
+part is there and `exit_code` is 0 with `truncated=True`. A runaway producer therefore runs until
+`timeout_s`, and the two caps are per-stream, so a failure on stderr survives a flood on stdout.
+
+**A JVM's heap and this scratch add up to less than the cap by luck, not by design.** The JVM takes
+1/4 of the cgroup (measured: `MaxHeapSize 134217728` under `memory_mb=512`) and the scratch clamp
+takes at most 1/2, and 3/4 fits. Write `-Xmx` at 3/4 of `memory_mb`, which people do, and the
+composition breaks: neither side knows about the other, and `/dev/shm` is in the same budget with no
+bound at all.
+
+**`track_files` reports the workspace, and only the workspace.** A job whose product lands in `/tmp`
+reports nothing changed while having produced output. Measured: writing `/workspace/a` and `/tmp/b`
+in one call reports `['a']`.
+
+**Nothing in `/tmp` survives a `snapshot`.** A tmpfs is on no layer, so a marker written to the
+scratch is gone after `restore` while the workspace marker is there. A `setup=` that stages files in
+`/tmp` loses them.
+
+**matplotlib works and complains.** It falls back to a temporary `MPLCONFIGDIR` because `$HOME` is not
+writable, so the figure is produced AND stderr carries `mkdir -p failed for path
+/root/.config/matplotlib: [Errno 30] Read-only file system`. `exit_code == 0` is green for a run the
+user will report as broken. Pass `env={"MPLCONFIGDIR": "/tmp"}`, which is what the MCP server already
+does.
+
+**Server images need three things, and each announces itself separately.** Measured on
+`nginx:alpine`: `open("/run/nginx.pid") failed (30: Read-only file system)`, then
+`chown(...) failed (1: Operation not permitted)`, then it serves.
+
+```python
+Sandbox(image="nginx:alpine",
+        tmpfs={"/run": "1m", "/var/cache/nginx": "16m", "/var/log/nginx": "4m"},
+        cap_drop=())   # CAP_CHOWN is in the default drop, and nginx chowns its cache
+```
+
+`cap_drop=()` **widens the default posture**, and it is the only recipe here that does: measured,
+`CapEff` goes from `0000000000000000` to `00000110bd84efff`. Under `security_profile="untrusted"` it
+does not, because the bundle wins over the option (`CapEff` stays zero even with `cap_drop=()`), so a
+server image and that bundle are mutually exclusive today. Both facts are pinned by the posture test.
+
+Name the REAL mountpoint: `/var/run` is a symlink to `/run` on Alpine, and a tmpfs at the alias
+leaves the path the program opens untouched. And a server that refuses to run as root (postgres:
+`initdb: error: cannot be run as root`) has no answer here yet, because this binding does not expose
+kern's `--user`. Rust, .NET and anything else with a package cache want the same two places for the same
+reason. `HOME` stays the caller's decision because a build cache in `/workspace` is a host directory
+nothing bounds; point it at a `tmpfs={"/home": "512m"}` instead if you want it capped and thrown away
+with the box.
+
 ## API
 
 - `kern.run_code(code, **kwargs)`, one-shot: a throwaway `Sandbox` under the hood.
-- `Sandbox(...).run_code(code, language="python"|"bash"|"node")` on the session workspace.
+- `Sandbox(...).run_code(code, language="python"|"bash"|"sh"|"node")` on the session workspace. The
+  enum is what the runner accepts, **not a promise about the image**: the default `python:3.12-slim`
+  ships `python`, `bash` and `sh` and no `node`, and asking for a missing interpreter returns an
+  `exec_failed` fault naming the binary and the image. **`bash` runs bash and `sh` runs the POSIX
+  shell**, which are different languages: `[[ ]]`, arrays and `pipefail` are bash. Alpine has no bash
+  at all, so ask for `sh` where the image may not carry one.
 - `Sandbox(...).run(argv_list)`, an arbitrary command (an **argv list**, never a shell string).
 - `Sandbox(...).write_file(path, data)` / `.read_file(path)` / `.list_files(subdir="")`, workspace
   I/O, confined to `/workspace`, `..`-safe, every path component opened `O_NOFOLLOW`, opened

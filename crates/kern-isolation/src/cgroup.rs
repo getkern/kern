@@ -19,6 +19,10 @@ use std::sync::OnceLock;
 /// `exec`s or `_exit`s), so only the supervisor cleans up - exactly once.
 pub struct CgroupGuard {
     dir: PathBuf,
+    /// The SIBLING leaf the supervisor was parked in, when the no-blast-radius layout was built. Removed
+    /// alongside `dir` on drop. `None` when the supervisor stayed in `dir` (the layout could not be built
+    /// here, e.g. the parent refuses a second child or `memory` did not reach the children).
+    sup: Option<PathBuf>,
     /// Where to move the supervisor back to before removing `dir`. On the direct fast path the supervisor
     /// moved ITSELF into the box cgroup (so the forked workload inherits the caps); a non-empty cgroup
     /// can't be `rmdir`'d, so it must VACATE first - else the direct path leaks one `kern-box-*` dir per
@@ -26,17 +30,93 @@ pub struct CgroupGuard {
     origin: Option<PathBuf>,
 }
 
+impl CgroupGuard {
+    /// The capped cgroup the WORKLOAD must run in. The supervisor is deliberately not in it (see
+    /// `apply_limits`), so the forked child has to join it explicitly before it execs.
+    #[must_use]
+    pub fn box_dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// Is the supervisor parked outside the capped cgroup? False when the layout could not be built and
+    /// the old "supervisor inside" behaviour is in force, in which case the forked child inherits the
+    /// cgroup and must NOT write itself in again (harmless, but the write would be pointless work on the
+    /// start path).
+    #[must_use]
+    pub fn supervisor_is_outside(&self) -> bool {
+        self.sup.is_some()
+    }
+}
+
+/// Whether the box's own cgroup recorded an OOM kill, latched at the one moment it can be read.
+///
+/// 0 = not looked at or nothing there, 1 = the box's cgroup counted at least one OOM kill. Latched
+/// rather than read on demand because the `CgroupGuard` removes that directory when it drops, which
+/// happens before the caller decides what to print: reading later finds nothing and reports nothing,
+/// which is the silent 137 this exists to end.
+static BOX_WAS_OOM_KILLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Latch whether `dir` recorded an OOM kill. Called right after the box is reaped, while its cgroup
+/// still exists. Reading `memory.events` of the BOX's own cgroup attributes the kill exactly: an
+/// ancestor's counter would also move for an unrelated box in the same subtree.
+pub fn latch_box_oom(dir: &std::path::Path) {
+    if oom_kill_count_at(dir).is_some_and(|n| n > 0) {
+        BOX_WAS_OOM_KILLED.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Did the box this process supervised die to its own memory cap? See [`latch_box_oom`].
+#[must_use]
+pub fn box_was_oom_killed() -> bool {
+    BOX_WAS_OOM_KILLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The capped cgroup THIS process created for its box, recorded by [`apply_limits`] and read by the
+/// supervisor after the box exits.
+///
+/// Recorded rather than re-derived, and that distinction was a measured defect. The obvious way to find
+/// it later is `box_cgroup_dir(pid1)`, reading the child's `/proc/<pid>/cgroup`; on WSL2 that returned
+/// `kern-box-<tag>-<pid>-sup`, the SUPERVISOR's leaf. The supervisor no longer sits in the box's cgroup,
+/// so a freshly forked child inherits the supervisor's leaf and only moves itself afterwards: any read
+/// racing that move answers with the wrong directory, and by teardown that one is gone. The path is
+/// known exactly at creation, so it is kept.
+static BOX_CGROUP_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The capped cgroup this process created for its box, if it created one. See [`BOX_CGROUP_DIR`].
+#[must_use]
+pub fn this_box_cgroup_dir() -> Option<&'static std::path::Path> {
+    BOX_CGROUP_DIR.get().map(PathBuf::as_path)
+}
+
+/// Put the CALLING process into `dir`, the box's capped cgroup. Called by the forked child before it
+/// execs, because the supervisor stays outside so a whole-box OOM cannot take it.
+///
+/// Returns false if the write failed, which the caller must treat as "this box would run UNCAPPED" and
+/// refuse: a box outside its own cgroup has no memory ceiling and no fork-bomb guard, and running it
+/// anyway would be the silent-uncapped failure this codebase refuses everywhere else.
+#[must_use]
+pub fn join_box_cgroup(dir: &std::path::Path) -> bool {
+    fs::write(dir.join("cgroup.procs"), std::process::id().to_string()).is_ok()
+}
+
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
-        // Vacate the box cgroup first - move the supervisor back to where it came from - so the now-empty
-        // dir can be removed. (On the scope path an outer `--collect` also cleans up; this is harmless
-        // there.) Best-effort: if the move fails the rmdir just no-ops on the non-empty dir, as before.
+        // Vacate first - move the supervisor back to where it came from - so the now-empty dirs can be
+        // removed. This matters in BOTH layouts: with the sibling leaf the supervisor sits in `sup`, which
+        // is just as un-removable while populated as `dir` was. (On the scope path an outer `--collect`
+        // also cleans up; this is harmless there.) Best-effort: if the move fails the rmdir just no-ops on
+        // the non-empty dir, as before.
         if let Some(origin) = &self.origin {
             let _ = fs::write(origin.join("cgroup.procs"), std::process::id().to_string());
         }
         // Best-effort: a non-empty cgroup or an already-removed dir (ENOENT - an outer `--collect` beat
-        // us to it) are both fine to ignore.
+        // us to it) are both fine to ignore. `sup` after `dir` so a failure on either still attempts the
+        // other; they are siblings, so there is no ordering constraint between them.
         let _ = fs::remove_dir(&self.dir);
+        if let Some(sup) = &self.sup {
+            let _ = fs::remove_dir(sup);
+        }
     }
 }
 
@@ -85,10 +165,66 @@ fn current_v2_cgroup() -> Option<PathBuf> {
 /// transient scope in. `None` when no ancestor exposes the file (cgroup v1, no memory controller, or
 /// a box that lands under a slice this process is not below), and `None` is not a failure: the caller
 /// then reports nothing rather than guessing.
+///
+/// ⚠️ WALKING **THIS** PROCESS'S ANCESTORS ANSWERS FOR THE BOX ONLY WHEN THE TWO SHARE ONE. That
+/// holds for an ordinary user session and does NOT hold for root, where it is not an edge case but
+/// the norm. Measured on a root VPS: kern sits in `/user.slice/user-0.slice/session-N.scope` while
+/// the box lands in `/system.slice/kern-box-N.scope`, two different branches whose only common
+/// ancestor is the cgroup ROOT, and the root never exposes `memory.events`. The kill happened
+/// (`system.slice` went 6 -> 8) and this function returned `None` for all of it, so the operator got
+/// exit 137 and an empty screen: exactly the failure the message exists to prevent, on the hosts
+/// where the cap is most likely to be enforced. Prefer [`oom_kill_count_for_pid`], which starts from
+/// where the box actually IS; this stays as the fallback for when that pid is already gone.
 pub fn oom_kill_count() -> Option<u64> {
-    let mut dir = current_v2_cgroup()?;
+    let dir = current_v2_cgroup()?;
     // Start at the PARENT: this process's own leaf does not contain the box, which is created as a
     // sibling, so the leaf's counter would never move however many boxes were killed.
+    nearest_oom_count_above(dir)
+}
+
+/// The same counter, but read from where the BOX is rather than from where kern is.
+///
+/// `pid` is a process already inside the box's scope, so its cgroup is the scope itself and the
+/// parent of that is the slice systemd created it in: `system.slice` under root, `app.slice` under a
+/// user manager. That parent outlives the box (the scope is `--collect`, the slice is not), which is
+/// the whole reason the counter is read there.
+///
+/// Returns the DIRECTORY, not the count, because the caller pairs a BEFORE with an AFTER and the two
+/// have to come from the same one: by the time the AFTER is read the pid is reaped and
+/// `/proc/<pid>/cgroup` is gone, so re-deriving it then would silently read somewhere else, or
+/// nowhere. Read it once, keep the path, use [`oom_kill_count_at`] for both ends.
+pub fn oom_kill_dir_for_pid(pid: i32) -> Option<PathBuf> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let rel = raw
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim)
+        .filter(|p| p.starts_with('/'))?;
+    let mut dir = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    // The nearest ancestor that HAS the file, resolved now: the scope itself is `--collect` and will
+    // be gone, its parent slice will not.
+    while dir.pop() {
+        if !dir.starts_with("/sys/fs/cgroup") || dir == Path::new("/sys/fs/cgroup") {
+            return None;
+        }
+        if dir.join("memory.events").is_file() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// `oom_kill` from a directory [`oom_kill_dir_for_pid`] already resolved. `None` if it went away.
+pub fn oom_kill_count_at(dir: &Path) -> Option<u64> {
+    fs::read_to_string(dir.join("memory.events"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// `oom_kill` from the nearest ancestor of `dir` that exposes `memory.events`, `dir` itself excluded.
+fn nearest_oom_count_above(mut dir: PathBuf) -> Option<u64> {
     while dir.pop() {
         if !dir.starts_with("/sys/fs/cgroup") || dir == Path::new("/sys/fs/cgroup") {
             return None;
@@ -1552,6 +1688,15 @@ pub fn apply_limits(
     // host that delegates one controller and not the other refuses the box instead of running it with
     // a silently-uncapped dimension. `false` keeps the historical best-effort "partial beats nothing".
     require_all: bool,
+    // Does the CALLER fork a child that will join the capped cgroup itself (`kern box`), or does it
+    // `exec()` the workload in place (`kern run`)?
+    //
+    // This decides whether the supervisor may be parked in a sibling leaf, and getting it wrong is not
+    // cosmetic: with `exec()` in place there is no second process, so the workload IS this process. Park
+    // it outside and the workload runs in the UNCAPPED sibling. Measured while building this: `kern run`
+    // on a root VPS stopped being killed by its own cgroup and was only caught by the outer scope's
+    // `MemoryMax`, and on a host without that scope it would not have been capped at all.
+    supervisor_forks_workload: bool,
 ) -> Option<CgroupGuard> {
     // cgroup v2 presents a unified hierarchy with this file at the root.
     if !PathBuf::from("/sys/fs/cgroup/cgroup.controllers").exists() {
@@ -1805,12 +1950,72 @@ pub fn apply_limits(
         return None;
     }
 
-    // Join the cgroup - binds the limits to us (and our future forked workload).
-    if fs::write(child.join("cgroup.procs"), std::process::id().to_string()).is_err() {
-        let _ = fs::remove_dir(&child);
-        return None;
+    // WHO JOINS THE CAPPED CGROUP, and this is a correctness question rather than a tidiness one.
+    //
+    // Historically the supervisor joined `child` itself and the forked workload inherited it. That makes
+    // the caps bind with no extra plumbing, and it puts the supervisor INSIDE a cgroup carrying
+    // `memory.oom.group = 1`: when the cap fires the kernel kills the whole group, so the process that
+    // would read the workload's status and explain the kill dies with it.
+    //
+    // MEASURED on WSL2 (uid 0, no systemd, so the direct path with nothing above it): a box past its cap
+    // exited 137 with an EMPTY stderr and the supervisor never reached its reporting branch. The same
+    // binary on the same host, with a workload exiting 7 instead, reached it and printed `code=7`. So the
+    // branch was correct and the process running it was dead. `prepare_delegated_scope` already takes the
+    // supervisor out of the blast radius on the SCOPE path, and its doc comment says it "mirrors the
+    // direct path's topology" - which was not true of this function.
+    //
+    // A SIBLING leaf, not a child of `child`: cgroup v2 forbids a cgroup with children from holding
+    // processes ("no internal processes"), so parking the supervisor under `child` would mean moving the
+    // workload one level deeper and changing the path every other subsystem records, reaps and identifies
+    // a box by. A sibling changes nothing outside this function.
+    //
+    // FAIL-SAFE, and the ordering IS the safety: the sibling is created and joined FIRST, and only a
+    // failure of either falls back to the old behaviour. There is no window in which the supervisor sits
+    // in the capped cgroup, because it never enters it. The workload is placed in `child` by the forked
+    // child itself (see `join_box_cgroup`), so nothing else has to move.
+    let sup_leaf = child.with_file_name(format!(
+        "{}-sup",
+        child
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("kern-box")
+    ));
+    let sup = if !supervisor_forks_workload {
+        // `exec()` in place: this process becomes the workload, so it must stay in the capped cgroup.
+        None
+    } else if fs::create_dir(&sup_leaf).is_ok() || sup_leaf.is_dir() {
+        if fs::write(
+            sup_leaf.join("cgroup.procs"),
+            std::process::id().to_string(),
+        )
+        .is_ok()
+        {
+            Some(sup_leaf)
+        } else {
+            // The parent accepted the mkdir but refuses the move: leave nothing behind, take the old path.
+            let _ = fs::remove_dir(&sup_leaf);
+            None
+        }
+    } else {
+        None
+    };
+    if sup.is_none() {
+        // Fallback: join the capped cgroup as before. The box is still capped and still OOM-killed as a
+        // unit; only the explanation is lost, which is exactly what shipped before this change.
+        if fs::write(child.join("cgroup.procs"), std::process::id().to_string()).is_err() {
+            let _ = fs::remove_dir(&child);
+            return None;
+        }
     }
-    Some(CgroupGuard { dir: child, origin })
+    // Record it before handing the guard back: the supervisor reads this after the box exits, and by
+    // then neither `/proc/<pid1>/cgroup` nor the sibling leaf can be trusted to name it (see
+    // `BOX_CGROUP_DIR`). `set` is idempotent-by-first-write; one box per process, so it fires once.
+    let _ = BOX_CGROUP_DIR.set(child.clone());
+    Some(CgroupGuard {
+        dir: child,
+        sup,
+        origin,
+    })
 }
 
 /// Write a cgroup limit AND verify it took: true only if, after the write, the file no longer reads the
@@ -2032,12 +2237,19 @@ static MEMORY_CAP_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomi
 /// on the scope path) and BEFORE the box forks. The value-aware [`memory_capped_at_or_below`] check
 /// mirrors `warn_unenforced_caps`, so the signal and the warning cannot disagree. No `--memory` leaves
 /// it `0` (undetermined): nothing to attribute an OOM to.
-pub fn record_memory_cap_signal(memory: Option<u64>) {
+pub fn record_memory_cap_signal(memory: Option<u64>, dir: Option<&std::path::Path>) {
     use std::sync::atomic::Ordering;
     let signal = match memory {
         None => 0,
-        Some(req) => match current_v2_cgroup() {
-            Some(dir) if memory_capped_at_or_below(&dir, req) => 1,
+        Some(req) => match dir
+            .map(std::path::Path::to_path_buf)
+            .or_else(current_v2_cgroup)
+        {
+            // `dir` is the BOX's cgroup, passed explicitly because the supervisor is no longer in it: it
+            // sits in a sibling leaf so a whole-box OOM cannot take it, and reading `/proc/self/cgroup`
+            // there would answer for the supervisor's uncapped leaf and report every box as unenforced.
+            // `None` keeps the old self-reading behaviour for the paths that still run inside the cgroup.
+            Some(d) if memory_capped_at_or_below(&d, req) => 1,
             Some(_) => 2,
             None => 0, // cgroup layout we do not model: stay undetermined rather than claim either way
         },
@@ -2053,26 +2265,125 @@ pub fn memory_cap_signal() -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE PROPERTY THAT MAKES THE FIX A FIX: the answer depends on the PID, not on this process.
+    ///
+    /// The test above asserts the helper resolves a directory, and it stayed green when the caller was
+    /// reverted to the old ancestors-of-kern walk. This one cannot: `pid 1` lives in `/init.scope`, a
+    /// different branch from any user session, so a function reading OUR ancestors would hand back OUR
+    /// directory for it. Measured on this host: kern sits under
+    /// `/user.slice/user-1000.slice/user@1000.service/app.slice/...` and pid 1 under `/init.scope`,
+    /// whose only ancestor is the cgroup root, which never carries `memory.events`.
+    ///
+    /// The guard reads `/proc` directly rather than calling the function under test, so it cannot be
+    /// satisfied by the defect it is guarding against.
+    #[test]
+    fn the_directory_depends_on_the_pid_and_not_on_this_process() {
+        let (Ok(mine_raw), Ok(init_raw)) = (
+            fs::read_to_string("/proc/self/cgroup"),
+            fs::read_to_string("/proc/1/cgroup"),
+        ) else {
+            eprintln!("SKIP: cannot read both cgroup files");
+            return;
+        };
+        let leaf = |t: &str| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("0::"))
+                .map(|p| p.trim().to_string())
+        };
+        let (Some(mine), Some(init)) = (leaf(&mine_raw), leaf(&init_raw)) else {
+            eprintln!("SKIP: not cgroup v2 here");
+            return;
+        };
+        if mine == init {
+            eprintln!("SKIP: this process and pid 1 share a cgroup ({mine}), so nothing distinguishes them");
+            return;
+        }
+        // Two pids in two branches must not resolve to one directory. Under the old walk they would:
+        // it never looked at the pid at all.
+        assert_ne!(
+            oom_kill_dir_for_pid(std::process::id() as i32),
+            oom_kill_dir_for_pid(1),
+            "pid 1 is in {init} and we are in {mine}, yet both resolved to the same directory: \
+             the answer is not being read from the pid"
+        );
+    }
+
+    /// The counter has to be read from where the BOX is, and this asserts the mechanism that makes
+    /// that possible rather than the message it produces.
+    ///
+    /// SHIPPED DEFECT this covers: `oom_kill_count()` walks THIS process's ancestors, which answers
+    /// for the box only when the two share one. Measured on a root VPS, kern sat in
+    /// `/user.slice/user-0.slice/session-N.scope` and the box landed in
+    /// `/system.slice/kern-box-N.scope`; their only common ancestor is the cgroup root, which never
+    /// exposes `memory.events`. So the count was `None`, the message never printed, and the operator
+    /// got exit 137 and an empty screen on exactly the hosts where the cap binds.
+    ///
+    /// Resolved from a LIVE pid on purpose: by the time the box has died its `/proc/<pid>/cgroup` is
+    /// gone, so the directory must be captured while it can still be named.
+    #[test]
+    fn the_oom_directory_is_resolved_from_a_pid_and_outlives_it() {
+        // WHETHER TO SKIP IS DECIDED WITHOUT CALLING THE FUNCTION UNDER TEST, which the first version
+        // of this test got wrong: it skipped on `None`, so a `oom_kill_dir_for_pid` sabotaged to return
+        // `None` for every pid still passed. A test whose skip condition is the defect cannot fail.
+        let me = std::process::id() as i32;
+        let mut probe = current_v2_cgroup();
+        let mut expected = false;
+        while let Some(d) = probe.as_mut() {
+            if !d.pop() || d == std::path::Path::new("/sys/fs/cgroup") {
+                break;
+            }
+            if d.join("memory.events").is_file() {
+                expected = true;
+                break;
+            }
+        }
+        if !expected {
+            eprintln!("SKIP: no ancestor of this process exposes memory.events (cgroup v1, or no memory controller)");
+            return;
+        }
+        let dir = oom_kill_dir_for_pid(me)
+            .expect("an ancestor exposes memory.events, so this must resolve a directory");
+        // It is an ancestor DIRECTORY that actually carries the file, not the leaf we started from.
+        assert!(
+            dir.join("memory.events").is_file(),
+            "{dir:?} has no memory.events"
+        );
+        assert!(dir.starts_with("/sys/fs/cgroup"));
+        assert_ne!(
+            dir,
+            std::path::Path::new("/sys/fs/cgroup"),
+            "the root never has the file"
+        );
+        // And it reads, which is what the before/after pair needs from both ends.
+        assert!(
+            oom_kill_count_at(&dir).is_some(),
+            "resolved a directory whose counter will not read"
+        );
+        // A pid that cannot exist resolves to nothing rather than to a wrong directory: the caller
+        // pairs two reads and a silent fallback elsewhere would compare unrelated counters.
+        assert!(oom_kill_dir_for_pid(-1).is_none());
+    }
     use super::*;
 
     #[test]
     fn memory_cap_signal_is_a_determined_verdict_only_for_a_request() {
         // No `--memory` requested -> undetermined (0): a SIGKILL cannot be attributed to a cap that was
         // never asked for. This holds on every host, so it anchors the round-trip through the atomic.
-        record_memory_cap_signal(None);
+        record_memory_cap_signal(None, None);
         assert_eq!(memory_cap_signal(), 0, "no request => undetermined");
         // A 1-byte request is satisfiable by NO real ancestor cap, so where cgroup v2 is present it must
         // read NOT-enforced (2), never enforced(1). Where /proc/self/cgroup has no `0::` line (an unusual
         // test host) the check cannot model the layout and stays undetermined (0). Anything else is a bug
         // in the value-aware comparison. This is the positive control that the signal compares against
         // the request, not mere `memory.max` existence.
-        record_memory_cap_signal(Some(1));
+        record_memory_cap_signal(Some(1), None);
         match memory_cap_signal() {
             0 => {} // no cgroup v2 layout to inspect on this host
             2 => {
                 // v2 present: a real request now resolves to a definite verdict (enforced or not),
                 // never back to undetermined.
-                record_memory_cap_signal(Some(64 * 1024 * 1024));
+                record_memory_cap_signal(Some(64 * 1024 * 1024), None);
                 let s = memory_cap_signal();
                 assert!(
                     s == 1 || s == 2,
@@ -2712,6 +3023,7 @@ mod tests {
         {
             let _g = CgroupGuard {
                 dir: d.clone(),
+                sup: None, // the sibling layout is not built in this unit test
                 origin: None,
             };
         } // guard dropped here
@@ -2819,6 +3131,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("kern-guard-gone-{}", std::process::id()));
         let g = CgroupGuard {
             dir: d.clone(),
+            sup: None, // no sibling leaf was built, so there is none to remove
             origin: None,
         }; // dir never created
         drop(g); // must not panic on ENOENT

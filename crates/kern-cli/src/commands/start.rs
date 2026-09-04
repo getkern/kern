@@ -1057,6 +1057,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         allow_uncapped: args.allow_uncapped,
         overlay_upper: args.overlay_upper.map(str::to_string),
         memory,
+        shm_size: args.shm_size,
         memory_swap_max: args.memory_swap_max,
         cpus,
         cpuset,
@@ -1397,6 +1398,25 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 }
                 let _ = unsafe { libc::close(fd) };
             }
+            // A BOX KILLED BY ITS OWN CAP MUST NOT VANISH IN SILENCE.
+            //
+            // 137 is `128 + SIGKILL` and SIGKILL has many senders, so on its own it tells an operator
+            // nothing. The counter read here is the BOX's own cgroup, so an increment names this box
+            // exactly rather than reporting that something in a shared subtree was killed. `None`
+            // whenever the directory is gone or the box never had a dedicated one, and `None` prints
+            // nothing rather than guessing.
+            if code == 128 + libc::SIGKILL {
+                {
+                    if kern_isolation::box_was_oom_killed() {
+                        eprintln!(
+                            "kern: the workload was killed by the kernel's OOM killer against this \
+                             box's own memory cap. Raise it with `--memory <size>` (or `memory = \
+                             \"<size>\"` in a vcpu: profile) if the workload needs more. On a device \
+                             with unified memory, GPU allocations count against the same cap."
+                        );
+                    }
+                }
+            }
             std::process::exit(code)
         }
         Err(e) => Err(Error::Setup(e.to_string())), // genuine sandbox-start failure → userns hint
@@ -1571,6 +1591,7 @@ pub fn run(
         &[],   // no vdisk io limits in `kern run`
         None,  // no --io-weight in `kern run`
         false, // `kern run` is a cooperative governor, never fail-closed (best-effort gate)
+        false, // supervisor_forks_workload: `kern run` exec()s in place, so THIS process is the workload
     );
     // For its RESOURCE CAPS `kern run` is a cooperative governor, not an isolation boundary - so unlike
     // `kern box` it does NOT fail-closed when a cap can't be applied. But make the drop VISIBLE, not

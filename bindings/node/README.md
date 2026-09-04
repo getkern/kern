@@ -28,7 +28,11 @@ const r = await kern.runCode("print(sum(range(100)))");
 console.log(r.stdout, r.success); // "4950\n" true
 ```
 
-TypeScript types ship in the box:
+TypeScript types ship in the box. `Buffer` appears in the public surface **because we typed it that
+way**, so a TypeScript consumer also needs `@types/node`; without it `tsc` reports `Cannot find name
+'Buffer'` against this package's `.d.ts` and tells you what to install. Typing that surface as
+`Uint8Array` would remove the requirement (a `Buffer` is one), and that is a change to the published
+surface rather than a fix, so it is not in this release.
 
 ```ts
 import { runCode, withSandbox, Sandbox } from "kern-sandbox";
@@ -93,7 +97,10 @@ const r = await kern.runCode("console.log([1,2,3].map(x => x * x))", {
 });
 ```
 
-`language` is `"python"` (default), `"bash"`, or `"node"`. Match the image to the language.
+`language` is `"python"` (default), `"bash"`, `"sh"` or `"node"`. Match the image to the language:
+**`bash` runs bash and `sh` runs the POSIX shell**, which are different languages (`[[ ]]`, arrays and
+`pipefail` are bash), and alpine carries no bash at all. Asking for one the image lacks returns an
+`exec_failed` fault naming it, never a different shell.
 
 ## The result
 
@@ -178,6 +185,7 @@ new Sandbox({
                    // user namespace. Pass [] to keep them (needed only if the workload binds a
                    // port below 1024 INSIDE the box).
   mounts,          // { hostSrc: boxTarget } or { src: [target, "ro"] }
+  tmpfs,           // omitted -> 64 MiB of scratch at /tmp; {} -> none; { "/tmp": "512m" } to resize
   profiles,        // reusable kern.toml profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]
   env,             // { KEY: "value" }
   maxOutputBytes,  // default 64 MiB
@@ -187,10 +195,51 @@ new Sandbox({
                    // apparmor=), an LSM layer over seccomp; kern fails the box CLOSED if it isn't loaded.
   requireLimits,   // default false; true = FAIL-CLOSED (refuse to start unless caps enforced). NOT
                    // enforceLimits (that picks the cap PATH); mutually exclusive with KERN_ALLOW_UNCAPPED env.
-  depsReadonly,    // default false
+  depsReadonly,    // default TRUE: runCode cannot modify what setup= installed
   trackFiles,      // default true: diff the workspace each call for result.files (O(files)); false = [], O(1)
   onStdout,        // (chunk: Buffer) => void, live stdout streaming (result.stdout still captured)
   onStderr,        // (chunk: Buffer) => void, live stderr streaming
+});
+```
+
+**Writable paths: `/workspace`, `/tmp` and `/dev/shm`.** The box root is read-only, so `/tmp` is a
+64 MiB tmpfs this binding mounts for you. Without it a write naming `/tmp` fails with `EROFS` and
+temp-file helpers fall back to the current directory, quietly putting scratch into your persistent
+workspace where `listFiles` then reports it. The bytes are charged to the box's own memory cgroup, so
+filling `/tmp` OOM-kills the box and never fills the host disk. Resize with `tmpfs: { "/tmp": "512m" }`,
+remove with `tmpfs: {}`, or bind your own directory at `/tmp` through `mounts` and the default steps
+aside (a `:ro` bind included, which leaves `/tmp` read-only: your call, not an accident). **The unit is
+required and the target may not contain a `:`.** kern's CLI takes both spellings and means the
+opposite of what you do: a bare `"64"` is 64 BYTES, `"0"` is UNLIMITED, and `["/scratch:9g"]` mounts
+`/scratch` at 9 GiB rather than a directory by that name. All three measured, all three refused here. A size larger than `memoryMb` is refused for the same family
+of reason: `df` would report it to a program that preflights. The binding's own default is clamped to
+half the cap instead.
+
+**`memoryMb` bounds the cgroup, not the workload's usable memory.** The cap is shared with
+memory-backed filesystems in the same box, and `/dev/shm` is one of them with **no size at all** (the
+kernel's tmpfs default, half of host RAM, so it scales with the machine and not with your config).
+Measured: 200 MiB written there under `memoryMb: 128` OOM-kills the box whatever `/tmp` is set to.
+`tmpfs: { "/dev/shm": ... }` is refused by kern; `mounts` at the same target IS accepted and stacks over
+kern's own mount; measured through it, `multiprocessing.shared_memory` and POSIX semaphores still
+work. Two costs: a plain directory is unbounded on DISK instead of in RAM, so bounding it means
+binding a host directory that is itself a sized tmpfs, and it has no tmpfs lifetime, so what the box
+writes to `/dev/shm` is still on the host after the box dies.
+
+**Scratch does not survive a call.** Each `runCode` is a fresh box, so `/tmp` is fresh too while the
+workspace persists. Put anything a later call must find in the workspace. The `setup` box is the exception: an install needs unbounded scratch, so the default is not
+applied there (an explicit `tmpfs` still is).
+
+**Toolchains in the box** need two writable places, and the error names neither. Go reports `failed to
+initialize build cache at /root/.cache`, which says nothing about `HOME`; npm renders a failed
+`mkdir /root/.npm` as `Invalid response body while trying to fetch https://registry.npmjs.org/...`,
+which reads as a network fault and is not one. Measured on `node:22`: neither -> exit 2, `HOME` alone
+with a read-only `/tmp` -> still exit 2, both -> exit 0. Pass both:
+
+```js
+new Sandbox({
+  image: "golang:1.23-alpine",
+  env: { HOME: "/workspace" },   // npm's ~/.npm, Go's ~/.cache, Rust's CARGO_HOME, .NET's NuGet
+  tmpfs: { "/tmp": "512m" },     // scratch; 64 MiB fits a small install, a real one needs more
 });
 ```
 

@@ -177,6 +177,19 @@ async function main() {
 
 		console.log("\nbash, adversarial");
 		const b = kernBashOps(box);
+
+		// Every exec below goes through this. `exec` THROWS on a timeout fault, and one throw at an
+		// unguarded call site cost an outside reviewer 31 of 88 assertions and any tally at all: a slow
+		// command on a cold machine ended the file. A throw is now ONE failed assertion with the reason
+		// attached, and the remaining assertions still run.
+		const ex = async (cmd: string, cwd: string, opts: Parameters<typeof b.exec>[2]) => {
+			try {
+				return await b.exec(cmd, cwd, opts);
+			} catch (e) {
+				ok(`exec did not throw: ${cmd.slice(0, 40)}`, false, e instanceof Error ? e.message : String(e));
+				return { exitCode: -1 };
+			}
+		};
 		let out = "";
 		const onData = (c: Buffer) => {
 			out += c.toString();
@@ -194,30 +207,32 @@ async function main() {
 		})();
 
 		out = "";
-		await b.exec("echo done", "/workspace/d", { onData });
+		await ex("echo done", "/workspace/d", { onData });
 		ok("an ordinary subdirectory cwd still works", out.includes("done"));
 
 		// env keys are validated because they are pasted into `export K=V`. A key that is not a shell
 		// name is DROPPED rather than escaped: there is nothing a shell would do with it.
 		out = "";
-		await b.exec("echo ${EVIL:-unset}", "/workspace", { onData, env: { "EVIL; id": "x", EVIL: "safe" } });
+		await ex("echo ${EVIL:-unset}", "/workspace", { onData, env: { "EVIL; id": "x", EVIL: "safe" } });
 		ok("a malformed env key cannot inject", !out.includes("uid="), JSON.stringify(out.slice(0, 80)));
 		ok("a well-formed env key still arrives", out.includes("safe"));
 
 		out = "";
-		await b.exec("echo \"$Q\"", "/workspace", { onData, env: { Q: "a'b\"c$(id)`id`" } });
+		await ex("echo \"$Q\"", "/workspace", { onData, env: { Q: "a'b\"c$(id)`id`" } });
 		ok("a hostile env VALUE is not evaluated", !out.includes("uid="), JSON.stringify(out.slice(0, 90)));
 		ok("the hostile value arrives verbatim", out.includes("a'b\"c$(id)`id`"));
 
 		out = "";
-		const big = await b.exec("head -c 300000 /dev/zero | tr '\\0' 'x'", "/workspace", { onData });
+		const big = await ex("head -c 300000 /dev/zero | tr '\\0' 'x'", "/workspace", { onData });
 		ok("300 KB of output does not break the stream", big.exitCode === 0 && out.length > 100000, `${out.length} bytes`);
 
 		// Unbounded output is the glob finding with a different lever: the agent picks the command and
 		// every chunk is forwarded into a single-threaded renderer. Two things must hold: the capture
 		// stops, and the process in the box actually dies rather than merely going unread.
 		out = "";
-		await b.exec("yes AAAAAAAAAAAAAAAA", "/workspace", { onData, timeout: 6 }).catch((e) => e);
+		// A timeout here is the EXPECTED outcome, so this one keeps its own catch rather than
+		// going through `ex`, which would report the expected throw as a failed assertion.
+		await b.exec("yes AAAAAAAAAAAAAAAA", "/workspace", { onData, timeout: 6 }).catch(() => {});
 		ok(
 			"an endless writer is bounded, not unbounded",
 			out.length < 40 * 1024 * 1024,
@@ -234,32 +249,68 @@ async function main() {
 		ok("a timed-out command is KILLED, not just unread", beatA === beatB, `${beatA} then ${beatB}`);
 
 		out = "";
-		const bin = await b.exec("head -c 256 /dev/urandom", "/workspace", { onData });
+		const bin = await ex("head -c 256 /dev/urandom", "/workspace", { onData });
 		ok("binary output does not throw", bin.exitCode === 0);
 
 		out = "";
-		const nz = await b.exec("exit 255", "/workspace", { onData });
+		const nz = await ex("exit 255", "/workspace", { onData });
 		ok("exit 255 is reported as data", nz.exitCode === 255 && Number.isInteger(nz.exitCode));
 
-		// A fork bomb is the case the caps exist for, and per the SDK's own docs an enforced pids cap
-		// produces NO fault: the refused fork is EAGAIN, which the shell handles and exits cleanly.
+		// THIS ASSERTION USED TO BE VACUOUS, and an outside reviewer found it. It ran
+		// `:(){ :|:& };:`, which is BASH syntax, through a `language: "bash"` that actually ran `sh`.
+		// dash answers `Syntax error: Bad function name` and exits 2 in 0.02 s without forking once,
+		// and the check was `typeof exitCode === "number"`, which a syntax error satisfies. It had
+		// never tested a fork bomb.
+		//
+		// The replacement needs no bash and no bomb: it starts a fixed number of background processes
+		// and COUNTS what is alive, which is a number the cap moves. A bomb is the wrong instrument
+		// anyway - at 300 forks under pids=256 the shell itself dies at the ceiling (exit 2, measured)
+		// and takes the reporting `echo` with it, so the run that proves the most says the least.
 		out = "";
-		const fb = await b.exec(":(){ :|:& };: 2>/dev/null; echo survived", "/workspace", { onData, timeout: 20 });
-		ok("a fork bomb does not take the host down", typeof fb.exitCode === "number", JSON.stringify(fb));
+		const storm = (n: number) =>
+			`i=0; while [ $i -lt ${n} ]; do sleep 5 & i=$((i+1)); done 2>/dev/null; echo alive=$(ls /proc | grep -c "^[0-9]")`;
+		const fb = await ex(storm(150), "/workspace", { onData, timeout: 30 });
+		const bigCap = Number((out.match(/alive=(\d+)/) ?? [])[1] ?? -1);
+		ok("150 background processes start and the box still answers", fb.exitCode === 0 && bigCap >= 150, JSON.stringify({ ...fb, bigCap }));
+
+		// The discriminant. Same script, same image, one thing different: pids. Without this the count
+		// above measures the loop bound and says nothing about a ceiling. Under pids=24 the box cannot
+		// reach 150 - either the shell dies at the wall or the count comes back short - and either way
+		// the call RETURNS, which is the half about not taking the host down.
+		const tiny = new Sandbox({ image: "python:3.12-slim", workspace: ws, memoryMb: 1024, pids: 24, timeoutS: 30 });
+		await tiny.open();
+		let tinyOut = "";
+		let tinyRc: number | null = -1;
+		try {
+			// Guarded like every other exec here: the low-cap box is the one MOST likely to time out.
+			tinyRc = (await kernBashOps(tiny)
+				.exec(storm(150), "/workspace", {
+					onData: (c: Buffer) => {
+						tinyOut += c.toString();
+					},
+					timeout: 30,
+				})
+				.catch(() => ({ exitCode: -1 }))).exitCode;
+		} finally {
+			await tiny.close();
+		}
+		const smallCap = Number((tinyOut.match(/alive=(\d+)/) ?? [])[1] ?? -1);
+		const bound = tinyRc !== 0 || (smallCap > 0 && smallCap < bigCap);
+		ok(`pids=24 binds where pids=256 does not (rc ${tinyRc}, alive ${smallCap} vs ${bigCap})`, bound, tinyOut.trim());
 
 		out = "";
-		const mem = await b.exec("python3 -c \"a='x'*(2*1024*1024*1024)\" 2>/dev/null; echo after", "/workspace", {
+		const mem = await ex("python3 -c \"a='x'*(2*1024*1024*1024)\" 2>/dev/null; echo after", "/workspace", {
 			onData,
 			timeout: 30,
 		});
 		ok("a 2 GB allocation under a 1 GB cap is contained", typeof mem.exitCode === "number", JSON.stringify(mem));
 
 		out = "";
-		await b.exec("cat /proc/1/environ 2>/dev/null | head -c 50; echo .", "/workspace", { onData });
+		await ex("cat /proc/1/environ 2>/dev/null | head -c 50; echo .", "/workspace", { onData });
 		ok("the host's pid 1 environment is not readable", !out.includes("KERN_"), JSON.stringify(out.slice(0, 80)));
 
 		out = "";
-		await b.exec("ls /workspace/.. 2>/dev/null | head -3 | tr '\\n' ' '; echo .", "/workspace", { onData });
+		await ex("ls /workspace/.. 2>/dev/null | head -3 | tr '\\n' ' '; echo .", "/workspace", { onData });
 		ok("the parent of the workspace is the box's root, not the host's", !out.includes("kern-pi-edge"), JSON.stringify(out.slice(0, 90)));
 	} finally {
 		await box.close();

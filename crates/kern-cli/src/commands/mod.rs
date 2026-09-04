@@ -289,6 +289,8 @@ pub struct BoxRunArgs<'a> {
     pub pids_limit: Option<u64>,
     /// `--tmpfs PATH[:size]` (repeatable): mount a fresh tmpfs at PATH inside the box.
     pub tmpfs: &'a [String],
+    /// `--shm-size SIZE`: an explicit cap for `/dev/shm`, in bytes. `None` derives one from `--memory`.
+    pub shm_size: Option<u64>,
     /// `--ulimit` limits, pre-resolved to `(RLIMIT_*, soft, hard)` by the CLI.
     pub ulimits: &'a [(i32, u64, u64)],
     /// `--sysctl KEY=VALUE` pairs, applied inside the box's namespaces.
@@ -1082,6 +1084,8 @@ struct BuildSpec<'a> {
     /// INTERNAL (build): a persistent overlay upper dir; overlays `lower` and keeps writes there.
     overlay_upper: Option<String>,
     memory: Option<u64>,
+    /// `--shm-size`: an explicit `/dev/shm` cap in bytes. `None` derives one from `memory`.
+    shm_size: Option<u64>,
     memory_swap_max: Option<u64>,
     cpus: Option<f64>,
     cpuset: Option<String>,
@@ -1299,6 +1303,15 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         pod_holder: b.pod_holder,
         uid_range: b.uid_range,
         memory_max: b.memory,
+        // `--shm-size` when given, else the cap that is ACTUALLY in force: `--memory` when the operator
+        // set one, and kern's own 512 MiB default when they did not. Resolved here because this is
+        // where that default lives - `SandboxSpec::memory_max` carries the raw flag, so deriving from
+        // it inside the isolation crate left the common case (no `--memory`) unsized, which is the
+        // exact case that was reporting half the HOST's RAM to a box the cgroup holds at 512 MiB.
+        shm_max: Some(
+            b.shm_size
+                .unwrap_or_else(|| b.memory.unwrap_or(SCOPE_MEMORY_MAX_BYTES)),
+        ),
         memory_swap_max: b.memory_swap_max,
         cpuset: b.cpuset,
         cpus: b.cpus,
@@ -1755,10 +1768,6 @@ fn scope_memory_max(memory: Option<u64>) -> u64 {
 /// On a byte: forward the catchable fatal signals to `child` (`systemd-run`), wait for it, and `exit`
 /// with its code - never returns. On EOF: reap `child` and RETURN, so the caller falls back.
 fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
-    // Read BEFORE the workload can allocate. The child was forked a moment ago and has not reached
-    // its own exec yet, so this is the baseline the comparison at the bottom needs. Cheap: one small
-    // read of one sysfs file, once per box, off the start path's critical section.
-    let oom_before = kern_isolation::oom_kill_count();
     let mut byte = [0u8; 1];
     let n = loop {
         let r = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
@@ -1773,6 +1782,22 @@ fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
         reap(child);
         return;
     }
+    // THE BASELINE, read here rather than before the wait, and from the CHILD rather than from us.
+    //
+    // The byte means the re-exec'd kern reached `main` inside the scope, so the box's cgroup exists
+    // and the workload has not run yet: the first moment the right directory can be named, and still
+    // before anything can allocate.
+    //
+    // From the child because kern's own ancestors answer for the box only when the two share one.
+    // Measured on a root VPS: kern sits in `/user.slice/user-0.slice/session-N.scope` and the box
+    // lands in `/system.slice/kern-box-N.scope`, whose only common ancestor is the cgroup root, which
+    // never exposes `memory.events`. The kill happened and this message never printed, on precisely
+    // the hosts where the cap binds. `systemd-run --scope` puts the child INSIDE the scope, so its
+    // cgroup is the box's and the parent of that is the slice that outlives it.
+    let oom_dir = kern_isolation::oom_kill_dir_for_pid(child);
+    let oom_before = oom_dir
+        .as_deref()
+        .and_then(kern_isolation::oom_kill_count_at);
     // The scope is up and the box runs under `systemd-run` (our child). Forward the catchable fatal
     // signals so Ctrl-C and a SIGTERM reach `systemd-run` (which relays them to the box) and the proxy
     // does not die first and orphan the wait. This path is `!die_with_parent` (detached / `kern run`):
@@ -1817,7 +1842,15 @@ fn scope_reexec_proxy(child: libc::pid_t, read_fd: i32) {
     // reads a hierarchical ancestor counter before and after, which says the OOM killer fired in
     // this subtree and not which process it took. The wording says that.
     if code == 128 + libc::SIGKILL {
-        let after = kern_isolation::oom_kill_count();
+        // THE SAME DIRECTORY AS THE BEFORE, which is the whole point of resolving it once. Reading
+        // the after with `oom_kill_count()` compares the box's slice against KERN's OWN ancestors:
+        // two unrelated counters, so `b > a` is decided by whichever subtree happened to be busier.
+        // Measured on a root VPS, where those are different branches entirely: the same binary
+        // printed the message on one run and stayed silent on the next two. That intermittency was
+        // this line, not a kernel race.
+        let after = oom_dir
+            .as_deref()
+            .and_then(kern_isolation::oom_kill_count_at);
         if let (Some(a), Some(b)) = (oom_before, after) {
             if b > a {
                 eprintln!(

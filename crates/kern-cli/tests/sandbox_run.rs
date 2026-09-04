@@ -7960,3 +7960,188 @@ fn compose_down_removes_the_relay_directory_it_created() {
         "`down` must remove the relay directory it created, leftovers: {after:?}"
     );
 }
+
+/// `PR_SET_NO_NEW_PRIVS` is armed in every box, asserted HERE because a decision in another artifact
+/// depends on it.
+///
+/// The Python and Node SDKs mount every `-v` volume `nosuid` and let that remount FAIL without
+/// refusing to start the box. That is only safe because no-new-privs already makes the setuid bit
+/// inert process-wide, so the mount flag is depth rather than the boundary. Today the invariant holds
+/// for free (seccomp requires the prctl, and kern fails closed if it cannot set it), but "for free"
+/// is exactly the kind of coupling that goes quiet: a future path where seccomp is off could take
+/// no-new-privs with it, and the SDK's mount decision would silently become load-bearing again with
+/// nobody looking. So the assertion lives in the runtime's own suite, and it says what depends on it.
+///
+/// The MECHANISM is proved separately, in `no_new_privs_really_neutralises_a_setuid_binary`, because
+/// it cannot be proved here: patching the prctl out does not yield a weaker box, it yields a box that
+/// refuses to start. Unreachable in situ, reachable in a reduced system.
+#[test]
+fn every_box_has_no_new_privs_armed_because_the_sdk_mount_decision_rests_on_it() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "nnp");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let out = kern_out(&[
+        "box",
+        "kern-nnp-probe",
+        "--rootfs",
+        &rootfs,
+        "--quiet",
+        "--",
+        "/bin/sh",
+        "-c",
+        "grep '^NoNewPrivs' /proc/self/status",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = fs::remove_dir_all(&root);
+    if stderr.contains("user namespaces") || stdout.is_empty() {
+        eprintln!("skip: box did not run here ({stderr})");
+        return;
+    }
+    assert!(
+        stdout.contains("NoNewPrivs:\t1"),
+        "no-new-privs is NOT armed in a box; the SDKs treat their nosuid mount as depth on the \
+         strength of this. Read the doc comment before changing either side. Got: {stdout:?}"
+    );
+}
+
+/// The mechanism behind the assertion above, proved in a system where the guard CAN be turned off.
+///
+/// A setuid binary owned by ANOTHER uid, executed by this one, with and without `no_new_privs`. The
+/// foreign owner is obtained the only way an unprivileged user can: a box with a mapped uid RANGE
+/// chowns the file to an in-box uid, which lands on the host as a subuid. Measured on the machine
+/// this was written on, with the file owned by 100999 and the caller 1000: euid 100999 without the
+/// flag, euid 1000 with it. Both halves are needed, and the first is the one that would go quiet.
+///
+/// Skip-graceful in every direction, because each precondition is a property of the host: `setpriv`,
+/// a usable uid range, and a source mount that is not already `nosuid`.
+#[test]
+fn no_new_privs_really_neutralises_a_setuid_binary() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    if Command::new("setpriv").arg("--help").output().is_err() {
+        eprintln!("skip: no setpriv");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("kern-nnp-ladder-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::create_dir_all(&dir);
+    // The instrument is CHOSEN BY TESTING IT, not by assuming which binary is where. busybox's `id -u`
+    // prints the REAL uid and coreutils' prints the EFFECTIVE one, so a ladder built on busybox reads
+    // 1000 in both rungs and passes while measuring nothing. Every candidate is staged, and the one
+    // that can actually see a euid change is the one used; if none can, this skips and says so.
+    let candidates = ["/usr/bin/id", "/bin/id", "/usr/bin/whoami"];
+    let mut staged: Vec<(String, PathBuf)> = Vec::new();
+    for (i, src) in candidates.iter().enumerate() {
+        if !Path::new(src).exists() {
+            continue;
+        }
+        // Named `id`/`whoami` in its own subdir: busybox dispatches on the basename it was invoked as,
+        // so a copy called anything else answers "applet not found" with empty stdout.
+        let sub = dir.join(format!("c{i}"));
+        let _ = fs::create_dir_all(&sub);
+        let name = Path::new(src).file_name().unwrap_or_default();
+        let dst = sub.join(name);
+        if fs::copy(src, &dst).is_ok() {
+            staged.push(((*src).to_string(), dst));
+        }
+    }
+    if staged.is_empty() {
+        let _ = fs::remove_dir_all(&dir);
+        eprintln!("skip: no candidate probe binary to stage");
+        return;
+    }
+    // A uid RANGE is what makes the chown land on a uid that is not ours; without it the file stays
+    // ours and the ladder cannot discriminate, which is a skip and not a pass.
+    let bind = format!("{}:/w", dir.display());
+    let root = build_rootfs(&busybox, "nnpladder");
+    let _ = fs::copy(&busybox, root.join("bin/sh"));
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let _ = kern()
+        .args([
+            "box",
+            "kern-nnp-chown",
+            "--rootfs",
+            &rootfs,
+            "--uid-range",
+            "-v",
+            &bind,
+            "--quiet",
+            "--",
+            "/bin/sh",
+            "-c",
+            "for f in /w/c*/*; do chown 1000:1000 \"$f\" && chmod 4755 \"$f\"; done",
+        ])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let me = unsafe { libc::getuid() };
+    let euid_of = |args: &[&str]| -> String {
+        Command::new(args[0])
+            .args(&args[1..])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    let mut chosen: Option<(String, u32, String)> = None;
+    for (src, probe) in &staged {
+        let Ok(md) = fs::metadata(probe) else {
+            continue;
+        };
+        let owner = std::os::unix::fs::MetadataExt::uid(&md);
+        if owner == me {
+            continue; // no usable subuid range: the file is still ours, so nothing can move
+        }
+        let p = probe.to_str().unwrap_or_default().to_string();
+        let out = euid_of(&[&p, "-u"]);
+        let out = if out.is_empty() { euid_of(&[&p]) } else { out };
+        if out == owner.to_string() {
+            chosen = Some((p, owner, src.clone()));
+            break;
+        }
+    }
+    let Some((probe, owner, src)) = chosen else {
+        let _ = fs::remove_dir_all(&dir);
+        eprintln!(
+            "skip: no instrument here reports the EFFECTIVE uid under setuid (busybox's `id -u` \
+             reports the real one), or no usable subuid range: the ladder would be blind"
+        );
+        return;
+    };
+    // Rung 1 already ran as the selection criterion: `probe` reports the owner's uid, so without the
+    // guard the setuid bit really does move the euid. That IS the positive control.
+    let with = euid_of(&["setpriv", "--no-new-privs", &probe, "-u"]);
+    let with = if with.is_empty() {
+        euid_of(&["setpriv", "--no-new-privs", &probe])
+    } else {
+        with
+    };
+    let _ = fs::remove_dir_all(&dir);
+    if with.is_empty() {
+        eprintln!("skip: setpriv could not run the probe here");
+        return;
+    }
+    assert_eq!(
+        with,
+        me.to_string(),
+        "no-new-privs did NOT neutralise a setuid binary owned by {owner} (instrument: {src}); the \
+         SDKs' decision to let a nosuid remount fail non-fatally rests on this"
+    );
+}

@@ -125,6 +125,9 @@ pub struct SandboxSpec {
     pub uid_range: UidRange,
     /// Hard memory ceiling in bytes for the box's cgroup (`--memory`). `None` → the default cap.
     pub memory_max: Option<u64>,
+    /// `--shm-size` in bytes: an explicit cap for `/dev/shm`. `None` derives one from `memory_max`
+    /// (see `shm_size_for`), which is the number the cgroup already enforces.
+    pub shm_max: Option<u64>,
     /// Swap allowance in bytes (`--memory-swap-max` → `memory.swap.max`). `None` → `0` (swap off, so
     /// `memory_max` is a hard total). This is the v2 swap limit, NOT a combined mem+swap total.
     pub memory_swap_max: Option<u64>,
@@ -815,7 +818,13 @@ fn child_setup_and_exec(
     // `-it` slave). The overwhelming common case (agent code-exec, CI, `sh -c`) never opens a PTY, so
     // gate the whole devpts mount+mkdir+symlink out of it - one fewer filesystem-mount syscall per box.
     let needs_pts = spec.ssh.is_some() || spec.tty_slave.is_some();
-    setup_dev(&spec.root, spec.tun, needs_pts, spec.tty_slave)?;
+    setup_dev(
+        &spec.root,
+        spec.tun,
+        needs_pts,
+        spec.tty_slave,
+        shm_size_for(spec.shm_max, spec.memory_max),
+    )?;
     setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
     t.mark("dev");
     setup_volumes(&spec.root, &spec.volumes)?;
@@ -1339,11 +1348,87 @@ fn open_source_nofollow(src: &str) -> Result<libc::c_int, Error> {
     Ok(dir)
 }
 
+/// The `size=` to mount `/dev/shm` with, in bytes, or `None` to leave it unsized.
+///
+/// `--shm-size` when the operator gave one. Otherwise the box's own `--memory` cap, which is the one
+/// number that is already true: the tmpfs is charged to that cgroup, so a box can never actually hold
+/// more shm than that, and saying so out loud costs nothing while an unsized mount reports half the
+/// HOST's RAM. Deliberately NOT Docker's fixed 64 MB default, which is the footgun the previous comment
+/// here was avoiding: it is what breaks Postgres under load, and it has no relationship to the box.
+/// An uncapped box keeps the previous behaviour, because there is no honest number to use.
+const fn shm_size_for(explicit: Option<u64>, memory_max: Option<u64>) -> Option<u64> {
+    match explicit {
+        Some(n) => Some(n),
+        None => memory_max,
+    }
+}
+
+/// The per-mount flags currently in force on the filesystem `fd` refers to, as `MS_*` bits.
+///
+/// Needed because a bind REMOUNT **sets** the per-mount flags rather than adding to them, and a user
+/// namespace refuses one that would clear a flag the kernel locked (`nosuid`, `nodev`, `noexec`, the
+/// atime policy and `rdonly` are locked on any mount a userns inherited). So "add nosuid" has to be
+/// spelled "everything already in force, plus nosuid", or the remount fails with `EPERM` on exactly the
+/// mounts that most need it. `statvfs`'s `ST_*` bits are the readable form of those flags.
+fn current_mount_flags(fd: libc::c_int) -> libc::c_ulong {
+    // `fstatfs64` and not `fstatvfs`: glibc implements the latter by PARSING `/proc/self/mounts` to
+    // fill `f_flag`, which is both slower and a second source of truth for something the kernel answers
+    // directly. This is the syscall, it reports THIS mount's own flags, and it works on the `O_PATH` fd
+    // this is called with. The `64` suffix is not optional: plain `statfs` carries no `f_flags` field on
+    // the glibc targets, while `statfs64` has it on glibc AND musl, which is what the release builds use.
+    let mut st: libc::statfs64 = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs64(fd, &mut st) } != 0 {
+        // Unreadable: claim nothing. The caller ORs in what it wants, and a remount that then tries to
+        // clear a locked flag fails - which is the safe direction, because this path is best-effort.
+        return 0;
+    }
+    let f = st.f_flags as libc::c_ulong;
+    // The kernel reports these bits in `f_flags` with the SAME numeric values as the `MS_*` mount
+    // flags, so one constant serves both sides. (The `ST_*` spellings are not used: musl does not
+    // define all of them, and the release builds are musl.)
+    //
+    // The list is explicit rather than a bulk copy of `f_flags`, and that is load-bearing: `f_flags`
+    // also carries `ST_VALID` (0x20), which is numerically `MS_REMOUNT`. Passing the raw word through
+    // would smuggle a flag nobody asked for into the very syscall this feeds.
+    let mut ms: libc::c_ulong = 0;
+    for bit in [
+        libc::MS_RDONLY,
+        libc::MS_NOSUID,
+        libc::MS_NODEV,
+        libc::MS_NOEXEC,
+        libc::MS_SYNCHRONOUS,
+        libc::MS_MANDLOCK,
+        libc::MS_NOATIME,
+        libc::MS_NODIRATIME,
+        libc::MS_RELATIME,
+    ] {
+        let b = bit as libc::c_ulong;
+        if f & b != 0 {
+            ms |= b;
+        }
+    }
+    ms
+}
+
 /// Bind each `-v` host path into the new root BEFORE pivot (while the host source is reachable at
 /// its real path). BOTH ends are resolved **symlink-free** via an `openat(O_NOFOLLOW)` component walk
 /// and the bind runs fd-to-fd through `/proc/self/fd/<n>` - so neither a hostile image's symlink at the
 /// mount point NOR a symlink swapped into the source path between check and mount can redirect the bind
-/// onto a host path. Read-only volumes are then remounted RO.
+/// onto a host path. Every volume is then remounted with `nosuid`, and a `:ro` one also read-only.
+///
+/// `nosuid` here is DEFENCE IN DEPTH and is deliberately best-effort, which is a correction of an
+/// earlier belief in this file. The reasoning that made it load-bearing (that under `--uid-range` a
+/// setuid-root file on a volume lets an in-box uid become box-root) is wrong for a kern box: kern arms
+/// `PR_SET_NO_NEW_PRIVS` before the workload runs, because seccomp requires it, and no-new-privs makes
+/// the setuid bit inert process-wide no matter how the filesystem is mounted. Measured: `NoNewPrivs: 1`
+/// in every reachable configuration, and a setuid-root binary on a `-v` volume executed by an in-box
+/// uid 1000 under `--uid-range` returns euid 1000 with the remount removed as well as with it.
+///
+/// So a failed `nosuid` remount is never fatal. Making it fatal would refuse to start a box for a
+/// property something else already guarantees, on exactly the kernels that reject bind remounts
+/// outright (Android-derived board kernels, as the `:ro` path below records). A `:ro` volume is
+/// different and still fatal: read-only is a contract the caller asked for, and nothing else provides
+/// it.
 fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
     if vols.is_empty() {
         return Ok(());
@@ -1414,9 +1499,15 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             result = Err(Error::last("mount(volume bind)"));
             break;
         }
-        if v.read_only {
-            // Re-resolve the target (it now points *into* the bind mount) and remount it RO. The
-            // pre-bind fd refers to the underlying dir, which can't be remounted.
+        {
+            // Lock the per-mount flags ON the bind. A FIRST bind ignores them - they take an
+            // `MS_REMOUNT` - so without this pass a `-v` volume honours a setuid binary sitting on it
+            // and a `:ro` volume is writable. ONE remount and not two: `nosuid` and `rdonly` are flags
+            // of the same syscall, and setting them separately would leave a window where the volume is
+            // bound with neither, plus a second chance to fail.
+            //
+            // Re-resolve the target (it now points *into* the bind mount). The pre-bind fd refers to
+            // the underlying dir, which can't be remounted.
             let ro_fd = match open_in_root(root_fd, &v.target, is_dir) {
                 Ok(fd) => fd,
                 Err(e) => {
@@ -1424,18 +1515,28 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
                     break;
                 }
             };
+            // Everything already in force, plus what we are adding. See `current_mount_flags`: a bind
+            // remount SETS flags, and a userns refuses one that clears a locked one.
+            let mut flags = current_mount_flags(ro_fd)
+                | (libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID) as libc::c_ulong;
+            if v.read_only {
+                flags |= libc::MS_RDONLY as libc::c_ulong;
+            }
             let ro_tgt = cstr(&format!("/proc/self/fd/{ro_fd}"))?; // decimal fd, but stated not asserted
             let r2 = unsafe {
                 libc::mount(
                     ptr::null(),
                     ro_tgt.as_ptr(),
                     ptr::null(),
-                    (libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY) as libc::c_ulong,
+                    flags,
                     ptr::null(),
                 )
             };
             unsafe { libc::close(ro_fd) };
-            if r2 != 0 {
+            // Losing `nosuid` is not worth refusing to start for: `PR_SET_NO_NEW_PRIVS` already makes
+            // the setuid bit inert in this box (see this function's doc), so the remount is depth and
+            // not the guard. Losing `:ro` IS fatal - nothing else provides it.
+            if r2 != 0 && v.read_only {
                 let e = std::io::Error::last_os_error();
                 result = Err(if e.raw_os_error() == Some(libc::EPERM) {
                     // EPERM on a bind remount-RO has more than one cause: the kernel may not support
@@ -1581,7 +1682,13 @@ const DEV_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 /// device binds all resolve to a directory we own *inside* the new root - never through the
 /// symlink. For a normal (already-a-directory) `/dev` nothing is mutated: the tmpfs simply
 /// shadows it, so the image/rootfs is left untouched.
-fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> Result<(), Error> {
+fn setup_dev(
+    root: &str,
+    tun: bool,
+    needs_pts: bool,
+    tty_slave: Option<i32>,
+    shm_size: Option<u64>,
+) -> Result<(), Error> {
     let dev_path = format!("{root}/dev");
     let dp = cstr(&dev_path)?;
     // Neutralize a hostile `/dev` symlink before any path resolves through it.
@@ -1655,14 +1762,24 @@ fn setup_dev(root: &str, tun: bool, needs_pts: bool, tty_slave: Option<i32>) -> 
         let shmdir = format!("{root}/dev/shm");
         if let Ok(sd) = cstr(&shmdir) {
             unsafe { libc::mkdir(sd.as_ptr(), 0o1777) };
-            if let (Ok(ty), Ok(opts)) = (cstr("tmpfs"), cstr("mode=1777")) {
+            // `size=` when we have one to give. The charge to the memory cgroup remains the real bound,
+            // and that has not changed; what changes is what the box is TOLD. An unsized tmpfs reports
+            // half the HOST's RAM through `statvfs`, so it both leaks a host fact into the box and lies
+            // to every workload that sizes a buffer from the filesystem it is about to write - Postgres'
+            // dynamic shared memory, Chromium, and a PyTorch DataLoader all do exactly that. A box under
+            // `--memory 256m` was being told it had gigabytes.
+            let opts = match shm_size {
+                Some(n) => format!("mode=1777,size={n}"),
+                None => "mode=1777".to_string(),
+            };
+            if let (Ok(ty), Ok(o)) = (cstr("tmpfs"), cstr(&opts)) {
                 unsafe {
                     libc::mount(
                         ty.as_ptr(),
                         sd.as_ptr(),
                         ty.as_ptr(),
                         (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
-                        opts.as_ptr() as *const libc::c_void,
+                        o.as_ptr() as *const libc::c_void,
                     )
                 };
             }
@@ -2674,6 +2791,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         &spec.io_max,
         spec.io_weight,
         spec.require_limits, // demand BOTH memory and pids bind, not just one
+        true, // supervisor_forks_workload: `kern box` forks PID 1, which joins the capped cgroup itself
     );
 
     // Under a systemd scope the caps were handed to `systemd-run` as `MemoryMax=`/`CPUQuota=`/
@@ -2686,11 +2804,21 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     }
 
     // Record whether the memory cap actually binds, for the `KERN_STARTED_FD` enforcement byte. HERE is
-    // the one correct point: `apply_limits` above has moved the supervisor into the box's own cgroup
-    // (`/proc/self/cgroup` is the `kern-box-*` child on the direct path, or the systemd scope on the
-    // scope path), and the box has not yet forked, so the value-aware check sees exactly the ceiling the
-    // box will run under. Read once by the box_run teardown that writes the started byte. All paths.
-    crate::cgroup::record_memory_cap_signal(spec.memory_max);
+    // the one correct point: the box's cgroup exists with its caps written and the box has not yet
+    // forked, so the value-aware check sees exactly the ceiling the box will run under. Read once by the
+    // box_run teardown that writes the started byte. All paths.
+    //
+    // The BOX's directory is passed explicitly rather than read from `/proc/self/cgroup`. The supervisor
+    // is no longer inside the capped cgroup on the direct path (it sits in a sibling leaf so a whole-box
+    // OOM cannot take it), so self-reading would answer for that uncapped leaf and report every box as
+    // unenforced. Where the layout could not be built the supervisor is still inside and `None` restores
+    // the self-read, which is the same answer as before.
+    crate::cgroup::record_memory_cap_signal(
+        spec.memory_max,
+        cg.as_ref()
+            .filter(|g| g.supervisor_is_outside())
+            .map(crate::cgroup::CgroupGuard::box_dir),
+    );
 
     // FAIL-CLOSED on the direct fast path. When we DELIBERATELY skipped the per-box systemd scope
     // (`took_direct_cap_path()` - the SAME canonical predicate `reexec` used, so they can't diverge), the
@@ -2778,7 +2906,10 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
             );
         }
     }
-    let _cg = cg; // held for RAII: its Drop removes the box's cgroup dir after waitpid (see CgroupGuard)
+    // Held for RAII: its Drop removes the box's cgroup dirs after waitpid (see CgroupGuard). Named
+    // rather than `_`-prefixed because the forked child below reads it to join the capped cgroup: the
+    // supervisor is no longer in that cgroup, so the workload is not placed there by inheritance.
+    let cg = cg;
 
     let mut pt_spawn = PhaseTimer::new();
     let euid = unsafe { libc::geteuid() };
@@ -2901,6 +3032,27 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         return Err(Error::last("fork"));
     }
     if pid == 0 {
+        // JOIN THE CAPPED CGROUP, FIRST, because nothing below is worth doing in a box that would run
+        // without its memory ceiling and fork-bomb guard.
+        //
+        // The supervisor deliberately stays OUTSIDE that cgroup (see `apply_limits`): it carries
+        // `memory.oom.group = 1`, so a process inside it is killed with the box and cannot report why the
+        // box died. That means the workload is no longer placed there by inheritance and has to write
+        // itself in. Done here, before any namespace or mount work, so a box that cannot be capped is
+        // refused having changed nothing.
+        //
+        // FAIL-CLOSED: a failed write means this box has no cap of its own. `_exit(126)` rather than
+        // continue, matching the fail-closed refusals in `apply_limits`, and one byte on the readiness fd
+        // first so the launcher reports a start failure instead of waiting.
+        if let Some(guard) = cg.as_ref().filter(|g| g.supervisor_is_outside()) {
+            if !crate::cgroup::join_box_cgroup(guard.box_dir()) {
+                if let Some(fd) = ready_fd {
+                    let b = [1u8];
+                    unsafe { libc::write(fd, b.as_ptr().cast(), 1) };
+                }
+                unsafe { libc::_exit(126) };
+            }
+        }
         // CHILD (box PID 1): set up and exec. Take the readiness fd from the guard (this process
         // now owns the signalling) and mark it close-on-exec - a successful `execvp` then closes
         // it, so the waiting launcher reads EOF = "the box is up". On any error below we write one
@@ -2994,6 +3146,16 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         return Err(Error::last("waitpid"));
     }
     let code = wait_code(status);
+    // LATCH THE OOM VERDICT HERE, the one point where it can still be read: the box is reaped, so its
+    // counter is final, and `cg`'s `Drop` (which removes that directory) has not run yet. The caller
+    // decides what to print only after this function returns, by which time the directory is gone -
+    // measured, and the reason a first attempt that read the path later reported nothing at all.
+    // Only on a SIGKILL exit, so the ordinary path reads no files.
+    if code == 128 + libc::SIGKILL {
+        if let Some(dir) = crate::cgroup::this_box_cgroup_dir() {
+            crate::cgroup::latch_box_oom(dir);
+        }
+    }
     hint_missing_uid_range(range_unmet, code);
     Ok(code)
 }
@@ -4798,5 +4960,85 @@ mod box_start_exit_code_is_docker_aligned {
             2,
             "the run_init workload child and the direct box path must both use box_start_exit_code"
         );
+    }
+}
+
+#[cfg(test)]
+mod shm_and_mount_flag_gates {
+    use super::*;
+
+    #[test]
+    fn shm_size_prefers_the_explicit_cap_and_falls_back_to_the_memory_one() {
+        // An operator's `--shm-size` wins outright.
+        assert_eq!(
+            shm_size_for(Some(16 << 20), Some(256 << 20)),
+            Some(16 << 20)
+        );
+        // Otherwise the memory cap, which is the number the cgroup already enforces: an unsized
+        // `/dev/shm` reports half the HOST's RAM, which both leaks a host fact and misleads every
+        // workload that sizes a buffer from `statvfs`.
+        assert_eq!(shm_size_for(None, Some(256 << 20)), Some(256 << 20));
+        // Nothing enforced anywhere means no honest number exists, so nothing is claimed.
+        assert_eq!(shm_size_for(None, None), None);
+        // Deliberately NOT Docker's fixed 64 MB: the fallback tracks the box, not a constant.
+        assert_eq!(shm_size_for(None, Some(2 << 30)), Some(2 << 30));
+    }
+
+    #[test]
+    fn the_mount_flag_map_never_smuggles_ms_remount() {
+        // `statfs.f_flags` carries ST_VALID (0x20), which is numerically MS_REMOUNT. Copying the raw
+        // word into a remount would add a flag nobody asked for, to the very syscall this feeds. The
+        // guard is that the mapping is an explicit allowlist of bits, so assert the bit is not in it.
+        const ST_VALID: libc::c_ulong = 0x0020;
+        assert_eq!(
+            ST_VALID,
+            libc::MS_REMOUNT as libc::c_ulong,
+            "the premise of this test: the two constants collide"
+        );
+        let mapped: libc::c_ulong = [
+            libc::MS_RDONLY,
+            libc::MS_NOSUID,
+            libc::MS_NODEV,
+            libc::MS_NOEXEC,
+            libc::MS_SYNCHRONOUS,
+            libc::MS_MANDLOCK,
+            libc::MS_NOATIME,
+            libc::MS_NODIRATIME,
+            libc::MS_RELATIME,
+        ]
+        .iter()
+        .fold(0, |a, b| a | *b as libc::c_ulong);
+        assert_eq!(
+            mapped & ST_VALID,
+            0,
+            "the preserved-flag set must not contain MS_REMOUNT/ST_VALID"
+        );
+    }
+
+    #[test]
+    fn current_mount_flags_reads_the_kernel_and_discriminates() {
+        // A positive control for the reader itself: `/proc` is `nosuid,nodev,noexec` on every Linux
+        // this runs on, and `/` is not, so a reader that returned a constant would fail one of the two.
+        let open = |p: &str| -> libc::c_int {
+            let c = cstr(p).expect("a literal path has no NUL");
+            unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
+        };
+        let proc_fd = open("/proc");
+        if proc_fd < 0 {
+            return; // no /proc (a stripped container): the check has nothing to read, so it says nothing
+        }
+        let f = current_mount_flags(proc_fd);
+        unsafe { libc::close(proc_fd) };
+        assert_ne!(
+            f & libc::MS_NOSUID as libc::c_ulong,
+            0,
+            "/proc is mounted nosuid; a reader that missed it would let a remount CLEAR the flag"
+        );
+        let root_fd = open("/");
+        if root_fd >= 0 {
+            let rf = current_mount_flags(root_fd);
+            unsafe { libc::close(root_fd) };
+            assert_ne!(f, rf, "the reader must discriminate: / and /proc differ");
+        }
     }
 }

@@ -4,8 +4,9 @@ on:
     # ONE NAME HERE, AND IT IS LOAD-BEARING: a branch absent from this list is tested by nothing.
     # `dev` was added while it carried unreleased work and removed with it, because a dead branch
     # name says something untrue about what is being built. Add the branch back, in the same push
-    # that creates it, whenever work leaves `main` again.
-    branches: [main]
+    # that creates it, whenever work leaves `main` again. It is back for the SDK scratch work
+    # (a writable /tmp and the tmpfs knob); remove it again when that lands on main.
+    branches: [main, dev]
   pull_request:
   workflow_dispatch: {}
 
