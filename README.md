@@ -332,17 +332,16 @@ first row and `python3 examples/benchmark.py` for the rest.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.4 ms** | ~2.5 ms | ~13.1 ms | ~297 ms | ~288 ms |
+| Cold start (bare box) | **~2.35 ms** | ~2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
 | 200 boxes in parallel | **~0.11 s** | ~0.13 s | ~0.29 s | ~43.1 s | ~16.7 s |
 
 Three thousand at once take ~2.2 s, and a live box costs ~0.3 MB of memory.
 
-**kern is faster than bubblewrap, by about 5%, and it takes care to show it.** Timed one runtime after
+**kern is faster than bubblewrap, by about 9%, and it takes care to show it.** Timed one runtime after
 the other, both read 2.5 ms: the gap is smaller than the drift between two batches minutes apart. With
-ALTERNATING batches on an idle machine they separate cleanly, kern at **2.41 ms against 2.56**, and
-over the eight most recent replicas kern led in **158 of 160 batches**. Across 31 replicas the
-direction has never once flipped, while the size ranged from 4% to 11% between sessions, so the number
-quoted is the bottom of that range. kern does more in
+ALTERNATING batches on an idle machine, against the binary **attached to the release** rather than a
+local build, they separate cleanly: kern at **2.35 ms against 2.60**, ahead in **238 of 240 batches**
+over the twelve most recent replicas. Across 35 replicas the direction has never once flipped. kern does more in
 that time: a seccomp filter, a registry entry, and a cgroup cap bubblewrap never applies.
 
 bwrap is namespace-matched, or it is not a comparison, and gets

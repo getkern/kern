@@ -42,24 +42,29 @@ kern ran there as the same static binary, copied over.
 The table above is one session. This is the same question asked 23 times, because the answer moved
 with how it was asked and the size of the margin was never stable enough to quote.
 
-**31 replicas, 108,000 box starts, on a machine measured idle** (CPU busy read from `/proc/stat` over
+**35 replicas, 116,000 box starts, on a machine measured idle** (CPU busy read from `/proc/stat` over
 two seconds, not from a load average that carries a minute of history). **The direction has never once
-flipped**: kern led in 457 of 460 batches over the first 23, and in **158 of 160** over the eight most
-recent. What moves between sessions is the SIZE, and it moves by more than the size itself.
+flipped**: kern led in 457 of 460 batches over the first 23, and in **238 of 240** over the twelve most
+recent.
 
-The eight most recent, on the v0.9.0 code, machine at 0.6% to 1.8% busy (medians of the four in each
-row):
+The four most recent were run against the **binary attached to the release**, downloaded and
+checksummed, rather than a local build, and that turned out to matter:
 
 | scheduler | kern | bubblewrap | margin |
 |---|---:|---:|---:|
-| free | **2.41 ms** | 2.56 ms | +5.9% |
-| pinned to one core | **1.78 ms** | 1.86 ms | +4.4% |
+| free | **2.35 ms** | 2.60 ms | +9.6% |
+| pinned to one core | **1.76 ms** | 1.89 ms | +7.3% |
 
-The four replicas within that were tight: +5.3, +5.1, +6.7 and +5.2 free, +4.1, +4.3, +4.4 and +3.8
-pinned. Earlier sessions on the same machine read **+9.2%** and **+10.9%** free and **+6.6%** pinned.
-So the honest statement is a RANGE, 4% to 11%, and the number quoted elsewhere in this repository is
-the bottom of it. A margin that moves this much between sessions is not a figure to carry to one
-decimal place, and quoting the best session would be picking the sample that flatters.
+**Which binary is a variable, and it was hiding inside the spread.** The four replicas before these
+read +5.3, +5.1, +6.7 and +5.2 free, on a `cargo build --release --target ...-musl` that was two days
+old. The shipped binary is built with `build-std` and `panic=immediate-abort`, is faster in absolute
+terms (2.35 against 2.41) and leaves bubblewrap unchanged, so the margin widens. Both are honest
+numbers about different binaries, and only one of them is the binary anyone downloads. That is the
+same lesson as musl-versus-glibc, one level further in, and it is why this section names the artifact.
+
+Earlier sessions on local builds read between +5% and +11%. The claim quoted elsewhere in this
+repository is **about 9%**, measured on the release artifact, and the range is stated rather than
+hidden.
 
 Both runtimes get roughly 0.6 ms faster with the core pinned, because the cache stays warm, and the
 margin compresses with them: **part of what looks like a code difference is scheduling.** These rows
