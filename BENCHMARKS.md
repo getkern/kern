@@ -6,22 +6,32 @@ filesystem.
 
 | runtime | cold start | 200 in parallel |
 |---|---:|---:|
-| **kern** `box --rootfs` | **2.7 ms** | **0.10 s** |
-| bubblewrap | 3.0 ms | 0.18 s |
-| runc (rootless) | 14.2 ms | 0.32 s |
-| podman `run --rm` | 288.1 ms | 43.7 s |
-| docker `run --rm` | 295.9 ms | 16.8 s |
+| **kern** `box --rootfs` | **2.5 ms** | **0.11 s** |
+| bubblewrap | 2.5 ms | 0.13 s |
+| runc (rootless) | 13.1 ms | 0.29 s |
+| podman `run --rm` | 296.6 ms | 43.1 s |
+| docker `run --rm` | 287.7 ms | 16.7 s |
 
 The bubblewrap column is namespace-matched, or it is not a comparison: `kern box` always makes a
 network namespace, so bwrap is given `--unshare-user --unshare-pid --unshare-ipc --unshare-uts
 --unshare-net --bind <rootfs> / --proc /proc --dev /dev`.
 
-kern leads bubblewrap by 0.3 ms and the two ranges do not overlap (2.6 to 2.7 against 2.9 to 3.0),
-which is a real margin and a small one. Both columns run WITHOUT a cgroup cap, which is what makes
-them the same job; kern is still installing a seccomp filter and writing a registry entry that bwrap
-does not, and the default `kern box` adds the cap on top. The gap that matters is to the engines.
-`box --image` is 3.5 ms, of which 1 ms is the rootless uid-range mapping: two setuid helpers kern
-does not control.
+**This table cannot separate kern from bubblewrap, and says so rather than pretending.** Measured one
+runtime after the other, which is what this script does, both read 2.5 ms: the difference between them
+is smaller than the drift between two batches taken minutes apart. Separating them takes ALTERNATING
+batches, which is the section below. Both columns here run WITHOUT a cgroup cap, which is what makes
+them the same job; the default `kern box` adds the cap on top. The gap this table DOES establish is
+the one to the engines, two orders of magnitude away, and no measurement subtlety is needed to see it.
+`box --image` is 3.4 ms (median of 7 batches of 100), which is the ~3.5 ms quoted on the front page:
+that figure is rounded up, so it errs against kern rather than for it. About 1 ms of it is the
+rootless uid-range mapping, two setuid helpers kern does not control.
+
+Stopping a service whose init handles SIGTERM: kern 2.3 ms, docker 162 ms, podman 194 ms (medians,
+same host, same day). The previous figures here read 310 and 380 ms for docker and podman, which
+OVERSTATED both: they are corrected downward against kern's own comparison, because a number that
+flatters is the one nobody re-checks. Measured with `trap "exit 0" TERM` as PID 1. Without a handler
+the same command takes docker and podman about 10.2 s each, because PID 1 ignores a signal it has no
+handler for and both wait out a 10 s grace period before SIGKILL.
 
 The claim that survives is reach rather than milliseconds. On a Raspberry Pi 5, docker, podman,
 runc, crun, bwrap, nerdctl, lxc-start and systemd-nspawn were all absent, checked one at a time;
@@ -32,20 +42,27 @@ kern ran there as the same static binary, copied over.
 The table above is one session. This is the same question asked 23 times, because the answer moved
 with how it was asked and the size of the margin was never stable enough to quote.
 
-**23 replicas, 92,000 box starts, on a machine measured idle** (0.9% CPU busy, read from `/proc/stat`
-over two seconds rather than from a load average that carries a minute of history). kern was faster in
-**457 of 460 batches**, and not one bootstrap interval touched zero. The direction never moved. What
-moved is the size:
+**27 replicas, 100,000 box starts, on a machine measured idle** (CPU busy read from `/proc/stat` over
+two seconds, not from a load average that carries a minute of history). **The direction has never once
+flipped**: kern led in 457 of 460 batches over the first 23, and in 78 of 80 over the four most recent.
+What moves between sessions is the SIZE, and it moves by more than the size itself.
+
+The most recent four, on the quietest machine yet (0.6% busy), on the v0.9.0 code:
 
 | scheduler | kern | bubblewrap | margin |
 |---|---:|---:|---:|
-| free | **2.5 ms** | 2.75 ms | +9.2% |
-| pinned to one core | **1.85 ms** | 2.0 ms | +6.6% |
+| free | **2.40 ms** | 2.53 ms | +5.3% |
+| pinned to one core | **1.76 ms** | 1.84 ms | +4.2% |
 
-Both runtimes drop about 0.7 ms with the core pinned, because the cache stays warm, and the margin
-compresses with them: **part of what looks like a code difference is scheduling.** These two rows are
-kern's DEFAULT, cgroup cap and all, which is not the same job as the namespace-matched table above and
-is why the numbers differ from it. Reproduce with `sh scripts/bench-idle.sh 4`.
+Earlier sessions, on the same machine at 0.9% to 1.4% busy, read **+9.2%** and **+10.9%** free and
+**+6.6%** pinned. So the honest statement is a RANGE, 4% to 11%, and the number quoted elsewhere in
+this repository is the bottom of it. A margin that moves this much between sessions is not a figure to
+carry to one decimal place, and quoting the best session would be picking the sample that flatters.
+
+Both runtimes get roughly 0.6 ms faster with the core pinned, because the cache stays warm, and the
+margin compresses with them: **part of what looks like a code difference is scheduling.** These rows
+are kern's DEFAULT, cgroup cap and all, which is not the same job as the namespace-matched table above
+and is why the numbers differ from it. Reproduce with `sh scripts/bench-idle.sh 4`.
 
 **Three variables each moved the answer by more than the answer**, which is why the script fixes all
 three rather than documenting them:

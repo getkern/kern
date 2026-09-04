@@ -40,14 +40,23 @@ and a stack runner at once, in one static binary with no daemon.
 
 - **A real container.** Real OCI images: `pull`, `build` from a Dockerfile, `commit`, `push`,
   `save`/`load`. A box from an image starts in ~3.5 ms.
+- **The sandbox an AI agent can afford to use on every call.** An agent's tool-call, a model's
+  generated snippet, a notebook cell, a CI step: code that runs before anyone reads it. kern gives
+  each call **its own box in ~2.4 ms** and throws it away after, which is cheap enough that "one
+  sandbox per tool-call" stops being a design you argue about and becomes the default. Network off,
+  memory and PID caps the kernel enforces, capabilities dropped, a deny-by-default seccomp allowlist,
+  and the timeout applied from OUTSIDE the box, so code that hangs cannot outlive it.
+  <br>**The failure comes back as data, not as an exception.** A timeout, an OOM-kill, a blocked
+  syscall and a command that was not in the image are each a typed `fault` on the result, next to
+  stdout and the exit code. An agent loop reads the field and decides; it does not parse a stack
+  trace to find out that the sandbox, and not the code, ended the run.
+  <br>`pip install kern-sandbox` or `npm i kern-sandbox`, a LangChain code tool and shell-middleware
+  policy, and an **MCP server** that hands Claude Desktop or Cursor a real box to execute in.
+  [bindings/python/README.md](bindings/python/README.md). For code written to attack you rather than
+  merely unread, read [What kern is not](#what-kern-is-not) first: the boundary is the Linux kernel.
 - **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
   `--security-profile untrusted`, is the whole hardened bundle.
-- **A sandbox for code you did not write.** Agent tool-calls, LLM-generated snippets, CI jobs, build
-  steps, notebook cells: a fresh box per call, network off, memory and pid caps, capabilities
-  dropped, and a timeout enforced from outside the box. A timeout, an OOM-kill or a blocked syscall
-  comes back as data on the result, not as an exception. `kern-sandbox` for Python and Node, and an
-  MCP server for Claude Desktop or Cursor. [bindings/python/README.md](bindings/python/README.md)
 - **Resource profiles, not just isolation.** CPU (`vcpu:`), memory, disk (`vdisk:`) and devices
   (`vgpio:`), declared once in a `kern.toml` and attached by name. `kern run` applies the same caps
   to a process on the host, with no sandbox at all, plus `--landlock-rw <path>` to confine that
@@ -306,9 +315,9 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.7 ms** | ~296 ms | ~288 ms |
-| Cold start, from an OCI image | **~3.5 ms** | ~296 ms | ~288 ms |
-| Stop a service (init handles SIGTERM) | **~1.9 ms** | ~310 ms | ~380 ms |
+| Cold start, bare box | **~2.5 ms** | ~288 ms | ~297 ms |
+| Cold start, from an OCI image | **~3.4 ms** | ~288 ms | ~297 ms |
+| Stop a service (init handles SIGTERM) | **~2.3 ms** | ~162 ms | ~194 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one static binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
@@ -323,8 +332,8 @@ Intel i7-14700KF, Linux 7.0.0, the release binary, one script you can run yourse
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.7 ms** | ~3.0 ms | ~14.2 ms | ~288 ms | ~296 ms |
-| 200 boxes in parallel | **~0.10 s** | ~0.18 s | ~0.32 s | ~43.7 s | ~16.8 s |
+| Cold start (bare box) | **~2.5 ms** | ~2.5 ms | ~13.1 ms | ~297 ms | ~288 ms |
+| 200 boxes in parallel | **~0.11 s** | ~0.13 s | ~0.29 s | ~43.1 s | ~16.7 s |
 
 Three thousand at once take ~2.2 s, and a live box costs ~0.3 MB of memory.
 
@@ -336,12 +345,14 @@ bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net \
       --bind <rootfs> / --proc /proc --dev /dev /bin/true
 ```
 
-Two honest notes. **The margin over bubblewrap is real but small**: 2.7 ms against 3.0 ms here, with
-the two ranges not overlapping (kern 2.6 to 2.7, bwrap 2.9 to 3.0), while kern is also installing a
-seccomp filter and recording a registry entry that bwrap does not. That comparison has since been run
-23 times on an idle machine, 92,000 starts, and kern led in 457 of 460 batches: **+9.2%** with the
-scheduler free and **+6.6%** with the core pinned, where both runtimes get 0.7 ms faster and part of
-the margin turns out to be scheduling rather than code. Both columns run WITHOUT a cgroup
+Two honest notes. **The margin over bubblewrap is real and small, and the table above cannot see
+it**: measured one runtime after the other, like the script does, the two read the same 2.5 ms. It
+takes ALTERNATING batches to separate them, and then kern leads by about **5%** (2.40 ms against 2.53)
+with the scheduler free and about **4%** with the core pinned, where both get roughly 0.6 ms faster
+because the cache stays warm. Across 27 replicas the direction has never once flipped, and the size
+has ranged from 4% to 11% between sessions, which is why the small number is the one quoted here.
+kern is doing more work in that time: a seccomp filter, a registry entry, and a cgroup cap bubblewrap
+never applies. Both columns run WITHOUT a cgroup
 cap, which is what makes them the same job; the default `kern box` adds one. bubblewrap is a
 launcher, not a runtime, and fractions of a millisecond are not why you would pick either. **The gap that means
 something is to the engines**, two orders of magnitude above. On aarch64 the same matched comparison
