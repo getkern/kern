@@ -1,17 +1,24 @@
 # kern-sandbox (Node.js / TypeScript)
 
-**[kern](https://getkern.dev)** is a fast, rootless sandbox and virtual resource
-runtime for any workload, including untrusted and AI-generated code: a real, kernel-enforced box
-that starts in **~3.5 ms** from an OCI image, out of one static binary, with no daemon.
-**kern-sandbox**
-is its Node / TypeScript binding: run untrusted or agent-generated code in a fresh, isolated box, from Node.
+**Run AI-generated code in a real sandbox, one fresh box per call, in about 4 ms.**
 
-On npm: [`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). For Python, the same
-package is on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/).
+`kern-sandbox` is the Node and TypeScript binding for **[kern](https://getkern.dev)**: a rootless,
+kernel-enforced sandbox out of one static binary, with no daemon, no VM and no cloud. An agent's
+tool-call, a model's generated snippet, a CI step: code that runs before anyone reads it gets its own
+box, and the box is thrown away after.
 
-It is a thin, dependency-free wrapper around the [`kern`](https://github.com/getkern/kern) binary:
-a fresh, isolated box per call, network off by default, hard resource caps, and a timeout the binding
-itself enforces. Kernel-enforced isolation (namespaces, cgroups v2, seccomp), local, with no cloud, no account, no VM.
+Network off, memory and PID caps the kernel enforces, capabilities dropped, a deny-by-default seccomp
+allowlist, and a wall-clock deadline the binding applies from **outside** the box, so code that hangs
+cannot outlive it. Dependency-free: it shells out to the `kern` binary and does not re-implement
+isolation in JavaScript.
+
+**The failure comes back as data, not as an exception.** A timeout, an OOM-kill, a blocked syscall or
+a missing interpreter is a typed `fault` on the result, beside stdout and the exit code, so an agent
+loop reads a field instead of parsing a stack trace to learn that the sandbox ended the run.
+
+On npm: [`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). Python gets the same
+package on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/), which also ships an **MCP
+server** for Claude Desktop and Cursor.
 
 ```js
 const kern = require("kern-sandbox");

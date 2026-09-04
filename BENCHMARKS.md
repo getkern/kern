@@ -42,22 +42,24 @@ kern ran there as the same static binary, copied over.
 The table above is one session. This is the same question asked 23 times, because the answer moved
 with how it was asked and the size of the margin was never stable enough to quote.
 
-**27 replicas, 100,000 box starts, on a machine measured idle** (CPU busy read from `/proc/stat` over
+**31 replicas, 108,000 box starts, on a machine measured idle** (CPU busy read from `/proc/stat` over
 two seconds, not from a load average that carries a minute of history). **The direction has never once
-flipped**: kern led in 457 of 460 batches over the first 23, and in 78 of 80 over the four most recent.
-What moves between sessions is the SIZE, and it moves by more than the size itself.
+flipped**: kern led in 457 of 460 batches over the first 23, and in **158 of 160** over the eight most
+recent. What moves between sessions is the SIZE, and it moves by more than the size itself.
 
-The most recent four, on the quietest machine yet (0.6% busy), on the v0.9.0 code:
+The eight most recent, on the v0.9.0 code, machine at 0.6% to 1.8% busy (medians of the four in each
+row):
 
 | scheduler | kern | bubblewrap | margin |
 |---|---:|---:|---:|
-| free | **2.40 ms** | 2.53 ms | +5.3% |
-| pinned to one core | **1.76 ms** | 1.84 ms | +4.2% |
+| free | **2.41 ms** | 2.56 ms | +5.9% |
+| pinned to one core | **1.78 ms** | 1.86 ms | +4.4% |
 
-Earlier sessions, on the same machine at 0.9% to 1.4% busy, read **+9.2%** and **+10.9%** free and
-**+6.6%** pinned. So the honest statement is a RANGE, 4% to 11%, and the number quoted elsewhere in
-this repository is the bottom of it. A margin that moves this much between sessions is not a figure to
-carry to one decimal place, and quoting the best session would be picking the sample that flatters.
+The four replicas within that were tight: +5.3, +5.1, +6.7 and +5.2 free, +4.1, +4.3, +4.4 and +3.8
+pinned. Earlier sessions on the same machine read **+9.2%** and **+10.9%** free and **+6.6%** pinned.
+So the honest statement is a RANGE, 4% to 11%, and the number quoted elsewhere in this repository is
+the bottom of it. A margin that moves this much between sessions is not a figure to carry to one
+decimal place, and quoting the best session would be picking the sample that flatters.
 
 Both runtimes get roughly 0.6 ms faster with the core pinned, because the cache stays warm, and the
 margin compresses with them: **part of what looks like a code difference is scheduling.** These rows

@@ -150,6 +150,45 @@ Every read verb also answers in JSON, so nothing has to parse a table:
 kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
 ```
 
+## Run an agent's code: Python, Node, MCP
+
+An agent needs somewhere to run what the model just wrote.
+**[`kern-sandbox`](bindings/python/README.md)** is that place, called from your own program: a thin,
+dependency-free wrapper over the `kern` binary. Every call runs in a fresh isolated box, with the
+network off, memory and pid caps, capabilities dropped, output bounded, and a timeout the binding
+enforces itself.
+
+```sh
+pip install kern-sandbox        # PyPI   · needs the `kern` binary above, on PATH or $KERN_BIN
+npm  install kern-sandbox       # npm    · same
+```
+
+```python
+from kern_sandbox import run_code
+
+r = run_code("import platform; print(platform.python_version())")
+print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
+```
+
+- **Faults are data, not exceptions**: a timeout, OOM-kill or blocked syscall is a field on the
+  result, not a raise. A fresh box per call by default; `Sandbox` keeps a workspace across calls and
+  a warm `kernel()` keeps one interpreter for sub-millisecond cells (weaker isolation, by choice).
+- **Rich results without a Jupyter kernel**: the last expression, `display()` and matplotlib figures
+  come back captured, like a notebook cell.
+- Ships an **MCP server** (`kern-mcp`): a dependency-free stdio server that gives Claude Desktop,
+  Cursor or any MCP client a local code interpreter. Point the client at it:
+
+```json
+{ "mcpServers": { "kern": { "command": "kern-mcp" } } }
+```
+
+Tools: `run_code` (python/bash/node), `write_file`, `read_file`, `list_files`. Each call is a fresh
+network-off box; files persist across calls in a workspace on disk. Setup command, image and the
+other options: [bindings/python/README.md](bindings/python/README.md).
+
+Full API, Python and Node: [bindings/python/README.md](bindings/python/README.md) ·
+[bindings/node/README.md](bindings/node/README.md).
+
 ## Stacks
 
 One file, one command. kern reads its own format, and it reads the `docker-compose.yml` you already
@@ -217,45 +256,6 @@ kern compose stack.toml stop web           # one service; the rest keep running
 Official images that drop to a non-root user (postgres, redis, ...) want `uidmap` and an
 `/etc/subuid` line, and outbound pulls want `pasta`; both are one `apt install`, and `kern doctor`
 names either if it is missing. This is the local dev loop, not a production orchestrator.
-
-## Run an agent's code: Python, Node, MCP
-
-An agent needs somewhere to run what the model just wrote.
-**[`kern-sandbox`](bindings/python/README.md)** is that place, called from your own program: a thin,
-dependency-free wrapper over the `kern` binary. Every call runs in a fresh isolated box, with the
-network off, memory and pid caps, capabilities dropped, output bounded, and a timeout the binding
-enforces itself.
-
-```sh
-pip install kern-sandbox        # PyPI   · needs the `kern` binary above, on PATH or $KERN_BIN
-npm  install kern-sandbox       # npm    · same
-```
-
-```python
-from kern_sandbox import run_code
-
-r = run_code("import platform; print(platform.python_version())")
-print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
-```
-
-- **Faults are data, not exceptions**: a timeout, OOM-kill or blocked syscall is a field on the
-  result, not a raise. A fresh box per call by default; `Sandbox` keeps a workspace across calls and
-  a warm `kernel()` keeps one interpreter for sub-millisecond cells (weaker isolation, by choice).
-- **Rich results without a Jupyter kernel**: the last expression, `display()` and matplotlib figures
-  come back captured, like a notebook cell.
-- Ships an **MCP server** (`kern-mcp`): a dependency-free stdio server that gives Claude Desktop,
-  Cursor or any MCP client a local code interpreter. Point the client at it:
-
-```json
-{ "mcpServers": { "kern": { "command": "kern-mcp" } } }
-```
-
-Tools: `run_code` (python/bash/node), `write_file`, `read_file`, `list_files`. Each call is a fresh
-network-off box; files persist across calls in a workspace on disk. Setup command, image and the
-other options: [bindings/python/README.md](bindings/python/README.md).
-
-Full API, Python and Node: [bindings/python/README.md](bindings/python/README.md) ·
-[bindings/node/README.md](bindings/node/README.md).
 
 ## Resource profiles
 
@@ -327,39 +327,30 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 
 ## Performance
 
-Intel i7-14700KF, Linux 7.0.0, the release binary, one script you can run yourself:
-`python3 examples/benchmark.py`. Yours will differ with your CPU, kernel and filesystem.
+Intel i7-14700KF, Linux 7.0.0, the release binary. Reproduce with `sh scripts/bench-idle.sh 4` for the
+first row and `python3 examples/benchmark.py` for the rest.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.5 ms** | ~2.5 ms | ~13.1 ms | ~297 ms | ~288 ms |
+| Cold start (bare box) | **~2.4 ms** | ~2.5 ms | ~13.1 ms | ~297 ms | ~288 ms |
 | 200 boxes in parallel | **~0.11 s** | ~0.13 s | ~0.29 s | ~43.1 s | ~16.7 s |
 
 Three thousand at once take ~2.2 s, and a live box costs ~0.3 MB of memory.
 
-The bubblewrap column is namespace-matched, or it is not a comparison. `kern box` always makes a
-network namespace, and a bwrap invocation without `--unshare-net` is doing less work:
+**kern is faster than bubblewrap, by about 5%, and it takes care to show it.** Timed one runtime after
+the other, both read 2.5 ms: the gap is smaller than the drift between two batches minutes apart. With
+ALTERNATING batches on an idle machine they separate cleanly, kern at **2.41 ms against 2.56**, and
+over the eight most recent replicas kern led in **158 of 160 batches**. Across 31 replicas the
+direction has never once flipped, while the size ranged from 4% to 11% between sessions, so the number
+quoted is the bottom of that range. kern does more in
+that time: a seccomp filter, a registry entry, and a cgroup cap bubblewrap never applies.
 
-```sh
-bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net \
-      --bind <rootfs> / --proc /proc --dev /dev /bin/true
-```
+bwrap is namespace-matched, or it is not a comparison, and gets
+`--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net`. It is a launcher rather than
+a runtime, and fractions of a millisecond are not why you would pick either: **the gap that means
+something is the one to the engines**, two orders of magnitude above.
 
-Two honest notes. **The margin over bubblewrap is real and small, and the table above cannot see
-it**: measured one runtime after the other, like the script does, the two read the same 2.5 ms. It
-takes ALTERNATING batches to separate them, and then kern leads by about **5%** (2.40 ms against 2.53)
-with the scheduler free and about **4%** with the core pinned, where both get roughly 0.6 ms faster
-because the cache stays warm. Across 27 replicas the direction has never once flipped, and the size
-has ranged from 4% to 11% between sessions, which is why the small number is the one quoted here.
-kern is doing more work in that time: a seccomp filter, a registry entry, and a cgroup cap bubblewrap
-never applies. Both columns run WITHOUT a cgroup
-cap, which is what makes them the same job; the default `kern box` adds one. bubblewrap is a
-launcher, not a runtime, and fractions of a millisecond are not why you would pick either. **The gap that means
-something is to the engines**, two orders of magnitude above. On aarch64 the same matched comparison
-puts kern 21% ahead of bubblewrap, and the default slower, for a reason worth reading before quoting
-either number: [BENCHMARKS.md](BENCHMARKS.md).
-
-The table and how to reproduce it: **[BENCHMARKS.md](BENCHMARKS.md)**.
+Method, the aarch64 boards, and every caveat: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ## Security
 
