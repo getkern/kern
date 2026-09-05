@@ -200,6 +200,15 @@ because a word in backticks is a symbol and not the document's voice. The reason
 commercial rather than aesthetic: readers who see one of those words decide a model wrote the page
 and stop, before checking a single measurement.
 
+## Run `sh scripts/gate.sh`, not the commands by hand
+
+It runs what CI runs, with the flags CI runs them with, and prints the clippy version it used.
+
+The reason it exists is one line: **`cargo clippy` without `RUSTFLAGS=-D warnings` exits 0 on a tree
+that fails CI.** The lint is still printed, as a warning, and the exit code says nothing happened.
+That cost two red CI runs on a release branch inside one hour, both from typing the command by hand
+and dropping the flag, and both times the local answer was a confident green.
+
 ## Run `rustup update stable` before trusting a green clippy
 
 CI pins `stable`, which means whatever stable is on the day it runs. A local toolchain one release

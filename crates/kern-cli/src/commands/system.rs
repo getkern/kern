@@ -26,45 +26,6 @@ pub fn help() -> Result<(), Error> {
 /// text per verb is the obvious fix and the wrong one, because two texts describing one parser
 /// drift, which is the defect class this project keeps paying for. So there is still exactly one
 /// text and [`help_for`] filters it.
-
-/// Does this line of the command reference declare `verb`?
-///
-/// Matching the FIRST token was not enough, and the three it missed are the three that are documented
-/// as the second half of a pair: `kill <name>... | killall`, `up … / down`, and
-/// `login [registry] … / logout [registry]`. Each of those is a real verb the parser accepts, and
-/// each answered `kern <verb> --help` with the entire 184-line reference, because nothing matched and
-/// the caller falls back to printing everything.
-///
-/// So the head of the line is read instead: the part before the description column, with `<…>`, `[…]`
-/// and `(…)` removed so a placeholder or an option list cannot supply a false match. `volume
-/// <create|rm|edit|prune>` therefore declares `volume` and not `rm`, which is a different verb with
-/// its own line.
-fn line_declares_verb(trimmed: &str, verb: &str) -> bool {
-    // The description is separated by two or more spaces; everything before it names the command.
-    let head = match trimmed.find("  ") {
-        Some(i) => &trimmed[..i],
-        None => trimmed,
-    };
-    let mut depth = 0i32;
-    let mut token = String::new();
-    let mut found = false;
-    for ch in head.chars().chain(std::iter::once(' ')) {
-        match ch {
-            '<' | '[' | '(' => depth += 1,
-            '>' | ']' | ')' => depth = (depth - 1).max(0),
-            c if depth == 0 && (c.is_ascii_alphanumeric() || c == '-') => token.push(c),
-            _ if depth == 0 => {
-                if token == verb {
-                    found = true;
-                }
-                token.clear();
-            }
-            _ => {}
-        }
-    }
-    found
-}
-
 fn help_text(p: &crate::ui::Palette) -> String {
     let (b, c, d, z) = (p.b, p.c, p.d, p.z);
     // The compose sub-verbs come from COMPOSE_VERBS, so help cannot describe a set of verbs the
@@ -254,6 +215,44 @@ fn help_text(p: &crate::ui::Palette) -> String {
 {d}Docs & issues: {z}{c}https://github.com/getkern/kern{z}",
         ver = kern_common::VERSION
     )
+}
+
+/// Does this line of the command reference declare `verb`?
+///
+/// Matching the FIRST token was not enough, and the three it missed are the three that are documented
+/// as the second half of a pair: `kill <name>... | killall`, `up … / down`, and
+/// `login [registry] … / logout [registry]`. Each of those is a real verb the parser accepts, and
+/// each answered `kern <verb> --help` with the entire 184-line reference, because nothing matched and
+/// the caller falls back to printing everything.
+///
+/// So the head of the line is read instead: the part before the description column, with `<…>`, `[…]`
+/// and `(…)` removed so a placeholder or an option list cannot supply a false match. `volume
+/// <create|rm|edit|prune>` therefore declares `volume` and not `rm`, which is a different verb with
+/// its own line.
+fn line_declares_verb(trimmed: &str, verb: &str) -> bool {
+    // The description is separated by two or more spaces; everything before it names the command.
+    let head = match trimmed.find("  ") {
+        Some(i) => &trimmed[..i],
+        None => trimmed,
+    };
+    let mut depth = 0i32;
+    let mut token = String::new();
+    let mut found = false;
+    for ch in head.chars().chain(std::iter::once(' ')) {
+        match ch {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth = (depth - 1).max(0),
+            c if depth == 0 && (c.is_ascii_alphanumeric() || c == '-') => token.push(c),
+            _ if depth == 0 => {
+                if token == verb {
+                    found = true;
+                }
+                token.clear();
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// `kern <verb> --help`: the lines of the full reference that describe THAT verb.
