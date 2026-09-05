@@ -32,7 +32,24 @@ paired batches**. Fifteen would be a tie. An earlier run of the same harness at 
 +0.101 and 0 of 14.
 
 So the gap is between 0.10 and 0.18 ms depending on how it is measured, and it is not variance in
-either. The 2.4 ms this file used to quote is still v0.9.0's number; it is not v0.9.1's. `strace -c`
+either. The 2.4 ms this file used to quote is still v0.9.0's number; it is not v0.9.1's.
+
+**No compiler flag takes it back, and that is the confirmation rather than the disappointment.**
+`Cargo.toml` justifies `opt-level = "z"` by asserting that this start is syscall-bound rather than
+CPU-bound. Tested directly: a third binary built with the release configuration PLUS
+`-C target-cpu=native`, on the i7-14700KF it was built for, run in the same harness in the same
+session as the other two.
+
+| | free | pinned |
+|---|---:|---:|
+| v0.9.1, `target-cpu=native` | 2.563 ms | 1.955 ms |
+| v0.9.1, the portable release build | 2.572 ms | 1.983 ms |
+| v0.9.0 | 2.449 ms | 1.799 ms |
+
+The most aggressive codegen this machine can produce buys 0.009 ms free and 0.028 pinned, which is
+inside the run-to-run drift: v0.9.0 itself read 2.407 in one run and 2.449 in the next. The
+assertion in `Cargo.toml` now has a measurement under it, and the 0.15 ms is where the profiler said
+it was, in a `mkdir` and an `rmdir` on cgroupfs. `strace -c`
 puts the two within two syscalls of each other, 962 against 964, and the difference is one extra
 `mkdir` and one extra `rmdir`: the supervisor's sibling cgroup, `kern-box-<name>-<pid>-sup`.
 
