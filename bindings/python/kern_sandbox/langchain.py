@@ -849,7 +849,15 @@ def _cap_drop_to_bool(v):
 _SANDBOX_ALIASES = {
     "timeout_s": ("command_timeout", lambda v: v),  # seconds on both sides
     "memory_mb": ("memory_bytes", _mib_to_bytes),
-    "network": ("network_enabled", lambda v: None if v is None else bool(v)),
+    # `bool(v)` with NO `None` passthrough, unlike `memory_mb` and `pids` above. On those, `None`
+    # means "uncapped" on BOTH sides and is a value a caller writes on purpose. `Sandbox.network` is
+    # `bool = False`: `None` is not one of its values, so passing it through would set a field declared
+    # `bool` to `None`. A reviewer flagged this as the same class as the `cap_drop` bug and ranked it
+    # first, on the assumption that langchain's `network_enabled` might default to True. Measured, it
+    # does not: the field is ours, defaults False, and is read as `"host" if network_enabled else
+    # "none"`, so `None` was falsy and produced `--net none`. The defect was a type lie, not an open
+    # network. `bool(None)` is `False`, which is both correct and the declared type.
+    "network": ("network_enabled", bool),
     "pids": ("pids_limit", lambda v: v),  # task ceiling, None = uncapped, on both sides
     "cap_drop": ("drop_all_capabilities", _cap_drop_to_bool),
 }

@@ -105,6 +105,20 @@ CASES: list[Case] = [
      lambda t: t + '\nfn _selftest2() {\n    eprintln!(\n        "\u2713 done {}",\n        1\n    );\n}\n'),
     ("progress-is-tty-gated", "a bare progress line in the libc-only crate", "crates/kern-isolation/src/ports.rs",
      lambda t: t + '\nfn _selftest3() { eprintln!("\u2192 publishing a port"); }\n'),
+    # The case the MARKER version of this gate passed and the scoped version catches: progress with no
+    # marker at all. A reviewer predicted it; running the scoped gate then found seven real ones.
+    ("progress-is-tty-gated", "progress with no marker, which the old gate passed",
+     "crates/kern-cli/src/commands/build.rs",
+     lambda t: t + '\nfn _selftest4() { eprintln!("[1/3] building the thing"); }\n'),
+    # A diagnostic with no `kern: ` prefix is invisible to the SDK, which is how three live ones hid.
+    ("progress-is-tty-gated", "a warning with no kern: prefix",
+     "crates/kern-cli/src/commands/images.rs",
+     lambda t: t + '\nfn _selftest5() { eprintln!("warning: something the SDK cannot attribute"); }\n'),
+    # The Rust line-continuation shape that DOTALL fixed. Without it the regex skips the real format
+    # string and matches a later literal in the argument list, in either direction.
+    ("progress-is-tty-gated", "a bad line whose string is continued with a backslash",
+     "crates/kern-oci/src/push.rs",
+     lambda t: t + '\nfn _selftest6() {\n    eprintln!(\n        "uploading {} of \\\n         {}",\n        1, 2\n    );\n}\n'),
     # --- stale-numbers: one case per arm ---
     ("stale-numbers", "a retired figure (Docker's old footprint)", "SECURITY.md",
      prepend("Docker's resident memory is ~186 MB.")),

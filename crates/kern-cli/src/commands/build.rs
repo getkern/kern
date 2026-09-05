@@ -268,7 +268,9 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     let capture = crate::builds::Capture::start(&id);
     for w in &warns {
         if !args.quiet {
-            eprintln!("warning: {w}");
+            // `kern: warning:`, like every other diagnostic: the SDK separates kern's voice from
+            // the workload's by that prefix, and a bare `warning:` is invisible to it.
+            kern_common::progress!("kern: warning: {w}");
         }
     }
     let t0 = std::time::Instant::now();
@@ -355,7 +357,7 @@ fn build_multi_stage(
     let ms_key = flat_image_key("multistage", instrs, ctx, &ms_ctx_root, ms_ig.as_ref());
     if flat_cache_hit(tag, &ms_key) {
         if !quiet {
-            eprintln!("  [cached · multi-stage image unchanged]");
+            kern_common::progress!("  [cached · multi-stage image unchanged]");
         }
         announce_built(tag);
         return Ok(());
@@ -489,7 +491,7 @@ fn build_run(
     // `build_run` builds ONE stage. A multi-stage Dockerfile is orchestrated by `build_multi_stage`,
     // which calls us once per stage with a single-stage slice - so we never see a second FROM here.
     if !quiet {
-        eprintln!("[1/{total}] FROM {base_ref}");
+        kern_common::progress!("[1/{total}] FROM {base_ref}");
     }
     let (base_lower, base_cfg) = resolve_image(base_ref)?;
     let mut config = base_cfg;
@@ -545,7 +547,7 @@ fn build_run(
     // fallback (slower + a full base copy) never looks like "layered but big".
     if layered {
         if !quiet {
-            eprintln!("  [layered · base shared, no copy]");
+            kern_common::progress!("  [layered · base shared, no copy]");
         }
         return build_layered_cached(quiet, tag, ctx, work, instrs, base_ref, &base_lower, config);
     }
@@ -562,7 +564,7 @@ fn build_run(
     let flat_key = flat_image_key(&base_lower, instrs, ctx, &ctx_root, ig.as_ref());
     if flat_cache_hit(tag, &flat_key) {
         if !quiet {
-            eprintln!("  [cached · flat image unchanged]");
+            kern_common::progress!("  [cached · flat image unchanged]");
         }
         announce_built(tag);
         return Ok(());
@@ -575,7 +577,7 @@ fn build_run(
         // field report measured 2m49s and 1.9 GB per build and could not tell whether that was kern
         // or their host. It is neither; it is whether this filesystem does copy-on-write.
         let cow = supports_reflink(work);
-        eprintln!(
+        kern_common::progress!(
             "  [flat · {}, copying the base{}]",
             flat_because.map_or("no layered build", FlatReason::why),
             match cow {
@@ -597,7 +599,7 @@ fn build_run(
 
     let announce = |s: usize, what: String| {
         if !quiet {
-            eprintln!("[{s}/{total}] {what}");
+            kern_common::progress!("[{s}/{total}] {what}");
         }
     };
     let mut cmd_from_dockerfile = false;
@@ -796,7 +798,7 @@ fn build_layered_cached(
     let total = instrs.len();
     let announce = |s: usize, what: String| {
         if !quiet {
-            eprintln!("[{s}/{total}] {what}");
+            kern_common::progress!("[{s}/{total}] {what}");
         }
     };
     // Overlay lower chain (base first); a layer dir is appended per fs-unit. `key` is the running

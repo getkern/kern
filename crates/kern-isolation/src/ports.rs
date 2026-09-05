@@ -294,7 +294,9 @@ fn announce(m: &PortMap) {
         if m.udp { "/udp" } else { "" }
     );
     if ip == 0 {
-        eprintln!("  warning: bound 0.0.0.0 - box port {bp} is reachable from the network");
+        // `kern: warning:` and not a bare `warning:`, for the reason the images.rs note carries: the
+        // SDK tells kern's lines from the workload's by that prefix and nothing else.
+        eprintln!("kern: warning: bound 0.0.0.0 - box port {bp} is reachable from the network");
     }
 }
 

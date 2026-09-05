@@ -194,8 +194,11 @@ pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(
     kern_oci::pull(image, &dest, plat.as_ref()).map_err(|e| Error::Oci(e.to_string()))?;
     if let Some(p) = &plat {
         if !p.is_host() {
+            // `kern: note:` and not a bare `note:`. The SDK reads kern's voice off a shared stderr by
+            // that prefix, so a diagnostic without it is indistinguishable from something the
+            // workload printed and lands in the model's context as if the code had produced it.
             eprintln!(
-                "note: pulled linux/{} - it won't run natively on this {} host without a qemu-user + binfmt handler",
+                "kern: note: pulled linux/{} - it won't run natively on this {} host without a qemu-user + binfmt handler",
                 p.as_oci_arch(),
                 kern_oci::Platform::host().as_oci_arch()
             );

@@ -72,9 +72,25 @@ message on hosts where it never printed, and one new `kern box` flag. The CLI ch
   thought of as progress, including the port-publishing path that every `-p` box hits. The gate reads
   the whole macro call, covers both crates, and self-tests through `gates-selftest.py`.
 
-  This is the source-side half of the diagnostic-noise fix. The SDK's prefix classifier stays as the
-  consumer-side half: it still catches `kern: note:`/`warning:` lines, which legitimately reach a pipe,
-  and it still works against an older kern binary.
+  These are NOT two layers over one problem, and calling the prefix classifier a "consumer-side
+  complement" to this gate overstated the arrangement. They cover disjoint sets. Progress must not
+  reach a pipe, so the TTY gate closes it at the source and the classifier never sees one. A warning
+  MUST reach a pipe, which is what a warning is for, so the gate deliberately passes it and the prefix
+  classifier is the ONLY mechanism for that class. The auditor's objection, that the next diagnostic
+  will not be in the list, is therefore unmitigated for warnings rather than half-mitigated.
+
+  What bounds it is that kern's own lines are required to carry `kern: `, and three that did not were
+  fixed in this release (below). A file descriptor per writer is the only thing that would remove the
+  convention entirely; it is not built, and the honest statement is that this class rests on a
+  convention plus a gate over the modules an SDK caller's stderr is made of.
+
+- **Three diagnostics were invisible to the SDK because they lacked the `kern: ` prefix.** A bare
+  `warning: bound 0.0.0.0 - box port N is reachable from the network` (every `-p 0.0.0.0` box), a bare
+  `note: pulled linux/arm64 ...` (every cross-architecture pull) and a bare `warning:` from `kern
+  build` reached `code_stderr` as though the workload had printed them. Five `kern compose:` lines had
+  a near-miss prefix that matches neither the benign list nor the failure marker, and are now
+  `kern: warning: compose:` / `kern: note: compose:`. Found by the gate above once it was scoped to
+  whole modules instead of to a set of leading markers.
 
 - **A cgroup probe printed systemd's bus error onto kern's stderr.** To find out whether a delegated
   slice can be made, kern runs `systemd-run ... -- true` and reads the answer from the exit status. Its

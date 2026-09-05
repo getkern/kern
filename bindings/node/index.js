@@ -514,14 +514,42 @@ class ExecutionResult {
    *
    * This is what belongs in a model's context. A workload CAN forge one of kern's prefixes, and the
    * consequence is its own line moving to {@link runtimeNotes}: the trick removes its text from this
-   * field, it cannot inject text into it. Mirrors `ExecutionResult.code_stderr` in Python. */
+   * field, it cannot inject text into it.
+   *
+   * The guarantee is LINE-ALIGNED, not absolute: a workload that leaves a line unterminated and is
+   * then interleaved with a `kern: warning:` on the shared stderr produces one line starting with the
+   * workload's text, which no prefix matches, so kern's warning lands here framed by bytes the
+   * workload chose. Racy rather than reliable, and in the less harmful direction, but real. Mirrors
+   * `ExecutionResult.code_stderr` in Python. */
   get codeStderr() {
-    return codeStderr(this.stderr);
+    return this._splitStderr()[0];
+  }
+  /** Partition `stderr` ONCE into [what the code wrote, the lines kern wrote].
+   *
+   * One pass and one cache, mirroring `_split_stderr` in Python. The two public halves are a single
+   * partition, so computing them separately left two filters that had to agree by inspection rather
+   * than by construction; and each was O(n) on every read, measured at 13.9 ms on a 200k-line stderr
+   * in the Python binding before this. Keyed on the string it partitioned, so reassigning `stderr`
+   * recomputes rather than serving a stale answer. Non-enumerable, so it stays out of JSON and out of
+   * anything that walks the result's own keys. */
+  _splitStderr() {
+    const raw = String(this.stderr || "");
+    if (this._stderrSplit && this._stderrSplit[0] === raw) {
+      return [this._stderrSplit[1], this._stderrSplit[2]];
+    }
+    const kept = [];
+    const notes = [];
+    for (const line of raw.split("\n")) (isKernDiagnostic(line) ? notes : kept).push(line);
+    const joined = kept.join("\n");
+    Object.defineProperty(this, "_stderrSplit", {
+      value: [raw, joined, notes], writable: true, enumerable: false, configurable: true,
+    });
+    return [joined, notes];
   }
   /** The lines on `stderr` that KERN wrote, the complement of {@link codeStderr}. Reported rather
    * than removed: `stderr` still holds every byte in its original order. */
   get runtimeNotes() {
-    return runtimeNotes(this.stderr);
+    return this._splitStderr()[1].slice();
   }
 }
 
@@ -847,25 +875,7 @@ function isKernDiagnostic(line) {
   return KERN_DIAGNOSTICS.some((p) => s.startsWith(p));
 }
 
-/** `stderr` with kern's own diagnostics removed: what the user's code actually wrote.
- *
- * The box's launcher and the workload share one stderr, so a note about overlayfs or an undelegated
- * cgroup arrives interleaved with the code's output. That is fine for a human reading a terminal and
- * wrong for anything that feeds stderr to a model, where it costs context and can be mistaken for the
- * program's own errors. Nothing is hidden: `stderr` still holds every byte in its original order. */
-function codeStderr(stderr) {
-  return String(stderr || "")
-    .split("\n")
-    .filter((ln) => !isKernDiagnostic(ln))
-    .join("\n");
-}
 
-/** The lines on `stderr` that kern wrote, the complement of {@link codeStderr}. */
-function runtimeNotes(stderr) {
-  return String(stderr || "")
-    .split("\n")
-    .filter((ln) => isKernDiagnostic(ln));
-}
 
 function looksLikeStartupFailure(stderr) {
   const markers = [

@@ -232,7 +232,7 @@ pub fn pull(
         // the deterministic tmp name covers a panicked thread).
         if let Err(e) = process_layer(&tmp, &layers[i], dest, i + 1, total) {
             if let Some(h) = next.take() {
-                eprintln!(
+                kern_common::progress!(
                     "✗ layer {}/{total} failed - stopping the in-flight prefetch…",
                     i + 1
                 );

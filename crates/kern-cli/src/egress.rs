@@ -739,10 +739,11 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
     // visible. The audit then ran the probe on its own host and both rows stood.
     //
     // A guard written for either row alone would be wrong on the other kernel: checking the bind's errno
-    // misses 7.0, and trusting a successful bind misses nothing but proves nothing. Readiness has to mean
-    // reachable, not bound. So this checks the interface the connections will arrive over, before and
-    // independently of the bind, and dies if it is not up, which the launcher reads as EOF and turns into
-    // a refusal. That covers both rows for the same reason rather than by handling two cases.
+    // passes the whole 7.0 row, where the bind succeeds and nothing can reach the port. What makes ONE
+    // check right on both is that `IFF_UP` is a property of the interface the connections arrive over,
+    // rather than the outcome of one syscall, and the two kernels disagree only about the syscall. So
+    // this reads the interface, before and independently of the bind, and dies if it is not up, which
+    // the launcher reads as EOF and turns into a refusal.
     if !kern_isolation::bring_loopback_up() {
         eprintln!(
             "kern: egress pump: the box's loopback is down and could not be raised, so nothing in \

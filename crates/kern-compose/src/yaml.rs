@@ -3307,7 +3307,7 @@ fn build_value(node: &Node) -> BuildDirective {
 /// Emit a compat warning to stderr. Prefixed so it's clearly kern's compose-import voice, and so the
 /// user sees exactly which part of their compose didn't map 1:1.
 fn warn(msg: &str) {
-    eprintln!("kern compose: {}", sanitize_for_terminal(msg));
+    eprintln!("kern: warning: compose: {}", sanitize_for_terminal(msg));
 }
 
 /// `warn`, but the same text is printed once per run.

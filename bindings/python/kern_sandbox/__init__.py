@@ -623,7 +623,7 @@ class ExecutionResult:
         nothing that used to be visible has become invisible; this and :attr:`code_stderr` are the
         two halves, for callers that need to tell the reporter's voice from the subject's.
         """
-        return [ln for ln in self.stderr.split("\n") if ln.lstrip().startswith(_KERN_DIAGNOSTICS)]
+        return list(self._split_stderr()[1])
 
     @property
     def code_stderr(self) -> str:
@@ -633,14 +633,48 @@ class ExecutionResult:
         kern's by printing the prefix itself, and the consequence of that is its line moving to
         :attr:`runtime_notes`: it cannot use the trick to inject text into this field, only to remove
         its own from it.
+
+        THE OTHER DIRECTION, which the sentence above does not cover and a reviewer named: the split
+        works on lines, so it holds only for LINE-ALIGNED output. A workload that writes a partial line
+        with no trailing newline, and is then interleaved with a `kern: warning:` on the shared stderr,
+        produces ONE line that begins with the workload's text. That line does not match a prefix, so
+        kern's warning lands here, framed by bytes the workload chose. Two writers on one fd make it
+        racy rather than a reliable primitive, and it moves kern's voice into the code's half rather
+        than the reverse, but the guarantee is line-aligned, not absolute. A file descriptor per writer
+        is the only thing that would make it absolute.
         """
-        # `split("\n")` and NOT `splitlines()`, for two independent reasons. It keeps the trailing
-        # newline (`splitlines()` drops the empty final element, so `"a\n"` came back as `"a"` while
-        # the Node binding returned `"a\n"` - a parity gap of exactly the kind the timeout exit code
-        # already had), and it splits on `\n` alone, where `splitlines()` also breaks on `\r`, `\v`,
-        # `\f` and `\x1c`, none of which start a line as far as the two runtimes agree.
-        kept = [ln for ln in self.stderr.split("\n") if not ln.lstrip().startswith(_KERN_DIAGNOSTICS)]
-        return "\n".join(kept)
+        return self._split_stderr()[0]
+
+    def _split_stderr(self) -> "tuple[str, list[str]]":
+        """Partition ``stderr`` ONCE into (what the code wrote, the lines kern wrote).
+
+        One pass and one cache, for two reasons. The two public halves are a single partition, so
+        computing them separately left two filters that had to agree by inspection rather than by
+        construction. And each was O(n) on EVERY read: measured 16 ms on a 200k-line stderr, which one
+        caller paid twice in a single statement before it was spotted.
+
+        Keyed on the IDENTITY of the string it partitioned, so reassigning ``stderr`` recomputes rather
+        than serving a stale answer. Stored through ``__dict__`` to stay out of the dataclass's fields,
+        and therefore out of ``==`` and ``repr``: a cache that changed how two results compare would be
+        a worse bug than the one it saves.
+
+        ``split("\n")`` and NOT ``splitlines()``, for two independent reasons. It keeps the trailing
+        newline (``splitlines()`` drops the empty final element, so ``"a\n"`` came back as ``"a"``
+        while the Node binding returned ``"a\n"`` - a parity gap of exactly the kind the timeout exit
+        code already had), and it splits on ``\n`` alone, where ``splitlines()`` also breaks on
+        ``\r``, ``\v``, ``\f`` and ``\x1c``, none of which start a line as far as the two runtimes
+        agree.
+        """
+        cached = self.__dict__.get("_stderr_split")
+        if cached is not None and cached[0] is self.stderr:
+            return cached[1], cached[2]
+        kept: list[str] = []
+        notes: list[str] = []
+        for line in self.stderr.split("\n"):
+            (notes if line.lstrip().startswith(_KERN_DIAGNOSTICS) else kept).append(line)
+        joined = "\n".join(kept)
+        self.__dict__["_stderr_split"] = (self.stderr, joined, notes)
+        return joined, notes
 
     def __bool__(self) -> bool:
         return self.success

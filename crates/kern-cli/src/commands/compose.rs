@@ -392,7 +392,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             for kv in b.sysctls.iter().filter(|s| s.starts_with("net.")) {
                 let key = kv.split('=').next().unwrap_or(kv);
                 eprintln!(
-                    "kern compose: service '{}': sysctl '{key}' applies to the WHOLE pod (services \
+                    "kern: warning: compose: service '{}': sysctl '{key}' applies to the WHOLE pod (services \
                      share one network namespace) - the last service to start wins; use --no-pod for \
                      per-service network settings",
                     b.name
@@ -809,8 +809,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 eprintln!("{note}");
             }
             if report.up > 0 {
+                // A `kern: note:` and NOT `progress!`, though it opens with the same arrow. Gating it
+                // on a terminal was wrong and a test said so: with `--no-pod` the relays ARE the
+                // mechanism peers reach each other by, so how many came up is state a reader needs,
+                // not narration of a step kern is taking. The prefix keeps it out of a model's context
+                // while a pipe still gets it, which is the split the two mechanisms exist to make.
                 eprintln!(
-                    "\u{2192} {} peer relay(s) up: services reach each other by name without a pod",
+                    "kern: note: {} peer relay(s) up: services reach each other by name without a pod",
                     report.up
                 );
             }

@@ -3712,11 +3712,22 @@ fn shares_our_namespace(pid1: i32, kind: &str) -> bool {
 /// IDEMPOTENT, and that is load-bearing rather than incidental: two processes reach for this on the
 /// same net ns. The box's own init calls it during setup, and the egress pump calls it after joining
 /// the ns from outside, because the pump is handed the box's pid the instant `clone` returns and
-/// cannot wait for an init that is still pivoting its root. Re-raising a flag already set is a no-op,
-/// so whoever arrives second pays an ioctl and nothing else.
+/// cannot wait for an init that is still pivoting its root. Whoever arrives second reads the flag,
+/// finds it set and returns: ONE ioctl, and no write at all. (A first draft of this comment said the
+/// second caller "re-raises a no-op", which describes a simpler implementation than the one here.)
 ///
-/// Returns whether `lo` is UP on the way out, which is what a caller about to `bind(127.0.0.1)`
-/// actually needs to know: `true` also for a loopback that was already up before the call.
+/// Returns whether `lo` carries `IFF_UP` on the way out, `true` included for a loopback something
+/// else had already raised.
+///
+/// `IFF_UP` is the flag and `127.0.0.1` is an address, and a caller about to `bind` needs the second.
+/// They are not the same thing, so this was measured rather than assumed. In a fresh net ns:
+///
+///   before  IFF_UP=0  SIOCGIFADDR=-1 EADDRNOTAVAIL   (no address at all)
+///   after   IFF_UP=1  SIOCGIFADDR=0  127.0.0.1
+///
+/// The kernel assigns the loopback address when the interface comes up, so raising the flag is what
+/// makes the address exist and the flag IS the thing to report. If that ever stops being true on some
+/// kernel, this function is where it breaks, and `SIOCGIFADDR` after the set is the stronger check.
 pub fn bring_loopback_up() -> bool {
     unsafe {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);

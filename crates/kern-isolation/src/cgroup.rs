@@ -1443,8 +1443,23 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
         // dbus as though its own code had produced it. `--quiet` does not cover this: it suppresses
         // systemd-run's info messages, not the bus error.
         //
-        // The other three systemd-run call sites already null both. This one did not, and the leak is
-        // the whole difference between a probe and a command whose failure a user needs to read.
+        // The other three systemd-run call sites already null both. This one did not.
+        //
+        // THE RULE IS A JUDGEMENT AND THERE IS NO MECHANICAL FORM OF IT. Worth writing down, because
+        // two candidates were tried and both are wrong. "A probe, versus a command whose failure a
+        // user reads" is circular. "Whether the exit status is the whole answer" sounds checkable and
+        // is not: 30 call sites in this workspace read only `.status()` while inheriting stderr, and
+        // `tar`, `curl`, `mkfs.ext4` and `ssh-keygen` are all among them and all correct, because a
+        // user who cannot see why tar failed cannot fix it.
+        //
+        // What actually separates this one: its failure is an EXPECTED, HANDLED outcome. "No delegated
+        // slice here" is a normal answer that the caller acts on by taking another path, so there is
+        // nothing for a human to do about the message. Every one of those 30 reports an ABNORMAL
+        // outcome that ends the operation, where the message is the only thing that explains it.
+        //
+        // Since the rule cannot be checked, the exposure is bounded instead:
+        // `scripts/progress-is-tty-gated.py` enforces the shape of what kern writes in the modules an
+        // SDK caller's stderr is actually made of.
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

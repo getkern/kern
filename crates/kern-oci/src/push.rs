@@ -303,7 +303,7 @@ fn upload_blob(
     head.extend_from_slice(&["--connect-timeout", "10", "--max-time", "60"]);
     if let Ok(code) = curl_authed(&head, &head_url, auth) {
         if String::from_utf8_lossy(&code).trim() == "200" {
-            eprintln!("  blob {} already present - skipped", short(digest));
+            kern_common::progress!("  blob {} already present - skipped", short(digest));
             return Ok(());
         }
     }

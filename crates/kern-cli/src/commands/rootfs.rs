@@ -890,7 +890,7 @@ pub(crate) fn resolve_relative_binds(
                     ))
                 })?;
                 eprintln!(
-                    "kern compose: service '{}': created missing bind source '{src}'",
+                    "kern: note: compose: service '{}': created missing bind source '{src}'",
                     b.name
                 );
             }

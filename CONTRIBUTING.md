@@ -213,15 +213,30 @@ crate::progress!("-> publishing {hp} -> box :{bp}");  // kern-isolation, which i
 ```
 
 Both write only when stderr is a terminal, which is the rule the `kern box` status panel already
-followed and the pull path never did. `python3 scripts/progress-is-tty-gated.py` fails the build on a
-progress line that goes out any other way, and it reads the whole macro call rather than one line.
+followed and the pull path never did.
 
-This gate exists because converting the sites by hand missed five of nineteen. Fourteen were found by
-grep; one had its format string on the following line, and four more were in files nobody thought of
-as progress. The one that mattered most was in the port-publishing path, which every `-p` box hits.
+**A diagnostic is the other half of the rule, and it must carry `kern: `.** That prefix is the only
+thing the SDK has to tell kern's voice from the workload's on a shared stderr, so a bare
+`warning: bound 0.0.0.0` reaches an agent's context as a line the program printed. Three such lines
+were live when this was written; five more used `kern compose:`, which matches neither the benign list
+nor the failure marker.
+
+`python3 scripts/progress-is-tty-gated.py` enforces both halves, exhaustively, inside the modules an
+SDK caller's stderr is actually made of: in those files every `eprintln!` is one or the other. It
+reads the whole macro call rather than one line, because the site that first escaped had its format
+string on the following line.
+
+**It is scoped rather than global, and the scope is the judgement.** Its first version instead matched
+a set of leading markers (`->`, `OK`, `  layer `). A reviewer pointed out that this freezes today's
+punctuation rather than the rule, and they were right: rescoping it immediately found seven more
+progress lines written as `[1/3] FROM ...` and `  [cached - ...]`, plus the three unprefixed
+diagnostics. A global rule is not reachable statically, because 55 `eprintln!` calls in the workspace
+print a variable with no literal to inspect. `--audit` lists what it cannot check instead of passing
+it in silence.
 
 **Errors, warnings and `kern: note:` advice are NOT progress.** A pipe is exactly where those must
-still arrive, and the gate does not touch them.
+still arrive. And the two mechanisms are NOT layers over one problem: the TTY gate closes progress at
+the source, and for the warning class the `kern: ` convention is the only mechanism there is.
 
 ## A changelog entry is not a commit message
 

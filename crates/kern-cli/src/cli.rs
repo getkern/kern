@@ -1256,10 +1256,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // `--parallel` is not silently honoured - kern has its own concurrency cap.
                     "--ansi" | "--progress" | "--parallel" => {
                         let v = it.next().map(|v| (*v).to_string()).unwrap_or_default();
-                        eprintln!("kern compose: '{a} {v}' has no effect on kern - ignored");
+                        eprintln!(
+                            "kern: warning: compose: '{a} {v}' has no effect on kern - ignored"
+                        );
                     }
                     "--no-ansi" | "--compatibility" | "--dry-run" => {
-                        eprintln!("kern compose: '{a}' has no effect on kern - ignored");
+                        eprintln!("kern: warning: compose: '{a}' has no effect on kern - ignored");
                     }
                     // `-d`/`--detach` is how almost every Docker user starts a stack, and it is what
                     // kern ALREADY does: `up` starts the services and returns. Accepted SILENTLY,
