@@ -42,6 +42,19 @@ message on hosts where it never printed, and one new `kern box` flag. The CLI ch
   init had already raised, so either order is a success. A test in a fresh net namespace pins the
   asymmetry, with the unreachable state asserted first as its own positive control.
 
+- **`kern_execution_policy(cap_drop=("ALL",))` was disabling the drop it asked for.** Found in a
+  clean-code pass over the aliases added the same day, not by a test. `Sandbox.cap_drop` is a sequence
+  of capability names and the policy's `drop_all_capabilities` is a bool, and the converter compared
+  the value against the STRING `"ALL"`. A tuple is not that string, so `("ALL",)` - which is
+  `Sandbox`'s own default and the spelling anyone copying from the docs writes - produced
+  `drop_all_capabilities=False`. A narrower set like `("SYS_ADMIN", "NET_RAW")` collapsed the same way,
+  its narrowing discarded in silence.
+
+  A convenience alias that quietly weakens a boundary is worse than no alias. The two values with an
+  exact image convert (`("ALL",)` and `()`, in every spelling), and everything else raises, naming the
+  field to set directly. `None` now passes through on `memory_mb` and `pids`, where it means "no cap"
+  on both sides and used to raise a message about `int()`.
+
 - **kern's progress output no longer contaminates a pipe.** Nineteen lines (`-> resolving …`,
   `-> layer …`, `✓ pulled …`, per-service compose bring-up, port publishing) were written with a bare
   `eprintln!` and so went out on kern's stderr whatever was reading it. Under the SDK that stream is the

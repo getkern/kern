@@ -2643,6 +2643,11 @@ def test_a_signal_death_is_reported_as_128_plus_n_not_as_minus_n():
     assert ordinary.fault is None
 
 
+# The prefixes, read FROM the module under test rather than retyped: a test carrying its own copy of
+# the rule agrees with itself and not with the code.
+from kern_sandbox import _KERN_DIAGNOSTICS as NOTE_PREFIXES
+
+
 class TestKernNotesAreNotTheCodesStderr:
     """kern and the workload share ONE stderr, so the raw field carries the launcher's own voice.
 
@@ -2666,8 +2671,13 @@ class TestKernNotesAreNotTheCodesStderr:
             r = ExecutionResult(stdout="", stderr=raw, exit_code=0, duration_ms=0)
             assert r.code_stderr == code, f"code_stderr of {raw!r}"
             assert r.runtime_notes == notes, f"runtime_notes of {raw!r}"
-            # Nothing is invented and nothing is lost: every line lands in exactly one half.
-            assert len(r.code_stderr.split("\n")) + len(r.runtime_notes) == len(raw.split("\n"))
+            # Every line lands in exactly one half. Counted over the LINES kept, not over
+            # `code_stderr.split()`: `"\n".join([])` is `""`, which re-splits to one empty element, so
+            # the string form of this identity is true only when the input ends in a newline. Every
+            # case in this table happens to, which is why it passed while being the wrong assertion.
+            lines = raw.split("\n")
+            kept = [ln for ln in lines if not ln.lstrip().startswith(NOTE_PREFIXES)]
+            assert len(kept) + len(r.runtime_notes) == len(lines)
 
     def test_stderr_itself_is_untouched(self):
         """The operator's field keeps every byte in its original order. `code_stderr` is a second
@@ -2684,3 +2694,74 @@ class TestKernNotesAreNotTheCodesStderr:
         )
         assert r.code_stderr == ""
         assert "forged" in r.runtime_notes[0]
+
+
+class TestTheStderrSplitAtItsEdges:
+    """Extreme inputs to the two halves of `stderr`. The rule is a partition: every line lands in
+    exactly one side, `stderr` keeps every byte, and no input makes the two disagree."""
+
+    def _r(self, stderr):
+        return ExecutionResult(stdout="", stderr=stderr, exit_code=0, duration_ms=0)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "\n",
+            "\n\n\n",
+            "kern: note: a" * 1,
+            "kern: note:",                      # the prefix with nothing after it
+            "kern: note",                       # one character short of the prefix
+            "KERN: NOTE: shouted",              # case matters: not kern's line
+            "kern:  note: two spaces",          # not the prefix either
+            " \t kern: warning: deep indent",
+            "\r\nkern: note: after a crlf\r\n",
+            "kern: note: \x00 with a nul",
+            "kern: note: " + "x" * 100_000,     # one very long note
+            "a\n" * 10_000,                     # many workload lines, no notes
+            "kern: note: n\n" * 10_000,         # many notes, no workload lines
+        ],
+    )
+    def test_the_two_halves_always_partition_and_never_invent(self, raw):
+        r = self._r(raw)
+        assert r.stderr == raw, "stderr must keep every byte"
+        # The invariant is over the LINES, and it has to be, because `"\n".join([])` is `""` and `""`
+        # re-splits to ONE empty element rather than none. Written as
+        # `len(code_stderr.split()) + len(notes) == len(raw.split())` it holds only when the input
+        # happens to end in a newline, and every case here that does not ends in a newline broke it.
+        lines = raw.split("\n")
+        kept = [ln for ln in lines if not ln.lstrip().startswith(NOTE_PREFIXES)]
+        assert r.code_stderr == "\n".join(kept)
+        assert len(kept) + len(r.runtime_notes) == len(lines)
+        # Nothing appears in code_stderr that was not in stderr.
+        for line in kept:
+            assert line in lines
+        # And no line kern wrote survived into what the model reads.
+        for line in r.code_stderr.split("\n"):
+            assert not line.lstrip().startswith(("kern: note:", "kern: warning:", "kern: security-profile="))
+
+    def test_a_crlf_line_keeps_its_carriage_return_on_the_code_side(self):
+        """`splitlines()` would break on the bare `\\r` too and silently drop it. `split("\\n")` keeps
+        the `\\r` attached, which is what the workload actually wrote and what Node also returns."""
+        r = self._r("hello\r\nworld\n")
+        assert r.code_stderr == "hello\r\nworld\n"
+
+    def test_a_note_split_across_a_carriage_return_is_not_a_note(self):
+        """A `\\r` is not a line break here, so a workload cannot use one to smuggle a fake prefix into
+        the middle of its own line and have the whole line disappear from the model's view."""
+        r = self._r("real output\rkern: note: not at line start\n")
+        assert r.runtime_notes == []
+        assert "real output" in r.code_stderr
+
+    def test_a_very_large_stderr_is_scanned_once_per_read_not_per_line(self):
+        """Guards the shape, not the timing: the property must stay linear. A quadratic rewrite (say,
+        repeated string concatenation) would make a 200k-line result unusable rather than merely slow,
+        and the MCP renderer used to read it twice in one statement."""
+        import time
+
+        raw = "riga di output\n" * 200_000
+        r = self._r(raw)
+        start = time.perf_counter()
+        r.code_stderr
+        one = time.perf_counter() - start
+        assert one < 2.0, f"one scan of 200k lines took {one:.2f}s: the split is no longer linear"

@@ -801,12 +801,57 @@ def kern_execution_policy(**kwargs):
 #
 # So both spellings are accepted and the dataclass keeps langchain's names. The alias is translated,
 # never added as a second field: one value, one place, no way for the two to disagree.
+def _mib_to_bytes(v):
+    """``memory_mb`` is MiB (kern's ``--memory 512m``); the policy's ``memory_bytes`` is bytes."""
+    return None if v is None else int(v) * 1024 * 1024
+
+
+def _cap_drop_to_bool(v):
+    """``cap_drop`` is a SEQUENCE and ``drop_all_capabilities`` is a bool, so only two values of the
+    first have an exact image in the second. Everything else is refused.
+
+    This started as `v == "ALL" or v is True`, which is wrong in the direction that costs the most.
+    `cap_drop=("ALL",)` is `Sandbox`'s own DEFAULT and the spelling anyone copying from the SDK docs
+    would write, and a tuple is not the string "ALL", so it produced `drop_all_capabilities=False`: a
+    caller asking for every capability to be dropped got a policy that kept them. A narrower set like
+    `("SYS_ADMIN", "NET_RAW")` collapsed the same way, its narrowing discarded in silence.
+
+    A convenience alias that quietly weakens a boundary is worse than no alias, so the two exact cases
+    convert and the rest raise. The policy has no per-capability control to translate a narrow set INTO;
+    saying so is the honest answer, and it names the field the caller has to use instead.
+    """
+    # Normalise to a tuple of names FIRST, so every branch below compares the same kind of thing. A
+    # bool is not iterable and a str iterates into characters, so both are handled before any
+    # `tuple(v)`: the first draft of this check called `tuple(v)` on whatever arrived and raised
+    # "'bool' object is not iterable" from inside a helper, for an argument the caller could have been
+    # told about directly.
+    if isinstance(v, bool):
+        return v
+    try:
+        names = (v,) if isinstance(v, str) else tuple(v)
+    except TypeError:
+        names = None  # not a sequence at all: falls through to the message below, like a narrow set
+    if names == ("ALL",):
+        return True
+    if names == ():
+        return False
+    raise TypeError(
+        f"cap_drop={v!r} cannot be translated: the policy has a boolean drop_all_capabilities and no "
+        f"per-capability control, so a narrower set has no equivalent. Pass cap_drop=('ALL',) or "
+        f"cap_drop=() for the two cases that do, or set drop_all_capabilities= directly."
+    )
+
+
+# `Sandbox` field -> (policy field, converter). A converter takes the caller's value and returns the
+# policy's, or raises TypeError when the two fields cannot express the same thing. `None` means "no
+# cap" on both sides and is passed through: `int(None)` would otherwise fail with a message about
+# int() rather than about the argument the caller wrote.
 _SANDBOX_ALIASES = {
-    "timeout_s": ("command_timeout", lambda v: v),
-    "memory_mb": ("memory_bytes", lambda v: int(v) * 1024 * 1024),
-    "network": ("network_enabled", bool),
-    "pids": ("pids_limit", lambda v: v),
-    "cap_drop": ("drop_all_capabilities", lambda v: v == "ALL" or v is True),
+    "timeout_s": ("command_timeout", lambda v: v),  # seconds on both sides
+    "memory_mb": ("memory_bytes", _mib_to_bytes),
+    "network": ("network_enabled", lambda v: None if v is None else bool(v)),
+    "pids": ("pids_limit", lambda v: v),  # task ceiling, None = uncapped, on both sides
+    "cap_drop": ("drop_all_capabilities", _cap_drop_to_bool),
 }
 
 

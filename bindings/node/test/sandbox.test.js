@@ -1662,3 +1662,51 @@ test("a forging workload can only remove its own line from codeStderr", () => {
   assert.strictEqual(r.codeStderr, "");
   assert.match(r.runtimeNotes[0], /forged/);
 });
+
+// The same extreme inputs the Python suite runs, because this pair has drifted twice: the timeout
+// exit code agreed on the fault and disagreed on the number, and the first cut of this very split had
+// Python dropping a trailing newline Node kept. A shared table is the only way the two stay honest.
+//
+// The invariant is over the LINES, not over `codeStderr.split("\n")`: joining an empty list gives "",
+// which re-splits to one empty element, so the string form of the identity holds only when the input
+// ends in a newline. Written the other way it passes on a table that happens to, and lies otherwise.
+const NOTE_PREFIXES = ["kern: security-profile=", "kern: warning:", "kern: note:"];
+const EDGE_STDERR = [
+  "",
+  "\n",
+  "\n\n\n",
+  "kern: note: a",
+  "kern: note:",
+  "kern: note",
+  "KERN: NOTE: shouted",
+  "kern:  note: two spaces",
+  " \t kern: warning: deep indent",
+  "\r\nkern: note: after a crlf\r\n",
+  "kern: note:   with a nul",
+  "kern: note: " + "x".repeat(100000),
+  "a\n".repeat(10000),
+  "kern: note: n\n".repeat(10000),
+];
+
+test("the stderr split partitions every edge input, identically to Python", () => {
+  for (const raw of EDGE_STDERR) {
+    const r = new kern.ExecutionResult({ stdout: "", stderr: raw, exitCode: 0, durationMs: 0 });
+    assert.strictEqual(r.stderr, raw, "stderr must keep every byte");
+    const lines = raw.split("\n");
+    const kept = lines.filter((ln) => !NOTE_PREFIXES.some((p) => ln.replace(/^\s+/, "").startsWith(p)));
+    assert.strictEqual(r.codeStderr, kept.join("\n"), `codeStderr of ${JSON.stringify(raw.slice(0, 40))}`);
+    assert.strictEqual(kept.length + r.runtimeNotes.length, lines.length);
+  }
+});
+
+test("a CRLF line keeps its carriage return, and a mid-line prefix is not a note", () => {
+  // `\r` is not a line break here, so a workload cannot smuggle a fake prefix into the middle of its
+  // own line and have the whole line vanish from what the model reads.
+  const a = new kern.ExecutionResult({ stdout: "", stderr: "hello\r\nworld\n", exitCode: 0, durationMs: 0 });
+  assert.strictEqual(a.codeStderr, "hello\r\nworld\n");
+  const b = new kern.ExecutionResult({
+    stdout: "", stderr: "real output\rkern: note: not at line start\n", exitCode: 0, durationMs: 0,
+  });
+  assert.deepStrictEqual(b.runtimeNotes, []);
+  assert.match(b.codeStderr, /real output/);
+});

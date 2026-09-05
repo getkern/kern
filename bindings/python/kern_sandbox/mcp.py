@@ -524,8 +524,12 @@ class _Server:
         # `code_stderr`: the same reason the LangChain renderer uses it. kern and the workload share
         # one stderr, and this string is read by a model, so kern's own `note:`/`warning:` lines are
         # context spent on the runtime's housekeeping and are easy to mistake for the code's errors.
-        if r.code_stderr.strip():
-            take("[stderr]\n" + _clip(r.code_stderr.rstrip(), _MAX_TEXT))
+        # Bound to a local because `code_stderr` is a PROPERTY that rescans the whole stream on every
+        # read: measured 16 ms on a 200k-line stderr, so reading it twice in one statement doubled it.
+        # `stdout` above is a plain field and costs nothing to repeat; this one is not.
+        code_err = r.code_stderr
+        if code_err.strip():
+            take("[stderr]\n" + _clip(code_err.rstrip(), _MAX_TEXT))
         for res in r.results:
             if text_budget <= 0:
                 text_truncated = True

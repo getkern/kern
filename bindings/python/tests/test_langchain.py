@@ -1354,3 +1354,71 @@ class TestBothVocabulariesReachThePolicy:
     def test_an_unknown_name_says_what_would_have_worked(self):
         e = pytest.raises(TypeError, self._policy, memory_gb=1)
         assert "memory_bytes" in str(e.value), "the message must name the accepted spelling"
+
+
+class TestTheAliasesCannotWeakenWhatTheyTranslate:
+    """The edge cases, and one of them was a real defect this suite exists to keep closed.
+
+    An alias translates between two vocabularies. Where the two fields cannot express the same set of
+    values, translating is not a convenience, it is a silent reinterpretation of what the caller asked
+    for, and the direction it fails in is the direction that matters.
+    """
+
+    def _policy(self, **kw):
+        from kern_sandbox.langchain import kern_execution_policy
+
+        return kern_execution_policy(**kw)
+
+    def test_the_sandbox_default_cap_drop_does_not_disable_dropping(self):
+        """THE REGRESSION. `cap_drop=("ALL",)` is `Sandbox`'s own default and the spelling anyone
+        copying from the docs writes. A first draft compared it against the STRING "ALL", so the tuple
+        did not match and the policy came back with `drop_all_capabilities=False`: the caller asked for
+        every capability to be dropped and got a box that kept them."""
+        assert self._policy(cap_drop=("ALL",)).drop_all_capabilities is True
+        assert self._policy(cap_drop="ALL").drop_all_capabilities is True
+        assert self._policy(cap_drop=["ALL"]).drop_all_capabilities is True
+
+    def test_dropping_nothing_is_the_other_exact_case(self):
+        assert self._policy(cap_drop=()).drop_all_capabilities is False
+        assert self._policy(cap_drop=[]).drop_all_capabilities is False
+
+    @pytest.mark.parametrize(
+        "value", [("SYS_ADMIN", "NET_RAW"), ("NET_RAW",), "SYS_ADMIN", ["NET_ADMIN", "SYS_PTRACE"]]
+    )
+    def test_a_narrower_set_is_refused_not_flattened(self, value):
+        """The policy has a boolean and no per-capability control, so a narrow set has no image. The
+        old converter mapped every one of these to False, discarding the narrowing in silence, which
+        reads as "drop nothing" rather than "drop these two"."""
+        with pytest.raises(TypeError, match="no per-capability control|cannot be translated"):
+            self._policy(cap_drop=value)
+
+    @pytest.mark.parametrize("value", [3, None, 3.5, {"a": 1}, object()])
+    def test_a_value_that_is_not_a_sequence_still_gets_OUR_message(self, value):
+        """`tuple(3)` raises "'int' object is not iterable" from inside a helper, which tells the
+        caller nothing about the argument they wrote. Every rejection names the field and the two
+        spellings that work."""
+        with pytest.raises(TypeError, match="cap_drop="):
+            self._policy(cap_drop=value)
+
+    def test_none_means_uncapped_on_both_sides_and_does_not_crash(self):
+        """`memory_mb=None` is "no cap" in `Sandbox` and `memory_bytes=None` is "no cap" in the policy,
+        so it passes through. Multiplying it by 1024*1024 first would have raised a TypeError about
+        int() for a value that is perfectly meaningful."""
+        p = self._policy(memory_mb=None, pids=None, network=None)
+        assert (p.memory_bytes, p.pids_limit) == (None, None)
+
+    def test_the_unit_conversion_is_exact_at_the_defaults(self):
+        """MiB against bytes, checked where an off-by-1024 would be invisible: the two packages'
+        defaults must describe the same cap."""
+        from kern_sandbox import Sandbox
+
+        assert self._policy(memory_mb=Sandbox.memory_mb).memory_bytes == self._policy().memory_bytes
+
+    def test_a_huge_value_survives_the_multiplication(self):
+        assert self._policy(memory_mb=1 << 40).memory_bytes == (1 << 40) * 1024 * 1024
+
+    def test_zero_is_carried_through_to_the_policys_own_validation(self):
+        """0 MiB is not a cap the policy accepts, and the refusal must come from the policy's own
+        check rather than from the alias silently turning it into None or into the default."""
+        with pytest.raises(ValueError, match="must be positive"):
+            self._policy(memory_mb=0)
