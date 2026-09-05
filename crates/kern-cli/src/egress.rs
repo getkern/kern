@@ -727,23 +727,26 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
     // already privileged over it), and it reports success for a loopback the init had already raised.
     //
     // The `_exit` below is the part that matters, and it is here because WHAT a down `lo` does is not
-    // the same on every kernel. Both of these were measured with the same C probe, in a fresh net ns:
+    // the same everywhere. Three hosts, one C probe, a fresh net ns on each:
     //
-    //   6.12.8+, uid 0   lo DOWN: bind=-1 EADDRNOTAVAIL   listen=-1        connect=-1 ENETUNREACH
-    //   7.0.0,  rootless lo DOWN: bind= 0 ok              listen= 0 ok     connect=-1 ENETUNREACH
+    //   6.12.8+, uid 0   lo DOWN: bind=-1 EADDRNOTAVAIL   listen=-1     connect=-1 ENETUNREACH
+    //   6.8.0,   uid 0   lo DOWN: bind= 0 ok              listen= 0 ok  connect=-1 ENETUNREACH
+    //   7.0.0,   rootless lo DOWN: bind= 0 ok             listen= 0 ok  connect=-1 ENETUNREACH
     //
-    // An external audit hit the first row and reported "the bind fails". On this tree that could not be
-    // reproduced, and what turned up instead is the second row, which is worse: bind and listen both
-    // SUCCEED, so the pump takes a port, writes its readiness byte, and the launcher starts the workload
-    // against a proxy no packet can reach. A false green in the very signal added to make this failure
-    // visible. The audit then ran the probe on its own host and both rows stood.
+    // The middle row is why this comment does not say "newer kernels accept the bind". It was written
+    // that way on two data points and the third contradicted it: 6.8 sides with 7.0, not with 6.12,
+    // so whatever makes the bind fail on that host is not the version. It is not established here.
     //
-    // A guard written for either row alone would be wrong on the other kernel: checking the bind's errno
-    // passes the whole 7.0 row, where the bind succeeds and nothing can reach the port. What makes ONE
-    // check right on both is that `IFF_UP` is a property of the interface the connections arrive over,
-    // rather than the outcome of one syscall, and the two kernels disagree only about the syscall. So
-    // this reads the interface, before and independently of the bind, and dies if it is not up, which
-    // the launcher reads as EOF and turns into a refusal.
+    // What IS established is the column that never varies. An external audit hit the first row and
+    // reported "the bind fails"; on this tree the second and third turned up instead, and those are
+    // worse, because bind and listen both SUCCEED. The pump takes a port, writes its readiness byte,
+    // and the launcher starts the workload against a proxy no packet can reach: a false green in the
+    // very signal added to make this failure visible.
+    //
+    // So the guard is built on `connect`, which fails on all three, rather than on `bind`, which
+    // disagrees for a reason nobody has pinned down. `IFF_UP` is a property of the interface the
+    // connections arrive over rather than the outcome of one syscall, so reading it is right on a
+    // host none of us has measured. Readiness means reachable, not bound.
     if !kern_isolation::bring_loopback_up() {
         eprintln!(
             "kern: egress pump: the box's loopback is down and could not be raised, so nothing in \

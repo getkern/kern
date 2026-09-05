@@ -211,52 +211,10 @@ new Sandbox({
 });
 ```
 
-**Writable paths: `/workspace`, `/tmp` and `/dev/shm`.** The box root is read-only, so `/tmp` is a
-64 MiB tmpfs this binding mounts for you. Without it a write naming `/tmp` fails with `EROFS` and
-temp-file helpers fall back to the current directory, quietly putting scratch into your persistent
-workspace where `listFiles` then reports it. The bytes are charged to the box's own memory cgroup, so
-filling `/tmp` OOM-kills the box and never fills the host disk. Resize with `tmpfs: { "/tmp": "512m" }`,
-remove with `tmpfs: {}`, or bind your own directory at `/tmp` through `mounts` and the default steps
-aside (a `:ro` bind included, which leaves `/tmp` read-only: your call, not an accident). **The unit is
-required and the target may not contain a `:`.** kern's CLI takes both spellings and means the
-opposite of what you do: a bare `"64"` is 64 BYTES, `"0"` is UNLIMITED, and `["/scratch:9g"]` mounts
-`/scratch` at 9 GiB rather than a directory by that name. All three measured, all three refused here. A size larger than `memoryMb` is refused for the same family
-of reason: `df` would report it to a program that preflights. The binding's own default is clamped to
-half the cap instead.
-
-**`memoryMb` bounds the cgroup, not the workload's usable memory.** The cap is shared with
-memory-backed filesystems in the same box, and `/dev/shm` is one of them with **no size at all** (the
-kernel's tmpfs default, half of host RAM, so it scales with the machine and not with your config).
-Measured: 200 MiB written there under `memoryMb: 128` OOM-kills the box whatever `/tmp` is set to.
-`tmpfs: { "/dev/shm": ... }` is refused by kern; `mounts` at the same target IS accepted and stacks over
-kern's own mount; measured through it, `multiprocessing.shared_memory` and POSIX semaphores still
-work. Two costs: a plain directory is unbounded on DISK instead of in RAM, so bounding it means
-binding a host directory that is itself a sized tmpfs, and it has no tmpfs lifetime, so what the box
-writes to `/dev/shm` is still on the host after the box dies.
-
-**Scratch does not survive a call.** Each `runCode` is a fresh box, so `/tmp` is fresh too while the
-workspace persists. Put anything a later call must find in the workspace. The `setup` box is the exception: an install needs unbounded scratch, so the default is not
-applied there (an explicit `tmpfs` still is).
-
-**Toolchains in the box** need two writable places, and the error names neither. Go reports `failed to
-initialize build cache at /root/.cache`, which says nothing about `HOME`; npm renders a failed
-`mkdir /root/.npm` as `Invalid response body while trying to fetch https://registry.npmjs.org/...`,
-which reads as a network fault and is not one. Measured on `node:22`: neither -> exit 2, `HOME` alone
-with a read-only `/tmp` -> still exit 2, both -> exit 0. Pass both:
-
-```js
-new Sandbox({
-  image: "golang:1.23-alpine",
-  env: { HOME: "/workspace" },   // npm's ~/.npm, Go's ~/.cache, Rust's CARGO_HOME, .NET's NuGet
-  tmpfs: { "/tmp": "512m" },     // scratch; 64 MiB fits a small install, a real one needs more
-});
-```
-
-`runCode`/`run` also take `timeoutS`/`onStdout`/`onStderr` as **per-call** options that override the
-session defaults for that one call. A `vcpu:` profile can carry `cpus`+`memory`; `memoryMb`/`cpus` are
-explicit flags that **override** a profile's values (and the `memoryMb` default `512` shadows a profile's
-`memory`, so pass `memoryMb: null` to let the profile apply). The **MCP server** (`kern-mcp`, for Claude
-Desktop / Cursor) ships in the Python package `kern-sandbox` (`pip install kern-sandbox`).
+**The sharp edges are in [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/node/SANDBOX-NOTES.md):**
+the writable paths and why `/tmp` is a tmpfs, `memoryMb` bounding the cgroup rather than usable
+memory, scratch that does not survive a call, and the two writable places a toolchain needs before
+`npm install` stops reporting a network error that is not one. Each is a measured surprise.
 
 ## Egress: the setting between no network and the host's
 
@@ -317,60 +275,24 @@ package manager imports `globSync` from `node:fs`, which landed in 22.
 
 ## Charts, rich results, live output, and checkpoints
 
-**Rich results (the "code interpreter" pattern).** `runCode` runs Python by default, and like a
-Jupyter cell it captures rich, mime-typed values into `result.results` (a list of `Result`) with
-**no Jupyter kernel**: the value of the code's **last bare expression**, every **`display(obj)`** call,
-and **every open matplotlib figure automatically** (no `savefig`). Accessors: `.png`/`.jpeg` (Buffer),
-`.html`, `.svg`, `.markdown`, `.json`, `.text`.
+`runCode` captures mime-typed values into `result.results` the way a notebook cell does: the **last
+bare expression**, every **`display(obj)`**, and **every open matplotlib figure automatically**, with
+no `savefig`. Accessors: `.png`, `.jpeg`, `.html`, `.svg`, `.markdown`, `.json`, `.text`.
 
 ```js
-await kern.withSandbox({ setup: "pip install matplotlib pandas" }, async (sbx) => {
-  let r = await sbx.runCode("import matplotlib; matplotlib.use('Agg')\n" +
-    "import matplotlib.pyplot as plt; plt.plot([1,4,9])");
-  const png = r.results.map((x) => x.png).find(Boolean) ?? null;  // figure Buffer, auto-captured
-
-  r = await sbx.runCode("import pandas as pd; pd.DataFrame({'a':[1,2]})");
-  r.results[0].html;                            // the DataFrame as an HTML table (also .text)
+await withSandbox({ setup: "pip install pandas matplotlib" }, async (sbx) => {
+  await sbx.writeFile("data.csv", "a,b\n1,2\n3,4\n");
+  const r = await sbx.runCode("import pandas as pd; pd.read_csv('data.csv').describe()");
+  r.results[0].html;                       // the DataFrame as an HTML table
 });
 ```
 
-Capture never touches `stdout`/`stderr`/`exitCode`; a statement returning `None` yields no result. You
-can still WRITE an artifact to the workspace and `readFile` it if you prefer.
+Capture never touches `stdout`, `stderr` or `exitCode`. Pass `onStdout` / `onStderr` to stream output
+as it arrives (best-effort: a slow callback drops chunks rather than stalling the box).
 
-**Warm kernel (kill the interpreter boot).** Each `runCode` starts a **fresh** interpreter, paying the
-CPython boot (~12 ms) every call. When you run many cells that share state (a REPL, a notebook, an
-agent's tool loop), open a `kernel()`: ONE warm interpreter in a long-lived box, fed cells over a pipe.
-In-memory state persists across cells and the per-cell cost drops from ~14 ms to **sub-millisecond**
-(~300x). Same rich `results` capture as `runCode`.
-
-```js
-await kern.withSandbox(async (sbx) => {
-  const k = await sbx.kernel();
-  try {
-    await k.runCode("import numpy as np; a = np.arange(1_000_000)");  // imports paid once
-    const r = await k.runCode("a.sum()");                            // 'a' is still here; ~sub-ms
-    console.log(r.results[0].text);                                  // 499999500000
-  } finally {
-    await k.close();                                                 // tears the box down
-  }
-});
-```
-
-The trade vs `runCode`: cells in a kernel share one process and one box, so it is call-fast but not
-call-isolated (still network-off and resource-capped; a fresh session or kernel is clean). An uncaught
-error is confined (`exitCode` 1, traceback on `stderr`, the kernel keeps serving); a per-cell `timeoutS`
-tears the kernel down (a running cell cannot be interrupted), after which it refuses further cells.
-
-**Live output.** Pass `onStdout` / `onStderr` to stream each chunk as it arrives. The callback is
-best-effort, not lossless: a SLOW callback drops chunks rather than applying backpressure to the box
-(the full capped output is always in `result.stdout`).
-
-**Checkpoints.** `sbx.snapshot(dest)` writes a portable `.tar.gz` of the workspace (a FILESYSTEM
-checkpoint, not memory); `sbx.restore(src)` extracts it back, refusing absolute / `..` / symlink
-members. Interoperable with `tar` and the Python binding (both write plain USTAR, so a workspace path
-must be under 100 bytes). The Node path uses a hand-rolled tar reader,
-so while it is new it is **opt-in**: set `KERN_SANDBOX_SNAPSHOT=1` to enable it (it fails closed with a
-clear error otherwise). The Python binding uses the stdlib `tarfile` and has no such gate.
+`snapshot(dest)` and `restore(src)` write a portable `.tar.gz` checkpoint of the **workspace**;
+`restore` refuses absolute, `..` and symlink members. Nothing in `/tmp` is on it, because a tmpfs is
+on no layer.
 
 ## Honest threat model
 
