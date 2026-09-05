@@ -1324,6 +1324,11 @@ def test_raw_sockets_stay_out_of_reach_and_that_is_rootless_not_a_flag():
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+# `@needs_shell`, not `@needs_langchain`: these build the POLICY, which lives in the umbrella
+# `langchain` package, while the `[langchain]` extra installs only `langchain-core`. Without the
+# marker they raise ImportError on both CI python jobs (3.9 installs no extra at all), which is
+# how they went red there while passing on a machine that happens to have the full package.
+@needs_shell
 class TestBothVocabulariesReachThePolicy:
     """`command_timeout` is langchain's name and `timeout_s` is this package's, and the policy is a
     subclass of langchain's base, so only one of the two can be the field. An external audit passed
@@ -1356,6 +1361,7 @@ class TestBothVocabulariesReachThePolicy:
         assert "memory_bytes" in str(e.value), "the message must name the accepted spelling"
 
 
+@needs_shell
 class TestTheAliasesCannotWeakenWhatTheyTranslate:
     """The edge cases, and one of them was a real defect this suite exists to keep closed.
 

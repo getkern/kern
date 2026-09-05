@@ -54,6 +54,7 @@ jobs:
           # the second one, in kern-cli, went unseen: a per-crate check has to be extended by hand, and
           # the second occurrence is the proof that it is not. This one reads the whole tree.
           python3 scripts/flat-continuation.py
+          python3 scripts/progress-is-tty-gated.py
           # Every entry under a code section declares what it did about its own injection. A warning,
           # never a refusal: it cannot verify an executed injection (several suites here need hardware
           # CI does not have), so demanding one would leave it checking that a FILE EXISTS - state

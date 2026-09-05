@@ -5091,6 +5091,29 @@ mod shm_and_mount_flag_gates {
 mod loopback_tests {
     use super::*;
 
+    /// Raise `lo` with our OWN ioctl, so the test can tell "this host refuses" from "the code did not
+    /// work". Deliberately a second implementation rather than a call to the function under test: if
+    /// this succeeds where `bring_loopback_up` failed, the failure is the code's and the test says so;
+    /// if this fails too, the host cannot grant CAP_NET_ADMIN over a fresh net ns and there is nothing
+    /// to measure, so the test skips with a reason instead of reporting a defect that is not there.
+    fn raise_lo_directly() -> bool {
+        unsafe {
+            let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if s < 0 {
+                return false;
+            }
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            ifr.ifr_name[0] = b'l' as libc::c_char;
+            ifr.ifr_name[1] = b'o' as libc::c_char;
+            let ok = libc::ioctl(s, libc::SIOCGIFFLAGS as _, &mut ifr) == 0 && {
+                ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
+                libc::ioctl(s, libc::SIOCSIFFLAGS as _, &ifr) == 0
+            };
+            libc::close(s);
+            ok
+        }
+    }
+
     /// Read `lo`'s IFF_UP in the CURRENT net namespace, independently of the function under test:
     /// `bring_loopback_up` must not be the instrument that reports on `bring_loopback_up`.
     fn lo_is_up() -> bool {
@@ -5162,9 +5185,18 @@ mod loopback_tests {
                         return 13;
                     }
                 }
-                // THE FIX.
+                // THE FIX. A `false` here is not automatically a defect: this function is documented
+                // best-effort, and a host that will not grant CAP_NET_ADMIN over a fresh net ns cannot
+                // raise `lo` no matter what the code does. GitHub's runners are such a host - AppArmor
+                // restricts the user namespace - and asserting success there turned this test red for
+                // an environment rather than for a regression.
+                //
+                // So the environment is separated from the code with an INDEPENDENT attempt: the test
+                // raises the flag itself, with its own ioctl, and only calls the failure a defect if
+                // its own attempt would have worked. Same discriminant as the positive control above,
+                // pointed the other way.
                 if !bring_loopback_up() {
-                    return 14;
+                    return if raise_lo_directly() { 14 } else { SKIP };
                 }
                 if !lo_is_up() {
                     return 15; // measured independently of the return value above
@@ -5188,7 +5220,10 @@ mod loopback_tests {
         assert!(unsafe { libc::waitpid(pid, &mut st, 0) } == pid, "waitpid");
         let code = (st >> 8) & 0xff;
         if code == SKIP {
-            eprintln!("skipped: this host has no unprivileged user namespaces");
+            eprintln!(
+                "skipped: this host cannot raise `lo` in a fresh net ns (no unprivileged user \
+                 namespace, or no CAP_NET_ADMIN over it - GitHub runners restrict this via AppArmor)"
+            );
             return;
         }
         assert_eq!(
