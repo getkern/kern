@@ -10,7 +10,7 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
-<sub>3.5 ms rounds a measured 3.4 up, on one machine and one workload: [how it was measured](BENCHMARKS.md)</sub>
+<sub>3.5 ms rounds a measured 3.4 up: a box **from an OCI image**, on one machine and one workload. A **bare box** is ~2.4 ms. Both numbers appear below, and [BENCHMARKS.md](BENCHMARKS.md) is how they were measured</sub>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
@@ -50,10 +50,9 @@ and a stack runner at once, in one static binary with no daemon.
   command that was not in the image each arrive as a typed `fault` on the result, beside stdout and
   the exit code. The agent branches on a value and keeps going, instead of parsing text to work out
   whether the sandbox stopped the run or the code did.
-  <br>`pip install kern-sandbox` or `npm i kern-sandbox`, a LangChain code tool and shell-middleware
-  policy, and an **MCP server** that hands Claude Desktop or Cursor a real box to execute in.
-  [bindings/python/README.md](bindings/python/README.md). For code written to attack you rather than
-  merely unread, read [What kern is not](#what-kern-is-not) first: the boundary is the Linux kernel.
+  <br>Python, Node, LangChain and MCP: [below](#run-an-agents-code-python-node-mcp). For code written
+  to attack you rather than merely unread, read [What kern is not](#what-kern-is-not) first: the
+  boundary is the Linux kernel.
 - **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
   `--security-profile untrusted`, is the whole hardened bundle.
