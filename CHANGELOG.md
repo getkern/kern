@@ -55,6 +55,24 @@ prefix were invisible to anything reading kern's output. Detail below.
 
 ### Fixed
 
+- **`kern killall --help`, `kern down --help` and `kern logout --help` printed the whole 184-line
+  reference.** The per-verb help matched the FIRST token of each command line, and those three are
+  documented as the second half of a pair: `kill <name>... | killall`, `up ... / down`,
+  `login ... / logout`. Nothing matched, and the fallback prints everything. The line's whole head is
+  read now, with `<...>`, `[...]` and `(...)` removed so a placeholder cannot pose as a verb, which is
+  why `volume <create|rm|edit|prune>` still declares only `volume`.
+
+  The test meant to catch this named fifteen verbs by hand and none of the three were in it. It now
+  reads the verb list out of the reference itself, all 51 of them.
+
+- **Nine lines of `kern --help` sat outside the description column** (five one short, two one long,
+  one three short, and `pod` twenty long because the line did not fit at all). `pod` is two lines now.
+  No verb and no flag changed: the snapshot moved on whitespace and that one split, checked by
+  extracting both sets and diffing them, 76 verbs and 83 flags either side.
+
+
+### Fixed
+
 - **The MCP server offered a language and then refused it.** The `run_code` tool schema advertised
   `["python", "bash", "sh", "node"]` while the guard in `_run_code` compared against a second,
   hand-written `("python", "bash", "node")`. A model reading the schema sent `sh` and got

@@ -26,6 +26,45 @@ pub fn help() -> Result<(), Error> {
 /// text per verb is the obvious fix and the wrong one, because two texts describing one parser
 /// drift, which is the defect class this project keeps paying for. So there is still exactly one
 /// text and [`help_for`] filters it.
+
+/// Does this line of the command reference declare `verb`?
+///
+/// Matching the FIRST token was not enough, and the three it missed are the three that are documented
+/// as the second half of a pair: `kill <name>... | killall`, `up … / down`, and
+/// `login [registry] … / logout [registry]`. Each of those is a real verb the parser accepts, and
+/// each answered `kern <verb> --help` with the entire 184-line reference, because nothing matched and
+/// the caller falls back to printing everything.
+///
+/// So the head of the line is read instead: the part before the description column, with `<…>`, `[…]`
+/// and `(…)` removed so a placeholder or an option list cannot supply a false match. `volume
+/// <create|rm|edit|prune>` therefore declares `volume` and not `rm`, which is a different verb with
+/// its own line.
+fn line_declares_verb(trimmed: &str, verb: &str) -> bool {
+    // The description is separated by two or more spaces; everything before it names the command.
+    let head = match trimmed.find("  ") {
+        Some(i) => &trimmed[..i],
+        None => trimmed,
+    };
+    let mut depth = 0i32;
+    let mut token = String::new();
+    let mut found = false;
+    for ch in head.chars().chain(std::iter::once(' ')) {
+        match ch {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth = (depth - 1).max(0),
+            c if depth == 0 && (c.is_ascii_alphanumeric() || c == '-') => token.push(c),
+            _ if depth == 0 => {
+                if token == verb {
+                    found = true;
+                }
+                token.clear();
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 fn help_text(p: &crate::ui::Palette) -> String {
     let (b, c, d, z) = (p.b, p.c, p.d, p.z);
     // The compose sub-verbs come from COMPOSE_VERBS, so help cannot describe a set of verbs the
@@ -85,26 +124,27 @@ fn help_text(p: &crate::ui::Palette) -> String {
 
   {d}Multi-box{z}
     {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
-    {c}up{z} [--no-pod] [-d] / {c}down{z}                                     Bring up / tear down the compose file in this dir
-    {c}compose{z} <file> {c}watch{z} [service...]                             Rebuild + restart ONE service when its `build:` context changes
-    {c}compose{z} <file> {c}port{z} <service> <container-port>                Print the host address serving that box port (non-zero if none)
-    {c}pod{z} create <name> [--no-outbound] [--uid-range] / pod ls [--json] / pod rm <name>  Shared-network pod (boxes reach each other by name)
+    {c}up{z} [--no-pod] [-d] / {c}down{z}                                      Bring up / tear down the compose file in this dir
+    {c}compose{z} <file> {c}watch{z} [service...]                              Rebuild + restart ONE service when its `build:` context changes
+    {c}compose{z} <file> {c}port{z} <service> <container-port>                 Print the host address serving that box port (non-zero if none)
+    {c}pod{z} create <name> [--no-outbound] [--uid-range]                Shared-network pod: peers reach each other by name
+    {c}pod{z} ls [--json] | {c}pod{z} rm <name>                                List pods, or remove one
 
   {d}Config & storage{z}
     {c}config{z} [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml
-    {c}config add{z} <kind:name> [--flags]                              Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
-    {c}config rm{z} <kind:name>                                         Delete a profile
+    {c}config add{z} <kind:name> [--flags]                               Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
+    {c}config rm{z} <kind:name>                                          Delete a profile
     {c}validate{z} [path]                                                Check a kern.toml
     {c}uninstall{z} [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     {c}examples{z}                                                       Print an example kern.toml
-    {c}volume{z} <create|rm|edit|prune> / <ls|inspect> [--json]           Manage named volumes
-    {c}login{z} [registry] [--username U] / {c}logout{z} [registry]         Registry credentials (private pulls)
+    {c}volume{z} <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes
+    {c}login{z} [registry] [--username U] / {c}logout{z} [registry]            Registry credentials (private pulls)
 
   {d}Diagnostics{z}
     {c}doctor{z}                                                         Preflight: will boxes run here?
     {c}probe{z}                                                          Host resources you can put in kern.toml
     {c}info{z}                                                           Runtime + host snapshot
-    {c}bench{z} (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]     Time box start→exit latency
+    {c}bench{z} (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]    Time box start→exit latency
     {c}completions{z} <bash|zsh|fish>                                    Print a shell-completion script
 
 {b}OPTIONS for box:{z}
@@ -274,7 +314,7 @@ pub fn help_for(verb: &str) -> Result<(), Error> {
             out.push(line.to_string());
             continue;
         }
-        if in_commands && trimmed.split_whitespace().next() == Some(verb) {
+        if in_commands && line_declares_verb(trimmed, verb) {
             out.push(line.to_string());
         }
     }

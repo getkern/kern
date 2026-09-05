@@ -48,26 +48,27 @@ COMMANDS:
 
   Multi-box
     compose <file> [up|down|stop|start|restart|ps|logs|build|pull|config|watch|port|systemd] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
-    up [--no-pod] [-d] / down                                     Bring up / tear down the compose file in this dir
-    compose <file> watch [service...]                             Rebuild + restart ONE service when its `build:` context changes
-    compose <file> port <service> <container-port>                Print the host address serving that box port (non-zero if none)
-    pod create <name> [--no-outbound] [--uid-range] / pod ls [--json] / pod rm <name>  Shared-network pod (boxes reach each other by name)
+    up [--no-pod] [-d] / down                                      Bring up / tear down the compose file in this dir
+    compose <file> watch [service...]                              Rebuild + restart ONE service when its `build:` context changes
+    compose <file> port <service> <container-port>                 Print the host address serving that box port (non-zero if none)
+    pod create <name> [--no-outbound] [--uid-range]                Shared-network pod: peers reach each other by name
+    pod ls [--json] | pod rm <name>                                List pods, or remove one
 
   Config & storage
     config [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml
-    config add <kind:name> [--flags]                              Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
-    config rm <kind:name>                                         Delete a profile
+    config add <kind:name> [--flags]                               Create a profile (vcpu/vgpio/vdisk), CLI twin of `kern top`
+    config rm <kind:name>                                          Delete a profile
     validate [path]                                                Check a kern.toml
     uninstall [--yes] [--keep-images]                              Remove everything kern created (lists it first)
     examples                                                       Print an example kern.toml
-    volume <create|rm|edit|prune> / <ls|inspect> [--json]           Manage named volumes
-    login [registry] [--username U] / logout [registry]         Registry credentials (private pulls)
+    volume <create|rm|edit|prune> / <ls|inspect> [--json]          Manage named volumes
+    login [registry] [--username U] / logout [registry]            Registry credentials (private pulls)
 
   Diagnostics
     doctor                                                         Preflight: will boxes run here?
     probe                                                          Host resources you can put in kern.toml
     info                                                           Runtime + host snapshot
-    bench (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]     Time box start→exit latency
+    bench (--image <ref>|--rootfs <dir>) [--bind-rootfs] [-n N]    Time box start→exit latency
     completions <bash|zsh|fish>                                    Print a shell-completion script
 
 OPTIONS for box:

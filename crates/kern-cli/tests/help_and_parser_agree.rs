@@ -289,6 +289,71 @@ fn every_read_verb_accepts_json() {
 /// universal `<tool> <verb> --help` habit by printing all 160 lines, so the reader had to find their
 /// own verb in it. The assertion is on both halves: the page must be SHORTER than the full one, and
 /// it must actually name the verb. Asserting only "shorter" would pass on an empty page.
+
+/// Every verb the command reference declares, taken from the reference rather than from a list.
+///
+/// Reads the head of each command line (the part before the description column), drops `<…>`, `[…]`
+/// and `(…)` so a placeholder cannot pose as a verb, and keeps the bare words. That is what picks up
+/// the second half of a pair: `kill <name>... | killall` declares both `kill` and `killall`, and
+/// `volume <create|rm|edit|prune>` declares only `volume`, because the alternatives are inside `<>`.
+fn verbs_declared_in(reference: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in reference.lines() {
+        if !line.starts_with("    ") || !line[4..].starts_with(|c: char| c.is_ascii_lowercase()) {
+            continue;
+        }
+        let trimmed = line.trim();
+        let head = match trimmed.find("  ") {
+            Some(i) => &trimmed[..i],
+            None => continue, // no description column: not a command line
+        };
+        // Split on " | " and " / " AT DEPTH ZERO, and take the first bare word of each piece.
+        //
+        // The spacing is the discriminant, and it is the whole trick. A line that offers two VERBS
+        // spaces its separator (`kill <name>... | killall`, `up … / down`, `login … / logout`), while
+        // one that lists SUBCOMMANDS does not (`build logs|inspect|rm|prune <id>`). Without that,
+        // `rm`, `watch`, `port`, `create`, `ls`, `edit`, `setup`, `clear` and `add` all arrive here as
+        // top-level verbs and the test demands a help page for things that are not verbs.
+        let mut depth = 0i32;
+        let mut piece = String::new();
+        let mut pieces: Vec<String> = Vec::new();
+        let bytes: Vec<char> = head.chars().collect();
+        let mut k = 0usize;
+        while k < bytes.len() {
+            let ch = bytes[k];
+            match ch {
+                '<' | '[' | '(' => depth += 1,
+                '>' | ']' | ')' => depth = (depth - 1).max(0),
+                _ => {}
+            }
+            let sep = depth == 0
+                && ch == ' '
+                && k + 2 < bytes.len()
+                && (bytes[k + 1] == '|' || bytes[k + 1] == '/')
+                && bytes[k + 2] == ' ';
+            if sep {
+                pieces.push(std::mem::take(&mut piece));
+                k += 3;
+                continue;
+            }
+            piece.push(ch);
+            k += 1;
+        }
+        pieces.push(piece);
+        for p in pieces {
+            let word: String = p
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            if word.starts_with(|c: char| c.is_ascii_lowercase()) && !out.contains(&word) {
+                out.push(word);
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn every_verb_has_its_own_help() {
     let full = kern().arg("--help").output().expect("run kern");
@@ -297,10 +362,23 @@ fn every_verb_has_its_own_help() {
         full_lines > 40,
         "the full reference is only {full_lines} lines; this test's premise is gone"
     );
-    for verb in [
-        "box", "run", "ps", "logs", "exec", "volume", "pod", "config", "diff", "images", "compose",
-        "stats", "pull", "push", "top",
-    ] {
+    // EVERY verb the reference declares, read out of the reference itself. This used to be a
+    // hand-written list of fifteen, and the three it happened not to name were the three that were
+    // broken: `killall`, `down` and `logout` each answered with the entire 184-line page, because the
+    // dispatcher matched the FIRST token of a command line and those are all the second half of a
+    // pair (`kill … | killall`, `up … / down`, `login … / logout`).
+    //
+    // A gate that samples finds what it was pointed at. Reading the list from the page cannot miss a
+    // verb the page declares, which is the property this test is supposed to have.
+    let reference = String::from_utf8_lossy(&full.stdout).to_string();
+    let verbs = verbs_declared_in(&reference);
+    assert!(
+        verbs.len() > 40,
+        "only {} verbs parsed out of the reference; the parser here is broken, not the CLI",
+        verbs.len()
+    );
+    for verb in verbs {
+        let verb = verb.as_str();
         let out = kern().args([verb, "--help"]).output().expect("run kern");
         let text = String::from_utf8_lossy(&out.stdout);
         let n = text.lines().count();
