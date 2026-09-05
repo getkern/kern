@@ -270,7 +270,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
         if !args.quiet {
             // `kern: warning:`, like every other diagnostic: the SDK separates kern's voice from
             // the workload's by that prefix, and a bare `warning:` is invisible to it.
-            kern_common::progress!("kern: warning: {w}");
+            eprintln!("kern: warning: {w}");
         }
     }
     let t0 = std::time::Instant::now();

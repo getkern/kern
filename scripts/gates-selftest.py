@@ -119,6 +119,9 @@ CASES: list[Case] = [
     ("progress-is-tty-gated", "a bad line whose string is continued with a backslash",
      "crates/kern-oci/src/push.rs",
      lambda t: t + '\nfn _selftest6() {\n    eprintln!(\n        "uploading {} of \\\n         {}",\n        1, 2\n    );\n}\n'),
+    ("progress-is-tty-gated", "a diagnostic wrapped in progress!, silent in a pipe",
+     "crates/kern-cli/src/commands/build.rs",
+     lambda t: t + '\nfn _selftest7() { kern_common::progress!("kern: warning: silenced in a pipe"); }\n'),
     # --- stale-numbers: one case per arm ---
     ("stale-numbers", "a retired figure (Docker's old footprint)", "SECURITY.md",
      prepend("Docker's resident memory is ~186 MB.")),

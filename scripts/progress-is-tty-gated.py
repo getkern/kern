@@ -93,6 +93,30 @@ def _calls(src: str):
         yield m.start(), src[m.start():i]
 
 
+# A diagnostic must never be wrapped in `progress!`. The two halves of the rule are exclusive, and
+# satisfying both at once is the one combination that reads as correct and is not: a `kern: warning:`
+# inside `progress!` passes the prefix test AND the progress test, and prints only on a terminal, so
+# the warning is silent exactly where a machine is reading. One shipped for four minutes, from a bulk
+# rewrite whose search found the wrong `eprintln!`.
+DIAGNOSTIC_PREFIXES = ("kern: warning:", "kern: note:", "kern: security-profile=")
+
+
+def _gated_diagnostics(src: str):
+    for m in re.finditer(r"\bprogress!\s*\(", src):
+        i, depth = m.end() - 1, 0
+        while i < len(src):
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        lit = re.search(r'"((?:[^"\\]|\\.)*)"', src[m.start():i], re.DOTALL)
+        if lit and lit.group(1).startswith(DIAGNOSTIC_PREFIXES):
+            yield src[: m.start()].count("\n") + 1, lit.group(1)[:64]
+
+
 def main() -> int:
     audit = "--audit" in sys.argv
     bad, unverifiable = [], []
@@ -120,6 +144,8 @@ def main() -> int:
                 unverifiable.append(f"{rel}:{line}: {why}, nothing to check statically")
             elif not lit.group(1).startswith(ALLOWED):
                 bad.append(f"{rel}:{line}: {lit.group(1)[:64]}")
+        for line, text in _gated_diagnostics(src):
+            bad.append(f"{rel}:{line}: a diagnostic inside progress!, so it prints only on a tty: {text}")
     if bad:
         print("in a narrating module, an eprintln! that is neither progress nor a kern: diagnostic:")
         for b in bad:
