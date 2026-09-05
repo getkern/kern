@@ -28,16 +28,28 @@ message on hosts where it never printed, and one new `kern box` flag. The CLI ch
   the loopback, so the two race. An audit saw the bind fail with `EADDRNOTAVAIL` and every allowed
   domain refused with it.
 
-  Measured here, a down loopback does something worse than fail: **`bind` and `listen` both succeed**,
-  and only the box's own `connect` fails, with `ENETUNREACH`. So the pump took a port and wrote the
-  readiness byte added last release to make exactly this failure visible, and the launcher started the
-  workload against a proxy no packet could reach. A false green in the signal built to prevent one.
+  What a down loopback does turns out to depend on the kernel, and one C probe run on both hosts
+  settled it. On 6.12.8+ the bind is refused, as reported. On 7.0.0 it is not: **`bind` and `listen`
+  both succeed**, and only the box's own `connect` fails, with `ENETUNREACH`. The second row is the
+  worse one, because the pump took a port and wrote the readiness byte added last release to make
+  exactly this failure visible, then the launcher started the workload against a proxy no packet could
+  reach. A false green in the signal built to prevent one.
 
   The pump now raises the loopback itself before binding, which removes the dependency on the init's
   progress instead of narrowing the window, and treats a loopback it cannot raise as fatal. Readiness
-  means reachable, not bound. `bring_loopback_up` is idempotent and reports success for a loopback the
+  means reachable, not bound - which is also what makes one guard right on both kernels, rather than
+  two cases handled separately. `bring_loopback_up` is idempotent and reports success for a loopback the
   init had already raised, so either order is a success. A test in a fresh net namespace pins the
   asymmetry, with the unreachable state asserted first as its own positive control.
+
+- **A cgroup probe printed systemd's bus error onto kern's stderr.** To find out whether a delegated
+  slice can be made, kern runs `systemd-run ... -- true` and reads the answer from the exit status. Its
+  stderr was inherited. On a host with the systemd tools installed but not booted (a container, a WSL
+  session, plain root), that probe answers "no" and prints `System has not been booted with systemd as
+  init system` and `Failed to connect to bus`, which travelled into a LangChain tool result where a
+  model read a line about dbus as though its own code had produced it. `--quiet` does not cover it: it
+  suppresses systemd-run's info messages, not the bus error. Both streams are now null, as the other
+  three `systemd-run` call sites already did. The verdict is unchanged; it was never in the output.
 
 - **kern's diagnostics no longer land in a model's context.** kern and the workload share one stderr,
   so `kern: note:` and `kern: warning:` lines arrive interleaved with the program's output. The audit

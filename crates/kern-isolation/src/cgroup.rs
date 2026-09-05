@@ -1429,6 +1429,24 @@ fn ensure_kern_slice_uncached() -> Option<PathBuf> {
             "--",
             "true",
         ])
+        // THIS IS A PROBE, so its output has no reader and must not have one. The verdict is the exit
+        // status, read below; the two streams only carry systemd's opinion of the question we asked.
+        //
+        // Inherited, they were kern's stderr, and kern's stderr is the box's stderr as far as the SDK
+        // is concerned. On a host with the systemd tools installed but not booted (a container, a WSL
+        // session, the plain-root machine an external audit ran on), this probe answers "no" and prints
+        //
+        //   System has not been booted with systemd as init system (PID 1). Can't operate.
+        //   Failed to connect to bus: Host is down
+        //
+        // which travelled all the way into a LangChain tool result, where a model read a line about
+        // dbus as though its own code had produced it. `--quiet` does not cover this: it suppresses
+        // systemd-run's info messages, not the bus error.
+        //
+        // The other three systemd-run call sites already null both. This one did not, and the leak is
+        // the whole difference between a probe and a command whose failure a user needs to read.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);

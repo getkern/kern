@@ -5103,11 +5103,13 @@ mod loopback_tests {
     /// `lo` yet. This pins the property the pump now relies on, in a REDUCED system: a fresh net ns,
     /// where `lo` is present, DOWN and address-less.
     ///
-    /// What it asserts is what was MEASURED, and it is not what an external report predicted. A down
-    /// loopback does NOT make the bind fail: `bind` and `listen` both succeed, and the failure lands
-    /// on the far side, at `connect`, with ENETUNREACH. That asymmetry is the whole reason the pump
-    /// treats a loopback it cannot raise as fatal instead of binding and reporting itself ready: a
-    /// successful bind is not evidence that anything can reach the port.
+    /// What it asserts is `connect`, NOT `bind`, and that choice is the point. Whether a down loopback
+    /// refuses the bind turns out to be kernel-dependent: measured with one C probe, 6.12.8+ fails it
+    /// with EADDRNOTAVAIL while 7.0.0 accepts it and lets `listen` succeed too. Only the far side
+    /// agrees across both, failing with ENETUNREACH either way. So this test pins the property that
+    /// holds everywhere, and a successful bind is asserted here as NOT evidence of reachability -
+    /// which is exactly why the pump treats a loopback it cannot raise as fatal rather than binding
+    /// and reporting itself ready.
     ///
     /// The DOWN-and-unreachable state asserted first is this test's positive control. It proves the
     /// environment can still produce the failure the fix exists for, so a `bring_loopback_up` that
@@ -5118,7 +5120,7 @@ mod loopback_tests {
     /// A host without unprivileged user namespaces cannot make the precondition, so it SKIPS rather
     /// than fails, and says which.
     #[test]
-    fn a_down_lo_breaks_connect_not_bind_and_bring_loopback_up_fixes_it_idempotently() {
+    fn a_down_lo_is_unreachable_on_every_kernel_and_bring_loopback_up_fixes_it_idempotently() {
         const SKIP: i32 = 99;
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork");
@@ -5131,17 +5133,23 @@ mod loopback_tests {
                 if lo_is_up() {
                     return 10; // a fresh net ns with lo already up would invalidate the test
                 }
-                // The trap, pinned: serving succeeds while the loopback is down.
-                let Ok(down_listener) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
-                    return 11; // if THIS ever fails, the pump's bind check would have sufficed
+                // On THIS kernel, does serving succeed while the loopback is down? 7.0 says yes and
+                // 6.12 says no, and the fix must hold either way, so a refused bind is not a failure
+                // of the test: it is the other kernel, and the reachability check below is skipped
+                // because there is no listener to be unreachable. Everything after the fix still runs.
+                let down_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok();
+                let addr = match down_listener.as_ref().map(|l| l.local_addr()) {
+                    Some(Ok(a)) => Some(a),
+                    Some(Err(_)) => return 12,
+                    None => None, // the bind was refused: this kernel fails earlier, nothing to probe
                 };
-                let Ok(addr) = down_listener.local_addr() else {
-                    return 12;
-                };
-                // ...and connecting to that same listening port does not, which is the failure the
-                // box's workload would hit while the pump reported itself ready.
-                if std::net::TcpStream::connect(addr).is_ok() {
-                    return 13;
+                // Where the bind DID succeed, connecting to that same listening port must not: this is
+                // the failure the box's workload would hit while the pump reported itself ready, and it
+                // is the reason readiness cannot be defined as "bound".
+                if let Some(a) = addr {
+                    if std::net::TcpStream::connect(a).is_ok() {
+                        return 13;
+                    }
                 }
                 // THE FIX.
                 if !bring_loopback_up() {
@@ -5150,8 +5158,12 @@ mod loopback_tests {
                 if !lo_is_up() {
                     return 15; // measured independently of the return value above
                 }
-                if std::net::TcpStream::connect(addr).is_err() {
-                    return 16; // the same port must now be reachable
+                if let Some(a) = addr {
+                    if std::net::TcpStream::connect(a).is_err() {
+                        return 16; // the same port must now be reachable
+                    }
+                } else if std::net::TcpListener::bind(("127.0.0.1", 0)).is_err() {
+                    return 16; // the kernel that refused the bind must now accept it
                 }
                 // IDEMPOTENT: the box's init calls this too, and either order must be a success.
                 if !bring_loopback_up() || !lo_is_up() {

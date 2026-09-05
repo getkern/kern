@@ -726,15 +726,23 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
     // call is idempotent, we hold CAP_NET_ADMIN over this ns (we joined its owning user ns, or we are
     // already privileged over it), and it reports success for a loopback the init had already raised.
     //
-    // The `_exit` below is the part that matters, and it is here because of what a down `lo` actually
-    // does. An external audit reported the bind failing with EADDRNOTAVAIL. Measured on this tree
-    // (kernel 7.0, `unshare -Un`), a down loopback does something worse than fail: **bind and listen
-    // both SUCCEED**, and only the box's own `connect` fails, with ENETUNREACH. So the pump would take
-    // a port, write its readiness byte, and the launcher would start the workload against a proxy no
-    // packet can reach - a false green in the very signal added to make this failure visible.
+    // The `_exit` below is the part that matters, and it is here because WHAT a down `lo` does is not
+    // the same on every kernel. Both of these were measured with the same C probe, in a fresh net ns:
     //
-    // Readiness has to mean reachable, not bound. So this checks the interface the connections will
-    // arrive over, and dies if it is not up, which the launcher reads as EOF and turns into a refusal.
+    //   6.12.8+, uid 0   lo DOWN: bind=-1 EADDRNOTAVAIL   listen=-1        connect=-1 ENETUNREACH
+    //   7.0.0,  rootless lo DOWN: bind= 0 ok              listen= 0 ok     connect=-1 ENETUNREACH
+    //
+    // An external audit hit the first row and reported "the bind fails". On this tree that could not be
+    // reproduced, and what turned up instead is the second row, which is worse: bind and listen both
+    // SUCCEED, so the pump takes a port, writes its readiness byte, and the launcher starts the workload
+    // against a proxy no packet can reach. A false green in the very signal added to make this failure
+    // visible. The audit then ran the probe on its own host and both rows stood.
+    //
+    // A guard written for either row alone would be wrong on the other kernel: checking the bind's errno
+    // misses 7.0, and trusting a successful bind misses nothing but proves nothing. Readiness has to mean
+    // reachable, not bound. So this checks the interface the connections will arrive over, before and
+    // independently of the bind, and dies if it is not up, which the launcher reads as EOF and turns into
+    // a refusal. That covers both rows for the same reason rather than by handling two cases.
     if !kern_isolation::bring_loopback_up() {
         eprintln!(
             "kern: egress pump: the box's loopback is down and could not be raised, so nothing in \
