@@ -735,13 +735,15 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
     //   6.8.0    x86_64 uid 0    bind= 0 ok              listen= 0 ok  connect=-1 ENETUNREACH
     //   7.0.0    x86_64 uid 1000 bind= 0 ok              listen= 0 ok  connect=-1 ENETUNREACH
     //
-    // THREE OF FIVE REFUSE THE BIND, and the reason is the kernel's ROUTING configuration, not
-    // anything about the version or the machine. `CONFIG_IP_MULTIPLE_TABLES` (policy routing)
-    // correlates with the outcome on all five, probed by whether `ip rule list` works at all:
+    // TWO OF SIX REFUSE THE BIND, and the reason is the kernel's ROUTING configuration, not anything
+    // about the version or the machine. `CONFIG_IP_MULTIPLE_TABLES` (policy routing) matches the
+    // outcome on all six, probed by whether `ip rule list` works at all:
     //
-    //   7.0.0    x86_64  policy routing YES  -> accepts     6.6.51  arm64  YES -> accepts
-    //   6.8.0    x86_64  policy routing YES  -> accepts     5.15.148 arm64 NO  -> refuses
-    //   6.16.7   arm64   policy routing NO   -> refuses
+    //   7.0.0     x86_64  policy routing YES -> accepts    6.6.51   arm64  YES -> accepts
+    //   6.8.0     x86_64  policy routing YES -> accepts    5.15.148 arm64  NO  -> REFUSES
+    //   6.18 WSL2 x86_64  policy routing YES -> accepts    6.16.7   arm64  NO  -> REFUSES
+    //
+    // (a seventh, the 6.12.8+ host of an external audit, refuses; its config was not readable)
     //
     // Three earlier guesses died on the way here, and they are worth listing because each looked
     // sufficient at the time. Not the kernel VERSION: ordered 5.15, 6.6, 6.8, 6.12, 6.16, 7.0 the
