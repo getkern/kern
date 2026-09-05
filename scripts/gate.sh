@@ -10,6 +10,14 @@
 # one release behind is the WEAKER gate. `rustup update stable` before trusting a green run.
 set -eu
 cd "$(dirname "$0")/.."
+# STAGE FIRST. Several of these gates read TRACKED files (`git ls-files`, `git grep`), so a file you
+# have just written is invisible to them until it is added. This script failed CI on the very commit
+# that introduced it, for a marker inside itself, after passing by hand while still untracked.
+untracked=$(git ls-files --others --exclude-standard | head -5)
+if [ -n "$untracked" ]; then
+    echo "  note: untracked files are INVISIBLE to the doc gates. git add them first:"
+    printf '        %s\n' $untracked
+fi
 RUSTFLAGS="-D warnings"
 export RUSTFLAGS
 fail=0
@@ -35,12 +43,16 @@ for g in flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \
     step "$g" python3 "scripts/$g.py"
 done
 echo "prose"
-printf 'a\342\200\224b\n' > /tmp/emctl.$$
-if ! grep -q '—' /tmp/emctl.$$; then
+# The character is BUILT, never typed: this file is scanned by the same gate it runs, so a literal
+# one here fails the build. It did, on the commit that added this script, because the check reads
+# TRACKED files and the script was still untracked when it was run by hand.
+EM=$(printf '\342\200\224')
+printf 'a%sb\n' "$EM" > /tmp/emctl.$$
+if ! grep -q "$EM" /tmp/emctl.$$; then
     echo "  em-dash          POSITIVE CONTROL FAILED: this grep cannot see an em-dash"
     fail=1
 else
-    n=$(git grep -l '—' | wc -l)
+    n=$(git grep -l "$EM" | wc -l)
     printf '  %-34s ' "em-dash (control passed)"
     [ "$n" -eq 0 ] && echo ok || { echo "FAILED: $n files"; fail=1; }
 fi

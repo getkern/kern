@@ -205,7 +205,13 @@ and stop, before checking a single measurement.
 It runs what CI runs, with the flags CI runs them with, and prints the clippy version it used.
 
 The reason it exists is one line: **`cargo clippy` without `RUSTFLAGS=-D warnings` exits 0 on a tree
-that fails CI.** The lint is still printed, as a warning, and the exit code says nothing happened.
+that fails CI.** The lint is still printed, as a warning, and the exit code says nothing
+happened.
+
+**`git add` before you run it.** Several gates read TRACKED files, so a file you have just written is
+invisible to them. This script failed CI on the commit that introduced it, for a marker inside itself,
+after passing by hand while still untracked. It now says so when the working tree has untracked
+files.
 That cost two red CI runs on a release branch inside one hour, both from typing the command by hand
 and dropping the flag, and both times the local answer was a confident green.
 
