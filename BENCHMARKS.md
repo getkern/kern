@@ -26,6 +26,12 @@ that by creating a sibling cgroup per box, and cost 0.10 ms.
 
 Faster than the first cut in 24 of 24 paired batches, and faster than v0.9.0 in 21 of 24.
 
+Those are the paired harness. `bench-idle.sh`, which is what the published figure quotes, reads the
+shipped v0.9.1 at **2.411 and 2.398 ms** free and **1.780 and 1.810** pinned, ahead of bubblewrap by
+8.6% to 11.7% and faster in 20 of 20 in all four replicas. **The published number stays 2.4 ms**: the
+release is measurably faster than v0.9.0 and the margin is smaller than the rounding, so moving the
+headline to 2.3 would be quoting the friendlier of two harnesses.
+
 **The leaf is needed on exactly one path.** `child` is freshly created, so the supervisor cannot
 already be inside it; the only cgroup that can take the supervisor down with the workload is its own.
 That happens when a scope or managed unit arms `origin` with `oom.group = 1`, which the code does when

@@ -10,7 +10,7 @@
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms against docker run's 297 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
 </p>
 
-<sub>3.5 ms rounds a measured 3.4 up: a box **from an OCI image**, on one machine and one workload. A **bare box** is ~2.3 ms. Both numbers appear below, and [BENCHMARKS.md](BENCHMARKS.md) is how they were measured</sub>
+<sub>3.5 ms rounds a measured 3.4 up: a box **from an OCI image**, on one machine and one workload. A **bare box** is ~2.4 ms. Both numbers appear below, and [BENCHMARKS.md](BENCHMARKS.md) is how they were measured</sub>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
 
@@ -42,7 +42,7 @@ and a stack runner at once, in one static binary with no daemon.
   `save`/`load`. A box from an image starts in ~3.4 ms.
 - **The sandbox an AI agent can afford to use on every call.** An agent's tool-call, a model's
   generated snippet, a notebook cell, a CI step: code that runs before anyone reads it. kern gives
-  each call **its own box in ~2.3 ms** and throws it away after, which is cheap enough that "one
+  each call **its own box in ~2.4 ms** and throws it away after, which is cheap enough that "one
   sandbox per tool-call" stops being a design you argue about and becomes the default. Network off,
   memory and PID caps the kernel enforces, capabilities dropped, a deny-by-default seccomp allowlist,
   and the timeout applied from OUTSIDE the box, so code that hangs cannot outlive it.
@@ -290,7 +290,7 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.3 ms** | ~288 ms | ~297 ms |
+| Cold start, bare box | **~2.4 ms** | ~288 ms | ~297 ms |
 | Cold start, from an OCI image | **~3.4 ms** | ~288 ms | ~297 ms |
 | Stop a service (init handles SIGTERM) | **~2.3 ms** | ~162 ms | ~194 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
@@ -306,7 +306,7 @@ Intel i7-14700KF, Linux 7.0.0, the release binary, alternating batches on an idl
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.3 ms** | ~2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
+| Cold start (bare box) | **~2.4 ms** | ~2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
 | 200 boxes in parallel | **~0.11 s** | ~0.13 s | ~0.29 s | ~43.1 s | ~16.7 s |
 
 kern is ahead of bubblewrap by about 9%, and that gap is small enough that it only holds up under a
@@ -349,7 +349,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Status
 
-**The core is done and the CLI is frozen.** 1056 Rust, 458 Python and 93 Node tests, clippy-clean and
+**The core is done and the CLI is frozen.** 1059 Rust, 458 Python and 93 Node tests, clippy-clean and
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning

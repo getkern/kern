@@ -1740,6 +1740,37 @@ const fn caps_gate_satisfied(mem_ok: bool, pids_ok: bool, require_all: bool) -> 
 /// (it `exec()`s IN PLACE - no supervisor to move back out - so it must stay on the systemd `--scope`
 /// `--collect` path and NEVER relocate into `kern.slice`). This is the one enforcement input that can't be
 /// re-derived from env, so the caller passes it explicitly; `took_direct_cap_path()` supplies the rest.
+
+/// Where does the supervisor belong, given the two facts that decide it?
+///
+/// `forks` is whether the caller forks the workload (`kern box`) or `exec()`s it in place
+/// (`kern run`). `origin_kills` is whether the supervisor's CURRENT cgroup is about to be armed with
+/// `memory.oom.group = 1`, which happens only on a scope or managed unit where
+/// `prepare_delegated_scope` did not move kern into a leaf of its own.
+///
+/// Returns whether a sibling leaf has to be built. The other half of the answer, whether the
+/// supervisor ends up OUTSIDE the capped cgroup, is [`supervisor_ends_up_outside`], because it also
+/// depends on whether building that leaf succeeded.
+///
+/// A pure function of two bools so the eight combinations can be asserted without a cgroup
+/// filesystem. The logic used to be three expressions spread over 300 lines, and the one that
+/// matters - a failed leaf on the scope path must fall back to the OLD topology rather than leave the
+/// supervisor in an armed cgroup - was not visible in any of them at once.
+fn supervisor_needs_leaf(forks: bool, origin_kills: bool) -> bool {
+    forks && origin_kills
+}
+
+/// Is the supervisor outside the capped cgroup once the layout above has been attempted?
+///
+/// `leaf_built` is the outcome of the `mkdir` + `cgroup.procs` write, which is best-effort. The
+/// FAIL-SAFE lives here: on the scope path with a failed leaf this returns `false`, which puts the
+/// supervisor back in `child` and makes the workload inherit it, the pre-fix topology. Losing the OOM
+/// message is bad; leaving the supervisor in a cgroup that is about to group-kill it, while telling
+/// the forked child it does not need to join anything, would leave the workload UNCAPPED.
+fn supervisor_ends_up_outside(forks: bool, origin_kills: bool, leaf_built: bool) -> bool {
+    forks && (leaf_built || !origin_kills)
+}
+
 #[allow(clippy::too_many_arguments)] // one cgroup knob per parameter - grouping them would only hide it
 pub fn apply_limits(
     allow_direct: bool,
@@ -2070,7 +2101,7 @@ pub fn apply_limits(
     let sup = if !supervisor_forks_workload {
         // `exec()` in place: this process becomes the workload, so it must stay in the capped cgroup.
         None
-    } else if !origin_group_kills {
+    } else if !supervisor_needs_leaf(supervisor_forks_workload, origin_group_kills) {
         None // already outside anything that can group-kill it: nothing to build, nothing to remove
     } else if fs::create_dir(&sup_leaf).is_ok() || sup_leaf.is_dir() {
         if fs::write(
@@ -2091,7 +2122,8 @@ pub fn apply_limits(
     // The supervisor joins `child` only when it is NOT outside: with `exec()` in place it must be
     // there, and on the scope path a failed leaf falls back to the old topology. When it is already
     // outside, the forked child puts ITSELF in (`join_box_cgroup`), which is what `outside` tells it.
-    let outside = supervisor_forks_workload && (sup.is_some() || !origin_group_kills);
+    let outside =
+        supervisor_ends_up_outside(supervisor_forks_workload, origin_group_kills, sup.is_some());
     if !outside {
         // Fallback: join the capped cgroup as before. The box is still capped and still OOM-killed as a
         // unit; only the explanation is lost, which is exactly what shipped before this change.
@@ -2374,6 +2406,75 @@ mod tests {
     /// to tell an orphaned box from an exited one.
     ///
     /// Asserted on the gate rather than on the message, because the gate is what every consumer shares.
+    /// All EIGHT combinations of the three bools that decide where the supervisor sits. Exhaustive
+    /// rather than sampled, because the table is small enough to be complete and one row of it is a
+    /// security property: a workload must never be told "you are already in the capped cgroup" when
+    /// it is not.
+    ///
+    /// Read `outside` as "the forked child must put ITSELF in the capped cgroup". When it is false the
+    /// supervisor is in there and the child inherits it. Either answer caps the workload; what would
+    /// not is a `true` with the supervisor sitting somewhere else and no leaf built.
+    #[test]
+    fn the_supervisor_layout_is_decided_the_same_way_for_all_eight_inputs() {
+        // (forks, origin_kills, leaf_built) -> (needs_leaf, outside)
+        let cases = [
+            // `kern run`: exec in place, the supervisor IS the workload and must stay in the cap.
+            ((false, false, false), (false, false)),
+            ((false, false, true), (false, false)),
+            ((false, true, false), (false, false)),
+            ((false, true, true), (false, false)),
+            // `kern box` on any ordinary path: origin cannot group-kill, so no leaf and the child joins.
+            ((true, false, false), (false, true)),
+            ((true, false, true), (false, true)),
+            // `kern box` on a scope whose origin IS armed: build the leaf.
+            ((true, true, true), (true, true)),
+            // ...and if building it FAILED, fall back to the old topology rather than trust a
+            // supervisor that is still sitting in the cgroup about to kill it.
+            ((true, true, false), (true, false)),
+        ];
+        for ((forks, kills, built), (want_leaf, want_outside)) in cases {
+            assert_eq!(
+                supervisor_needs_leaf(forks, kills),
+                want_leaf,
+                "needs_leaf({forks}, {kills})"
+            );
+            assert_eq!(
+                supervisor_ends_up_outside(forks, kills, built),
+                want_outside,
+                "ends_up_outside({forks}, {kills}, {built})"
+            );
+        }
+    }
+
+    /// The property the table above encodes, stated once on its own so a future edit to the table
+    /// cannot quietly drop it: `exec()`-in-place is NEVER outside. The supervisor becomes the
+    /// workload, so parking it anywhere else runs the workload uncapped. This was measured as a real
+    /// regression while the fix was being built, on a root VPS where `kern run` stopped being killed
+    /// by its own cgroup.
+    #[test]
+    fn exec_in_place_is_never_outside_the_capped_cgroup() {
+        for kills in [false, true] {
+            for built in [false, true] {
+                assert!(
+                    !supervisor_ends_up_outside(false, kills, built),
+                    "exec-in-place reported outside with kills={kills} built={built}"
+                );
+                assert!(
+                    !supervisor_needs_leaf(false, kills),
+                    "exec-in-place asked for a leaf"
+                );
+            }
+        }
+    }
+
+    /// A leaf is built ONLY where the supervisor's own cgroup is armed. Everywhere else it is cost
+    /// with no property behind it: 0.165 ms of a 2.3 ms box start, measured over 24 paired batches.
+    #[test]
+    fn a_leaf_is_built_only_when_the_supervisors_own_cgroup_group_kills() {
+        assert!(supervisor_needs_leaf(true, true));
+        assert!(!supervisor_needs_leaf(true, false));
+    }
+
     #[test]
     fn the_supervisor_leaf_is_not_accepted_as_a_box_cgroup() {
         // A box's own dir and the scope kern names: both are kern's, both stay accepted.
