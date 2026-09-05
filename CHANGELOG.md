@@ -13,6 +13,15 @@ is in the git history.
 
 ## v0.9.1 - 2026-09-05
 
+**This release is 0.10 ms slower than v0.9.0 on a bare box start, and the trade is deliberate.**
+Measured with both binaries built the way the release is built, 14 alternating batches of 40 on an
+idle machine: 2.502 ms against 2.401, slower in 14 out of 14, so not variance. `strace -c` puts them
+within two syscalls of each other and the difference is one `mkdir` plus one `rmdir`: the
+supervisor's sibling cgroup. That leaf is what keeps the process reporting an OOM out of the group
+the OOM kills, and it cannot be skipped for uncapped boxes because there are none. The published
+bare-box figure moves from 2.4 ms to 2.5 and the tables were updated.
+
+
 **Cut for one defect that the released binary has on most hosts.** `--egress-allow` in v0.9.0 could
 put a proxy on a port nothing in the box could reach, and on three of the five hosts measured it did
 not even get the port: `cannot bind 127.0.0.1:3128 in box: Address not available (99)`, then every

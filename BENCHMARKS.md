@@ -7,6 +7,32 @@ filesystem.
 | runtime | cold start | 200 in parallel |
 |---|---:|---:|
 | **kern** `box --rootfs` | **2.5 ms** | **0.11 s** |
+
+### v0.9.1 costs 0.10 ms against v0.9.0, on purpose
+
+Measured after the fact rather than assumed, both binaries built the way the release is built
+(nightly, `-Z build-std`, `panic=immediate-abort`), same rootfs, 14 alternating batches of 40 on an
+idle machine:
+
+| | median | min | max |
+|---|---:|---:|---:|
+| v0.9.1 | 2.502 ms | 2.460 | 2.545 |
+| v0.9.0 | 2.401 ms | 2.332 | 2.450 |
+
+**+0.101 ms, and v0.9.1 was slower in 14 batches out of 14**, so this is not variance. `strace -c`
+puts the two within two syscalls of each other, 962 against 964, and the difference is one extra
+`mkdir` and one extra `rmdir`: the supervisor's sibling cgroup, `kern-box-<name>-<pid>-sup`.
+
+That leaf is the fix for a box past its memory cap exiting 137 with an empty stderr. The supervisor
+used to sit in a cgroup carrying `memory.oom.group = 1`, so the whole-group kill took the process
+that was supposed to report the kill. It cannot be skipped for uncapped boxes either, because there
+are none: `apply_limits` falls back to `DEFAULT_MEMORY_MAX` when no `--memory` is given and writes
+`oom.group = 1` unconditionally, so every box is in the blast radius the leaf exists to leave.
+
+One tenth of a millisecond for an exit code that gets reported. The number above moved from 2.4 to
+2.5 because of it, and the tables were updated rather than left describing the older binary.
+
+
 | bubblewrap | 2.5 ms | 0.13 s |
 | runc (rootless) | 13.1 ms | 0.29 s |
 | podman `run --rm` | 296.6 ms | 43.1 s |
