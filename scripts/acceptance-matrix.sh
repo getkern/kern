@@ -201,8 +201,10 @@ echo "  egress: the proxy must ANSWER, not merely be bound"
 
 # CAN THIS HOST TELL THE TWO ARTIFACTS APART? Measured, not assumed, because the answer is no on the
 # machine most likely to run this. With `lo` down in a fresh net ns, three of five hosts tested refuse
-# a `127.0.0.1` bind and two accept it. The v0.9.0 defect only SHOWS on the refusing kind; on an
-# accepting host the old binary passes this case exactly as the fixed one does.
+# a `127.0.0.1` bind and two accept it, and the split is the kernel's routing configuration: every
+# host with policy routing (`CONFIG_IP_MULTIPLE_TABLES`, probed by whether `ip rule list` works)
+# accepted, every host without it refused, five out of five. The v0.9.0 defect only SHOWS on the
+# refusing kind; on an accepting host the old binary passes this case exactly as the fixed one does.
 #
 # So the case reports which it is. A green tick that cannot fail is the failure this whole matrix
 # exists to prevent, and printing it anyway would repeat the v0.8.5 field report: competent, all
@@ -226,9 +228,10 @@ if proxy_answered "$egr"; then
     case "$bind_refused_here" in
       yes) pass "egress: the proxy answered, on a host that REFUSES the bind - this discriminates" ;;
       no)  pass "egress: the proxy answered, but this host ACCEPTS a bind on a down loopback, so"
-           echo "          v0.9.0 passes this case here too. Re-run it on a host where"
-           echo "          \`unshare -Urn\` refuses a 127.0.0.1 bind (measured: two aarch64 boards"
-           echo "          and one 6.12 x86 host) before calling the fix validated." ;;
+           echo "          v0.9.0 passes this case here too, and this run has NOT validated the fix."
+           echo "          Re-run on a host WITHOUT policy routing: \`ip rule list\` failing is the"
+           echo "          discriminant, and it matched the bind outcome on all five hosts measured."
+           echo "          Here: ip rule list $(ip rule list >/dev/null 2>&1 && echo works || echo fails)." ;;
       *)   pass "egress: the proxy answered (could not determine whether this host discriminates)" ;;
     esac
 else

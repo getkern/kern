@@ -735,24 +735,28 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
     //   6.8.0    x86_64 uid 0    bind= 0 ok              listen= 0 ok  connect=-1 ENETUNREACH
     //   7.0.0    x86_64 uid 1000 bind= 0 ok              listen= 0 ok  connect=-1 ENETUNREACH
     //
-    // THREE OF FIVE REFUSE THE BIND, and no explanation for the split survived contact with the data.
-    // Not the kernel version: 5.15 and 6.16 refuse while 6.8 and 7.0 accept. Not privilege: both
-    // columns hold at uid 0 and at uid 1000. Not `ip_nonlocal_bind`, which reads 0 on every one of
-    // them, including inside the fresh namespace with `/proc` remounted so the value is that
-    // namespace's own and not the parent's. The two that accept are the x86_64 hosts, a correlation
-    // on n=5 with no mechanism behind it, so it is recorded as an observation and not as a cause.
+    // THREE OF FIVE REFUSE THE BIND, and the reason is the kernel's ROUTING configuration, not
+    // anything about the version or the machine. `CONFIG_IP_MULTIPLE_TABLES` (policy routing)
+    // correlates with the outcome on all five, probed by whether `ip rule list` works at all:
     //
-    // One more measurement narrows the question without answering it. On an accepting host, a fresh
-    // net ns binds ANY address, not just the loopback:
+    //   7.0.0    x86_64  policy routing YES  -> accepts     6.6.51  arm64  YES -> accepts
+    //   6.8.0    x86_64  policy routing YES  -> accepts     5.15.148 arm64 NO  -> refuses
+    //   6.16.7   arm64   policy routing NO   -> refuses
     //
-    //   bind 127.0.0.1 ok    bind 127.0.0.2 ok    bind 10.0.0.1 ok    bind 0.0.0.0 ok
+    // Three earlier guesses died on the way here, and they are worth listing because each looked
+    // sufficient at the time. Not the kernel VERSION: ordered 5.15, 6.6, 6.8, 6.12, 6.16, 7.0 the
+    // outcome goes refuse, accept, accept, refuse, refuse, accept, which is not monotonic in
+    // anything. Not the ARCHITECTURE: the Pi 5 is aarch64 and accepts, next to two aarch64 boards
+    // that refuse. Not PRIVILEGE: both outcomes occur at uid 0 and at uid 1000. Not
+    // `ip_nonlocal_bind`, which reads 0 on every host, inside the namespace with `/proc` remounted
+    // so the value is that namespace's own.
     //
-    // with an empty `/proc/net/route`, an empty `fib_trie`, no address on `lo`, and both
-    // `ip_nonlocal_bind` and `route_localnet` at 0. So this is not a special case for loopback: the
-    // accepting kernels permit a bind to an address that is local to nobody, in a namespace with no
-    // routing table at all. The open question is therefore why THOSE accept, not why the others
-    // refuse, and it is left open here rather than guessed at. Finishing it needs a board that was
-    // powered off when this was written.
+    // The mechanism is consistent with where `inet_addr_type` resolves. On an accepting host a fresh
+    // net ns binds ANY address, `10.0.0.1` included, with an empty `/proc/net/route`; on a refusing
+    // one the same file carries its header and only `0.0.0.0` binds. That reads as the rules engine
+    // and the single-table path disagreeing about an address in a namespace with nothing in it. It is
+    // a correlation over five hosts with a candidate mechanism, NOT a proven cause, and it is written
+    // that way on purpose.
     //
     // What never varies is `connect`, and that is what this guard is built on. An external audit
     // reported the first row and it could not be reproduced on the machine that wrote the fix, which
