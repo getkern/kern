@@ -1726,21 +1726,6 @@ const fn caps_gate_satisfied(mem_ok: bool, pids_ok: bool, require_all: bool) -> 
     }
 }
 
-/// Confine the current process in a fresh cgroup with memory + pid (+ optional swap / CPU quota /
-/// CPU pinning) caps. Returns the cgroup path on success (the workload, forked later, inherits it),
-/// or `None` if unavailable. `memory_max` (bytes) overrides the default ceiling; `memory_swap_max`
-/// (bytes, `--memory-swap-max`) sets `memory.swap.max` - the v2 swap *allowance*, separate from
-/// `memory.max`, default `0` (swap off, so `memory.max` is a hard total); `cpuset` (`--cpuset-cpus`,
-/// e.g. `"0-3"`) pins to specific CPUs via `cpuset.cpus`; `cpus` (cores, K8s semantics) caps CPU
-/// time via `cpu.max`. The swap/CPU/cpuset knobs are all best-effort - silently skipped where the
-/// controller isn't delegated (e.g. `cpuset` is often not delegated inside a systemd user scope).
-///
-/// `allow_direct` is the caller's authority to take the direct `kern.slice` path: `true` for `kern box`
-/// (a supervisor holds the RAII guard and vacates the box cgroup before `rmdir`), `false` for `kern run`
-/// (it `exec()`s IN PLACE - no supervisor to move back out - so it must stay on the systemd `--scope`
-/// `--collect` path and NEVER relocate into `kern.slice`). This is the one enforcement input that can't be
-/// re-derived from env, so the caller passes it explicitly; `took_direct_cap_path()` supplies the rest.
-
 /// Where does the supervisor belong, given the two facts that decide it?
 ///
 /// `forks` is whether the caller forks the workload (`kern box`) or `exec()`s it in place
@@ -1771,6 +1756,20 @@ fn supervisor_ends_up_outside(forks: bool, origin_kills: bool, leaf_built: bool)
     forks && (leaf_built || !origin_kills)
 }
 
+/// Confine the current process in a fresh cgroup with memory + pid (+ optional swap / CPU quota /
+/// CPU pinning) caps. Returns the cgroup path on success (the workload, forked later, inherits it),
+/// or `None` if unavailable. `memory_max` (bytes) overrides the default ceiling; `memory_swap_max`
+/// (bytes, `--memory-swap-max`) sets `memory.swap.max` - the v2 swap *allowance*, separate from
+/// `memory.max`, default `0` (swap off, so `memory.max` is a hard total); `cpuset` (`--cpuset-cpus`,
+/// e.g. `"0-3"`) pins to specific CPUs via `cpuset.cpus`; `cpus` (cores, K8s semantics) caps CPU
+/// time via `cpu.max`. The swap/CPU/cpuset knobs are all best-effort - silently skipped where the
+/// controller isn't delegated (e.g. `cpuset` is often not delegated inside a systemd user scope).
+///
+/// `allow_direct` is the caller's authority to take the direct `kern.slice` path: `true` for `kern box`
+/// (a supervisor holds the RAII guard and vacates the box cgroup before `rmdir`), `false` for `kern run`
+/// (it `exec()`s IN PLACE - no supervisor to move back out - so it must stay on the systemd `--scope`
+/// `--collect` path and NEVER relocate into `kern.slice`). This is the one enforcement input that can't be
+/// re-derived from env, so the caller passes it explicitly; `took_direct_cap_path()` supplies the rest.
 #[allow(clippy::too_many_arguments)] // one cgroup knob per parameter - grouping them would only hide it
 pub fn apply_limits(
     allow_direct: bool,

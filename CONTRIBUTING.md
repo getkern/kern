@@ -200,6 +200,19 @@ because a word in backticks is a symbol and not the document's voice. The reason
 commercial rather than aesthetic: readers who see one of those words decide a model wrote the page
 and stop, before checking a single measurement.
 
+## Run `rustup update stable` before trusting a green clippy
+
+CI pins `stable`, which means whatever stable is on the day it runs. A local toolchain one release
+behind runs the same command and reaches a different verdict, and the direction is the dangerous one:
+the newer clippy has more lints, so LOCAL IS THE WEAKER GATE.
+
+Measured, and it cost a red CI on a release commit: clippy 0.1.98 of 2026-08-18 accepted an empty
+line between a doc comment and the item it documents, and 0.1.98 of 2026-09-01 refuses it with
+`empty line after doc comment`. Same version number, six weeks apart, opposite answers.
+
+So `cargo clippy` passing here is not evidence until the toolchain matches. The check that settles it
+is a positive control: reintroduce the thing CI rejected and confirm your clippy now rejects it too.
+
 ## Progress goes through `progress!`, never `eprintln!`
 
 kern and a box's workload share one stderr. A progress line written with a bare `eprintln!` therefore
