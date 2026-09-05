@@ -14,7 +14,7 @@
     ]
   },
   "dependencies": {
-    "kern-sandbox": "^0.1.40"
+    "kern-sandbox": "^0.1.41"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.4",

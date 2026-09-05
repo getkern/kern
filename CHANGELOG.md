@@ -37,6 +37,21 @@ prefix were invisible to anything reading kern's output. Detail below.
 
 ## Unreleased
 
+**`kern-sandbox` 0.1.41** is a documentation release: no code changed from 0.1.40. PyPI and npm fix a
+package's description at upload time, so the only way to correct a landing page is to publish again.
+
+The two package READMEs had grown into reference manuals, 521 and 387 lines, and are now 384 and 309
+with nothing deleted. The operational tail moved to `SANDBOX-NOTES.md` beside each binding, the way
+`LANGCHAIN-SHELL.md` already handles the shell policy: scratch that does not survive a call,
+toolchains that need `HOME`, a `df` and an `nproc` that describe the host, output discarded past the
+cap while the job runs on, matplotlib rendering and complaining anyway. None of it is needed for a
+first call and all of it cost somebody an afternoon.
+
+Both pages now document `code_stderr`/`codeStderr` and `runtime_notes`/`runtimeNotes`, which shipped
+in 0.1.40 with no page saying so, and the LangChain section names the two vocabularies the policy
+accepts.
+
+
 **`kern-sandbox` 0.1.40** answers an external audit of the SDK, the pi extension and the LangChain
 integration. Four findings were reported; one was already closed in 0.1.39, and measuring the second
 found a worse defect underneath it than the one described.
