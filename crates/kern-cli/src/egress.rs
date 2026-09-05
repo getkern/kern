@@ -727,26 +727,37 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
     // already privileged over it), and it reports success for a loopback the init had already raised.
     //
     // The `_exit` below is the part that matters, and it is here because WHAT a down `lo` does is not
-    // the same everywhere. Three hosts, one C probe, a fresh net ns on each:
+    // the same everywhere. Five hosts, one C probe, a fresh net ns on each:
     //
-    //   6.12.8+, uid 0   lo DOWN: bind=-1 EADDRNOTAVAIL   listen=-1     connect=-1 ENETUNREACH
-    //   6.8.0,   uid 0   lo DOWN: bind= 0 ok              listen= 0 ok  connect=-1 ENETUNREACH
-    //   7.0.0,   rootless lo DOWN: bind= 0 ok             listen= 0 ok  connect=-1 ENETUNREACH
+    //   6.12.8+  x86?  uid 0     bind=-1 EADDRNOTAVAIL   listen=-1     connect=-1 ENETUNREACH
+    //   6.16.7   arm64 uid 1000  bind=-1 EADDRNOTAVAIL   listen=-1     connect=-1 ENETUNREACH
+    //   5.15.148 arm64 uid 1000  bind=-1 EADDRNOTAVAIL   listen=-1     connect=-1 ENETUNREACH
+    //   6.8.0    x86_64 uid 0    bind= 0 ok              listen= 0 ok  connect=-1 ENETUNREACH
+    //   7.0.0    x86_64 uid 1000 bind= 0 ok              listen= 0 ok  connect=-1 ENETUNREACH
     //
-    // The middle row is why this comment does not say "newer kernels accept the bind". It was written
-    // that way on two data points and the third contradicted it: 6.8 sides with 7.0, not with 6.12,
-    // so whatever makes the bind fail on that host is not the version. It is not established here.
+    // THREE OF FIVE REFUSE THE BIND, and no explanation for the split survived contact with the data.
+    // Not the kernel version: 5.15 and 6.16 refuse while 6.8 and 7.0 accept. Not privilege: both
+    // columns hold at uid 0 and at uid 1000. Not `ip_nonlocal_bind`, which is 0 on every one of them,
+    // in the fresh namespace as well as outside it. The two that accept happen to be the x86_64 hosts,
+    // which is a correlation on n=5 with no mechanism behind it, so it is written here as an
+    // observation and not as a cause.
     //
-    // What IS established is the column that never varies. An external audit hit the first row and
-    // reported "the bind fails"; on this tree the second and third turned up instead, and those are
-    // worse, because bind and listen both SUCCEED. The pump takes a port, writes its readiness byte,
-    // and the launcher starts the workload against a proxy no packet can reach: a false green in the
-    // very signal added to make this failure visible.
+    // What never varies is `connect`, and that is what this guard is built on. An external audit
+    // reported the first row and it could not be reproduced on the machine that wrote the fix, which
+    // is the second column. Reproduced later on an Orin Nano, byte for byte, with the SHIPPED binary:
     //
-    // So the guard is built on `connect`, which fails on all three, rather than on `bind`, which
-    // disagrees for a reason nobody has pinned down. `IFF_UP` is a property of the interface the
-    // connections arrive over rather than the outcome of one syscall, so reading it is right on a
-    // host none of us has measured. Readiness means reachable, not bound.
+    //   kern 0.9.0  kern: egress pump: cannot bind 127.0.0.1:3128 in box: Address not available (99)
+    //               wget: can't connect to remote host (127.0.0.1): Connection refused
+    //   this tree   wget: server returned error: HTTP/1.1 403 Forbidden      <- the proxy answering
+    //
+    // Same host, same command. The accepting rows are the worse ones, because bind AND listen succeed
+    // there, so the pump takes a port, writes its readiness byte, and the launcher starts the workload
+    // against a proxy no packet can reach: a false green in the very signal added to catch this.
+    //
+    // So: read `IFF_UP` on the interface the connections arrive over, before and independently of the
+    // bind, and die if it is not up. That is one check, correct on all five rows and on the host none
+    // of us has measured, because it does not depend on which syscall this kernel chooses to fail.
+    // Readiness means reachable, not bound.
     if !kern_isolation::bring_loopback_up() {
         eprintln!(
             "kern: egress pump: the box's loopback is down and could not be raised, so nothing in \

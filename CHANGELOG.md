@@ -11,6 +11,30 @@ scripts and SDKs written against the CLI can rely on it. Install the release bin
 with `cargo install --git https://github.com/getkern/kern getkern --locked`. Full detail for any entry
 is in the git history.
 
+## v0.9.1 - 2026-09-05
+
+**Cut for one defect that the released binary has on most hosts.** `--egress-allow` in v0.9.0 could
+put a proxy on a port nothing in the box could reach, and on three of the five hosts measured it did
+not even get the port: `cannot bind 127.0.0.1:3128 in box: Address not available (99)`, then every
+allowed domain refused with `Connection refused`. Reproduced on an Arduino UNO Q and a Jetson Orin
+Nano with the shipped v0.9.0 aarch64 binary, byte for byte, against the same command answering
+`403 Forbidden` from the proxy on this tree.
+
+The cause is a race: the egress pump joins the box's network namespace and binds while the box's init
+is still pivoting its root and has not yet raised the loopback. The pump now raises it itself and
+refuses to serve if it cannot, so readiness means reachable rather than bound. Five hosts measured,
+and neither the kernel version nor the privilege level explains which ones refuse the bind; only
+`connect` fails on all of them, which is why the guard reads the interface instead of a syscall.
+
+`scripts/acceptance-matrix.sh` now exercises this, and says out loud when it CANNOT: on a host that
+accepts a bind on a down loopback, v0.9.0 passes the case exactly as the fix does, so the matrix
+prints that instead of a green tick. Verified in both directions on hardware, red on the released
+binary and green on this one, on the board where the defect lives.
+
+Also in this release: kern's progress output no longer contaminates a pipe, a cgroup probe no longer
+prints systemd's bus error onto the box's stderr, and three diagnostics that lacked the `kern: `
+prefix were invisible to anything reading kern's output. Detail below.
+
 ## Unreleased
 
 **`kern-sandbox` 0.1.40** answers an external audit of the SDK, the pi extension and the LangChain
