@@ -137,9 +137,8 @@ python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
 ```
 
 One case is worth calling out because it is measured rather than theoretical: `--egress-allow` on a
-kernel WITHOUT policy routing (`ip rule list` fails, which is common on ARM boards) needs a binary
-newer than **v0.9.0**, or the box starts with a proxy nothing can reach. Everything else in this
-README works on v0.9.0.
+kernel WITHOUT policy routing (`ip rule list` fails, which is common on ARM boards) needs **v0.9.1**,
+or the box starts with a proxy nothing can reach.
 
 `kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
 [docs/INSTALL.md](docs/INSTALL.md). Common questions (Docker, bubblewrap, youki, E2B, Windows, the
@@ -166,7 +165,7 @@ kern box job --image python:3.12-slim --security-profile untrusted -- python3 /w
 in one flag. No network unless you ask, and seccomp is on either way. One runnable example per
 thing kern does: [examples/](examples/).
 
-Every read verb also answers in JSON, so nothing has to parse a table:
+Every verb that lists or inspects also answers in JSON, so nothing has to parse a table:
 
 ```sh
 kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
@@ -353,11 +352,11 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 `cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
 
 Scripts written against the CLI keep working: no verb, no flag and no `--json` field changes meaning
-inside a patch release. **v0.9.0 changes one exit code**, which is why it is a minor bump and not a
-patch: `kern box --plan` now exits 1 when a profile it named cannot attach, where it used to print the
-refusal and exit 0. A script that read the preview is unaffected; one that chained on `&&` now stops
-where it should have. That, and everything else in the release, is in the
-[0.9.0 notes](CHANGELOG.md#v090---2026-09-04).
+inside a patch release. **The 0.9 minor bump changes one exit code**, which is why it is minor and not
+a patch: `kern box --plan` now exits 1 when a profile it named cannot attach, where it used to print
+the refusal and exit 0. A script that read the preview is unaffected; one that chained on `&&` now
+stops where it should have. That, and everything else in the release, is in the
+[v0.9.1 notes](CHANGELOG.md#v091---2026-09-05).
 
 ## What kern is not
 
