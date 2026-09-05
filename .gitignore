@@ -85,3 +85,10 @@ node_modules/
 __pycache__/
 *.pyc
 kern-sandbox-*.tgz
+
+# Review and break-test correspondence for integrations/pi: working documents, not product. Ten of
+# them reached the public repo through a `git add -A`, where they were noise to a reader and a record
+# of process rather than of the thing. They live outside the tree now.
+integrations/pi/REVIEW-*.md
+integrations/pi/BREAK-*.md
+integrations/pi/REPORT.md
