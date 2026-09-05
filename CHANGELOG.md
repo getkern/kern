@@ -18,9 +18,7 @@ Measured twice, in two harnesses, because a number that moves a published figure
 one. `scripts/bench-idle.sh` on each binary in turn: 2.561 ms against 2.407 free, 1.964 against 1.780
 pinned. A second harness, 30 alternating batches: 2.496 against 2.385, with v0.9.1 faster in 1 of 30
 paired batches where fifteen would be a tie. The gap is 0.10 to 0.18 ms depending on the harness, and
-it is not variance in either. `strace -c` puts them
-within two syscalls of each other and the difference is one `mkdir` plus one `rmdir`: the
-supervisor's sibling cgroup. That leaf is what keeps the process reporting an OOM out of the group
+it is not variance in either. `strace -c` puts them within two syscalls of each other, and the cost is NOT the extra `mkdir` and `rmdir` that shows up there: a variant keeping the supervisor in place, with no sibling leaf at all, saves 0.008 ms and wins 11 of 20 paired batches. The cost is the workload's migration into the capped cgroup, 81 us measured, which v0.9.0 got for free by inheritance because its supervisor sat in the blast radius. That leaf is what keeps the process reporting an OOM out of the group
 the OOM kills, and it cannot be skipped for uncapped boxes because there are none. The published
 bare-box figure moves from 2.4 ms to 2.5 and the tables were updated.
 

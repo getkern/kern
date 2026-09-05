@@ -48,8 +48,43 @@ session as the other two.
 
 The most aggressive codegen this machine can produce buys 0.009 ms free and 0.028 pinned, which is
 inside the run-to-run drift: v0.9.0 itself read 2.407 in one run and 2.449 in the next. The
-assertion in `Cargo.toml` now has a measurement under it, and the 0.15 ms is where the profiler said
-it was, in a `mkdir` and an `rmdir` on cgroupfs. `strace -c`
+assertion in `Cargo.toml` now has a measurement under it: the cost is a syscall, and no compiler
+removes a syscall.
+
+### Where the 0.10 ms actually goes, and why it cannot be given back
+
+The first attribution was wrong, and the experiment that corrected it is the part worth keeping.
+`strace` named an extra `mkdir` and `rmdir`, the supervisor's sibling cgroup, so that looked like the
+answer. Measured in isolation on this host:
+
+| | |
+|---|---:|
+| `mkdir` + `rmdir` of a cgroup | 65.6 us |
+| moving a process INTO a cgroup | 81.2 us |
+| moving it back out | 9.5 us |
+
+The arithmetic agreed with the story, which is exactly why it was worth testing rather than
+believing. A variant was built that keeps the supervisor in the cgroup it was already in and creates
+no sibling leaf at all, then measured against the shipped layout in 20 alternating paired batches:
+
+| | median |
+|---|---:|
+| sibling leaf (shipped) | 2.517 ms |
+| supervisor stays put | 2.509 ms |
+| v0.9.0 | 2.409 ms |
+
+**It saves 0.008 ms and wins 11 of 20 paired batches, which is a coin flip**, and it still trails
+v0.9.0 by the full 0.100 ms. The leaf is not the cost.
+
+The cost is the WORKLOAD's migration into the capped cgroup. v0.9.0 got it there for free: the
+supervisor sat in the capped cgroup and the forked child inherited it, one write covering both. Any
+layout that keeps the supervisor out of the blast radius breaks that inheritance, so the child has to
+write itself in, and a migration is 81 us whichever cgroup it moves to.
+
+That is the whole trade, and no cleverer version recovers it: a process is in exactly one cgroup and a
+fork inherits the parent's, so "the workload is capped AND the supervisor is not" costs one migration
+under cgroup v2. The variant was reverted rather than kept, because a second code path that buys
+0.008 ms is a liability. `strace -c`
 puts the two within two syscalls of each other, 962 against 964, and the difference is one extra
 `mkdir` and one extra `rmdir`: the supervisor's sibling cgroup, `kern-box-<name>-<pid>-sup`.
 
