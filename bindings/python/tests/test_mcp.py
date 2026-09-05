@@ -1408,14 +1408,23 @@ class TestTheSchemaAndTheGuardCannotDisagree:
 
     def test_every_language_the_sdk_takes_is_offered_by_the_server(self):
         """The two surfaces are meant to match. `Sandbox.run_code` accepts python, bash, sh and node,
-        and a caller moving from the SDK to the MCP server should not lose one."""
-        import typing
+        and a caller moving from the SDK to the MCP server should not lose one.
+
+        Reads the ONE annotation it needs out of the signature string, rather than calling
+        `typing.get_type_hints`. That helper evaluates EVERY hint on the function, and `run_code` has
+        parameters written `X | None`, which is a runtime TypeError on Python 3.9 - the floor this
+        package declares and the floor CI actually tests. The first version of this test was green
+        here on 3.12 and red on the 3.9 job for exactly that reason.
+        """
+        import inspect
+        import re
 
         from kern_sandbox import Sandbox, mcp
 
-        hints = typing.get_type_hints(Sandbox.run_code)
-        sdk = set(typing.get_args(hints["language"]))
-        assert sdk, "run_code's language annotation is no longer a Literal this test can read"
+        ann = str(inspect.signature(Sandbox.run_code).parameters["language"].annotation)
+        assert "Literal" in ann, f"language is no longer a Literal this test can read: {ann!r}"
+        sdk = set(re.findall(r"['\"]([a-z]+)['\"]", ann))
+        assert sdk, f"no literal values found in {ann!r}"
         assert sdk == set(mcp._RUN_CODE_LANGUAGES), (
             f"SDK accepts {sorted(sdk)}, MCP offers {sorted(mcp._RUN_CODE_LANGUAGES)}"
         )

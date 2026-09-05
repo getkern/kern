@@ -118,6 +118,29 @@ That puts `kern` in `~/.cargo/bin`, which rustup adds to your `PATH` (open a new
 The release also ships an `aarch64` binary, a Windows `.exe` shim and a pre-baked WSL rootfs, each
 with its own `.sha256`; the tag is GPG-signed and independently timestamped ([provenance/](provenance/)).
 
+### Two versions, and they move separately
+
+The `kern` binary is versioned by its git tag and `kern-sandbox` by its own release, so the two can
+be out of step and it matters which way. **The SDK drives the binary as a subprocess**, so a binding
+newer than the binary asks for behaviour the binary does not have yet.
+
+Today `install.sh` gives you the latest **release**, and `pip install kern-sandbox` gives you the
+latest **SDK**. If the release predates a fix the SDK relies on, that shows up as behaviour this
+README describes and your machine does not do. The [CHANGELOG](CHANGELOG.md) is where the two are
+reconciled: an entry names the release it landed in.
+
+To see what you actually have:
+
+```sh
+kern --version                                   # the binary; `0.0.0` means you built it from source
+python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
+```
+
+One case is worth calling out because it is measured rather than theoretical: `--egress-allow` on a
+kernel WITHOUT policy routing (`ip rule list` fails, which is common on ARM boards) needs a binary
+newer than **v0.9.0**, or the box starts with a proxy nothing can reach. Everything else in this
+README works on v0.9.0.
+
 `kern doctor` tells you whether boxes will run here before you try. Boards, WSL2 and the long form:
 [docs/INSTALL.md](docs/INSTALL.md). Common questions (Docker, bubblewrap, youki, E2B, Windows, the
 threat model): [docs/FAQ.md](docs/FAQ.md).
@@ -151,15 +174,12 @@ kern ps --json | jq '.[] | select(.health == "unhealthy") | .name'
 
 ## Run an agent's code: Python, Node, MCP
 
-An agent needs somewhere to run what the model just wrote.
-**[`kern-sandbox`](bindings/python/README.md)** is that place, called from your own program: a thin,
-dependency-free wrapper over the `kern` binary. Every call runs in a fresh isolated box, with the
-network off, memory and pid caps, capabilities dropped, output bounded, and a timeout the binding
-enforces itself.
+An agent needs somewhere to run what the model just wrote. **[`kern-sandbox`](bindings/python/README.md)**
+is that place: a thin, dependency-free wrapper over the `kern` binary, called from your own program.
 
 ```sh
-pip install kern-sandbox        # PyPI   · needs the `kern` binary above, on PATH or $KERN_BIN
-npm  install kern-sandbox       # npm    · same
+pip install kern-sandbox        # PyPI · needs the `kern` binary above, on PATH or $KERN_BIN
+npm  install kern-sandbox       # npm  · same
 ```
 
 ```python
@@ -169,42 +189,26 @@ r = run_code("import platform; print(platform.python_version())")
 print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
 ```
 
-- **Faults are data, not exceptions**: a timeout, OOM-kill or blocked syscall is a field on the
-  result, not a raise. A fresh box per call by default; `Sandbox` keeps a workspace across calls and
-  a warm `kernel()` keeps one interpreter for sub-millisecond cells (weaker isolation, by choice).
-- **Rich results without a Jupyter kernel**: the last expression, `display()` and matplotlib figures
-  come back captured, like a notebook cell.
-- Ships an **MCP server** (`kern-mcp`): a dependency-free stdio server that gives Claude Desktop,
-  Cursor or any MCP client a local code interpreter. Point the client at it:
+Every call is a fresh isolated box: network off, memory and pid caps, capabilities dropped, output
+bounded, and a timeout the binding enforces itself. A timeout, an OOM-kill or a blocked syscall comes
+back as a typed `fault` on the result rather than as an exception. `code_stderr` is that result's
+stderr without kern's own notes, which is what belongs in a context window.
+
+It also ships **`kern-mcp`**, a dependency-free stdio server that gives Claude Desktop or Cursor a
+local code interpreter, and the server is stdio, so the same one line points a client at a box on
+another machine.
 
 ```json
 { "mcpServers": { "kern": { "command": "kern-mcp" } } }
 ```
 
-Tools: `run_code` (python/bash/sh, and node on an image that carries it), `write_file`, `read_file`,
-`list_files`. Each call is a fresh network-off box; files persist across calls in a workspace on disk.
-
-**The server is stdio, so it travels.** Nothing in MCP cares what carries the pipe, so the same one
-line points a client at a box on another machine: `"command": "ssh", "args": ["pi@board", "kern-mcp"]`
-runs the agent where you are and the sandbox where the board is. Measured on loopback, the ssh
-handshake is paid once per session and the marginal cost per call is 15 ms.
-[docs/MCP.md](docs/MCP.md) has the tools, every `KERN_MCP_*` variable, and what the remote form costs.
-
-**Prewarming, when the first millisecond is the one a user feels.** `prewarm=N` keeps N boxes started
-in advance, each holding a booted interpreter that has run nothing, and the refill happens on a worker
-thread while the agent thinks. Measured on `python:3.12-slim`: **14.2 ms p50 by default, 0.8 ms with
-`prewarm=4`**, and 30.9 ms against 0.9 for the first call. Each prewarmed box still serves ONE call and
-is thrown away, so the isolation is unchanged; only the moment of creation moves.
-
-**pi's coding tools, in a box.** [integrations/pi](integrations/pi/) routes
-[pi](https://github.com/earendil-works/pi)'s built-in `bash`, `read`, `write`, `edit`, `ls`, `grep` and
-`find` through the Node SDK into a kern box, with your working directory at `/workspace` so edits write
-through and nothing else survives. pi's default posture is no sandbox at all. The two halves are not
-confined by the same thing and its README says which is which: `bash` runs inside the box, while `read`
-and the staging half of `write` are host calls guarded by `O_NOFOLLOW` and a `/proc/self/fd` check.
-
-Full API, Python and Node: [bindings/python/README.md](bindings/python/README.md) ·
-[bindings/node/README.md](bindings/node/README.md) · [integrations/pi/](integrations/pi/).
+The rest is on the pages that own it, none of it repeated here: the full API, the rich-result capture,
+prewarming and the LangChain integration in
+[bindings/python/README.md](bindings/python/README.md) and
+[bindings/node/README.md](bindings/node/README.md); every `KERN_MCP_*` variable and the remote form in
+[docs/MCP.md](docs/MCP.md); and pi's `bash`, `read`, `write`, `edit`, `ls`, `grep` and `find` routed
+into a box, with a README that states which half is the kernel's boundary and which is a path check,
+in [integrations/pi/](integrations/pi/).
 
 ## Stacks
 
@@ -225,62 +229,29 @@ depends_on = ["db"]
 
 ```sh
 kern compose stack.toml up          # or point it at your compose.yaml instead
+kern compose stack.toml watch       # rebuild + restart a service when its build context changes
+kern compose stack.toml port web 80 # the host address serving that port, read from the running box
 ```
 
-Both official images start, `web` reaches `db` by service name, and the port is published. Warm, the
-web tier serves in **~0.3 s** and the stack costs only what postgres and adminer use (~66 MB here),
-with no daemon underneath. A resource profile attaches here too: `vcpu = "heavy"` on a service.
+Both official images start, `web` reaches `db` by service name, and the port is published. A compose
+file can also name kern's own things in the spec's extension namespace (`x-kern-vcpu`,
+`x-kern-security-profile`) and still run under Docker unchanged, because every other runtime ignores
+an `x-` field. A typo inside one is reported rather than dropped.
 
-A compose file can also name kern's own things, in the spec's extension namespace, and still run
-under Docker unchanged:
+**One constraint comes with the speed:** a stack is one pod on one network namespace, so two services
+cannot both listen on the same container port even when their published ports differ. `up` refuses
+the collision by name before starting anything, and `--no-pod` lifts it by giving each service its
+own namespace with peers reachable by name.
 
-```yaml
-services:
-  api:
-    image: alpine
-    x-kern-vcpu: heavy                   # a resource profile from your kern.toml
-    x-kern-security-profile: untrusted   # seccomp allowlist + cap-drop ALL + read-only
-```
-
-kern reads those; every other runtime ignores an `x-` field, which is what the namespace is for. A
-typo inside it is reported rather than dropped: a key of ours that does nothing and says nothing is
-the defect the mechanism exists to avoid.
-
-One constraint comes with the speed: a stack is one pod on one network namespace, so **two services
-cannot both listen on the same container port**, even when their published ports differ. `kern
-compose up` refuses the collision by name before starting anything.
-
-`--no-pod` lifts that constraint: each service gets its own network namespace, and peers stay
-reachable by name through per-service loopback aliases. A pair that shares an internal port keeps
-whichever direction it can: a service binding `0.0.0.0:PORT` owns every address on that port, so it
-cannot host a peer's alias there, while one binding `127.0.0.1:PORT` can. kern measures which it is
-once the services are running and names any direction it cannot serve, with both edits that clear
-it.
-
-Two verbs for the loop around a stack. `kern compose <file> watch` rebuilds and restarts a service
-when its build context changes, and nothing else. `kern compose <file> port <service> <port>` prints
-the host address serving that container port, read from the running box rather than from the file,
-so it answers what is published now.
-
-```sh
-kern compose stack.toml watch              # rebuild + restart on a change, until interrupted
-kern compose stack.toml port web 80        # the host address serving web's port 80
-kern compose stack.toml stop web           # one service; the rest keep running
-```
-
-[docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
-
-Official images that drop to a non-root user (postgres, redis, ...) want `uidmap` and an
-`/etc/subuid` line, and outbound pulls want `pasta`; both are one `apt install`, and `kern doctor`
-names either if it is missing. This is the local dev loop, not a production orchestrator.
+Official images that drop to a non-root user want `uidmap` and an `/etc/subuid` line, and outbound
+pulls want `pasta`; `kern doctor` names either if it is missing. This is the local dev loop, not a
+production orchestrator. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 
 ## Resource profiles
 
 A slice is declared once in `~/.config/kern/kern.toml` and attached by name, to a sandboxed box or a
-bare process, with the same token.
-
-Three kinds: `vcpu:` (CPU and memory), `vdisk:` (a size-capped scratch disk) and `vgpio:` (device
-nodes). Two of them, and the anchors they are carved from:
+bare process, with the same token. Three kinds: `vcpu:` (CPU and memory), `vdisk:` (a size-capped
+scratch disk) and `vgpio:` (device nodes).
 
 ```toml
 [[cpu]]                     # the host budget a slice is carved from
@@ -292,36 +263,23 @@ name    = "heavy"
 backend = "cpu:0"
 cpus    = 1.5
 memory  = "512m"
-
-[[gpio]]                    # a controller anchor
-id = "gpio:0"
-
-[[vgpio]]                   # exactly one device node ->  attach as  vgpio:sensor
-name    = "sensor"
-backend = "gpio:0"
-i2c     = ["/dev/i2c-1"]
 ```
 
 ```sh
 kern validate ~/.config/kern/kern.toml       # check it before anything runs
 kern box train --image alpine vcpu:heavy vdisk:scratch -- ./train.sh
 kern run vcpu:heavy -- ./train.sh            # the same slice, no sandbox
-kern box iot --image alpine vgpio:sensor -- ls /dev
 ```
 
-Profiles compose: several attach to one box, and an explicit flag beats a profile's own value. Every
-key is spelled like its CLI flag, so `cpus` is `--cpus` and `memory` is `--memory`. A backend naming
-no declared pool is refused when the config is read, not when the box runs.
-[docs/RESOURCES.md](docs/RESOURCES.md) has the field-by-field schema.
+Profiles compose, an explicit flag beats a profile's own value, and every key is spelled like its CLI
+flag. A backend naming no declared pool is refused when the config is read, not when the box runs.
 
-A `vdisk:` is a RAM-backed tmpfs when kern runs rootless, whatever its backend says, and an
-ext4-on-loop image with a real quota when it runs privileged. kern says which one you got, per
-profile, rather than letting you assume, and the size cap is enforced either way.
-
-**`vgpio:` is chip-granular, not per-line.** Asking for `pins` binds the whole `/dev/gpiochipN`, and
-that character device exposes every line of that controller. `pins = [17]` does not restrict the box
-to line 17: the kernel has no per-line mount boundary, so the pin list is cooperative metadata rather
-than a boundary. Naming a device node, as `i2c` above does, grants that node and nothing else.
+Two things this says out loud rather than letting you assume. A `vdisk:` is a RAM-backed tmpfs when
+kern runs rootless, whatever its backend says, and an ext4-on-loop image with a real quota when it
+runs privileged; kern reports which one you got, and the size cap binds either way. And **`vgpio:` is
+chip-granular, not per-line**: asking for `pins` binds the whole `/dev/gpiochipN`, which exposes every
+line of that controller, so `pins = [17]` is cooperative metadata rather than a boundary. Naming a
+device node grants that node and nothing else. [docs/RESOURCES.md](docs/RESOURCES.md)
 
 ## kern vs Docker vs Podman
 
@@ -344,31 +302,17 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 
 ## Performance
 
-Intel i7-14700KF, Linux 7.0.0, the release binary. Reproduce with `sh scripts/bench-idle.sh 4` for the
-first row and `python3 examples/benchmark.py` for the rest.
+Intel i7-14700KF, Linux 7.0.0, the release binary, alternating batches on an idle machine.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
 | Cold start (bare box) | **~2.4 ms** | ~2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
 | 200 boxes in parallel | **~0.11 s** | ~0.13 s | ~0.29 s | ~43.1 s | ~16.7 s |
 
-Three thousand at once take ~2.7 s, and a live box costs ~0.3 MB of memory. That is PSS: kern's own
-code is mapped into every box and has to be counted once, so summing RSS instead reads ~2.8 MB per
-box and is the wrong number.
-
-**kern is faster than bubblewrap, by about 9%, and it takes care to show it.** Timed one runtime after
-the other, both read 2.5 ms: the gap is smaller than the drift between two batches minutes apart. With
-ALTERNATING batches on an idle machine, against the binary **attached to the release** rather than a
-local build, they separate cleanly: kern at **2.35 ms against 2.60**, ahead in **238 of 240 batches**
-over the twelve most recent replicas. Across 35 replicas the direction has never once flipped. kern does more in
-that time: a seccomp filter, a registry entry, and a cgroup cap bubblewrap never applies.
-
-bwrap is namespace-matched, or it is not a comparison, and gets
-`--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net`. It is a launcher rather than
-a runtime, and fractions of a millisecond are not why you would pick either: **the gap that means
-something is the one to the engines**, two orders of magnitude above.
-
-Method, the aarch64 boards, and every caveat: **[BENCHMARKS.md](BENCHMARKS.md)**.
+kern is ahead of bubblewrap by about 9%, and that gap is small enough that it only holds up under a
+method: **[BENCHMARKS.md](BENCHMARKS.md)** has the alternation, the 240 batches, the aarch64 boards,
+why the release binary and not a local build, and every caveat. The gap that means something is the
+one to the engines, two orders of magnitude above.
 
 ## Security
 
