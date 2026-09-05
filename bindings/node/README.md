@@ -12,9 +12,9 @@ allowlist, and a wall-clock deadline the binding applies from **outside** the bo
 cannot outlive it. Dependency-free: it shells out to the `kern` binary and does not re-implement
 isolation in JavaScript.
 
-**The failure comes back as data, not as an exception.** A timeout, an OOM-kill, a blocked syscall or
-a missing interpreter is a typed `fault` on the result, beside stdout and the exit code, so an agent
-loop reads a field instead of parsing a stack trace to learn that the sandbox ended the run.
+**Your loop reads a field, not a stack trace.** A timeout, an OOM-kill, a blocked syscall or a missing
+interpreter each arrive as a typed `fault` on the result, beside stdout and the exit code, so the
+agent branches on a value instead of parsing text to work out who ended the run.
 
 On npm: [`npm install kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). Python gets the same
 package on PyPI: [`kern-sandbox`](https://pypi.org/project/kern-sandbox/), which also ships an **MCP

@@ -22,12 +22,12 @@ Network off, memory and PID caps the kernel enforces, capabilities dropped, a de
 allowlist, and a wall-clock deadline applied from **outside** the box, so code that hangs cannot
 outlive it. Node and TypeScript get the same package on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
 
-## The failure comes back as data, not as an exception
+## Your loop reads a field, not a stack trace
 
 This is the part that matters in an agent loop. A timeout, an OOM-kill, a blocked syscall or a
-missing interpreter is a **typed field on the result**, beside stdout and the exit code. Your loop
-reads a field and decides; it does not parse a traceback to find out that the sandbox, not the code,
-ended the run.
+missing interpreter each arrive as a **typed field on the result**, beside stdout and the exit code.
+The agent branches on a value and keeps going, instead of parsing a traceback to work out whether the
+sandbox stopped the run or the code did.
 
 ```python
 r = kern.run_code("while True: pass", timeout_s=5)

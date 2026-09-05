@@ -46,10 +46,10 @@ and a stack runner at once, in one static binary with no daemon.
   sandbox per tool-call" stops being a design you argue about and becomes the default. Network off,
   memory and PID caps the kernel enforces, capabilities dropped, a deny-by-default seccomp allowlist,
   and the timeout applied from OUTSIDE the box, so code that hangs cannot outlive it.
-  <br>**The failure comes back as data, not as an exception.** A timeout, an OOM-kill, a blocked
-  syscall and a command that was not in the image are each a typed `fault` on the result, next to
-  stdout and the exit code. An agent loop reads the field and decides; it does not parse a stack
-  trace to find out that the sandbox, and not the code, ended the run.
+  <br>**Your loop reads a field, not a stack trace.** A timeout, an OOM-kill, a blocked syscall and a
+  command that was not in the image each arrive as a typed `fault` on the result, beside stdout and
+  the exit code. The agent branches on a value and keeps going, instead of parsing text to work out
+  whether the sandbox stopped the run or the code did.
   <br>`pip install kern-sandbox` or `npm i kern-sandbox`, a LangChain code tool and shell-middleware
   policy, and an **MCP server** that hands Claude Desktop or Cursor a real box to execute in.
   [bindings/python/README.md](bindings/python/README.md). For code written to attack you rather than
