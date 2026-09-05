@@ -51,82 +51,50 @@ inside the run-to-run drift: v0.9.0 itself read 2.407 in one run and 2.449 in th
 assertion in `Cargo.toml` now has a measurement under it: the cost is a syscall, and no compiler
 removes a syscall.
 
-### Where the 0.10 ms actually goes, and why it cannot be given back
+### Where the 0.10 ms goes, after two wrong answers
 
-The first attribution was wrong, and the experiment that corrected it is the part worth keeping.
-`strace` named an extra `mkdir` and `rmdir`, the supervisor's sibling cgroup, so that looked like the
-answer. Measured in isolation on this host:
+**The first answer was wrong and the second answer was wronger, and both were published before they
+were checked.** Recorded here rather than quietly replaced, because the way each failed is the useful
+part.
+
+FIRST: `strace` showed one extra `mkdir` and `rmdir` against v0.9.0, the supervisor's sibling cgroup,
+and cgroup costs measured on this host made the arithmetic fit. That story was right and the
+arithmetic that supported it was not: the numbers came from a Python harness and were measuring
+Python. In C, on the same host:
 
 | | |
 |---|---:|
-| `mkdir` + `rmdir` of a cgroup | 65.6 us |
-| moving a process INTO a cgroup | 81.2 us |
-| moving it back out | 9.5 us |
+| `mkdir` of a cgroup | 90.5 us |
+| `rmdir` | 12.6 us |
+| moving a process in (`cgroup.procs`) | 19.4 us, FLAT from a 0 MB child to a 256 MB one |
+| `open()` of `cgroup.procs` | 4.1 us |
 
-The arithmetic agreed with the story, which is exactly why it was worth testing rather than
-believing. A variant was built that keeps the supervisor in the cgroup it was already in and creates
-no sibling leaf at all, then measured against the shipped layout in 20 alternating paired batches:
+The migration is cheap and does not scale with the child's footprint, so re-charging is not the
+mechanism. The `mkdir` is what costs.
+
+SECOND: a variant was built to test whether the leaf was the cost, it saved 0.008 ms, and that was
+written up as "the leaf is not the cost". **The variant never ran.** A refactor removed the branch
+that disabled the leaf, so the experiment measured the shipped code against itself. `strace -e mkdir`
+would have shown it in one command and was not run until afterwards, when it printed one `-sup`
+`mkdir` in both arms.
+
+WITH THE EXPERIMENT ACTUALLY ENABLED, verified first by that same `strace` printing 0 against 1:
 
 | | median |
 |---|---:|
-| sibling leaf (shipped) | 2.517 ms |
-| supervisor stays put | 2.509 ms |
-| v0.9.0 | 2.409 ms |
+| sibling leaf (shipped) | 2.498 ms |
+| supervisor stays where it already is | **2.331 ms** |
+| v0.9.0 | 2.405 ms |
 
-**It saves 0.008 ms and wins 11 of 20 paired batches, which is a coin flip**, and it still trails
-v0.9.0 by the full 0.100 ms. The leaf is not the cost.
+The variant saves **0.167 ms and wins 20 of 20 paired batches**, and it is faster than v0.9.0 by
+0.074 ms while keeping both properties the leaf exists for: the OOM message survives, and
+`memory.max` inside the box reads 134217728 for `--memory 128M`.
 
-The cost is the WORKLOAD's migration into the capped cgroup. v0.9.0 got it there for free: the
-supervisor sat in the capped cgroup and the forked child inherited it, one write covering both. Any
-layout that keeps the supervisor out of the blast radius breaks that inheritance, so the child has to
-write itself in, and a migration is 81 us whichever cgroup it moves to.
+So the cost IS the leaf, the first story was right, and the measurement that seemed to refute it was
+not a measurement. This is not shipped: it changes the code that decides who dies in an OOM, it has
+been validated on one host and one posture, and a variant that looks free is exactly the kind that
+needs the other postures before it is believed.
 
-That is the whole trade, and no cleverer version recovers it: a process is in exactly one cgroup and a
-fork inherits the parent's, so "the workload is capped AND the supervisor is not" costs one migration
-under cgroup v2. The variant was reverted rather than kept, because a second code path that buys
-0.008 ms is a liability. `strace -c`
-puts the two within two syscalls of each other, 962 against 964, and the difference is one extra
-`mkdir` and one extra `rmdir`: the supervisor's sibling cgroup, `kern-box-<name>-<pid>-sup`.
-
-That leaf is the fix for a box past its memory cap exiting 137 with an empty stderr. The supervisor
-used to sit in a cgroup carrying `memory.oom.group = 1`, so the whole-group kill took the process
-that was supposed to report the kill. It cannot be skipped for uncapped boxes either, because there
-are none: `apply_limits` falls back to `DEFAULT_MEMORY_MAX` when no `--memory` is given and writes
-`oom.group = 1` unconditionally, so every box is in the blast radius the leaf exists to leave.
-
-One tenth of a millisecond for an exit code that gets reported. The number above moved from 2.4 to
-2.5 because of it, and the tables were updated rather than left describing the older binary.
-
-
-| bubblewrap | 2.5 ms | 0.13 s |
-| runc (rootless) | 13.1 ms | 0.29 s |
-| podman `run --rm` | 296.6 ms | 43.1 s |
-| docker `run --rm` | 287.7 ms | 16.7 s |
-
-The bubblewrap column is namespace-matched, or it is not a comparison: `kern box` always makes a
-network namespace, so bwrap is given `--unshare-user --unshare-pid --unshare-ipc --unshare-uts
---unshare-net --bind <rootfs> / --proc /proc --dev /dev`.
-
-**This table cannot separate kern from bubblewrap, and says so rather than pretending.** Measured one
-runtime after the other, which is what this script does, both read 2.5 ms: the difference between them
-is smaller than the drift between two batches taken minutes apart. Separating them takes ALTERNATING
-batches, which is the section below. Both columns here run WITHOUT a cgroup cap, which is what makes
-them the same job; the default `kern box` adds the cap on top. The gap this table DOES establish is
-the one to the engines, two orders of magnitude away, and no measurement subtlety is needed to see it.
-`box --image` is 3.4 ms (median of 7 batches of 100), which is the ~3.5 ms quoted on the front page:
-that figure is rounded up, so it errs against kern rather than for it. About 1 ms of it is the
-rootless uid-range mapping, two setuid helpers kern does not control.
-
-Stopping a service whose init handles SIGTERM: kern 2.3 ms, docker 162 ms, podman 194 ms (medians,
-same host, same day). The previous figures here read 310 and 380 ms for docker and podman, which
-OVERSTATED both: they are corrected downward against kern's own comparison, because a number that
-flatters is the one nobody re-checks. Measured with `trap "exit 0" TERM` as PID 1. Without a handler
-the same command takes docker and podman about 10.2 s each, because PID 1 ignores a signal it has no
-handler for and both wait out a 10 s grace period before SIGKILL.
-
-The claim that survives is reach rather than milliseconds. On a Raspberry Pi 5, docker, podman,
-runc, crun, bwrap, nerdctl, lxc-start and systemd-nspawn were all absent, checked one at a time;
-kern ran there as the same static binary, copied over.
 
 ## kern against bubblewrap, settled
 

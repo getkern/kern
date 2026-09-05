@@ -18,7 +18,7 @@ Measured twice, in two harnesses, because a number that moves a published figure
 one. `scripts/bench-idle.sh` on each binary in turn: 2.561 ms against 2.407 free, 1.964 against 1.780
 pinned. A second harness, 30 alternating batches: 2.496 against 2.385, with v0.9.1 faster in 1 of 30
 paired batches where fifteen would be a tie. The gap is 0.10 to 0.18 ms depending on the harness, and
-it is not variance in either. `strace -c` puts them within two syscalls of each other, and the cost is NOT the extra `mkdir` and `rmdir` that shows up there: a variant keeping the supervisor in place, with no sibling leaf at all, saves 0.008 ms and wins 11 of 20 paired batches. The cost is the workload's migration into the capped cgroup, 81 us measured, which v0.9.0 got for free by inheritance because its supervisor sat in the blast radius. That leaf is what keeps the process reporting an OOM out of the group
+it is not variance in either. The cost is the extra cgroup `mkdir`, 90.5 us measured in C on this host; the workload's migration into the capped cgroup is 19.4 us and flat from a 0 MB child to a 256 MB one. A variant that keeps the supervisor where it already is, creating no leaf, runs at 2.331 ms and beats v0.9.0 while keeping the OOM message and the cap. It is NOT in this release: it rewrites the code that decides who dies in an OOM and has been validated on one host and one posture. BENCHMARKS.md carries the measurement and the two wrong answers that preceded it. That leaf is what keeps the process reporting an OOM out of the group
 the OOM kills, and it cannot be skipped for uncapped boxes because there are none. The published
 bare-box figure moves from 2.4 ms to 2.5 and the tables were updated.
 
