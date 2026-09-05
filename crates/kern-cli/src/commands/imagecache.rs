@@ -864,7 +864,7 @@ pub(crate) fn pull_to_cache(
         let staging = cache.join(format!("{safe}.pull-{pid}"));
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(&staging).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
-        eprintln!("→ re-pulling image '{image}' (--pull always)");
+        kern_common::progress!("→ re-pulling image '{image}' (--pull always)");
         let config = match kern_oci::pull(image, &staging, None) {
             Ok(c) => c,
             Err(e) => {
@@ -942,11 +942,15 @@ pub(crate) fn pull_to_cache(
                 .any(|e| e.file_name().to_string_lossy().starts_with(".kern-"))
         });
         if !sentinel.exists() {
-            eprintln!("→ image '{image}' not cached - pulling once (reused after)");
+            kern_common::progress!("→ image '{image}' not cached - pulling once (reused after)");
         } else if !rootfs_usable {
-            eprintln!("→ image '{image}' is cached without a usable rootfs - re-fetching it once");
+            kern_common::progress!(
+                "→ image '{image}' is cached without a usable rootfs - re-fetching it once"
+            );
         } else {
-            eprintln!("→ image '{image}' is cached without its config - re-fetching it once");
+            kern_common::progress!(
+                "→ image '{image}' is cached without its config - re-fetching it once"
+            );
         }
         // INVALIDATE THE ENTRY BEFORE TOUCHING THE ROOTFS. The sentinel is written LAST precisely so
         // that an interrupted extraction reads as absent - but that only holds when there was no

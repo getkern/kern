@@ -198,6 +198,40 @@ pub fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty())
 }
 
+/// Is kern's own PROGRESS output wanted here? True only when stderr is a terminal.
+///
+/// kern and a box's workload share one stderr, and kern's launcher writes progress into it: pull
+/// steps, layer lines, per-service compose bring-up. In a terminal that is the point. Anywhere else
+/// it is contamination of someone else's stream, and the SDK made the cost concrete: `run_code` on an
+/// uncached image came back with six `→ layer …` lines sitting in front of the program's own output,
+/// and an agent reading that result spent its context on kern's housekeeping.
+///
+/// The repo already had this rule for the `kern box` status panel ("ONLY when stderr is a terminal, so
+/// pipes/scripts/`kern logs` stay clean"); the pull and compose paths never adopted it. One predicate
+/// now, so a new progress line inherits the rule instead of having to remember it. `scripts/progress-
+/// is-tty-gated.py` fails the build on a progress line that goes out any other way.
+///
+/// NOT for errors, warnings or `kern: note:` advice. Those are how kern reports something the user has
+/// to act on, and a pipe is exactly where they must still arrive: silence there would trade one wrong
+/// behaviour for a worse one. This gates the narrator, not the messenger.
+pub fn progress_wanted() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
+}
+
+/// Write one line of kern's own progress to stderr, and ONLY when [`progress_wanted`].
+///
+/// Same arguments as `eprintln!`. Every progress line in the workspace goes through this; the gate
+/// script enforces it, because the failure it prevents is a line nobody thought of as output.
+#[macro_export]
+macro_rules! progress {
+    ($($arg:tt)*) => {{
+        if $crate::progress_wanted() {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

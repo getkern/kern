@@ -98,6 +98,13 @@ CASES: list[Case] = [
      lambda t: t + "\n# " + DASH + "\n"),
     ("no-ai-slop", "an em-dash in a manifest", "Cargo.toml",
      lambda t: t + "\n# " + DASH + "\n"),
+    # --- progress-is-tty-gated: both crates, and the multi-line shape that escaped the manual pass ---
+    ("progress-is-tty-gated", "a bare eprintln! progress line", "crates/kern-oci/src/pull.rs",
+     lambda t: t + '\nfn _selftest() { eprintln!("\u2192 pulling something"); }\n'),
+    ("progress-is-tty-gated", "the same, with the format string on the NEXT line", "crates/kern-oci/src/pull.rs",
+     lambda t: t + '\nfn _selftest2() {\n    eprintln!(\n        "\u2713 done {}",\n        1\n    );\n}\n'),
+    ("progress-is-tty-gated", "a bare progress line in the libc-only crate", "crates/kern-isolation/src/ports.rs",
+     lambda t: t + '\nfn _selftest3() { eprintln!("\u2192 publishing a port"); }\n'),
     # --- stale-numbers: one case per arm ---
     ("stale-numbers", "a retired figure (Docker's old footprint)", "SECURITY.md",
      prepend("Docker's resident memory is ~186 MB.")),

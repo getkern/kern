@@ -314,7 +314,7 @@ pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
     }
     if result.is_ok() {
         // On stderr so a `kern save img > img.tar` (stdout) stream stays clean.
-        eprintln!(
+        kern_common::progress!(
             "✓ saved '{image}'{}",
             out.map(|o| format!(" → {o}")).unwrap_or_default()
         );

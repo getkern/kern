@@ -200,6 +200,29 @@ because a word in backticks is a symbol and not the document's voice. The reason
 commercial rather than aesthetic: readers who see one of those words decide a model wrote the page
 and stop, before checking a single measurement.
 
+## Progress goes through `progress!`, never `eprintln!`
+
+kern and a box's workload share one stderr. A progress line written with a bare `eprintln!` therefore
+lands in whatever is reading that stream: a shell pipeline, `kern logs`, or an agent's context through
+the SDK, where an external audit found six `-> layer ...` lines sitting in front of the program's own
+output inside a LangChain tool result.
+
+```sh
+kern_common::progress!("-> resolving {image}");   // kern-cli, kern-oci
+crate::progress!("-> publishing {hp} -> box :{bp}");  // kern-isolation, which is libc-only by design
+```
+
+Both write only when stderr is a terminal, which is the rule the `kern box` status panel already
+followed and the pull path never did. `python3 scripts/progress-is-tty-gated.py` fails the build on a
+progress line that goes out any other way, and it reads the whole macro call rather than one line.
+
+This gate exists because converting the sites by hand missed five of nineteen. Fourteen were found by
+grep; one had its format string on the following line, and four more were in files nobody thought of
+as progress. The one that mattered most was in the port-publishing path, which every `-p` box hits.
+
+**Errors, warnings and `kern: note:` advice are NOT progress.** A pipe is exactly where those must
+still arrive, and the gate does not touch them.
+
 ## A changelog entry is not a commit message
 
 The commit explains how a defect was found and why the fix is shaped that way. That is the right

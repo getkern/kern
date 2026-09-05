@@ -3495,7 +3495,7 @@ fn resolve_builds(
             .clone()
             .unwrap_or_else(|| format!("kern-compose-{}:latest", b.name));
 
-        eprintln!("→ building '{}' from {}", b.name, bd.context);
+        kern_common::progress!("→ building '{}' from {}", b.name, bd.context);
         let mut cmd = std::process::Command::new(self_exe);
         cmd.arg("build").arg("-t").arg(&tag);
         if let Some(df) = &dfile {

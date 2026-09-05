@@ -614,7 +614,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // reconciliation the levels may already have been filtered down to the changed ones, and a
     // header promising more boxes than it starts is the kind of small untruth this codebase avoids.
     let total: usize = levels.iter().map(Vec::len).sum();
-    eprintln!(
+    kern_common::progress!(
         "→ bringing up {total} box(es) in {} dependency {}: {}",
         levels.len(),
         if levels.len() == 1 { "level" } else { "levels" },
@@ -679,7 +679,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                 .as_deref()
                                 .or(b.rootfs.as_deref())
                                 .unwrap_or("(no source)");
-                            eprintln!("→ [{n}/{total}] starting '{}'  {src}{dep}", b.name);
+                            kern_common::progress!(
+                                "→ [{n}/{total}] starting '{}'  {src}{dep}",
+                                b.name
+                            );
                             let mut cmd = std::process::Command::new(self_exe);
                             // Anchor the box's relative paths (env_file/-v/rootfs) to the project dir.
                             cmd.current_dir(project_dir);

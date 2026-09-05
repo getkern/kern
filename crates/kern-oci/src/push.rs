@@ -45,7 +45,7 @@ pub fn push(
     // registry with a clear 401/403 that we surface. (Loopback dev registries are usually open.)
     let auth = discover_auth_scoped(&registry, &repo, "push,pull")?;
 
-    eprintln!("→ packing rootfs into a layer…");
+    kern_common::progress!("→ packing rootfs into a layer…");
     let (layer_path, layer_digest, diff_id, layer_size) = pack_layer(rootfs, work)?;
 
     // Build the config JSON and its digest.
@@ -57,20 +57,20 @@ pub fn push(
     let config_size = config_json.len() as u64;
 
     // Upload the two blobs (layer, config) - skip any the registry already has.
-    eprintln!(
+    kern_common::progress!(
         "→ uploading layer ({})…",
         kern_common::fmt_bytes(layer_size)
     );
     upload_blob(&ep, &repo, &layer_digest, &layer_path, &auth)?;
-    eprintln!("→ uploading config…");
+    kern_common::progress!("→ uploading config…");
     upload_blob(&ep, &repo, &config_digest, &config_path, &auth)?;
 
     // Build + PUT the manifest.
     let manifest = build_manifest(&config_digest, config_size, &layer_digest, layer_size);
-    eprintln!("→ pushing manifest {reference}…");
+    kern_common::progress!("→ pushing manifest {reference}…");
     put_manifest(&ep, &repo, &reference, &manifest, &auth)?;
 
-    eprintln!("✓ pushed {image}");
+    kern_common::progress!("✓ pushed {image}");
     Ok(())
 }
 

@@ -12,6 +12,31 @@
 
 use std::marker::PhantomData;
 
+/// Write one line of kern's own progress to stderr, and ONLY when stderr is a terminal.
+///
+/// A DELIBERATE twin of `kern_common::progress!`, not an oversight. This crate's dependency list is
+/// `libc` and nothing else, on purpose ("the single boundary to the kernel"), and it already keeps its
+/// own `env_flag` for the same reason rather than reach for the shared one. Six lines duplicated is
+/// the cheaper half of that trade.
+///
+/// The rule both copies enforce: kern and a box's workload share one stderr, so a progress line
+/// written with a bare `eprintln!` lands in whatever is reading that stream - a pipeline, `kern logs`,
+/// or an agent's context through the SDK. `scripts/progress-is-tty-gated.py` fails the build on one
+/// that goes out any other way, and it checks both crates.
+///
+/// NOT for errors, warnings or `kern: note:` advice: a pipe is exactly where those must still arrive.
+#[macro_export]
+macro_rules! progress {
+    ($($arg:tt)*) => {{
+        if {
+            use std::io::IsTerminal;
+            std::io::stderr().is_terminal()
+        } {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
 mod cgroup;
 mod landlock;
 

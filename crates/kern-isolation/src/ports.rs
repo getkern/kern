@@ -285,7 +285,7 @@ pub fn fork_forwarders(ports: &[PortMap]) -> Result<Forwarders, (u16, String)> {
 /// Tell the user what is now listening - AFTER the bind succeeded, never before.
 fn announce(m: &PortMap) {
     let (ip, hp, bp) = (m.bind_ip, m.host, m.box_port);
-    eprintln!(
+    crate::progress!(
         "→ publishing {}.{}.{}.{}:{hp} → box :{bp}{}",
         ip >> 24 & 0xff,
         ip >> 16 & 0xff,

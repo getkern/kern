@@ -109,7 +109,7 @@ pub fn pull(
 ) -> Result<ImageConfig, OciError> {
     let host = Platform::host();
     let want = platform.unwrap_or(&host);
-    eprintln!("→ resolving {image} ({}/{})", want.os, want.arch);
+    kern_common::progress!("→ resolving {image} ({}/{})", want.os, want.arch);
     let (registry, repo, reference) = parse_ref(image)?;
     let auth = discover_auth(&registry, &repo)?;
 
@@ -161,7 +161,7 @@ pub fn pull(
         )));
     }
     let total = layers.len();
-    eprintln!(
+    kern_common::progress!(
         "→ {total} layer{} to download + extract",
         if total == 1 { "" } else { "s" }
     );
@@ -242,7 +242,7 @@ pub fn pull(
             return Err(e);
         }
     }
-    eprintln!("✓ pulled {image} → {} ({total} layers)", dest.display());
+    kern_common::progress!("✓ pulled {image} → {} ({total} layers)", dest.display());
     Ok(config)
 }
 
@@ -1166,7 +1166,7 @@ fn download_layer(
     dest: &Path,
 ) -> Result<std::path::PathBuf, OciError> {
     let short = short_digest(digest);
-    eprintln!("→ layer  {short}  downloading…");
+    kern_common::progress!("→ layer  {short}  downloading…");
     let url = format!("{}/v2/{repo}/blobs/{digest}", reg_base(registry));
     let tmp = layer_tmp_path(dest, idx, digest);
     let tmp_s = tmp.to_string_lossy().into_owned();
@@ -1212,7 +1212,7 @@ fn process_layer(
     // downloaded size on the same line so a big multi-hundred-MB image shows real progress per layer
     // (curl's own meter is off - it's noise over a redirected CDN blob).
     let size = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
-    eprintln!(
+    kern_common::progress!(
         "  layer {idx}/{total}  {short}  {}  verifying + extracting…",
         kern_common::fmt_bytes(size)
     );

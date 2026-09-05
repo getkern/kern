@@ -42,6 +42,27 @@ message on hosts where it never printed, and one new `kern box` flag. The CLI ch
   init had already raised, so either order is a success. A test in a fresh net namespace pins the
   asymmetry, with the unreachable state asserted first as its own positive control.
 
+- **kern's progress output no longer contaminates a pipe.** Nineteen lines (`-> resolving …`,
+  `-> layer …`, `✓ pulled …`, per-service compose bring-up, port publishing) were written with a bare
+  `eprintln!` and so went out on kern's stderr whatever was reading it. Under the SDK that stream is the
+  box's stderr, and a validation run on an uncached image came back with six of them in front of the
+  program's own output, inside a LangChain tool result. They are now written through
+  `kern_common::progress!` (and a deliberate twin in the libc-only `kern-isolation`), which prints only
+  when stderr is a terminal: the rule the `kern box` status panel already followed and the pull path
+  never did.
+
+  A terminal is unchanged, verified as a positive control rather than assumed. Errors, warnings and
+  `kern: note:` advice are untouched, because a pipe is exactly where those must still arrive.
+
+  `scripts/progress-is-tty-gated.py` is the reason this stays true. Converting the sites by hand found
+  fourteen and missed five: one whose format string sat on the following line, and four in files nobody
+  thought of as progress, including the port-publishing path that every `-p` box hits. The gate reads
+  the whole macro call, covers both crates, and self-tests through `gates-selftest.py`.
+
+  This is the source-side half of the diagnostic-noise fix. The SDK's prefix classifier stays as the
+  consumer-side half: it still catches `kern: note:`/`warning:` lines, which legitimately reach a pipe,
+  and it still works against an older kern binary.
+
 - **A cgroup probe printed systemd's bus error onto kern's stderr.** To find out whether a delegated
   slice can be made, kern runs `systemd-run ... -- true` and reads the answer from the exit status. Its
   stderr was inherited. On a host with the systemd tools installed but not booted (a container, a WSL
