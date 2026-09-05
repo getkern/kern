@@ -111,6 +111,24 @@ regardless, `never` runs with no mount and a working directory of `/`.
 kern_execution_policy(mount_workspace="always", image="python:3.12-slim", memory_bytes=1 << 30)
 ```
 
+### Two vocabularies, both accepted
+
+`command_timeout`, `max_output_bytes`, `startup_timeout` and `termination_timeout` are langchain's
+own field names, inherited from the policy base this class subclasses. Renaming them would stop it
+being a drop-in peer of `DockerExecutionPolicy`, which is the point. `Sandbox` spells the same two
+ideas `timeout_s` and `memory_mb`, because that is this package's surface.
+
+Both spellings reach the policy, and the unit converts with the name:
+
+```python
+kern_execution_policy(timeout_s=17, memory_mb=256)          # this package's names
+kern_execution_policy(command_timeout=17, memory_bytes=268435456)   # langchain's, the same policy
+```
+
+`network`/`network_enabled`, `pids`/`pids_limit` and `cap_drop`/`drop_all_capabilities` pair up the
+same way. Passing both halves of a pair is a `TypeError` rather than a silent winner, and an unknown
+name is refused with the accepted spelling in the message.
+
 The workspace has **no disk ceiling**, the same as for the code tool above: it is a host directory, and
 file state persisting is the point. Bound it yourself if that matters where you run.
 

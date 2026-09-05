@@ -521,8 +521,11 @@ class _Server:
 
         if r.stdout.strip():
             take(_clip(r.stdout.rstrip(), _MAX_TEXT))
-        if r.stderr.strip():
-            take("[stderr]\n" + _clip(r.stderr.rstrip(), _MAX_TEXT))
+        # `code_stderr`: the same reason the LangChain renderer uses it. kern and the workload share
+        # one stderr, and this string is read by a model, so kern's own `note:`/`warning:` lines are
+        # context spent on the runtime's housekeeping and are easy to mistake for the code's errors.
+        if r.code_stderr.strip():
+            take("[stderr]\n" + _clip(r.code_stderr.rstrip(), _MAX_TEXT))
         for res in r.results:
             if text_budget <= 0:
                 text_truncated = True

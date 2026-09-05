@@ -109,6 +109,8 @@ const r = await kern.runCode("console.log([1,2,3].map(x => x * x))", {
 | field | meaning |
 |---|---|
 | `stdout`, `stderr` | captured output (each capped at `maxOutputBytes`) |
+| `codeStderr` | `stderr` with kern's own `note:`/`warning:` lines removed: what the code wrote. Feed THIS to a model |
+| `runtimeNotes` | the complement: the lines kern wrote about itself. `stderr` still holds both, in order |
 | `exitCode` | the process exit code |
 | `durationMs` | wall-clock duration of the call, in ms |
 | `success` | `true` iff `exitCode === 0` **and** no sandbox fault |
@@ -118,6 +120,13 @@ const r = await kern.runCode("console.log([1,2,3].map(x => x * x))", {
 | `truncated` | output hit the cap and overflow was discarded |
 
 A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it is a normal result.
+
+`stderr` is one stream shared by kern and your code, so a note about overlayfs or an undelegated
+cgroup arrives interleaved with the program's own output. That is right for a human reading a
+terminal and wrong for anything that puts `stderr` into a prompt, where it spends context on the
+runtime's housekeeping and reads like an error the code produced. `codeStderr` is the same string
+without those lines, and nothing is hidden: `runtimeNotes` holds exactly what was taken out. The
+LangChain tool and the MCP server already use it.
 `fault` is only set when the **sandbox** acted:
 
 | `fault.type` | when |

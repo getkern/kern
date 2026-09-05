@@ -193,7 +193,12 @@ def _render(result: ExecutionResult, limit: int) -> str:
         elif value.data.keys() & {"image/png", "image/jpeg", "image/svg+xml"}:
             blocks.append("[an image was produced; it cannot be shown in a text result]")
 
-    stderr = _untrusted(result.stderr)
+    # `code_stderr`, NOT `stderr`: kern and the workload share one stderr, so the raw field carries
+    # kern's own `note:`/`warning:` lines about overlayfs or an undelegated cgroup. An external audit
+    # found them inside this tool's result, where they spend the model's context on the runtime's
+    # housekeeping and can be misread as the program's own errors. The operator still sees them on
+    # `result.stderr`; the model reads what the code wrote.
+    stderr = _untrusted(result.code_stderr)
     if stderr.strip():
         blocks.append("stderr:\n" + stderr.rstrip())
 
@@ -782,4 +787,57 @@ def kern_execution_policy(**kwargs):
     cls = _POLICY_CACHE.get("cls")
     if cls is None:
         cls = _POLICY_CACHE["cls"] = _build_policy_class()
-    return cls(**kwargs)
+    return cls(**_accept_sandbox_vocabulary(kwargs, cls))
+
+
+# `Sandbox` field -> the policy field meaning the same thing, and how to convert the value.
+#
+# TWO VOCABULARIES MEET HERE, and only one of them is ours to choose. `command_timeout`,
+# `max_output_bytes` and friends are inherited from langchain's own policy base: renaming them would
+# stop this being a drop-in peer of `DockerExecutionPolicy`, which is the entire point of the class.
+# `Sandbox` spells the same ideas `timeout_s` and `memory_mb`, because that is this package's own
+# surface. An external audit hit the seam the obvious way, passing `timeout_s=` and getting
+# `TypeError: unexpected keyword argument`.
+#
+# So both spellings are accepted and the dataclass keeps langchain's names. The alias is translated,
+# never added as a second field: one value, one place, no way for the two to disagree.
+_SANDBOX_ALIASES = {
+    "timeout_s": ("command_timeout", lambda v: v),
+    "memory_mb": ("memory_bytes", lambda v: int(v) * 1024 * 1024),
+    "network": ("network_enabled", bool),
+    "pids": ("pids_limit", lambda v: v),
+    "cap_drop": ("drop_all_capabilities", lambda v: v == "ALL" or v is True),
+}
+
+
+def _accept_sandbox_vocabulary(kwargs: dict, cls) -> dict:
+    """Translate `Sandbox`'s field names into the policy's, and refuse a collision rather than pick.
+
+    Raises:
+        TypeError: both spellings of one setting were passed, or a name is neither vocabulary. The
+            message names the accepted spelling, because the failure this exists for was a caller who
+            had no way to learn it from the exception.
+    """
+    import dataclasses
+
+    out = dict(kwargs)
+    for alias, (real, convert) in _SANDBOX_ALIASES.items():
+        if alias not in out:
+            continue
+        if real in out:
+            raise TypeError(
+                f"{alias}= and {real}= are the same setting spelled two ways; pass one. "
+                f"{real}= is the langchain policy's own name and is what the field is called."
+            )
+        out[real] = convert(out.pop(alias))
+    known = {f.name for f in dataclasses.fields(cls)}
+    for name in out:
+        if name not in known:
+            near = sorted(k for k in known if name.split("_")[0] in k)
+            hint = f" Did you mean {' or '.join(near)}?" if near else ""
+            raise TypeError(
+                f"kern_execution_policy() got an unexpected keyword argument '{name}'.{hint} "
+                f"This policy takes langchain's field names (it subclasses langchain's base), plus "
+                f"{', '.join(sorted(_SANDBOX_ALIASES))} spelled as Sandbox spells them."
+            )
+    return out

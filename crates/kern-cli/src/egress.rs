@@ -717,6 +717,31 @@ fn pump_main(box_pid1: i32, box_port: u16, sock_path: &std::path::Path, ready_fd
         );
         unsafe { libc::_exit(1) };
     }
+    // RAISE `lo` BEFORE BINDING, and refuse to serve if it cannot be raised.
+    //
+    // A fresh net ns has `lo` present, DOWN, and with no address. The box's init does raise it, but we
+    // cannot wait for that: the pump is handed the box's pid the moment `clone` returns, while the init
+    // is still mounting and pivoting its root and has not reached its own `bring_loopback_up` yet. The
+    // two race. Raising the flag ourselves removes the dependency rather than narrowing the window; the
+    // call is idempotent, we hold CAP_NET_ADMIN over this ns (we joined its owning user ns, or we are
+    // already privileged over it), and it reports success for a loopback the init had already raised.
+    //
+    // The `_exit` below is the part that matters, and it is here because of what a down `lo` actually
+    // does. An external audit reported the bind failing with EADDRNOTAVAIL. Measured on this tree
+    // (kernel 7.0, `unshare -Un`), a down loopback does something worse than fail: **bind and listen
+    // both SUCCEED**, and only the box's own `connect` fails, with ENETUNREACH. So the pump would take
+    // a port, write its readiness byte, and the launcher would start the workload against a proxy no
+    // packet can reach - a false green in the very signal added to make this failure visible.
+    //
+    // Readiness has to mean reachable, not bound. So this checks the interface the connections will
+    // arrive over, and dies if it is not up, which the launcher reads as EOF and turns into a refusal.
+    if !kern_isolation::bring_loopback_up() {
+        eprintln!(
+            "kern: egress pump: the box's loopback is down and could not be raised, so nothing in \
+             the box could reach 127.0.0.1:{box_port}"
+        );
+        unsafe { libc::_exit(1) };
+    }
     let listener = match std::net::TcpListener::bind(("127.0.0.1", box_port)) {
         Ok(l) => l,
         Err(e) => {

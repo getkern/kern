@@ -13,10 +13,49 @@ is in the git history.
 
 ## Unreleased
 
-**`kern-sandbox` 0.1.39** is on PyPI and npm, with the `integrations/pi` extension that requires it.
+**`kern-sandbox` 0.1.40** answers an external audit of the SDK, the pi extension and the LangChain
+integration. Four findings were reported; one was already closed in 0.1.39, and measuring the second
+found a worse defect underneath it than the one described.
 The **runtime** changed too, so this one needs a tag: mount-posture fixes in `kern-isolation`, the OOM
 message on hosts where it never printed, and one new `kern box` flag. The CLI change is additive
 (`--shm-size`), which the stability policy above allows on a patch.
+
+### Fixed
+
+- **The egress pump could report itself ready on a box nothing could reach.** With `--egress-allow`,
+  the pump joins the box's net namespace and listens on `127.0.0.1:3128`. It is handed the box's pid
+  the instant `clone` returns, while the box's init is still pivoting its root and has not yet raised
+  the loopback, so the two race. An audit saw the bind fail with `EADDRNOTAVAIL` and every allowed
+  domain refused with it.
+
+  Measured here, a down loopback does something worse than fail: **`bind` and `listen` both succeed**,
+  and only the box's own `connect` fails, with `ENETUNREACH`. So the pump took a port and wrote the
+  readiness byte added last release to make exactly this failure visible, and the launcher started the
+  workload against a proxy no packet could reach. A false green in the signal built to prevent one.
+
+  The pump now raises the loopback itself before binding, which removes the dependency on the init's
+  progress instead of narrowing the window, and treats a loopback it cannot raise as fatal. Readiness
+  means reachable, not bound. `bring_loopback_up` is idempotent and reports success for a loopback the
+  init had already raised, so either order is a success. A test in a fresh net namespace pins the
+  asymmetry, with the unreachable state asserted first as its own positive control.
+
+- **kern's diagnostics no longer land in a model's context.** kern and the workload share one stderr,
+  so `kern: note:` and `kern: warning:` lines arrive interleaved with the program's output. The audit
+  found them inside a LangChain tool result, where they cost context and read like errors the code
+  produced. `result.code_stderr` / `result.codeStderr` is `stderr` without them and is what the
+  LangChain tool and the MCP server now render; `runtime_notes` / `runtimeNotes` holds exactly what
+  was removed, and `stderr` still holds every byte in its original order. The classifier is one
+  constant per binding, shared with the startup-failure heuristic that used a second copy of the same
+  list. A workload that forges one of kern's prefixes moves its own line out of what the model reads
+  and cannot inject text into it.
+
+- **`kern_execution_policy` accepts `Sandbox`'s vocabulary.** `command_timeout` and `memory_bytes` are
+  langchain's own field names, inherited from the base class this policy subclasses, so they cannot be
+  renamed without it ceasing to be a drop-in peer of `DockerExecutionPolicy`. `timeout_s=` therefore
+  raised `TypeError: unexpected keyword argument` with nothing in the message naming the spelling that
+  works. Both are accepted now, the unit converting with the name (`memory_mb=256` becomes
+  `memory_bytes=268435456`); passing both halves of a pair is refused rather than silently resolved,
+  and an unknown name is rejected with the accepted spelling in the message.
 
 ### Changed
 

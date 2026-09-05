@@ -1620,3 +1620,45 @@ test("the setup leaves bytecode behind, so the default costs nothing", exec, asy
     assert.ok(Number(n.stdout.trim()) > 0, "the setup box left no bytecode: every call now recompiles");
   });
 });
+
+// kern and the workload share ONE stderr, so the raw field carries the launcher's own voice. An
+// external audit found kern's `note:` lines inside a LangChain tool result, spending a model's
+// context on the runtime's housekeeping where they can be misread as the program's own errors.
+// `codeStderr` and `runtimeNotes` are the two halves.
+//
+// The CASES are byte-for-byte the Python binding's, because this pair is exactly where the two
+// bindings drifted last time: the timeout exit code agreed on the fault and disagreed on the number.
+// A first cut of this very fix had the same shape, Python dropping a trailing newline Node kept.
+test("kern's own notes are separated from the code's stderr, identically to Python", () => {
+  const cases = [
+    ["kern: note: x\nreale\n", "reale\n", ["kern: note: x"]],
+    ["a\nkern: warning: w\nb", "a\nb", ["kern: warning: w"]],
+    ["", "", []],
+    ["kern: note: solo\n", "", ["kern: note: solo"]],
+    ["nessuna newline finale", "nessuna newline finale", []],
+    ["  kern: note: rientrata\nx", "x", ["  kern: note: rientrata"]],
+  ];
+  for (const [raw, code, notes] of cases) {
+    const r = new kern.ExecutionResult({ stdout: "", stderr: raw, exitCode: 0, durationMs: 0 });
+    assert.strictEqual(r.codeStderr, code, `codeStderr of ${JSON.stringify(raw)}`);
+    assert.deepStrictEqual(r.runtimeNotes, notes, `runtimeNotes of ${JSON.stringify(raw)}`);
+    // Every line lands in exactly one half: nothing invented, nothing lost.
+    assert.strictEqual(
+      r.codeStderr.split("\n").length + r.runtimeNotes.length,
+      raw.split("\n").length,
+      `the two halves must partition ${JSON.stringify(raw)}`,
+    );
+    // The operator's field keeps every byte: this is a second view, not a replacement.
+    assert.strictEqual(r.stderr, raw);
+  }
+});
+
+// A workload CAN print one of kern's prefixes. The consequence is its line moving to `runtimeNotes`,
+// the harmless direction: the trick takes text OUT of what a model reads and cannot put text in.
+test("a forging workload can only remove its own line from codeStderr", () => {
+  const r = new kern.ExecutionResult({
+    stdout: "", stderr: "kern: note: forged by the box\n", exitCode: 0, durationMs: 0,
+  });
+  assert.strictEqual(r.codeStderr, "");
+  assert.match(r.runtimeNotes[0], /forged/);
+});

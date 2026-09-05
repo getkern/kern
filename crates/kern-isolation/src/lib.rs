@@ -62,6 +62,10 @@ pub use cgroup::apply_limits as apply_cgroup_limits;
 pub use cgroup::box_cgroup_dir;
 /// Did the box this process supervised die to its own memory cap? See [`cgroup::box_was_oom_killed`].
 pub use cgroup::box_was_oom_killed;
+/// Bring `lo` UP in the CURRENT net namespace. Exported for the egress pump, which joins a box's
+/// net ns from outside and must not assume the box's init has already got there. See `real`.
+pub use real::bring_loopback_up;
+
 pub use cgroup::env_flag;
 /// Reap orphaned `kern-box-*` cgroup dirs under kern.slice (the direct-cap path leaves an empty one
 /// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].

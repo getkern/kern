@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.39";
+const VERSION = "0.1.40";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -510,6 +510,19 @@ class ExecutionResult {
   get success() {
     return this.exitCode === 0 && this.fault === null;
   }
+  /** `stderr` with kern's own `note:`/`warning:`/posture lines removed: what the code actually wrote.
+   *
+   * This is what belongs in a model's context. A workload CAN forge one of kern's prefixes, and the
+   * consequence is its own line moving to {@link runtimeNotes}: the trick removes its text from this
+   * field, it cannot inject text into it. Mirrors `ExecutionResult.code_stderr` in Python. */
+  get codeStderr() {
+    return codeStderr(this.stderr);
+  }
+  /** The lines on `stderr` that KERN wrote, the complement of {@link codeStderr}. Reported rather
+   * than removed: `stderr` still holds every byte in its original order. */
+  get runtimeNotes() {
+    return runtimeNotes(this.stderr);
+  }
 }
 
 /** A sandbox event `{type, message}` for `result.fault`. NB: `startup_failed` is decided from an
@@ -821,6 +834,39 @@ function execFailureBinary(stderr) {
   return m ? { what: m[1], reason: (m[2] || "").trim() } : null;
 }
 
+/** The prefixes of stderr lines KERN writes about itself, as opposed to lines the workload wrote: the
+ * `--security-profile` posture banner and any `warning:`/`note:` diagnostic.
+ *
+ * ONE definition, used for two purposes that must agree by construction: `codeStderr` subtracts these
+ * to build what a model should read, and `looksLikeStartupFailure` skips them so a benign note is not
+ * read as a box that failed to start. Mirrors `_KERN_DIAGNOSTICS` in the Python binding. */
+const KERN_DIAGNOSTICS = ["kern: security-profile=", "kern: warning:", "kern: note:"];
+
+function isKernDiagnostic(line) {
+  const s = line.replace(/^\s+/, "");
+  return KERN_DIAGNOSTICS.some((p) => s.startsWith(p));
+}
+
+/** `stderr` with kern's own diagnostics removed: what the user's code actually wrote.
+ *
+ * The box's launcher and the workload share one stderr, so a note about overlayfs or an undelegated
+ * cgroup arrives interleaved with the code's output. That is fine for a human reading a terminal and
+ * wrong for anything that feeds stderr to a model, where it costs context and can be mistaken for the
+ * program's own errors. Nothing is hidden: `stderr` still holds every byte in its original order. */
+function codeStderr(stderr) {
+  return String(stderr || "")
+    .split("\n")
+    .filter((ln) => !isKernDiagnostic(ln))
+    .join("\n");
+}
+
+/** The lines on `stderr` that kern wrote, the complement of {@link codeStderr}. */
+function runtimeNotes(stderr) {
+  return String(stderr || "")
+    .split("\n")
+    .filter((ln) => isKernDiagnostic(ln));
+}
+
 function looksLikeStartupFailure(stderr) {
   const markers = [
     "kern:",
@@ -833,14 +879,9 @@ function looksLikeStartupFailure(stderr) {
     "error: oci:",
     "error: image:",
   ];
-  // kern also writes BENIGN `kern:` diagnostics that are NOT a box-start failure: the
-  // `--security-profile` posture banner, and `warning:`/`note:` lines. They start with `kern:` too, so
-  // without this skip a workload that merely exits non-zero WHILE one is on stderr (e.g. code run under
-  // securityProfile: "untrusted" that hits a network error) would be mislabeled `startup_failed`.
-  const benign = ["kern: security-profile=", "kern: warning:", "kern: note:"];
   for (const line of stderr.split("\n")) {
     const s = line.replace(/^\s+/, "");
-    if (benign.some((b) => s.startsWith(b))) continue;
+    if (isKernDiagnostic(s)) continue;
     if (s.includes("sandbox setup failed") || markers.some((m) => s.startsWith(m))) return true;
   }
   return false;

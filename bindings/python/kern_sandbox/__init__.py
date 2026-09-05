@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.39"
+__version__ = "0.1.40"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -581,6 +581,14 @@ class Result:
         return list(self.data.keys())
 
 
+# The prefixes of stderr lines KERN writes about itself, as opposed to lines the workload wrote.
+# ONE definition, used twice and for two different purposes, which is why it is a module constant:
+# `ExecutionResult.code_stderr` subtracts these to build what a model should read, and
+# `_looks_like_startup_failure` skips them so a benign note cannot be read as a box that failed to
+# start. Those two must agree by construction; when they were separate lists they did not have to.
+_KERN_DIAGNOSTICS = ("kern: security-profile=", "kern: warning:", "kern: note:")
+
+
 @dataclass
 class ExecutionResult:
     """The outcome of one ``run_code``/``run``. ``fault`` is the source of truth for "did the SANDBOX
@@ -599,6 +607,40 @@ class ExecutionResult:
     def success(self) -> bool:
         """True iff the code exited 0 AND no sandbox fault fired."""
         return self.exit_code == 0 and self.fault is None
+
+    @property
+    def runtime_notes(self) -> "list[str]":
+        """The lines on ``stderr`` that KERN wrote, not the code: the ``--security-profile`` banner
+        and any ``warning:``/``note:`` diagnostic.
+
+        The box's launcher and the workload share one stderr, so a note about overlayfs or an
+        undelegated cgroup arrives interleaved with whatever the code printed. That is fine for a
+        human reading a terminal and wrong for anything that feeds ``stderr`` to a model: an external
+        audit found kern's own notes inside a LangChain tool result, where they cost context and can
+        be mistaken for the program's own errors.
+
+        Reported rather than removed. ``stderr`` still holds every byte in its original order, so
+        nothing that used to be visible has become invisible; this and :attr:`code_stderr` are the
+        two halves, for callers that need to tell the reporter's voice from the subject's.
+        """
+        return [ln for ln in self.stderr.split("\n") if ln.lstrip().startswith(_KERN_DIAGNOSTICS)]
+
+    @property
+    def code_stderr(self) -> str:
+        """``stderr`` with kern's own diagnostics removed: what the user's code actually wrote.
+
+        This is what belongs in a model's context. A workload CAN forge a line that looks like one of
+        kern's by printing the prefix itself, and the consequence of that is its line moving to
+        :attr:`runtime_notes`: it cannot use the trick to inject text into this field, only to remove
+        its own from it.
+        """
+        # `split("\n")` and NOT `splitlines()`, for two independent reasons. It keeps the trailing
+        # newline (`splitlines()` drops the empty final element, so `"a\n"` came back as `"a"` while
+        # the Node binding returned `"a\n"` - a parity gap of exactly the kind the timeout exit code
+        # already had), and it splits on `\n` alone, where `splitlines()` also breaks on `\r`, `\v`,
+        # `\f` and `\x1c`, none of which start a line as far as the two runtimes agree.
+        kept = [ln for ln in self.stderr.split("\n") if not ln.lstrip().startswith(_KERN_DIAGNOSTICS)]
+        return "\n".join(kept)
 
     def __bool__(self) -> bool:
         return self.success
@@ -3167,10 +3209,9 @@ def _looks_like_startup_failure(stderr: str) -> bool:
     # `--security-profile` posture banner, and `warning:`/`note:` lines. They start with `kern:` too, so
     # without this skip a workload that merely exits non-zero WHILE one is on stderr (e.g. code run under
     # `security_profile="untrusted"` that hits a network error) would be mislabeled `startup_failed`.
-    benign = ("kern: security-profile=", "kern: warning:", "kern: note:")
     for line in stderr.splitlines():
         s = line.lstrip()
-        if s.startswith(benign):
+        if s.startswith(_KERN_DIAGNOSTICS):
             continue
         if "sandbox setup failed" in s or any(s.startswith(m) for m in markers):
             return True

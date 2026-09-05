@@ -1322,3 +1322,35 @@ def test_raw_sockets_stay_out_of_reach_and_that_is_rootless_not_a_flag():
             proc.kill()
             proc.wait(timeout=20)
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+class TestBothVocabulariesReachThePolicy:
+    """`command_timeout` is langchain's name and `timeout_s` is this package's, and the policy is a
+    subclass of langchain's base, so only one of the two can be the field. An external audit passed
+    `timeout_s=` and got `TypeError: unexpected keyword argument` with nothing naming the spelling
+    that works. Both are accepted now; the dataclass still keeps langchain's names."""
+
+    def _policy(self, **kw):
+        from kern_sandbox.langchain import kern_execution_policy
+
+        return kern_execution_policy(**kw)
+
+    def test_the_sandbox_spelling_is_translated(self):
+        p = self._policy(timeout_s=17, memory_mb=256)
+        assert p.command_timeout == 17
+        assert p.memory_bytes == 256 * 1024 * 1024  # MB, not bytes: the unit converts too
+
+    def test_the_langchain_spelling_still_works(self):
+        """The controprova. Accepting the alias must not have moved the field."""
+        p = self._policy(command_timeout=9, memory_bytes=1234)
+        assert (p.command_timeout, p.memory_bytes) == (9, 1234)
+
+    def test_both_spellings_at_once_is_refused_rather_than_resolved(self):
+        """Two names for one setting is a caller who believes something that is not true. Picking a
+        winner silently would leave the other value discarded with no way to notice."""
+        with pytest.raises(TypeError, match="same setting spelled two ways"):
+            self._policy(timeout_s=1, command_timeout=2)
+
+    def test_an_unknown_name_says_what_would_have_worked(self):
+        e = pytest.raises(TypeError, self._policy, memory_gb=1)
+        assert "memory_bytes" in str(e.value), "the message must name the accepted spelling"

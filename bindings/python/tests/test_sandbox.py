@@ -2641,3 +2641,46 @@ def test_a_signal_death_is_reported_as_128_plus_n_not_as_minus_n():
     ordinary = kern.run_code("raise SystemExit(7)")
     assert ordinary.exit_code == 7, "an ordinary exit code must pass through unchanged"
     assert ordinary.fault is None
+
+
+class TestKernNotesAreNotTheCodesStderr:
+    """kern and the workload share ONE stderr, so the raw field carries the launcher's own voice.
+
+    An external audit found kern's `note:` lines inside a LangChain tool result, spending the model's
+    context on the runtime's housekeeping where they can be misread as the program's own errors.
+    `code_stderr` and `runtime_notes` are the two halves. These run on FIXED strings rather than a box,
+    so they pin the rule itself and cannot pass because a particular host happened to print no notes.
+    """
+
+    CASES = [
+        ("kern: note: x\nreale\n", "reale\n", ["kern: note: x"]),
+        ("a\nkern: warning: w\nb", "a\nb", ["kern: warning: w"]),
+        ("", "", []),
+        ("kern: note: solo\n", "", ["kern: note: solo"]),
+        ("nessuna newline finale", "nessuna newline finale", []),
+        ("  kern: note: rientrata\nx", "x", ["  kern: note: rientrata"]),
+    ]
+
+    def test_the_two_halves_partition_stderr(self):
+        for raw, code, notes in self.CASES:
+            r = ExecutionResult(stdout="", stderr=raw, exit_code=0, duration_ms=0)
+            assert r.code_stderr == code, f"code_stderr of {raw!r}"
+            assert r.runtime_notes == notes, f"runtime_notes of {raw!r}"
+            # Nothing is invented and nothing is lost: every line lands in exactly one half.
+            assert len(r.code_stderr.split("\n")) + len(r.runtime_notes) == len(raw.split("\n"))
+
+    def test_stderr_itself_is_untouched(self):
+        """The operator's field keeps every byte in its original order. `code_stderr` is a second
+        view, not a replacement, so nothing that used to be visible has become invisible."""
+        raw = "kern: note: x\nreale\n"
+        assert ExecutionResult(stdout="", stderr=raw, exit_code=0, duration_ms=0).stderr == raw
+
+    def test_a_forging_workload_can_only_remove_its_own_line(self):
+        """A workload CAN print one of kern's prefixes. The consequence is its line moving to
+        `runtime_notes`, which is the harmless direction: the trick takes text OUT of what the model
+        reads and cannot put text in."""
+        r = ExecutionResult(
+            stdout="", stderr="kern: note: forged by the box\n", exit_code=0, duration_ms=0
+        )
+        assert r.code_stderr == ""
+        assert "forged" in r.runtime_notes[0]

@@ -3708,22 +3708,37 @@ fn shares_our_namespace(pid1: i32, kind: &str) -> bool {
 /// Bring the loopback interface (`lo`) up in the current network namespace via `SIOCSIFFLAGS`, so
 /// `127.0.0.1` works inside an otherwise-isolated box. Best-effort (a fresh net ns owned by our
 /// user namespace grants CAP_NET_ADMIN, so this normally succeeds; failures leave `lo` down).
-pub(crate) fn bring_loopback_up() {
+///
+/// IDEMPOTENT, and that is load-bearing rather than incidental: two processes reach for this on the
+/// same net ns. The box's own init calls it during setup, and the egress pump calls it after joining
+/// the ns from outside, because the pump is handed the box's pid the instant `clone` returns and
+/// cannot wait for an init that is still pivoting its root. Re-raising a flag already set is a no-op,
+/// so whoever arrives second pays an ioctl and nothing else.
+///
+/// Returns whether `lo` is UP on the way out, which is what a caller about to `bind(127.0.0.1)`
+/// actually needs to know: `true` also for a loopback that was already up before the call.
+pub fn bring_loopback_up() -> bool {
     unsafe {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if sock < 0 {
-            return;
+            return false;
         }
         let mut ifr: libc::ifreq = std::mem::zeroed();
         ifr.ifr_name[0] = b'l' as libc::c_char;
         ifr.ifr_name[1] = b'o' as libc::c_char;
         // `ioctl`'s request arg is `c_ulong` on x86_64 but `c_int` on aarch64 - `as _` casts the
         // SIOC* constant to whatever this target expects, so this compiles on every arch.
+        let mut up = false;
         if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) == 0 {
-            ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
-            libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr);
+            if ifr.ifr_ifru.ifru_flags & libc::IFF_UP as i16 != 0 {
+                up = true; // already up: someone else won the race, which is a success for us
+            } else {
+                ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
+                up = libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) == 0;
+            }
         }
         libc::close(sock);
+        up
     }
 }
 
@@ -5058,5 +5073,105 @@ mod shm_and_mount_flag_gates {
             unsafe { libc::close(root_fd) };
             assert_ne!(f, rf, "the reader must discriminate: / and /proc differ");
         }
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+
+    /// Read `lo`'s IFF_UP in the CURRENT net namespace, independently of the function under test:
+    /// `bring_loopback_up` must not be the instrument that reports on `bring_loopback_up`.
+    fn lo_is_up() -> bool {
+        unsafe {
+            let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if s < 0 {
+                return false;
+            }
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            ifr.ifr_name[0] = b'l' as libc::c_char;
+            ifr.ifr_name[1] = b'o' as libc::c_char;
+            let ok = libc::ioctl(s, libc::SIOCGIFFLAGS as _, &mut ifr) == 0;
+            let up = ok && ifr.ifr_ifru.ifru_flags & libc::IFF_UP as i16 != 0;
+            libc::close(s);
+            up
+        }
+    }
+
+    /// The egress pump serves `127.0.0.1` in a net ns it joined from OUTSIDE, and it is handed the
+    /// box's pid while the box's init is still setting up, so it cannot assume the init has raised
+    /// `lo` yet. This pins the property the pump now relies on, in a REDUCED system: a fresh net ns,
+    /// where `lo` is present, DOWN and address-less.
+    ///
+    /// What it asserts is what was MEASURED, and it is not what an external report predicted. A down
+    /// loopback does NOT make the bind fail: `bind` and `listen` both succeed, and the failure lands
+    /// on the far side, at `connect`, with ENETUNREACH. That asymmetry is the whole reason the pump
+    /// treats a loopback it cannot raise as fatal instead of binding and reporting itself ready: a
+    /// successful bind is not evidence that anything can reach the port.
+    ///
+    /// The DOWN-and-unreachable state asserted first is this test's positive control. It proves the
+    /// environment can still produce the failure the fix exists for, so a `bring_loopback_up` that
+    /// did nothing would be caught here rather than passing on a loopback something else had raised.
+    ///
+    /// Runs entirely in a FORKED child: `unshare` moves the calling process, and cargo's test harness
+    /// is multi-threaded, so doing this in-process would drag every other test into a new namespace.
+    /// A host without unprivileged user namespaces cannot make the precondition, so it SKIPS rather
+    /// than fails, and says which.
+    #[test]
+    fn a_down_lo_breaks_connect_not_bind_and_bring_loopback_up_fixes_it_idempotently() {
+        const SKIP: i32 = 99;
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let rc = (|| -> i32 {
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+                    return SKIP; // no unprivileged userns here; nothing to measure
+                }
+                // POSITIVE CONTROL: the precondition the fix addresses is really present.
+                if lo_is_up() {
+                    return 10; // a fresh net ns with lo already up would invalidate the test
+                }
+                // The trap, pinned: serving succeeds while the loopback is down.
+                let Ok(down_listener) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
+                    return 11; // if THIS ever fails, the pump's bind check would have sufficed
+                };
+                let Ok(addr) = down_listener.local_addr() else {
+                    return 12;
+                };
+                // ...and connecting to that same listening port does not, which is the failure the
+                // box's workload would hit while the pump reported itself ready.
+                if std::net::TcpStream::connect(addr).is_ok() {
+                    return 13;
+                }
+                // THE FIX.
+                if !bring_loopback_up() {
+                    return 14;
+                }
+                if !lo_is_up() {
+                    return 15; // measured independently of the return value above
+                }
+                if std::net::TcpStream::connect(addr).is_err() {
+                    return 16; // the same port must now be reachable
+                }
+                // IDEMPOTENT: the box's init calls this too, and either order must be a success.
+                if !bring_loopback_up() || !lo_is_up() {
+                    return 17;
+                }
+                0
+            })();
+            unsafe { libc::_exit(rc) };
+        }
+        let mut st = 0i32;
+        assert!(unsafe { libc::waitpid(pid, &mut st, 0) } == pid, "waitpid");
+        let code = (st >> 8) & 0xff;
+        if code == SKIP {
+            eprintln!("skipped: this host has no unprivileged user namespaces");
+            return;
+        }
+        assert_eq!(
+            code, 0,
+            "fresh-netns loopback check failed at step {code} (10..13 = the control itself broke, \
+             14..17 = bring_loopback_up did not raise lo, or was not idempotent)"
+        );
     }
 }

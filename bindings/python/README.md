@@ -49,7 +49,16 @@ class ExecutionResult:
     results: list[Result]        # rich mime-typed values: last expression, display(), matplotlib
     truncated: bool              # output hit max_output_bytes and the overflow was discarded
     success: bool                # exit_code == 0 AND fault is None
+    code_stderr: str             # stderr minus kern's own note:/warning: lines - feed THIS to a model
+    runtime_notes: list[str]     # the complement: the lines kern wrote about itself
 ```
+
+`stderr` is one stream shared by kern and your code, so a note about overlayfs or an undelegated
+cgroup arrives interleaved with the program's own output. That is right for a human reading a
+terminal and wrong for anything that puts `stderr` into a prompt, where it spends context on the
+runtime's housekeeping and reads like an error the code produced. `code_stderr` is the same string
+without those lines, and nothing is hidden: `runtime_notes` holds exactly what was taken out, and
+`stderr` still holds both in their original order. The LangChain tool and the MCP server use it.
 
 **A Python exception in the code is NOT a fault.** That is `exit_code != 0`, a traceback in `stderr`,
 and `fault is None`, because the code ran and the sandbox did nothing. `fault` is set only when the
