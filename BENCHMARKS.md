@@ -8,18 +8,31 @@ filesystem.
 |---|---:|---:|
 | **kern** `box --rootfs` | **2.5 ms** | **0.11 s** |
 
+<sub>2.5 ms is the round figure this file publishes and it sits inside the spread, not at its centre:
+today the same binary read 2.496 in one harness and 2.561 in the other, and 1.96 with the core
+pinned. The protocol below is what makes a single number mean anything.</sub>
+
 ### v0.9.1 costs 0.10 ms against v0.9.0, on purpose
 
 Measured after the fact rather than assumed, both binaries built the way the release is built
-(nightly, `-Z build-std`, `panic=immediate-abort`), same rootfs, 14 alternating batches of 40 on an
-idle machine:
+(nightly, `-Z build-std`, `panic=immediate-abort`), and measured twice, in two harnesses, because a
+number that moves a published figure should not rest on one.
 
-| | median | min | max |
-|---|---:|---:|---:|
-| v0.9.1 | 2.502 ms | 2.460 | 2.545 |
-| v0.9.0 | 2.401 ms | 2.332 | 2.450 |
+`scripts/bench-idle.sh`, the harness this file documents, run on each binary in turn on the same idle
+machine minutes apart:
 
-**+0.101 ms, and v0.9.1 was slower in 14 batches out of 14**, so this is not variance. `strace -c`
+| | free scheduler | pinned | margin over bubblewrap |
+|---|---:|---:|---|
+| v0.9.0 | **2.407 ms** | 1.780 ms | +13.3% and +10.6%, 20/20 and 20/20 |
+| v0.9.1 | **2.561 ms** | 1.964 ms | +8.2% and +2.6% |
+
+A second harness, 30 alternating batches of 40 with the order flipping every batch, agrees on the
+direction and reads a smaller gap: 2.496 ms against 2.385, **+0.111 ms, with v0.9.1 faster in 1 of 30
+paired batches**. Fifteen would be a tie. An earlier run of the same harness at 14 batches said
++0.101 and 0 of 14.
+
+So the gap is between 0.10 and 0.18 ms depending on how it is measured, and it is not variance in
+either. The 2.4 ms this file used to quote is still v0.9.0's number; it is not v0.9.1's. `strace -c`
 puts the two within two syscalls of each other, 962 against 964, and the difference is one extra
 `mkdir` and one extra `rmdir`: the supervisor's sibling cgroup, `kern-box-<name>-<pid>-sup`.
 

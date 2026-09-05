@@ -14,8 +14,11 @@ is in the git history.
 ## v0.9.1 - 2026-09-05
 
 **This release is 0.10 ms slower than v0.9.0 on a bare box start, and the trade is deliberate.**
-Measured with both binaries built the way the release is built, 14 alternating batches of 40 on an
-idle machine: 2.502 ms against 2.401, slower in 14 out of 14, so not variance. `strace -c` puts them
+Measured twice, in two harnesses, because a number that moves a published figure should not rest on
+one. `scripts/bench-idle.sh` on each binary in turn: 2.561 ms against 2.407 free, 1.964 against 1.780
+pinned. A second harness, 30 alternating batches: 2.496 against 2.385, with v0.9.1 faster in 1 of 30
+paired batches where fifteen would be a tie. The gap is 0.10 to 0.18 ms depending on the harness, and
+it is not variance in either. `strace -c` puts them
 within two syscalls of each other and the difference is one `mkdir` plus one `rmdir`: the
 supervisor's sibling cgroup. That leaf is what keeps the process reporting an OOM out of the group
 the OOM kills, and it cannot be skipped for uncapped boxes because there are none. The published
