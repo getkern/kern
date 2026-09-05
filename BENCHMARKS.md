@@ -12,46 +12,31 @@ filesystem.
 today the same binary read 2.496 in one harness and 2.561 in the other, and 1.96 with the core
 pinned. The protocol below is what makes a single number mean anything.</sub>
 
-### v0.9.1 costs 0.10 ms against v0.9.0, on purpose
+### v0.9.1 is 0.05 ms FASTER than v0.9.0, after two wrong answers about why it was slower
 
-Measured after the fact rather than assumed, both binaries built the way the release is built
-(nightly, `-Z build-std`, `panic=immediate-abort`), and measured twice, in two harnesses, because a
-number that moves a published figure should not rest on one.
+The OOM fix in this release parks kern's supervisor outside the cgroup that carries
+`memory.oom.group = 1`, so the process that reports a kill is not killed by it. The first cut did
+that by creating a sibling cgroup per box, and cost 0.10 ms.
 
-`scripts/bench-idle.sh`, the harness this file documents, run on each binary in turn on the same idle
-machine minutes apart:
+| | median | |
+|---|---:|---|
+| v0.9.0 | 2.346 ms | |
+| v0.9.1, first cut | 2.464 ms | the sibling leaf, created on every box |
+| **v0.9.1, shipped** | **2.300 ms** | the leaf only where it is needed |
 
-| | free scheduler | pinned | margin over bubblewrap |
-|---|---:|---:|---|
-| v0.9.0 | **2.407 ms** | 1.780 ms | +13.3% and +10.6%, 20/20 and 20/20 |
-| v0.9.1 | **2.561 ms** | 1.964 ms | +8.2% and +2.6% |
+Faster than the first cut in 24 of 24 paired batches, and faster than v0.9.0 in 21 of 24.
 
-A second harness, 30 alternating batches of 40 with the order flipping every batch, agrees on the
-direction and reads a smaller gap: 2.496 ms against 2.385, **+0.111 ms, with v0.9.1 faster in 1 of 30
-paired batches**. Fifteen would be a tie. An earlier run of the same harness at 14 batches said
-+0.101 and 0 of 14.
+**The leaf is needed on exactly one path.** `child` is freshly created, so the supervisor cannot
+already be inside it; the only cgroup that can take the supervisor down with the workload is its own.
+That happens when a scope or managed unit arms `origin` with `oom.group = 1`, which the code does when
+`prepare_delegated_scope` did not manage to move kern into a leaf of its own. Everywhere else the
+supervisor is already outside the blast radius and the leaf is pure cost.
 
-So the gap is between 0.10 and 0.18 ms depending on how it is measured, and it is not variance in
-either. The 2.4 ms this file used to quote is still v0.9.0's number; it is not v0.9.1's.
+Correctness re-checked in both layouts on four hosts and four systemd versions (249, 252, 255, 257):
+the OOM message survives, `memory.max` and `pids.max` inside the box read the caps exactly, a wide cap
+still lets the same workload finish, and `--egress-allow` still gets a 403 from its proxy.
 
-**No compiler flag takes it back, and that is the confirmation rather than the disappointment.**
-`Cargo.toml` justifies `opt-level = "z"` by asserting that this start is syscall-bound rather than
-CPU-bound. Tested directly: a third binary built with the release configuration PLUS
-`-C target-cpu=native`, on the i7-14700KF it was built for, run in the same harness in the same
-session as the other two.
-
-| | free | pinned |
-|---|---:|---:|
-| v0.9.1, `target-cpu=native` | 2.563 ms | 1.955 ms |
-| v0.9.1, the portable release build | 2.572 ms | 1.983 ms |
-| v0.9.0 | 2.449 ms | 1.799 ms |
-
-The most aggressive codegen this machine can produce buys 0.009 ms free and 0.028 pinned, which is
-inside the run-to-run drift: v0.9.0 itself read 2.407 in one run and 2.449 in the next. The
-assertion in `Cargo.toml` now has a measurement under it: the cost is a syscall, and no compiler
-removes a syscall.
-
-### Where the 0.10 ms goes, after two wrong answers
+### How the 0.10 ms was mis-attributed, twice
 
 **The first answer was wrong and the second answer was wronger, and both were published before they
 were checked.** Recorded here rather than quietly replaced, because the way each failed is the useful
@@ -91,9 +76,9 @@ The variant saves **0.167 ms and wins 20 of 20 paired batches**, and it is faste
 `memory.max` inside the box reads 134217728 for `--memory 128M`.
 
 So the cost IS the leaf, the first story was right, and the measurement that seemed to refute it was
-not a measurement. This is not shipped: it changes the code that decides who dies in an OOM, it has
-been validated on one host and one posture, and a variant that looks free is exactly the kind that
-needs the other postures before it is believed.
+not a measurement. It IS shipped, after the other postures said so: four hosts, four systemd versions, and the leaf kept
+on the one path where the supervisor's own cgroup is the one being armed. The table at the top of this
+file is the result.
 
 
 ## kern against bubblewrap, settled

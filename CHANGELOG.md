@@ -13,14 +13,20 @@ is in the git history.
 
 ## v0.9.1 - 2026-09-05
 
-**This release is 0.10 ms slower than v0.9.0 on a bare box start, and the trade is deliberate.**
-Measured twice, in two harnesses, because a number that moves a published figure should not rest on
-one. `scripts/bench-idle.sh` on each binary in turn: 2.561 ms against 2.407 free, 1.964 against 1.780
-pinned. A second harness, 30 alternating batches: 2.496 against 2.385, with v0.9.1 faster in 1 of 30
-paired batches where fifteen would be a tie. The gap is 0.10 to 0.18 ms depending on the harness, and
-it is not variance in either. The cost is the extra cgroup `mkdir`, 90.5 us measured in C on this host; the workload's migration into the capped cgroup is 19.4 us and flat from a 0 MB child to a 256 MB one. A variant that keeps the supervisor where it already is, creating no leaf, runs at 2.331 ms and beats v0.9.0 while keeping the OOM message and the cap. It is NOT in this release: it rewrites the code that decides who dies in an OOM and has been validated on one host and one posture. BENCHMARKS.md carries the measurement and the two wrong answers that preceded it. That leaf is what keeps the process reporting an OOM out of the group
-the OOM kills, and it cannot be skipped for uncapped boxes because there are none. The published
-bare-box figure moves from 2.4 ms to 2.5 and the tables were updated.
+**This release is FASTER than v0.9.0 on a bare box start, and it took two wrong answers to get
+there.** 2.300 ms against 2.346, faster in 21 of 24 paired batches, while keeping the OOM fix.
+
+The first cut of that fix was 0.10 ms SLOWER, because it parked kern's supervisor in a sibling cgroup
+to keep it out of the whole-group kill, and a cgroup `mkdir` costs 90.5 us on this host. Measuring it
+properly showed the leaf is needed on exactly one path: a scope or managed unit where
+`prepare_delegated_scope` did not move kern into a leaf of its own, so the supervisor's own cgroup is
+the one being armed with `oom.group = 1`. Everywhere else `child` is freshly created, the supervisor
+cannot be inside it, and moving it buys nothing.
+
+So the leaf is now created only on that path. 0.165 ms back, 24 of 24 paired batches, and the
+properties it defends were re-checked in both layouts on four hosts and four systemd versions (249,
+252, 255, 257): the OOM message survives, `memory.max` and `pids.max` inside the box read the caps
+exactly, and a wide cap still lets the same workload finish.
 
 
 **Cut for one defect that the released binary has on most hosts.** `--egress-allow` in v0.9.0 could

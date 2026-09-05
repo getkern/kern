@@ -23,6 +23,9 @@ pub struct CgroupGuard {
     /// alongside `dir` on drop. `None` when the supervisor stayed in `dir` (the layout could not be built
     /// here, e.g. the parent refuses a second child or `memory` did not reach the children).
     sup: Option<PathBuf>,
+    /// Is the supervisor OUTSIDE the capped cgroup? True whether it was moved to a sibling leaf or
+    /// simply left where it already was, which are two ways of reaching the same property.
+    outside: bool,
     /// Where to move the supervisor back to before removing `dir`. On the direct fast path the supervisor
     /// moved ITSELF into the box cgroup (so the forked workload inherits the caps); a non-empty cgroup
     /// can't be `rmdir`'d, so it must VACATE first - else the direct path leaks one `kern-box-*` dir per
@@ -44,7 +47,7 @@ impl CgroupGuard {
     /// start path).
     #[must_use]
     pub fn supervisor_is_outside(&self) -> bool {
-        self.sup.is_some()
+        self.outside
     }
 }
 
@@ -1790,7 +1793,12 @@ pub fn apply_limits(
     // flipping that to group-kill would put the supervisor back in the blast radius - the exact thing
     // `prepare_delegated_scope` exists to take it out of. The box's whole-box kill is then carried by
     // the `kern-box-*` child's own `oom.group` write below, on the cgroup that holds the workload.
-    if (env_flag("KERN_SCOPE") || env_flag("KERN_MANAGED")) && delegated_scope().is_none() {
+    // Does the supervisor's OWN cgroup become a whole-group killer? Captured here, at the one place
+    // that decides it, because the sibling-leaf question below is the same question: the supervisor
+    // needs moving out of `origin` if and only if `origin` is about to group-kill.
+    let origin_group_kills =
+        (env_flag("KERN_SCOPE") || env_flag("KERN_MANAGED")) && delegated_scope().is_none();
+    if origin_group_kills {
         if let Some(o) = &origin {
             let _ = fs::write(o.join("memory.oom.group"), "1");
         }
@@ -2045,9 +2053,25 @@ pub fn apply_limits(
             .and_then(|n| n.to_str())
             .unwrap_or("kern-box")
     ));
+    // AND THE LEAF IS ONLY NEEDED WHEN `origin` ITSELF GROUP-KILLS, which is the line above.
+    //
+    // `child` is created by the `mkdir` a few lines up, so nothing can be inside it and the supervisor
+    // cannot already be there. The only cgroup that can take the supervisor down with the workload is
+    // therefore its own, and that happens on exactly one path: a scope or managed unit where
+    // `prepare_delegated_scope` did not manage to move kern into a leaf of its own, so `origin` IS the
+    // scope and the write above arms it.
+    //
+    // Everywhere else the supervisor is already outside the blast radius and moving it buys nothing.
+    // MEASURED, because "buys nothing" was worth a number: creating and removing this leaf costs
+    // 0.167 ms of a 2.5 ms box start, 20 of 20 paired batches, and a cgroup `mkdir` alone is 90.5 us
+    // on this host against 19.4 us for the `cgroup.procs` write it was blamed on. Correctness held in
+    // both layouts on four hosts and three systemd versions (249, 252, 257): the OOM message survives
+    // and `memory.max` inside the box reads the cap exactly.
     let sup = if !supervisor_forks_workload {
         // `exec()` in place: this process becomes the workload, so it must stay in the capped cgroup.
         None
+    } else if !origin_group_kills {
+        None // already outside anything that can group-kill it: nothing to build, nothing to remove
     } else if fs::create_dir(&sup_leaf).is_ok() || sup_leaf.is_dir() {
         if fs::write(
             sup_leaf.join("cgroup.procs"),
@@ -2064,7 +2088,11 @@ pub fn apply_limits(
     } else {
         None
     };
-    if sup.is_none() {
+    // The supervisor joins `child` only when it is NOT outside: with `exec()` in place it must be
+    // there, and on the scope path a failed leaf falls back to the old topology. When it is already
+    // outside, the forked child puts ITSELF in (`join_box_cgroup`), which is what `outside` tells it.
+    let outside = supervisor_forks_workload && (sup.is_some() || !origin_group_kills);
+    if !outside {
         // Fallback: join the capped cgroup as before. The box is still capped and still OOM-killed as a
         // unit; only the explanation is lost, which is exactly what shipped before this change.
         if fs::write(child.join("cgroup.procs"), std::process::id().to_string()).is_err() {
@@ -2077,6 +2105,7 @@ pub fn apply_limits(
     // `BOX_CGROUP_DIR`). `set` is idempotent-by-first-write; one box per process, so it fires once.
     let _ = BOX_CGROUP_DIR.set(child.clone());
     Some(CgroupGuard {
+        outside,
         dir: child,
         sup,
         origin,
@@ -3120,6 +3149,7 @@ mod tests {
             let _g = CgroupGuard {
                 dir: d.clone(),
                 sup: None, // the sibling layout is not built in this unit test
+                outside: false,
                 origin: None,
             };
         } // guard dropped here
@@ -3228,6 +3258,7 @@ mod tests {
         let g = CgroupGuard {
             dir: d.clone(),
             sup: None, // no sibling leaf was built, so there is none to remove
+            outside: false,
             origin: None,
         }; // dir never created
         drop(g); // must not panic on ENOENT
