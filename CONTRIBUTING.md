@@ -169,6 +169,21 @@ without warning. This is **blocking** on review, same as tests:
 - A new flag must land with a parser test asserting it populates the right `Command` field, and a
   rejection must land with a test asserting the `Usage` error (see `cpu_ram_flag_freeze`).
 
+## Before a tag: the acceptance matrix
+
+`sh scripts/acceptance-matrix.sh <path-to-kern>` runs every compose lifecycle transition in both
+network modes and checks the three things the unit suites do not: that the OUTPUT agrees with the
+state (a line naming a pod on a stack that has none is a failure, not cosmetics), that a payload
+crosses with NO settling time (a bare connect cannot see a stale relay; only bytes back can), and that
+`down` leaves nothing behind in processes OR on disk, counted by pid rather than by process name.
+
+It was written after four defects in one release cycle were found by an external reviewer rather than
+by this repo's own tests, and all four had that shape. `--self-check` exercises its own assertions
+against fixed strings, so a matrix that cannot fail is caught before it is trusted.
+
+Run it against the binary a tag will actually publish, not against `cargo build --release`: this
+project has twice measured the wrong artifact that way.
+
 ## Documentation has a gate too
 
 Prose is checked the same way code is, mechanically, before the commit:
