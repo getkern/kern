@@ -171,6 +171,13 @@ _TOOLS = [
     },
 ]
 
+# THE ONE LIST. Derived from the schema above rather than retyped, because the two disagreed: the
+# schema advertised `sh` and the guard in `_run_code` rejected it, so the server offered a model a
+# value and then refused it. Anything that reads this reads what the client was told.
+_RUN_CODE_LANGUAGES = next(
+    t["inputSchema"]["properties"]["language"]["enum"] for t in _TOOLS if t["name"] == "run_code"
+)
+
 # Required arguments (and their types) per tool. Validated UP FRONT as -32602 before any binding call,
 # so a KeyError/TypeError from deep in the binding can never be misreported as a "missing argument".
 _ARG_SPEC = {
@@ -459,8 +466,17 @@ class _Server:
     def _run_code(self, args: dict) -> "tuple[list, bool]":
         code = args.get("code", "")
         language = args.get("language", "python")
-        if language not in ("python", "bash", "node"):  # defense in depth (the binding also validates)
-            return [{"type": "text", "text": f"unsupported language: {language!r}"}], True
+        # READ FROM THE SCHEMA, not from a second list written by hand. This guard used to be the
+        # literal tuple ("python", "bash", "node") while the schema above advertised
+        # ["python", "bash", "sh", "node"], so the server told a model `sh` was valid and then refused
+        # it. That is worse than not offering it: on an image with no bash and no python (alpine is
+        # the obvious one) `sh` is the ONLY shell there is, and the model had been told it could ask.
+        # Found by driving the server 60 times in a row rather than by reading either line.
+        allowed = _RUN_CODE_LANGUAGES
+        if language not in allowed:
+            return [
+                {"type": "text", "text": f"unsupported language: {language!r} (accepted: {', '.join(allowed)})"}
+            ], True
         kw = {}
         # bool is an int subclass, so exclude it explicitly (timeout_s=true would pass isinstance(int)
         # and reach the binding as a deadline of 1); also require a positive number, else use the default.

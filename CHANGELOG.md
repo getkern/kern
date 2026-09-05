@@ -37,6 +37,23 @@ prefix were invisible to anything reading kern's output. Detail below.
 
 ## Unreleased
 
+### Fixed
+
+- **The MCP server offered a language and then refused it.** The `run_code` tool schema advertised
+  `["python", "bash", "sh", "node"]` while the guard in `_run_code` compared against a second,
+  hand-written `("python", "bash", "node")`. A model reading the schema sent `sh` and got
+  `unsupported language: 'sh'`, and the message did not say what would have worked.
+
+  It mattered most where it was least visible. On an image with neither python nor bash, `sh` is the
+  only shell there is, so `KERN_MCP_IMAGE=alpine` gave a server whose own schema promised something
+  it could not do. The guard now IS the schema's list rather than a copy of it, and a refusal names
+  the accepted values. Found by driving the server sixty times in a row, not by reading either line.
+
+  Three tests pin it: the guard must be the same object as the schema's enum, every language
+  `Sandbox.run_code` accepts must be offered by the server, and `sh` must be among them. Mutation
+  checked by reverting the constant to the old triple, which turns all three red.
+
+
 **`kern-sandbox` 0.1.41** is a documentation release: no code changed from 0.1.40. PyPI and npm fix a
 package's description at upload time, so the only way to correct a landing page is to publish again.
 

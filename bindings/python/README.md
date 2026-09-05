@@ -144,6 +144,12 @@ and refills on a worker thread while your agent thinks. Measured on `python:3.12
 | default | 30.9 ms | 14.2 ms |
 | `prewarm=4` | 0.9 ms | **0.8 ms** |
 
+**The pool also fills on that worker thread, so the first call is fast only once it HAS filled.**
+Measured on `python:3.12-slim`: constructing with `prewarm=4` and calling immediately gives 13.7 ms
+five times over and 0.5 ms on the sixth, because the boxes were still starting. Given half a second
+the same burst reads 0.8, 0.6, 0.5, 0.6 for the first four and then 32.7 for the fifth, which is the
+pool empty. The table above is the steady state, not the first moment after construction.
+
 Each prewarmed box still serves ONE call and is thrown away, so the isolation is unchanged: only the
 moment of creation moves. That is the difference from `kernel()`, which shares one process across
 cells and says so. If calls arrive faster than the pool refills you are back to the default cost, so N

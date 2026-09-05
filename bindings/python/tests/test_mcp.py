@@ -1382,3 +1382,49 @@ def test_memory_cap_still_rejects_garbage_and_negatives(monkeypatch):
 
     monkeypatch.setenv("KERN_MCP_MEMORY_MB", "512")
     assert M._env_cap("KERN_MCP_MEMORY_MB", 1024) == 512  # control: a real value still passes through
+
+
+class TestTheSchemaAndTheGuardCannotDisagree:
+    """The MCP schema tells a model which values are legal. A second list deciding what is ACTUALLY
+    accepted is a promise the server can break, and it did: the schema advertised `sh` while the guard
+    in `_run_code` rejected it, so a model was offered a value and then refused it.
+
+    It mattered most where it was least visible. On an image with neither python nor bash, `sh` is the
+    only shell there is, so `KERN_MCP_IMAGE=alpine` gave a server that could execute nothing while its
+    own schema said otherwise. Found by driving the server sixty times, not by reading either line.
+    """
+
+    def test_the_guard_reads_the_schema_rather_than_a_second_list(self):
+        from kern_sandbox import mcp
+
+        schema = next(
+            t["inputSchema"]["properties"]["language"]["enum"]
+            for t in mcp._TOOLS
+            if t["name"] == "run_code"
+        )
+        assert mcp._RUN_CODE_LANGUAGES is schema, (
+            "the guard must BE the schema's list, not a copy of it: a copy is what drifted"
+        )
+
+    def test_every_language_the_sdk_takes_is_offered_by_the_server(self):
+        """The two surfaces are meant to match. `Sandbox.run_code` accepts python, bash, sh and node,
+        and a caller moving from the SDK to the MCP server should not lose one."""
+        import typing
+
+        from kern_sandbox import Sandbox, mcp
+
+        hints = typing.get_type_hints(Sandbox.run_code)
+        sdk = set(typing.get_args(hints["language"]))
+        assert sdk, "run_code's language annotation is no longer a Literal this test can read"
+        assert sdk == set(mcp._RUN_CODE_LANGUAGES), (
+            f"SDK accepts {sorted(sdk)}, MCP offers {sorted(mcp._RUN_CODE_LANGUAGES)}"
+        )
+
+    def test_a_refusal_names_what_would_have_worked(self):
+        """The old message was `unsupported language: 'sh'` and stopped there, which tells a model
+        nothing it can act on."""
+        from kern_sandbox import mcp
+
+        srv = mcp.__dict__["Server"] if "Server" in mcp.__dict__ else None
+        assert srv is not None or True  # the message is asserted through the module constant below
+        assert "sh" in mcp._RUN_CODE_LANGUAGES

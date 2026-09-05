@@ -242,6 +242,11 @@ so a `runCode` claims one instead of paying for a box start plus an interpreter 
 `python:3.12-slim`, six calls each: **14.2 ms p50 by default against 0.8 ms with `prewarm: 4`**, and
 30.9 ms against 0.9 for the first call.
 
+**The pool also fills on that worker thread, so the first call is fast only once it HAS filled.**
+Measured: constructing with `prewarm: 4` and calling immediately gives 13.7 ms five times over,
+while half a second later the same burst reads 0.8, 0.6, 0.5, 0.6 for the first four and then
+32.7 for the fifth, the pool empty. The table is the steady state, not the first moment.
+
 The refill runs while your agent thinks, so it is off the caller's clock. That also says when it buys
 nothing: if calls arrive faster than the pool refills, the pool empties and you are back to the
 default cost. N is the burst you want covered, not a throughput knob.
