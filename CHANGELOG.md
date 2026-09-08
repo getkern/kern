@@ -5,6 +5,10 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## Unreleased
+
+**Agent skills:** add self-contained Kern guidance for Claude Code and GitHub Copilot, including CLI, Compose, and `kern-sandbox` workflows.
+
 ## v0.9.3 - 2026-09-07
 
 **If you run kern on Ubuntu 23.10 or later, your install needs one action.** That is not a new
