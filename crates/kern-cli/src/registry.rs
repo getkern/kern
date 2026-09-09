@@ -871,7 +871,32 @@ fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
     let memo = MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(m) = memo.lock() {
         if let Some(p) = m.get(&key) {
-            return Ok(p.clone());
+            // A CACHED PATH IS NOT A PROMISE THE DIRECTORY IS STILL THERE, and this returned one for
+            // the rest of the process's life. `runtime_subdir_uncached` is what CREATES the
+            // directory and it runs only on a miss, so anything that removed
+            // `$XDG_RUNTIME_DIR/kern/<leaf>` after the first call - a `systemd-tmpfiles` sweep of
+            // `/run/user`, a logout, an operator clearing it, another kern's cleanup - left every
+            // later registry write in this process failing `NotFound`, permanently, with the box's
+            // registration silently lost. It is not a narrow race: once the memo is poisoned it
+            // never heals.
+            //
+            // Observed first as five registry tests red in one `cargo test` and green in the next,
+            // which looked like flakiness and was a cache that never revalidates.
+            //
+            // COST, MEASURED AND NOT ARGUED. This adds one `stat` per resolve, and the memo exists
+            // to avoid eight failing `mkdir`s on a box start, so the question is whether the guard
+            // eats the saving. Five blocks of 200 `box --rootfs` each, same binary otherwise:
+            //
+            //     with this check     3.030 ms median   (3.015 3.049 3.030 3.015 3.059)
+            //     without it          3.098 ms median   (3.098 3.062 3.078 3.125 3.123)
+            //
+            // The sign favours the version doing MORE work, which is not a real effect: it is
+            // between-run drift on a machine that is not idle. No direction is written from it. What
+            // the numbers do support is the only claim that matters here: the guard costs nothing
+            // measurable, and the memo keeps its reason for existing.
+            if p.is_dir() {
+                return Ok(p.clone());
+            }
         }
     }
     let made = runtime_subdir_uncached(leaf)?;
@@ -2502,6 +2527,52 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A memoised runtime path must stop being returned once the directory it names is gone.
+    ///
+    /// MEASURED DEFECT this pins, and it is a PRODUCT defect that first showed up wearing a test
+    /// flake's costume: five registry tests red in one `cargo test` and green in the next, on an
+    /// unchanged tree. `runtime_subdir` memoises the PATH and `runtime_subdir_uncached` is what
+    /// CREATES the directory, so the creation runs only on a miss. Anything that removed
+    /// `$XDG_RUNTIME_DIR/kern/instances` after the first call left every later registry write in
+    /// that process failing with `NotFound` - not for a moment, but for the life of the process,
+    /// because the memo never revalidates and so never heals. A detached box registered after that
+    /// point is simply lost, and `/run/user` is swept by `systemd-tmpfiles`, cleared on logout, and
+    /// removable by any operator who thinks it is scratch space.
+    ///
+    /// The reproduction needs no timing, which is why it is a test and not an observation: resolve
+    /// once, delete, resolve again, write. Before the revalidation the second write is `NotFound`.
+    #[test]
+    fn a_memoised_runtime_dir_is_re_created_after_something_removes_it() {
+        let Ok(first) = dir() else {
+            eprintln!("skip: no runtime dir on this host");
+            return;
+        };
+        assert!(first.is_dir(), "the first resolve must have created it");
+
+        // Exactly what a `/run/user` sweep does. Best-effort: if it cannot be removed here there is
+        // nothing to measure, and saying so beats asserting on a host that would not let us set the
+        // condition up.
+        if fs::remove_dir_all(&first).is_err() || first.is_dir() {
+            eprintln!(
+                "skip: could not remove {} to set the case up",
+                first.display()
+            );
+            return;
+        }
+
+        let second = dir().expect("resolving again must succeed after the directory was removed");
+        assert!(
+            second.is_dir(),
+            "a resolve after the directory was removed must re-create it, not hand back a path to \
+             nothing: {}",
+            second.display()
+        );
+        // The property that actually broke: a write through the re-resolved path lands.
+        let probe = second.join(format!("memo-probe-{}", std::process::id()));
+        fs::write(&probe, b"x").expect("a write through the re-resolved path must succeed");
+        let _ = fs::remove_file(&probe);
+    }
 
     /// `comm` is the workload's own executable name, so it is hostile input to every reader of
     /// `/proc/<pid>/stat`: it can hold spaces and parentheses and is not quoted or escaped. A reader

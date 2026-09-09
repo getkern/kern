@@ -2545,6 +2545,32 @@ impl Drop for DirHandle {
     }
 }
 
+/// A directory's permission bits (`st_mode & 0o7777`), read through an `O_NOFOLLOW` descriptor.
+///
+/// `None` when the path is not a directory, IS a symlink, or cannot be opened - each of which means
+/// there is no directory mode of ours to report. The no-follow open is the point: the caller uses
+/// this to copy a mode from one tree to another, and a symlink planted at either end must not turn
+/// that into a read of whatever it points at.
+#[must_use]
+pub fn dir_mode(dir: &Path) -> Option<u32> {
+    DirHandle::open(dir).and_then(|h| h.mode())
+}
+
+/// Set a directory's permission bits through an `O_NOFOLLOW` descriptor. `false` if the path could
+/// not be opened as a real directory or the kernel refused the `fchmod`.
+///
+/// Path-based `set_permissions` FOLLOWS symlinks; this does not, so a symlink standing where the
+/// caller expects a directory is skipped rather than chmod'ed through. Same discipline as the
+/// widen/restore above, and for the same reason: the trees involved hold layer content.
+///
+/// `#[must_use]` because the ONE caller that drops this drops the whole point: a directory whose
+/// chmod failed keeps `create_dir`'s `0o777 & ~umask`, which is exactly the mode-rewriting defect
+/// this function was added to fix. The compiler is the only thing that catches that reliably.
+#[must_use]
+pub fn set_dir_mode(dir: &Path, mode: u32) -> bool {
+    DirHandle::open(dir).is_some_and(|h| h.chmod(mode & 0o7777))
+}
+
 /// Grant OURSELVES `u+wx` on a directory we are about to descend into or empty, best-effort.
 ///
 /// Unlinking an entry is governed by the mode of the DIRECTORY that holds it, and reading it needs

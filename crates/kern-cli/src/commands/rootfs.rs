@@ -1351,6 +1351,85 @@ pub(crate) fn collapse_dot_segments(path: &str) -> String {
     out
 }
 
+/// Create every directory of `rel` inside THIS layer, giving each component the mode the merged view
+/// below already has for it, and `0o755` for a component that is genuinely new.
+///
+/// WHY THIS IS NOT `create_dir_all`. A `COPY` writes into a FRESH overlay layer, so the whole
+/// destination path is created here even when it already exists in the base image - and an upper
+/// layer's directory entry SHADOWS the lower one, mode included. `create_dir_all` creates at
+/// `0o777 & ~umask`, so a single COPY silently rewrote the image's modes. Measured on
+/// `mcr.microsoft.com/dotnet/aspnet:9.0` with the builder's umask at 002: `COPY x /tmp/y` took `/tmp`
+/// from 1777 to 0775, dropping the sticky bit AND world write. That is not cosmetic - it broke a real
+/// build: `apt` lowers its privileges to `_apt` for signature checking, could no longer create
+/// `/tmp/apt.conf.XXXXXX`, reported every repository as unsigned, and `apt-get update` failed the
+/// stage with exit 100. It cut the other way too, `/usr/share` going 0755 -> 0775, shipping
+/// group-writable system directories nobody asked for. Docker leaves an existing destination
+/// directory alone.
+///
+/// The `0o755` for a NEW directory is the second half of the same defect. At `0o777 & ~umask` the
+/// modes baked into a layer depended on the umask of whoever ran the build, so the same Dockerfile
+/// produced different images on two machines. Docker creates COPY parents at 0755; pinning it makes
+/// the layer reproducible.
+///
+/// A component that already exists IN THIS LAYER is left untouched: an earlier COPY in the same unit
+/// created it and set its mode, and re-deciding it here would let the last COPY win over the first.
+fn materialize_dst_dirs(rootfs: &std::path::Path, chain: &[String], rel: &str) {
+    let mut acc = String::new();
+    for part in rel.split('/').filter(|s| !s.is_empty() && *s != ".") {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(part);
+        let here = rootfs.join(&acc);
+        match std::fs::create_dir(&here) {
+            Ok(()) => {
+                // `chain_dir_mode` carries the full `0o7777`, so `/tmp`'s sticky bit survives.
+                //
+                // THE `None` HAS TWO MEANINGS AND ONLY ONE OF THEM IS `0o755`. `dir_mode` answers
+                // `None` for "no layer has this name as a real directory" AND for "a layer has it
+                // but the descriptor would not open" - EACCES on a layer directory owned by a mapped
+                // subuid, EMFILE down a deep chain, a transient I/O error. Collapsing both onto the
+                // default would give an EXISTING `/tmp` the mode of a new one: 0755, sticky and
+                // world-write gone, which is the defect this function exists to fix, reached by
+                // another road and with the same `apt` exit 100 at the end of it.
+                //
+                // `chain_has_dir` is the discriminant and it is already here: it `stat`s where
+                // `dir_mode` `open`s, and a `stat` succeeds in exactly the cases where the open does
+                // not. So the two disagree precisely on "exists but unreadable", and that case must
+                // not be guessed.
+                let mode = match crate::commands::imagecache::chain_dir_mode(chain, &acc) {
+                    Some(m) => m,
+                    // Nothing below holds the name: genuinely new, and Docker creates COPY parents
+                    // at 0755. Pinned rather than umask-derived, so the layer is reproducible.
+                    None if !crate::commands::imagecache::chain_has_dir(chain, &acc) => 0o755,
+                    // Below and unreadable. FAIL CLOSED: undo the component and stop, so the copy
+                    // that follows fails on a missing parent instead of the build shipping a
+                    // directory whose mode was invented. A wrong mode is invisible until something
+                    // downstream breaks for a reason that names nothing; a failed copy is not.
+                    None => {
+                        let _ = std::fs::remove_dir(&here);
+                        return;
+                    }
+                };
+                // The chmod is checked for the same reason. It runs on a directory this process just
+                // created, so a failure is close to unreachable - but if it does fail the component
+                // keeps `create_dir`'s `0o777 & ~umask`, which IS the original defect, silently.
+                if !kern_oci::set_dir_mode(&here, mode) {
+                    let _ = std::fs::remove_dir(&here);
+                    return;
+                }
+            }
+            // Already there: ours from an earlier COPY, or - in the flat (chainless) build, where
+            // `rootfs` IS the real rootfs - the image's own directory. Either way its mode is already
+            // the right one and must not be re-decided here. This is why the flat build is unchanged.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // Anything else (a symlink in the way, a permission problem): stop and let the copy that
+            // follows fail with the real error, which says more than anything we could invent here.
+            Err(_) => return,
+        }
+    }
+}
+
 pub(crate) fn copy_into_rootfs(
     ctx: &std::path::Path,
     src_rel: &str,
@@ -1418,9 +1497,7 @@ pub(crate) fn copy_into_rootfs(
         )));
     }
     let target = rootfs.join(&target_rel);
-    if let Some(p) = target.parent() {
-        let _ = std::fs::create_dir_all(p);
-    }
+    materialize_dst_dirs(rootfs, chain, &parent_rel);
     // If the target itself is an existing symlink, unlink it so we don't copy THROUGH it out of the
     // rootfs (COPY overwrites the name, following Docker).
     if let Ok(m) = std::fs::symlink_metadata(&target) {
@@ -1435,7 +1512,9 @@ pub(crate) fn copy_into_rootfs(
     // file (the common case) the fast `cp -a` path below is unchanged.
     if src.is_dir() {
         if let Some(ig) = crate::dockerignore::DockerIgnore::load(ctx) {
-            let _ = std::fs::create_dir_all(&target);
+            // The destination itself is a directory here, so it gets the same treatment as its
+            // parents: the image's mode when the chain below already has it, 0755 when it is new.
+            materialize_dst_dirs(rootfs, chain, &target_rel);
             // Match ignore paths relative to the CANONICAL context root: `src` is already canonicalized,
             // so a symlinked context path (e.g. `/tmp` -> `/private/tmp`, or a symlinked project dir)
             // would otherwise make `strip_prefix` fail and silently disable filtering - a fail-OPEN
@@ -1448,7 +1527,7 @@ pub(crate) fn copy_into_rootfs(
         }
     }
     let arg = if src.is_dir() {
-        let _ = std::fs::create_dir_all(&target);
+        materialize_dst_dirs(rootfs, chain, &target_rel);
         format!("{}/.", src.display())
     } else {
         src.to_string_lossy().into_owned()

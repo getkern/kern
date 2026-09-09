@@ -91,6 +91,7 @@ pub use cgroup::box_was_oom_killed;
 /// net ns from outside and must not assume the box's init has already got there. See `real`.
 pub use real::bring_loopback_up;
 
+/// The same question asked of /proc, for a host with no per-box cgroup. See [`cgroup::live_box_supervisors_via_proc`].
 pub use cgroup::env_flag;
 /// Reap orphaned `kern-box-*` cgroup dirs under kern.slice (the direct-cap path leaves an empty one
 /// on a box SIGKILL). Called by `kern gc`. See [`cgroup::gc_orphan_box_cgroups`].
@@ -99,6 +100,9 @@ pub use cgroup::gc_orphan_box_cgroups;
 /// See [`cgroup::oom_kill_count`].
 /// Put the calling process into the box's capped cgroup. See [`cgroup::join_box_cgroup`].
 pub use cgroup::join_box_cgroup;
+/// Boxes the kernel still has, whatever the registry says. See [`cgroup::live_box_cgroups`].
+pub use cgroup::live_box_cgroups;
+pub use cgroup::live_box_supervisors_via_proc;
 /// Whether a `--memory` cap can actually be ENFORCED here (the `memory` controller is available in
 /// the cgroup tree). False on kernels that don't delegate it - a stock Raspberry Pi OS and the
 /// default WSL2 kernel - where a `memory.max` write is accepted but never bites. Used only to warn.

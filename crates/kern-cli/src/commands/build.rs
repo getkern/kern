@@ -338,6 +338,9 @@ fn build_multi_stage(
     let pid = std::process::id();
     // Temp tags for the non-final stages, cleaned up at the end (whatever happens).
     let mut stage_tags: Vec<String> = Vec::with_capacity(n);
+    // Set when the LAST stage's `FROM` named an earlier stage: its overlay chain then rests on a temp
+    // tag that `cleanup_stage_tags` is about to delete.
+    let mut final_rests_on_stage = false;
     let cleanup_stage_tags = |tags: &[String]| {
         for t in tags {
             let _ = drop_cached_image(t);
@@ -389,7 +392,15 @@ fn build_multi_stage(
             stage_instrs,
             pulled_from_stage,
             stage_uses_context,
+            from_stage,
         } = prep;
+        // Only the FINAL stage's dependency matters. An intermediate stage that rests on an earlier
+        // one is itself a temp tag that gets dropped; nothing survives to reference it. The final
+        // image is the one artifact that outlives the build, and if its chain rests on a temp tag it
+        // has to be materialised before the cleanup below.
+        if is_last {
+            final_rests_on_stage = from_stage;
+        }
 
         // Choose the stage's build context WITHOUT copying the (possibly huge) real context unless the
         // stage actually COPYs from it (Finding B): the common `FROM alpine` + only `COPY --from` case
@@ -421,11 +432,130 @@ fn build_multi_stage(
             stage_tags.push(stage_tag);
         }
     }
+    // MATERIALISE BEFORE THE CLEANUP, and the order is the whole correctness of `FROM <stage>`.
+    //
+    // `COPY --from` takes FILES out of a stage, so the product owns them and the stage can go. `FROM
+    // <stage>` makes the stage the product's BASE: the final image's overlay chain rests on the temp
+    // tag, and `cleanup_stage_tags` deletes that tag's layer directory. MEASURED without this step:
+    // the build printed `built` and the image would not run (`registry: no layers in manifest`) - a
+    // loud failure at build time traded for a silent one at run time.
+    //
+    // Keeping the temp tag instead is worse, not better: the tags are `kern-stage-<pid>-<i>`, so
+    // leaving one alive leaks an image under a name nobody recognises, and the first `kern gc
+    // --images` deletes it and breaks an image that worked yesterday. A delayed failure is the worst
+    // of the three.
+    //
+    // So the final image is squashed into a flat rootfs it OWNS. The merge is read from the
+    // KERNEL-MERGED overlay view, never hand-rolled: a bottom-up copy of the raw layer dirs
+    // re-includes a file a higher layer deleted, both for a per-file `.wh.` whiteout and for an
+    // OPAQUE directory (`rm -rf d && mkdir d`), which is how a secret removed in a build step
+    // reappears in the shipped image. Same reader the push path uses, for the same reason.
+    //
+    // FAIL CLOSED: if any part of this cannot be done, the tag is dropped and the build FAILS. A
+    // half-materialised image is exactly the silent breakage this block exists to prevent.
+    if final_rests_on_stage {
+        if let Err(e) = materialize_final_image(tag) {
+            let _ = drop_cached_image(tag);
+            cleanup_stage_tags(&stage_tags);
+            return Err(e);
+        }
+    }
     cleanup_stage_tags(&stage_tags);
     // Stamp the whole-build key on the final tag so the NEXT identical multi-stage build hits the cache
     // above (overwrites the last stage's per-stage key that its `build_run` wrote). Harmless on a
     // layered final image - the `is_dir` guard in `flat_cache_hit` never false-hits on it.
     write_flat_key(tag, &ms_key);
+    Ok(())
+}
+
+/// Squash `tag`'s overlay chain into a flat rootfs that the tag OWNS, so nothing it references can be
+/// deleted out from under it.
+///
+/// Only used by the multi-stage path, and only when the final stage's `FROM` named an earlier stage:
+/// everywhere else an image already owns its layers or shares ones nobody is about to drop.
+///
+/// # Why the kernel-merged view and not a copy of the layer dirs
+///
+/// A bottom-up `cp -a` of the raw layers re-includes a file a higher layer DELETED. Two shapes do it:
+/// a per-file `.wh.` whiteout, and an OPAQUE directory (`rm -rf d && mkdir d`, recorded in an xattr,
+/// with no `.wh.` file anywhere). A secret removed in a build step would reappear in the shipped
+/// image. `merged_view_extract` reads the view the kernel has already resolved, which is the only
+/// correct reader; a single-layer chain has no cross-layer opaque and is copied directly.
+///
+/// # Failure modes, all of which return `Err` rather than leaving a partial image
+///
+/// * the chain will not resolve, or the merged view cannot be extracted (no unprivileged overlay);
+/// * the temp tree cannot be created, or the rename onto the tag fails;
+/// * the config cannot be written.
+///
+/// The caller drops the tag on any of them, so the build ends with no image rather than a broken one.
+///
+/// # What the squash does NOT preserve, measured
+///
+/// The extraction reads the merged view as a tree of files, so structure that lives BELOW the
+/// directory entry does not survive. Measured on a stage built for the purpose:
+///
+/// | property                     | before | after |
+/// |------------------------------|--------|-------|
+/// | directory mode, incl. sticky and setgid | 1777, 2755, 0555 | unchanged |
+/// | hard link count              | 2      | **1** (two copies) |
+/// | sparse file, 8 MB apparent   | 0 blocks | **16384 blocks** (hole filled) |
+///
+/// NOT INTRODUCED HERE. `push` squashes through the same `merged_view_extract` with the same shape,
+/// so an image pushed from kern has always had this; `FROM <stage>` is a second door onto a property
+/// that was already there. It is written down because the door is new: an author who never pushes can
+/// now reach it, and the cost is disk - a rootfs whose binaries are hard-linked (a coreutils
+/// multi-call image) pays a copy per link.
+///
+/// The directory-mode row is the one that had to be checked rather than assumed: this branch exists
+/// because `COPY` was rewriting directory modes, and a second copier that did the same would have
+/// reintroduced the defect through the fix for a different one.
+fn materialize_final_image(tag: &str) -> Result<(), Error> {
+    let (lower, config) = resolve_image(tag)?;
+    let chain: Vec<String> = lower.split(':').map(str::to_string).collect();
+    let cache = cache_dir();
+    let safe = sanitize_ref(tag);
+    // A sibling of the final location, so the rename below is within one filesystem.
+    let tmp = cache.join(format!(".materialize-{}-{}", safe, std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)
+        .map_err(|e| Error::Sandbox(format!("materialize '{tag}': temp dir: {e}")))?;
+    if chain.len() >= 2 {
+        merged_view_extract(&chain, None, &tmp).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&tmp);
+        })?;
+    } else {
+        // One layer is already its own merged rootfs: no cross-layer opaque can exist.
+        let ok = std::process::Command::new("cp")
+            .arg("-a")
+            .arg("--reflink=auto")
+            .arg("--")
+            .arg(format!("{}/.", chain[0]))
+            .arg(&tmp)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(Error::Sandbox(format!(
+                "materialize '{tag}': could not copy the single-layer rootfs"
+            )));
+        }
+    }
+    // Commit in the SAME order the flat build finalises in: put the new form in place first, then
+    // drop the layered form, so a failed rename never leaves the tag with neither.
+    let flat = cache.join(&safe);
+    let _ = std::fs::remove_dir_all(&flat);
+    std::fs::rename(&tmp, &flat).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&tmp);
+        Error::Sandbox(format!("materialize '{tag}': finalize: {e}"))
+    })?;
+    let _ = std::fs::remove_dir_all(cache.join(format!("{safe}.diff")));
+    let _ = std::fs::remove_file(cache.join(format!("{safe}.base")));
+    let _ = std::fs::remove_file(cache.join(format!("{safe}.layers")));
+    write_image_config(&cache.join(format!("{safe}.image")), &config)
+        .map_err(|e| Error::Sandbox(format!("materialize '{tag}': image config: {e}")))?;
+    let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
     Ok(())
 }
 
@@ -717,7 +847,10 @@ fn build_run(
                 i += 1;
             }
             Instr::Env(k, v) => {
-                set_config_env(&mut config.env, k, v);
+                // Finish the value HERE: the parser deliberately left references it could not know
+                // (the base image's own env) verbatim. See `dockerfile::subst_env`.
+                let v = crate::dockerfile::expand_env_value(v, &config.env);
+                set_config_env(&mut config.env, k, &v);
                 i += 1;
             }
             Instr::Workdir(d) => {
@@ -1069,7 +1202,10 @@ fn build_layered_cached(
                 i += 1;
             }
             Instr::Env(k, v) => {
-                set_config_env(&mut config.env, k, v);
+                // Same deferred expansion as the flat loop. The EXPANDED value goes into the layer
+                // key: two bases with different `PATH` must not share a cached layer.
+                let v = crate::dockerfile::expand_env_value(v, &config.env);
+                set_config_env(&mut config.env, k, &v);
                 key = layer_key(&key, &format!("ENV\u{0}{k}={v}"));
                 i += 1;
             }

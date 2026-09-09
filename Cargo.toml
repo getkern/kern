@@ -27,8 +27,29 @@ authors = ["Alex <261468952+getkerndev@users.noreply.github.com>"]
 # min-startup, switch opt-level to "z" - kept at 3 here on purpose.)
 [profile.release]
 # opt-level "z" (size): kern's cold start is syscall-bound (unshare/mount/exec), not CPU-bound, so
-# size-optimised codegen shrinks the binary noticeably with no measurable latency cost - verified a
-# hair faster, likely better I-cache. There is no hot CPU path to slow down.
+# size-optimised codegen shrinks the binary noticeably with no measurable latency cost.
+#
+# "VERIFIED A HAIR FASTER" IS WHAT THIS COMMENT USED TO SAY, AND IT WAS BACKWARDS. Re-run by
+# `scripts/bench-codegen.sh` against `[profile.perf]`, eleven paired runs of 120 to 400 samples each,
+# on an instrument shown in the same runs to resolve an injected 50 us out of a 2.6 ms box start.
+# Opt-level 3 on our crates: five runs, point estimates from +7.6 to -38.3 us, two intervals spanning
+# zero. Opt-level 3 plus a std built without `optimize_for_size`: six runs, -16 to -50 us, five
+# intervals spanning zero. So the SIZE-optimised profile is the slightly slower one if either is,
+# which is the opposite of what was recorded, and the effect is under 1.5% of a box start with a sign
+# that does not hold across replicas on a machine carrying other work.
+#
+# The rule that produced the old sentence is worth more than the number: a direction may not be
+# written when the interval spans zero, and "a hair faster" was a direction.
+#
+# WHY THE NULL IS THE EXPECTED ANSWER, measured rather than argued: starting the binary and exiting
+# costs about 250 us of a 2.58 ms box start, so roughly 90% of the wall clock is namespace, mount and
+# cgroup construction, which no codegen flag touches. The single most expensive item is the network
+# namespace, worth 351 us on its own (CI95 [326, 379]) against `--net host`.
+#
+# So the choice stands, but for a reason that has to be stated honestly rather than as a win: "z" is
+# not faster, it may be a fraction of a percent slower, and it costs half again LESS binary. At 1.5%
+# of a cold start that trade is worth taking, and it would stop being worth taking the moment a hot
+# CPU path existed, which is the condition under which to re-run this script rather than re-read it.
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
@@ -41,3 +62,16 @@ incremental = false
 # Tweak here without touching `cargo build --release` for development.
 [profile.dist]
 inherits = "release"
+
+# `perf`: the SPEED extreme, which exists to be MEASURED AGAINST `release` rather than assumed
+# better. The comment above `release` claims size-optimised codegen costs no latency and is "verified
+# a hair faster", and that claim was made once, on one machine, about a binary that has since changed
+# in six behavioural ways. A claim of the form "cheaper AND faster" is the one most worth re-running,
+# because it is the one nobody re-runs.
+#
+# Two axes move independently and both are held here: `opt-level = 3` is OUR crates, and dropping
+# `-Z build-std-features=optimize_for_size` from the build command is the STANDARD LIBRARY. A run
+# that changes both at once cannot say which paid, so they are measured separately as well.
+[profile.perf]
+inherits = "release"
+opt-level = 3

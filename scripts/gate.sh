@@ -42,6 +42,12 @@ for g in flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \
          registry-classified stale-numbers test-count progress-is-tty-gated gates-selftest; do
     step "$g" python3 "scripts/$g.py"
 done
+# The compose corpus, and it is LAST among the doc gates because it is the slowest and the only one
+# that needs an input this repository does not carry. It SKIPS with a reason when
+# `KERN_COMPOSE_CORPUS` points at nothing, which is why it is here and not in `pentest/run-all.sh`,
+# where a skip must block the stamp. It earned its place in one run: it caught three real compose
+# files that the tree had started refusing, which the 1097 Rust tests did not and could not see.
+step "compose-corpus" python3 "scripts/compose-corpus-gate.py"
 echo "prose"
 # The character is BUILT, never typed: this file is scanned by the same gate it runs, so a literal
 # one here fails the build. It did, on the commit that added this script, because the check reads

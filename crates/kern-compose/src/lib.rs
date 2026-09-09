@@ -216,6 +216,16 @@ pub struct ComposeBox {
     /// each to the pod's shared `/etc/hosts` (→ `127.0.0.1`), so a peer that connects to an alias
     /// resolves it exactly like the service name. Empty for the common (no-alias) case.
     pub net_aliases: Vec<String>,
+    /// Every network this service declares is marked `internal: true`, and it declares at least one.
+    ///
+    /// POSITIVE EVIDENCE, and the shape is the point. kern gives a stack ONE network namespace, so
+    /// `internal: true` is all-or-nothing: it can only be honoured when EVERY service in the file is
+    /// exclusively on internal networks, and then it maps onto the pod's existing `--no-outbound`.
+    /// A service with no `networks:` key, or naming a network the file does not mark internal, sets
+    /// this `false` - so anything the parser does not positively confirm leaves outbound ON, which is
+    /// the safe direction: a stack that silently loses the internet fails in a way nobody attributes
+    /// to a compose key that used to be ignored.
+    pub only_internal_networks: bool,
 }
 
 impl ComposeBox {
@@ -538,6 +548,23 @@ impl ComposeBox {
 /// compat entry: point `kern compose` at either and it just works (YAML degrades-with-warning on the
 /// long tail - see `yaml::parse`). Auto-detect is deliberate: the two grammars are unambiguous at the
 /// first non-comment line (`[` opens a TOML table; a bare `key:` opens a YAML mapping).
+/// Does `internal: true` apply to this whole stack?
+///
+/// ONE DEFINITION, because this is a derived condition and it was written twice: once in the parser
+/// to decide whether to warn that the key is being dropped, and once in the compose driver to decide
+/// the pod's `--no-outbound`. Two copies of the same rule are two things that can drift, and the
+/// drift here is the worst shape available: the warning would tell the reader outbound is open while
+/// the run closes it, or the reverse. Both callers now read this.
+///
+/// kern gives a stack ONE network namespace, so the key is all-or-nothing: it can be honoured only
+/// when EVERY service is confined to networks the file marks internal. An empty stack is not
+/// internal - there is nothing to confine, and answering "yes" would create a pod with no egress for
+/// a file that starts nothing.
+#[must_use]
+pub fn stack_is_internal_only(boxes: &[ComposeBox]) -> bool {
+    !boxes.is_empty() && boxes.iter().all(|b| b.only_internal_networks)
+}
+
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     parse_with_env(text, &DotEnv::default())
 }
@@ -2921,6 +2948,12 @@ mod contract_tests {
             (
                 "expose",
                 "check_pod_global_conflicts: a claim on the pod's shared namespace",
+            ),
+            (
+                "only_internal_networks",
+                "the compose driver reads it across ALL services to decide the pod's `--no-outbound`: \
+                 kern gives a stack one namespace, so `internal: true` is honoured only when every \
+                 service is confined, and it is a property of the STACK rather than a flag on a box",
             ),
             (
                 "profiles",

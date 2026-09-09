@@ -49,6 +49,58 @@ pub fn parse(spec: &str) -> Option<Vec<kern_isolation::PortMap>> {
     )
 }
 
+/// Does this spec name an IPv6 bind address, in any of the forms a compose file actually uses?
+///
+/// # Why a predicate and not support
+///
+/// [`PortMap::bind_ip`] is a `u32` and every socket in the forwarder is `AF_INET`, so IPv6 is not a
+/// gap in this parser: it is a feature spanning two crates, 48 uses of `bind_ip`, seven `AF_INET`
+/// call sites, the UDP path, the `fmt`/`parse_display` round trip that `kern ps` and `inspect --json`
+/// read back, and the conflict detection in `cli.rs`. It also decides WHAT GETS EXPOSED, so guessing
+/// a semantic for a form nobody has specified is the wrong direction of error.
+///
+/// What this predicate buys is the difference between a user who thinks they made a typo and a user
+/// who knows they hit a missing feature. FOUND ON A 240-FILE COMPOSE CORPUS: mailcow publishes
+/// `${HTTPS_BIND:-:}:${HTTPS_PORT:-443}:443`, which expands to `::443:443`, and kern answered
+/// `invalid port spec` - so the reader looks for a typo in a line that has none.
+///
+/// The forms, all of which this must catch:
+///
+/// * `[::]:443:443` and `[::1]:443:443` - the bracketed form Docker documents.
+/// * `::443:443` - what mailcow's default expands to.
+/// * `:443:443` - an EMPTY bind address. Deliberately included: it is equally unsupported.
+///
+/// # Why refusing, and not mapping onto the nearest IPv4
+///
+/// TWO DIFFERENT REASONS, and citing only one of them was the first version of this comment. A wrong
+/// explanation outlives a wrong line, because the next reader inherits it:
+///
+/// * `[::1]` and `::1` are IPv6 LOOPBACK. Reading them as `0.0.0.0` would WIDEN the exposure from one
+///   interface to every interface, which is a vulnerability produced by a convenience.
+/// * `[::]` and `::` are already "all interfaces". Reading them as `0.0.0.0` does not widen anything:
+///   it silently changes the ADDRESS FAMILY, so a service the author published for IPv6 clients
+///   answers only IPv4 ones and the failure appears in the client, far from the file.
+///
+/// The empty address is the third case and has no defined meaning in compose's short syntax at all,
+/// so any reading of it is invention.
+#[must_use]
+pub fn names_ipv6_or_empty_bind(spec: &str) -> bool {
+    // Strip the protocol suffix the same way `parse` does, so `[::]:443:443/udp` is recognised too.
+    let head = match spec.rsplit_once('/') {
+        Some((h, p)) if p.eq_ignore_ascii_case("udp") || p.eq_ignore_ascii_case("tcp") => h,
+        _ => spec,
+    };
+    // A bracketed address is unambiguous: `[` opens it and `]:` closes it before the ports.
+    if head.starts_with('[') && head.contains("]:") {
+        return true;
+    }
+    // Unbracketed: `parse` splits on every `:`, so anything with more than the two separators of
+    // `ip:host:box` is either an IPv6 literal or the empty-address form. `:443:443` has exactly two
+    // and an empty first field, which is the same case for the reader and is named the same way.
+    let fields: Vec<&str> = head.split(':').collect();
+    fields.len() > 3 || (fields.len() == 3 && fields[0].is_empty())
+}
+
 /// Parse a `PORT` or a `START-END` range (each 1..=65535, `START <= END`). Returns `(start, end)`
 /// with `end == start` for a single port; `None` if malformed or out of range.
 fn parse_port_or_range(s: &str) -> Option<(u16, u16)> {
@@ -362,5 +414,49 @@ mod tests {
             }
         }
         assert_eq!(checked, 4 * 9 * 9 * 2, "the whole space must be walked");
+    }
+
+    /// The IPv6 and empty-bind forms are RECOGNISED, so the refusal names the missing feature.
+    ///
+    /// They are still refused - `PortMap::bind_ip` is a `u32` and every forwarder socket is
+    /// `AF_INET` - and this test pins the recognition, not support. It exists because the generic
+    /// "invalid port spec" sent an author bisecting fourteen of mailcow's ports one at a time
+    /// looking for a typo in a line that had none.
+    #[test]
+    fn ipv6_and_empty_bind_addresses_are_named_rather_than_called_typos() {
+        for spec in [
+            "[::]:443:443",     // the bracketed form Docker documents
+            "[::1]:443:443",    // IPv6 loopback
+            "::443:443",        // what mailcow's ${HTTPS_BIND:-:} expands to
+            "::1:443:443",      // unbracketed loopback
+            ":443:443",         // empty bind address
+            "[::]:443:443/udp", // the protocol suffix must not hide it
+        ] {
+            assert!(
+                names_ipv6_or_empty_bind(spec),
+                "{spec} must be recognised as an IPv6/empty bind address"
+            );
+            assert!(
+                parse(spec).is_none(),
+                "{spec} must still be refused: the forwarder is AF_INET"
+            );
+        }
+
+        // AND THE OTHER DIRECTION, which is the half that matters: a real IPv4 spec must NOT be
+        // mislabelled. If this ever fires, a working publish is being reported as an unsupported
+        // feature, which is worse than the message it replaced.
+        for spec in [
+            "8080:80",
+            "0.0.0.0:443:443",
+            "127.0.0.1:443:443",
+            "8000-8010:9000-9010",
+            "0.0.0.0:53:53/udp",
+        ] {
+            assert!(
+                !names_ipv6_or_empty_bind(spec),
+                "{spec} is IPv4 and must not be reported as IPv6"
+            );
+            assert!(parse(spec).is_some(), "{spec} must still parse");
+        }
     }
 }

@@ -491,7 +491,24 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         } else {
             UidRange::Off
         };
-        crate::pod::create_with_range(&pod, true, pod_needs_range)?;
+        // `internal: true`, HONOURED WHERE IT CAN BE. kern gives a stack ONE network namespace, so
+        // the key is all-or-nothing: it maps onto the pod's existing `--no-outbound` only when EVERY
+        // service is exclusively on networks the file marks internal. One service on an ordinary
+        // network, or one with no `networks:` key at all, and the pod keeps its egress - because a
+        // single netns cannot give one service the internet and deny it to another.
+        //
+        // MEASURED BEFORE THIS EXISTED, with a payload rather than a connection: a service on a
+        // network marked `internal: true` reached 1.1.1.1:443 and 8.8.8.8:443 and resolved DNS,
+        // exactly like one on an ordinary network. That is the declaration people use to keep a
+        // database off the internet, so accepting it and doing nothing is the "runs and lies" failure
+        // this codebase refuses everywhere else.
+        //
+        // The predicate is positive evidence per service (see `ComposeBox::only_internal_networks`),
+        // so anything the parser cannot confirm leaves outbound ON. That direction is deliberate: a
+        // stack that silently loses the internet fails in a way nobody attributes to a compose key
+        // that used to be ignored.
+        let stack_is_internal = kern_compose::stack_is_internal_only(&boxes);
+        crate::pod::create_with_range(&pod, !stack_is_internal, pod_needs_range)?;
         // Feedback-first, and the counterpart of the rule just above: the pod's user namespace has ONE
         // map, the holder's, so a member that asked for the narrow one does not get it when a peer needs
         // the range. That is structural, not a bug to fix, but silently handing a service a WIDER map

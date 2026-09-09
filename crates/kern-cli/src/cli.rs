@@ -2789,8 +2789,13 @@ fn discover_compose_file() -> Option<String> {
 /// `kern build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V]... [-q] [<context>]`.
 fn parse_build(rest: &[&str]) -> Result<Command, Error> {
     // `build <sub> …` - build-history management subcommands. A bare `build … -t <name>` (an actual
-    // build) never starts with one of these verbs, so the dispatch is unambiguous. `--json` may sit
-    // anywhere after the verb.
+    // build) never starts with one of these verbs, so the dispatch is unambiguous.
+    //
+    // `--json` may sit anywhere after the verb OF A SUBCOMMAND THAT EMITS JSON, which is `inspect`.
+    // This line used to say "anywhere after the verb" without that qualification, and `prune` now
+    // refuses the flag, so the sentence promised something the code no longer does. Prose and code
+    // disagreeing about a predicate is the shape of today's other defect, where the comment above
+    // the line-folding rule already said `- ` with the space and the code tested for a bare `-`.
     let json = rest.contains(&"--json");
     let first_id = || -> Result<String, Error> {
         rest.iter()
@@ -2829,6 +2834,26 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
                         .next()
                         .and_then(|n| n.parse().ok())
                         .ok_or(Error::Usage("build prune --keep <N>"))?;
+                } else if *a == "--json" {
+                    // `--json` is READ AT THE TOP OF THIS FUNCTION for every `build` subcommand, but
+                    // `Command::BuildPrune` has no field for it and prune has never emitted JSON, so
+                    // it was accepted and did nothing. Refusing it is the same rule as the branch
+                    // below, but the reason is different and the message has to say which: telling
+                    // someone who typed `--json` that "the count needs --keep" is a WRONG
+                    // explanation, and a wrong explanation costs more than a vague one because it
+                    // sends them to look at the wrong argument.
+                    return Err(Error::Usage(
+                        "build prune has no JSON output (drop --json; `build inspect` has it)",
+                    ));
+                } else {
+                    // Anything else was SILENTLY IGNORED, and that is worse than refusing it: the
+                    // obvious guess is a positional count, so `kern build prune 0` read as "keep
+                    // nothing", ran with the default 20, and reported "kept the 20 newest" - a line
+                    // nobody re-reads after asking for zero. Measured live: the caller believed the
+                    // cache was empty and debugged the next failure against that belief.
+                    return Err(Error::Usage(
+                        "build prune [--keep <N>] (the count needs --keep)",
+                    ));
                 }
             }
             return Ok(Command::BuildPrune { keep });

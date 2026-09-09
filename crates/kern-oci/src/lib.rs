@@ -8,7 +8,8 @@ mod push;
 mod search;
 pub use archive::{load, save, Loaded};
 pub use pull::{
-    normalize_ref, pull, split_tag, valid_reference, ImageConfig, OciError, Platform, DEFAULT_TAG,
+    dir_mode, normalize_ref, pull, set_dir_mode, split_tag, valid_reference, ImageConfig, OciError,
+    Platform, DEFAULT_TAG,
 };
 pub use push::{push, ImageConfigOut};
 pub use search::{search, SearchResult};

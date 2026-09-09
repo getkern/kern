@@ -46,6 +46,78 @@ pub fn ps(
         .into_iter()
         .filter(|b| ps_matches(b, filters))
         .collect();
+    // ASK THE KERNEL TOO, because the registry is the one source that can be erased while the boxes it
+    // describes keep running. `$XDG_RUNTIME_DIR/kern/instances` is swept by `systemd-tmpfiles`, cleared
+    // on logout, and deleted by any operator who reads `/run/user` as scratch. Reproduced here:
+    //
+    //     box r1 -d -- sleep 120      ps: r1
+    //     rm -rf $XDG_RUNTIME_DIR/kern/instances
+    //     ps                          r1 GONE
+    //     stop r1                     error: no running box named 'r1'
+    //     /proc/<pid>                 still there
+    //     kern.slice/kern-box-r1-…    still there
+    //
+    // The box was invisible and unstoppable through kern while every fact needed to find it sat in the
+    // cgroup tree, whose directory name carries the tag and the supervisor pid. This does NOT invent a
+    // row for it: the two sources disagree, and a table that quietly merged them would be claiming an
+    // instance record it does not have (no uptime, no ports, no health). It says the disagreement out
+    // loud, with the pid, which is the difference between a leak nobody can see and one an operator can
+    // act on with a single `kill`.
+    //
+    // Silent when the two agree, which is every ordinary run, and silent under `--quiet`/`--format`,
+    // whose callers are parsing.
+    if !quiet && format.is_none() && filters.is_empty() {
+        let known: std::collections::HashSet<&str> =
+            boxes.iter().map(|b| b.name.as_str()).collect();
+        let cg_candidates = kern_isolation::live_box_cgroups();
+        let mut lost: Vec<(String, u32)> = cg_candidates
+            .iter()
+            .filter(|(tag, _)| !known.contains(tag.as_str()))
+            .cloned()
+            .collect();
+        // FALLBACK, and only when the first channel had nothing to say. A host without cgroup
+        // delegation has no `kern-box-*` directory, so the evidence above does not exist there -
+        // which is precisely the host where an independent reviewer, as uid 0 with no systemd,
+        // measured three live `kern box` processes after a registry wipe: absent from `ps`,
+        // unreachable by `stop`, untouched by `gc`, and unreported, because the warning had nothing
+        // to read. Asking `/proc` costs about as much as `ps` itself (6.11 ms over 534 pids), so a
+        // host that HAS the cheap channel never pays for the expensive one.
+        // THE FALLBACK RUNS WHENEVER THE CGROUP CHANNEL PRODUCED NO EVIDENCE, and getting this
+        // condition right took two wrong answers, both reported by the same reviewer.
+        //
+        // First I asked "did the cgroup channel find an ORPHAN", which is false on a healthy host
+        // with no boxes, so the most ordinary `kern ps` on earth fell through to the scan every time:
+        // 3.9 ms against 1.1. So I gated on "does the cheap channel EXIST here", meaning `kern.slice`
+        // is a directory. That was worse, and the reviewer's host proved it in one command: there
+        // `kern.slice` EXISTS and has no `kern-box-*` children at all, so the gate said yes, the
+        // fallback never ran, and three live boxes stayed invisible after a registry wipe - the exact
+        // case the fallback was written for. ⛔ A directory existing is not a channel answering.
+        //
+        // The condition that is actually true is the simplest one: if the cgroup channel produced no
+        // CANDIDATES - not "no orphans", no candidates at all - then it has told us nothing, whether
+        // because nothing runs or because it cannot see. Ask the other one.
+        //
+        // The cost that made me reach for a gate is gone: reordering the scan to read the two cheap
+        // kernel facts first took it from 3.55 ms to 1.69, and narrowed it from 423 candidates to 2.
+        // 1.7 ms on a command a human reads is not worth a gate that can be wrong.
+        if cg_candidates.is_empty() {
+            lost = kern_isolation::live_box_supervisors_via_proc()
+                .into_iter()
+                .filter(|(tag, _)| !known.contains(tag.as_str()))
+                .collect();
+        }
+        if !lost.is_empty() {
+            eprintln!(
+                "kern: warning: {} box(es) are RUNNING with no registry record, so `kern stop` cannot \
+                 reach them (the runtime dir was cleared under them). Kill by pid, or `kern gc` once \
+                 they exit:",
+                lost.len()
+            );
+            for (tag, pid) in &lost {
+                eprintln!("kern:   {tag} (supervisor pid {pid})");
+            }
+        }
+    }
     // `-a`/`--all` (or an explicit `status=exited`) also surfaces boxes that have exited but whose
     // `waitexit` breadcrumb `gc` has not yet reaped - Docker's `ps -a`. A `status=running` query never
     // wants them, and `exited_matches` (which honours the same status filter) excludes anything the

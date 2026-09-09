@@ -208,6 +208,63 @@ const HOLDER_ARGV: &str = "__pod-holder";
 /// userspace NAT that nothing can name for the rest of the session.
 const PASTA_WATCHED: &str = "pasta.watched";
 
+/// The boot this pod dir belongs to, as `/proc/sys/kernel/random/boot_id`.
+///
+/// BOTH HALVES OF `pid:starttime` ARE BOOT-RELATIVE, and that is the flaw this closes. The pid space
+/// resets at boot and the start-time is ticks since boot, so a marker written before a reboot names
+/// a process that cannot exist while describing it in numbers a NEW process can coincidentally
+/// match: start-time granularity is `USER_HZ`, typically 100 Hz, so any two processes started in the
+/// same centisecond share a value. A recorded pair therefore cannot tell "this is my process" from
+/// "this is a stranger who inherited both numbers across a reboot", and the consequence of guessing
+/// wrong is a SIGKILL to an arbitrary process.
+///
+/// REACHABLE, NOT THEORETICAL. `pods_root` is `$XDG_RUNTIME_DIR/kern/pods`, falling back to
+/// `/run/user/<uid>`, which systemd hosts clear at boot. But `XDG_RUNTIME_DIR` is the user's to set,
+/// and a value pointing anywhere persistent makes the whole pod store outlive a reboot.
+///
+/// ONE FILE SERVES BOTH MARKERS, rather than a third field in each, because `holder` and `pasta.id`
+/// share a format and would need the same change twice. A mismatch means every pid in this dir
+/// belongs to a boot that is over: nothing recorded here survived, so the safe action and the
+/// correct action are the same one, which is to reap nothing and treat the pod as gone.
+const POD_BOOT: &str = "boot";
+
+/// What [`record_pod_boot`] writes when `boot_id` cannot be read: a positive fact about the host
+/// rather than an absence to be interpreted.
+///
+/// WHY IT CANNOT COLLIDE, WRITTEN DOWN RATHER THAN LEFT TO BE RE-DERIVED. This is a sentinel living
+/// in the same namespace as the real values, which is the shape that has bitten this project three
+/// times: `0` reaching `kill` as the caller's own process group, `0` meaning unlimited where a real
+/// cap was meant, and `st = 0` after a failed `waitpid` reading as "exited cleanly". Each was safe
+/// until it was not. Here it is safe for a STRUCTURAL reason and not a lucky one: a `boot_id` is a
+/// UUID, whose alphabet is hex digits and `-`, and this string contains neither a hex-only body nor
+/// the shape. No boot id can ever equal it, so the two namespaces do not actually overlap.
+const POD_BOOT_UNAVAILABLE: &str = "unavailable";
+
+/// kern's OWN identity record for the pod's pasta: `pid:starttime`, the same format and the same
+/// primitive as the holder marker.
+///
+/// It is a second file rather than a richer `pasta.pid` because `pasta.pid` is not kern's to shape:
+/// pasta writes it itself, under `-P`, and its format is pasta's. Recording identity beside it keeps
+/// the two halves of the pod's state symmetric - `holder` carries `pid:starttime`, `pasta.id` now
+/// does too - and [`read_pid_file`] already parses that format for both.
+const PASTA_ID: &str = "pasta.id";
+
+/// How long to wait for pasta to write the pidfile it was given under `-P`, and how the wait grows.
+///
+/// pasta daemonizes: the parent kern waited on has exited by the time the spawn returns, and the
+/// pidfile is written by the child that survives it. The two are not ordered, so the read is polled
+/// rather than assumed. Failing to record identity is not fatal - it falls back to the `comm` check
+/// that was the only guard before - so this is bounded and biased towards the fast case.
+///
+/// THE BACKOFF IS NOT COSMETIC, IT WAS MEASURED. A flat 2 ms first sleep cost `pod create` 1.6 ms
+/// of its 15.9 (12 alternated pairs against the shipped binary), because the file is usually there
+/// within a few hundred microseconds and the flat wait paid a full step to find out. Starting at
+/// 250 us and doubling to a 4 ms ceiling keeps the common case near the true latency and still
+/// reaches the same total budget for a pasta that is genuinely slow.
+const PASTA_PID_POLL_FIRST: std::time::Duration = std::time::Duration::from_micros(250);
+const PASTA_PID_POLL_CEIL: std::time::Duration = std::time::Duration::from_millis(4);
+const PASTA_PID_POLL_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// How long [`stop_pasta`] waits for a no-watch pasta to leave before SIGKILL. pasta was measured
 /// leaving about 30 ms after SIGTERM, so this is eight times its observed exit.
 const PASTA_STOP_BUDGET_MS: u64 = 250;
@@ -261,6 +318,16 @@ fn self_exe_file_name() -> Option<Vec<u8>> {
 /// Does this pid's argv carry kern's holder marker? IO wrapper over [`cmdline_is_holder`]; an
 /// unreadable `/proc/<pid>/cmdline` (the process died, or it is another user's) answers no, because
 /// "cannot read it" is not "it is ours".
+/// DEPRECATED, AND ITS POPULATION IS SHRINKING TO ZERO. Since the `pid:starttime` holder marker
+/// landed this is reached only from the `None` arm of [`holder_to_reap`], i.e. for a bare-pid marker
+/// written by an older kern into a runtime dir that has survived the upgrade. Any pod created by a
+/// current binary records the start-time and never takes this branch.
+///
+/// REMOVAL CONDITION, stated so this is not a back-compat path with no expiry: it can be deleted
+/// once a bare marker can no longer be produced by a supported version, which is one release after
+/// the marker became unconditional. The value it reads is argv, which the process it examines
+/// controls, so what is being retired is a forgeable check - the reason to give it a date rather
+/// than leave it to be noticed.
 fn is_holder_argv(pid: i32) -> bool {
     std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|b| cmdline_is_holder(&b))
@@ -322,6 +389,12 @@ fn holder_to_reap(name: &str) -> Option<i32> {
         return Some(pid); // identity confirmed by the recorded netns inode
     }
     let dir = pod_dir(name);
+    // The boot check comes before the pid is even read: after a reboot the number in this file
+    // addresses a process that cannot be ours, and both remaining branches would compare
+    // boot-relative values against a live stranger. See [`POD_BOOT`].
+    if !pod_boot_is_current(&dir) {
+        return None;
+    }
     let pid = read_pid_file(&dir.join("holder"))?;
     if unsafe { libc::kill(pid, 0) } != 0 {
         return None;
@@ -331,6 +404,253 @@ fn holder_to_reap(name: &str) -> Option<i32> {
         // Back-compat only: a bare-pid marker predating this format.
         None => (is_holder_argv(pid) && !claimed_by_another_pod(pid, name)).then_some(pid),
     }
+}
+
+/// This boot's identity, or `None` when it cannot be read.
+///
+/// `boot_id` rather than `btime` from `/proc/stat`: it is a UUID regenerated per boot, so it cannot
+/// collide across boots the way a wall-clock second can on a host whose clock steps backwards.
+fn current_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// What this pod dir's boot record permits. FOUR STATES, ONE MEANING EACH.
+///
+/// ONLY ONE OF THEM NEEDS A CURRENT READ, and that is the strongest property of this shape: the
+/// answers live on disk. A host whose `boot_id` becomes unreadable between create and teardown
+/// therefore degrades to a refusal rather than to a wrong verdict.
+enum PodBoot {
+    /// Written during the boot that is running now, OR no record at all. Absence is permissive and
+    /// permanently so: a dir with no [`POD_BOOT`] predates this record, and refusing to reap it
+    /// would leak a holder and a pasta that really are ours for the life of the session, which is
+    /// the exact harm the marker exists to prevent, inflicted by the marker.
+    Attributable,
+    /// A different boot id, or a real one that cannot be compared because `boot_id` is unreadable
+    /// NOW. Either way this pid belongs to a boot that is over, or to one we cannot prove is this
+    /// one. A torn write lands here by construction.
+    NotThisBoot,
+    /// [`POD_BOOT_UNAVAILABLE`]: the host could not read `boot_id` when the pod was created, so
+    /// nothing in this dir can be attributed to a boot AT ALL.
+    ///
+    /// THIS USED TO BE PERMISSIVE, AND THAT WAS THE DEFECT. The reasoning was that a host which
+    /// cannot evaluate the guard should not lose the ability to tear pods down. But it makes the
+    /// state in which kern knows the LEAST the only one that authorises a kill on `pid:starttime`
+    /// alone - and both of those fields are boot-relative, which is the entire reason this record
+    /// exists. Measured by an external reviewer on WSL2, varying only this file against a live
+    /// stranger whose `pid:starttime` matched: every unknown state was conservative except the one
+    /// string kern writes itself, and there the stranger was killed in three runs out of three.
+    ///
+    /// It is the same shape as the enforcement warning that read the supervisor's cgroup: a guard
+    /// defaulting to "everything is fine" from a read that never succeeded.
+    ///
+    /// THE TRADE, TAKEN DELIBERATELY. Refusing here leaks a pasta on every teardown on such a host.
+    /// That leak is visible and recoverable and its pid can be printed; killing a stranger's process
+    /// is silent and final. `boot_id` has existed since 2.6.19, so this branch is rare, and paying a
+    /// rare visible leak to remove a rare silent kill is the trade this project has taken every
+    /// other time it has been offered.
+    Unattributable,
+}
+
+/// Read this pod dir's boot record. See [`PodBoot`] for what each answer means.
+fn pod_boot(dir: &std::path::Path) -> PodBoot {
+    let Ok(recorded) = std::fs::read_to_string(dir.join(POD_BOOT)) else {
+        return PodBoot::Attributable; // no record: a pod from before this existed
+    };
+    let recorded = recorded.trim();
+    if recorded == POD_BOOT_UNAVAILABLE {
+        return PodBoot::Unattributable;
+    }
+    match current_boot_id() {
+        None => PodBoot::NotThisBoot, // a real boot id was recorded and cannot be compared against
+        Some(now) if recorded == now => PodBoot::Attributable,
+        Some(_) => PodBoot::NotThisBoot,
+    }
+}
+
+/// May this pod dir's recorded pids be signalled at all? The predicate the decision paths use.
+fn pod_boot_is_current(dir: &std::path::Path) -> bool {
+    matches!(pod_boot(dir), PodBoot::Attributable)
+}
+
+/// Record the boot this pod dir belongs to. Written once at create, atomically, for the same reason
+/// the holder marker is: a torn value must read as a mismatch and never as a match.
+///
+/// CALLED FIRST, AHEAD OF EVERY FALLIBLE STEP IN `create`, and that ordering claim lives HERE rather
+/// than at the call site on purpose. It was written at the call site once; when the call moved, the
+/// comment stayed with the LOCATION and not with the CALL, and went on describing an ordering sixty
+/// lines from the one it named. A claim about when a function runs belongs to the function, which
+/// travels with it.
+///
+/// What the ordering buys: between the `mkdir` that claims the pod dir and this call there must be
+/// nothing that can return early, because every such path exits with the DIRECTORY ALREADY CREATED
+/// and no record in it - the one state [`pod_boot_is_current`] cannot distinguish from a legacy dir.
+/// Two `?` returns used to sit in that gap.
+///
+/// FAIL-FAST, UNLIKE EVERY OTHER MARKER WRITE HERE, and the ordering above is why. Writing this before the holder marker is what guarantees a dir can never hold a pid without
+/// the boot that pid belongs to - but a `let _ =` write that ERRORS and lets creation proceed
+/// produces exactly the unqualified marker the ordering exists to prevent, and
+/// [`pod_boot_is_current`] then trusts it as legacy. A failure to write is therefore a failure to
+/// create the pod.
+///
+/// An unreadable `boot_id` WRITES [`POD_BOOT_UNAVAILABLE`] rather than nothing, and that sentinel is
+/// what keeps "absent" meaning one thing.
+///
+/// Leaving the file out was the first cut, and it merged two states that need opposite answers: a
+/// dir from a kern that predates this record, and a dir from a current kern on a host that cannot
+/// read `boot_id`. Both read as absent, so any rule for one is wrong for the other - which is why
+/// the question of what to do with an absent record could be argued both ways indefinitely. With the
+/// sentinel, absent means NOTHING WROTE HERE, and the host that genuinely cannot evaluate the guard
+/// says so on disk instead of being inferred from a gap.
+///
+/// Failing `pod create` on such a host is not the alternative: that trades a defect nobody has hit
+/// for a product that does not run, and failing `pod rm` later is the same trade arriving worse,
+/// with the pods already created and now unreapable.
+fn record_pod_boot(dir: &std::path::Path) -> Result<(), Error> {
+    let id = current_boot_id().unwrap_or_else(|| POD_BOOT_UNAVAILABLE.to_string());
+    let tmp = dir.join("boot.new");
+    std::fs::write(&tmp, id).map_err(|e| Error::Sandbox(format!("pod boot record: {e}")))?;
+    // Same directory, so the rename is the atomic replace it looks like.
+    std::fs::rename(&tmp, dir.join(POD_BOOT)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        Error::Sandbox(format!("pod boot record: {e}"))
+    })
+}
+
+/// The WHOLE `pasta.id` record as `(pid, starttime)`, or `None` when there is none: a pod created
+/// before this record existed, or one whose write did not land.
+///
+/// BOTH HALVES, not just the start-time. The pid this record names and the pid teardown acts on come
+/// from DIFFERENT FILES - `pasta.id` is kern's, `pasta.pid` is pasta's - so reading only the
+/// start-time compares a number from one file against a process identified by the other, and the two
+/// can disagree. The holder marker does not have this shape: its pid and its start-time are the two
+/// halves of one file, so `read_pid_file` already refuses a record with an empty pid.
+///
+/// Found by a test asserting that no partial write parses: `":1082818"` read as a valid start-time
+/// while naming no process at all.
+/// WHY THE RECORD CARRIES A PID AT ALL, since `pasta.pid` already names one: it is what re-couples
+/// two files into one identity. An identity assembled from two sources where only one is validated
+/// is the defect this shape had - kern's start-time paired with pasta's pid, and nothing asserting
+/// the two describe the same process. Dropping the pid here as redundant would restore it.
+fn recorded_pasta_identity(dir: &std::path::Path) -> Option<(i32, u64)> {
+    let raw = std::fs::read_to_string(dir.join(PASTA_ID)).ok()?;
+    let (pid, started) = raw.trim().split_once(':')?;
+    let pid: i32 = pid.parse().ok()?;
+    if pid <= 0 {
+        return None;
+    }
+    Some((pid, started.parse().ok()?))
+}
+
+/// Does ANOTHER pod's `pasta.pid` name this pid? The pasta-side twin of [`claimed_by_another_pod`],
+/// and it closes the case that made it necessary here.
+///
+/// Every pasta on the host has `comm == "pasta"`, so the family check cannot tell one pod's NAT from
+/// another's. If pod A's recorded pid has been recycled onto pod B's pasta, A's teardown would find
+/// a live process whose `comm` says pasta, SIGTERM it, and - with no [`PASTA_WATCHED`] marker -
+/// escalate to SIGKILL on B's working NAT. The holder side has been guarded against exactly this
+/// since the marker landed; this side had nothing.
+fn claimed_by_another_pasta(pid: i32, except: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(pods_root()) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let n = e.file_name();
+        let other = n.to_string_lossy();
+        other != except && read_pid_file(&e.path().join("pasta.pid")) == Some(pid)
+    })
+}
+
+/// Record `pid:starttime` for the pasta just started for this pod. Best-effort throughout: every
+/// failure leaves the record absent, which is the state [`pasta_to_signal`] already handles.
+fn record_pasta_identity(dir: &std::path::Path) {
+    let pidfile = dir.join("pasta.pid");
+    let mut waited = std::time::Duration::ZERO;
+    let mut step = PASTA_PID_POLL_FIRST;
+    loop {
+        if let Some(pid) = read_pid_file(&pidfile) {
+            let started = crate::registry::proc_starttime(pid);
+            // A zero start-time means `/proc/<pid>/stat` could not be read or parsed, and writing
+            // `pid:0` would be worse than writing nothing: teardown would compare against a value
+            // no live process can have and decline to signal a pasta that is really ours.
+            if started != 0 {
+                // ATOMIC, for the reason the holder marker is: a torn `471621:` parses as absent
+                // and silently drops the pod to the weaker fallback, which is indistinguishable
+                // from an old-format record. `.new` + rename in the same directory removes the
+                // ambiguity, so a bare record provably means an older kern and nothing else.
+                let tmp = dir.join("pasta.id.new");
+                if std::fs::write(&tmp, format!("{pid}:{started}")).is_ok()
+                    && std::fs::rename(&tmp, dir.join(PASTA_ID)).is_err()
+                {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            return;
+        }
+        if waited >= PASTA_PID_POLL_BUDGET {
+            return; // no record; `pasta_to_signal` falls back, which is the prior behaviour
+        }
+        std::thread::sleep(step);
+        waited += step;
+        step = (step * 2).min(PASTA_PID_POLL_CEIL);
+    }
+}
+
+/// The pasta this pod may signal, or `None` when the recorded pid is not the process kern started.
+///
+/// Mirrors [`holder_to_reap`] deliberately, including the shape of the fallback: identity by
+/// start-time when it was recorded, and the weaker pair of checks only for a pod that predates the
+/// record. The weaker branch is the one the recycled-pid case lives in, so it carries the
+/// cross-pod claim check rather than the family check alone.
+fn pasta_to_signal(name: &str, dir: &std::path::Path, pid: i32) -> Option<i32> {
+    if pid <= 0 {
+        return None;
+    }
+    if !pod_boot_is_current(dir) {
+        return None; // every pid recorded here belongs to a boot that is over
+    }
+    match recorded_pasta_identity(dir) {
+        // The record must name THIS pid and that pid must still carry the recorded start-time. A
+        // record naming a different pid is not evidence about this one, so it decides nothing and
+        // must not silently authorise: it refuses.
+        Some((want_pid, want_start)) => {
+            (want_pid == pid && crate::registry::proc_starttime(pid) == want_start).then_some(pid)
+        }
+        // NO RECORD: a pod dir from before `pasta.id` existed, which is this branch's whole
+        // population. Three checks, and all three are needed: `comm` says "a pasta", the argv says
+        // "ours", the scan says "not another pod's". A missing holder file leaves nothing to tie the
+        // process to this pod, so it declines rather than falling back to the two weaker halves.
+        None => (pid_is_pasta(pid)
+            && read_pid_file(&dir.join("holder")).is_some_and(|h| pasta_argv_names_pod(pid, h))
+            && !claimed_by_another_pasta(pid, name))
+        .then_some(pid),
+    }
+}
+
+/// The process state out of a `/proc/<pid>/stat` body, or `None` if it does not parse.
+///
+/// The state is the first field AFTER the last `)`, never the third whitespace-separated token:
+/// `comm` is parenthesised and may itself contain spaces and parentheses, so splitting from the left
+/// misparses any process whose name has one. Split out as a pure function so that case is testable
+/// without a process that has such a name.
+fn stat_state(stat: &str) -> Option<&str> {
+    stat.rsplit_once(')')?.1.split_whitespace().next()
+}
+
+/// Is this pid a zombie - exited, not yet reaped?
+///
+/// `comm` outlives the process it named until the parent reaps it, unlike `cmdline`, which empties.
+/// So a pasta that has already died still passes the family check, takes a SIGTERM nothing receives,
+/// and then - because `kill(pid, 0)` succeeds on a zombie - runs the full escalation budget before a
+/// SIGKILL that also does nothing. The outcome was always correct; the cost was 250 ms of polling
+/// spent on a process that had already gone.
+fn proc_is_zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| stat_state(&s).map(|st| st == "Z"))
+        .unwrap_or(false)
 }
 
 /// The start-time half of the `pid:starttime` holder marker, or `None` for a bare-pid marker.
@@ -420,6 +740,9 @@ pub fn create_with_range(
             return Err(Error::Sandbox(format!("pod dir: {e}")));
         }
     }
+    // First after the claim, and nothing fallible may be inserted above it: see `record_pod_boot`,
+    // which owns that argument so it cannot be separated from the call again.
+    record_pod_boot(&dir)?;
     // Mark this claim as in-progress with OUR `pid:starttime`, BEFORE the (slow) holder startup, so a
     // concurrent loser above sees a live starter and backs off instead of reclaiming a half-built pod.
     // The start-time pins the pid's identity (as the registry does for supervisors) so a stale marker
@@ -835,6 +1158,7 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
         // HEALTHY case rather than the dangerous one.
         Ok(o) if o.status.success() => {
             let _ = std::fs::write(dir.join(PASTA_WATCHED), b"");
+            record_pasta_identity(&dir);
         }
         Ok(o) if is_netns_dir_denial(&String::from_utf8_lossy(&o.stderr)) => {
             // ONE narrower retry, and only for this refusal. pasta opens the netns's DIRECTORY
@@ -851,7 +1175,14 @@ fn setup_outbound(name: &str, holder: i32) -> Outbound {
                 // on its own, and is exactly the case `teardown` must confirm; the absence of
                 // [`PASTA_WATCHED`] is what tells it so, and a marker that has to be written for
                 // the dangerous case can fail to be written. See the constant.
-                Ok(o2) if o2.status.success() => {}
+                Ok(o2) if o2.status.success() => {
+                    // Identity IS recorded here, unlike [`PASTA_WATCHED`]. The two answer different
+                    // questions: the watch marker says whether this pasta will leave on its own, and
+                    // its absence must stay the dangerous-case default; the identity record says
+                    // WHICH process teardown may signal, and a retried pasta is the one that most
+                    // needs it, because it is the one teardown escalates to SIGKILL.
+                    record_pasta_identity(&dir);
+                }
                 Ok(o2) => {
                     return Outbound::Failed(format!(
                         "{first}; retried without the netns watch and it also failed: {}",
@@ -1017,10 +1348,41 @@ pub fn list() -> Result<(), Error> {
 /// the guard carries more weight than it did. The variant is always introduced by a `.`, so
 /// requiring that separator costs one comparison and removes the whole class of unrelated names
 /// that merely share a prefix.
+/// THE TWO NAMES ACCEPT EACH OTHER, AND THAT IS DELIBERATE. `pasta` and `passt` are the same
+/// binary under two names (pasta is passt in its namespace mode), so a process whose `comm` reads
+/// `passt` satisfies a check written for `pasta` and the reverse. It reads like a bug to anyone
+/// sweeping this file, which is why it is stated here rather than left to be re-derived.
 fn is_pasta_comm(comm: &str) -> bool {
     ["pasta", "passt"]
         .iter()
         .any(|base| comm == *base || comm.strip_prefix(base).is_some_and(|r| r.starts_with('.')))
+}
+
+/// Does this pasta's argv name THIS pod's netns? The fallback's only tie between a process and the
+/// pod that started it that a coincidence cannot satisfy.
+///
+/// `comm` says "a pasta", never "OUR pasta": every pasta on the host answers to it, and podman uses
+/// pasta too, so the stranger is not hypothetical. `claimed_by_another_pasta` covers other kern pods
+/// and nothing else. What is left is argv, which for a pasta kern spawned contains
+/// `--netns /proc/<holder>/ns/net`, built by [`pasta_args`] from THIS pod's holder pid.
+///
+/// FORGEABLE IN PRINCIPLE, AND THAT IS ACCEPTED HERE. A process can set its own argv, so this would
+/// not stop an adversary. It is not aimed at one: the case is a coincidence, a recycled pid landing
+/// on something that happens to be called pasta, and a coincidence does not also arrange to carry
+/// our holder's pid in its arguments. The strong path (`pasta.id`) is what answers an adversary, and
+/// this branch exists only for pod dirs written before that record did.
+///
+/// Measured before it existed, with `ns_last_pid` under `unshare -Ur -p --fork`
+/// (`scripts/pid-recycle-pasta.py`): a stranger renamed to `pasta` that inherited the recorded pid
+/// was signalled by a teardown that never started it.
+fn pasta_argv_names_pod(pid: i32, holder: i32) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let want = format!("/proc/{holder}/ns/net");
+    // NUL-separated, and compared as a WHOLE argument rather than as a substring: a match inside a
+    // longer string would accept `/proc/999/ns/net.bak` for holder 999.
+    raw.split(|b| *b == 0).any(|arg| arg == want.as_bytes())
 }
 
 /// Is this pid, right now, a pasta? Identity by `comm`, read at the moment it is asked rather than
@@ -1057,10 +1419,17 @@ fn pid_is_pasta(pid: i32) -> bool {
 ///
 /// The `pid > 0` check is belt and braces: [`read_pid_file`] is what actually guarantees it, and
 /// this repeats it because the argument is an `i32` and the next caller may not come from a file.
-fn stop_pasta(pid: i32, escalate: bool) {
-    if pid <= 0 || !pid_is_pasta(pid) {
+fn stop_pasta(name: &str, dir: &std::path::Path, pid: i32, escalate: bool) {
+    if pasta_to_signal(name, dir, pid).is_none() {
         return;
     }
+    // CAPTURED ONCE, NOT RE-READ. The re-verification before the SIGKILL guards against the pid
+    // being recycled during the budget, but re-reading `pasta.id` would also pick up a record
+    // REWRITTEN during it: `pod create <same name>` inside those 250 ms replaces the file, and a
+    // re-read would then authorise the kill against the NEW pod's pasta. Comparing against the
+    // value captured before the SIGTERM keeps the question "is this still the process I decided to
+    // signal", which is the only question the escalation may ask.
+    let captured = recorded_pasta_identity(dir);
     unsafe { libc::kill(pid, libc::SIGTERM) };
     if !escalate {
         return;
@@ -1073,6 +1442,13 @@ fn stop_pasta(pid: i32, escalate: bool) {
         if unsafe { libc::kill(pid, 0) } != 0 {
             return; // gone
         }
+        // `kill(pid, 0)` SUCCEEDS on a zombie, so the probe above cannot end this loop for a pasta
+        // that has exited and not been reaped: without this the budget runs to the end, 250 ms
+        // spent waiting for a process that already left. Checked after the signal probe, not
+        // before, because the common case is a live pasta and that path must not pay a second read.
+        if proc_is_zombie(pid) {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_millis(step));
         waited += step;
         step = (step * 2).min(32);
@@ -1080,7 +1456,23 @@ fn stop_pasta(pid: i32, escalate: bool) {
     // Still there after the budget. RE-VERIFY IDENTITY before escalating: a quarter of a second is
     // long enough for the pid to have been recycled by something unrelated, and SIGKILL to a
     // stranger is not recoverable.
-    if pid_is_pasta(pid) {
+    let still_ours = match captured {
+        // Identity was recorded: the pid must be the one named and must still carry the start-time
+        // captured above.
+        Some((want_pid, want_start)) => {
+            want_pid == pid && crate::registry::proc_starttime(pid) == want_start
+        }
+        // No record: the same weaker pair the decision used, re-asked. `claimed_by_another_pasta`
+        // is re-run rather than captured because another pod can only have ACQUIRED a claim during
+        // the budget, and a claim that appeared is a reason to stop, never a reason to proceed.
+        None => {
+            pod_boot_is_current(dir)
+                && pid_is_pasta(pid)
+                && read_pid_file(&dir.join("holder")).is_some_and(|h| pasta_argv_names_pod(pid, h))
+                && !claimed_by_another_pasta(pid, name)
+        }
+    };
+    if still_ours {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
 }
@@ -1127,12 +1519,23 @@ pub fn teardown(name: &str) -> (bool, usize) {
     // holder one line before the directory naming it was deleted.
     let holder = holder_to_reap(name);
     if let Some(pp) = read_pid_file(&dir.join("pasta.pid")) {
+        // THE LEAK IS SAID OUT LOUD, because the branch is otherwise invisible from either side: the
+        // pasta keeps running and nothing explains why. A pod created on a host that could not read
+        // `boot_id` cannot have its pids attributed across a possible reboot, so kern declines to
+        // signal them and names what it left behind instead of leaving it to be discovered.
+        if matches!(pod_boot(&dir), PodBoot::Unattributable) && unsafe { libc::kill(pp, 0) } == 0 {
+            eprintln!(
+                "kern: note: pod '{name}' recorded no boot id when it was created, so its pasta \
+                 (pid {pp}) cannot be attributed across a possible reboot and was left running. \
+                 Stop it with `kill {pp}` once you have confirmed it is this pod's."
+            );
+        }
         // A pasta with no watch will never leave on its own, so its exit is confirmed before the
         // pidfile that names it is deleted. Every other pod pays nothing for this.
         // ESCALATE UNLESS THE POD IS RECORDED AS WATCHED. Absence covers both "the retry was
         // used" and "the marker write failed", and both need the confirmation, so the default
         // falls on the safe side rather than the fast one.
-        stop_pasta(pp, !dir.join(PASTA_WATCHED).exists());
+        stop_pasta(name, &dir, pp, !dir.join(PASTA_WATCHED).exists());
     }
     if let Some(pid) = holder {
         unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -1152,6 +1555,16 @@ pub fn teardown(name: &str) -> (bool, usize) {
     // first would make the pasta unreachable for good, while leaving it means the next `pod rm`
     // can try again. Free, and it costs nothing when the removal succeeds, which is the normal
     // case and does not reach this branch at all.
+    //
+    // THE ORDER IS NOW COUPLED TO A POLICY, AND THE COUPLING IS THE FRAGILE PART. Naming the pasta
+    // is no longer enough on its own: [`pasta_to_signal`] also reads [`POD_BOOT`] and [`PASTA_ID`],
+    // both of which appear in this list ABOVE `pasta.pid` and can therefore be gone while it
+    // remains. The retry still works only because BOTH degrade permissively when absent - `POD_BOOT`
+    // missing reads as a legacy dir, `PASTA_ID` missing falls back to the `comm` check plus the
+    // cross-pod scan. If either is ever made to REFUSE on absence, this ordering stops delivering
+    // what it promises and a pasta becomes unreachable exactly in the case the ordering exists for.
+    // Stated here rather than left to be re-derived, because the change that would break it happens
+    // in another function and would look correct there.
     if std::fs::remove_dir_all(&dir).is_err() {
         for stale in [
             "resolv.conf",
@@ -1159,6 +1572,8 @@ pub fn teardown(name: &str) -> (bool, usize) {
             "netns",
             "hosts",
             PASTA_WATCHED,
+            PASTA_ID,
+            POD_BOOT,
             "pasta.pid",
         ] {
             let _ = std::fs::remove_file(dir.join(stale));
@@ -1234,6 +1649,307 @@ mod tests {
         ] {
             assert!(validate_name(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn a_pod_dir_from_a_previous_boot_reaps_nothing() {
+        // The test the reviewer said needs no reboot: write a boot id that cannot be this boot's
+        // and assert that BOTH markers refuse, including the fallback, which is the branch a stale
+        // dir would otherwise reach with a live stranger's pid in it.
+        let root = pods_root();
+        if std::fs::create_dir_all(&root).is_err() {
+            eprintln!("skip: no writable pods root");
+            return;
+        }
+        let name = format!("boot-{}", std::process::id());
+        let dir = root.join(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("skip: cannot build the fixture");
+            return;
+        }
+        let Ok(mut child) = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skip: cannot spawn a helper process");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let pid = child.id() as i32;
+        let started = crate::registry::proc_starttime(pid);
+
+        // A record that would otherwise MATCH: same pid, correct start-time. Only the boot differs.
+        let _ = std::fs::write(dir.join(PASTA_ID), format!("{pid}:{started}"));
+        let _ = std::fs::write(dir.join("holder"), format!("{pid}:{started}"));
+
+        // Absence of the boot record keeps the previous behaviour: identity alone decides, and here
+        // it matches, so the pid IS signalled. This is the control - without it the assertion below
+        // could pass because the fixture never resolved, rather than because the boot refused it.
+        assert_eq!(
+            pasta_to_signal(&name, &dir, pid),
+            Some(pid),
+            "control: with no boot record, a matching start-time is signalled"
+        );
+
+        let _ = std::fs::write(dir.join(POD_BOOT), "00000000-0000-0000-0000-000000000000");
+        assert!(
+            !pod_boot_is_current(&dir),
+            "a boot id of all zeros is not this boot"
+        );
+        assert_eq!(
+            pasta_to_signal(&name, &dir, pid),
+            None,
+            "a pid recorded in a previous boot is never signalled, matching start-time or not"
+        );
+        assert_eq!(
+            holder_to_reap(&name),
+            None,
+            "the same guard covers the holder marker, which shares the format"
+        );
+
+        // And the current boot restores it, so the guard is the boot id and not the file's presence.
+        if let Some(now) = current_boot_id() {
+            let _ = std::fs::write(dir.join(POD_BOOT), now);
+            assert!(pod_boot_is_current(&dir));
+            assert_eq!(pasta_to_signal(&name, &dir, pid), Some(pid));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_boot_record_that_cannot_be_evaluated_refuses_rather_than_defaults() {
+        // The third state, and the one that used to be folded into "absent". A dir that HAS a boot
+        // record was written by a kern that could read `boot_id`; if the read fails now, the only
+        // signal that a reboot happened is gone, and the primary path would go on comparing
+        // start-times that are themselves boot-relative.
+        //
+        // The unreadable case is reached by pointing the reader at a path that cannot be read,
+        // which is what a masked `/proc/sys` produces, rather than by unmounting procfs under a
+        // running test.
+        let root = pods_root();
+        if std::fs::create_dir_all(&root).is_err() {
+            eprintln!("skip: no writable pods root");
+            return;
+        }
+        let name = format!("bootstate-{}", std::process::id());
+        let dir = root.join(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("skip: cannot build the fixture");
+            return;
+        }
+
+        // 1. Absent: permissive, and it must stay so or every legacy pod leaks.
+        assert!(
+            pod_boot_is_current(&dir),
+            "a dir with no boot record predates the record and is reaped as before"
+        );
+
+        // 2. Present and equal to this boot: reaped.
+        let Some(now) = current_boot_id() else {
+            eprintln!("skip: boot_id unreadable on this host, which is the case under test");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let _ = std::fs::write(dir.join(POD_BOOT), &now);
+        assert!(pod_boot_is_current(&dir), "this boot's record is current");
+
+        // 3. Present and different: refused.
+        let _ = std::fs::write(dir.join(POD_BOOT), "00000000-0000-0000-0000-000000000000");
+        assert!(
+            !pod_boot_is_current(&dir),
+            "a record from another boot must never be reaped"
+        );
+
+        // 4. Present and empty, the torn write: reads as different, refused.
+        let _ = std::fs::write(dir.join(POD_BOOT), "");
+        assert!(
+            !pod_boot_is_current(&dir),
+            "a torn boot record lands on the safe side"
+        );
+
+        // 5. The sentinel: a host that could not read `boot_id` at create time said so, and that
+        // is a positive fact rather than a gap. Permissive, and it must NOT depend on whether the
+        // read succeeds now - the whole point is that the answer is on disk.
+        // 5. THE SENTINEL REFUSES. It says the host could not read `boot_id` when the pod was
+        // created, so nothing here can be attributed to a boot at all - which makes it the state
+        // where kern knows the LEAST. Trusting it authorised a kill on `pid:starttime` alone, and
+        // both of those are boot-relative, which is the entire reason this record exists.
+        let _ = std::fs::write(dir.join(POD_BOOT), POD_BOOT_UNAVAILABLE);
+        assert!(
+            !pod_boot_is_current(&dir),
+            "the state in which kern knows the least must not be the one that authorises a kill"
+        );
+        assert!(
+            matches!(pod_boot(&dir), PodBoot::Unattributable),
+            "and it is its own state, not folded into 'a different boot': teardown prints the pid \
+             it left running only for this one"
+        );
+        // And it is distinguishable from every real boot id, which is what makes it safe to key on.
+        assert_ne!(
+            POD_BOOT_UNAVAILABLE,
+            now.as_str(),
+            "the sentinel must never collide with a boot id"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_torn_pasta_record_falls_back_and_never_matches() {
+        let root = pods_root();
+        if std::fs::create_dir_all(&root).is_err() {
+            eprintln!("skip: no writable pods root");
+            return;
+        }
+        let name = format!("torn-{}", std::process::id());
+        let dir = root.join(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("skip: cannot build the fixture");
+            return;
+        }
+        // Every shape a partial or legacy write can leave. None may parse as a start-time, because
+        // a value that parsed would be compared against a live process and could match.
+        for raw in [
+            "471621:",
+            "471621",
+            "",
+            "471621:notanumber",
+            ":1082818",
+            "\n",
+        ] {
+            let _ = std::fs::write(dir.join(PASTA_ID), raw);
+            assert_eq!(
+                recorded_pasta_identity(&dir),
+                None,
+                "{raw:?} must read as no record, not as a start-time"
+            );
+        }
+        // A whole record still parses, so the assertions above are not passing vacuously.
+        let _ = std::fs::write(dir.join(PASTA_ID), "471621:1082818");
+        assert_eq!(recorded_pasta_identity(&dir), Some((471_621, 1_082_818)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_state_survives_a_comm_with_spaces_and_parentheses() {
+        // The state is the token after the LAST `)`. A left-to-right split takes field 3, which is
+        // the state only when `comm` contains no whitespace: the two lines below are exactly the
+        // shapes that break it, and both are legal process names.
+        let plain = "42 (pasta) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 0 0";
+        assert_eq!(stat_state(plain), Some("S"));
+        let nasty = "42 (pas ta (x)) Z 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 0 0";
+        assert_eq!(
+            stat_state(nasty),
+            Some("Z"),
+            "a comm with a space and a nested paren must not shift the field"
+        );
+        assert_eq!(stat_state("no parenthesis here"), None);
+    }
+
+    #[test]
+    fn a_pasta_pid_claimed_by_another_pod_is_not_signalled() {
+        // The defect this closes: two pods, both with a pasta, both `comm == "pasta"`. If A's
+        // recorded pid has been recycled onto B's pasta, the family check alone says yes and A's
+        // teardown kills B's NAT.
+        let root = pods_root();
+        if std::fs::create_dir_all(&root).is_err() {
+            eprintln!("skip: no writable pods root");
+            return;
+        }
+        let a = format!("claim-a-{}", std::process::id());
+        let b = format!("claim-b-{}", std::process::id());
+        let (da, db) = (root.join(&a), root.join(&b));
+        let _ = std::fs::remove_dir_all(&da);
+        let _ = std::fs::remove_dir_all(&db);
+        if std::fs::create_dir_all(&da).is_err() || std::fs::create_dir_all(&db).is_err() {
+            eprintln!("skip: cannot build the fixture");
+            return;
+        }
+        // A live pid that is NOT this process: `read_pid_file` refuses kern's own pid outright, so
+        // the fixture has to be a real third party or the claim check never sees it. Found by this
+        // test failing on the first attempt, which used `std::process::id()`.
+        let Ok(mut child) = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skip: cannot spawn a helper process");
+            let _ = std::fs::remove_dir_all(&da);
+            let _ = std::fs::remove_dir_all(&db);
+            return;
+        };
+        let other = child.id() as i32;
+        let _ = std::fs::write(db.join("pasta.pid"), format!("{other}\n"));
+
+        assert!(
+            claimed_by_another_pasta(other, &a),
+            "pod B's pasta.pid names this pid, so pod A must not claim it"
+        );
+        assert!(
+            !claimed_by_another_pasta(other, &b),
+            "a pod does not claim a pid against itself"
+        );
+        // And the decision built on it declines. This helper's `comm` is `sleep`, so the family
+        // check would refuse it too; the assertion that carries the meaning is the pair above.
+        assert_eq!(
+            pasta_to_signal(&a, &da, other),
+            None,
+            "a pid another pod claims is never signalled"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&da);
+        let _ = std::fs::remove_dir_all(&db);
+    }
+
+    #[test]
+    fn a_recorded_pasta_start_time_rejects_a_recycled_pid() {
+        let root = pods_root();
+        if std::fs::create_dir_all(&root).is_err() {
+            eprintln!("skip: no writable pods root");
+            return;
+        }
+        let name = format!("ident-{}", std::process::id());
+        let dir = root.join(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("skip: cannot build the fixture");
+            return;
+        }
+        let me = std::process::id() as i32;
+        let real = crate::registry::proc_starttime(me);
+
+        // The recorded start-time matches: the pid IS the recorded process, and identity decides
+        // without ever consulting `comm` - which for this test process does not say pasta.
+        let _ = std::fs::write(dir.join(PASTA_ID), format!("{me}:{real}"));
+        assert_eq!(recorded_pasta_identity(&dir), Some((me, real)));
+        assert_eq!(
+            pasta_to_signal(&name, &dir, me),
+            Some(me),
+            "identity confirmed by start-time is sufficient on its own"
+        );
+
+        // The same pid with a different start-time is a DIFFERENT process wearing a reused number.
+        let _ = std::fs::write(dir.join(PASTA_ID), format!("{me}:{}", real.wrapping_add(1)));
+        assert_eq!(
+            pasta_to_signal(&name, &dir, me),
+            None,
+            "a start-time that does not match must never be signalled"
+        );
+
+        // A bare record with no start-time falls back, and the fallback refuses this pid because
+        // its `comm` is not in the pasta family.
+        let _ = std::fs::write(dir.join(PASTA_ID), format!("{me}"));
+        assert_eq!(recorded_pasta_identity(&dir), None);
+        assert_eq!(pasta_to_signal(&name, &dir, me), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

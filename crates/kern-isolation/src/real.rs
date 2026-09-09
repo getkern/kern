@@ -1,5 +1,15 @@
 //! Real-syscall sandbox execution (Linux).
 //!
+//! ONE RULE THAT EVERY FORKED CHILD IN THIS FILE OBEYS, STATED HERE BECAUSE THREE PLACES OBEY IT AND
+//! NONE OF THEM SAID IT: **between `fork` and `exec`, nothing may allocate, take a lock, or format a
+//! string.** A child of `fork` inherits the address space of a process that may have had other
+//! threads, and the allocator's lock can have been copied while another thread held it; that thread
+//! does not exist in the child, so it will never release it and the first allocation hangs forever.
+//! Diagnostics on those paths are therefore `libc::write(2, …)` over a `const` byte literal, and file
+//! reads fill a caller-owned stack buffer instead of building a `String`. The three places are the
+//! box-start child's fail-closed refusal, the `kern exec` child, and the OOM reporter; a fourth
+//! should read this line rather than rediscover it.
+//!
 //! [`RealMounts`] performs the mount/pivot/remount ops the [`crate::Rootfs`] typestate issues;
 //! [`run_in_sandbox`] sets up an unprivileged user namespace + PID namespace, builds the root
 //! through that same typestate, mounts a fresh `/proc`, remounts the root read-only (last -
@@ -814,10 +824,25 @@ fn child_setup_and_exec(
     // Set up `<root>/dev` and bind `-v` volumes BEFORE pivot, while the host source paths are
     // reachable. Device nodes must be bound by real host path to stay writable from the user
     // namespace; volume targets are resolved symlink-safely, confined to the new root.
-    // devpts is only needed when the box will host an in-box PTY (an `--ssh` sshd, or an interactive
-    // `-it` slave). The overwhelming common case (agent code-exec, CI, `sh -c`) never opens a PTY, so
-    // gate the whole devpts mount+mkdir+symlink out of it - one fewer filesystem-mount syscall per box.
-    let needs_pts = spec.ssh.is_some() || spec.tty_slave.is_some();
+    // devpts is mounted in EVERY box, not only where kern itself needs a PTY (`--ssh`, `-it`).
+    //
+    // It used to be gated on `spec.ssh.is_some() || spec.tty_slave.is_some()`, to save one
+    // mount+mkdir+symlink per box, under the reasoning that "the overwhelming common case (agent
+    // code-exec, CI, `sh -c`) never opens a PTY". That reasoning confuses two different questions:
+    // whether the BOX's own stdio is a terminal, and whether a process INSIDE the box may allocate
+    // one. `-i`/`-t` answer the first; devpts answers the second, and docker mounts it in every
+    // container for exactly that reason.
+    //
+    // The gap it left is not exotic. Reported as #8 by a user running Paseo, an agent daemon whose
+    // terminal manager calls `forkpty(3)`: the call failed with "out of pty devices" in a detached
+    // box while succeeding under `-it`, so a whole class of workloads (agent runners, web terminals,
+    // anything spawning `script`/`tmux`/an sshd of its own) could not run. Measured on x86_64 before
+    // this change, so it was never about the reporter's aarch64 host.
+    //
+    // The saving was real but small, and it bought a wrong answer. `--tmpfs /dev/pts` stays refused:
+    // a caller must not be able to shadow the hardened `/dev`, so kern owns this mount rather than
+    // leaving users to improvise one.
+    let needs_pts = true;
     setup_dev(
         &spec.root,
         spec.tun,
@@ -839,6 +864,7 @@ fn child_setup_and_exec(
         make_box_tmpfs(&spec.root, "run")?;
     }
     setup_secrets(&spec.root, &spec.secrets, run_tmpfs)?;
+    setup_etc_identity(&spec.root, &spec.hostname);
     setup_extra_hosts(&spec.root, &spec.extra_hosts);
     t.mark("volumes");
     // Self-pivot into the new root. The old root is left stacked at "/"; mount a fresh `proc`
@@ -1037,6 +1063,13 @@ fn child_setup_and_exec(
     // `exec` and would otherwise keep the caller's fds readable via `/proc/1/fd`). The pty slave, if
     // any, was already dup'd onto 0/1/2 and its high fd closed by `adopt_controlling_tty` above.
     shed_inherited_fds(ready_fd.unwrap_or(-1));
+    // THE LAST THING PID 1 DOES BEFORE THE WORKLOAD, and until this mark existed it was invisible.
+    // `box lifetime` minus the marked phases left a residue of about 670 us that did not move with the
+    // image, the rootfs, the workload's linkage or the network namespace - constant across four
+    // configurations, and therefore structural rather than a property of what was being run. A block
+    // that size with no marker is the largest thing in this file nobody can attribute, and the fd shed
+    // walks `/proc/self/fd`, so it is the first candidate the residue has to be split against.
+    t.mark("shed-fds");
     if spec.init {
         // `--init`: this PID-1 process forks the workload and becomes a reaping init. Never returns.
         run_init(spec, argv, ready_fd)
@@ -1672,6 +1705,47 @@ fn set_env(key: &str, val: &str) {
 /// terminal enables TIOCSTI-style injection on unhardened kernels) and never `/dev/mem`, disks…
 const DEV_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 
+/// Create a mountpoint, mount `fstype` on it with the standard hardening, and REMOVE THE DIRECTORY
+/// AGAIN if the mount does not take. Returns whether it took.
+///
+/// THE ARTIFACT RULE, IN ONE PLACE. A best-effort mount that leaves its mountpoint behind produces a
+/// path that EXISTS and answers nothing: the failure then surfaces deep inside the workload, at the
+/// `mq_open` or the `forkpty`, instead of at the one place that knew the mount did not happen. That
+/// is the same shape as an `/etc/hosts` that exists and resolves no `localhost`, and the same shape
+/// that made issue #8 appear at `forkpty(3)` rather than at box setup. The rule for every
+/// best-effort mount here: the box sees the ARTIFACT of success, never the residue of an attempt.
+///
+/// EXTRACTED SO THE FAILURE BRANCH CAN BE TESTED WITHOUT A FAULT SWITCH. The alternative considered
+/// and rejected was an env-gated failure injector in this path: it is new surface in box setup whose
+/// only purpose is testability, and its shape ("a variable makes a mount not happen") invites
+/// extension to mounts that ARE load-bearing. A function that takes the filesystem type by name is
+/// testable by passing a type the kernel does not have, which is what the unit test does.
+///
+/// `rmdir`, not a recursive delete: the directory was created empty one syscall earlier and nothing
+/// can have populated it, so recursion would only add a way to remove something else if the path
+/// were ever wrong.
+fn mount_or_leave_nothing(path: &str, fstype: &str) -> bool {
+    let (Ok(p), Ok(ty)) = (cstr(path), cstr(fstype)) else {
+        return false;
+    };
+    if unsafe { libc::mkdir(p.as_ptr(), 0o755) } != 0 {
+        return false;
+    }
+    let ok = unsafe {
+        libc::mount(
+            ty.as_ptr(),
+            p.as_ptr(),
+            ty.as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+            ptr::null(),
+        )
+    } == 0;
+    if !ok {
+        unsafe { libc::rmdir(p.as_ptr()) };
+    }
+    ok
+}
+
 /// Populate `<root>/dev` BEFORE pivot, while the host's `/dev` is still reachable at its real
 /// path. A device node bound from the host's devtmpfs is only *writable* from an unprivileged
 /// user namespace when bound by its real path (a post-pivot bind via `/proc/self/fd` leaves
@@ -1824,6 +1898,26 @@ fn setup_dev(
             }
         }
     }
+    // `/dev/mqueue`: POSIX message queues as their own filesystem, exactly like Docker/runc mount it.
+    // `mq_open(3)` resolves names under this mount, so without it every POSIX-mqueue call fails
+    // ENOENT/ENOSYS rather than working - it is not a fallback the C library can emulate. Nothing
+    // host-global is exposed: the mount is scoped to the box's IPC namespace, which kern already
+    // unshares, so the queues a box creates are invisible to the host and to sibling boxes and die
+    // with the namespace.
+    //
+    // NOSUID|NODEV|NOEXEC for the same reason as `/dev/shm`: a filesystem the workload can create
+    // files in must never host a setuid binary, a device node, or an executable page. Best-effort - a
+    // kernel built without CONFIG_POSIX_MQUEUE, or one that refuses the mount, leaves the box without
+    // `/dev/mqueue` (the behaviour before this existed) instead of failing the box.
+    // THE DIRECTORY IS REMOVED WHEN THE MOUNT FAILS, and that is not tidiness. A best-effort mount
+    // that leaves its mountpoint behind produces a path that EXISTS and answers nothing: `mq_open`
+    // then fails deep inside the workload instead of at the one place that knows the mount did not
+    // happen. It is the same shape as an `/etc/hosts` that exists and resolves no `localhost`, and
+    // the same shape that made #8 surface at `forkpty(3)` rather than at box setup. `devpts` above
+    // already keys its `/dev/ptmx` symlink on the mount result, so its artifact is honest too: the
+    // rule for every best-effort mount here is that the box must see the ARTIFACT of success, never
+    // the residue of an attempt.
+    mount_or_leave_nothing(&format!("{root}/dev/mqueue"), "mqueue");
     // Standard `/dev` symlinks into procfs - `/dev/fd`, `/dev/std{in,out,err}` - exactly as Docker/runc
     // provide them. Bash/shell process substitution (`<(...)` → `/dev/fd/63`) and many entrypoints
     // (e.g. postgres `initdb`) need them; without `/dev/fd` they fail "No such file or directory". They
@@ -1846,9 +1940,11 @@ fn setup_dev(
     // `gid=` (group 5 isn't mapped in a single-uid box, which would EINVAL the mount). Best-effort - a
     // host/kernel that refuses it just leaves the box without in-box PTYs (kern's own `-it` uses a HOST
     // pty and is unaffected).
-    // Only stand up a devpts instance when the box actually needs an in-box PTY (`--ssh` / `-it`).
-    // Skipping it in the common case removes a whole filesystem-mount syscall (+ mkdir + symlink) from
-    // box setup. kern's own `-it` uses a HOST pty (unaffected); this is for PTYs opened INSIDE the box.
+    // Stood up for EVERY box, on the same reasoning as `/dev/shm` a few lines above: what the
+    // workload may open is not what kern was asked for. kern's own `-it` uses a HOST pty and never
+    // needed this; the caller who does is the process INSIDE the box. Measured cost of doing it
+    // unconditionally, 40 alternated runs per binary on one host: +0.03 ms median on a bare box,
+    // +1.1%. See the `needs_pts` binding for what that saving used to buy.
     if needs_pts {
         let ptsdir = format!("{root}/dev/pts");
         if let Ok(pd) = cstr(&ptsdir) {
@@ -2233,6 +2329,205 @@ fn setup_tmpfs(root: &str, entries: &[(String, String)]) -> Result<(), Error> {
 /// the append out of the box root (this runs pre-pivot, where a naive open would resolve through the
 /// HOST root). Content is guarded too: an entry whose name or IP carries whitespace/control is skipped,
 /// so a crafted value can't inject extra `/etc/hosts` lines.
+/// Give a box the `/etc/hosts` that every container runtime provides.
+///
+/// Images do not ship one (`python:3.12-slim` and the whole debian family do not): docker writes it
+/// at run time, and kern only did so for pod members, whose `/etc/hosts` is the pod's shared file
+/// bind-mounted over this path. A standalone box got nothing, so glibc went `files` then `dns`,
+/// found no file, and a box without outbound has no DNS either. Measured before this existed:
+/// `getaddrinfo("localhost")` failed with `EAI_AGAIN` in a plain box. That breaks anything talking
+/// to itself by name (a daemon serving a UI on a port, a health check hitting `http://localhost`)
+/// and anything resolving its OWN hostname at startup, which the JVM, Postgres and RabbitMQ do.
+///
+/// Seeds an ABSENT-or-EMPTY file only, which leaves the two working cases untouched: an image that
+/// ships its own, and the pod bind, whose file already carries these two localhost lines plus every
+/// peer's name. `setup_extra_hosts` appends after this, so `--add-host` entries land under the
+/// seeds instead of into an empty file.
+/// Write the two `/etc` files a container runtime owns: `/etc/hosts` and `/etc/hostname`.
+///
+/// WHY BOTH IN ONE FUNCTION, AND WHY NOT `open_in_root`
+///     Both files live in the same directory, so the symlink-safe descent to `etc` is walked ONCE
+///     and each file is then opened with a single `openat` from that directory fd. The earlier shape
+///     called `open_in_root` per file, which returns an `O_PATH` fd (what a bind-mount TARGET needs)
+///     and therefore forced a reopen through `/proc/self/fd/<n>` to get something writable: a full
+///     path resolution per file, for a plain write that never needed one. Two root opens, two
+///     descents and two `/proc` resolutions became one descent and two `openat`s.
+///
+/// THE GUARANTEE IS UNCHANGED
+///     `O_NOFOLLOW` on `etc` (with `O_DIRECTORY`) and on each final component, from a fd rooted at
+///     the box root, is exactly what the per-component walk enforced: a symlinked `/etc`, `/etc/hosts`
+///     or `/etc/hostname` is refused rather than followed out of the box root. `..` cannot appear
+///     because the components are literals here, not caller input.
+///
+/// `/etc/hosts` IS SEEDED, `/etc/hostname` IS OVERWRITTEN
+///     Images ship neither a useful hosts file nor a correct hostname. `python:3.12-slim` and the
+///     debian family carry NO `/etc/hosts` at all, so glibc went `files` then `dns`, found no file,
+///     and a box without outbound has no DNS either: measured before this existed,
+///     `getaddrinfo("localhost")` failed with `EAI_AGAIN`, which breaks anything that talks to itself
+///     by name (a daemon serving a UI on a port, a health check on `http://localhost`) and anything
+///     resolving its OWN hostname at startup, which the JVM, Postgres and RabbitMQ do. Hosts is
+///     seeded only when ABSENT-OR-EMPTY, which leaves untouched an image that ships its own and the
+///     pod bind, whose shared file already carries these lines plus every peer name.
+///     `/etc/hostname` is different: the file an image ships is a fact about the machine that BUILT
+///     the image (`debuerreotype` on the debian family), never about this box, and `HOSTNAME` and
+///     `uname -n` were already correct, so the file was the only one of the three that disagreed.
+///     It is truncated and rewritten. Safe on every rootfs kern accepts: `--rootfs` is overlayed,
+///     verified by removing a file inside a box and finding the host directory untouched.
+///
+/// Best-effort in every branch: no failure here fails the box, and `setup_extra_hosts` appends
+/// `--add-host` entries after this, so they land under the seeds instead of into an empty file.
+fn setup_etc_identity(root: &str, hostname: &str) {
+    /// The two lines every runtime seeds, byte-identical to what the pod's shared file carries so a
+    /// standalone box and a pod member cannot disagree about `localhost`.
+    const LOCALHOST_SEED: &[u8] = b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n";
+    /// Prefix of the box's own entry. Split from the name so neither has to be copied to be written.
+    const SELF_PREFIX: &[u8] = b"127.0.0.1\t";
+    /// What an `/etc/hosts` must already contain for kern to leave it alone.
+    const LOCALHOST: &[u8] = b"localhost";
+
+    let h = hostname.trim();
+    let name_ok = !h.is_empty() && !h.chars().any(|c| c.is_whitespace() || c.is_control());
+
+    let Ok(rc) = cstr(root) else {
+        return;
+    };
+    let root_fd = unsafe {
+        libc::open(
+            rc.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return;
+    }
+    // Descend into `etc` once. `mkdirat` first so a rootfs without one still works; `O_NOFOLLOW`
+    // refuses a symlinked `/etc` rather than following it out of the box root.
+    let Ok(etc) = cstr("etc") else {
+        unsafe { libc::close(root_fd) };
+        return;
+    };
+    unsafe { libc::mkdirat(root_fd, etc.as_ptr(), 0o755) };
+    // Open `etc` as a REAL directory fd, not `O_PATH`. `openat(2)` accepts an `O_PATH` descriptor as
+    // its `dirfd`, which is what `root_fd` is, so the descent needs no `/proc/self/fd` round trip:
+    // an earlier shape took the `O_PATH` fd here and reopened it by name through procfs to get
+    // something usable as a `dirfd`, and that reopen is a full path resolution. Measured with
+    // `KERN_TIMING=1`, 60 alternated runs per binary: the `volumes` phase went 2 -> 72 us with the
+    // procfs reopen in place, against 24 us for the two mounts this change also added, so the
+    // resolution cost three times what the mounts did. `O_NOFOLLOW` still refuses a symlinked `/etc`.
+    let dir_fd = unsafe {
+        libc::openat(
+            root_fd,
+            etc.as_ptr(),
+            libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    unsafe { libc::close(root_fd) };
+    if dir_fd < 0 {
+        return;
+    }
+
+    // --- /etc/hosts: append the seeds unless the file ALREADY RESOLVES `localhost` ----------------
+    //
+    // The predicate is "does this file answer the question", not "is this file empty". Size zero was
+    // the first cut and it is the same mistake this project has made twice before on the sibling
+    // file: `resolv.conf` was once gated on `exists()`, which debian satisfies with an EMPTY file,
+    // and then on non-empty, which a comments-only file satisfies while naming no nameserver. An
+    // `/etc/hosts` carrying nothing but comments exists, is non-empty, and still leaves
+    // `getaddrinfo("localhost")` failing. So the file is read and the seeds are appended unless a
+    // `localhost` entry is already there.
+    //
+    // O_APPEND, not O_TRUNC: whatever an image put there is kept and the seeds go under it, which is
+    // also what makes this safe against the pod bind. That shared file always carries `localhost`,
+    // so it is matched and skipped; if it somehow did not, appending would still not destroy the
+    // peer names it exists to carry.
+    if let Ok(f) = cstr("hosts") {
+        let fd = unsafe {
+            libc::openat(
+                dir_fd,
+                f.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o644,
+            )
+        };
+        if fd >= 0 {
+            // A bounded read: an /etc/hosts that answers for `localhost` states it in the first few
+            // lines, and a box must not be able to make kern read an unbounded file at setup.
+            let mut buf = [0u8; 4096];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let head = if n > 0 {
+                #[allow(clippy::cast_sign_loss)] // n > 0 is checked
+                &buf[..n as usize]
+            } else {
+                &buf[..0]
+            };
+            let resolves_localhost = head
+                .windows(LOCALHOST.len())
+                .any(|w| w.eq_ignore_ascii_case(LOCALHOST));
+            if !resolves_localhost {
+                // `writev` over borrowed slices: the two constant halves are `'static` and the name
+                // is borrowed from the caller, so the file is written with ZERO heap allocation and
+                // ONE syscall. The earlier shape built a `String` per box to concatenate three
+                // fragments that never needed to be contiguous.
+                let mut iov = [libc::iovec {
+                    iov_base: ptr::null_mut(),
+                    iov_len: 0,
+                }; 4];
+                let mut n = 0usize;
+                let mut push = |b: &[u8]| {
+                    iov[n] = libc::iovec {
+                        iov_base: b.as_ptr() as *mut libc::c_void,
+                        iov_len: b.len(),
+                    };
+                    n += 1;
+                };
+                push(LOCALHOST_SEED);
+                if name_ok {
+                    push(SELF_PREFIX);
+                    push(h.as_bytes());
+                    push(b"\n");
+                }
+                unsafe { libc::writev(fd, iov.as_ptr(), n as libc::c_int) };
+            }
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    // --- /etc/hostname: always the box's own name ------------------------------------------------
+    if name_ok {
+        if let Ok(f) = cstr("hostname") {
+            let fd = unsafe {
+                libc::openat(
+                    dir_fd,
+                    f.as_ptr(),
+                    libc::O_CREAT
+                        | libc::O_WRONLY
+                        | libc::O_TRUNC
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o644,
+                )
+            };
+            if fd >= 0 {
+                // Same reason as the hosts write above: two borrowed fragments, one syscall, no
+                // allocation. `h` is a slice of the caller's `hostname`, never copied.
+                let iov = [
+                    libc::iovec {
+                        iov_base: h.as_ptr() as *mut libc::c_void,
+                        iov_len: h.len(),
+                    },
+                    libc::iovec {
+                        iov_base: b"\n".as_ptr() as *mut libc::c_void,
+                        iov_len: 1,
+                    },
+                ];
+                unsafe { libc::writev(fd, iov.as_ptr(), 2) };
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+    unsafe { libc::close(dir_fd) };
+}
+
 fn setup_extra_hosts(root: &str, hosts: &[(String, String)]) {
     if hosts.is_empty() {
         return;
@@ -2516,6 +2811,65 @@ fn spawn_idmap(
         .ok()
 }
 
+// A CONCURRENT USER NAMESPACE THAT MEASURED WORSE, recorded so the next person does not rebuild it.
+//
+// THE IDEA. The ranged id map is the most expensive step of a box start (914 us in-program against
+// 21 us for the single-uid map). It cannot be overlapped in place, because `newuidmap` writes the
+// `uid_map` of a process that is ALREADY unshared, and between that unshare and the map being
+// written the process has no mapped uid and so cannot touch the filesystem at all. The way around
+// that ordering is a CARRIER child: it unshares the user namespace and blocks, kern stays in the
+// host namespace with its real uid, points the two setuid helpers at the carrier's pid, and does the
+// cgroup, the ports and the image while they run; then `setns`es into the mapped namespace and
+// unshares the remaining four. The `setns` is legal for the same reason the `--pod` path's is, and
+// it was verified: the resulting `uid_map` and `gid_map` inside the box were byte-identical.
+//
+// IT WORKED AND IT WAS SLOWER. Implemented in full, the phase it targets fell from 914 us to 2 us -
+// the helpers really did finish during the setup - and the whole box start got 66 us SLOWER
+// (CI95 [+29, +112], 250 paired samples). The cost had moved, not gone: a new `parent:userns-start`
+// mark put it at 986 us, MORE than the 914 it was hiding.
+//
+// WHY, so the next attempt starts from the reason and not from the idea. The preparation step
+// blocked three times, and none of the three is the setuid helpers:
+//   * it reads the carrier's readiness byte, which is a scheduling round trip;
+//   * it `waitpid`s the carrier after opening its namespace, another round trip;
+//   * and `std::process::Command::spawn` is `posix_spawn`, which every libc implements with
+//     `CLONE_VFORK`: THE PARENT IS SUSPENDED UNTIL THE CHILD EXECS. Two spawns in sequence mean kern
+//     pays both exec latencies synchronously, which is most of what the overlap was supposed to hide.
+//
+// A shape that could still win has to remove all three: a thin helper forked once, early, that owns
+// the carrier AND both spawns and reports a verdict kern reads later. That is a third process and
+// three more handshakes on the path that establishes the box'"'"'s user namespace, and there is no
+// measurement yet saying it wins. It is not attempted here for the reason this comment exists: on
+// this path a change that is slower in the program is a regression whatever the idea says.
+
+// A SECOND SHAPE OF THE SAME OVERLAP, ALSO MEASURED, ALSO NOT SHIPPED. Read this with the note
+// above it: together they bound the idea, so the next attempt starts from the boundary and not from
+// scratch.
+//
+// The first attempt failed because kern drove the carrier itself and blocked three times, the worst
+// being `posix_spawn`: every libc implements it with `CLONE_VFORK`, so the caller is suspended until
+// the child execs, and two spawns put both exec latencies back on the critical path. The second
+// attempt removed all three by giving a thin `prep` helper the carrier AND both spawns, leaving kern
+// one `fork` before it could continue. That part WORKED and was measured: `parent:userns-start` cost
+// 77 us against the 986 us the first shape cost, and the id map phase fell from 914 us to 3 us.
+//
+// THE TOTAL DID NOT MOVE AT ALL: 3853.2 us against 3853.2 us, difference -1.8 us with a 95% interval
+// of [-44.6, +43.9] over 300 paired samples. Not a loss this time - a wash.
+//
+// THE REASON IS AN INEQUALITY, and it is what makes this worth writing down. Overlapping only pays
+// while there is work to overlap WITH. Inside `run_in_sandbox_with` there is about 226 us of it (the
+// ports and the cgroup); the helper chain is about 985 us end to end, and the extra process adds a
+// round trip of its own. 226 us of hiding minus that round trip is zero.
+//
+// WHAT WOULD CHANGE THE ANSWER, stated as a condition rather than as a plan: an overlap window wider
+// than the chain. The only place one exists is the CLI's own phases before the sandbox call - about
+// 487 us of name check, config, claim and image resolution - which would put the total window near
+// 713 us and predict roughly 0.6 ms. Starting there crosses the `KERN_SCOPE` re-exec: kern re-execs
+// itself under `systemd-run` on the scope path, destructors do not run across `execve`, and the
+// prepared processes would be left holding a namespace with nobody to release them. Any third
+// attempt has to solve THAT first, and the gain has to be weighed against putting user-namespace
+// lifetime state in the CLI, on the path that establishes the box'"'"'s security boundary.
+
 /// Apply BOTH id maps, overlapping the two setuid helpers instead of running them back to back.
 ///
 /// They used to run in sequence, so a box paid two full spawn + exec + wait cycles one after the
@@ -2544,6 +2898,8 @@ fn run_both_idmaps(r: &IdRange, pid: i32, euid: u32, egid: u32) -> bool {
 /// unprivileged process can only self-map a single id, the actual mapping is applied by a helper
 /// child that stays in the HOST user namespace (where the setuid `newuidmap`/`newgidmap` work) and
 /// targets us by pid, synchronized over pipes. Leaves `setgroups` allowed (newgidmap is the
+/// privileged writer), so the box can use supplementary groups.
+///
 /// # A restructuring that MEASURED WORSE, so that nobody repeats it
 ///
 /// The obvious cut here is the middle process: kern forks one helper, which then forks `newuidmap`
@@ -2560,12 +2916,17 @@ fn run_both_idmaps(r: &IdRange, pid: i32, euid: u32, egid: u32) -> bool {
 /// known is that a change which is slower in the program is a regression whatever a bench says, and
 /// that the bench did not model whatever decides it here.
 ///
-/// privileged writer), so the box can use supplementary groups.
+/// `pt` splits the two halves for the profiler, and the split is the reason it exists: this function
+/// was the single most expensive step in a box start (about 1.27 ms of 3.63 ms on the `--image` path)
+/// behind ONE label, so "the unshare" and "two setuid helpers" could not be told apart. Both arms of
+/// the caller now emit the same pair, `parent:unshare(ns)` and `parent:idmap`, so one profile answers
+/// which of the two a given host is paying for. `None` from the `--pod` path, which has no timer.
 fn apply_userns_range(
     ns_flags: libc::c_int,
     euid: u32,
     egid: u32,
     r: &IdRange,
+    pt: Option<&mut PhaseTimer>,
 ) -> Result<(), Error> {
     let mut p2h = [0 as libc::c_int; 2]; // parent → helper: "I've unshared, map me"
     let mut h2p = [0 as libc::c_int; 2]; // helper → parent: '1' mapped / '0' failed
@@ -2607,6 +2968,10 @@ fn apply_userns_range(
             return Err(Error::Unsupported(USERNS_UNAVAILABLE));
         }
         return Err(Error::Syscall("unshare(namespaces)", e));
+    }
+    // The namespaces exist; everything after this point is the two setuid helpers and the handshake.
+    if let Some(p) = pt {
+        p.mark("parent:unshare(ns)");
     }
     let _ = unsafe { libc::write(p2h[1], b"x".as_ptr() as *const libc::c_void, 1) };
     // Wait for the helper's verdict. Retry on EINTR so a stray signal can't be misread as a
@@ -2771,8 +3136,23 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // showing a mapping nothing serves; each then blocks until we send it the box's PID 1 after the
     // fork below. (Empty `ports` → no forwarders.) The returned set is RAII: every error return
     // between here and the box's start tears the bound ports down.
+    // The spawn-side timer starts HERE, before the ports and the cgroup, so that everything between
+    // this point and the box's fork is inside the profile. A step that is not marked is a step whose
+    // cost is attributed to whatever is marked next, which is how a 986 us block sat unnoticed in
+    // front of `parent:limits+cgroup` during the concurrent-namespace attempt documented above.
+    let mut pt_spawn = PhaseTimer::new();
+
     let forwarders = crate::ports::fork_forwarders(ports)
         .map_err(|(hp, why)| Error::Spec(format!("cannot publish host port {hp}: {why}")))?;
+
+    // STARTED HERE RATHER THAN AFTER `apply_limits`, because everything `apply_limits` does was
+    // invisible to this profiler and it is not small. `box lifetime` minus every marked phase left
+    // about 670 us unattributed, CONSTANT across four configurations - image or host rootfs, dynamic
+    // or static workload, with or without a network namespace - so it was structural and not a
+    // property of the workload. Three candidates were measured and eliminated before this one: the
+    // fd shed is 3 us, the pid namespace is 27 us (anchored externally against bubblewrap with and
+    // without `--unshare-pid`), and the dynamic loader is not it either, since a statically linked
+    // busybox leaves the same residue. What remained unmarked was the cgroup and scope setup.
 
     // Best-effort cgroup v2 cap (memory + PIDs) BEFORE namespacing, so the forked workload
     // inherits it. Degrades gracefully where the hierarchy isn't delegated. The returned guard owns
@@ -2920,8 +3300,8 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // rather than `_`-prefixed because the forked child below reads it to join the capped cgroup: the
     // supervisor is no longer in that cgroup, so the workload is not placed there by inheritance.
     let cg = cg;
+    pt_spawn.mark("parent:limits+cgroup");
 
-    let mut pt_spawn = PhaseTimer::new();
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
 
@@ -2997,6 +3377,13 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         } else {
             None
         };
+        // THE LAST UNMEASURED STEP ON THE RANGED PATH, and it sat inside `parent:unshare(ns)` where
+        // it was indistinguishable from the namespace syscall itself. `detect_id_range` stats up to
+        // four directories per helper, resolves the login name and reads `/etc/subuid` and
+        // `/etc/subgid`; none of that is obviously free, and the difference between the ranged and
+        // single-map arms of `parent:unshare(ns)` (about 100 us) had to be attributed to either this
+        // or the helper fork, with no way to tell which.
+        pt_spawn.mark("parent:id-range-detect");
         // Wanted and not buildable. Recorded for the ONE moment it is information rather than
         // noise: a non-zero exit, at the two returns below. `Requested` is deliberately excluded,
         // because it was already reported above, and saying the same thing twice about one
@@ -3006,13 +3393,13 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         range_unmet = spec.uid_range == UidRange::ImageDefault && range.is_none();
         match range {
             Some(range) => {
-                apply_userns_range(ns_flags, euid, egid, &range)?;
-                // The RANGED branch was the one arm without a mark, which is why a `KERN_TIMING` run of
-                // the `--image` path (where the range is the default) attributed about a millisecond to
-                // nothing: the two setuid helpers are the single most expensive step in a box start and
-                // they were the step nobody could see. Same label as the cheap branch, so one line
-                // answers "what did the id map cost here" whichever path a host took.
-                pt_spawn.mark("parent:unshare(ns)+idmap");
+                // TWO MARKS, NOT ONE, and the same two on both arms. The ranged branch used to have no
+                // mark at all, so a `KERN_TIMING` run of the `--image` path attributed about a
+                // millisecond to nothing; then it had one, and the one hid which half was paying. The
+                // inner `parent:unshare(ns)` is emitted by `apply_userns_range` itself, so the
+                // difference between the two arms is exactly the id map and nothing else.
+                apply_userns_range(ns_flags, euid, egid, &range, Some(&mut pt_spawn))?;
+                pt_spawn.mark("parent:idmap");
             }
             None => {
                 if unsafe { libc::unshare(ns_flags) } != 0 {
@@ -3022,8 +3409,9 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
                     }
                     return Err(Error::Syscall("unshare(namespaces)", e));
                 }
+                pt_spawn.mark("parent:unshare(ns)");
                 write_single_uid_map(euid, egid)?;
-                pt_spawn.mark("parent:unshare(ns)+idmap");
+                pt_spawn.mark("parent:idmap");
             }
         }
     }
@@ -3037,7 +3425,36 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
     // refuses `--privileged` as real root up front; this is the authoritative, property-based gate.)
     let allow_nesting = spec.privileged && box_root_is_unprivileged();
 
-    let pid = unsafe { libc::fork() };
+    // THE WORKLOAD'S CGROUP IS DECIDED BEFORE THE FORK, because that is the only place it can be used
+    // to avoid a migration: `clone3(CLONE_INTO_CGROUP)` creates the child already inside, and the
+    // `cgroup.procs` write below is what costs 5 to 20 ms on an idle machine (see `fork_into_cgroup`).
+    // `None` means "the supervisor stays in the capped cgroup", where the child inherits it and there
+    // is nothing to place.
+    //
+    // The binding is read again IN THE CHILD after the fork. That is sound and copies nothing: the
+    // child is a copy-on-write duplicate of this address space, so `cg_target` names the same path
+    // there, and `born_in_cgroup` carries the same value the parent computed.
+    // Opened as a DESCRIPTOR, like the `kern exec` path, so both placements go through one API and
+    // neither can be handed a path that stops naming anything after a namespace change. Nothing
+    // crosses a `setns` here, so this is the same thing the path did; it is uniform on purpose.
+    //
+    // FAIL-CLOSED when the directory exists but cannot be opened: `cg_target` is `Some` only when a
+    // cap was created and the supervisor stayed outside it, so a `None` here means the cap is real and
+    // unreachable, and the child's placement below must refuse rather than run the box uncapped.
+    let cg_target = cg
+        .as_ref()
+        .filter(|g| g.supervisor_is_outside())
+        .map(|g| g.box_dir());
+    let cg_ref = match cg_target.map(crate::cgroup::CgroupRef::open) {
+        None => None,
+        Some(Some(r)) => Some(r),
+        Some(None) => {
+            return Err(Error::Unsupported(
+                "cannot open the box's cgroup to place it (the box would run without its caps)",
+            ))
+        }
+    };
+    let (pid, born_in_cgroup) = crate::cgroup::fork_into_cgroup(cg_ref.as_ref());
     if pid < 0 {
         return Err(Error::last("fork"));
     }
@@ -3054,14 +3471,36 @@ pub fn run_in_sandbox_with<F: FnOnce(i32)>(
         // FAIL-CLOSED: a failed write means this box has no cap of its own. `_exit(126)` rather than
         // continue, matching the fail-closed refusals in `apply_limits`, and one byte on the readiness fd
         // first so the launcher reports a start failure instead of waiting.
-        if let Some(guard) = cg.as_ref().filter(|g| g.supervisor_is_outside()) {
-            if !crate::cgroup::join_box_cgroup(guard.box_dir()) {
+        //
+        // SKIPPED ENTIRELY WHEN THE CHILD WAS BORN IN THE CGROUP. `born_in_cgroup` is true only when
+        // `clone3(CLONE_INTO_CGROUP)` returned success, and the kernel places the task before the
+        // syscall returns, so there is no window in which this process is outside `dir`. The
+        // fail-closed property is unchanged: on every path where the kernel would not do it, the
+        // write below still runs and still refuses.
+        if let Some(cgr) = cg_ref.as_ref() {
+            if !born_in_cgroup && !crate::cgroup::join_box_cgroup(cgr) {
+                // AND SAY SO, because refusing in silence is its own defect. Measured by forcing
+                // `EACCES` on the `cgroup.procs` open: the box exited 126 with ZERO bytes on either
+                // stream, so a host that cannot delegate a cgroup answered `kern box --memory 64m`
+                // with a bare 126 and nothing that named the cause. The safe branch was taken and
+                // told nobody, which is the same defect as the silent unsafe branch read backwards.
+                //
+                // A literal through `write(2)` and not `eprintln!`: this is a forked child, and the
+                // allocator's lock can have been copied held from a thread that no longer exists
+                // here. Async-signal-safe or nothing.
+                const MSG: &[u8] = b"kern: refusing to start: the box could not be placed in its \
+                    own cgroup, so its --memory/--pids caps would not apply (cgroup delegation \
+                    unavailable or not writable here)\n";
+                unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
                 if let Some(fd) = ready_fd {
                     let b = [1u8];
                     unsafe { libc::write(fd, b.as_ptr().cast(), 1) };
                 }
                 unsafe { libc::_exit(126) };
             }
+            // Closed here, in the child, for the same reason as on the exec path: everything below is
+            // namespace and mount setup, and it must not carry a descriptor onto `/sys/fs/cgroup`.
+            cgr.close();
         }
         // CHILD (box PID 1): set up and exec. Take the readiness fd from the guard (this process
         // now owns the signalling) and mark it close-on-exec - a successful `execvp` then closes
@@ -3789,7 +4228,10 @@ pub fn run_pod_holder() -> ! {
     match range {
         Some(r) => {
             // apply_userns_range does its own unshare(ns) + fork-helper newuidmap/newgidmap + sync.
-            if let Err(e) = apply_userns_range(ns, euid, egid, &r) {
+            // `None`: the pod holder is created by `kern pod create`, which has no `PhaseTimer` in
+            // scope and is not on a box's hot path. Passing one would time a different operation
+            // under the box's labels, which is worse than not timing it.
+            if let Err(e) = apply_userns_range(ns, euid, egid, &r, None) {
                 eprintln!(
                     "kern: pod: ranged user-ns map failed ({e}) - falling back to single-uid"
                 );
@@ -3968,6 +4410,173 @@ fn exec_fail_closed(reason: &str) -> ! {
 /// Not a descendant of PID 1, so the box's own seccomp filter doesn't block the `setns` calls
 /// here; the new process gets its own copy of the filter for parity. Requires that the caller is
 /// the same user that created the box (its user namespace owner).
+/// The live end of the pipe that tells the OOM reporter this process is gone. Closing it, whether by
+/// `Drop` on a normal return or by the kernel on a `SIGKILL`, is the only signal the reporter waits
+/// on, so this must stay owned for as long as the exec runs.
+struct OomReporter {
+    write_fd: libc::c_int,
+}
+
+impl Drop for OomReporter {
+    fn drop(&mut self) {
+        if self.write_fd >= 0 {
+            // ONE BYTE THAT MEANS "I LEFT ON MY OWN FEET", and it is the whole reason the reporter
+            // can afford to wait. A `SIGKILL` cannot run this, so the reporter tells a clean exit
+            // from a killed one by whether the byte arrived before the EOF: on a clean exit it stops
+            // immediately and costs the caller nothing, and only in the killed case does it wait for
+            // the counter to catch up.
+            let b = *b".";
+            unsafe { libc::write(self.write_fd, b.as_ptr().cast(), 1) };
+            unsafe { libc::close(self.write_fd) };
+        }
+    }
+}
+
+/// Fork a process that OUTLIVES a whole-box OOM and reports it, because nothing inside the box's
+/// cgroup can.
+///
+/// `kern exec` migrates the launcher into the box's cgroup so the command it forks inherits the
+/// caps. With `memory.oom.group = 1` that means a box that blows its memory ceiling takes the
+/// launcher with it, and it goes by `SIGKILL`, which cannot be caught. Measured on a `--memory 32m`
+/// box before this existed: the `kern exec` process itself returned `-9`, with empty stdout and
+/// empty stderr, while `memory.events` recorded `oom_group_kill 1`. The person who typed the command
+/// saw it die and got no reason.
+///
+/// So the reporter is forked BEFORE the migration and stays in the caller's cgroup and namespaces.
+/// It holds the read end of a pipe whose only writer is the launcher; when the launcher dies, for
+/// any reason, the write end closes and the read returns EOF. The reporter then compares
+/// `oom_group_kill` against the value it captured before anything ran, and speaks only if it grew.
+///
+/// FAILURE MODES, all of them deliberately silent, because this is a diagnostic and must never be
+/// the reason an exec does not happen:
+///
+/// * the box has no real `memory.max`, so a group OOM is not possible here -> no reporter,
+///   and no process spent on a box that cannot produce the event;
+/// * `memory.events` unreadable NOW -> no reporter, because without a baseline an increase cannot
+///   be told from a count that was already there, and announcing an OOM that did not happen is the
+///   same defect as the silence, pointed the other way;
+/// * `pipe2` or `fork` fails -> no reporter, and the exec proceeds untouched.
+///
+/// The pipe is `O_CLOEXEC` on both ends: the exec'd program must not inherit the write end and hold
+/// the reporter open for its whole life, and the reporter never execs.
+fn spawn_oom_reporter(cg: &crate::cgroup::CgroupRef, pid1: i32) -> Option<OomReporter> {
+    if !cg.has_real_memory_cap() {
+        return None;
+    }
+    // NOT THE BOX'S OWN CGROUP, an ANCESTOR of it. The first version read the box's own
+    // `memory.events` after the launcher died and it was a coin toss, because `memory.oom.group`
+    // takes the directory down with the processes: sampling every 2 ms from the host, the box's
+    // cgroup was gone 10.7 ms in and `oom_group_kill` was never seen non-zero there, since the
+    // counter increments at the instant the directory is torn down. The same command reported the
+    // OOM under one harness and stayed silent under another, which is worse than never reporting:
+    // the one run that matters is the one nobody repeats.
+    //
+    // The counters are hierarchical and the ancestor outlives the box, so the event lands somewhere
+    // that is still readable afterwards. Measured across one group kill: `kern.slice` went
+    // `oom_group_kill 228 -> 229`. This is the mechanism `oom_kill_dir_for_pid` already existed for
+    // on the `kern run` path, and reusing it is the point: the rule for which directory outlives a
+    // box is not one to hold two opinions about.
+    let anc = crate::cgroup::oom_kill_dir_for_pid(pid1)?;
+    let events_fd = crate::cgroup::open_oom_events_fd(&anc)?;
+    let Some(baseline) = crate::cgroup::oom_group_kill_from_fd(events_fd) else {
+        unsafe { libc::close(events_fd) };
+        return None;
+    };
+
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return None;
+    }
+    let (r, w) = (fds[0], fds[1]);
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::close(r) };
+        unsafe { libc::close(w) };
+        return None;
+    }
+    if pid == 0 {
+        // THE REPORTER. NOTHING BELOW MAY ALLOCATE: this is a forked child, and the allocator's lock
+        // can have been copied held from a thread that does not exist here, which would make a
+        // single allocation a permanent hang. `oom_group_kill_from_fd` reads into a stack buffer for
+        // exactly this reason, and the message is a literal.
+        unsafe { libc::close(w) };
+        let mut byte = [0u8; 1];
+        // One byte means the launcher ran its `Drop`, so it was not killed and there is nothing to
+        // explain. EOF or an error means it went without one.
+        let clean = loop {
+            let n = unsafe { libc::read(r, byte.as_mut_ptr().cast(), 1) };
+            if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
+            }
+            break n == 1;
+        };
+        if clean {
+            unsafe { libc::_exit(0) };
+        }
+
+        // KILLED, so wait for the counter instead of sampling it once. Reading after the death is
+        // safe here and was not in the first version - this descriptor is on an ancestor that
+        // outlives the box - but "safe to read" is not "already updated": measured, one sample taken
+        // the instant the pipe closed reported the OOM in only 3 runs out of 10, because the process
+        // dies before the count that explains it lands. Retrying turns a race into a bounded wait.
+        //
+        // The wait costs NOTHING on a healthy exec: that path exited above on the byte. It is only
+        // ever paid by a command that has already been killed, where a few hundred milliseconds are
+        // invisible next to the fact that the caller is about to be told why.
+        //
+        // WHY A BARE CONSTANT IS ALLOWED TO STAND HERE, which is the part worth reading and not the
+        // number. This is the longest this process will spend EXPLAINING A FAILURE THAT HAS ALREADY
+        // HAPPENED, and both directions of getting it wrong are harmless:
+        //
+        //   too short  the reporter gives up before the counter lands and the caller sees `-9` with
+        //              no reason. That is the state before this reporter existed, on a path that had
+        //              already failed. No cap is lost, no process escapes, nothing regresses.
+        //   too long   someone who has just been killed waits a fraction of a second longer to read
+        //              why. Nobody perceives it after a `-9`.
+        //
+        // A constant whose two failure directions are both innocuous does not need a distribution to
+        // justify it, and measuring one would be an activity rather than an answer. This is NOT the
+        // class of a timeout on a live path, where being short is a wrong result and the number has
+        // to be earned. Raise it or lower it freely; the only thing lowering it too far costs is the
+        // sentence, never the enforcement.
+        //
+        // The margin IS measured, because it is one timestamp inside the ten runs that were needed
+        // anyway: over ten group kills the counter landed after ONE 2 ms step every time (median 2 ms,
+        // max 2 ms, one run at 0). The ceiling is 200x the slowest observed, which is what makes it
+        // generous rather than lucky.
+        let deadline = 400; // ms, in 2 ms steps
+        let mut waited = 0;
+        let mut fired =
+            crate::cgroup::oom_group_kill_from_fd(events_fd).is_some_and(|now| now > baseline);
+        while !fired && waited < deadline {
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 2_000_000,
+            };
+            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            waited += 2;
+            fired =
+                crate::cgroup::oom_group_kill_from_fd(events_fd).is_some_and(|now| now > baseline);
+        }
+        if fired {
+            // WHAT THIS CLAIMS, AND WHAT IT DOES NOT. A group kill happened in the slice this box
+            // lives in while this command was running, and this command died. The slice is shared
+            // with kern's other boxes, so the counter does not name THIS box the way the `kern run`
+            // path's does; the sentence says "its box", which is what the caller can act on, and
+            // stops short of naming the process. Overclaiming here would be the same defect as the
+            // silence it replaces, pointed the other way.
+            const MSG: &[u8] = b"kern: exec: this command was killed with its box by the kernel's \
+                OOM killer, against the box's memory cap (memory.oom.group kills the whole box, the \
+                exec'd command included). Raise it with `--memory <size>`.\n";
+            unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+    unsafe { libc::close(r) };
+    Some(OomReporter { write_fd: w })
+}
+
 #[allow(clippy::too_many_arguments)] // each arg is a distinct exec knob; grouping would only hide it
 pub fn exec_in_box(
     pid1: i32,
@@ -4089,17 +4698,89 @@ pub fn exec_in_box(
     // on `Unbounded` alone would fire on EVERY exec on every rootless host (a `kern exec box ls`
     // included) - noise the user never asked about. A `--health-cmd` probe passes `false` too, so it
     // never spams the box log every interval.
-    let cgroup_join = crate::cgroup::join_box_cgroup_for_exec(pid1);
-    if box_has_explicit_caps {
-        if let crate::cgroup::ExecCgroupJoin::Unbounded = cgroup_join {
+    // PLACE THE PROCESS IN THE BOX'S CGROUP HERE, BEFORE THE `setns` BELOW, AND NOT AFTER IT. The
+    // ordering is the whole point of this being a separate step, and it holds for two independent
+    // reasons that were learned the expensive way:
+    //
+    //   1. NAMING. After the cgroup namespace is joined, `/proc/<pid1>/cgroup` reports a path relative
+    //      to THAT namespace and no longer names a directory under `/sys/fs/cgroup`.
+    //   2. REACHABILITY, which a descriptor does NOT fix. Inside the box's cgroup namespace the box's
+    //      own cgroup is the root, and the common ancestor it shares with the caller's cgroup cannot
+    //      be named there at all. The kernel refuses the placement outright, whether it is asked for
+    //      through `clone3(CLONE_INTO_CGROUP)` with an fd or through a write on a pre-opened
+    //      `cgroup.procs`. Both come back ENOENT, not EPERM - traced:
+    //
+    //          setns(3, CLONE_NEWUSER)                                    = 0
+    //          setns(4, CLONE_NEWCGROUP)                                  = 0
+    //          clone3({flags=CLONE_INTO_CGROUP, ..., cgroup=10}, 88)      = -1 ENOENT
+    //          openat(10, "cgroup.procs", O_WRONLY|O_CLOEXEC)             = 3        <- opens fine
+    //          write(3, "0", 1)                                           = -1 ENOENT
+    //
+    // The consequence of getting this wrong was not a slower exec, it was an UNCAPPED one: measured on
+    // the binary that placed after the `setns`, `kern exec` into a `--pids-limit 2 --memory 64M` box
+    // ran in the CALLER's cgroup - read from the host by pid, with the box's own PID 1 as the positive
+    // control and the exec'd process verified to be in the box's PID namespace - and said nothing,
+    // because the probe that decides whether a failed placement cost a cap read `memory.max` from the
+    // same unreachable place and concluded there was no cap to lose.
+    //
+    // SO THE MIGRATION STAYS ON THIS PATH, and with it its cost: it is a `cgroup.procs` write, which
+    // takes `cgroup_threadgroup_rwsem` for write and therefore an RCU grace period - 11.7 to 25.8 ms on
+    // a quiet host against 1.7 to 2.2 ms without it. `clone3(CLONE_INTO_CGROUP)` avoids that grace
+    // period and IS used, but only on the box START path, which places its child before entering any
+    // namespace and where the saving is real. Buying those milliseconds here costs the cap.
+    //
+    // KNOWN PROPERTY, not a new one: this puts the launcher inside the box's memory cap for the rest
+    // of its life, where a whole-box OOM can take it down. Recovering that without losing the cap needs
+    // the child to be created in the cgroup before the namespaces are joined and then to enter the PID
+    // namespace itself, which takes a second fork - a restructure, not an ordering change.
+    //
+    // WHAT THE CALLER USED TO SEE WHEN THAT HAPPENED, measured rather than guessed. A `--memory 32m`
+    // box, an exec'd command that allocates past it:
+    //
+    //     returncode -9 (SIGKILL) on the `kern exec` process ITSELF
+    //     stdout b''   stderr b''
+    //     memory.events: max 20 oom 1 oom_kill 4 oom_group_kill 1
+    //
+    // Zero bytes explaining it, because `memory.oom.group = 1` kills the launcher along with the box
+    // and SIGKILL cannot be caught. Nothing inside the group can report it, by construction, so
+    // `spawn_oom_reporter` below puts one process OUTSIDE the group whose only job is to say it.
+    let box_cg = crate::cgroup::box_cgroup_dir_for_exec(pid1).and_then(|d| {
+        let cg = crate::cgroup::CgroupRef::open(&d);
+        if cg.is_none() && box_has_explicit_caps {
+            // Say it rather than fall into the quiet branch: this is the one place that can tell the
+            // difference between "the box has no cap" and "kern could not reach the cap it has".
             eprintln!(
-                "kern: exec: warning: this host runs the box in a per-box systemd scope that the \
-                 kernel won't let `kern exec` join, so the command runs OUTSIDE the box's \
-                 --memory/--pids caps (its namespaces + seccomp still isolate it). A host with \
-                 kern's delegated kern.slice (e.g. running kern as root) caps exec'd commands too."
+                "kern: exec: warning: cannot open the box's cgroup ({}), so the command runs \
+                 OUTSIDE the box's --memory/--pids caps (its namespaces + seccomp still isolate it)",
+                d.display()
             );
         }
+        cg
+    });
+    // Migrate NOW, while the caller is still in its own namespaces, so the child forked after the
+    // `setns` inherits the cgroup. Reported from the outcome, exactly as before.
+    // BEFORE the migration below, because a reporter forked after it would be inside the group and
+    // would die with everything else. `_reporter` keeps the pipe's write end alive for exactly as
+    // long as this process is alive; that is the whole signal.
+    let _reporter = box_cg.as_ref().and_then(|c| spawn_oom_reporter(c, pid1));
+
+    let placed = box_cg.as_ref().is_some_and(crate::cgroup::join_box_cgroup);
+    if !placed && box_has_explicit_caps {
+        if let Some(cg) = box_cg.as_ref() {
+            if let crate::cgroup::ExecCgroupJoin::Unbounded =
+                crate::cgroup::exec_join_outcome_after_failure(cg)
+            {
+                eprintln!(
+                    "kern: exec: warning: this host runs the box in a per-box systemd scope that \
+                     the kernel won't let `kern exec` join, so the command runs OUTSIDE the box's \
+                     --memory/--pids caps (its namespaces + seccomp still isolate it). A host with \
+                     kern's delegated kern.slice (e.g. running kern as root) caps exec'd commands \
+                     too."
+                );
+            }
+        }
     }
+    drop(box_cg);
 
     for (fd, flag) in &fds {
         if unsafe { libc::setns(*fd, *flag) } != 0 {
@@ -4119,7 +4800,10 @@ pub fn exec_in_box(
         unsafe { libc::close(*fd) };
     }
 
-    // Fork: with the box's pid namespace entered, the child becomes a member of it.
+    // Fork: with the box's pid namespace entered, the child becomes a member of it, and it inherits
+    // the cgroup this process was migrated into above. NOTHING IS PLACED HERE - a second placement
+    // after the `setns` is not a safety net, it is a copy of the same decision that always fails, and
+    // reading its failure is what produced the silent uncapped exec.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(Error::last("fork"));
@@ -4639,6 +5323,169 @@ mod cpuset_expand_tests {
 #[cfg(test)]
 mod add_host_tests {
     use super::*;
+
+    #[test]
+    fn a_mount_that_does_not_take_leaves_no_mountpoint_behind() {
+        // The artifact rule, on the branch that only fires when a mount fails. No fault switch is
+        // needed: a filesystem type the kernel does not have fails for a real kernel reason, on a
+        // real path, and unprivileged it fails regardless of type - either way the assertion is the
+        // same one, that nothing is left to be mistaken for a successful mount.
+        let base = std::env::temp_dir().join(format!("kern-mountrule-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let Ok(()) = std::fs::create_dir_all(&base) else {
+            return;
+        };
+
+        let bogus = base.join("nosuch");
+        let took = mount_or_leave_nothing(&bogus.to_string_lossy(), "nosuchfs-kern-test");
+        assert!(
+            !took,
+            "a filesystem type the kernel does not have cannot mount"
+        );
+        assert!(
+            !bogus.exists(),
+            "a mount that did not take must leave NO directory: an empty mountpoint is a path that \
+             exists and answers nothing, which is the failure this rule removes"
+        );
+
+        // The mountpoint is not created when the mkdir itself cannot succeed, so a pre-existing
+        // path is never adopted and never removed. `rmdir` must not reach something kern did not
+        // make one syscall earlier.
+        let taken = base.join("taken");
+        let Ok(()) = std::fs::create_dir_all(&taken) else {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        let _ = std::fs::write(taken.join("keep"), b"x");
+        assert!(!mount_or_leave_nothing(
+            &taken.to_string_lossy(),
+            "nosuchfs-kern-test"
+        ));
+        assert!(
+            taken.join("keep").exists(),
+            "an existing directory is neither mounted over nor removed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn etc_identity_seeds_hosts_and_rewrites_hostname() {
+        let tmp = std::env::temp_dir().join(format!("kern-etcid-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let Ok(()) = std::fs::create_dir_all(tmp.join("etc")) else {
+            return;
+        };
+        // The shape an image actually ships: no hosts file at all, and a hostname naming the
+        // machine that BUILT the image (debian images carry `debuerreotype`).
+        let _ = std::fs::write(tmp.join("etc/hostname"), "debuerreotype\n");
+        let root = tmp.to_string_lossy().into_owned();
+
+        setup_etc_identity(&root, "boxname");
+
+        let hosts = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
+        assert!(
+            hosts.contains("127.0.0.1\tlocalhost") && hosts.contains("::1\tlocalhost"),
+            "both localhost seeds are written: {hosts:?}"
+        );
+        assert!(
+            hosts.contains("127.0.0.1\tboxname"),
+            "the box resolves its own name: {hosts:?}"
+        );
+        let hn = std::fs::read_to_string(tmp.join("etc/hostname")).unwrap_or_default();
+        assert_eq!(
+            hn, "boxname\n",
+            "the image's build-host name is replaced, not appended to"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn etc_identity_leaves_a_populated_hosts_alone() {
+        let tmp = std::env::temp_dir().join(format!("kern-etcid-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let Ok(()) = std::fs::create_dir_all(tmp.join("etc")) else {
+            return;
+        };
+        // Alpine ships one; so does the pod bind, which arrives as a non-empty file over this path.
+        let shipped = "127.0.0.1\tlocalhost localhost.localdomain\n";
+        let _ = std::fs::write(tmp.join("etc/hosts"), shipped);
+        let root = tmp.to_string_lossy().into_owned();
+
+        setup_etc_identity(&root, "boxname");
+
+        let hosts = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
+        assert_eq!(
+            hosts, shipped,
+            "a non-empty hosts file is never rewritten, so a pod's shared file is not duplicated"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn etc_identity_seeds_a_file_that_exists_but_answers_nothing() {
+        // The third instance of a predicate this project has got wrong twice on `resolv.conf`:
+        // `exists()` was satisfied by debian's EMPTY file, non-empty is satisfied by a file that
+        // names nothing. An `/etc/hosts` of pure comments is non-empty and still leaves
+        // `getaddrinfo("localhost")` failing, so the test is what the file ANSWERS, not its size.
+        let tmp = std::env::temp_dir().join(format!("kern-etcid-d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let Ok(()) = std::fs::create_dir_all(tmp.join("etc")) else {
+            return;
+        };
+        let comments = "# written by the build\n# do not edit\n";
+        let _ = std::fs::write(tmp.join("etc/hosts"), comments);
+
+        setup_etc_identity(&tmp.to_string_lossy(), "boxname");
+
+        let out = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
+        assert!(
+            out.starts_with(comments),
+            "what the image wrote is kept, the seeds go under it: {out:?}"
+        );
+        assert!(
+            out.contains("127.0.0.1\tlocalhost") && out.contains("127.0.0.1\tboxname"),
+            "a file that resolved nothing is seeded: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn etc_identity_refuses_a_symlinked_etc_and_a_symlinked_target() {
+        let tmp = std::env::temp_dir().join(format!("kern-etcid-c-{}", std::process::id()));
+        let out = std::env::temp_dir().join(format!("kern-etcid-c-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&out);
+        let Ok(()) = std::fs::create_dir_all(&out) else {
+            return;
+        };
+        let Ok(()) = std::fs::create_dir_all(&tmp) else {
+            return;
+        };
+
+        // 1. `/etc` itself is a symlink out of the root: the descent must refuse it.
+        if std::os::unix::fs::symlink(&out, tmp.join("etc")).is_ok() {
+            setup_etc_identity(&tmp.to_string_lossy(), "boxname");
+            assert!(
+                !out.join("hosts").exists() && !out.join("hostname").exists(),
+                "a symlinked /etc must not be followed out of the box root"
+            );
+            let _ = std::fs::remove_file(tmp.join("etc"));
+        }
+
+        // 2. `/etc` is real but `/etc/hosts` points outside: the final component must refuse too.
+        let Ok(()) = std::fs::create_dir_all(tmp.join("etc")) else {
+            return;
+        };
+        if std::os::unix::fs::symlink(out.join("pwned"), tmp.join("etc/hosts")).is_ok() {
+            setup_etc_identity(&tmp.to_string_lossy(), "boxname");
+            assert!(
+                !out.join("pwned").exists(),
+                "a symlinked /etc/hosts must not be followed out of the box root"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&out);
+    }
 
     #[test]
     fn extra_hosts_writes_clean_entries_and_refuses_injection() {

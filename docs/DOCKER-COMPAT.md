@@ -39,6 +39,13 @@ invisible to a service), so the boundary is between the stack and the host, not 
 the services of one stack. Put a service you do not trust with its peers in its own
 stack, not in this one.
 
+**That includes the `networks:` block in your file.** A compose file that puts `frontend`
+on one network and `backend` on another is expressing a separation kern does not apply:
+both services land in the same namespace and reach each other, and so does `internal:
+true`, which does not stop egress. kern says so on `up` and on `config`, naming the
+consequence rather than the feature, and then starts the stack anyway. If the separation
+is the point of the file rather than documentation of intent, split it into two stacks.
+
 **Outbound needs `pasta`, and kern says so when it is missing.** Reaching the internet
 from a rootless network namespace needs a userspace network stack, so `kern compose up`
 attaches `pasta` (the `passt` package) to the pod for NAT'd egress and DNS. It is on by

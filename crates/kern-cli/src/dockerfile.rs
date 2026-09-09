@@ -403,7 +403,20 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
                 for (k, v) in
                     parse_env(rest, &vars).map_err(|m| format!("Dockerfile line {lineno}: {m}"))?
                 {
-                    vars.insert(k.clone(), v.clone());
+                    // A value that still carries a reference is NOT resolved yet (see `subst_env`):
+                    // the build loop finishes it against the base image's env. Publishing the
+                    // half-done string to `vars` would let it reach the instructions that substitute
+                    // from there - notably RUN, where `subst_soft` would inject `/opt/venv/bin:${PATH}`
+                    // into the command line and the box's shell would then expand the inner `${PATH}`
+                    // a SECOND time, so `RUN echo $PATH` reported the prefix twice. Dropping the key
+                    // instead leaves `$PATH` verbatim for that shell, which reads the real, finished
+                    // value. Measured: with the entry published, `RUN echo $PATH` printed
+                    // `/FFF:/FFF:/usr/local/sbin:...` while the image itself was correct.
+                    if v.contains('$') {
+                        vars.remove(&k);
+                    } else {
+                        vars.insert(k.clone(), v.clone());
+                    }
                     out.push(Instr::Env(k, v));
                 }
             }
@@ -891,7 +904,7 @@ fn parse_env(rest: &str, vars: &HashMap<String, String>) -> Result<Vec<(String, 
         let (k, v) = t
             .split_once(char::is_whitespace)
             .ok_or("ENV KEY needs a value")?;
-        return Ok(vec![(k.to_string(), subst(v.trim(), vars))]);
+        return Ok(vec![(k.to_string(), subst_env(v.trim(), vars))]);
     }
     // Modern `K=V K2=V2` - split on unquoted whitespace, then each token on its first `=`.
     let mut pairs = Vec::new();
@@ -900,7 +913,7 @@ fn parse_env(rest: &str, vars: &HashMap<String, String>) -> Result<Vec<(String, 
         if k.is_empty() {
             return Err("ENV key can't be empty".to_string());
         }
-        pairs.push((k.to_string(), subst(v, vars)));
+        pairs.push((k.to_string(), subst_env(v, vars)));
     }
     Ok(pairs)
 }
@@ -940,14 +953,47 @@ fn split_ws(s: &str) -> Vec<String> {
 /// **Hard** substitution (ADD/COPY/ENV/FROM/USER/WORKDIR/EXPOSE, matching Docker's env-replace
 /// list): `${VAR}`/`$VAR` from `vars`, an unknown var → **empty**, `$$` → literal `$`.
 fn subst(s: &str, vars: &HashMap<String, String>) -> String {
-    subst_impl(s, vars, false)
+    subst_impl(s, vars, false, false)
+}
+
+/// Substitution for **ENV values**, which cannot be finished at parse time.
+///
+/// `vars` holds only what THIS Dockerfile has declared (ARG/ENV). The base image's environment is not
+/// in it and cannot be: the parser runs before `FROM` is resolved, and a multi-stage file has a
+/// different base per stage. So `ENV PATH="/opt/venv/bin:${PATH}"` - the prepend-to-PATH idiom every
+/// venv/toolchain Dockerfile uses - hard-substituted `${PATH}` to EMPTY, and the image shipped
+/// `PATH=/opt/venv/bin:`. Measured: the next `RUN mkdir -p ...` died with `mkdir: not found` (exit
+/// 127), because /usr/bin had fallen off the path.
+///
+/// Unknown references are therefore left VERBATIM here and finished by [`expand_env_value`] in the
+/// build loop, where the base image's env is known. `$$` still collapses to a literal `$` (hard
+/// semantics), because that part does not depend on what the base image declares.
+fn subst_env(s: &str, vars: &HashMap<String, String>) -> String {
+    subst_impl(s, vars, false, true)
+}
+
+/// Finish an ENV value against the environment accumulated so far, as `KEY=VALUE` entries - the image
+/// config, which IS seeded from the base image. A reference still unknown here is genuinely undefined
+/// and expands to empty, which is what Docker does.
+pub(crate) fn expand_env_value(v: &str, env: &[String]) -> String {
+    if !v.contains('$') {
+        return v.to_string();
+    }
+    let map: HashMap<String, String> = env
+        .iter()
+        .filter_map(|e| {
+            e.split_once('=')
+                .map(|(k, val)| (k.to_string(), val.to_string()))
+        })
+        .collect();
+    subst_impl(v, &map, false, false)
 }
 
 /// **Soft** substitution for RUN/CMD/ENTRYPOINT, which Docker does NOT env-expand: known ARG/ENV are
 /// filled, but an unknown `$VAR`/`${VAR}` and `$$` are left **verbatim** for the shell - so
 /// `RUN echo $HOME`, `awk '{print $1}'` and `$$` (PID) keep working.
 fn subst_soft(s: &str, vars: &HashMap<String, String>) -> String {
-    subst_impl(s, vars, true)
+    subst_impl(s, vars, true, true)
 }
 
 /// Shared substitution engine; `soft` decides how unknown vars and `$$` are treated (see the two
@@ -956,7 +1002,7 @@ fn subst_soft(s: &str, vars: &HashMap<String, String>) -> String {
 /// Accumulates BYTES (not `char`s) so multibyte UTF-8 in a value passes through intact - every byte
 /// copied comes from a valid `&str`, so the final `from_utf8` never fails. The `$`/`{`/`}`/name
 /// bytes we branch on are all ASCII, and every `&s[..]` slice boundary lands on one, so no panic.
-fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool) -> String {
+fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool, keep_unknown: bool) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let b = s.as_bytes();
     let mut i = 0;
@@ -1002,7 +1048,7 @@ fn subst_impl(s: &str, vars: &HashMap<String, String>, soft: bool) -> String {
             Some(v) => out.extend_from_slice(v.as_bytes()),
             // Soft mode leaves an unknown reference verbatim (the shell may expand it); hard mode
             // drops it (empty), as Docker does for its env-replaced instructions.
-            None if soft => out.extend_from_slice(&b[i..next]),
+            None if keep_unknown => out.extend_from_slice(&b[i..next]),
             None => {}
         }
         i = next;

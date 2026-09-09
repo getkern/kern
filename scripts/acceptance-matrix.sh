@@ -37,6 +37,10 @@ set -u
 FAIL=0
 pass() { printf '    ok    %s\n' "$1"; }
 fail() { printf '    FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
+# A case that cannot run here says so and is NOT counted as a pass. It was used before it was
+# defined: the `exec -it` case calls it when `script(1)` is absent, which on a host without that
+# binary would have died with "skip: not found" instead of reporting the reason.
+skip() { printf '    skip  %s\n' "$1"; }
 
 # --- the assertions, as functions, so --self-check can exercise them without starting anything ----
 
@@ -178,7 +182,11 @@ for l in $(ldd "$BB" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*'); do
 done
 # The applets are SYMLINKED, and their absence has cost this project four rounds of diagnosis twice:
 # `sh: nc: not found` reads exactly like an unreachable peer.
-for a in sh nc httpd netstat; do ln -sf busybox "$RF/bin/$a"; done
+# `cat` and `grep` are here for the parity cases at the end. They were NOT here first, and the
+# distro lab is what found it: Ubuntu's busybox is built with the standalone shell, so those two
+# resolve to applets with no link and the cases passed on this machine by accident. On Debian 13,
+# Fedora 44 and Rocky 10 the same cases read `sh: cat: not found` and reported it as a kern failure.
+for a in sh nc httpd netstat cat grep; do ln -sf busybox "$RF/bin/$a"; done
 echo PAYLOAD_OK > "$RF/tmp/hello"
 cat > "$D/s.toml" <<TOML
 [box.a]
@@ -532,6 +540,97 @@ else
     else
         fail "caps: a 400M load survived a 256m cap and kern said nothing"
     fi
+fi
+
+# --- WHAT EVERY CONTAINER RUNTIME PROVIDES, AND KERN DID NOT --------------------------------------
+# Five fixes whose common property is that each REVERTS INVISIBLY: none of them breaks another test
+# when it regresses, and all of them would ship green. That is the whole reason they are here rather
+# than only in unit tests - a gated devpts, a size-based hosts predicate or a mountpoint left behind
+# by a failed mount are silent everywhere except inside a workload.
+#
+# `$RF` ships NO `/etc` at all (see its construction: bin, tmp, proc, dev), which is what makes it
+# the right fixture: anything found under `/etc` here was put there by kern.
+echo
+echo "  what a container runtime provides"
+# `KERN_QUIET=1`: this matrix runs under a TEMP `XDG_RUNTIME_DIR`, and on a host whose user manager
+# lives at `/run/user/<uid>` that makes kern warn, correctly, that caps are not delegated to it. The
+# warning is about the fixture and not about what these cases assert, and captured into `$out` it
+# becomes the value every one of them reads. Found on three distros at once, for the same reason as
+# the applet links above.
+B() { XDG_RUNTIME_DIR=$XDG KERN_QUIET=1 "$KERN" box "$@" 2>&1; }
+
+# devpts, in a DETACHED box. The gate this replaces was `--ssh || -it`, so the case has to be a box
+# that asks for neither; under `-it` it passed before the fix too.
+out=$(B ptsprobe --rootfs "$RF" -- /bin/busybox sh -c 'test -c /dev/ptmx && grep -c " /dev/pts devpts " /proc/self/mounts')
+printf '%s' "$out" | grep -q '^1$' \
+    && pass "a detached box has a devpts instance and a /dev/ptmx, so an in-box forkpty(3) can work" \
+    || fail "no devpts in a detached box (got '$out'): issue #8 is back"
+
+# /dev/mqueue. POSIX message queues resolve names under this mount and the C library cannot emulate
+# it, so its absence is not a degraded mode, it is every mq_* call failing.
+out=$(B mqprobe --rootfs "$RF" -- /bin/busybox sh -c 'grep -c " /dev/mqueue mqueue " /proc/self/mounts')
+printf '%s' "$out" | grep -q '^1$' \
+    && pass "and a /dev/mqueue mount, as runc provides" \
+    || fail "no /dev/mqueue (got '$out')"
+
+# THE ARTIFACT RULE, from the other side: a mountpoint must never exist without its mount. A bare
+# directory at either path is the state a failed best-effort mount used to leave, and the state that
+# defers the failure to the workload instead of reporting it here.
+out=$(B artifact --rootfs "$RF" -- /bin/busybox sh -c '
+    for p in /dev/pts /dev/mqueue; do
+        [ -d "$p" ] || continue
+        grep -q " $p " /proc/self/mounts || { echo "BARE:$p"; exit 0; }
+    done; echo CLEAN')
+if printf '%s' "$out" | grep -q CLEAN; then
+    # THIS CASE DOES NOT DISCRIMINATE ON A HOST WHERE THE MOUNTS SUCCEED, and saying so is the point.
+    # The artifact rule only fires when a best-effort mount is ATTEMPTED AND FAILS; where both take,
+    # a binary that leaves residue and one that does not are indistinguishable here. Verified: the
+    # pre-fix binary passes this case too, while failing the six around it. The branch itself is
+    # covered by a unit test that mounts a filesystem type the kernel does not have
+    # (`a_mount_that_does_not_take_leaves_no_mountpoint_behind`); this case guards the invariant on
+    # the success path and would catch a mountpoint created without its mount.
+    pass "no mountpoint exists without its mount, though on a host where both mounts SUCCEED"
+    printf '          this case cannot tell the fix from its absence: the failure branch is\n'
+    printf '          covered by a unit test, not here.\n'
+else
+    fail "a mountpoint exists without its mount ($out)"
+fi
+
+# /etc/hosts, seeded because the image ships none. The predicate is what the file ANSWERS, so the
+# assertion is resolution-shaped: both localhost lines AND the box's own name.
+out=$(B hostsprobe --rootfs "$RF" -- /bin/busybox sh -c 'cat /etc/hosts')
+printf '%s' "$out" | grep -q 'localhost' && printf '%s' "$out" | grep -q 'hostsprobe' \
+    && pass "/etc/hosts is seeded, so localhost and the box's own name resolve" \
+    || fail "/etc/hosts missing or does not answer (got '$(printf '%s' "$out" | tr '\n' '|')')"
+
+# /etc/hostname, which an image fills with the name of the machine that BUILT it.
+out=$(B hostnameprobe --rootfs "$RF" -- /bin/busybox sh -c 'cat /etc/hostname')
+[ "$(printf '%s' "$out" | tr -d '\n')" = "hostnameprobe" ] \
+    && pass "/etc/hostname names the box, not the image's build host" \
+    || fail "/etc/hostname is '$out', not the box name"
+
+# THE POD'S OWN IDENTITY RECORDS. Cheap, and it catches the failure that matters: the file quietly
+# not being written, which leaves teardown on the weaker fallback with nothing reporting it.
+if XDG_RUNTIME_DIR=$XDG "$KERN" pod create amx >/dev/null 2>&1; then
+    PD=$XDG/kern/pods/amx
+    if [ -s "$PD/boot" ] && [ "$(cat "$PD/boot")" = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]; then
+        pass "a pod records the boot it belongs to, so a dir surviving a reboot reaps nothing"
+    else
+        fail "the pod's boot record is missing or is not this boot"
+    fi
+    if [ -s "$PD/pasta.pid" ]; then
+        # Only meaningful where pasta actually started; a loopback-only pod has no pasta to identify.
+        if printf '%s' "$(cat "$PD/pasta.id" 2>/dev/null)" | grep -qE '^[0-9]+:[0-9]+$'; then
+            pass "and its pasta by pid:starttime, so a recycled pid is not signalled"
+        else
+            fail "pasta is running but pasta.id is missing or malformed ('$(cat "$PD/pasta.id" 2>/dev/null)')"
+        fi
+    else
+        skip "no pasta for this pod, so there is no identity record to assert"
+    fi
+    XDG_RUNTIME_DIR=$XDG "$KERN" pod rm amx >/dev/null 2>&1
+else
+    skip "pod create failed here, so the pod identity records cannot be asserted"
 fi
 
 rm -rf "$D"

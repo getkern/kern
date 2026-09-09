@@ -266,6 +266,17 @@ fn compose_config_and_up_agree_on_what_the_file_may_say() {
         };
         let (config_ok, config_out) = run("config");
         let (_, up_out) = run("up");
+        // TEAR THE STACK DOWN, even though the `up` FAILED, because it does not fail early enough to
+        // leave nothing behind: it creates the pod and only then dies on the unreachable registry.
+        // Without this the pod and its holder survive the test, and the holder is a live process
+        // holding a network namespace that nothing will ever reap.
+        //
+        // MEASURED, and it is why this line exists rather than being tidiness: after a day of
+        // running this suite the machine carried 477 orphaned kern processes and 378 pods with zero
+        // boxes, 1.6 GB of RSS, the oldest from the morning. This one test accounts for 5 pods and
+        // ~7 processes PER RUN, which multiplied out is nearly all of it. `kern gc` does not collect
+        // them - it reaps box cgroups and scratch dirs, not pods - so nothing else would have.
+        let _ = run("down");
 
         assert_eq!(
             config_ok, !refused,
@@ -6054,7 +6065,23 @@ fn a_box_start_still_reaps_an_orphan_cgroup() {
         eprintln!("skip: could not plant an orphan in {}", slice.display());
         return;
     }
-    assert!(orphan.is_dir(), "the planted orphan must exist to be swept");
+    // The orphan is planted at a FIXED name in a slice shared by every kern on this machine, and the
+    // sweep it is bait for runs on EVERY box start. So a box started by any other test - in another
+    // test binary, which `cargo test` runs as a separate process outside this binary's thread
+    // scheduling - can reap it in this window. Observed once in a full `cargo test`, never in three
+    // replicas of this binary alone, which is the signature of cross-binary concurrency.
+    //
+    // That is an environment race and not a defect, and asserting on it turns "the sweep worked, just
+    // not from our box" into a red. It also cannot hide the failure this test is for: the property is
+    // "an orphan does NOT survive a box start", and the orphan being gone early is consistent with it.
+    // The assertion that matters is below and is untouched.
+    if !orphan.is_dir() {
+        eprintln!(
+            "skip: another box start swept the planted orphan before this test's own box ran"
+        );
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
 
     let out = run_one("sweepbox");
     // The sweep runs after the spawn, so give the launcher a moment to reach it.
@@ -6342,18 +6369,307 @@ fn compose_full_schema_brings_box_up() {
     let _ = fs::remove_file(&toml);
 }
 
-/// Regression: `kern exec` must place the exec'd process in the BOX'S cgroup, so a command run
-/// via `kern exec` is bound by the box's `--memory`/`--pids` caps (like `docker exec`), not the
-/// launcher's ambient cgroup. Before the cgroup-join in `exec_in_box`, a fork bomb or memory hog
-/// run via `kern exec` escaped the box's limits entirely (namespaces + seccomp still held; only
-/// the resource cap leaked). We compare the exec'd process's own cgroup (`/proc/self/cgroup`)
-/// with the box PID 1's (`/proc/1/cgroup`): the join makes them the SAME `kern-box-*` cgroup.
+/// A running box's own cgroup directory ON THE HOST, from its PID 1's host pid. `None` when this
+/// host gave the box no `kern-box-*` cgroup of its own, which is a genuine skip and not a failure.
 ///
-/// Skip-graceful on two axes: no busybox / no userns (like the tests above), AND no cgroup
-/// delegation - on a best-effort host the box's own PID 1 isn't in a `kern-box-*` cgroup either,
-/// so there is nothing for exec to join and nothing to assert. Gating on PID 1's cgroup (an
-/// INDEPENDENT signal of "the box got capped here") is what lets a broken join FAIL rather than
-/// silently skip on the hosts where the cap actually applies.
+/// FROM THE HOST, AND THAT IS THE POINT. The obvious version of this reads `/proc/1/cgroup` from
+/// inside the box, and it cannot work: inside the box's cgroup namespace the box's own cgroup is the
+/// root, so PID 1's line is `0::/` for a capped box and an uncapped one alike. A test that asked
+/// whether that path named a `kern-box-*` directory therefore skipped on every host where the caps
+/// actually apply, while reporting the opposite. The kernel writes `/proc/<host pid>/cgroup`, the
+/// box cannot rewrite it, and the pid comes from `inspect --json`, so the reading and the subject are
+/// independent.
+///
+/// Shared by every test that needs it rather than copied into each: the derived condition here (what
+/// counts as "this box has its own cgroup") is exactly the kind that rots when it exists twice.
+fn box_cgroup_dir(tag: &str) -> Option<PathBuf> {
+    let js = kern().args(["inspect", tag, "--json"]).output().ok()?;
+    let txt = String::from_utf8_lossy(&js.stdout).to_string();
+    let pid1: i64 = txt
+        .split("\"pid1\"")
+        .nth(1)?
+        .trim_start_matches([':', ' '])
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    let rel = fs::read_to_string(format!("/proc/{pid1}/cgroup")).ok()?;
+    let rel = rel.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let dir = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    dir.file_name()?
+        .to_str()?
+        .starts_with("kern-box-")
+        .then_some(dir)
+}
+
+/// A cgroup control file read as a number, or `None` when it is absent, unreadable, or the `max`
+/// no-limit sentinel. Callers use `None` as "there is no cap to test here" and skip.
+fn cgroup_num(p: PathBuf) -> Option<u64> {
+    fs::read_to_string(p).ok()?.trim().parse::<u64>().ok()
+}
+
+/// A command that grows the shell's own ANONYMOUS memory until something stops it.
+///
+/// Anonymous and not a file, on purpose: page cache is reclaimable, so a `dd` into a file can push a
+/// cgroup to its ceiling and be reclaimed instead of killed, which would make this test depend on
+/// how much the host felt like reclaiming. Concatenating into a shell variable cannot be reclaimed.
+const MEMORY_HOG: &str = r#"A=""; while :; do A="$A$(/bin/busybox dd if=/dev/zero bs=1M count=4 2>/dev/null | /bin/busybox tr "\0" "x")"; done"#;
+
+/// A box the kernel still has must not vanish from `ps` because its registry record did.
+///
+/// MEASURED DEFECT this pins. kern's registry lives in `$XDG_RUNTIME_DIR/kern/instances`, and
+/// `/run/user` is swept by `systemd-tmpfiles`, cleared on logout, and deleted by any operator who
+/// reads it as scratch. The box does not care: its supervisor keeps running and its cgroup stays.
+/// Only kern forgets, and it forgets completely:
+///
+///     box r1 -d -- sleep 120      ps: r1
+///     rm -rf $XDG_RUNTIME_DIR/kern/instances
+///     ps                          r1 GONE
+///     stop r1                     error: no running box named 'r1'
+///     /proc/<pid>                 still there
+///     kern.slice/kern-box-r1-…    still there
+///
+/// Invisible AND unstoppable, while the cgroup directory name carried the tag and the supervisor
+/// pid the whole time. `ps` now reads that too and says the two disagree.
+///
+/// DELETES ONE ENTRY, NOT THE DIRECTORY, and that is not cosmetic: `cargo test` runs several test
+/// binaries at once against this same shared runtime directory, so wiping it would orphan every box
+/// the other tests have running and turn this test into the very defect it describes. One file
+/// reproduces the condition exactly.
+#[test]
+fn a_box_whose_registry_record_vanished_is_still_reported_by_ps() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces unavailable");
+        return;
+    }
+    let tag = "psghost";
+    let _ = kern().args(["stop", tag]).output();
+    let root = build_rootfs(&busybox, tag);
+    let started = kern()
+        .args([
+            "box",
+            tag,
+            "--rootfs",
+            root.to_str().unwrap_or("."),
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .output()
+        .expect("start detached box")
+        .status
+        .success();
+
+    // PROBED TO THE END, not one step short: the box must exist AND have a `kern-box-*` cgroup of
+    // its own, because that directory is the entire evidence this feature reads. A host that gives
+    // the box no cgroup (no delegation) can neither produce the defect nor detect it.
+    let cg = started.then(|| box_cgroup_dir(tag)).flatten();
+    let entry = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .map(|x| x.join("kern/instances"))
+        .and_then(|d| {
+            fs::read_dir(d).ok()?.flatten().find_map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with(&format!("{tag}-")).then(|| e.path())
+            })
+        });
+
+    let (Some(_cg), Some(entry)) = (cg, entry) else {
+        let _ = kern().args(["stop", tag]).output();
+        let _ = fs::remove_dir_all(&root);
+        eprintln!("skip: this host gave the box no cgroup or no registry entry to remove");
+        return;
+    };
+
+    // The sweep, in miniature: the record goes, the box stays.
+    let _ = fs::remove_file(&entry);
+    let out = kern().args(["ps"]).output().expect("run kern ps");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // Stop by name cannot work any more - that is the defect, not a bug in this test - so the
+    // supervisor is killed through the pid `ps` just reported. Cleaning up BEFORE asserting, so a
+    // failure never leaves a box nobody can reach.
+    let _ = kern().args(["stop", tag]).output();
+    // ONLY THIS TEST'S BOX, and the filter is not caution, it is a defect this test HAD. The warning
+    // lists every running box with no registry record, and in a full `cargo test` that set can hold
+    // boxes belonging to OTHER test binaries running at the same moment. Killing every pid it
+    // mentions SIGKILLed them, and two unrelated tests went red - reproducibly, twice on a clean
+    // machine, while the previous commit was green twice. A test that reaches outside its own
+    // subject does not measure that subject; it breaks the suite and blames the code.
+    for line in err.lines() {
+        let mine = line.split_whitespace().any(|w| w == tag);
+        if !mine {
+            continue;
+        }
+        if let Some(p) = line.split("supervisor pid ").nth(1) {
+            if let Ok(pid) = p.trim_end_matches(')').trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(
+        err.contains(tag) && err.contains("no registry record"),
+        "a running box with no registry record must be named on stderr, or it is invisible AND \
+         unstoppable; got {err:?}"
+    );
+}
+
+/// A `kern exec` that dies because the BOX blew its memory ceiling must say so.
+///
+/// MEASURED DEFECT this pins. `kern exec` migrates the launcher into the box's cgroup so the command
+/// it forks inherits the caps, and the box carries `memory.oom.group = 1`, so a box that exceeds
+/// `--memory` is killed as a unit and the launcher goes with it. By `SIGKILL`, which cannot be
+/// caught. On a `--memory 32m` box, measured before the reporter existed:
+///
+///     returncode -9 (SIGKILL)   stdout b''   stderr b''   memory.events: oom_group_kill 1
+///
+/// The caller's command was killed and nothing anywhere said why. Nothing INSIDE the cgroup can say
+/// it, by construction, so a reporter is forked before the migration and waits outside on a pipe the
+/// launcher holds.
+///
+/// The exit code stays `SIGKILL` and this test does not assert otherwise: that part is the kernel's
+/// and is not fixable. What is asserted is that the reason reaches stderr.
+///
+/// THE SILENT HALF IS ASSERTED FIRST, and it is the half that can rot: a reporter that always fires
+/// is not a detector, and "the message appeared" would be true of one. So a healthy exec on an
+/// equally capped box must produce nothing, and only then is the killed one allowed to speak.
+#[test]
+fn an_exec_killed_by_the_box_oom_cap_says_why() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces unavailable");
+        return;
+    }
+    let start = |tag: &str, rootfs: &str, mem: &str| {
+        kern()
+            .args([
+                "box",
+                tag,
+                "--rootfs",
+                rootfs,
+                "--memory",
+                mem,
+                "--pids-limit",
+                "40",
+                "-d",
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "sleep 40",
+            ])
+            .output()
+    };
+    let says_oom =
+        |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).contains("memory.oom.group");
+
+    // ---- the silent half.
+    let quiet = "oomquiet";
+    let _ = kern().args(["stop", quiet]).output();
+    let root_q = build_rootfs(&busybox, quiet);
+    let q_up = start(quiet, root_q.to_str().unwrap(), "64m")
+        .expect("start detached box")
+        .status
+        .success();
+    let capped = q_up
+        .then(|| box_cgroup_dir(quiet))
+        .flatten()
+        .and_then(|d| cgroup_num(d.join("memory.max")))
+        .is_some();
+    let quiet_out = capped.then(|| {
+        kern()
+            .args(["exec", quiet, "--", "/bin/busybox", "true"])
+            .output()
+            .expect("run exec")
+    });
+    let _ = kern().args(["stop", quiet]).output();
+    let _ = fs::remove_dir_all(&root_q);
+
+    let Some(quiet_out) = quiet_out else {
+        eprintln!(
+            "skip: this host gave the box no enforced memory.max, so it cannot OOM as a group"
+        );
+        return;
+    };
+    assert!(
+        !says_oom(&quiet_out),
+        "an exec that was never OOM-killed must say nothing about it, or the message proves \
+         nothing when it does appear; got {:?}",
+        String::from_utf8_lossy(&quiet_out.stderr)
+    );
+
+    // ---- the killed half.
+    let loud = "oomloud";
+    let _ = kern().args(["stop", loud]).output();
+    let root_l = build_rootfs(&busybox, loud);
+    let l_up = start(loud, root_l.to_str().unwrap(), "32m")
+        .expect("start detached box")
+        .status
+        .success();
+    let loud_out = l_up.then(|| {
+        kern()
+            .args(["exec", loud, "--", "/bin/busybox", "sh", "-c", MEMORY_HOG])
+            .output()
+            .expect("run exec")
+    });
+    let _ = kern().args(["stop", loud]).output();
+    let _ = fs::remove_dir_all(&root_l);
+
+    let Some(loud_out) = loud_out else {
+        eprintln!("skip: the capped box did not start");
+        return;
+    };
+    // If the workload somehow survived, there was no OOM to report and the test has measured
+    // nothing. Say so rather than assert on a message that would be wrong to print.
+    if loud_out.status.success() {
+        eprintln!("skip: the memory hog was not killed, so no group OOM happened here");
+        return;
+    }
+    assert!(
+        says_oom(&loud_out),
+        "a command killed by the box's group OOM must be told why; it exited {:?} with stderr {:?}",
+        loud_out.status,
+        String::from_utf8_lossy(&loud_out.stderr)
+    );
+}
+
+/// Regression: `kern exec` must place the exec'd process in the BOX'S cgroup, so a command run via
+/// `kern exec` is bound by the box's `--memory`/`--pids` caps (like `docker exec`), not the
+/// launcher's ambient cgroup. Without that placement a fork bomb or a memory hog run through
+/// `kern exec` escapes the box's limits entirely (namespaces + seccomp still hold; only the resource
+/// cap leaks).
+///
+/// THIS TEST USED TO READ THE ANSWER FROM INSIDE THE BOX and it could never fail. It compared
+/// `/proc/self/cgroup` with `/proc/1/cgroup` as seen by the exec'd process, and inside the box's
+/// CGROUP NAMESPACE the box's own cgroup is the root, so PID 1's line is `0::/` and its leaf is the
+/// empty string. The skip guard asked whether that leaf started with `kern-box-`, which it cannot,
+/// so on a host with working delegation the test printed "skip: host has no delegated cgroup" and
+/// asserted nothing. Measured: on this host the box's PID 1 is in
+/// `.../kern.slice/kern-box-<tag>-<pid>` read from the HOST, and the test still skipped. It stayed
+/// green while `kern exec` ran its process in the CALLER's cgroup, which is the defect it is named
+/// for. The measurement went through a channel the subject rewrites.
+///
+/// So both readings now come from OUTSIDE: `/proc/<pid1>/cgroup` on the host for the box's real
+/// cgroup, and `pids.current` on that cgroup for what the exec did. And the assertion that decides
+/// the test is a CONSEQUENCE rather than a path, so it survives a change of mechanism: a box whose
+/// `pids.max` is already reached must REFUSE an exec. Any implementation that places the process
+/// inside the cap refuses it; one that does not, succeeds. Verified both ways - the binary that
+/// placed after the `setns` returned 0 here.
+///
+/// Skip-graceful on three axes: no busybox, no userns, and no real cgroup delegation - the last one
+/// now determined from the host, where it can actually be observed.
 #[test]
 fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
     let Some(busybox) = static_busybox() else {
@@ -6364,75 +6680,106 @@ fn exec_joins_the_box_cgroup_so_resource_caps_apply() {
         eprintln!("skip: unprivileged user namespaces unavailable");
         return;
     }
-    let tag = "cgexec";
-    let _ = kern().args(["stop", tag]).output(); // clear any leftover from a prior aborted run
-    let root = build_rootfs(&busybox, tag);
-    let rootfs = root.to_str().unwrap();
 
-    let start = kern()
-        .args([
-            "box",
-            tag,
-            "--rootfs",
-            rootfs,
-            "--memory",
-            "64m",
-            "--pids-limit",
-            "32",
-            "-d",
-            "--",
-            "/bin/busybox",
-            "sleep",
-            "30",
-        ])
-        .output()
-        .expect("start detached box");
-    if !start.status.success() {
-        eprintln!(
-            "skip: box did not start ({})",
-            String::from_utf8_lossy(&start.stderr).trim()
-        );
-        let _ = fs::remove_dir_all(&root);
-        return;
-    }
-
-    // One exec prints the exec'd process's own cgroup AND the box PID 1's cgroup (v2 `0::<path>`).
-    let out = kern_out(&[
-        "exec",
-        tag,
-        "--",
-        "/bin/busybox",
-        "sh",
-        "-c",
-        "cat /proc/self/cgroup; echo SEP; cat /proc/1/cgroup",
-    ]);
-    let text = String::from_utf8_lossy(&out.stdout);
-    let leaf = |s: &str| -> String {
-        s.lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .and_then(|p| p.rsplit('/').next())
-            .unwrap_or("")
-            .trim()
-            .to_string()
+    // A workload of exactly TWO processes (the shell plus the sleep it waits on), so a `--pids-limit
+    // 2` box is saturated the moment it is up and any correctly placed exec must be refused.
+    let two_procs = "/bin/busybox sleep 30 & wait";
+    let start = |tag: &str, rootfs: &str, limit: &str| {
+        kern()
+            .args([
+                "box",
+                tag,
+                "--rootfs",
+                rootfs,
+                "--memory",
+                "64m",
+                "--pids-limit",
+                limit,
+                "-d",
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                two_procs,
+            ])
+            .output()
     };
-    let mut parts = text.split("SEP");
-    let exec_leaf = leaf(parts.next().unwrap_or(""));
-    let box_leaf = leaf(parts.next().unwrap_or(""));
 
-    // Stop + clean BEFORE asserting so a failing assert never leaks a running box.
-    let _ = kern().args(["stop", tag]).output();
-    let _ = fs::remove_dir_all(&root);
+    // ---- part 1, the positive control: a box with room must let an exec in, AND the exec must show
+    // up in the box's own `pids.current`. This is the property stated directly; part 2 is the
+    // property's consequence. If part 1 could not run, part 2's refusal would prove nothing.
+    let roomy = "cgexecok";
+    let _ = kern().args(["stop", roomy]).output();
+    let root_ok = build_rootfs(&busybox, roomy);
+    let ok_started = start(roomy, root_ok.to_str().unwrap(), "32")
+        .expect("start detached box")
+        .status
+        .success();
+    let dir_ok = ok_started.then(|| box_cgroup_dir(roomy)).flatten();
+    let mut grew = None;
+    if let Some(dir) = dir_ok.as_ref() {
+        let base = cgroup_num(dir.join("pids.current")).unwrap_or(0);
+        let mut child = kern()
+            .args(["exec", roomy, "--", "/bin/busybox", "sleep", "3"])
+            .spawn()
+            .expect("spawn exec");
+        let mut peak = base;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            peak = peak.max(cgroup_num(dir.join("pids.current")).unwrap_or(0));
+        }
+        let _ = child.wait();
+        grew = Some((base, peak));
+    }
+    let _ = kern().args(["stop", roomy]).output();
+    let _ = fs::remove_dir_all(&root_ok);
 
-    // No cgroup delegation here → the box PID 1 isn't in a `kern-box-*` cgroup, so there is nothing
-    // for exec to join. Skip rather than assert (matches the runtime's best-effort fallback).
-    if !box_leaf.starts_with("kern-box-") {
-        eprintln!("skip: host has no delegated cgroup (box PID 1 cgroup leaf: {box_leaf:?})");
+    if !ok_started || dir_ok.is_none() {
+        eprintln!("skip: no box with a delegated `kern-box-*` cgroup on this host");
         return;
     }
-    assert_eq!(
-        exec_leaf, box_leaf,
-        "`kern exec` must join the box's cgroup ({box_leaf:?}); the exec'd process was in \
-         {exec_leaf:?}, so it would escape the box's --memory/--pids caps"
+    if let Some((base, peak)) = grew {
+        assert!(
+            peak > base,
+            "an exec'd process must count against the box's own cgroup: `pids.current` never rose \
+             above {base} (peak {peak}), so the command ran outside the box's caps"
+        );
+    }
+
+    // ---- part 2, the consequence, and the one that is independent of HOW the placement is done: a
+    // box already at its `pids.max` must refuse the exec.
+    let full = "cgexecfull";
+    let _ = kern().args(["stop", full]).output();
+    let root_full = build_rootfs(&busybox, full);
+    let full_started = start(full, root_full.to_str().unwrap(), "2")
+        .expect("start detached box")
+        .status
+        .success();
+    let dir_full = full_started.then(|| box_cgroup_dir(full)).flatten();
+    // Confirm the precondition rather than assume it: the cap must be REACHED, or a refusal would
+    // mean nothing and an acceptance would not be a defect.
+    let saturated = dir_full.as_ref().is_some_and(|d| {
+        cgroup_num(d.join("pids.max")) == Some(2) && cgroup_num(d.join("pids.current")) == Some(2)
+    });
+    let exec_rc = saturated.then(|| {
+        kern()
+            .args(["exec", full, "--", "/bin/busybox", "true"])
+            .output()
+            .expect("run exec")
+            .status
+            .success()
+    });
+    let _ = kern().args(["stop", full]).output();
+    let _ = fs::remove_dir_all(&root_full);
+
+    let Some(succeeded) = exec_rc else {
+        eprintln!("skip: could not saturate a --pids-limit 2 box on this host");
+        return;
+    };
+    assert!(
+        !succeeded,
+        "`kern exec` into a box already at its --pids-limit must be REFUSED; it succeeded, so the \
+         exec'd process was placed outside the box's cgroup and escapes its --memory/--pids caps"
     );
 }
 
@@ -8265,5 +8612,156 @@ fn no_new_privs_really_neutralises_a_setuid_binary() {
         me.to_string(),
         "no-new-privs did NOT neutralise a setuid binary owned by {owner} (instrument: {src}); the \
          SDKs' decision to let a nosuid remount fail non-fatally rests on this"
+    );
+}
+
+/// `FROM <earlier-stage>` builds AND the image it produces runs.
+///
+/// Both halves, because the first fix for this passed the first half and failed the second: the
+/// rewrite to the stage's temp tag made `build` print `built`, and the image would not start
+/// (`no layers in manifest`) because its overlay chain rested on a tag the build then deleted. A
+/// test that only asserted "the build succeeded" would have shipped that.
+///
+/// The third assertion is the one with teeth: a file DELETED in a later stage must not reappear.
+/// Materialising the final image squashes a layer chain, and a squash that reads the raw layer dirs
+/// instead of the kernel-merged view resurrects whatever a higher layer removed - including the
+/// `rm -rf d && mkdir d` shape, which leaves an opaque-dir xattr and no `.wh.` file at all. That is
+/// how a secret removed in a build step ends up in a shipped image.
+///
+/// SKIPs rather than fails when the case cannot be built: no network for the base image, or no
+/// unprivileged overlay. A skip is not a pass and says which it was.
+#[test]
+fn from_an_earlier_stage_builds_an_image_that_runs_and_hides_deleted_files() {
+    let dir = std::env::temp_dir().join(format!("kern-ms-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("skip: could not create the build context");
+        return;
+    }
+    let dockerfile = "FROM alpine:3.20 AS base\n\
+         RUN mkdir -p /opt/bin /segreti && printf 'DA-BASE\\n' > /opt/bin/marker.txt \
+         && printf 'SEGRETO\\n' > /segreti/chiave.txt\n\
+         \n\
+         FROM base AS finale\n\
+         RUN rm -rf /segreti && mkdir -p /segreti && printf 'NUOVO\\n' > /segreti/nuovo.txt\n";
+    if std::fs::write(dir.join("Dockerfile"), dockerfile).is_err() {
+        eprintln!("skip: could not write the Dockerfile");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    // CAN A BOX START HERE AT ALL? Asked with a box that exercises nothing this test measures, and
+    // asked BEFORE the assertion, because the skip below used to be a guessed list of words
+    // (`registry`, `overlay`, `network`) and the failure that actually happened was in none of them.
+    // On GitHub's runners this test went red with:
+    //
+    //     unshare: write failed /proc/self/uid_map: Operation not permitted
+    //     kern: sandbox setup failed: unshare(CLONE_NEWNS) failed: Operation not permitted
+    //
+    // which is the AppArmor `apparmor_restrict_unprivileged_userns` shape: the namespace is ALLOWED
+    // and the step after it is refused, so `userns_plausible()` says yes and nothing runs. Probing
+    // one step short of the end is what produced the red, and matching on error text would only have
+    // moved the guess. A probe that does not touch `FROM <stage>` cannot hide a defect in it.
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox to probe whether a box can start here");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let probe_root = build_rootfs(&busybox, "msprobe");
+    let probe = kern()
+        .args([
+            "box",
+            &format!("msprobe{}", std::process::id()),
+            "--rootfs",
+            probe_root.to_str().unwrap_or("."),
+            "--",
+            "/bin/busybox",
+            "true",
+        ])
+        .output();
+    let can_box = probe.map(|p| p.status.success()).unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&probe_root);
+    if !can_box {
+        eprintln!("skip: no box starts on this host, so no build that runs one can be measured");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let tag = format!("kern-ms-test:{}", std::process::id());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+        .args(["build", "-t", &tag, "."])
+        .current_dir(&dir)
+        .output();
+    let Ok(built) = out else {
+        eprintln!("skip: could not run kern build");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    if !built.status.success() {
+        let err = String::from_utf8_lossy(&built.stderr);
+        // The environment, not the feature: no base image to pull, or no overlay to squash.
+        if err.contains("registry") || err.contains("overlay") || err.contains("network") {
+            eprintln!("skip: the build environment cannot build this case: {err}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        panic!("FROM <stage> must build, got: {err}");
+    }
+    let run = |args: &[&str]| -> String {
+        std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    let boxname = format!("msrun{}", std::process::id());
+    let marker = run(&[
+        "box",
+        &boxname,
+        "--image",
+        &tag,
+        "--",
+        "/bin/cat",
+        "/opt/bin/marker.txt",
+    ]);
+    let leaked = run(&[
+        "box",
+        &boxname,
+        "--image",
+        &tag,
+        "--",
+        "/bin/sh",
+        "-c",
+        "test -f /segreti/chiave.txt && echo LEAK || echo clean",
+    ]);
+    // THE POSITIVE CONTROL FOR THE EXTRACTION ITSELF. Without it an extraction that produced an
+    // EMPTY tree would pass the secret assertion below - "the secret is absent" is true of nothing at
+    // all. This file is written into the directory the later stage recreated, so it exists only if
+    // the merged view was read AND the opaque directory was honoured in the right direction.
+    let present = run(&[
+        "box",
+        &boxname,
+        "--image",
+        &tag,
+        "--",
+        "/bin/cat",
+        "/segreti/nuovo.txt",
+    ]);
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+        .args(["rmi", &tag])
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        marker.contains("DA-BASE"),
+        "the image must RUN and carry the base stage's content, got {marker:?}"
+    );
+    assert!(
+        present.contains("NUOVO"),
+        "the file the later stage wrote must survive the squash, got {present:?} - without this an \
+         empty extraction would pass the secret assertion below"
+    );
+    assert!(
+        leaked.contains("clean"),
+        "a file deleted behind an opaque directory must not reappear in the squashed image, got {leaked:?}"
     );
 }

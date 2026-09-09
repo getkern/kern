@@ -1334,6 +1334,91 @@ mod net_resource_tests {
         assert!(parse_tmpfs(&["/var/cache:64m".into()]).is_ok());
     }
 
+    /// `--tmpfs` speaks Docker's option list AND kern's bare size, because it is now the only place
+    /// that speaks either.
+    ///
+    /// MEASURED DEFECT this pins, on 245 real `docker-compose.yml` files. kern had two tmpfs
+    /// grammars: this one (`PATH:64m`) and kern-compose's rewriting of Docker's
+    /// (`PATH:size=64m,mode=1770`). The rewriter decided which it held by asking whether the suffix
+    /// contained an `=` at all, so an option list with none in it went through as a size:
+    ///
+    ///     compose  /run:rw                    "bad size 'rw'"       <- valid Docker, refused
+    ///     compose  /run:exec                  "bad size 'exec'"     <- valid Docker, refused
+    ///     box      /run:size=64m              "bad size 'size=64m'" <- what compose ACCEPTS
+    ///     box      /run:64m                   accepted              <- what compose cannot produce
+    ///
+    /// The last two are one binary contradicting itself. Both spellings are accepted here now.
+    ///
+    /// AND AN UNKNOWN TOKEN IS AN ERROR, NOT A DROP, which is the half that keeps this honest: a
+    /// silently ignored `sze=64m` is a tmpfs with no cap at all, and the caller who typed it has no
+    /// way to find out.
+    #[test]
+    fn tmpfs_accepts_dockers_option_list_and_names_what_it_cannot_read() {
+        let size_of = |spec: &str| -> Option<String> {
+            parse_tmpfs(&[spec.into()])
+                .ok()
+                .and_then(|v| v.first().map(|(_, s)| s.clone()))
+        };
+        // Both spellings of a size, and both reach the same value.
+        assert_eq!(size_of("/run:64m").as_deref(), Some("64m"));
+        assert_eq!(size_of("/run:size=64m").as_deref(), Some("64m"));
+        assert_eq!(
+            size_of("/run:rw,noexec,nosuid,size=64m").as_deref(),
+            Some("64m")
+        );
+        // Option lists with no size at all: accepted, and the size stays empty (kernel default).
+        for spec in [
+            "/run:rw",
+            "/run:exec",
+            "/run:noexec,nosuid",
+            "/run:ro",
+            "/run:mode=1770,uid=1000",
+        ] {
+            assert_eq!(
+                size_of(spec).as_deref(),
+                Some(""),
+                "{spec} must parse with no size"
+            );
+        }
+        // A typo is named, not dropped.
+        for bad in [
+            "/run:sze=64m",
+            "/run:wat",
+            "/run:size=wat",
+            "/run:rw,nonsense",
+        ] {
+            assert!(
+                parse_tmpfs(&[bad.into()]).is_err(),
+                "{bad} must be refused, not ignored"
+            );
+        }
+    }
+
+    /// `/dev/shm` and `/dev/pts` are refused with their OWN sentences, not the generic one.
+    ///
+    /// Both are the most common `tmpfs:` entries a Docker user carries over, and both are already
+    /// solved in kern, so the generic "it would shadow a hardened mount" sends the reader to
+    /// conclude a problem exists that does not. The refusals stay; what the messages must do is say
+    /// the mount is already there and what to use instead.
+    #[test]
+    fn the_two_dev_tmpfs_refusals_say_what_is_already_true() {
+        let msg = |spec: &str| format!("{:?}", parse_tmpfs(&[spec.into()]).err());
+        for spelling in ["/dev/shm", "//dev/shm", "/dev//shm", "/dev/shm/"] {
+            let m = msg(spelling);
+            assert!(
+                m.contains("--memory") || m.contains("shm-size"),
+                "{spelling}: {m}"
+            );
+        }
+        for spelling in ["/dev/pts", "//dev/pts", "/dev/pts/"] {
+            assert!(msg(spelling).contains("devpts"), "{spelling}");
+        }
+        // A neighbour that is NOT one of the two keeps the generic refusal: a message that fires on
+        // the wrong path is worse than the generic one it replaces.
+        let other = msg("/dev/shmx");
+        assert!(other.contains("hardened"), "{other}");
+    }
+
     #[test]
     fn image_command_resolution() {
         let img = kern_oci::ImageConfig {

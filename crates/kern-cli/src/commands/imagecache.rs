@@ -1197,7 +1197,18 @@ pub(crate) fn content_hash(
 
 /// A completed layer's sentinel exists (`<key>.ok`) → it's a cache hit.
 pub(crate) fn layer_cached(lc: &std::path::Path, key: &str) -> bool {
-    lc.join(format!("{key}.ok")).exists()
+    // BOTH, and the directory is not redundant. The sentinel says "a layer with this key was
+    // completed"; the directory IS the layer. They can disagree - anything that removes cache
+    // content without removing the marker (a partial `rm -rf` that hits a file owned by a mapped
+    // subuid and stops, a full disk, an interrupted cleanup) leaves the marker standing over
+    // nothing. The build then treated it as a hit, pushed a path that is not there onto the overlay
+    // chain, and died with `mount(overlay) failed: No such file or directory` - an errno that names
+    // neither the cache nor the missing layer, several steps away from the cause. Measured: a
+    // half-completed cache wipe cost an hour of debugging aimed at the wrong subsystem.
+    //
+    // Checking both turns that into an ordinary cache MISS: the layer is rebuilt and nobody notices.
+    // A miss is always safe; a false hit never is.
+    lc.join(format!("{key}.ok")).exists() && lc.join(key).is_dir()
 }
 
 /// Commit a freshly-built layer's content dir into the layer cache under `key` (atomic rename +
@@ -1233,6 +1244,23 @@ pub(crate) fn chain_has_dir(chain: &[String], rel: &str) -> bool {
             .map(|m| m.is_dir())
             .unwrap_or(false)
     })
+}
+
+/// The mode `rel` already has in the merged view BELOW this layer, or `None` if no layer has it as a
+/// real directory.
+///
+/// Scans the chain top-down (`.rev()`, same order as [`chain_has_dir`]) because that is what overlay
+/// does: the highest layer holding the name is the one whose mode is visible. Symlinks are skipped by
+/// [`kern_oci::dir_mode`]'s no-follow open, so a layer that shipped `tmp -> /elsewhere` contributes no
+/// mode instead of leaking the target's.
+pub(crate) fn chain_dir_mode(chain: &[String], rel: &str) -> Option<u32> {
+    if rel.is_empty() {
+        return None;
+    }
+    chain
+        .iter()
+        .rev()
+        .find_map(|d| kern_oci::dir_mode(&std::path::Path::new(d).join(rel)))
 }
 
 /// A filesystem-safe directory name for an image reference.

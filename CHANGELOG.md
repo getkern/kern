@@ -5,9 +5,72 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## Unreleased
+## v0.9.31 - 2026-09-09
 
-**Agent skills:** add self-contained Kern guidance for Claude Code and GitHub Copilot, including CLI, Compose, and `kern-sandbox` workflows.
+**If you use `kern exec`, this release is the one that makes it obey the box's limits.** It did not.
+A command run through `kern exec` was placed in the CALLER's cgroup, outside the box's `--memory` and
+`--pids-limit`, and said nothing about it. Measured from the host by pid, with the box's own PID 1 as
+the control and the exec'd process verified to be in the box's PID namespace:
+
+```
+box PID 1                  .../kern.slice/kern-box-<tag>-<pid>     capped
+the kern exec'd process    .../app.slice/app-<the caller>.scope    the CALLER's cgroup
+```
+
+A fork bomb or a memory hog started with `kern exec` therefore ran without the ceiling the box was
+given. Namespaces and seccomp always held; it is the resource cap that leaked. The placement now
+happens BEFORE the namespaces are joined, which is the only order in which the kernel permits it:
+afterwards the box's own cgroup is the root of its namespace and the common ancestor cannot be named,
+so both `clone3(CLONE_INTO_CGROUP)` and a write to `cgroup.procs` answer ENOENT.
+
+**The cost is real and is stated rather than hidden.** Placing before the `setns` means a
+`cgroup.procs` write, which takes an RCU grace period: `kern exec` is back to 11.7-25.8 ms on a quiet
+host against 1.7-2.2 without it. The faster path shipped in v0.9.3 was faster because it was not
+applying the cap. `clone3(CLONE_INTO_CGROUP)` is still used where it is correct, on the box START
+path, which places its child before entering any namespace.
+
+**A command killed by the box's memory cap now says so.** `memory.oom.group` kills the whole box, the
+exec'd command included, and it goes by SIGKILL, so the process that would explain it is the one being
+killed. Before, the caller saw exit `-9` with empty stdout and empty stderr. A reporter now waits
+outside the group and names the cause. The exit code is still `-9`: that part belongs to the kernel.
+
+**A box whose registry record is lost stays visible.** kern's registry lives in
+`$XDG_RUNTIME_DIR/kern/instances`, and `/run/user` is swept by `systemd-tmpfiles`, cleared on logout,
+and deleted by anyone who reads it as scratch. The box does not care: it keeps running. Before, only
+kern forgot, completely - the box vanished from `ps`, `kern stop <name>` answered "no running box",
+and nothing could reach it again. `ps` now reads what the kernel still holds and names those boxes
+with their supervisor pid on stderr, on hosts with a delegated cgroup and, through `/proc`, on hosts
+without one. It does not invent a table row for them: there is no record, so there is no uptime, no
+ports and no health to show.
+
+**Multi-stage builds produce an image that runs.** `FROM <stage>` printed `built` and left an image
+that failed at `kern box` with "no layers in manifest", because the final image rested on a stage's
+overlay chain. The final image is now materialized, fail-closed. `COPY` also stopped flattening
+directory modes: a rootfs shipping a 1777 `/tmp` or a 2755 setgid directory came out 0755, and the
+program that needed it failed for a reason nothing in the Dockerfile explained.
+
+**Compose reads files it used to refuse, and refuses files it used to accept in silence.** A
+`command:` continuation line starting with `-` was read as a sequence entry, so `--source`, `-drive`
+and `-netdev` broke a plain folded scalar; two real files from public repositories now parse. `!!str`
+is accepted over a scalar and refused over a list or a map, where it used to be dropped in silence
+and the box started with something else. `tmpfs:` has ONE grammar again: `kern box --tmpfs
+/run:size=64m` used to fail on the exact spelling `kern compose` produced, while `/run:rw` and
+`/run:exec` - both valid Docker - were read as sizes and refused. An IPv6 port refusal now names the
+missing feature instead of suggesting a typo, and `/dev/shm` and `/dev/pts` say the mount is already
+there rather than giving the generic refusal.
+
+**`kern build prune` refuses arguments it used to ignore.** `kern build prune 0` was read as "keep
+nothing", ran with the default 20, and reported "kept the 20 newest".
+
+**Fixed, no interface change:** a memoised runtime path outlived the directory it named, so anything
+that cleared `/run/user` left every later registry write in that process failing, for the life of the
+process; the layer cache treated a sentinel without its directory as a hit, and the build then died
+on a `mount(overlay)` ENOENT that named neither.
+
+**Known and unchanged:** the resource caps are verified on one machine. CI does not start boxes, and
+the second reviewer's host has no cgroup delegation, so `--memory`/`--pids-limit` enforcement has one
+witness. The squash that `FROM <stage>` and `push` share loses hard links and fills sparse files.
+Compose networks do not isolate services from each other: one stack is one namespace, and `up` says so.
 
 ## v0.9.3 - 2026-09-07
 
