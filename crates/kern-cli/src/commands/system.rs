@@ -90,6 +90,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      Two services may then share a container port, and no relay is built
     {c}compose{z} <file> {c}watch{z} [service...]                              Rebuild + restart ONE service when its `build:` context changes
     {c}compose{z} <file> {c}port{z} <service> <container-port>                 Print the host address serving that box port (non-zero if none)
+    {c}compose{z} <file> {c}run{z} [--rm] [--no-deps] <service> [cmd...]       One-off box from a service definition, in the foreground; its exit code is kern's
+    {c}up{z} [-d] [--wait [--wait-timeout N]] / {c}down{z} [-v]                  --wait holds until every service is ready; down -v also deletes this project's named volumes
     {c}pod{z} create <name> [--no-outbound] [--uid-range] [--bridge <cidr>] Shared-network pod: peers reach each other by name.
                                                                      With --bridge each member keeps its own namespace and a
                                                                      127.0.0.1 no peer can reach, meeting on a bridge

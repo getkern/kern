@@ -7,6 +7,38 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`compose run`.** The step 2 of nearly every project README (`run --rm web python manage.py
+migrate`, `run --rm app npm test`), and the verb two independent reviewers each put first among
+what kern was missing. It takes a service's definition, runs it once in the foreground with a
+different command, and exits with THAT command's status: `run --rm web sh -c 'exit 7'` exits 7,
+which is what a CI job needs to tell a failing test suite from a failing runtime. Measured against
+Docker 29.6.2 and matching on all four observables: the service's environment and working directory
+reach the one-off (`DATABASE_URL` and `/tmp`), its `depends_on` are brought up and nothing else is,
+the exit code is the command's, and the service's published ports are NOT taken - the service's own
+box may be holding them. The dependencies are started by re-invoking `up -d <deps>` rather than by a
+second copy of the ordering rules, so `service_healthy`, profiles and pod creation cannot drift from
+what `up` does. After `run <service>`, every remaining word is the command: `-c` in
+`run web sh -c 'exit 7'` was a usage error before, and that is the exact line the READMEs use.
+
+**`up --wait` and `--wait-timeout N`.** The CI pattern `up -d --wait && ./smoke`, without which the
+smoke test races the healthchecks. Docker's four cases, measured on 29.6.2 and reproduced: a
+service with a healthcheck must reach healthy (one that flips at 6 s returns at 6 s here, 7 s
+there), a service without one only has to be running (returns at once), a service that has already
+EXITED fails the wait even with status 0, and a check that never passes exits 1 at the timeout. The
+default bound is kern's own condition timeout, the one `depends_on: service_healthy` already waits
+under; Docker's default is unbounded, and a CLI that hangs forever is the one shape this cannot
+take.
+
+**`--build` is accepted and `--no-build` is refused, both for the same measured reason.** With the
+Dockerfile edited between two runs, Docker without `--build` printed the OLD marker and kern printed
+the new one: kern rebuilds a `build:` service whose context changed. So `--build` names what already
+happens and is taken silently, while `--no-build` asks for the stale image kern cannot promise and
+says so.
+
+**A workload's exit status is kern's.** `Error::Workload(code)` carries it to the one place that
+maps a result to an exit code, so the command layer still returns `Result` and never calls
+`process::exit` itself. It prints nothing: the command already said whatever it had to say.
+
 **The regression gate was grading the wrong binary.** `compose-corpus-gate.py` preferred
 `target/release/kern` and fell back to debug, while every edit-and-check cycle here builds debug, so
 the gate that decides whether a change ships kept measuring a build from before the change. An audit

@@ -538,6 +538,22 @@ pub enum Command {
         /// unit) keeps today's behaviour exactly and CANNOT be left blocking on a follow that never
         /// ends. An interactive `up` is the one place where the Docker habit is unambiguous.
         detach: bool,
+        /// `--wait`: after `up`, hold until every service this invocation started is ready.
+        ///
+        /// Docker's semantics, MEASURED on 29.6.2: a service with a healthcheck must reach
+        /// `healthy` (7 s for one that flips at 6 s), a service without one must be RUNNING and
+        /// returns at once, a service that has already EXITED fails the wait even with status 0,
+        /// and `--wait-timeout 8` on a check that never passes exits 1 after 8 seconds.
+        wait_ready: bool,
+        /// `--wait-timeout N`, in seconds. `None` uses kern's own condition timeout, the same bound
+        /// `depends_on: service_healthy` already waits under.
+        wait_timeout: Option<u64>,
+        /// The argv after `run <service>`, verbatim. Empty means "the service's own command".
+        run_cmd: Vec<String>,
+        /// `run --rm`: drop the one-off box's registry entry when it exits.
+        run_rm: bool,
+        /// `--no-deps`: do not bring the target's `depends_on` up first.
+        no_deps: bool,
         /// `-v`/`--volumes` on `down`: also delete the named volumes this project owns.
         ///
         /// kern DOES create named volumes and never removed them, so a stack torn down and started
@@ -1344,9 +1360,21 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut all = false;
             let mut detach = false;
             let mut remove_volumes = false;
+            let mut wait_ready = false;
+            let mut wait_timeout: Option<u64> = None;
+            let mut run_cmd: Vec<String> = Vec::new();
+            let mut run_rm = false;
+            let mut no_deps = false;
             let mut services: Vec<String> = Vec::new();
             let mut it = rest.iter().skip(1).peekable();
             while let Some(a) = it.next() {
+                // `run <service> <command…>`: ONCE THE SERVICE IS NAMED, THE REST IS THE COMMAND,
+                // flags and all. Without this, `run web sh -c 'exit 7'` has `-c` read as a kern
+                // flag and the invocation from every project README is a usage error.
+                if action == Some(commands::ComposeAction::Run) && !services.is_empty() {
+                    run_cmd.push((*a).to_string());
+                    continue;
+                }
                 match *a {
                     "--no-pod" => no_pod = true,
                     // `--bridge`: the third wiring, and the only one that is Docker's arrangement.
@@ -1410,6 +1438,40 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // named volumes (under its volumes dir) and never removed them, so a stack torn
                     // down and started fresh silently reused the old data.
                     "-v" | "--volumes" => remove_volumes = true,
+                    // `up -d --wait`: hold until every service is ready, which is what a CI job
+                    // needs before it runs anything against the stack. Docker's semantics,
+                    // measured on 29.6.2 and reproduced here: a service with a healthcheck must
+                    // reach `healthy`, one without must still be RUNNING, and a service that has
+                    // already exited fails the wait even with status 0.
+                    "--wait" => wait_ready = true,
+                    // `run --rm`: the spelling every README uses. kern's foreground box leaves no
+                    // running entry either way, so this is accepted and honoured rather than
+                    // refused on a technicality.
+                    "--rm" if action == Some(commands::ComposeAction::Run) => run_rm = true,
+                    "-T" if action == Some(commands::ComposeAction::Run) => {}
+                    "--no-deps" => no_deps = true,
+                    "--wait-timeout" => {
+                        wait_timeout = Some(
+                            it.next()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .ok_or(Error::Usage("compose --wait-timeout N (seconds)"))?,
+                        );
+                        wait_ready = true;
+                    }
+                    // `--build` names what kern ALREADY does, and this one is measured rather than
+                    // assumed: with the Dockerfile edited between two runs, Docker without the flag
+                    // printed the OLD marker and kern printed the new one. So the flag is accepted
+                    // silently, and `--no-build` is refused loudly for the same reason: kern cannot
+                    // promise the stale image the flag is asking for.
+                    "--build" => {}
+                    "--no-build" => {
+                        eprintln!(
+                            "kern: warning: compose: '--no-build' cannot be honoured - kern rebuilds \
+                             a `build:` service whose context changed, where Docker would reuse the \
+                             image it built before. Run `kern compose <file> build` when you want \
+                             the build on its own."
+                        );
+                    }
                     "--tail" => {
                         // A non-numeric `--tail` is a typo, not "show everything": refuse it.
                         tail = Some(
@@ -1460,6 +1522,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 allow_device_grants,
                 detach,
                 remove_volumes,
+                wait_ready,
+                wait_timeout,
+                run_cmd,
+                run_rm,
+                no_deps,
                 tail,
                 follow,
                 all,
@@ -1500,6 +1567,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 // up -d`, and without it an interactive `kern up` streams like Docker's.
                 detach: rest.contains(&"-d") || rest.contains(&"--detach"),
                 remove_volumes: rest.contains(&"-v") || rest.contains(&"--volumes"),
+                wait_ready: rest.contains(&"--wait"),
+                wait_timeout: None,
+                run_cmd: Vec::new(),
+                run_rm: false,
+                no_deps: rest.contains(&"--no-deps"),
                 tail: None,
                 follow: false,
                 all: false,
@@ -3713,6 +3785,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             allow_device_grants,
             detach,
             remove_volumes,
+            wait_ready,
+            wait_timeout,
+            run_cmd,
+            run_rm,
+            no_deps,
             tail,
             follow,
             all,
@@ -3730,6 +3807,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             allow_device_grants,
             detach,
             remove_volumes,
+            wait_ready,
+            wait_timeout,
+            run_cmd: &run_cmd,
+            run_rm,
+            no_deps,
             tail,
             follow,
             all,
@@ -3969,6 +4051,79 @@ mod tests {
         assert!(
             p(&["compose", "stack.yml", "up", "--detatch"]).is_err(),
             "a typo must still be a usage error"
+        );
+    }
+
+    /// AFTER `run <service>`, EVERYTHING IS THE COMMAND, flags included.
+    ///
+    /// `docker compose run --rm web sh -c 'exit 7'` is the line in nearly every project README, and
+    /// a parser that kept reading flags past the service name would take `-c` for one of its own
+    /// and answer with a usage error. The service is the LAST thing the parser decides; the rest is
+    /// handed over verbatim.
+    #[test]
+    fn run_hands_everything_after_the_service_to_the_command() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let (_, cmd) = p(&[
+            "compose",
+            "stack.yml",
+            "run",
+            "--rm",
+            "web",
+            "sh",
+            "-c",
+            "exit 7",
+        ])
+        .unwrap_or_else(|e| panic!("the README line must parse: {e}"));
+        match cmd {
+            Command::Compose {
+                action,
+                services,
+                run_cmd,
+                run_rm,
+                ..
+            } => {
+                assert_eq!(action, crate::commands::ComposeAction::Run);
+                assert!(run_rm, "--rm before the service is still a kern flag");
+                assert_eq!(services, vec!["web".to_string()], "one service, not three");
+                assert_eq!(
+                    run_cmd,
+                    vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
+                    "`-c` belongs to the command, not to kern"
+                );
+            }
+            other => panic!("must be a compose run: {other:?}"),
+        }
+
+        // POSITIVE CONTROL: for any OTHER verb the same words are service selectors, and a stray
+        // flag is still refused. Without this the test passes on a parser that stopped reading
+        // flags everywhere.
+        assert!(
+            p(&["compose", "stack.yml", "logs", "web", "-c", "x"]).is_err(),
+            "outside `run`, an unknown flag is still a usage error"
+        );
+    }
+
+    /// `--wait-timeout N` implies `--wait`, because a bound with nothing to bound is a typo that
+    /// would otherwise return instantly and look like success.
+    #[test]
+    fn wait_timeout_implies_wait_and_takes_seconds() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let (_, cmd) = p(&["compose", "s.yml", "up", "-d", "--wait-timeout", "8"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match cmd {
+            Command::Compose {
+                wait_ready,
+                wait_timeout,
+                ..
+            } => {
+                assert!(wait_ready, "a timeout implies the wait");
+                assert_eq!(wait_timeout, Some(8));
+            }
+            other => panic!("must be a compose up: {other:?}"),
+        }
+        assert!(
+            p(&["compose", "s.yml", "up", "--wait-timeout", "soon"]).is_err(),
+            "a non-numeric bound is a typo, not a default"
         );
     }
 

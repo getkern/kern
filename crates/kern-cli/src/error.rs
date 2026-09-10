@@ -42,6 +42,15 @@ pub enum Error {
     /// where profiles live.
     Cli(String),
     Usage(&'static str),
+    /// A WORKLOAD's own exit status, to be adopted as kern's.
+    ///
+    /// `compose run <service> <command>` is transparent about what the command did: a test runner
+    /// that exits 3 must make `kern` exit 3, or a CI job cannot tell a failing suite from a failing
+    /// runtime. Carried as an error variant rather than a `process::exit` inside the command layer,
+    /// because that layer returns `Result` and the mapping to a status happens in exactly one place
+    /// (see `main`). It prints NOTHING: the command already said whatever it had to say on its own
+    /// stdout, and "error: exited 3" underneath would be kern narrating someone else's result.
+    Workload(i32),
 }
 
 impl Error {
@@ -53,6 +62,9 @@ impl Error {
             // remains are collected, which is two verbs because they are two decisions. An outside
             // reviewer typed it, and so does everyone arriving from Docker; kern's own README
             // shipped it once. Naming the pair costs one line and absorbs the habit.
+            // A workload's own status carries no hint: kern has nothing to add about someone
+            // else's exit code.
+            Error::Workload(_) => None,
             Error::UnknownCommand(c) => Some(match c.as_str() {
                 "rm" => "kern has no `rm`: `kern stop <name>` ends a box and `kern gc` collects \
                          what stopped boxes left behind. For an image it is `kern rmi`, for a \
@@ -233,6 +245,8 @@ impl std::fmt::Display for Error {
             Error::Config(why) => write!(f, "config: {why}"),
             Error::Cli(why) => write!(f, "{why}"),
             Error::Usage(u) => write!(f, "usage: kern {u}"),
+            // Deliberately empty: `main` never prints this one. See the variant's doc.
+            Error::Workload(_) => Ok(()),
         }
     }
 }

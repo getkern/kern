@@ -131,6 +131,10 @@ fn main() -> ExitCode {
     // `Result`, never calls `process::exit` itself).
     match cli::run(&args) {
         Ok(()) => ExitCode::SUCCESS,
+        // A WORKLOAD'S OWN STATUS, adopted verbatim and printed nowhere: `compose run` is
+        // transparent about what the command it ran did. `as u8` is the whole range a process exit
+        // status has; a code outside it cannot be produced by `WEXITSTATUS`.
+        Err(error::Error::Workload(code)) => ExitCode::from(code as u8),
         Err(e) => {
             // These two lines are the ONLY place an error reaches the user, so they are where the
             // control characters come off. An error message can carry a string kern did not write:

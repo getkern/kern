@@ -322,3 +322,49 @@ Nine of the twelve are not compose files at all by name (`.bak`, `.dist`, `.old`
 
 The refusals are agreement with Docker, so the 95% ceiling on the neutral corpus is bounded by files
 Docker cannot read either, not by kern's parser.
+
+## 24. `compose run`
+
+```
+Docker 29.6.2                                        kern
+  run --rm web sh -c 'echo $DATABASE_URL $(pwd)'
+    postgres://x /tmp                                  postgres://x /tmp
+  the service's depends_on come up, alone              same (db up, web not)
+  run --rm web sh -c 'exit 7'   ->  7                  7
+  the service's published ports are NOT taken          same (nothing binds 8055)
+```
+
+kern brings the dependencies up by re-invoking `up -d <deps>`, so `service_healthy`, `profiles:`
+and pod creation are `up`'s and cannot drift from it. The one-off joins the stack's pod when there
+is one, so it reaches `db` by name exactly as the service would.
+
+`--service-ports` is not implemented: the ports stay unpublished, which is Docker's default.
+
+## 25. `up --wait`
+
+Four cases, measured on Docker 29.6.2 and reproduced here:
+
+| case | Docker | kern |
+|---|---|---|
+| no healthcheck, service stays up | exit 0, 1 s | exit 0, 0 s |
+| healthcheck flips at 6 s | exit 0, 7 s | exit 0, 6 s |
+| healthcheck never passes, `--wait-timeout 8` | exit 1, 8 s | exit 1, 8 s |
+| service exits 0 immediately, no healthcheck | exit 1, 1 s | exit 1, 0 s |
+
+The last row is the one worth stating: "ready" means still there, so a one-shot that finished is a
+failure for `--wait` under both runtimes, whatever its status.
+
+Default bound: Docker waits forever, kern uses its own condition timeout, the same one
+`depends_on: service_healthy` already waits under.
+
+## 26. `--build`
+
+```
+Dockerfile edited between two runs, then `up`:
+  Docker without --build   VERSIONE_UNO     (the image it built before)
+  Docker with --build      VERSIONE_DUE
+  kern, always             VERSIONE_DUE
+```
+
+kern rebuilds a `build:` service whose context changed, so `--build` names what already happens and
+is accepted silently. `--no-build` asks for the stale image and is refused by name.

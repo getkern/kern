@@ -4309,6 +4309,13 @@ pub enum ComposeAction {
     Pull,
     /// Parse, interpolate and validate, then print the resolved services. No side effects.
     Config,
+    /// `run <service> [command…]`: one-off box from a service's definition, in the foreground.
+    ///
+    /// The step 2 of nearly every project README (`run --rm web python manage.py migrate`), and the
+    /// verb two independent reviewers both put first among what kern was missing. It brings the
+    /// service's dependencies up exactly as `up` does, because it IS `up`: the dependencies are
+    /// started by re-invoking this binary rather than by a second copy of the ordering rules.
+    Run,
     /// `watch [service...]`: rebuild and restart a service when its `build:` context changes, and
     /// nothing else. Blocks until interrupted. See [`watch`] for the failure modes it handles.
     Watch,
@@ -4340,6 +4347,7 @@ pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
     ("watch", ComposeAction::Watch),
     ("port", ComposeAction::Port),
     ("systemd", ComposeAction::Systemd),
+    ("run", ComposeAction::Run),
 ];
 
 impl ComposeAction {
@@ -6622,7 +6630,10 @@ fn run_terminal_verb(
                 names.len()
             );
         }
-        ComposeAction::Up | ComposeAction::Start => {}
+        // `Run` is terminal but does its work in `compose()`, where the pod name, the project
+        // directory and the resolved box flags all are. It falls through here for the same reason
+        // `Up` does: this function answers "did a read-only verb already finish", and it did not.
+        ComposeAction::Up | ComposeAction::Start | ComposeAction::Run => {}
     }
     Ok(false)
 }
@@ -6633,6 +6644,17 @@ pub struct ComposeOpts<'a> {
     /// One or more compose files, merged left-to-right (`-f base.yml -f override.yml`).
     pub files: &'a [String],
     pub action: ComposeAction,
+    /// `--wait`: hold after `up` until every service started is ready. See
+    /// [`crate::cli::Command::Compose::wait_ready`] for the measured semantics.
+    pub wait_ready: bool,
+    /// `--wait-timeout N` in seconds; `None` uses kern's own condition timeout.
+    pub wait_timeout: Option<u64>,
+    /// The argv after `run <service>`; empty means the service's own `command:`.
+    pub run_cmd: &'a [String],
+    /// `run --rm`.
+    pub run_rm: bool,
+    /// `--no-deps`.
+    pub no_deps: bool,
     /// `-v` on `down`: also delete the named volumes this project owns (see
     /// [`remove_project_volumes`] for the three conditions that bound what it deletes).
     pub remove_volumes: bool,

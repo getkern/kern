@@ -438,7 +438,6 @@ fn docker_only_verb_hint(word: &str, on_box: Option<&str>) -> Option<String> {
     let target = on_box.unwrap_or("<box>");
     let what = match word {
         "exec" => format!("`kern exec {target} <command>`"),
-        "run" => "`kern box --image <image> -- <command>` (kern has no `compose run`)".to_string(),
         "kill" => format!("`kern kill {target}`"),
         "cp" => format!("`kern cp {target}:<path> <path>`"),
         "wait" => format!("`kern wait {target}`"),
@@ -452,10 +451,16 @@ fn docker_only_verb_hint(word: &str, on_box: Option<&str>) -> Option<String> {
         "version" => "`kern --version`".to_string(),
         _ => return None,
     };
+    // THE VERB LIST IS DERIVED, not retyped. `run` was in the table above until kern grew the verb,
+    // and a hand-written list here would still be telling readers it does not exist.
+    let verbs: Vec<&str> = crate::commands::COMPOSE_VERBS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
     Some(format!(
         "'{word}' is a `docker compose` verb that kern's compose does not have; run \
-         {what}. kern compose takes: up, down, stop, start, restart, ps, logs, build, pull, config, \
-         watch, port, systemd."
+         {what}. kern compose takes: {}.",
+        verbs.join(", ")
     ))
 }
 
@@ -551,6 +556,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         allow_device_grants,
         detach,
         remove_volumes,
+        wait_ready,
+        wait_timeout,
+        run_cmd,
+        run_rm,
+        no_deps,
         tail,
         follow,
         all,
@@ -1414,6 +1424,22 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // to absolute (confined under the compose dir - traversal guard, like a build context). A `named:`
     // source or an already-absolute `/host:/dst` passes through untouched.
     resolve_relative_binds(&mut boxes, file)?;
+
+    // `run` DIVERGES HERE, after the builds and the bind resolution and before the bring-up: it
+    // needs a service's fully resolved definition and none of the stack-wide launch that follows.
+    if action == ComposeAction::Run {
+        return compose_run(
+            &mut boxes,
+            &pod,
+            file,
+            services,
+            run_cmd,
+            run_rm,
+            no_deps,
+            &self_exe,
+            &project_dir,
+        );
+    }
 
     // A fresh epoch token for THIS `up`. Stamped into every `depends_completed` target's exit sidecar
     // and required to match on read, so a sidecar left by a previous `up` of the same stack can't
@@ -2475,6 +2501,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         println!("  pod '{pod}': {net}. tear down with `kern compose {file} down`.");
     }
     // ATTACHED `up`. Everything above is unchanged; this is the part `docker compose up` does next.
+    // `--wait` BEFORE the attach decision: both spellings of `up` mean the same thing by it, and a
+    // CI job that asked to wait must have waited by the time this call returns either way.
+    if wait_ready {
+        wait_until_ready(&mine, wait_timeout)?;
+    }
     if !detach {
         if should_attach(detach, unsafe { libc::isatty(1) } == 1) {
             return attach_to_stack(&mine, &boxes, &pod, file);
@@ -2491,6 +2522,182 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
              the stack, as `docker compose up` does."
         );
     }
+    Ok(())
+}
+
+/// `compose run [--rm] [--no-deps] <service> [command…]`: a one-off box from a service definition.
+///
+/// THE VERB TWO INDEPENDENT REVIEWERS BOTH PUT FIRST. It is step 2 of nearly every project README
+/// (`run --rm web python manage.py migrate`, `run --rm app npm test`, `run --rm db psql`), and
+/// nothing kern had could stand in for it: the service's environment, volumes, working directory,
+/// user and network, with a different command, once.
+///
+/// THE DEPENDENCIES ARE BROUGHT UP BY RE-INVOKING THIS BINARY, not by a second copy of the ordering
+/// rules. `up -d <deps>` already expands the graph, waits on `service_healthy`, honours profiles and
+/// creates the pod; a `run` that reimplemented any of that would drift from it on the first change.
+/// The cost is one process, which is what every service in a stack already costs.
+///
+/// PORTS ARE NOT PUBLISHED, which is Docker's rule and not tidiness: the service's own box may be
+/// running and holding those host ports, so publishing them would make `run` fail with a bind
+/// conflict against the very stack it is meant to join.
+///
+/// THE EXIT CODE IS THE COMMAND'S. `run --rm web sh -c 'exit 7'` exits 7 under Docker (measured on
+/// 29.6.2) and here, through [`Error::Workload`], so a CI job can tell a failing test suite from a
+/// failing runtime.
+#[allow(clippy::too_many_arguments)]
+fn compose_run(
+    boxes: &mut [crate::compose::ComposeBox],
+    pod: &str,
+    file: &str,
+    selected: &[String],
+    cmd: &[String],
+    rm: bool,
+    no_deps: bool,
+    self_exe: &std::path::Path,
+    project_dir: &std::path::Path,
+) -> Result<(), Error> {
+    let Some(target) = selected.first() else {
+        return Err(Error::Compose(format!(
+            "run needs a service: `kern compose {file} run <service> [command…]`"
+        )));
+    };
+    let Some(idx) = boxes.iter().position(|b| &b.name == target) else {
+        return Err(Error::Compose(format!(
+            "run: no service '{target}' in {file}"
+        )));
+    };
+
+    // 1. THE DEPENDENCIES, through `up` itself.
+    let deps: Vec<String> = boxes
+        .get(idx)
+        .map(|b| b.depends_on.clone())
+        .unwrap_or_default();
+    if !no_deps && !deps.is_empty() {
+        // The names as the FILE writes them: `up` maps its own selectors onto box names, and
+        // `depends_on` holds file names.
+        let mut up = std::process::Command::new(self_exe);
+        up.current_dir(project_dir);
+        up.arg("compose").arg(file).arg("up").arg("-d");
+        for d in &deps {
+            up.arg(d);
+        }
+        let st = up
+            .status()
+            .map_err(|e| Error::Compose(format!("run: starting dependencies: {e}")))?;
+        if !st.success() {
+            return Err(Error::Compose(format!(
+                "run: the dependencies of '{}' did not come up",
+                boxes.get(idx).map_or(target.as_str(), |b| b.service_name())
+            )));
+        }
+    }
+
+    // 2. THE ONE-OFF BOX. A distinct name, because the service's own box may be running and box
+    // names are global. Docker's is `<project>-<service>-run-<hash>`; this is the same idea with the
+    // pid, which is unique among live boxes by construction.
+    let Some(b) = boxes.get_mut(idx) else {
+        return Err(Error::Compose("run: the service disappeared".to_string()));
+    };
+    let one_off = format!("{}-run-{}", b.name, std::process::id());
+    // See the doc: published ports belong to the service's own box, not to a one-off beside it.
+    b.ports.clear();
+    b.expose.clear();
+    let mut c = std::process::Command::new(self_exe);
+    c.current_dir(project_dir);
+    c.arg("box").arg(&one_off);
+    b.push_box_flags(&mut c);
+    // Join the stack's pod when there IS one, so the one-off reaches `db` by name exactly as the
+    // service would. There is none when the stack was never started and the target has no
+    // dependencies, and then a one-off with no peers needs no network of its own.
+    if crate::pod::holder_pid(pod).is_some() {
+        c.arg("--pod").arg(pod);
+    }
+    // The command: what was typed, or the service's own when nothing was.
+    let argv: &[String] = if cmd.is_empty() { &b.command } else { cmd };
+    if !argv.is_empty() {
+        c.arg("--");
+        for a in argv {
+            c.arg(a);
+        }
+    }
+    // FOREGROUND, stdio inherited: this is an interactive one-off and its output is the point.
+    let st = c
+        .status()
+        .map_err(|e| Error::Compose(format!("run: launching '{one_off}': {e}")))?;
+    if rm {
+        // Best effort, and after the fact: a foreground box leaves no running entry, so this only
+        // reaps an exit record the run may have left. Never fails the command, whose status is the
+        // workload's.
+        crate::registry::clear_waitexit_pod(pod, std::slice::from_ref(&one_off));
+    }
+    match st.code() {
+        Some(0) | None => Ok(()),
+        Some(code) => Err(Error::Workload(code)),
+    }
+}
+
+/// `--wait`: hold until every service this invocation started is ready, or say which one is not.
+///
+/// THE FOUR RULES ARE DOCKER'S, MEASURED on 29.6.2 rather than read off the documentation:
+///
+///  * a service WITH a healthcheck must reach `healthy`. One whose check flips at 6 s returned at
+///    7 s with status 0.
+///  * a service WITHOUT a healthcheck only has to be RUNNING: that case returned in 1 second.
+///  * a service that has already EXITED fails the wait, even with status 0 (measured: `command:
+///    ["true"]` and no healthcheck exits 1 after a second). "Ready" means still there, and a
+///    one-shot that finished is not something a CI job can run against.
+///  * `--wait-timeout 8` on a check that never passes exits 1 after 8 seconds.
+///
+/// The default bound is kern's own condition timeout, the same one `depends_on: service_healthy`
+/// already waits under, so a stack cannot wait longer here than it would there. Docker's default is
+/// unbounded; a CLI that hangs forever is the one shape this cannot take.
+fn wait_until_ready(
+    mine: &[&crate::compose::ComposeBox],
+    timeout: Option<u64>,
+) -> Result<(), Error> {
+    use std::time::{Duration, Instant};
+    let limit = timeout.unwrap_or(crate::commands::COMPOSE_CONDITION_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(limit);
+    for b in mine {
+        let has_check = b.health_cmd.is_some() || !b.health_argv.is_empty();
+        loop {
+            // ORDER MATTERS: a box that is gone can still have a stale `healthy` sidecar from the
+            // seconds before it exited, so liveness is read FIRST and decides.
+            let alive = registry::find_ref(&b.name).is_some();
+            if !alive {
+                return Err(Error::Compose(format!(
+                    "--wait: service '{}' is not running. A service that has exited is not ready, \
+                     which is Docker's reading too: `up --wait` on a service whose command simply \
+                     finished exits non-zero there as well.",
+                    b.service_name()
+                )));
+            }
+            if !has_check {
+                break; // running is the whole requirement
+            }
+            match crate::commands::current_health(&b.name).as_str() {
+                "healthy" => break,
+                "unhealthy" => {
+                    return Err(Error::Compose(format!(
+                        "--wait: service '{}' is unhealthy. Its own check is failing; \
+                         `kern compose <file> logs {}` has what it printed.",
+                        b.service_name(),
+                        b.service_name()
+                    )));
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Compose(format!(
+                    "--wait: service '{}' did not become healthy within {limit}s (its check has \
+                     not reported yet). Raise the bound with `--wait-timeout N`.",
+                    b.service_name()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    println!("compose up: {} service(s) ready", mine.len());
     Ok(())
 }
 
