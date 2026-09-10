@@ -159,12 +159,15 @@ pub fn render_unit(spec: &UnitSpec<'_>) -> Result<String, Error> {
          {network}\
          \n\
          [Service]\n\
-         # `up` starts detached boxes and exits, so the unit is `oneshot` + `RemainAfterExit`:\n\
+         # `up -d` starts detached boxes and exits, so the unit is `oneshot` + `RemainAfterExit`:\n\
          # with `Type=simple` systemd would read that exit as the stack having died.\n\
+         # THE `-d` IS WRITTEN OUT rather than left to the default. Without it, `up` streams the\n\
+         # stack's logs when stdout is a terminal, and a unit that depended on the default would\n\
+         # be one behaviour change away from hanging in `activating` until TimeoutStartSec.\n\
          Type=oneshot\n\
          RemainAfterExit=yes\n\
          WorkingDirectory={dir_q}\n\
-         ExecStart={bin_q} compose {file_q} up\n\
+         ExecStart={bin_q} compose {file_q} up -d\n\
          ExecStop={bin_q} compose {file_q} down\n\
          # `up` pulls images on first boot, which can outlast the default 90s.\n\
          TimeoutStartSec=600\n\

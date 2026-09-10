@@ -18,7 +18,9 @@ Usage:
     e2e-semantic.py [--kern PATH] [--json] [--only NAME]   run the battery
     e2e-semantic.py --self-test [--kern PATH]              prove each probe can fail
 
-Exit status is 0 when every probe passes (or is skipped), 1 otherwise, so it can gate a build.
+Exit status is 0 only when every probe PASSED. A skipped probe is a measurement that did not
+happen, so it is red too unless --allow-skip says otherwise: a battery that excluded skips from
+its rate printed "1/1 = 100%" on a host where six of seven fixtures never came up.
 """
 
 import argparse
@@ -30,7 +32,15 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kernbin
+
 IMAGE = os.environ.get("KERN_E2E_IMAGE", "alpine:3.19")
+
+# The detail a check that THREW carries. Named so `--self-test` can tell "the probe measured the
+# broken fixture and reported a mismatch" from "the probe crashed", which is red for the wrong
+# reason and proves nothing about the probe's discriminating power.
+RAISED = "the check raised"
 
 
 class Probe:
@@ -383,7 +393,7 @@ def run_probe(kern, probe, broken=False):
         try:
             ok, detail = probe.check(scratch)
         except Exception as e:  # a probe that throws is a probe that failed, not a crashed battery
-            return "fail", f"the check raised: {e}"
+            return "fail", f"{RAISED}: {e}"
         if ok is None:
             return "skip", detail
         return ("pass" if ok else "fail"), detail
@@ -394,6 +404,8 @@ def run_probe(kern, probe, broken=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kern", default="./target/debug/kern")
+    ap.add_argument("--allow-skip", action="store_true",
+                    help="exit 0 even when a probe could not run (never in a gate)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--only")
     ap.add_argument(
@@ -404,6 +416,11 @@ def main():
     args = ap.parse_args()
     # ABSOLUTE, because every fixture runs with its own scratch directory as the working directory:
     # a relative path would resolve against the fixture and vanish.
+    # The same refusal the rate script makes: a battery run against a binary that is not this tree
+    # measures a build nobody asked about. See scripts/kernbin.py for the identity check.
+    rc = kernbin.require_current(args.kern, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if rc:
+        return rc
     kern = os.path.abspath(args.kern)
     if not os.path.exists(kern):
         print(f"no kern binary at {kern}", file=sys.stderr)
@@ -415,7 +432,11 @@ def main():
         for p in probes:
             status, detail = run_probe(kern, p, broken=True)
             print(f"  {p.name:24} broken fixture -> {status}  ({detail})")
-            if status != "fail":
+            # RED FOR THE RIGHT REASON. `status == "fail"` alone accepts a probe that crashed, and a
+            # crash proves nothing about whether the probe can tell the two fixtures apart: a check
+            # that always threw would pass this self-test while measuring nothing at all. A `skip`
+            # (the fixture never came up) is rejected by the same condition.
+            if status != "fail" or detail.startswith(RAISED):
                 bad.append(p.name)
         if bad:
             print(f"\n{len(bad)} probe(s) could not go red: {', '.join(bad)}")
@@ -431,7 +452,10 @@ def main():
     npass = sum(1 for r in results if r["status"] == "pass")
     nfail = sum(1 for r in results if r["status"] == "fail")
     nskip = sum(1 for r in results if r["status"] == "skip")
-    rate = npass / (npass + nfail) if (npass + nfail) else 0.0
+    # A SKIP IS IN THE DENOMINATOR. It used to be excluded, so a host where six of seven fixtures
+    # never came up printed "1/1 = 100%" and exited 0: the strongest false green a battery can
+    # produce, because the number reads perfect precisely when nothing was measured.
+    rate = npass / len(results) if results else 0.0
     if args.json:
         print(json.dumps({"probes": results, "pass": npass, "fail": nfail, "skip": nskip,
                           "e2e": round(rate, 4)}, indent=2))
@@ -439,10 +463,19 @@ def main():
         for r in results:
             mark = {"pass": "ok  ", "fail": "FAIL", "skip": "skip"}[r["status"]]
             print(f"  {mark} {r['probe']:24} {r['detail']}")
-        print(f"\ne2e-semantic: {npass}/{npass + nfail} = {rate * 100:.0f}%"
-              f"{f' ({nskip} skipped)' if nskip else ''}")
+        print(f"\ne2e-semantic: {npass}/{len(results)} = {rate * 100:.0f}%"
+              f"{f' ({nskip} SKIPPED, counted against the rate)' if nskip else ''}")
         print("this number moves when a runtime difference is closed; the config rate does not")
-    return 0 if nfail == 0 else 1
+    # A SKIPPED PROBE IS A MEASUREMENT THAT DID NOT HAPPEN, so as a gate it is red. `--allow-skip`
+    # is for running the battery by hand on a host that genuinely cannot bring a fixture up; a gate
+    # never passes it, or the battery goes green on the day it stops working.
+    if nfail:
+        return 1
+    if nskip and not args.allow_skip:
+        print(f"\n{nskip} probe(s) skipped: nothing was measured for them. Pass --allow-skip to "
+              f"accept that, or fix the host so the fixtures come up.", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

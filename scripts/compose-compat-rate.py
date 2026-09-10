@@ -18,8 +18,12 @@ Usage:  compose-compat-rate.py <corpus-dir> [--kern PATH] [--verbose]
 import argparse
 import pathlib
 import re
+import os
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kernbin
 from collections import Counter
 
 # A warning that is NOT a behavioural difference from Docker. Every entry states WHY, because the
@@ -133,39 +137,6 @@ def label(line):
     return "UNCLASSIFIED (counted as a difference)"
 
 
-def stale_binary(kern):
-    """Refuse to measure with a binary older than the sources, or with none at all.
-
-    THE INSTRUMENT MEASURED WHATEVER WAS ON DISK. The default is `target/release/kern`, while every
-    edit-and-check cycle in this repo builds `target/debug/kern`, so a whole day's work can be
-    followed by a rate that predates it and says so nowhere. MEASURED: a run reported 38% clean from
-    a binary six hours and 28 source files old; the same corpus with the binary rebuilt reported
-    34%, and the four points were a warning the older build did not emit. A number that names no
-    build is not a measurement.
-
-    Refusing rather than warning, because a rate is quoted: a warning on stderr ends up scrolled
-    past and the figure ends up in a commit message.
-    """
-    exe = pathlib.Path(kern)
-    if not exe.exists():
-        return f"{exe} does not exist. Build it first: cargo build --release --bin kern"
-    built = exe.stat().st_mtime
-    newer = [
-        p
-        for p in pathlib.Path("crates").rglob("*.rs")
-        if p.is_file() and p.stat().st_mtime > built
-    ]
-    if not newer:
-        return None
-    shown = ", ".join(str(p) for p in sorted(newer)[:3])
-    return (
-        f"{exe} is older than {len(newer)} source file(s) ({shown}"
-        f"{', …' if len(newer) > 3 else ''}).\n"
-        f"Rebuild before measuring: cargo build --release --bin kern\n"
-        f"(pass --kern target/debug/kern to measure the debug build instead)"
-    )
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("corpus", type=pathlib.Path)
@@ -173,10 +144,11 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    stale = stale_binary(args.kern)
-    if stale:
-        print(stale, file=sys.stderr)
-        return 2
+    # The shared check: identity first (`kern --version` carries the commit), date only where a
+    # dirty build makes the commit insufficient. See scripts/kernbin.py.
+    rc = kernbin.require_current(args.kern)
+    if rc:
+        return rc
 
     files = sorted(p for p in args.corpus.iterdir() if p.is_file())
     if not files:
@@ -244,7 +216,10 @@ def main():
           f"{pct(shapes['healthcheck'])} a healthcheck; median services/file {median}")
     print(f"ZERO differences    {clean} = {clean * 100 // total}%")
     if refused:
-        print(f"REFUSED             {len(refused)} (not counted as clean; see compose-corpus-gate.py)")
+        print(
+        f"REFUSED             {len(refused)} (not counted as clean; MEASURED on Docker 29.6.2: it "
+        f"refuses the same 12)"
+    )
         for name in refused:
             print(f"                      {name}")
     # THE CEILING, so the rate is read against what closing every remaining difference could buy

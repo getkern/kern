@@ -964,7 +964,11 @@ pub fn docker_socket_note(boxes: &[ComposeBox]) -> Option<String> {
         "these services mount the Docker socket: {}. kern is DAEMONLESS: it runs no Docker daemon \
          and serves no Engine API, so the mount carries whatever that path holds on this host and \
          the service's Docker client has nothing to talk to. There is no kern equivalent; such a \
-         service needs real Docker",
+         service needs real Docker. WHAT YOU WILL SEE: the service starts, reports healthy if its \
+         check does not exercise the socket, and then fails in ITS OWN log with a connection error \
+         that reads as a Docker problem rather than as this note. On this corpus the service \
+         holding the socket is the whole stack in 8 files of 14 and the front proxy in 5 more, so \
+         the rest of the stack rarely survives it either",
         name_list(&users)
     ))
 }

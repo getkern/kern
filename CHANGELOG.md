@@ -7,6 +7,44 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**The regression gate was grading the wrong binary.** `compose-corpus-gate.py` preferred
+`target/release/kern` and fell back to debug, while every edit-and-check cycle here builds debug, so
+the gate that decides whether a change ships kept measuring a build from before the change. An audit
+found SEVENTEEN scripts invoking a binary by a default path and exactly one checking that the binary
+was current. The check now lives in `scripts/kernbin.py` and is shared by the rate, the corpus gate,
+the wiring census and the e2e battery, and it is the build's IDENTITY rather than its date:
+`kern --version` carries `git describe`, so the commit it was built from is compared with `HEAD`.
+That catches what a timestamp cannot, and did while it was being written, a release binary a whole
+commit behind `HEAD` with an mtime that looked perfectly fresh. Date is consulted only where the
+hash cannot decide, for a build from a dirty tree.
+
+**A skipped e2e probe counted as a pass.** The rate excluded skips from its denominator, so a host
+where six of seven fixtures never came up printed `1/1 = 100%` and exited 0: the strongest false
+green a battery can produce, because the number reads perfect exactly when nothing was measured.
+Skips are in the denominator now and are red unless `--allow-skip` says otherwise. The self-test
+also rejects a broken fixture that failed because the CHECK THREW: a probe that always crashed used
+to satisfy "each probe can go red" while discriminating nothing.
+
+**The 12 files kern refuses, Docker refuses too.** Measured on Docker 29.6.2, all twelve: three
+YAML scanner errors, two `services must be a mapping`, two failed interpolations, and the rest
+unparseable. The refusals are agreement, not a parser gap, so the 95% ceiling is bounded by files
+Docker cannot read either. The rate says so instead of leaving it to the corpus gate.
+
+**`up` deviates from Docker when stdout is not a terminal, and now says so.** Measured on Docker
+29.6.2: `timeout 5 sh -c 'docker compose up 2>&1 | cat'` exits 124, a plain redirect exits 124, and
+so does a run with stdin closed. Docker attaches whatever stdout is; only `-d` returns. kern returns
+on a pipe, because `kern compose <file> systemd` emits a unit that is `Type=oneshot` +
+`RemainAfterExit=yes`, which requires `up` to exit: a unit whose `ExecStart` blocked would sit in
+`activating` until `TimeoutStartSec` and fail, taking every deployed stack with it. A note on stderr
+now names the split, the generated unit spells `-d` so it no longer depends on any default, and the
+decision is a function with a test on all four of its cases.
+
+**The Docker-socket warning predicts where the failure will appear.** The service starts, reports
+healthy if its check does not exercise the socket, and then fails in ITS OWN log with a connection
+error that reads as a Docker problem rather than as kern's note. Measured on the 14 corpus files
+that mount it: in 8 the socket-mounting service is the whole stack, in 5 more it is the front proxy
+with a dependent, so the rest of the stack rarely survives it either.
+
 **A named volume belonged to every stack that used its name.** kern mounted `data:/var/lib/x` at
 `<volumes dir>/data`, with nothing in the path naming the project, so two unrelated stacks that both
 declare the ordinary names - `data`, `db_data`, `pgdata`, `redis-data` - shared ONE directory.

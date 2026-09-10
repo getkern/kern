@@ -293,3 +293,32 @@ that checks it now learns something true.
 stops the stack. kern does the same WHEN STDOUT IS A TERMINAL. Piped or redirected - a CI script, a
 systemd unit, the SDK - it keeps returning as soon as the stack is up, because a follow that ends
 only on a signal would hang a caller that cannot send one. `-d` is explicit and works either way.
+
+## 22b. `up` on a pipe: the deviation, and the contract that forces it
+
+```
+Docker 29.6.2, service that loops forever:
+  timeout 5 sh -c 'docker compose up 2>&1 | cat'   EXIT=124   (attached, killed by timeout)
+  timeout 5 sh -c 'docker compose up > file 2>&1'  EXIT=124
+  timeout 5 sh -c 'docker compose up </dev/null 2>&1 | cat'   EXIT=124
+  timeout 5 sh -c 'docker compose up -d'           EXIT=0
+```
+
+Docker attaches whatever stdout is. kern attaches only on a terminal, and the reason is its own
+systemd integration: `kern compose <file> systemd` emits `Type=oneshot` with `RemainAfterExit=yes`,
+a shape that requires `up` to EXIT. A unit whose `ExecStart` blocked would sit in `activating` until
+`TimeoutStartSec` and then fail, and every stack deployed that way would go with it. Docker's
+equivalent unit writes `-d` or uses `Type=simple`.
+
+Two consequences, both shipped rather than assumed: the generated unit now writes `-d` explicitly,
+so it does not depend on this decision at all, and a piped `up` prints a note naming what it did.
+The decision itself is a function with a test over all four of `(detach, stdout is a tty)`.
+
+## 23. The 12 files kern refuses
+
+Docker 29.6.2 refuses all twelve: three YAML scanner errors, two `services must be a mapping`, two
+failed interpolations (`${VAR:?}` with nothing to substitute), and the rest unparseable at load.
+Nine of the twelve are not compose files at all by name (`.bak`, `.dist`, `.old`, `.md`, `-e`).
+
+The refusals are agreement with Docker, so the 95% ceiling on the neutral corpus is bounded by files
+Docker cannot read either, not by kern's parser.

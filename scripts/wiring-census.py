@@ -21,10 +21,19 @@ advisory and a decision, so it was one run's variance and was not chased. Record
 spends the hour again.
 """
 import os, subprocess, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kernbin
 from pathlib import Path
 
 CORPUS = Path(os.environ.get("KERN_COMPOSE_CORPUS", "/var/tmp/kern-corpus/files"))
 KERN = os.environ.get("KERN_BIN", "/home/alex/dev/kern-compat/target/debug/kern")
+# A census is a number, so it refuses a binary that is not this tree, like the rate script and the
+# corpus gate. See scripts/kernbin.py: the check is the build's own commit, not its date.
+_why = kernbin.why_not_current(KERN, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _why:
+    print(_why, file=sys.stderr)
+    sys.exit(2)
 counts = {"pod": 0, "pod_one_service": 0, "bridge": 0, "relays": 0, "refused": 0, "unknown": 0}
 relay_files = []
 for f in sorted(CORPUS.iterdir()):

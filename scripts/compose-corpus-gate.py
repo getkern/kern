@@ -29,6 +29,9 @@ because a gate that silently passes when its input is missing is worse than no g
 import os
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kernbin
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,17 +44,29 @@ CORPUS = Path(os.environ.get("KERN_COMPOSE_CORPUS", "/var/tmp/kern-corpus/files"
 TIMEOUT_S = 20
 
 
-def kern_binary() -> Path | None:
-    """The binary to test, preferring a release build and falling back to debug.
+def kern_binary() -> tuple[Path | None, list[str]]:
+    """The binary to test: the first that exists AND represents this working tree.
 
-    `None` when neither exists, which is a skip and not a failure: this gate is run by hand and by
-    `pentest/run-all.sh`, and neither should fail because nobody built first.
+    Returns `(binary, reasons_the_others_were_rejected)`. `(None, [])` means nobody has built, which
+    is a skip and not a failure: this gate is run by hand and by `pentest/run-all.sh`, and neither
+    should fail because of that. `(None, [why, …])` means a binary exists and is NOT this tree,
+    which is a failure - this is the gate that decides whether a change ships, and a green from a
+    binary that predates the change decides nothing.
+
+    IT PREFERRED RELEASE, and that is how the defect arrived: every edit-and-check cycle here builds
+    debug, so the gate kept grading a release binary from before the change. Caught in this repo
+    with the release binary a whole commit behind `HEAD` and an mtime that looked fresh.
     """
+    stale: list[str] = []
     for rel in ("target/release/kern", "target/debug/kern"):
         p = ROOT / rel
-        if p.is_file() and os.access(p, os.X_OK):
-            return p
-    return None
+        if not (p.is_file() and os.access(p, os.X_OK)):
+            continue
+        why = kernbin.why_not_current(str(p), ROOT)
+        if why is None:
+            return p, stale
+        stale.append(why)
+    return None, stale
 
 
 def outcomes(kern: Path, files: list[Path]) -> dict[str, int]:
@@ -114,10 +129,15 @@ def main() -> int:
         print(f"SKIP: {CORPUS} holds no files")
         return 0
 
-    kern = kern_binary()
-    if kern is None:
+    kern, stale = kern_binary()
+    if kern is None and not stale:
         print("SKIP: no kern binary built (cargo build [--release])")
         return 0
+    if kern is None:
+        print("no kern binary represents this working tree:", file=sys.stderr)
+        for why in stale:
+            print(f"  {why}", file=sys.stderr)
+        return 2
 
     res = outcomes(kern, files)
     accepted = sum(1 for v in res.values() if v == 0)

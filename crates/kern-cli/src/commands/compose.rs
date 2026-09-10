@@ -2475,10 +2475,44 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         println!("  pod '{pod}': {net}. tear down with `kern compose {file} down`.");
     }
     // ATTACHED `up`. Everything above is unchanged; this is the part `docker compose up` does next.
-    if !detach && unsafe { libc::isatty(1) } == 1 {
-        return attach_to_stack(&mine, &boxes, &pod, file);
+    if !detach {
+        if should_attach(detach, unsafe { libc::isatty(1) } == 1) {
+            return attach_to_stack(&mine, &boxes, &pod, file);
+        }
+        // THE SPLIT IS ANNOUNCED, because a command with two behaviours decided by a property of
+        // the caller is exactly the shape this codebase refuses to leave silent. Docker attaches
+        // either way (measured on 29.6.2: `timeout 5 sh -c 'docker compose up 2>&1 | cat'` exits
+        // 124, and so does a plain redirect and a run with stdin closed; only `-d` exits 0), so
+        // this line is where kern says it did something else and why the reader may not have
+        // noticed.
+        eprintln!(
+            "kern: note: stdout is not a terminal, so `up` returned instead of streaming the \
+             stack. `-d` says so explicitly; on a terminal it follows the logs and Ctrl-C stops \
+             the stack, as `docker compose up` does."
+        );
     }
     Ok(())
+}
+
+/// Does this `up` stream the stack, or return as soon as it is up?
+///
+/// A FUNCTION AND NOT AN INLINE `&&`, so the polarity is testable. Getting it backwards is a defect
+/// with no visible symptom on the machine that writes it: an interactive `up` that returns looks
+/// like the old behaviour, and a piped `up` that attaches hangs somebody else's script.
+///
+/// WHERE THIS DEVIATES FROM DOCKER, MEASURED rather than assumed. `docker compose up` attaches
+/// whatever stdout is: on Docker 29.6.2, `timeout 5 sh -c 'docker compose up 2>&1 | cat'` exits
+/// 124, a plain `> file` redirect exits 124, stdin closed exits 124, and only `-d` exits 0. kern
+/// returns on a pipe, and says so on stderr.
+///
+/// THE REASON IS KERN'S OWN CONTRACT WITH SYSTEMD. `kern compose <file> systemd` emits a unit that
+/// is `Type=oneshot` + `RemainAfterExit=yes`, which requires `up` to EXIT: a unit whose `ExecStart`
+/// blocked would sit in `activating` until `TimeoutStartSec` and then fail, taking every deployed
+/// stack with it. Docker's equivalent unit writes `-d` or uses `Type=simple`. The generated unit now
+/// writes `-d` explicitly, so it no longer depends on this decision at all, and the deviation is
+/// recorded in docs/RUNTIME-PARITY.md.
+fn should_attach(detach: bool, stdout_is_tty: bool) -> bool {
+    !detach && stdout_is_tty
 }
 
 /// Stream a just-started stack until it exits or Ctrl-C, then tear it down: `docker compose up`
@@ -2556,6 +2590,46 @@ fn attach_to_stack(
 mod tests {
     use super::*;
     use crate::compose::ComposeBox;
+
+    /// THE FOUR CASES OF THE ATTACH DECISION, because three of them are wrong in a way nobody on
+    /// the machine that wrote them would notice.
+    ///
+    /// The one that costs the most is `(false, false)`: a piped `up` that attached would hang every
+    /// script, and the unit `kern compose <file> systemd` emits is `Type=oneshot` +
+    /// `RemainAfterExit=yes`, so it would sit in `activating` until `TimeoutStartSec` and fail.
+    #[test]
+    fn up_streams_on_a_terminal_and_returns_everywhere_else() {
+        assert!(should_attach(false, true), "a bare `up` on a tty streams");
+        assert!(
+            !should_attach(false, false),
+            "a bare `up` on a pipe must RETURN: a systemd unit is `oneshot` and needs the exit"
+        );
+        assert!(!should_attach(true, true), "`-d` wins on a tty");
+        assert!(!should_attach(true, false), "`-d` wins on a pipe");
+    }
+
+    /// THE GENERATED UNIT DOES NOT DEPEND ON A DEFAULT. It is `Type=oneshot` + `RemainAfterExit`,
+    /// which requires `up` to exit; written without `-d` it was one behaviour change away from
+    /// hanging in `activating`, and that change was made in this same session.
+    #[test]
+    fn the_systemd_unit_asks_for_detach_explicitly() {
+        let unit = crate::systemd::render_unit(&crate::systemd::UnitSpec {
+            kern_bin: "/usr/local/bin/kern",
+            compose_file: "/srv/app/compose.yaml",
+            workdir: "/srv/app",
+            project: "app",
+            scope: crate::systemd::UnitScope::User,
+        })
+        .expect("the unit renders");
+        assert!(
+            unit.contains("compose") && unit.contains("up -d"),
+            "ExecStart must spell `-d`, not rely on the default: {unit}"
+        );
+        assert!(
+            unit.contains("Type=oneshot") && unit.contains("RemainAfterExit=yes"),
+            "and the unit shape that REQUIRES the exit must still be the one asserted: {unit}"
+        );
+    }
 
     /// THE OVERRIDE FILE IS FOUND, and only where Docker finds one.
     ///
