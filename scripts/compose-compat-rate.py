@@ -176,6 +176,29 @@ def main():
 
     total = len(files)
     print(f"corpus              {total} files, one per repository")
+    # WHAT THE CORPUS IS MADE OF, printed with the rate and not left for the reader to assume.
+    # "One file per repository" is neutral about repositories and NOT about stacks: it favours the
+    # small ones. Measured on this corpus: a third of it is single-service files, for which several
+    # of the differences below cannot arise at all. A rate quoted without this denominator invites
+    # the reading that every point applies to every file.
+    shapes = {"multi": 0, "networks": 0, "healthcheck": 0}
+    counts = []
+    for f in files:
+        body = f.read_text(errors="replace")
+        n = len(re.findall(r"^  [A-Za-z0-9_.-]+:\s*$", body, re.M))
+        counts.append(n)
+        if n >= 2:
+            shapes["multi"] += 1
+        if re.search(r"^networks:", body, re.M):
+            shapes["networks"] += 1
+        if re.search(r"^\s+healthcheck:", body, re.M):
+            shapes["healthcheck"] += 1
+    counts.sort()
+    median = counts[len(counts) // 2] if counts else 0
+    pct = lambda n: f"{n * 100 // total}%" if total else "0%"
+    print(f"                    {pct(shapes['multi'])} have 2+ services, "
+          f"{pct(shapes['networks'])} declare `networks:`, "
+          f"{pct(shapes['healthcheck'])} a healthcheck; median services/file {median}")
     print(f"ZERO differences    {clean} = {clean * 100 // total}%")
     if refused:
         print(f"REFUSED             {len(refused)} (not counted as clean; see compose-corpus-gate.py)")

@@ -3759,6 +3759,42 @@ fn apply_cmd_entrypoint(
     }
 }
 
+/// Apply a DECLARATION-only instruction (`HEALTHCHECK`, `STOPSIGNAL`) to the image config.
+///
+/// ONE PLACE, FOR THE SAME REASON AS `apply_cmd_entrypoint`: the flat and the layer-cached build
+/// loops both reach it, and a rule written twice is a rule that drifts. Neither instruction touches
+/// the filesystem, so neither advances the layer key.
+///
+/// `HEALTHCHECK NONE` CLEARS an inherited check rather than storing the word: that is Docker's
+/// meaning, and storing `["NONE"]` would leave the runtime to interpret a sentinel it has no reason
+/// to know about. The runtime asks one question, "is there a check", and this answers it.
+fn apply_declaration(config: &mut kern_oci::ImageConfig, ins: &crate::dockerfile::Instr) {
+    use crate::dockerfile::Instr;
+    match ins {
+        Instr::StopSignal(sig) => config.stop_signal = Some(sig.clone()),
+        Instr::Healthcheck {
+            test,
+            interval_ns,
+            timeout_ns,
+            start_period_ns,
+            retries,
+        } => {
+            if test.first().is_some_and(|t| t == "NONE") {
+                config.healthcheck = None;
+            } else {
+                config.healthcheck = Some(kern_oci::ImageHealthcheck {
+                    test: test.clone(),
+                    interval_ns: *interval_ns,
+                    timeout_ns: *timeout_ns,
+                    start_period_ns: *start_period_ns,
+                    retries: *retries,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Resolve a `WORKDIR` operand: absolute stays as-is, relative joins onto the previous workdir
 /// (default `/`), matching Docker.
 fn resolve_workdir(prev: Option<&str>, d: &str) -> String {
@@ -4327,14 +4363,63 @@ impl ComposeAction {
 /// One race remains for pure name-scoping: `down A` stops A's `migrate`, a concurrent `up B`
 /// re-creates a `migrate` box, then A's reap would delete B's fresh sidecar. Closed BY CONSTRUCTION:
 /// a box's sidecars are reaped ONLY if that box is no longer alive.
-fn stop_stack(names: Vec<String>, pod: &str) -> Vec<String> {
-    let _ = stop(&names, false); // best-effort - some may already be gone
+fn stop_stack(boxes: &[crate::compose::ComposeBox], selected: &[String], pod: &str) -> Vec<String> {
+    // DEPENDENTS FIRST, AND ONE LEVEL AT A TIME. Docker stops a service before the services it
+    // depends on, and waits for a level to exit (or exhaust its grace) before signalling the next.
+    //
+    // kern signalled the whole stack at once. MEASURED with a trap that timestamps both the signal
+    // and its own exit, on `a` depending on `b`: both traps fired in the same centisecond and the
+    // whole `down` cost 3011 ms, which is ONE trap and not two. The consequence is not cosmetic: an
+    // application writing to a database receives SIGTERM at the same instant as the database, so the
+    // write it is in the middle of has nowhere to land.
+    //
+    // `stop` is already two-phase - it signals its batch, then waits per box - so calling it once
+    // per level in reverse order is exactly the semantics, with no second mechanism. A level whose
+    // boxes are already gone returns `NotRunning`, which is why the result stays best-effort.
+    //
+    // WHAT IT COSTS, so nobody reads a slow teardown as a hang: a five-level stack with a ten-second
+    // grace can take fifty seconds to stop, and that is what Docker does with the same file.
+    // THE ORDER COMES FROM THE WHOLE GRAPH, THE SET FROM THE SELECTION. `compose stop web` stops one
+    // service, and the level it belongs to is still decided by every edge in the file: intersecting
+    // afterwards keeps one rule instead of two.
+    let names: Vec<String> = selected.to_vec();
+    for batch in stop_batches(boxes, &names) {
+        let _ = stop(&batch, false);
+    }
     for n in &names {
         if !is_box_alive(n) {
             registry::clear_exit_matching(&exit_key_prefix(pod), &format!("-{n}"));
         }
     }
     names
+}
+
+/// The batches a teardown signals, in the order it signals them: dependents first, one dependency
+/// level at a time, intersected with the services actually being stopped.
+///
+/// SPLIT OUT SO THE ORDER IS TESTABLE WITHOUT STOPPING ANYTHING. The rule is two lines and the cost
+/// of getting it wrong is a database that receives SIGTERM in the same instant as the application
+/// writing to it, which no test that only checks "everything stopped" can see.
+///
+/// A GRAPH THAT DOES NOT SORT STILL HAS TO STOP: `up` refuses a cycle, so an unsortable graph is
+/// reachable only for a stack whose file changed under a running deployment. That falls back to one
+/// batch with everything in it, which is what the teardown did before it had an order at all.
+fn stop_batches(boxes: &[crate::compose::ComposeBox], selected: &[String]) -> Vec<Vec<String>> {
+    let Ok(levels) = crate::compose::topo_levels(boxes) else {
+        return vec![selected.to_vec()];
+    };
+    levels
+        .iter()
+        .rev()
+        .map(|level| {
+            level
+                .iter()
+                .filter(|n| selected.iter().any(|s| s == *n))
+                .cloned()
+                .collect::<Vec<String>>()
+        })
+        .filter(|batch| !batch.is_empty())
+        .collect()
 }
 
 /// Every container port a service declares, with its protocol, from all THREE spellings.
@@ -5423,9 +5508,10 @@ fn no_pod_peer_names_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) ->
         "kern: note: --no-pod gives each service its own network namespace, and peers are reached \
          through per-service loopback aliases instead of a shared one. A service cannot host a peer's \
          alias on a port it binds itself, so two services that share an internal port are still not \
-         mutually reachable; any such pair is named with it. Every other service is held before its \
-         first instruction until its relays exist, so none of them starts against a half-built \
-         network."
+         mutually reachable; any such pair is named with it. A relay carries TCP, so a datagram one \
+         service sends to another's UDP port does not cross in this wiring, whether or not the file \
+         declares the port. Every other service is held before its first instruction until its \
+         relays exist, so none of them starts against a half-built network."
             .to_string(),
     )
 }
@@ -6057,7 +6143,17 @@ fn run_terminal_verb(
                 // hiding it would leave the one command that exists to explain the file silent about
                 // a field that changes both. Named as what it does, not just as its number.
                 if let Some(p) = b.port {
-                    println!("    port: {p} (reserved in the pod, passed as PORT={p})");
+                    // WHERE IT IS RESERVED DEPENDS ON THE WIRING, and this line said "in the
+                    // pod" under every one of them. Measured on a `--no-pod` stack: `config`
+                    // announced a reservation in a pod the stack does not have.
+                    println!(
+                        "    port: {p} (reserved {}, passed as PORT={p})",
+                        if own_namespaces {
+                            "for this service"
+                        } else {
+                            "in the pod"
+                        }
+                    );
                 }
                 if !b.expose.is_empty() {
                     let list: Vec<String> = b
@@ -6065,7 +6161,15 @@ fn run_terminal_verb(
                         .iter()
                         .map(|(n, udp)| format!("{n}/{}", if *udp { "udp" } else { "tcp" }))
                         .collect();
-                    println!("    expose: {} (reserved in the pod)", list.join(", "));
+                    println!(
+                        "    expose: {} (reserved {})",
+                        list.join(", "),
+                        if own_namespaces {
+                            "for this service"
+                        } else {
+                            "in the pod"
+                        }
+                    );
                 }
                 // Through the reverse map first; `short` remains the fallback for an edge onto a
                 // service that is not in this file, where there is no service name to recover and
@@ -6327,7 +6431,11 @@ fn run_terminal_verb(
             if let Ok(dir) = crate::relayhold::stack_dir(pod) {
                 crate::relayhold::kill_holder(&dir);
             }
-            let names = stop_stack(boxes.iter().map(|b| b.name.clone()).collect(), pod);
+            let names = stop_stack(
+                boxes,
+                &boxes.iter().map(|b| b.name.clone()).collect::<Vec<_>>(),
+                pod,
+            );
             // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
             // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
             // `compose ps -a` is empty after a `down` (matching Docker), while `compose stop` (which does
@@ -6368,14 +6476,14 @@ fn run_terminal_verb(
             let was_no_pod = boxes
                 .iter()
                 .any(|b| registry::find(&b.name).is_some_and(|i| i.pod.is_empty()));
-            let names = stop_stack(
-                boxes
-                    .iter()
-                    .filter(|b| selected(b))
-                    .map(|b| b.name.clone())
-                    .collect(),
-                pod,
-            );
+            // The same selection as before, and the ordering still read from the WHOLE graph: a
+            // `stop web` must not lose the order the full teardown has.
+            let chosen: Vec<String> = boxes
+                .iter()
+                .filter(|b| selected(b))
+                .map(|b| b.name.clone())
+                .collect();
+            let names = stop_stack(boxes, &chosen, pod);
             if was_no_pod {
                 // No pod is named, because none exists. `start` is still the way back, and it carries
                 // the mode forward on its own.
@@ -6401,14 +6509,14 @@ fn run_terminal_verb(
         ComposeAction::Restart => {
             // Same selection as `stop`; the bring-up below narrows to the same names, so
             // `restart b` stops and starts b and leaves its peers alone.
-            let names = stop_stack(
-                boxes
-                    .iter()
-                    .filter(|b| selected(b))
-                    .map(|b| b.name.clone())
-                    .collect(),
-                pod,
-            );
+            // The same selection as before, and the ordering still read from the WHOLE graph: a
+            // `stop web` must not lose the order the full teardown has.
+            let chosen: Vec<String> = boxes
+                .iter()
+                .filter(|b| selected(b))
+                .map(|b| b.name.clone())
+                .collect();
+            let names = stop_stack(boxes, &chosen, pod);
             println!(
                 "compose restart: {} box(es) stopped, restarting",
                 names.len()

@@ -927,6 +927,13 @@ fn build_run(
                 );
                 i += 1;
             }
+            // CONFIG-ONLY, like CMD/ENTRYPOINT/EXPOSE: they change what the image DECLARES and never
+            // the filesystem, so they are applied to `config` and do not advance the layer key.
+            // Editing a healthcheck must not bust a cached RUN.
+            Instr::Healthcheck { .. } | Instr::StopSignal(_) => {
+                apply_declaration(&mut config, &instrs[i]);
+                i += 1;
+            }
         }
     }
     // Undo the seed so host DNS isn't baked in. EXACT, not a delete: a base that shipped an empty
@@ -1280,6 +1287,13 @@ fn build_layered_cached(
                     step,
                     format!("EXPOSE {p} (informational - publish with -p at run)"),
                 );
+                i += 1;
+            }
+            // CONFIG-ONLY, like CMD/ENTRYPOINT/EXPOSE: they change what the image DECLARES and never
+            // the filesystem, so they are applied to `config` and do not advance the layer key.
+            // Editing a healthcheck must not bust a cached RUN.
+            Instr::Healthcheck { .. } | Instr::StopSignal(_) => {
+                apply_declaration(&mut config, &instrs[i]);
                 i += 1;
             }
         }

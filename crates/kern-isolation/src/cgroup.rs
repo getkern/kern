@@ -3015,9 +3015,21 @@ pub fn apply_limits(
     // `memory.swap.max` - the v2 swap allowance (separate from memory.max, NOT a combined total).
     // Default `0` keeps `memory.max` a hard total (overflow is OOM-killed, not swapped); a
     // `--memory-swap-max N` lets the box swap up to N.
+    // `u64::MAX` IS THE UNLIMITED SENTINEL, spelled `max` in the file the kernel reads. A compose
+    // `memswap_limit: -1` means "swap is not capped", and there is no finite byte count that says
+    // it: writing a very large number would cap it somewhere, which is a different statement.
     let _ = fs::write(
         child.join("memory.swap.max"),
-        memory_swap_max.map_or_else(|| "0".to_string(), |b| b.to_string()),
+        memory_swap_max.map_or_else(
+            || "0".to_string(),
+            |b| {
+                if b == u64::MAX {
+                    "max".to_string()
+                } else {
+                    b.to_string()
+                }
+            },
+        ),
     );
     // `memory.oom.group = 1`: when THIS cgroup hits its memory limit, the kernel kills EVERY process in
     // it as one unit, not just the single highest-`oom_score` task. Without it an OOM can kill a child

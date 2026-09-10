@@ -3905,6 +3905,57 @@ mod port_collision_tests {
         }
     }
 
+    /// A TEARDOWN SIGNALS DEPENDENTS BEFORE DEPENDENCIES, ONE LEVEL AT A TIME.
+    ///
+    /// Docker stops a service before the services it depends on, and waits for a level to exit (or
+    /// exhaust its grace) before signalling the next. kern signalled the whole stack at once.
+    ///
+    /// MEASURED with a trap that timestamps both its signal and its own exit, on `a` depending on
+    /// `b`: both traps fired in the same centisecond and the whole `down` cost 3011 ms, which is ONE
+    /// trap and not two. After the fix the same file takes 6015 ms and `b` is signalled 10 ms after
+    /// `a` has finished. The consequence is not cosmetic: an application writing to a database was
+    /// getting SIGTERM in the same instant as the database.
+    ///
+    /// The batches are asserted rather than the timings, because the timing test needs two live
+    /// boxes and this rule is decided before any process is signalled.
+    #[test]
+    fn a_teardown_signals_dependents_before_their_dependencies() {
+        let svc = |name: &str, deps: &[&str]| crate::compose::ComposeBox {
+            name: name.to_string(),
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            ..Default::default()
+        };
+        // web -> api -> db: three levels, and the teardown must walk them backwards.
+        let stack = vec![svc("db", &[]), svc("api", &["db"]), svc("web", &["api"])];
+        let all: Vec<String> = stack.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(
+            stop_batches(&stack, &all),
+            vec![
+                vec!["web".to_string()],
+                vec!["api".to_string()],
+                vec!["db".to_string()]
+            ],
+            "the dependent is signalled first and the dependency last"
+        );
+        // TWO SERVICES ON ONE LEVEL STAY ON ONE LEVEL: there is no edge between them, so ordering
+        // them would be inventing a dependency the file does not state.
+        let flat = vec![svc("a", &[]), svc("b", &[])];
+        let both: Vec<String> = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(stop_batches(&flat, &both).len(), 1);
+        // A SELECTION KEEPS THE ORDER OF THE WHOLE GRAPH. `compose stop web db` skips `api` but must
+        // still take web before db.
+        let picked = vec!["web".to_string(), "db".to_string()];
+        assert_eq!(
+            stop_batches(&stack, &picked),
+            vec![vec!["web".to_string()], vec!["db".to_string()]]
+        );
+        // AND A GRAPH THAT DOES NOT SORT STILL STOPS: one batch with everything, the behaviour the
+        // teardown had before it had an order.
+        let cyclic = vec![svc("x", &["y"]), svc("y", &["x"])];
+        let xy: Vec<String> = vec!["x".to_string(), "y".to_string()];
+        assert_eq!(stop_batches(&cyclic, &xy), vec![xy.clone()]);
+    }
+
     /// THE SHIFT IS ONE PLAN FOR THE STACK, NOT ONE PER SERVICE.
     ///
     /// MEASURED before this existed: a file where `web` publishes `80` and `other` publishes `8080`

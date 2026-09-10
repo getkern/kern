@@ -1147,6 +1147,105 @@ fn a_foreground_box_evaluates_its_health_check() {
     );
 }
 
+/// AN INIT THAT IGNORES THE STOP SIGNAL GETS ITS FULL GRACE; ONE THAT NEVER HEARS IT DOES NOT.
+///
+/// Three dispositions, two behaviours. A PID-namespace init with the DEFAULT disposition never
+/// learns the signal happened (the kernel discards it), so the grace is a wait for an event that
+/// cannot occur: kern skips it, which is what turns a `kern stop` on a `sleep` box from 9 s into
+/// milliseconds, and it is a deliberate deviation from Docker, which waits. An init that IGNORES the
+/// signal has been told to stop and has declined, which is precisely what `stop_grace_period` is
+/// written for: a checkpoint wrapped in `trap '' TERM` may still finish and exit inside the window.
+///
+/// MEASURED before the split existed: an ignoring init with a 2 s grace was torn down in 5 ms.
+///
+/// Both halves are asserted here, because the fix is only correct if the fast path SURVIVES it: a
+/// version that simply waited always would pass the first assertion and regress the second.
+#[test]
+fn an_init_that_ignores_the_stop_signal_is_given_its_grace() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "stop-grace");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-grace-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    // `while :; do sleep 1; done` and not a bare `sleep`: a shell whose last command is a sleep
+    // EXECS it, and the exec drops the trap, so the test would measure a process with the default
+    // disposition while believing it measured an ignoring one. Found by getting 5 ms from a case
+    // that had just been fixed.
+    let start = |name: &str, cmd: &str| -> std::process::Output {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                &rootfs,
+                "-d",
+                "--stop-timeout",
+                "2",
+                "--",
+                "/bin/sh",
+                "-c",
+                cmd,
+            ])
+            .output()
+            .expect("run kern")
+    };
+    let out = start(
+        "grace-ign",
+        "trap '' TERM; while :; do /bin/busybox sleep 1; done",
+    );
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    let _ = start("grace-dfl", "while :; do /bin/busybox sleep 1; done");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let timed = |name: &str| -> u128 {
+        let t = std::time::Instant::now();
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", name])
+            .output();
+        t.elapsed().as_millis()
+    };
+    let ignoring = timed("grace-ign");
+    let default_disposition = timed("grace-dfl");
+    for n in ["grace-ign", "grace-dfl"] {
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["prune", n])
+            .output();
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    assert!(
+        ignoring >= 1_500,
+        "an init that ignores the stop signal was killed after {ignoring} ms, not given its 2 s"
+    );
+    assert!(
+        default_disposition < 1_000,
+        "the fast path regressed: an init that cannot hear the signal waited {default_disposition} ms"
+    );
+}
+
 /// A COMMAND RUN INSIDE A BOX KNOWS THE BOX'S NAME, because Docker sets `HOSTNAME` and checks read it.
 ///
 /// `exec_in_box` passes no hostname to the environment builder - it did not create the namespace and

@@ -2898,10 +2898,14 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
 /// Like [`parse_size`] but accepts an explicit `0`. Used for `--memory-swap-max`, where `0` is a
 /// meaningful, valid value (zero swap allowance = swap off - the default) rather than a nonsense cap.
 fn parse_size_z(s: &str) -> Option<u64> {
-    if s.trim() == "0" {
-        Some(0)
-    } else {
-        parse_size(s)
+    match s.trim() {
+        "0" => Some(0),
+        // `max` IS A SIZE HERE, and the only way to say "not capped". cgroup v2 spells an absent
+        // limit exactly that way, and a compose `memswap_limit: -1` has to reach it: the largest
+        // finite byte count is still a cap, which is a different statement. `-1` is accepted as the
+        // spelling the compose file uses, so the two layers do not need a translation table.
+        "max" | "-1" => Some(u64::MAX),
+        other => parse_size(other),
     }
 }
 

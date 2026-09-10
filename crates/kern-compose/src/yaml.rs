@@ -4091,7 +4091,76 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
         // file asked for.
         b.entrypoint = Some(entrypoint);
     }
+    // `memswap_limit` IS A TOTAL, AND `memory.swap.max` IS NOT. This is the whole of the
+    // translation, and it lives here because it needs BOTH keys, which the loop above collects
+    // independently.
+    //
+    // Docker's `memswap_limit` is memory PLUS swap; cgroup v2's `memory.swap.max` is swap alone, so
+    // the conversion is a subtraction. kern forwarded the value verbatim, which gave a box 256m of
+    // memory and 512m of swap where the file asked for 512m in total: 50% more than it said.
+    //
+    // MEASURED on Docker 29.6.2, cgroup v2, six cases, and every rule below is one of them:
+    //
+    //      --memory 256m                    -> memory.max 268435456   swap.max 268435456
+    //      --memory 256m --memory-swap 512m -> memory.max 268435456   swap.max 268435456
+    //      --memory 256m --memory-swap 256m -> memory.max 268435456   swap.max 0
+    //      --memory 256m --memory-swap -1   -> memory.max 268435456   swap.max max
+    //      --memory-swap 512m (no --memory) -> refused: "You should always set the Memory limit
+    //                                          when using Memoryswap limit"
+    //      --memory 512m --memory-swap 256m -> refused: "Minimum memoryswap limit should be larger
+    //                                          than memory limit"
+    //
+    // The two refusals are COPIED, because they are the two ways a file states something that has no
+    // meaning, and a runtime that quietly picks an interpretation for either is inventing intent.
+    //
+    // THE DEFAULT IS DELIBERATELY NOT DOCKER'S. With no `memswap_limit`, Docker allows swap equal to
+    // the memory limit, so `mem_limit` is really a 2x total; kern leaves `memory.swap.max` at 0, so
+    // `mem_limit` is the total it appears to be. That is the stricter direction, it is what makes
+    // the number in the file the number in force, and its failure mode is a loud early OOM rather
+    // than a box quietly growing into host swap. It is recorded in docs/RUNTIME-PARITY.md.
+    if let Some(raw) = b.swap_max.take() {
+        let spec = raw.trim();
+        let Some(mem) = b.memory.as_deref().and_then(parse_binary_size_str) else {
+            return Err(format!(
+                "service '{name}': `memswap_limit: {spec}` without a `mem_limit:`. Docker refuses \
+                 the same pair (\"You should always set the Memory limit when using Memoryswap \
+                 limit\") because the key is memory PLUS swap, so it says nothing on its own: set \
+                 `mem_limit:` as well, or drop this key."
+            ));
+        };
+        if spec == "-1" || spec.eq_ignore_ascii_case("max") {
+            // Unlimited swap. `max` is what the cgroup file takes and what `--memory-swap-max`
+            // accepts; there is no byte count that means "no cap".
+            b.swap_max = Some("max".to_string());
+        } else {
+            let Some(total) = parse_binary_size_str(spec) else {
+                return Err(format!(
+                    "service '{name}': `memswap_limit: {spec}` is not a size (expected a form like \
+                     512m, 2g, a byte count, or -1 for unlimited)."
+                ));
+            };
+            if total < mem {
+                return Err(format!(
+                    "service '{name}': `memswap_limit: {spec}` is below `mem_limit`. Docker refuses \
+                     this pair (\"Minimum memoryswap limit should be larger than memory limit\"): \
+                     the key is memory PLUS swap, so a total under the memory limit describes \
+                     nothing. Raise it above the memory limit, or use -1 for unlimited."
+                ));
+            }
+            // The subtraction. Equal values mean no swap at all, which is Docker's own reading and
+            // the reason the difference is taken rather than the total forwarded.
+            b.swap_max = Some((total - mem).to_string());
+        }
+    }
     Ok(b)
+}
+
+/// Parse a compose size (`512m`, `2g`, `268435456`) to bytes, or `None` if it is not one.
+///
+/// The SAME parser the CLI flags use, so a `mem_limit` and a `--memory` can never disagree about
+/// what `512m` is. Compose sizes are binary units, like Docker's.
+fn parse_binary_size_str(s: &str) -> Option<u64> {
+    kern_common::parse_binary_size(s.trim())
 }
 
 /// Map Docker Compose v3 `deploy.resources.limits.{memory,cpus,pids}` onto kern's hard caps - the
@@ -4928,8 +4997,44 @@ fn platform_matches_host(v: &str) -> bool {
 /// asked for.
 #[must_use]
 pub(crate) fn docker_shares_to_cpu_weight(shares: u64) -> u64 {
-    let s = shares.clamp(2, 262_144);
-    (s.saturating_mul(100) / 1024).clamp(1, 10_000)
+    // DOCKER'S OWN CURVE, IDENTIFIED FROM TEN MEASURED POINTS, not a linear scale on 1024 and not
+    // the formula two reviewers (and this codebase) remembered.
+    //
+    // Measured on Docker 29.6.2, cgroup v2, aarch64, one container per value:
+    //
+    //      shares       2     8   100   256   512  1024  2048   8192  65536  262144
+    //      cpu.weight   1     3    17    35    59   100   174    532   3023   10000
+    //
+    // The linear map this replaced (`shares * 100 / 1024`) agrees only at the default: it gave 50
+    // where Docker gives 59, 200 where Docker gives 174, and 6400 where Docker gives 3023. The
+    // "runc formula" `1 + (shares - 2) * 9999 / 262142` proposed instead is worse still, giving 20
+    // for 512 and 39 for 1024: it would have moved the DEFAULT off 100, which the measurement above
+    // shows Docker does not do.
+    //
+    // The closed form is a quadratic in log2 fitting the three fixed points (2 -> 1, 1024 -> 100,
+    // 262144 -> 10000): with `l = log2(shares)`,
+    //
+    //      weight = ceil( 100 ^ ( (l - 1)(l + 126) / 1224 ) )
+    //
+    // At `l = 10` the numerator is exactly 1224, so the default maps to 100 by construction rather
+    // than by rounding; at `l = 1` it is 0 and at `l = 18` it is 2. It reproduces all ten measured
+    // points exactly, which is the only reason it is here instead of a documented deviation.
+    //
+    // Float is acceptable: this runs once per service at PARSE time, never in a box's hot path.
+    if shares <= 2 {
+        return 1;
+    }
+    if shares >= 262_144 {
+        return 10_000;
+    }
+    let l = (shares as f64).log2();
+    let weight = 100f64.powf(((l - 1.0) * (l + 126.0)) / 1224.0).ceil();
+    // A non-finite result cannot come from this domain, but the cast is only defined for finite
+    // values, so it is checked rather than assumed.
+    if !weight.is_finite() {
+        return 1;
+    }
+    (weight as u64).clamp(1, 10_000)
 }
 
 pub(crate) fn normalise_links(entries: &[String], depends_on: &mut Vec<String>) -> Vec<String> {
@@ -6644,30 +6749,103 @@ mod tests {
         }
     }
 
-    /// A SHARE IS A RATIO AGAINST THE DEFAULT, SO THE DEFAULT MUST MAP TO THE DEFAULT.
+    /// `memswap_limit` IS A TOTAL AND `memory.swap.max` IS NOT, so the translation is a subtraction.
     ///
-    /// Docker's `cpu_shares` is 2..=262144 with **1024 = normal**; cgroup v2's `cpu.weight` is
-    /// 1..=10000 with **100 = normal**. A file writing `cpu_shares: 1024` is asking for an ordinary
-    /// slice, and any mapping that does not return 100 for it has changed what the file said.
+    /// kern forwarded the value verbatim: a file asking for 256m of memory and 512m of memory-plus-
+    /// swap got 256m of memory and 512m of SWAP, which is 768m in total, half again what it wrote.
     ///
-    /// MEASURED on the first version of this function, which mapped the ENDPOINTS onto each other
-    /// instead: inside a box, `cpu_shares: 1024` produced `cpu.weight = 39`. The stack ran, nothing
-    /// warned, and an ordinary service had been given well under half an ordinary slice. This test
-    /// exists because the endpoints looked like the invariant and were not.
+    /// Every row below is a measurement on Docker 29.6.2, cgroup v2, not a reading of the docs:
+    ///
+    ///     --memory 256m                    -> swap.max 268435456   (kern deviates: 0, on purpose)
+    ///     --memory 256m --memory-swap 512m -> swap.max 268435456
+    ///     --memory 256m --memory-swap 256m -> swap.max 0
+    ///     --memory 256m --memory-swap -1   -> swap.max max
+    ///     --memory-swap without --memory   -> refused
+    ///     --memory 512m --memory-swap 256m -> refused
     #[test]
-    fn docker_shares_map_normal_onto_normal_and_stay_inside_the_kernel_range() {
-        // The one that matters: Docker's default is cgroup v2's default.
-        assert_eq!(docker_shares_to_cpu_weight(1024), 100);
-        // Proportional either side of it.
-        assert_eq!(docker_shares_to_cpu_weight(2048), 200);
-        assert_eq!(docker_shares_to_cpu_weight(512), 50);
-        // Both ends of Docker's range land inside the kernel's, by clamping rather than by wrapping.
+    fn memswap_limit_is_converted_to_a_swap_allowance_and_its_two_nonsense_forms_are_refused() {
+        let swap_of = |keys: &str| -> Option<String> {
+            let y = format!("services:\n  a:\n    image: alpine\n{keys}");
+            parse(&y).ok().and_then(|b| b.first()?.swap_max.clone())
+        };
+        // The subtraction: total minus memory is the allowance.
         assert_eq!(
-            docker_shares_to_cpu_weight(2),
-            1,
-            "the minimum is a valid weight, not 0"
+            swap_of("    mem_limit: 256m\n    memswap_limit: 512m\n").as_deref(),
+            Some("268435456")
         );
-        assert_eq!(docker_shares_to_cpu_weight(262_144), 10_000);
+        // Equal means no swap at all, which is Docker's reading of the same pair.
+        assert_eq!(
+            swap_of("    mem_limit: 256m\n    memswap_limit: 256m\n").as_deref(),
+            Some("0")
+        );
+        // `-1` is unlimited, and no byte count can say that.
+        assert_eq!(
+            swap_of("    mem_limit: 256m\n    memswap_limit: -1\n").as_deref(),
+            Some("max")
+        );
+        // Without the key, kern leaves the allowance unset: the DELIBERATE deviation, so `mem_limit`
+        // is the total it appears to be. Docker would allow swap equal to the memory limit.
+        assert_eq!(swap_of("    mem_limit: 256m\n"), None);
+
+        // THE TWO REFUSALS, each naming the Docker message it copies. A runtime that picks an
+        // interpretation for either is inventing intent the file did not state.
+        let err = |keys: &str| -> String {
+            let y = format!("services:\n  a:\n    image: alpine\n{keys}");
+            parse(&y).err().unwrap_or_default()
+        };
+        let no_mem = err("    memswap_limit: 512m\n");
+        assert!(
+            no_mem.contains("without a `mem_limit:`"),
+            "a total with nothing to subtract from must be refused: {no_mem:?}"
+        );
+        let below = err("    mem_limit: 512m\n    memswap_limit: 256m\n");
+        assert!(
+            below.contains("below `mem_limit`"),
+            "a total under the memory limit describes nothing: {below:?}"
+        );
+        // A value that is not a size at all is refused rather than read as zero.
+        assert!(!err("    mem_limit: 256m\n    memswap_limit: banana\n").is_empty());
+    }
+
+    /// THE TABLE IS DOCKER'S, MEASURED, AND THE ONLY AUTHORITY HERE.
+    ///
+    /// `cpu_shares` is 2..=262144 with 1024 normal; `cpu.weight` is 1..=10000 with 100 normal. Two
+    /// mappings looked obviously right and were both wrong, which is why this asserts ten points
+    /// read off a real daemon instead of an invariant somebody reasoned to:
+    ///
+    /// * the ENDPOINT map (2 -> 1, 262144 -> 10000, linear between) put the DEFAULT at 39. Caught
+    ///   inside a box: an ordinary service had well under half an ordinary slice.
+    /// * the LINEAR map on 1024 fixed the default and missed everything else: 50 where Docker gives
+    ///   59, 200 where it gives 174, 6400 where it gives 3023.
+    /// * `1 + (shares - 2) * 9999 / 262142`, offered as "runc's formula" by two independent
+    ///   reviewers and remembered as such here, gives 20 for 512 and 39 for 1024. It was about to be
+    ///   shipped on that recollection; the measurement below stopped it.
+    ///
+    /// Measured on Docker 29.6.2, cgroup v2, aarch64: one container per value, `cat cpu.weight`.
+    #[test]
+    fn docker_shares_reproduce_the_measured_docker_curve() {
+        for (shares, weight) in [
+            (2_u64, 1_u64),
+            (8, 3),
+            (100, 17),
+            (256, 35),
+            (512, 59),
+            (1024, 100),
+            (2048, 174),
+            (8192, 532),
+            (65536, 3023),
+            (262_144, 10_000),
+        ] {
+            assert_eq!(
+                docker_shares_to_cpu_weight(shares),
+                weight,
+                "cpu_shares {shares} must map to the weight Docker writes"
+            );
+        }
+        // THE MIXED CASE IS THE ONE THAT BITES, because it is what real files do: one service sets
+        // shares and its peer sets nothing. The ratio against the default 100 is what the kernel
+        // arbitrates with, and the linear map made it 1:2 where Docker makes it nearly 1:5.
+        assert_eq!(docker_shares_to_cpu_weight(512), 59);
         // Out-of-range input cannot produce an out-of-range weight, in either direction.
         for s in [0_u64, 1, u64::MAX, 999_999_999] {
             let w = docker_shares_to_cpu_weight(s);

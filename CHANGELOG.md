@@ -7,6 +7,55 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`cpu_shares` produces the weight Docker produces.** kern mapped Docker's shares onto cgroup v2's
+`cpu.weight` linearly on 1024, which agrees at the default and nowhere else. Ten points read off a
+real daemon (Docker 29.6.2, cgroup v2): 512 -> 59, 1024 -> 100, 2048 -> 174, 65536 -> 3023. The
+linear map gave 50, 100, 200 and 6400. The formula `1 + (shares - 2) * 9999 / 262142`, which two
+independent reviewers and this codebase all remembered as runc's, gives 20 for 512 and 39 for 1024:
+it was about to be shipped on that recollection, and the measurement stopped it. The curve is now
+`ceil(100 ^ ((l - 1)(l + 126) / 1224))` with `l = log2(shares)`, which reproduces all ten points.
+Where it bites is the mixed case real files are full of, one service with shares against a peer
+without: Docker makes that ratio 1 to 5, the linear map made it 1 to 2.
+
+**`memswap_limit` is a total, and cgroup v2's field is not.** Docker's key is memory PLUS swap;
+`memory.swap.max` is swap alone, so the conversion is a subtraction. kern forwarded the value
+verbatim, so a file asking for 256m of memory and 512m in total got 256m of memory and 512m of
+swap - half again what it wrote. Six cases measured on Docker and now matched: the subtraction, the
+equal case (no swap), `-1` (unlimited), and both refusals, `memswap_limit` without `mem_limit` and
+`memswap_limit` below it. One row deviates on purpose: with no `memswap_limit` Docker allows swap
+equal to the memory limit, and kern leaves it at zero so `mem_limit` is the total it appears to be.
+
+**A teardown stops dependents before their dependencies, and waits.** kern signalled the whole stack
+at once. Measured with traps that timestamp both the signal and their own exit, on `a` depending on
+`b`: both fired in the same centisecond and the whole `down` cost 3011 ms, which is one trap and not
+two. An application writing to a database was getting SIGTERM in the same instant as the database.
+The teardown now walks the dependency levels backwards and waits for each before signalling the
+next: the same file takes 6015 ms and `b` is signalled 10 ms after `a` has finished. A five-level
+stack with a ten-second grace can therefore take fifty seconds to stop, which is what Docker does.
+
+**An init that IGNORES the stop signal is given its grace.** kern skips the graceful phase when the
+box's init cannot be terminated by the signal, which is what turns `kern stop` on a `sleep` box from
+9 s into milliseconds: a PID-namespace init with the DEFAULT disposition never learns the signal
+happened, because the kernel discards it. That shortcut was also being taken for an init that
+IGNORES the signal, which is a different statement: `trap '' TERM` around a checkpoint is exactly
+what `stop_grace_period` is written for, and the process may still exit inside the window. Measured:
+an ignoring init with a 2 s grace was torn down in 5 ms, and now takes 2007 ms. The fast path for
+the default disposition is unchanged and asserted in the same test.
+
+**`HEALTHCHECK` and `STOPSIGNAL` are baked into an image kern builds.** Both were parsed and
+dropped, with a note telling the operator to pass `--health-cmd` by hand. That is unusable from
+compose, where nobody types a `kern box` line: a service with `build:` whose Dockerfile declares a
+check got none, and a peer with `depends_on: condition: service_healthy` on it could never be
+satisfied, so kern refused the whole stack at config and the file did not run. Both now reach the
+image config, with Docker's precedence measured in both directions: a compose `healthcheck:` or
+`stop_signal:` overrides the image's, and without one the image's is used.
+
+**The relay wiring says that it carries TCP.** A service that binds a UDP port without declaring it
+got silence: measured, a datagram between two peers arrives in a pod and does not arrive under
+`--no-pod`, and the only warning kern had was for services whose DECLARED ports are all UDP. The
+wiring note now states the limit itself. In the same pass, `config` stopped saying a port is
+"reserved in the pod" for stacks that have no pod.
+
 **A health check runs AS the workload, not as the box's root.** Docker runs a `HEALTHCHECK` as the
 container's user, measured rather than assumed (on Docker 29.6.2 a container started
 `--user 1000:1000 -w /tmp` reports `uid=1000 gid=1000 groups=1000` and `/tmp` from inside its own
@@ -92,6 +141,16 @@ redirected is a remote certificate authority. When the moved set contains 80 or 
 says that a service issuing its own TLS certificates (Caddy's automatic HTTPS, Traefik with Let's
 Encrypt) cannot complete an ACME challenge on a moved port. `docs/RUNTIME-PARITY.md` records the rest of the
 comparison, including that podman refuses such a port outright where kern moves it.
+
+**A second number: `scripts/e2e-semantic.py`.** The compatibility rate is read from kern's warnings
+at `config`, which makes it blind to everything that only exists once a box runs: the seven defects
+closed this week moved it by zero points, and every one of them was found by running a stack and
+looking inside it. The battery measures the other half with six probes, each an observable read from
+inside a live box or from the timing of a real teardown: the health probe's identity and working
+directory, `memory.max`, `ulimit -n`, the teardown order, a peer answered by name, and `HOME`. Each
+probe ships with a BROKEN fixture it must report as failing, and `--self-test` runs them: a probe
+that cannot go red measures nothing. That check earned its place immediately by catching a probe
+reading the HOST's `$HOME`, because a single `$` in a compose file is a compose variable.
 
 **`kern compose <file> config` prints the wiring as a field.** The wiring is announced on stderr in
 a sentence that names the alternatives, which is right for a reader and wrong for anything that

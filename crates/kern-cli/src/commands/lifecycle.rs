@@ -524,6 +524,33 @@ pub(crate) unsafe fn signal_box(pidfd: i32, pid1: i32, sig: i32) {
 /// stays on the patient path rather than being killed early. Guessing wrong in that direction costs
 /// a wait; guessing wrong the other way would cut a real shutdown short.
 pub(crate) fn init_catches_signal(pid1: i32, sig: i32) -> bool {
+    signal_in_mask(pid1, sig, "SigCgt:")
+}
+
+/// Does this box's init IGNORE `sig` (`SIG_IGN`), as opposed to catching it or leaving it default?
+///
+/// THE THIRD DISPOSITION, AND IT IS NOT THE SAME AS THE SECOND. A PID-namespace init with the
+/// DEFAULT disposition never learns the signal happened: the kernel discards it, so the grace is a
+/// wait for an event that cannot occur, which is why [`init_catches_signal`] exists and why
+/// `kern stop` on a `sleep` box takes 2 ms instead of 9 s. An init that IGNORES it has been told, by
+/// its own author, to keep running: `trap '' TERM` around a checkpoint is exactly the shape a
+/// `stop_grace_period` is written for, and the process may well exit on its own inside that window.
+///
+/// MEASURED before this existed: a box whose PID 1 runs `trap '' TERM; while :; do sleep 1; done`
+/// with `stop_grace_period: 2s` was torn down in 5 ms. Docker waits the two seconds and only then
+/// sends SIGKILL. The two cases had been collapsed because neither init can exit BECAUSE of the
+/// signal; the difference is that one of them was asked and the other never heard.
+///
+/// Same source and same fail-safe as the caught mask: unreadable or unparsable means "we do not
+/// know", and not knowing keeps the box on the patient path.
+pub(crate) fn init_ignores_signal(pid1: i32, sig: i32) -> bool {
+    signal_in_mask(pid1, sig, "SigIgn:")
+}
+
+/// One bit out of one `/proc/<pid>/status` signal mask (`SigCgt:`, `SigIgn:`, ...), signal `n` at
+/// bit `n - 1`. Unreadable, unparsable or absent answers `true`: the callers use it to decide
+/// whether to be PATIENT, and an unknown must not shorten a real shutdown.
+fn signal_in_mask(pid1: i32, sig: i32, field: &str) -> bool {
     if pid1 <= 0 || !(1..=64).contains(&sig) {
         return true;
     }
@@ -532,7 +559,7 @@ pub(crate) fn init_catches_signal(pid1: i32, sig: i32) -> bool {
     };
     let Some(mask) = status
         .lines()
-        .find_map(|l| l.strip_prefix("SigCgt:"))
+        .find_map(|l| l.strip_prefix(field))
         .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
     else {
         return true;
@@ -782,7 +809,14 @@ pub(crate) fn kill_box_graceful(
         // Skip the graceful phase entirely when the init provably cannot receive the signal: see
         // `init_catches_signal`. This is the difference between `kern stop` returning in 2 ms and in
         // 9 s for the most ordinary box there is. Already dead is the same case: nothing to wait for.
-        let graceful = grace_ms > 0 && already.is_none() && init_catches_signal(pid1, stop_signal);
+        // CAUGHT OR IGNORED BOTH GET THE GRACE; ONLY THE DEFAULT DISPOSITION SKIPS IT. See
+        // `init_ignores_signal`: an init that ignores the signal was asked to stop and declined,
+        // which is what a `stop_grace_period` is for, and it may still exit on its own inside the
+        // window. An init with the default disposition never hears the signal at all, because the
+        // kernel discards it for a PID-namespace init, so waiting on it is a guaranteed delay.
+        let graceful = grace_ms > 0
+            && already.is_none()
+            && (init_catches_signal(pid1, stop_signal) || init_ignores_signal(pid1, stop_signal));
         if graceful {
             // Graceful phase: the configured signal to the box init, and to the supervisor's group so
             // a foreground box's helpers hear it too. SKIPPED ENTIRELY when the caller has already

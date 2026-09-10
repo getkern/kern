@@ -22,6 +22,15 @@ identity, environment and mount rules, decided by runc and the daemon rather tha
 | 6 | A privileged host port, rootless | not measured (see below) | refuses | moves it | kern deviates, documented |
 | 7 | Submounts of a `-v` source | carried INTO the container | (as Docker) | left outside | kern deviates: EXPOSURE |
 | 7b | ... and does `:ro` cover them | yes, `ro` inside, write refused | (as Docker) | n/a, they are not there | Docker has no `:ro` hole |
+| 8 | `cpu_shares: 512` / `1024` / `2048` | `cpu.weight` 59 / 100 / 174 | not measured | same | agree (curve fitted to 10 points) |
+| 9 | `mem_limit` alone | `swap.max` = the memory limit | not measured | `0` | kern deviates: STRICTER |
+| 9b | `memswap_limit` present | `swap.max` = total minus memory | not measured | same, and the same two refusals | agree |
+| 10 | `oom_score_adj` of PID 1 | the daemon's (0) | not measured | inherited from the session (100 here) | kern deviates: no daemon to reset it |
+| 11 | `/etc/resolv.conf` | the daemon's DNS (`127.0.0.11`) | not measured | the host's nameservers | differs; peers resolve from `/etc/hosts` either way |
+| 12 | `logging: max-size` | rotates into `max-file` files | not measured | one window, newest kept | differs: the first line of the window can be cut mid-line |
+| 13 | `network_mode: host` | the host's interfaces | not measured | same (measured: `lo enp5s0 wlp4s0`) | agree |
+| 14 | A named volume, two different uids | writer AND reader refused (`0:0 755`) | not measured | same | agree |
+| 15 | UDP between peers | works (one network) | works | works in a pod, NOT under the relay wiring | kern deviates under `--no-pod`, and says so |
 
 ---
 
@@ -153,3 +162,60 @@ Docker binds recursively; kern does not, so those filesystems stay outside the b
 whoever mounted them, and the box asked for a directory rather than for everything mounted under it.
 The kernel then refuses such a bind when the submounts were inherited (`has_locked_children`), and
 kern's error names the paths and the reason instead of reporting `Invalid argument`.
+
+## 8. `cpu_shares`, and why the obvious formula is wrong twice
+
+Ten points read off the daemon, one container per value:
+
+```
+shares       2     8   100   256   512  1024  2048   8192  65536  262144
+cpu.weight   1     3    17    35    59   100   174    532   3023   10000
+```
+
+Neither of the two mappings that "look right" reproduces it. A linear scale on 1024 gives 50 where
+Docker gives 59 and 6400 where it gives 3023; `1 + (shares - 2) * 9999 / 262142`, which two
+independent reviewers and this codebase all remembered as runc's, gives 20 for 512 and would move
+the DEFAULT off 100, which the table shows Docker does not do. kern now computes
+`ceil(100 ^ ((l - 1)(l + 126) / 1224))` with `l = log2(shares)`, which reproduces all ten.
+
+## 9. `memswap_limit` is a total; `memory.swap.max` is not
+
+Six cases, all measured:
+
+```
+--memory 256m                    -> memory.max 268435456   swap.max 268435456
+--memory 256m --memory-swap 512m -> memory.max 268435456   swap.max 268435456
+--memory 256m --memory-swap 256m -> memory.max 268435456   swap.max 0
+--memory 256m --memory-swap -1   -> memory.max 268435456   swap.max max
+--memory-swap 512m (no --memory) -> refused: "You should always set the Memory limit when using
+                                    Memoryswap limit"
+--memory 512m --memory-swap 256m -> refused: "Minimum memoryswap limit should be larger than
+                                    memory limit"
+```
+
+kern converts by subtraction and copies both refusals. It deviates on ONE row: with no
+`memswap_limit`, Docker allows swap equal to the memory limit, so `mem_limit` is really a 2x total;
+kern leaves the allowance at 0, so `mem_limit` is the total it appears to be. The failure mode of
+the strict side is a loud early OOM; the failure mode of the other is a box growing quietly into
+host swap.
+
+## 10. `oom_score_adj`
+
+A kern box inherits the caller's value (100 in a systemd user session here); a Docker container gets
+the daemon's, which is 0. There is no daemon to reset it in a rootless runtime, and resetting it to
+0 would make a box HARDER for the kernel to pick than the session that started it. The compose key
+`oom_score_adj:` is refused by name rather than silently accepted.
+
+## 12. The log window
+
+`logging: options: max-size` is honoured: measured 1k -> 19 lines, 8k -> 224, no key -> all 500, and
+the window kept is the most recent one (lines 481-499 of 500), which is the end that matters. Docker
+rotates into `max-file` files and therefore never shows a partial line; kern's window can begin
+mid-line (`empimento-481`). Nothing is lost that the cap would not have dropped anyway.
+
+## 15. UDP between peers
+
+In a pod the services share one namespace and UDP crosses. Under the relay wiring a peer is reached
+through a per-service loopback alias served by a TCP relay, so a datagram does not cross at all. That
+is now stated in the wiring note itself rather than only for services that DECLARE a UDP port,
+because a service that binds one without declaring it is the common case and was getting silence.

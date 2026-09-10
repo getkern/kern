@@ -82,6 +82,88 @@ pub enum Instr {
         dst: String,
         chmod: Option<String>,
     },
+    /// `HEALTHCHECK [--interval=D] [--timeout=D] [--start-period=D] [--retries=N] CMD ...`, or
+    /// `HEALTHCHECK NONE`.
+    ///
+    /// BAKED INTO THE IMAGE CONFIG, which it was not: the instruction was parsed and dropped with a
+    /// note telling the operator to pass `--health-cmd` by hand. That is unusable from compose,
+    /// where nobody types a `kern box` line: a service with `build:` whose Dockerfile declares a
+    /// check got no check at all, and a peer with `depends_on: condition: service_healthy` on it
+    /// could never be satisfied, so kern refuses the whole stack at config and the file does not run.
+    ///
+    /// `test` follows the OCI/Docker convention exactly, because that is what the image config
+    /// carries and what `ImageHealthcheck::probe` already reads: `["NONE"]` disables an inherited
+    /// check, `["CMD", argv...]` is the exec form, `["CMD-SHELL", script]` is the shell form.
+    /// Durations are NANOSECONDS, the unit of the OCI config, not the seconds the CLI flag takes.
+    Healthcheck {
+        test: Vec<String>,
+        interval_ns: Option<u64>,
+        timeout_ns: Option<u64>,
+        start_period_ns: Option<u64>,
+        retries: Option<u32>,
+    },
+    /// `STOPSIGNAL <signal>`: the signal the runtime sends to PID 1 to stop the container. Baked for
+    /// the same reason as `Healthcheck`: a compose `stop_signal:` can override it, but a file that
+    /// relies on the image's own signal has no other way to express it.
+    StopSignal(String),
+}
+
+/// Parse a Docker duration (`30s`, `1m30s`, `500ms`, `2h`, `100us`, `10ns`) to NANOSECONDS.
+///
+/// Docker parses these with Go's `time.ParseDuration`, which accepts a sequence of
+/// `<decimal><unit>` pairs and sums them. Implemented here rather than pulled in: the subset that
+/// appears in a Dockerfile is small, and a dependency for six units is not worth the supply chain.
+///
+/// Returns `None` for anything that is not exactly that shape, so a malformed duration becomes a
+/// build error the caller reports rather than a silent zero: `--interval=30` without a unit means
+/// nothing in Docker either.
+pub fn parse_go_duration_ns(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut total: u64 = 0;
+    let mut saw_pair = false;
+    while i < b.len() {
+        // The numeric part: digits, optionally with a fractional tail (`1.5s` is legal Go).
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let num: f64 = s.get(start..i)?.parse().ok()?;
+        // The unit: the longest match wins, so `ms` is not read as `m` followed by `s`.
+        let rest = s.get(i..)?;
+        let (unit_len, mult): (usize, f64) = if rest.starts_with("ns") {
+            (2, 1.0)
+        } else if rest.starts_with("us") {
+            (2, 1_000.0)
+        } else if rest.starts_with("ms") {
+            (2, 1_000_000.0)
+        } else if rest.starts_with('s') {
+            (1, 1_000_000_000.0)
+        } else if rest.starts_with('m') {
+            (1, 60.0 * 1_000_000_000.0)
+        } else if rest.starts_with('h') {
+            (1, 3600.0 * 1_000_000_000.0)
+        } else {
+            return None;
+        };
+        i += unit_len;
+        let part = num * mult;
+        // A duration that does not fit a u64 of nanoseconds (about 584 years) is not one anyone
+        // wrote on purpose, and saturating it would silently change the meaning.
+        if !part.is_finite() || part < 0.0 || part > u64::MAX as f64 {
+            return None;
+        }
+        total = total.checked_add(part as u64)?;
+        saw_pair = true;
+    }
+    saw_pair.then_some(total)
 }
 
 /// The source of a `COPY --from=<X>`. `X` is resolved at parse time: it names an earlier build
@@ -615,15 +697,109 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             }
             // A runtime stop signal - no build-time filesystem effect, so accept and drop (like VOLUME)
             // rather than failing a stock Dockerfile that declares one.
-            "STOPSIGNAL" => { /* runtime signal - advisory at build */ }
+            // BAKED, not advisory. See `Instr::StopSignal`. The value is not validated here: the
+            // runtime's own signal table is the one authority, and a name it refuses must fail
+            // where that table lives rather than in two places that can disagree.
+            "STOPSIGNAL" => out.push(Instr::StopSignal(subst(rest, &vars).trim().to_string())),
+            // BAKED INTO THE IMAGE CONFIG. See `Instr::Healthcheck` for what dropping it cost.
+            //
+            // The grammar is Docker's: zero or more `--flag=value` before the verb, then `NONE` or
+            // `CMD` followed by an exec array or a shell string. An unknown flag or a malformed
+            // duration is an ERROR and not a shrug: a check whose interval silently became the
+            // default is a check that reports on a schedule nobody chose.
             "HEALTHCHECK" => {
-                // Don't fail; nudge the user to the runtime flags. `HEALTHCHECK NONE` disables - nothing to say.
                 let body = subst(rest, &vars);
-                if !body.trim().eq_ignore_ascii_case("none") {
-                    eprintln!(
-                        "kern build: HEALTHCHECK accepted but not baked into the image - add it at run \
-                         with `kern box … --health-cmd '<cmd>'` (see `kern box --help`)"
-                    );
+                let body = body.trim();
+                if body.eq_ignore_ascii_case("none") {
+                    out.push(Instr::Healthcheck {
+                        test: vec!["NONE".to_string()],
+                        interval_ns: None,
+                        timeout_ns: None,
+                        start_period_ns: None,
+                        retries: None,
+                    });
+                } else {
+                    let mut interval_ns = None;
+                    let mut timeout_ns = None;
+                    let mut start_period_ns = None;
+                    let mut retries = None;
+                    let mut tail = body;
+                    while tail.starts_with("--") {
+                        let (flag, rest_of) = match tail.find(char::is_whitespace) {
+                            Some(n) => (&tail[..n], tail[n..].trim_start()),
+                            None => (tail, ""),
+                        };
+                        let (name, value) = flag.split_once('=').ok_or_else(|| {
+                            format!(
+                                "Dockerfile line {lineno}: HEALTHCHECK flag `{flag}` needs a value, \
+                                 as in `--interval=30s`"
+                            )
+                        })?;
+                        let dur = |v: &str| -> Result<Option<u64>, String> {
+                            parse_go_duration_ns(v).map(Some).ok_or_else(|| {
+                                format!(
+                                    "Dockerfile line {lineno}: HEALTHCHECK {name}={v} is not a \
+                                     duration (expected a form like 30s, 1m30s, 500ms)"
+                                )
+                            })
+                        };
+                        match name {
+                            "--interval" => interval_ns = dur(value)?,
+                            "--timeout" => timeout_ns = dur(value)?,
+                            "--start-period" => start_period_ns = dur(value)?,
+                            // BuildKit's newer knob. kern's checker has no separate first-probe
+                            // interval, so honouring it would be a claim it cannot keep: accepted
+                            // and named, because refusing the build over it would be worse.
+                            "--start-interval" => {
+                                dur(value)?;
+                                eprintln!(
+                                    "kern build: HEALTHCHECK --start-interval is accepted and not \
+                                     applied - kern's checker uses one interval, so the first probe \
+                                     follows --interval"
+                                );
+                            }
+                            "--retries" => {
+                                retries = Some(value.parse::<u32>().map_err(|_| {
+                                    format!(
+                                    "Dockerfile line {lineno}: HEALTHCHECK --retries={value} is \
+                                         not a whole number"
+                                )
+                                })?)
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "Dockerfile line {lineno}: HEALTHCHECK does not take `{name}`"
+                                ))
+                            }
+                        }
+                        tail = rest_of;
+                    }
+                    let (verb, cmd) = match tail.find(char::is_whitespace) {
+                        Some(n) => (&tail[..n], tail[n..].trim()),
+                        None => (tail, ""),
+                    };
+                    if !verb.eq_ignore_ascii_case("cmd") || cmd.is_empty() {
+                        return Err(format!(
+                            "Dockerfile line {lineno}: HEALTHCHECK needs `NONE` or `CMD <command>`"
+                        ));
+                    }
+                    // The exec form keeps its argv; anything else is the shell form, and the two are
+                    // distinguished by the first element exactly as the OCI config does.
+                    let test = match parse_exec_array(cmd) {
+                        Some(argv) if !argv.is_empty() => {
+                            let mut v = vec!["CMD".to_string()];
+                            v.extend(argv);
+                            v
+                        }
+                        _ => vec!["CMD-SHELL".to_string(), cmd.to_string()],
+                    };
+                    out.push(Instr::Healthcheck {
+                        test,
+                        interval_ns,
+                        timeout_ns,
+                        start_period_ns,
+                        retries,
+                    });
                 }
             }
             // Still genuinely unsupported: ONBUILD changes DOWNSTREAM build behaviour (deferred
@@ -1393,18 +1569,64 @@ mod tests {
         assert_eq!(parse(df, &ba()).unwrap()[0], from("alpine"));
     }
 
+    /// `VOLUME` STILL EMITS NOTHING; `HEALTHCHECK` AND `STOPSIGNAL` NOW REACH THE IMAGE CONFIG.
+    ///
+    /// All three used to be parsed and dropped so a stock upstream Dockerfile would build. For
+    /// `VOLUME` that is still right: it declares a runtime mount point and Docker's own build does
+    /// nothing with it either. For the other two it made a compose `build:` service lose a contract
+    /// the file states: a Dockerfile healthcheck vanished, and a peer with
+    /// `depends_on: condition: service_healthy` on that service could never be satisfied.
     #[test]
-    fn volume_and_healthcheck_are_accepted_not_fatal() {
-        // A stock upstream Dockerfile with VOLUME/HEALTHCHECK must BUILD, not explode. They carry no
-        // build-time filesystem effect, so they produce no instruction - the FROM/RUN around them do.
-        let df = "FROM alpine\nVOLUME /data\nHEALTHCHECK --interval=30s CMD curl -f localhost || exit 1\nRUN echo hi\n";
-        let got = parse(df, &ba()).expect("VOLUME/HEALTHCHECK must not fail the build");
-        // Only FROM + RUN survive as instructions; VOLUME/HEALTHCHECK emit none.
-        assert_eq!(got.len(), 2);
+    fn volume_emits_nothing_while_healthcheck_and_stopsignal_are_baked() {
+        let df = "FROM alpine\nVOLUME /data\nHEALTHCHECK --interval=30s --retries=2 CMD curl -f localhost || exit 1\nSTOPSIGNAL SIGQUIT\nRUN echo hi\n";
+        let got = parse(df, &ba()).expect("a stock Dockerfile must build");
         assert_eq!(got[0], from("alpine"));
-        assert!(matches!(got[1], Instr::Run(_)));
-        // `HEALTHCHECK NONE` is also fine (disables - nothing to nudge).
-        assert!(parse("FROM alpine\nHEALTHCHECK NONE\n", &ba()).is_ok());
+        // VOLUME contributes nothing at all, so the next instruction is the healthcheck.
+        assert_eq!(
+            got[1],
+            Instr::Healthcheck {
+                test: vec![
+                    "CMD-SHELL".to_string(),
+                    "curl -f localhost || exit 1".to_string()
+                ],
+                interval_ns: Some(30_000_000_000),
+                timeout_ns: None,
+                start_period_ns: None,
+                retries: Some(2),
+            }
+        );
+        assert_eq!(got[2], Instr::StopSignal("SIGQUIT".to_string()));
+        assert!(matches!(got[3], Instr::Run(_)));
+        assert_eq!(got.len(), 4);
+        // THE EXEC FORM KEEPS ITS ARGV, and is told apart from the shell form by the first element,
+        // exactly as the OCI config does.
+        let exec = parse("FROM alpine\nHEALTHCHECK CMD [\"/bin/true\"]\n", &ba()).unwrap();
+        assert_eq!(
+            exec[1],
+            Instr::Healthcheck {
+                test: vec!["CMD".to_string(), "/bin/true".to_string()],
+                interval_ns: None,
+                timeout_ns: None,
+                start_period_ns: None,
+                retries: None,
+            }
+        );
+        // `HEALTHCHECK NONE` disables an inherited check rather than describing one.
+        let none = parse("FROM alpine\nHEALTHCHECK NONE\n", &ba()).unwrap();
+        assert!(matches!(&none[1], Instr::Healthcheck { test, .. } if test == &["NONE"]));
+        // A MALFORMED DURATION IS AN ERROR, not a silent default: a check whose interval quietly
+        // became something else reports on a schedule nobody chose.
+        assert!(parse("FROM alpine\nHEALTHCHECK --interval=30 CMD true\n", &ba()).is_err());
+        assert!(parse("FROM alpine\nHEALTHCHECK --nope=1 CMD true\n", &ba()).is_err());
+        assert!(parse("FROM alpine\nHEALTHCHECK --retries=x CMD true\n", &ba()).is_err());
+        assert!(parse("FROM alpine\nHEALTHCHECK\n", &ba()).is_err());
+        // Go durations, the forms a Dockerfile actually uses.
+        assert_eq!(parse_go_duration_ns("30s"), Some(30_000_000_000));
+        assert_eq!(parse_go_duration_ns("1m30s"), Some(90_000_000_000));
+        assert_eq!(parse_go_duration_ns("500ms"), Some(500_000_000));
+        assert_eq!(parse_go_duration_ns("2h"), Some(7_200_000_000_000));
+        assert_eq!(parse_go_duration_ns("30"), None);
+        assert_eq!(parse_go_duration_ns(""), None);
     }
 
     #[test]
