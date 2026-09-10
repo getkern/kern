@@ -699,6 +699,7 @@ pub fn create_with_range(
     name: &str,
     want_outbound: bool,
     uid_range: kern_isolation::UidRange,
+    bridge: Option<&str>,
 ) -> Result<(), Error> {
     validate_name(name)?;
     let dir = pod_dir(name);
@@ -753,9 +754,12 @@ pub fn create_with_range(
         format!("{me}:{}", crate::registry::proc_starttime(me)),
     );
     // Seed the shared /etc/hosts. Every member box bind-mounts this; members are appended on join.
+    // BYTE-IDENTICAL to `LOCALHOST_SEED` in the isolation crate, including `localhost` being on the
+    // IPv4 line only: the two files are the same fact, and a pod member and a standalone box must
+    // not disagree about what `localhost` resolves to. See that constant for the measurement.
     std::fs::write(
         hosts_path(name),
-        "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n",
+        "127.0.0.1\tlocalhost\n::1\tip6-localhost ip6-loopback\n",
     )
     .map_err(|e| Error::Sandbox(format!("pod hosts: {e}")))?;
 
@@ -773,6 +777,12 @@ pub fn create_with_range(
         // Tell the holder to map a subordinate uid range (so member OCI images can drop privilege),
         // and WHY, so it only reports an unavailable range the caller actually asked for.
         cmd.env("KERN_POD_UID_RANGE", uid_range.as_env());
+    }
+    // A BRIDGE POD, where each member keeps its own network namespace and loopback. Passed by
+    // environment for the reason the uid range is: the holder is a forked process and this is the
+    // channel that already exists for telling it what kind of pod it is holding.
+    if let Some(cidr) = bridge {
+        cmd.env("KERN_POD_BRIDGE", cidr);
     }
     let mut child = cmd
         .spawn()

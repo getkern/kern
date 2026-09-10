@@ -112,8 +112,9 @@ const INTERNAL_NOT_APPLIED: &str = "a network is marked `internal: true` but at 
 const INTERNAL_SATISFIED_BY_NO_POD: &str = "a network is marked `internal: true`, and with a \
      namespace per service kern ENFORCES it: a service whose networks are all internal gets no NAT \
      at all, so there is no route out of its namespace rather than a filter. Services on other \
-     networks keep their egress. A service with `restart:` gets no NAT either way - it is started \
-     by systemd, which kern cannot hold while it attaches one";
+     networks keep their egress. A service with `restart:` that SYSTEMD starts gets no NAT either \
+     way - kern cannot hold a box the manager launches later; a pod member with `restart:` is \
+     supervised in-process instead, so it does get one";
 
 const MAX_DEPTH: usize = 32;
 /// Total nodes an anchor/alias/merge expansion may materialize. Every aliased clone spends from this
@@ -132,7 +133,13 @@ const MAX_ANCHOR_NODES: usize = 10_000;
 /// `parse` exactly as callers without a project `.env` reach it.
 #[cfg(test)]
 fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
-    parse_with_env(text, &crate::DotEnv::default(), true, crate::StackNet::Pod)
+    parse_with_env(
+        text,
+        &crate::DotEnv::default(),
+        true,
+        crate::StackNet::Pod,
+        None,
+    )
 }
 
 /// The `--no-pod` counterpart of [`parse`], for tests that assert what segregation changes.
@@ -143,6 +150,7 @@ fn parse_no_pod(text: &str) -> Result<Vec<ComposeBox>, String> {
         &crate::DotEnv::default(),
         true,
         crate::StackNet::PerService,
+        None,
     )
 }
 
@@ -151,6 +159,7 @@ pub(crate) fn parse_with_env(
     dotenv: &crate::DotEnv,
     require_runnable: bool,
     net: crate::StackNet,
+    dir: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeBox>, String> {
     // Fold multi-line block scalars (`|`/`>`) and multi-line flow collections onto single logical lines
     // first, so the rest of the pipeline stays line-at-a-time (block-scalar bodies become opaque values).
@@ -200,7 +209,7 @@ pub(crate) fn parse_with_env(
     resolve_anchors(&mut root)?;
     // Resolve `extends:` (a service inheriting another service's fields) - a real Compose feature the
     // `x-`/anchor pattern doesn't cover, since it references another SERVICE by name. Same-file only.
-    resolve_extends(&mut root)?;
+    resolve_extends(&mut root, dir, dotenv)?;
 
     // Top level must have `services:`. `volumes:`/`networks:`/`version:`/`name:` are recognized;
     // everything else at the top is warned and ignored.
@@ -208,7 +217,9 @@ pub(crate) fn parse_with_env(
     // `secrets: [name]` reference can be resolved to its file. Only the `file:`-backed form maps to
     // kern (`--secret <file>:<name>` → `/run/secrets/<name>`); `external:`/`environment:` secrets warn.
     let secret_files = collect_secret_files(&root);
+    let secret_envs = collect_secret_envs(&root);
     let internal_networks = collect_internal_networks(&root);
+    let network_subnets = collect_network_subnets(&root);
     // Collected first for the same reason as the secrets above: `volumes:` may sit below `services:`
     // in the file, and a service that mounts an external volume has to be marked whichever order the
     // two blocks appear in.
@@ -239,7 +250,25 @@ pub(crate) fn parse_with_env(
                     if !seen_names.insert(name.clone()) {
                         return Err(format!("duplicate service '{name}'"));
                     }
-                    let b = service_to_box(name, svc, &secret_files, &internal_networks, net)?;
+                    let mut b = service_to_box(
+                        name,
+                        svc,
+                        &ServiceCtx {
+                            secret_files: &secret_files,
+                            secret_envs: &secret_envs,
+                            internal_networks: &internal_networks,
+                            net,
+                            dir,
+                            dotenv,
+                        },
+                    )?;
+                    // The subnet of the FIRST network this service joins that declares one.
+                    b.net_subnet = b.networks.iter().find_map(|n| {
+                        network_subnets
+                            .iter()
+                            .find(|(name, _)| name == n)
+                            .map(|(_, cidr)| cidr.clone())
+                    });
                     // Docker profiles: a service with a non-empty profile list is INACTIVE unless one
                     // of its profiles is enabled via COMPOSE_PROFILES. A plain `up` starts only the
                     // profile-less services - so we SKIP an inactive one (never start it by accident),
@@ -306,7 +335,7 @@ pub(crate) fn parse_with_env(
                                 "service '{}': 'volumes_from: {svc}' - '{svc}' itself inherits \
                                  volumes, and kern does not follow the chain: only what '{svc}' \
                                  declares directly is copied",
-                                b.service
+                                b.service_name()
                             ));
                         }
                         for v in &src.volumes {
@@ -320,7 +349,7 @@ pub(crate) fn parse_with_env(
                     }
                     None => warn(&format!(
                         "service '{}': 'volumes_from: {svc}' names no service in this file - ignored",
-                        b.service
+                        b.service_name()
                     )),
                 }
             }
@@ -334,6 +363,29 @@ pub(crate) fn parse_with_env(
                     b.volumes.push(v);
                 }
             }
+        }
+    }
+    // `network_mode: service:X` RESOLVED AFTER THE LOOP, for the reason `volumes_from` is: the
+    // service it names may be written below the one that names it.
+    //
+    // WHAT IT RESOLVES INTO IS MEMBERSHIP. A container inside another's network namespace is on that
+    // namespace's networks, so the sharer inherits the memberships of the service it names. Before
+    // this it inherited nothing: a service with `network_mode:` has no `networks:` key of its own, so
+    // it sat on the implicit `default` network while the service it named sat on another, and kern
+    // read the pair as SEGREGATED - no relay, no hosts entry, no name resolution - in exactly the
+    // file that asked the two to be one host.
+    //
+    // THE CHAIN IS FOLLOWED, unlike `volumes_from`, because it terminates in a single namespace and
+    // truncating it would copy a membership that is itself a copy: `a` inside `b` inside `c` is one
+    // namespace, `c`'s. The walk is bounded by the service count, so a file that points a service at
+    // itself is reported instead of spinning.
+    let shared = resolve_net_share(&boxes);
+    for note in &shared.notes {
+        warn(note);
+    }
+    for (i, nets) in shared.inherit {
+        if let Some(b) = boxes.get_mut(i) {
+            b.networks = nets;
         }
     }
     // AFTER the `volumes_from` inheritance above: an inherited mount of an external volume is still a
@@ -437,7 +489,7 @@ fn degrade_orphan_health_gates(boxes: &mut [ComposeBox]) {
     // Which service names lack a health command (so a `service_healthy` gate toward them is unsatisfiable).
     let no_health: std::collections::HashSet<String> = boxes
         .iter()
-        .filter(|b| b.health_cmd.is_none())
+        .filter(|b| !b.has_health())
         .map(|b| b.name.clone())
         .collect();
     for b in boxes.iter_mut() {
@@ -482,6 +534,18 @@ fn any_profile_active(profiles: &[String]) -> bool {
 /// model without losing real newlines (the verbatim unquoting never expands a `\n` escape), and marks
 /// a line as an opaque scalar so prescreen/lex don't scan its shell-script bytes as YAML structure.
 const BLOCK_NL: char = '\u{1}';
+
+/// Private marker for "a `${VAR}` with no default resolved to nothing", written by the interpolator
+/// and erased by [`scalar_str`], so it never reaches a value.
+///
+/// It exists to keep two spellings apart that Docker treats differently and that interpolation
+/// otherwise flattens into the same thing. MEASURED: `K:` and `K: ${UNSET}` both arrive at the
+/// parser as `scalar: None`, and Docker passes the FIRST from the environment (omitting it when
+/// nothing is bound) while setting the SECOND to the empty string. Sentry self-hosted needs both in
+/// one file: `SENTRY_EVENT_RETENTION_DAYS:` must pick up its `.env` value, and a valueless key whose
+/// name is bound nowhere must be absent, not empty - passed as empty, its config dies on
+/// `value[0]` with `IndexError: string index out of range`.
+const UNSET_MARK: char = '\u{2}';
 
 /// Fold the multi-line YAML the line scanner can't span, before prescreen/lex:
 ///  * BLOCK SCALARS - `key: |`/`>` and the list form `- |`/`- >` (with `-`/`+`/indent indicators): the
@@ -964,7 +1028,10 @@ fn prescreen(text: &str) -> Result<(), String> {
         let is_merge_line = colon_index(line).map(|ci| line[..ci].trim()) == Some("<<");
         if !is_merge_line && line_has_inline_anchor(line) {
             return Err(format!(
-                "line {ln}: YAML anchors/aliases not supported (rewrite the value inline)"
+                "line {ln}: an anchor or alias INSIDE a flow collection (`[*x]`, `{{k: *x}}`) is \
+                 not expanded. Block-level anchors, aliases and merge keys are: write `<<: *x`, or \
+                 the sequence as block items. If this line has no anchor in it, look for an \
+                 unclosed `[` or `{{` earlier in the value: it makes a later `&` or `*` read as one"
             ));
         }
         // Explicit type tags (`!!str`, `!!float`, …) - refuse ONLY when the tag is at value position
@@ -1280,10 +1347,36 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
             }
         }
 
-        // Dedent / sibling: pop levels whose opening column is >= this line's column. A list item (`-`)
-        // lives AT its key's child-indent, so the same rule applies.
+        // A YAML sequence item is a dash FOLLOWED BY WHITESPACE (`- x`) or a bare `-` (empty). A dash
+        // NOT followed by space is part of a key - e.g. `--net:` is a (bad) key, NOT the list item
+        // `-net:`. Matching a bare `strip_prefix('-')` mis-parsed `--net:` as a list item; require the
+        // space/EOL boundary. Decided BEFORE the dedent below, which needs to know.
+        let is_list_item = ln.content == "-"
+            || ln
+                .content
+                .strip_prefix('-')
+                .is_some_and(|r| r.starts_with([' ', '\t']));
+
+        // Dedent / sibling: pop levels whose opening column is >= this line's column.
+        //
+        // A LIST ITEM POPS ONLY ON A STRICTLY SMALLER COLUMN, because YAML lets a block sequence sit
+        // at ITS KEY'S OWN indentation - the `-` is itself an indentation indicator:
+        //
+        //     ports:
+        //     - "8080:80"
+        //
+        // That is not an exotic spelling. It is what `docker compose config` prints, what PyYAML and
+        // every other dumper emit, and how a large share of hand-written files are written. Under the
+        // `<=` rule the `ports:` level was popped by its own first item, so the items landed on the
+        // PARENT mapping, where nothing reads them: the key parsed, the value vanished, and kern said
+        // NOTHING. MEASURED on a two-service file written that way: `ports`, `depends_on`, `volumes`,
+        // `environment` and `command` all silently empty, `kern compose config` printing a service
+        // with no ports and no dependencies, exit 0. Found while running Zabbix, whose `healthcheck.
+        // test` is written this way and was reported "not convertible" - the only visible symptom of
+        // a defect that is otherwise completely quiet.
+        let pop_at_equal = !is_list_item;
         while let Some(&c) = cols.last() {
-            if ln.indent <= c {
+            if ln.indent < c || (pop_at_equal && ln.indent == c) {
                 path.pop();
                 cols.pop();
             } else {
@@ -1297,15 +1390,7 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
             ));
         }
 
-        // List item: append to the mapping that opened the current level. A YAML sequence item is a
-        // dash FOLLOWED BY WHITESPACE (`- x`) or a bare `-` (empty). A dash NOT followed by space is
-        // part of a key - e.g. `--net:` is a (bad) key, NOT the list item `-net:`. Matching a bare
-        // `strip_prefix('-')` mis-parsed `--net:` as a list item; require the space/EOL boundary.
-        let is_list_item = ln.content == "-"
-            || ln
-                .content
-                .strip_prefix('-')
-                .is_some_and(|r| r.starts_with([' ', '\t']));
+        // List item: append to the mapping that opened the current level.
         if is_list_item {
             let item = ln.content[1..].trim();
             if item.is_empty() {
@@ -1542,12 +1627,43 @@ fn apply_anchors(
     Ok(())
 }
 
-/// Resolve Compose `extends:` - a service inheriting another service's fields. Same-file only
-/// (`extends: base` or `extends: {service: base}`); a `{file: …}` cross-file extends is a clear error
-/// (inline the service instead). Merge is SHALLOW and the extending service WINS on a key conflict -
-/// the same rule kern uses for `<<` merge - resolved transitively (A extends B extends C) with a
-/// cycle guard.
-fn resolve_extends(root: &mut Node) -> Result<(), String> {
+/// Resolve Compose `extends:` - a service inheriting another service's fields, in this file
+/// (`extends: base`, `extends: {service: base}`) or in ANOTHER (`extends: {file: b.yaml, service:
+/// base}`). Merge is SHALLOW and the extending service WINS on a key conflict - the same rule kern
+/// uses for `<<` merge - resolved transitively (A extends B extends C) with a cycle guard that spans
+/// files.
+///
+/// CROSS-FILE USED TO BE A REFUSAL ("inline the base service"), and inlining is exactly what a
+/// project cannot do when the base file is the thing it maintains. MEASURED on Zabbix's own stack:
+/// 17 services, every one of them an `extends` into `compose_zabbix_components.yaml`, so the file
+/// its maintainers run daily did not start at all. The refusal was honest and complete: it named
+/// the construct and stopped, which is why this is a missing feature and not a defect.
+///
+/// `dir` is the directory of the file being parsed - `file:` resolves against it, per the
+/// Specification, and against nothing else. With no directory (a string parsed in a test, stdin)
+/// there is nothing to resolve from, and the refusal says that instead of guessing a cwd.
+fn resolve_extends(
+    root: &mut Node,
+    dir: Option<&std::path::Path>,
+    dotenv: &crate::DotEnv,
+) -> Result<(), String> {
+    // One cache and one chain for the whole pass: Zabbix's 17 services all extend into the SAME
+    // file, and parsing it once per service would read and interpolate a 725-line document
+    // seventeen times. The chain is shared for a stronger reason - a cycle can leave this file and
+    // come back, and only a chain that crosses files can see it. Each service still starts from the
+    // state it left (push/pop are symmetric), so sharing costs no accuracy.
+    let mut loaded: Vec<(std::path::PathBuf, Node)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    resolve_extends_in(root, dir, dotenv, &mut loaded, &mut seen)
+}
+
+fn resolve_extends_in(
+    root: &mut Node,
+    dir: Option<&std::path::Path>,
+    dotenv: &crate::DotEnv,
+    loaded: &mut Vec<(std::path::PathBuf, Node)>,
+    seen: &mut Vec<String>,
+) -> Result<(), String> {
     let Some(si) = root.children.iter().position(|(k, _)| k == "services") else {
         return Ok(());
     };
@@ -1569,14 +1685,70 @@ fn resolve_extends(root: &mut Node) -> Result<(), String> {
         .map(|(k, _)| k.clone())
         .collect();
     for name in &names {
-        resolve_service_extends(&mut root.children[si].1, name, &mut Vec::new())?;
+        resolve_service_extends(&mut root.children[si].1, name, seen, dir, dotenv, loaded)?;
     }
     Ok(())
 }
 
-/// The target service name of an `extends` node: the scalar short form, or the `service:` key of the
-/// map form. A `file:` key (cross-file) is rejected clearly.
-fn extends_target(n: &Node) -> Result<String, String> {
+/// The keys a service NEVER inherits through `extends`, per the Specification: they name OTHER
+/// services, and copying them would give the extending service dependencies and links its author
+/// never wrote - in a different file, against services that may not even exist there.
+const EXTENDS_NOT_INHERITED: &[&str] = &["depends_on", "links", "external_links", "volumes_from"];
+
+/// How deep an `extends` chain may go before it is treated as a mistake. A real chain is one or two
+/// links; this exists so a hostile pair of files cannot drive unbounded recursion, and it is checked
+/// in ADDITION to the exact-cycle guard (which catches the honest case with a better message).
+const MAX_EXTENDS_DEPTH: usize = 32;
+
+/// Load another compose file as a node tree, ready to be extended from: interpolated with the same
+/// `.env`, folded, prescreened, anchor-expanded, and with its OWN `extends` already resolved
+/// relative to ITS directory. Cached by path within one parse.
+fn load_extends_base<'a>(
+    path: &std::path::Path,
+    dotenv: &crate::DotEnv,
+    loaded: &'a mut Vec<(std::path::PathBuf, Node)>,
+    seen: &mut Vec<String>,
+) -> Result<&'a Node, String> {
+    if let Some(i) = loaded.iter().position(|(p, _)| p == path) {
+        return Ok(&loaded[i].1);
+    }
+    if seen.len() > MAX_EXTENDS_DEPTH {
+        return Err(format!(
+            "`extends` chains more than {MAX_EXTENDS_DEPTH} files deep - refusing to follow further"
+        ));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("`extends` reads {}: {e}", path.display()))?;
+    let folded = fold_multiline(&text)?;
+    prescreen(&folded)?;
+    // The SAME `.env`, because a base file is written with the same variables as the file that
+    // extends it - Zabbix's components file is `${ZABBIX_SERVER_PGSQL_IMAGE}` from end to end. A
+    // `${VAR:?}` it requires is collected by the same thread-local and reported with the rest.
+    let interpolated = interpolate_document(&folded, dotenv);
+    let lines = lex(&interpolated)?;
+    let mut root = build_tree(&lines)?;
+    resolve_anchors(&mut root)?;
+    // ITS extends, from ITS directory: a base file may extend a third file next to itself. The
+    // cache and the chain travel with it, which is what makes a cycle through two files visible
+    // instead of a recursion that runs until the stack ends (measured: it did).
+    resolve_extends_in(&mut root, path.parent(), dotenv, loaded, seen)?;
+    loaded.push((path.to_path_buf(), root));
+    let last = loaded.len() - 1;
+    Ok(&loaded[last].1)
+}
+
+/// What an `extends` names: a service, and the file it lives in when that is not this one.
+#[derive(Debug, PartialEq, Eq)]
+struct ExtendsTarget {
+    service: String,
+    /// `file:` verbatim, as written. Resolved against the EXTENDING file's directory by the caller,
+    /// which is the only place that knows what that directory is.
+    file: Option<String>,
+}
+
+/// The target of an `extends` node: the scalar short form (`extends: base`), or the map form's
+/// `service:` plus optional `file:`.
+fn extends_target(n: &Node) -> Result<ExtendsTarget, String> {
     // STRUCTURED form first. A flow mapping (`extends: {service: b}`) carries BOTH the expanded
     // `children` and the raw `{…}` text as a scalar; reading the scalar first took that raw text as a
     // service NAME and reported "unknown service '{file: base.yml, service: b}'" instead of resolving
@@ -1586,36 +1758,45 @@ fn extends_target(n: &Node) -> Result<String, String> {
             // The short form is a bare service name; a leftover `{…}` is a mapping we failed to expand,
             // never a name - fall through to the structured errors rather than inventing a target.
             if !s.is_empty() && !s.starts_with('{') {
-                return Ok(s.to_string());
+                return Ok(ExtendsTarget {
+                    service: s.to_string(),
+                    file: None,
+                });
             }
         }
     }
-    if n.children.iter().any(|(k, _)| k == "file") {
-        return Err(
-            "cross-file `extends: {file: …}` isn't supported yet - inline the base service into this \
-             compose file"
-                .to_string(),
-        );
+    let value_of = |key: &str| -> Option<String> {
+        n.children
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.scalar.as_deref())
+            .map(|s| scalar_str(s.trim()))
+            .filter(|s| !s.is_empty())
+    };
+    let file = value_of("file");
+    if let Some(service) = value_of("service") {
+        return Ok(ExtendsTarget { service, file });
     }
-    if let Some((_, sv)) = n.children.iter().find(|(k, _)| k == "service") {
-        if let Some(s) = sv.scalar.as_deref().map(str::trim) {
-            if !s.is_empty() {
-                return Ok(s.to_string());
-            }
-        }
-    }
+    // A `file:` with no `service:` names a document, not a service: there is nothing to inherit.
     Err(
-        "`extends` needs a service name (`extends: base` or `extends: {service: base}`)"
+        "`extends` needs a service name (`extends: base`, `extends: {service: base}` or \
+         `extends: {file: other.yaml, service: base}`)"
             .to_string(),
     )
 }
 
 /// Resolve one service's `extends`, first expanding the target (so chains fully flatten), then folding
 /// the target's keys in where this service doesn't already define them.
+///
+/// `seen` carries the chain being resolved, so a cycle is named rather than followed - and it holds
+/// `file#service` keys, because a cycle can leave this file and come back.
 fn resolve_service_extends(
     services: &mut Node,
     name: &str,
     seen: &mut Vec<String>,
+    dir: Option<&std::path::Path>,
+    dotenv: &crate::DotEnv,
+    loaded: &mut Vec<(std::path::PathBuf, Node)>,
 ) -> Result<(), String> {
     let Some(idx) = services.children.iter().position(|(k, _)| k == name) else {
         return Ok(());
@@ -1629,35 +1810,142 @@ fn resolve_service_extends(
         return Ok(());
     };
     let target = extends_target(&services.children[idx].1.children[ep].1)?;
-    if target == name || seen.iter().any(|s| s == name) {
-        return Err(format!("circular `extends` involving service '{name}'"));
-    }
-    seen.push(name.to_string());
-    resolve_service_extends(services, &target, seen)?;
-    seen.pop();
-    let Some(tidx) = services.children.iter().position(|(k, _)| k == &target) else {
-        return Err(format!(
-            "service '{name}' extends unknown service '{target}'"
-        ));
+    // The parent's keys, from this file or from the one it names.
+    let parent = match &target.file {
+        None => {
+            if target.service == name || seen.iter().any(|s| s == name) {
+                return Err(format!("circular `extends` involving service '{name}'"));
+            }
+            seen.push(name.to_string());
+            let r = resolve_service_extends(services, &target.service, seen, dir, dotenv, loaded);
+            seen.pop();
+            r?;
+            let Some(tidx) = services
+                .children
+                .iter()
+                .position(|(k, _)| k == &target.service)
+            else {
+                return Err(format!(
+                    "service '{name}' extends unknown service '{}'",
+                    target.service
+                ));
+            };
+            services.children[tidx].1.children.clone()
+        }
+        Some(f) => {
+            // RESOLVED AGAINST THE EXTENDING FILE'S DIRECTORY, which the Specification requires and
+            // a cwd would only accidentally match: `kern compose -f ../stack/compose.yaml` runs from
+            // somewhere else entirely.
+            let Some(dir) = dir else {
+                return Err(format!(
+                    "service '{name}' extends `{f}`, but this stack was not read from a file on \
+                     disk, so there is no directory to resolve `{f}` against"
+                ));
+            };
+            let path = dir.join(f);
+            let key = format!("{}#{}", path.display(), target.service);
+            if seen.contains(&key) {
+                return Err(format!(
+                    "circular `extends` involving service '{}' in {}",
+                    target.service,
+                    path.display()
+                ));
+            }
+            seen.push(key);
+            let base = load_extends_base(&path, dotenv, loaded, seen);
+            let out = base.and_then(|root| {
+                root.child("services")
+                    .and_then(|s| s.child(&target.service))
+                    .map(|svc| svc.children.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "service '{name}' extends '{}' in {}, which has no such service",
+                            target.service,
+                            path.display()
+                        )
+                    })
+            });
+            seen.pop();
+            out?
+        }
     };
-    let parent = services.children[tidx].1.children.clone();
-    // Drop the `extends` key now that it's being resolved, then fold in the parent's keys the child
-    // doesn't already set (child wins - Compose's override semantics).
+    // Drop the `extends` key now that it's being resolved, then fold the base in underneath.
     services.children[idx].1.children.remove(ep);
-    for (pk, pv) in parent {
-        if pk == "extends" {
+    let base: Vec<(String, Node)> = parent
+        .into_iter()
+        .filter(|(pk, _)| pk != "extends" && !EXTENDS_NOT_INHERITED.contains(&pk.as_str()))
+        .collect();
+    fold_base_into(&mut services.children[idx].1, base, "");
+    Ok(())
+}
+
+/// Fold a base service's keys into the service extending it, by the Compose Specification's merge
+/// rules: a mapping gains the base's missing entries and merges the conflicting ones, a sequence is
+/// the base's items followed by the extending service's, and a scalar the extending service sets
+/// wins outright.
+///
+/// IT USED TO BE "WHOLE KEY, CHILD WINS", which is right for a scalar and wrong for everything else.
+/// MEASURED on Zabbix: `server-pgsql` extends `server` and then writes `networks: {backend:
+/// {aliases: […]}}` purely to add an alias. Replacing the key dropped the `database` network the
+/// base put it on, so kern reported that its Zabbix server and its PostgreSQL "share no network and
+/// do not resolve each other" - a stack that cannot work, produced from a file that does.
+///
+/// `path` is the key path being merged (empty at the service level), for the one exception that
+/// needs to know where it is: `healthcheck.test`.
+fn fold_base_into(child: &mut Node, base: Vec<(String, Node)>, path: &str) {
+    for (bk, bv) in base {
+        let Some(pos) = child.children.iter().position(|(ck, _)| *ck == bk) else {
+            child.children.push((bk, bv));
+            continue;
+        };
+        // SHELL COMMANDS ARE REPLACED, NEVER APPENDED - the Specification names the three, and the
+        // reason is plain: two concatenated argv run neither program.
+        let full = if path.is_empty() {
+            bk.clone()
+        } else {
+            format!("{path}.{bk}")
+        };
+        if matches!(full.as_str(), "command" | "entrypoint" | "healthcheck.test") {
             continue;
         }
-        if !services.children[idx]
-            .1
-            .children
-            .iter()
-            .any(|(ck, _)| *ck == pk)
-        {
-            services.children[idx].1.children.push((pk, pv));
+        let slot = &mut child.children[pos].1;
+        if !bv.children.is_empty() {
+            fold_base_into(slot, bv.children, &full);
+            continue;
         }
+        if !bv.items.is_empty() {
+            // The base's items first, then the extending service's - "appending values from the
+            // overriding file to the previous one".
+            let mut merged = bv.items;
+            // UNIQUE RESOURCES: `volumes`, `secrets` and `configs` are keyed by their TARGET, so an
+            // entry the extending service writes for a target REPLACES the base's rather than
+            // mounting twice over the same path.
+            if matches!(bk.as_str(), "volumes" | "secrets" | "configs") {
+                let targets: Vec<String> = slot.items.iter().map(|i| mount_target(i)).collect();
+                merged.retain(|b| !targets.contains(&mount_target(b)));
+            } else {
+                // Everything else appends, minus exact duplicates: a repeated `- backend` or
+                // `- K=V` says nothing the first one did not.
+                merged.retain(|b| !slot.items.contains(b));
+            }
+            merged.extend(std::mem::take(&mut slot.items));
+            slot.items = merged;
+            continue;
+        }
+        // A scalar the extending service already set: it wins, which is the one part of the old
+        // rule that was right.
     }
-    Ok(())
+}
+
+/// The TARGET of a mount-shaped entry (`src:target[:opts]`, `target`, or `name:target`), which is
+/// the key the Specification makes these sequences unique on. Bare entries (an anonymous volume, a
+/// secret named without a target) are their own target.
+fn mount_target(entry: &str) -> String {
+    let e = scalar_str(entry.trim());
+    match e.split(':').nth(1) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => e,
+    }
 }
 
 /// Split a `key: value` line into `(key, Some(value))` or a bare `key:` into `(key, Some(""))`.
@@ -1716,12 +2004,17 @@ fn scalar_str(s: &str) -> String {
     let sq = b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'';
     // Decode a folded block scalar's U+0001 line-break sentinel back to a real newline.
     if dq {
-        decode_double_quoted(&t[1..t.len() - 1]).replace(BLOCK_NL, "\n")
+        decode_double_quoted(&t[1..t.len() - 1])
+            .replace(BLOCK_NL, "\n")
+            .replace(UNSET_MARK, "")
     } else if sq {
         // Single quotes take no backslash escapes at all; `''` is the only one, and it means `'`.
-        t[1..t.len() - 1].replace("''", "'").replace(BLOCK_NL, "\n")
+        t[1..t.len() - 1]
+            .replace("''", "'")
+            .replace(BLOCK_NL, "\n")
+            .replace(UNSET_MARK, "")
     } else {
-        t.replace(BLOCK_NL, "\n")
+        t.replace(BLOCK_NL, "\n").replace(UNSET_MARK, "")
     }
 }
 
@@ -2404,6 +2697,58 @@ fn mark_external_volumes(
     }
 }
 
+/// The subnet a top-level network declares, as `networks.<name>.ipam.config[].subnet`.
+///
+/// WHY IT IS READ AT ALL. A file that pins services with `ipv4_address:` declares the network those
+/// addresses belong to, and kern used to invent its own bridge network instead: the declared
+/// addresses then fell outside it and a peer that hard-coded one had no route. With the file's own
+/// subnet on the bridge, the address the file wrote IS the address the service answers on, which is
+/// exactly what Docker does and the only way this key is honoured rather than approximated.
+///
+/// THE FIRST `subnet` OF THE FIRST NETWORK THAT HAS ONE. A file may declare several networks with
+/// several subnets; one bridge can carry one of them, so kern takes the first and the driver refuses
+/// to use it when a service's address falls outside. Guessing which of several was meant would be a
+/// silent choice about where a service answers.
+fn collect_network_subnets(root: &Node) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Some(nets) = root.child("networks") else {
+        return out;
+    };
+    for (name, def) in &nets.children {
+        let Some(ipam) = def.child("ipam") else {
+            continue;
+        };
+        let Some(config) = ipam.child("config") else {
+            continue;
+        };
+        // `config:` IS A SEQUENCE OF MAPPINGS, AND THIS PARSER FOLDS EACH ITEM INTO ONE INLINE
+        // SCALAR: a block item `- subnet: 172.28.0.0/16` arrives as the text `{subnet:
+        // 172.28.0.0/16}`, exactly as `reconstruct_volume_item` documents for the long-form volume.
+        // Walking `children` finds nothing, which is what it did: the file's own network was never
+        // read and the bridge got one kern invented.
+        for item in list_value(config) {
+            let inner = item.trim().trim_start_matches('{').trim_end_matches('}');
+            for field in split_top_commas(inner) {
+                let Some((k, v)) = field.split_once(':') else {
+                    continue;
+                };
+                if k.trim() != "subnet" {
+                    continue;
+                }
+                let v = scalar_str(v).trim().to_string();
+                if !v.is_empty() {
+                    out.push((name.trim().to_string(), v));
+                    break;
+                }
+            }
+            if out.last().is_some_and(|(n, _)| n == name.trim()) {
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn collect_internal_networks(root: &Node) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     if let Some(nets) = root.child("networks") {
@@ -2456,6 +2801,108 @@ pub const fn networks_note(net: crate::StackNet) -> Option<&'static str> {
     }
 }
 
+/// The sentence a stack is owed about `ipv4_address:`, once the wiring is settled.
+///
+/// THE KEY IS HALF-CLOSED AND THE HALF DEPENDS ON THE WIRING, which is exactly why this cannot be
+/// said by the parser. In one shared namespace every service's address lands on the one loopback, so
+/// a peer that hard-codes the address reaches the service and the key is honoured: measured on a
+/// two-service file, `web` connecting to `172.28.1.10:6000` read back what `db` was serving, three
+/// runs out of three, where before the change there was no route at all. With a namespace per
+/// service a box claims only its OWN address, so the service answers on it and a PEER still cannot
+/// reach it. Saying "applied" in that case would be the same defect this branch exists to remove.
+#[must_use]
+pub fn net_ipv4_note(net: crate::StackNet, pairs: &[(String, String)]) -> Option<String> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let rendered: Vec<String> = pairs.iter().map(|(a, b)| format!("{a} at {b}")).collect();
+    let shown: Vec<&str> = rendered.iter().map(String::as_str).collect();
+    let list = crate::name_list(&shown);
+    match net {
+        crate::StackNet::Pod => Some(format!(
+            "`ipv4_address:` is applied here ({list}): each address is claimed as a /32 on the \
+             stack's shared loopback, so a peer that connects to the literal address reaches the \
+             service. In one namespace it is the PORT that selects the service and not the address, \
+             so a stack whose services share an internal port is wired with a namespace per service \
+             instead, where the two cannot be confused"
+        )),
+        crate::StackNet::PerService => Some(format!(
+            "`ipv4_address:` is claimed only where each service itself runs ({list}), because this \
+             stack has a namespace per service: the service answers on its own address, and a PEER \
+             connecting to that literal address still has no route to it. Peers reach each other by \
+             name, so use the service name rather than a fixed address, which also keeps the file \
+             working under Docker"
+        )),
+        crate::StackNet::Undecided => None,
+    }
+}
+
+/// The sentence a `--bridge` stack is owed about `ipv4_address:`, which is the one wiring that
+/// honours the key exactly.
+///
+/// A THIRD SENTENCE AND NOT A THIRD ARM OF [`net_ipv4_note`], because it is not a variation on the
+/// other two: in a pod the address is an alias on a shared loopback and the PORT selects the
+/// service, with a namespace per service the peer has no route at all, and on a bridge the address
+/// IS the service's address on a real network - the same thing Docker gives it. Folding three
+/// different facts into one function keyed on an enum with two wiring values is how the first two
+/// came to say each other's sentence.
+#[must_use]
+pub fn net_ipv4_bridge_note(cidr: &str, pairs: &[(String, String)]) -> Option<String> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let rendered: Vec<String> = pairs.iter().map(|(a, b)| format!("{a} at {b}")).collect();
+    let shown: Vec<&str> = rendered.iter().map(String::as_str).collect();
+    Some(format!(
+        "`ipv4_address:` is honoured exactly here ({}): the bridge carries this file's own network \
+         {cidr}, so the address the file pinned IS the address the service answers on and a peer \
+         that hard-codes it reaches that service and no other",
+        crate::name_list(&shown)
+    ))
+}
+
+/// The sentence a stack is owed about `network_mode: service:X`, once the wiring is settled.
+///
+/// A FUNCTION AND NOT AN INLINE `warn`, so a test can ask what the stack was told for a given
+/// wiring. This key had a sentence at parse time and it was WRONG in the wiring kern now picks by
+/// itself: it said "kern already does this" and pointed the reader at `--no-pod` as the case to
+/// worry about, while kern selects that case from the file. MEASURED on the corpus: 75 files use the
+/// key and 20 of them get the per-service wiring, so the reassurance was false for one file in four
+/// that reads it.
+///
+/// THE TWO ARMS ARE DIFFERENT CLAIMS, not two phrasings. In one namespace the key is satisfied
+/// exactly: the services do share a stack, a loopback and a route. In a namespace per service the
+/// membership is inherited (so the pair resolves and gets a relay, which is the half kern can give)
+/// and the rest is not, and the half that is missing is the reason people write this key: a service
+/// pinned behind a VPN or proxy container egresses through it. Saying "not shared" without saying
+/// where the traffic goes instead would leave the reader believing the safer of the two readings.
+#[must_use]
+pub fn net_share_note(net: crate::StackNet, pairs: &[(String, String)]) -> Option<String> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let rendered: Vec<String> = pairs.iter().map(|(a, b)| format!("{a} -> {b}")).collect();
+    let shown: Vec<&str> = rendered.iter().map(String::as_str).collect();
+    let list = crate::name_list(&shown);
+    match net {
+        crate::StackNet::Pod => Some(format!(
+            "'network_mode: service:' is satisfied here ({list}): every service in this stack shares \
+             ONE network namespace, so each of these reaches the service it names on 127.0.0.1 and \
+             leaves through the same route"
+        )),
+        crate::StackNet::PerService => Some(format!(
+            "'network_mode: service:' is NOT given a shared namespace here ({list}), because this \
+             stack is wired with one namespace per service. Each of these services inherits the \
+             `networks:` of the one it names, so it resolves it by name and reaches it through a \
+             relay. What one namespace would also give it does not have: 127.0.0.1 is not shared, \
+             and its outbound traffic does NOT pass through the service it names, so a service put \
+             behind a VPN or a proxy container this way reaches the network directly. `--pod` wires \
+             the whole stack as one namespace, which does satisfy the key"
+        )),
+        crate::StackNet::Undecided => None,
+    }
+}
+
 /// Name the per-service network sub-keys kern does NOT honour, one line per service.
 ///
 /// SILENCE HERE WAS THE WORST DEFECT THIS PARSER HAD. MEASURED before this existed, on a file
@@ -2482,13 +2929,11 @@ fn unhonoured_net_keys(networks: &Node) -> Vec<&'static str> {
     ///
     /// A TABLE AND NOT A `matches!`, so the set is one list a reader can check against the Compose
     /// Specification rather than a pattern spread across a condition and a mapping.
-    const UNHONOURED: [&str; 5] = [
-        "ipv4_address",
-        "ipv6_address",
-        "link_local_ips",
-        "priority",
-        "gw_priority",
-    ];
+    // `ipv4_address` LEFT THIS TABLE WHEN IT STOPPED BEING UNHONOURED. It is now claimed as a /32 on
+    // the box's loopback, so the literal address exists; what a peer can do with it depends on the
+    // wiring, and that sentence is said by the driver, where the wiring is known. `ipv6_address`
+    // stays: kern claims no IPv6 address for a box.
+    const UNHONOURED: [&str; 4] = ["ipv6_address", "link_local_ips", "priority", "gw_priority"];
     // ITERATED OVER THE TABLE, NOT OVER THE FILE, so the order of the report is the order of this
     // list and not the order the author happened to type the keys in. A message whose wording depends
     // on the input's layout is one that reads differently for two files that mean the same thing.
@@ -2523,6 +2968,29 @@ fn warn_unhonoured_net_keys(networks: &Node, service: &str) {
     ));
 }
 
+/// The literal addresses a service is pinned to under `networks.<net>.ipv4_address`.
+///
+/// ONE PER NETWORK, IN FILE ORDER, and all of them: a service on two networks has two addresses and
+/// keeping only the first would drop a peer's route without saying so. Validated as IPv4 literals
+/// here rather than passed on as text, so a typo is caught while the file is being read instead of
+/// by a box that cannot say which key it came from.
+fn collect_net_ipv4(networks: &Node) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_net, def) in &networks.children {
+        let Some(node) = def.child("ipv4_address") else {
+            continue;
+        };
+        let Some(v) = node.scalar.as_deref().map(scalar_str) else {
+            continue;
+        };
+        let v = v.trim();
+        if v.parse::<std::net::Ipv4Addr>().is_ok() && !out.iter().any(|o| o == v) {
+            out.push(v.to_string());
+        }
+    }
+    out
+}
+
 fn collect_net_aliases(networks: &Node) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_net, def) in &networks.children {
@@ -2553,6 +3021,74 @@ fn list_value(node: &Node) -> Vec<String> {
             scalar_str(it)
         })
         .collect()
+}
+
+/// `env_file:` in BOTH of its spellings: the short one (a path, or a list of paths) and the long one
+/// the Specification added for optional files:
+///
+/// ```yaml
+/// env_file:
+///  - path: ./env_vars/.env_db
+///    required: true
+///  - path: ./env_vars/.env_db_override
+///    required: false
+/// ```
+///
+/// A `required: false` entry whose file is not there is DROPPED - that is the whole meaning of the
+/// key, and it is how a project ships an override file the user may never create. Every other entry
+/// is forwarded as a path, and a missing one still fails the box, loudly, as before.
+///
+/// IT USED TO BE READ AS A PATH, verbatim: kern handed `kern box --env-file` the string
+/// `{path: ./env_vars/.env_db_pgsql, required: true}` and the box refused a file by that name.
+/// MEASURED on Zabbix, where it stopped the database service and with it the stack.
+///
+/// `dir` is the compose file's own directory, which is what a relative path in it is relative to;
+/// without one, the check falls back to the working directory, which is where kern was run from.
+fn env_file_value(node: &Node, svc: &str, dir: Option<&std::path::Path>) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in list_value(node) {
+        let e = entry.trim();
+        // The long form arrives folded into `{path: …, required: …}` - the same shape the long-form
+        // port takes, from the same folding in `build_tree`.
+        let Some(inner) = e.strip_prefix('{').and_then(|r| r.strip_suffix('}')) else {
+            out.push(entry);
+            continue;
+        };
+        let mut path: Option<String> = None;
+        let mut required = true; // the Specification's default
+        for field in split_top_commas(inner) {
+            let Some((k, v)) = field.split_once(':') else {
+                continue;
+            };
+            match k.trim() {
+                "path" => path = Some(scalar_str(v.trim())),
+                "required" => required = !matches!(scalar_str(v.trim()).as_str(), "false" | "no"),
+                // `format:` (the newer `raw` reader) is not implemented; a file kern reads with its
+                // own rules is still read, so saying nothing here would be silent. Named below.
+                other => warn(&format!(
+                    "service '{svc}': env_file `{other}:` is not applied (kern reads the file with \
+                     Docker's default rules)"
+                )),
+            }
+        }
+        let Some(p) = path else {
+            warn(&format!(
+                "service '{svc}': an `env_file:` entry has no `path:` - skipped"
+            ));
+            continue;
+        };
+        if !required {
+            let full = match dir {
+                Some(d) => d.join(&p),
+                None => std::path::PathBuf::from(&p),
+            };
+            if !full.exists() {
+                continue; // exactly what `required: false` asks for
+            }
+        }
+        out.push(p);
+    }
+    out
 }
 
 /// A service's `secrets:` reference names. Short form is a list of names (`[db_pw, api_key]`); long
@@ -2673,15 +3209,65 @@ fn collect_secret_files(root: &Node) -> std::collections::HashMap<String, String
     out
 }
 
+/// Top-level secrets whose CONTENT comes from an environment variable
+/// (`secrets: {db_pw: {environment: DB_PW}}`), as `secret name -> variable name`.
+///
+/// A SPECIFICATION FEATURE THAT WAS BEING SKIPPED, and skipping it breaks the stack rather than
+/// degrading it: the service still reads `/run/secrets/<name>`, the file is not there, and the
+/// workload fails inside its own code. MEASURED on a held-out corpus of 167 recent compose files: a
+/// MySQL stack whose `MYSQL_PASSWORD_FILE` points at a secret declared this way.
+///
+/// THE VARIABLE NAME AND NOT ITS VALUE, because this runs while the document is being read and the
+/// value belongs to the environment the driver will hand the box. Carrying the value from here
+/// would put a secret in a struct that is cloned, printed by `config` and compared in tests.
+fn collect_secret_envs(root: &Node) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if let Some(sec) = root.child("secrets") {
+        for (name, def) in &sec.children {
+            if let Some(v) = def.child("environment").and_then(|f| f.scalar.as_deref()) {
+                let v = scalar_str(v).trim().to_string();
+                if !v.is_empty() {
+                    out.insert(name.clone(), v);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Convert one `services:` entry into a `ComposeBox`, applying every mapping rule + degrade-with-warn.
 /// `secret_files` maps a top-level secret name to its backing file (for `secrets: [name]` refs).
-fn service_to_box(
-    name: &str,
-    svc: &Node,
-    secret_files: &std::collections::HashMap<String, String>,
-    internal_networks: &std::collections::HashSet<String>,
+/// What a service needs from the DOCUMENT around it to become a box: the tables collected from the
+/// top-level blocks, the wiring the stack will be given, and where the file itself lives.
+///
+/// A struct because these six travel together and always will: every one of them is a fact about
+/// the file rather than about the service, and passing them one by one made the signature grow a
+/// parameter each time the parser learned to read another top-level block.
+struct ServiceCtx<'a> {
+    /// `secrets:` name -> the file backing it.
+    secret_files: &'a std::collections::HashMap<String, String>,
+    /// `secrets:` name -> the environment variable backing it.
+    secret_envs: &'a std::collections::HashMap<String, String>,
+    /// The networks declared `internal: true`.
+    internal_networks: &'a std::collections::HashSet<String>,
+    /// How the stack will be wired, which decides what `networks:` MEANS here.
     net: crate::StackNet,
-) -> Result<ComposeBox, String> {
+    /// The compose file's own directory: what a relative `extends: {file:}` or `env_file:` is
+    /// relative to. `None` when the document did not come from a file on disk.
+    dir: Option<&'a std::path::Path>,
+    /// The project `.env`, for the one lookup that is not interpolation: a bare `build.args` name.
+    dotenv: &'a crate::DotEnv,
+}
+
+fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox, String> {
+    let ServiceCtx {
+        secret_files,
+        secret_envs,
+        internal_networks,
+        net,
+        dir,
+        dotenv,
+    } = *cx;
     kern_common::BoxName::parse(name)
         .map_err(|e| format!("service '{name}': invalid name: {e}"))?;
     let mut b = ComposeBox::new(name.to_string());
@@ -2750,8 +3336,8 @@ fn service_to_box(
                 let (ep, _) = entrypoint_value(node);
                 entrypoint = ep;
             }
-            "environment" => b.env = kv_pairs(node),
-            "env_file" => b.env_file = list_value(node),
+            "environment" => b.env = kv_pairs_from(node, Some(dotenv)),
+            "env_file" => b.env_file = env_file_value(node, name, dir),
             "ports" => {
                 // A container-only entry joins the DECLARED space (what `expose:`/`port:` feed)
                 // instead of being refused: same statement, one space, as everywhere else here.
@@ -2818,7 +3404,7 @@ fn service_to_box(
             "restart" => apply_restart(&mut b, node, name),
             "user" => b.user = node.scalar.as_deref().map(scalar_str),
             "working_dir" | "workdir" => b.workdir = node.scalar.as_deref().map(scalar_str),
-            "build" => b.build = Some(build_value(node)),
+            "build" => b.build = Some(build_value(node, dotenv)),
             // Resource / capability / hardening keys - these map 1:1 to `kern box` flags the runtime
             // already enforces, so CONVERT them (not warn-and-ignore): a compose that sets `mem_limit`
             // or `read_only` must get those limits, else the stack "runs but without the constraints
@@ -2933,13 +3519,11 @@ fn service_to_box(
             "read_only" => b.read_only = scalar_is_true(node),
             // `privileged: true` has no kern equivalent (rootless by design) - warn, don't silently
             // pretend. The box runs UNprivileged; a workload needing real privilege will notice.
-            "privileged" => {
-                if scalar_is_true(node) {
-                    warn(&format!(
-                        "service '{name}': 'privileged: true' has no kern equivalent (rootless) - running unprivileged"
-                    ));
-                }
-            }
+            // `privileged: true` IS RECORDED, NOT ANSWERED HERE. Whether kern gives it depends on
+            // something the parser cannot see: whether the OPERATOR granted it, on the command line
+            // or in their own config. The parser's old sentence ("no kern equivalent (rootless)")
+            // was wrong on both halves - there is an equivalent, and it is not the file's to take.
+            "privileged" => b.privileged = scalar_is_true(node),
             "secrets" => {
                 // A service `secrets: [name, …]` (or long-form `{source: name, target: …}`) references
                 // top-level secret definitions. Map each `file:`-backed one to `--secret <file>:<name>`
@@ -2957,10 +3541,16 @@ fn service_to_box(
                     warn(&format!("service '{name}': {note}"));
                 }
                 for entry in refs {
-                    match secret_files.get(&entry) {
-                        Some(file) => b.secrets.push(format!("{file}:{entry}")),
-                        None => warn(&format!(
-                            "service '{name}': secret '{entry}' has no top-level `file:` definition - skipped (external/env secrets aren't supported)"
+                    match (secret_files.get(&entry), secret_envs.get(&entry)) {
+                        (Some(file), _) => b.secrets.push(format!("{file}:{entry}")),
+                        // The VARIABLE travels, never the value: the driver puts the value in the
+                        // box's environment, so it never appears in `argv` where `/proc/<pid>/cmdline`
+                        // makes it world-readable.
+                        (None, Some(var)) => b.secret_envs.push(format!("{entry}={var}")),
+                        (None, None) => warn(&format!(
+                            "service '{name}': secret '{entry}' has no top-level `file:` or \
+                             `environment:` definition - skipped (an `external: true` secret has no \
+                             daemon to come from here)"
                         )),
                     }
                 }
@@ -2979,6 +3569,7 @@ fn service_to_box(
             "networks" => {
                 b.net_aliases = collect_net_aliases(node);
                 b.networks = collect_net_names(node);
+                b.net_ipv4 = collect_net_ipv4(node);
                 warn_unhonoured_net_keys(node, name);
                 // POSITIVE EVIDENCE ONLY: at least one network, and every one of them marked
                 // `internal: true` at the top level. A name the file does not mark internal, or a
@@ -3086,26 +3677,53 @@ fn service_to_box(
             // SELinux label is not set at all.
             "security_opt" => {
                 let mut already: Vec<&str> = Vec::new();
+                let mut matched: Vec<&str> = Vec::new();
                 let mut absent: Vec<String> = Vec::new();
                 for raw in list_value(node) {
                     let v = raw.trim().to_string();
-                    let head = v
-                        .split([':', '='])
-                        .next()
-                        .unwrap_or("")
-                        .trim()
+                    let (head, tail) = match v.split_once([':', '=']) {
+                        Some((h, t)) => (h.trim().to_ascii_lowercase(), t.trim().to_string()),
+                        None => (v.trim().to_ascii_lowercase(), String::new()),
+                    };
+                    // The value carries its own punctuation in real files (`unconfined;`,
+                    // "unconfined`"): compare on the word rather than on the token.
+                    let word = tail
+                        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '/' && c != '-' && c != '_')
                         .to_ascii_lowercase();
                     match head.as_str() {
                         "no-new-privileges" => already.push("no-new-privileges"),
-                        "seccomp" => absent.push("seccomp: kern runs its own deny-by-default \
-                                                  allowlist on every box and does not load a profile \
-                                                  from the file"
-                            .to_string()),
-                        "apparmor" => absent
-                            .push("apparmor: kern applies its own profile, not the one named here"
-                                .to_string()),
-                        "label" => absent
-                            .push("label: SELinux labels are not set by kern".to_string()),
+                        // THE ONLY ONE OF THE FOUR THAT IS STILL A DIFFERENCE, and it is one by
+                        // design: the file asks for NO filter and kern keeps its deny-by-default
+                        // allowlist on every box. Honouring it would let a downloaded file switch
+                        // off the guard, which is the one thing this runtime does not do.
+                        "seccomp" if word == "unconfined" => absent.push(
+                            "seccomp=unconfined: kern keeps its deny-by-default allowlist on every \
+                             box, because a file that can switch off the filter is not a filter. \
+                             The workload runs; a syscall outside the allowlist does not"
+                                .to_string(),
+                        ),
+                        "seccomp" => absent.push(format!(
+                            "seccomp={tail}: a Docker seccomp profile is a JSON format kern does not \
+                             read, so its own allowlist runs instead"
+                        )),
+                        // MEASURED, and the sentence this replaces was false: inside a box
+                        // `/proc/self/attr/current` reads the same as the caller's, because kern
+                        // applies no AppArmor profile of its own. A file asking for `unconfined`
+                        // therefore gets exactly what it asked for.
+                        "apparmor" if word == "unconfined" => {
+                            matched.push("apparmor=unconfined");
+                        }
+                        // A NAMED PROFILE IS FORWARDED, which it never was. `kern box --apparmor`
+                        // has existed all along; a profile the host has not loaded fails the box
+                        // CLOSED, which is the flag's own documented behaviour and the right one.
+                        "apparmor" if !word.is_empty() => b.apparmor = Some(word.clone()),
+                        // `label=disable` asks for no SELinux labelling, and kern sets no SELinux
+                        // label on anything: the outcome is what the key asks for.
+                        "label" if word == "disable" => matched.push("label=disable"),
+                        "label" => absent.push(format!(
+                            "label={tail}: kern sets no SELinux label, so a label OTHER than \
+                             `disable` cannot be applied"
+                        )),
                         // An unresolved `${VAR}` or a spelling this parser does not know: name the
                         // value verbatim rather than guess what it asked for.
                         _ => absent.push(format!("{v}: no kern equivalent")),
@@ -3116,6 +3734,14 @@ fn service_to_box(
                         "service '{name}': 'security_opt: {}' is ALREADY ENFORCED - kern sets \
                          NoNewPrivs on every box and there is no way to switch it off",
                         already.join(", ")
+                    ));
+                }
+                if !matched.is_empty() {
+                    warn(&format!(
+                        "service '{name}': 'security_opt: {}' is ALREADY WHAT KERN DOES - it loads \
+                         no AppArmor profile of its own and sets no SELinux label, so the box runs \
+                         as the key asks",
+                        matched.join(", ")
                     ));
                 }
                 if !absent.is_empty() {
@@ -3129,9 +3755,16 @@ fn service_to_box(
             //
             // 123 of the 156 `network_mode` values in the corpus are `service:X`, which asks for
             // exactly what a kern stack does by default: every service in the stack shares ONE
-            // network namespace. Reporting that as unsupported told the user the opposite of what
-            // happens. The condition is stated because it is real: under `--no-pod` each service
-            // gets its own namespace and the request is NOT satisfied there.
+            // network namespace.
+            //
+            // THE PARSER NO LONGER ANSWERS `service:X` WITH A SENTENCE, because the sentence was
+            // about a wiring the parser cannot know. It said "kern already does this, NOT satisfied
+            // under --no-pod" at a point where nothing has decided whether this stack gets one
+            // namespace or one per service, and kern now makes that choice ITSELF from the file.
+            // MEASURED on the corpus: 75 files use the key, and in 20 of them kern selects the
+            // per-service wiring, so the reassurance was false and pointed at a flag the reader
+            // never passed. It is recorded as a field and answered where the wiring is known, which
+            // is the same correction `networks:` already got two commits ago.
             "network_mode" => {
                 let v = node
                     .scalar
@@ -3142,14 +3775,39 @@ fn service_to_box(
                     .to_string();
                 let head = v.split(':').next().unwrap_or("").to_ascii_lowercase();
                 match head.as_str() {
-                    "service" | "container" => warn(&format!(
-                        "service '{name}': 'network_mode: {v}' is what a kern stack already does - \
-                         every service shares ONE network namespace, so they reach each other on \
-                         localhost. NOT satisfied under --no-pod, where each service gets its own"
+                    "service" => match v.split_once(':').map(|(_, t)| t.trim()) {
+                        Some(target) if !target.is_empty() => {
+                            b.net_share = Some(target.to_string())
+                        }
+                        // `network_mode: service` with nothing after it names no service. Docker
+                        // rejects the value; kern reports it rather than recording an empty target
+                        // that would silently match no service later.
+                        _ => warn(&format!(
+                            "service '{name}': 'network_mode: {v}' names no service - ignored"
+                        )),
+                    },
+                    // `container:X` NAMES A CONTAINER, NOT A SERVICE, and kern has no container
+                    // outside this file to join: the value is Docker's way of reaching something
+                    // started elsewhere. Zero of the 240 corpus files use it, so this is the arm
+                    // that reports rather than the arm that works.
+                    "container" => warn(&format!(
+                        "service '{name}': 'network_mode: {v}' names a container outside this file, \
+                         and kern joins no namespace it did not create - ignored. If '{}' is a \
+                         service in this file, write `network_mode: service:{}` instead",
+                        v.split_once(':').map(|(_, t)| t.trim()).unwrap_or(""),
+                        v.split_once(':').map(|(_, t)| t.trim()).unwrap_or("")
                     )),
+                    // SAID WITHOUT NAMING A WIRING, which is the only way the parser can say it and
+                    // be right. The sentence used to read "maps to the stack's pod - one shared
+                    // namespace", and MEASURED on a file whose `networks:` segregate, kern printed
+                    // that line and then, four lines below, that it was giving each service its own
+                    // namespace. `bridge` and `default` ask for the stack's ordinary network, and
+                    // that request is satisfied under both wirings: the service is wired like every
+                    // peer that wrote no `network_mode` at all.
                     "bridge" | "default" => warn(&format!(
-                        "service '{name}': 'network_mode: {v}' maps to the stack's pod - one shared \
-                         namespace with outbound through pasta"
+                        "service '{name}': 'network_mode: {v}' is the stack's own network, which is \
+                         what a service that names no `network_mode` gets: kern wires it exactly \
+                         like its peers"
                     )),
                     // APPLIED NOW, PER SERVICE, and the sentence that said otherwise was written
                     // when a stack was always one namespace. It is not: a service on the host
@@ -3383,6 +4041,11 @@ fn service_to_box(
             // Every other vendor's service-level extension field: defined by the spec, ignored on
             // purpose, silently.
             other if other.starts_with("x-") => {}
+            // KEYS DOCKER ITSELF IGNORES ON LINUX. `cpu_count`, `cpu_percent` and `isolation` are
+            // Windows-container options: the Linux daemon does not act on them either, so kern
+            // ignoring them is not a difference from Docker and reporting one is a false alarm. On
+            // the corpus, `cpu_count` was the ONLY difference two files had.
+            "cpu_count" | "cpu_percent" | "cpus_shares" | "isolation" => {}
             other => warn(&format!(
                 "service '{name}': '{other}:' ignored (unsupported)"
             )),
@@ -3618,7 +4281,36 @@ fn command_argv(node: &Node) -> (Vec<String>, bool) {
 /// host environment. If the host has it, we emit `API_KEY=<host value>`; if not, we OMIT it (Docker
 /// does too). Passing the bare `API_KEY` straight through was a bug - the box's `--env K=V` parser
 /// rejected it and the whole service failed to start.
-fn kv_pairs(node: &Node) -> Vec<String> {
+/// `environment:`/`build.args` as `K=V` strings, in every shape the Specification allows: a map, a
+/// block list, a flow list, a list item that is itself a map, and a key with no value at all.
+///
+/// `dotenv` is the project `.env`, consulted for a BARE pass-through name after the process
+/// environment.
+///
+/// `build.args` and `environment:` both pass one, and in both cases the reason is evidence rather
+/// than symmetry. `args: [SENTRY_IMAGE]` against a `.env` that sets `SENTRY_IMAGE` is Sentry
+/// self-hosted's own build - the image would otherwise be built `FROM` nothing. And its
+/// `environment:` block says so in a comment, above the two keys it writes with no value:
+///
+/// ```yaml
+///     # Leaving the value empty to just pass whatever is set
+///     # on the host system (or in the .env file)
+///     COMPOSE_PROFILES:
+///     SENTRY_EVENT_RETENTION_DAYS:
+/// ```
+///
+/// MEASURED before it was believed: with the shell alone, `SENTRY_EVENT_RETENTION_DAYS` reached the
+/// box EMPTY and Sentry's own config died on `int("")` - `ValueError: invalid literal for int() with
+/// base 10: ''` - on every start of the `web` service.
+///
+/// A variable the file never names still does not reach the box: this only resolves the two
+/// spellings that ASK for a pass-through.
+fn kv_pairs_from(node: &Node, dotenv: Option<&crate::DotEnv>) -> Vec<String> {
+    let lookup = |name: &str| -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .or_else(|| dotenv.and_then(|d| d.get(name)).map(str::to_string))
+    };
     let mut out = Vec::new();
     // A FLOW list (`environment: [A=1, B=2]`) arrives as one scalar, not as `items`: without this it
     // was dropped entirely, so a service silently ran with none of its environment. The block list
@@ -3643,8 +4335,8 @@ fn kv_pairs(node: &Node) -> Vec<String> {
             }
         } else if entry.contains('=') {
             out.push(entry);
-        } else if let Ok(val) = std::env::var(&entry) {
-            // bare `- KEY` present in the host env → pass its value through.
+        } else if let Some(val) = lookup(&entry) {
+            // bare `- KEY` present in the environment → pass its value through.
             out.push(format!("{entry}={val}"));
         }
         // bare `- KEY` absent from the host env → omit (Docker semantics).
@@ -3656,11 +4348,23 @@ fn kv_pairs(node: &Node) -> Vec<String> {
         // than empty: it looks like a value. The check is on the RAW scalar, so a deliberate
         // `K: "null"` keeps its quotes and stays a real value.
         let literal_null = match v.scalar.as_deref() {
-            // A MISSING scalar is left as an empty value, not a passthrough: interpolation runs over
-            // the document first, so `X: ${UNSET}` reaches us indistinguishable from a bare `X:`, and
-            // Docker sets the first to empty. The `- KEY` list form remains the spelling that means
-            // "take it from the host", and it already did.
-            None => false,
+            // A value that is nothing but marks: a reference was written and resolved to nothing,
+            // which Docker renders as the empty string.
+            Some(sc) if !sc.is_empty() && sc.chars().all(|c| c == UNSET_MARK) => false,
+            // A MISSING scalar asks for a PASSTHROUGH WHEN THERE IS SOMETHING TO PASS, and is an
+            // empty value otherwise. The two spellings that reach here as `None` cannot be told
+            // apart - MEASURED: a bare `K:` and `K: ${UNSET}` are both `scalar: None` after
+            // interpolation, while `K: ""` is `Some("\"\"")` and `K: null` is `Some("null")` - and
+            // Docker reads them differently: the first takes the value from the environment, the
+            // second is the empty string.
+            //
+            // Told apart by [`UNSET_MARK`], which the interpolator leaves where a REFERENCE
+            // resolved to nothing: a scalar of nothing but marks is the empty string Docker gives
+            // `K: ${UNSET}`, and a truly absent scalar is the passthrough Docker gives `K:`. Sentry
+            // self-hosted needs both in one file - `SENTRY_EVENT_RETENTION_DAYS:` picks up its
+            // `.env` value, and a valueless key bound nowhere stays absent, because passed as empty
+            // its config dies on `value[0]`.
+            None => true,
             // NOT the empty string: interpolation runs over the whole document first, so
             // `X: ${UNSET}` arrives here as an empty scalar and Docker wants X set to EMPTY, not
             // omitted. Only an explicit YAML null (or no scalar at all) means passthrough.
@@ -3669,7 +4373,7 @@ fn kv_pairs(node: &Node) -> Vec<String> {
         if literal_null {
             // Present in the host env → forward its value; absent → omit the variable entirely
             // (Docker semantics: an unresolved passthrough is not set, not set-to-empty).
-            if let Ok(val) = std::env::var(k) {
+            if let Some(val) = lookup(k) {
                 out.push(format!("{k}={val}"));
             }
             continue;
@@ -3737,7 +4441,13 @@ fn split_at_comment(line: &str) -> (&str, &str) {
 
 /// Interpolate `${VAR}`/`${VAR:-default}`/`$$` in a single comment-free fragment. Slices are at
 /// `${`/`}`/`$$` ASCII offsets, so multibyte values in the document are never sliced mid-char.
-fn interpolate_fragment(text: &str, dotenv: &crate::DotEnv) -> String {
+/// Erase [`UNSET_MARK`] from a string that is already a final value rather than a YAML scalar - the
+/// `.env` reader, which has no absent-versus-empty distinction to make.
+pub(crate) fn strip_unset_mark(s: &str) -> String {
+    s.replace(UNSET_MARK, "")
+}
+
+pub(crate) fn interpolate_fragment(text: &str, dotenv: &crate::DotEnv) -> String {
     interpolate_depth(text, 0, dotenv)
 }
 
@@ -3939,7 +4649,11 @@ fn interpolate_expr(expr: &str, dotenv: &crate::DotEnv) -> String {
             warn(&format!(
                 "${{{var}}} is not set (no default) - substituted empty (set it in your shell, like Docker)"
             ));
-            String::new()
+            // The empty string Docker substitutes, carrying the mark that says a REFERENCE was
+            // written here - which is what tells a valueless key apart from one whose value
+            // resolved to nothing. `scalar_str` erases it at the single place a scalar becomes a
+            // value, so no consumer ever sees it.
+            UNSET_MARK.to_string()
         }),
     }
 }
@@ -4471,9 +5185,12 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
         ));
         return;
     };
-    let cmd = healthcheck_test(test);
-    match cmd {
-        Some(c) => b.health_cmd = Some(c),
+    match healthcheck_test(test) {
+        // The FORM travels with the command: `CMD` is an argv kern execs, `CMD-SHELL` (and a bare
+        // string) a line kern hands to `/bin/sh -c`. Flattening the first into the second is what
+        // made every image without a shell permanently unhealthy - see `ComposeBox::health_argv`.
+        Some(TestForm::Exec(argv)) => b.health_argv = argv,
+        Some(TestForm::Shell(c)) => b.health_cmd = Some(c),
         None => {
             // Omit the health entirely rather than half-convert it (a partial health lies). Any
             // `depends_healthy` edge toward this box is degraded to start-order later in
@@ -4508,12 +5225,22 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
     }
 }
 
+/// A healthcheck `test`, with the form Docker wrote it in. The two are not interchangeable: the exec
+/// form runs with NO shell, which is the only thing that works in an image that ships none.
+#[derive(Debug, PartialEq, Eq)]
+enum TestForm {
+    /// `CMD-SHELL "…"`, or a bare string: run through `/bin/sh -c`.
+    Shell(String),
+    /// `CMD ["prog", "arg"]`: exec'd directly, argument boundaries intact.
+    Exec(Vec<String>),
+}
+
 /// Convert a healthcheck `test` to a health command, or `None` if not faithfully convertible.
-///  * `["CMD", "curl", "-f", "u"]`      → exec-form → `curl -f u` (argv joined for `--health-cmd`)
+///  * `["CMD", "curl", "-f", "u"]`      → exec-form → the argv, KEPT as an argv (no shell, no join)
 ///  * `["CMD-SHELL", "curl -f u"]`      → shell-form → the shell string
 ///  * bare string `"curl -f u"`         → IMPLICIT CMD-SHELL (Docker) → the string (NEVER split-on-space)
 ///  * `["NONE"]`                        → no health → `None` (caller omits)
-fn healthcheck_test(node: &Node) -> Option<String> {
+fn healthcheck_test(node: &Node) -> Option<TestForm> {
     // Inline / block list form.
     let list = if let Some(sc) = &node.scalar {
         let sc = sc.trim();
@@ -4521,7 +5248,7 @@ fn healthcheck_test(node: &Node) -> Option<String> {
             Some(parse_inline_list(sc))
         } else if !sc.is_empty() {
             // Bare string = implicit CMD-SHELL. Return verbatim (the box wraps it in `sh -c`).
-            return Some(scalar_str(sc));
+            return Some(TestForm::Shell(scalar_str(sc)));
         } else {
             None
         }
@@ -4534,18 +5261,20 @@ fn healthcheck_test(node: &Node) -> Option<String> {
     let (head, rest) = list.split_first()?;
     match head.as_str() {
         "NONE" => None,
-        "CMD-SHELL" => rest.first().cloned(),
+        "CMD-SHELL" => rest.first().cloned().map(TestForm::Shell),
         "CMD" => {
             if rest.is_empty() {
                 None
             } else {
-                // exec-form: join argv into a command line the health-checker runs.
-                Some(rest.join(" "))
+                // exec-form: the argv IS the check. It used to be joined with spaces and run through
+                // `/bin/sh -c`, which fails outright in an image with no shell - and an image with
+                // no shell is exactly the one that writes this form.
+                Some(TestForm::Exec(rest.to_vec()))
             }
         }
         // A list whose first item isn't a known directive → treat the whole thing as a shell string
         // only if it's a single element; otherwise not faithfully convertible.
-        _ if list.len() == 1 => Some(list[0].clone()),
+        _ if list.len() == 1 => Some(TestForm::Shell(list[0].clone())),
         _ => None,
     }
 }
@@ -4650,7 +5379,7 @@ fn apply_restart(b: &mut ComposeBox, node: &Node, svc: &str) {
 /// `build`: resolve to a [`BuildDirective`]. `context`/`dockerfile` are kept RELATIVE (the caller in
 /// `compose()` confines them under the compose file's dir - traversal guard). `args` values are
 /// already `${VAR}`-substituted document-wide.
-fn build_value(node: &Node) -> BuildDirective {
+fn build_value(node: &Node, dotenv: &crate::DotEnv) -> BuildDirective {
     // Short form: `build: ./dir`
     if let Some(sc) = &node.scalar {
         let sc = scalar_str(sc);
@@ -4674,7 +5403,10 @@ fn build_value(node: &Node) -> BuildDirective {
         .and_then(|n| n.scalar.as_deref())
         .map(scalar_str);
     // `args` is the same `- K=v` list / `K: v` map shape as `environment`.
-    let args = node.child("args").map(kv_pairs).unwrap_or_default();
+    let args = node
+        .child("args")
+        .map(|n| kv_pairs_from(n, Some(dotenv)))
+        .unwrap_or_default();
     let target = node
         .child("target")
         .and_then(|n| n.scalar.as_deref())
@@ -4686,6 +5418,102 @@ fn build_value(node: &Node) -> BuildDirective {
         args,
         target,
     }
+}
+
+/// What resolving every `network_mode: service:X` in a file comes to.
+///
+/// A RETURNED VALUE AND NOT A PAIR OF SIDE EFFECTS, because both halves are decisions a test has to
+/// be able to interrogate. `warn` writes to stderr and returns nothing, so a resolution that warned
+/// inline could be asserted by nothing at all: a cycle could stop being reported, or an inheritance
+/// could start copying the wrong service's networks, and every test in this file would stay green.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SharedNamespaces {
+    /// `(index into the boxes, the membership that box inherits)`, applied by the caller.
+    inherit: Vec<(usize, Vec<String>)>,
+    /// The sentences the file is owed, in the order the services appear in it.
+    notes: Vec<String>,
+}
+
+/// Resolve `network_mode: service:X` into network membership, following the chain.
+///
+/// PURE, so the resolution can be asserted directly. The caller applies `inherit` and prints
+/// `notes`; nothing here touches the boxes or stderr.
+fn resolve_net_share(boxes: &[ComposeBox]) -> SharedNamespaces {
+    let mut out = SharedNamespaces::default();
+    for (i, b) in boxes.iter().enumerate() {
+        let Some(first) = b.net_share.as_deref() else {
+            continue;
+        };
+        let mut hops = 0usize;
+        let mut cur = first.to_string();
+        // The walk ends at the first service that does not itself name another, which is the
+        // namespace everything in the chain lives in. Bounded by the service count so a file that
+        // points a service at itself, or two at each other, is reported instead of spinning.
+        let terminal = loop {
+            match boxes.iter().position(|o| o.service == cur || o.name == cur) {
+                None => {
+                    out.notes.push(format!(
+                        "service '{}': 'network_mode: service:{cur}' names no service in this file \
+                         - ignored, and '{}' keeps its own network membership",
+                        b.service_name(),
+                        b.service_name()
+                    ));
+                    break None;
+                }
+                Some(j) => match boxes[j].net_share.as_deref() {
+                    None => break Some(j),
+                    Some(next) => {
+                        hops += 1;
+                        if hops > boxes.len() {
+                            out.notes.push(format!(
+                                "service '{}': 'network_mode: service:{first}' leads in a cycle - \
+                                 ignored, and '{}' keeps its own network membership",
+                                b.service_name(),
+                                b.service_name()
+                            ));
+                            break None;
+                        }
+                        cur = next.to_string();
+                    }
+                },
+            }
+        };
+        let Some(j) = terminal else { continue };
+        let host = &boxes[j];
+        // `network_mode:` AND `networks:` ARE MUTUALLY EXCLUSIVE in the specification, and Docker
+        // refuses a service that writes both. kern reports instead of refusing, because refusing a
+        // file the world already runs is the difference this work exists to remove, and it says
+        // which of the two it kept: the one that describes where the service actually lives.
+        if !b.networks.is_empty() && b.networks != host.networks {
+            out.notes.push(format!(
+                "service '{}': 'network_mode: service:{}' and 'networks:' are mutually exclusive \
+                 (Docker refuses a service that writes both); kern keeps the namespace it names, so \
+                 '{}' is on {}'s networks and not on the one it declares",
+                b.service_name(),
+                host.service_name(),
+                b.service_name(),
+                host.service_name()
+            ));
+        }
+        // `host` AND `none` ARE NOT CARRIED ACROSS THE SHARE, they are named. Under Docker a
+        // container in the namespace of one on the host network is itself on the host network, and
+        // giving a box that posture because a downloaded file chained two keys is a widening kern
+        // should not perform quietly. No corpus file chains them, so naming costs nothing here and
+        // applying could surprise.
+        if host.net || host.net_none {
+            out.notes.push(format!(
+                "service '{}': 'network_mode: service:{}' names a service that is itself on \
+                 'network_mode: {}', and kern does not carry that across the share: '{}' stays an \
+                 ordinary member of the stack's network",
+                b.service_name(),
+                host.service_name(),
+                if host.net { "host" } else { "none" },
+                b.service_name()
+            ));
+        }
+        out.inherit.push((i, host.networks.clone()));
+    }
+    out
 }
 
 /// Emit a compat warning to stderr. Prefixed so it's clearly kern's compose-import voice, and so the
@@ -4880,9 +5708,14 @@ mod tests {
                 .expect("the networks node");
             unhonoured_net_keys(svc)
         };
-        assert_eq!(
-            keys_for("        ipv4_address: 1.2.3.4\n"),
-            vec!["ipv4_address"]
+        // `ipv4_address` LEFT THIS TABLE, ON PURPOSE. It is no longer unhonoured: the address is
+        // claimed as a /32 on the box's loopback, so the literal address exists and, in one shared
+        // namespace, a peer that hard-codes it reaches the service (measured: `web` read back what
+        // `db` was serving at `172.28.1.10:6000`, three runs out of three). What it is worth depends
+        // on the wiring, so the sentence moved to `net_ipv4_note` where the wiring is known.
+        assert!(
+            keys_for("        ipv4_address: 1.2.3.4\n").is_empty(),
+            "an applied key must not be reported as unhonoured"
         );
         assert_eq!(
             keys_for("        ipv6_address: ::1\n"),
@@ -4896,7 +5729,8 @@ mod tests {
         // Several at once are reported together, in the table's order, so one line covers a service.
         assert_eq!(
             keys_for("        priority: 10\n        ipv4_address: 1.2.3.4\n"),
-            vec!["ipv4_address", "priority"]
+            vec!["priority"],
+            "the applied key drops out and the unhonoured one still reports"
         );
         // THE SHAPES KERN DOES HONOUR MUST STAY SILENT, or the note becomes noise on every file that
         // uses an alias - which is most of them - and a noisy note is one nobody reads.
@@ -4916,8 +5750,10 @@ mod tests {
     /// `none` service reported `lo` alone and its outbound connect was refused, and an ordinary
     /// service in the same file still reached the internet. Three services, one file, one run.
     ///
-    /// `service:`/`container:`/`bridge`/`default` stay notes rather than fields: they describe the
-    /// wiring kern already provides, so there is nothing to set.
+    /// `service:X` IS A FIELD TOO NOW, and it was the last one still answered with a sentence. It
+    /// names a namespace, which is a fact about this file that survives the parse; what kern can do
+    /// about it depends on a wiring the parser cannot see. `container:`/`bridge`/`default` stay
+    /// notes: the first names something outside the file, the other two describe what kern provides.
     #[test]
     fn network_mode_host_and_none_become_fields_and_the_rest_stay_notes() {
         let svc = |mode: &str| {
@@ -4936,14 +5772,388 @@ mod tests {
             "and must NOT be confused with sharing the host's"
         );
 
-        // The wirings kern already provides set neither: there is nothing to change.
-        for inert in ["bridge", "default", "service:db", "container:x"] {
+        let shared = svc("service:db");
+        assert_eq!(
+            shared.net_share.as_deref(),
+            Some("db"),
+            "`service:X` must record the service it names, not answer with a sentence"
+        );
+        assert!(
+            !shared.net && !shared.net_none,
+            "and must not be confused with either of the postures that leave the stack"
+        );
+
+        // A value with nothing after the colon names no service: recording an empty target would
+        // silently match nothing later, so it is reported and no field is set.
+        let empty = svc("service:");
+        assert_eq!(empty.net_share, None);
+
+        // The wirings kern already provides, and the one that names a container outside this file.
+        for inert in ["bridge", "default", "container:x"] {
             let b = svc(inert);
             assert!(
-                !b.net && !b.net_none,
-                "'{inert}' describes what kern already does and must set no field"
+                !b.net && !b.net_none && b.net_share.is_none(),
+                "'{inert}' must set no field"
             );
         }
+    }
+
+    /// `network_mode: service:X` MUST PUT THE SERVICE WHERE X LIVES, and before this it put it in
+    /// the one place X provably was not.
+    ///
+    /// A service with `network_mode:` has no `networks:` key, so it landed on the implicit `default`
+    /// network while the service it named sat on a declared one. kern then read the pair as
+    /// SEGREGATED and gave it no relay, no hosts entry and no name resolution - for the one key in
+    /// the whole file that asks two services to be a single host.
+    ///
+    /// MEASURED end to end, both directions, on the file this test encodes: with the fix, `sidecar`
+    /// reached `db` by name and read back the string `db` was serving; the control in the same run,
+    /// a service on another network, could not resolve the name at all (`nc: bad address 'db'`).
+    /// Before the fix `sidecar` was in the control's position.
+    #[test]
+    fn network_mode_service_inherits_the_membership_of_the_service_it_names() {
+        let src = "services:\n  \
+                   web:\n    image: alpine\n    networks: [front]\n  \
+                   db:\n    image: alpine\n    networks: [back]\n  \
+                   sidecar:\n    image: alpine\n    network_mode: service:db\n";
+        let boxes = parse(src).expect("parses");
+        let by = |n: &str| {
+            boxes
+                .iter()
+                .find(|b| b.service_name() == n)
+                .unwrap_or_else(|| panic!("service '{n}' parsed"))
+        };
+        assert_eq!(
+            by("sidecar").networks,
+            vec!["back".to_string()],
+            "the sharer must be on the networks of the service it names"
+        );
+        assert_eq!(
+            by("sidecar").net_share.as_deref(),
+            Some("db"),
+            "and must keep the record of why, so the driver can say what the wiring gives"
+        );
+        // THE CONTROL, and it is what makes the assertion above mean anything: the inheritance is
+        // targeted, not a blanket "put everyone together". `web` named no share and must be left
+        // exactly where the file put it.
+        assert_eq!(by("web").networks, vec!["front".to_string()]);
+        assert_eq!(by("db").networks, vec!["back".to_string()]);
+        // And the pair the file asked to be one host must now share a network, which is the whole
+        // difference between a relay and silence.
+        assert_eq!(by("sidecar").networks, by("db").networks);
+    }
+
+    /// A CHAIN TERMINATES IN ONE NAMESPACE, so the walk follows it instead of copying a copy.
+    ///
+    /// `a` inside `b` inside `c` is one namespace, `c`'s. Stopping at `b` would hand `a` whatever
+    /// `b`'s membership happened to be at that moment, which is itself inherited: the resolution
+    /// would depend on the order the services are written in. `volumes_from` stops at one level and
+    /// says so, because a mount list can be truncated and still be a mount list; a namespace cannot.
+    #[test]
+    fn a_network_mode_chain_resolves_to_the_terminal_namespace() {
+        let src = "services:\n  \
+                   c:\n    image: alpine\n    networks: [deep]\n  \
+                   b:\n    image: alpine\n    network_mode: service:c\n  \
+                   a:\n    image: alpine\n    network_mode: service:b\n";
+        let boxes = parse(src).expect("parses");
+        for name in ["a", "b", "c"] {
+            let b = boxes
+                .iter()
+                .find(|x| x.service_name() == name)
+                .expect("service parsed");
+            assert_eq!(
+                b.networks,
+                vec!["deep".to_string()],
+                "'{name}' must end up on the terminal namespace's networks"
+            );
+        }
+    }
+
+    /// A CYCLE IS REPORTED AND CHANGES NOTHING, and the bound is what stops the walk.
+    ///
+    /// Two services naming each other have no terminal namespace to inherit, and a walk that
+    /// followed the chain without a bound would not return. The count of services is the bound
+    /// because a chain longer than that must repeat a service.
+    #[test]
+    fn a_network_mode_cycle_is_reported_and_changes_nothing() {
+        let src = "services:\n  \
+                   a:\n    image: alpine\n    network_mode: service:b\n  \
+                   b:\n    image: alpine\n    network_mode: service:a\n";
+        let boxes = parse(src).expect("parses");
+        let shared = resolve_net_share(&boxes);
+        assert!(
+            shared.inherit.is_empty(),
+            "a cycle must give nobody a membership: {:?}",
+            shared.inherit
+        );
+        assert_eq!(shared.notes.len(), 2, "both services are owed a sentence");
+        for n in &shared.notes {
+            assert!(n.contains("cycle"), "the sentence must name the shape: {n}");
+        }
+        // A service naming ITSELF is the same defect with one service, and the same bound catches it.
+        let self_ref = parse("services:\n  a:\n    image: alpine\n    network_mode: service:a\n")
+            .expect("parses");
+        let shared = resolve_net_share(&self_ref);
+        assert!(shared.inherit.is_empty());
+        assert_eq!(shared.notes.len(), 1);
+    }
+
+    /// A TARGET THAT IS NOT A SERVICE IS REPORTED, not silently treated as the implicit network.
+    ///
+    /// Zero of the 240 corpus files do this, which is exactly why it needs a test: the arm has no
+    /// real file keeping it honest.
+    #[test]
+    fn a_network_mode_target_that_is_not_a_service_is_reported() {
+        let src = "services:\n  \
+                   a:\n    image: alpine\n    networks: [mine]\n    network_mode: service:ghost\n";
+        let boxes = parse(src).expect("parses");
+        let shared = resolve_net_share(&boxes);
+        assert!(shared.inherit.is_empty(), "nothing to inherit from nothing");
+        assert_eq!(shared.notes.len(), 1);
+        assert!(
+            shared.notes[0].contains("names no service in this file"),
+            "{}",
+            shared.notes[0]
+        );
+        // And the membership the file DID declare is left alone, so the service keeps working.
+        assert_eq!(boxes[0].networks, vec!["mine".to_string()]);
+    }
+
+    /// THE REFUSAL MUST NOT NAME A FEATURE THIS PARSER SUPPORTS.
+    ///
+    /// Reported by an outside reviewer against the released binary: a malformed file of theirs was
+    /// refused with "YAML anchors/aliases not supported (rewrite the value inline)", and anchors,
+    /// aliases and merge keys all work - `DOCKER-COMPAT.md` lists them as supported and they verify
+    /// four ways. The message sent the reader to rewrite the one construct that was never the
+    /// problem. Only the FLOW form is unexpanded, and that is what the message says now.
+    ///
+    /// I could not reproduce the exact input in five attempts, so this test pins what IS
+    /// verifiable: which forms parse, which one refuses, and that the refusal describes itself.
+    #[test]
+    fn the_anchor_refusal_names_the_flow_form_and_not_anchors_in_general() {
+        // Block-level: a merge key, a sequence alias and a scalar alias all resolve.
+        let ok = parse(
+            "x-base: &base\n  image: alpine\nx-env: &envs\n  - FOO=1\nservices:\n  \
+             a:\n    <<: *base\n    environment: *envs\n  b:\n    <<: *base\n",
+        )
+        .expect("block anchors, aliases and merge keys parse");
+        assert_eq!(ok.len(), 2);
+        assert_eq!(ok[0].image.as_deref(), Some("alpine"));
+        assert_eq!(ok[1].image.as_deref(), Some("alpine"));
+
+        // The flow form is the one that is refused, and the message says so instead of blaming
+        // anchors as a whole.
+        let err = parse("x: &a alpine\nservices:\n  s:\n    image: alpine\n    command: [*a]\n")
+            .expect_err("an alias inside a flow collection is refused");
+        assert!(err.contains("flow collection"), "{err}");
+        assert!(
+            !err.contains("anchors/aliases not supported"),
+            "the message must not deny a feature this parser has: {err}"
+        );
+        // And it points a reader whose file is malformed for another reason at the real suspect.
+        assert!(err.contains("unclosed"), "{err}");
+    }
+
+    /// `security_opt` IS ANSWERED BY VALUE, AND ANSWERING IT BY KEY SAID FALSE THINGS.
+    ///
+    /// MEASURED inside a box: `/proc/self/attr/current` reads the caller's own AppArmor context,
+    /// because kern applies no profile of its own, and SELinux is not even mounted on the host this
+    /// was written on. So `apparmor=unconfined` and `label=disable` ask for exactly what kern does,
+    /// and the parser answered both with "not honoured", on 11 corpus files.
+    ///
+    /// A NAMED PROFILE IS FORWARDED, which it never was: `kern box --apparmor` has existed all
+    /// along. `seccomp=unconfined` stays a difference on purpose - the file asks for NO filter, and
+    /// a filter a downloaded file can switch off is not a filter.
+    #[test]
+    fn security_opt_is_answered_by_value_and_a_named_apparmor_profile_travels() {
+        let one = |v: &str| {
+            parse(&format!(
+                "services:\n  a:\n    image: alpine\n    security_opt:\n      - {v}\n"
+            ))
+            .expect("parses")
+            .remove(0)
+        };
+        // A named profile becomes a field, so `push_box_flags` can send `--apparmor`.
+        assert_eq!(
+            one("apparmor=docker-default").apparmor.as_deref(),
+            Some("docker-default")
+        );
+        assert_eq!(
+            one("apparmor:my-profile").apparmor.as_deref(),
+            Some("my-profile")
+        );
+        // `unconfined` is NOT a profile name: asking the LSM to transition to a profile called
+        // "unconfined" is a different request from applying none, which is what kern does.
+        assert_eq!(one("apparmor=unconfined").apparmor, None);
+        assert_eq!(one("apparmor:unconfined").apparmor, None);
+        // Real files carry punctuation on the value; the word is what decides.
+        assert_eq!(one("apparmor:unconfined;").apparmor, None);
+        // Nothing else sets it.
+        assert_eq!(one("label=disable").apparmor, None);
+        assert_eq!(one("seccomp=unconfined").apparmor, None);
+        assert_eq!(one("no-new-privileges=true").apparmor, None);
+    }
+
+    /// `privileged: true` IS A FIELD, AND THE PARSER DOES NOT DECIDE IT.
+    ///
+    /// Whether kern gives it depends on something the parser cannot see: whether the OPERATOR
+    /// granted it. The sentence this replaces claimed there was "no kern equivalent (rootless)",
+    /// which is wrong twice - `kern box --privileged --cap-add ALL` is the equivalent a rootless
+    /// runtime can give, and it is not the file's to take.
+    #[test]
+    fn privileged_is_recorded_for_the_operator_to_decide() {
+        let b = |v: &str| {
+            parse(&format!(
+                "services:\n  a:\n    image: alpine\n    privileged: {v}\n"
+            ))
+            .expect("parses")
+            .remove(0)
+        };
+        assert!(b("true").privileged);
+        assert!(!b("false").privileged);
+        // Absent means absent, which is the control that makes the two above mean something.
+        let none = parse("services:\n  a:\n    image: alpine\n")
+            .expect("parses")
+            .remove(0);
+        assert!(!none.privileged);
+
+        // THE FLAGS IT BECOMES, and both are needed: Docker's one key is two things here, every
+        // capability the box's own user namespace can hold and the relaxed seccomp a nested runtime
+        // needs. MEASURED end to end: `CapEff` goes from 00000110bd84efff to 000001ffffffffff, and
+        // `Seccomp` stays 2 in both, because kern never runs a box without a filter.
+        let mut cmd = std::process::Command::new("kern");
+        b("true").push_box_flags(&mut cmd);
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(argv.iter().any(|a| a == "--privileged"), "{argv:?}");
+        assert!(
+            argv.windows(2).any(|w| w == ["--cap-add", "ALL"]),
+            "{argv:?}"
+        );
+        // And a service that never asked sends neither.
+        let mut cmd = std::process::Command::new("kern");
+        b("false").push_box_flags(&mut cmd);
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!argv.iter().any(|a| a == "--privileged"), "{argv:?}");
+    }
+
+    /// `ipv4_address:` IS READ, ONE PER NETWORK, AND ONLY IF IT IS AN ADDRESS.
+    ///
+    /// A service on two networks has two addresses and keeping the first would drop a peer's route
+    /// with nothing said. A value that is not an IPv4 literal is not carried at all: it would reach
+    /// `kern box --ip` and fail there, where nothing can point back at the key it came from.
+    #[test]
+    fn ipv4_address_is_collected_per_network_and_validated() {
+        let one = parse(
+            "services:\n  a:\n    image: alpine\n    networks:\n      net:\n        \
+             ipv4_address: 172.28.1.10\n",
+        )
+        .expect("parses");
+        assert_eq!(one[0].net_ipv4, vec!["172.28.1.10".to_string()]);
+
+        let two = parse(
+            "services:\n  a:\n    image: alpine\n    networks:\n      front:\n        \
+             ipv4_address: 172.28.1.10\n      back:\n        ipv4_address: 10.5.0.7\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            two[0].net_ipv4,
+            vec!["172.28.1.10".to_string(), "10.5.0.7".to_string()],
+            "a service on two networks keeps both addresses, in file order"
+        );
+
+        // Not an address: dropped here rather than carried to a flag that cannot name the key.
+        for bad in ["172.28.1.999", "not-an-ip", "", "2001:db8::1"] {
+            let b = parse(&format!(
+                "services:\n  a:\n    image: alpine\n    networks:\n      net:\n        \
+                 ipv4_address: {bad}\n"
+            ))
+            .expect("parses");
+            assert!(b[0].net_ipv4.is_empty(), "{bad:?} must not be carried");
+        }
+        // THE CONTROL: a service with no such key carries nothing, so the assertions above are
+        // about the key and not about the parser filling something in.
+        let none =
+            parse("services:\n  a:\n    image: alpine\n    networks: [net]\n").expect("parses");
+        assert!(none[0].net_ipv4.is_empty());
+    }
+
+    /// THE `ipv4_address:` SENTENCE IS HONOURED IN ONE WIRING AND HALF-HONOURED IN THE OTHER.
+    ///
+    /// In one namespace every address lands on the one loopback and a peer that hard-codes it
+    /// reaches the service. With a namespace per service a box claims only its own, so the service
+    /// answers there and a PEER does not reach it. Calling both "applied" would put the file back in
+    /// the position this work exists to remove.
+    #[test]
+    fn the_ipv4_sentence_promises_a_peer_route_only_where_there_is_one() {
+        let pairs = vec![("db".to_string(), "172.28.1.10".to_string())];
+        let pod = net_ipv4_note(crate::StackNet::Pod, &pairs).expect("owed");
+        let per = net_ipv4_note(crate::StackNet::PerService, &pairs).expect("owed");
+        assert!(pod.contains("is applied here"), "{pod}");
+        assert!(
+            pod.contains("reaches the service"),
+            "the pod sentence must promise the peer route it delivers: {pod}"
+        );
+        assert!(per.contains("is claimed only where"), "{per}");
+        assert!(
+            per.contains("still has no route to it"),
+            "the per-service sentence must say the peer route is NOT there: {per}"
+        );
+        assert!(
+            !per.contains("is applied here"),
+            "and must not claim the key is applied: {per}"
+        );
+        for s in [&pod, &per] {
+            assert!(s.contains("db at 172.28.1.10"), "{s}");
+        }
+        assert_eq!(net_ipv4_note(crate::StackNet::Pod, &[]), None);
+        assert_eq!(net_ipv4_note(crate::StackNet::Undecided, &pairs), None);
+    }
+
+    /// THE SENTENCE MUST SAY OPPOSITE THINGS IN THE TWO WIRINGS, because the two wirings make
+    /// opposite things true, and the one it used to say was picked before the wiring was known.
+    ///
+    /// The old sentence claimed the key was satisfied and named `--no-pod` as the case to worry
+    /// about. MEASURED on the corpus: 75 files use the key and kern selects the per-service wiring
+    /// for 20 of them on its own, so the reassurance was false for one file in four that read it,
+    /// and the flag it told the reader to avoid was one they never passed.
+    #[test]
+    fn the_net_share_sentence_says_opposite_things_in_the_two_wirings() {
+        let pairs = vec![("client".to_string(), "vpn".to_string())];
+        let pod = net_share_note(crate::StackNet::Pod, &pairs).expect("a pod stack is owed one");
+        let per = net_share_note(crate::StackNet::PerService, &pairs)
+            .expect("a per-service stack is owed one");
+        assert!(
+            pod.contains("is satisfied here"),
+            "in one namespace the key IS satisfied: {pod}"
+        );
+        assert!(
+            per.contains("is NOT given a shared namespace here"),
+            "with a namespace per service it is not: {per}"
+        );
+        // THE HALF THAT MATTERS. People write this key to put a service behind a VPN or a proxy
+        // container. A sentence that says "not shared" without saying where the traffic goes
+        // instead leaves the reader with the safer of the two readings, which is the wrong one.
+        assert!(
+            per.contains("does NOT pass through the service it names"),
+            "the per-service sentence must say where the traffic goes: {per}"
+        );
+        assert!(
+            !pod.contains("does NOT pass through"),
+            "and the pod sentence must not, because there it does: {pod}"
+        );
+        // Both name the pair, so a reader knows which services the sentence is about.
+        for s in [&pod, &per] {
+            assert!(s.contains("client -> vpn"), "{s}");
+        }
+        // Nothing to say when nothing asked, and nothing to say before the wiring is settled.
+        assert_eq!(net_share_note(crate::StackNet::Pod, &[]), None);
+        assert_eq!(net_share_note(crate::StackNet::Undecided, &pairs), None);
     }
 
     /// `shm_size:` IS FORWARDED NOW, AND THE OLD REASONING WAS RIGHT ABOUT THE WRONG DIRECTION.
@@ -6248,9 +7458,18 @@ mod tests {
         );
         // `${A${B}}`: the inner `${B}` resolves (unset -> empty), leaving `${A}` -> empty. No stray `}`
         // leaks (the balanced-brace scan closes at the OUTER `}`).
+        // `${A${B}}`: the inner `${B}` resolves (unset -> empty), leaving `${A}` -> empty. The
+        // result carries `UNSET_MARK`, the private character that records "a reference resolved to
+        // nothing" so a valueless key can be told from a value that vanished; `scalar_str` erases it
+        // before anything reads the value.
         assert_eq!(
             interpolate_document("x=${A${B}}", &crate::DotEnv::default()),
-            "x="
+            format!("x={UNSET_MARK}")
+        );
+        assert_eq!(
+            scalar_str(&interpolate_document("${A${B}}", &crate::DotEnv::default())),
+            "",
+            "the mark never survives into a value"
         );
         // A normal `${VAR:-def}` still works.
         assert_eq!(
@@ -6349,7 +7568,9 @@ mod tests {
         let b = &boxes(y)[0];
         assert!(b.env.contains(&"FOO=bar".to_string()));
         assert!(b.env.contains(&"BAZ=qux".to_string()));
-        assert_eq!(b.health_cmd.as_deref(), Some("true"));
+        // `["CMD", "true"]` is the EXEC form: an argv, not a shell string.
+        assert_eq!(b.health_argv, vec!["true".to_string()]);
+        assert_eq!(b.health_cmd, None);
         assert_eq!(b.health_interval, Some(2));
     }
 
@@ -6606,12 +7827,25 @@ mod tests {
 
     #[test]
     fn healthcheck_cmd_exec_vs_shell_vs_bare() {
+        // THE EXEC FORM STAYS AN ARGV. It used to be joined into "pg_isready -U app" and run through
+        // `/bin/sh -c`, which is a check no shell-less image can ever pass - and `CMD` is the form
+        // such an image writes. Measured on Supabase: PostgREST answers `postgrest --ready` every
+        // time through `kern exec`, and reported `unhealthy` for as long as the wrapper was there.
         let y = "services:\n  a:\n    image: alpine\n    healthcheck:\n      test: [\"CMD\", \"pg_isready\", \"-U\", \"app\"]\n";
-        assert_eq!(boxes(y)[0].health_cmd.as_deref(), Some("pg_isready -U app"));
+        let b = &boxes(y)[0];
+        assert_eq!(b.health_argv, ["pg_isready", "-U", "app"]);
+        assert_eq!(b.health_cmd, None, "the exec form is not a shell string");
+        // An argument WITH A SPACE keeps its boundary; joining made it two arguments.
+        let ys = "services:\n  a:\n    image: alpine\n    healthcheck:\n      test: [\"CMD\", \"probe\", \"a b\"]\n";
+        assert_eq!(boxes(ys)[0].health_argv, ["probe", "a b"]);
         let y2 = "services:\n  a:\n    image: alpine\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready || exit 1\"]\n";
         assert_eq!(
             boxes(y2)[0].health_cmd.as_deref(),
             Some("pg_isready || exit 1")
+        );
+        assert!(
+            boxes(y2)[0].health_argv.is_empty(),
+            "the shell form is not an argv"
         );
         let y3 =
             "services:\n  a:\n    image: alpine\n    healthcheck:\n      test: curl -f localhost\n";
@@ -6628,19 +7862,28 @@ mod tests {
         // list (exec). With the dual scalar+children representation, the converter must read whichever
         // is PRESENT for the value's form, not blindly the same one - else the block/inline × list/bare
         // matrix drops or mis-parses a cell. All four cells must resolve to the same command.
+        //
+        // The command is the same in all four; the FORM is not, and both halves are asserted: a
+        // list cell must land in `health_argv` (exec, no shell) and a string cell in `health_cmd`.
         let cases = [
-            // (yaml, expected)
-            ("services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD\",\"redis-cli\",\"ping\"]\n", "redis-cli ping"), // block list
-            ("services:\n  a:\n    image: r\n    healthcheck: {test: [\"CMD\",\"redis-cli\",\"ping\"]}\n", "redis-cli ping"), // inline list
-            ("services:\n  a:\n    image: r\n    healthcheck:\n      test: \"redis-cli ping\"\n", "redis-cli ping"), // block bare-string
-            ("services:\n  a:\n    image: r\n    healthcheck: {test: \"redis-cli ping\"}\n", "redis-cli ping"), // inline bare-string
+            // (yaml, argv, shell)
+            ("services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD\",\"redis-cli\",\"ping\"]\n", true), // block list
+            ("services:\n  a:\n    image: r\n    healthcheck: {test: [\"CMD\",\"redis-cli\",\"ping\"]}\n", true), // inline list
+            ("services:\n  a:\n    image: r\n    healthcheck:\n      test: \"redis-cli ping\"\n", false), // block bare-string
+            ("services:\n  a:\n    image: r\n    healthcheck: {test: \"redis-cli ping\"}\n", false), // inline bare-string
         ];
-        for (y, expected) in cases {
-            assert_eq!(
-                boxes(y)[0].health_cmd.as_deref(),
-                Some(expected),
-                "for:\n{y}"
-            );
+        for (y, exec) in cases {
+            let b = &boxes(y)[0];
+            if exec {
+                assert_eq!(b.health_argv, ["redis-cli", "ping"], "for:\n{y}");
+                assert_eq!(b.health_cmd, None, "for:\n{y}");
+            } else {
+                assert_eq!(b.health_cmd.as_deref(), Some("redis-cli ping"), "for:\n{y}");
+                assert!(b.health_argv.is_empty(), "for:\n{y}");
+            }
+            // Whichever form, the box HAS a check: this is the question every `service_healthy`
+            // gate asks, and answering it from `health_cmd` alone degraded a real gate.
+            assert!(b.has_health(), "for:\n{y}");
         }
     }
 
@@ -6839,11 +8082,6 @@ mod tests {
                 "services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U postgres\"]\n",
                 "pg_isready -U postgres",
             ),
-            // Exec form with a comma in an argument.
-            (
-                "services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD\", \"sh\", \"-c\", \"echo a,b\"]\n",
-                "sh -c echo a,b",
-            ),
         ];
         for (y, expected) in cases {
             assert_eq!(
@@ -6852,12 +8090,125 @@ mod tests {
                 "the health command was truncated for:\n{y}"
             );
         }
+        // EXEC FORM WITH A COMMA IN AN ARGUMENT, and it stays ONE argument. The joined version read
+        // `sh -c echo a,b`, which - run through a second shell - executes `echo` with no operand and
+        // `a,b` as `$0`: the check silently stopped being the check that was written.
+        let y = "services:\n  a:\n    image: r\n    healthcheck:\n      test: [\"CMD\", \"sh\", \"-c\", \"echo a,b\"]\n";
+        assert_eq!(boxes(y)[0].health_argv, ["sh", "-c", "echo a,b"]);
     }
 
     #[test]
     fn ports_reconstructs_and_warns() {
         let y = "services:\n  a:\n    image: alpine\n    ports:\n      - \"8080:80\"\n";
         assert_eq!(boxes(y)[0].ports, ["8080:80"]);
+    }
+
+    /// A BLOCK SEQUENCE AT ITS KEY'S OWN INDENTATION IS THE SAME SEQUENCE, and kern used to drop it
+    /// entirely, in silence.
+    ///
+    /// YAML lets the `-` sit at the key's column (the dash is itself an indentation indicator), and
+    /// that is not a curiosity: it is what `docker compose config` prints, what every YAML dumper
+    /// emits, and how a large share of hand-written files look. kern's dedent rule popped the key's
+    /// level when it saw an item at the same column, so the items landed on the parent mapping,
+    /// where nothing reads them. The key parsed, the value vanished, nothing was warned, exit 0.
+    ///
+    /// MEASURED: 16 files of a 240-file corpus write at least one sequence this way - `volumes` 20
+    /// times, `cap_add` 14, `security_opt` 12, `devices` 11, `ports` 10, `depends_on` 4. Every one
+    /// of them was counted COMPATIBLE by the compat-rate script, because a rate that reads kern's
+    /// own silence cannot see what kern never noticed.
+    ///
+    /// Found by running Zabbix, where the only visible symptom was `healthcheck test not
+    /// convertible` on five services.
+    #[test]
+    fn a_sequence_at_its_keys_own_indentation_is_not_dropped() {
+        let y = concat!(
+            "services:\n",
+            "  web:\n",
+            "    image: nginx\n",
+            "    ports:\n",
+            "    - \"8080:80\"\n",
+            "    - \"8443:443\"\n",
+            "    environment:\n",
+            "    - K=V\n",
+            "    depends_on:\n",
+            "    - db\n",
+            "    command:\n",
+            "    - nginx\n",
+            "    - -g\n",
+            "    - daemon off;\n",
+            "    healthcheck:\n",
+            "      test:\n",
+            "      - CMD-SHELL\n",
+            "      - curl -f localhost || exit 1\n",
+            "  db:\n",
+            "    image: alpine\n",
+        );
+        let bs = boxes(y);
+        let web = bs.iter().find(|b| b.name == "web").expect("web");
+        assert_eq!(web.ports, ["8080:80", "8443:443"]);
+        assert_eq!(web.env, ["K=V"]);
+        assert_eq!(web.depends_on, ["db"]);
+        assert_eq!(web.command, ["nginx", "-g", "daemon off;"]);
+        assert_eq!(
+            web.health_cmd.as_deref(),
+            Some("curl -f localhost || exit 1")
+        );
+        // The service AFTER the compact block is still its own service: the dedent must still end
+        // the sequence when a key at a smaller column arrives.
+        assert_eq!(bs.len(), 2);
+        assert_eq!(bs[1].image.as_deref(), Some("alpine"));
+
+        // THE DEEPER STYLE MUST NOT HAVE MOVED. It is the same file with two more spaces, and a fix
+        // that traded one spelling for the other would be no fix at all.
+        let deep = concat!(
+            "services:\n",
+            "  web:\n",
+            "    image: nginx\n",
+            "    ports:\n",
+            "      - \"8080:80\"\n",
+            "    depends_on:\n",
+            "      - db\n",
+            "  db:\n",
+            "    image: alpine\n",
+        );
+        let bs = boxes(deep);
+        assert_eq!(bs[0].ports, ["8080:80"]);
+        assert_eq!(bs[0].depends_on, ["db"]);
+        assert_eq!(bs.len(), 2);
+
+        // A list of MAPPINGS in the compact style (the long-form port) folds the same way.
+        let maps = concat!(
+            "services:\n",
+            "  web:\n",
+            "    image: nginx\n",
+            "    ports:\n",
+            "    - target: 80\n",
+            "      published: 8080\n",
+            "    - target: 443\n",
+            "      published: 8443\n",
+        );
+        assert_eq!(boxes(maps)[0].ports, ["8080:80", "8443:443"]);
+
+        // COLUMN ZERO is the boundary the rule has to survive, because there the pop-at-equal has
+        // nothing left to pop: a top-level key whose items sit at its own indentation (`include:`
+        // is written this way in the spec's own examples) is followed by `services:` at the same
+        // column 0. Asked for by a reviewer as the case a dedent rule is most likely to get wrong.
+        let top = concat!(
+            "include:\n",
+            "- ./other.yml\n",
+            "services:\n",
+            "  web:\n",
+            "    image: nginx\n",
+            "volumes:\n",
+            "- data\n",
+            "networks:\n",
+            "  default:\n",
+            "    driver: bridge\n",
+        );
+        let bs = boxes(top);
+        assert_eq!(bs.len(), 1, "services after a column-0 sequence");
+        assert_eq!(bs[0].name, "web");
+        assert_eq!(bs[0].image.as_deref(), Some("nginx"));
     }
 
     #[test]
@@ -6901,6 +8252,106 @@ mod tests {
         let bd2 = boxes(y2)[0].build.clone().unwrap();
         assert_eq!(bd2.context, "./svc");
         assert_eq!(bd2.dockerfile.as_deref(), Some("Custom.file"));
+    }
+
+    /// A KEY WITH NO VALUE TAKES ITS VALUE FROM THE ENVIRONMENT, WHICH INCLUDES THE PROJECT `.env`.
+    ///
+    /// Sentry self-hosted writes it with the reason in a comment above the keys - "Leaving the value
+    /// empty to just pass whatever is set on the host system (or in the .env file)" - and its `.env`
+    /// sets both. Read as an empty value instead, `SENTRY_EVENT_RETENTION_DAYS=` reached the box and
+    /// Sentry's own config died on `int("")` at every start of the `web` service.
+    ///
+    /// The other half is pinned by `unresolvable_var_substitutes_empty_never_literal`: an unset
+    /// `${VAR}` is indistinguishable from a bare key here (both `scalar: None`) and must stay the
+    /// empty string Docker gives it. Deciding by whether the name is BOUND is what satisfies both.
+    #[test]
+    fn a_valueless_key_passes_the_environment_through_including_the_dotenv() {
+        let de = crate::parse_dotenv("SENTRY_EVENT_RETENTION_DAYS=90\n");
+        let y = concat!(
+            "services:\n",
+            "  web:\n",
+            "    image: x\n",
+            "    environment:\n",
+            "      SENTRY_EVENT_RETENTION_DAYS:\n",
+            "      NON_LEGATO_DA_NESSUNA_PARTE:\n",
+        );
+        let boxes = parse_with_env(y, &de, false, crate::StackNet::Pod, None).expect("parses");
+        let env = &boxes[0].env;
+        assert!(
+            env.contains(&"SENTRY_EVENT_RETENTION_DAYS=90".to_string()),
+            "the .env value must be passed through: {env:?}"
+        );
+        // Bound NOWHERE: Docker does not pass the variable at all, and neither does kern. Passed as
+        // an empty string it is worse than absent - Sentry's own config reads `value[0]` on it and
+        // dies with `IndexError: string index out of range`.
+        assert!(
+            !env.iter()
+                .any(|e| e.starts_with("NON_LEGATO_DA_NESSUNA_PARTE")),
+            "a valueless key bound nowhere is omitted, not passed empty: {env:?}"
+        );
+        // ...while a value that RESOLVED to nothing is the empty string, which is the other half of
+        // the same distinction.
+        let y2 =
+            "services:\n  web:\n    image: x\n    environment:\n      K: ${KERN_UNSET_ABC_XYZ}\n";
+        let b2 = parse_with_env(y2, &de, false, crate::StackNet::Pod, None).expect("parses");
+        assert!(
+            b2[0].env.contains(&"K=".to_string()),
+            "an unset reference is Docker's empty string: {:?}",
+            b2[0].env
+        );
+    }
+
+    /// A BARE BUILD ARG TAKES ITS VALUE FROM THE PROJECT `.env` TOO, not from the shell alone.
+    ///
+    /// `args: [SENTRY_IMAGE]` against a `.env` that sets `SENTRY_IMAGE` is Sentry self-hosted's own
+    /// build, and its Dockerfile is `ARG SENTRY_IMAGE` / `FROM ${SENTRY_IMAGE}`: with the value
+    /// unresolved the image is built `FROM` nothing. MEASURED - kern stopped with `Dockerfile line
+    /// 2: FROM needs an image reference` while `docker compose build` builds it.
+    ///
+    /// The shell still wins, and `environment:` is deliberately NOT changed: no measurement says a
+    /// bare name there reads the `.env`, and putting a value into a container that Docker may not
+    /// put there is the kind of guess this parser does not make.
+    #[test]
+    fn a_bare_build_arg_resolves_from_the_project_env() {
+        let de = crate::parse_dotenv("SENTRY_IMAGE=ghcr.io/getsentry/sentry:nightly\n");
+        let y = concat!(
+            "services:\n",
+            "  web:\n",
+            "    build:\n",
+            "      context: ./sentry\n",
+            "      args:\n",
+            "      - SENTRY_IMAGE\n",
+            "      - EXPLICIT=1\n",
+            "      - ASSENTE_OVUNQUE\n",
+        );
+        let boxes =
+            parse_with_env(y, &de, false, crate::StackNet::Pod, None).expect("parses with .env");
+        let args = boxes[0].build.clone().expect("build directive").args;
+        assert!(
+            args.contains(&"SENTRY_IMAGE=ghcr.io/getsentry/sentry:nightly".to_string()),
+            "the bare name must resolve from the .env: {args:?}"
+        );
+        assert!(args.contains(&"EXPLICIT=1".to_string()));
+        // Unresolvable anywhere: Docker leaves such an arg UNSET rather than setting it empty, so
+        // the Dockerfile's own `ARG x=default` still applies.
+        assert!(
+            !args.iter().any(|a| a.starts_with("ASSENTE_OVUNQUE")),
+            "an unresolved passthrough must not be forwarded at all: {args:?}"
+        );
+        // Without a `.env` the same file resolves nothing, which is what made this visible.
+        let bare = parse_with_env(
+            y,
+            &crate::DotEnv::default(),
+            false,
+            crate::StackNet::Pod,
+            None,
+        )
+        .expect("parses");
+        let args = bare[0].build.clone().expect("build directive").args;
+        assert!(
+            !args.iter().any(|a| a.starts_with("SENTRY_IMAGE")),
+            "no .env and no shell value: nothing to pass through ({args:?})"
+        );
     }
 
     #[test]
@@ -7546,11 +8997,117 @@ services:
         assert!(parse("services:\n  w:\n    extends: ghost\n    image: x\n")
             .unwrap_err()
             .contains("unknown service"));
-        assert!(
-            parse("services:\n  w:\n    extends:\n      file: base.yml\n      service: b\n")
-                .unwrap_err()
-                .contains("cross-file")
+        // A cross-file extends with NO directory to resolve against says exactly that, instead of
+        // guessing a working directory. (With a directory it works: the test below.)
+        let err = parse("services:\n  w:\n    extends:\n      file: base.yml\n      service: b\n")
+            .unwrap_err();
+        assert!(err.contains("no directory to resolve"), "{err}");
+    }
+
+    /// `extends: {file: other.yaml, service: base}` - the Specification's cross-file form, which
+    /// used to be a refusal ("inline the base service").
+    ///
+    /// MEASURED on Zabbix's own stack: 17 services, every one of them extending into
+    /// `compose_zabbix_components.yaml`, so the file its maintainers publish and run did not start
+    /// at all. The cases below are that file's shape reduced: a base in a sibling file, a local
+    /// override on top, a chain that leaves the file and comes back, and the relationship keys the
+    /// Specification does NOT inherit.
+    #[test]
+    fn extends_reaches_into_another_file_and_stops_at_relationships() {
+        let dir = std::env::temp_dir().join(format!("kern-extends-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let at = |text: &str| {
+            parse_with_env(
+                text,
+                &crate::DotEnv::default(),
+                true,
+                crate::StackNet::Pod,
+                Some(dir.as_path()),
+            )
+        };
+
+        std::fs::write(
+            dir.join("components.yaml"),
+            concat!(
+                "services:\n",
+                "  server-base:\n",
+                "    image: base-image\n",
+                "    read_only: true\n",
+                "    environment:\n",
+                "    - FROM_BASE=1\n",
+                // Never inherited: it names a service that need not exist in the other file.
+                "    depends_on:\n",
+                "    - a-service-only-this-file-has\n",
+            ),
+        )
+        .expect("write base");
+
+        let boxes = at(concat!(
+            "services:\n",
+            "  zabbix-server:\n",
+            "    extends:\n",
+            "      file: components.yaml\n",
+            "      service: server-base\n",
+            "    image: my-own-image\n",
+        ))
+        .expect("cross-file extends resolves");
+        let b = &boxes[0];
+        assert_eq!(
+            b.image.as_deref(),
+            Some("my-own-image"),
+            "the extending service wins"
         );
+        assert!(b.read_only, "a key only the base sets is inherited");
+        assert_eq!(b.env, ["FROM_BASE=1"]);
+        assert!(
+            b.depends_on.is_empty(),
+            "`depends_on` is a relationship: it names services of the OTHER file and is not \
+             inherited (got {:?})",
+            b.depends_on
+        );
+
+        // A CHAIN THAT LEAVES THE FILE AND COMES BACK is a cycle, and must be named as one rather
+        // than followed until something else breaks.
+        std::fs::write(
+            dir.join("loop.yaml"),
+            concat!(
+                "services:\n",
+                "  there:\n",
+                "    extends:\n",
+                "      file: loop.yaml\n",
+                "      service: there\n",
+                "    image: x\n",
+            ),
+        )
+        .expect("write loop");
+        let err = at(concat!(
+            "services:\n",
+            "  here:\n",
+            "    extends:\n",
+            "      file: loop.yaml\n",
+            "      service: there\n",
+        ))
+        .unwrap_err();
+        assert!(err.contains("circular"), "{err}");
+
+        // A file that is not there names itself in the error, with the path it looked at.
+        let err = at("services:\n  w:\n    extends:\n      file: nope.yaml\n      service: b\n")
+            .unwrap_err();
+        assert!(err.contains("nope.yaml"), "{err}");
+
+        // A service the base file does not define is named too, rather than reported as "no image".
+        let err = at(concat!(
+            "services:\n",
+            "  w:\n",
+            "    extends:\n",
+            "      file: components.yaml\n",
+            "      service: ghost\n",
+        ))
+        .unwrap_err();
+        assert!(err.contains("no such service"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

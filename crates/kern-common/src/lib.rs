@@ -28,8 +28,21 @@ pub mod toml_lite;
 pub struct BoxName(String);
 
 impl BoxName {
-    /// Maximum length, in bytes. Conservative - box names are short identifiers.
-    pub const MAX_LEN: usize = 64;
+    /// Maximum length, in bytes, DERIVED from the longest name kern builds out of it rather than
+    /// picked for being small.
+    ///
+    /// Every derived name is `kern-box-<name>-<pid>` or shorter: 9 bytes of prefix, the name, a
+    /// separator and a pid (10 digits covers any `pid_max`), plus `.scope` when it becomes a systemd
+    /// unit. At 200 that is 226 bytes, inside both `NAME_MAX` (255, the filesystem limit on the
+    /// registry entry, the cgroup leaf, the log and the health sidecar) and systemd's 256.
+    ///
+    /// IT WAS 64, "conservative", and 64 is what `<project>-<service>` exceeds on any real compose
+    /// project: MEASURED on Sentry self-hosted, where
+    /// `sentry-self-hosted-snuba-subscription-consumer-generic-metrics-counters` is 71 bytes and the
+    /// service simply refused to start, on a name Docker Compose generates and accepts. The box's
+    /// hostname is a separate matter and always was: `set_hostname` truncates to `HOST_NAME_MAX`,
+    /// which is 64 and is the kernel's limit, not this one.
+    pub const MAX_LEN: usize = 200;
 
     /// Parse a box name under the conservative rules above.
     pub fn parse(s: &str) -> Result<Self, &'static str> {
@@ -37,7 +50,7 @@ impl BoxName {
             return Err("box name is empty");
         }
         if s.len() > Self::MAX_LEN {
-            return Err("box name is too long (max 64 characters)");
+            return Err("box name is too long (max 200 characters)");
         }
         // First char gates the two injection-class footguns: leading '-' (looks like a flag)
         // and leading '.' (`.`, `..`, hidden dirs).
@@ -86,11 +99,41 @@ pub fn parse_binary_size(s: &str) -> Option<u64> {
         '0'..='9' => (t, 1),
         _ => return None,
     };
-    num.trim()
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(mult))
-        .filter(|b| *b > 0)
+    let num = num.trim();
+    if let Some(n) = num.parse::<u64>().ok().and_then(|n| n.checked_mul(mult)) {
+        return Some(n).filter(|b| *b > 0);
+    }
+    // A FRACTIONAL SIZE, WHICH DOCKER ACCEPTS AND THIS PARSER REFUSED. Compose sizes go through
+    // go-units, whose `RAMInBytes` parses a float, so `1.5g` is an ordinary thing to write in a
+    // compose file. MEASURED on Docker's OWN `minecraft` sample, which sets
+    // `deploy.resources.limits.memory: 1.5G`: the stack died with `usage: kern --memory <size>`,
+    // an error about kern's flag for a value the user never typed.
+    //
+    // THE CHARSET IS CHECKED EXPLICITLY rather than left to `f64::from_str`, which also accepts
+    // `1e3`, `inf`, `NaN` and a sign. A size is digits with at most one dot; everything else is a
+    // typo, and a parser that silently read `inf` or `-1` as a memory cap would be worse than one
+    // that refuses a fraction.
+    let mut dots = 0usize;
+    if num.is_empty()
+        || !num.bytes().all(|c| {
+            if c == b'.' {
+                dots += 1;
+                true
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+        || dots != 1
+    {
+        return None;
+    }
+    let f: f64 = num.parse().ok()?;
+    // Truncating, which is what go-units does: `1.5g` is 1610612736 bytes under both.
+    let bytes = f * mult as f64;
+    if !bytes.is_finite() || bytes < 1.0 || bytes >= u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes as u64)
 }
 
 /// The shared rule for a kern resource name - volume, secret, pod, profile/vdisk. Each becomes a
@@ -277,6 +320,47 @@ mod tests {
         assert_eq!(parse_binary_size("b"), None);
     }
 
+    /// A FRACTIONAL SIZE IS A SIZE, because Docker's own samples write one.
+    ///
+    /// Compose sizes are parsed by go-units, which takes a float, so `1.5G` is ordinary in a compose
+    /// file. MEASURED on Docker's `minecraft` sample (`deploy.resources.limits.memory: 1.5G`): the
+    /// stack died with a usage error about kern's `--memory` flag. After the change the box comes up
+    /// and its own cgroup reads `memory.max` = 1610612736, which is the number this test asserts.
+    #[test]
+    fn parse_binary_size_takes_a_fraction_and_still_refuses_a_non_number() {
+        assert_eq!(parse_binary_size("1.5g"), Some(1_610_612_736));
+        assert_eq!(parse_binary_size("1.5G"), Some(1_610_612_736));
+        assert_eq!(parse_binary_size("1.5gb"), Some(1_610_612_736));
+        assert_eq!(parse_binary_size("0.5k"), Some(512));
+        // Truncating, which is what go-units does, so the two agree on the awkward values too.
+        assert_eq!(parse_binary_size("1.7"), Some(1));
+        // THE INTEGER PATH IS UNCHANGED AND EXACT. A size big enough to lose precision as an `f64`
+        // must not start going through the float branch: 2^53 + 1 bytes is representable as a `u64`
+        // and is not as an `f64`, so this asserts the integer parse still runs first.
+        assert_eq!(
+            parse_binary_size("9007199254740993"),
+            Some(9_007_199_254_740_993)
+        );
+        // WHAT A FLOAT PARSER WOULD HAVE TAKEN AND A SIZE MUST NOT. `f64::from_str` accepts every
+        // one of these, and a memory cap of `inf` or `-1` is worse than a refused fraction.
+        // A LEADING DOT IS A NUMBER: Go's `ParseFloat` reads ".5" and so does this, so the two
+        // agree that `.5g` is half a gibibyte rather than one of them refusing it.
+        assert_eq!(parse_binary_size(".5g"), Some(512 * 1024 * 1024));
+        for junk in [
+            "1e3", "inf", "-inf", "NaN", "-1", "-1g", "1.2.3", "1.", "1 . 5", ".",
+        ] {
+            assert_eq!(parse_binary_size(junk), None, "{junk} must not parse");
+        }
+        // A LEADING `+` IS TAKEN, AND THAT PREDATES THIS CHANGE: `u64::from_str` accepts one, so the
+        // integer branch has always read `+5` as 5. Recorded rather than quietly left untested, so
+        // that whoever decides to tighten it is changing something this file says out loud.
+        assert_eq!(parse_binary_size("+5"), Some(5));
+        assert_eq!(parse_binary_size("+5g"), Some(5 * 1024 * 1024 * 1024));
+        // Zero stays rejected however it is spelled: a cap of nothing is not a cap.
+        assert_eq!(parse_binary_size("0.0g"), None);
+        assert_eq!(parse_binary_size("0.0000001k"), None);
+    }
+
     #[test]
     fn box_name_accepts_sane_identifiers() {
         for ok in ["web", "my_box", "api-1", "v2.3", "_internal", "A0"] {
@@ -318,6 +402,23 @@ mod tests {
     fn box_name_enforces_length_cap() {
         assert!(BoxName::parse(&"a".repeat(BoxName::MAX_LEN)).is_ok());
         assert!(BoxName::parse(&"a".repeat(BoxName::MAX_LEN + 1)).is_err());
+        // THE LENGTH A REAL COMPOSE PROJECT PRODUCES. `<project>-<service>` is what Docker Compose
+        // names a container, and Sentry self-hosted's longest is 71 bytes - refused outright while
+        // the limit was 64, on a name `docker compose up` accepts. The name kern derives from it
+        // (`kern-box-<name>-<pid>`, plus `.scope` as a systemd unit) still fits every limit below.
+        let real = "sentry-self-hosted-snuba-subscription-consumer-generic-metrics-counters";
+        assert_eq!(real.len(), 71);
+        assert!(BoxName::parse(real).is_ok(), "{real}");
+        let derived = format!(
+            "kern-box-{}-{}.scope",
+            "a".repeat(BoxName::MAX_LEN),
+            u32::MAX
+        );
+        assert!(
+            derived.len() < 255,
+            "the longest name kern builds must fit NAME_MAX and a systemd unit name: {}",
+            derived.len()
+        );
     }
 }
 
@@ -384,10 +485,16 @@ mod size_spellings {
     }
 
     /// A suffix is not a size on its own, and nothing here may make one parse.
+    ///
+    /// `"2.5gib"` USED TO BE IN THIS LIST AND WAS MOVED OUT ON PURPOSE. It is not a bare unit: it is
+    /// a fractional size, refused as a side effect of an integer-only parse rather than by any rule
+    /// this test states. It now parses, because Docker's own samples write one, and it is asserted
+    /// in `parse_binary_size_takes_a_fraction_and_still_refuses_a_non_number` with its value. A
+    /// negative fraction stays here, where it belongs.
     #[test]
     fn a_bare_unit_is_still_refused() {
         for s in [
-            "", " ", "b", "gib", "ib", "g", "kib", "two gib", "-2gib", "2.5gib",
+            "", " ", "b", "gib", "ib", "g", "kib", "two gib", "-2gib", "-2.5gib", "gib2",
         ] {
             assert_eq!(p(s), None, "{s:?}");
         }

@@ -251,6 +251,7 @@ fn join_pod_and_bind_its_files(
     volumes: &mut Vec<kern_isolation::Volume>,
     dns_requested: bool,
     inherit_nameservers: &mut Vec<String>,
+    on_bridge: bool,
 ) -> Result<Option<i32>, Error> {
     let Some(pod) = pod else { return Ok(None) };
     let holder = crate::pod::holder_pid(pod).ok_or_else(|| {
@@ -258,6 +259,21 @@ fn join_pod_and_bind_its_files(
             "no running pod '{pod}' - create it first with `kern pod create {pod}`"
         ))
     })?;
+    // A BRIDGE MEMBER GETS NEITHER THE ENTRY NOR THE FILE, and this is not an optimisation.
+    //
+    // The pod's shared hosts file maps every member to `127.0.0.1`, which is true of a SHARED
+    // network namespace and false of a bridge: there each member has its own loopback and meets its
+    // peers at their addresses. The file is bound over `/etc/hosts` BEFORE the driver's own
+    // `--add-host` lines, and `/etc/hosts` is read top-down, so the pod's `127.0.0.1 <name>` shadows
+    // the correct address whenever a `container_name:` makes the two names the same.
+    //
+    // MEASURED on a two-service file with `container_name: db` and `container_name: web`: inside
+    // `web`, `/etc/hosts` carried `127.0.0.1 db` above `10.89.0.2 db`, and a connection to `db`
+    // reached `web` itself - the same "a name answers as the wrong service" defect an outside
+    // reviewer found in the relay wiring, arriving by a different door.
+    if on_bridge {
+        return Ok(Some(holder));
+    }
     crate::pod::add_member(pod, name)?;
     // Bind the pod's shared hosts over /etc/hosts. RW (not `:ro`): a read-only remount of a bind is
     // refused inside the pod's single-uid user ns (EPERM), and pod members are co-trusted anyway
@@ -477,9 +493,47 @@ fn seed_now(lower: &str, volumes: &[(String, String)]) {
 /// A FUNCTION so the precedence can be asserted. Written inline as an `.or_else` chain it was only
 /// ever checked end to end, which needs a box, an image with a `STOPSIGNAL`, and a workload that
 /// reports which signal it caught.
+/// The lowest port an unprivileged process may bind on this host.
+///
+/// NOT A DECISION, ONLY A SENTENCE. The refusal that calls this comes from a bind that actually
+/// failed with `EACCES`, so kern never assumes where the boundary is: a host that lowers this sysctl
+/// publishes port 80 rootless and kern says nothing at all. The number is read so the message can
+/// name the rule the kernel is applying instead of the `1024` it used to quote, which is a default
+/// and not a law, and so the reader is pointed at the knob that would let the port through.
+///
+/// TAKES THE PATH so the parse can be asserted. A sentence built from an unreadable `/proc` file is
+/// exactly the kind of thing that silently becomes `0` or panics, and neither would be visible from
+/// the call site.
+pub(crate) fn unprivileged_port_start_at(path: &str) -> u16 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        // The kernel's own default, and the answer for any host that does not expose the knob.
+        .unwrap_or(1024)
+}
+
+fn unprivileged_port_start() -> u16 {
+    unprivileged_port_start_at("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+}
+
 pub(crate) fn resolve_stop_signal(flag: Option<i32>, image: Option<&str>) -> i32 {
     flag.or_else(|| image.and_then(crate::cli::parse_signal_name))
         .unwrap_or(libc::SIGTERM)
+}
+
+/// The check the CALLER named, in the form they named it in: `--health-cmd-argv` (repeatable) is
+/// Docker's `CMD` exec form - argv exec'd directly, no shell - and `--health-cmd` is its
+/// `CMD-SHELL`. The CLI parser refuses both at once, so the order here settles nothing a caller can
+/// reach; it is written argv-first anyway, because a form that needs no shell is the safe reading
+/// of an ambiguous pair.
+pub(crate) fn flag_health_probe(
+    cmd: Option<&str>,
+    argv: &[String],
+) -> Option<kern_oci::HealthTest> {
+    if !argv.is_empty() {
+        return Some(kern_oci::HealthTest::Exec(argv.to_vec()));
+    }
+    cmd.map(|c| kern_oci::HealthTest::Shell(c.to_string()))
 }
 
 /// What an image's own `HEALTHCHECK` contributes, once the caller's flags have had their say.
@@ -488,7 +542,9 @@ pub(crate) fn resolve_stop_signal(flag: Option<i32>, image: Option<&str>) -> i32
 /// call site to the flag's value (which already carries kern's default).
 #[derive(Default, Debug, PartialEq, Eq)]
 pub(crate) struct ImageHealthDefaults {
-    pub(crate) cmd: Option<String>,
+    /// The image's check WITH ITS FORM (`CMD` exec / `CMD-SHELL`), never flattened to a string: an
+    /// image that ships `CMD ["prog"]` typically has no shell to run a flattened one with.
+    pub(crate) probe: Option<kern_oci::HealthTest>,
     pub(crate) interval: Option<u64>,
     pub(crate) retries: Option<u32>,
     pub(crate) start_period: Option<u64>,
@@ -510,19 +566,19 @@ pub(crate) struct ImageHealthDefaults {
 /// which side wins leaves every test green.
 pub(crate) fn image_health_defaults(
     img: Option<&kern_oci::ImageHealthcheck>,
-    flag_cmd: Option<&str>,
+    flag_probe: Option<&kern_oci::HealthTest>,
 ) -> ImageHealthDefaults {
     // The caller named a command: the image contributes nothing at all, numbers included.
-    let Some(h) = img.filter(|_| flag_cmd.is_none()) else {
+    let Some(h) = img.filter(|_| flag_probe.is_none()) else {
         return ImageHealthDefaults::default();
     };
     // `HEALTHCHECK NONE` disables a check a base image set, so it contributes nothing either - and
     // must not leave its INTERVALS behind to be applied to a check that does not exist.
-    let Some(cmd) = h.shell_command() else {
+    let Some(probe) = h.probe() else {
         return ImageHealthDefaults::default();
     };
     ImageHealthDefaults {
-        cmd: Some(cmd),
+        probe: Some(probe),
         interval: secs_from_nanos(h.interval_ns),
         retries: h.retries,
         start_period: secs_from_nanos(h.start_period_ns),
@@ -817,6 +873,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         &mut volumes,
         dns_requested,
         &mut inherited_nameservers,
+        args.pod_bridge.is_some(),
     )?;
     // `--env-file` first (K=V lines from a file), then `--env` on top (explicit wins).
     let mut env = parse_env_files(args.env_file)?;
@@ -1057,7 +1114,21 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
 
     // `--secret`: read the values on the host (files/stdin/inline) BEFORE the fork; the box writes
     // them into a RAM-backed `/run/secrets` tmpfs (mode 0400) that never touches the overlay upper.
-    let secrets = crate::secret::parse_secrets(args.secrets, args.secret_mode)?;
+    let mut secrets = crate::secret::parse_secrets(args.secrets, args.secret_mode)?;
+    // The environment-sourced ones join the same list, so everything downstream sees one kind of
+    // secret: a name and its bytes. Appended AFTER, and a name already delivered from a file is
+    // refused rather than shadowed, because two sources for one `/run/secrets/<name>` is the file
+    // saying two different things.
+    for s in crate::secret::parse_secret_envs(args.secret_envs, args.secret_mode)? {
+        if secrets.iter().any(|e| e.name == s.name) {
+            return Err(Error::Sandbox(format!(
+                "secret '{}' is given both a file and an environment source; only one can land at \
+                 /run/secrets/{}",
+                s.name, s.name
+            )));
+        }
+        secrets.push(s);
+    }
 
     // SECURITY: `--ssh` cannot mean anything with `--net`, and what it WOULD do is dangerous.
     // `--ssh <port>` publishes `127.0.0.1:<port>` → box `:22`. With `--net` the box has no network
@@ -1139,6 +1210,29 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
              `[kern] publish_bind` policy, overriding what the spec asked for"
         );
     }
+    // A PORT KERN CANNOT BIND IS MOVED RATHER THAN FATAL, unless the operator asked otherwise.
+    // Rootless, the kernel refuses a bind below `net.ipv4.ip_unprivileged_port_start`, and 15 of the
+    // 39 samples Docker itself ships publish such a port: `80` in fourteen of them. Refusing means
+    // more than a third of Docker's own examples do not start here for a reason that is about the
+    // machine and not about the file. Every move is printed with both numbers, so the reader is
+    // never left looking for a service on a port it is not on.
+    let floor = unprivileged_port_start_at("/proc/sys/net/ipv4/ip_unprivileged_port_start");
+    match crate::commands::privileged_port_policy() {
+        Ok(true) => {
+            let moved = crate::commands::shift_privileged_ports(&mut eff_ports, floor);
+            for (from, to) in &moved {
+                eprintln!(
+                    "kern: note: host port {from} needs a privilege kern lacks when rootless, so it \
+                     is published on {to} instead (this host binds from {floor} upward; set `[kern] \
+                     privileged_port = \"refuse\"` to fail instead of moving it)"
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "kern: warning: {e}; a privileged port is moved rather than refused, which is the default"
+        ),
+    }
     let ports: &[kern_isolation::PortMap] = &eff_ports;
     // Fail fast if a `-p` host port is already taken (by another box or any process): otherwise the
     // forwarder fails inside its fork - whose stderr a detached box swallows - and the box would
@@ -1148,10 +1242,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // CAP_NET_BIND_SERVICE, so the fix is a higher port - sending the user to `kern ps`/`kern stop`
         // would chase a phantom holder (the old message did). `EADDRINUSE` (or any other errno) IS the
         // taken-port case, where AlreadyRunning's "run `kern ps` … `kern stop`" hint fits.
-        if e.raw_os_error() == Some(libc::EACCES) && hp < 1024 {
+        if e.raw_os_error() == Some(libc::EACCES) && hp < unprivileged_port_start() {
+            let start = unprivileged_port_start();
             return Err(Error::Sandbox(format!(
-                "cannot publish port {hp}: a port below 1024 needs a privilege kern lacks when rootless \
-                 (CAP_NET_BIND_SERVICE) - publish it on a host port >=1024 instead (e.g. -p 8080:80)"
+                "cannot publish port {hp}: this host lets an unprivileged process bind from {start} \
+                 upward (net.ipv4.ip_unprivileged_port_start) and kern is rootless, so it lacks the \
+                 CAP_NET_BIND_SERVICE a lower port needs. Publish it on a host port >={start} \
+                 instead (e.g. -p 8080:80), or have the machine's owner lower that sysctl"
             )));
         }
         return Err(Error::AlreadyRunning(format!(
@@ -1198,6 +1295,27 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         image_config.user.as_deref(),
         &user_or_image as &dyn Fn(&str) -> Option<(u32, u32)>,
     )?;
+    // THE GROUPS THAT USER IS IN, from the SAME spec `run_as` was resolved from and only when that
+    // spec named no group. Docker and podman fill the supplementary set exactly there and nowhere
+    // else (measured; see `image_supplementary_gids`), so an operator writing `--user 1000:1000`
+    // still gets that pair and nothing added to it.
+    let user_spec = args
+        .run_as
+        .filter(|u| !u.is_empty())
+        .or(image_config.user.as_deref().filter(|u| !u.is_empty()));
+    let extra_gids = match user_spec {
+        Some(spec) => image_supplementary_gids(spec, &lower),
+        None => Vec::new(),
+    };
+    // HOME FOLLOWS THE USER, as a DEFAULT under both the image's own `Env` and the caller's `-e`:
+    // it is only added when neither of those named it, so an explicit `HOME=` still wins. The box
+    // keeps `/root` when it runs as box root, which is that uid's home in every image that has one.
+    // See `image_user_home` for what a fixed `/root` cost a non-root workload.
+    if let Some((uid, _)) = run_as {
+        if uid != 0 && !env.iter().any(|(k, _)| k == "HOME") {
+            env.insert(0, ("HOME".to_string(), image_user_home(uid, &lower)));
+        }
+    }
     // COMPAT HEADS-UP (not a security check; not parsing the entrypoint - only the image's own declared
     // `User`). An OCI image that drops privilege to a non-root user (postgres/redis/nginx via `User` or
     // an entrypoint `setpriv`/`gosu`) needs uids beyond box-root. Two honest cases:
@@ -1315,6 +1433,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         read_only, // profile-adjusted: `--security-profile=untrusted` forces read-only on
         seccomp_mode, // resolved above (explicit KERN_SECCOMP > profile > default), not from env here
         landlock_rw: args.landlock_rw.to_vec(),
+        net_ips: args.net_ips.to_vec(),
+        pod_bridge: args.pod_bridge.clone(),
         apparmor: args.apparmor.map(|s| s.to_string()),
         volumes,
         env,
@@ -1357,6 +1477,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         init: args.init,
         tmpfs,
         run_as,
+        extra_gids,
         pids_max: args.pids_limit,
         caps,
         io_max: vdisk_io_max,
@@ -1463,9 +1584,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // the default folded in as a value, honouring the image would have meant overriding somebody's
     // deliberate choice, and keeping the flag would have meant never honouring the image.
     let stop_signal = resolve_stop_signal(args.stop_signal, image_config.stop_signal.as_deref());
-    let img_health = image_health_defaults(image_config.healthcheck.as_ref(), args.health_cmd);
+    let flag_probe = flag_health_probe(args.health_cmd, args.health_cmd_argv);
+    let img_health = image_health_defaults(image_config.healthcheck.as_ref(), flag_probe.as_ref());
     let health_cfg = HealthConfig {
-        cmd: args.health_cmd.or(img_health.cmd.as_deref()),
+        probe: flag_probe.or(img_health.probe),
         interval: img_health.interval.unwrap_or(args.health_interval),
         retries: img_health.retries.unwrap_or(args.health_retries),
         start_period: img_health.start_period.unwrap_or(args.health_start_period),
@@ -1551,6 +1673,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             volumes: mounted_vols.clone(),
             pod: args.pod.unwrap_or("").to_string(),
             workdir: spec.workdir.clone().unwrap_or_default(),
+            run_as: spec.run_as,
+            extra_gids: spec.extra_gids.clone(),
             egress: args.egress_allow.join(","),
             landlock_rw: spec.landlock_rw.join(","),
             labels: args.labels.join(","),
@@ -1618,13 +1742,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     //
     // Keyed by THIS process's pid, the same value the entry above was registered under, so
     // `set_health` and `kern ps` agree on where the status lives.
-    let health_wd = health_cfg.cmd.and_then(|cmd| {
-        spawn_health_checker(
-            name.as_str().to_string(),
-            launcher_pid,
-            health_cfg.owned(cmd),
-        )
-    });
+    let health_wd = health_cfg
+        .into_owned()
+        .and_then(|hc| spawn_health_checker(name.as_str().to_string(), launcher_pid, hc));
     // Egress filter: spawn BOTH helpers NOW, while box_run is still in the HOST pid namespace (before
     // `run_in_sandbox_with` does `unshare(CLONE_NEWPID)`). Spawning them from the `on_started` callback
     // instead would land them in the BOX pid namespace (box_run's `pid_for_children` is the box pidns by
@@ -2399,6 +2519,10 @@ pub fn exec(
             sock_parent: parent,
             retarget: crate::pty::retarget_resize,
         }),
+        // `kern exec` stays BOX-ROOT: see the parameter's doc on `exec_in_box`. The health probe is
+        // the one caller that passes the workload's own identity.
+        None,
+        &[],
     );
 
     if let Some(prev) = saved.as_ref() {
@@ -2569,6 +2693,12 @@ fn supervise_box(
     let exit_key = std::env::var("KERN_EXIT_KEY")
         .ok()
         .filter(|k| !k.is_empty());
+    // The box's log file, resolved here in the SUPERVISOR (whose pid names it) so the runner child
+    // can append a diagnosis to it by path. See the pids message below for why by path and not by
+    // writing to stderr.
+    let log_path = registry::logs_dir()
+        .ok()
+        .map(|d| d.join(format!("{}-{}.log", name.as_str(), std::process::id())));
     let mut attempt = 0u32;
     let final_code = loop {
         let ready = if attempt == 0 {
@@ -2580,6 +2710,12 @@ fn supervise_box(
         let started = std::time::Instant::now();
         let runner = unsafe { libc::fork() };
         if runner == 0 {
+            // Filled by the callback below, which runs in THIS process: the supervisor never sees
+            // it, which is why the diagnosis is written here rather than after the wait.
+            #[allow(clippy::type_complexity)]
+            let pids_baseline: std::cell::OnceCell<
+                Option<(Option<u64>, std::path::PathBuf)>,
+            > = std::cell::OnceCell::new();
             let code = match run_in_sandbox_with(
                 spec,
                 ready,
@@ -2594,6 +2730,27 @@ fn supervise_box(
                     // `kern-box-*` leaf) leaves liveness on the supervisor pid, as before. Re-resolved on
                     // every `--restart` re-register, so it never goes stale.
                     (inst.cgroup, inst.cgroup_id) = registry::box_cgroup_record(pid1);
+                    // OPENED WHILE THE BOX IS ALIVE, because the counter dies with the cgroup. The
+                    // refusal count lives on the box's OWN leaf (that is where the limit is), and the
+                    // leaf is torn down with the box, so a path read after the exit finds nothing -
+                    // measured: the message never printed for a box that had just been refused forty
+                    // forks. See `open_pids_events_fd`.
+                    // THE ANCESTOR'S COUNTER, and a baseline the moment PID 1 exists.
+                    //
+                    // Not the box's own leaf: `pids.events` there is unreadable once the cgroup is
+                    // torn down with the box, which is exactly when the answer is wanted (measured:
+                    // an fd held open across the exit read back `None` for a box that had just been
+                    // refused forty forks). The counter is HIERARCHICAL, so the parent slice records
+                    // the same refusal and survives: measured on this host, `kern.slice` went
+                    // `max 438 -> 439` for one box hitting its own cap, with its own `pids.max` unset.
+                    pids_baseline
+                        .set(
+                            std::path::Path::new(&inst.cgroup)
+                                .parent()
+                                .map(std::path::Path::to_path_buf)
+                                .map(|p| (kern_isolation::pids_denied_count_at(&p), p)),
+                        )
+                        .ok();
                     // If the box was `kern rename`d since the last (re)register, adopt its CURRENT
                     // on-disk name so a `--restart` re-register updates that entry instead of
                     // resurrecting the original name as a duplicate live entry.
@@ -2656,6 +2813,61 @@ fn supervise_box(
                     127
                 }
             };
+            // WHY IT DIED, WHEN THE CGROUP KNOWS. A box that hit its pids cap does not say so: the
+            // kernel refuses the fork or the thread with `EAGAIN` and the workload reports whatever
+            // it makes of that, which is rarely the truth. MEASURED on Sentry's ClickHouse under
+            // kern's default cap of 512: it aborts with "Couldn't get 512 threads from global thread
+            // pool: Not enough threads. Please make sure max_thread_pool_size is considerably bigger
+            // than background_schedule_pool_size" - a sentence about ClickHouse's own settings,
+            // produced by a limit kern applied and never mentioned, on a stack whose compose file
+            // asks for no such cap.
+            //
+            // `pids.events`'s `max` counts exactly those refusals, so this claims only what the
+            // kernel counted, and only on a failing exit: a box that ends cleanly having once been
+            // throttled has nothing to explain.
+            if code != 0 {
+                if let Some(Some((before, dir))) = pids_baseline.get() {
+                    let after = kern_isolation::pids_denied_count_at(dir);
+                    if let (Some(a), Some(b)) = (before, after) {
+                        if b > *a {
+                            // WRITTEN TO THE LOG FILE BY PATH, NOT TO STDERR, and that is the whole
+                            // difference between a diagnostic and a defect.
+                            //
+                            // By the time this runs the workload is gone and this process's stderr
+                            // is the log PUMP's pipe, whose reader can be gone with it. `main` sets
+                            // `SIGPIPE` to `SIG_DFL` (so `kern … | head` behaves like a Unix tool),
+                            // so that write KILLS this process - and the supervisor then records
+                            // `128 + 13 = 141` as the box's exit, replacing whatever the workload
+                            // meant to say.
+                            //
+                            // MEASURED, and it was exactly this message: a box whose init does
+                            // `trap 'exit 7' TERM` recorded 141 instead of 7, reproducibly at 28-way
+                            // test parallelism and never below 8; with the message removed the suite
+                            // passed 116/116 twice; an instrumented supervisor named the signal
+                            // (`sig=13`, no core). The line goes where a reader looks for it -
+                            // `kern logs` - and reaches it through the file rather than the pipe.
+                            let line = format!(
+                                "kern: box '{}': the kernel refused a fork or a thread because a \
+                                 pids cap was reached while it ran ({} refusal(s) in kern's \
+                                 cgroup). A box gets a pids cap it cannot exceed; raise it with \
+                                 `--pids-limit <n>` (compose: `pids_limit:`) if the workload needs \
+                                 more tasks - ClickHouse, a JVM and an Elasticsearch node all ask \
+                                 for more than the default.\n",
+                                name.as_str(),
+                                b - a
+                            );
+                            if let Some(path) = log_path.as_deref() {
+                                use std::io::Write;
+                                if let Ok(mut f) =
+                                    std::fs::OpenOptions::new().append(true).open(path)
+                                {
+                                    let _ = f.write_all(line.as_bytes());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             unsafe { libc::_exit(code) };
         }
         // Supervisor: drop our readiness-pipe copy so the launcher sees EOF when the box exec()s.
@@ -2826,6 +3038,8 @@ fn run_detached(
         volumes: volumes.to_string(),
         pod: pod.to_string(),
         workdir: spec.workdir.clone().unwrap_or_default(),
+        run_as: spec.run_as,
+        extra_gids: spec.extra_gids.clone(),
         egress: String::new(), // --egress-allow is foreground-only; a detached box never carries it
         landlock_rw: spec.landlock_rw.join(","),
         labels: labels.to_string(),
@@ -2859,8 +3073,8 @@ fn run_detached(
                                    // `--health-cmd`: a sidecar process that periodically probes the box and records its health for
                                    // `kern ps`. Lives in this supervisor's process group, so it's reaped on stop with everything else.
     let health_pid = health
-        .cmd
-        .and_then(|hc| spawn_health_checker(name.as_str().to_string(), pid, health.owned(hc)));
+        .into_owned()
+        .and_then(|hc| spawn_health_checker(name.as_str().to_string(), pid, hc));
     // `--timeout N`: a watchdog that auto-stops the box N seconds after it starts (registry/scratch
     // cleaned up like `kern stop`). Cancelled below if the box exits on its own first.
     let timeout_pid = (timeout > 0)
@@ -3539,13 +3753,13 @@ mod image_defaults_tests {
             ImageHealthDefaults::default()
         );
         assert_eq!(
-            image_health_defaults(None, Some("curl -f /")),
+            image_health_defaults(None, Some(&shell_probe("curl -f /"))),
             ImageHealthDefaults::default()
         );
 
         // The image alone: its command AND its numbers.
         let d = image_health_defaults(Some(&hc(&["CMD-SHELL", "test -f /ready"])), None);
-        assert_eq!(d.cmd.as_deref(), Some("test -f /ready"));
+        assert_eq!(d.probe, Some(shell_probe("test -f /ready")));
         assert_eq!(
             (d.interval, d.timeout, d.start_period, d.retries),
             (Some(30), Some(5), Some(2), Some(4))
@@ -3554,7 +3768,10 @@ mod image_defaults_tests {
         // THE FLAG REPLACES THE WHOLE CHECK, numbers included: Compose's `healthcheck.test` does not
         // merge with the image's, and half of each would be a check nobody wrote.
         assert_eq!(
-            image_health_defaults(Some(&hc(&["CMD-SHELL", "test -f /ready"])), Some("mine")),
+            image_health_defaults(
+                Some(&hc(&["CMD-SHELL", "test -f /ready"])),
+                Some(&shell_probe("mine"))
+            ),
             ImageHealthDefaults::default()
         );
 
@@ -3564,6 +3781,46 @@ mod image_defaults_tests {
             image_health_defaults(Some(&hc(&["NONE"])), None),
             ImageHealthDefaults::default()
         );
+
+        // THE IMAGE'S EXEC FORM SURVIVES AS AN EXEC FORM. It used to arrive here joined into a
+        // string and leave wrapped in `/bin/sh -c`, which an image that has no shell - the very
+        // reason it writes `CMD` rather than `CMD-SHELL` - fails on every single probe.
+        let d = image_health_defaults(Some(&hc(&["CMD", "postgrest", "--ready"])), None);
+        assert_eq!(
+            d.probe,
+            Some(kern_oci::HealthTest::Exec(vec![
+                "postgrest".to_string(),
+                "--ready".to_string()
+            ]))
+        );
+    }
+
+    /// THE CALLER'S FLAGS KEEP THEIR FORM TOO, and `--health-cmd-argv` is the one that needs no
+    /// shell in the box.
+    #[test]
+    fn a_flag_probe_carries_the_form_the_caller_wrote() {
+        assert_eq!(flag_health_probe(None, &[]), None);
+        assert_eq!(
+            flag_health_probe(Some("pg_isready -U app"), &[]),
+            Some(shell_probe("pg_isready -U app"))
+        );
+        let argv = vec!["postgrest".to_string(), "--ready".to_string()];
+        assert_eq!(
+            flag_health_probe(None, &argv),
+            Some(kern_oci::HealthTest::Exec(argv.clone()))
+        );
+        // The exec form runs WITHOUT a shell - that is the whole of the fix, so it is asserted on
+        // the argv itself and not on the enum variant alone.
+        let p = flag_health_probe(None, &argv).expect("a probe");
+        assert_eq!(p.argv(), vec!["postgrest", "--ready"]);
+        assert_eq!(
+            shell_probe("x").argv(),
+            vec!["/bin/sh".to_string(), "-c".to_string(), "x".to_string()]
+        );
+    }
+
+    fn shell_probe(c: &str) -> kern_oci::HealthTest {
+        kern_oci::HealthTest::Shell(c.to_string())
     }
 
     /// A ZERO IS "UNSET", NOT "EVERY ZERO SECONDS". The OCI config writes 0 for a field the image
@@ -3591,6 +3848,12 @@ mod image_defaults_tests {
         let empty_named = crate::volume::volumes_dir()
             .join("kern-seed-probe")
             .join("data");
+        // CLEARED FIRST, because this test asserts the volume is EMPTY and then deliberately fills
+        // it. An assertion failing between the write and the remove leaves the file behind, and the
+        // test then fails on every later run on that machine for a reason that has nothing to do
+        // with the change under test. MEASURED: a stray `x` from an interrupted run the previous
+        // evening turned this red while `is_seedable` was untouched.
+        let _ = std::fs::remove_dir_all(&empty_named);
         let _ = std::fs::create_dir_all(&empty_named);
         let v = |src: &std::path::Path, target: &str| Volume {
             source: src.to_string_lossy().into_owned(),

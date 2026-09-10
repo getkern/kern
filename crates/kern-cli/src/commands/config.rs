@@ -1027,7 +1027,8 @@ mod tests {
                 "[[cpu]]\nid = \"cpu:0\"\nmemory = \"nonsense\"\n",
                 "bad memory",
             ),
-            ("[[cpu]]\nid = \"cpu:0\"\nmemory = \"1.5g\"\n", "bad memory"),
+            // `1,5g`: `1.5g` parses now, and always did under Docker.
+            ("[[cpu]]\nid = \"cpu:0\"\nmemory = \"1,5g\"\n", "bad memory"),
             (
                 "[[disk]]\nid = \"d0\"\npath = \"/tmp\"\nsize = \"-5\"\n",
                 "bad size",
@@ -1085,7 +1086,8 @@ mod tests {
     /// `kern validate` MUST REFUSE WHAT THE LAUNCH REFUSES, and it did not.
     ///
     /// Measured on a three-line file: `validate` said "valid" and `kern run` on that same file
-    /// answered `bad memory '1.5g' in [[vcpu]] 'x'`. The checks that existed looked at REFERENCES
+    /// answered `bad memory '1,5g' in [[vcpu]] 'x'`. (The case used `1.5g` until the size parser
+    /// learned to read a fraction, which Docker always did; the comma is a typo under every reading.) The checks that existed looked at REFERENCES
     /// (that `backend` names something that exists); nobody called the resolvers, and those are what
     /// decide whether a value carrying a unit is readable and whether a number means anything.
     ///
@@ -1099,12 +1101,12 @@ mod tests {
         for (name, text, want) in [
             (
                 "vcpu.toml",
-                "[[cpu]]\nid = \"cpu:0\"\ncores = 8\n[[vcpu]]\nname = \"x\"\nbackend = \"cpu:0\"\nmemory = \"1.5g\"\n",
+                "[[cpu]]\nid = \"cpu:0\"\ncores = 8\n[[vcpu]]\nname = \"x\"\nbackend = \"cpu:0\"\nmemory = \"1,5g\"\n",
                 "bad memory",
             ),
             (
                 "vdisk.toml",
-                "[[disk]]\nid = \"d0\"\npath = \"/tmp\"\n[[vdisk]]\nname = \"x\"\nbackend = \"d0\"\nsize = \"1.5g\"\n",
+                "[[disk]]\nid = \"d0\"\npath = \"/tmp\"\n[[vdisk]]\nname = \"x\"\nbackend = \"d0\"\nsize = \"1,5g\"\n",
                 "bad size",
             ),
         ] {

@@ -549,3 +549,324 @@ fn no_fork_failure_is_ever_blamed_on_user_namespaces_or_the_rootfs() {
          misleading pointer for no pointer at all: {err}"
     );
 }
+
+/// COMPOSE'S OWN VARIABLES COME FROM THE PROJECT `.env`, which is what Docker means by loading that
+/// file "both for self-configuration and interpolation".
+///
+/// kern read `COMPOSE_PROFILES` from the process environment alone, so a project that ships its
+/// profile selection in its `.env` - the ordinary way to ship one - had every profiled service
+/// skipped, with a message telling the reader to set a variable their file already sets. MEASURED
+/// on Sentry self-hosted, whose `.env` opens with `COMPOSE_PROFILES=feature-complete`: 28 of its 55
+/// services were dropped.
+///
+/// The control is the same file with the line removed, which must still skip the service: without
+/// it, this test would pass on a kern that ignores profiles altogether.
+#[test]
+fn compose_reads_its_own_variables_from_the_project_env_file() {
+    let dir = std::env::temp_dir().join(format!("kern-it-profiles-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let file = dir.join("docker-compose.yml");
+    std::fs::write(
+        &file,
+        concat!(
+            "services:\n",
+            "  sempre:\n",
+            "    image: alpine\n",
+            "  opzionale:\n",
+            "    image: alpine\n",
+            "    profiles: [extra]\n",
+        ),
+    )
+    .expect("write compose");
+
+    let config = |env_body: &str| -> String {
+        std::fs::write(dir.join(".env"), env_body).expect("write .env");
+        let out = kern()
+            .current_dir(&dir)
+            // The variable must NOT be inherited from whoever runs the suite, or the control below
+            // would be measuring the test runner's environment.
+            .env_remove("COMPOSE_PROFILES")
+            .env_remove("COMPOSE_PROJECT_NAME")
+            .args(["compose", "-f", "docker-compose.yml", "config"])
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    let with_profiles = config("COMPOSE_PROFILES=extra\n");
+    let without = config("# nessun profilo qui\n");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        with_profiles.contains("2 service(s)") && !with_profiles.contains("skipped - profile"),
+        "a profile named in the project .env must activate its service:\n{with_profiles}"
+    );
+    assert!(
+        without.contains("skipped - profile"),
+        "the CONTROL failed: with no profile selected the service must still be skipped, or this \
+         test would pass on a kern that ignores `profiles:` entirely:\n{without}"
+    );
+}
+
+/// `config` PRINTS THE WIRING AS A FIELD, because a tool that counts must not read prose.
+///
+/// The wiring is announced on stderr in a sentence that also names the alternatives, and that is
+/// right for a reader: the pod advisory recommends the bridge, in those words. It is wrong for
+/// anything that counts. A census keyed on `"on a bridge"` therefore counted every POD stack as a
+/// bridge and reported 60% bridge on a corpus that is 85% pod; it was caught only by a count that
+/// refused to reconcile. Improving an advisory must not be able to move a number, so the decision
+/// is also printed as one token that says nothing else.
+///
+/// Both values are asserted from ONE file plus a flag, so the test cannot pass by printing a
+/// constant.
+#[test]
+fn compose_config_prints_the_wiring_as_a_field() {
+    let dir = std::env::temp_dir().join(format!("kern-it-wiring-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        concat!(
+            "services:\n",
+            "  a:\n",
+            "    image: alpine\n",
+            "  b:\n",
+            "    image: alpine\n",
+        ),
+    )
+    .expect("write compose");
+    let field = |extra: &[&str], key: &str| -> String {
+        let mut c = kern();
+        c.current_dir(&dir)
+            .args(["compose", "-f", "docker-compose.yml", "config"]);
+        for a in extra {
+            c.arg(a);
+        }
+        let out = c.output().expect("run kern");
+        let want = format!("  {key}: ");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix(&want).map(str::to_string))
+            .unwrap_or_default()
+    };
+    let plain = field(&[], "wiring");
+    let bridged = field(&["--bridge"], "wiring");
+    let separated = field(&["--no-pod"], "wiring");
+    // THE PROVENANCE, which is a second token so the first one can stay stable. `--bridge` and a
+    // file that kern bridges by itself both print `bridge`, and only this line tells them apart:
+    // one is a wiring the operator asked for, the other is kern diverging from the pod default.
+    let plain_src = field(&[], "wiring-source");
+    let bridged_src = field(&["--bridge"], "wiring-source");
+    // A file that COLLIDES gets the bridge without anyone typing it.
+    std::fs::write(
+        dir.join("collide.yml"),
+        concat!(
+            "services:\n",
+            "  a:\n",
+            "    image: alpine\n",
+            "    expose: [8080]\n",
+            "  b:\n",
+            "    image: alpine\n",
+            "    expose: [8080]\n",
+        ),
+    )
+    .expect("write compose");
+    let auto = kern()
+        .current_dir(&dir)
+        .args(["compose", "-f", "collide.yml", "config"])
+        .output()
+        .expect("run kern");
+    let auto_out = String::from_utf8_lossy(&auto.stdout).to_string();
+    let line = |k: &str| -> String {
+        let want = format!("  {k}: ");
+        auto_out
+            .lines()
+            .find_map(|l| l.strip_prefix(&want).map(str::to_string))
+            .unwrap_or_default()
+    };
+    let (auto_wiring, auto_src) = (line("wiring"), line("wiring-source"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(plain, "pod", "two services with nothing to separate them");
+    assert_eq!(bridged, "bridge", "--bridge is a namespace per service");
+    assert_eq!(separated, "relay", "--no-pod reaches peers through relays");
+    assert_eq!(plain_src, "auto", "nobody typed the pod default");
+    assert_eq!(bridged_src, "flag", "--bridge was typed");
+    assert_eq!(
+        (auto_wiring.as_str(), auto_src.as_str()),
+        ("bridge", "auto"),
+        "a collision gets the bridge without anyone typing it, and the source says so"
+    );
+}
+
+/// A BRIDGE STACK IS NOT TOLD ABOUT RELAYS IT WILL NOT HAVE.
+///
+/// The relay notes describe the `--no-pod` wiring: peers reached through per-service loopback
+/// aliases, and two services sharing an internal port not mutually reachable. A bridge has neither
+/// property - its members meet on a real network - but the notes were keyed on "each service has its
+/// own namespace", which a bridge also gives.
+///
+/// MEASURED on Elastic's own compose file, which kern wires on a bridge because three nodes share
+/// port 9200: kern announced the bridge and then, in the very next line, said that two services
+/// sharing an internal port "are still not mutually reachable", contradicting itself about the one
+/// thing the reader had just been told the bridge was for.
+///
+/// The control is the SAME file under `--no-pod`, where every sentence in the note is true and it
+/// must still appear: without it this test would pass on a kern that never prints the note at all.
+#[test]
+fn a_bridge_stack_is_not_told_about_the_relay_wiring_it_does_not_use() {
+    let dir = std::env::temp_dir().join(format!("kern-it-relaynote-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    // Two services on the SAME internal port: the shape that makes kern choose a bridge by itself.
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        concat!(
+            "services:\n",
+            "  a:\n",
+            "    image: alpine\n",
+            "    expose: [9200]\n",
+            "  b:\n",
+            "    image: alpine\n",
+            "    expose: [9200]\n",
+        ),
+    )
+    .expect("write compose");
+    let config = |extra: &[&str]| -> String {
+        let mut c = kern();
+        c.current_dir(&dir)
+            .args(["compose", "-f", "docker-compose.yml", "config"]);
+        for a in extra {
+            c.arg(a);
+        }
+        let out = c.output().expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let auto = config(&[]);
+    let nopod = config(&["--no-pod"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        auto.contains("on a bridge"),
+        "the premise failed: this file must select the bridge:\n{auto}"
+    );
+    assert!(
+        !auto.contains("loopback aliases"),
+        "a bridge stack must not be told its peers are reached through relays:\n{auto}"
+    );
+    assert!(
+        nopod.contains("loopback aliases"),
+        "the CONTROL failed: under --no-pod the relay note is true and must be printed:\n{nopod}"
+    );
+}
+
+/// A BRIDGE MEMBER REACHES ITS PEERS *AND* THE INTERNET, which is the arrangement a Docker container
+/// has and the one `--bridge` exists to give.
+///
+/// Every member has its own network namespace, so the pod's single NAT - which lives in the holder's
+/// namespace - is not theirs. `outbound_targets` knew that and then excluded any service writing
+/// `restart:`, on the reasoning that systemd starts those and kern cannot hold them at the gate. That
+/// reasoning is about a STANDALONE box: `persistent_supervision` puts every pod member on the
+/// in-process supervisor whatever systemd offers, because it needs the holder's namespace.
+///
+/// MEASURED on Sentry self-hosted, which sets `restart: unless-stopped` on nearly every service: a
+/// member's routing table held the on-link `10.89.0.0/24` and nothing else, there was no
+/// `/etc/resolv.conf` at all, and pgbouncer died inside libevent's `evdns_base_new`. The stack's own
+/// summary line meanwhile said "outbound to the internet (pasta)".
+///
+/// The peer half is asserted in the same run, because the fix adds a SECOND interface to the
+/// namespace: if the default route and the bridge route ever fight, this is where it shows.
+#[test]
+fn a_bridge_member_has_a_route_out_and_still_reaches_its_peers() {
+    let dir = std::env::temp_dir().join(format!("kern-it-bridgenet-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(
+        dir.join("compose.yml"),
+        concat!(
+            "services:\n",
+            "  uno:\n",
+            "    image: alpine\n",
+            // `restart:` ON PURPOSE: it is the key that used to remove the NAT.
+            "    restart: unless-stopped\n",
+            "    command: [\"sleep\", \"60\"]\n",
+            "  due:\n",
+            "    image: alpine\n",
+            "    restart: unless-stopped\n",
+            "    command: [\"sleep\", \"60\"]\n",
+        ),
+    )
+    .expect("write compose");
+    let xdg = std::env::temp_dir().join(format!("kern-it-bridgenet-xdg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> (String, String) {
+        let out = kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    let (_, err) = run(&[
+        "compose",
+        "-f",
+        "compose.yml",
+        "-p",
+        "brt",
+        "--bridge",
+        "up",
+        "-d",
+    ]);
+    let inside = |cmd: &str| run(&["exec", "brt-uno", "--", "sh", "-c", cmd]).0;
+    let routes = inside("ip route");
+    let resolv = inside("cat /etc/resolv.conf");
+    let peer = inside("getent hosts due");
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "brt", "down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+
+    // A host without pasta, or one whose policy refuses the namespace opens, cannot produce the
+    // condition: say so instead of asserting on a machine that could not answer.
+    if err.contains("user namespaces")
+        || err.contains("pasta")
+        || (routes.is_empty() && peer.is_empty())
+    {
+        eprintln!("skip: this host could not bring the bridge stack up ({err})");
+        return;
+    }
+    // THE CONTROL: the bridge route must be there, or the box under test is not a bridge member and
+    // the assertion about the default route would be about something else entirely.
+    assert!(
+        routes.contains("eth0"),
+        "the CONTROL failed: no bridge interface in the member, so this is not measuring a bridge \
+         member: {routes:?}"
+    );
+    assert!(
+        routes.contains("default"),
+        "a bridge member has no route out: {routes:?}"
+    );
+    assert!(
+        resolv.contains("nameserver"),
+        "a bridge member has no resolver, so a workload that initialises one fails at start: \
+         {resolv:?}"
+    );
+    assert!(
+        peer.contains("due"),
+        "the second interface must not cost the member its peers: {peer:?}"
+    );
+}

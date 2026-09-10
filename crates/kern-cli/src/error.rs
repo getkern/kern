@@ -48,9 +48,26 @@ impl Error {
     /// An optional one-line, actionable hint shown under the error.
     pub fn hint(&self) -> Option<String> {
         match self {
-            Error::UnknownCommand(_) => Some("run `kern --help` for the list of commands".into()),
+            // A DOCKER HABIT GETS THE PAIR THAT DOES THE JOB, rather than a pointer to a list of
+            // fifty verbs. `kern rm` does not exist and never will: a box is stopped and its
+            // remains are collected, which is two verbs because they are two decisions. An outside
+            // reviewer typed it, and so does everyone arriving from Docker; kern's own README
+            // shipped it once. Naming the pair costs one line and absorbs the habit.
+            Error::UnknownCommand(c) => Some(match c.as_str() {
+                "rm" => "kern has no `rm`: `kern stop <name>` ends a box and `kern gc` collects \
+                         what stopped boxes left behind. For an image it is `kern rmi`, for a \
+                         volume `kern volume rm`"
+                    .into(),
+                "start" => "kern has no `start`: a box is created and started in one step, with \
+                            `kern box <name> --image <image>`"
+                    .into(),
+                "restart" => "kern has no `restart`: `kern stop <name>` and start it again, or \
+                              give the box `--restart` so kern supervises it"
+                    .into(),
+                _ => "run `kern --help` for the list of commands".to_string(),
+            }),
             Error::InvalidBox(_) => Some(
-                "box names: letters/digits/_/./- only, no leading '-' or '.', max 64 chars".into(),
+                "box names: letters/digits/_/./- only, no leading '-' or '.', max 200 chars".into(),
             ),
             // Operational/validation errors are self-explanatory - no generic hint (it used to
             // wrongly show the userns/rootfs hint on `-v`/secret/port errors).
@@ -123,6 +140,14 @@ impl Error {
                 "the process could not be created. The errno above is the kernel's own answer. The two limits a fork can hit are `ulimit -u`, which is per-UID and counts threads across the whole system, and the `pids.max` of the cgroup kern is starting in. The user namespace and the rootfs are already established by the time kern forks, so neither is the cause"
                     .into(),
             ),
+            // A refused `-v` already carries its own cause and its own remedy, and the general hint
+            // under it is not merely redundant but false: it says the failure is "a host capability
+            // rather than a wrong command" when the host is fine and the source path is the wrong
+            // one, then sends the reader to `kern doctor`, which cannot see a submount under a
+            // volume source. Keyed on the message rather than the variant, same shape as
+            // `Error::Volume` above and `oci_hint` below, because the setup error crosses a process
+            // boundary as a plain string and the variant that built it is gone by here.
+            Error::Setup(msg) if msg.contains("mount(volume bind) failed for -v ") => None,
             // THE SAME STRING THE ISOLATION CRATE PRINTS from inside the forked child, which cannot
             // reach this function. Two wordings for one condition drift, and the older one here named
             // two of the four things a setup failure is.
@@ -452,6 +477,29 @@ mod tests {
         assert_eq!(other, kern_isolation::SETUP_FAILURE_HINT, "got: {other}");
     }
 
+    /// A volume bind that explained itself gets no generic hint under it, and every other setup
+    /// failure still does.
+    ///
+    /// The subject is the REAL message: it is built by the same code path the sandbox uses, so if
+    /// that wording is ever rephrased past the key this test goes red instead of the field silently
+    /// regaining a hint that contradicts the line above it.
+    #[test]
+    fn a_refused_volume_bind_does_not_collect_the_generic_setup_hint() {
+        let msg = "mount(volume bind) failed for -v /tmp:/x: Invalid argument (os error 22). 1 filesystem is mounted under /tmp (/tmp/RustDesk-1000/cliprdr-server). kern binds a volume NON-recursively";
+        assert!(
+            Error::Setup(msg.into()).hint().is_none(),
+            "a message that already names its own remedy must not be followed by the generic one"
+        );
+        // THE CONTROL: the suppression is keyed on this message and not on the variant, so a
+        // different setup failure keeps the hint. Compared against the CONSTANT, not its prose.
+        assert_eq!(
+            Error::Setup("mount(overlay) failed: Invalid argument (os error 22)".into())
+                .hint()
+                .unwrap_or_default(),
+            kern_isolation::SETUP_FAILURE_HINT
+        );
+    }
+
     #[test]
     fn oci_hint_points_at_the_actual_cause() {
         // A tool failure → the tooling hint.
@@ -485,5 +533,39 @@ mod tests {
             rl.contains("quota"),
             "the hint must name the actual remedy: {rl}"
         );
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::Error;
+
+    /// A DOCKER VERB THAT KERN DOES NOT HAVE NAMES THE PAIR THAT DOES THE JOB.
+    ///
+    /// `kern rm` does not exist and never will: stopping a box and collecting what it left behind
+    /// are two decisions, so they are two verbs. Everyone arriving from Docker types it anyway, an
+    /// outside reviewer did, and kern's own README shipped it once. A hint that only says "run
+    /// --help" sends them to a list of fifty verbs to find the two.
+    #[test]
+    fn a_docker_verb_kern_lacks_is_answered_with_the_verbs_that_replace_it() {
+        let hint = |v: &str| Error::UnknownCommand(v.to_string()).hint().expect("a hint");
+        let rm = hint("rm");
+        assert!(rm.contains("kern stop"), "{rm}");
+        assert!(rm.contains("kern gc"), "{rm}");
+        assert!(
+            rm.contains("kern rmi"),
+            "and the image verb, which IS `rm`-shaped: {rm}"
+        );
+        assert!(hint("start").contains("kern box"), "{}", hint("start"));
+        assert!(hint("restart").contains("--restart"), "{}", hint("restart"));
+        // THE FALLBACK IS STILL THERE, or this would be a table that swallowed every typo.
+        assert_eq!(
+            hint("nonsense"),
+            "run `kern --help` for the list of commands"
+        );
+        // The hints are single-line: a line break in a hint reads as a second error.
+        for v in ["rm", "start", "restart", "nonsense"] {
+            assert!(!hint(v).contains('\n'), "{v} hint wraps: {}", hint(v));
+        }
     }
 }

@@ -124,25 +124,68 @@ pub struct ImageHealthcheck {
     pub retries: Option<u32>,
 }
 
+/// A health check's command WITH THE FORM IT WAS WRITTEN IN - the distinction Docker makes between
+/// `CMD` and `CMD-SHELL`, kept instead of collapsed.
+///
+/// IT USED TO BE COLLAPSED, and that was a defect with a name: `CMD ["postgrest", "--ready"]` was
+/// joined into the string `postgrest --ready` and handed to `/bin/sh -c`. An image with no shell
+/// (PostgREST, distroless, `FROM scratch`) then failed EVERY probe with `execvp: No such file or
+/// directory` and could never report healthy - which is precisely why such an image writes the exec
+/// form in the first place. Measured on Supabase self-hosted: `supabase-rest` answered its own
+/// `--ready` probe 10 times out of 10 through `kern exec`, and `kern ps` said `unhealthy`, because
+/// the shell the wrapper needed does not exist in that rootfs.
+///
+/// Joining also loses argument boundaries: an argument containing a space becomes two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthTest {
+    /// `CMD-SHELL "…"`, or a bare string: run through `/bin/sh -c`, shell metacharacters and all.
+    Shell(String),
+    /// `CMD ["prog", "arg", …]`: exec'd directly, no shell, argument boundaries preserved.
+    Exec(Vec<String>),
+}
+
+impl HealthTest {
+    /// The argv one probe execs. The shell form is wrapped here, at the single place that knows the
+    /// form, so no reader has to remember to wrap it (forgetting is what the exec form was doing
+    /// wrong in reverse).
+    pub fn argv(&self) -> Vec<String> {
+        match self {
+            HealthTest::Shell(c) => vec!["/bin/sh".to_string(), "-c".to_string(), c.clone()],
+            HealthTest::Exec(a) => a.clone(),
+        }
+    }
+
+    /// One line naming what the probe runs, for a diagnostic. Not a shell quoting: it exists to be
+    /// read by a person, never to be re-parsed.
+    pub fn describe(&self) -> String {
+        match self {
+            HealthTest::Shell(c) => c.clone(),
+            HealthTest::Exec(a) => a.join(" "),
+        }
+    }
+}
+
 impl ImageHealthcheck {
-    /// The shell command this check runs, or `None` when there is nothing to run.
+    /// The command this check runs and the form it runs in, or `None` when there is nothing to run.
     ///
     /// `["NONE"]` IS A DISABLE, NOT A COMMAND. Docker's `HEALTHCHECK NONE` exists to switch off a
     /// check a base image defined, so treating the word as a program would run `NONE` and report the
     /// service unhealthy forever - the exact opposite of what the image asked for.
-    pub fn shell_command(&self) -> Option<String> {
+    pub fn probe(&self) -> Option<HealthTest> {
         match self.test.split_first() {
-            Some((kind, rest)) if kind == "CMD-SHELL" => {
-                Some(rest.join(" ")).filter(|s| !s.is_empty())
+            Some((kind, rest)) if kind == "CMD-SHELL" => Some(rest.join(" "))
+                .filter(|s| !s.is_empty())
+                .map(HealthTest::Shell),
+            // `CMD` is an argv, and it stays one: this is the form an image uses precisely when it
+            // has no shell to offer.
+            Some((kind, rest)) if kind == "CMD" => {
+                (!rest.is_empty()).then(|| HealthTest::Exec(rest.to_vec()))
             }
-            // `CMD` is an argv. kern's `--health-cmd` takes a shell string, and the arguments of a
-            // real image healthcheck (`curl -f http://localhost/`) contain no shell metacharacters,
-            // so joining is faithful; an argument with a space would be the exception, and quoting
-            // it here would break the common case for a shape that does not occur in practice.
-            Some((kind, rest)) if kind == "CMD" => Some(rest.join(" ")).filter(|s| !s.is_empty()),
             Some((kind, _)) if kind == "NONE" => None,
             // A bare list with no prefix is the legacy shell form.
-            Some(_) => Some(self.test.join(" ")).filter(|s| !s.is_empty()),
+            Some(_) => Some(self.test.join(" "))
+                .filter(|s| !s.is_empty())
+                .map(HealthTest::Shell),
             None => None,
         }
     }
@@ -4522,26 +4565,45 @@ mod tests {
         assert_eq!(h.retries, Some(3));
         // `CMD-SHELL` is a shell string; the prefix is not part of the command.
         assert_eq!(
-            h.shell_command().as_deref(),
-            Some("curl -f http://localhost/ || exit 1")
+            h.probe(),
+            Some(HealthTest::Shell(
+                "curl -f http://localhost/ || exit 1".to_string()
+            ))
         );
 
-        // `CMD` is an argv, joined for kern's shell-string flag.
+        // `CMD` IS AN ARGV AND STAYS ONE: it is exec'd, never joined and handed to a shell the
+        // image may not have. Its `argv()` is the argv itself, with no `/bin/sh` in front.
         let c = parse_image_config(
             r#"{"config":{"Healthcheck":{"Test":["CMD","pg_isready","-U","postgres"]}}}"#,
         );
         let h = c.healthcheck.expect("declared");
-        assert_eq!(h.shell_command().as_deref(), Some("pg_isready -U postgres"));
+        let p = h.probe().expect("an exec-form check");
+        assert_eq!(
+            p,
+            HealthTest::Exec(vec![
+                "pg_isready".to_string(),
+                "-U".to_string(),
+                "postgres".to_string()
+            ])
+        );
+        assert_eq!(p.argv(), vec!["pg_isready", "-U", "postgres"]);
+        // ... while the shell form carries its wrapper, at the one place that knows the form.
+        assert_eq!(
+            HealthTest::Shell("test -f /r".to_string()).argv(),
+            vec!["/bin/sh", "-c", "test -f /r"]
+        );
+        // An argument WITH A SPACE survives the exec form; joining would have made it two.
+        assert_eq!(
+            HealthTest::Exec(vec!["prog".to_string(), "a b".to_string()]).argv(),
+            vec!["prog", "a b"]
+        );
         // Absent numbers stay absent rather than becoming zero, so the reader can fall back.
         assert_eq!((h.interval_ns, h.retries), (None, None));
 
         // `NONE` DISABLES a check a base image set. Reading it as a command would run `NONE` and
         // report the service unhealthy forever - the opposite of what the image asked for.
         let c = parse_image_config(r#"{"config":{"Healthcheck":{"Test":["NONE"]}}}"#);
-        assert_eq!(
-            c.healthcheck.expect("present but disabled").shell_command(),
-            None
-        );
+        assert_eq!(c.healthcheck.expect("present but disabled").probe(), None);
 
         // An image with neither key must produce neither, or every image would appear to have one.
         let c = parse_image_config(r#"{"config":{"Cmd":["sh"]}}"#);

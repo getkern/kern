@@ -260,6 +260,104 @@ pub(crate) fn image_account_entry(
     None
 }
 
+/// Read a whole account file out of the image rootfs, from the first layer that has it.
+///
+/// Same confinement and same top-most-layer rule as [`image_account_entry`], which looks up ONE
+/// entry; this returns the text, because a group membership scan has to read every line rather than
+/// stop at the first match.
+fn image_account_file(lower: &str, file: &str) -> Option<String> {
+    use std::path::Path;
+    for layer in lower.split(':') {
+        let (Ok(target), Ok(base)) = (
+            std::fs::canonicalize(Path::new(layer).join(file)),
+            std::fs::canonicalize(layer),
+        ) else {
+            continue;
+        };
+        if !target.starts_with(&base) {
+            continue; // an image symlink pointing OUT of the rootfs is not followed
+        }
+        return std::fs::read_to_string(&target).ok();
+    }
+    None
+}
+
+/// The SUPPLEMENTARY groups an image's `config.User` spec puts the workload in, from the image's own
+/// `/etc/group`.
+///
+/// EMPTY WHEN THE SPEC NAMES A GROUP, and that is the rule Docker and podman follow rather than a
+/// choice made here: runc's `GetExecUser` fills the supplementary set only for a user given WITHOUT
+/// a group. CONFIRMED ON DOCKER 29.6.2 with an image whose `/etc/group` reads `root:x:0:app`: a bare
+/// `USER 1000` gives `groups=0(root),1000(app)` and an explicit `--user 1000:1000` gives
+/// `groups=1000(app)`. MEASURED first with podman 4.9.3 on the dev host, three cases: the kibana image (`User "1000"`,
+/// no group) gives `uid=1000 gid=1000 groups=1000,0`; the elasticsearch image (`User "1000:0"`)
+/// gives `groups=0` and nothing more; and an explicit `--user 1000:1000` on the kibana image gives
+/// `groups=1000`. kern granted none of them, which cost Elastic's own compose file its Kibana - the
+/// certificates its `setup` service writes are `root:root` mode 640 and readable only through
+/// group 0, where `root:x:0:kibana` puts it.
+///
+/// The PRIMARY gid is not repeated here: `setgid` already sets it.
+pub(crate) fn image_supplementary_gids(spec: &str, lower: &str) -> Vec<u32> {
+    if spec.contains(':') {
+        return Vec::new();
+    }
+    // The account NAME, which is what a group's member list holds. A numeric spec has to be turned
+    // into its name first, and an uid with no passwd entry has no memberships to find.
+    let name = match spec.parse::<u32>() {
+        Ok(n) => match image_account_entry(lower, "etc/passwd", &n.to_string(), 2) {
+            Some(e) => e.first().cloned().unwrap_or_default(),
+            None => return Vec::new(),
+        },
+        Err(_) => spec.to_string(),
+    };
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let Some(text) = image_account_file(lower, "etc/group") else {
+        return Vec::new();
+    };
+    let mut out: Vec<u32> = Vec::new();
+    for line in text.lines() {
+        // `name:x:gid:member,member`
+        let f: Vec<&str> = line.split(':').collect();
+        let (Some(gid), Some(members)) = (f.get(2), f.get(3)) else {
+            continue;
+        };
+        if !members.split(',').any(|m| m.trim() == name) {
+            continue;
+        }
+        if let Ok(g) = gid.parse::<u32>() {
+            if !out.contains(&g) {
+                out.push(g);
+            }
+        }
+    }
+    out
+}
+
+/// The HOME the workload's uid has in the image's own `/etc/passwd` (field 6), or `/` when the image
+/// has no entry for it.
+///
+/// kern set `HOME=/root` for every box whatever user it ran as, and that is not a cosmetic default:
+/// a Python console script installed with `pip install --user` lives under `$HOME/.local`, so an
+/// image that puts its tools there loses them entirely. MEASURED on `apache/airflow:3.3.1`, whose
+/// passwd says `airflow:x:50000:0:…:/home/airflow`: podman runs `airflow version` and prints 3.3.1,
+/// kern ran the same command in the same image as the same uid and got
+/// `ModuleNotFoundError: No module named 'airflow'`, because with `HOME=/root` the interpreter's
+/// user site-packages directory is `/root/.local/...`, which does not exist.
+///
+/// `/` for an unknown uid is runc's default user, and it is what Docker actually does: measured on
+/// Docker 29.6.2, `--user 1234 -w /opt/wd` prints `HOME=/`, while podman substitutes the image's
+/// WorkingDir for the same input (`HOME=/opt/airflow` for `--user 1000` on the airflow image). This
+/// is the one rule here taken from Docker over podman, and both halves are now measured rather than
+/// argued: a known uid gives its passwd home under all three.
+pub(crate) fn image_user_home(uid: u32, lower: &str) -> String {
+    image_account_entry(lower, "etc/passwd", &uid.to_string(), 2)
+        .and_then(|e| e.get(5).cloned())
+        .filter(|h| h.starts_with('/'))
+        .unwrap_or_else(|| "/".to_string())
+}
+
 /// Resolve an image's `config.User` spec (`user[:group]`, each a NAME or a number) to `(uid, gid)` using
 /// the image's OWN `/etc/passwd` and `/etc/group`, exactly as Docker does. The rootfs is already
 /// extracted on the host pre-pivot, so `USER memcache` no longer forces the box to run as root: it maps

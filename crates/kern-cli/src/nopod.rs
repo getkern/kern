@@ -69,6 +69,16 @@ pub struct Assigned {
     /// there rather than
     /// filling it in here, so one place decides what an absent key means.
     pub networks: Vec<String>,
+    /// The extra names this service answers to - `networks.<net>.aliases` - INCLUDING its own name,
+    /// which the driver puts there.
+    ///
+    /// They are peers' names too: a service that writes `aliases: [db]` is asking to be reachable as
+    /// `db`, and a stack whose DSNs say `db` needs that to resolve. In a POD they already do (the
+    /// shared hosts file carries them); on a bridge and under `--no-pod` each box gets `--add-host`
+    /// entries instead, and the aliases were not among them - so the same file resolved `db` in one
+    /// wiring and not in the other. MEASURED on a real dev stack whose postgres declares
+    /// `aliases: [db]`: `getent hosts db` answered in the pod and answered nothing on the bridge.
+    pub aliases: Vec<String>,
 }
 
 /// Docker's implicit network: the one a service with no `networks:` key joins.
@@ -127,9 +137,12 @@ pub fn hosts_name_is_safe(name: &str) -> bool {
 ///
 /// A message naming the offending service when a name is unusable in a hosts file, when two services
 /// share a name, or when the stack has more services than there are addresses.
-pub fn assign_aliases(
-    services: &[(String, String, Vec<u16>, Vec<String>)],
-) -> Result<Vec<Assigned>, String> {
+/// One service as the address plan needs it: `(service name, box name, declared container ports,
+/// networks, aliases)`. Named because the tuple travels from the compose driver to here and a
+/// five-element type spelled out at every site is a type nobody can read.
+pub type ServiceInput = (String, String, Vec<u16>, Vec<String>, Vec<String>);
+
+pub fn assign_aliases(services: &[ServiceInput]) -> Result<Vec<Assigned>, String> {
     if services.len() > MAX_PEER_INDEX {
         return Err(format!(
             "a --no-pod stack can address at most {MAX_PEER_INDEX} services (127.0.0.2 through \
@@ -138,7 +151,7 @@ pub fn assign_aliases(
         ));
     }
     let mut out: Vec<Assigned> = Vec::with_capacity(services.len());
-    for (i, (service, box_name, ports, networks)) in services.iter().enumerate() {
+    for (i, (service, box_name, ports, networks, aliases)) in services.iter().enumerate() {
         if !hosts_name_is_safe(service) {
             return Err(format!(
                 "service '{service}' cannot be written into a hosts file: a name may hold only \
@@ -155,12 +168,25 @@ pub fn assign_aliases(
                 "no loopback alias left for service '{service}' (index {i})"
             ));
         };
+        // An alias is written into a hosts file exactly like the service name, so it is held to the
+        // same rule and refused by NAME rather than dropped: a file whose alias cannot be a host
+        // name is broken for Docker too, and silently losing it would leave a DSN pointing at
+        // nothing with no line saying why.
+        for al in aliases {
+            if !hosts_name_is_safe(al) {
+                return Err(format!(
+                    "service '{service}' declares the alias '{al}', which cannot be written into a \
+                     hosts file: a name may hold only letters, digits, '-', '.' and '_'"
+                ));
+            }
+        }
         out.push(Assigned {
             service: service.clone(),
             box_name: box_name.clone(),
             alias,
             ports: ports.clone(),
             networks: networks.clone(),
+            aliases: aliases.clone(),
         });
     }
     Ok(out)
@@ -179,7 +205,7 @@ pub fn assign_aliases(
 ///
 /// A BOX MUST RESOLVE ITS OWN NAME TO `127.0.0.1` and not to its alias: the alias is bound by relays
 /// inside OTHER boxes, so a service that resolved itself there would reach nothing at all.
-pub fn add_host_args(plan: &[Assigned], me: &str) -> Option<Vec<String>> {
+pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec<String>> {
     if !plan.iter().any(|a| a.service == me) {
         return None;
     }
@@ -187,8 +213,23 @@ pub fn add_host_args(plan: &[Assigned], me: &str) -> Option<Vec<String>> {
         .iter()
         .find(|a| a.service == me)
         .map_or(&[], |a| a.networks.as_slice());
+    let my_ports: &[u16] = plan
+        .iter()
+        .find(|a| a.service == me)
+        .map_or(&[], |a| a.ports.as_slice());
     let mut out = Vec::with_capacity(plan.len());
     out.push(format!("{me}:127.0.0.1"));
+    // MY OWN ALIASES POINT AT MY OWN LOOPBACK, like my name: a service that calls itself by an alias
+    // must not be sent across the network to reach itself.
+    for al in plan
+        .iter()
+        .find(|a| a.service == me)
+        .map_or(&[][..], |a| a.aliases.as_slice())
+    {
+        if al != me {
+            out.push(format!("{al}:127.0.0.1"));
+        }
+    }
     let mut buf = [0u8; 15];
     for a in plan {
         if a.service == me {
@@ -202,11 +243,46 @@ pub fn add_host_args(plan: &[Assigned], me: &str) -> Option<Vec<String>> {
         if !shares_network(mine, &a.networks) {
             continue;
         }
-        out.push(format!(
-            "{}:{}",
-            a.service,
-            alias_to_dotted(a.alias, &mut buf)
-        ));
+        // A PEER THAT DECLARES A PORT THIS BOX ALSO DECLARES DOES NOT RESOLVE EITHER, and this is
+        // the same rule as the line above for a harder-to-see reason.
+        //
+        // WHAT THE ENTRY USED TO DO. The peer's alias is in `127.0.0.0/8`, which is local in every
+        // namespace without being configured, so the address EXISTS here whether or not kern
+        // managed to bind a relay on it. When both services bind the same port, kern deliberately
+        // does not bind the alias (the workload's own bind would fail), and the workload's
+        // `0.0.0.0` listener then owns every local address on that port - the peer's alias
+        // included. So a call to the peer BY NAME connected to the caller ITSELF and returned the
+        // caller's own response.
+        //
+        // MEASURED, twice, by an outside reviewer on the released binary and again here: two
+        // services both binding 8080, the client fetches `srv:8080` and reads back its own body,
+        // while from outside `:9201` serves one and `:9202` serves the other, so neither is broken.
+        // The stack reports the pair on a `kern: unreachable:` line, and the word is wrong: the
+        // call does not fail, it succeeds to the wrong service. A name that answers as the wrong
+        // service costs hours; a name that does not resolve costs a minute.
+        //
+        // PER PEER AND NOT PER PORT, because a hosts entry maps a NAME to ONE address and there is
+        // nowhere to record "this name, but not on 8080". A pair that collides on one port and
+        // needs another therefore loses both, which is the smaller of the two wrongs.
+        //
+        // ONLY WHERE PEERS ARE REACHED THROUGH A RELAY. On a bridge each service has its own network
+        // namespace and its own port space, so two services binding the same container port is
+        // ordinary and both names must resolve: it is exactly what Docker does. The rule is about
+        // the relay taking a port in THIS box, not about the port number.
+        if via_relay && a.ports.iter().any(|p| my_ports.contains(p)) {
+            continue;
+        }
+        let addr = alias_to_dotted(a.alias, &mut buf).to_string();
+        out.push(format!("{}:{}", a.service, addr));
+        // AND EVERY NAME THAT PEER ANSWERS TO. `aliases:` is how a compose file says "this service
+        // is also called `db`", and a DSN written against that name resolves only if the entry is
+        // here: the pod's shared hosts file carries them, and without this the same file worked in
+        // one wiring and not in the other.
+        for al in &a.aliases {
+            if al != &a.service {
+                out.push(format!("{al}:{addr}"));
+            }
+        }
     }
     Some(out)
 }
@@ -383,23 +459,101 @@ mod tests {
 
     /// A service on NO declared network, i.e. Docker's implicit `default` - which is what almost
     /// every compose file in the wild writes, and therefore the case the existing tests assert.
-    fn svc(name: &str, ports: &[u16]) -> (String, String, Vec<u16>, Vec<String>) {
+    type Svc = super::ServiceInput;
+
+    fn svc(name: &str, ports: &[u16]) -> Svc {
         (
             name.to_string(),
             format!("pod-tok-{name}"),
             ports.to_vec(),
             Vec::new(),
+            Vec::new(),
         )
     }
 
     /// The same, on an explicit set of networks.
-    fn svc_on(name: &str, ports: &[u16], nets: &[&str]) -> (String, String, Vec<u16>, Vec<String>) {
+    fn svc_on(name: &str, ports: &[u16], nets: &[&str]) -> Svc {
         (
             name.to_string(),
             format!("pod-tok-{name}"),
             ports.to_vec(),
             nets.iter().map(|n| (*n).to_string()).collect(),
+            Vec::new(),
         )
+    }
+
+    /// The same, answering to extra names (`networks.<net>.aliases`).
+    fn svc_aka(name: &str, ports: &[u16], aliases: &[&str]) -> Svc {
+        (
+            name.to_string(),
+            format!("pod-tok-{name}"),
+            ports.to_vec(),
+            Vec::new(),
+            aliases.iter().map(|a| (*a).to_string()).collect(),
+        )
+    }
+
+    /// A `networks.<net>.aliases` NAME RESOLVES IN EVERY WIRING, not only in the pod.
+    ///
+    /// A service that writes `aliases: [db]` is asking to be reachable as `db`, and a DSN written
+    /// against that name is the reason the key exists. In a pod the shared hosts file carries the
+    /// aliases; on a bridge and under `--no-pod` each box gets `--add-host` entries instead, and the
+    /// aliases were not among them - so the same file resolved `db` in one wiring and answered
+    /// nothing in the other. MEASURED on a real dev stack whose postgres declares `aliases: [db]`:
+    /// `getent hosts db` answered `127.0.0.1 db` in the pod and answered NOTHING on the bridge.
+    #[test]
+    fn an_alias_resolves_for_its_peers_and_for_the_service_itself() {
+        let plan = assign_aliases(&[
+            svc_aka("postgres", &[5432], &["db", "primary"]),
+            svc("rest", &[3000]),
+        ])
+        .expect("plan");
+        let db_addr = alias_to_dotted(plan[0].alias, &mut [0u8; 15]).to_string();
+
+        // From a PEER: the aliases point where the service is.
+        let from_rest = add_host_args(&plan, "rest", true).expect("rest is in the plan");
+        assert!(from_rest.contains(&format!("postgres:{db_addr}")));
+        assert!(
+            from_rest.contains(&format!("db:{db_addr}")),
+            "the alias must resolve to the same address as the service: {from_rest:?}"
+        );
+        assert!(from_rest.contains(&format!("primary:{db_addr}")));
+
+        // From the service ITSELF: its own aliases are its own loopback, like its own name - a
+        // service that calls itself `db` must not be sent across the network to reach itself.
+        let from_pg = add_host_args(&plan, "postgres", true).expect("postgres is in the plan");
+        assert!(from_pg.contains(&"postgres:127.0.0.1".to_string()));
+        assert!(from_pg.contains(&"db:127.0.0.1".to_string()), "{from_pg:?}");
+
+        // THE CONTROL: a peer on no shared network contributes nothing, aliases included. Without
+        // it this test would pass on an implementation that hands every name to everybody.
+        let split = assign_aliases(&[
+            (
+                "postgres".into(),
+                "b-postgres".into(),
+                vec![5432],
+                vec!["back".into()],
+                vec!["db".into()],
+            ),
+            (
+                "web".into(),
+                "b-web".into(),
+                vec![80],
+                vec!["front".into()],
+                Vec::new(),
+            ),
+        ])
+        .expect("plan");
+        let from_web = add_host_args(&split, "web", true).expect("web is in the plan");
+        assert!(
+            !from_web.iter().any(|e| e.starts_with("db:")),
+            "an alias of a service on no shared network must not resolve: {from_web:?}"
+        );
+
+        // An alias that cannot be a host name is refused BY NAME, like a service name.
+        let e = assign_aliases(&[svc_aka("postgres", &[5432], &["db name"])])
+            .expect_err("an unusable alias is refused");
+        assert!(e.contains("db name"), "{e}");
     }
 
     /// AN ABSENT `networks:` KEY IS THE `default` NETWORK, NOT "every network".
@@ -480,14 +634,14 @@ mod tests {
         );
 
         // The hosts file must agree with the graph, name by name.
-        let web = add_host_args(&plan, "web").expect("web is in the plan");
+        let web = add_host_args(&plan, "web", true).expect("web is in the plan");
         assert!(web.iter().any(|e| e.starts_with("web:127.0.0.1")));
         assert!(web.iter().any(|e| e.starts_with("app:")));
         assert!(
             !web.iter().any(|e| e.starts_with("db:")),
             "a peer with no shared network must not resolve at all: {web:?}"
         );
-        let app = add_host_args(&plan, "app").expect("app is in the plan");
+        let app = add_host_args(&plan, "app", true).expect("app is in the plan");
         assert!(
             app.iter().any(|e| e.starts_with("db:")) && app.iter().any(|e| e.starts_with("web:"))
         );
@@ -508,7 +662,9 @@ mod tests {
             "three services, one port each, every ordered pair"
         );
         assert_eq!(
-            add_host_args(&plan, "a").expect("a is in the plan").len(),
+            add_host_args(&plan, "a", true)
+                .expect("a is in the plan")
+                .len(),
             3,
             "itself plus both peers"
         );
@@ -663,7 +819,7 @@ mod tests {
     #[test]
     fn add_host_points_a_box_at_itself_and_its_peers_at_their_aliases() {
         let plan = assign_aliases(&[svc("db", &[5432]), svc("api", &[8080])]).expect("plan");
-        let db = add_host_args(&plan, "db").expect("db is in the plan");
+        let db = add_host_args(&plan, "db", true).expect("db is in the plan");
         assert_eq!(db.len(), 2, "one self entry and one peer: {db:?}");
         assert!(db.contains(&"db:127.0.0.1".to_string()), "{db:?}");
         assert!(db.contains(&"api:127.0.0.3".to_string()), "{db:?}");
@@ -671,24 +827,63 @@ mod tests {
             !db.iter().any(|e| e == "db:127.0.0.2"),
             "never itself at its own alias, where nothing binds inside its namespace: {db:?}"
         );
-        let api = add_host_args(&plan, "api").expect("api is in the plan");
+        let api = add_host_args(&plan, "api", true).expect("api is in the plan");
         assert!(api.contains(&"api:127.0.0.1".to_string()), "{api:?}");
         assert!(api.contains(&"db:127.0.0.2".to_string()), "{api:?}");
     }
 
     /// A service outside the plan gets no entries, and saying so is better than emitting a set that
     /// cannot resolve the caller.
+    /// A PEER THAT DECLARES A PORT THIS SERVICE ALSO DECLARES MUST NOT RESOLVE.
+    ///
+    /// FOUND ON THE RELEASED BINARY BY AN OUTSIDE REVIEWER, and reproduced here before anything was
+    /// changed. Two services both binding 8080: kern deliberately does not bind the peer's alias
+    /// (the workload's own bind would fail), the alias is in `127.0.0.0/8` and therefore local
+    /// anyway, and the caller's `0.0.0.0` listener owns every local address on that port. So a
+    /// fetch of `peer:8080` by NAME returned the CALLER'S OWN response, while both services were
+    /// healthy and answered differently from outside. The stack reported the pair as `unreachable`,
+    /// and the call was not unreachable: it succeeded, to the wrong service.
+    ///
+    /// A name that answers as the wrong service is worse than a name that does not answer: the
+    /// first presents as an application misconfiguration and costs hours, the second is a one-line
+    /// diagnosis. Measured after the change: the same fetch answers `bad address`.
+    #[test]
+    fn a_peer_that_shares_a_declared_port_is_left_out_of_the_hosts_file() {
+        let plan = assign_aliases(&[svc("srv", &[8080]), svc("cli", &[8080]), svc("db", &[5432])])
+            .expect("plan");
+
+        let cli = add_host_args(&plan, "cli", true).expect("cli is in the plan");
+        assert!(
+            !cli.iter().any(|e| e.starts_with("srv:")),
+            "a peer on the same declared port must not resolve: {cli:?}"
+        );
+        // THE CONTROL, and without it this test passes against a function that writes nothing: a
+        // peer on a DIFFERENT port still resolves, and the service still finds itself.
+        assert!(cli.iter().any(|e| e == "db:127.0.0.4"), "{cli:?}");
+        assert!(cli.iter().any(|e| e == "cli:127.0.0.1"), "{cli:?}");
+
+        // Symmetric: the rule is about the pair, so `srv` does not see `cli` either.
+        let srv = add_host_args(&plan, "srv", true).expect("srv is in the plan");
+        assert!(!srv.iter().any(|e| e.starts_with("cli:")), "{srv:?}");
+        assert!(srv.iter().any(|e| e.starts_with("db:")), "{srv:?}");
+
+        // And a service that declares nothing collides with nobody.
+        let db = add_host_args(&plan, "db", true).expect("db is in the plan");
+        assert!(db.iter().any(|e| e.starts_with("srv:")), "{db:?}");
+        assert!(db.iter().any(|e| e.starts_with("cli:")), "{db:?}");
+    }
+
     #[test]
     fn a_service_outside_the_plan_gets_no_entries() {
         let plan = assign_aliases(&[svc("db", &[5432])]).expect("plan");
-        assert_eq!(add_host_args(&plan, "nosuch"), None);
+        assert_eq!(add_host_args(&plan, "nosuch", true), None);
         assert_eq!(
-            add_host_args(&[], "db"),
+            add_host_args(&[], "db", true),
             None,
             "an empty plan resolves nothing"
         );
         // A single-service stack still names itself: a workload that resolves its own hostname works.
-        let solo = add_host_args(&plan, "db").expect("db is in the plan");
+        let solo = add_host_args(&plan, "db", true).expect("db is in the plan");
         assert_eq!(solo, vec!["db:127.0.0.1".to_string()]);
     }
 
@@ -824,12 +1019,13 @@ mod tests {
         );
 
         // The cap is where a real plan meets it: 33 services with one port each is 1,056.
-        let svcs: Vec<(String, String, Vec<u16>, Vec<String>)> = (0..33)
+        let svcs: Vec<Svc> = (0..33)
             .map(|i| {
                 (
                     format!("s{i}"),
                     format!("b{i}"),
                     vec![9000 + i as u16],
+                    Vec::new(),
                     Vec::new(),
                 )
             })
@@ -843,12 +1039,13 @@ mod tests {
         );
 
         // And 32 does not, so the cap sits between two stacks a person could plausibly write.
-        let svcs: Vec<(String, String, Vec<u16>, Vec<String>)> = (0..32)
+        let svcs: Vec<Svc> = (0..32)
             .map(|i| {
                 (
                     format!("s{i}"),
                     format!("b{i}"),
                     vec![9000 + i as u16],
+                    Vec::new(),
                     Vec::new(),
                 )
             })

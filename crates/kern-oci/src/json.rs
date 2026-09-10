@@ -50,36 +50,101 @@ pub(crate) fn object_after<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     bracketed_after(json, key, b'{', b'}')
 }
 
+/// One JSON escape, decoded from the characters that FOLLOW its backslash (already consumed).
+///
+/// ONE IMPLEMENTATION FOR BOTH READERS, because they drifted and the drift shipped. The array
+/// reader below knew `\n`, `\t` and `\r` and passed every other escape through as the plain letter
+/// after the backslash, so `>` decoded to `u003e`. Go's `encoding/json` - what Docker builds
+/// image configs with - escapes `<`, `>` and `&` BY DEFAULT, and the arrays this reads are an
+/// image's `Cmd`, `Entrypoint`, `Env` and `Healthcheck.Test`. Any of those three characters in an
+/// image's own argv therefore arrived corrupted.
+///
+/// MEASURED on `supabase/postgres-meta:v0.99.0`, whose `HEALTHCHECK` is a JavaScript arrow
+/// function: `(r) => {…}` reached the box as `(r) =u003e {…}`, a syntax error, so the service
+/// reported `unhealthy` for as long as it ran while its own `/health` answered 200 to the same
+/// request. The scalar reader (`value_after_colon`) had decoded `\uXXXX` correctly all along,
+/// which is why one field was right and the one next to it was wrong.
+///
+/// `None` = the string ended mid-escape (truncated input, so the caller must stop). `Some(None)` =
+/// an escape that decodes to no character - an unpaired surrogate half - which is skipped rather
+/// than failing the whole parse.
+fn decode_escape(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Option<char>> {
+    Some(match chars.next()? {
+        'n' => Some('\n'),
+        't' => Some('\t'),
+        'r' => Some('\r'),
+        'b' => Some('\u{08}'),
+        'f' => Some('\u{0C}'),
+        'u' => {
+            let hi = hex4(chars)?;
+            // The common case: a plain code point, `>` included.
+            if !(0xD800..0xE000).contains(&hi) {
+                return Some(char::from_u32(hi));
+            }
+            // A LOW half on its own builds nothing: there is no high half to pair it with.
+            if hi >= 0xDC00 {
+                return Some(None);
+            }
+            // A HIGH half is half a character; the low half follows as its own `\uXXXX`.
+            if chars.peek() != Some(&'\\') {
+                return Some(None);
+            }
+            chars.next();
+            // What follows the backslash need not be another `\u`. Decode it on its own terms
+            // rather than swallowing it: dropping a `\n` because the escape before it was
+            // malformed would corrupt a second value to punish the first.
+            if chars.peek() != Some(&'u') {
+                return decode_escape(chars);
+            }
+            chars.next();
+            let lo = hex4(chars)?;
+            if !(0xDC00..0xE000).contains(&lo) {
+                return Some(char::from_u32(lo));
+            }
+            char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
+        }
+        other => Some(other), // covers `"`, `\`, `/`, and anything else written after a backslash
+    })
+}
+
+/// The four hex digits of a `\uXXXX`, or `None` if they are not there.
+fn hex4(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<u32> {
+    let mut code = 0u32;
+    for _ in 0..4 {
+        code = code * 16 + chars.next()?.to_digit(16)?;
+    }
+    Some(code)
+}
+
 /// The string ELEMENTS of the `[...]` array following `"key"` (a JSON string array like an OCI
-/// config's `Env`/`Cmd`/`Entrypoint`). Escape-aware; empty if the key/array is absent. Non-BMP
-/// `\uXXXX` escapes are dropped (not the common case for image configs).
+/// config's `Env`/`Cmd`/`Entrypoint`). Escape-aware; empty if the key/array is absent.
 pub(crate) fn str_array_after(json: &str, key: &str) -> Vec<String> {
     let Some(arr) = array_after(json, key) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     let mut cur = String::new();
-    let (mut in_str, mut esc) = (false, false);
-    for c in arr.chars() {
-        if in_str {
-            if esc {
-                cur.push(match c {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    other => other, // covers `"`, `\`, `/`, and the rest
-                });
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else if c == '"' {
+    let mut in_str = false;
+    let mut chars = arr.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !in_str {
+            in_str = c == '"';
+            continue;
+        }
+        match c {
+            '"' => {
                 out.push(std::mem::take(&mut cur));
                 in_str = false;
-            } else {
-                cur.push(c);
             }
-        } else if c == '"' {
-            in_str = true;
+            '\\' => match decode_escape(&mut chars) {
+                Some(Some(ch)) => cur.push(ch),
+                // An escape that decodes to nothing: skip it and keep reading the element.
+                Some(None) => {}
+                // Truncated mid-escape: the element has no closing quote either, so there is
+                // nothing further to read. What was already complete is returned.
+                None => break,
+            },
+            _ => cur.push(c),
         }
     }
     out
@@ -110,36 +175,21 @@ pub(crate) fn split_objects(arr: &str) -> Vec<&str> {
 
 /// The next JSON string value after the first `:` in `s`, properly **unescaped** and
 /// **escape-aware** (a `\"` inside the value doesn't end it). Only valid for STRING-valued keys -
-/// for a numeric value use [`u64_field`]. Surrogate-pair `\uXXXX` (non-BMP) is skipped, not the
-/// common case for registry/Hub fields.
+/// for a numeric value use [`u64_field`]. Escapes are decoded by [`decode_escape`], the same
+/// routine the array reader uses, so the two cannot answer differently about one escape again.
 pub(crate) fn value_after_colon(s: &str) -> Option<String> {
     let after = &s[s.find(':')? + 1..];
     let body = &after[after.find('"')? + 1..];
     let mut out = String::new();
-    let mut chars = body.chars();
+    let mut chars = body.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '"' => return Some(out), // unescaped closing quote
-            '\\' => match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                'b' => out.push('\u{08}'),
-                'f' => out.push('\u{0C}'),
-                'u' => {
-                    let mut code = 0u32;
-                    for _ in 0..4 {
-                        code = code * 16 + chars.next()?.to_digit(16)?;
-                    }
-                    if let Some(ch) = char::from_u32(code) {
-                        out.push(ch);
-                    }
+            '\\' => {
+                if let Some(ch) = decode_escape(&mut chars)? {
+                    out.push(ch);
                 }
-                other => out.push(other),
-            },
+            }
             _ => out.push(c),
         }
     }
@@ -246,6 +296,61 @@ mod tests {
         assert_eq!(
             first_str(j, "description").as_deref(),
             Some("reverse / proxy \"quoted\"\nline")
+        );
+    }
+
+    /// `\uXXXX` DECODES IN AN ARRAY, and the array is where an image's argv lives.
+    ///
+    /// Go's `encoding/json` - what Docker writes image configs with - escapes `<`, `>` and `&` by
+    /// default, so these three appear as `<`, `>` and `&` in almost every real
+    /// config. The array reader turned each into the letters `u003e`, silently, while the scalar
+    /// reader next to it decoded them correctly.
+    ///
+    /// THE FIRST CASE IS THE ONE THAT WAS MEASURED, byte for byte from
+    /// `supabase/postgres-meta:v0.99.0`: the image's own HEALTHCHECK is an arrow function, kern ran
+    /// it as `(r) =u003e {…}`, node exited on a syntax error, and the service was `unhealthy` for
+    /// its whole life while answering 200 on the very endpoint the check asks about.
+    #[test]
+    fn an_escaped_code_point_decodes_in_arrays_exactly_as_in_scalars() {
+        let real = r#"{"Healthcheck":{"Test":["CMD-SHELL","node -e \"fetch('http://localhost:8080/health').then((r) => {if (r.status !== 200) throw new Error(r.status)})\""]}}"#;
+        let test = str_array_after(real, "Test");
+        assert_eq!(test.len(), 2);
+        assert_eq!(test[0], "CMD-SHELL");
+        assert!(
+            test[1].contains("(r) => {"),
+            "the arrow function must survive the parse: {}",
+            test[1]
+        );
+        assert!(!test[1].contains("u003e"), "got: {}", test[1]);
+
+        // The three Go escapes HTML-escapes by default, in an array and in a scalar, same answer.
+        let both = r#"{"Cmd":["sh","-c","a && b > /log < /in"],"S":"a && b > /log < /in"}"#;
+        let expected = "a && b > /log < /in";
+        assert_eq!(str_array_after(both, "Cmd")[2], expected);
+        assert_eq!(first_str(both, "S").as_deref(), Some(expected));
+
+        // A surrogate PAIR builds the one character it spells, in both readers. Written as the two
+        // ESCAPES a real encoder emits (not the character itself, which would test nothing).
+        let pair = "{\"a\":[\"\\ud83d\\ude00\"],\"s\":\"\\ud83d\\ude00\"}";
+        assert_eq!(str_array_after(pair, "a"), vec!["\u{1F600}"]);
+        assert_eq!(first_str(pair, "s").as_deref(), Some("\u{1F600}"));
+
+        // A HALF surrogate spells no character: it is skipped, and the rest of the value survives.
+        assert_eq!(str_array_after(r#"{"a":["x\ud83dy"]}"#, "a"), vec!["xy"]);
+        assert_eq!(str_array_after(r#"{"a":["x\udc00y"]}"#, "a"), vec!["xy"]);
+        // A half surrogate followed by ANOTHER escape must not eat that escape.
+        assert_eq!(
+            str_array_after(r#"{"a":["x\ud83d\ty"]}"#, "a"),
+            vec!["x\ty"]
+        );
+
+        // Truncated mid-escape: no panic, and no half-read element invented.
+        assert!(str_array_after(r#"{"a":["x\u00"#, "a").is_empty());
+        assert_eq!(value_after_colon(r#":"x\u00"#), None);
+        // The plain escapes still decode, in the array reader too.
+        assert_eq!(
+            str_array_after(r#"{"a":["q\"q","s\\s","p\/p","\b\f"]}"#, "a"),
+            vec!["q\"q", "s\\s", "p/p", "\u{08}\u{0C}"]
         );
     }
 }

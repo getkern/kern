@@ -85,10 +85,14 @@ fn help_text(p: &crate::ui::Palette) -> String {
 
   {d}Multi-box{z}
     {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
-    {c}up{z} [--no-pod|--pod] [-d] / {c}down{z}                                 Bring up / tear down the stack (--no-pod: a namespace per service; --pod: one shared; default: split only when `networks:` separate two services)
+    {c}up{z} [--no-pod|--pod|--bridge] [-d] / {c}down{z}                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared; default: split only when `networks:` separate two services)
+                                                                     With --bridge each service keeps its own namespace and its own 127.0.0.1
+                                                                     Two services may then share a container port, and no relay is built
     {c}compose{z} <file> {c}watch{z} [service...]                              Rebuild + restart ONE service when its `build:` context changes
     {c}compose{z} <file> {c}port{z} <service> <container-port>                 Print the host address serving that box port (non-zero if none)
-    {c}pod{z} create <name> [--no-outbound] [--uid-range]                Shared-network pod: peers reach each other by name
+    {c}pod{z} create <name> [--no-outbound] [--uid-range] [--bridge <cidr>] Shared-network pod: peers reach each other by name.
+                                                                     With --bridge each member keeps its own namespace and a
+                                                                     127.0.0.1 no peer can reach, meeting on a bridge
     {c}pod{z} ls [--json] | {c}pod{z} rm <name>                                List pods, or remove one
 
   {d}Config & storage{z}
@@ -147,6 +151,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --secret SPEC       Deliver a secret as /run/secrets/NAME: SRC[:NAME] (file), NAME=- (from
                         stdin), or NAME=value (inline - the value lands in argv, so it is readable
                         by any user via `ps`: use a file or stdin for a real one); repeatable
+    --secret-env NAME   Deliver a secret whose CONTENT is in this process's environment, at
+                        KERN_SECRET_NAME. Nothing reaches argv, so `ps` shows nothing: this is
+                        what a compose file's secret with an `environment:` source becomes
     --secret-mode OCT   File mode for every --secret of this box (octal, default 400 = owner
                         only). `kern compose` sends 444, the Compose Specification's default, so
                         an image that runs as a non-root user can read its own secret
@@ -155,6 +162,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --ssh-key FILE      Authorize this public key instead of generating a throwaway keypair
     --restart           Restart a detached box if it exits non-zero (on-failure)
     --health-cmd <cmd>  Shell command probed in the box; sets ps HEALTH (exit 0 = healthy)
+    --health-cmd-argv A The same check with NO shell: one argv element per flag, repeated
+                        (Docker's exec form). Use it when the image has no /bin/sh
     --health-interval N Seconds between health checks (default 30)
     --health-retries N  Consecutive failures before a box is unhealthy (default 3)
     --health-start-period N  Grace period where failures keep it starting (default 0)
@@ -188,6 +197,14 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --restart-max <n>   How many times --restart retries before giving up (default 10)
     --ulimit <n=s[:h]>  Set a resource limit (e.g. nofile=1024:2048); rootless can only LOWER; repeatable
     --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable
+    --pod-bridge <ip>/<n> Join the pod through its BRIDGE with this address, instead of sharing the
+                        pod's network namespace. The box then keeps its own 127.0.0.1, which no
+                        peer can reach, and meets its peers at their addresses: what a Docker
+                        container gets. Needs a pod made with `pod create --bridge <cidr>`
+    --ip <addr>         Extra IPv4 address the box's loopback answers on, as a /32; repeatable.
+                        This is what a compose file's `ipv4_address:` becomes: the literal address
+                        a peer hard-codes exists inside the box's network namespace instead of
+                        nowhere. It claims one address, not a subnet, and adds no route out
     -l, --label <k=v>   Attach metadata, selectable with `ps --filter label=`; repeatable
     --landlock-rw <path> Confine writes to these paths with the Landlock LSM; root stays read+exec (repeatable)
                         Also valid on `run`, where it is the only real confinement: it needs no

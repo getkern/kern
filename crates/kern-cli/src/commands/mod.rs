@@ -233,6 +233,10 @@ pub struct BoxRunArgs<'a> {
     /// under Landlock, so the workload cannot `mkdir` a missing allowlist dir, and a path absent at start
     /// is skipped (fail-safe, so the box is only ever MORE confined, never less).
     pub landlock_rw: &'a [String],
+    /// `--ip <addr>` (repeatable): extra IPv4 addresses this box's loopback answers on.
+    pub net_ips: &'a [std::net::Ipv4Addr],
+    /// `--pod-bridge <ip>/<prefix>`: this box's place on the pod's bridge, when it has one.
+    pub pod_bridge: Option<kern_isolation::BridgeAttach>,
     /// `--apparmor <profile>`: a pre-loaded AppArmor profile the box enters on exec, or None.
     pub apparmor: Option<&'a str>,
     pub workdir: Option<&'a str>,
@@ -275,6 +279,8 @@ pub struct BoxRunArgs<'a> {
     /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret as
     /// `/run/secrets/NAME` (mode 0400) without it hitting the image or the workload env.
     pub secrets: &'a [String],
+    /// `--secret-env <name>`: content from `KERN_SECRET_<name>` rather than from argv.
+    pub secret_envs: &'a [String],
     /// `--secret-mode <octal>`: the file mode every `--secret` of this box is created with.
     ///
     /// PER BOX AND NOT PER SECRET, deliberately and measurably: `mode:` under a service's `secrets:`
@@ -327,6 +333,10 @@ pub struct BoxRunArgs<'a> {
     pub restart: RestartPolicy,
     /// `--health-cmd <cmd>`: shell command run periodically in the box (exit 0 = healthy).
     pub health_cmd: Option<&'a str>,
+    /// `--health-cmd-argv <arg>` (repeatable): the SAME check in Docker's `CMD` exec form - one
+    /// argv element per occurrence, exec'd directly with no shell. The form an image without a
+    /// shell needs, and the form compose's `test: ["CMD", …]` means.
+    pub health_cmd_argv: &'a [String],
     /// `--health-interval <sec>`: seconds between health checks.
     pub health_interval: u64,
     /// `--health-retries <n>`: consecutive failures before "unhealthy".
@@ -1123,6 +1133,8 @@ struct BuildSpec<'a> {
     cmd: Vec<String>,
     read_only: bool,
     landlock_rw: Vec<String>,
+    net_ips: Vec<std::net::Ipv4Addr>,
+    pod_bridge: Option<kern_isolation::BridgeAttach>,
     apparmor: Option<String>,
     volumes: Vec<Volume>,
     env: Vec<(String, String)>,
@@ -1159,6 +1171,9 @@ struct BuildSpec<'a> {
     init: bool,
     tmpfs: Vec<kern_isolation::TmpfsMount>,
     run_as: Option<(u32, u32)>,
+    /// The supplementary groups the image puts that user in. See
+    /// [`crate::commands::image_supplementary_gids`] for why they are resolved and when they are not.
+    extra_gids: Vec<u32>,
     pids_max: Option<u64>,
     caps: kern_isolation::CapSpec,
     io_max: Vec<String>,
@@ -1358,6 +1373,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         overlay,
         read_only: b.read_only,
         landlock_rw: b.landlock_rw,
+        net_ips: b.net_ips,
+        pod_bridge: b.pod_bridge,
         apparmor: b.apparmor,
         command: b.cmd,
         hostname,
@@ -1392,6 +1409,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         init: b.init,
         tmpfs: b.tmpfs,
         run_as: b.run_as,
+        extra_gids: b.extra_gids,
         pids_max: b.pids_max,
         caps: b.caps,
         io_max: b.io_max,
@@ -1430,17 +1448,74 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
     Ok((spec, eph))
 }
 
-/// Parse `-v src:dst[:ro]` specs into [`Volume`]s. The target must be absolute; the source is a
+/// The third field of a `-v` spec: mount options kern reads, and options it accepts and does not act
+/// on.
+///
+/// `z` AND `Z` ARE SELINUX RELABEL REQUESTS, and refusing them cost a whole stack. Docker relabels
+/// the host path so a confined container may read it; kern sets no SELinux label on anything, so the
+/// request is satisfied by there being nothing to relabel. MEASURED on Supabase's own
+/// `docker-compose.yml`, 587 lines and 11 services: three of its binds carry `:z`/`:Z` and the first
+/// box refused to start with `bad -v … (expected src:dst[:ro])`, which named the wrong thing - the
+/// spec was not malformed, it was Docker's.
+///
+/// THE macOS PERFORMANCE HINTS ARE THE SAME SHAPE: `cached`, `delegated` and `consistent` describe
+/// how a bind is synchronised through a VM that does not exist on Linux, and Docker itself ignores
+/// them there. `nocopy` asks that a named volume NOT be seeded from the image, which kern reads.
+///
+/// AN UNKNOWN OPTION IS STILL AN ERROR. The table is a list of things kern has decided about; a
+/// value nobody has decided about must not be silently dropped, because the next one may be a
+/// boundary.
+fn volume_option(opt: &str) -> Option<VolumeOpt> {
+    match opt {
+        "ro" => Some(VolumeOpt::ReadOnly),
+        "rw" => Some(VolumeOpt::ReadWrite),
+        "nocopy" => Some(VolumeOpt::NoCopy),
+        // SELinux relabelling and the macOS consistency hints: accepted, acted on by nobody here.
+        "z" | "Z" | "cached" | "delegated" | "consistent" => Some(VolumeOpt::Inert),
+        _ => None,
+    }
+}
+
+/// What one `-v` option means to kern.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VolumeOpt {
+    ReadOnly,
+    ReadWrite,
+    /// Do not seed an empty named volume from the image.
+    NoCopy,
+    /// Recognised, and there is nothing for kern to do about it.
+    Inert,
+}
+
+/// Parse `-v src:dst[:opt,opt…]` specs into [`Volume`]s. The target must be absolute; the source is a
 /// volume name, an absolute path, or a `./`-style path relative to the current directory, and must
-/// exist on the host. A trailing `:ro` (or `:rw`) sets the mode.
+/// exist on the host. The options are read by [`volume_option`].
 fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
     let mut out = Vec::with_capacity(specs.len());
     for s in specs {
         let parts: Vec<&str> = s.split(':').collect();
         let (source, target, read_only) = match parts.as_slice() {
             [src, dst] => (*src, *dst, false),
-            [src, dst, "ro"] => (*src, *dst, true),
-            [src, dst, "rw"] => (*src, *dst, false),
+            // THE OPTION FIELD IS A COMMA-SEPARATED LIST, which is what Docker accepts: `:ro,z` is
+            // one field with two options, and splitting on `:` alone made it a fourth part and an
+            // error. The last of `ro`/`rw` wins, as it does for a mount option list.
+            [src, dst, opts] => {
+                let mut ro = false;
+                for opt in opts.split(',').filter(|o| !o.is_empty()) {
+                    match volume_option(opt) {
+                        Some(VolumeOpt::ReadOnly) => ro = true,
+                        Some(VolumeOpt::ReadWrite) => ro = false,
+                        Some(VolumeOpt::NoCopy | VolumeOpt::Inert) => {}
+                        None => {
+                            return Err(Error::Sandbox(format!(
+                                "bad -v '{s}': unknown mount option '{opt}' (kern reads ro, rw and \
+                                 nocopy, and accepts z, Z, cached, delegated and consistent)"
+                            )))
+                        }
+                    }
+                }
+                (*src, *dst, ro)
+            }
             _ => {
                 return Err(Error::Sandbox(format!(
                     "bad -v '{s}' (expected src:dst[:ro])"
@@ -1487,8 +1562,42 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
         let source = match crate::volume::classify(source) {
             crate::volume::SourceKind::Named => crate::volume::resolve_named(source)?,
             crate::volume::SourceKind::Path => {
-                let canon = std::fs::canonicalize(source)
-                    .map_err(|e| Error::Sandbox(format!("-v '{s}': source {source}: {e}")))?;
+                // A MISSING SOURCE IS CREATED, WHICH IS WHAT DOCKER DOES and what compose files are
+                // written against: "if you bind-mount a directory that does not yet exist, Docker
+                // creates it on the host for you". kern refused, and a file that relies on it
+                // stopped with a bare errno. MEASURED on two of Docker's own samples in one sitting:
+                // `pihole-cloudflared-DoH` binds `/etc/pihole/` and `wireguard` binds
+                // `/usr/share/appdata/wireguard/config`.
+                //
+                // CREATED ONLY WHERE THE CALLER ALREADY COULD, which is the whole difference between
+                // this and Docker's daemon: `create_dir_all` runs as the user, so a path under
+                // `/etc` or `/usr` fails with EACCES and is reported instead of being made. kern is
+                // rootless, so the rule needs no policy of its own - the kernel is the policy.
+                //
+                // THE REGISTRY IS CHECKED BEFORE ANYTHING IS CREATED, on the nearest ancestor that
+                // exists. The guard below runs on the canonical path and cannot run before the path
+                // is there, so creating first would let a compose file plant empty directories
+                // inside the registry and have the mount refused afterwards - the refusal would be
+                // correct and the directories would still be there.
+                if !std::path::Path::new(source).exists() {
+                    if let Some(planned) = planned_bind_source(source) {
+                        if !crate::registry::path_overlaps_trusted_state(&planned) {
+                            let _ = std::fs::create_dir_all(source);
+                        }
+                    }
+                }
+                let canon = std::fs::canonicalize(source).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        Error::Sandbox(format!(
+                            "-v '{s}': source {source} does not exist and kern could not create it. \
+                             Docker's daemon creates a missing bind source as root; kern is \
+                             rootless, so it can only create one where you could yourself. Create \
+                             it first, or point the mount at a path you own"
+                        ))
+                    } else {
+                        Error::Sandbox(format!("-v '{s}': source {source}: {e}"))
+                    }
+                })?;
                 // A box that can WRITE the kern registry can forge a PEER box's recorded capability/
                 // seccomp posture and elevate that peer's `kern exec` (proven, adversarial review).
                 // Refuse to bind a trust-bearing registry dir - or a parent that contains one - into
@@ -1542,8 +1651,9 @@ fn parse_envs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
     Ok(out)
 }
 
-/// Parse `--env-file PATH` files: one `K=V` per line, `#`-comment and blank lines skipped, surrounding
-/// whitespace on the key trimmed. Later files (and `--env`) override earlier keys by list order.
+/// Parse `--env-file PATH` files with Docker's `.env` rules, through the compose crate's reader -
+/// the ONE implementation of that format. Later files (and `--env`) override earlier keys by list
+/// order; a line that binds nothing is refused by name rather than skipped.
 fn parse_env_files(paths: &[String]) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
     for p in paths {
@@ -1553,23 +1663,32 @@ fn parse_env_files(paths: &[String]) -> Result<Vec<(String, String)>, Error> {
         let bytes = crate::secret::read_host_file_for_box(p, "--env-file")?;
         let body = String::from_utf8(bytes)
             .map_err(|_| Error::Sandbox(format!("--env-file '{p}' is not valid UTF-8")))?;
+        // A LINE THAT BINDS NOTHING IS STILL AN ERROR, and it is checked here rather than left to
+        // the reader below: `parse_dotenv` is deliberately total (it skips what it cannot read, so
+        // one stray line cannot take a whole stack down), and a `--env-file` the caller named
+        // explicitly deserves to be told instead. Both properties, one pass each.
         for (n, raw) in body.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            match line.split_once('=') {
-                Some((k, v)) if !k.trim().is_empty() => {
-                    out.push((k.trim().to_string(), v.to_string()))
-                }
-                _ => {
-                    return Err(Error::Sandbox(format!(
-                        "bad line {} in --env-file '{p}' (expected K=V): {line}",
-                        n + 1
-                    )))
-                }
+            if !line.contains('=') && !line.contains(':') {
+                return Err(Error::Sandbox(format!(
+                    "bad line {} in --env-file '{p}' (expected K=V): {line}",
+                    n + 1
+                )));
             }
         }
+        // ONE READER OF THE `.env` FORMAT, and it is the compose crate's, which implements Docker's
+        // rules: `export ` tolerated, `K:V` as well as `K=V`, quotes stripped with single-quoted
+        // values left literal, an inline ` #` comment removed, and `${VAR}` interpolated for
+        // unquoted and double-quoted values. This function used to be a second, cruder reader -
+        // split on the first `=`, keep the rest verbatim - and the two disagreed about the same
+        // file. MEASURED on Zabbix, whose `.env_srv` ends a line with ` # Available since 6.0.0`:
+        // the comment reached the box as part of the value and `zabbix_server` exited with
+        // `invalid "NodeAddress" configuration parameter`, naming a config key nobody had written
+        // that way.
+        out.extend(crate::compose::parse_dotenv(&body).into_pairs());
     }
     Ok(out)
 }
@@ -1702,6 +1821,7 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<kern_isolation::TmpfsMount>, Erro
         // process mounts for one box.
         let mut size = String::new();
         let mut mode = String::new();
+        let (mut uid, mut gid) = (String::new(), String::new());
         let (mut noexec, mut read_only) = (false, false);
         let mut recognised: Vec<&str> = Vec::new();
         for tok in suffix.split(',').filter(|t| !t.is_empty()) {
@@ -1721,6 +1841,23 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<kern_isolation::TmpfsMount>, Erro
                     }
                     mode = v.to_string();
                 }
+                // `uid=`/`gid=` ARE APPLIED NOW. They are the tmpfs mount's own options, the box
+                // sets them at mount time, and the sandbox retries without them when the user
+                // namespace does not map the id - so asking for an ownership kern cannot give costs
+                // the ownership and never the mount. Validated here as digits: the value travels to
+                // `mount(2)` as text, and one the kernel cannot parse fails the whole mount.
+                Some((k @ ("uid" | "gid"), v)) => {
+                    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(Error::Sandbox(format!(
+                            "--tmpfs '{s}': {k} '{v}' is not a numeric id"
+                        )));
+                    }
+                    if k == "uid" {
+                        uid = v.to_string();
+                    } else {
+                        gid = v.to_string();
+                    }
+                }
                 Some((k, _)) if TMPFS_KNOWN_KEYS.contains(&k) => recognised.push(tok),
                 Some(_) => {
                     return Err(Error::Sandbox(format!(
@@ -1732,6 +1869,13 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<kern_isolation::TmpfsMount>, Erro
                 None if tok == "ro" => read_only = true,
                 // `exec` and `rw` are kern's defaults, so they are honoured by not acting.
                 None if tok == "exec" || tok == "rw" => {}
+                // `nosuid` AND `nodev` ARE ALREADY APPLIED, so asking for them is not a loss and
+                // must not be reported as one. MEASURED on a running box:
+                // `tmpfs /scratch tmpfs rw,nosuid,nodev,relatime,...`. The sentence below even says
+                // kern "mounts every --tmpfs nosuid and nodev, which it will not relax", and it was
+                // printed for files that asked for exactly that: on the corpus, 6 files carried
+                // this as their ONLY difference from Docker.
+                None if tok == "nosuid" || tok == "nodev" => {}
                 None if TMPFS_KNOWN_OPTS.contains(&tok) => recognised.push(tok),
                 None if is_bare_tmpfs_size(tok) => size = tok.to_string(),
                 None => {
@@ -1828,6 +1972,8 @@ fn parse_tmpfs(specs: &[String]) -> Result<Vec<kern_isolation::TmpfsMount>, Erro
             path: path.to_string(),
             size: size.to_ascii_lowercase(),
             mode,
+            uid,
+            gid,
             noexec,
             read_only,
         });
@@ -3988,7 +4134,7 @@ fn validate_conditions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error
     let find = |n: &str| boxes.iter().find(|x| x.name == n);
     for b in boxes {
         for dep in &b.depends_healthy {
-            if find(dep).is_some_and(|x| x.health_cmd.is_none()) {
+            if find(dep).is_some_and(|x| !x.has_health()) {
                 return Err(Error::Compose(format!(
                     "box '{}' waits for '{dep}' to be healthy, but '{dep}' declares no `health_cmd` \
                      (add one, or use `depends_on`/`depends_completed`)",
@@ -4218,6 +4364,22 @@ fn declared_container_ports(b: &crate::compose::ComposeBox) -> Vec<(u16, bool)> 
         .collect()
 }
 
+/// The HOST ports a service publishes, deduplicated, in the order the file names them.
+///
+/// The host side, unlike [`declared_container_ports`]'s box side: what the stack claims on the
+/// machine, which is what the privileged-port floor and the shift plan are about.
+pub(crate) fn declared_host_ports(b: &crate::compose::ComposeBox) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::new();
+    for spec in &b.ports {
+        for pm in crate::ports::parse(spec).unwrap_or_default() {
+            if !out.contains(&pm.host) {
+                out.push(pm.host);
+            }
+        }
+    }
+    out
+}
+
 /// Fingerprint of everything that DEFINES a box, so `up` can tell a running service apart from the
 /// file that describes it now.
 ///
@@ -4404,6 +4566,178 @@ pub(crate) fn apply_publish_policy(
     moved
 }
 
+/// Whether a published port kern cannot bind is moved or refused.
+pub(crate) fn privileged_port_policy() -> Result<bool, String> {
+    let cfg = crate::config::load_cached(None)?;
+    // Absent means shift, which is what makes a file written for Docker run here at all.
+    Ok(cfg.kern.privileged_port.as_deref() != Some("refuse"))
+}
+
+/// The port a privileged one is moved to. `80` becomes `8080`, `443` becomes `8443`, `53` becomes
+/// `8053`: the conventional alternative for every port people actually publish, from one rule.
+const PRIVILEGED_PORT_SHIFT: u16 = 8000;
+
+/// Move every published host port below `floor` to one above it, returning `(from, to)` per port.
+///
+/// SEPARATED FROM THE POLICY LOOKUP for [`apply_publish_policy`]'s reason: a function that both
+/// reads a config and rewrites its argument can be asserted by nothing.
+///
+/// KEYED BY THE PORT AND NOT BY THE ENTRY, so `53/tcp` and `53/udp` move together. A file that
+/// publishes both and got two different host ports would be broken in a way that is very hard to
+/// see: the DNS sample in Docker's own examples publishes exactly that pair.
+///
+/// A SHIFT NEVER LANDS ON A PORT THE SAME BOX ALREADY CLAIMS. Without that, a file publishing `80`
+/// and `8080` would end with two entries on `8080`, and the second bind would fail with
+/// `EADDRINUSE` blamed on some other process.
+pub(crate) fn shift_privileged_ports(
+    ports: &mut [kern_isolation::PortMap],
+    floor: u16,
+) -> Vec<(u16, u16)> {
+    let mut low: Vec<u16> = ports
+        .iter()
+        .map(|p| p.host)
+        .filter(|h| *h < floor)
+        .collect();
+    low.sort_unstable();
+    low.dedup();
+    let mut taken: std::collections::HashSet<u16> = ports
+        .iter()
+        .map(|p| p.host)
+        .filter(|h| *h >= floor)
+        .collect();
+    let mut plan: Vec<(u16, u16)> = Vec::new();
+    for from in low {
+        let mut to = from.saturating_add(PRIVILEGED_PORT_SHIFT);
+        while (to < floor || taken.contains(&to)) && to < u16::MAX {
+            to = to.saturating_add(1);
+        }
+        if to < floor || taken.contains(&to) {
+            // Nothing free above the floor at all. Left alone, so the bind fails and says so
+            // rather than this quietly producing a duplicate.
+            continue;
+        }
+        taken.insert(to);
+        plan.push((from, to));
+    }
+    // Every `from` is below the floor and every `to` is at or above it, so a port moved here can
+    // never match another `from` and be moved twice.
+    for p in ports.iter_mut() {
+        if let Some((_, to)) = plan.iter().find(|(f, _)| *f == p.host) {
+            p.host = *to;
+        }
+    }
+    plan
+}
+
+/// Re-spell one published port spec with new host ports, keeping everything the operator wrote.
+///
+/// THE BIND ADDRESS IS COPIED AS TEXT, never rebuilt from the parsed value. `crate::ports::parse`
+/// fills in a DEFAULT address for a spec that names none, and that default is the operator's
+/// `publish` policy at the box, so emitting `0.0.0.0:8080:80` for a file that said `80:80` would
+/// silently overrule a configured `publish = "127.0.0.1"`. Copying the written prefix (present or
+/// absent) leaves that decision exactly where it was.
+///
+/// `hosts` is one port per `PortMap` the spec expands to, in order, so a range spec becomes one spec
+/// per element - the only way to say "these three moved and that one did not" in this syntax.
+fn respell_port_spec(spec: &str, hosts: &[u16]) -> Option<Vec<String>> {
+    let pms = crate::ports::parse(spec)?;
+    if pms.len() != hosts.len() {
+        return None;
+    }
+    let (head, proto) = match spec.rsplit_once('/') {
+        Some((h, p)) if p.eq_ignore_ascii_case("udp") || p.eq_ignore_ascii_case("tcp") => {
+            (h, format!("/{p}"))
+        }
+        _ => (spec, String::new()),
+    };
+    // Three parts means an explicit `ip:`; two means the caller's policy decides, and it must keep
+    // deciding.
+    let ip = match head.split(':').collect::<Vec<_>>().as_slice() {
+        [ip, _, _] => format!("{ip}:"),
+        _ => String::new(),
+    };
+    Some(
+        pms.iter()
+            .zip(hosts)
+            .map(|(pm, host)| format!("{ip}{host}:{}{proto}", pm.box_port))
+            .collect(),
+    )
+}
+
+/// Move every privileged host port in the STACK to one kern can bind, as ONE plan.
+///
+/// Returns `(service, from, to)` per port moved, and rewrites the services' `ports:` in place.
+///
+/// ONE PLAN FOR THE WHOLE STACK, because the per-box shift cannot see its peers and that is a
+/// MEASURED failure, not a theoretical one: a file where `web` publishes `80` and `other` publishes
+/// `8080` starts `other` on 8080, moves `web`'s 80 onto 8080, and kills `web` with
+/// `cannot publish host port 8080: Address already in use (os error 98)` - a message that names
+/// neither the shift nor the service it collided with. Each box was avoiding only its OWN ports, so
+/// every box independently picked the same conventional target.
+///
+/// Run before anything starts, so `config` and `up` report the same plan and neither can start half
+/// a stack. A port at or above the floor is untouched, and a spec that does not parse is left for
+/// the validation that already reports it.
+pub(crate) fn shift_privileged_ports_across(
+    boxes: &mut [crate::compose::ComposeBox],
+    floor: u16,
+) -> Vec<(String, u16, u16)> {
+    // Every published PortMap in the stack, flattened, remembering where each came from.
+    let mut all: Vec<kern_isolation::PortMap> = Vec::new();
+    let mut origin: Vec<(usize, usize)> = Vec::new();
+    for (bi, b) in boxes.iter().enumerate() {
+        for (si, spec) in b.ports.iter().enumerate() {
+            let Some(pms) = crate::ports::parse(spec) else {
+                continue;
+            };
+            for pm in pms {
+                all.push(pm);
+                origin.push((bi, si));
+            }
+        }
+    }
+    let before: Vec<u16> = all.iter().map(|p| p.host).collect();
+    let plan = shift_privileged_ports(&mut all, floor);
+    if plan.is_empty() {
+        return Vec::new();
+    }
+    // Group the new host ports back by (service, spec), then re-spell only the specs that moved.
+    let mut moves: Vec<(String, u16, u16)> = Vec::new();
+    let mut rewrites: std::collections::BTreeMap<(usize, usize), Vec<u16>> =
+        std::collections::BTreeMap::new();
+    let mut changed: std::collections::BTreeSet<(usize, usize)> = std::collections::BTreeSet::new();
+    for (i, pm) in all.iter().enumerate() {
+        let key = origin[i];
+        rewrites.entry(key).or_default().push(pm.host);
+        if pm.host != before[i] {
+            changed.insert(key);
+            let service = boxes[key.0].service_name().to_string();
+            let mv = (service, before[i], pm.host);
+            if !moves.contains(&mv) {
+                moves.push(mv);
+            }
+        }
+    }
+    for (key, hosts) in rewrites {
+        if !changed.contains(&key) {
+            continue;
+        }
+        let (bi, si) = key;
+        let Some(new_specs) = respell_port_spec(&boxes[bi].ports[si], &hosts) else {
+            continue;
+        };
+        // The spec at `si` becomes the first, and any extra elements are appended: the indices of
+        // the specs still to be visited must not move under this loop.
+        let mut it = new_specs.into_iter();
+        if let Some(first) = it.next() {
+            boxes[bi].ports[si] = first;
+        }
+        let extra: Vec<String> = it.collect();
+        boxes[bi].ports.extend(extra);
+    }
+    moves
+}
+
 /// The memory ceiling policy for a `kern compose` stack: `(operator_ceiling, host_ram)`.
 ///
 /// FAIL-CLOSED ON A BROKEN CONFIG, for [`publish_policy`]'s reason and with the same asymmetry: an
@@ -4540,6 +4874,70 @@ fn device_grants_allowed_by_config() -> bool {
         Ok(cfg) => cfg.kern.allow_device_grants,
         Err(_) => false,
     }
+}
+
+/// Has the OPERATOR granted `privileged: true` to compose files, on the command line or in their
+/// own config?
+///
+/// NEVER THE COMPOSE FILE, and never a config a compose file named: the same rule as
+/// [`device_grants_allowed_by_config`], for the same reason. `privileged: true` relaxes the seccomp
+/// filter, and a filter a downloaded file can switch off is not a filter.
+///
+/// FAIL-CLOSED ON AN UNREADABLE CONFIG, which is the only safe direction for a grant: a file that
+/// will not parse must not be read as permission.
+fn privileged_allowed_by_config() -> bool {
+    match crate::config::load_cached(None) {
+        Ok(cfg) => cfg.kern.compose_privileged,
+        Err(_) => false,
+    }
+}
+
+/// Apply the operator's decision to every service that asked for `privileged: true`, and return the
+/// sentence the stack is owed.
+///
+/// TAKES THE GRANT AS AN ARGUMENT AND CLEARS THE FIELD ITSELF, so `push_box_flags` has nothing to
+/// decide: a flag that is emitted from a field which one caller sets and another might not clear is
+/// how a grant comes to be applied where nobody asked for it. After this runs, `privileged` is true
+/// only where it was granted.
+///
+/// WHAT IS GRANTED, EXACTLY: every capability the box's own user namespace can hold, and the relaxed
+/// seccomp a nested runtime needs. What is NOT granted, and it is the dangerous third of Docker's
+/// key: `/proc` and `/sys` stay masked. `/proc/sys/kernel/core_pattern` is not namespaced on Linux,
+/// and unmasking it has already been a real escape in this project.
+pub(crate) fn apply_privileged_grant(
+    boxes: &mut [crate::compose::ComposeBox],
+    granted: bool,
+) -> Option<String> {
+    let asked: Vec<String> = boxes
+        .iter()
+        .filter(|b| b.privileged)
+        .map(|b| b.service_name().to_string())
+        .collect();
+    if asked.is_empty() {
+        return None;
+    }
+    if !granted {
+        for b in boxes.iter_mut() {
+            b.privileged = false;
+        }
+        let names: Vec<&str> = asked.iter().map(String::as_str).collect();
+        return Some(format!(
+            "service(s) {} ask for `privileged: true`, which relaxes the seccomp filter, so kern \
+             does not take it from the file: they run unprivileged. Grant it with \
+             `--allow-privileged` on this command, or `[kern] compose_privileged = true` in your \
+             own kern.toml. Rootless, the grant is every capability inside the box's OWN user \
+             namespace and nothing over the host",
+            crate::compose::name_list(&names)
+        ));
+    }
+    let names: Vec<&str> = asked.iter().map(String::as_str).collect();
+    Some(format!(
+        "service(s) {} run with `privileged: true` as you granted: every capability their own user \
+         namespace can hold, and the relaxed seccomp a nested runtime needs. NOT granted, because a \
+         rootless runtime must not: `/proc` and `/sys` stay masked, so `core_pattern` and its \
+         neighbours are unreachable. Docker's `privileged` unmasks them and is not rootless",
+        crate::compose::name_list(&names)
+    ))
 }
 
 fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Option<String> {
@@ -4786,6 +5184,74 @@ fn check_pod_global_conflicts(
     // 3. An `extra_hosts` entry that shadows a SERVICE name. Both write the pod's /etc/hosts, so the
     //    winner is decided by write order - and a service silently resolving to somewhere else is the
     //    worst kind of wrong.
+    if let Some((svc, host)) = pod_hosts_collision(boxes) {
+        return Err(Error::Compose(format!(
+            "service '{svc}': extra_hosts entry '{host}' has the same name as a service in this \
+             stack. Both write the pod's shared /etc/hosts, so which one resolves would depend \
+             on start order: rename one of them."
+        )));
+    }
+    Ok(())
+}
+
+/// Where a bind source WOULD land if it were created, symlink-resolved as far as the path exists.
+///
+/// EXISTS BECAUSE THE REGISTRY GUARD RUNS ON A CANONICAL PATH AND A MISSING PATH HAS NONE. The guard
+/// has to answer before anything is created, or a compose file could plant empty directories inside
+/// the registry and have the mount refused afterwards: the refusal would be right and the
+/// directories would still be there.
+///
+/// THE FIRST VERSION ASKED THE GUARD ABOUT THE NEAREST EXISTING ANCESTOR AND THAT IS A DIFFERENT
+/// QUESTION. The guard refuses any path that is an ANCESTOR of the registry root, because mounting
+/// one exposes the whole registry - so `/run/user/1000` is refused, and every path under it was
+/// therefore treated as registry-adjacent and never created. MEASURED with a positive control: a
+/// source under `/run/user/1000/kern-not-the-registry/` was not created either, which is how the
+/// mistake surfaced. Only the FULL intended path can be asked.
+///
+/// `None` when the path cannot be resolved that way, which includes a `..` in the part that does not
+/// exist yet. Nothing is created then, which is the conservative direction.
+fn planned_bind_source(source: &str) -> Option<std::path::PathBuf> {
+    let want = std::path::Path::new(source);
+    let abs = if want.is_absolute() {
+        want.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(want)
+    };
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = abs.as_path();
+    loop {
+        if let Ok(existing) = std::fs::canonicalize(probe) {
+            let mut planned = existing;
+            for name in tail.iter().rev() {
+                planned.push(name);
+            }
+            return Some(planned);
+        }
+        match (probe.parent(), probe.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                tail.push(name.to_os_string());
+                probe = parent;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The first `extra_hosts` entry that shadows a service name, as `(service, host)`.
+///
+/// ONE DEFINITION FOR TWO READERS, and they ask opposite questions of it: the pod conflict check
+/// turns it into a refusal, and the wiring selector turns it into a REASON TO PICK THE OTHER WIRING.
+/// Written twice they would drift, and the drift has a direction that matters: a selector that
+/// missed a collision the checker catches would refuse a file kern can run.
+///
+/// WHY IT IS A POD CONDITION AND NOT A DEFECT IN THE FILE. Under Docker every container has its own
+/// `/etc/hosts`, so a service mapping `postgres` to a fixed address shadows the name FOR ITSELF and
+/// nobody else, and the file is unambiguous. Only one shared namespace makes the two entries fight,
+/// so only one shared namespace has to refuse.
+#[must_use]
+pub(crate) fn pod_hosts_collision(
+    boxes: &[crate::compose::ComposeBox],
+) -> Option<(String, String)> {
     let names: std::collections::HashSet<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
     for b in boxes {
         for host in b.add_host.iter().filter_map(|h| h.split(':').next()) {
@@ -4796,16 +5262,11 @@ fn check_pod_global_conflicts(
                     .iter()
                     .any(|o| o.net_aliases.iter().any(|a| a == host));
             if clashes {
-                return Err(Error::Compose(format!(
-                    "service '{}': extra_hosts entry '{host}' has the same name as a service in this \
-                     stack. Both write the pod's shared /etc/hosts, so which one resolves would depend \
-                     on start order: rename one of them.",
-                    short(b)
-                )));
+                return Some((b.service_name().to_string(), host.to_string()));
             }
         }
     }
-    Ok(())
+    None
 }
 
 /// Best-effort WARNING for two pod services whose IMAGES expose the same container port even though
@@ -5016,9 +5477,22 @@ fn no_pod_restart_gate_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) 
     ))
 }
 
-fn warn_image_expose_collisions(boxes: &[crate::compose::ComposeBox], no_pod: bool) {
-    if no_pod || boxes.len() < 2 {
-        return;
+/// Pairs of services whose IMAGES expose the same port without either DECLARING it: `(first,
+/// second, port, udp)`. Best-effort and cache-only - an image kern has not pulled contributes
+/// nothing, because pulling to answer a question about wiring would be a surprise.
+///
+/// ONE SCAN, TWO READERS, and that is the whole point of returning them. This used to warn inline,
+/// so the wiring decision could not see what the warning had just found: kern printed "the images
+/// of 'postgres' and 'pgbouncer' both EXPOSE 5432/tcp; if both bind it the second fails at runtime
+/// with EADDRINUSE" and then ran the stack in one shared namespace, where pgbouncer died with
+/// exactly that. MEASURED on Sentry self-hosted, and the same shape had already cost Supabase a
+/// bring-up (studio and rest, both on 3000).
+pub(crate) fn image_expose_collisions(
+    boxes: &[crate::compose::ComposeBox],
+) -> Vec<(String, String, u16, bool)> {
+    let mut out = Vec::new();
+    if boxes.len() < 2 {
+        return out;
     }
     let mut seen: std::collections::HashMap<(u16, bool), String> = std::collections::HashMap::new();
     for b in boxes {
@@ -5026,22 +5500,32 @@ fn warn_image_expose_collisions(boxes: &[crate::compose::ComposeBox], no_pod: bo
             continue; // a `--rootfs`/`build`-only service has no image config to read
         };
         let Ok((_, cfg)) = resolve_image_depth(image, 0, PullPolicy::Never) else {
-            continue; // not cached: do not pull just to warn
+            continue; // not cached: do not pull just to answer this
         };
         for (port, udp) in cfg.exposed_ports {
             if let Some(other) = seen.insert((port, udp), b.name.clone()) {
                 if other != b.name {
-                    let proto = if udp { "udp" } else { "tcp" };
-                    eprintln!(
-                        "kern: warning: the images of '{other}' and '{}' both EXPOSE {port}/{proto}; a \
-                         stack shares ONE network namespace, so if both bind it the second fails at \
-                         runtime with EADDRINUSE. If they really serve the same port, give one a \
-                         different internal port (its own config, or `port:`), or run with --no-pod.",
-                        b.name
-                    );
+                    out.push((other, b.name.clone(), port, udp));
                 }
             }
         }
+    }
+    out
+}
+
+fn warn_image_expose_collisions(boxes: &[crate::compose::ComposeBox], no_pod: bool) {
+    if no_pod {
+        return;
+    }
+    for (other, name, port, udp) in image_expose_collisions(boxes) {
+        let proto = if udp { "udp" } else { "tcp" };
+        eprintln!(
+            "kern: warning: the images of '{other}' and '{name}' both EXPOSE {port}/{proto}; a \
+             stack shares ONE network namespace, so if both bind it the second fails at runtime \
+             with EADDRINUSE. If they really serve the same port, give one a different internal \
+             port (its own config, or `port:`), or run with `--bridge`, which gives each service \
+             its own loopback."
+        );
     }
 }
 
@@ -5066,7 +5550,7 @@ const BRING_UP_SETTLE_MS: u64 = 150;
 /// window to say so. Watching costs one cheap liveness check per service per tick and turns the
 /// failure path from "always the full window" into "as fast as the failure happened", while a stack
 /// that stays up pays exactly what it paid before.
-fn watch_for_early_death(boxes: &[crate::compose::ComposeBox], ms: u64) {
+fn watch_for_early_death(boxes: &[&crate::compose::ComposeBox], ms: u64) {
     // 10 ms: far below the window, far above the cost of one liveness check per service, so the
     // watch adds no measurable work to a stack that stays up.
     const TICK_MS: u64 = 10;
@@ -5092,10 +5576,15 @@ fn watch_for_early_death(boxes: &[crate::compose::ComposeBox], ms: u64) {
 ///
 /// One watch for the whole stack, then one registry read per service to classify what is gone.
 fn settle_and_collect_dead(
-    boxes: &[crate::compose::ComposeBox],
+    boxes: &[&crate::compose::ComposeBox],
     pod: &str,
     token: &str,
 ) -> Vec<String> {
+    // BY REFERENCE, because the caller passes a SUBSET: `up web` starts web and its dependencies,
+    // and the services the caller deliberately left out must not be examined. They were reported as
+    // "died within 150ms of starting" - a death for a box that was never started - and turned a
+    // bring-up that did exactly what was asked into a non-zero exit. MEASURED on a two-service file:
+    // `up -d uno` printed `1 service(s) died: due`.
     watch_for_early_death(boxes, BRING_UP_SETTLE_MS);
     boxes
         .iter()
@@ -5216,9 +5705,29 @@ struct TerminalOpts<'a> {
     /// `-a/--all` for `ps`: also list the stack's recently-exited services.
     all: bool,
     services: &'a [String],
-    /// Needed by the read-only verbs too: `config` and `systemd` answer questions ABOUT a bring-up,
-    /// so they have to know whether that bring-up would share a namespace.
-    no_pod: bool,
+    /// Whether the bring-up this verb is answering questions about gives each service its OWN
+    /// network namespace.
+    ///
+    /// NAMED FOR WHAT IT MEANS AND NOT FOR THE FLAG. It was called `no_pod`, and the name was the
+    /// defect: `--bridge` also gives each service its own namespace, and the field kept saying "was
+    /// --no-pod typed". MEASURED on the corpus: `config --bridge` refused 17 files that `config`
+    /// accepts, all of them for the ONE-shared-namespace reason that a bridge does not have.
+    own_namespaces: bool,
+    /// Whether that bring-up reaches peers through RELAYS, which is a narrower question than the
+    /// field above and the reason both exist.
+    ///
+    /// A bridge also gives each service its own namespace, but its members meet on a real network:
+    /// they resolve each other by name, on any port, with no relay in between. The relay notes were
+    /// keyed on `own_namespaces` and so were printed for a bridge stack, where every sentence in
+    /// them is false. MEASURED on Elastic's own compose file, which kern wires on a bridge because
+    /// three nodes share port 9200: kern said it was giving each service its own namespace on a
+    /// bridge and then, in the next line, that two services sharing an internal port "are still not
+    /// mutually reachable" - which is exactly what the bridge had just fixed.
+    relay_wiring: bool,
+    /// Whether the wiring was TYPED (`--pod`, `--bridge`, `--no-pod`) rather than chosen by kern.
+    /// Reported by `config` as `wiring-source:`; see where it is captured in the driver for why the
+    /// provenance has to travel next to the decision.
+    wiring_from_flag: bool,
     /// See [`ComposeOpts::allow_device_grants`]; `config`/`systemd` refuse what `up` would.
     allow_device_grants: bool,
 }
@@ -5234,8 +5743,16 @@ fn run_terminal_verb(
     boxes: &mut [crate::compose::ComposeBox],
     o: &TerminalOpts<'_>,
 ) -> Result<bool, Error> {
-    let (pod, file, tail, follow, all, services, no_pod) =
-        (o.pod, o.file, o.tail, o.follow, o.all, o.services, o.no_pod);
+    let (pod, file, tail, follow, all, services, own_namespaces) = (
+        o.pod,
+        o.file,
+        o.tail,
+        o.follow,
+        o.all,
+        o.services,
+        o.own_namespaces,
+    );
+    let relay_wiring = o.relay_wiring;
     let allow_device_grants = o.allow_device_grants;
     let selected =
         |b: &crate::compose::ComposeBox| services.is_empty() || services.contains(&b.name);
@@ -5250,7 +5767,7 @@ fn run_terminal_verb(
             crate::compose::topo_levels(boxes).map_err(Error::Compose)?;
             validate_conditions(boxes)?;
             check_port_collisions(boxes)?;
-            check_pod_global_conflicts(boxes, no_pod)?;
+            check_pod_global_conflicts(boxes, own_namespaces)?;
             // REFUSES, unlike `config` below: this emits a unit that a machine will run unattended,
             // so it is a bring-up with a delay rather than a dry run.
             if let Some(msg) = device_grant_problem(boxes, allow_device_grants) {
@@ -5269,7 +5786,7 @@ fn run_terminal_verb(
             // The pod-global conflicts too: `config` is the verb you run to find out whether the file
             // will come up, so every rejection `up` performs has to be reachable from here. Reporting
             // a clean dry run for a stack that `up` then refuses is worse than not having the verb.
-            check_pod_global_conflicts(boxes, no_pod)?;
+            check_pod_global_conflicts(boxes, own_namespaces)?;
             // The `--no-pod` trade belongs here too, not only at bring-up: `config` is the command
             // that answers "what will this file be", and `--no-pod` changes the answer. Measured
             // before this: `up --no-pod` said what it cost and `config --no-pod` said nothing, so
@@ -5282,7 +5799,11 @@ fn run_terminal_verb(
             //
             // Unlike the unreachable-pair report, which is measured from RUNNING services and can
             // therefore only exist at bring-up, nothing here needs a box.
-            if no_pod {
+            // ONLY WHEN THE FILE SEGREGATES, which is what makes this correct under `--bridge`
+            // too: a file whose `networks:` separate keeps the relay wiring even with the flag (one
+            // bridge would put every service back on one network), and a file that separates nothing
+            // produces no pairs here at all.
+            if own_namespaces {
                 let members: Vec<(String, Vec<String>)> = boxes
                     .iter()
                     .map(|b| (b.service.clone(), b.networks.clone()))
@@ -5297,7 +5818,7 @@ fn run_terminal_verb(
                     );
                 }
             }
-            if let Some(note) = no_pod_peer_names_note(boxes, no_pod) {
+            if let Some(note) = no_pod_peer_names_note(boxes, relay_wiring) {
                 eprintln!("{note}");
             }
             // REPORTS, and does not refuse. The device-grant refusal tells its reader to run THIS
@@ -5406,6 +5927,33 @@ fn run_terminal_verb(
                 }
             }
             println!("compose config: {} service(s) in {file}", boxes.len());
+            // ONE FIELD, FOR WHATEVER COUNTS. The wiring is announced on stderr in prose that says
+            // what it costs and what the alternatives are, which is right for a reader and wrong for
+            // a tool: a census that matched `"on a bridge"` counted every POD stack as a bridge,
+            // because the pod advisory recommends the bridge in that same sentence. It reported 60%
+            // bridge on a corpus that is 85% pod, and it was only caught by a count that refused to
+            // reconcile (136 files carrying the shared-loopback advisory against 85 read as pod).
+            //
+            // Improving an advisory must not be able to move a number, so the decision is also
+            // printed as a token that says nothing else: `wiring: pod|bridge|relay`. Prose for the
+            // reader, a field for whoever counts, and never one read as the other. It is derived
+            // from the SAME two flags the bring-up carries, not re-derived from the file.
+            println!(
+                "  wiring: {}",
+                match (own_namespaces, relay_wiring) {
+                    (_, true) => "relay",
+                    (true, false) => "bridge",
+                    (false, false) => "pod",
+                }
+            );
+            // A SECOND TOKEN, so the first one stays stable. `file` is not reachable yet: no compose
+            // key pins the wiring today. It is in the vocabulary because the census that will have
+            // to separate "kern chose this" from "the file asked for this" is written against this
+            // field, and adding the value later must not change what `auto` and `flag` mean.
+            println!(
+                "  wiring-source: {}",
+                if o.wiring_from_flag { "flag" } else { "auto" }
+            );
             // `config` reports the FILE, so it prints service names as written, not the
             // project-scoped box names the runtime uses.
             //
@@ -5878,6 +6426,10 @@ pub struct ComposeOpts<'a> {
     pub files: &'a [String],
     pub action: ComposeAction,
     pub no_pod: bool,
+    /// `--bridge`: a network namespace per service, meeting on a bridge the pod holds.
+    pub bridge: bool,
+    /// `--allow-privileged`: the operator granting a file's `privileged: true`.
+    pub allow_privileged: bool,
     /// `--pod`: keep ONE namespace even when the file expresses segregation, which is the explicit
     /// opt-out of the auto-selection. Mutually exclusive with `no_pod`; the driver refuses both.
     pub force_pod: bool,

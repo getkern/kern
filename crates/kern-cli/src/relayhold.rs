@@ -829,8 +829,7 @@ impl std::fmt::Display for BlockReason {
             ),
             Self::NotListeningYet => write!(
                 f,
-                "it declares that port and is not listening on it yet, so binding the peer's alias \
-                 now would make its own later bind fail"
+                "both declare that port, so neither can host the other's alias on it"
             ),
             Self::AliasInUse => write!(
                 f,
@@ -890,12 +889,24 @@ impl std::fmt::Display for BlockReport<'_> {
                 self.reason.specific_instead(),
                 self.port
             ),
-            // No bind advice here: the port is not owned by anyone yet, so there is nothing to move.
-            // What the user needs to know is that the edge waits on THIS service.
+            // WHAT THIS USED TO SAY WAS THE OPPOSITE OF WHAT HAPPENS. It read "the edge comes up on
+            // its own once '{holder}' binds that port", which describes a wait. It is not a wait: a
+            // workload that binds `0.0.0.0` owns every local address on the port, so the alias can
+            // never be bound afterwards either, and the edge never comes up.
+            //
+            // WORSE, THE HEADLINE VERB WAS WRONG TOO, and an outside reviewer measured it on the
+            // released binary: `cannot reach` says the call will fail. It did not fail. The peer's
+            // alias is in `127.0.0.0/8`, which is local without being configured, so the caller's
+            // own wildcard listener answered it: a fetch of `peer:8080` returned the CALLER'S OWN
+            // body. Their words for the cost are the right ones - a name that answers as the wrong
+            // service presents as an application misconfiguration, and the reader spends hours in
+            // the wrong place. kern no longer writes the hosts entry for such a pair, so the name
+            // does not resolve at all, and this says so.
             BlockReason::NotListeningYet => write!(
                 f,
-                ". The edge comes up on its own once '{}' binds that port",
-                self.holder
+                ". Their names do NOT resolve in each other's box, so a call fails to resolve \
+                 rather than connecting back to the caller itself. Give one of them a different \
+                 internal port, which keeps the file working under Docker too"
             ),
             // SAME REMEDY AS THE WILDCARD, because it is the same situation: the holder owns the
             // whole port. The one thing worth adding is WHY kern did not say so before starting -

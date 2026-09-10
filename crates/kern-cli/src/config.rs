@@ -71,6 +71,45 @@ pub struct KernSettings {
     /// arbitrary per-host bind address belongs in the spec, where it is visible next to the port it
     /// applies to.
     pub publish_bind: Option<String>,
+    /// `privileged_port` - what kern does with a published host port below the kernel's floor.
+    ///
+    /// A ROOTLESS PROCESS CANNOT BIND ONE, and 15 of Docker's own 39 `awesome-compose` samples
+    /// publish one: `80` almost always, `53` and `67` for the DNS sample. Refusing the box is what
+    /// kern used to do, and it means that more than a third of the examples Docker ships do not
+    /// start at all, for a reason that has nothing to do with the file.
+    ///
+    /// Absent means `"shift"`: the port moves to one kern can bind (`80` becomes `8080`, `443`
+    /// becomes `8443`), the stack comes up, and every move is printed with both numbers. `"refuse"`
+    /// is the older, stricter answer, for anyone who would rather a port be the port or nothing.
+    ///
+    /// THE FLOOR IS READ FROM THE HOST and not assumed: on a machine whose owner lowered
+    /// `net.ipv4.ip_unprivileged_port_start`, nothing is shifted because nothing needs to be.
+    ///
+    /// KERN IS THE ONLY ROOTLESS RUNTIME THAT MOVES THE PORT, and an operator choosing between the
+    /// two values should know it. Measured on this host: `podman run -p 80:80` answers
+    /// `rootlessport cannot expose privileged port 80, you can add
+    /// 'net.ipv4.ip_unprivileged_port_start=80' to /etc/sysctl.conf (currently 1024), or choose a
+    /// larger port number (>= 1024)`, and Docker rootless fails through the same rootlesskit path.
+    /// `"refuse"` is that behaviour. The default is not it, deliberately, and the number above is
+    /// why: the alternative is that a third of Docker's own samples do not start.
+    ///
+    /// WHAT THE SHIFT COSTS is one class, and it is the class where the other end is not a person
+    /// reading stderr: ACME. Caddy's automatic HTTPS and Traefik's Let's Encrypt resolver need the
+    /// CA to reach port 80 (HTTP-01) or 443 (TLS-ALPN) on the published address, and a certificate
+    /// cannot be issued to `:8080`. A stack that terminates TLS itself wants `"refuse"` plus a
+    /// lowered `net.ipv4.ip_unprivileged_port_start`, or a proxy in front that owns the two ports.
+    /// kern says so at bring-up when the moved set contains 80 or 443.
+    pub privileged_port: Option<String>,
+    /// `compose_privileged` - may a compose file's `privileged: true` be honoured?
+    ///
+    /// DEFAULT FALSE, and the default is the point. The key relaxes the seccomp filter, and the rule
+    /// this codebase does not bend is that a policy a downloaded file can defeat is not a policy.
+    /// The operator grants it here or with `--allow-privileged`; the file can never grant itself.
+    ///
+    /// WHAT THE GRANT IS WORTH, rootless: every capability the box's own user namespace can hold,
+    /// which confers nothing over the host, plus the relaxed seccomp a nested runtime needs. `/proc`
+    /// and `/sys` stay masked either way.
+    pub compose_privileged: bool,
     /// `compose_memory_max` - the ceiling a `kern compose` SERVICE gets when its file names none.
     ///
     /// Absent means the host's own RAM, which is what a `docker compose` service is bounded by:
@@ -534,6 +573,7 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
         "log_level" => k.log_level = Some(value_string(v)?),
         "crash_recovery" => k.crash_recovery = value_bool(v)?,
         "allow_device_grants" => k.allow_device_grants = value_bool(v)?,
+        "compose_privileged" => k.compose_privileged = value_bool(v)?,
         // VALIDATED HERE, where the file is read, so a typo cannot silently leave every box on a
         // policy the operator did not choose. The value decides where services LISTEN, so a value
         // nobody checked is the shape of an accident nobody notices until a port answers on the LAN.
@@ -546,6 +586,21 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
                         "[kern] publish_bind = '{other}': expected \"0.0.0.0\" (Docker's default, \
                          every interface) or \"127.0.0.1\" (loopback only). A different address \
                          belongs in the port spec itself, e.g. `10.0.0.5:8080:80`"
+                    ))
+                }
+            }
+        }
+        // VALIDATED HERE for `publish_bind`'s reason: a typo must not leave a stack on a policy the
+        // operator did not choose, and this one decides whether a stack starts at all.
+        "privileged_port" => {
+            let raw = value_string(v)?;
+            match raw.trim() {
+                "shift" | "refuse" => k.privileged_port = Some(raw.trim().to_string()),
+                other => {
+                    return Err(format!(
+                        "[kern] privileged_port = '{other}': expected \"shift\" (move a port kern \
+                         cannot bind to one it can, and say so) or \"refuse\" (fail the box \
+                         instead)"
                     ))
                 }
             }
@@ -3234,7 +3289,10 @@ mod tests {
         for (k, v) in [
             ("pins", "44545454545"),
             ("nice", "-25"),
-            ("memory", "1.5g"),
+            // `1,5g` AND NOT `1.5g`, WHICH IS NOW A SIZE. The comma is the typo a European
+            // keyboard produces and there is no reading of it that is a byte count; the dot form
+            // was only invalid while the parser was integer-only, and Docker always took it.
+            ("memory", "1,5g"),
             ("cpus", "1.2.3"),
             ("extra", "rftre errte"), // garbage - not a /dev path (the reported bug)
             ("extra", "/etc/passwd"), // a path, but not under /dev

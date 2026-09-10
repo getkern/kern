@@ -60,6 +60,19 @@ pub struct Instance {
     /// with `working_dir: /app` should not need `-w /app` typed again on every exec. Empty when the
     /// box has none; absent in older entries.
     pub workdir: String,
+    /// The uid:gid the WORKLOAD runs as (`--user`, or the image's own `User`), and the supplementary
+    /// groups it was given. `None` for a box that runs as its namespace root; absent in older
+    /// entries, which read as `None`.
+    ///
+    /// Recorded because the HEALTH PROBE must reproduce the workload's identity, not kern's. A probe
+    /// running as box root reads files the workload cannot: this stack's own certificates are 640
+    /// `root:root`, so a `test -r` probe would report healthy while the service dies of EACCES, and
+    /// `depends_on: service_healthy` would then release a dependent onto a service that is about to
+    /// exit. `kern exec` deliberately does NOT use this and stays box-root: it is the operator's
+    /// door into the box, and the CLI has no `--user` on it to get root back with.
+    pub run_as: Option<(u32, u32)>,
+    /// See [`Instance::run_as`]. Empty when the workload got none.
+    pub extra_gids: Vec<u32>,
     /// The `--egress-allow` domain allowlist (comma-joined) governing this box's outbound traffic;
     /// empty when the box is fully isolated or shares the host network. Absent in older entries.
     pub egress: String,
@@ -1172,7 +1185,7 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\n",
         inst.name,
         inst.pid,
         inst.pid1_recorded,
@@ -1192,6 +1205,14 @@ fn encode(inst: &Instance) -> String {
         inst.stop_grace,
         one_line(&inst.def_hash),
         one_line(&inst.workdir),
+        inst.run_as
+            .map(|(u, g)| format!("{u}:{g}"))
+            .unwrap_or_default(),
+        inst.extra_gids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         u8::from(inst.cap_drop_all),
         one_line(&inst.cap_drops),
         one_line(&inst.cap_adds),
@@ -2345,6 +2366,8 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
     let mut def_hash = String::new();
     let mut workdir = String::new();
+    let mut run_as: Option<(u32, u32)> = None;
+    let mut extra_gids: Vec<u32> = Vec::new();
     let mut cap_drop_all = false;
     let (mut cap_drops, mut cap_adds) = (String::new(), String::new());
     let mut apparmor = String::new();
@@ -2409,6 +2432,19 @@ fn parse(body: &str) -> Option<Instance> {
             "stopgrace" => stop_grace = v.parse().unwrap_or(0),
             "defhash" => def_hash = v.to_string(),
             "workdir" => workdir = v.to_string(),
+            // Absent, empty or malformed all read as "runs as the namespace root", which is what a
+            // box written by an older kern did.
+            "runas" => {
+                run_as = v
+                    .split_once(':')
+                    .and_then(|(u, g)| Some((u.trim().parse().ok()?, g.trim().parse().ok()?)))
+            }
+            "sgids" => {
+                extra_gids = v
+                    .split(',')
+                    .filter_map(|g| g.trim().parse::<u32>().ok())
+                    .collect()
+            }
             // The presence of `capdropall` marks a box that DID record its capability posture. A
             // value other than `0`/`1` is corruption, not a default - flag it so `exec` refuses rather
             // than silently reading it as `false` (the LESS restrictive direction).
@@ -2485,6 +2521,8 @@ fn parse(body: &str) -> Option<Instance> {
         volumes,
         pod,
         workdir,
+        run_as,
+        extra_gids,
         egress,
         landlock_rw,
         labels,
@@ -2627,13 +2665,46 @@ mod tests {
     ///
     /// The reproduction needs no timing, which is why it is a test and not an observation: resolve
     /// once, delete, resolve again, write. Before the revalidation the second write is `NotFound`.
+    ///
+    /// IT RUNS AGAINST A RUNTIME DIR OF ITS OWN, and that is not tidiness. It used to resolve the
+    /// REAL one and `remove_dir_all` it, so `cargo test` on a machine with running boxes deleted
+    /// every registry entry underneath them: the boxes kept running, `kern ps` printed "N box(es)
+    /// are RUNNING with no registry record, so `kern stop` cannot reach them", and stopping them
+    /// meant killing pids by hand. MEASURED with a positive control - one live box before the run,
+    /// zero entries and the same box still running after it - while bisecting why a compose stack
+    /// lost its registry three times in one afternoon. The memo is keyed on `XDG_RUNTIME_DIR`
+    /// (`runtime_subdir` says so), so pointing that at a temp directory exercises the identical
+    /// path on state this test owns. `TEST_ENV_LOCK` serialises the process-global variable, the
+    /// same way `runstats`'s tests already do.
     #[test]
     fn a_memoised_runtime_dir_is_re_created_after_something_removes_it() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("kern-memo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+        // Whatever this test does from here, the real runtime dir is out of reach: every path below
+        // resolves under `tmp` because the memo is keyed on the variable just set.
+        let restore = Restore(tmp.clone());
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("XDG_RUNTIME_DIR");
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
         let Ok(first) = dir() else {
             eprintln!("skip: no runtime dir on this host");
             return;
         };
         assert!(first.is_dir(), "the first resolve must have created it");
+        assert!(
+            first.starts_with(&restore.0),
+            "the case must be set up under this test's own runtime dir, not the live one: {}",
+            first.display()
+        );
 
         // Exactly what a `/run/user` sweep does. Best-effort: if it cannot be removed here there is
         // nothing to measure, and saying so beats asserting on a host that would not let us set the
@@ -2938,6 +3009,8 @@ mod tests {
             volumes: String::new(),
             pod: "stack".into(),
             workdir: "/app".into(),
+            run_as: None,
+            extra_gids: Vec::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
@@ -3206,6 +3279,8 @@ mod tests {
             volumes: String::new(),
             pod: "stack".into(),
             workdir: String::new(),
+            run_as: None,
+            extra_gids: Vec::new(),
             egress: "pypi.org,files.pythonhosted.org".into(),
             landlock_rw: "/tmp,/data".into(),
             memory_max: Some(134_217_728),
@@ -3566,6 +3641,8 @@ mod tests {
                 volumes: String::new(),
                 pod: String::new(),
                 workdir: String::new(),
+                run_as: None,
+                extra_gids: Vec::new(),
                 egress: String::new(),
                 landlock_rw: String::new(),
                 memory_max: None,
@@ -3641,6 +3718,8 @@ mod tests {
             volumes: String::new(),
             pod: String::new(),
             workdir: String::new(),
+            run_as: None,
+            extra_gids: Vec::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
@@ -3719,6 +3798,8 @@ mod tests {
             volumes: String::new(),
             pod: String::new(),
             workdir: String::new(),
+            run_as: None,
+            extra_gids: Vec::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,

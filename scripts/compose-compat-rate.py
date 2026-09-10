@@ -41,17 +41,43 @@ BENIGN = [
     (r"share no network, so they get no relay", "reproduces Docker's segregation"),
     (r"this file separates services with `networks:`", "announces the wiring that matches Docker"),
     (r"puts two services on the same internal port", "announces the wiring that matches Docker"),
+    (r"gives a service's own name a fixed address with `extra_hosts:`", "announces the wiring that matches Docker"),
     (r"--no-pod gives each service its own network namespace", "announces the chosen wiring"),
     (r"and with a namespace per service kern ENFORCES it", "`internal:` is honoured, and this says how"),
+    # `network_mode: service:X` asks for one namespace, and in a pod the stack IS one namespace.
+    # The per-service arm of the same sentence is a difference and is listed below: the two arms
+    # make opposite claims, so they cannot share a line here.
+    (r"'network_mode: service:' is satisfied here", "one namespace is exactly what the key asks for"),
+    # `bridge`/`default` ask for the stack's ordinary network, which is what every service that
+    # writes no `network_mode` gets, under either wiring.
+    (r"is the stack's own network, which is", "the key asks for the wiring kern already gives"),
+    # Docker's `json-file` and `local` drivers write the container's output to a file on the host.
+    # kern captures stdout and stderr of every box and serves them with `kern logs`. What is
+    # genuinely dropped is rotation and the network drivers, and those are counted below.
+    (r"is what kern already does - stdout/stderr are captured", "the driver asks for what kern does"),
+    # MEASURED, and it replaces a line that said the opposite. Inside a box
+    # `/proc/self/attr/current` reads the caller's own context: kern applies no AppArmor profile of
+    # its own and sets no SELinux label, so `apparmor=unconfined` and `label=disable` get exactly
+    # what they ask for. They were counted as differences on 11 files.
+    (r"is ALREADY WHAT KERN DOES", "kern's own posture already is what the key asks for"),
+    # `ipv4_address:` is HONOURED in one shared namespace: the address is claimed on the stack's
+    # loopback and a peer that hard-codes it reaches the service, which is what the file asked for.
+    # The per-service arm of the same sentence is a difference and is listed below.
+    (r"`ipv4_address:` is applied here", "the address a peer hard-codes reaches the service"),
 ]
 
 # Everything else counts as a difference. Named here only so `--verbose` can group the output; an
 # unmatched line is counted as a difference regardless, so a NEW warning is never silently benign.
 KNOWN_DIFFERENCES = [
     (r"compose_memory_max", "an operator ceiling caps a service below what the file asks"),
-    (r"ONE shared network namespace", "services share 127.0.0.1"),
+    (r"'network_mode: service:' is NOT given a shared namespace", "no shared loopback, and egress does not pass through the named service"),
+    (r"this stack runs in ONE shared network namespace", "services share 127.0.0.1"),
     (r"mount the Docker socket", "no daemon behind the socket"),
-    (r"`ipv4_address` are NOT applied", "the literal address is unreachable"),
+    # WIDENED FROM ``ipv4_address` are NOT applied``, which is the SINGULAR rendering: a service
+    # naming two of these keys produces "`ipv4_address`, `priority` are NOT applied" and fell through
+    # to UNCLASSIFIED. It still counted as a difference, which is the safe direction, but it counted
+    # under a label that named nothing.
+    (r"under `networks:` the key\(s\)", "a `networks:` sub-key kern does not apply, a fixed address above all"),
     (r"has no kern equivalent \(rootless\)", "`privileged:` cannot be given"),
     (r"NOT applied - the box keeps its own IPC", "`ipc:` not shared"),
     (r"ignored \(unsupported\)", "a key kern does not implement"),
@@ -61,6 +87,20 @@ KNOWN_DIFFERENCES = [
     (r"long-form", "a volume long form kern cannot express"),
     (r"is not a port in 1", "an out-of-range port is skipped"),
     (r"output is captured", "a `logging:` driver kern cannot provide"),
+    (r"label=[^:]*: kern sets no SELinux label", "an SELinux label other than `disable`"),
+    (r"seccomp=unconfined", "the file asks for NO seccomp filter, which kern does not take from a file"),
+    (r"seccomp=[^:]*: a Docker seccomp profile", "a Docker seccomp JSON profile"),
+    (r"ask for `privileged: true`", "`privileged:` needs the operator's grant, and nothing granted it"),
+    (r"run with `privileged: true` as you granted", "`privileged:` granted, minus the /proc and /sys unmask"),
+    (r"'security_opt:' not honoured", "a `security_opt` value with no kern equivalent"),
+    (r"has no usable healthcheck", "a `service_healthy` gate degraded to start-order"),
+    (r"the box keeps its own PID namespace", "`pid:` not shared"),
+    (r"'pid: [a-z]+' is NOT applied", "`pid:` not shared"),
+    (r"deploy\.[a-z_]+ ignored", "a `deploy:` key that needs an orchestrator"),
+    (r"extra_hosts entry '.*' is incomplete", "an `extra_hosts` entry kern drops"),
+    (r"max-size and max-file to its own capture", "a `logging:` option kern cannot provide"),
+    (r"under `secrets:` the key\(s\)", "a secret long-syntax key that moves the file or its owner"),
+    (r"`ipv4_address:` is claimed only where", "a fixed address a peer still cannot route to"),
 ]
 
 BENIGN_RE = [(re.compile(p), why) for p, why in BENIGN]
@@ -101,6 +141,12 @@ def main():
         return 2
 
     clean, causes, dirty, refused = 0, Counter(), [], []
+    # THE COUNT IS PER FILE AND THE HEADING SAYS SO, because it used to say so while counting LINES.
+    # MEASURED: the `ipv4_address` cause printed 230 next to the words "by files affected" on a
+    # 240-file corpus, which reads as almost every file in the corpus. The true figure is 63 files;
+    # the 230 was warning lines, one per service. A measurement that misreports its own unit is worse
+    # than no measurement, because the number looks answerable and nobody re-derives it.
+    only_cause = {}  # cause -> files where it is the ONLY thing standing between them and clean
     for f in files:
         run = subprocess.run(
             [args.kern, "compose", "-f", str(f), "config"],
@@ -119,8 +165,12 @@ def main():
         diffs = differences(run.stderr)
         if diffs:
             dirty.append((f.name, diffs))
-            for d in diffs:
-                causes[label(d)] += 1
+            # A file counts ONCE per cause however many services carry it.
+            here = {label(d) for d in diffs}
+            for why in here:
+                causes[why] += 1
+            if len(here) == 1:
+                only_cause[next(iter(here))] = only_cause.get(next(iter(here)), 0) + 1
         else:
             clean += 1
 
@@ -131,9 +181,30 @@ def main():
         print(f"REFUSED             {len(refused)} (not counted as clean; see compose-corpus-gate.py)")
         for name in refused:
             print(f"                      {name}")
-    print("\ncauses, by files affected (a file may have several):")
+    # THE CEILING, so the rate is read against what closing every remaining difference could buy
+    # rather than against 100%. A refused file is not reachable by closing a difference: it never
+    # rendered, and only the corpus gate can say whether the refusal is right.
+    reachable = total - len(refused)
+    print(f"CEILING             {reachable} = {reachable * 100 // total}% (every accepted file, if")
+    print("                      every remaining difference below were closed)")
+    # THE DISTRIBUTION, NEXT TO THE RATE AND NOT INSTEAD OF IT. The clean/dirty pair is insensitive
+    # to progress on the dirty side, and that is measurable rather than suspected: closing the
+    # `ipv4_address` silence moved this corpus from 90 clean to 90 clean, because every file carrying
+    # that difference carried another one too. Differences are CORRELATED - a file that has one tends
+    # to have three - so a cause can be closed for real without a single file crossing into the zero
+    # bucket. The histogram shows the 3+ bucket draining into 2, which the rate cannot.
+    spread = Counter(len({label(d) for d in diffs}) for _, diffs in dirty)
+    print("\ndistribution by NUMBER of named differences (the rate above is only the first row):")
+    print(f"  {clean:5d}  files with 0")
+    for k in sorted(spread):
+        if k < 3:
+            print(f"  {spread[k]:5d}  files with {k}")
+    three_plus = sum(n for k, n in spread.items() if k >= 3)
+    print(f"  {three_plus:5d}  files with 3 or more")
+    print("\ncauses, by FILES affected (a file may carry several; the second column is the files")
+    print("this cause is the ONLY thing keeping from clean, which is what closing it would buy):")
     for why, n in causes.most_common():
-        print(f"  {n:5d}  {why}")
+        print(f"  {n:5d}  {only_cause.get(why, 0):5d}  {why}")
     if args.verbose:
         print("\nfiles with a difference:")
         for name, diffs in dirty:

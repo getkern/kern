@@ -43,6 +43,17 @@ pub fn compose_verbs_help() -> String {
 /// exactly this descriptor and close the rest.
 const GATE_FD: libc::c_int = 900;
 
+/// The network ONE bridge will carry, from the subnets the file declares. Pure: the notes about a
+/// file that declares several, or one kern cannot build a bridge on, stay at the bring-up site that
+/// owns them. Split out so `config` can answer the `ipv4_address:` question with the same value the
+/// bring-up will use instead of a second derivation that can drift from it.
+fn bridge_cidr_for<'a>(declared: &[&'a str]) -> &'a str {
+    match declared.first() {
+        Some(cidr) if kern_isolation::pod_bridge_parts(cidr).is_some() => cidr,
+        _ => COMPOSE_BRIDGE_CIDR,
+    }
+}
+
 /// Give every service the memory ceiling the policy says it gets, and return the sentence that owes
 /// the reader, if any.
 ///
@@ -50,6 +61,87 @@ const GATE_FD: libc::c_int = 900;
 /// on the developer's machine - the split `apply_publish_policy` already makes for the same reason.
 /// It also keeps the decision out of `compose()`, which is long enough that a block buried in it is
 /// a block nobody finds.
+/// The sentences a stack is owed about a service that died on a port something else holds.
+///
+/// A FUNCTION AND NOT AN INLINE `eprintln`, so a test can ask what a given shape is told. The two
+/// wirings fail for MIRROR reasons and one sentence would be wrong for one of them: in a pod a PEER
+/// holds the port, and without a pod it is kern's OWN relay that took it before the workload could.
+fn dead_service_port_notes(
+    dead: &[String],
+    boxes: &[crate::compose::ComposeBox],
+    use_pod: bool,
+    address_plan: &[crate::nopod::Assigned],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    // Any LIVE member sees the pod's shared socket table; the dead one's namespace is already gone.
+    let live_pid1 = if use_pod {
+        boxes
+            .iter()
+            .filter(|b| !dead.iter().any(|d| d == b.service_name()))
+            .find_map(|b| crate::registry::find(&b.name).and_then(|i| i.live_pid1()))
+    } else {
+        None
+    };
+    for name in dead {
+        let Some(b) = boxes.iter().find(|b| b.service_name() == name) else {
+            continue;
+        };
+        for (port, udp) in crate::commands::declared_container_ports(b) {
+            if udp {
+                continue; // the check below reads the TCP table
+            }
+            let held = live_pid1.is_some_and(|pid1| {
+                !matches!(
+                    crate::relayhold::port_state(pid1, port),
+                    crate::relayhold::PortState::NotListening
+                )
+            });
+            if use_pod && held {
+                out.push(format!(
+                    "service '{name}' declares container port {port} and something else in this \
+                     stack is already listening on it. Every service here shares ONE network \
+                     namespace, so only one of them can bind a given port; under Docker each has its \
+                     own and both can. Change one of the two container ports, or run the stack with \
+                     `--no-pod` and read the note it prints about ports a peer also binds"
+                ));
+            }
+        }
+    }
+    // WITHOUT A POD THE DEAD SERVICE IS USUALLY THE ONE THAT DECLARED NOTHING, so its own ports say
+    // nothing about why it died. What kern DOES know is what kern itself bound in that box: a relay
+    // for every port a PEER declares. A workload that then binds the same port on `0.0.0.0` cannot
+    // start, and this is the one place that can say so, because nothing in the file mentions it.
+    if !use_pod {
+        for name in dead {
+            let Some(me) = boxes.iter().find(|b| b.service_name() == name) else {
+                continue;
+            };
+            let mut ports: Vec<u16> = crate::nopod::relay_plan(address_plan)
+                .into_iter()
+                .filter(|r| r.in_box == me.name)
+                .map(|r| r.port)
+                .collect();
+            ports.sort_unstable();
+            ports.dedup();
+            if ports.is_empty() {
+                continue;
+            }
+            let list = ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!(
+                "service '{name}' died, and kern had bound port(s) {list} inside its network \
+                 namespace to serve a peer's alias. A workload that binds one of those on 0.0.0.0 \
+                 cannot start: the address is already taken. Under Docker a peer is reached over a \
+                 network rather than a loopback alias, so those ports stay free"
+            ));
+        }
+    }
+    out
+}
+
 fn apply_memory_policy(
     boxes: &mut [crate::compose::ComposeBox],
     (ceiling, host_ram): (Option<u64>, Option<u64>),
@@ -116,6 +208,14 @@ fn missing_external_volumes(
 ///
 /// Panic-free: every failure is the caller's `Error`, and no descriptor leaks on the error path
 /// because `pipe2` either fills both slots or fills neither.
+/// The network a `--bridge` stack meets on.
+///
+/// A FIXED PRIVATE /24, which holds 253 services and is the range Docker's own default bridge pools
+/// draw from. It lives only inside the pod's network namespaces, so it cannot collide with anything
+/// on the host: two stacks with the same number are two different bridges in two different
+/// namespaces.
+const COMPOSE_BRIDGE_CIDR: &str = "10.89.0.0/24";
+
 /// Which services get a NAT of their own, decided from the file before anything starts.
 ///
 /// A FUNCTION AND NOT AN INLINE FILTER, because this decides where a workload can reach and that is
@@ -130,20 +230,32 @@ fn missing_external_volumes(
 ///    mean what Compose says it means, and it means it by the ABSENCE of a route rather than by a
 ///    filter that has to stay correct;
 ///  * one on the host network, which already has the host's own connectivity;
-///  * one with `restart:`, which is installed as a systemd unit and started later by the manager, so
-///    `up` never holds it at the gate and there is no instant at which a NAT could be attached. That
-///    limit is named at bring-up rather than left to be discovered.
+///  * one with `restart:` that SYSTEMD will start, which is a different thing from a service that
+///    merely writes `restart:`. A standalone persistent box is installed as a unit and started later
+///    by the manager, so `up` never holds it at the gate and there is no instant at which a NAT
+///    could be attached. A POD MEMBER is not: `persistent_supervision` puts every pod member on the
+///    in-process supervisor regardless of systemd, because it needs the holder's namespace - so it
+///    IS held at the gate and can be given one.
+///
+/// THAT DISTINCTION WAS MISSING AND IT COST A WHOLE STACK. The filter asked "does it write
+/// `restart:`" instead of "will systemd start it", so on a bridge - where every member has its own
+/// namespace and needs its own NAT - a stack that sets `restart: unless-stopped` on its services got
+/// no route out and no `/etc/resolv.conf` at all. MEASURED on Sentry self-hosted, which sets it on
+/// nearly every service: `ip route` inside a member showed the on-link `10.89.0.0/24` and nothing
+/// else, and pgbouncer died in libevent's `evdns_base_new` for want of a resolver.
 #[must_use]
 fn outbound_targets(
     boxes: &[crate::compose::ComposeBox],
-    use_pod: bool,
+    shared_namespace: bool,
+    members_supervised_in_process: bool,
 ) -> std::collections::HashSet<String> {
-    if use_pod {
+    if shared_namespace {
         return std::collections::HashSet::new();
     }
     boxes
         .iter()
-        .filter(|b| !b.net && !b.net_none && !b.restart_always && !b.only_internal_networks)
+        .filter(|b| !b.net && !b.net_none && !b.only_internal_networks)
+        .filter(|b| members_supervised_in_process || !b.restart_always)
         .map(|b| b.name.clone())
         .collect()
 }
@@ -255,6 +367,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let ComposeOpts {
         files,
         action,
+        bridge: want_bridge,
+        allow_privileged,
         force_pod,
         no_pod,
         allow_device_grants,
@@ -301,6 +415,41 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .map(|t| crate::compose::parse_dotenv(&t))
             .unwrap_or_default(),
     };
+    // COMPOSE'S OWN VARIABLES COME FROM THE `.env` TOO, which is what Docker means by loading that
+    // file "both for self-configuration and interpolation". kern read `COMPOSE_PROFILES` from the
+    // process environment alone, so a project that ships its profile selection in its `.env` - the
+    // ordinary way to ship one - had every profiled service silently skipped.
+    //
+    // MEASURED on Sentry self-hosted, whose `.env` opens with `COMPOSE_PROFILES=feature-complete`:
+    // 28 of its 55 services were reported "skipped - profile(s) [feature-complete] not active",
+    // advising the reader to set a variable their file already sets.
+    //
+    // THE SHELL STILL WINS, and `--profile` (merged into the same variable above) with it: this only
+    // fills in a value nobody supplied. One assignment, at the CLI boundary, exactly like the flag.
+    if std::env::var("COMPOSE_PROFILES")
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+    {
+        if let Some(v) = dotenv
+            .get("COMPOSE_PROFILES")
+            .filter(|v| !v.trim().is_empty())
+        {
+            std::env::set_var("COMPOSE_PROFILES", v);
+        }
+    }
+    // The project name follows the same rule, in Docker's order: `-p` wins, then the environment,
+    // then the `.env`, then the name kern derives from the file. Without it a stack that names
+    // itself in its `.env` came up under a different name than `docker compose` gives it, so its
+    // boxes and its pod answered to something else.
+    let project_from_env = std::env::var("COMPOSE_PROJECT_NAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            dotenv
+                .get("COMPOSE_PROJECT_NAME")
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_string)
+        });
     // THE MODE IS KNOWN HERE AND ONLY HERE, so it is handed to the parser rather than guessed there.
     // `networks:` means opposite things in the two wirings, and the parser's sentence about it is a
     // claim about what this run will do.
@@ -327,14 +476,34 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 .to_string(),
         ));
     }
-    let mut boxes =
-        crate::compose::parse_with_env(&text, &dotenv, stack_net).map_err(Error::Compose)?;
+    // THE FILE'S OWN DIRECTORY, not the working one: a cross-file `extends: {file: …}` resolves
+    // against the file that wrote it (the Specification says so), and `kern compose -f
+    // ../stack/compose.yaml` is run from somewhere else entirely. Each `-f` carries its own.
+    let dir_of = |f: &str| {
+        std::path::Path::new(f)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    };
+    let mut boxes = crate::compose::parse_with_env_at(
+        &text,
+        &dotenv,
+        stack_net,
+        Some(dir_of(&files[0]).as_path()),
+    )
+    .map_err(Error::Compose)?;
     // Merge every additional `-f`, left to right (see `merge_stacks` for the exact rules).
     for extra in &files[1..] {
         let t = std::fs::read_to_string(extra)
             .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?;
-        let over =
-            crate::compose::parse_override(&t, &dotenv, stack_net).map_err(Error::Compose)?;
+        let over = crate::compose::parse_override_at(
+            &t,
+            &dotenv,
+            stack_net,
+            Some(dir_of(extra).as_path()),
+        )
+        .map_err(Error::Compose)?;
         boxes = crate::compose::merge_stacks(boxes, over);
     }
     // Per-service validation, on the MERGED stack and UNCONDITIONALLY. Merged, because an override
@@ -348,7 +517,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // network so services reach each other by name.
     let pod = match project {
         Some(p) => p.to_string(),
-        None => compose_pod_name(file),
+        None => project_from_env
+            .clone()
+            .unwrap_or_else(|| compose_pod_name(file)),
     };
 
     // PROJECT-SCOPED BOX NAMES. Docker names a container `<project>-<service>`; kern used the bare
@@ -447,19 +618,81 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // exists to remove, so the collision now SELECTS the wiring that expresses it instead of ending
     // the run. `--pod` still gets the refusal, which is the right answer for someone who asked for
     // one namespace.
-    let collides = crate::commands::pod_would_collide(&boxes);
-    let auto_no_pod = !no_pod && !force_pod && (segregates || collides);
-    if auto_no_pod {
+    let collides = crate::commands::pod_would_collide(&boxes)
+        // THE SAME KNOWLEDGE THE WARNING HAS. A collision between two IMAGES' exposed ports is a
+        // collision: kern named it and then ran the stack in one namespace anyway, where the second
+        // service died of the EADDRINUSE the warning had just predicted. Measured on Sentry
+        // (postgres and pgbouncer, both 5432) and on Supabase (studio and rest, both 3000).
+        || !crate::commands::image_expose_collisions(&boxes).is_empty();
+    // THE THIRD REASON ONE NAMESPACE CANNOT EXPRESS THE FILE: an `extra_hosts` entry that shadows a
+    // service name. Under Docker each container has its own `/etc/hosts`, so a service mapping
+    // `postgres` to a fixed address shadows the name for ITSELF and the file is unambiguous; one
+    // shared namespace makes the two entries fight over a single file and kern refused the stack.
+    // MEASURED: the two `bitmagnet` files in the corpus do exactly this, and both are files Docker
+    // runs. They were being accepted only because a service with `network_mode:` used to fall onto
+    // the implicit `default` network and segregate the stack by accident, so the refusal was already
+    // reachable and was being dodged rather than answered.
+    let hosts_collide = crate::commands::pod_hosts_collision(&boxes).is_some();
+    // `--bridge` ANSWERS TWO OF THE THREE REASONS, so it must be consulted before the selection and
+    // not after it. A port collision and an `extra_hosts` collision are both "one namespace cannot
+    // hold this", and a bridge gives each service its own namespace: they are exactly what it is for.
+    // Segregation is the one it does NOT answer yet, because one bridge puts every service back on
+    // one network, so a file whose `networks:` separate still gets the relay wiring.
+    //
+    // Without this the flag was silently ignored on the files that need it most: MEASURED on a
+    // two-service file where both bind 8080, `--bridge` fell through to the relay wiring and the
+    // stack behaved as if the flag had not been typed.
+    // A COLLISION SELECTS THE BRIDGE, NOT THE RELAY WIRING, and that is a correctness change rather
+    // than a preference. Both reasons are "one namespace cannot hold this", and both wirings answer
+    // it by giving each service its own namespace - but the relay wiring then BINDS the colliding
+    // port inside each box to serve a peer's alias, and a workload that wants that port on
+    // `0.0.0.0` cannot start. MEASURED on Docker's own `nginx-golang`, where `proxy` and `backend`
+    // both bind 80: the pod cannot run it, the relay wiring kills `backend`, and the bridge answers
+    // HTTP 200. A bridge costs one `veth` per service, which is less than a relay per ordered pair
+    // per port.
+    //
+    // SEGREGATION STILL GOES TO RELAYS, because one bridge puts every service back on one network
+    // and would drop the separation the file asked for. A bridge per compose network is the next
+    // step and is not this one.
+    // WHERE THE WIRING CAME FROM, captured BEFORE the automatic decisions are folded into the two
+    // flags below, because after that the answer is unrecoverable. Reported next to the wiring
+    // itself: today `wiring: pod` can only mean "kern chose it", but once a compose file can pin the
+    // wiring explicitly the same token will also mean "the file asked for it", and the two count in
+    // opposite directions. One is the divergence from Docker that a default change would remove; the
+    // other is a file that diverges ON PURPOSE and must not be counted as anything to fix. A census
+    // taken after the change would otherwise not be comparable with one taken before it.
+    let wiring_from_flag = no_pod || want_bridge || force_pod;
+    let auto_bridge = !no_pod && !force_pod && !segregates && (collides || hosts_collide);
+    let want_bridge = want_bridge || auto_bridge;
+    let auto_no_pod = !no_pod && !force_pod && segregates;
+    if auto_no_pod || auto_bridge {
         let why = if segregates {
             "separates services with `networks:`"
-        } else {
+        } else if collides {
             "puts two services on the same internal port"
+        } else {
+            "gives a service's own name a fixed address with `extra_hosts:`"
+        };
+        // THE 30 ms IS MEASURED AND BROKEN DOWN, because the breakdown is what decides whether the
+        // bridge can ever become the default wiring. Alternated runs of this same binary, whole
+        // `up -d`, image warm: a pod is FLAT at 172 ms for 1, 4 or 8 services (it is paid once and
+        // the bring-up is concurrent per level), while a bridge is 198 ms for 1, 312 for 4 and 402
+        // for 8 - about 30 ms per service. Of those 30, roughly 12 are the per-member NAT and 17
+        // are the namespace, the veth and its addressing: the same 8 services on a bridge whose
+        // network is `internal: true`, which gets no NAT at all (measured: 9 pasta processes for 8
+        // members with outbound, 0 without, 1 for the whole pod), come up in 305 ms. So one NAT per
+        // bridge instead of one per member would buy back 12 ms a service and not the other 17.
+        let how = if auto_bridge {
+            "so kern gives each service its own network namespace on a bridge, which is Docker's \
+             arrangement. That costs about 30 ms a service at start"
+        } else {
+            "so kern gives each service its own network namespace (as `--no-pod` does). That costs \
+             a relay hop between peers"
         };
         eprintln!(
-            "kern: note: this file {why}, which ONE shared namespace cannot do, so kern gives each \
-             service its own network namespace (as `--no-pod` does). That costs a relay hop between \
-             peers; pass `--pod` to keep one shared namespace instead, where kern refuses the \
-             stack rather than running it with the separation dropped"
+            "kern: note: this file {why}, which ONE shared namespace cannot do, {how}; pass `--pod` \
+             to keep one shared namespace instead, where kern refuses the stack rather than running \
+             it with the separation dropped"
         );
     }
     let no_pod = no_pod || auto_no_pod;
@@ -487,6 +720,34 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 eprintln!("kern: warning: compose: {note}");
             }
         }
+    }
+    // `network_mode: service:X` ANSWERED HERE, for the reason the two sentences above are answered
+    // here: what to say about it is a claim about the wiring, and the wiring is settled one line
+    // above rather than while the file is being read. Outside the `segregates` block on purpose - a
+    // file can reach the per-service wiring through a port collision without any `networks:` key at
+    // all, and that stack is owed the sentence just as much.
+    //
+    // ONLY THE SHARES THAT RESOLVED. A target the file names but does not define was already
+    // reported by the parser as naming no service, and listing it here again would put it in a
+    // sentence that says what the wiring gives it - a claim about a service that does not exist.
+    let net_share_pairs: Vec<(String, String)> = boxes
+        .iter()
+        .filter_map(|b| b.net_share.as_ref().map(|t| (b.service.clone(), t.clone())))
+        .filter(|(_, target)| {
+            boxes
+                .iter()
+                .any(|o| o.service == *target || o.name == *target)
+        })
+        .collect();
+    if let Some(note) = crate::compose::net_share_note(
+        if no_pod {
+            crate::compose::StackNet::PerService
+        } else {
+            crate::compose::StackNet::Pod
+        },
+        &net_share_pairs,
+    ) {
+        eprintln!("kern: warning: compose: {note}");
     }
     // THE MEMORY CEILING EVERY SERVICE ACTUALLY GETS, RESOLVED ONCE FOR THE WHOLE STACK.
     //
@@ -517,8 +778,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     if let Some(note) = crate::compose::docker_socket_note(&boxes) {
         eprintln!("kern: warning: compose: {note}");
     }
+    // A BRIDGE POD IS NOT A SHARED NAMESPACE, and this sentence is only true of one. It says the
+    // stack's services share `127.0.0.1`; on a bridge each of them has its own, which is the whole
+    // reason the wiring exists. Keyed on `no_pod` alone it fired on every bridge stack and told the
+    // reader the opposite of what was happening: MEASURED on the corpus, 17 files gained that
+    // difference under `--bridge` instead of losing it.
     if let Some(note) = crate::compose::wiring_note(
-        if no_pod {
+        if no_pod || want_bridge {
             crate::compose::StackNet::PerService
         } else {
             crate::compose::StackNet::Pod
@@ -528,6 +794,145 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         eprintln!("kern: note: compose: {note}");
     }
     // Verbs that answer a question about the stack rather than changing it return here.
+    // The read-only verbs answer questions about a bring-up, so they are told what that bring-up
+    // would do, not which flag was typed: `--bridge` gives each service its own namespace exactly as
+    // `--no-pod` does, and a check keyed on the flag refused files the bridge runs.
+    // `privileged: true` IS DECIDED HERE, BEFORE ANY VERB, so `config` answers exactly what `up`
+    // would do rather than describing a stack the bring-up will refuse to build that way. The grant
+    // comes from the command line or the operator's own config, never from the file; without it the
+    // field is cleared, so nothing downstream can emit the flag by accident.
+    if let Some(note) = crate::commands::apply_privileged_grant(
+        &mut boxes,
+        allow_privileged || crate::commands::privileged_allowed_by_config(),
+    ) {
+        eprintln!("kern: note: compose: {note}");
+    }
+    // THE PRIVILEGED-PORT DECISION BELONGS BEFORE THE READ-ONLY VERBS, for `apply_privileged_grant`'s
+    // reason directly above: `config` must answer what `up` would do. The collision check runs first
+    // and on the ports THE FILE NAMES, so a file publishing 80 twice is refused saying 80 rather than
+    // the port the shift would have moved both onto.
+    check_port_collisions(&boxes)?;
+    // WHAT HAPPENS TO A PRIVILEGED PORT IS DECIDED HERE, FOR THE WHOLE STACK, BEFORE ANYTHING RUNS.
+    //
+    // It used to be decided inside each box, which cannot see its peers: MEASURED on a two-service
+    // file publishing `80` and `8080`, `web`'s 80 was moved onto the 8080 `other` had already bound
+    // and `web` died with `Address already in use`, naming neither the move nor the service it
+    // collided with. One plan over the union of the stack's ports cannot do that, and `config`
+    // reports the same plan `up` will carry out.
+    //
+    // `refuse` refuses HERE too, for the reason the shift moved: at the box it is one service
+    // failing after its peers have started, and the operator has to read a log to find out which.
+    {
+        let floor = crate::commands::unprivileged_port_start_at(
+            "/proc/sys/net/ipv4/ip_unprivileged_port_start",
+        );
+        match crate::commands::privileged_port_policy() {
+            Ok(true) => {
+                let moved = crate::commands::shift_privileged_ports_across(&mut boxes, floor);
+                if !moved.is_empty() {
+                    let list = moved
+                        .iter()
+                        .map(|(svc, from, to)| format!("{svc} {from} -> {to}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    // THE ONE CLASS THE SHIFT BREAKS, named when it is actually in play. An ACME
+                    // challenge is answered to a REMOTE certificate authority, which reaches the
+                    // published address on 80 (HTTP-01) or 443 (TLS-ALPN) and never reads this
+                    // note: Caddy's automatic HTTPS and Traefik's Let's Encrypt resolver both fail
+                    // issuance on a moved port, and the error surfaces from the CA rather than from
+                    // kern. Every other consequence of a shift is visible to whoever typed the
+                    // command; this one is not.
+                    let acme = if moved.iter().any(|(_, from, _)| *from == 80 || *from == 443) {
+                        " A certificate authority cannot be redirected: if a service issues its own \
+                         TLS certificates (Caddy's automatic HTTPS, Traefik with Let's Encrypt), \
+                         ACME needs the CA to reach 80 or 443 themselves and issuance will fail \
+                         here."
+                    } else {
+                        ""
+                    };
+                    eprintln!(
+                        "kern: note: this host binds from {floor} upward, so kern publishes these \
+                         on a port it can bind: {list}. The service still listens where its own \
+                         config says it does; set `[kern] privileged_port = \"refuse\"` to fail \
+                         instead of moving them.{acme}"
+                    );
+                }
+            }
+            Ok(false) => {
+                // ONE SENTENCE PER SERVICE, with all of its ports: caddy publishes 80 and 443, and
+                // "caddy publishes 80; caddy publishes 443" reads like two different problems.
+                let low: Vec<String> = boxes
+                    .iter()
+                    .filter_map(|b| {
+                        let ports: Vec<String> = crate::commands::declared_host_ports(b)
+                            .into_iter()
+                            .filter(|p| *p < floor)
+                            .map(|p| p.to_string())
+                            .collect();
+                        (!ports.is_empty())
+                            .then(|| format!("{} publishes {}", b.service_name(), ports.join(", ")))
+                    })
+                    .collect();
+                if !low.is_empty() {
+                    return Err(Error::Compose(format!(
+                        "{}, and this host only lets an unprivileged process bind from {floor} \
+                         upward. `[kern] privileged_port = \"refuse\"` is set, so kern does not \
+                         move it: publish a port at or above {floor}, or lower \
+                         `net.ipv4.ip_unprivileged_port_start` on the host.",
+                        low.join("; ")
+                    )));
+                }
+            }
+            Err(e) => eprintln!(
+                "kern: warning: {e}; a privileged port is moved rather than refused, which is the \
+                 default"
+            ),
+        }
+    }
+    // `ipv4_address:` IS A QUESTION `config` MUST ANSWER, and it was answered only at bring-up.
+    //
+    // MEASURED on the corpus: of the 29 files kern wires with relays, 19 pin a service with
+    // `ipv4_address:` and for 16 of them `kern compose <file> config` said nothing at all. That key
+    // is how those files address each other - ICS simulations, data diodes, router topologies - and
+    // under the relay wiring a box claims only its OWN address, so the service answers there and a
+    // peer connecting to it does not. A dry run that stays silent about it is the silence this
+    // project treats as the expensive defect, not a missing feature.
+    //
+    // THE SAME SENTENCE, from the same function the bring-up calls: only the wiring selection is
+    // repeated here, because at this point the file's wiring is known and the registry's is not.
+    // The bring-up keeps its own call, where `use_pod` also reflects a stack that is already
+    // running without a pod, and prints the subnet notes that belong to it.
+    if matches!(action, ComposeAction::Config | ComposeAction::Systemd) {
+        let pairs: Vec<(String, String)> = boxes
+            .iter()
+            .flat_map(|b| {
+                b.net_ipv4
+                    .iter()
+                    .map(move |ip| (b.service.clone(), ip.clone()))
+            })
+            .collect();
+        let note = if want_bridge {
+            let mut declared: Vec<&str> = boxes
+                .iter()
+                .filter_map(|b| b.net_subnet.as_deref())
+                .collect();
+            declared.sort_unstable();
+            declared.dedup();
+            crate::compose::net_ipv4_bridge_note(bridge_cidr_for(&declared), &pairs)
+        } else {
+            crate::compose::net_ipv4_note(
+                if no_pod {
+                    crate::compose::StackNet::PerService
+                } else {
+                    crate::compose::StackNet::Pod
+                },
+                &pairs,
+            )
+        };
+        if let Some(note) = note {
+            eprintln!("kern: warning: compose: {note}");
+        }
+    }
     if run_terminal_verb(
         action,
         &mut boxes,
@@ -538,7 +943,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             follow,
             all,
             services,
-            no_pod,
+            own_namespaces: no_pod || want_bridge,
+            wiring_from_flag,
+            // A bridge stack has NO relays: its members meet on a real network. See the field's doc.
+            relay_wiring: no_pod && !want_bridge,
             allow_device_grants,
         },
     )? {
@@ -697,7 +1105,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     check_port_collisions(&boxes)?;
     // Self-gated (see its doc comment): `config` and `systemd` reach the SAME rejection through the
     // same call, so the dry run can never disagree with the bring-up about what is startable.
-    check_pod_global_conflicts(&boxes, no_pod)?;
+    // THE ARGUMENT IS "DOES EACH SERVICE HAVE ITS OWN NAMESPACE", not "was --no-pod typed". All
+    // three checks below are about ONE SHARED NAMESPACE: two services cannot both bind a port, two
+    // cannot set the same `net.*` sysctl differently, and one `/etc/hosts` cannot hold two entries
+    // for a name. `--bridge` gives each service its own namespace, so none of the three applies, and
+    // asking the raw flag refused a stack the bridge runs perfectly well.
+    let own_namespaces = no_pod || want_bridge;
+    check_pod_global_conflicts(&boxes, own_namespaces)?;
     // Self-explaining (see its doc): a device grant a compose file asked for needs a command-line
     // acknowledgement, because the file cannot reach the command line.
     if let Some(msg) = device_grant_problem(&boxes, allow_device_grants) {
@@ -706,7 +1120,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // Softer sibling: two services whose IMAGES expose the same port without either DECLARING it (two
     // nginx on :80, two node apps on :3000). Best-effort and cache-only (never pulls just to warn),
     // a WARNING not an error because an image's EXPOSE is a hint, not a guaranteed bind.
-    warn_image_expose_collisions(&boxes, no_pod);
+    warn_image_expose_collisions(&boxes, own_namespaces);
     // THE ESCAPE HATCH SAYS WHAT IT COSTS. `--no-pod` is what the port-collision refusal sends people
     // to, and it is not free: MEASURED on the same two-service stack, `getent hosts db` answers
     // `127.0.0.1 db db` in a pod and NOTHING under `--no-pod`. Trading a loud refusal at bring-up for
@@ -714,7 +1128,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // this project treats as the expensive kind of defect. Once per bring-up, not once per service.
     // THE UNDECLARED-PORT NOTE BELONGS HERE, at config time: it follows from the file alone, and its
     // whole value is arriving before a service logs `Connection refused`.
-    if let Some(note) = no_pod_undeclared_ports_note(&boxes, no_pod) {
+    // THE RELAY WIRING, not "its own namespace": a relay is built per DECLARED port, and a bridge
+    // builds none - its members reach any port of a peer by name. Printed for a bridge stack this
+    // note tells an operator to declare a port that nothing needs.
+    if let Some(note) = no_pod_undeclared_ports_note(&boxes, no_pod && !want_bridge) {
         eprintln!("{note}");
     }
     // The peer-names note does NOT belong here: it promises the colliding pairs, and those are
@@ -813,11 +1230,117 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         );
     }
     let use_pod = use_pod;
+    // THE BRIDGE WIRING: A POD THAT HOLDS A BRIDGE INSTEAD OF A LOOPBACK.
+    //
+    // WHY IT EXISTS. A shared namespace is fast and is the one thing kern does that Docker does not:
+    // every service sees the same `127.0.0.1`, so two services cannot both bind a port and a port one
+    // binds on the loopback is reachable by every peer. The wiring kern had for a private loopback
+    // pays a TCP relay per ORDERED PAIR PER PORT, which is quadratic and takes a port the workload
+    // may want. On a bridge each service keeps its own namespace and its own loopback and meets its
+    // peers at their addresses: Docker's arrangement, one `veth` per service, no relay.
+    //
+    // MEASURED on Docker's own `nginx-golang`, which fails under BOTH older wirings because `proxy`
+    // and `backend` each bind port 80 and neither declares it: in a shared namespace the second
+    // cannot bind, and without a pod kern's own relay takes the port first.
+    //
+    // ONE NETWORK FOR NOW, and a file whose `networks:` SEGREGATE keeps the relay wiring, because one
+    // bridge puts every service back on one network and would drop the separation the file asked
+    // for. A bridge per compose network is the next step and is not this one.
+    // THE FILE'S OWN NETWORK IS USED WHEN IT DECLARES ONE, and that is what makes `ipv4_address:`
+    // honoured rather than approximated: the address the file pinned IS the address the service
+    // answers on, which is Docker's arrangement. Without it kern invents a network, the declared
+    // addresses fall outside it, and a peer that hard-codes one has no route.
+    //
+    // ONE BRIDGE CARRIES ONE NETWORK. A file that declares two subnets is told which one was taken,
+    // because silently picking decides where a service answers.
+    let declared: Vec<&str> = {
+        let mut v: Vec<&str> = boxes
+            .iter()
+            .filter_map(|b| b.net_subnet.as_deref())
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let bridge_cidr: Option<&str> = if want_bridge && use_pod {
+        match declared.first() {
+            // A subnet kern cannot build a bridge on (a /31, an IPv6 prefix, a typo) falls back to
+            // kern's own rather than failing the stack: the addresses then do not match, and the
+            // note below says so.
+            Some(cidr) if kern_isolation::pod_bridge_parts(cidr).is_some() => {
+                if declared.len() > 1 {
+                    eprintln!(
+                        "kern: note: compose: this file declares {} subnets and one bridge carries \
+                         one: kern uses {cidr}. A service pinned inside another one keeps its \
+                         address on its own loopback but is not reachable there by a peer",
+                        declared.len()
+                    );
+                }
+                Some(cidr)
+            }
+            Some(cidr) => {
+                eprintln!(
+                    "kern: note: compose: '{cidr}' is not a network kern can put a bridge on \
+                     (expected an IPv4 network with a prefix between 8 and 30), so the stack meets \
+                     on {COMPOSE_BRIDGE_CIDR} instead and an `ipv4_address:` from that subnet is \
+                     not the address a peer reaches"
+                );
+                Some(COMPOSE_BRIDGE_CIDR)
+            }
+            None => Some(COMPOSE_BRIDGE_CIDR),
+        }
+    } else {
+        None
+    };
+
+    // `ipv4_address:` ANSWERED HERE TOO, and for the same reason: the key is honoured in one wiring
+    // and only half honoured in the other, so the parser cannot say which without knowing the
+    // wiring. Pairs are (service, address); a service on two networks contributes two.
+    let net_ipv4_pairs: Vec<(String, String)> = boxes
+        .iter()
+        .flat_map(|b| {
+            b.net_ipv4
+                .iter()
+                .map(move |ip| (b.service.clone(), ip.clone()))
+        })
+        .collect();
+    // THREE WIRINGS, THREE DIFFERENT FACTS about the same key, so the bridge gets its own sentence
+    // rather than the pod's: there the address is an alias on a shared loopback and the PORT picks
+    // the service, here it is the service's own address on the file's own network.
+    let ipv4_note = match bridge_cidr {
+        Some(cidr) => crate::compose::net_ipv4_bridge_note(cidr, &net_ipv4_pairs),
+        None => crate::compose::net_ipv4_note(
+            if no_pod {
+                crate::compose::StackNet::PerService
+            } else {
+                crate::compose::StackNet::Pod
+            },
+            &net_ipv4_pairs,
+        ),
+    };
+    if let Some(note) = ipv4_note {
+        eprintln!("kern: warning: compose: {note}");
+    }
+    if want_bridge && !use_pod {
+        eprintln!(
+            "kern: note: --bridge needs a pod to hold the bridge, and this stack is wired without \
+             one; it keeps the per-service relay wiring"
+        );
+    }
     // THE PRE-EXEC GATE IS ACTIVE EXACTLY WHEN PEER RELAYS WILL BE BUILT, and that condition is
     // written once here rather than re-derived at the three points that consume it. A stack with no
     // relays has no network to finish building, so its boxes exec the moment they are set up and the
     // gate costs nothing but the variable being unset.
-    let gate_active = !use_pod && boxes.len() > 1;
+    // THE GATE IS ABOUT NAMESPACES BEING BUILT FROM OUTSIDE, not about the pod. Two things are done
+    // to a box while it is held: peer relays, and the NAT. A bridge stack has no relays but every
+    // member gets its own NAT, and pasta configures an interface INSIDE the box's namespace from
+    // outside it - a workload already running would see no route one instant and a route the next.
+    // MEASURED: with the gate keyed on `!use_pod`, a bridge member came up with an address on the
+    // bridge, reached its peers, and could not reach the internet at all.
+    //
+    // A ONE-SERVICE BRIDGE STACK IS HELD TOO. The `> 1` is a relay argument (one service has no
+    // peers), and it does not carry over: one service still needs its route.
+    let gate_active = bridge_cidr.is_some() || (!use_pod && boxes.len() > 1);
     // WHICH SERVICES GET EGRESS, decided once, from the file, before anything starts.
     //
     // In a pod this is empty: the pod itself carries one NAT for every member, and attaching a
@@ -832,7 +1355,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // A SERVICE WITH `restart:` IS EXCLUDED, for the same reason it is excluded from the gate: it is
     // installed as a systemd unit and started later by the manager, so `up` never holds it and there
     // is no safe instant to attach a NAT to. It is already named in the bring-up note.
-    let outbound_for = outbound_targets(&boxes, use_pod);
+    // ON A BRIDGE EVERY MEMBER NEEDS ITS OWN NAT: the pod's single NAT lives in the holder's
+    // namespace, which a bridge member is not in. The rule is about ONE SHARED NAMESPACE and not
+    // about the word "pod", which is why the argument is the shared-namespace question.
+    let outbound_for = outbound_targets(&boxes, use_pod && bridge_cidr.is_none(), use_pod);
     // Write ends, one per PREPARED box, held by `up` and keyed by box name so the release can be
     // ordered by dependency level.
     //
@@ -873,7 +1399,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // stack that silently loses the internet fails in a way nobody attributes to a compose key
         // that used to be ignored.
         let stack_is_internal = kern_compose::stack_is_internal_only(&boxes);
-        crate::pod::create_with_range(&pod, !stack_is_internal, pod_needs_range)?;
+        crate::pod::create_with_range(&pod, !stack_is_internal, pod_needs_range, bridge_cidr)?;
         // Feedback-first, and the counterpart of the rule just above: the pod's user namespace has ONE
         // map, the holder's, so a member that asked for the narrow one does not get it when a peer needs
         // the range. That is structural, not a bug to fix, but silently handing a service a WIDER map
@@ -956,7 +1482,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // has TCP ports keeps those, and the UDP ones are named per service.
         let mut udp_only: Vec<String> = Vec::new();
         let mut udp_ports: Vec<String> = Vec::new();
-        let services: Vec<(String, String, Vec<u16>, Vec<String>)> = boxes
+        let services: Vec<crate::nopod::ServiceInput> = boxes
             .iter()
             .map(|b| {
                 let declared = declared_container_ports(b);
@@ -982,7 +1508,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         udp_ports.push(format!("{} ({list}/udp)", b.service));
                     }
                 }
-                (b.service.clone(), b.name.clone(), tcp, b.networks.clone())
+                (
+                    b.service.clone(),
+                    b.name.clone(),
+                    tcp,
+                    b.networks.clone(),
+                    b.net_aliases.clone(),
+                )
             })
             .collect();
         for who in &udp_only {
@@ -1035,6 +1567,126 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         plan
     } else {
         Vec::new()
+    };
+
+    // THE BRIDGE ADDRESS PLAN, built separately from the relay one and not by rewriting it.
+    //
+    // The relay plan carries decisions that only make sense with relays: a UDP port gets none and is
+    // named, a wide mesh is refused by an arithmetic about processes. On a bridge there are no
+    // relays, UDP works like everything else, and the cost is one `veth` per service. Reusing that
+    // block would print warnings about a mechanism this wiring does not have.
+    //
+    // `assign_aliases` is still what validates the services (a name a hosts file can hold, no
+    // duplicates), and only the ADDRESS is replaced afterwards: the alias field is a full 32-bit
+    // address already, so a bridge address travels through `add_host_args` and `links` unchanged.
+    let address_plan: Vec<crate::nopod::Assigned> = match bridge_cidr {
+        None => address_plan,
+        Some(cidr) => {
+            let (gw, _, prefix) = kern_isolation::pod_bridge_parts(cidr).ok_or_else(|| {
+                Error::Compose(format!("'{cidr}' is not a network kern can bridge"))
+            })?;
+            let first = u32::from(gw) + 1;
+            let last = u32::from(gw) | (!0u32 >> prefix);
+            let services: Vec<crate::nopod::ServiceInput> = boxes
+                .iter()
+                .map(|b| {
+                    (
+                        b.service_name().to_string(),
+                        b.name.clone(),
+                        declared_container_ports(b)
+                            .iter()
+                            .map(|(p, _)| *p)
+                            .collect(),
+                        b.networks.clone(),
+                        b.net_aliases.clone(),
+                    )
+                })
+                .collect();
+            let mut plan = crate::nopod::assign_aliases(&services).map_err(Error::Compose)?;
+            // The last address of the network is its broadcast and is not usable, so the count is
+            // checked against what the network actually holds rather than against the plan's own cap.
+            let room = (last - first) as usize;
+            if plan.len() > room {
+                return Err(Error::Compose(format!(
+                    "a --bridge stack on {cidr} can address at most {room} services; this one has {}",
+                    plan.len()
+                )));
+            }
+            // THE ADDRESS THE FILE PINNED, WHERE IT PINNED ONE. `ipv4_address:` is the whole reason
+            // the bridge uses the file's own subnet: taking the declared address makes the key
+            // honoured exactly, and a peer that hard-codes it reaches the service.
+            //
+            // AN ADDRESS OUTSIDE THIS BRIDGE'S NETWORK IS NOT TAKEN, and the reader is told: it
+            // would not be routable here, and putting it on the interface anyway would produce a
+            // service that answers nowhere its peers can reach. A file with two subnets lands here.
+            //
+            // TWO SERVICES ON ONE ADDRESS is the file's own error and is refused: the second would
+            // silently take the first's traffic.
+            let mut taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut outside: Vec<String> = Vec::new();
+            for (i, a) in plan.iter_mut().enumerate() {
+                let pinned = boxes
+                    .iter()
+                    .find(|b| b.service_name() == a.service)
+                    .and_then(|b| b.net_ipv4.first())
+                    .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
+                    .map(u32::from)
+                    .filter(|v| {
+                        let inside = *v >= first && *v < last;
+                        if !inside {
+                            outside.push(format!(
+                                "{} at {}",
+                                a.service,
+                                std::net::Ipv4Addr::from(*v)
+                            ));
+                        }
+                        inside
+                    });
+                if let Some(v) = pinned {
+                    if !taken.insert(v) {
+                        return Err(Error::Compose(format!(
+                            "two services are pinned to {} with `ipv4_address:`; only one of them \
+                             can answer there",
+                            std::net::Ipv4Addr::from(v)
+                        )));
+                    }
+                    a.alias = v;
+                } else {
+                    a.alias = first + i as u32;
+                }
+            }
+            // A SECOND PASS FOR THE UNPINNED ONES, because the first pass may have handed an
+            // allocated address to a service that a LATER service pinned. Without it two services
+            // share an address and the file said nothing wrong.
+            let mut next = first;
+            for a in plan.iter_mut() {
+                if taken.contains(&a.alias) {
+                    continue;
+                }
+                while taken.contains(&next) && next < last {
+                    next += 1;
+                }
+                if next >= last {
+                    return Err(Error::Compose(format!(
+                        "a --bridge stack on {cidr} ran out of addresses for {} services",
+                        plan.len()
+                    )));
+                }
+                a.alias = next;
+                taken.insert(next);
+                next += 1;
+            }
+            if !outside.is_empty() {
+                let shown: Vec<&str> = outside.iter().map(String::as_str).collect();
+                eprintln!(
+                    "kern: warning: compose: `ipv4_address:` outside the bridge's network {cidr} is \
+                     not taken ({}): the address would not be routable here, so the service gets one \
+                     from {cidr} and its peers reach it there",
+                    crate::compose::name_list(&shown)
+                );
+            }
+            plan
+        }
     };
 
     // Count what will actually be LAUNCHED, not how many services the file has: with drift
@@ -1164,15 +1816,31 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // all, and a pod would hand it both peers and egress.
                             if use_pod && !b.net && !b.net_none {
                                 cmd.arg("--pod").arg(pod);
+                                // ON A BRIDGE the box joins the pod's USER namespace and keeps its
+                                // OWN network one, taking its address on the bridge. That is what
+                                // gives it a `127.0.0.1` no peer can reach.
+                                if let Some(cidr) = bridge_cidr {
+                                    if let (Some((_, _, prefix)), Some(a)) = (
+                                        kern_isolation::pod_bridge_parts(cidr),
+                                        address_plan.iter().find(|a| a.service == b.service),
+                                    ) {
+                                        cmd.arg("--pod-bridge").arg(format!(
+                                            "{}/{prefix}",
+                                            std::net::Ipv4Addr::from(a.alias)
+                                        ));
+                                    }
+                                }
                             }
                             // Without a pod, the same reachability is spelled out: every peer at its
                             // alias, this box at its own loopback. A box on the host net is skipped -
                             // it already resolves whatever the host resolves, and pointing its name
                             // at a loopback alias would break that.
                             if !b.net {
-                                if let Some(entries) =
-                                    crate::nopod::add_host_args(address_plan, &b.service)
-                                {
+                                if let Some(entries) = crate::nopod::add_host_args(
+                                    address_plan,
+                                    &b.service,
+                                    bridge_cidr.is_none(),
+                                ) {
                                     for e in entries {
                                         cmd.arg("--add-host").arg(e);
                                     }
@@ -1230,7 +1898,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // nothing regresses for it; what it does not get is the guarantee that
                             // its peers' relays exist first. That limit is the manager's, not the
                             // gate's, and it is stated in the note below rather than papered over.
-                            let gate_this = gate_active && !b.restart_always;
+                            //
+                            // A POD MEMBER IS NOT THAT CASE. `persistent_supervision` puts every pod
+                            // member on the in-process supervisor whatever systemd offers (it needs
+                            // the holder's namespace), so the descriptor does cross into the box and
+                            // the gate works exactly as it does for any other member. Asking the
+                            // question as "does it write `restart:`" instead of "will systemd start
+                            // it" is what left every `restart:` service on a bridge with no NAT.
+                            let gate_this = gate_active && (use_pod || !b.restart_always);
                             if gate_this {
                                 let (rd, wr) = gate_pipe()?;
                                 let raw = std::os::fd::AsRawFd::as_raw_fd(&rd);
@@ -1506,8 +2181,27 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             }
         }
     }
-    let dead = settle_and_collect_dead(&boxes, &pod, &up_token);
+    // ONLY WHAT THIS INVOCATION STARTED. `boxes` is the whole file; `levels` is what was launched,
+    // after `up web` narrowed it to web and its dependencies. See `settle_and_collect_dead`.
+    let started: std::collections::HashSet<&str> =
+        levels.iter().flatten().map(String::as_str).collect();
+    let mine: Vec<&crate::compose::ComposeBox> = boxes
+        .iter()
+        .filter(|b| started.contains(b.name.as_str()))
+        .collect();
+    let dead = settle_and_collect_dead(&mine, &pod, &up_token);
     if !dead.is_empty() {
+        // WHY IT DIED, WHEN KERN CAN SEE WHY. A service that binds a port another service in the same
+        // network namespace already holds fails with `Address already in use` in its OWN logs, and
+        // kern reported only that it "died within 150ms". The reader is then looking at nginx's
+        // error with no reason to suspect the stack's wiring, which is the whole cause.
+        //
+        // MEASURED on Docker's own `nginx-golang` sample: `proxy` (nginx) and `backend` (a Go binary
+        // built `FROM scratch`) BOTH bind port 80, and neither declares it anywhere kern can read.
+        // Under Docker each service has its own network namespace and both bind it.
+        for note in dead_service_port_notes(&dead, &boxes, use_pod, &address_plan) {
+            eprintln!("kern: note: {note}");
+        }
         return Err(Error::Compose(format!(
             "{} service(s) died within {BRING_UP_SETTLE_MS}ms of starting: {}\n  the rest of the \
              stack is still running; inspect with `kern compose {file} logs <service>`\n  (`up` \
@@ -1528,7 +2222,21 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // printed "install `passt`/`pasta`" on every false, so a pod whose pasta was installed and
         // refused to start told its owner to install it (#6), two lines under kern's own correct
         // "pasta IS installed but did not start". Five states, one bool, wrong branch.
-        let net = crate::pod::network_summary(&pod);
+        // A BRIDGE MEMBER IS NOT IN THE POD'S NAMESPACE, so the pod's outbound is not its outbound.
+        // `network_summary` answers about the namespace pasta runs in - the holder's - and printing
+        // it here told the operator "services reach each other by name + outbound to the internet
+        // (pasta)" about a stack whose members have NO default route at all. MEASURED inside a
+        // bridge member of a 56-service stack: `ip route` shows the on-link `10.89.0.0/24` and
+        // nothing else, and there is no `/etc/resolv.conf` - pgbouncer died in libevent's
+        // `evdns_base_new` because of it. Saying what is true is the least this can do until a
+        // member gets a route out.
+        let net = if want_bridge {
+            "each service has its own namespace and its own 127.0.0.1, meets its peers on the pod's \
+             bridge, and reaches the internet through its own NAT (pasta)"
+                .to_string()
+        } else {
+            crate::pod::network_summary(&pod)
+        };
         println!("  pod '{pod}': {net}. tear down with `kern compose {file} down`.");
     }
     Ok(())
@@ -1538,6 +2246,53 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::compose::ComposeBox;
+
+    /// THE READER IS TOLD WHY A SERVICE DIED, WHEN KERN CAN SEE WHY, and the two wirings need two
+    /// different sentences because they fail for mirror reasons.
+    ///
+    /// MEASURED on Docker's own `nginx-golang`: `proxy` (nginx) and `backend` (a Go binary built
+    /// `FROM scratch`) both bind port 80 and NEITHER declares it anywhere kern can read. In one
+    /// shared namespace the second one to try cannot bind. Without a pod the mirror happens: kern
+    /// binds port 80 inside `backend` to serve `proxy`'s alias, and `backend`'s own bind on
+    /// `0.0.0.0:80` then fails, so the service kern killed is the one that declared nothing. Its own
+    /// ports say nothing, and the relay plan says everything.
+    #[test]
+    fn a_service_that_died_on_a_port_is_told_which_port_and_which_wiring_took_it() {
+        let plan = crate::nopod::assign_aliases(&[
+            ("proxy".into(), "p-proxy".into(), vec![80], vec![], vec![]),
+            ("backend".into(), "p-backend".into(), vec![], vec![], vec![]),
+        ])
+        .expect("a two-service plan");
+        let mut boxes = crate::compose::parse(
+            "services:\n  proxy:\n    image: nginx\n    ports: [\"80:80\"]\n  \
+             backend:\n    image: alpine\n",
+        )
+        .expect("parses");
+        for b in &mut boxes {
+            b.service = b.name.clone();
+            b.name = format!("p-{}", b.service);
+        }
+
+        // WITHOUT A POD: the dead service declared nothing, and the sentence still names the port,
+        // because it comes from what kern bound rather than from the file.
+        let notes = dead_service_port_notes(&["backend".into()], &boxes, false, &plan);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("port(s) 80"), "{}", notes[0]);
+        assert!(notes[0].contains("peer's alias"), "{}", notes[0]);
+
+        // THE CONTROL: a service kern bound nothing in gets no sentence, so the one above is about
+        // the relay and not about dying.
+        assert!(dead_service_port_notes(&["proxy".into()], &boxes, false, &plan).is_empty());
+
+        // IN A POD the relay does not exist, so that sentence must not be said at all. The pod arm
+        // needs a live member's socket table, which a unit test has no way to stand up; what is
+        // asserted here is that the wrong sentence is never printed for the wrong wiring.
+        let pod_notes = dead_service_port_notes(&["backend".into()], &boxes, true, &plan);
+        assert!(
+            pod_notes.iter().all(|n| !n.contains("peer's alias")),
+            "{pod_notes:?}"
+        );
+    }
 
     /// `external: true` on a missing volume is a REFUSAL, and the existence test is injected so the
     /// decision can be asserted without creating volumes on the machine running the suite.
@@ -1905,9 +2660,10 @@ mod outbound_tests {
     /// assertion - a build that attached no NAT to anything would satisfy "the confined service has
     /// no route" while having removed the feature instead of enforcing the boundary.
     ///
-    /// The three exclusions fail differently and are asserted separately: a confined service must
-    /// not have egress, a host-network service already has the host's own, and a `restart:` service
-    /// CANNOT be given one because `up` never holds it at the gate.
+    /// The exclusions fail differently and are asserted separately: a confined service must not have
+    /// egress, a host-network service already has the host's own, and a `restart:` service can be
+    /// given one exactly when kern supervises it in process - which is every POD member, and no
+    /// standalone box, because that one is started later by systemd and never held at the gate.
     #[test]
     fn only_the_services_that_may_reach_out_are_given_a_nat() {
         let mut confined = svc("db");
@@ -1919,7 +2675,8 @@ mod outbound_tests {
         let plain = svc("web");
         let boxes = [plain, confined, on_host, managed];
 
-        let got = outbound_targets(&boxes, false);
+        // Standalone (no pod): `restart:` means systemd starts it, so it cannot be held.
+        let got = outbound_targets(&boxes, false, false);
         assert!(
             got.contains("web"),
             "an ordinary service reaches out: {got:?}"
@@ -1934,13 +2691,28 @@ mod outbound_tests {
         );
         assert!(
             !got.contains("cache"),
-            "a `restart:` service is started by systemd and cannot be held while a NAT is attached: \
-             {got:?}"
+            "a standalone `restart:` service is started by systemd and cannot be held while a NAT \
+             is attached: {got:?}"
         );
         assert_eq!(got.len(), 1, "and nobody else: {got:?}");
 
-        // In a pod the pod carries the one NAT: a second per box would put two default routes in one
-        // namespace.
-        assert!(outbound_targets(&boxes, true).is_empty());
+        // ON A BRIDGE the members are pod members, and `persistent_supervision` puts every pod
+        // member on the in-process supervisor whatever systemd offers - so a `restart:` service IS
+        // held at the gate and does get a NAT. Excluding it is what left Sentry self-hosted, which
+        // writes `restart: unless-stopped` on nearly every service, with no route out at all.
+        let bridge = outbound_targets(&boxes, false, true);
+        assert!(
+            bridge.contains("cache") && bridge.contains("web"),
+            "a bridge member with `restart:` is supervised in-process and gets its own NAT: \
+             {bridge:?}"
+        );
+        assert!(
+            !bridge.contains("db") && !bridge.contains("edge"),
+            "the other two exclusions are unchanged by the wiring: {bridge:?}"
+        );
+
+        // In ONE SHARED namespace the pod carries the single NAT: a second per box would put two
+        // default routes in one namespace.
+        assert!(outbound_targets(&boxes, true, true).is_empty());
     }
 }

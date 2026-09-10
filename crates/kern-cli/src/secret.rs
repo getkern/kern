@@ -39,6 +39,58 @@ pub const DEFAULT_SECRET_MODE: libc::mode_t = 0o400;
 
 /// `mode` is the file mode each secret is created with inside the box; see
 /// [`kern_isolation::Secret`] for why it is a parameter and not a constant.
+/// The environment variable a `--secret-env <name>` reads its content from.
+///
+/// PREFIXED AND DERIVED, so the box and the driver cannot disagree about where to look, and so a
+/// variable the workload happens to have cannot be mistaken for a secret's content.
+#[must_use]
+pub(crate) fn secret_env_var(name: &str) -> String {
+    format!("KERN_SECRET_{name}")
+}
+
+/// `--secret-env <name>`: a secret whose CONTENT comes from this process's environment.
+///
+/// THE ARGV-FREE FORM THE `--secret NAME=value` WARNING STEERS TO. `/proc/<pid>/cmdline` is
+/// world-readable on Linux and, when kern re-execs under a systemd scope, the argv is recorded in
+/// the journal where it outlives the box. A value in the environment is readable only by the same
+/// user, and never persists.
+///
+/// EXISTS FOR THE SPECIFICATION'S `secrets: {x: {environment: VAR}}`, which `kern compose` forwards
+/// by putting the value in the child's environment and the NAME on the command line.
+///
+/// A MISSING VARIABLE IS AN ERROR AND NOT AN EMPTY SECRET. A service that reads a password file
+/// would take the empty string as the password, which fails somewhere else entirely; refusing here
+/// names the variable the caller has to set.
+pub(crate) fn parse_secret_envs(
+    names: &[String],
+    mode: libc::mode_t,
+) -> Result<Vec<kern_isolation::Secret>, Error> {
+    let mut out: Vec<kern_isolation::Secret> = Vec::with_capacity(names.len());
+    for name in names {
+        if !valid_name(name) {
+            return Err(name_err(name));
+        }
+        let var = secret_env_var(name);
+        let Ok(value) = std::env::var(&var) else {
+            return Err(Error::Sandbox(format!(
+                "--secret-env {name}: {var} is not set in this process's environment, so there is \
+                 no content to deliver at /run/secrets/{name}"
+            )));
+        };
+        if out.iter().any(|s| s.name == *name) {
+            return Err(Error::Sandbox(format!(
+                "--secret-env: duplicate name '{name}'"
+            )));
+        }
+        out.push(kern_isolation::Secret {
+            name: name.clone(),
+            bytes: value.into_bytes(),
+            mode,
+        });
+    }
+    Ok(out)
+}
+
 pub fn parse_secrets(
     specs: &[String],
     mode: libc::mode_t,

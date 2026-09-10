@@ -5,6 +5,291 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## Unreleased
+
+**A health check runs AS the workload, not as the box's root.** Docker runs a `HEALTHCHECK` as the
+container's user, measured rather than assumed (on Docker 29.6.2 a container started
+`--user 1000:1000 -w /tmp` reports `uid=1000 gid=1000 groups=1000` and `/tmp` from inside its own
+probe); kern ran it as box root, which is a false-green generator rather than a cosmetic
+difference: the probe reads a file the service cannot, reports healthy, and
+`depends_on: service_healthy` then releases a dependent onto a service about to die of `EACCES`. Not
+hypothetical, it is this release's own Elastic stack, whose certificates are `root:root` mode 640.
+The probe now drops to the workload's uid, gid and supplementary groups (recorded with the box) and
+fails closed if it cannot: a probe that cannot reproduce the workload's identity must not report on
+it. `kern exec` deliberately stays box-root, because it is the operator's door into the box and the
+frozen CLI has no `--user` on it to get root back with.
+
+**A health check runs where the workload runs.** Docker evaluates a `HEALTHCHECK` in the image's
+`WORKDIR`, and a check is written by the same author, in the same file, as the command beside it:
+Elastic's official compose file checks `[ -f config/certs/es01/es01.crt ]`, relative to
+`/usr/share/elasticsearch`. kern passed no working directory to the probe, so every probe ran in `/`.
+Measured with a discriminator: a box with `-w /etc` and `--health-cmd 'test -f hostname'` reported
+`unhealthy` while the same box with the absolute path reported `healthy`, and a probe running `pwd`
+printed `/`. On the ELK stack it cost the whole bring-up - `setup` stayed unhealthy with the
+certificate present, and every service behind `condition: service_healthy` refused to start.
+
+**`HOME` follows the user the box runs as.** kern exported `HOME=/root` for every box whatever user
+it ran as, and that is not a cosmetic default: a Python console script installed with
+`pip install --user` lives under `$HOME/.local`, so an image that puts its tools there loses them.
+Measured on `apache/airflow:3.3.1`, whose passwd says `airflow:x:50000:0:…:/home/airflow`: `airflow
+version` printed `ModuleNotFoundError: No module named 'airflow'` under kern and `3.3.1` under
+podman. Four of Airflow's own services report unhealthy on that alone, because their checks all
+invoke `airflow`. It is now taken from the image's own passwd entry for the running uid (`/` when
+the image has no entry, which is runc's default user), as a default under both the image's `Env` and
+an explicit `-e HOME=`.
+
+**A workload gets the groups its image puts it in.** kern cleared the supplementary group set before
+dropping to the workload's user. Measured against podman and confirmed on Docker 29.6.2, three
+cases: an image whose `User` names
+no group gets the memberships from its own `/etc/group`, one that writes `1000:0` outright gets
+nothing added, and an explicit `--user 1000:1000` gets nothing either - which is runc's rule, not a
+choice made here. It cost Elastic's Kibana: the certificates its `setup` service writes are
+`root:root` mode 640, `root:x:0:kibana` puts Kibana in group 0, and with the set cleared it died on
+`EACCES ... config/certs/ca/ca.crt` while the three Elasticsearch nodes, which have gid 0 outright,
+were green.
+
+**`localhost` no longer resolves to an address nothing is listening on.** kern's `/etc/hosts` put
+`localhost` on the `::1` line as well, which is what Docker writes. With both records present musl
+prefers `::1` and busybox's `wget` uses the first address only, so the name cannot reach an
+IPv4-only listener. Measured on three runtimes with one image, an IPv4-only listener and the check
+`wget -O- http://localhost:5000/` that compose files are full of: 0 under podman, whose hosts file
+does not claim the name for `::1`; failure under kern; and failure under **Docker 29.6.2 as well**,
+whose container has IPv6 enabled and `::1` on `lo`. kern now follows podman here, which is a
+deliberate deviation from Docker in the direction that makes the check work. The IPv6 loopback keeps
+`ip6-localhost` and `ip6-loopback`. See `docs/RUNTIME-PARITY.md`.
+
+**A command run inside a box knows the box's name.** `kern exec` and every health probe ran with
+`HOSTNAME=` empty while `hostname` printed the name correctly one command later, because the exec
+path passes no name to the environment builder and the empty string was taken literally. Airflow's
+scheduler check passes `"$${HOSTNAME}"` to `airflow jobs check`, which was then asking about a host
+called "". It is now read back from the UTS namespace the process is already in, so it cannot
+disagree with whatever set it.
+
+**A privileged port is moved once for the whole stack, before anything starts.** The shift was
+decided inside each box, which cannot see its peers. Measured on a two-service file publishing `80`
+and `8080`: `web`'s 80 was moved onto the 8080 `other` had already bound, and `web` died with
+`Address already in use` naming neither the move nor the service it collided with - and which service
+died depended on which won the race. One plan over the union of the stack's ports cannot do that, and
+`kern compose <file> config` now reports the same plan `up` will carry out. With
+`privileged_port = "refuse"` the refusal also happens there, naming the service and its ports, rather
+than one service failing after its peers have started.
+
+**A refused `-v` says what is under the source.** A volume bind that the kernel rejects reported
+`Invalid argument` and nothing else, on a path that exists and is readable. When the source has
+filesystems mounted under it, the failure now names them and the reason: a recursive bind would put
+those filesystems inside the box, and they belong to whoever mounted them rather than to this
+workload. The explanation is selected by the evidence read back at failure time rather than by the
+errno, so a kernel that reports something else does not turn the message into a false claim. The
+reason given is deliberately not the `:ro` one this first shipped with (a recursive bind leaving
+cloned submounts writable under a read-only volume): an outside reviewer pointed out that it expires
+the moment anyone reaches for `mount_setattr(MOUNT_ATTR_RDONLY, AT_RECURSIVE)`, which has covered
+submounts since 5.12, and an argument with an expiry date is the wrong one to put in an error
+message.
+
+**A moved privileged port says what it costs an ACME client.** Every other consequence of the shift
+is visible to whoever typed the command; this one is not, because the party that cannot be
+redirected is a remote certificate authority. When the moved set contains 80 or 443, the note now
+says that a service issuing its own TLS certificates (Caddy's automatic HTTPS, Traefik with Let's
+Encrypt) cannot complete an ACME challenge on a moved port. `docs/RUNTIME-PARITY.md` records the rest of the
+comparison, including that podman refuses such a port outright where kern moves it.
+
+**`kern compose <file> config` prints the wiring as a field.** The wiring is announced on stderr in
+a sentence that names the alternatives, which is right for a reader and wrong for anything that
+counts: the pod advisory recommends the bridge in those words, so a census keyed on `"on a bridge"`
+counted every POD stack as a bridge and reported 60% bridge on a corpus that is 85% pod. It was
+caught only by a count that refused to reconcile. Improving an advisory must not be able to move a
+number, so `config` now also prints `wiring: pod|bridge|relay`, one token that says nothing else,
+derived from the same two flags the bring-up carries. Prose for the reader, a field for whoever
+counts, and never one read as the other. A second line, `wiring-source: auto|flag`, says whether kern
+chose it or someone typed it: once a compose key can pin the wiring, the same token will also mean
+"the file asked for this", and a file that keeps the pod on purpose is not the divergence a default
+change would remove. The value `file` is in the vocabulary and not yet reachable, so adding it later
+cannot change what the other two mean.
+
+**`kern compose <file> config` answers the `ipv4_address:` question it used to leave to the bring-up.**
+The key is how a whole class of files addresses its own services, and under the per-service wiring a
+box claims only its OWN address: the service answers there and a peer connecting to that literal
+address has no route to it. kern said so at `up` and nothing at `config`. Measured on the 240-file
+STRESS corpus, which is where that shape lives (it was collected with searches aimed at the hard
+side, so it is the right set for a regression gate and the wrong one for a rate): of the 30 files
+kern wires with relays there, 20 pin a service with `ipv4_address:` and 16 of those got no word from
+`config`. Now 3, and those three write `ipv4_address: ${VAR}` with the variable unset, so there is no
+address to name and the unset-variable warning is what fires. On the neutral 259-file corpus the
+same fix moves nothing, because only 7 files carry the key and the one that reaches this wiring
+already had another difference. The sentence comes from
+the same function the bring-up calls; only the wiring selection is repeated, because at that point
+the file's wiring is known and a running stack's is not.
+
+**A bridge stack is not told about relays it does not have.** The `--no-pod` notes describe peers
+reached through per-service loopback aliases and two services sharing an internal port not being
+mutually reachable; a bridge has neither property. They were keyed on "each service has its own
+namespace", which a bridge also gives, so on Elastic's file kern announced the bridge and then, in
+the next line, contradicted the one thing the bridge had just fixed.
+
+**A `ulimit` the kernel will not raise costs headroom, not the whole service.** `memlock: -1` and
+`nofile: 65536` are Elasticsearch's standard block and appear in thousands of compose files; a
+rootless box cannot raise a HARD bound (that needs `CAP_SYS_RESOURCE` in the initial user namespace),
+so the kernel answers EPERM and kern refused to start at all. Measured with OpenCTI's Elasticsearch
+block verbatim: the box never ran. A refused RAISE is now clamped to the bound the box inherited and
+the difference is named; a refused LOWERING is still a refusal, because a cap that does not bind is
+the failure this check exists to prevent.
+
+**A `networks.<net>.aliases` name resolves in every wiring, not only in the pod.** A service that
+writes `aliases: [db]` is asking to be reachable as `db`, and a DSN written against that name is why
+the key exists. The pod's shared hosts file carried the aliases; on a bridge and under `--no-pod`,
+where each box gets `--add-host` entries instead, they were missing - so the same file resolved `db`
+in one wiring and answered nothing in the other. Measured on a real dev stack whose postgres declares
+`aliases: [db]`: `getent hosts db` answered in the pod and answered NOTHING on the bridge, and now
+answers the service's bridge address from a peer and `127.0.0.1` from the service itself. An alias
+that cannot be written into a hosts file is refused by name, like a service name.
+
+**A service on the bridge reaches the internet, and has a resolver.** Every bridge member has its
+own network namespace, so the pod's single NAT - which lives in the holder's namespace - is not
+theirs; each needs its own. kern knew that and then excluded any service writing `restart:`, on the
+reasoning that systemd starts those and cannot be held at the pre-exec gate. That reasoning is about
+a STANDALONE box: a pod member is put on the in-process supervisor whatever systemd offers, because
+it needs the holder's namespace, so it is held like any other. Measured on Sentry self-hosted, which
+sets `restart: unless-stopped` on nearly every service: a member's routing table held the on-link
+`10.89.0.0/24` and nothing else, there was no `/etc/resolv.conf` at all, and pgbouncer died inside
+libevent's `evdns_base_new`. A member now has both routes - peers on the bridge, the internet through
+its own NAT - and the resolver that comes with it.
+
+**Compose reads its own variables from the project `.env`, not from the shell alone.**
+`COMPOSE_PROFILES` and `COMPOSE_PROJECT_NAME` set there are what Docker calls loading that file
+"for self-configuration": kern ignored both, so a project that ships its profile selection in its
+`.env` had every profiled service skipped, with a message telling the reader to set a variable their
+file already sets. Measured on Sentry self-hosted, whose `.env` opens with
+`COMPOSE_PROFILES=feature-complete`: 28 of its 55 services were dropped. The shell still wins, and
+`--profile` with it.
+
+**A pass-through name resolves from the `.env` too, in `environment:` and in `build.args`.** Sentry
+writes `SENTRY_IMAGE` under `build.args` and `SENTRY_EVENT_RETENTION_DAYS:` under `environment:`,
+with the reason in a comment above the keys ("Leaving the value empty to just pass whatever is set on
+the host system (or in the .env file)"). kern looked only at the shell, so the image was built `FROM`
+nothing and Sentry's config died on `int("")`. A key with NO value is a pass-through (absent when
+nothing is bound, as Docker does); a value that RESOLVED to nothing stays the empty string. The two
+spellings are indistinguishable after interpolation, so the interpolator now marks the second.
+
+**The wiring decision uses the port collisions kern already prints.** `up` warned "the images of
+'postgres' and 'pgbouncer' both EXPOSE 5432/tcp; if both bind it the second fails at runtime with
+EADDRINUSE" and then ran the stack in one shared namespace, where pgbouncer died of exactly that. An
+image-exposed collision now selects the bridge, the same way a declared one does.
+
+**`up <service>` no longer reports the services it did not start as dead.** The liveness check ran
+over the whole file, so a selective bring-up that did exactly what was asked printed "N service(s)
+died within 150ms of starting" and exited non-zero.
+
+**A box name may be 200 characters, not 64.** `<project>-<service>` exceeds 64 on any real compose
+project - `sentry-self-hosted-snuba-subscription-consumer-generic-metrics-counters` is 71 - and the
+service simply refused to start. The new bound is derived from the longest name kern builds
+(`kern-box-<name>-<pid>.scope`), which stays inside `NAME_MAX` and systemd's limit.
+
+**A box that dies against its pids cap says so.** The kernel refuses the fork or the thread with
+`EAGAIN` and the workload reports whatever it makes of that: ClickHouse aborts with "Couldn't get 512
+threads from global thread pool", a sentence about ClickHouse's own settings, produced by kern's
+default `--pids-limit` and mentioned nowhere. The refusal count comes from `pids.events`, so the
+message claims only what the kernel counted, and it is appended to the box's log FILE rather than
+written to stderr: by the time it runs the workload is gone and the reader of that stream can be
+gone with it, and `SIGPIPE` is `SIG_DFL` in this binary - the message would then kill the process
+whose exit it was explaining, replacing the workload's own code with 141. Measured before it was
+believed: reproducibly at 28-way test parallelism, never below 8.
+
+**A stack wired on the bridge no longer claims outbound it does not have.** The summary line printed
+"services reach each other by name + outbound to the internet (pasta)" for a stack whose members have
+no default route at all: a bridge member is not in the pod's namespace, so pasta's outbound is not
+its outbound. Measured inside one: `ip route` shows the on-link `10.89.0.0/24` and nothing else, and
+there is no `/etc/resolv.conf` - pgbouncer died in libevent's `evdns_base_new` because of it. The
+line now says that, until a member gets a route out.
+
+**A block sequence written at its key's own indentation is no longer dropped in silence.** YAML
+lets the `-` sit at the key's column, which is what `docker compose config` prints and how a large
+share of hand-written files look:
+
+```yaml
+    ports:
+    - "8080:80"
+```
+
+kern's dedent rule popped the key's level when it saw an item at the same column, so the items
+landed nowhere: `ports`, `volumes`, `environment`, `depends_on`, `command` and `healthcheck.test`
+parsed as EMPTY, with no warning and exit 0. Measured on a 240-file corpus: 16 files write at least
+one sequence this way (`volumes` 20 times, `cap_add` 14, `security_opt` 12, `devices` 11, `ports`
+10), and every one of them was being counted compatible, because a rate that reads kern's own
+silence cannot see what kern never noticed.
+
+**`.env` values are interpolated, and `env_file:` accepts its long form.** Docker's rule for both
+files is that unquoted and double-quoted values have interpolation applied; kern took them verbatim,
+so a `.env` that builds one variable out of others - `ZBX_IMAGE_TAG=${OS}-${ZBX_VERSION}-latest`,
+which is Zabbix's own - produced image tags no registry can answer for. Single-quoted values stay
+literal, and a value that arrives from `.env` is still not interpolated a second time. `env_file:
+[{path: …, required: false}]` now reads the path and skips a file that is not there, instead of
+passing the whole `{…}` blob to the box as a filename.
+
+**`--env-file` reads the same format `.env` does.** It was a second, cruder parser: split on the
+first `=` and keep the rest, so quotes stayed, `export ` was not understood, `K: V` was not either,
+and an inline ` # comment` arrived inside the value. Zabbix's `.env_srv` ends a line with
+` # Available since 6.0.0`; `zabbix_server` refused to start on `invalid "NodeAddress" configuration
+parameter`. One reader now, the compose crate's.
+
+**`extends: {file: …}` - a service inheriting from another compose file - works.** It was a
+refusal ("inline the base service"), which is the one thing a project cannot do when the base file
+is the thing it maintains: Zabbix's stack is 17 services, every one of them an `extends` into a
+sibling file. Merging follows the Specification rather than "the child wins on the whole key":
+mappings merge, sequences append, `command`/`entrypoint`/`healthcheck.test` are replaced, and
+`volumes`/`secrets`/`configs` are unique by target. That distinction is not academic - a service
+that re-declares `networks:` only to add an alias was losing every other network the base put it on.
+`depends_on`, `links`, `external_links` and `volumes_from` are not inherited, as the Specification
+requires.
+
+**A workload running as its own uid can reopen `/dev/stdout`.** A detached box's stdout is a pipe,
+a pipe is born `0600` owned by the caller, and kern maps the caller to root inside the box - so an
+image that runs as a non-root user could write to fd 1 but not reopen it. That is how essentially
+every containerised web server logs: Zabbix's nginx frontend died at start with `open("/dev/stdout")
+failed (13: Permission denied)` on every restart. The pipe is now openable by the box's own uids;
+the log file on disk keeps its owner-only mode.
+
+**A healthcheck written in Docker's exec form is run WITHOUT a shell, so an image that has none can
+report healthy.** `test: ["CMD", "postgrest", "--ready"]` was joined into a string and handed to
+`/bin/sh -c`; an image with no `/bin/sh` - PostgREST, distroless, `FROM scratch` - failed every
+probe with `execvp: No such file or directory` and stayed `unhealthy` for its whole life, which is
+precisely why such an image writes the exec form. A `depends_on: {condition: service_healthy}` on
+it never resolved. The form now travels end to end: compose keeps it, `kern box --health-cmd-argv
+<arg>` (repeatable) carries one argv element per flag, and the probe execs it directly. The shell
+form (`CMD-SHELL`, a bare string, `--health-cmd`) is unchanged, and the two cannot be mixed on one
+command line. Joining also lost argument boundaries: `["CMD", "sh", "-c", "echo a,b"]` used to run
+`echo` with no operand.
+
+**An image's own `HEALTHCHECK`, `Cmd`, `Entrypoint` and `Env` no longer lose `<`, `>` and `&`.** The
+OCI config reader decoded `\uXXXX` in scalars and not in arrays, so Go's default HTML escaping -
+which Docker writes into every image config - turned `>` into the letters `u003e`. Measured on
+`supabase/postgres-meta`, whose image healthcheck is a JavaScript arrow function: kern ran a syntax
+error every five seconds and reported the service unhealthy while its own `/health` answered 200.
+An image already in the cache keeps the corrupted config until it is pulled again (`--pull always`).
+
+**A secret can come from an environment variable, which the Compose Specification allows and kern
+skipped.** `secrets: {db_pw: {environment: DB_PW}}` now lands at `/run/secrets/db_pw`; before, the
+secret was skipped and the service read a file that was not there. `kern box --secret-env NAME`
+takes the content from `KERN_SECRET_NAME` in its own environment, so nothing reaches `argv`, where
+`/proc/<pid>/cmdline` would make it readable by every user on the machine.
+
+**`--tmpfs uid=`/`gid=` are applied.** They were recognised and dropped. A user namespace accepts
+only an id it maps, so a mount the kernel refuses is retried without the two and says which
+happened: asking for an ownership kern cannot give costs the ownership, never the directory.
+
+**A pod can be a BRIDGE, so each service keeps its own `127.0.0.1`.** `kern pod create --bridge
+10.89.0.0/24` holds a bridge instead of a shared network namespace, and `kern box --pod-bridge
+10.89.0.2/24` joins it with that address. A member then has the arrangement a Docker container has:
+its own loopback, which no peer can reach, and its peers at their addresses. The shared namespace
+stays the default and stays faster (measured: 3 ms a box against 23 to 36, which is what creating a
+`veth` costs); the bridge is linear in the number of services, where kern's other private-loopback
+wiring costs a TCP relay per ordered pair per port. `kern compose` does not choose it yet.
+
+**`kern box --ip <addr>`, and with it `ipv4_address:` in a compose file.** A service pinned to an
+address under `networks:` had that address exist nowhere: a peer that hard-coded it got no route,
+and kern could only say so. The address is now claimed as a `/32` on the box's loopback, so the
+literal address answers inside the stack. It claims one address, not a subnet, and adds no route
+out. Additive: no existing flag or output changed.
+
 ## v0.9.32 - 2026-09-09
 
 **A published port now binds `0.0.0.0`, not `127.0.0.1`. Read this one.** `-p 8080:80` and a compose

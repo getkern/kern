@@ -1318,12 +1318,32 @@ mod tests {
             Err((p, _)) => assert_eq!(p, taken, "reported the conflicting port"),
             Ok(()) => panic!("preflight passed a port that is actively listening"),
         }
-        // A free port passes. (Grab one from the OS, release it, then check.)
-        let free = {
-            let t = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            t.local_addr().unwrap().port()
-        };
-        assert!(preflight(&[pm(free)]).is_ok(), "a free port should pass");
+        // A FREE PORT PASSES, AND THE FIRST VERSION OF THIS ASSERTION WAS A RACE. It took an
+        // ephemeral port from the OS, released it, and asserted the port was free - between those
+        // two instants any other thread in this binary, or any process on the machine, may take it.
+        // Observed as a one-in-many failure in a full `cargo test` run and green three times out of
+        // three when run alone, which is the signature.
+        //
+        // RETRIED RATHER THAN WEAKENED: the claim is still "preflight passes a port nobody holds",
+        // and a port that lost the race is simply not that port. A handful of attempts makes a
+        // spurious failure vanishingly unlikely without ever passing for the wrong reason, because
+        // every attempt asserts the same thing.
+        let mut passed = false;
+        for _ in 0..16 {
+            let Ok(t) = TcpListener::bind(("127.0.0.1", 0)) else {
+                continue;
+            };
+            let Ok(addr) = t.local_addr() else {
+                continue;
+            };
+            let free = addr.port();
+            drop(t);
+            if preflight(&[pm(free)]).is_ok() {
+                passed = true;
+                break;
+            }
+        }
+        assert!(passed, "a free port should pass");
     }
 
     /// EVERY SET IS EMPTY AFTER A NARROWED DROP, INCLUDING THE BOUNDING SET.

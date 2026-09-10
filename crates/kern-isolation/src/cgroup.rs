@@ -598,6 +598,71 @@ pub fn oom_kill_count_at(dir: &Path) -> Option<u64> {
     )
 }
 
+/// `max` from `pids.events` in an already-resolved directory: how many times the kernel REFUSED a
+/// fork or a thread because the pids cap was reached. `None` if the file is not there.
+///
+/// The counterpart of [`oom_kill_count_at`], and it exists for the same reason: the cap kern applies
+/// is invisible in the workload's own error. A process that cannot create a thread reports whatever
+/// it makes of `EAGAIN`, and what it makes of it is rarely the truth. MEASURED on Sentry's
+/// ClickHouse, which aborts with *"Couldn't get 512 threads from global thread pool: Not enough
+/// threads. Please make sure max_thread_pool_size is considerably bigger than
+/// background_schedule_pool_size"* - a sentence about ClickHouse's own settings, produced by kern's
+/// default `--pids-limit`, which the reader has no reason to suspect and no way to see.
+pub fn pids_denied_count_at(dir: &Path) -> Option<u64> {
+    parse_flat_key(
+        fs::read_to_string(dir.join("pids.events")).ok()?.as_bytes(),
+        b"max",
+    )
+}
+
+/// Open `pids.events` in `dir` and KEEP the descriptor, so the count can be re-read AFTER the box is
+/// gone.
+///
+/// The descriptor exists for the reason [`open_oom_events_fd`] documents and that this repeated on
+/// its own: a box's cgroup leaf is torn down with the box, and the refusal counter lives on THAT
+/// leaf, because that is where the limit was. MEASURED - reading the path after the workload exited
+/// found no file at all, so the message never printed for a box that had just been refused 40 forks.
+/// Unlike the OOM counter there is no ancestor to fall back on: `pids.events` counts the events of
+/// the cgroup whose own limit was hit.
+///
+/// The caller owns the descriptor. Pair it with [`pids_denied_from_fd`].
+#[must_use]
+pub fn open_pids_events_fd(dir: &Path) -> Option<libc::c_int> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = dir.join("pids.events");
+    let bytes = p.as_os_str().as_bytes();
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    if bytes.is_empty() || bytes.len() >= buf.len() || bytes.contains(&0) {
+        return None;
+    }
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let fd = unsafe {
+        libc::open(
+            buf.as_ptr().cast::<libc::c_char>(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    (fd >= 0).then_some(fd)
+}
+
+/// `max` re-read from a descriptor opened by [`open_pids_events_fd`], allocating nothing. The read
+/// rewinds first, so the same descriptor answers repeatedly.
+pub fn pids_denied_from_fd(fd: libc::c_int) -> Option<u64> {
+    let mut buf = [0u8; 512];
+    parse_flat_key(read_fd_raw(fd, &mut buf)?, b"max")
+}
+
+/// The pids cap in force in `dir` (`pids.max`), or `None` when there is none or the file is gone.
+/// `max` (the kernel's word for "no limit") reads as `None`, so a caller cannot report a limit that
+/// does not exist.
+pub fn pids_max_at(dir: &Path) -> Option<u64> {
+    fs::read_to_string(dir.join("pids.max"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Open `memory.events` in `dir` and KEEP the descriptor, for a reader that must survive the box.
 ///
 /// The descriptor exists because of a race this codebase has already documented once and that I

@@ -30,7 +30,7 @@ pub use yaml::normalise_devices;
 /// tell the parser which one it is before parsing, so the parser is handed [`StackNet::Undecided`],
 /// says nothing about `networks:`/`internal:`, and the driver says both here. Pure functions of the
 /// decision, so what gets said can be asserted without capturing stderr.
-pub use yaml::{internal_note, networks_note};
+pub use yaml::{internal_note, net_ipv4_bridge_note, net_ipv4_note, net_share_note, networks_note};
 
 /// A resolved compose `build:` directive. `context` is a path RELATIVE to the compose file's dir (the
 /// caller confines it beneath that dir before use - traversal guard). `dockerfile` is relative to the
@@ -151,7 +151,18 @@ pub struct ComposeBox {
     pub user: Option<String>,
     pub ssh: Option<String>,
     pub ssh_key: Option<String>,
+    /// `healthcheck.test` in Docker's SHELL form (`CMD-SHELL`, or a bare string): run through
+    /// `/bin/sh -c` inside the box.
     pub health_cmd: Option<String>,
+    /// `healthcheck.test` in Docker's EXEC form (`["CMD", "prog", "arg"]`): argv, exec'd with no
+    /// shell. Mutually exclusive with `health_cmd` - it is the same check, in the other form.
+    ///
+    /// THE FORM IS NOT DECORATION. It used to be joined into `health_cmd` and run through a shell,
+    /// which an image that HAS no shell fails on every probe: `execvp: No such file or directory`,
+    /// `HEALTH = unhealthy`, and a `depends_on: {condition: service_healthy}` on it never
+    /// satisfied. Measured on Supabase self-hosted, where `supabase-rest` (PostgREST, no `/bin/sh`
+    /// in the image) declares `test: ["CMD", "postgrest", "--ready"]` for exactly that reason.
+    pub health_argv: Vec<String>,
     pub health_interval: Option<i64>,
     pub health_retries: Option<String>,
     pub health_start_period: Option<String>,
@@ -170,6 +181,50 @@ pub struct ComposeBox {
     /// reported as "not applied per service", which was true only while a stack was always one
     /// namespace.
     pub net_none: bool,
+    /// Compose `network_mode: service:X` - the service asked to live inside X's network namespace.
+    ///
+    /// A MEMBERSHIP, NOT A NOTE. The parser used to answer this key with a sentence saying kern
+    /// "already does" it, which was written when a stack was always one namespace and is false in
+    /// the wiring kern now selects on its own. Worse than false: a service with `network_mode:` has
+    /// no `networks:` key of its own, so it landed on the implicit `default` network while the
+    /// service it named sat on another, and the two got NO relay at all. MEASURED on a file with
+    /// `vpn` and `client: network_mode: service:vpn` alongside a pair that segregates: the netns
+    /// inode read from inside each box was 4026534073 for `vpn` and 4026533775 for `client`, and
+    /// kern reported the pair as unable to resolve each other, in the same output that claimed one
+    /// shared namespace. The file asks for the tightest coupling there is and got total separation.
+    ///
+    /// Held as the service NAME and resolved after the whole file is read, because the service it
+    /// names may be defined below it. What it resolves INTO is network membership: the box inherits
+    /// the memberships of the service it names, which is what Docker gives it (a container in
+    /// another's namespace is on that namespace's networks). The residue that inheritance cannot
+    /// express - one namespace, one loopback, one route out - is named at the wiring decision,
+    /// where the wiring is finally known.
+    pub net_share: Option<String>,
+    /// Compose `networks.<net>.ipv4_address` - the literal addresses this service is pinned to.
+    ///
+    /// A LIST BECAUSE A SERVICE MAY SIT ON SEVERAL NETWORKS, one address per network, and picking
+    /// one of them would silently drop the others. Each becomes a `kern box --ip`, which claims it
+    /// as a `/32` on the box's loopback. Before this the address existed nowhere at all: kern has no
+    /// user-defined subnet to allocate from, so a peer that hard-coded the address got no route and
+    /// the only thing kern could do was say so.
+    ///
+    /// WHAT IT BUYS DEPENDS ON THE WIRING, and the sentence about it is said where the wiring is
+    /// known. In one shared namespace every service's address lands on the one loopback, so a peer
+    /// reaches it exactly as the file intends. With a namespace per service a box claims only its
+    /// OWN address, so the service answers there while a peer connecting to it does not, and that
+    /// half is named rather than left to be discovered.
+    pub net_ipv4: Vec<String>,
+    /// The subnet the service's own network declares (`networks.<n>.ipam.config[].subnet`).
+    ///
+    /// CARRIED ON THE SERVICE AND NOT ON THE DOCUMENT, because that is where it is used: the driver
+    /// builds ONE bridge and has to know which network the addresses on it belong to. A file that
+    /// declares two networks with two subnets can only have one of them on that bridge, and the
+    /// driver says so rather than silently picking.
+    ///
+    /// WITHOUT IT the bridge gets a network kern invented, the addresses a file pinned with
+    /// `ipv4_address:` fall outside it, and a peer that hard-codes one has no route: the key is
+    /// approximated instead of honoured.
+    pub net_subnet: Option<String>,
     pub uid_range: bool,
     /// Set when the compose file wrote `uid_range = false` explicitly, so the per-image default
     /// (turn it ON for OCI images) does NOT override a deliberate opt-out.
@@ -327,6 +382,44 @@ pub struct ComposeBox {
     /// Compose `sysctls:` → one `--sysctl KEY=VALUE` per entry (mapping or `KEY=VALUE` list form).
     pub sysctls: Vec<String>,
     pub cap_add: Vec<String>,
+    /// Compose `privileged: true`, RECORDED rather than acted on by the parser.
+    ///
+    /// WHAT DOCKER GIVES AND WHAT A ROOTLESS RUNTIME CAN GIVE ARE NOT THE SAME THING. Docker's
+    /// `privileged` grants every capability, every device, and an UNMASKED `/proc` and `/sys`.
+    /// Rootless, the first is bounded by the box's own user namespace (a capability there confers
+    /// nothing over the host) and the second by what the calling user can already open. The third is
+    /// the dangerous one and kern does not give it: `/proc/sys/kernel/core_pattern` is NOT
+    /// namespaced on Linux, and unmasking it has already been a real escape in this project.
+    ///
+    /// NOT HONOURED FROM THE FILE ALONE. It relaxes the seccomp filter, and a policy a downloaded
+    /// file can defeat is not a policy: the same rule that makes `vgpio` device grants need
+    /// `--allow-device-grants`. The operator grants it on the command line or in their own config,
+    /// and kern says which when a file asks and nothing granted it.
+    pub privileged: bool,
+    /// Environment-backed secrets, as `<secret name>=<VARIABLE>`
+    /// (`secrets: {db_pw: {environment: DB_PW}}` in the Compose Specification).
+    ///
+    /// THE VARIABLE NAME, NEVER THE VALUE. `push_box_flags` puts the value in the child's
+    /// ENVIRONMENT and the name in `argv`, because `/proc/<pid>/cmdline` is world-readable on Linux
+    /// and a secret on a command line is a secret every user on the machine can read.
+    ///
+    /// WHY IT IS NOT A FILE. kern's `--secret` takes a path, and writing the value to a temporary
+    /// file to hand it over would put the secret on disk for the stack's whole life. The isolation
+    /// layer already takes BYTES, so the value can go from the environment straight into the box's
+    /// `/run/secrets` tmpfs without ever being written anywhere else.
+    pub secret_envs: Vec<String>,
+    /// `security_opt: apparmor=<profile>` - a pre-loaded AppArmor profile the box enters on exec.
+    ///
+    /// FORWARDED, WHICH IT WAS NOT. kern has had `kern box --apparmor` all along and the compose
+    /// parser answered the key with "kern applies its own profile, not the one named here". That
+    /// sentence is FALSE and was measured to be: inside a box, `/proc/self/attr/current` reads
+    /// `vscode (unconfined)`, the same as the caller's - kern applies no profile of its own. So a
+    /// file naming a profile got nothing and was told it got something else, and a file naming
+    /// `unconfined` got exactly what it asked for and was told it did not.
+    ///
+    /// `unconfined` LEAVES THIS EMPTY, on purpose: kern loading no profile IS that request, and
+    /// `--apparmor unconfined` would ask the LSM to transition to a profile by that name.
+    pub apparmor: Option<String>,
     pub cap_drop: Vec<String>,
     /// Compose `profiles: [...]`. A service with a non-empty profile list is INACTIVE unless one of
     /// its profiles is enabled (via `COMPOSE_PROFILES`), exactly like Docker: a plain `up` starts only
@@ -398,6 +491,17 @@ pub struct ComposeBox {
 }
 
 impl ComposeBox {
+    /// Whether this box declares a health check AT ALL, in either of Docker's two forms.
+    ///
+    /// ONE QUESTION, ONE ANSWER, because there are now two fields holding one thing and every reader
+    /// that asked `health_cmd.is_none()` would answer "no health check" for a service whose check is
+    /// an exec-form argv. Two of those readers gate a `depends_on: {condition: service_healthy}`:
+    /// one degrades the edge to start-order, the other refuses the stack outright. Both would have
+    /// been wrong about a service that has a perfectly good check.
+    pub fn has_health(&self) -> bool {
+        self.health_cmd.is_some() || !self.health_argv.is_empty()
+    }
+
     /// The `PORT=<n>` pair kern adds for a declared `port`, or `None` when there is nothing to add.
     ///
     /// `PORT` is the only variable injected, and deliberately so. It is the one convention shared
@@ -499,6 +603,41 @@ impl ComposeBox {
         if let Some(v) = &self.security_profile {
             cmd.arg("--security-profile").arg(v);
         }
+        // `ipv4_address:` -> `--ip`. Sent under BOTH wirings and not only in a pod: a box claiming
+        // its own address answers there either way, which is the half that does not depend on how
+        // the stack is wired. The half that does (whether a PEER reaches it) is what the driver's
+        // sentence is about.
+        for ip in &self.net_ipv4 {
+            cmd.arg("--ip").arg(ip);
+        }
+        // `privileged: true`, and ONLY once the operator has granted it: the driver clears this
+        // field back to false when nothing did, so this site cannot be the place that decides.
+        //
+        // TWO FLAGS BECAUSE DOCKER'S ONE KEY IS TWO THINGS: every capability the box's own user
+        // namespace can hold, and the relaxed seccomp a nested runtime needs. Neither reaches the
+        // host: rootless, a capability in that namespace confers nothing outside it.
+        if self.privileged {
+            cmd.arg("--privileged");
+            cmd.arg("--cap-add").arg("ALL");
+        }
+        // THE NAME ON THE COMMAND LINE, THE VALUE IN THE ENVIRONMENT. `/proc/<pid>/cmdline` is
+        // world-readable, so a secret passed as an argument is readable by every user on the
+        // machine; the environment of a process is not.
+        for spec in &self.secret_envs {
+            let Some((name, var)) = spec.split_once('=') else {
+                continue;
+            };
+            // An unset variable is not a secret with an empty value: it is a file the compose file
+            // says exists and does not. Skipped here, so `kern box` reports the one that is missing
+            // rather than delivering an empty file the workload reads as a password.
+            if let Ok(value) = std::env::var(var) {
+                cmd.env(format!("KERN_SECRET_{name}"), value);
+                cmd.arg("--secret-env").arg(name);
+            }
+        }
+        if let Some(p) = &self.apparmor {
+            cmd.arg("--apparmor").arg(p);
+        }
         if let Some(v) = &self.image {
             cmd.arg("--image").arg(v);
         }
@@ -558,6 +697,13 @@ impl ComposeBox {
         }
         if let Some(v) = &self.health_cmd {
             cmd.arg("--health-cmd").arg(v);
+        }
+        // The exec form travels as one flag per argv element, so an argument containing a space
+        // arrives as ONE argument: the boundaries are the whole reason this form exists. Never both
+        // forms at once - `has_health` is the one question every other reader asks, and `kern box`
+        // refuses a command line carrying the two.
+        for a in &self.health_argv {
+            cmd.arg("--health-cmd-argv").arg(a);
         }
         if let Some(n) = self.health_interval {
             cmd.arg("--health-interval").arg(n.to_string());
@@ -848,8 +994,9 @@ pub const fn wiring_note(net: StackNet, service_count: usize) -> Option<&'static
 pub const POD_SHARED_LOOPBACK: &str =
     "this stack runs in ONE shared network namespace, so its services share 127.0.0.1: a port a \
      service binds on the loopback is reachable from every other service in the stack, which under \
-     Docker it would not be. `--no-pod` gives each service its own namespace (and its own loopback) \
-     at the cost of a relay hop between peers";
+     Docker it would not be. `--bridge` gives each service its own namespace and its own loopback, \
+     meeting on a bridge as Docker does, for about 30 ms a service at start; `--no-pod` also \
+     separates them but reaches peers through a relay per ordered pair per port";
 
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     parse_with_env(text, &DotEnv::default(), StackNet::Pod)
@@ -890,7 +1037,24 @@ pub fn parse_with_env(
     dotenv: &DotEnv,
     net: StackNet,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, true, net)
+    parse_layer(text, dotenv, true, net, None)
+}
+
+/// [`parse_with_env`] for a file that exists ON DISK, whose directory is where its own relative
+/// references resolve from.
+///
+/// Only one construct needs it today - a cross-file `extends: {file: …}`, which the Compose
+/// Specification resolves relative to the file that wrote it - and that is why the path is a
+/// directory rather than a file: nothing here reads the document again, it reads its NEIGHBOURS.
+/// `None` (the plain entry point above, and every test that parses a string) means there is no
+/// directory to resolve from, and the one construct that needs one says so instead of guessing.
+pub fn parse_with_env_at(
+    text: &str,
+    dotenv: &DotEnv,
+    net: StackNet,
+    dir: Option<&std::path::Path>,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, true, net, dir)
 }
 
 /// Parse an OVERRIDE layer (`-f base.yml -f override.yml`, every file after the first).
@@ -904,7 +1068,18 @@ pub fn parse_override(
     dotenv: &DotEnv,
     net: StackNet,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, false, net)
+    parse_layer(text, dotenv, false, net, None)
+}
+
+/// [`parse_override`] for an override file on disk - see [`parse_with_env_at`] for what the
+/// directory is for.
+pub fn parse_override_at(
+    text: &str,
+    dotenv: &DotEnv,
+    net: StackNet,
+    dir: Option<&std::path::Path>,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, false, net, dir)
 }
 
 /// Assert every service ended up with something to run. Called on the merged stack (see
@@ -1024,6 +1199,7 @@ fn parse_layer(
     dotenv: &DotEnv,
     require_runnable: bool,
     net: StackNet,
+    dir: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeBox>, String> {
     // Strip a leading UTF-8 BOM (Windows editors add one) so the first key/table header is recognized
     // - Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
@@ -1037,7 +1213,7 @@ fn parse_layer(
         return Err("the file is empty: a compose file needs a `services:` block".into());
     }
     if is_yaml(text) {
-        yaml::parse_with_env(text, dotenv, require_runnable, net)
+        yaml::parse_with_env(text, dotenv, require_runnable, net, dir)
     } else {
         parse_toml(text)
     }
@@ -1094,7 +1270,6 @@ impl ComposeBox {
             user,
             ssh,
             ssh_key,
-            health_cmd,
             health_interval,
             health_retries,
             health_start_period,
@@ -1169,6 +1344,15 @@ impl ComposeBox {
             ($($f:ident),* $(,)?) => { $( if !o.$f.is_empty() { self.$f = o.$f; } )* };
         }
         replace_seq!(vcpu, vdisk, vgpio);
+        // THE TWO HEALTH FORMS ARE ONE FIELD, so they merge as one. Docker's `healthcheck.test`
+        // REPLACES the base's, and a base that wrote the exec form with an override that writes the
+        // shell form is one check written twice, not two checks: merged independently, both would
+        // survive, `push_box_flags` would send `--health-cmd` AND `--health-cmd-argv`, and `kern
+        // box` refuses that pair - an override touching a healthcheck would fail the box outright.
+        if o.health_cmd.is_some() || !o.health_argv.is_empty() {
+            self.health_cmd = o.health_cmd;
+            self.health_argv = o.health_argv;
+        }
         // argv REPLACES: appending two commands would run neither.
         if !o.command.is_empty() {
             self.command = o.command;
@@ -1198,6 +1382,12 @@ impl DotEnv {
             .map(|(_, v)| v.as_str())
     }
 
+    /// The bindings, in file order, for a caller that needs the pairs rather than lookups - the
+    /// `--env-file` reader, which hands them to the box.
+    pub fn into_pairs(self) -> Vec<(String, String)> {
+        self.0
+    }
+
     /// Number of bindings (0 when there is no `.env`).
     pub fn len(&self) -> usize {
         self.0.len()
@@ -1221,11 +1411,20 @@ impl DotEnv {
 ///    ` #` (a `#` with no preceding space is part of the value, e.g. a colour or a fragment URL);
 ///  * a key that is empty or contains whitespace is skipped (it could not be referenced anyway).
 ///
-/// `${…}` inside values is NOT expanded here: kern interpolates once, over the whole compose document,
-/// after the environment and this table are merged - expanding twice would substitute a value that
-/// itself looks like a reference.
+/// `${…}` INSIDE A VALUE IS EXPANDED HERE, against the process environment first and then the lines
+/// of this same file that came before it. Docker's own rule, from the `.env` file syntax:
+/// *"Unquoted and double-quoted (`"`) values have interpolation applied."* A single-quoted value
+/// stays literal, which is the escape hatch for a value that really contains a `$`.
+///
+/// IT USED TO BE LEFT VERBATIM, on the reasoning that kern interpolates once over the whole document
+/// and expanding twice would substitute a value that itself looks like a reference. The document is
+/// still interpolated exactly once - a value that ARRIVES from `.env` is not re-expanded - but a
+/// `.env` that builds one variable out of others was never resolved at all. MEASURED on Zabbix,
+/// whose shipped `.env` reads `ZBX_IMAGE_TAG=${OS}-${ZBX_VERSION}-latest`: every image in a
+/// 17-service stack came out as `zabbix-server-pgsql:${OS}-${ZBX_VERSION}-latest`, a tag that cannot
+/// be pulled, from a file its project runs daily.
 pub fn parse_dotenv(text: &str) -> DotEnv {
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out = DotEnv(Vec::new());
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1243,13 +1442,25 @@ pub fn parse_dotenv(text: &str) -> DotEnv {
         if key.is_empty() || key.split_whitespace().count() != 1 {
             continue;
         }
-        out.push((key.to_string(), dotenv_value(line[cut + 1..].trim())));
+        // Resolved against what is already bound: the process environment (which wins) and the
+        // EARLIER lines of this file, exactly what a reader of a `.env` expects when line 12 names
+        // line 3. The accumulator IS the table being built, so that ordering is a property of the
+        // loop rather than an assumption about it.
+        let value = dotenv_value(line[cut + 1..].trim(), &out);
+        out.0.push((key.to_string(), value));
     }
-    DotEnv(out)
+    out
 }
 
 /// Decode one `.env` value: quote handling + inline-comment stripping. See [`parse_dotenv`].
-fn dotenv_value(v: &str) -> String {
+fn dotenv_value(v: &str, so_far: &DotEnv) -> String {
+    // Unquoted and double-quoted values have interpolation applied; a single-quoted one does not.
+    // The rule is Docker's, and the three branches below are the only place that knows which style
+    // this value was written in, which is why the expansion happens here and not at the call site.
+    // The interpolator marks a reference that resolved to nothing (see `UNSET_MARK`), because a YAML
+    // scalar needs to tell that apart from an absent value. A `.env` value has no such distinction to
+    // make - it is already a final string - so the mark is erased here.
+    let expand = |s: String| yaml::strip_unset_mark(&yaml::interpolate_fragment(&s, so_far));
     let mut chars = v.chars();
     match chars.next() {
         // Single quotes: literal to the closing quote; anything after it is a comment.
@@ -1278,13 +1489,13 @@ fn dotenv_value(v: &str) -> String {
                     out.push(c);
                 }
             }
-            out
+            expand(out)
         }
         // Unquoted: an inline comment must be preceded by a space, so only ` #` ends the value.
-        _ => match v.find(" #") {
+        _ => expand(match v.find(" #") {
             Some(at) => v[..at].trim_end().to_string(),
             None => v.to_string(),
-        },
+        }),
     }
 }
 
@@ -2818,11 +3029,42 @@ mod dotenv_tests {
         assert_eq!(v("A=1", "A").as_deref(), Some("1"));
     }
 
+    /// A `.env` VALUE IS INTERPOLATED, which is Docker's documented rule for the file: *"Unquoted
+    /// and double-quoted values have interpolation applied."*
+    ///
+    /// This test used to assert the opposite - that `A=${B}` stays verbatim - on the reasoning that
+    /// kern interpolates the document once and expanding here would expand twice. The document is
+    /// still expanded exactly once (the last case below pins that); what was missing is that a
+    /// `.env` building one variable out of others was never resolved at all. MEASURED on Zabbix,
+    /// whose shipped `.env` reads `ZBX_IMAGE_TAG=${OS}-${ZBX_VERSION}-latest`: all 17 services got
+    /// an image tag no registry can answer for.
     #[test]
-    fn dollar_is_left_for_the_document_pass() {
-        // `${…}` inside a value must survive verbatim: kern interpolates ONCE over the whole compose
-        // document after merging env + .env. Expanding here would substitute twice.
-        assert_eq!(v("A=${B}\n", "A").as_deref(), Some("${B}"));
+    fn a_dotenv_value_is_interpolated_against_the_lines_before_it() {
+        // The Zabbix shape: a tag assembled from two earlier bindings.
+        let e = parse_dotenv("OS=alpine\nZBX_VERSION=7.4\nTAG=${OS}-${ZBX_VERSION}-latest\n");
+        assert_eq!(e.get("TAG"), Some("alpine-7.4-latest"));
+
+        // TOP DOWN: a value cannot see a binding written below it, exactly as a reader expects.
+        let e = parse_dotenv("A=${B}\nB=late\n");
+        assert_eq!(e.get("A"), Some(""));
+
+        // A default applies when the name is unbound.
+        assert_eq!(v("A=${NOPE:-fallback}\n", "A").as_deref(), Some("fallback"));
+
+        // SINGLE QUOTES ARE THE ESCAPE HATCH: they keep a value that really contains a `$`.
+        let e = parse_dotenv("B=x\nA='${B}'\n");
+        assert_eq!(e.get("A"), Some("${B}"));
+
+        // AND THE DOCUMENT STILL INTERPOLATES ONCE. A value that ARRIVES from `.env` carrying
+        // `${…}` is inserted, not re-expanded - the property the old assertion was protecting.
+        let de = parse_dotenv("B=espanso\nLIT='${B}'\n");
+        let yaml = "services:\n  a:\n    image: alpine\n    command: echo ${LIT}\n";
+        let boxes = parse_with_env(yaml, &de, StackNet::Pod).expect("parses");
+        assert_eq!(
+            boxes[0].command.join(" "),
+            "echo ${B}",
+            "a value from .env must not be interpolated a second time"
+        );
     }
 
     #[test]
@@ -2896,6 +3138,37 @@ mod dotenv_tests {
     /// nothing else: `--uid-range` only when the file asked, `--no-uid-range` only for a deliberate
     /// opt-out, and NEITHER for a plain image box (whose default is applied downstream). Emitting the
     /// default here would state the rule twice and make every image box look like an explicit request.
+    /// EVERY DECLARED ADDRESS TRAVELS, and one that is not an address does not.
+    ///
+    /// A service on two networks has two, and sending only the first would drop a peer's route with
+    /// nothing said anywhere. The flag is sent under BOTH wirings because a box claiming its own
+    /// address answers there either way; what a PEER gets is what the driver's sentence is about.
+    #[test]
+    fn push_box_flags_sends_every_fixed_address_the_file_declares() {
+        let argv = |src: &str| -> Vec<String> {
+            let s = crate::parse(src).expect("parses");
+            let mut cmd = std::process::Command::new("kern");
+            s[0].push_box_flags(&mut cmd);
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let two = argv(
+            "services:\n  a:\n    image: alpine\n    networks:\n      front:\n        \
+             ipv4_address: 172.28.1.10\n      back:\n        ipv4_address: 10.5.0.7\n",
+        );
+        assert!(
+            two.windows(2).any(|w| w == ["--ip", "172.28.1.10"]),
+            "{two:?}"
+        );
+        assert!(two.windows(2).any(|w| w == ["--ip", "10.5.0.7"]), "{two:?}");
+        assert_eq!(two.iter().filter(|a| *a == "--ip").count(), 2, "{two:?}");
+        // THE CONTROL: a service that declares none sends none, so the assertions above are about
+        // the key rather than about a flag the driver always emits.
+        let none = argv("services:\n  a:\n    image: alpine\n    networks: [front]\n");
+        assert!(!none.iter().any(|a| a == "--ip"), "{none:?}");
+    }
+
     #[test]
     fn push_box_flags_forwards_uid_range_intent_not_the_image_default() {
         let argv = |src: &str| -> Vec<String> {
@@ -3310,6 +3583,40 @@ mod contract_tests {
                 "net_none",
                 "the compose driver keeps the box out of the pod and attaches no NAT to it, which is \
                  exactly `network_mode: none`",
+            ),
+            (
+                "secret_envs",
+                "`push_box_flags` sends `--secret-env <name>` and puts the value in the child's \
+                 environment, where `kern box` reads it and delivers it at `/run/secrets/<name>`",
+            ),
+            (
+                "privileged",
+                "the compose driver refuses to honour it unless the operator granted it, and then \
+                 `push_box_flags` sends `--privileged --cap-add ALL`",
+            ),
+            (
+                "apparmor",
+                "`push_box_flags` sends `--apparmor <profile>`, which the box enters on exec; an \
+                 unloadable profile fails the box closed",
+            ),
+            (
+                "net_subnet",
+                "the compose driver builds the pod's bridge on this network instead of one kern \
+                 invents, which is what makes an `ipv4_address:` from the file the address the \
+                 service actually answers on",
+            ),
+            (
+                "net_ipv4",
+                "the compose driver turns each address into a `kern box --ip`, which claims it as a \
+                 /32 on the box's loopback so the literal address a peer hard-codes exists inside \
+                 the stack",
+            ),
+            (
+                "net_share",
+                "the YAML parser resolves it into `networks` after the whole file is read (the named \
+                 service may be defined below the one that shares it), so the relay graph and the \
+                 hosts file are built from it; the compose driver reads the field again once the \
+                 wiring is settled, to say what a namespace per service cannot give",
             ),
             (
                 "on_internal_network",

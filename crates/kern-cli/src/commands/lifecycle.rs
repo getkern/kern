@@ -11,8 +11,9 @@
 
 use super::*;
 
-/// Fork a health-checker for a detached box: every `interval` s it runs `health_cmd` (via
-/// `/bin/sh -c`) inside the box and records `healthy`/`unhealthy` in the registry health sidecar
+/// Fork a health-checker for a detached box: every `interval` s it runs the probe (a shell string
+/// through `/bin/sh -c`, or an argv exec'd directly - whichever form the check was written in)
+/// inside the box and records `healthy`/`unhealthy` in the registry health sidecar
 /// (shown by `kern ps`). It re-reads the box's PID 1 each round, so it follows `--restart`s.
 /// Returns the checker's pid.
 pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> Option<i32> {
@@ -51,7 +52,12 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
     // number the kernel may hand to someone else once its owner is gone. See `pid_is_still`.
     let launcher_start = registry::proc_starttime(pid);
     registry::set_health(&name, pid, "starting");
-    let probe = ["/bin/sh".to_string(), "-c".to_string(), hc.cmd];
+    // THE FORM THE CHECK WAS WRITTEN IN DECIDES THIS, not a fixed `/bin/sh -c`. It used to be the
+    // latter: every probe, whatever its form, was wrapped in a shell. An image with no shell
+    // (PostgREST, distroless, `FROM scratch`) failed every probe with `execvp: No such file or
+    // directory` and was reported unhealthy while it answered perfectly - and the exec form is
+    // exactly what such an image writes, which is how the wrapper broke the case it was needed for.
+    let probe = hc.probe.argv();
     let mut elapsed = 0u64; // seconds since the checker started
     let mut fails = 0u32; // consecutive failures
     let mut acted = false; // acted on the *current* unhealthy episode (reset when healthy again)
@@ -119,7 +125,32 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
             // under this name has a different environment, and a cached one would probe the new box
             // with the old box's `PATH`.
             let box_env = registry::box_env(&cur, pid);
-            let ok = run_probe(pid1, &probe, &box_env, hc.timeout, mode);
+            // The box's own workdir, from the SAME entry as `pid1` and re-read every round, so a
+            // box recreated under this name is probed where IT runs rather than where its
+            // predecessor did. Empty means the box named none, which is `/` and needs no request.
+            let wd = entry
+                .as_ref()
+                .map(|b| b.workdir.as_str())
+                .filter(|w| !w.is_empty());
+            // The workload's own uid/gid and groups, re-read every round from the SAME entry as
+            // `pid1`, so a box recreated under this name is probed as ITSELF.
+            let who = entry.as_ref().and_then(|b| b.run_as);
+            let sgids: Vec<u32> = entry
+                .as_ref()
+                .map(|b| b.extra_gids.clone())
+                .unwrap_or_default();
+            let ok = run_probe(
+                pid1,
+                &probe,
+                &ProbeAs {
+                    env: &box_env,
+                    timeout: hc.timeout,
+                    seccomp_mode: mode,
+                    workdir: wd,
+                    run_as: who,
+                    extra_gids: &sgids,
+                },
+            );
             if ok {
                 fails = 0;
                 acted = false;
@@ -949,13 +980,40 @@ pub(crate) fn spawn_timeout_stop(name: String, sup_pid: i32, secs: u64) -> Optio
 /// `rabbitmq-diagnostics` was not on it, and the image's own `HEALTHCHECK` reported the service
 /// UNHEALTHY while its management API answered 200. A health check that cannot find the binary it
 /// was told to run reports on kern's environment, not on the service.
-pub(crate) fn run_probe(
-    pid1: i32,
-    probe: &[String],
-    env: &[(String, String)],
-    timeout: u64,
-    seccomp_mode: kern_isolation::SeccompFilter,
-) -> bool {
+/// Everything about the BOX that a probe has to reproduce, read from its registry entry.
+///
+/// A struct and not seven parameters because the list is one idea: "run this the way the workload
+/// runs". Each field arrived from a defect where the probe differed from the workload on exactly
+/// that axis, and the grouping is what keeps the next one from being added as an eighth argument
+/// nobody passes at the second call site.
+pub(crate) struct ProbeAs<'a> {
+    /// The environment kern gave the box, recorded at start (`registry::box_env`).
+    pub env: &'a [(String, String)],
+    /// `--health-timeout`, 0 for none.
+    pub timeout: u64,
+    /// The box's RECORDED seccomp filter, so the probe runs under PID 1's posture.
+    pub seccomp_mode: kern_isolation::SeccompFilter,
+    /// The box's `--workdir`, or `None` for a box that named none.
+    ///
+    /// THE PROBE RUNS WHERE THE WORKLOAD RUNS, which is what Docker does: a check is written by the
+    /// same author, in the same file, as the command beside it. This was `None`, so every probe ran
+    /// in `/` while the workload ran in its workdir, and a relative path in a check could never be
+    /// found. MEASURED with a discriminator: a box with `-w /etc` and
+    /// `--health-cmd 'test -f hostname'` reported UNHEALTHY, the same box with the absolute path
+    /// reported HEALTHY, and a probe running `pwd` printed `/`. It cost a whole stack: Elastic's own
+    /// compose file checks `[ -f config/certs/es01/es01.crt ]`, relative to
+    /// `/usr/share/elasticsearch`, so `setup` stayed unhealthy with the file present and every
+    /// service behind `condition: service_healthy` refused to start.
+    pub workdir: Option<&'a str>,
+    /// The uid/gid the WORKLOAD runs as, and the groups it was given. See `exec_in_box`: a probe
+    /// with more access than the service it watches reports healthy for a service that cannot run.
+    pub run_as: Option<(u32, u32)>,
+    pub extra_gids: &'a [u32],
+}
+
+pub(crate) fn run_probe(pid1: i32, probe: &[String], b: &ProbeAs<'_>) -> bool {
+    let (env, timeout, seccomp_mode) = (b.env, b.timeout, b.seccomp_mode);
+    let (workdir, run_as, extra_gids) = (b.workdir, b.run_as, b.extra_gids);
     let to = (timeout > 0).then_some(timeout);
     let probe_pid = unsafe { libc::fork() };
     if probe_pid == 0 {
@@ -972,7 +1030,7 @@ pub(crate) fn run_probe(
             pid1,
             probe,
             env,
-            None,
+            workdir,
             None,
             None,
             to,
@@ -1021,6 +1079,11 @@ pub(crate) fn run_probe(
             kern_isolation::Unplaceable::ProceedQuietly,
             // A health probe has no terminal, so there is no handover: `-it` never applies to it.
             None,
+            // AS THE WORKLOAD, not as box root: see the parameter's doc on `exec_in_box`. A probe
+            // with more access than the service it watches reports healthy for a service that
+            // cannot run.
+            run_as,
+            extra_gids,
         )
         .unwrap_or(1);
         unsafe { libc::_exit(code) };
@@ -1072,9 +1135,14 @@ pub(crate) fn parse_health_action(s: Option<&str>) -> Result<HealthAction, Error
     }
 }
 
-/// The health-check policy for a detached box (`--health-*`).
-pub(crate) struct HealthConfig<'a> {
-    pub(crate) cmd: Option<&'a str>,
+/// The health-check policy for a box (`--health-*`).
+///
+/// `probe` carries the FORM as well as the command (`kern_oci::HealthTest`): `--health-cmd` is
+/// Docker's `CMD-SHELL`, `--health-cmd-argv` its `CMD`, and an image's own `HEALTHCHECK` is
+/// whichever of the two the image wrote. Flattening the two into a shell string is what made a
+/// shell-less image permanently unhealthy; see `HealthTest`.
+pub(crate) struct HealthConfig {
+    pub(crate) probe: Option<kern_oci::HealthTest>,
     pub(crate) interval: u64,
     pub(crate) retries: u32,
     pub(crate) start_period: u64,
@@ -1082,28 +1150,29 @@ pub(crate) struct HealthConfig<'a> {
     pub(crate) action: HealthAction,
 }
 
-impl HealthConfig<'_> {
-    /// The same policy, owned, for a checker that outlives `box_run`'s borrowed args.
+impl HealthConfig {
+    /// The same policy, owned, for a checker that outlives `box_run`'s borrowed args - or `None`
+    /// when there is no check to run, which is the one question every caller asks first.
     ///
     /// ONE CONVERSION FOR BOTH LAUNCH PATHS. Each used to build `OwnedHealth` field by field at its
     /// own call site, from different sources, which is how a flag comes to mean one thing detached
-    /// and another in the foreground. `cmd` is taken separately because the caller has already
-    /// matched on it to decide there is a checker to start at all.
-    pub(crate) fn owned(&self, cmd: &str) -> OwnedHealth {
-        OwnedHealth {
-            cmd: cmd.to_string(),
+    /// and another in the foreground.
+    pub(crate) fn into_owned(self) -> Option<OwnedHealth> {
+        let probe = self.probe?;
+        Some(OwnedHealth {
+            probe,
             interval: self.interval,
             retries: self.retries,
             start_period: self.start_period,
             timeout: self.timeout,
             action: self.action,
-        }
+        })
     }
 }
 
 /// Owned health policy handed to the forked checker (it outlives `box_run`'s borrowed args).
 pub(crate) struct OwnedHealth {
-    pub(crate) cmd: String,
+    pub(crate) probe: kern_oci::HealthTest,
     pub(crate) interval: u64,
     pub(crate) retries: u32,
     pub(crate) start_period: u64,

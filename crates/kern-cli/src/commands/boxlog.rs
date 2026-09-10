@@ -218,13 +218,37 @@ impl CappedLog {
 /// box's cgroup cap. Falls back to `read`+`write` permanently if the filesystem refuses `splice`
 /// (`EINVAL`); drains to `/dev/null` (still zero-copy) when there is no log or the disk is full, so the
 /// box NEVER blocks on a full pipe.
+///
+/// AND IT ONLY EVER STOPS AT EOF. Every other outcome - no log, no `/dev/null`, an error `splice`
+/// has never returned here before - drops to reading the pipe and throwing the bytes away. This
+/// process is the only reader of the box's stdout: if it leaves while the box still holds the write
+/// end, the box's next write raises SIGPIPE and takes the workload down, and the box's recorded exit
+/// becomes 141 instead of whatever the workload meant to say. MEASURED: the suite's own
+/// `stop_records_the_workloads_own_exit_code` recorded 141 for a box whose init does
+/// `trap 'exit 7' TERM`, reproducibly at 28-way parallelism and never below 8, which is where a
+/// descriptor runs out and an `open` starts failing. A log is diagnostics; it may be lost, and it
+/// may never be the reason a workload dies.
 pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
     let mut log = CappedLog::open(path, cap);
     // A /dev/null sink for the no-log case and disk-full overflow: the pipe must still be drained.
     let void = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
     let mut use_splice = true;
     let mut scratch = [0u8; 64 * 1024]; // read+write fallback buffer (splice-unsupported fs)
+                                        // Set when there is nowhere left to put the bytes. The pipe is still drained - see the note on
+                                        // this function about what leaving instead costs the workload.
+    let mut discard = false;
     loop {
+        if discard {
+            // SAFETY: `scratch` is a live buffer this frame owns and `rd` is the pipe read end.
+            let n = unsafe { libc::read(rd, scratch.as_mut_ptr().cast(), scratch.len()) };
+            if n > 0 {
+                continue; // bytes read and dropped: the box keeps writing, and keeps living
+            }
+            if n == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break; // EOF, or a read error on the pipe itself - there is no pipe left to serve
+            }
+            continue;
+        }
         // Choose this round's sink and how much may go to it. `to_log` distinguishes the real log (count
         // toward the cap) from the /dev/null shed (do not).
         let (sink, want, to_log) = match log.as_mut() {
@@ -242,7 +266,10 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
             None => (void, PUMP_SPLICE_CHUNK, false),
         };
         if sink < 0 {
-            break; // neither a log nor /dev/null could be opened - nothing to drain into
+            // Neither a log nor `/dev/null` could be opened - under fd exhaustion, both `open`s fail
+            // at once. Keep reading anyway: the bytes go nowhere and the box stays alive.
+            discard = true;
+            continue;
         }
         if use_splice {
             match splice_once(rd, sink, want) {
@@ -263,7 +290,9 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
                 }
                 // This kernel/filesystem cannot splice this pipe->fd pair: fall back permanently.
                 Err(libc::EINVAL) => use_splice = false,
-                Err(_) => break, // an unexpected splice error - stop draining
+                // An error `splice` has not returned here before. Whatever it is, it is not a
+                // reason to leave the box's stdout without a reader.
+                Err(_) => discard = true,
             }
         } else {
             let n = unsafe { libc::read(rd, scratch.as_mut_ptr().cast(), scratch.len()) };
@@ -274,9 +303,10 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
                         let _ = unsafe { libc::write(void, scratch.as_ptr().cast(), n as usize) };
                     }
                 }
-            } else if n == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-            {
-                break; // EOF (n == 0) or a real read error; EINTR falls through and retries
+            } else if n == 0 {
+                break; // EOF: every write end (workload + supervisor) is closed
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break; // a real error on the pipe read end itself; EINTR falls through and retries
             }
         }
     }
@@ -306,6 +336,23 @@ pub(crate) unsafe fn start_log_pump(path: &std::path::Path, cap: LogCap) -> Opti
     // most what the pipe holds, so a bigger buffer means one `splice` drains up to 1 MiB instead of
     // 64 KiB - ~16x fewer syscalls under a flood, and fewer `write` wake-ups for the box. Best-effort:
     // capped by `/proc/sys/fs/pipe-max-size`, and a failure just leaves the default size (still correct).
+    // THE WRITE END IS REOPENABLE BY THE WORKLOAD'S OWN UID, and that is not cosmetic: a pipe is
+    // created 0600 owned by the caller, kern maps the caller to root inside the box, and an image
+    // that runs as a non-root user is therefore a DIFFERENT uid in there. Such a workload can still
+    // WRITE to the inherited fd 1, but it cannot REOPEN it - and `/dev/stdout` is a symlink to
+    // `/proc/self/fd/1`, so opening it is a reopen.
+    //
+    // MEASURED, twice: `kern box --user 1997 -- sh -c 'echo x > /dev/stdout'` answers `Permission
+    // denied` while the same box as root prints the line; and Zabbix's nginx frontend, whose image
+    // runs as uid 1997 and whose config logs to `/dev/stdout`, died at start with `open()
+    // "/dev/stdout" failed (13: Permission denied)` on every restart. Logging to `/dev/stdout` is
+    // the convention EVERY containerised web server follows, so the uid that cannot do it is the
+    // uid a large share of hardened images run as.
+    //
+    // 0666 on the pipe, not on the log file: the file keeps its owner-only mode, and the pipe is an
+    // anonymous pipefs inode with no name in any filesystem. The only processes that can reach it
+    // are the ones already holding the descriptor - this box and the pump.
+    libc::fchmod(wr, 0o666);
     libc::fcntl(rd, libc::F_SETPIPE_SZ, PUMP_SPLICE_CHUNK as libc::c_int);
     let pid = libc::fork();
     if pid < 0 {

@@ -145,12 +145,35 @@ pub struct SandboxSpec {
     /// Share the host network namespace instead of an isolated (loopback-only) one (`--net`).
     /// Opt-in: gives the box outbound networking at the cost of network isolation.
     pub share_net: bool,
+    /// `--ip <addr>` (repeatable): extra IPv4 addresses `lo` answers on inside the box's network
+    /// namespace, each as a `/32`.
+    ///
+    /// EXISTS FOR `ipv4_address:`. A compose file that pins a service to an address under
+    /// `networks:` is naming what its peers connect to, and a kern stack has no user-defined subnet
+    /// to allocate from, so the literal address existed NOWHERE: a peer that hard-coded it got no
+    /// route at all, and kern could only warn. Added by [`add_loopback_alias`] before the capability
+    /// drop, because the box itself must not be able to reconfigure its network afterwards.
+    ///
+    /// NOT A SUBNET AND NOT A ROUTE. Each address is claimed as a `/32` on the loopback, so it
+    /// answers inside the namespace and changes nothing about how the box reaches the world.
+    pub net_ips: Vec<std::net::Ipv4Addr>,
     /// `--pod <name>`: JOIN this pod holder's user + net namespace instead of creating a fresh one,
     /// so every box in the pod shares one loopback network (they reach each other on `127.0.0.1`,
     /// resolved by name via a shared `/etc/hosts`). The value is the holder process's PID; the box
     /// still gets its own mount/pid/uts/ipc namespaces. Pod members are co-trusted (they share the
     /// pod's user+net ns) - the pod is the network trust unit, like a Kubernetes pod.
     pub pod_holder: Option<i32>,
+    /// `--pod-bridge <ip>/<prefix>`: join the pod through its BRIDGE instead of sharing its network
+    /// namespace, taking this address on it.
+    ///
+    /// THE DIFFERENCE IS THE LOOPBACK. Sharing one namespace is what makes a kern stack fast, and it
+    /// is also the one thing it does that Docker does not: every service sees the same `127.0.0.1`,
+    /// so a port a service binds there is reachable by every peer. On the bridge each member keeps
+    /// its own loopback and reaches its peers by address, which is Docker's arrangement, at the cost
+    /// of one `veth` per service. The wiring kern had for a private loopback cost a TCP relay per
+    /// ORDERED PAIR PER PORT instead: measured on six services, 170-183 ms to bring up against
+    /// 247-352 ms, and 56 processes against 122.
+    pub pod_bridge: Option<BridgeAttach>,
     /// Map a subordinate uid/gid *range* into the box (`--uid-range`) instead of just the caller.
     /// Opt-in because it (a) costs two `newuidmap`/`newgidmap` subprocesses at start and (b) maps
     /// 65k extra ids into the namespace; the default single-uid map is both faster and more
@@ -213,6 +236,13 @@ pub struct SandboxSpec {
     /// `--user UID[:GID]`: drop to this uid/gid just before exec (after all privileged setup). `None`
     /// → keep the namespace root. Only ids mapped into the box's userns work (see `--uid-range`).
     pub run_as: Option<(u32, u32)>,
+    /// The supplementary groups the workload's user belongs to, resolved by the CALLER from the
+    /// image's own `/etc/group` (see `image_supplementary_gids`). Empty means "clear the set", which
+    /// is what a box with no image-declared user gets and what an explicit `--user UID:GID` gets.
+    ///
+    /// RESOLVED OUTSIDE, APPLIED HERE, because the resolution reads a file in the image rootfs and
+    /// this code runs after the pivot with no allocation budget and no message path.
+    pub extra_gids: Vec<u32>,
     /// `--pids-limit N`: the box's `pids.max` (task ceiling). `None` → the default. Fork-bomb cap.
     pub pids_max: Option<u64>,
     /// `--cap-add`/`--cap-drop` policy on top of the always-dropped dangerous caps. Default drops
@@ -321,6 +351,16 @@ pub struct TmpfsMount {
     pub size: String,
     /// tmpfs `mode=` value (`"1777"`, `"0755"`), or empty for kern's `1777` default.
     pub mode: String,
+    /// tmpfs `uid=` value, or empty for the mounting identity.
+    ///
+    /// APPLIED, WITH A FALL-BACK. A tmpfs in a user namespace accepts only an id that namespace
+    /// MAPS: without `--uid-range` a box maps exactly one, so `uid=10001` would make `mount(2)`
+    /// fail with `EINVAL` and the box would lose the mount entirely. A file asking for an ownership
+    /// kern cannot give must not cost it the directory, so the mount is retried without the two and
+    /// the reader is told which happened.
+    pub uid: String,
+    /// tmpfs `gid=` value, or empty. See [`Self::uid`].
+    pub gid: String,
     /// `MS_NOEXEC`: no execution from this mount.
     pub noexec: bool,
     /// `MS_RDONLY`: the mount is read-only.
@@ -1190,6 +1230,13 @@ fn child_setup_and_exec(
     if !spec.share_net && spec.pod_holder.is_none() {
         bring_loopback_up();
     }
+    // `--ip`: the addresses a compose file pinned to this service. Done for a POD MEMBER TOO, which
+    // is why it is not inside the branch above: the holder brought the shared `lo` UP, but an address
+    // belongs to the service that declared it and every member adds its own to the namespace they
+    // share. Best-effort and per address, so one that cannot be claimed does not cost the others.
+    for ip in &spec.net_ips {
+        add_loopback_alias(*ip);
+    }
 
     // `--ssh`: stand up the in-box sshd (mounts /run tmpfs, writes keys/config, forks sshd). Done
     // here - after loopback (sshd binds 127.0.0.1) and pivot (privileged mounts), before seccomp
@@ -1246,7 +1293,7 @@ fn child_setup_and_exec(
     //    setuid (once uid is non-root you can't change gid); setuid to a non-root uid then sheds the
     //    effective caps itself. Only mapped ids succeed; a failure fails closed (refuses to exec).
     if let Some((uid, gid)) = spec.run_as {
-        set_user(uid, gid)?;
+        set_user(uid, gid, &spec.extra_gids)?;
     }
     // 3. Clear the dropped caps from effective/permitted/inheritable. For a non-root `--user` step 2
     //    already emptied them; this covers a root box and is otherwise a harmless no-op. Fatal on a
@@ -1492,6 +1539,15 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
                  present in the rootfs"
             );
         }
+    } else if matches!(e, Error::Spec(_)) {
+        // A `Spec` error is BY CONSTRUCTION the one kind of setup failure that already named the
+        // field, the reason and what to change, so the generic hint under it would contradict it:
+        // it asserts the failure is "a host capability rather than a wrong command" and points at
+        // `kern doctor`, and a spec refusal is the opposite of both - the host is fine and doctor
+        // cannot see the value that was refused. Branching on the VARIANT and not on the wording,
+        // because here the type is still in hand (the CLI has only the rendered string by the time
+        // it decides, and keys the same suppression off the message).
+        eprintln!("kern: sandbox setup failed: {e}");
     } else {
         // AND IT CARRIES ITS OWN REMEDY, because nothing downstream can add one. This branch runs in
         // the FORKED CHILD, which `_exit`s on the next line, so the error never reaches the CLI's hint
@@ -1516,11 +1572,44 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
 /// without `newuidmap`/`newgidmap` fell back to the single-uid map), return `Err` so the box
 /// **refuses to exec** rather than silently running the workload as in-box root. Dropping privilege
 /// must never *grant* it. `--user 0` (explicitly root) is a successful no-op.
-fn set_user(uid: u32, gid: u32) -> Result<(), Error> {
+fn set_user(uid: u32, gid: u32, extra_gids: &[u32]) -> Result<(), Error> {
     unsafe {
-        // Best-effort: setgroups may be EPERM under `/proc/self/setgroups=deny` (single-uid box); the
-        // single mapped group is already the whole set, so a failure here is harmless.
-        libc::setgroups(0, std::ptr::null());
+        if extra_gids.is_empty() {
+            // Best-effort: setgroups may be EPERM under `/proc/self/setgroups=deny` (single-uid box);
+            // the single mapped group is already the whole set, so a failure here is harmless.
+            libc::setgroups(0, std::ptr::null());
+        } else {
+            // THE IMAGE'S OWN GROUP MEMBERSHIPS, resolved by the caller from the image's `/etc/group`
+            // exactly as Docker and podman resolve them, and granted here because clearing them
+            // breaks images that rely on one.
+            //
+            // MEASURED on Elastic's official three-node compose file: its `setup` service writes the
+            // certificates `root:root` mode 640, `kibana` is `kibana:x:1000:1000` in the image's
+            // passwd and a MEMBER of group 0 in its `/etc/group` (`root:x:0:kibana`), and podman
+            // gives it `groups=1000,0`. kern cleared the set, so kibana ran with group 1000 only and
+            // died with `FATAL Error: EACCES: permission denied, open 'config/certs/ca/ca.crt'` -
+            // while the three Elasticsearch nodes, whose image declares `1000:0` outright, were
+            // green. This is not a grant kern invents: a supplementary gid is only usable inside the
+            // box's own gid map, so it can reach nothing the box could not already reach.
+            let gids: Vec<libc::gid_t> = extra_gids.iter().map(|g| *g as libc::gid_t).collect();
+            if libc::setgroups(gids.len(), gids.as_ptr()) != 0 {
+                // NOT FATAL, BUT NAMED. A single-uid box has `/proc/self/setgroups` set to `deny`,
+                // where this cannot succeed and the box is still perfectly usable for images that do
+                // not depend on a group. Silence would leave the reader with the EACCES above and
+                // nothing pointing at its cause.
+                let e = std::io::Error::last_os_error();
+                let list = extra_gids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "kern: warning: could not give the workload the group(s) its image puts it in \
+                     ({list}): {e}. A file readable only through one of those groups will fail with \
+                     EACCES; `--uid-range` maps a range of gids and lets this succeed."
+                );
+            }
+        }
         if libc::setgid(gid as libc::gid_t) != 0 && gid != 0 {
             return Err(Error::Unsupported(
                 "cannot drop to the target gid - it isn't mapped into the box (needed by --user or the \
@@ -1734,6 +1823,90 @@ fn current_mount_flags(fd: libc::c_int) -> libc::c_ulong {
 /// outright (Android-derived board kernels, as the `:ro` path below records). A `:ro` volume is
 /// different and still fatal: read-only is a contract the caller asked for, and nothing else provides
 /// it.
+/// Decode the four escapes the kernel writes into a `mountinfo` path field (`\040` space, `\011`
+/// tab, `\012` newline, `\134` backslash). Anything else is copied through byte for byte.
+fn unescape_mountinfo(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() {
+            let oct = &s[i + 1..i + 4];
+            match u8::from_str_radix(oct, 8) {
+                Ok(v) if oct.bytes().all(|c| c.is_ascii_digit()) => {
+                    out.push(v as char);
+                    i += 4;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// The mount points sitting strictly UNDER `src` in this mount namespace, at most `max` of them.
+///
+/// Used ONLY to explain a bind the kernel already refused, never to refuse one ourselves, and that
+/// split is measured rather than assumed. The kernel's rule in `__do_loopback` is
+/// `has_locked_children`, not "has children": a mount inherited when the user namespace was created
+/// carries `MNT_LOCKED` and makes a non-recursive bind fail with EINVAL, while a mount made INSIDE
+/// the namespace afterwards does not. Probed on this host in a fresh user+mount namespace: binding
+/// `/tmp` (one inherited submount) returned EINVAL, and binding a directory whose child tmpfs was
+/// mounted in the same namespace returned 0. `MNT_LOCKED` does not appear in `mountinfo`, and kern's
+/// own `/proc`, `/dev` and devpts under the box root are exactly the second kind, so a pre-mount
+/// refusal keyed on this evidence would refuse binds that work.
+///
+/// Because the explanation is gated on evidence that is read back at failure time and not on the
+/// errno, a kernel that starts reporting something other than EINVAL does not turn the message into
+/// a false claim: no submounts found means the raw syscall error is reported unchanged.
+///
+/// THE ROOT CASE IS UNREACHABLE HERE, and it is worth writing down because the first question a
+/// reader asks is "and if kern runs as root, where the copies are not locked?". A box's namespaces
+/// are created with `CLONE_NEWUSER` unconditionally (`ns_flags` in `run_in_sandbox_with`, with no
+/// branch that omits it), and its mount namespace is unshared inside that new user namespace, so
+/// the mounts copied into it are always locked: `copy_mnt_ns` locks the copies whenever the new
+/// mount namespace's user namespace differs from the old one's. There is no kern box whose
+/// inherited mounts are unlocked, whatever the caller's uid.
+fn submounts_under(src: &str, max: usize) -> (Vec<String>, usize) {
+    let Ok(body) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return (Vec::new(), 0);
+    };
+    submounts_in(&body, src, max)
+}
+
+/// The parsing half of [`submounts_under`], split out so a test can hand it a `mountinfo` body.
+/// Returns the first `max` mount points strictly under `src` and how many there are in total.
+///
+/// DISTINCT mount points, counted and listed once each, because two filesystems can be stacked on
+/// one path and the operator acts on the path. Measured: binding `/proc` on this host reported
+/// `/proc/sys/fs/binfmt_misc` twice, since `mountinfo` carries a line for the autofs and one for the
+/// filesystem mounted over it.
+pub(crate) fn submounts_in(body: &str, src: &str, max: usize) -> (Vec<String>, usize) {
+    let prefix = if src.ends_with('/') {
+        src.to_string()
+    } else {
+        format!("{src}/")
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for line in body.lines() {
+        // Field 5 (1-based) is the mount point; it is escaped but never contains a bare space.
+        let Some(mp) = line.split(' ').nth(4) else {
+            continue;
+        };
+        let mp = unescape_mountinfo(mp);
+        if !mp.starts_with(&prefix) || seen.contains(&mp) {
+            continue;
+        }
+        seen.push(mp);
+    }
+    let total = seen.len();
+    seen.truncate(max);
+    (seen, total)
+}
+
 fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
     if vols.is_empty() {
         return Ok(());
@@ -1783,10 +1956,24 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
         let tgt = cstr(&format!("/proc/self/fd/{tgt_fd}"))?;
         // Deliberately NON-recursive (`MS_BIND`, not `MS_BIND | MS_REC`) - same rationale as the bind
         // root above: if the operator's volume source has host filesystems mounted *underneath* it
-        // (a NAS share, an external disk), a recursive bind would clone those submounts into the box.
-        // The RO remount below is per-mount (`MS_REMOUNT` is not recursive on Linux), so a recursive
-        // bind would leave every cloned submount WRITABLE under a `:ro` volume - silently breaking the
-        // operator's explicit read-only contract. A plain bind exposes the directory tree only.
+        // (a NAS share, an external disk, another program's socket dir), a recursive bind would put
+        // those filesystems INSIDE the box. They belong to whoever mounted them, and the box asked
+        // for a directory, not for everything that happens to be mounted under it. That is the
+        // reason, and it does not expire.
+        //
+        // DOCKER DOES THE OPPOSITE, measured rather than assumed: with a tmpfs mounted at
+        // `/tmp/kern-sub` on the host, `docker run -v /tmp:/x` shows two mount lines under `/x` and
+        // `/x/kern-sub` is a mount point INSIDE the container (Docker 29.6.2, aarch64). So this is a
+        // deliberate difference and not an oversight: kern hands the box the directory tree it asked
+        // for, and nothing else that happens to be mounted under it.
+        //
+        // The `:ro` argument is NOT the reason, and saying so out loud is the point of this
+        // paragraph. This comment used to lead with "the RO remount is per-mount, so a recursive
+        // bind would leave the cloned submounts writable under a `:ro` volume". True on the mount
+        // API kern uses, and an outside reviewer pointed out that it stops being true the moment
+        // anyone reaches for `mount_setattr(MOUNT_ATTR_RDONLY, AT_RECURSIVE)`, which has covered
+        // submounts since 5.12. An argument with an expiry date is the wrong one to build a refusal
+        // on, and the wrong one to put in the operator's error message.
         let r = unsafe {
             libc::mount(
                 src.as_ptr(),
@@ -1801,7 +1988,35 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             libc::close(src_fd);
         }
         if r != 0 {
-            result = Err(Error::last("mount(volume bind)"));
+            let os = std::io::Error::last_os_error();
+            // Say WHY, when the evidence for a why is there. A bare "Invalid argument" on a `-v` is
+            // unactionable: the operator sees a path that exists, is readable, and still cannot be
+            // mounted. See `submounts_under` for why this reads the evidence after the failure
+            // instead of refusing before the syscall.
+            let (named, total) = submounts_under(&v.source, 3);
+            result = Err(if total == 0 {
+                Error::Syscall("mount(volume bind)", os)
+            } else {
+                let subject = if total == 1 {
+                    format!("1 path under {} has a filesystem mounted on it", v.source)
+                } else {
+                    format!(
+                        "{total} paths under {} have a filesystem mounted on them",
+                        v.source
+                    )
+                };
+                let more = if total > named.len() {
+                    format!(", and {} more", total - named.len())
+                } else {
+                    String::new()
+                };
+                Error::Spec(format!(
+                    "mount(volume bind) failed for -v {}:{}: {os}. {subject} ({}{more}). kern binds a volume NON-recursively, because a recursive bind would put those filesystems INSIDE the box, and they belong to whatever mounted them rather than to this workload. The kernel then refuses a non-recursive bind of a source holding mounts inherited from outside the box. Bind a subdirectory that has none, or unmount them on the host.",
+                    v.source,
+                    v.target,
+                    named.join(", "),
+                ))
+            });
             break;
         }
         {
@@ -1960,7 +2175,29 @@ fn set_clean_env(hostname: &str, extra: &[(String, String)]) -> Result<(), Error
     );
     set_env("HOME", "/root");
     set_env("TERM", "xterm");
-    set_env("HOSTNAME", hostname);
+    // ASK THE KERNEL WHEN THE CALLER DID NOT SAY. `exec_in_box` passes an empty name - it did not
+    // create the namespace and does not know what was put in it - so every `kern exec` and every
+    // health probe ran with `HOSTNAME=` while `hostname` printed the box's name correctly. Docker
+    // sets it, and a check that reads it (Airflow's scheduler probe passes `"$${HOSTNAME}"` to
+    // `airflow jobs check`) is comparing against an empty string. Reading it back from the UTS
+    // namespace we are already in cannot drift from whatever actually set it.
+    let mut buf = [0i8; 256];
+    let live = if hostname.is_empty()
+        && unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len() - 1) } == 0
+    {
+        let bytes: Vec<u8> = buf
+            .iter()
+            .take_while(|b| **b != 0)
+            .map(|b| *b as u8)
+            .collect();
+        String::from_utf8(bytes).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    set_env(
+        "HOSTNAME",
+        if hostname.is_empty() { &live } else { hostname },
+    );
     for (k, v) in extra {
         set_env(k, v);
     }
@@ -2644,7 +2881,7 @@ fn setup_tmpfs(root: &str, entries: &[TmpfsMount]) -> Result<(), Error> {
         // `MS_NOEXEC` and `MS_RDONLY` ARE the caller's: neither weakens the box (both only remove
         // capability from the mount), and `noexec` on `/tmp` is a hardening measure real files ask
         // for.
-        let mut opts = String::with_capacity(32);
+        let mut opts = String::with_capacity(48);
         if !m.size.is_empty() {
             opts.push_str("size=");
             opts.push_str(&m.size);
@@ -2652,6 +2889,17 @@ fn setup_tmpfs(root: &str, entries: &[TmpfsMount]) -> Result<(), Error> {
         }
         opts.push_str("mode=");
         opts.push_str(if m.mode.is_empty() { "1777" } else { &m.mode });
+        // `uid=`/`gid=` LAST, so the retry below can cut them off by truncating the string rather
+        // than rebuilding it. Kept out of the string entirely when the file named neither.
+        let without_ids = opts.len();
+        if !m.uid.is_empty() {
+            opts.push_str(",uid=");
+            opts.push_str(&m.uid);
+        }
+        if !m.gid.is_empty() {
+            opts.push_str(",gid=");
+            opts.push_str(&m.gid);
+        }
         let mut hardening = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
         if m.noexec {
             hardening |= libc::MS_NOEXEC as libc::c_ulong;
@@ -2659,16 +2907,52 @@ fn setup_tmpfs(root: &str, entries: &[TmpfsMount]) -> Result<(), Error> {
         if m.read_only {
             hardening |= libc::MS_RDONLY as libc::c_ulong;
         }
-        if let (Ok(t), Ok(ty), Ok(o)) = (cstr(&full), cstr("tmpfs"), cstr(&opts)) {
-            unsafe {
-                libc::mount(
-                    ty.as_ptr(),
-                    t.as_ptr(),
-                    ty.as_ptr(),
-                    hardening,
-                    o.as_ptr() as *const libc::c_void,
-                )
+        let Ok(t) = cstr(&full) else { continue };
+        let Ok(ty) = cstr("tmpfs") else { continue };
+        let mounted = match cstr(&opts) {
+            Ok(o) => {
+                // SAFETY: three NUL-terminated strings that outlive the call, and a flag word built
+                // from libc constants.
+                unsafe {
+                    libc::mount(
+                        ty.as_ptr(),
+                        t.as_ptr(),
+                        ty.as_ptr(),
+                        hardening,
+                        o.as_ptr() as *const libc::c_void,
+                    ) == 0
+                }
+            }
+            Err(_) => false,
+        };
+        // THE RETRY EXISTS BECAUSE THE FALL-BACK MUST NOT BE THE MISSING MOUNT. A tmpfs in a user
+        // namespace takes only an id that namespace MAPS, and a box without `--uid-range` maps
+        // exactly one: `uid=10001` from a real compose file then fails the mount with `EINVAL` and
+        // the workload finds no directory at all. Asking for an ownership kern cannot give must
+        // cost the ownership, not the mount.
+        if !mounted && opts.len() > without_ids {
+            opts.truncate(without_ids);
+            let retried = match cstr(&opts) {
+                // SAFETY: as above, with the shortened option string.
+                Ok(o) => unsafe {
+                    libc::mount(
+                        ty.as_ptr(),
+                        t.as_ptr(),
+                        ty.as_ptr(),
+                        hardening,
+                        o.as_ptr() as *const libc::c_void,
+                    ) == 0
+                },
+                Err(_) => false,
             };
+            if retried {
+                eprintln!(
+                    "kern: note: --tmpfs '{}': uid=/gid= were refused by the kernel (a user \
+                     namespace accepts only the ids it maps; `--uid-range` maps more), so the mount \
+                     is there and owned by the box's own identity",
+                    m.path
+                );
+            }
         }
     }
     Ok(())
@@ -2790,7 +3074,29 @@ fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
 fn setup_etc_identity(root: &str, hostname: &str) {
     /// The two lines every runtime seeds, byte-identical to what the pod's shared file carries so a
     /// standalone box and a pod member cannot disagree about `localhost`.
-    const LOCALHOST_SEED: &[u8] = b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n";
+    ///
+    /// `localhost` IS ON THE IPv4 LINE ONLY, which is podman's spelling and NOT Docker's. A
+    /// deliberate deviation, and the one place in this file where matching Docker would be the wrong
+    /// thing to do.
+    ///
+    /// MEASURED, three runtimes, one image (`python:3.12-alpine`, an IPv4-only listener, the check
+    /// `wget -O- http://localhost:5000/` that real compose files are full of):
+    ///
+    /// * podman: hosts file reads `::1 ip6-localhost ip6-loopback`, `wget` returns 0.
+    /// * Docker 29.6.2: hosts file reads `::1 localhost ip6-localhost ip6-loopback`, the container's
+    ///   `disable_ipv6` is `0` and `lo` HAS `::1` - and `wget http://localhost:5000/` FAILS while
+    ///   `http://127.0.0.1:5000/` returns 0. Docker has the defect too.
+    /// * kern before this: same as Docker, for the same reason.
+    ///
+    /// A previous version of this comment explained the difference by saying a Docker container has
+    /// IPv6 switched off, so its `::1` is demoted by musl's address sorting. That explanation is
+    /// WRONG, and the Docker measurement above is what killed it: IPv6 is on there and the check
+    /// fails anyway. What is actually true is smaller and does not need a theory about Docker: with
+    /// both records present musl prefers `::1`, busybox's `wget` uses the first address only, and an
+    /// IPv4-only listener is then unreachable by name. podman avoids it by not claiming the name for
+    /// `::1`, and kern does the same. The IPv6 loopback keeps its own names, which is what anything
+    /// asking for IPv6 by name uses.
+    const LOCALHOST_SEED: &[u8] = b"127.0.0.1\tlocalhost\n::1\tip6-localhost ip6-loopback\n";
     /// Prefix of the box's own entry. Split from the name so neither has to be copied to be written.
     const SELF_PREFIX: &[u8] = b"127.0.0.1\t";
     /// What an `/etc/hosts` must already contain for kern to leave it alone.
@@ -3999,11 +4305,31 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
                 "pod holder is gone (create the pod first with `kern pod create`)",
             ));
         }
-        if unsafe { libc::setns(user, libc::CLONE_NEWUSER) } != 0
-            || unsafe { libc::setns(net, libc::CLONE_NEWNET) } != 0
-        {
+        if unsafe { libc::setns(user, libc::CLONE_NEWUSER) } != 0 {
             let e = std::io::Error::last_os_error();
-            return Err(Error::Syscall("setns(pod user+net)", e));
+            return Err(Error::Syscall("setns(pod user)", e));
+        }
+        // TWO WAYS TO BE IN A POD, and they differ in exactly one namespace. Sharing the holder's
+        // network namespace is the default and the fast one. With `--pod-bridge` the member unshares
+        // its OWN network namespace and reaches its peers over the pod's bridge, which is what gives
+        // it a `127.0.0.1` no peer can reach.
+        match &spec.pod_bridge {
+            None => {
+                if unsafe { libc::setns(net, libc::CLONE_NEWNET) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    return Err(Error::Syscall("setns(pod net)", e));
+                }
+            }
+            Some(at) => {
+                if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    return Err(Error::Syscall("unshare(net) for the pod bridge", e));
+                }
+                // The member's OWN loopback, brought up before the bridge end arrives so a workload
+                // that binds `127.0.0.1` finds it there whatever the bridge does.
+                bring_loopback_up();
+                attach_to_pod_bridge(holder, at)?;
+            }
         }
         unsafe {
             libc::close(user);
@@ -4601,14 +4927,72 @@ fn read_cap_bnd() -> Result<u64, Error> {
 
 /// Apply `--ulimit` resource limits with `setrlimit(2)`.
 ///
-/// FAIL-CLOSED by design: a workload that asked for a limit and silently got a different one is a
-/// correctness bug that surfaces later as an inexplicable EMFILE or a fork bomb that was supposed to
-/// be capped. Rootless reality, stated plainly: LOWERING either bound always succeeds; RAISING the
-/// HARD bound requires `CAP_SYS_RESOURCE` in the INIT user namespace, which a rootless box never has,
-/// so that attempt returns EPERM and we refuse to start rather than run under the inherited limit.
+/// FAIL-CLOSED FOR A LIMIT THAT BINDS, CLAMPED-AND-SAID FOR ONE THAT DOES NOT.
 ///
-/// No allocation: the spec arrives pre-resolved as `(resource, soft, hard)` from the CLI, and the
-/// error path formats only when it is already failing.
+/// A workload that asked to be CONFINED and silently got a wider bound is a correctness bug: it
+/// surfaces later as a fork bomb that was supposed to be capped. Lowering either bound always
+/// succeeds rootless, so a refusal there is a real failure and stays one.
+///
+/// RAISING is the opposite ask and it is the common one in compose files: `memlock: -1` and
+/// `nofile: 65536` are Elasticsearch's standard block, present in thousands of stacks. The kernel
+/// refuses that rootless - a hard bound goes up only with `CAP_SYS_RESOURCE` in the INIT user
+/// namespace - and refusing to start cost the whole service. MEASURED: `--ulimit memlock=-1:-1`
+/// (OpenCTI's Elasticsearch, verbatim) failed with EPERM on a host whose hard limit is 4085088, and
+/// the box never ran. Docker on the same rootless host cannot grant it either; the difference is
+/// that kern was turning "you get less headroom" into "you get nothing".
+///
+/// So a refused RAISE is retried at the highest value this box can have - its inherited hard bound -
+/// and the difference is NAMED. Nothing is confined more loosely than asked: the clamp can only
+/// lower what was requested.
+/// The `--ulimit` names, the `RLIMIT_*` each resolves to, the `ulimit` flag that reads the same bound
+/// in a shell (verified against `help ulimit`, not guessed), and the UNIT `setrlimit` counts in
+/// (`getrlimit(2)`; empty where the value is a bare number, as for `nice` and `rtprio`).
+///
+/// ONE table, read in BOTH directions, and it lives at this layer rather than in the CLI because
+/// this is where the failures are. The clamp warning below used to say `--ulimit resource 8`: the
+/// operator wrote `memlock`, compose wrote `memlock`, and the only place the number appeared was
+/// kern's own diagnostic. Naming it needs the reverse lookup here, and a second copy of the table in
+/// two crates is how the two spellings drift.
+///
+/// The unit column is not decoration. `--ulimit memlock=-1` on this host clamps to 4183130112, while
+/// the `ulimit -l` the message sends the operator to prints 4085088: the same limit in KILOBYTES.
+/// A number offered for comparison against a command that scales it differently is a wrong number.
+pub const ULIMITS: &[(&str, i32, char, &str)] = &[
+    ("core", libc::RLIMIT_CORE as i32, 'c', "bytes"),
+    ("cpu", libc::RLIMIT_CPU as i32, 't', "seconds"),
+    ("data", libc::RLIMIT_DATA as i32, 'd', "bytes"),
+    ("fsize", libc::RLIMIT_FSIZE as i32, 'f', "bytes"),
+    ("locks", libc::RLIMIT_LOCKS as i32, 'x', "locks"),
+    ("memlock", libc::RLIMIT_MEMLOCK as i32, 'l', "bytes"),
+    ("msgqueue", libc::RLIMIT_MSGQUEUE as i32, 'q', "bytes"),
+    ("nice", libc::RLIMIT_NICE as i32, 'e', ""),
+    ("nofile", libc::RLIMIT_NOFILE as i32, 'n', "descriptors"),
+    ("nproc", libc::RLIMIT_NPROC as i32, 'u', "processes"),
+    ("rss", libc::RLIMIT_RSS as i32, 'm', "bytes"),
+    ("rtprio", libc::RLIMIT_RTPRIO as i32, 'r', ""),
+    ("rttime", libc::RLIMIT_RTTIME as i32, 'R', "microseconds"),
+    ("sigpending", libc::RLIMIT_SIGPENDING as i32, 'i', "signals"),
+    ("stack", libc::RLIMIT_STACK as i32, 's', "bytes"),
+];
+
+/// The name a `RLIMIT_*` number was written as, the `ulimit` flag that reads it in a shell, and the
+/// unit its value is counted in.
+pub fn ulimit_named(resource: i32) -> Option<(&'static str, char, &'static str)> {
+    ULIMITS
+        .iter()
+        .find(|(_, r, _, _)| *r == resource)
+        .map(|(n, _, f, u)| (*n, *f, *u))
+}
+
+/// An rlimit value as the operator wrote it: `RLIM_INFINITY` is `unlimited`, not 18446744073709551615.
+fn rlim_text(v: libc::rlim_t) -> String {
+    if v == libc::RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
 fn apply_ulimits(limits: &[(i32, u64, u64)]) -> Result<(), Error> {
     for &(resource, soft, hard) in limits {
         let rl = libc::rlimit {
@@ -4617,18 +5001,101 @@ fn apply_ulimits(limits: &[(i32, u64, u64)]) -> Result<(), Error> {
         };
         // SAFETY: `resource` is one of the RLIMIT_* constants (the CLI resolves the name against a
         // fixed table and rejects anything else), and `rl` is a fully initialised `rlimit` we own.
-        if unsafe { libc::setrlimit(resource as _, &rl) } != 0 {
-            let e = std::io::Error::last_os_error();
-            let hint = if e.raw_os_error() == Some(libc::EPERM) {
-                " (raising a HARD limit needs CAP_SYS_RESOURCE in the initial user namespace - a \
-                 rootless box can only LOWER its inherited limits)"
-            } else {
-                ""
-            };
-            return Err(Error::Spec(format!(
-                "--ulimit: setrlimit(resource {resource}, soft {soft}, hard {hard}) failed: {e}{hint}"
-            )));
+        if unsafe { libc::setrlimit(resource as _, &rl) } == 0 {
+            continue;
         }
+        let e = std::io::Error::last_os_error();
+        // The inherited bounds, which are the ceiling a rootless box cannot pass.
+        let mut cur = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: same constant, and `cur` is a live `rlimit` this call fills in.
+        let have = unsafe { libc::getrlimit(resource as _, &mut cur) } == 0;
+        let raising = have && hard as libc::rlim_t > cur.rlim_max;
+        if e.raw_os_error() == Some(libc::EPERM) && raising {
+            let clamped = libc::rlimit {
+                rlim_cur: (soft as libc::rlim_t).min(cur.rlim_max),
+                rlim_max: cur.rlim_max,
+            };
+            // SAFETY: as above; `clamped` is derived from values the kernel just reported.
+            if unsafe { libc::setrlimit(resource as _, &clamped) } == 0 {
+                // NAME THE LIMIT AND WHERE IT LIVES. An operator reading this has one decision to
+                // make - accept the headroom or change the host - and the warning has to carry
+                // enough to make it: which limit (by the name they typed, not the RLIMIT_ number),
+                // what the ceiling actually is, and the three places that ceiling is set. kern
+                // cannot raise it from inside, so the remedy is never anything kern can do.
+                let named = ulimit_named(resource);
+                let label = match named {
+                    Some((n, _, _)) => format!("--ulimit {n}"),
+                    None => format!("--ulimit resource {resource}"),
+                };
+                // The unit belongs to the numbers, not to the remedy: `ulimit -l` prints kilobytes
+                // for the same bound `setrlimit` counts in bytes, so the ceiling is pointed at by
+                // NAME and the operator reads its value from the host in the host's own units.
+                let unit = match named {
+                    Some((_, _, u)) if !u.is_empty() => format!(" {u}"),
+                    _ => String::new(),
+                };
+                let where_to_change = match named {
+                    Some((n, f, _)) => format!(
+                        " If the service really needs more, the ceiling is the HOST's own {n} \
+                         limit: `ulimit -{f}` in the shell that starts kern, a `{n}` line in \
+                         /etc/security/limits.conf, or Limit{}= in its systemd unit.",
+                        n.to_ascii_uppercase()
+                    ),
+                    None => String::new(),
+                };
+                // MEMLOCK IS NOT LIKE THE OTHERS, and a clamped `memlock: -1` is the single most
+                // common one in the wild (Elasticsearch, OpenSearch and everything derived from
+                // their compose files ship it). `mlockall` charges the whole RESERVED address space,
+                // not the resident set, so a JVM that reserves more than this ceiling cannot lock at
+                // all and `bootstrap.memory_lock: true` then refuses to start rather than running
+                // with less. MEASURED in a box with this exact ceiling: 8 GiB of PROT_NONE
+                // reservation made `mlockall` return ENOMEM, 1 GiB returned 0, and Elastic's own
+                // three-node compose file died with "memory locking requested ... but memory is not
+                // locked". Saying only "less headroom" would describe that as a degradation when it
+                // is a refusal.
+                let locking = if resource == libc::RLIMIT_MEMLOCK as i32
+                    && hard as libc::rlim_t == libc::RLIM_INFINITY
+                {
+                    " A process that calls `mlockall` counts its whole reserved address space \
+                     against this, not the memory it is using, so a workload that REQUIRES memory \
+                     locking (Elasticsearch's `bootstrap.memory_lock`) refuses to start here rather \
+                     than running with less."
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "kern: warning: {label}: asked for soft {} / hard {}, applied soft {} / hard \
+                     {}{unit} - a rootless box cannot raise a hard limit (that needs \
+                     CAP_SYS_RESOURCE in the initial user namespace), so it keeps the one it \
+                     inherited. The workload runs with less headroom than the file asked \
+                     for.{locking}{where_to_change}",
+                    rlim_text(soft as libc::rlim_t),
+                    rlim_text(hard as libc::rlim_t),
+                    rlim_text(clamped.rlim_cur),
+                    rlim_text(clamped.rlim_max)
+                );
+                continue;
+            }
+        }
+        let hint = if e.raw_os_error() == Some(libc::EPERM) {
+            " (raising a HARD limit needs CAP_SYS_RESOURCE in the initial user namespace - a \
+             rootless box can only LOWER its inherited limits)"
+        } else {
+            ""
+        };
+        // Same reason as the warning above: the operator typed a name, so the failure says the name.
+        let label = match ulimit_named(resource) {
+            Some((n, _, _)) => n.to_string(),
+            None => format!("resource {resource}"),
+        };
+        return Err(Error::Spec(format!(
+            "--ulimit {label}: setrlimit(soft {}, hard {}) failed: {e}{hint}",
+            rlim_text(soft as libc::rlim_t),
+            rlim_text(hard as libc::rlim_t)
+        )));
     }
     Ok(())
 }
@@ -4875,6 +5342,348 @@ pub fn bring_loopback_up() -> bool {
     }
 }
 
+/// The interface alias label kern gives one extra loopback address: `lo:` + the address in hex.
+///
+/// DERIVED FROM THE ADDRESS AND NOT FROM A COUNTER, and that is the whole reason this is a function.
+/// `SIOCSIFADDR` sets the address OF A LABEL, so two boxes in one pod both writing `lo:0` would have
+/// the second replace the first's address rather than add to it, and the first service would quietly
+/// lose the address the file gave it. Keyed by the address, a repeated call is idempotent and two
+/// different addresses cannot collide. Eight hex digits keep the label at 11 characters, inside the
+/// kernel's 15-character limit for every possible address, which a decimal label is not.
+#[must_use]
+pub fn loopback_alias_label(ip: std::net::Ipv4Addr) -> String {
+    let o = ip.octets();
+    format!("lo:{:02x}{:02x}{:02x}{:02x}", o[0], o[1], o[2], o[3])
+}
+
+/// Give `lo` an extra address in the current network namespace, as a `/32`.
+///
+/// WHY A BOX NEEDS ONE. A compose file that writes `ipv4_address:` under a service's `networks:` is
+/// naming the address its peers connect to, and a kern stack has no user-defined subnet to allocate
+/// from, so the literal address existed NOWHERE and a peer that hard-coded it got no route. Every
+/// address in `127.0.0.0/8` is local on `lo` without configuration, which is why the per-service
+/// aliases need none; an address outside it has to be added.
+///
+/// `ioctl` AND NOT NETLINK, matching [`bring_loopback_up`]: the same `AF_INET` socket, two calls,
+/// no message construction and no dependency. Measured in a rootless `unshare -rn`: `SIOCSIFADDR`
+/// followed by `SIOCSIFNETMASK` on a per-address label gives `172.20.0.5/32 scope global`, a second
+/// identical call returns 0 again, and a listener on `0.0.0.0` answers on it.
+///
+/// CALLED BEFORE THE CAPABILITY DROP, because it needs `CAP_NET_ADMIN` and kern takes that away from
+/// the box: measured from inside a running box, `ip addr add` answers `RTNETLINK answers: Operation
+/// not permitted` with bit 12 clear in `CapEff`. The box gets the address and still cannot
+/// reconfigure the network afterwards, which is the posture kern wants.
+/// Write an interface name into an `ifreq`, bounded by the array the kernel reads.
+fn ifr_name(ifr: &mut libc::ifreq, name: &str) {
+    for (i, b) in name.bytes().enumerate() {
+        if i + 1 >= ifr.ifr_name.len() {
+            break;
+        }
+        ifr.ifr_name[i] = b as libc::c_char;
+    }
+}
+
+/// One `SIOCSIFADDR`-family call: an interface name and one IPv4 value.
+///
+/// ONE DEFINITION FOR THE ADDRESS AND THE MASK, and for the loopback alias and the bridge member
+/// alike. The byte-order line is the whole reason: `octets()` is already network order and
+/// `from_ne_bytes` keeps that layout, so a `to_be()` here would write the address backwards on a
+/// little-endian machine. Written once, it can only be wrong once.
+fn iface_set_ipv4_field(
+    sock: libc::c_int,
+    name: &str,
+    request: libc::c_ulong,
+    addr: std::net::Ipv4Addr,
+) -> bool {
+    // SAFETY: an `ifreq` filled in full before the ioctl reads it.
+    unsafe {
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        ifr_name(&mut ifr, name);
+        let sin = std::ptr::addr_of_mut!(ifr.ifr_ifru.ifru_addr).cast::<libc::sockaddr_in>();
+        (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
+        (*sin).sin_port = 0;
+        (*sin).sin_addr.s_addr = u32::from_ne_bytes(addr.octets());
+        libc::ioctl(sock, request as _, &ifr) == 0
+    }
+}
+
+/// Give an interface an IPv4 address and netmask in the current network namespace.
+pub fn iface_set_ipv4(name: &str, ip: std::net::Ipv4Addr, mask: std::net::Ipv4Addr) -> bool {
+    // SAFETY: a datagram socket opened only to carry the ioctls, closed on every path.
+    unsafe {
+        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sock < 0 {
+            return false;
+        }
+        let ok = iface_set_ipv4_field(sock, name, libc::SIOCSIFADDR, ip)
+            && iface_set_ipv4_field(sock, name, libc::SIOCSIFNETMASK, mask);
+        libc::close(sock);
+        ok
+    }
+}
+
+/// Raise `IFF_UP` on an interface in the current network namespace. Idempotent.
+pub fn iface_up(name: &str) -> bool {
+    // SAFETY: an `ifreq` read back before it is written, on a socket closed on every path.
+    unsafe {
+        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sock < 0 {
+            return false;
+        }
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        ifr_name(&mut ifr, name);
+        let mut ok = false;
+        if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) == 0 {
+            if ifr.ifr_ifru.ifru_flags & libc::IFF_UP as i16 != 0 {
+                ok = true;
+            } else {
+                ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
+                ok = libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) == 0;
+            }
+        }
+        libc::close(sock);
+        ok
+    }
+}
+
+/// Rename an interface (it must be down), so a `veth` end created with a unique name in the holder's
+/// namespace becomes the ordinary `eth0` inside the box.
+///
+/// UNIQUE ON CREATION, ORDINARY AFTER THE MOVE. Both ends are created in the HOLDER's namespace,
+/// where every member's ends live at once, so a member cannot create `eth0` there without colliding
+/// with the next member. The name only has to be ordinary on the far side, which is after the move.
+pub fn iface_rename(old: &str, new: &str) -> bool {
+    // SAFETY: both names are written into the fixed-size arrays the ioctl reads.
+    unsafe {
+        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sock < 0 {
+            return false;
+        }
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        ifr_name(&mut ifr, old);
+        let np = std::ptr::addr_of_mut!(ifr.ifr_ifru.ifru_newname).cast::<libc::c_char>();
+        for (i, b) in new.bytes().enumerate() {
+            if i + 1 >= libc::IFNAMSIZ {
+                break;
+            }
+            *np.add(i) = b as libc::c_char;
+        }
+        let ok = libc::ioctl(sock, libc::SIOCSIFNAME as _, &ifr) == 0;
+        libc::close(sock);
+        ok
+    }
+}
+
+pub fn add_loopback_alias(ip: std::net::Ipv4Addr) -> bool {
+    let label = loopback_alias_label(ip);
+    unsafe {
+        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sock < 0 {
+            return false;
+        }
+        let set = |request: libc::c_ulong, addr: std::net::Ipv4Addr| -> bool {
+            iface_set_ipv4_field(sock, &label, request, addr)
+        };
+        // VERIFIED AND RETRIED, BECAUSE A CONCURRENT ADD LOSES ONE. Two boxes joining the same pod
+        // add their addresses to the same `lo` at the same time, and the legacy label interface
+        // drops one of them: MEASURED with two `kern box --pod` started in parallel, where only the
+        // later address survived, while the identical pair added one after the other both stuck.
+        // The check is a `bind` rather than a read-back ioctl because binding is the thing the
+        // caller actually needs to be true, and an address that cannot be bound is not there
+        // whatever a query says.
+        let mut ok = false;
+        for _ in 0..ATTEMPTS {
+            if set(libc::SIOCSIFADDR, ip)
+                && set(
+                    libc::SIOCSIFNETMASK,
+                    std::net::Ipv4Addr::new(255, 255, 255, 255),
+                )
+                && ipv4_is_local(sock, ip)
+            {
+                ok = true;
+                break;
+            }
+            // Short enough that a whole retry budget is invisible next to a box start, long enough
+            // that the racing process gets to finish rather than being fought for the same slot.
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_MS));
+        }
+        libc::close(sock);
+        ok
+    }
+}
+
+/// How many times [`add_loopback_alias`] re-adds an address it cannot bind afterwards.
+const ATTEMPTS: usize = 12;
+/// The pause between those attempts.
+const RETRY_MS: u64 = 5;
+
+/// Can this address be bound in the current network namespace?
+///
+/// The direct question the caller has: `bind` succeeds on a local address and fails with
+/// `EADDRNOTAVAIL` on one the namespace does not hold. Port 0 so the kernel picks an ephemeral one
+/// and nothing is claimed; the socket is closed immediately.
+fn ipv4_is_local(_probe: libc::c_int, ip: std::net::Ipv4Addr) -> bool {
+    unsafe {
+        let s = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        if s < 0 {
+            return false;
+        }
+        let mut sa: libc::sockaddr_in = std::mem::zeroed();
+        sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        sa.sin_port = 0;
+        sa.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
+        let r = libc::bind(
+            s,
+            std::ptr::addr_of!(sa).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        libc::close(s);
+        r == 0
+    }
+}
+
+/// The bridge interface a pod holder builds, and the one its members attach to.
+pub const POD_BRIDGE: &str = "kbr0";
+
+/// A member's place on the pod bridge: the address it takes and the size of the network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeAttach {
+    /// The address this box answers on, reachable from every other member.
+    pub ip: std::net::Ipv4Addr,
+    /// Prefix length of the pod's network, so the member knows which peers are directly connected.
+    pub prefix: u8,
+}
+
+/// Split `10.89.0.0/24` into the address a bridge takes (`.1`) and its netmask.
+///
+/// THE GATEWAY IS THE FIRST HOST ADDRESS, which is the convention every reader expects and the one
+/// Docker uses for its own bridges. Members start at `.2`, the same place kern's loopback aliases
+/// start, for the same reason: `.0` is the network and `.1` is where the bridge sits.
+#[must_use]
+pub fn pod_bridge_parts(cidr: &str) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, u8)> {
+    let (net, prefix) = cidr.split_once('/')?;
+    let net: std::net::Ipv4Addr = net.trim().parse().ok()?;
+    let prefix: u8 = prefix.trim().parse().ok()?;
+    // A /31 or /32 holds no bridge and two members; anything wider than /8 is not a mistake this
+    // should silently accept either.
+    if !(8..=30).contains(&prefix) {
+        return None;
+    }
+    let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
+    let base = u32::from_be_bytes(net.octets()) & mask;
+    Some((
+        std::net::Ipv4Addr::from(base + 1),
+        std::net::Ipv4Addr::from(mask),
+        prefix,
+    ))
+}
+
+/// The netmask for a prefix length.
+#[must_use]
+pub fn mask_of(prefix: u8) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0))
+}
+
+/// Put this process's network namespace on the pod's bridge, as `eth0`.
+///
+/// THE MEMBER HAS ALREADY UNSHARED ITS OWN NETWORK NAMESPACE when this runs, which is the whole
+/// point: it keeps a `127.0.0.1` no other service can reach, exactly as a Docker container does,
+/// while still reaching its peers. The shared-namespace pod cannot do the first, and the
+/// relay wiring pays a TCP hop per ordered pair per port for the second.
+///
+/// A FORKED HELPER DOES THE WORK IN THE HOLDER'S NAMESPACE, because both ends of a `veth` are born
+/// where it is created and one of them has to be born next to the bridge. The helper `setns`es into
+/// the holder's network namespace (legal: the member is already in the pod's USER namespace, which
+/// owns it), builds the pair, attaches one end to the bridge and hands the other back by this
+/// process's pid. The caller then renames it and gives it its address, in its own namespace.
+fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
+    let me = std::process::id() as i32;
+    let vname = format!("kv{me}");
+    let pname = format!("kp{me}");
+    // SAFETY: a fork from the single-threaded box setup path; the child only does namespace and
+    // netlink work and then `_exit`s without touching the parent's state.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(Error::Syscall(
+            "fork(pod bridge helper)",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if pid == 0 {
+        let code = {
+            let path = format!("/proc/{holder}/ns/net\0");
+            // SAFETY: the path is NUL-terminated above and the fd is used only for `setns`.
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr().cast::<libc::c_char>(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                2
+            // SAFETY: `fd` is a namespace file just opened.
+            } else if unsafe { libc::setns(fd, libc::CLONE_NEWNET) } != 0 {
+                3
+            } else if crate::netlink::add_veth(&vname, &pname).is_err() {
+                4
+            } else {
+                match (
+                    crate::netlink::index_of(&vname),
+                    crate::netlink::index_of(POD_BRIDGE),
+                    crate::netlink::index_of(&pname),
+                ) {
+                    (Some(v), Some(b), Some(p)) => {
+                        if crate::netlink::set_master(v, b).is_err() {
+                            6
+                        } else if !iface_up(&vname) {
+                            7
+                        } else if crate::netlink::move_to_netns(p, me).is_err() {
+                            9
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 5,
+                }
+            }
+        };
+        // SAFETY: leaving the forked child without running the parent's handlers.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0i32;
+    // SAFETY: waiting on the child just forked.
+    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+        return Err(Error::Syscall(
+            "waitpid(pod bridge helper)",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        -1
+    };
+    if code != 0 {
+        return Err(Error::Unsupported(
+            "could not attach this box to the pod bridge (is the pod holder still running, and was \
+             the pod created with a bridge?)",
+        ));
+    }
+    // The end is here now, under the unique name it was born with. `eth0` is what a workload
+    // expects to find, and the name only has to be ordinary once it is on this side.
+    if !iface_rename(&pname, "eth0") {
+        return Err(Error::Unsupported(
+            "the pod bridge interface arrived but could not be renamed to eth0",
+        ));
+    }
+    if !iface_set_ipv4("eth0", at.ip, mask_of(at.prefix)) || !iface_up("eth0") {
+        return Err(Error::Unsupported(
+            "the pod bridge interface could not be addressed",
+        ));
+    }
+    Ok(())
+}
+
 /// Create and HOLD a pod's shared user + net namespace, then block forever. `kern pod create` forks
 /// this as a detached holder process; `--pod` boxes `setns` into `/proc/<holder>/ns/{user,net}` to
 /// share its loopback network. Unshares a fresh user ns (single-uid map: pod-root = the caller) + a
@@ -4936,6 +5745,33 @@ pub fn run_pod_holder() -> ! {
         }
     }
     bring_loopback_up();
+    // `KERN_POD_BRIDGE=<cidr>`: this pod gives every member its own network namespace on a bridge
+    // instead of sharing this one. Set by `kern pod create --bridge`, read here for the reason
+    // `KERN_POD_UID_RANGE` is: the holder is forked by a verb that cannot pass it a struct.
+    //
+    // FAIL-CLOSED. A member that cannot reach the bridge has no peers at all, so a holder that could
+    // not build one must not report itself ready: the alternative is a pod that starts, looks fine
+    // and silently isolates every service in it.
+    if let Ok(cidr) = std::env::var("KERN_POD_BRIDGE") {
+        match pod_bridge_parts(&cidr) {
+            Some((gw, mask, _)) => {
+                if crate::netlink::add_bridge(POD_BRIDGE).is_err()
+                    || !iface_set_ipv4(POD_BRIDGE, gw, mask)
+                    || !iface_up(POD_BRIDGE)
+                {
+                    eprintln!("kern: pod: could not build the pod bridge ({cidr})");
+                    unsafe { libc::_exit(1) };
+                }
+            }
+            None => {
+                eprintln!(
+                    "kern: pod: '{cidr}' is not a network kern can build a bridge on (expected \
+                     something like 10.89.0.0/24, prefix between 8 and 30)"
+                );
+                unsafe { libc::_exit(1) };
+            }
+        }
+    }
     // Signal readiness (the parent waits for this line on our stdout) so `kern pod create` only
     // records the holder once its namespaces are actually set up.
     println!("pod-ready");
@@ -5164,6 +6000,19 @@ pub fn exec_in_box(
     // so `ttyname()` can resolve it inside the box. `None` keeps the host pty in `tty_slave`, which
     // works but has no name there. See [`crate::ptybox`].
     pty: Option<PtyHandover>,
+    // Drop to this uid/gid (with these supplementary groups) before the exec, or stay box-root.
+    //
+    // ONLY THE HEALTH PROBE PASSES A USER, and the asymmetry is deliberate. Docker runs a
+    // `HEALTHCHECK` as the container's user - measured, not assumed: on Docker 29.6.2 a container
+    // started `--user 1000:1000 -w /tmp` with a probe that records `id` and `pwd` reports
+    // `uid=1000 gid=1000 groups=1000` and `/tmp`. A probe that runs as root is a FALSE-GREEN
+    // generator: it reads files the workload cannot, reports healthy, and
+    // `depends_on: service_healthy` then releases a dependent onto a service that dies of EACCES.
+    // Measured on Elastic's own stack, whose certificates are `root:root` mode 640. `kern exec`
+    // keeps box-root: it is the operator's door into the box and the frozen CLI has no `--user` on
+    // it to get root back with.
+    run_as: Option<(u32, u32)>,
+    extra_gids: &[u32],
 ) -> Result<i32, Error> {
     if command.is_empty() {
         return Err(Error::Unsupported("no command given to exec in the box"));
@@ -5495,15 +6344,6 @@ pub fn exec_in_box(
         if let Some(slave) = box_slave.or(tty_slave) {
             adopt_controlling_tty(slave);
         }
-        // Honor `--workdir` - fatal if it can't be entered (consistent with `kern box -w`, so a
-        // typo'd dir is an error, not a silent run in `/`).
-        if let Some(wd) = workdir {
-            let entered = cstr(wd).is_ok_and(|c| unsafe { libc::chdir(c.as_ptr()) } == 0);
-            if !entered {
-                eprintln!("kern: exec: cannot enter workdir {wd}");
-                unsafe { libc::_exit(127) };
-            }
-        }
         // Parity with a box's own workload: reapply the box's OWN capability spec, so an `exec`'d
         // command is no MORE privileged than the box's PID 1 (which ran `drop_dangerous_caps` with the
         // same spec + seccomp before its own exec). `box_caps` is rebuilt by the caller from the
@@ -5515,6 +6355,27 @@ pub fn exec_in_box(
         // baseline while the box's PID 1 dropped it would be a silent privilege gap in the box.
         if drop_dangerous_caps(box_caps).is_err() {
             exec_fail_closed("could not drop capabilities");
+        }
+        // THE IDENTITY, THEN THE DIRECTORY, and both AFTER the capability drop: dropping the
+        // BOUNDING set needs `CAP_SETPCAP`, which a non-root uid no longer has. Measured by doing it
+        // the other way round first: with the drop before it, every probe on a `--user` box failed
+        // closed at "could not drop capabilities" and the box reported unhealthy. `CAP_SETUID` and
+        // `CAP_SETGID` are not in the dangerous mask, so they are still here.
+        //
+        // FAIL CLOSED. Running the probe as root is exactly the false green this exists to remove.
+        if let Some((uid, gid)) = run_as {
+            if set_user(uid, gid, extra_gids).is_err() {
+                exec_fail_closed("could not drop to the box's own user");
+            }
+        }
+        // Honor `--workdir` - fatal if it can't be entered (consistent with `kern box -w`, so a
+        // typo'd dir is an error, not a silent run in `/`).
+        if let Some(wd) = workdir {
+            let entered = cstr(wd).is_ok_and(|c| unsafe { libc::chdir(c.as_ptr()) } == 0);
+            if !entered {
+                eprintln!("kern: exec: cannot enter workdir {wd}");
+                unsafe { libc::_exit(127) };
+            }
         }
         // Fail CLOSED if seccomp can't install - never run the exec'd command unfiltered (the box's
         // PID 1 fails closed on this same call; `exec` must match, not fall through unprotected).
@@ -6107,8 +6968,16 @@ mod add_host_tests {
 
         let hosts = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert!(
-            hosts.contains("127.0.0.1\tlocalhost") && hosts.contains("::1\tlocalhost"),
-            "both localhost seeds are written: {hosts:?}"
+            hosts.contains("127.0.0.1\tlocalhost"),
+            "the localhost seed is written: {hosts:?}"
+        );
+        // `localhost` MUST NOT ALSO NAME `::1`. With a working IPv6 loopback, musl prefers `::1`
+        // and busybox `wget` uses the first address only, so `wget http://localhost:PORT` against
+        // an IPv4-only listener - the most common health check spelling there is - was refused in
+        // a kern box and returned 0 under podman. The IPv6 loopback keeps its own names.
+        assert!(
+            hosts.contains("::1\tip6-localhost") && !hosts.contains("::1\tlocalhost"),
+            "the IPv6 line must not claim the name `localhost`: {hosts:?}"
         );
         assert!(
             hosts.contains("127.0.0.1\tboxname"),
@@ -6876,6 +7745,77 @@ mod cpu_topology_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod loopback_alias_tests {
+    use super::loopback_alias_label;
+    use std::net::Ipv4Addr;
+
+    /// THE LABEL IS KEYED BY THE ADDRESS, AND A COUNTER WOULD LOSE AN ADDRESS.
+    ///
+    /// `SIOCSIFADDR` sets the address OF A LABEL. Two boxes in one pod both writing `lo:0` would
+    /// have the second REPLACE the first's address rather than add to it, and the first service
+    /// would silently lose the address its file gave it. Keyed by the address, a repeat is
+    /// idempotent and two addresses cannot collide.
+    ///
+    /// THE LENGTH IS THE OTHER HALF. An interface name is at most 15 characters, and a decimal
+    /// label (`lo:255.255.255.255`) is 18. Hex is always 11.
+    #[test]
+    fn a_loopback_alias_label_is_unique_per_address_and_always_fits() {
+        assert_eq!(
+            loopback_alias_label(Ipv4Addr::new(172, 20, 0, 5)),
+            "lo:ac140005"
+        );
+        assert_eq!(
+            loopback_alias_label(Ipv4Addr::new(10, 5, 0, 100)),
+            "lo:0a050064"
+        );
+        // The widest possible address still fits inside the kernel's 15-character limit.
+        let widest = loopback_alias_label(Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(widest, "lo:ffffffff");
+        assert!(widest.len() <= 15, "{widest} is {} chars", widest.len());
+        // Two different addresses never share a label, including ones that differ only in an octet
+        // a decimal rendering would run together (`1.2.3.4` vs `12.3.4` is not a thing here, but
+        // `1.20.3.4` and `1.2.03.4` would be if the label were built by joining decimals).
+        assert_ne!(
+            loopback_alias_label(Ipv4Addr::new(1, 20, 3, 4)),
+            loopback_alias_label(Ipv4Addr::new(12, 0, 3, 4))
+        );
+        // And the same address twice is the same label, which is what makes a repeat idempotent.
+        assert_eq!(
+            loopback_alias_label(Ipv4Addr::new(192, 168, 1, 1)),
+            loopback_alias_label(Ipv4Addr::new(192, 168, 1, 1))
+        );
+    }
+
+    /// THE ADD IS RETRIED, AND THAT IS A DECISION RATHER THAN A HABIT.
+    ///
+    /// Two boxes joining the same pod add their addresses to the same `lo` at the same time and the
+    /// legacy label interface DROPS ONE: measured with two `kern box --pod` started in parallel,
+    /// where only the later address survived, against the identical pair added one after the other,
+    /// where both stuck. With the retry, three boxes started in parallel all keep their address, and
+    /// a two-service compose stack reached the literal address three runs out of three.
+    ///
+    /// PINNED HERE BECAUSE NO UNIT TEST REACHES IT. Reproducing the race needs a private network
+    /// namespace and two processes racing inside it, which a unit test in this crate cannot stand
+    /// up; the evidence is the end-to-end runs above. What this asserts is that the retry is still
+    /// there, so removing it is a deliberate act and not a silent one.
+    // THE LINT IS EXACTLY WRONG HERE. `assertions_on_constants` exists to catch an assertion that
+    // can never fail and therefore tests nothing. This one tests nothing about a RUN and everything
+    // about a DECISION: it fails at the moment someone edits the constant, which is the only moment
+    // that matters, and it fails with the reason the constant exists.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn the_alias_add_still_retries_because_a_concurrent_add_loses_one() {
+        assert!(
+            super::ATTEMPTS > 1,
+            "a single attempt loses an address when two boxes join a pod at once"
+        );
+        // Long enough to outlast a racing add, short enough to be invisible next to a box start:
+        // the whole budget is under a tenth of a second.
+        assert!(super::ATTEMPTS as u64 * super::RETRY_MS <= 100);
     }
 }
 

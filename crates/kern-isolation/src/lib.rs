@@ -39,6 +39,8 @@ macro_rules! progress {
 
 mod cgroup;
 mod landlock;
+/// RTNETLINK: the link operations that have no ioctl form (veth, bridge, master, netns move).
+pub mod netlink;
 
 /// The kernel's Landlock ABI version, or `None` when Landlock is unavailable (not compiled in, or
 /// disabled at boot). Exposed so `kern doctor` can SAY SO up front: `--landlock-rw` degrades to
@@ -138,6 +140,7 @@ pub use cgroup::missing_manager_clause;
 pub use cgroup::oom_kill_count;
 /// `oom_kill` read from a directory already resolved. See [`cgroup::oom_kill_count_at`].
 pub use cgroup::oom_kill_count_at;
+
 /// The cgroup directory whose `oom_kill` counter covers the box a pid runs in, resolved while that
 /// pid is alive. See [`cgroup::oom_kill_dir_for_pid`].
 pub use cgroup::oom_kill_dir_for_pid;
@@ -196,6 +199,10 @@ pub use cgroup::{fleet_status, FleetStatus};
 /// cannot tell "delegated" from "listed but inert". See [`cgroup::memory_cap_state`].
 pub use cgroup::{memory_cap_probe_sites, memory_cap_state, MemoryCapState};
 pub use cgroup::{memory_cap_signal, record_memory_cap_signal};
+/// How many forks/threads the pids cap REFUSED, and the cap itself: the counterpart of the OOM
+/// counter, for the limit whose failure the workload always misreports. See
+/// [`cgroup::pids_denied_count_at`].
+pub use cgroup::{open_pids_events_fd, pids_denied_count_at, pids_denied_from_fd, pids_max_at};
 pub use outcome::{Outcome, OutputView, ResourceSource};
 
 /// The remedy line for a box that could not be BUILT, as opposed to one whose command was wrong.
@@ -238,9 +245,10 @@ pub use real::PhaseTimer;
 pub use real::{
     default_dropped_cap_mask, exec_in_box, run_in_sandbox, run_in_sandbox_with, run_pod_holder,
     set_cpu_affinity, shed_inherited_fds, shed_inherited_fds_keeping, sub_range, trusted_helper,
-    username, CapSpec, OverlayDirs, RealMounts, SandboxSpec, TmpfsMount, UidRange, Unplaceable,
-    VdiskMount, Volume,
+    ulimit_named, username, BridgeAttach, CapSpec, OverlayDirs, RealMounts, SandboxSpec,
+    TmpfsMount, UidRange, Unplaceable, VdiskMount, Volume, ULIMITS,
 };
+pub use real::{iface_set_ipv4, iface_up, pod_bridge_parts, POD_BRIDGE};
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};
 pub use seccomp::{denied_syscall_count, SeccompFilter};
@@ -455,6 +463,60 @@ mod tests {
                 "remount_ro(/)".to_string(),
             ]
         );
+    }
+
+    /// A refused volume bind can only blame a submount when there IS one, and it must name it.
+    ///
+    /// The `-v /tmp:/x` case measured on the dev host: `/tmp` carries one mount inherited from
+    /// outside the box, kern binds non-recursively, and the kernel answers EINVAL. What the
+    /// operator saw was "Invalid argument" and nothing else. The evidence, not the errno, is what
+    /// selects the explanation, so a source with nothing under it keeps the raw syscall error even
+    /// when the syscall fails - that is the control below.
+    #[test]
+    fn a_refused_bind_names_the_submounts_under_the_source_and_nothing_else() {
+        // Shape taken from a real `/proc/self/mountinfo`: the mount point is field 5.
+        let body = "\
+24 30 0:22 / /tmp rw,nosuid,nodev shared:2 - tmpfs tmpfs rw
+41 24 0:41 / /tmp/RustDesk-1000/cliprdr-server rw,relatime shared:9 - fuse fuse rw
+42 24 0:42 / /tmp/my\\040vol rw,relatime shared:10 - tmpfs tmpfs rw
+43 24 0:43 / /tmp/my\\040vol rw,relatime shared:13 - tmpfs tmpfs rw
+50 30 0:50 / /var/tmp rw,relatime shared:11 - ext4 /dev/sda1 rw
+51 30 0:51 / /tmpfoo rw,relatime shared:12 - tmpfs tmpfs rw
+";
+        let (named, total) = crate::real::submounts_in(body, "/tmp", 3);
+        // Two lines for `/tmp/my vol` (one filesystem stacked on another) are ONE path to act on:
+        // measured on `/proc`, where binfmt_misc appears twice and the operator saw it listed twice.
+        assert_eq!(
+            total, 2,
+            "only what is strictly UNDER /tmp counts, once each"
+        );
+        assert_eq!(
+            named,
+            vec![
+                "/tmp/RustDesk-1000/cliprdr-server".to_string(),
+                // The kernel octal-escapes a space in the path; the message must not show `\040`.
+                "/tmp/my vol".to_string(),
+            ]
+        );
+        // `/tmp` itself is not its own submount, and a sibling that merely shares the prefix
+        // (`/tmpfoo`) is not under it either.
+        assert!(!named.contains(&"/tmp".to_string()));
+        assert!(!named.contains(&"/tmpfoo".to_string()));
+
+        // Control: a source with nothing mounted under it yields no evidence, so the failure path
+        // reports the syscall error unchanged instead of inventing a cause.
+        let (named, total) = crate::real::submounts_in(body, "/var/tmp", 3);
+        assert!(named.is_empty() && total == 0);
+
+        // Only the first `max` are named, and the count still tells the whole truth.
+        let many = "\
+1 2 0:1 / /a/one rw - tmpfs t rw
+2 2 0:2 / /a/two rw - tmpfs t rw
+3 2 0:3 / /a/three rw - tmpfs t rw
+4 2 0:4 / /a/four rw - tmpfs t rw
+";
+        let (named, total) = crate::real::submounts_in(many, "/a", 3);
+        assert_eq!((named.len(), total), (3, 4));
     }
 
     /// Each `MountMode` produces the expected initial mount call.

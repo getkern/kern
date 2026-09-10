@@ -65,6 +65,12 @@ pub enum Command {
         egress_allow: Vec<String>,
         /// `--landlock-rw <path>` (repeatable): a Landlock write-allowlist (box RO except these paths).
         landlock_rw: Vec<String>,
+        /// `--pod-bridge <ip>/<prefix>`: join the pod through its bridge with this address.
+        pod_bridge: Option<kern_isolation::BridgeAttach>,
+        /// `--ip <addr>` (repeatable): extra IPv4 addresses this box's `lo` answers on, each a `/32`.
+        /// Parsed into `Ipv4Addr` here rather than carried as a string, so a value that is not an
+        /// address is refused before a box exists instead of failing where nothing can point at it.
+        net_ips: Vec<std::net::Ipv4Addr>,
         /// `--apparmor <profile>`: a pre-loaded AppArmor profile the box enters on exec (Docker's
         /// `--security-opt apparmor=`). A missing/unloaded profile fails the box closed.
         apparmor: Option<String>,
@@ -134,6 +140,8 @@ pub enum Command {
         /// `--secret SRC[:NAME]` / `NAME=value` / `NAME=-` (repeatable): deliver a secret to the box
         /// as `/run/secrets/NAME` (mode 0400) without it touching the image or the workload env.
         secrets: Vec<String>,
+        /// `--secret-env <name>`: content from `KERN_SECRET_<name>`, never from argv.
+        secret_envs: Vec<String>,
         /// `--secret-mode <octal>`: the mode every secret of this box is created with. Defaults to
         /// `secret::DEFAULT_SECRET_MODE` (0400); `kern compose` passes the Compose Specification's
         /// `0444` explicitly, because a secret only the owner can read is unreadable to every image
@@ -182,6 +190,9 @@ pub enum Command {
         restart: commands::RestartPolicy,
         /// `--health-cmd <cmd>`: shell command run periodically in the box (exit 0 = healthy).
         health_cmd: Option<String>,
+        /// `--health-cmd-argv <arg>` (repeatable): the same check in Docker's `CMD` exec form - one
+        /// argv element per occurrence, run with NO shell.
+        health_cmd_argv: Vec<String>,
         /// `--health-interval <sec>`: seconds between health checks (default 30).
         health_interval: u64,
         /// `--health-retries <n>`: consecutive failures before a box is marked unhealthy (default 3).
@@ -300,11 +311,15 @@ pub enum Command {
         /// `build.target:`).
         target: Option<String>,
     },
-    /// `kern pod create <name> [--no-outbound] [--uid-range]` / `pod ls` / `pod rm <name>`: shared-network pods.
+    /// `kern pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>]` / `pod ls` / `pod rm
+    /// <name>`: a pod is a shared network, either one namespace or one bridge.
     PodCreate {
         name: String,
         outbound: bool,
         uid_range: bool,
+        /// `--bridge <cidr>`: hold a bridge instead of a shared loopback, so every member gets its
+        /// own network namespace and its own `127.0.0.1` while still reaching its peers.
+        bridge: Option<String>,
     },
     PodList {
         /// `--json`: the same scan as the table, machine-readable. Every read verb takes it; a verb
@@ -499,6 +514,12 @@ pub enum Command {
         /// Which compose verb to run (see [`commands::ComposeAction`]).
         action: commands::ComposeAction,
         no_pod: bool,
+        /// `--bridge`: wire the stack the way Docker does. Each service keeps its OWN network
+        /// namespace, and therefore its own `127.0.0.1`, and they meet on a bridge the pod holds.
+        /// One `veth` per service instead of a TCP relay per ordered pair per port.
+        bridge: bool,
+        /// `--allow-privileged`: the operator's half of a file's `privileged: true`.
+        allow_privileged: bool,
         /// `--pod`: keep one shared namespace even when the file expresses segregation.
         force_pod: bool,
         /// `--allow-device-grants`: see [`commands::ComposeOpts::allow_device_grants`]. CLI-only on
@@ -556,6 +577,21 @@ pub enum Command {
 // Usage/rejection strings shared by the `box` and `run` resource-flag arms, so the two parsers
 // can never drift out of sync (they take the same flags with identical semantics).
 const USAGE_MEMORY: &str = "--memory <size> (e.g. 512m, 1g, 268435456)";
+
+/// The message for a size flag whose VALUE is wrong, as opposed to missing.
+///
+/// IT NAMES THE VALUE, and the sentence it replaces did not. `usage: kern --memory <size>` is what a
+/// compose user saw when their file said `memory: 1.5G`: an error about a kern flag they never
+/// typed, for a value it did not print, from a file it did not mention. Three keys in a compose file
+/// reach this flag, so the last line says so and the reader knows where to look.
+fn bad_size(flag: &str, v: &str) -> String {
+    format!(
+        "{flag} '{v}' is not a size. Write digits with an optional binary unit (512m, 1g, 1.5g, \
+         2gb, 268435456). A compose file's `mem_limit:`, `memswap_limit:` or \
+         `deploy.resources.limits.memory:` reaches this flag, so this may be a value your compose \
+         file wrote rather than one you typed"
+    )
+}
 const USAGE_CPUS: &str = "--cpus <n> (e.g. 1.5 = 1½ cores, 2)";
 const USAGE_CPUSET: &str = "--cpuset-cpus <list> (e.g. 0-3, 0,2,4)";
 const USAGE_SWAP_MAX: &str = "--memory-swap-max <size> (e.g. 1g, 512m)";
@@ -641,9 +677,32 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
     // `-- --help` inside a box/run command is NOT treated as a help request.
     if rest.len() > 1 {
         let mut saw_help = false;
+        // A FLAG'S VALUE IS NOT A HELP REQUEST, and for these two flags a value that begins with a
+        // dash is ORDINARY. Each carries ONE ARGV ELEMENT and is repeated to build a list, so
+        // `-h`, `--help` or any other option of the program being described is a normal element:
+        // `--health-cmd-argv pg_isready --health-cmd-argv -U --health-cmd-argv postgres
+        // --health-cmd-argv -h --health-cmd-argv localhost` is Supabase's own database check.
+        //
+        // MEASURED, not anticipated: eight of the eleven Supabase services died within 150 ms of
+        // starting, each `kern box` printing the box help instead of running, because the `-h` in
+        // `pg_isready -h localhost` reached this scan as an argument of its own. The shell form
+        // hid it - there the whole check is a single argv element, so `-h` never appears alone -
+        // which is why it surfaced only when the exec form started being preserved.
+        //
+        // A LIST OF TWO, on a criterion rather than by enumeration of what has broken so far: a
+        // flag belongs here exactly when its value is one element of somebody else's argv.
+        const ARGV_ELEMENT_FLAGS: &[&str] = &["--health-cmd-argv", "--entrypoint"];
+        let mut skip_value = false;
         for a in &rest[1..] {
             if *a == "--" {
                 break;
+            }
+            if std::mem::take(&mut skip_value) {
+                continue;
+            }
+            if ARGV_ELEMENT_FLAGS.contains(a) {
+                skip_value = true;
+                continue;
             }
             if matches!(*a, "--help" | "-h") {
                 saw_help = true;
@@ -1258,6 +1317,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut action: Option<commands::ComposeAction> = None;
             let mut no_pod = false;
             let mut force_pod = false;
+            let mut bridge = false;
+            let mut allow_privileged = false;
             let mut allow_device_grants = false;
             let mut tail: Option<usize> = None;
             let mut follow = false;
@@ -1267,12 +1328,22 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             while let Some(a) = it.next() {
                 match *a {
                     "--no-pod" => no_pod = true,
+                    // `--bridge`: the third wiring, and the only one that is Docker's arrangement.
+                    // Each service gets its own network namespace on a bridge the pod holds, so a
+                    // port a service binds on its loopback is ITS OWN, two services may bind the
+                    // same container port, and peers meet at addresses instead of through a relay.
+                    "--bridge" => bridge = true,
                     // The explicit opt-OUT of the auto-selection below. Without it a file that
                     // expresses segregation is wired per service, which is what it asked for; with
                     // it the stack keeps one namespace and the segregation is dropped, which is what
                     // kern did before and is still the faster wiring.
                     "--pod" => force_pod = true,
                     "--allow-device-grants" => allow_device_grants = true,
+                    // The operator's half of `privileged: true`. Its own flag and not folded into
+                    // `--allow-device-grants`: one grants access to named device nodes, the other
+                    // relaxes the seccomp filter, and an operator who wants one has not asked for
+                    // the other.
+                    "--allow-privileged" => allow_privileged = true,
                     "-f" | "--follow" => follow = true,
                     "-a" | "--all" => all = true,
                     "-p" | "--project-name" => {
@@ -1357,6 +1428,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 files,
                 action: action.unwrap_or(commands::ComposeAction::Up),
                 no_pod,
+                bridge,
+                allow_privileged,
                 force_pod,
                 allow_device_grants,
                 tail,
@@ -1378,8 +1451,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 commands::ComposeAction::Up
             };
             let no_pod = rest.contains(&"--no-pod");
+            let bridge = rest.contains(&"--bridge");
             let force_pod = rest.contains(&"--pod");
             let allow_device_grants = rest.contains(&"--allow-device-grants");
+            let allow_privileged = rest.contains(&"--allow-privileged");
             let file = discover_compose_file().ok_or_else(|| {
                 Error::Compose(
                     "no compose file in this directory (looked for docker-compose.yml, compose.yml, compose.yaml, kern.toml)".to_string(),
@@ -1389,6 +1464,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 files: vec![file],
                 action,
                 no_pod,
+                bridge,
+                allow_privileged,
                 force_pod,
                 allow_device_grants,
                 tail: None,
@@ -1543,26 +1620,16 @@ fn parse_ulimit(spec: &str) -> Result<(i32, u64, u64), Error> {
         "--ulimit NAME=SOFT[:HARD] where NAME is one of: core cpu data fsize locks \
                          memlock msgqueue nice nofile nproc rss rtprio rttime sigpending stack";
     let (name, bounds) = spec.split_once('=').ok_or(Error::Usage(USAGE))?;
-    // Table, not a match on `&str` scattered through the parser: one place to audit, and the CLI is
-    // the ONLY layer that knows these names (the sandbox receives resolved integers).
-    let resource: i32 = match name.trim().to_ascii_lowercase().as_str() {
-        "core" => libc::RLIMIT_CORE as i32,
-        "cpu" => libc::RLIMIT_CPU as i32,
-        "data" => libc::RLIMIT_DATA as i32,
-        "fsize" => libc::RLIMIT_FSIZE as i32,
-        "locks" => libc::RLIMIT_LOCKS as i32,
-        "memlock" => libc::RLIMIT_MEMLOCK as i32,
-        "msgqueue" => libc::RLIMIT_MSGQUEUE as i32,
-        "nice" => libc::RLIMIT_NICE as i32,
-        "nofile" => libc::RLIMIT_NOFILE as i32,
-        "nproc" => libc::RLIMIT_NPROC as i32,
-        "rss" => libc::RLIMIT_RSS as i32,
-        "rtprio" => libc::RLIMIT_RTPRIO as i32,
-        "rttime" => libc::RLIMIT_RTTIME as i32,
-        "sigpending" => libc::RLIMIT_SIGPENDING as i32,
-        "stack" => libc::RLIMIT_STACK as i32,
-        _ => return Err(Error::Usage(USAGE)),
-    };
+    // ONE table for the whole binary, and it is the sandbox's: the CLI resolves a name to a number
+    // here, and a diagnostic from inside the box resolves that number back to this same name. The
+    // copy that used to live in this function was the reason a clamped limit was reported as
+    // `--ulimit resource 8`. See `kern_isolation::ULIMITS`.
+    let wanted = name.trim().to_ascii_lowercase();
+    let resource: i32 = kern_isolation::ULIMITS
+        .iter()
+        .find(|(n, _, _, _)| *n == wanted)
+        .map(|(_, r, _, _)| *r)
+        .ok_or(Error::Usage(USAGE))?;
     let one = |v: &str| -> Result<u64, Error> {
         let v = v.trim();
         match v {
@@ -1616,6 +1683,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut read_only = false;
     let mut share_net = false;
     let mut pod: Option<String> = None;
+    let mut pod_bridge: Option<kern_isolation::BridgeAttach> = None;
     let mut uid_range = false;
     let mut no_uid_range = false;
     let mut bind_rootfs = false;
@@ -1628,6 +1696,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut tty = false;
     let mut restart = commands::RestartPolicy::No;
     let mut health_cmd: Option<String> = None;
+    let mut health_cmd_argv: Vec<String> = Vec::new();
     let mut health_interval = 30u64;
     let mut health_retries = 3u32;
     let mut health_start_period = 0u64;
@@ -1651,6 +1720,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut memory_reservation: Option<u64> = None;
     let mut cpu_weight: Option<u64> = None;
     let mut secrets: Vec<String> = Vec::new();
+    let mut secret_envs: Vec<String> = Vec::new();
     let mut ssh_port: Option<u16> = None;
     let mut ssh_key: Option<String> = None;
     let mut hostname: Option<String> = None;
@@ -1684,6 +1754,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut env: Vec<String> = Vec::new();
     let mut egress_allow: Vec<String> = Vec::new();
     let mut landlock_rw: Vec<String> = Vec::new();
+    let mut net_ips: Vec<std::net::Ipv4Addr> = Vec::new();
     let mut apparmor: Option<String> = None;
     let mut workdir: Option<String> = None;
     let mut entrypoint: Option<Vec<String>> = None;
@@ -1729,6 +1800,28 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--pod" => {
                     i += 1;
                     pod = Some(rest.get(i).ok_or(Error::Usage("--pod <name>"))?.to_string());
+                }
+                // `--pod-bridge <ip>/<prefix>`: join the pod through its bridge with this address,
+                // instead of sharing the pod's network namespace. Parsed here so a value that is
+                // not an address and a prefix is refused before a box exists.
+                "--pod-bridge" => {
+                    i += 1;
+                    let v = rest.get(i).copied().ok_or(Error::Usage(
+                        "--pod-bridge <ip>/<prefix> (e.g. 10.89.0.2/24)",
+                    ))?;
+                    let bad = || {
+                        Error::Cli(format!(
+                            "--pod-bridge '{v}' is not an address and a prefix. Write it like \
+                             10.89.0.2/24, inside the network the pod was created with"
+                        ))
+                    };
+                    let (ip, prefix) = v.split_once('/').ok_or_else(bad)?;
+                    let ip: std::net::Ipv4Addr = ip.trim().parse().map_err(|_| bad())?;
+                    let prefix: u8 = prefix.trim().parse().map_err(|_| bad())?;
+                    if !(8..=30).contains(&prefix) {
+                        return Err(bad());
+                    }
+                    pod_bridge = Some(kern_isolation::BridgeAttach { ip, prefix });
                 }
                 // `--network host|none`: the Docker-style spelling. `host` shares the host network
                 // (= `--net`); `none` is the default isolated loopback-only namespace, made explicit.
@@ -1986,6 +2079,17 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         None => return Err(Error::Usage("--health-cmd <shell command>")),
                     }
                 }
+                // `--health-cmd-argv <arg>` (repeatable): the same check WITHOUT a shell - Docker's
+                // `CMD` exec form, one argv element per occurrence. Repeatable rather than one
+                // string, because a string would have to be split and splitting on spaces is the
+                // very loss this flag exists to avoid.
+                "--health-cmd-argv" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(c) => health_cmd_argv.push((*c).to_string()),
+                        None => return Err(Error::Usage("--health-cmd-argv <argv element>")),
+                    }
+                }
                 // `--health-interval <sec>`: seconds between health checks (default 30).
                 "--health-interval" => {
                     i += 1;
@@ -2185,6 +2289,30 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         );
                     }
                 }
+                // `--ip <addr>`: an extra address this box's loopback answers on. REFUSED AT THE
+                // BOUNDARY rather than carried as a string, so a value that is not an IPv4 literal
+                // cannot reach a box and fail there with nothing to point at. Repeatable: a service
+                // may sit on more than one network.
+                "--ip" => {
+                    i += 1;
+                    match rest.get(i).map(|v| v.trim()) {
+                        Some(v) if !v.is_empty() => match v.parse::<std::net::Ipv4Addr>() {
+                            Ok(ip) => {
+                                if !net_ips.contains(&ip) {
+                                    net_ips.push(ip);
+                                }
+                            }
+                            Err(_) => {
+                                return Err(Error::Cli(format!(
+                                    "--ip '{v}' is not an IPv4 address. A compose file's \
+                                     `ipv4_address:` under a service's `networks:` reaches this \
+                                     flag, so this may be a value your compose file wrote"
+                                )))
+                            }
+                        },
+                        _ => return Err(Error::Usage("--ip <address> (e.g. 172.20.0.5)")),
+                    }
+                }
                 "--landlock-rw" => {
                     i += 1;
                     if let Some(v) = rest.get(i) {
@@ -2345,6 +2473,16 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         }
                     }
                 }
+                // `--secret-env <name>`: the content comes from `KERN_SECRET_<name>` in this
+                // process's environment, so it never appears in `argv`. This is what a compose
+                // file's `secrets: {x: {environment: VAR}}` becomes.
+                "--secret-env" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => secret_envs.push((*v).to_string()),
+                        None => return Err(Error::Usage("--secret-env <name>")),
+                    }
+                }
                 "--secret" => {
                     i += 1;
                     match rest.get(i) {
@@ -2376,9 +2514,12 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 }
                 "-m" | "--memory" => {
                     i += 1;
-                    match rest.get(i).and_then(|v| parse_size(v)) {
-                        Some(b) => memory = Some(b),
+                    match rest.get(i) {
                         None => return Err(Error::Usage(USAGE_MEMORY)),
+                        Some(v) => match parse_size(v) {
+                            Some(b) => memory = Some(b),
+                            None => return Err(Error::Cli(bad_size("--memory", v))),
+                        },
                     }
                 }
                 "--cpus" => {
@@ -2471,6 +2612,16 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
              these are contradictory. Drop the profile, or drop --privileged.",
         ));
     }
+    // ONE HEALTH CHECK, IN ONE FORM. The two flags are the two Docker forms of the same check
+    // (`CMD-SHELL` and `CMD`), so a command line carrying both has said two different things about
+    // one probe and there is no reading of it that is not a guess. Refusing costs a retyped line;
+    // picking one silently would run a check the caller did not write.
+    if health_cmd.is_some() && !health_cmd_argv.is_empty() {
+        return Err(Error::Usage(
+            "--health-cmd and --health-cmd-argv are the two forms of ONE check (shell and exec); \
+             pass one of them, not both",
+        ));
+    }
     // Always route to the real command; missing name → BoxName rejects it, missing rootfs/image
     // → box_run reports it. `--plan` wins (non-destructive preview).
     let cmd = if plan {
@@ -2497,6 +2648,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             env,
             egress_allow,
             landlock_rw,
+            net_ips,
+            pod_bridge,
             apparmor,
             workdir,
             share_net,
@@ -2525,6 +2678,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             memory_reservation,
             cpu_weight,
             secrets,
+            secret_envs,
             secret_mode,
             ssh_port,
             ssh_key,
@@ -2546,6 +2700,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             cap_drop,
             restart,
             health_cmd,
+            health_cmd_argv,
             health_interval,
             health_retries,
             health_start_period,
@@ -2608,11 +2763,13 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--allow-uncapped",
     "--security-profile",
     "--secret",
+    "--secret-env",
     "--tmpfs",
     "--shm-size",
     "--pids-limit",
     "--restart",
     "--health-cmd",
+    "--health-cmd-argv",
     "--ssh",
     "--pod",
     "--hostname",
@@ -2650,9 +2807,12 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
             }
             "-m" | "--memory" => {
                 i += 1;
-                match rest.get(i).and_then(|v| parse_size(v)) {
-                    Some(b) => memory = Some(b),
+                match rest.get(i) {
                     None => return Err(Error::Usage(USAGE_MEMORY)),
+                    Some(v) => match parse_size(v) {
+                        Some(b) => memory = Some(b),
+                        None => return Err(Error::Cli(bad_size("--memory", v))),
+                    },
                 }
             }
             "--memory-swap-max" => {
@@ -2927,16 +3087,21 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
     }
     match rest.get(1).copied() {
         Some("create" | "new" | "up") => {
-            reject_unknown_flags("pod create", &rest[1..], &["--no-outbound", "--uid-range"])?;
+            reject_unknown_flags(
+                "pod create",
+                &rest[1..],
+                &["--no-outbound", "--uid-range", "--bridge"],
+            )?;
             let name = rest
                 .iter()
                 .skip(2)
                 .find(|a| !a.starts_with('-'))
                 .ok_or(Error::Usage(
-                    "pod create <name> [--no-outbound] [--uid-range]",
+                    "pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>]",
                 ))?;
             Ok(Command::PodCreate {
                 name: name.to_string(),
+                bridge: flag_value(rest, "--bridge"),
                 outbound: !rest.contains(&"--no-outbound"),
                 // Map a subordinate uid range into the pod's shared user namespace, so member OCI
                 // images that drop privilege / chown to a fixed uid (postgres, mysql, …) work inside
@@ -2964,7 +3129,7 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
             Ok(Command::PodRemove { names })
         }
         _ => Err(Error::Usage(
-            "pod create <name> [--no-outbound] [--uid-range] | pod ls | pod rm <name>",
+            "pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>] | pod ls | pod rm <name>",
         )),
     }
 }
@@ -3148,6 +3313,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env,
             egress_allow,
             landlock_rw,
+            net_ips,
+            pod_bridge,
             apparmor,
             workdir,
             share_net,
@@ -3176,6 +3343,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             memory_reservation,
             cpu_weight,
             secrets,
+            secret_envs,
             secret_mode,
             ssh_port,
             ssh_key,
@@ -3197,6 +3365,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             cap_drop,
             restart,
             health_cmd,
+            health_cmd_argv,
             health_interval,
             health_retries,
             health_start_period,
@@ -3224,6 +3393,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env: &env,
             egress_allow: &egress_allow,
             landlock_rw: &landlock_rw,
+            net_ips: &net_ips,
+            pod_bridge: pod_bridge.clone(),
             apparmor: apparmor.as_deref(),
             workdir: workdir.as_deref(),
             share_net,
@@ -3244,6 +3415,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             tty,
             ports: &ports,
             secrets: &secrets,
+            secret_envs: &secret_envs,
             secret_mode,
             ssh_port,
             ssh_key: ssh_key.as_deref(),
@@ -3265,6 +3437,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             cap_drop: &cap_drop,
             restart,
             health_cmd: health_cmd.as_deref(),
+            health_cmd_argv: &health_cmd_argv,
             health_interval,
             health_retries,
             health_start_period,
@@ -3331,6 +3504,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             name,
             outbound,
             uid_range,
+            bridge,
         } => crate::pod::create_with_range(
             &name,
             outbound,
@@ -3340,6 +3514,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             } else {
                 kern_isolation::UidRange::Off
             },
+            bridge.as_deref(),
         ),
         Command::PodList { json } => {
             if json {
@@ -3428,6 +3603,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             files,
             action,
             no_pod,
+            bridge,
+            allow_privileged,
             force_pod,
             allow_device_grants,
             tail,
@@ -3441,6 +3618,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             files: &files,
             action,
             no_pod,
+            bridge,
+            allow_privileged,
             force_pod,
             allow_device_grants,
             tail,
@@ -3464,6 +3643,54 @@ pub fn run(args: &[String]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `--ulimit` name the usage line advertises resolves, and nothing else does.
+    ///
+    /// The usage text and the table used to be two lists in one function; they are now a list and a
+    /// table in two crates, which is exactly the shape that drifts. This compares one against the
+    /// other, so adding a limit to the sandbox's table without advertising it (or the reverse) is a
+    /// red test rather than a name that parses but is undocumented.
+    #[test]
+    fn every_advertised_ulimit_name_resolves_and_nothing_else_does() {
+        let usage = match parse_ulimit("nonsense") {
+            Err(Error::Usage(u)) => u,
+            other => panic!("a spec with no '=' must be a usage error, got {other:?}"),
+        };
+        let advertised: Vec<&str> = usage
+            .split_once("one of:")
+            .map(|(_, tail)| tail.split_whitespace().collect())
+            .unwrap_or_default();
+        assert_eq!(advertised.len(), 15, "usage list: {advertised:?}");
+        for name in &advertised {
+            let (res, soft, hard) = parse_ulimit(&format!("{name}=1:2"))
+                .unwrap_or_else(|_| panic!("advertised name `{name}` does not parse"));
+            assert_eq!((soft, hard), (1, 2));
+            assert_eq!(
+                kern_isolation::ulimit_named(res).map(|(n, _, _)| n),
+                Some(*name),
+                "`{name}` resolves to {res}, which the sandbox names differently"
+            );
+        }
+        let table: Vec<&str> = kern_isolation::ULIMITS.iter().map(|(n, ..)| *n).collect();
+        assert_eq!(advertised, table, "usage line and table disagree");
+        // Nothing outside the table parses, including a near-miss and a bare RLIMIT number.
+        for bad in ["nofiles=1", "mem lock=1", "8=1", "=1"] {
+            assert!(
+                parse_ulimit(bad).is_err(),
+                "`{bad}` must not resolve to a limit"
+            );
+        }
+        // The name is case-insensitive and space-tolerant, as it was before the table moved.
+        let mixed = parse_ulimit(" MemLock =-1").expect("case and spaces are tolerated");
+        assert_eq!(
+            mixed,
+            (
+                libc::RLIMIT_MEMLOCK as i32,
+                libc::RLIM_INFINITY,
+                libc::RLIM_INFINITY
+            )
+        );
+    }
 
     /// A flag the read-only config verbs do not take must be REFUSED. `kern config list --json`
     /// printed the human listing and exited 0, so a script that asked for JSON got prose and had no
@@ -3774,6 +4001,81 @@ mod tests {
         );
     }
 
+    /// A FLAG'S VALUE IS NOT A HELP REQUEST. `--health-cmd-argv` and `--entrypoint` each carry one
+    /// element of somebody else's argv, where a leading dash is ordinary.
+    ///
+    /// MEASURED FIRST, on the real thing: eight of the eleven Supabase self-hosted services died
+    /// within 150 ms of starting, every `kern box` printing the box help instead of running,
+    /// because `pg_isready -U postgres -h localhost` sends `-h` through as an argument of its own.
+    #[test]
+    fn an_argv_element_that_looks_like_help_is_not_a_help_request() {
+        let argv = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+        for c in [
+            vec!["box", "n", "--image", "i", "--health-cmd-argv", "-h"],
+            vec!["box", "n", "--image", "i", "--health-cmd-argv", "--help"],
+            vec![
+                "box",
+                "n",
+                "--image",
+                "i",
+                "--health-cmd-argv",
+                "pg_isready",
+                "--health-cmd-argv",
+                "-h",
+                "--health-cmd-argv",
+                "localhost",
+            ],
+            // `--entrypoint` refuses a leading dash on its FIRST occurrence (a typo guard, see its
+            // parse arm), so the element that can legitimately look like a flag is a later one.
+            vec![
+                "box",
+                "n",
+                "--image",
+                "i",
+                "--entrypoint",
+                "prog",
+                "--entrypoint",
+                "-h",
+            ],
+        ] {
+            assert!(
+                matches!(parse(&argv(&c)).map(|(_, c)| c), Ok(Command::BoxRun { .. })),
+                "`kern {}` must RUN, not print help",
+                c.join(" ")
+            );
+        }
+        // POSITIVE CONTROL, twice over: skipping a value must not deafen the scan. A `-h` that is
+        // NOT a value is still a help request, both after such a flag has taken its own value and
+        // before one appears at all.
+        for c in [
+            vec!["box", "n", "--health-cmd-argv", "true", "-h"],
+            vec!["box", "n", "-h", "--health-cmd-argv", "true"],
+            vec!["box", "n", "--entrypoint", "sh", "--help"],
+        ] {
+            assert_eq!(
+                parse(&argv(&c)).unwrap().1,
+                Command::HelpFor("box".to_string()),
+                "`kern {}` asks for help",
+                c.join(" ")
+            );
+        }
+        // And the two forms of one check are refused together rather than one being picked.
+        let both = argv(&[
+            "box",
+            "n",
+            "--image",
+            "i",
+            "--health-cmd",
+            "true",
+            "--health-cmd-argv",
+            "true",
+        ]);
+        assert!(
+            matches!(parse(&both), Err(Error::Usage(_))),
+            "the shell and exec forms of one check cannot both be given"
+        );
+    }
+
     #[test]
     fn box_dispatch_and_plan() {
         // `box <name> --plan` → BoxPlan.
@@ -3910,9 +4212,112 @@ mod tests {
             Command::BoxRun { memory: Some(m), cpus: Some(c), .. }
                 if m == 256 * 1024 * 1024 && (c - 1.5).abs() < 1e-9
         ));
-        // Malformed values are usage errors, never silently ignored.
+        // Malformed values are refused, never silently ignored. THE ERROR CARRIES THE VALUE now:
+        // `Error::Usage` holds a `&'static str` and could only print the flag's grammar, which is
+        // what a compose user saw when their file wrote a size kern did not parse. `Error::Cli`
+        // carries an owned message and gets the same `--help` hint.
+        let bad = parse(&["box".into(), "x".into(), "--memory".into(), "nope".into()]);
+        match bad {
+            Err(Error::Cli(msg)) => {
+                assert!(
+                    msg.contains("'nope'"),
+                    "the message must quote the value: {msg}"
+                );
+                assert!(
+                    msg.contains("mem_limit"),
+                    "and say a compose file reaches it: {msg}"
+                );
+            }
+            other => panic!("a malformed --memory must be refused with the value named: {other:?}"),
+        }
+        // `--ip` IS REFUSED AT THE BOUNDARY, WITH THE VALUE AND ITS ORIGIN NAMED. The value comes
+        // from a compose file's `ipv4_address:` far more often than from a keyboard, so an error
+        // that only printed the flag's grammar would be addressed to the wrong person.
+        match parse(&[
+            "box".into(),
+            "x".into(),
+            "--ip".into(),
+            "172.28.1.999".into(),
+        ]) {
+            Err(Error::Cli(msg)) => {
+                assert!(msg.contains("'172.28.1.999'"), "quote the value: {msg}");
+                assert!(
+                    msg.contains("ipv4_address"),
+                    "name where it comes from: {msg}"
+                );
+            }
+            other => panic!("a malformed --ip must be refused with the value named: {other:?}"),
+        }
+        // A good one parses, repeats, and de-duplicates: a service on two networks may name the
+        // same address twice and the box has no use for it twice.
+        let (_, cmd) = parse(&[
+            "box".into(),
+            "x".into(),
+            "--image".into(),
+            "alpine".into(),
+            "--ip".into(),
+            "172.28.1.10".into(),
+            "--ip".into(),
+            "10.5.0.7".into(),
+            "--ip".into(),
+            "172.28.1.10".into(),
+        ])
+        .expect("parses");
+        match cmd {
+            Command::BoxRun { net_ips, .. } => assert_eq!(
+                net_ips,
+                vec![
+                    "172.28.1.10"
+                        .parse::<std::net::Ipv4Addr>()
+                        .expect("literal"),
+                    "10.5.0.7".parse::<std::net::Ipv4Addr>().expect("literal"),
+                ]
+            ),
+            other => panic!("expected BoxRun, got {other:?}"),
+        }
+        // `--pod-bridge` IS AN ADDRESS AND A PREFIX, refused at the boundary like every other
+        // network value. A box that reached the sandbox with a malformed one would fail where
+        // nothing can point at the flag.
+        match parse(&[
+            "box".into(),
+            "x".into(),
+            "--pod-bridge".into(),
+            "10.89.0.2".into(),
+        ]) {
+            Err(Error::Cli(msg)) => assert!(msg.contains("10.89.0.2"), "{msg}"),
+            other => panic!("an address with no prefix must be refused: {other:?}"),
+        }
+        for bad in ["10.89.0.2/31", "10.89.0.2/7", "nope/24", "10.89.0.2/x"] {
+            assert!(
+                matches!(
+                    parse(&["box".into(), "x".into(), "--pod-bridge".into(), bad.into()]),
+                    Err(Error::Cli(_))
+                ),
+                "{bad} must be refused"
+            );
+        }
+        let (_, cmd) = parse(&[
+            "box".into(),
+            "x".into(),
+            "--image".into(),
+            "alpine".into(),
+            "--pod-bridge".into(),
+            "10.89.0.2/24".into(),
+        ])
+        .expect("parses");
+        match cmd {
+            Command::BoxRun { pod_bridge, .. } => assert_eq!(
+                pod_bridge,
+                Some(kern_isolation::BridgeAttach {
+                    ip: "10.89.0.2".parse().expect("literal"),
+                    prefix: 24,
+                })
+            ),
+            other => panic!("expected BoxRun, got {other:?}"),
+        }
+        // A flag with NO value at all is still the flag's own usage error: there is no value to name.
         assert!(matches!(
-            parse(&["box".into(), "x".into(), "--memory".into(), "nope".into()]),
+            parse(&["box".into(), "x".into(), "--memory".into()]),
             Err(Error::Usage(_))
         ));
         assert!(matches!(

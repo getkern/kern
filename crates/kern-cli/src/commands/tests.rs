@@ -254,6 +254,90 @@ mod image_user_resolution_tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
+    /// HOME IS THE USER'S, NOT A CONSTANT.
+    ///
+    /// kern exported `HOME=/root` for every box whatever it ran as. MEASURED on
+    /// `apache/airflow:3.3.1` (passwd `airflow:x:50000:0:…:/home/airflow`): `airflow version` printed
+    /// `ModuleNotFoundError: No module named 'airflow'` under kern and `3.3.1` under podman, because
+    /// the tool is installed with `pip install --user` under `$HOME/.local` and the interpreter looks
+    /// for its user site-packages relative to HOME. Four of Airflow's own services report unhealthy
+    /// on that alone: their checks all invoke `airflow`.
+    #[test]
+    fn home_comes_from_the_images_passwd_entry_for_the_running_uid() {
+        let root = std::env::temp_dir().join(format!("kern-home-{}", std::process::id()));
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nairflow:x:50000:0:First Last,,,:/home/airflow:/bin/bash\nweird:x:7:7::relative/path:/bin/sh\n",
+        )
+        .unwrap();
+        let lower = root.to_string_lossy();
+
+        assert_eq!(image_user_home(50000, &lower), "/home/airflow");
+        assert_eq!(image_user_home(0, &lower), "/root");
+        // A uid the image does not know gets runc's default user home, never a guess at one.
+        assert_eq!(image_user_home(1234, &lower), "/");
+        // A passwd entry with a home that is not absolute is not usable as HOME either.
+        assert_eq!(image_user_home(7, &lower), "/");
+        // No account file at all (a scratch image) is the same answer.
+        let empty = std::env::temp_dir().join(format!("kern-home-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(image_user_home(50000, &empty.to_string_lossy()), "/");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// THE GROUPS THE IMAGE PUTS ITS USER IN, and only when the image named no group.
+    ///
+    /// Elastic's Kibana image is the case: `config.User` is the bare `1000`, its passwd says
+    /// `kibana:x:1000:1000` and its group file says `root:x:0:kibana`, so the process belongs to
+    /// group 0 as well. Its sibling Elasticsearch image writes `1000:0` outright and gets NO
+    /// supplementary group. Both behaviours were measured against podman 4.9.3 on this host before
+    /// being written here, and both are runc's `GetExecUser` rule rather than a choice of kern's.
+    ///
+    /// What it cost: the certificates Elastic's `setup` service writes are `root:root` mode 640, so
+    /// with the set cleared Kibana died on `EACCES ... config/certs/ca/ca.crt` while the three
+    /// Elasticsearch nodes, which have gid 0 outright, were green.
+    #[test]
+    fn the_supplementary_groups_come_from_the_image_and_only_for_a_group_less_user() {
+        let root = std::env::temp_dir().join(format!("kern-sgid-{}", std::process::id()));
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nkibana:x:1000:1000::/usr/share/kibana:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(
+            etc.join("group"),
+            "root:x:0:kibana\nwheel:x:10:kibana,someone\nkibana:x:1000:\nother:x:77:someone\n",
+        )
+        .unwrap();
+        let lower = root.to_string_lossy();
+
+        // A NUMERIC user is resolved to its NAME first, because a member list holds names.
+        assert_eq!(image_supplementary_gids("1000", &lower), vec![0, 10]);
+        // The same by name.
+        assert_eq!(image_supplementary_gids("kibana", &lower), vec![0, 10]);
+        // AN EXPLICIT GROUP TAKES THE WHOLE ANSWER: this is the elasticsearch case, and the rule
+        // that keeps `--user 1000:1000` from quietly gaining memberships.
+        assert!(image_supplementary_gids("1000:0", &lower).is_empty());
+        assert!(image_supplementary_gids("kibana:root", &lower).is_empty());
+        // A uid the image does not know has no memberships to find, and a name in no member list
+        // gets nothing rather than everything.
+        assert!(image_supplementary_gids("4242", &lower).is_empty());
+        assert!(image_supplementary_gids("root", &lower).is_empty());
+        // A scratch image with no account files answers with nothing, never with a guess.
+        let empty = std::env::temp_dir().join(format!("kern-sgid-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(image_supplementary_gids("1000", &empty.to_string_lossy()).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
     /// A NUMERIC `USER` TAKES ITS GROUP FROM THE IMAGE, NOT FROM ITS OWN NUMBER.
     ///
     /// `gid = uid` for anything numeric, which is right only when the image happens to agree. It
@@ -991,6 +1075,8 @@ mod net_resource_tests {
             volumes: String::new(),
             pod: pod.to_string(),
             workdir: String::new(),
+            run_as: None,
+            extra_gids: Vec::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
@@ -3339,6 +3425,8 @@ mod label_filter_tests {
             volumes: String::new(),
             pod: String::new(),
             workdir: String::new(),
+            run_as: None,
+            extra_gids: Vec::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
@@ -3464,6 +3552,8 @@ mod drift_tests {
             volumes: String::new(),
             pod: String::new(),
             workdir: String::new(),
+            run_as: None,
+            extra_gids: Vec::new(),
             egress: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
@@ -3813,6 +3903,56 @@ mod port_collision_tests {
             ports: ports.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// THE SHIFT IS ONE PLAN FOR THE STACK, NOT ONE PER SERVICE.
+    ///
+    /// MEASURED before this existed: a file where `web` publishes `80` and `other` publishes `8080`
+    /// started `other` on 8080, moved `web`'s 80 onto the same 8080 (each box could see only its own
+    /// ports, so each picked the same conventional target), and killed `web` with
+    /// `cannot publish host port 8080: Address already in use (os error 98)`. The message named
+    /// neither the move nor the service it collided with, and which service died depended on which
+    /// won the race.
+    #[test]
+    fn a_privileged_port_shift_avoids_every_port_the_stack_publishes_not_just_its_own() {
+        let mut stack = vec![svc("web", &["80:80"]), svc("other", &["8080:8080"])];
+        let moved = shift_privileged_ports_across(&mut stack, 1024);
+        assert_eq!(moved, vec![("web".to_string(), 80, 8081)]);
+        assert_eq!(stack[0].ports, ["8081:80"], "the BOX side must not move");
+        assert_eq!(stack[1].ports, ["8080:8080"], "a legal port is untouched");
+
+        // THE BIND ADDRESS IS THE OPERATOR'S, and a shift must not decide it. A spec that named one
+        // keeps it; a spec that named none must NOT gain one, or a configured
+        // `publish = "127.0.0.1"` would be overruled by a port move.
+        let mut addrs = vec![svc(
+            "a",
+            &["127.0.0.1:80:80", "443:443", "0.0.0.0:53:53/udp"],
+        )];
+        let moved = shift_privileged_ports_across(&mut addrs, 1024);
+        assert_eq!(
+            addrs[0].ports,
+            ["127.0.0.1:8080:80", "8443:443", "0.0.0.0:8053:53/udp"],
+            "moved: {moved:?}"
+        );
+
+        // A RANGE SPLITS ONLY AS FAR AS IT HAS TO. With the floor at 1024, `1022-1025` has two
+        // ports below it and two above; the two above stay where the file put them.
+        let mut range = vec![svc("r", &["1022-1025:1022-1025"])];
+        shift_privileged_ports_across(&mut range, 1024);
+        let mut got = range[0].ports.clone();
+        got.sort();
+        assert_eq!(got, ["1024:1024", "1025:1025", "9022:1022", "9023:1023"]);
+
+        // NOTHING TO DO LEAVES THE FILE'S OWN SPELLING ALONE, byte for byte: a stack with no
+        // privileged port must not be re-spelled at all.
+        let mut none = vec![svc("n", &["8080:80", "127.0.0.1:9000-9001:9000-9001"])];
+        assert!(shift_privileged_ports_across(&mut none, 1024).is_empty());
+        assert_eq!(none[0].ports, ["8080:80", "127.0.0.1:9000-9001:9000-9001"]);
+
+        // AND NOTHING MOVES WHEN THE HOST ALLOWS IT: the owner who lowered the sysctl gets port 80.
+        let mut low = vec![svc("web", &["80:80"])];
+        assert!(shift_privileged_ports_across(&mut low, 80).is_empty());
+        assert_eq!(low[0].ports, ["80:80"]);
     }
 
     // Assert a collision was reported AND that the message names both offenders (a silent or vague
@@ -5795,4 +5935,396 @@ fn run_forks_only_when_it_has_both_a_cgroup_to_enter_and_nobody_else_supervising
     // `kern run` is a cooperative governor and does not refuse; it warns and runs.
     assert!(!run_should_fork(false, false));
     assert!(!run_should_fork(true, false));
+}
+
+/// A MISSING BIND SOURCE IS PLANNED BEFORE IT IS CREATED, and the plan is the FULL path.
+///
+/// `kern` creates a missing bind source, as Docker does, and the registry guard has to answer before
+/// anything exists on disk - otherwise a compose file could plant empty directories inside the
+/// registry and have the mount refused afterwards, which leaves the refusal right and the
+/// directories there.
+///
+/// THE FIRST VERSION ASKED ABOUT THE NEAREST EXISTING ANCESTOR AND THAT IS A DIFFERENT QUESTION. The
+/// guard refuses any ANCESTOR of the registry root, because mounting one exposes the whole registry,
+/// so the runtime directory itself answers "overlaps" and every path under it was treated as
+/// registry-adjacent and never created. It was caught by a positive control, not by the first
+/// measurement: a source outside the registry with the same parent was not created either.
+#[test]
+fn a_planned_bind_source_resolves_the_whole_path_and_not_just_its_ancestor() {
+    use crate::commands::planned_bind_source;
+
+    let base = std::env::temp_dir().join(format!("kern-planned-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("base");
+    let canon_base = std::fs::canonicalize(&base).expect("canonicalize base");
+
+    // The whole tail is carried, however deep, and the part that exists is symlink-resolved.
+    let deep = base.join("a/b/c");
+    assert_eq!(
+        planned_bind_source(deep.to_str().expect("utf8")),
+        Some(canon_base.join("a/b/c")),
+        "the plan must name where the directory would land, not where the walk stopped"
+    );
+
+    // An existing path plans as itself.
+    assert_eq!(
+        planned_bind_source(base.to_str().expect("utf8")),
+        Some(canon_base.clone())
+    );
+
+    // A `..` inside the part that does not exist is not resolvable this way, and the answer is
+    // None so that nothing is created. Conservative on purpose: the alternative is guessing where
+    // the path lands and asking the guard about the wrong place.
+    assert_eq!(
+        planned_bind_source(base.join("x/../y").to_str().expect("utf8")),
+        None
+    );
+
+    // THE CASE THE FIRST VERSION GOT WRONG. The plan for a path under the registry's PARENT must be
+    // that path, which the guard allows; asking about the parent instead would have refused it.
+    let planned = planned_bind_source(
+        canon_base
+            .join("not-the-registry/probe")
+            .to_str()
+            .expect("utf8"),
+    )
+    .expect("plannable");
+    assert!(planned.ends_with("not-the-registry/probe"));
+    assert!(planned.starts_with(&canon_base));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// THE PRIVILEGED-PORT SENTENCE READS THE HOST'S RULE, and the read has to be asserted somewhere.
+///
+/// kern does not decide that 1024 is the boundary: it publishes by binding, and only classifies the
+/// `EACCES` that comes back. This number exists so the message names the sysctl the kernel is
+/// applying rather than a default it does not own, which also tells a machine owner which knob would
+/// let port 80 through.
+///
+/// WHAT IS NOT MEASURED HERE, and it is the interesting half: that LOWERING the sysctl actually
+/// makes kern publish port 80. That needs root on the host and could not be run on the machine this
+/// was written on. The claim rests on the code path (the refusal is reached only from a failed bind)
+/// and not on a measurement, and it is written that way in the commit.
+#[test]
+fn the_unprivileged_port_floor_is_read_from_the_host_and_falls_back_to_the_kernel_default() {
+    use crate::commands::start::unprivileged_port_start_at;
+
+    let dir = std::env::temp_dir().join(format!("kern-portfloor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("case dir");
+
+    let with = |name: &str, body: &str| {
+        let f = dir.join(name);
+        std::fs::write(&f, body).expect("write");
+        unprivileged_port_start_at(f.to_str().expect("utf8"))
+    };
+
+    // A host that lowered it: the sentence must quote 80, not 1024.
+    assert_eq!(with("lowered", "80\n"), 80);
+    // A host that raised it.
+    assert_eq!(with("raised", "2048\n"), 2048);
+    // No trailing newline, which is how a hand-written file often looks.
+    assert_eq!(with("bare", "443"), 443);
+    // Unreadable, absent or nonsense: the kernel's own default, never 0 (which would make the
+    // message claim every port is unprivileged) and never a panic.
+    assert_eq!(with("junk", "not a number"), 1024);
+    assert_eq!(with("empty", ""), 1024);
+    assert_eq!(
+        unprivileged_port_start_at(dir.join("does-not-exist").to_str().expect("utf8")),
+        1024
+    );
+    // Out of range for a port: refused rather than truncated.
+    assert_eq!(with("huge", "70000"), 1024);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A MISSING BIND SOURCE INSIDE THE REGISTRY IS NOT CREATED, and the check runs BEFORE creation.
+///
+/// kern creates a missing bind source, as Docker does. The registry guard refuses to MOUNT a
+/// trust-bearing directory, but it can only speak once the path exists, so creating first and asking
+/// afterwards would leave the refusal correct and the directories planted: a compose file could make
+/// `instances/<name>` appear and shadow a box's posture record.
+///
+/// THE POSITIVE CONTROL IS THE POINT. A source outside the registry with the SAME parent must be
+/// created, or this test would pass against a kern that stopped creating anything at all - which is
+/// exactly the state the first version of the guard produced, and it took a control to see it.
+#[test]
+fn a_bind_source_inside_the_registry_is_never_created_and_one_beside_it_is() {
+    use crate::commands::parse_volumes;
+
+    // The registry ROOT is the parent of `instances/`; `registry_root` itself is private, and the
+    // public `dir()` is the same path one level down, which is what the guard is written against.
+    let Some(root) = crate::registry::dir()
+        .ok()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .and_then(|r| std::fs::canonicalize(r).ok())
+    else {
+        eprintln!("skipping: no registry root on this host");
+        return;
+    };
+    let inside = root.join("instances").join("kern-guard-probe");
+    let beside = root
+        .parent()
+        .expect("the registry root has a parent")
+        .join("kern-not-the-registry-probe");
+    let _ = std::fs::remove_dir_all(&inside);
+    let _ = std::fs::remove_dir_all(&beside);
+
+    let spec = format!("{}:/mnt/x", inside.to_str().expect("utf8"));
+    assert!(
+        parse_volumes(&[spec]).is_err(),
+        "a mount inside the registry must be refused"
+    );
+    assert!(
+        !inside.exists(),
+        "and nothing may be created there on the way to refusing it"
+    );
+
+    // THE CONTROL: same parent, outside the registry, must be created and accepted.
+    let ok_spec = format!("{}:/mnt/x", beside.to_str().expect("utf8"));
+    assert!(
+        parse_volumes(&[ok_spec]).is_ok(),
+        "a missing source outside the registry is created, as Docker does"
+    );
+    assert!(
+        beside.exists(),
+        "if this is absent the refusal above proves nothing: kern would simply create nothing"
+    );
+    let _ = std::fs::remove_dir_all(&beside);
+}
+
+/// A PORT KERN CANNOT BIND IS MOVED, AND THE MOVE IS PREDICTABLE.
+///
+/// Rootless, the kernel refuses a bind below `net.ipv4.ip_unprivileged_port_start`, and 15 of the 39
+/// samples Docker itself ships publish such a port (`80` in fourteen of them). Refusing means more
+/// than a third of Docker's own examples do not start here for a reason about the machine rather
+/// than the file. `+ 8000` is one rule that lands on the conventional alternative for every port
+/// people actually publish.
+#[test]
+fn a_privileged_port_moves_to_the_conventional_alternative_and_never_onto_a_taken_one() {
+    use crate::commands::shift_privileged_ports;
+    let map = |host: u16, box_port: u16, udp: bool| kern_isolation::PortMap {
+        bind_ip: 0,
+        host,
+        box_port,
+        udp,
+    };
+
+    let mut ports = vec![map(80, 80, false), map(443, 443, false)];
+    let moved = shift_privileged_ports(&mut ports, 1024);
+    assert_eq!(moved, vec![(80, 8080), (443, 8443)]);
+    assert_eq!(ports[0].host, 8080);
+    assert_eq!(ports[1].host, 8443);
+    // The BOX side is untouched: the service still listens where its config says it does.
+    assert_eq!(ports[0].box_port, 80);
+
+    // THE SAME PORT ON TWO PROTOCOLS MOVES TOGETHER. Docker's DNS sample publishes 53/tcp and
+    // 53/udp; landing them on two different host ports would be a defect that is very hard to see.
+    let mut dns = vec![map(53, 53, false), map(53, 53, true)];
+    assert_eq!(shift_privileged_ports(&mut dns, 1024), vec![(53, 8053)]);
+    assert_eq!(dns[0].host, 8053);
+    assert_eq!(dns[1].host, 8053);
+
+    // A SHIFT NEVER LANDS ON A PORT THIS BOX ALREADY CLAIMS, or the second bind would fail with
+    // `EADDRINUSE` blamed on some other process.
+    let mut clash = vec![map(80, 80, false), map(8080, 8080, false)];
+    assert_eq!(shift_privileged_ports(&mut clash, 1024), vec![(80, 8081)]);
+    assert_eq!(clash[0].host, 8081);
+    assert_eq!(clash[1].host, 8080);
+
+    // NOTHING MOVES WHEN NOTHING NEEDS TO. On a host whose owner lowered the sysctl, port 80 is
+    // bindable and kern must leave it exactly where the file put it.
+    let mut low_floor = vec![map(80, 80, false)];
+    assert!(shift_privileged_ports(&mut low_floor, 80).is_empty());
+    assert_eq!(low_floor[0].host, 80);
+
+    // And an ordinary port is never touched, whatever the floor.
+    let mut ordinary = vec![map(8080, 80, false)];
+    assert!(shift_privileged_ports(&mut ordinary, 1024).is_empty());
+    assert_eq!(ordinary[0].host, 8080);
+}
+
+/// `privileged: true` IS THE OPERATOR'S TO GRANT, NEVER THE FILE'S TO TAKE.
+///
+/// The key relaxes the seccomp filter, and the rule this codebase does not bend is that a policy a
+/// downloaded file can defeat is not a policy: the same reason `vgpio` device grants need
+/// `--allow-device-grants`. Without a grant the field is CLEARED, so no site downstream can emit
+/// the flag by accident, and the sentence names both ways to grant it.
+///
+/// WHAT THE GRANT IS AND IS NOT, measured end to end on a running box: `CapEff` goes from
+/// `00000110bd84efff` to `000001ffffffffff` and `Seccomp` stays `2` in both, because kern never runs
+/// a box without a filter. What stays closed: writing `/proc/sys/kernel/core_pattern` is
+/// `Permission denied`, and a box that mounts `cgroup2` for itself sees its own `memory.max` of
+/// 268435456 and gets `EPERM` trying to raise it.
+#[test]
+fn a_file_cannot_grant_itself_privileged_and_the_grant_clears_the_field() {
+    use crate::commands::apply_privileged_grant;
+
+    let mk = || {
+        crate::compose::parse(
+            "services:\n  a:\n    image: alpine\n    privileged: true\n  \
+             b:\n    image: alpine\n",
+        )
+        .expect("parses")
+    };
+
+    // NOT GRANTED: the field is cleared and the reader is told how to grant it.
+    let mut boxes = mk();
+    let note =
+        apply_privileged_grant(&mut boxes, false).expect("a service asked, so it is owed one");
+    assert!(
+        !boxes[0].privileged,
+        "the field must be cleared, not merely unused"
+    );
+    assert!(note.contains("--allow-privileged"), "{note}");
+    assert!(
+        note.contains("compose_privileged"),
+        "and the config spelling too: {note}"
+    );
+    assert!(note.contains("run unprivileged"), "{note}");
+
+    // GRANTED: the field survives and the sentence says what is NOT given, which is the half that
+    // makes the grant honest.
+    let mut boxes = mk();
+    let note = apply_privileged_grant(&mut boxes, true).expect("owed");
+    assert!(boxes[0].privileged);
+    assert!(
+        note.contains("/proc"),
+        "the unmask kern does not do must be named: {note}"
+    );
+    assert!(note.contains("masked"), "{note}");
+
+    // THE CONTROL: a service that never asked is untouched either way, and a stack where nobody
+    // asked is owed no sentence at all.
+    assert!(!boxes[1].privileged);
+    let mut none = crate::compose::parse("services:\n  a:\n    image: alpine\n").expect("parses");
+    assert_eq!(apply_privileged_grant(&mut none, false), None);
+    assert_eq!(apply_privileged_grant(&mut none, true), None);
+}
+
+/// A SECRET FROM THE ENVIRONMENT NEVER TOUCHES `argv`, and that is the whole reason the flag takes
+/// a NAME instead of a value.
+///
+/// `/proc/<pid>/cmdline` is world-readable on Linux, and when kern re-execs under a systemd scope
+/// the argv is recorded in the journal, where it outlives the box. kern's own `--secret NAME=value`
+/// warns about exactly this and steers to stdin or a file; a compose file's
+/// `secrets:` with an `environment:` source has neither, so it needs a third way in.
+///
+/// MEASURED with a positive control, which is what makes the negative mean anything: with
+/// `--secret pw=<value>` the scan found the value in 3 of 3 box processes' `argv`; with
+/// `--secret-env pw` it found it in 0 of 3, and `/run/secrets/pw` still held the value.
+#[test]
+fn a_secret_from_the_environment_is_read_from_the_environment_and_refused_when_absent() {
+    use crate::secret::{parse_secret_envs, secret_env_var};
+
+    // The variable name is DERIVED, so the driver and the box cannot look in two different places.
+    assert_eq!(secret_env_var("db_password"), "KERN_SECRET_db_password");
+
+    // Absent variable: an ERROR, not an empty secret. A service reading a password file would take
+    // the empty string as the password and fail somewhere else entirely.
+    let missing = parse_secret_envs(&["kern_test_absent_secret".to_string()], 0o444);
+    match missing {
+        Err(crate::error::Error::Sandbox(msg)) => {
+            assert!(msg.contains("KERN_SECRET_kern_test_absent_secret"), "{msg}");
+            assert!(
+                msg.contains("/run/secrets/"),
+                "and where it would have landed: {msg}"
+            );
+        }
+        other => panic!("an unset variable must be refused: {other:?}"),
+    }
+
+    // Present: the bytes are the variable's value, and the mode travels with it.
+    // SAFETY: single-threaded test process setting a variable it alone reads.
+    unsafe { std::env::set_var("KERN_SECRET_kern_test_present", "hunter2") };
+    let got = parse_secret_envs(&["kern_test_present".to_string()], 0o444).expect("present");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].name, "kern_test_present");
+    assert_eq!(got[0].bytes, b"hunter2".to_vec());
+    assert_eq!(got[0].mode, 0o444);
+
+    // A duplicate name would deliver two different contents to one path.
+    let dup = parse_secret_envs(
+        &[
+            "kern_test_present".to_string(),
+            "kern_test_present".to_string(),
+        ],
+        0o444,
+    );
+    assert!(
+        dup.is_err(),
+        "two sources for one /run/secrets path must be refused"
+    );
+
+    // A name that cannot be a path component is refused before anything is read.
+    assert!(parse_secret_envs(&["../escape".to_string()], 0o444).is_err());
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("KERN_SECRET_kern_test_present") };
+}
+
+/// `--env-file` READS THE `.env` FORMAT DOCKER READS, because it is the same format and now the same
+/// reader.
+///
+/// This function used to be a second implementation: split on the first `=`, keep the rest verbatim.
+/// It therefore kept quotes, kept a trailing ` # comment`, did not know `export `, and did not know
+/// the `K:V` spelling - while `kern_compose::parse_dotenv`, ten files away, implemented all four.
+///
+/// MEASURED on Zabbix's `env_vars/.env_srv`, which ends a line with ` # Available since 6.0.0`: the
+/// comment arrived inside the value and `zabbix_server` exited with `invalid "NodeAddress"
+/// configuration parameter: address "zabbix-server:10051 # Available since 6.0.0" is invalid`. A
+/// config error naming a value nobody wrote that way is the shape a parsing difference takes when it
+/// reaches a workload.
+#[test]
+fn an_env_file_is_read_with_dockers_rules_not_a_second_parser() {
+    let dir = std::env::temp_dir().join(format!("kern-envfile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("env");
+    std::fs::write(
+        &path,
+        concat!(
+            "# un commento\n",
+            "\n",
+            "ZBX_NODEADDRESS=zabbix-server:10051 # Available since 6.0.0\n",
+            "export EXPORTED=1\n",
+            "QUOTED=\"con spazi\"\n",
+            "LITERAL='$NON_ESPANSO'\n",
+            "COLON: due-punti\n",
+            "HASHINSIDE=colore#ff0000\n",
+        ),
+    )
+    .expect("write env file");
+
+    let pairs = super::parse_env_files(&[path.to_string_lossy().into_owned()]).expect("parses");
+    let get = |k: &str| {
+        pairs
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("<assente>")
+    };
+    // THE CASE THAT BROKE ZABBIX: an inline comment preceded by a space ends the value.
+    assert_eq!(get("ZBX_NODEADDRESS"), "zabbix-server:10051");
+    assert_eq!(get("EXPORTED"), "1");
+    assert_eq!(get("QUOTED"), "con spazi");
+    // Single quotes keep a `$` literal - the escape hatch, and proof the value is not interpolated
+    // out of existence.
+    assert_eq!(get("LITERAL"), "$NON_ESPANSO");
+    assert_eq!(get("COLON"), "due-punti");
+    // A `#` with no space before it is part of the value, not a comment: a colour, a fragment URL.
+    assert_eq!(get("HASHINSIDE"), "colore#ff0000");
+
+    // A LINE THAT BINDS NOTHING IS STILL AN ERROR. The shared reader is deliberately total (one
+    // stray line must not take a whole stack down), so this file's own strictness is checked here,
+    // by name, rather than inherited.
+    let bad = dir.join("bad");
+    std::fs::write(&bad, "K=1\nquesta riga non lega niente\n").expect("write");
+    let err = super::parse_env_files(&[bad.to_string_lossy().into_owned()])
+        .expect_err("a line with no delimiter is refused");
+    assert!(format!("{err}").contains("bad line 2"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

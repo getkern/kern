@@ -1147,6 +1147,530 @@ fn a_foreground_box_evaluates_its_health_check() {
     );
 }
 
+/// A COMMAND RUN INSIDE A BOX KNOWS THE BOX'S NAME, because Docker sets `HOSTNAME` and checks read it.
+///
+/// `exec_in_box` passes no hostname to the environment builder - it did not create the namespace and
+/// has no business inventing a name - and the builder took that empty string literally, so every
+/// `kern exec` and every health probe ran with `HOSTNAME=` while `hostname` printed the box's name
+/// correctly one command later. Airflow's scheduler check passes `"$${HOSTNAME}"` to
+/// `airflow jobs check`, which is then asking about a host called "".
+///
+/// The fix reads it back from the UTS namespace the process is already in, so it cannot disagree
+/// with whatever set it; the control here is exactly that comparison.
+#[test]
+fn a_command_in_a_box_sees_the_boxs_name_in_hostname() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "hostname-env");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let name = format!("hn-env-{}", std::process::id());
+    let xdg = std::env::temp_dir().join(format!("kern-it-hnenv-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            &name,
+            "--rootfs",
+            &rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "20",
+        ])
+        .output()
+        .expect("run kern");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    // Both answers in ONE exec, so nothing can drift between them.
+    let probe = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "exec",
+            &name,
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo env=$HOSTNAME; echo uts=$(hostname)",
+        ])
+        .output()
+        .expect("run kern exec");
+    let text = String::from_utf8_lossy(&probe.stdout).to_string();
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", &name])
+        .output();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["prune", &name])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    let line = |k: &str| -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (env, uts) = (line("env="), line("uts="));
+    if uts.is_empty() {
+        eprintln!("skip: the box did not run here (no output at all): {text:?}");
+        return;
+    }
+    assert_eq!(
+        env, uts,
+        "HOSTNAME and the UTS name disagree inside the box: {text:?}"
+    );
+    assert!(
+        env.contains("hn-env-"),
+        "the name in HOSTNAME is not this box's: {text:?}"
+    );
+}
+
+/// A HEALTH PROBE RUNS AS THE WORKLOAD, so it cannot report on access the workload does not have.
+///
+/// Docker runs a `HEALTHCHECK` as the container's user. kern ran it as box root, which is a
+/// FALSE-GREEN generator rather than a cosmetic difference: the probe reads a file the service
+/// cannot, reports healthy, and `depends_on: service_healthy` then releases a dependent onto a
+/// service about to die of EACCES. The shape is not hypothetical - Elastic's own stack writes its
+/// certificates `root:root` mode 640 and its Kibana runs as uid 1000.
+///
+/// THE POSITIVE CONTROL IS THE SAME BOX, THE SAME PROBE SPELLING, ON A WORLD-READABLE FILE: without
+/// it, a kern whose probes always failed would pass the assertion below.
+#[test]
+fn a_health_probe_cannot_read_what_the_workload_cannot() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "probe-user");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    // Two files in the rootfs: one only the box's root can read, one anybody can. The box runs as
+    // an in-box uid that is NOT the owner, so the modes are what decides.
+    let secret = root.join("secret");
+    let public = root.join("public");
+    let mode = |p: &PathBuf, m: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(p, fs::Permissions::from_mode(m)).is_ok()
+    };
+    if fs::write(&secret, b"x").is_err()
+        || fs::write(&public, b"x").is_err()
+        || !mode(&secret, 0o600)
+        || !mode(&public, 0o644)
+    {
+        eprintln!("skip: could not prepare the test files");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-pruser-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    let health_of = |name: &str| -> Option<String> {
+        let mut txt = String::new();
+        for _ in 0..4 {
+            let out = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["ps", "--json"])
+                .output()
+                .ok()?;
+            txt = String::from_utf8_lossy(&out.stdout).to_string();
+            if !txt.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        let at = txt.find(&format!("\"name\":\"{name}\""))?;
+        let tail = &txt[at..];
+        let h = tail.find("\"health\":\"")?;
+        let rest = &tail[h + 10..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    };
+    // The LAST status inside the window: a box that never turns healthy stays distinguishable from
+    // one that was never probed (`""`).
+    let settle = |name: &str| -> String {
+        let mut last = String::new();
+        for _ in 0..80 {
+            if let Some(h) = health_of(name) {
+                if h == "healthy" {
+                    return h;
+                }
+                last = h;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        last
+    };
+    let start = |name: &str, check: &str| -> std::process::Output {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                &rootfs,
+                "-d",
+                "--user",
+                "1000:1000",
+                "--health-cmd",
+                check,
+                "--health-interval",
+                "1",
+                "--health-retries",
+                "2",
+                "--",
+                "/bin/busybox",
+                "sleep",
+                "25",
+            ])
+            .output()
+            .expect("run kern")
+    };
+
+    let out = start("pr-secret", "test -r /secret");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    if err.contains("user namespaces") || err.contains("newuidmap") || err.contains("subuid") {
+        eprintln!("skip: this host cannot map a second uid: {err}");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    let _ = start("pr-public", "test -r /public");
+    let secret_health = settle("pr-secret");
+    let public_health = settle("pr-public");
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "pr-secret", "pr-public"])
+        .output();
+    for n in ["pr-secret", "pr-public"] {
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["prune", n])
+            .output();
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    assert_eq!(
+        public_health, "healthy",
+        "the CONTROL failed: a probe on a world-readable file must pass, or the assertion below \
+         would hold for a kern whose probes never run at all"
+    );
+    assert_ne!(
+        secret_health, "healthy",
+        "the probe read a root-only file that the workload's own uid cannot: it is running with \
+         more access than the service it reports on"
+    );
+}
+
+/// A HEALTH PROBE RUNS WHERE THE WORKLOAD RUNS, so a relative path in a check resolves.
+///
+/// Docker runs a `HEALTHCHECK` in the image's `WORKDIR`, and a check is written by the same author,
+/// in the same file, as the command beside it: Elastic's official compose file checks
+/// `[ -f config/certs/es01/es01.crt ]`, relative to `/usr/share/elasticsearch`. kern passed no
+/// working directory to the probe, so every probe ran in `/`.
+///
+/// MEASURED before the fix, with a discriminator: a box with `-w /etc` and
+/// `--health-cmd 'test -f hostname'` reported `unhealthy` while the same box with the ABSOLUTE
+/// `test -f /etc/hostname` reported `healthy`, and a probe running `pwd` printed `/`. On the ELK
+/// stack it cost the whole bring-up: `setup` stayed unhealthy with the certificate present, and
+/// every service behind `condition: service_healthy` refused to start.
+///
+/// THE NEGATIVE CONTROL IS A RELATIVE PATH THAT IS NOT THERE, on the same box with the same
+/// workdir: without it, a kern that reported every box healthy would pass this test.
+#[test]
+fn a_health_probe_runs_in_the_boxs_working_directory() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "health-workdir");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    // The file the relative check looks for, and the directory the box will work in.
+    if fs::create_dir_all(root.join("work")).is_err()
+        || fs::write(root.join("work/marker"), b"x").is_err()
+    {
+        eprintln!("skip: could not build the workdir in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-hwd-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    let health_of = |name: &str| -> Option<String> {
+        // Retried on empty stdout for the reason `kern_out` gives at the top of this file.
+        let mut txt = String::new();
+        for _ in 0..4 {
+            let out = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["ps", "--json"])
+                .output()
+                .ok()?;
+            txt = String::from_utf8_lossy(&out.stdout).to_string();
+            if !txt.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        let at = txt.find(&format!("\"name\":\"{name}\""))?;
+        let tail = &txt[at..];
+        let h = tail.find("\"health\":\"")?;
+        let rest = &tail[h + 10..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    };
+    let wait_healthy = |name: &str| -> String {
+        let mut last = String::new();
+        for _ in 0..80 {
+            if let Some(h) = health_of(name) {
+                if h == "healthy" {
+                    return h;
+                }
+                last = h;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        last
+    };
+
+    let start = |name: &str, check: &str| -> std::process::Output {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                &rootfs,
+                "-d",
+                "--workdir",
+                "/work",
+                "--health-cmd",
+                check,
+                "--health-interval",
+                "1",
+                "--health-retries",
+                "2",
+                "--",
+                "/bin/busybox",
+                "sleep",
+                "20",
+            ])
+            .output()
+            .expect("run kern")
+    };
+
+    let out = start("hc-wd-rel", "test -f marker");
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    let _ = start("hc-wd-absent", "test -f no-such-marker");
+    let relative = wait_healthy("hc-wd-rel");
+    let control = wait_healthy("hc-wd-absent");
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "hc-wd-rel", "hc-wd-absent"])
+        .output();
+    for n in ["hc-wd-rel", "hc-wd-absent"] {
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["prune", n])
+            .output();
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    assert_eq!(
+        relative, "healthy",
+        "a check relative to the box's --workdir was not found (health was {relative:?}): the \
+         probe is running somewhere other than where the workload runs"
+    );
+    assert_ne!(
+        control, "healthy",
+        "the CONTROL failed: a check for a file that does not exist reported healthy, so the \
+         subject above proves nothing"
+    );
+}
+
+/// AN IMAGE WITH NO SHELL MUST BE ABLE TO REPORT HEALTHY, and that is the whole of Docker's `CMD`
+/// exec form.
+///
+/// kern ran EVERY health probe as `/bin/sh -c <cmd>`, so a rootfs without `/bin/sh` failed each one
+/// with `execvp: No such file or directory` and could never leave `starting` - while the service
+/// inside answered its own probe perfectly. The images that write the exec form are exactly the
+/// images with no shell to run the other one with: PostgREST, distroless, `FROM scratch`.
+///
+/// MEASURED on Supabase self-hosted before the fix: `supabase-rest` answered `postgrest --ready` 10
+/// times out of 10 through `kern exec`, `kern ps` said `unhealthy`, and `depends_on: {condition:
+/// service_healthy}` on it could never resolve.
+///
+/// THE CONTROL IS THE SHELL FORM ON THE SAME ROOTFS, which must NOT reach healthy: it proves this
+/// rootfs really has no shell, so the subject's pass cannot be a shell quietly doing the work. The
+/// sibling test above copies busybox to `bin/sh` for precisely that reason; this one must not.
+#[test]
+fn an_exec_form_health_check_passes_in_a_rootfs_with_no_shell() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // NO `bin/sh` in this rootfs. That absence IS the test.
+    let root = build_rootfs(&busybox, "health-noshell");
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-hns-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    let health_of = |name: &str| -> Option<String> {
+        // Retried on empty stdout for the reason `kern_out` gives at the top of this file.
+        let mut txt = String::new();
+        for _ in 0..4 {
+            let out = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["ps", "--json"])
+                .output()
+                .ok()?;
+            txt = String::from_utf8_lossy(&out.stdout).to_string();
+            if !txt.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        let at = txt.find(&format!("\"name\":\"{name}\""))?;
+        let tail = &txt[at..];
+        let h = tail.find("\"health\":\"")?;
+        let rest = &tail[h + 10..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    };
+    // The LAST status seen inside the window, so a box that never turns healthy is distinguishable
+    // from one that was never probed at all (`""`).
+    let wait_healthy = |name: &str| -> String {
+        let mut last = String::new();
+        for _ in 0..80 {
+            if let Some(h) = health_of(name) {
+                if h == "healthy" {
+                    return h;
+                }
+                last = h;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        last
+    };
+
+    let start = |name: &str, probe: &[&str]| -> std::process::Output {
+        let mut args = vec!["box", name, "--rootfs", &rootfs, "-d"];
+        args.extend_from_slice(probe);
+        args.extend_from_slice(&[
+            "--health-interval",
+            "1",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "20",
+        ]);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&args)
+            .output()
+            .expect("run kern")
+    };
+
+    // SUBJECT: the exec form. `/bin/busybox true` exits 0 and needs no shell.
+    let out = start(
+        "hc-exec",
+        &[
+            "--health-cmd-argv",
+            "/bin/busybox",
+            "--health-cmd-argv",
+            "true",
+        ],
+    );
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    let exec_form = wait_healthy("hc-exec");
+
+    // CONTROL: the same probe, written as a shell command, in a rootfs with no shell to run it.
+    let _ = start("hc-shell", &["--health-cmd", "/bin/busybox true"]);
+    let shell_form = wait_healthy("hc-shell");
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "hc-exec", "hc-shell"])
+        .output();
+    for n in ["hc-exec", "hc-shell"] {
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["prune", n])
+            .output();
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    assert_ne!(
+        shell_form, "healthy",
+        "the CONTROL failed: a shell-form probe reported healthy in a rootfs with no /bin/sh, so \
+         this rootfs has a shell after all and the assertion below proves nothing"
+    );
+    assert_eq!(
+        exec_form, "healthy",
+        "an exec-form health check did not pass without a shell (health was {exec_form:?}): the \
+         probe is being run through /bin/sh again, which no distroless image has"
+    );
+}
+
 /// Pull the hex value of a `CapXxx:` line out of `/proc/self/status` text (the last whitespace field).
 fn cap_hex<'a>(status: &'a str, cap: &str) -> Option<&'a str> {
     status
@@ -1669,14 +2193,27 @@ fn stop_records_the_workloads_own_exit_code_not_a_blanket_137() {
 
         let mut got = None;
         let mut last = String::new();
-        for _ in 0..40 {
+        // 15 s, NOT 4. The loop exits the instant the record appears, so the window costs nothing on
+        // an idle machine and is the difference between a pass and a red on a busy one: MEASURED,
+        // this assertion failed with `None` while a 55-box stack was running on the same host and
+        // passed on its own, which is machine state reported as a regression. The window is the one
+        // thing that decides which of the two a loaded host produces.
+        for _ in 0..150 {
             let all = kern()
                 .env("XDG_RUNTIME_DIR", &xdg)
                 .args(["ps", "-a", "--json"])
                 .output()
                 .expect("run kern");
             let s = String::from_utf8_lossy(&all.stdout);
-            last = s.to_string();
+            // ONLY THIS BOX'S ROW in the failure message. `ps -a` reports every box on the machine
+            // (live boxes are found in the cgroup tree, which no `XDG_RUNTIME_DIR` isolates), so a
+            // developer running this suite next to a real stack got 33 KB of somebody else's JSON
+            // and had to find the one row that mattered.
+            last = s
+                .split("{\"name\"")
+                .find(|row| row.contains(name))
+                .map(|row| format!("{{\"name\"{row}"))
+                .unwrap_or_else(|| format!("no row for '{name}' in {} bytes of ps -a", s.len()));
             if let Some(row) = s.split(name).nth(1) {
                 if let Some(code) = row.split("\"exit_code\":").nth(1) {
                     got = code
@@ -9835,5 +10372,179 @@ fn doctor_names_the_escape_on_the_host_class_where_exec_refuses() {
         text.contains("health"),
         "and name the probe, whose own stderr is unreadable, so this row is the only place that \
          consequence can be stated: {text}"
+    );
+}
+
+/// A NON-ROOT WORKLOAD CAN REOPEN `/dev/stdout`, which is how every containerised web server logs.
+///
+/// A detached box's stdout is a pipe kern creates, and a pipe is born `0600` owned by the caller.
+/// kern maps the caller to root INSIDE the box, so an image that runs as its own user is a
+/// different uid in there: it can write to the inherited fd 1 and cannot REOPEN it - and
+/// `/dev/stdout` is a symlink to `/proc/self/fd/1`, so opening it is a reopen.
+///
+/// MEASURED on Zabbix's nginx frontend (image uid 1997, `access_log /dev/stdout`): `open()
+/// "/dev/stdout" failed (13: Permission denied)`, box exit 1, restart, forever. The stack could not
+/// serve a page until the pipe was openable by the workload's own uid.
+///
+/// THE CONTROL IS THE SAME BOX AS ROOT, which worked before this and must keep working: if the
+/// control ever fails, the subject below is measuring the harness and not the fix.
+#[test]
+fn a_non_root_workload_can_reopen_dev_stdout() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "devstdout");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-devout-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+
+    // The box writes through a REOPENED /dev/stdout, so the marker appears in the log only if the
+    // reopen succeeded. `--user` is what makes the workload a different uid from the box's root.
+    let run = |name: &str, user: Option<&str>| -> String {
+        let mut args = vec!["box", name, "--rootfs", &rootfs, "-d"];
+        if let Some(u) = user {
+            args.extend_from_slice(&["--user", u]);
+        }
+        args.extend_from_slice(&[
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo RIAPERTO > /dev/stdout || echo FALLITO",
+        ]);
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&args)
+            .output()
+            .expect("run kern");
+        if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+            return "skip".to_string();
+        }
+        // The box exits immediately; give the pump a moment to drain the pipe into the log.
+        let mut seen = String::new();
+        for _ in 0..40 {
+            let logs = kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["logs", name])
+                .output();
+            if let Ok(l) = logs {
+                seen = String::from_utf8_lossy(&l.stdout).to_string();
+                if seen.contains("RIAPERTO") || seen.contains("FALLITO") {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        seen
+    };
+
+    let as_root = run("devout-root", None);
+    let as_user = run("devout-user", Some("1997"));
+
+    for n in ["devout-root", "devout-user"] {
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", n])
+            .output();
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["prune", n])
+            .output();
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    if as_root == "skip" || as_user == "skip" {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    assert!(
+        as_root.contains("RIAPERTO"),
+        "the CONTROL failed: even as root the box could not reopen /dev/stdout ({as_root:?}), so \
+         the assertion below would be measuring the harness"
+    );
+    assert!(
+        as_user.contains("RIAPERTO"),
+        "a workload running as its own uid could not reopen /dev/stdout ({as_user:?}): every image \
+         that logs the containerised way is broken by that, and it is what the pipe's mode decides"
+    );
+}
+
+/// A `--ulimit` THE KERNEL WILL NOT RAISE COSTS HEADROOM, NOT THE WHOLE BOX.
+///
+/// `memlock: -1` and `nofile: 65536` are Elasticsearch's standard block and appear in thousands of
+/// compose files. A rootless box cannot raise a HARD bound - that needs `CAP_SYS_RESOURCE` in the
+/// initial user namespace - so the kernel answers EPERM, and kern refused to start at all: the file
+/// asked for more headroom and got no service. MEASURED with OpenCTI's Elasticsearch block verbatim.
+///
+/// It is now clamped to the bound the box inherited and the difference is named. Nothing is confined
+/// more loosely than asked: the clamp can only lower what was requested, which is why a LOWERING
+/// that fails is still a refusal.
+#[test]
+fn an_unraisable_ulimit_is_clamped_and_named_not_fatal() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "ulimit-clamp");
+    if fs::copy(&busybox, root.join("bin/sh")).is_err() {
+        eprintln!("skip: could not place /bin/sh in the test rootfs");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let out = kern()
+        .args([
+            "box",
+            "ulimclamp",
+            "--rootfs",
+            &rootfs,
+            // Verbatim from OpenCTI's `elasticsearch` service.
+            "--ulimit",
+            "memlock=-1:-1",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo MEMLOCK=$(ulimit -l)",
+        ])
+        .output()
+        .expect("run kern");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = fs::remove_dir_all(&root);
+
+    if stderr.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    // A host that CAN raise it (a hard limit already unlimited, or a privileged runner) grants the
+    // ask outright: that is a pass too, and saying so keeps the assertion from demanding the clamp
+    // on a machine that never needed it.
+    let granted = stdout.contains("MEMLOCK=unlimited");
+    assert!(
+        out.status.success(),
+        "a ulimit the kernel will not raise must not take the box down: {stderr}"
+    );
+    assert!(
+        stdout.contains("MEMLOCK="),
+        "the workload must have run: {stdout:?} {stderr:?}"
+    );
+    assert!(
+        granted || stderr.contains("cannot raise a hard limit"),
+        "the clamp must be NAMED, or the difference is silent: {stderr:?}"
     );
 }
