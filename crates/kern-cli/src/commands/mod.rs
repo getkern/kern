@@ -5508,9 +5508,9 @@ fn no_pod_peer_names_note(boxes: &[crate::compose::ComposeBox], no_pod: bool) ->
         "kern: note: --no-pod gives each service its own network namespace, and peers are reached \
          through per-service loopback aliases instead of a shared one. A service cannot host a peer's \
          alias on a port it binds itself, so two services that share an internal port are still not \
-         mutually reachable; any such pair is named with it. A relay carries TCP, so a datagram one \
-         service sends to another's UDP port does not cross in this wiring, whether or not the file \
-         declares the port. Every other service is held before its first instruction until its \
+         mutually reachable; any such pair is named with it. A relay exists per DECLARED port \
+         (`ports:`, `expose:` or `port:`), so a peer answers by name only on a port the file names, \
+         and it carries TCP, so a datagram sent to another service's UDP port does not cross at all. Every other service is held before its first instruction until its \
          relays exist, so none of them starts against a half-built network."
             .to_string(),
     )

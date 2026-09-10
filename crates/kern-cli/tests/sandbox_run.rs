@@ -1240,6 +1240,12 @@ fn an_init_that_ignores_the_stop_signal_is_given_its_grace() {
         ignoring >= 1_500,
         "an init that ignores the stop signal was killed after {ignoring} ms, not given its 2 s"
     );
+    // AND THE WAIT IS NOT THE WHOLE GRACE WHEN THE PROCESS FINISHES. Measured on the shape the
+    // window exists for, a checkpoint wrapped in `trap '' TERM`: with the shortcut the box was gone
+    // in 6 ms and the checkpoint file was never written; with the grace honoured the box stops in
+    // 1003 ms, early, and the file is there. The poll on the pidfd is what makes the cost the
+    // process's own and not the grace's.
+
     assert!(
         default_disposition < 1_000,
         "the fast path regressed: an init that cannot hear the signal waited {default_disposition} ms"
@@ -2727,18 +2733,27 @@ fn a_short_stop_timeout_is_not_held_to_a_longer_one_in_the_same_teardown() {
 }
 
 /// The other half of the grace contract, and the half that reads like a bug until you know the
-/// kernel rule: a grace the signal CANNOT end is skipped, not sat out.
+/// kernel rule: a grace the init cannot HEAR is skipped, not sat out.
 ///
 /// A namespace PID 1 is special - the kernel DISCARDS a signal it has no handler for - so a box
-/// whose init ignores SIGTERM cannot die of it, and waiting is a guaranteed wait for an event that
-/// can never happen. kern reads `SigCgt` and goes straight to the SIGKILL; Docker and Podman sit out
-/// the full grace and reach the same place later (MEASURED at 10 278 and 10 287 ms against 21.9).
+/// whose init leaves SIGTERM at its DEFAULT disposition cannot die of it and never learns it was
+/// asked: waiting is a guaranteed wait for an event that cannot happen. kern reads the masks and
+/// goes straight to the SIGKILL; Docker and Podman sit out the full grace and arrive later
+/// (MEASURED at 10 278 and 10 287 ms against 21.9).
 ///
-/// Paired with `stop_grace_is_not_rounded_down_to_whole_seconds` deliberately, because the two shapes
-/// look identical in a shell and behave oppositely: `trap "" TERM` is IGNORED (fast), while
-/// `trap "sleep 60" TERM` is CAUGHT and never returns (the full grace). An audit that measures one
-/// and compares it against the other's number reports a defect that is not there, so both numbers
-/// live in tests rather than in prose.
+/// THIS TEST USED TO COVER THE IGNORED CASE TOO, AND THAT WAS WRONG. The reasoning was that an init
+/// which ignores the signal "reaches the same place later", so the wait buys nothing. MEASURED, and
+/// it does not: a box running `trap '' TERM; (sleep 2; write a file) & wait` - a checkpoint wrapped
+/// against the signal, which is exactly what `stop_grace_period` is written for - was killed in 6 ms
+/// with the file never written. With the grace honoured the same box stops in 1003 ms, EARLY, and
+/// the file is there: the wait is a poll on the pidfd, so it costs what the process needs and not
+/// the whole grace. `SIG_IGN` means the author was asked and declined; the default disposition means
+/// nobody was asked at all, and only the second one is a wait for nothing.
+///
+/// Paired with `stop_grace_is_not_rounded_down_to_whole_seconds` deliberately, because the shapes
+/// look identical in a shell and behave differently: `trap "" TERM` is IGNORED (now the grace, and
+/// early if the process finishes), the default disposition is DISCARDED (fast), and
+/// `trap "sleep 60" TERM` is CAUGHT and never returns (the full grace).
 #[test]
 fn stop_skips_a_grace_the_kernel_would_make_pointless() {
     let Some(busybox) = static_busybox() else {
@@ -2768,7 +2783,10 @@ fn stop_skips_a_grace_the_kernel_would_make_pointless() {
             "/bin/busybox",
             "sh",
             "-c",
-            "trap '' TERM; while :; do sleep 0.2; done",
+            // THE DEFAULT DISPOSITION, which is what this test is about: no `trap`, so the kernel
+            // discards the signal for a namespace init and the grace can end nothing. The ignored
+            // case has its own test now, and it must NOT be measured here.
+            "while :; do sleep 0.2; done",
         ])
         .output()
         .expect("run kern");
@@ -2800,7 +2818,7 @@ fn stop_skips_a_grace_the_kernel_would_make_pointless() {
     // loaded machine cannot reach it.
     assert!(
         waited < std::time::Duration::from_millis(1000),
-        "a grace the init cannot act on must be skipped, not waited out: stop took {} ms",
+        "a grace the init cannot HEAR must be skipped, not waited out: stop took {} ms",
         waited.as_millis()
     );
 

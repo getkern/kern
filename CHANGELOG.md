@@ -37,10 +37,14 @@ stack with a ten-second grace can therefore take fifty seconds to stop, which is
 box's init cannot be terminated by the signal, which is what turns `kern stop` on a `sleep` box from
 9 s into milliseconds: a PID-namespace init with the DEFAULT disposition never learns the signal
 happened, because the kernel discards it. That shortcut was also being taken for an init that
-IGNORES the signal, which is a different statement: `trap '' TERM` around a checkpoint is exactly
-what `stop_grace_period` is written for, and the process may still exit inside the window. Measured:
-an ignoring init with a 2 s grace was torn down in 5 ms, and now takes 2007 ms. The fast path for
-the default disposition is unchanged and asserted in the same test.
+IGNORES the signal, on the reasoning that both arrive at the same place and one merely arrives
+later. Measured, and they do not: a box running `trap '' TERM; (sleep 2; write a file) & wait` - a
+checkpoint wrapped against the signal, which is what `stop_grace_period` exists for - was killed in
+6 ms with the file never written, and with the grace honoured stops in 1003 ms, EARLY, with the file
+there. The wait is a poll on the pidfd, so it costs what the process needs rather than the whole
+grace. `SIG_IGN` means the author was asked and declined; the default disposition means nobody was
+asked, and only the second is a wait for nothing. The fast path for it is unchanged and asserted in
+the same tests.
 
 **`HEALTHCHECK` and `STOPSIGNAL` are baked into an image kern builds.** Both were parsed and
 dropped, with a note telling the operator to pass `--health-cmd` by hand. That is unusable from
@@ -141,6 +145,18 @@ redirected is a remote certificate authority. When the moved set contains 80 or 
 says that a service issuing its own TLS certificates (Caddy's automatic HTTPS, Traefik with Let's
 Encrypt) cannot complete an ACME challenge on a moved port. `docs/RUNTIME-PARITY.md` records the rest of the
 comparison, including that podman refuses such a port outright where kern moves it.
+
+**A peer resolves the name a service ANNOUNCES, not only the one the file writes.** A clustered
+service does not publish the string in the compose file: it publishes what `hostname` returns, and
+puts that in its membership state. Kafka writes it into `advertised.listeners`, a Mongo replica set
+into `rs.initiate`, Redis Sentinel into its gossip, and every peer then dials the announced name.
+Measured on a two-service stack where one writes `hostname` to a shared file and the other reads it
+back: in a pod both the resolve and the connect succeed, because the pod's shared hosts file carries
+an entry per box name; on a bridge the same file answered `NON-RISOLVE` and `nc: bad address`,
+because the per-service entries carried the compose name and nothing else. The stack comes up, every
+health check passes, and the cluster is dead at its first rebalance. Both the box name and the
+service name now resolve in every wiring. Under the relay wiring the name resolves and the connect
+still needs a DECLARED port, which the wiring note now states.
 
 **A second number: `scripts/e2e-semantic.py`.** The compatibility rate is read from kern's warnings
 at `config`, which makes it blind to everything that only exists once a box runs: the seven defects

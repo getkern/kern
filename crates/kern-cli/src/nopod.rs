@@ -219,6 +219,17 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
         .map_or(&[], |a| a.ports.as_slice());
     let mut out = Vec::with_capacity(plan.len());
     out.push(format!("{me}:127.0.0.1"));
+    // MY OWN BOX NAME TOO, because that is what `hostname` answers inside the box and what a
+    // clustered service ANNOUNCES to its peers. See the peer loop below for what it cost.
+    if let Some(bn) = plan
+        .iter()
+        .find(|a| a.service == me)
+        .map(|a| a.box_name.as_str())
+    {
+        if bn != me {
+            out.push(format!("{bn}:127.0.0.1"));
+        }
+    }
     // MY OWN ALIASES POINT AT MY OWN LOOPBACK, like my name: a service that calls itself by an alias
     // must not be sent across the network to reach itself.
     for al in plan
@@ -274,6 +285,23 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
         }
         let addr = alias_to_dotted(a.alias, &mut buf).to_string();
         out.push(format!("{}:{}", a.service, addr));
+        // AND THE PEER'S BOX NAME, which is the name it ANNOUNCES rather than the name the file
+        // calls it by.
+        //
+        // A clustered service does not publish the string in the compose file: it publishes what
+        // `hostname` returns, and puts THAT in its membership state. Kafka writes it into
+        // `advertised.listeners`, a Mongo replica set into `rs.initiate`, Redis Sentinel into its
+        // gossip. Every peer then dials the announced name.
+        //
+        // MEASURED on a two-service stack where one writes `hostname` to a shared file and the other
+        // reads it back: in a POD the name resolves and the TCP connect succeeds, because the pod's
+        // shared hosts file carries an entry per BOX name. On a bridge the same file answered
+        // `NON-RISOLVE` and `nc: bad address`, because these entries carried the SERVICE name and
+        // nothing else. The stack comes up, every health check passes, and the cluster is dead at
+        // the first rebalance - which is the shape that costs a day rather than a minute.
+        if a.box_name != a.service {
+            out.push(format!("{}:{}", a.box_name, addr));
+        }
         // AND EVERY NAME THAT PEER ANSWERS TO. `aliases:` is how a compose file says "this service
         // is also called `db`", and a DSN written against that name resolves only if the entry is
         // here: the pod's shared hosts file carries them, and without this the same file worked in
@@ -525,6 +553,26 @@ mod tests {
         assert!(from_pg.contains(&"postgres:127.0.0.1".to_string()));
         assert!(from_pg.contains(&"db:127.0.0.1".to_string()), "{from_pg:?}");
 
+        // THE BOX NAME RESOLVES TOO, and it is not decoration: `hostname` inside the box answers the
+        // BOX name, and a clustered service publishes THAT rather than the string in the compose
+        // file. Kafka puts it in `advertised.listeners`, a Mongo replica set in `rs.initiate`, Redis
+        // Sentinel in its gossip, and every peer then dials the announced name.
+        //
+        // MEASURED on a two-service stack where one writes `hostname` to a shared file and the other
+        // reads it back: in a POD both the resolve and the connect succeed, because the pod's shared
+        // hosts file carries an entry per box name; on a bridge the same file answered `NON-RISOLVE`
+        // and `nc: bad address`. The stack comes up, every health check passes, and the cluster is
+        // dead at its first rebalance.
+        assert!(
+            from_rest.contains(&format!("{}:{db_addr}", plan[0].box_name)),
+            "a peer must resolve the name the service ANNOUNCES, not only the one the file uses: \
+             {from_rest:?}"
+        );
+        assert!(
+            from_pg.contains(&format!("{}:127.0.0.1", plan[0].box_name)),
+            "and a service must resolve its OWN announced name to its own loopback: {from_pg:?}"
+        );
+
         // THE CONTROL: a peer on no shared network contributes nothing, aliases included. Without
         // it this test would pass on an implementation that hands every name to everybody.
         let split = assign_aliases(&[
@@ -665,8 +713,8 @@ mod tests {
             add_host_args(&plan, "a", true)
                 .expect("a is in the plan")
                 .len(),
-            3,
-            "itself plus both peers"
+            6,
+            "itself plus both peers, each under its compose name and its box name"
         );
         assert!(
             segregated_pairs(&membership_of(&plan)).is_empty(),
@@ -820,7 +868,13 @@ mod tests {
     fn add_host_points_a_box_at_itself_and_its_peers_at_their_aliases() {
         let plan = assign_aliases(&[svc("db", &[5432]), svc("api", &[8080])]).expect("plan");
         let db = add_host_args(&plan, "db", true).expect("db is in the plan");
-        assert_eq!(db.len(), 2, "one self entry and one peer: {db:?}");
+        // TWO NAMES EACH: the compose name and the box name, which is what `hostname` answers inside
+        // the box and what a clustered service announces to its peers.
+        assert_eq!(
+            db.len(),
+            4,
+            "two names for itself and two for its peer: {db:?}"
+        );
         assert!(db.contains(&"db:127.0.0.1".to_string()), "{db:?}");
         assert!(db.contains(&"api:127.0.0.3".to_string()), "{db:?}");
         assert!(
@@ -883,8 +937,15 @@ mod tests {
             "an empty plan resolves nothing"
         );
         // A single-service stack still names itself: a workload that resolves its own hostname works.
+        // BOTH names: the compose one and the BOX one, which is what `hostname` answers inside it.
         let solo = add_host_args(&plan, "db", true).expect("db is in the plan");
-        assert_eq!(solo, vec!["db:127.0.0.1".to_string()]);
+        assert_eq!(
+            solo,
+            vec![
+                "db:127.0.0.1".to_string(),
+                format!("{}:127.0.0.1", plan[0].box_name)
+            ]
+        );
     }
 
     /// The relay plan is every ordered pair of distinct services, per declared port, and never a
