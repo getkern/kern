@@ -5701,6 +5701,98 @@ fn compose_dir(file: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+/// Delete the named volumes a project OWNS: `docker compose down -v`.
+///
+/// THREE CONDITIONS, and each one keeps a deletion from reaching data that is not this project's:
+///
+///  * the source must be a NAME, never a host path - a `-v /srv/db:/data` names a directory the
+///    project did not create and must not remove;
+///  * it must carry this project's prefix, which `scope_named_volumes` put there. A volume without
+///    it predates the scoping and may hold another stack's data (that sharing is the very defect
+///    the scoping fixed), so it is left alone;
+///  * it must not be declared `external: true`. Docker never removes an external volume, because
+///    the key means "this exists independently of me".
+///
+/// The path is then re-derived through `volume::volumes_dir()` and checked to still live under it
+/// after canonicalisation, so a symlink planted at `<volumes dir>/<name>` cannot turn a delete into
+/// a delete somewhere else.
+///
+/// Returns how many volumes were removed.
+fn remove_project_volumes(
+    boxes: &[crate::compose::ComposeBox],
+    project: &str,
+) -> Result<usize, Error> {
+    let dir = crate::volume::volumes_dir();
+    let base = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+    let prefix = format!("{project}_");
+    let mut done: Vec<String> = Vec::new();
+    for b in boxes {
+        for v in &b.volumes {
+            let Some((src, _)) = v.split_once(':') else {
+                continue;
+            };
+            if !matches!(
+                crate::volume::classify(src),
+                crate::volume::SourceKind::Named
+            ) || !src.starts_with(&prefix)
+                || b.external_volumes.iter().any(|e| e == src)
+                || done.iter().any(|d| d == src)
+            {
+                continue;
+            }
+            let path = dir.join(src);
+            if !path.exists() {
+                continue;
+            }
+            let real = std::fs::canonicalize(&path)
+                .map_err(|e| Error::Volume(format!("volume '{src}': {e}")))?;
+            if !real.starts_with(&base) {
+                return Err(Error::Volume(format!(
+                    "volume '{src}' resolves outside the volumes directory (symlink?) - refusing to \
+                     remove it"
+                )));
+            }
+            std::fs::remove_dir_all(&real)
+                .map_err(|e| Error::Volume(format!("removing volume '{src}': {e}")))?;
+            done.push(src.to_string());
+        }
+    }
+    Ok(done.len())
+}
+
+/// Stop a stack's services, reap its sidecars and remove its pod: the body of `compose down`.
+///
+/// SHARED with an attached `up`, whose Ctrl-C means exactly what `down` means, so the two cannot
+/// drift into tearing down different amounts of the same stack. `selected` is what to stop (the
+/// whole file for `down`, only what this invocation started for an attached `up`); `boxes` stays the
+/// WHOLE graph either way, because the teardown order is read from the full dependency graph.
+///
+/// Returns how many services were stopped and whether a pod existed to remove.
+pub(crate) fn tear_down_stack(
+    boxes: &[crate::compose::ComposeBox],
+    selected: &[String],
+    pod: &str,
+) -> (usize, bool) {
+    // The relay holder FIRST, before the boxes stop. Killing it takes every relay with it through
+    // PDEATHSIG, and doing it first means no relay is left pumping into a box that is being torn
+    // down under it. Best-effort and idempotent: a stack that ran in a pod has no holder, and a
+    // second `down` finds no file.
+    if let Ok(dir) = crate::relayhold::stack_dir(pod) {
+        crate::relayhold::kill_holder(&dir);
+    }
+    let names = stop_stack(boxes, selected, pod);
+    // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
+    // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
+    // `compose ps -a` is empty after a `down` (matching Docker), while `compose stop` (which does
+    // not call this) leaves the exited services visible.
+    registry::clear_waitexit_pod(pod, &names);
+    // Tear the pod down QUIETLY (we just stopped the members, so `pod::remove`'s "members keep
+    // running" note would contradict this). Only claim it was removed if one existed - a `--no-pod`
+    // stack has none.
+    let (pod_existed, _) = crate::pod::teardown(pod);
+    (names.len(), pod_existed)
+}
+
 /// Every mapping seen so far for ONE `(host port, protocol)` pair - the bucket that makes the
 /// collision check linear instead of pairwise. `wildcard` is the service that bound `0.0.0.0` on this
 /// pair (it subsumes every address, so anything else here conflicts with it); `specific` maps each
@@ -5816,6 +5908,8 @@ struct TerminalOpts<'a> {
     wiring_from_flag: bool,
     /// See [`ComposeOpts::allow_device_grants`]; `config`/`systemd` refuse what `up` would.
     allow_device_grants: bool,
+    /// `down -v`: also delete the named volumes this project owns.
+    remove_volumes: bool,
 }
 
 /// Run the compose verbs that never launch a box, and report whether one ran.
@@ -6382,13 +6476,34 @@ fn run_terminal_verb(
                 .filter(|b| selected(b))
                 .map(|b| b.name.as_str())
                 .collect();
-            // `-f` on several services would need one blocking reader each; rather than interleave
-            // them badly, require a single service and say exactly how to ask for it.
-            if follow && wanted.len() != 1 {
-                return Err(Error::Compose(format!(
-                    "compose logs -f follows ONE service at a time; name it (e.g. `compose {file} logs -f {}`)",
-                    wanted.first().copied().unwrap_or("<service>")
-                )));
+            // `-f` over the WHOLE stack, interleaved and prefixed, which is what `docker compose
+            // logs -f` does and what an attached `up` needs. It used to be refused ("follows ONE
+            // service at a time"), on the belief that it needed a blocking reader per service; a log
+            // file never blocks, so one poll pass reads them all (see `follow_many`).
+            if follow && wanted.len() > 1 {
+                let mut who = Vec::with_capacity(wanted.len());
+                for b in boxes.iter().filter(|b| selected(b)) {
+                    let Some(ins) = registry::find_ref(&b.name) else {
+                        continue; // never started, or already exited: nothing to follow
+                    };
+                    match Followed::open(
+                        b.service_name().to_string(),
+                        b.name.clone(),
+                        ins.pid,
+                        tail,
+                    ) {
+                        Ok(Some(f)) => who.push(f),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("compose logs: {}: {e}", b.service_name()),
+                    }
+                }
+                if who.is_empty() {
+                    return Err(Error::Compose(
+                        "compose logs -f: none of the selected services is running".to_string(),
+                    ));
+                }
+                follow_many(who, &FOLLOW_FOREVER)?;
+                return Ok(true);
             }
             for (i, name) in wanted.iter().enumerate() {
                 if wanted.len() > 1 {
@@ -6424,34 +6539,19 @@ fn run_terminal_verb(
             return Ok(true);
         }
         ComposeAction::Down => {
-            // The relay holder FIRST, before the boxes stop. Killing it takes every relay with it
-            // through PDEATHSIG, and doing it first means no relay is left pumping into a box that is
-            // being torn down under it. Best-effort and idempotent: a stack that ran in a pod has no
-            // holder, and a second `down` finds no file.
-            if let Ok(dir) = crate::relayhold::stack_dir(pod) {
-                crate::relayhold::kill_holder(&dir);
-            }
-            let names = stop_stack(
-                boxes,
-                &boxes.iter().map(|b| b.name.clone()).collect::<Vec<_>>(),
-                pod,
-            );
-            // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
-            // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
-            // `compose ps -a` is empty after a `down` (matching Docker), while `compose stop` (which does
-            // not call this) leaves the exited services visible.
-            registry::clear_waitexit_pod(pod, &names);
-            // Tear the pod down QUIETLY (we just stopped the members, so `pod::remove`'s "members keep
-            // running" note would contradict this). Only claim it was removed if one existed - a
-            // `--no-pod` stack has none.
-            let (pod_existed, _) = crate::pod::teardown(pod);
+            let all: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
+            let (stopped, pod_existed) = tear_down_stack(boxes, &all, pod);
             if pod_existed {
-                println!(
-                    "compose down: {} box(es) stopped, pod '{pod}' removed",
-                    names.len()
-                );
+                println!("compose down: {stopped} box(es) stopped, pod '{pod}' removed");
             } else {
-                println!("compose down: {} box(es) stopped", names.len());
+                println!("compose down: {stopped} box(es) stopped");
+            }
+            if o.remove_volumes {
+                match remove_project_volumes(boxes, pod) {
+                    Ok(0) => println!("compose down: no named volumes to remove"),
+                    Ok(n) => println!("compose down: {n} named volume(s) removed"),
+                    Err(e) => return Err(e),
+                }
             }
             return Ok(true);
         }
@@ -6533,6 +6633,13 @@ pub struct ComposeOpts<'a> {
     /// One or more compose files, merged left-to-right (`-f base.yml -f override.yml`).
     pub files: &'a [String],
     pub action: ComposeAction,
+    /// `-v` on `down`: also delete the named volumes this project owns (see
+    /// [`remove_project_volumes`] for the three conditions that bound what it deletes).
+    pub remove_volumes: bool,
+    /// `-d`: return as soon as the stack is up. Without it, an `up` whose stdout is a TERMINAL
+    /// streams the stack's logs and stops the stack on Ctrl-C, as `docker compose up` does. See
+    /// [`crate::cli::Command::Compose::detach`] for why the terminal is the condition.
+    pub detach: bool,
     pub no_pod: bool,
     /// `--bridge`: a network namespace per service, meeting on a bridge the pod holds.
     pub bridge: bool,

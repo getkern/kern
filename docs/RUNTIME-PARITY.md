@@ -31,6 +31,13 @@ identity, environment and mount rules, decided by runc and the daemon rather tha
 | 13 | `network_mode: host` | the host's interfaces | not measured | same (measured: `lo enp5s0 wlp4s0`) | agree |
 | 14 | A named volume, two different uids | writer AND reader refused (`0:0 755`) | not measured | same | agree |
 | 15 | UDP between peers | works (one network) | works | works in a pod, NOT under the relay wiring | kern deviates under `--no-pod`, and says so |
+| 16 | Two projects, one volume name | isolated (`pa_shared`, `pb_shared`); the reader gets `EMPTY` | not measured | same, keyed on kern's project name | agree (see below) |
+| 17 | `docker-compose.override.yml` beside the file | loaded by `docker compose`, NOT by `-f <file>` | not measured | loaded, and the line is printed | kern follows the no-`-f` form, deliberately |
+| 18 | The same port written twice | one mapping, stack runs | not measured | same | agree |
+| 19 | Two sources on one volume target | one mount, the LAST source | not measured | same | agree |
+| 20 | Two mappings sharing a host port | accepted, **fails at runtime** half-started | not measured | refused at `config` | kern deviates: STRICTER, before anything runs |
+| 21 | `up -d` when a service exits immediately | exit **0**, nothing said | not measured | exit **1**, names the service | kern deviates: LOUDER |
+| 22 | `up` without `-d` | attaches, streams, Ctrl-C stops the stack | not measured | same **on a terminal**; unchanged when piped | kern follows Docker where it cannot hang a script |
 
 ---
 
@@ -219,3 +226,70 @@ In a pod the services share one namespace and UDP crosses. Under the relay wirin
 through a per-service loopback alias served by a TCP relay, so a datagram does not cross at all. That
 is now stated in the wiring note itself rather than only for services that DECLARE a UDP port,
 because a service that binds one without declaring it is the common case and was getting silence.
+
+## 16. A named volume belongs to a project
+
+Two directories, two projects, the same volume name; project A writes `/d/who`, project B mounts a
+volume with that name and reads it.
+
+```
+Docker 29.6.2   b-1 | EMPTY        volumes: pa_shared, pb_shared
+kern (before)   B   | FROM_PROJECT_A   one directory, shared by every stack that used the name
+kern (now)      B   | EMPTY        volumes: pA-<hash>_shared, pB-<hash>_shared
+```
+
+The names that collide are the ordinary ones - `data`, `db_data`, `pgdata`, `redis-data` - so two
+Postgres stacks were sharing one data directory.
+
+The scope key differs from Docker's and the difference cuts both ways. Docker keys on the
+directory's basename, so `/a/myapp` and `/b/myapp` ARE one project and share volumes; kern's project
+name carries a hash of the file's path, so those two do not collide, and the mirror case is that
+moving a project directory leaves its volumes behind under the old name. `-p NAME` pins the project
+name under either runtime and is the answer to both.
+
+A volume declared `external: true` is never renamed and never removed: the key means it exists
+independently of this project.
+
+## 17. The override file
+
+`docker compose` with no `-f` loads `compose.override.yaml` / `.yml` / `docker-compose.override.*`
+beside the file it discovered; `docker compose -f docker-compose.yml` does NOT (measured: the
+override's `command`, its extra port and its `environment` keys were all absent). `COMPOSE_FILE`
+suppresses it as well.
+
+`kern compose <file>` is literally the `-f` form, and follows the OTHER one: it loads the override
+and prints the line that says so. The command a compose file's author actually runs is
+`docker compose up`, and a stack silently missing its dev overrides is a worse outcome than a stack
+that says what it added. `COMPOSE_FILE` pins an exact list here too, and is the way to opt out.
+
+Merge rules, all measured on the same daemon: `command` and `entrypoint` REPLACE; `environment` is a
+mapping and merges per key; `ports` append, and an identical entry appears once; `volumes` are keyed
+on the container path, so the override's source wins; `healthcheck` merges as a mapping with `test`
+replaced; an override may introduce a service, and the merged result must still name an image or a
+build context.
+
+## 20. A host port claimed twice
+
+`ports: ["8001:80", "8001:81"]` is accepted by `docker compose config` and fails at `up`, after the
+container has been created:
+
+```
+Error response from daemon: failed to set up container networking: driver failed programming
+external connectivity ... Bind for :::8001 failed: port is already allocated
+```
+
+kern refuses the same file at `config`, before anything starts. The identical-mapping case above is
+the opposite decision for the opposite reason: `8001:80` twice asks for ONE thing twice, and
+`8001:80` with `8001:81` asks for two things that cannot both happen.
+
+## 21-22. `up`, attached and detached
+
+`docker compose up -d` exits 0 even when a service exits 7 immediately; only
+`--abort-on-container-exit` or `--exit-code-from` surface it. kern's `up` reports the death, names
+the service, and exits 1. A script written against Docker that ignores the status keeps working; one
+that checks it now learns something true.
+
+`docker compose up` without `-d` attaches and streams every service's log, prefixed, and Ctrl-C
+stops the stack. kern does the same WHEN STDOUT IS A TERMINAL. Piped or redirected - a CI script, a
+systemd unit, the SDK - it keeps returning as soon as the stack is up, because a follow that ends
+only on a signal would hang a caller that cannot send one. `-d` is explicit and works either way.

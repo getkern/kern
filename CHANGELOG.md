@@ -7,6 +7,66 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A named volume belonged to every stack that used its name.** kern mounted `data:/var/lib/x` at
+`<volumes dir>/data`, with nothing in the path naming the project, so two unrelated stacks that both
+declare the ordinary names - `data`, `db_data`, `pgdata`, `redis-data` - shared ONE directory.
+Measured on both runtimes with the same two files, project A writing `/d/who` and project B reading
+it: Docker 29.6.2 printed `EMPTY` and holds `pa_shared` and `pb_shared`; kern printed
+`FROM_PROJECT_A`. Two Postgres stacks were sharing a data directory. Volumes are now named
+`<project>_<volume>`, as Docker names them. A volume declared `external: true` keeps its name, since
+the key means it exists independently of the project. Nothing is moved: a stack that already has
+data under the old unscoped name gets a note with both paths and the `mv` that adopts it, because
+two projects may hold data under one legacy name and no rule can decide whose it is.
+
+**`docker-compose.override.yml` was ignored.** `docker compose` with no `-f` loads the override
+beside the file it discovered; kern loaded only the base and said nothing, so a project's dev
+overrides - source bind-mounts, debug ports, a different command - vanished in silence. kern now
+loads it and prints the line that says so. Measured conditions, each against the daemon: an explicit
+`-f` suppresses the override there, so does `COMPOSE_FILE`, and the override search is independent
+of which base name was used (`docker-compose.override.yml` applies to `compose.yaml`). Passing two
+files, naming a file Docker would not have discovered, or setting `COMPOSE_FILE` all keep the old
+behaviour.
+
+**An override that restated a port failed the whole stack.** `ports: ["8001:80"]` in the base and
+again in the override is the most ordinary line an override contains, and kern refused it:
+"publishes host port 8001/tcp more than once". Docker collapses a repeat, in one file and across a
+merge alike - measured: one entry at `config`, and the stack runs. kern now collapses the same
+three: an identical port appears once, two sources on one container path become the LAST source
+(measured: `cat /data/f` prints the second file's contents under Docker), and a repeated environment
+key becomes one entry, which is all a mapping could ever have expressed. The replacement keeps the
+base's POSITION, so an override replacing `/data` cannot end up mounted on top of `/data/sub` and
+hide it. Two mappings that merely share a host port are still refused: Docker accepts that file and
+fails at `up`, half-started, with "port is already allocated".
+
+**`compose logs -f` follows the whole stack.** It used to refuse more than one service ("follows ONE
+service at a time"), on the belief that each needed a blocking reader. A log file never blocks, so
+one poll pass reads them all; output is interleaved and prefixed with the service name, as
+`docker compose logs` does.
+
+**`-d` on `compose up` did nothing.** `up` always returned as soon as the stack was started, and
+`-d` was accepted as a name for what already happened: measured by diffing the output of `up`
+against `up -d` on one file, which differed only in a pid. `up` now streams the stack's logs and
+stops it on Ctrl-C, like `docker compose up`, WHEN STDOUT IS A TERMINAL, and `-d` turns that off.
+The terminal is the condition because the follow ends only when every service exits or a signal
+arrives: every caller that redirects or pipes - a CI script, a systemd unit, the SDK - keeps exactly
+the behaviour it had and cannot be left blocking on a signal it has no way to send.
+
+**`compose down -v` removes this project's named volumes.** kern created named volumes and never
+removed them, so a stack torn down and started fresh silently reused the previous run's data. The
+flag was a usage error before. It deletes only sources that are NAMES, carry this project's prefix,
+and are not `external: true`, and it re-checks that the path still resolves under the volumes
+directory so a planted symlink cannot redirect a delete.
+
+**A `docker compose` verb was reported as a missing service.** The parser takes the first bare word
+that is not one of kern's verbs as the file and every later one as a service, so
+`kern compose x.yml exec web sh` answered "no service 'exec' in x.yml" - a sentence about a service
+the reader never wrote, for a verb they did. Twelve Docker verbs kern does not have (`exec`, `run`,
+`kill`, `cp`, `top`, `stats`, `images`, `events`, `wait`, `ls`, `rm`, `create`) now name themselves
+and the kern command that does the job, resolved down to the box name so it can be run as printed. A
+service genuinely named `exec` still works, and a genuinely missing service is still reported as
+one. Unknown FLAGS now name the flag too, instead of printing a usage dump that does not contain
+it, and the dozen most likely Docker flags each say what kern does instead.
+
 **`cpu_shares` produces the weight Docker produces.** kern mapped Docker's shares onto cgroup v2's
 `cpu.weight` linearly on 1024, which agrees at the default and nowhere else. Ten points read off a
 real daemon (Docker 29.6.2, cgroup v2): 512 -> 59, 1024 -> 100, 2048 -> 174, 65536 -> 3023. The

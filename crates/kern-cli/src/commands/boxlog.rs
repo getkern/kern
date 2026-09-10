@@ -519,6 +519,225 @@ pub(crate) fn follow_log(mut f: std::fs::File, name: &str, pid: i32) -> Result<(
     }
 }
 
+/// Set by [`arm_follow_interrupt`]'s handler so an attached `compose up` can leave the follow loop
+/// and tear its stack down, instead of dying where it stands and orphaning it.
+///
+/// A plain `logs -f` never arms the handler, so SIGINT keeps its default disposition there and
+/// Ctrl-C ends the process at once, which is what a reader of a log expects.
+static FOLLOW_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_follow_signal(_: libc::c_int) {
+    // The ONLY operation here is an atomic store, which is async-signal-safe. `Release` pairs with
+    // the `Acquire` load in `follow_many`: everything the handler observed happens-before the loop's
+    // exit, and no stronger ordering buys anything for a single flag.
+    FOLLOW_STOP.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Trap SIGINT/SIGTERM for the duration of an attached follow, and report whether the trap took.
+///
+/// Returns the flag the caller polls. Installed by `compose up` (attached) only.
+pub(crate) fn arm_follow_interrupt() -> &'static std::sync::atomic::AtomicBool {
+    FOLLOW_STOP.store(false, std::sync::atomic::Ordering::Release);
+    unsafe {
+        // `as *const () as sighandler_t`, the same two-step `watch` and the TUI use: a direct
+        // function-item-to-integer cast is refused by lint, so the pointer is formed explicitly.
+        libc::signal(
+            libc::SIGINT,
+            on_follow_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_follow_signal as *const () as libc::sighandler_t,
+        );
+    }
+    &FOLLOW_STOP
+}
+
+/// A flag that is never set, for the follow paths that want SIGINT's default disposition.
+pub(crate) static FOLLOW_FOREVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One service being followed by [`follow_many`]: where its output is, and how to label it.
+pub(crate) struct Followed {
+    /// The name the compose FILE uses. Boxes are named `<project>-<service>`, and a reader
+    /// recognises the service, so the prefix carries that and not the scoped name.
+    label: String,
+    /// The scoped box name and pid, the exact pair `registry::pair_alive` needs: a duplicate
+    /// same-name entry must not make a live box read as exited.
+    box_name: String,
+    pid: i32,
+    file: std::fs::File,
+    /// Bytes read that do not yet end in a newline, held back so a prefix never lands mid-line.
+    pending: Vec<u8>,
+    /// Set once the box has left the registry AND its file has been drained one final time.
+    done: bool,
+}
+
+impl Followed {
+    /// Open a service's log for following, or `None` when it has produced none (never started, or
+    /// started so recently the pump has not created the file yet).
+    ///
+    /// `tail` bounds what is shown BEFORE the follow begins, exactly as in the single-box path:
+    /// `None` replays the whole log, `Some(n)` its last `n` lines.
+    pub(crate) fn open(
+        label: String,
+        box_name: String,
+        pid: i32,
+        tail: Option<usize>,
+    ) -> Result<Option<Self>, Error> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some(path) = newest_log(&box_name)? else {
+            return Ok(None);
+        };
+        let mut file =
+            std::fs::File::open(&path).map_err(|e| Error::Sandbox(format!("opening log: {e}")))?;
+        let pending = match tail {
+            Some(n) => {
+                let window = tail_file(&mut file, n)?;
+                // Leave the cursor at EOF so the follow streams only NEW appends.
+                file.seek(SeekFrom::End(0))
+                    .map_err(|e| Error::Sandbox(format!("seeking log: {e}")))?;
+                window
+            }
+            None => {
+                let mut all = Vec::new();
+                file.read_to_end(&mut all)
+                    .map_err(|e| Error::Sandbox(format!("reading log: {e}")))?;
+                all
+            }
+        };
+        Ok(Some(Self {
+            label,
+            box_name,
+            pid,
+            file,
+            pending,
+            done: false,
+        }))
+    }
+
+    /// Append everything currently readable. A short read means "nothing more right now", not EOF:
+    /// the box is still open on the other end.
+    fn read_available(&mut self) {
+        use std::io::Read;
+        let mut buf = [0u8; 8192];
+        loop {
+            match self.file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => match buf.get(..k) {
+                    Some(s) => self.pending.extend_from_slice(s),
+                    None => break,
+                },
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Emit every COMPLETE line held, each prefixed, leaving a partial tail for the next pass.
+    ///
+    /// Linear in the bytes drained: `start` only moves forward, so the scan never re-reads a line.
+    fn drain_lines(&mut self, width: usize, out: &mut Vec<u8>) {
+        let mut start = 0usize;
+        while let Some(rest) = self.pending.get(start..) {
+            let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let Some(line) = rest.get(..nl) else {
+                break;
+            };
+            push_prefixed(out, &self.label, width, line);
+            start = start.saturating_add(nl).saturating_add(1);
+        }
+        if start > 0 {
+            self.pending.drain(..start);
+        }
+    }
+
+    /// Emit a final line that never got its newline, once the box is gone and none is coming.
+    fn flush_partial(&mut self, width: usize, out: &mut Vec<u8>) {
+        if !self.pending.is_empty() {
+            let held = std::mem::take(&mut self.pending);
+            push_prefixed(out, &self.label, width, &held);
+        }
+    }
+}
+
+/// Write one labelled line: `label<pad> | text`, the shape `docker compose logs` uses.
+fn push_prefixed(out: &mut Vec<u8>, label: &str, width: usize, line: &[u8]) {
+    out.extend_from_slice(label.as_bytes());
+    for _ in label.chars().count()..width {
+        out.push(b' ');
+    }
+    out.extend_from_slice(b" | ");
+    out.extend_from_slice(line);
+    out.push(b'\n');
+}
+
+/// Follow SEVERAL services at once, interleaved and prefixed, until every one has exited or `stop`
+/// is set.
+///
+/// WHY POLLING AND NOT A READER PER SERVICE. A log file never blocks: a read at EOF returns 0
+/// immediately, so one pass over N files costs N cheap reads and the loop sleeps 200 ms between
+/// passes, the same cadence the single-box follow already uses. A thread per service would buy
+/// nothing (there is nothing to block on) and would need a lock around stdout to keep lines whole.
+///
+/// ORDERING WITHIN A PASS is by service, not by timestamp: kern's box logs carry no per-line clock,
+/// so lines written 10 ms apart in two services cannot be truthfully interleaved. `docker compose
+/// logs` has the same property. Lines are never split or mixed - the whole pass is written under one
+/// stdout lock.
+///
+/// THE FINAL DRAIN is not decoration. A box that writes its last line and exits would lose that line
+/// to a loop that checked the registry first and read second, so each service is read again AFTER
+/// its death is observed, and only then marked done.
+pub(crate) fn follow_many(
+    mut who: Vec<Followed>,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<(), Error> {
+    use std::io::Write;
+    if who.is_empty() {
+        return Ok(());
+    }
+    // Align the prefixes, but never let one long service name push every line off the screen.
+    let width = who
+        .iter()
+        .map(|w| w.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+    let stdout = std::io::stdout();
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        out.clear();
+        let mut live = 0usize;
+        for w in who.iter_mut() {
+            if w.done {
+                continue;
+            }
+            w.read_available();
+            w.drain_lines(width, &mut out);
+            if registry::pair_alive(&w.box_name, w.pid) {
+                live = live.saturating_add(1);
+            } else {
+                w.read_available();
+                w.drain_lines(width, &mut out);
+                w.flush_partial(width, &mut out);
+                w.done = true;
+            }
+        }
+        if !out.is_empty() {
+            let mut lock = stdout.lock();
+            if lock.write_all(&out).is_err() {
+                return Ok(()); // a closed pipe ends the follow quietly, as in `follow_log`
+            }
+            let _ = lock.flush();
+        }
+        if live == 0 || stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        unsafe { libc::usleep(200_000) }; // 200 ms - the cadence `follow_log` already uses
+    }
+}
+
 /// The newest `<name>-<pid>.log` under the logs dir, or `None` if the box has produced no log.
 pub(crate) fn newest_log(name: &str) -> Result<Option<PathBuf>, Error> {
     let dir = registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;

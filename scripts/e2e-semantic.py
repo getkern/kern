@@ -246,6 +246,65 @@ def ck_home(scratch):
     return got != "/root", f"HOME={got} for a non-root user"
 
 
+# --------------------------------------------------------------------------------------------
+# 7. A named volume belongs to ONE project.
+# --------------------------------------------------------------------------------------------
+def volumes_dir():
+    """Where kern keeps named volumes, derived the same way kern derives it."""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share"
+    )
+    return os.path.join(base, "kern", "volumes")
+
+
+def fx_volume_scope(scratch, named=True):
+    """Write a marker into a NAMED volume (good) or into a host bind (broken).
+
+    The broken fixture is not a mutilated version of the good one: it is the same stack writing to a
+    bind mount, so the marker exists but NOT inside a project-scoped named volume - which is exactly
+    what the check is looking for, and exactly what kern did before volumes were scoped.
+    """
+    out_dir(scratch)
+    if named:
+        mount, decl = "e2evol:/v", "volumes:\n  e2evol:\n"
+    else:
+        mount, decl = f"{scratch}/out:/v", ""
+    return f"""services:
+  s:
+    image: {IMAGE}
+    volumes: ["{mount}"]
+    command: ["sh", "-c", "echo MARKER > /v/marker; sleep 8"]
+{decl}"""
+
+
+def ck_volume_scope(scratch):
+    """The marker must land in `<project>_e2evol`, never in a bare `e2evol` every stack shares.
+
+    MEASURED before this was fixed: two projects declaring the same volume name mounted ONE
+    directory, so project B read project A's data (Docker 29.6.2 prints EMPTY for the same pair and
+    holds `pa_shared` + `pb_shared`).
+    """
+    root = volumes_dir()
+    if not os.path.isdir(root):
+        return None, f"no volumes directory at {root}"
+    scoped, bare = [], False
+    for name in os.listdir(root):
+        if not name.endswith("e2evol"):
+            continue
+        if os.path.isfile(os.path.join(root, name, "data", "marker")):
+            if name == "e2evol":
+                bare = True
+            else:
+                scoped.append(name)
+    for name in scoped + (["e2evol"] if bare else []):
+        shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+    if bare:
+        return False, "the marker landed in the UNSCOPED volume 'e2evol', shared by every stack"
+    if not scoped:
+        return False, "no project-scoped volume holds the marker"
+    return True, f"marker is in {scoped[0]}"
+
+
 PROBES = [
     Probe(
         "identity_healthcheck",
@@ -291,6 +350,14 @@ PROBES = [
         lambda s: fx_home(s, True),
         lambda s: fx_home(s, False),
         ck_home,
+    ),
+    Probe(
+        "volume_belongs_to_the_project",
+        "a named volume must belong to one project, not to every stack that uses the name",
+        lambda s: fx_volume_scope(s, True),
+        lambda s: fx_volume_scope(s, False),
+        ck_volume_scope,
+        settle=5.0,
     ),
 ]
 

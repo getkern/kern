@@ -4152,6 +4152,10 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             b.swap_max = Some((total - mem).to_string());
         }
     }
+    // ONE file repeats too: `ports: ["8001:80","8001:80"]` is one mapping at Docker's `config`, and
+    // two sources on one target are one mount there. Applied here as well as after a merge, so the
+    // two paths cannot disagree about what a repeat means. See `collapse_repeated_mappings`.
+    b.collapse_repeated_mappings();
     Ok(b)
 }
 

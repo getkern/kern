@@ -363,6 +363,183 @@ fn resolve_box_names(
     box_name_of
 }
 
+/// The four names `docker compose` looks for when no `-f` is given, most specific first.
+const DEFAULT_COMPOSE_NAMES: [&str; 4] = [
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+];
+
+/// The four override names, searched in this order and INDEPENDENTLY of which base name was used.
+///
+/// MEASURED on Docker 29.6.2: a project whose base file is `compose.yaml` still picks up
+/// `docker-compose.override.yml`, so the two searches do not have to agree on a spelling.
+const DEFAULT_OVERRIDE_NAMES: [&str; 4] = [
+    "compose.override.yaml",
+    "compose.override.yml",
+    "docker-compose.override.yaml",
+    "docker-compose.override.yml",
+];
+
+/// The override file `docker compose` would have loaded beside `files[0]`, if there is one.
+///
+/// THE SILENT DIFFERENCE THIS CLOSES. A developer whose project has `docker-compose.yml` plus
+/// `docker-compose.override.yml` - the standard way to keep source bind-mounts and debug ports out
+/// of the committed file - runs `docker compose up` and gets both. The same person runs
+/// `kern compose docker-compose.yml up` and got only the base: the overrides vanished with no
+/// message, which is the worst shape a compose difference can take.
+///
+/// The mapping is not exact and the deviation is deliberate. `kern compose F` is literally Docker's
+/// `-f F`, and `-f` SUPPRESSES the auto-override (measured: with `-f docker-compose.yml` the
+/// override's `command`, `environment` and second port were all absent). kern follows the
+/// no-`-f` behaviour instead, because that is the command the file's author actually runs, and it
+/// PRINTS the file it added, so the difference is visible rather than silent.
+///
+/// Three conditions, each one measured against Docker rather than assumed:
+///
+///  * exactly ONE file was given - two files are already an explicit list, and Docker adds nothing
+///    to an explicit list;
+///  * that file carries one of the four default names - a file named `ci.yml` is not a default
+///    project file, and Docker would not have found it without `-f` either;
+///  * `COMPOSE_FILE` is unset - setting it declares the exact list, and Docker suppresses the
+///    auto-override when it is set (measured: `COMPOSE_FILE=docker-compose.yml docker compose
+///    config` printed `B: base`, the un-overridden value). That is also the escape hatch here, and
+///    it needs no flag kern does not already have.
+fn default_override_for(files: &[String]) -> Option<String> {
+    let [only] = files else {
+        return None;
+    };
+    if std::env::var_os("COMPOSE_FILE").is_some() {
+        return None;
+    }
+    let path = std::path::Path::new(only);
+    let name = path.file_name()?.to_str()?;
+    if !DEFAULT_COMPOSE_NAMES.contains(&name) {
+        return None;
+    }
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    DEFAULT_OVERRIDE_NAMES
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+        .and_then(|p| p.to_str().map(str::to_string))
+}
+
+/// The message for a `docker compose` verb kern does not have, or `None` when the word is not one.
+///
+/// `on_box` is the scoped box name the NEXT word refers to, when it names a service, so the
+/// suggested command can be copied and run rather than adapted. kern's own verbs take a BOX name
+/// (`<project>-<service>`), which is exactly the thing a reader of a compose file does not know.
+///
+/// Every target named here is a verb kern actually has: `kern --help` lists cp, events, exec,
+/// images, inspect, kill, logs, ps, run, stats, stop, top, wait.
+fn docker_only_verb_hint(word: &str, on_box: Option<&str>) -> Option<String> {
+    let target = on_box.unwrap_or("<box>");
+    let what = match word {
+        "exec" => format!("`kern exec {target} <command>`"),
+        "run" => "`kern box --image <image> -- <command>` (kern has no `compose run`)".to_string(),
+        "kill" => format!("`kern kill {target}`"),
+        "cp" => format!("`kern cp {target}:<path> <path>`"),
+        "wait" => format!("`kern wait {target}`"),
+        "top" => "`kern top`".to_string(),
+        "stats" => "`kern stats`".to_string(),
+        "images" => "`kern images`".to_string(),
+        "events" => "`kern events`".to_string(),
+        "ls" => "`kern ps`".to_string(),
+        "rm" => format!("`kern stop {target}`, or `compose down` for the whole stack"),
+        "create" => "`compose up` (kern has no create/start split)".to_string(),
+        "version" => "`kern --version`".to_string(),
+        _ => return None,
+    };
+    Some(format!(
+        "'{word}' is a `docker compose` verb that kern's compose does not have; run \
+         {what}. kern compose takes: up, down, stop, start, restart, ps, logs, build, pull, config, \
+         watch, port, systemd."
+    ))
+}
+
+/// Scope a project's NAMED volumes to that project, as Docker names them `<project>_<volume>`.
+///
+/// THE DEFECT THIS CLOSES IS DATA CROSSING BETWEEN UNRELATED STACKS. kern mounted a named volume at
+/// `<volumes dir>/<name>/data`, with nothing in the path naming the project, so every stack that
+/// declares the ordinary names - `data`, `db_data`, `pgdata`, `redis-data` - shared ONE directory.
+///
+/// MEASURED, both runtimes, same two files: project A writes `/d/who`, project B mounts a volume
+/// with the same name and reads it. Docker 29.6.2 printed `EMPTY` and holds two volumes, `pa_shared`
+/// and `pb_shared`. kern printed `FROM_PROJECT_A`. Two Postgres stacks that both call their volume
+/// `pgdata` were sharing one data directory.
+///
+/// THE KEY IS KERN'S PROJECT NAME, not Docker's. Docker keys on the directory's basename, so
+/// `/a/myapp` and `/b/myapp` are ONE project and share volumes; kern's project name carries a hash
+/// of the file's path, so those two do not collide. The cost is the mirror case: moving a project
+/// directory changes its project name, and its volumes stay behind under the old one. `-p NAME`
+/// pins the project name and is the answer to both, exactly as it is under Docker.
+///
+/// NOT SCOPED: a volume declared `external: true`. Docker uses an external name verbatim, because
+/// the whole meaning of the key is "this one already exists and is not mine to name".
+///
+/// Returns the scoped names this project owns, deduped, for `down -v` to remove.
+fn scope_named_volumes(boxes: &mut [crate::compose::ComposeBox], project: &str) -> Vec<String> {
+    let mut owned: Vec<String> = Vec::new();
+    for b in boxes.iter_mut() {
+        for v in b.volumes.iter_mut() {
+            let Some((src, rest)) = v.split_once(':') else {
+                continue; // malformed spec: `kern box` reports it precisely
+            };
+            if !matches!(
+                crate::volume::classify(src),
+                crate::volume::SourceKind::Named
+            ) {
+                continue; // a host path is not ours to rename
+            }
+            if b.external_volumes.iter().any(|e| e == src) {
+                continue;
+            }
+            let scoped = format!("{project}_{src}");
+            if !owned.iter().any(|o| o == &scoped) {
+                owned.push(scoped.clone());
+            }
+            *v = format!("{scoped}:{rest}");
+        }
+    }
+    owned
+}
+
+/// Name the volumes that hold data under the OLD unscoped layout, so an upgrade cannot look like
+/// data loss.
+///
+/// A stack that ran before volumes were project-scoped left its data at `<volumes dir>/<name>/data`.
+/// After the scoping the same stack looks for `<project>_<name>` and finds nothing, so it would
+/// create an empty volume and the reader would see an empty database with no explanation.
+///
+/// NOTHING IS MOVED. Two projects may hold data under one legacy name - that is the defect being
+/// fixed - so no rule here can decide whose it is. The paths are printed and the reader decides.
+fn legacy_volume_notes(owned: &[String], project: &str) -> Vec<String> {
+    let dir = crate::volume::volumes_dir();
+    let mut notes = Vec::new();
+    for scoped in owned {
+        let Some(bare) = scoped.strip_prefix(&format!("{project}_")) else {
+            continue;
+        };
+        let legacy = dir.join(bare).join("data");
+        // Only when the old volume HOLDS something and the new one does not exist yet: an empty
+        // leftover directory is not data, and a project already migrated must stay quiet.
+        let has_data = std::fs::read_dir(&legacy).is_ok_and(|mut e| e.next().is_some());
+        if has_data && !dir.join(scoped).exists() {
+            notes.push(format!(
+                "volume '{bare}' now belongs to this project as '{scoped}' (volumes used to be \
+                 shared by name across every stack). Its old contents are still at {}; move them \
+                 with `mv {} {}` if they are this project's.",
+                legacy.display(),
+                dir.join(bare).display(),
+                dir.join(scoped).display()
+            ));
+        }
+    }
+    notes
+}
+
 pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let ComposeOpts {
         files,
@@ -372,6 +549,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         force_pod,
         no_pod,
         allow_device_grants,
+        detach,
+        remove_volumes,
         tail,
         follow,
         all,
@@ -393,6 +572,24 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         all.extend(profiles.iter().cloned());
         std::env::set_var("COMPOSE_PROFILES", all.join(","));
     }
+    // The override `docker compose` would have loaded, appended so it merges LAST (see
+    // `default_override_for` for the three conditions and what each one was measured against).
+    let with_override: Vec<String>;
+    let files: &[String] = match default_override_for(files) {
+        Some(extra) => {
+            eprintln!(
+                "kern: note: also loading {extra} (docker compose loads it too; set COMPOSE_FILE \
+                 to pin an exact list)"
+            );
+            with_override = files
+                .iter()
+                .cloned()
+                .chain(std::iter::once(extra))
+                .collect();
+            &with_override
+        }
+        None => files,
+    };
     // The FIRST file names the project (pod, relative paths, `.env` location), as in Docker.
     let file = files
         .first()
@@ -553,6 +750,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         .collect();
     let services = &services[..];
 
+    // NAMED VOLUMES BELONG TO THE PROJECT, as they do under Docker. Done here, before the verbs
+    // split, so `config` prints the name that will be mounted and `down -v` removes the name that
+    // was. See `scope_named_volumes` for the measurement that made this necessary.
+    let owned_volumes = scope_named_volumes(&mut boxes, &pod);
+    for note in legacy_volume_notes(&owned_volumes, &pod) {
+        eprintln!("kern: note: {note}");
+    }
+
     // A `--filter`/service selection narrows the read-only verbs to the named services; empty = all.
     // Validated up front so a typo names itself instead of silently matching nothing.
     //
@@ -566,8 +771,26 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     } else {
         services
     };
-    for want in to_validate {
-        if !boxes.iter().any(|b| &b.name == want) {
+    for (i, want) in to_validate.iter().enumerate() {
+        if boxes.iter().any(|b| &b.name == want) {
+            continue;
+        }
+        // A DOCKER VERB IS NOT A MISSING SERVICE. The parser takes the first bare word that is not
+        // one of kern's verbs as the FILE and every later bare word as a SERVICE, so
+        // `kern compose x.yml exec web sh` reported "no service 'exec' in x.yml" - a sentence about
+        // a service the reader never wrote, for a verb they did. Only the FIRST positional can be a
+        // mistaken verb; a later one really is a service name.
+        if i == 0 {
+            // The box the next word names, so the suggested command can be run as printed.
+            let on_box = to_validate
+                .get(1)
+                .and_then(|next| boxes.iter().find(|b| &b.name == next || &b.service == next))
+                .map(|b| b.name.as_str());
+            if let Some(msg) = docker_only_verb_hint(want, on_box) {
+                return Err(Error::Compose(msg));
+            }
+        }
+        {
             return Err(Error::Compose(format!(
                 // `b.service` is the name as WRITTEN IN THE FILE; `b.name` is the scoped box name
                 // kern gives it. Listing the latter answered a typo with names the reader's file does
@@ -948,6 +1171,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             // A bridge stack has NO relays: its members meet on a real network. See the field's doc.
             relay_wiring: no_pod && !want_bridge,
             allow_device_grants,
+            remove_volumes,
         },
     )? {
         return Ok(());
@@ -2239,6 +2463,81 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         };
         println!("  pod '{pod}': {net}. tear down with `kern compose {file} down`.");
     }
+    // ATTACHED `up`. Everything above is unchanged; this is the part `docker compose up` does next.
+    if !detach && unsafe { libc::isatty(1) } == 1 {
+        return attach_to_stack(&mine, &boxes, &pod, file);
+    }
+    Ok(())
+}
+
+/// Stream a just-started stack until it exits or Ctrl-C, then tear it down: `docker compose up`
+/// without `-d`.
+///
+/// WHY A TERMINAL IS THE CONDITION, and why it is not a heuristic dressed up as one: the follow ends
+/// only when every service exits or a signal arrives, so a caller that cannot send Ctrl-C would hang
+/// forever. Every non-interactive caller kern already has - CI scripts, systemd units, the SDK,
+/// `getkern.dev`'s own unit - reaches this code with a pipe or a file on fd 1 and keeps the exact
+/// behaviour it had before. `-d` is the explicit form and works either way.
+///
+/// CTRL-C STOPS THE STACK, as it does under Docker, rather than detaching. Leaving it running would
+/// strand a stack whose owner believes they cancelled it, and the next `up` would then fail on a box
+/// name that is already taken. `kern attach` keeps the opposite meaning for a single box and says so
+/// in its own message; the two are different verbs and each states which it is.
+///
+/// The teardown is `compose down`'s, through the shared [`tear_down_stack`], restricted to what THIS
+/// invocation started - an `up web` that pulled in `db` stops both and nothing else.
+fn attach_to_stack(
+    mine: &[&crate::compose::ComposeBox],
+    all: &[crate::compose::ComposeBox],
+    pod: &str,
+    file: &str,
+) -> Result<(), Error> {
+    let mut who = Vec::with_capacity(mine.len());
+    for b in mine {
+        // A service that exited during the settle window has no live pid to follow. It is not an
+        // error: `settle_and_collect_dead` has already reported any death, and the rest of the
+        // stack must still be followable.
+        let Some(ins) = registry::find_ref(&b.name) else {
+            continue;
+        };
+        // `None` replays the log from its start: the box was launched seconds ago, so this is
+        // everything it has printed, which is what an attached `up` shows under Docker.
+        match crate::commands::Followed::open(
+            b.service_name().to_string(),
+            b.name.clone(),
+            ins.pid,
+            None,
+        ) {
+            Ok(Some(f)) => who.push(f),
+            Ok(None) => {}
+            Err(e) => eprintln!("kern: warning: {}: {e}", b.service_name()),
+        }
+    }
+    if who.is_empty() {
+        return Ok(());
+    }
+    // The handler is armed AFTER the stack is up, so a Ctrl-C during bring-up keeps its default
+    // disposition and kills this process without a half-built stack to tear down.
+    let stop = crate::commands::arm_follow_interrupt();
+    eprintln!(
+        "kern: attached to {} service(s) - Ctrl-C stops the stack (`-d` returns instead)",
+        who.len()
+    );
+    crate::commands::follow_many(who, stop)?;
+    if !stop.load(std::sync::atomic::Ordering::Acquire) {
+        // Every service exited on its own. Docker leaves the containers in place and returns 0; so
+        // does kern, and `compose ps -a` still shows them.
+        println!("compose up: every service exited. tear down with `kern compose {file} down`.");
+        return Ok(());
+    }
+    println!("\ncompose up: stopping the stack");
+    let selected: Vec<String> = mine.iter().map(|b| b.name.clone()).collect();
+    let (stopped, pod_existed) = crate::commands::tear_down_stack(all, &selected, pod);
+    if pod_existed {
+        println!("compose down: {stopped} box(es) stopped, pod '{pod}' removed");
+    } else {
+        println!("compose down: {stopped} box(es) stopped");
+    }
     Ok(())
 }
 
@@ -2246,6 +2545,53 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::compose::ComposeBox;
+
+    /// THE OVERRIDE FILE IS FOUND, and only where Docker finds one.
+    ///
+    /// MEASURED on Docker 29.6.2: `docker compose` (no `-f`) in a directory holding
+    /// `docker-compose.yml` + `docker-compose.override.yml` merged both - the override's `command`,
+    /// its extra port and its `environment` keys were all in `config`. kern loaded only the base and
+    /// said nothing, so a project's dev overrides vanished in silence.
+    ///
+    /// The `COMPOSE_FILE` condition is NOT asserted here on purpose: it reads a process-wide
+    /// environment variable, and these tests share one process with tests that read the same
+    /// environment. Asserting it would mean mutating global state under a thread pool.
+    #[test]
+    fn the_default_override_is_discovered_beside_a_default_named_file() {
+        let root = std::env::temp_dir().join(format!("kern-ovr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch dir");
+        let write = |n: &str| {
+            let p = root.join(n);
+            std::fs::write(&p, "services: {}\n").expect("fixture");
+            p.to_string_lossy().to_string()
+        };
+        let base = write("docker-compose.yml");
+        let over = write("docker-compose.override.yml");
+
+        assert_eq!(
+            default_override_for(std::slice::from_ref(&base)).as_deref(),
+            Some(over.as_str()),
+            "a default-named file must pick up its sibling override, as `docker compose` does"
+        );
+
+        // Two files are already an explicit list; Docker adds nothing to one.
+        assert_eq!(default_override_for(&[base.clone(), over]), None);
+
+        // A file Docker would not have found without `-f` gets no override either.
+        let odd = write("ci.yml");
+        assert_eq!(default_override_for(&[odd]), None);
+
+        // POSITIVE CONTROL: with the override removed, the same base file discovers nothing. Without
+        // this the first assertion could pass on a function that returns a path it never checked.
+        std::fs::remove_file(root.join("docker-compose.override.yml")).expect("removable");
+        assert_eq!(
+            default_override_for(std::slice::from_ref(&base)),
+            None,
+            "no override file, no override"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// THE READER IS TOLD WHY A SERVICE DIED, WHEN KERN CAN SEE WHY, and the two wirings need two
     /// different sentences because they fail for mirror reasons.

@@ -1357,6 +1357,113 @@ impl ComposeBox {
         if !o.command.is_empty() {
             self.command = o.command;
         }
+        // Appending is only half of Docker's rule: it also COLLAPSES what it appended.
+        self.collapse_repeated_mappings();
+    }
+
+    /// Collapse the repetitions Docker collapses, so a file that is legal there is legal here.
+    ///
+    /// Appending two documents produces repeats that the base and the override each wrote once, and
+    /// a repeat does not mean twice. MEASURED on Docker 29.6.2, in ONE file and across a merge,
+    /// which behave identically:
+    ///
+    ///  * `ports: ["8001:80","8001:80"]` -> ONE entry at `config`, and the stack runs. kern REFUSED
+    ///    it: `check_port_collisions` saw the second copy and said "publishes host port 8001/tcp
+    ///    more than once", so an override restating a port it did not change - the most ordinary
+    ///    line an override contains - failed the whole stack before a box started.
+    ///  * two sources on one target (`/a:/data` then `/b:/data`) -> ONE mount, the LAST source, at
+    ///    `config`; `cat /data/f` printed the second file's contents under Docker.
+    ///  * `environment` is a mapping there, so a repeated key is not even expressible; appended
+    ///    here it reached the box twice and drew a "set more than once" warning that Docker's
+    ///    reader has no way to provoke.
+    ///
+    /// NOT collapsed: two mappings that merely share a host port (`8001:80` and `8001:81`). Docker
+    /// accepts that file and fails at RUNTIME, half-started ("Bind for :::8001 failed: port is
+    /// already allocated"); kern still refuses it at `config`, before anything runs. That deviation
+    /// is deliberate and recorded in docs/RUNTIME-PARITY.md.
+    ///
+    /// The last value wins at the FIRST position, which matters for volumes and is not cosmetic:
+    /// `/a:/data` + `/b:/data/sub` + an override's `/c:/data` mounted in last-occurrence order
+    /// would mount `/data` on top of `/data/sub` and hide it. Keeping the first position preserves
+    /// the shallow-before-deep order the base established.
+    pub(crate) fn collapse_repeated_mappings(&mut self) {
+        dedupe_exact(&mut self.ports);
+        dedupe_exact(&mut self.expose);
+        collapse_by_key(&mut self.volumes, volume_target);
+        collapse_by_key(&mut self.env, env_key);
+    }
+}
+
+/// Drop every entry textually identical to an earlier one, keeping the first.
+///
+/// Two passes and no clone: the mask borrows `items` immutably, and is consumed by the `retain`
+/// that borrows it mutably afterwards.
+fn dedupe_exact<T: std::hash::Hash + Eq>(items: &mut Vec<T>) {
+    let keep: Vec<bool> = {
+        let mut seen: std::collections::HashSet<&T> = std::collections::HashSet::new();
+        items.iter().map(|it| seen.insert(it)).collect()
+    };
+    if keep.iter().all(|k| *k) {
+        return;
+    }
+    let mut mask = keep.into_iter();
+    // `unwrap_or(true)` cannot be reached: the mask has exactly one entry per item. It is written
+    // rather than indexed so a future change cannot turn a length mismatch into a panic.
+    items.retain(|_| mask.next().unwrap_or(true));
+}
+
+/// Keep ONE entry per key: the last value written, at the position of the first.
+///
+/// First-seen order is kept by a linear scan rather than a hash map, so the result does not depend
+/// on hash iteration order: two runs on one file must produce byte-identical `config` output.
+fn collapse_by_key(items: &mut Vec<String>, key_of: fn(&str) -> &str) {
+    let winners: Vec<usize> = {
+        let mut keys: Vec<&str> = Vec::with_capacity(items.len());
+        let mut last: Vec<usize> = Vec::with_capacity(items.len());
+        for (i, it) in items.iter().enumerate() {
+            let k = key_of(it);
+            match keys.iter().position(|s| *s == k) {
+                Some(p) => {
+                    if let Some(slot) = last.get_mut(p) {
+                        *slot = i;
+                    }
+                }
+                None => {
+                    keys.push(k);
+                    last.push(i);
+                }
+            }
+        }
+        last
+    };
+    if winners.len() == items.len() {
+        return;
+    }
+    let collapsed: Vec<String> = winners
+        .into_iter()
+        .filter_map(|i| items.get(i).cloned())
+        .collect();
+    *items = collapsed;
+}
+
+/// The container path a short-form volume entry mounts on: `[SOURCE:]TARGET[:MODE]`.
+///
+/// Docker splits into at most three fields, so a target is field 2 when there is one and the whole
+/// entry when there is not (`- /data`, an anonymous volume, is its own target).
+fn volume_target(spec: &str) -> &str {
+    let mut f = spec.splitn(3, ':');
+    match (f.next(), f.next()) {
+        (Some(_source), Some(target)) => target,
+        (Some(only), None) => only,
+        _ => spec,
+    }
+}
+
+/// The variable name in a `KEY=VALUE` entry, or the whole entry for the bare `KEY` pass-through form.
+fn env_key(spec: &str) -> &str {
+    match spec.split_once('=') {
+        Some((k, _)) => k,
+        None => spec,
     }
 }
 
@@ -2731,6 +2838,87 @@ mod compat_field_tests {
         );
         assert_eq!(a.ports, ["1:1", "2:2"], "sequences append, override last");
         assert_eq!(a.env, ["X=1", "Y=2"]);
+    }
+
+    /// A REPEAT IS NOT TWICE, and Docker's own reader proves it in both places kern can produce one.
+    ///
+    /// MEASURED on Docker 29.6.2 (`docker compose config`, then `up`):
+    ///  * `ports: ["8001:80","8001:80"]` in ONE file -> a single entry, and the stack runs. kern
+    ///    refused the file outright ("publishes host port 8001/tcp more than once"), which is what
+    ///    an override restating an unchanged port produces - the most ordinary line an override has.
+    ///  * `volumes: ["/tmp/va:/data","/tmp/vb:/data"]` -> one mount, source `/tmp/vb`; `cat /data/f`
+    ///    printed the SECOND file's contents.
+    ///  * across `base` + `override`, both behave identically to the single-file case.
+    #[test]
+    fn a_repeated_mapping_collapses_the_way_docker_collapses_it() {
+        let one = |y: &str| {
+            let mut v = parse(y).expect("parses");
+            assert_eq!(v.len(), 1);
+            v.remove(0)
+        };
+
+        // ONE file, the exact fixture measured on Docker.
+        let b = one(concat!(
+            "services:\n  a:\n    image: alpine\n",
+            "    ports: [\"8001:80\", \"8001:80\"]\n",
+            "    volumes: [\"/tmp/va:/data\", \"/tmp/vb:/data\"]\n",
+            "    environment: [K=one, K=two]\n",
+        ));
+        assert_eq!(b.ports, ["8001:80"], "an identical mapping is ONE mapping");
+        assert_eq!(
+            b.volumes,
+            ["/tmp/vb:/data"],
+            "one target is one mount, and the LAST source wins"
+        );
+        assert_eq!(b.env, ["K=two"], "environment is a mapping in the format");
+
+        // POSITIVE CONTROL: mappings that are merely SIMILAR are all kept. Without this the test
+        // passes on an implementation that throws away everything after the first entry.
+        let keep = one(concat!(
+            "services:\n  a:\n    image: alpine\n",
+            "    ports: [\"8001:80\", \"8002:80\"]\n",
+            "    volumes: [\"/tmp/va:/one\", \"/tmp/va:/two\"]\n",
+            "    environment: [K=1, J=2]\n",
+        ));
+        assert_eq!(keep.ports, ["8001:80", "8002:80"]);
+        assert_eq!(keep.volumes, ["/tmp/va:/one", "/tmp/va:/two"]);
+        assert_eq!(keep.env, ["K=1", "J=2"]);
+
+        // ACROSS A MERGE, which is where the refusal actually bit.
+        let base = parse("services:\n  a:\n    image: alpine\n    ports: [\"8001:80\"]\n    volumes: [\"/tmp/va:/data\"]\n").expect("base");
+        let over = parse_override(
+            "services:\n  a:\n    ports: [\"8001:80\"]\n    volumes: [\"/tmp/vb:/data\"]\n",
+            &DotEnv::default(),
+            StackNet::Pod,
+        )
+        .expect("override");
+        let m = merge_stacks(base, over);
+        let a = m.first().expect("one service");
+        assert_eq!(a.ports, ["8001:80"], "an override may restate a port");
+        assert_eq!(a.volumes, ["/tmp/vb:/data"], "and may replace a mount");
+    }
+
+    /// The collapse keeps the FIRST position, which is not cosmetic: mounting a parent AFTER its
+    /// child hides the child. An override replacing `/data` must not push it behind `/data/sub`.
+    #[test]
+    fn a_replaced_mount_keeps_the_base_position_so_nesting_survives() {
+        let base = parse(
+            "services:\n  a:\n    image: alpine\n    volumes: [\"/tmp/va:/data\", \"/tmp/vb:/data/sub\"]\n",
+        )
+        .expect("base");
+        let over = parse_override(
+            "services:\n  a:\n    volumes: [\"/tmp/vc:/data\"]\n",
+            &DotEnv::default(),
+            StackNet::Pod,
+        )
+        .expect("override");
+        let m = merge_stacks(base, over);
+        let a = m.first().expect("one service");
+        assert_eq!(
+            a.volumes,
+            ["/tmp/vc:/data", "/tmp/vb:/data/sub"],
+            "the replacement takes the base's position; appending it would mount /data over /data/sub"
+        );
     }
 
     #[test]

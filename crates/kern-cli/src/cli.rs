@@ -506,8 +506,9 @@ pub enum Command {
     Top,
     /// `kern compose <file> [up|down] [--no-pod] [-d]`: bring up (or tear down) a stack of boxes in
     /// dependency order. `up` auto-creates a pod so services reach each other by name (`--no-pod`
-    /// opts out); `down` stops the boxes and removes the pod. `-d`/`--detach` is accepted and is
-    /// what `up` already does, so a `docker compose up -d` runs unchanged.
+    /// opts out); `down` stops the boxes and removes the pod. `-d`/`--detach` returns as soon as the
+    /// stack is up; without it, an `up` ON A TERMINAL streams the stack's logs the way `docker
+    /// compose up` does, and Ctrl-C stops the stack (see [`Command::Compose::detach`]).
     Compose {
         /// One or more compose files, merged left-to-right (`-f base -f override`).
         files: Vec<String>,
@@ -525,9 +526,27 @@ pub enum Command {
         /// `--allow-device-grants`: see [`commands::ComposeOpts::allow_device_grants`]. CLI-only on
         /// purpose, so a compose file cannot grant itself the hardware it names.
         allow_device_grants: bool,
+        /// `-d`/`--detach`: return as soon as the stack is up, instead of streaming its logs.
+        ///
+        /// THE FLAG USED TO DO NOTHING. `up` always returned immediately, and `-d` was accepted as
+        /// a name for what already happened - a flag that changes nothing, which is the shape this
+        /// codebase refuses everywhere else. `docker compose up` attaches, and a switcher's first
+        /// command produced a prompt where Docker produces a stream of logs.
+        ///
+        /// ATTACHING IS GATED ON STDOUT BEING A TERMINAL, which is not timidity: every existing
+        /// caller that redirects or pipes (a CI script, a systemd unit, the SDK, `getkern.dev`'s own
+        /// unit) keeps today's behaviour exactly and CANNOT be left blocking on a follow that never
+        /// ends. An interactive `up` is the one place where the Docker habit is unambiguous.
+        detach: bool,
+        /// `-v`/`--volumes` on `down`: also delete the named volumes this project owns.
+        ///
+        /// kern DOES create named volumes and never removed them, so a stack torn down and started
+        /// again silently reused the previous run's data - the opposite of what someone typing
+        /// `down -v` is asking for. The flag used to be a usage error whose message named no flag.
+        remove_volumes: bool,
         /// `--tail N` for `logs`.
         tail: Option<usize>,
-        /// `-f/--follow` for `logs` (one service only).
+        /// `-f/--follow` for `logs` (the whole stack, interleaved, or a named subset).
         follow: bool,
         /// `-a/--all` for `ps`: also list the stack's recently-exited services.
         all: bool,
@@ -1323,6 +1342,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut tail: Option<usize> = None;
             let mut follow = false;
             let mut all = false;
+            let mut detach = false;
+            let mut remove_volumes = false;
             let mut services: Vec<String> = Vec::new();
             let mut it = rest.iter().skip(1).peekable();
             while let Some(a) = it.next() {
@@ -1379,13 +1400,16 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "--no-ansi" | "--compatibility" | "--dry-run" => {
                         eprintln!("kern: warning: compose: '{a}' has no effect on kern - ignored");
                     }
-                    // `-d`/`--detach` is how almost every Docker user starts a stack, and it is what
-                    // kern ALREADY does: `up` starts the services and returns. Accepted SILENTLY,
-                    // not with the "has no effect" note the presentation flags above get, because
-                    // that note would be false here. The flag has exactly the effect it names; it is
-                    // simply not optional. Refusing it was a usage error on the single most common
-                    // invocation there is, hit while running kern's own acceptance battery.
-                    "-d" | "--detach" => {}
+                    // `-d`/`--detach` is how almost every Docker user starts a stack. It now carries
+                    // the meaning it names: WITH it `up` returns as soon as the stack is up, and
+                    // WITHOUT it an interactive `up` streams the stack's logs like Docker's. It used
+                    // to be a no-op, which made the two spellings indistinguishable.
+                    "-d" | "--detach" => detach = true,
+                    // `down -v` deletes this project's named volumes, as Docker's does. Refused
+                    // before, with a usage dump that named no flag: MEASURED that kern DOES create
+                    // named volumes (under its volumes dir) and never removed them, so a stack torn
+                    // down and started fresh silently reused the old data.
+                    "-v" | "--volumes" => remove_volumes = true,
                     "--tail" => {
                         // A non-numeric `--tail` is a typo, not "show everything": refuse it.
                         tail = Some(
@@ -1394,7 +1418,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                                 .ok_or(Error::Usage("compose --tail N (a number of lines)"))?,
                         );
                     }
-                    f if f.starts_with('-') => return Err(Error::Usage(usage)),
+                    f if f.starts_with('-') => {
+                        return Err(Error::Compose(unknown_compose_flag(f)));
+                    }
                     // First bare word that names a verb IS the verb; the file is the first bare word
                     // that is not one (Docker puts the file behind `-f`, kern takes it positionally).
                     w => {
@@ -1432,6 +1458,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 allow_privileged,
                 force_pod,
                 allow_device_grants,
+                detach,
+                remove_volumes,
                 tail,
                 follow,
                 all,
@@ -1468,6 +1496,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 allow_privileged,
                 force_pod,
                 allow_device_grants,
+                // The shorthand takes `-d` too: `kern up -d` is the same habit as `docker compose
+                // up -d`, and without it an interactive `kern up` streams like Docker's.
+                detach: rest.contains(&"-d") || rest.contains(&"--detach"),
+                remove_volumes: rest.contains(&"-v") || rest.contains(&"--volumes"),
                 tail: None,
                 follow: false,
                 all: false,
@@ -3138,6 +3170,74 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
     }
 }
 
+/// What to say about a flag `kern compose` does not accept.
+///
+/// IT USED TO SAY NOTHING. Every unknown flag returned the same usage dump, which does not contain
+/// the flag that was rejected: `kern compose x.yml down -v` printed the full verb list and left the
+/// reader to diff it by eye. MEASURED across the Docker habits a switcher arrives with -
+/// `--remove-orphans`, `--wait`, `--exit-code-from`, `--format`, `--services`, `-q` - all six
+/// produced that same dump.
+///
+/// Each clause below states only what has been measured about kern, and says nothing about flags
+/// whose kern-side answer has not been. A flag with no entry gets the accurate general sentence
+/// rather than an invented equivalence.
+fn unknown_compose_flag(flag: &str) -> String {
+    // The `docker compose` flags most likely to be typed here, each with what kern does INSTEAD.
+    let known: &[(&str, &str)] = &[
+        (
+            "--no-deps",
+            "kern's `up <service>` starts that service's `depends_on` too, and cannot be asked not to",
+        ),
+        (
+            "--wait",
+            "kern's `up` already waits for the conditions the file declares (`service_healthy`, \
+             `service_completed_successfully`) and reports any service that died at startup",
+        ),
+        (
+            "--wait-timeout",
+            "kern's `up` waits on the file's own `depends_on` conditions; there is no separate timeout flag",
+        ),
+        (
+            "--exit-code-from",
+            "kern's `up` exits non-zero when a service dies at startup, and names it",
+        ),
+        (
+            "--abort-on-container-exit",
+            "kern's `up` exits non-zero when a service dies at startup, and names it",
+        ),
+        (
+            "--format",
+            "`kern ps --format T` and `kern ps --json` format the box list",
+        ),
+        ("--services", "`kern compose <file> config` lists the services"),
+        ("-q", "`kern ps -q` prints ids only"),
+        ("--quiet", "`kern ps -q` prints ids only"),
+        (
+            "--remove-orphans",
+            "kern's `down` stops the services THIS file declares; a box the file no longer names is \
+             left alone and `kern ps` still lists it",
+        ),
+        ("--build", "`kern compose <file> build` builds the `build:` services"),
+        ("--scale", "kern has no replica count; a service is one box"),
+        (
+            "--rm",
+            "`--rm` belongs to `docker compose run`, which kern does not have; \
+             `kern box --image <image> -- <command>` runs a one-off box",
+        ),
+    ];
+    let extra = known
+        .iter()
+        .find(|(f, _)| *f == flag)
+        .map(|(_, what)| format!(" {what}."))
+        .unwrap_or_default();
+    format!(
+        "unknown flag '{flag}'.{extra} `kern compose` takes: -p/--project-name, \
+         --env-file, --profile, --no-pod, --pod, --bridge, --allow-privileged, \
+         --allow-device-grants, -d/--detach, -v/--volumes (on `down`), --tail N, -f/--follow, \
+         -a/--all"
+    )
+}
+
 /// Discover a compose file in the current directory for `kern up`/`down`. Prefers Docker's canonical
 /// names (so an existing project just works), then kern's own. Returns the first that exists.
 fn discover_compose_file() -> Option<String> {
@@ -3611,6 +3711,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             allow_privileged,
             force_pod,
             allow_device_grants,
+            detach,
+            remove_volumes,
             tail,
             follow,
             all,
@@ -3626,6 +3728,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             allow_privileged,
             force_pod,
             allow_device_grants,
+            detach,
+            remove_volumes,
             tail,
             follow,
             all,
@@ -3815,25 +3919,50 @@ mod tests {
     /// `docker compose up -d` IS THE MOST COMMON WAY ANYONE STARTS A STACK, AND IT MUST PARSE.
     ///
     /// It used to be a usage error: the flag loop rejected every unknown `-x`, and `-d` was not in
-    /// the list. kern's `up` is already detached, so the flag names exactly what happens and is
-    /// accepted silently rather than with the "has no effect" note the presentation flags get -
-    /// that note would be false here. Found while running kern's own acceptance battery, which
-    /// reached for the Docker habit without thinking, which is the point.
+    /// the list. Found while running kern's own acceptance battery, which reached for the Docker
+    /// habit without thinking, which is the point.
+    ///
+    /// IT ALSO USED TO MEAN NOTHING. `up` always returned as soon as the stack was started, so `-d`
+    /// was accepted as a name for what already happened, and the two spellings were
+    /// indistinguishable: MEASURED by diffing the output of `up` against `up -d` on the same file,
+    /// which differed only in a pid. `up` now streams the stack on a terminal, as Docker's does,
+    /// and `-d` is what turns that off - so the flag is asserted here to REACH the command, not
+    /// merely to parse. A no-op flag cannot be tested for its effect; that was the defect.
     #[test]
-    fn compose_up_accepts_the_detach_flag_because_that_is_what_it_already_does() {
+    fn compose_up_accepts_the_detach_flag_and_carries_it() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
 
         for flag in ["-d", "--detach"] {
             let (_, cmd) = p(&["compose", "stack.yml", "up", flag])
                 .unwrap_or_else(|e| panic!("`compose up {flag}` must parse: {e}"));
             match cmd {
-                Command::Compose { files, action, .. } => {
+                Command::Compose {
+                    files,
+                    action,
+                    detach,
+                    ..
+                } => {
                     assert_eq!(files, vec!["stack.yml".to_string()]);
                     assert_eq!(action, crate::commands::ComposeAction::Up);
+                    assert!(detach, "`{flag}` must reach the command, not be swallowed");
                 }
                 other => panic!("`compose up {flag}` must stay a compose up: {other:?}"),
             }
         }
+
+        // THE DISCRIMINATOR. Without the flag the same command must arrive with `detach` false, or
+        // the assertion above passes on a parser that hardcodes it and `-d` means nothing again.
+        let (_, plain) = p(&["compose", "stack.yml", "up"]).unwrap_or_else(|e| panic!("{e}"));
+        match plain {
+            Command::Compose { detach, .. } => {
+                assert!(!detach, "a bare `up` must not arrive pre-detached")
+            }
+            other => panic!("`compose up` must stay a compose up: {other:?}"),
+        }
+
+        // The `kern up` shorthand carries the same flag, and is NOT asserted here: it discovers its
+        // file in the process CWD, which a test cannot pin without mutating global state that the
+        // other tests in this binary read concurrently.
 
         // POSITIVE CONTROL: an unknown flag is STILL refused, so the arm above did not open the
         // gate for everything. A parser that accepts any `-x` cannot report a typo.
