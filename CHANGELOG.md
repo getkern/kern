@@ -35,6 +35,12 @@ the new one: kern rebuilds a `build:` service whose context changed. So `--build
 happens and is taken silently, while `--no-build` asks for the stale image kern cannot promise and
 says so.
 
+**`--no-deps` reaches `up`.** It arrived with `run` and was honoured only there, which made
+`up --no-deps web` a flag that parsed and changed nothing, the defect class this codebase refuses
+everywhere else. Measured once it was wired: `up -d web` starts two boxes, `up -d --no-deps web`
+starts one. It is the flag in `up -d --no-deps --build web`, the redeploy line that must not restart
+the database under the service.
+
 **A workload's exit status is kern's.** `Error::Workload(code)` carries it to the one place that
 maps a result to an exit code, so the command layer still returns `Result` and never calls
 `process::exit` itself. It prints nothing: the command already said whatever it had to say.

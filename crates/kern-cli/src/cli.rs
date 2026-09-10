@@ -4103,6 +4103,32 @@ mod tests {
         );
     }
 
+    /// `--no-deps` reaches `up`, not only `run`.
+    ///
+    /// It arrived with `run` and was honoured only there, which made `up --no-deps web` a flag that
+    /// parsed and changed nothing. MEASURED once it was wired: `up -d web` starts two boxes,
+    /// `up -d --no-deps web` starts one.
+    #[test]
+    fn no_deps_reaches_up_and_not_only_run() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        for verb in ["up", "run"] {
+            let (_, cmd) = p(&["compose", "s.yml", verb, "--no-deps", "web"])
+                .unwrap_or_else(|e| panic!("`{verb} --no-deps` must parse: {e}"));
+            match cmd {
+                Command::Compose { no_deps, .. } => {
+                    assert!(no_deps, "`{verb} --no-deps` must carry the flag")
+                }
+                other => panic!("must stay a compose command: {other:?}"),
+            }
+        }
+        // DISCRIMINATOR: without the flag the same command must arrive with it unset.
+        let (_, plain) = p(&["compose", "s.yml", "up", "web"]).unwrap_or_else(|e| panic!("{e}"));
+        match plain {
+            Command::Compose { no_deps, .. } => assert!(!no_deps),
+            other => panic!("must stay a compose up: {other:?}"),
+        }
+    }
+
     /// `--wait-timeout N` implies `--wait`, because a bound with nothing to bound is a typo that
     /// would otherwise return instantly and look like success.
     #[test]

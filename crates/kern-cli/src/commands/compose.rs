@@ -1274,7 +1274,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // Compose's split: `up web` has to bring the `db` it declares or it starts something that cannot
     // work, while `start web` and `restart web` are instructions about web alone.
     if !services.is_empty() {
-        let wanted: std::collections::HashSet<String> = if action == ComposeAction::Up {
+        // `--no-deps` TURNS THE EXPANSION OFF, which is what `up -d --no-deps --build web` is for:
+        // redeploying one service without restarting the database under it. Honoured HERE and not
+        // only in `run`, because a flag that parses and changes nothing is the defect this codebase
+        // refuses everywhere else, and it would have been one the moment `run` introduced the flag.
+        let wanted: std::collections::HashSet<String> = if action == ComposeAction::Up && !no_deps {
             crate::compose::with_dependencies(&boxes, services)
         } else {
             services.iter().cloned().collect()
