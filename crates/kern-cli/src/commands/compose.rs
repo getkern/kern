@@ -754,8 +754,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // split, so `config` prints the name that will be mounted and `down -v` removes the name that
     // was. See `scope_named_volumes` for the measurement that made this necessary.
     let owned_volumes = scope_named_volumes(&mut boxes, &pod);
-    for note in legacy_volume_notes(&owned_volumes, &pod) {
-        eprintln!("kern: note: {note}");
+    // THE MIGRATION NOTE BELONGS TO A BRING-UP, NOT TO A READING OF THE FILE. It reports what is on
+    // this machine's disk, so emitting it from `config` made a STATIC answer depend on local state:
+    // MEASURED on the neutral corpus, where leftover volumes from unrelated stacks made 15 files
+    // print it and cost the measured rate 12 points that had nothing to do with the files. `config`
+    // answers what the file means; only a verb that is about to MOUNT something needs to say where
+    // the old contents are.
+    if matches!(
+        action,
+        ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart
+    ) {
+        for note in legacy_volume_notes(&owned_volumes, &pod) {
+            eprintln!("kern: note: {note}");
+        }
     }
 
     // A `--filter`/service selection narrows the read-only verbs to the named services; empty = all.

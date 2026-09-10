@@ -78,7 +78,6 @@ KNOWN_DIFFERENCES = [
     # to UNCLASSIFIED. It still counted as a difference, which is the safe direction, but it counted
     # under a label that named nothing.
     (r"under `networks:` the key\(s\)", "a `networks:` sub-key kern does not apply, a fixed address above all"),
-    (r"has no kern equivalent \(rootless\)", "`privileged:` cannot be given"),
     (r"NOT applied - the box keeps its own IPC", "`ipc:` not shared"),
     (r"ignored \(unsupported\)", "a key kern does not implement"),
     (r"not honoured - seccomp", "`security_opt` seccomp profile"),
@@ -86,6 +85,12 @@ KNOWN_DIFFERENCES = [
     (r"recognised but not applied", "tmpfs options dropped"),
     (r"long-form", "a volume long form kern cannot express"),
     (r"is not a port in 1", "an out-of-range port is skipped"),
+    # THE WHOLE UNCLASSIFIED BUCKET WAS THIS ONE LINE. Measured on the neutral corpus: 38 files
+    # carried an unlabelled difference and every one of them was this note, 11 of them with nothing
+    # else. It is a real difference and keeps counting as one - a rootful Docker binds :80 and kern,
+    # rootless, publishes :8080, so the service is not where the file says - but it was counting
+    # under a label that named nothing, which is the state that makes a bucket look mysterious.
+    (r"binds from 1024 upward", "a privileged host port is republished above 1024"),
     (r"output is captured", "a `logging:` driver kern cannot provide"),
     (r"label=[^:]*: kern sets no SELinux label", "an SELinux label other than `disable`"),
     (r"seccomp=unconfined", "the file asks for NO seccomp filter, which kern does not take from a file"),
@@ -128,12 +133,50 @@ def label(line):
     return "UNCLASSIFIED (counted as a difference)"
 
 
+def stale_binary(kern):
+    """Refuse to measure with a binary older than the sources, or with none at all.
+
+    THE INSTRUMENT MEASURED WHATEVER WAS ON DISK. The default is `target/release/kern`, while every
+    edit-and-check cycle in this repo builds `target/debug/kern`, so a whole day's work can be
+    followed by a rate that predates it and says so nowhere. MEASURED: a run reported 38% clean from
+    a binary six hours and 28 source files old; the same corpus with the binary rebuilt reported
+    34%, and the four points were a warning the older build did not emit. A number that names no
+    build is not a measurement.
+
+    Refusing rather than warning, because a rate is quoted: a warning on stderr ends up scrolled
+    past and the figure ends up in a commit message.
+    """
+    exe = pathlib.Path(kern)
+    if not exe.exists():
+        return f"{exe} does not exist. Build it first: cargo build --release --bin kern"
+    built = exe.stat().st_mtime
+    newer = [
+        p
+        for p in pathlib.Path("crates").rglob("*.rs")
+        if p.is_file() and p.stat().st_mtime > built
+    ]
+    if not newer:
+        return None
+    shown = ", ".join(str(p) for p in sorted(newer)[:3])
+    return (
+        f"{exe} is older than {len(newer)} source file(s) ({shown}"
+        f"{', …' if len(newer) > 3 else ''}).\n"
+        f"Rebuild before measuring: cargo build --release --bin kern\n"
+        f"(pass --kern target/debug/kern to measure the debug build instead)"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("corpus", type=pathlib.Path)
     ap.add_argument("--kern", default="target/release/kern")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    stale = stale_binary(args.kern)
+    if stale:
+        print(stale, file=sys.stderr)
+        return 2
 
     files = sorted(p for p in args.corpus.iterdir() if p.is_file())
     if not files:
@@ -234,6 +277,39 @@ def main():
             print(f"  {name}")
             for d in diffs:
                 print(f"      {label(d)}")
+
+    # NOTHING MAY BE UNCLASSIFIED, and this is a gate rather than a line in the table.
+    #
+    # WHY IT EXISTS, measured rather than argued: the classifier reads the PROSE of kern's warnings,
+    # so rewording one silently rewrites the number. Rewriting "is DECLARED, not published" as "is
+    # DECLARED rather than published" - the same sentence, the same meaning, one word - took a
+    # 12-file corpus from 58% clean to 0% clean. Nothing else changed and nothing said so.
+    #
+    # The signal was always in the output: those twelve files landed under UNCLASSIFIED. What was
+    # missing was a threshold, so the slide showed up as a smaller rate and not as a failure. With
+    # every cause named, the count is ZERO and any drift - a reworded message, a warning added
+    # without a label - takes it above zero on the first run.
+    #
+    # This is the cheap half of the fix. The expensive half is a stable code per warning, which
+    # would decouple the classifier from the wording entirely; the gate below makes the coupling
+    # SELF-ANNOUNCING, which is the property that was missing.
+    unlabelled = [d for _, diffs in dirty for d in diffs if label(d).startswith("UNCLASSIFIED")]
+    if unlabelled:
+        shapes = Counter(d[:120] for d in unlabelled)
+        print(
+            f"\nUNCLASSIFIED must be 0, found {len(unlabelled)} line(s) in "
+            f"{len(shapes)} shape(s):",
+            file=sys.stderr,
+        )
+        for shape, n in shapes.most_common(10):
+            print(f"  {n:4d}  {shape}", file=sys.stderr)
+        print(
+            "\nEither the warning is new and needs a line in KNOWN_DIFFERENCES/BENIGN, or one it "
+            "used to match was reworded and the pattern no longer does. A rate whose classifier is "
+            "out of step with the binary is not a measurement.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
