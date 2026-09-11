@@ -810,10 +810,28 @@ pub fn create_with_range(
             .unwrap_or(false)
     });
     if !ready {
+        // DO NOT GUESS A CAUSE THE HOLDER ALREADY NAMED. This said "unprivileged user namespaces may
+        // be unavailable" whatever went wrong, and the holder's stderr is INHERITED, so its own
+        // diagnosis is already on the reader's terminal one line above. MEASURED on a host where user
+        // namespaces work perfectly: `pod create --bridge 127.0.0.0/8` printed the holder's exact
+        // refusal and then this sentence, which sent the reader to look at a kernel setting that had
+        // nothing to do with it.
+        //
+        // The two cases are distinguishable and mean different things: a holder that EXITED decided
+        // something and said why, while one still running after the timeout is wedged and said
+        // nothing, which is the only case where a host-capability guess is worth making.
+        let exited = child.try_wait().ok().flatten().is_some();
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&dir); // also drops the `starting` marker
         return Err(Error::Sandbox(
-            "pod holder failed to start (unprivileged user namespaces may be unavailable)".into(),
+            if exited {
+                "the pod holder exited before the pod was ready - it printed the reason above"
+            } else {
+                "the pod holder never signalled ready and is still running after 10s: namespace \
+                 setup is wedged on this host (unprivileged user namespaces may be unavailable). \
+                 `kern doctor` reports what this host allows"
+            }
+            .into(),
         ));
     }
     // Record the holder PID + its net ns inode (identity, to reject a later PID reuse). Write the

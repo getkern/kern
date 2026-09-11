@@ -148,7 +148,20 @@ cat <<EOF
         curl -sL https://github.com/getkern/kern/releases/download/$VERSION/kern-x86_64-unknown-linux-musl.tar.gz | tar xz -O kern | wc -c
         ./kern --version     # must print $VERSION, not a -dirty or a -N-g suffix
 
-   3. Provenance, which is NOT automatic:
+   3. WHAT \`install.sh\` ACTUALLY SERVES, which is a different question from step 2. The installer
+      follows \`releases/latest\`, and \`latest\` skips a release marked PRE-RELEASE: mark this one by
+      mistake and every reader keeps getting the previous binary, with a checksum that verifies,
+      because the old \`.sha256\` is the one they fetch too. Nothing about that looks wrong.
+
+        curl -sI https://github.com/getkern/kern/releases/latest | grep -i '^location:'   # must name $VERSION
+        # then, on a machine that has never had kern:
+        curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+        kern --version    # must print $VERSION
+
+      Do this BEFORE announcing anywhere. A post that describes a version the install line does not
+      deliver is the one launch failure no amount of testing prevents.
+
+   4. Provenance, which is NOT automatic:
         sh provenance/make-provenance.sh $VERSION
         git add provenance/$VERSION.provenance.txt provenance/$VERSION.provenance.txt.ots
         git commit -m 'chore(provenance): anchor $VERSION' && git push origin main

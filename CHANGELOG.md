@@ -7,6 +7,33 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A pod bridge in the loopback range was accepted and silently isolated every member.** MEASURED:
+`kern pod create --bridge 127.0.0.0/8` succeeded, two members joined with `--pod-bridge 127.0.0.5/8`
+and `127.0.0.6/8`, both started and got those addresses on `eth0`, and then neither could reach the
+other and the peer's name did not resolve at all. The kernel routes 127/8 to `lo` inside each
+namespace, so nothing ever crossed the bridge. The holder's fail-closed check could not see it
+because the bridge itself was built without error. Loopback is now refused where the other unusable
+CIDRs are, and the refusal says why.
+
+**The pod holder's failure stopped guessing a cause it had already been told.** Whatever went wrong,
+`pod create` reported "unprivileged user namespaces may be unavailable" - including on a host where
+they work perfectly and the holder had just printed the real reason one line above, which is
+inherited straight to the terminal. A holder that EXITED decided something and said why, so the error
+now points at that line; one still running after the timeout is wedged and said nothing, which is the
+only case where a host-capability guess is worth making.
+
+**The README described the compose default that stopped being the default.** It said a stack is one
+network namespace "when the file fits in one", while a two-service file with no `networks:` key gets
+a namespace per service on a bridge. Same sentence, same wrong rule, as the `--help` line fixed
+above. It now states what the code does, and the section gains the line a reader on a VPS needs:
+an ordinary ssh session is outside the systemd user manager, so `compose exec` refuses until
+`systemd-run --user --scope bash` is run once.
+
+**`cut-release.sh` now says how to check what `install.sh` actually serves.** Step 2 verified the
+asset by downloading it; nothing verified that `releases/latest` points at the new tag. A release
+marked pre-release by mistake leaves `latest` on the previous one, so every reader keeps getting the
+old binary with a checksum that verifies, because the old `.sha256` is what they fetch too.
+
 **`compose exec`/`run` accept the `--` every Docker user types.** `kern compose f.yml exec -T web --
 echo hi` tried to execute a file named `--` and died with `execvp failed: No such file or directory`,
 while the same line without the separator worked, and `kern exec <box> -- echo hi` had always worked:

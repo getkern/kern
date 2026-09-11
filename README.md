@@ -214,17 +214,31 @@ file can also name kern's own things in the spec's extension namespace (`x-kern-
 `x-kern-security-profile`) and still run anywhere else unchanged, because the spec has
 every runtime ignore an `x-` field. A typo inside one is reported rather than dropped.
 
-**A stack is one network namespace when the file fits in one,** which is where the speed comes from:
-services reach each other on `127.0.0.1` with nothing in between. A file that does not fit gets a
-namespace per service instead, chosen by kern and announced with what it costs, which is a relay hop
-between peers. Two cases do not fit: two services listening on the same container port, and
-`networks:` that leave services with nothing in common. `--pod` forces one namespace and refuses such
-a file by name rather than running it with the separation dropped; `--no-pod` forces a namespace per
-service.
+**Each service gets its own network namespace, and they meet on a bridge,** which is the arrangement
+a Docker user already has: a service's `127.0.0.1` is its own, two services may listen on the same
+container port, and peers reach each other by name at their addresses. A single-service stack keeps
+one namespace, because there is nobody to separate it from. When `networks:` leave two services with
+nothing in common, kern honours that separation with a namespace per service and no bridge between
+them, announcing what it costs (a relay hop between the peers that do share a network). `--pod`
+forces one shared namespace, which is faster and refuses a file it cannot express rather than running
+it with the separation dropped; `--bridge` and `--no-pod` ask for the other two explicitly.
 
 Official images that drop to a non-root user want `uidmap` and an `/etc/subuid` line, and outbound
 pulls want `pasta`; `kern doctor` names either if it is missing. This is the local dev loop, not a
 production orchestrator. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
+
+**On a server you reached over `ssh`, run kern inside a scope once.** An ordinary ssh session sits
+outside the systemd user manager on every distribution we measured, and a box's caps live in a cgroup
+that session cannot write into: the stack comes up and is capped correctly, but `kern compose … exec`
+refuses, because entering the box would step outside those caps. One line fixes it for the whole
+session and keeps the caps enforced:
+
+```sh
+systemd-run --user --scope bash     # then run kern in that shell
+```
+
+`kern doctor` reports which cap path a host takes. On Ubuntu 23.10 and newer there is one more thing
+to do first, once, with root: see [docs/INSTALL.md](docs/INSTALL.md#requirements-and-limitations).
 
 ## Resource profiles
 

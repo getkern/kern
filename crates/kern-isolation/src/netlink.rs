@@ -619,9 +619,22 @@ mod tests {
             "10.89.0.0/x",
             "not-a-network/24",
             "",
+            // LOOPBACK, and it is here because it was ACCEPTED and then silently broke the pod.
+            // MEASURED with `--bridge 127.0.0.0/8`: the holder built the bridge without error, two
+            // members joined with `127.0.0.5/8` and `127.0.0.6/8` and started, and then neither
+            // could reach the other and the peer's name did not resolve. The kernel routes 127/8 to
+            // `lo` inside each namespace, so nothing ever crossed the bridge.
+            "127.0.0.0/8",
+            "127.0.0.0/24",
+            "127.42.0.0/16",
         ] {
             assert!(pod_bridge_parts(bad).is_none(), "{bad:?} must be refused");
         }
+        // CONTROL: the refusal is about loopback, not about the shape of those strings. A network
+        // one octet away parses, or the three lines above would hold for a parser that refuses
+        // everything with a `/8` or a leading `1`.
+        assert!(pod_bridge_parts("128.0.0.0/8").is_some());
+        assert!(pod_bridge_parts("10.127.0.0/16").is_some());
 
         // The mask is the same function the members use, so a member cannot disagree with the
         // bridge about how wide the network is.

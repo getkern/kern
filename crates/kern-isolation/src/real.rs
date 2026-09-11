@@ -5625,6 +5625,17 @@ pub fn pod_bridge_parts(cidr: &str) -> Option<(std::net::Ipv4Addr, std::net::Ipv
     if !(8..=30).contains(&prefix) {
         return None;
     }
+    // LOOPBACK IS NOT A NETWORK A BRIDGE CAN CARRY, and accepting it built a pod in which nothing
+    // worked and nothing said so. MEASURED: `pod create --bridge 127.0.0.0/8` succeeded, two members
+    // joined with `--pod-bridge 127.0.0.5/8` and `127.0.0.6/8` started and got those addresses on
+    // `eth0`, and then the first could not reach the second at all (`nc` rc=1) and the peer's NAME
+    // did not resolve. The kernel routes 127/8 to `lo` inside each namespace, so the packets never
+    // crossed the bridge. A pod that comes up and silently isolates every member is the exact shape
+    // the holder's fail-closed check above exists to prevent; the check could not see it because the
+    // bridge itself was built without error.
+    if net.is_loopback() {
+        return None;
+    }
     let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
     let base = u32::from_be_bytes(net.octets()) & mask;
     Some((
@@ -5866,7 +5877,9 @@ pub fn run_pod_holder() -> ! {
             None => {
                 eprintln!(
                     "kern: pod: '{cidr}' is not a network kern can build a bridge on (expected \
-                     something like 10.89.0.0/24, prefix between 8 and 30)"
+                     something like 10.89.0.0/24: an IPv4 network, prefix between 8 and 30, and not \
+                     loopback - the kernel routes 127/8 to `lo`, so members would get addresses that \
+                     never cross the bridge)"
                 );
                 unsafe { libc::_exit(1) };
             }
