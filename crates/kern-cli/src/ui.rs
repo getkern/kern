@@ -17,6 +17,18 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// Every code empty: the palette a test renders through, so an assertion about a table's SHAPE
+    /// is about characters a reader sees and not about escape sequences. Without it a test has to
+    /// strip colour itself, which is a second definition of what colour is.
+    ///
+    /// TEST-ONLY, because production never wants a palette chosen by hand: `detect` answers from the
+    /// stream, and a second way to get an uncoloured one is a second place for the rule to drift.
+    #[cfg(test)]
+    #[must_use]
+    pub fn plain() -> Self {
+        Self::for_stream(false)
+    }
+
     /// Colour on iff stdout is a terminal and `NO_COLOR` is unset (the de-facto standard).
     pub fn detect() -> Self {
         Self::for_stream(std::io::stdout().is_terminal())

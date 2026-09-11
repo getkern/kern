@@ -686,12 +686,16 @@ fn push_prefixed(out: &mut Vec<u8>, label: &str, width: usize, line: &[u8]) {
 /// logs` has the same property. Lines are never split or mixed - the whole pass is written under one
 /// stdout lock.
 ///
+/// `until_first_exit` returns as soon as ONE service has ended instead of waiting for all of them,
+/// which is what `--abort-on-container-exit` needs.
+///
 /// THE FINAL DRAIN is not decoration. A box that writes its last line and exits would lose that line
 /// to a loop that checked the registry first and read second, so each service is read again AFTER
 /// its death is observed, and only then marked done.
 pub(crate) fn follow_many(
     mut who: Vec<Followed>,
     stop: &std::sync::atomic::AtomicBool,
+    until_first_exit: bool,
 ) -> Result<(), Error> {
     use std::io::Write;
     if who.is_empty() {
@@ -731,7 +735,16 @@ pub(crate) fn follow_many(
             }
             let _ = lock.flush();
         }
-        if live == 0 || stop.load(std::sync::atomic::Ordering::Acquire) {
+        // `until_first_exit` is `--abort-on-container-exit`: the caller tears the stack down as soon
+        // as ONE service ends, so the follow has to stop at the same moment rather than waiting for
+        // the rest. The final drain above has already run for whichever service ended, so its last
+        // line is out before this returns.
+        let ended = if until_first_exit {
+            who.iter().any(|w| w.done)
+        } else {
+            live == 0
+        };
+        if ended || stop.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         unsafe { libc::usleep(200_000) }; // 200 ms - the cadence `follow_log` already uses

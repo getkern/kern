@@ -91,11 +91,18 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}compose{z} <file> {c}watch{z} [service...]                              Rebuild + restart ONE service when its `build:` context changes
     {c}compose{z} <file> {c}port{z} <service> <container-port>                 Print the host address serving that box port (non-zero if none)
     {c}compose{z} <file> {c}run{z} [--rm] [--no-deps] <service> [cmd...]       One-off box from a service definition, in the foreground; its exit code is kern's
-    {c}up{z} [-d] [--wait [--wait-timeout N]] / {c}down{z} [-v]                  --wait holds until every service is ready; down -v also deletes this project's named volumes
+    {c}compose{z} <file> {c}cp{z} <service>:<path> <dst> | <src> <service>:<path> Copy a file in or out, naming the SERVICE rather than the box
+    {c}compose{z} <file> {c}exec{z} [-T] <service> <cmd...>                     Run a command in a RUNNING service; its exit code is kern's
+    {c}compose{z} <file> {c}ps{z} [-q] [--services] [--format json]            Ids only, service names from the file, or NDJSON for a script
+    {c}up{z} [-d] [--wait [--wait-timeout N]] / {c}down{z} [-v] [--remove-orphans]  --wait holds until every service is ready; down -v deletes this project's named volumes
+    {c}up{z} [--abort-on-container-exit] [--exit-code-from <service>]        Stop the stack when a service exits, and adopt that service's status
     {c}pod{z} create <name> [--no-outbound] [--uid-range] [--bridge <cidr>] Shared-network pod: peers reach each other by name.
                                                                      With --bridge each member keeps its own namespace and a
                                                                      127.0.0.1 no peer can reach, meeting on a bridge
     {c}pod{z} ls [--json] | {c}pod{z} rm <name>                                List pods, or remove one
+    {c}network{z} create <name> | {c}network{z} ls [--json] | {c}network{z} rm <name>  A network shared BETWEEN projects, which is what a
+                                                                     compose file names with `external: true`. Services of
+                                                                     DIFFERENT files on one resolve and reach each other by name
 
   {d}Config & storage{z}
     {c}config{z} [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml
@@ -428,6 +435,21 @@ pub fn gc(images: bool) -> Result<(), Error> {
             p.g,
             p.z,
             if retired == 1 { "" } else { "s" }
+        );
+    }
+    // Reap NATs whose namespace is gone. A `pasta` started without its netns watch - the fallback a
+    // host that refuses the netns-directory open forces - lives until teardown signals it, so a
+    // stack that was killed rather than taken down leaves one per service running for the life of
+    // the session. MEASURED before this existed: 27 of them, hours old. See `sweep_orphan_nats` for
+    // the two conditions that decide a victim.
+    let nats = crate::pod::sweep_orphan_nats();
+    if nats > 0 {
+        let p = crate::ui::Palette::detect();
+        println!(
+            "{}terminated{} {nats} NAT{} whose namespace is gone",
+            p.g,
+            p.z,
+            if nats == 1 { "" } else { "s" }
         );
     }
     // Reap `kern wait` exit sidecars of boxes whose supervisor is gone and were never waited on.

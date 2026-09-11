@@ -428,8 +428,17 @@ fn seed_empty_named_volumes(lower: &str, volumes: &[Volume]) {
 /// thing standing between this and overwriting live data. A TARGET THAT IS NOT THE ROOT: a volume
 /// over `/` has no meaningful "the image's content at the mount point" to copy.
 fn is_seedable(v: &Volume) -> bool {
+    is_seedable_under(&crate::volume::volumes_dir(), v)
+}
+
+/// [`is_seedable`] against an explicit volumes root.
+///
+/// Split for the reason given on [`crate::volume::name_of_data_dir_under`]: the three conditions are
+/// a rule about a path and a directory, and exercising them must not require writing into the one
+/// directory every kern on this machine shares.
+fn is_seedable_under(root: &std::path::Path, v: &Volume) -> bool {
     let src = std::path::Path::new(&v.source);
-    crate::volume::name_of_data_dir(src).is_some()
+    crate::volume::name_of_data_dir_under(root, src).is_some()
         && crate::volume::data_dir_is_empty(src)
         && !v.target.trim_matches('/').is_empty()
 }
@@ -3841,41 +3850,117 @@ mod image_defaults_tests {
     ///
     /// Seeding writes image content, and its owner and mode, onto a directory: getting this
     /// predicate wrong once means filling somebody's bind mount, or overwriting live data.
+    ///
+    /// UNDER A ROOT THIS TEST OWNS. It used to build its fixture inside the real `volumes_dir()`,
+    /// which is one directory for the whole user that every kern on the machine writes to, and then
+    /// assert that a directory there was EMPTY. It went red twice with the predicate untouched, both
+    /// times while other kern processes were running, and the writer was never identified. It was
+    /// not reproducible under concurrent volume churn either, so the honest conclusion is not "the
+    /// racer is X" but "nothing here should have been able to race at all": a test of a pure rule
+    /// that shares state with the machine proves nothing when it is green.
+    ///
+    /// THE WIRING IS STILL ASSERTED, at the end, and it is a pure path computation that opens no
+    /// file: `name_of_data_dir` must resolve against the REAL volumes directory, or this whole test
+    /// would pass while production looked somewhere else.
     #[test]
     fn only_an_empty_named_volume_at_a_real_path_is_seeded() {
-        let dir = std::env::temp_dir().join(format!("kern-seedable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let empty_named = crate::volume::volumes_dir()
-            .join("kern-seed-probe")
-            .join("data");
-        // CLEARED FIRST, because this test asserts the volume is EMPTY and then deliberately fills
-        // it. An assertion failing between the write and the remove leaves the file behind, and the
-        // test then fails on every later run on that machine for a reason that has nothing to do
-        // with the change under test. MEASURED: a stray `x` from an interrupted run the previous
-        // evening turned this red while `is_seedable` was untouched.
-        let _ = std::fs::remove_dir_all(&empty_named);
-        let _ = std::fs::create_dir_all(&empty_named);
+        let base = std::env::temp_dir().join(format!("kern-seedable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("volumes");
+        let host_path = base.join("a-host-directory");
+        let empty_named = root.join("kern-seed-probe").join("data");
+        std::fs::create_dir_all(&empty_named).expect("mkdir volume data");
+        std::fs::create_dir_all(&host_path).expect("mkdir host path");
         let v = |src: &std::path::Path, target: &str| Volume {
             source: src.to_string_lossy().into_owned(),
             target: target.to_string(),
             read_only: false,
         };
+        let seedable =
+            |src: &std::path::Path, target: &str| is_seedable_under(&root, &v(src, target));
 
-        assert!(is_seedable(&v(&empty_named, "/etc/nginx")));
+        // NAMED, EMPTY, AND NOT THE ROOT: the only shape Docker seeds, and the only one kern does.
+        assert!(
+            seedable(&empty_named, "/etc/nginx"),
+            "an empty named volume at a real target is the case seeding exists for"
+        );
         // A BIND MOUNT of a host path: the caller's own directory, never kern's to fill.
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        assert!(!is_seedable(&v(&dir, "/etc/nginx")));
+        assert!(
+            !seedable(&host_path, "/etc/nginx"),
+            "a host path is not kern's to write image content into"
+        );
         // A volume that already holds something: Docker seeds only an empty one, and this is the
         // only thing standing between seeding and overwriting live data.
         std::fs::write(empty_named.join("x"), b"1").expect("write");
-        assert!(!is_seedable(&v(&empty_named, "/etc/nginx")));
+        assert!(
+            !seedable(&empty_named, "/etc/nginx"),
+            "a volume that already holds data must never be seeded over"
+        );
         std::fs::remove_file(empty_named.join("x")).expect("rm");
+        assert!(
+            seedable(&empty_named, "/etc/nginx"),
+            "and emptying it makes it seedable again, so the condition is the CONTENT and not a \
+             one-way flag"
+        );
         // A volume over the ROOT has no "the image's content at the mount point" to copy.
-        assert!(!is_seedable(&v(&empty_named, "/")));
-        assert!(!is_seedable(&v(&empty_named, "///")));
+        assert!(
+            !seedable(&empty_named, "/"),
+            "a volume over / has no mount point content"
+        );
+        assert!(
+            !seedable(&empty_named, "///"),
+            "and neither does a slash-only target"
+        );
+        // A DIRECTORY THAT IS NOT THERE answers false rather than true: `read_dir` fails, and the
+        // safe reading of a failure is "do not write into it".
+        assert!(
+            !seedable(&root.join("kern-seed-probe").join("nope"), "/etc/nginx"),
+            "a path that is not a volume's data directory is not seedable"
+        );
 
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(crate::volume::volumes_dir().join("kern-seed-probe"));
+        // THE WIRING, AND IT HAS TO BE A POSITIVE ASSERTION AGAINST THE REAL DIRECTORY.
+        //
+        // The refusal of a foreign root is NOT enough, and that was measured rather than assumed: a
+        // mutation pointing production at `/` left this test green, because `/` refuses the fixture
+        // for the same reason the correct root does. Only a volume under the REAL `volumes_dir()`
+        // that production ACCEPTS pins which root production uses.
+        //
+        // WHICH PUTS ONE FIXTURE BACK IN A SHARED DIRECTORY, so it is built to survive a third party
+        // instead of pretending there is none: the name carries this process's pid, so nothing can
+        // collide with it by name, and the attempt is repeated because the failure this test
+        // actually suffered was a directory that stopped being readable between its creation and its
+        // reading. A broken predicate fails every attempt; a sweeper loses to the next one. The same
+        // shape as the `prune` convergence loop in the integration suite, and for the same reason.
+        let shared = crate::volume::volumes_dir()
+            .join(format!("kern-seed-probe-{}", std::process::id()))
+            .join("data");
+        let mut wired = false;
+        let mut why = String::from("never created");
+        for _ in 0..8 {
+            let _ = std::fs::remove_dir_all(&shared);
+            if let Err(e) = std::fs::create_dir_all(&shared) {
+                why = format!("could not create {}: {e}", shared.display());
+                continue;
+            }
+            if is_seedable(&v(&shared, "/etc/nginx")) {
+                wired = true;
+                break;
+            }
+            why = match std::fs::read_dir(&shared) {
+                Ok(d) => format!("the directory held {} entries", d.count()),
+                Err(e) => format!("the directory could not be read: {e}"),
+            };
+        }
+        let _ = std::fs::remove_dir_all(
+            crate::volume::volumes_dir().join(format!("kern-seed-probe-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            wired,
+            "an empty named volume under the REAL volumes directory must be seedable, or production \
+             is resolving against some other root and every assertion above is about a directory it \
+             never looks at. Last attempt: {why}"
+        );
     }
 
     /// THE PRECEDENCE, asserted. MEASURED end to end before it was a function: an image declaring

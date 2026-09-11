@@ -32,6 +32,7 @@ mod eintr;
 mod error;
 mod gpu;
 /// Peer addressing and hosts files for a `--no-pod` stack.
+mod network;
 mod nopod;
 mod openat2;
 mod pod;

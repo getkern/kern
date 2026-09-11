@@ -464,8 +464,20 @@ fn listener_main(status: i32, pair: i32, a: BoxRef, alias_ip: u32, port: u16, pa
     if !die_with_parent(parent) {
         unsafe { libc::_exit(0) };
     }
+    // THE STEP IS ENCODED IN THE SIGN, because the reader needs to know WHICH one failed.
+    //
+    // MEASURED, and it cost an afternoon: a stack whose service runs as a non-root user died with
+    // "binding 127.0.0.2:5432 inside the calling box: errno 13", and NOTHING had been bound. The
+    // bind was never reached: `/proc/<pid1>/ns/user` and `ns/net` answer EACCES for a box whose
+    // PID 1 has switched to a mapped uid, so the namespace entry failed and the 13 was this very
+    // line inventing an errno for a step it did not name. Two wrong facts in one sentence, both
+    // pointing the reader at the network.
+    //
+    // A NEGATIVE STATUS IS "could not get in", a positive one is "got in, the bind failed". The
+    // pipe already carries an `i32`, so this needs no new channel and no second write.
     if !enter_box_ns_pinned(a.pid1, a.starttime) {
-        write_status(status, if errno() != 0 { errno() } else { libc::EACCES });
+        let e = if errno() != 0 { errno() } else { libc::EACCES };
+        write_status(status, -e);
         unsafe { libc::_exit(1) };
     }
     // NARROW BEFORE THE BIND, ZERO AFTER. Entering A's user namespace granted a full effective set,
@@ -887,18 +899,51 @@ pub fn spawn(
         (Some(0), Some(0)) => Ok(relay),
         (Some(e), _) if e != 0 => {
             relay.shutdown();
-            Err(format!(
-                "peer relay: binding {}.{}.{}.{}:{port} inside the calling box: errno {e}",
+            let (a0, a1, a2, a3) = (
                 alias_ip >> 24 & 0xff,
                 alias_ip >> 16 & 0xff,
                 alias_ip >> 8 & 0xff,
-                alias_ip & 0xff
-            ))
+                alias_ip & 0xff,
+            );
+            if e < 0 {
+                let errno = -e;
+                // THE ONE CAUSE THIS IS KNOWN TO HAVE, named, because `errno 13` on its own sends
+                // the reader to the network and the cause is not the network. `/proc/<pid>/ns/*`
+                // is readable only to someone the kernel would let ptrace that process, and a box
+                // whose PID 1 has switched to a mapped uid is not that, from here.
+                let why = if errno == libc::EACCES {
+                    ". A box whose service runs as a non-root user (`user:` in the file, or a \
+                     `USER` in its image) does not let this process open its namespaces, and the \
+                     relay wiring cannot reach into it. `--pod` does not need to: it puts the \
+                     stack in one namespace. This is a limit of the relay wiring, not of the file"
+                } else {
+                    ""
+                };
+                Err(format!(
+                    "peer relay: entering the calling box's namespaces to serve \
+                     {a0}.{a1}.{a2}.{a3}:{port}: errno {errno}{why}"
+                ))
+            } else {
+                Err(format!(
+                    "peer relay: binding {a0}.{a1}.{a2}.{a3}:{port} inside the calling box: errno {e}"
+                ))
+            }
         }
         (_, Some(e)) if e != 0 => {
             relay.shutdown();
+            // THE SAME CAUSE FROM THE OTHER SIDE. This half names the step already, because it has
+            // only one; what it lacked was the reason, and it is the same one the listener now
+            // gives. Said in both places rather than in the one that happened to be debugged: the
+            // peer box is as likely to be the one running as a non-root user.
+            let why = if e == libc::EACCES {
+                ". A box whose service runs as a non-root user (`user:` in the file, or a `USER` \
+                 in its image) does not let this process open its namespaces, and the relay wiring \
+                 cannot reach into it. `--pod` does not need to: it puts the stack in one namespace"
+            } else {
+                ""
+            };
             Err(format!(
-                "peer relay: entering the peer box's namespaces: errno {e}"
+                "peer relay: entering the peer box's namespaces: errno {e}{why}"
             ))
         }
         _ => {

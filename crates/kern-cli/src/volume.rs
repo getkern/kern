@@ -62,14 +62,26 @@ fn is_relative_path(source: &str) -> bool {
     source == "." || source == ".." || source.starts_with("./") || source.starts_with("../")
 }
 
-/// The volume NAME behind a resolved data directory, or `None` when the path is not one.
+/// The volume NAME behind a resolved data directory under `root`, or `None` when the path is not one.
 ///
 /// The inverse of [`resolve_named`], and it exists so the two cannot disagree. A caller that has
 /// already resolved a `-v` spec holds `<volumes_dir>/<name>/data` and no longer knows the name or
 /// even that the mount is a named volume at all; deriving that with an ad-hoc `starts_with` at the
 /// call site would be a second, drifting definition of the same layout.
-pub fn name_of_data_dir(path: &std::path::Path) -> Option<String> {
-    let rest = path.strip_prefix(volumes_dir()).ok()?;
+///
+///
+/// THE ROOT IS A PARAMETER BECAUSE A TEST OF A PURE RULE MUST NOT REACH INTO SHARED STATE.
+/// `volumes_dir()` is one directory for the whole user: every kern on the machine writes there, and
+/// a test that creates a directory under it, asserts the directory is EMPTY, and then reads it again
+/// is asserting something no test owns. MEASURED: the seeding predicate's test went red twice while
+/// the predicate was untouched, both times with other kern processes running, and the specific
+/// writer was never identified - which is the point. A test that can be perturbed by an unidentified
+/// third party proves nothing when it is green either.
+///
+/// Production passes `volumes_dir()` from one call site, and the seeding test asserts that wiring by
+/// checking the production predicate REJECTS a fixture that this one accepts under a private root.
+pub fn name_of_data_dir_under(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let rest = path.strip_prefix(root).ok()?;
     let mut it = rest.components();
     let name = it.next()?.as_os_str().to_str()?.to_string();
     // Exactly `<name>/data`: a deeper path is a bind into a volume's contents, not the volume.
@@ -1051,29 +1063,41 @@ mod tests {
     fn only_a_volumes_own_data_dir_is_recognised_as_one() {
         let base = super::volumes_dir();
         assert_eq!(
-            super::name_of_data_dir(&base.join("pgdata/data")),
+            super::name_of_data_dir_under(&base, &base.join("pgdata/data")),
             Some("pgdata".to_string())
         );
         // A path INSIDE a volume is a bind into its contents, not the volume itself: seeding it
         // would write image content into a subdirectory of live data.
-        assert_eq!(super::name_of_data_dir(&base.join("pgdata/data/sub")), None);
-        // The volume directory without its `data` child is the metadata dir, not the mount source.
-        assert_eq!(super::name_of_data_dir(&base.join("pgdata")), None);
-        // Anywhere else on the filesystem is a bind mount and must never be touched.
         assert_eq!(
-            super::name_of_data_dir(std::path::Path::new("/etc/data")),
+            super::name_of_data_dir_under(&base, &base.join("pgdata/data/sub")),
             None
         );
-        assert_eq!(super::name_of_data_dir(std::path::Path::new("/")), None);
+        // The volume directory without its `data` child is the metadata dir, not the mount source.
+        assert_eq!(
+            super::name_of_data_dir_under(&base, &base.join("pgdata")),
+            None
+        );
+        // Anywhere else on the filesystem is a bind mount and must never be touched.
+        assert_eq!(
+            super::name_of_data_dir_under(&base, std::path::Path::new("/etc/data")),
+            None
+        );
+        assert_eq!(
+            super::name_of_data_dir_under(&base, std::path::Path::new("/")),
+            None
+        );
         // A traversal never reaches the name check at all: `../escape/data` has `escape` where
         // `data` must be. Kept because it is the shape an attacker writes.
-        assert_eq!(super::name_of_data_dir(&base.join("../escape/data")), None);
+        assert_eq!(
+            super::name_of_data_dir_under(&base, &base.join("../escape/data")),
+            None
+        );
         // THE NAME RULE ITSELF, reached only by a path of the RIGHT SHAPE carrying a name the volume
         // layer would refuse. Without these the rule could be deleted and every assertion above would
         // still pass, because they are all stopped by the shape check one line earlier.
         for bad in ["-lead", ".lead", "has space", "has!bang", ".."] {
             assert_eq!(
-                super::name_of_data_dir(&base.join(bad).join("data")),
+                super::name_of_data_dir_under(&base, &base.join(bad).join("data")),
                 None,
                 "'{bad}' is not a name `resolve_named` would accept, so it is not one here either"
             );

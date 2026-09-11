@@ -773,6 +773,13 @@ pub fn create_with_range(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .process_group(0); // its own session/group so it survives this command exiting
+                           // WHERE THE POD LIVES, so the holder can stop holding when the pod stops existing. Without it a
+                           // holder that outlives its own directory - a deleted runtime dir, a `/run/user/<uid>` cleaned on
+                           // logout, a test harness removing its temporary tree - keeps a user and net namespace alive that
+                           // nothing can name, address or remove, for the life of the session. MEASURED: 140 such holders
+                           // and 116 `pasta` beside them, the oldest 5.8 hours old. See `hold_until_the_pod_is_gone`, which
+                           // treats a missing variable as "hold forever" so an older holder keeps its old behaviour.
+    cmd.env("KERN_POD_DIR", pod_dir(name));
     if uid_range.is_on() {
         // Tell the holder to map a subordinate uid range (so member OCI images can drop privilege),
         // and WHY, so it only reports an unavailable range the caller actually asked for.
@@ -1290,6 +1297,199 @@ pub fn host_nameservers() -> Vec<String> {
         out.push("1.1.1.1".to_string()); // host has only a local stub -> public fallback
     }
     out
+}
+
+/// Stop every per-box NAT recorded under a stack's `outbound/` tree. Returns how many were signalled.
+///
+/// THE TEARDOWN USED TO DELETE THE EVIDENCE INSTEAD OF ACTING ON IT. `kill_holder` removed
+/// `outbound/` with `remove_dir_all`, and that subtree is where every box's `pasta.pid` and
+/// `pasta.id` live: the processes were never signalled, and the files that identified them were
+/// destroyed in the same call, so nothing could ever find them again.
+///
+/// IT DID NOT SHOW because a NAT that kept its netns watch exits by itself when the box's namespace
+/// goes, so a healthy stack looked clean. The population it lost was the OTHER one: a host that
+/// refuses the netns-directory open makes pasta fall back to `--no-netns-quit`, and that process has
+/// no watch and waits to be signalled by exactly the pid file teardown had just deleted. MEASURED on
+/// this machine: 27 such processes, every one from a box whose service runs as a non-root user - the
+/// case where that open is refused - some of them hours old.
+///
+/// IDENTITY IS CHECKED BEFORE ANY SIGNAL, and the check is the start time and not just the pid,
+/// because a pid recorded minutes ago may belong to something else now. Two levels, strongest first:
+///
+///   * `pasta.id` holds `pid:starttime`, written by kern; the process must still carry that exact
+///     start time. A pid that was recycled fails this and is left alone.
+///   * with no record - a stack from a kern that predates `pasta.id` - the pid file is read and the
+///     process must at least be A pasta by its `comm`. Weaker, and it is the same fallback
+///     `pasta_to_signal` already applies for the same population.
+///
+/// `pod_boot_is_current` is NOT consulted here, and that is deliberate rather than an omission: it
+/// reads a marker `pod create` writes into a POD's directory, and these directories are created by
+/// `attach_box_outbound`, which writes no such marker. Asking would refuse every box NAT there is.
+/// The start-time check is what makes a stale record safe, and it does not need the boot to say so.
+pub fn stop_stack_outbound_nats(stack_dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(stack_dir.join("outbound")) else {
+        return 0; // a pod stack, or a directory already gone: nothing recorded, nothing to stop
+    };
+    let mut signalled: Vec<i32> = Vec::new();
+    for e in entries.filter_map(Result::ok) {
+        let dir = e.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let pid = match recorded_pasta_identity(&dir) {
+            Some((pid, started)) => {
+                if crate::registry::proc_starttime(pid) == started {
+                    Some(pid)
+                } else {
+                    None // recycled, or long gone: this record is not evidence about a live process
+                }
+            }
+            None => read_pid_file(&dir.join("pasta.pid")).filter(|p| pid_is_pasta(*p)),
+        };
+        let Some(pid) = pid else { continue };
+        // SAFETY: `pid` is positive (`read_pid_file` and `recorded_pasta_identity` both refuse
+        // anything else), so this signals one process and never a group or everything.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        signalled.push(pid);
+    }
+    if !signalled.is_empty() {
+        // The same budget `stop_pasta` uses: pasta was measured leaving about 30 ms after SIGTERM.
+        std::thread::sleep(std::time::Duration::from_millis(PASTA_STOP_BUDGET_MS));
+        for pid in &signalled {
+            // SAFETY: same argument; `kill(pid, 0)` only asks whether it is still there.
+            unsafe {
+                if libc::kill(*pid, 0) == 0 {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    signalled.len()
+}
+
+/// Does this `-P` argument name a pidfile in kern's own layout?
+///
+/// THE SHAPE AND NOT THE ROOT, and the difference is what makes the sweep useful. Matching against
+/// THIS process's runtime directory only recognises debris left under the same `XDG_RUNTIME_DIR`,
+/// and the debris that actually accumulates comes from runs under a different one: a test harness
+/// with its own temporary tree, a user whose runtime directory was recreated, a stack started from a
+/// different session. MEASURED: 18 orphans stayed behind a root-anchored check that a shape check
+/// reaps.
+///
+/// THE SHAPE IS NARROW. Both forms end in `pasta.pid` and sit under a `kern/` directory, in one of
+/// the two subtrees kern writes NAT state into. It is combined with two other conditions at the call
+/// site - the binary is `pasta`, and the namespace it watches is GONE - and a pasta whose namespace
+/// is gone is doing nothing for anybody, so a false positive would have to be a `pasta` someone else
+/// runs, from a path shaped exactly like kern's, already pointing at a dead namespace.
+fn pidfile_path_is_kerns(path: &str) -> bool {
+    if !path.ends_with("/pasta.pid") {
+        return false;
+    }
+    // `<…>/kern/pods/<pod>/pasta.pid` or `<…>/kern/relays/<stack>/outbound/<svc>/pasta.pid`.
+    path.contains("/kern/pods/") || (path.contains("/kern/relays/") && path.contains("/outbound/"))
+}
+
+/// Terminate every kern NAT whose namespace is gone, and report how many. Called by `kern gc`.
+///
+/// WHAT LEAKS, AND WHY THE WATCH IS NOT ENOUGH. A NAT is a `pasta` attached to one box's or one
+/// pod's namespaces. The first attempt keeps pasta's own netns watch, so it exits when the namespace
+/// goes; a host that refuses the netns-DIRECTORY open falls back to `--no-netns-quit`, and that one
+/// has no watch at all and exists until teardown signals it through its pid file. If teardown never
+/// runs - the stack was killed, the bring-up failed after the NAT was attached, the runtime
+/// directory was deleted - nothing ever signals it.
+///
+/// MEASURED on this machine before this existed: 27 such processes, every one of them from a box
+/// whose service runs as a non-root user, which is exactly the case where the directory open is
+/// refused (see `PR_SET_DUMPABLE` in kern-isolation). They had been running for hours.
+///
+/// TWO CONDITIONS, BOTH REQUIRED, because this signals processes by scanning `/proc` and the cost of
+/// being wrong is killing something that is not ours:
+///
+///   1. THE PROCESS IS OURS. Its `-P` pidfile argument must point inside kern's own runtime
+///      directory. A `pasta` a user runs for their own reasons names a path somewhere else and is
+///      never touched.
+///   2. ITS NAMESPACE IS GONE. Only the `--netns /proc/<pid>/ns/net` form is read, and only when
+///      `/proc/<pid>` no longer exists. Any other spelling of the argument, or a pid that is still
+///      there, leaves the process alone.
+///
+/// A pid that is alive but RECYCLED cannot be distinguished here and does not need to be: the test
+/// is that the pid is GONE, and a recycled pid is present, so the answer is "leave it".
+pub fn sweep_orphan_nats() -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let me = std::process::id() as i32;
+    let mut victims: Vec<i32> = Vec::new();
+    for e in entries.filter_map(Result::ok) {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let argv: Vec<&[u8]> = raw.split(|c| *c == 0).filter(|a| !a.is_empty()).collect();
+        let Some(arg0) = argv.first() else { continue };
+        // The BINARY must be pasta, read from argv[0]'s file name: a command that merely mentions
+        // pasta in a later argument is not one.
+        let base = match arg0.iter().rposition(|c| *c == b'/') {
+            Some(i) => &arg0[i + 1..],
+            None => &arg0[..],
+        };
+        if base != b"pasta" && base != b"passt" {
+            continue;
+        }
+        // CONDITION 1: ours.
+        let mut ours = false;
+        let mut watched: Option<i32> = None;
+        for (i, a) in argv.iter().enumerate() {
+            if *a == b"-P" || *a == b"--pid" {
+                if let Some(path) = argv.get(i + 1).and_then(|p| std::str::from_utf8(p).ok()) {
+                    ours = pidfile_path_is_kerns(path);
+                }
+            }
+            // CONDITION 2: the namespace it watches, in the one form this reads.
+            if *a == b"--netns" {
+                if let Some(ns) = argv.get(i + 1).and_then(|p| std::str::from_utf8(p).ok()) {
+                    watched = ns
+                        .strip_prefix("/proc/")
+                        .and_then(|r| r.split('/').next())
+                        .and_then(|p| p.parse::<i32>().ok());
+                }
+            }
+        }
+        let (true, Some(target)) = (ours, watched) else {
+            continue;
+        };
+        if std::path::Path::new(&format!("/proc/{target}")).exists() {
+            continue; // the namespace's process is still there
+        }
+        victims.push(pid);
+    }
+    // SIGTERM, then SIGKILL only what is still there after the same budget `stop_pasta` uses.
+    // pasta was measured leaving about 30 ms after SIGTERM; this is eight times that.
+    for pid in &victims {
+        // SAFETY: `pid` was parsed from a `/proc` entry and is positive, so this signals exactly one
+        // process and never a group (`kill(0, …)`) or everything (`kill(-1, …)`).
+        unsafe { libc::kill(*pid, libc::SIGTERM) };
+    }
+    if !victims.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(PASTA_STOP_BUDGET_MS));
+        for pid in &victims {
+            // SAFETY: same argument as above; `kill(pid, 0)` only asks whether it is still there.
+            unsafe {
+                if libc::kill(*pid, 0) == 0 {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    victims.len()
 }
 
 /// Attach a rootless NAT to a BOX's namespaces, so a `--no-pod` service reaches the internet.
@@ -2433,5 +2633,51 @@ mod tests {
             "start-time mismatch → reused pid → not alive"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod nat_sweep_tests {
+    use super::pidfile_path_is_kerns;
+
+    /// THE SWEEP'S OWNERSHIP TEST, WHICH DECIDES WHETHER A PROCESS GETS A SIGNAL.
+    ///
+    /// `sweep_orphan_nats` scans `/proc` and terminates what it finds, so the cost of a false
+    /// positive is signalling something that is not kern's. This predicate is one of the three
+    /// conditions that guard it (the others: the binary is `pasta`, and the namespace it watches no
+    /// longer exists), and it is the only one that can be got wrong by being too generous.
+    ///
+    /// THE NEGATIVES ARE THE POINT. A path that merely mentions kern, a pidfile of another program
+    /// under a kern directory, and a kern-shaped path that is not a NAT must all be refused.
+    #[test]
+    fn only_a_kern_nat_pidfile_is_recognised_as_ours() {
+        for good in [
+            "/run/user/1000/kern/pods/proj-abc123/pasta.pid",
+            "/tmp/harness/kern/pods/tmp-1/pasta.pid",
+            "/run/user/1000/kern/relays/proj-abc123/outbound/web/pasta.pid",
+            "/var/tmp/x/kern/relays/s/outbound/db/pasta.pid",
+        ] {
+            assert!(pidfile_path_is_kerns(good), "{good} is one of ours");
+        }
+        for bad in [
+            // Not a NAT pidfile at all.
+            "/run/user/1000/kern/pods/proj/holder",
+            "/run/user/1000/kern/pods/proj/pasta.id",
+            // A pasta someone else runs, wherever it keeps its pidfile.
+            "/run/user/1000/pasta.pid",
+            "/home/alex/pasta.pid",
+            "/tmp/pasta.pid",
+            // Under a kern directory but not in a subtree kern puts NAT state in: the shape has to
+            // match, not merely the word.
+            "/run/user/1000/kern/scratch/box/pasta.pid",
+            "/run/user/1000/kern/logs/pasta.pid",
+            // A relays path with no `outbound/`: that tree holds the relay plan, not a NAT.
+            "/run/user/1000/kern/relays/proj/pasta.pid",
+            // The word appears, the shape does not.
+            "/home/alex/my-kern-notes/pasta.pid",
+            "",
+        ] {
+            assert!(!pidfile_path_is_kerns(bad), "{bad} must NOT be signalled");
+        }
     }
 }

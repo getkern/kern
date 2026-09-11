@@ -4170,7 +4170,10 @@ fn validate_conditions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error
     let find = |n: &str| boxes.iter().find(|x| x.name == n);
     for b in boxes {
         for dep in &b.depends_healthy {
-            if find(dep).is_some_and(|x| !x.has_health()) {
+            // BOTH SOURCES. `has_health()` answers about the file; `health_from_image` is set by
+            // `settle_deferred_health_gates` when the image supplies the check. Reading only the
+            // first refused a gate kern was about to honour, on a box already reporting `starting`.
+            if find(dep).is_some_and(|x| !x.has_health() && !x.health_from_image) {
                 return Err(Error::Compose(format!(
                     "box '{}' waits for '{dep}' to be healthy, but '{dep}' declares no `health_cmd` \
                      (add one, or use `depends_on`/`depends_completed`)",
@@ -4309,6 +4312,20 @@ pub enum ComposeAction {
     Pull,
     /// Parse, interpolate and validate, then print the resolved services. No side effects.
     Config,
+    /// `exec [-T] [-e K=V] [-w DIR] <service> <command…>`: run a command in a RUNNING service.
+    ///
+    /// It used to be read as a service name, then as "a docker verb kern does not have, run
+    /// `kern exec <box> …` instead". Both were wrong answers to the same question: the reader knows
+    /// `web`, not `<project>-<hash>-web`, and looking the box up by hand is the step that sends
+    /// people back to Docker. The command's exit status is kern's, as it is under Docker.
+    Exec,
+    /// `cp <service>:<path> <dst>` / `cp <src> <service>:<path>`: copy a file in or out.
+    ///
+    /// The same copier `kern cp` uses, with the SERVICE name resolved to the box name it now has.
+    /// That resolution is the whole point: a reader of a compose file knows `web`, not
+    /// `<project>-<hash>-web`, and looking it up by hand is the step that makes people reach for
+    /// `exec … | tar` instead.
+    Cp,
     /// `run <service> [command…]`: one-off box from a service's definition, in the foreground.
     ///
     /// The step 2 of nearly every project README (`run --rm web python manage.py migrate`), and the
@@ -4348,6 +4365,8 @@ pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
     ("port", ComposeAction::Port),
     ("systemd", ComposeAction::Systemd),
     ("run", ComposeAction::Run),
+    ("cp", ComposeAction::Cp),
+    ("exec", ComposeAction::Exec),
 ];
 
 impl ComposeAction {
@@ -4893,6 +4912,51 @@ pub(crate) fn compose_memory_ceiling(configured: Result<Option<&str>, ()>) -> Op
 /// suggestion: a compose file is frequently something downloaded, and a limit a downloaded file can
 /// raise by writing a bigger number limits nothing. It never RAISES a smaller `mem_limit:` - a
 /// service that asked for less is asking for less than the operator allows, which is allowed.
+/// The swap allowance a compose service gets, which until now was ZERO and is the difference that
+/// kills a workload silently.
+///
+/// MEASURED ON THREE RUNTIMES, the same file, the same question:
+///
+/// ```text
+///                                  Docker 29.6.2   podman 4.9.3   kern (before)
+///   no memory key at all            max / max       max / max      hostRAM / 0
+///   mem_limit: 256m                 256m / 256m     256m / 256m    256m / 0
+/// ```
+///
+/// THE PREMISE OF THE OLD CHOICE WAS FALSE. `memory.swap.max = 0` was taken as "stricter and said
+/// so", on the belief that a rootless runtime had to. podman is rootless and gives `max`/`max`, so
+/// it did not have to; and kern's own ceiling is the host's RAM, not a small number, so the box was
+/// not bounded either. Not strict, not Docker, and with no warning: a service that would have
+/// swapped and survived under both references was OOM-killed here at the host's RAM, and nothing
+/// at `config` said a word.
+///
+/// THE RULES, each one the measured behaviour of the two references:
+///
+///  * `memswap_limit` written: untouched. The parser already turned Docker's TOTAL into the v2
+///    swap-only figure by subtraction, with Docker's two refusals copied.
+///  * `mem_limit` written and no `memswap_limit`: the allowance equals the limit, so the service
+///    gets the same 2x total Docker gives it. A file tuned against Docker's behaviour keeps it.
+///  * nothing written: the host's own `SwapTotal`, which is the same decision the BUILD path already
+///    took for the same measured reason, and grants no more than the machine has.
+///
+/// A host with no swap gets no flag: there is nothing to allow, and writing 0 would restate the
+/// defect this closes.
+pub(crate) fn service_swap_allowance(
+    declared_memswap: Option<&str>,
+    file_asked_memory: Option<&str>,
+    host_swap: Option<u64>,
+) -> Option<String> {
+    if declared_memswap.is_some() {
+        return None; // the file said it; the parser has already converted it
+    }
+    if let Some(asked) = file_asked_memory {
+        // Docker's own pairing: `mem_limit` alone means memory AND an equal swap allowance.
+        // An unparseable value is left alone rather than guessed at, exactly as the ceiling does.
+        return kern_common::parse_binary_size(asked).map(|b| b.to_string());
+    }
+    host_swap.filter(|s| *s > 0).map(|s| s.to_string())
+}
+
 pub(crate) fn service_memory_cap(
     asked: Option<&str>,
     ceiling: Option<u64>,
@@ -5593,15 +5657,235 @@ pub(crate) fn image_expose_collisions(
         let Some(image) = b.image.as_deref() else {
             continue; // a `--rootfs`/`build`-only service has no image config to read
         };
-        let Ok((_, cfg)) = resolve_image_depth(image, 0, PullPolicy::Never) else {
-            continue; // not cached: do not pull just to answer this
+        // Local image, then the memo, then the registry's CONFIG BLOB: see `image_exposed_ports`.
+        // `None` is "could not find out" and is left to `images_not_read` to report; it is NOT an
+        // empty EXPOSE set, which would put two colliding services into one namespace.
+        let Some(exposed) = image_exposed_ports(image) else {
+            continue;
         };
-        for (port, udp) in cfg.exposed_ports {
+        for (port, udp) in exposed {
             if let Some(other) = seen.insert((port, udp), b.name.clone()) {
                 if other != b.name {
                     out.push((other, b.name.clone(), port, udp));
                 }
             }
+        }
+    }
+    out
+}
+
+/// Where the EXPOSE sets read from a registry are remembered, for the wiring decision only.
+///
+/// A DIRECTORY OF ITS OWN, deliberately not the image store. An image-store entry holding a config
+/// and no layers would read as "this image is present" to every other caller, and the next
+/// `kern box --image` would fail on a rootfs nobody extracted. Nothing here is ever mistaken for an
+/// image: the files hold port numbers and nothing else.
+fn expose_memo_dir() -> std::path::PathBuf {
+    if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
+        return std::path::PathBuf::from(x).join("kern").join("expose");
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(h).join(".cache/kern/expose");
+    }
+    std::path::PathBuf::from(format!("/tmp/kern-expose-{}", unsafe { libc::getuid() }))
+}
+
+/// A filename for an image reference: every byte that is not a safe name character becomes `_`.
+///
+/// NOT a hash, so the directory stays readable by a person debugging a wiring decision, and not the
+/// raw reference, which carries `/` and `:`. The mapping is many-to-one in principle
+/// (`a/b:1` and `a_b_1` collide), so the file's FIRST LINE is the reference it was written for and a
+/// read that does not match it is discarded. A collision then costs a refetch, never a wrong answer.
+fn expose_memo_name(image: &str) -> String {
+    image
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The ports an image EXPOSEs, for the wiring decision: from the local image if it is there, from
+/// this cache if it has been asked before, and from the registry's CONFIG BLOB otherwise.
+///
+/// THE ORDER IS THE POINT. A pulled image always wins, so a `pull` that changes what a tag means
+/// takes effect immediately and this cache can never override the real thing. The memo exists so a
+/// second `config` on the same file is offline. The network is the last resort and costs a few
+/// kilobytes: the config blob is a JSON document named by the manifest, not a layer.
+///
+/// `None` means "could not find out", which is a THIRD answer and not an empty set: an empty set
+/// says the image exposes nothing, and reading a failure as that would put two services that do
+/// collide into one namespace. Every caller distinguishes them.
+fn image_exposed_ports(image: &str) -> Option<Vec<(u16, bool)>> {
+    if let Ok((_, cfg)) = resolve_image_depth(image, 0, PullPolicy::Never) {
+        return Some(cfg.exposed_ports);
+    }
+    let memo = expose_memo_dir().join(expose_memo_name(image));
+    if let Ok(text) = std::fs::read_to_string(&memo) {
+        let mut lines = text.lines();
+        // The reference is the first line: a sanitised name is many-to-one, so a memo that was
+        // written for a different image is discarded rather than trusted.
+        if lines.next() == Some(image) {
+            let mut ports = Vec::new();
+            for l in lines {
+                let (p, proto) = match l.split_once('/') {
+                    Some((p, proto)) => (p, proto),
+                    None => (l, "tcp"),
+                };
+                if let Ok(port) = p.parse::<u16>() {
+                    ports.push((port, proto == "udp"));
+                }
+            }
+            return Some(ports);
+        }
+    }
+    // THE REGISTRY IS OPT-IN, and the measurement is why. Fetching a config blob costs one round
+    // trip per image when the registry answers (~2 s measured on Docker Hub) and EIGHTY SECONDS for
+    // a two-service file whose registry does not resolve at all, because the curl timeouts under
+    // this path are 10 s connect / 30 s total and there are several requests per image. A dry run
+    // that can take eighty seconds is not a dry run; Docker's `config` never touches the network.
+    //
+    // So the default answer stays "could not find out", declared as `wiring-images-unread:`, and
+    // the fetch happens for callers that want the exact answer and can pay for it:
+    // `compose-compat-rate.py` sets this because a published number must not depend on which
+    // images a machine happens to hold.
+    //
+    // `up` DOES NOT NEED THIS. It resolves its images through the ordinary pull path before the
+    // wiring is decided (see `ensure_images_for_wiring`), so the runtime answer is exact whatever
+    // this variable says.
+    std::env::var_os("KERN_COMPOSE_FETCH_IMAGE_CONFIG")?;
+    // A scratch directory that is removed either way: the blob is a means, not a thing to keep, and
+    // the image store must not learn about an image whose layers are absent.
+    let scratch = expose_memo_dir().join(format!(".fetch-{}", std::process::id()));
+    let fetched = kern_oci::fetch_image_config(image, &scratch, None);
+    let _ = std::fs::remove_dir_all(&scratch);
+    let cfg = fetched.ok()?;
+    let mut text = String::with_capacity(64);
+    text.push_str(image);
+    text.push('\n');
+    for (port, udp) in &cfg.exposed_ports {
+        text.push_str(&format!("{port}/{}\n", if *udp { "udp" } else { "tcp" }));
+    }
+    // Best effort: a cache that cannot be written costs a refetch, not an answer.
+    if std::fs::create_dir_all(expose_memo_dir()).is_ok() {
+        let _ = std::fs::write(&memo, text);
+    }
+    Some(cfg.exposed_ports)
+}
+
+/// Settle the `service_healthy` gates the parser could not decide, now that images can be read.
+///
+/// THE DEFECT THIS CLOSES. A service with no `healthcheck:` in the file whose IMAGE carries a
+/// `HEALTHCHECK` is healthy-gateable under Docker; kern downgraded the gate to start-order at parse
+/// time, because the parser cannot open an image config. MEASURED with an image whose check flips at
+/// 6 s: the dependent started at 0 s, so `condition: service_healthy` was another name for
+/// `service_started`. `kern box` has always applied the image's healthcheck (`image_health_defaults`
+/// in `start`), so the box really does report health; only the GATE was lost.
+///
+/// RESTORED, NOT WARNED, when the image supplies one: the gate is the file's own instruction and
+/// kern can honour it. Reported when it does not, which is the warning the parser used to print and
+/// now prints only for a target it could judge itself.
+///
+/// `depends_on` keeps the entry the parser added. It is implied by the stronger gate, so leaving it
+/// costs an ordering constraint that is already satisfied and avoids a removal that could reorder a
+/// graph for a reason unrelated to health.
+fn settle_deferred_health_gates(boxes: &mut [crate::compose::ComposeBox]) {
+    // Which services have an image healthcheck, resolved once: a stack of eight services on one
+    // image must not open it eight times.
+    let mut verdict: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for b in boxes.iter() {
+        let Some(img) = b.image.as_deref() else {
+            continue;
+        };
+        if verdict.contains_key(img) {
+            continue;
+        }
+        let has = resolve_image_depth(img, 0, PullPolicy::Never)
+            .map(|(_, cfg)| cfg.healthcheck.is_some())
+            .unwrap_or(false);
+        verdict.insert(img.to_string(), has);
+    }
+    // Name -> image, so a gate can ask about its TARGET rather than about itself.
+    let image_of: std::collections::HashMap<String, String> = boxes
+        .iter()
+        .filter_map(|b| b.image.as_ref().map(|i| (b.name.clone(), i.clone())))
+        .collect();
+    let mut restored: Vec<(String, String)> = Vec::new();
+    let mut lost: Vec<(String, String)> = Vec::new();
+    for b in boxes.iter_mut() {
+        for dep in std::mem::take(&mut b.degraded_health) {
+            let has = image_of
+                .get(&dep)
+                .and_then(|img| verdict.get(img))
+                .copied()
+                .unwrap_or(false);
+            if has {
+                if !b.depends_healthy.contains(&dep) {
+                    b.depends_healthy.push(dep.clone());
+                }
+                restored.push((b.service_name().to_string(), dep));
+            } else {
+                lost.push((b.service_name().to_string(), dep));
+            }
+        }
+    }
+    // The TARGETS whose health comes from their image, marked so every later reader agrees with the
+    // box that is already running that check. Done in a second pass because the loop above holds a
+    // mutable borrow of the dependent, not of the target.
+    let targets: std::collections::HashSet<String> =
+        restored.iter().map(|(_, dep)| dep.clone()).collect();
+    for b in boxes.iter_mut() {
+        if targets.contains(&b.name) {
+            b.health_from_image = true;
+        }
+    }
+    for (who, dep) in restored {
+        eprintln!(
+            "kern: note: compose: service '{who}': dependency '{dep}' declares no `healthcheck:` but \
+             its IMAGE carries one, so the `service_healthy` gate is honoured"
+        );
+    }
+    for (who, dep) in lost {
+        eprintln!(
+            "kern: warning: compose: service '{who}': dependency '{dep}' has no usable healthcheck \
+             (neither the file nor its image declares one) → its `service_healthy` gate is degraded \
+             to start-order (depends_on); verify that's acceptable"
+        );
+    }
+}
+
+/// The services whose image could not be read, because it is not in the local cache.
+///
+/// WHY THIS HAS TO BE REPORTED. `image_expose_collisions` reads each image's `EXPOSE` set with
+/// `PullPolicy::Never`, so its answer depends on what happens to be cached, and that answer DECIDES
+/// THE WIRING: a file whose two services expose the same port is wired per service, and the same
+/// file with the images absent is wired into one pod.
+///
+/// MEASURED on this corpus, same binary, same file, one pull apart:
+///
+/// ```text
+/// image in the cache      config -> wiring: bridge
+/// kern rmi <image>        config -> wiring: pod
+/// ```
+///
+/// Two files moved between the buckets of a published rate that way, silently. Pulling to answer a
+/// question about a file would be worse (a `config` that downloads gigabytes is not a dry run), so
+/// the answer stays cache-dependent and SAYS SO.
+pub(crate) fn images_not_read(boxes: &[crate::compose::ComposeBox]) -> Vec<String> {
+    let mut out = Vec::new();
+    if boxes.len() < 2 {
+        return out; // one service cannot collide with another
+    }
+    for b in boxes {
+        let Some(image) = b.image.as_deref() else {
+            continue;
+        };
+        if image_exposed_ports(image).is_none() {
+            out.push(format!("{} ({image})", b.service_name()));
         }
     }
     out
@@ -5709,6 +5993,38 @@ fn compose_dir(file: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+/// Stop this project's boxes that the file no longer names: `docker compose down --remove-orphans`.
+///
+/// WHAT LEAVES ONE BEHIND. A service renamed in the file (`web` becomes `api`) leaves the old box
+/// running under the old name, still holding its published ports, and the next `up` fails on a bind
+/// conflict against something the file no longer mentions. `down` alone cannot see it: it stops what
+/// the file declares, and the orphan is by definition not declared.
+///
+/// THE SCOPE IS THE POD, which is this project's identity: a box is an orphan when it is a member of
+/// this project's pod and its name is not one of the names the file resolves to. Nothing outside the
+/// pod is touched, so another project's `db` is never in range however it is named.
+///
+/// Returns the names stopped.
+fn remove_orphan_boxes(boxes: &[crate::compose::ComposeBox], pod: &str) -> Vec<String> {
+    if pod.is_empty() {
+        return Vec::new(); // a `--no-pod` stack has no membership to read
+    }
+    let declared: Vec<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
+    let orphans: Vec<String> = registry::list()
+        .into_iter()
+        .filter(|i| i.pod == pod && !declared.iter().any(|d| *d == i.name))
+        .map(|i| i.name)
+        .collect();
+    let mut stopped = Vec::new();
+    for name in orphans {
+        // Best effort and one at a time: an orphan that is already gone must not stop the rest.
+        if stop(std::slice::from_ref(&name), false).is_ok() {
+            stopped.push(name);
+        }
+    }
+    stopped
+}
+
 /// Delete the named volumes a project OWNS: `docker compose down -v`.
 ///
 /// THREE CONDITIONS, and each one keeps a deletion from reaching data that is not this project's:
@@ -5781,6 +6097,23 @@ pub(crate) fn tear_down_stack(
     selected: &[String],
     pod: &str,
 ) -> (usize, bool) {
+    tear_down_stack_keeping(boxes, selected, pod, true).0
+}
+
+/// [`tear_down_stack`], with a say over whether the exit records are reaped, and returning the
+/// names it stopped.
+///
+/// WHY THE CHOICE EXISTS. `--exit-code-from` has to READ a service's exit status, and the status of
+/// a service the teardown itself killed is only written DURING the stop. Reaping inside the teardown
+/// left nothing to read: measured, `up --exit-code-from tests` exited 0 on a stack whose `tests`
+/// exits 3, because `clear_waitexit_pod` had already removed the record by the time it was looked
+/// up. That path stops, reads, and reaps afterwards.
+pub(crate) fn tear_down_stack_keeping(
+    boxes: &[crate::compose::ComposeBox],
+    selected: &[String],
+    pod: &str,
+    reap: bool,
+) -> ((usize, bool), Vec<String>) {
     // The relay holder FIRST, before the boxes stop. Killing it takes every relay with it through
     // PDEATHSIG, and doing it first means no relay is left pumping into a box that is being torn
     // down under it. Best-effort and idempotent: a stack that ran in a pod has no holder, and a
@@ -5788,17 +6121,51 @@ pub(crate) fn tear_down_stack(
     if let Ok(dir) = crate::relayhold::stack_dir(pod) {
         crate::relayhold::kill_holder(&dir);
     }
+    // LEAVE EVERY `external:` NETWORK, BEFORE THE BOXES STOP, and in this order for two reasons.
+    //
+    // The hosts lines this project wrote into ANOTHER project's boxes are removed by reaching into
+    // those boxes, which only works while OUR record still says which networks we were on - and a
+    // box that has stopped can no longer be looked up to find its peers. Leaving first also means a
+    // stack coming up in the same instant never sees us as a member we are about to stop being.
+    //
+    // BEST EFFORT, LIKE THE HOLDER ABOVE. A `down` after a crash, a second `down`, or a stack that
+    // never joined anything all reach this and must all be quiet: every step is a removal, and a
+    // removal of something absent is what was wanted.
+    let external: Vec<(String, String)> = boxes
+        .iter()
+        .filter(|b| !b.external_networks.is_empty())
+        .flat_map(|b| {
+            b.external_networks
+                .iter()
+                .map(|n| (n.clone(), b.name.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if !external.is_empty() {
+        // The foreign boxes that hold our names: everything on those networks that is not ours.
+        let mut nets: Vec<String> = external.iter().map(|(n, _)| n.clone()).collect();
+        nets.sort();
+        nets.dedup();
+        for (_, m, _) in crate::network::peers_of(&nets, pod) {
+            crate::network::drop_foreign_hosts(&m.box_name, pod);
+        }
+        for (net, box_name) in &external {
+            crate::network::leave(net, box_name);
+        }
+    }
     let names = stop_stack(boxes, selected, pod);
     // Reap THIS stack's `waitexit` sidecars (by pod + our own service names), including services
     // that had ALREADY exited before `down` - a live-only capture would miss exactly those. So
     // `compose ps -a` is empty after a `down` (matching Docker), while `compose stop` (which does
     // not call this) leaves the exited services visible.
-    registry::clear_waitexit_pod(pod, &names);
+    if reap {
+        registry::clear_waitexit_pod(pod, &names);
+    }
     // Tear the pod down QUIETLY (we just stopped the members, so `pod::remove`'s "members keep
     // running" note would contradict this). Only claim it was removed if one existed - a `--no-pod`
     // stack has none.
     let (pod_existed, _) = crate::pod::teardown(pod);
-    (names.len(), pod_existed)
+    ((names.len(), pod_existed), names)
 }
 
 /// Every mapping seen so far for ONE `(host port, protocol)` pair - the bucket that makes the
@@ -5918,6 +6285,12 @@ struct TerminalOpts<'a> {
     allow_device_grants: bool,
     /// `down -v`: also delete the named volumes this project owns.
     remove_volumes: bool,
+    /// `down --remove-orphans`: also stop this project's boxes the file no longer names.
+    remove_orphans: bool,
+    /// `ps -q` / `--services` / `--format`.
+    ps_quiet: bool,
+    ps_services: bool,
+    ps_format: Option<&'a str>,
 }
 
 /// Run the compose verbs that never launch a box, and report whether one ran.
@@ -6142,6 +6515,30 @@ fn run_terminal_verb(
                 "  wiring-source: {}",
                 if o.wiring_from_flag { "flag" } else { "auto" }
             );
+            // THE ANSWER'S DEPENDENCE ON THE LOCAL CACHE, stated where the answer is. kern reads
+            // each image's `EXPOSE` set to find two services claiming one internal port, and that
+            // decides the wiring; an image that is not cached is not read, so the SAME file answers
+            // `pod` before a pull and `bridge` after one. Measured on this corpus, one `kern rmi`
+            // apart. A `config` that pulled to answer would not be a dry run, so the dependence
+            // stays and is named.
+            if !o.wiring_from_flag {
+                let unread = images_not_read(boxes);
+                if !unread.is_empty() {
+                    println!(
+                        "  wiring-images-unread: {} ({})",
+                        unread.len(),
+                        unread.join(", ")
+                    );
+                    eprintln!(
+                        "kern: note: compose: the wiring above was decided WITHOUT reading {} \
+                         image(s) that are not in the local cache: {}. kern reads an image's \
+                         EXPOSE set to find two services claiming one internal port, so this answer \
+                         can change after `kern compose <file> pull`.",
+                        unread.len(),
+                        unread.join(", ")
+                    );
+                }
+            }
             // `config` reports the FILE, so it prints service names as written, not the
             // project-scoped box names the runtime uses.
             //
@@ -6424,7 +6821,37 @@ fn run_terminal_verb(
             } else {
                 ("name".to_string(), format!("{pod}-"))
             };
-            let rc = ps(false, false, all, std::slice::from_ref(&filter), None);
+            // `--services` ANSWERS FROM THE FILE, not from the registry, which is Docker's
+            // behaviour and the only one that is useful: the list a deploy script iterates must be
+            // the same whether the stack is up or down. Every other form asks `kern ps`.
+            if o.ps_services {
+                for b in boxes.iter().filter(|b| selected(b)) {
+                    println!("{}", b.service_name());
+                }
+                return Ok(true);
+            }
+            // `--format json` is the spelling `docker compose ps` takes; `kern ps` calls the same
+            // thing `--json`, so the two words are mapped onto the one renderer rather than
+            // duplicating it. Any other template goes through as a template.
+            let (shape, template) = match o.ps_format {
+                // NDJSON, not an array: see `JsonShape::Lines` for the version this tracks.
+                Some(f) if f.eq_ignore_ascii_case("json") => (JsonShape::Lines, None),
+                Some(f) => (JsonShape::No, Some(f)),
+                None => (JsonShape::No, None),
+            };
+            let as_json = shape != JsonShape::No;
+            let rc = ps(
+                shape,
+                o.ps_quiet,
+                all,
+                std::slice::from_ref(&filter),
+                template,
+            );
+            // The lines below explain a DEGRADED stack to a person. A machine-readable form has no
+            // room for prose, and a script parsing NDJSON must not be handed a sentence.
+            if as_json || o.ps_quiet || template.is_some() {
+                return rc.map(|()| true);
+            }
             // DEGRADED EDGES, NAMED HERE, because this is where a person looks to decide whether
             // something is wrong. A `--no-pod` stack's relays repair themselves; an edge that could
             // not be rebuilt is left alone so the rest keep working, and that trade is only
@@ -6510,7 +6937,7 @@ fn run_terminal_verb(
                         "compose logs -f: none of the selected services is running".to_string(),
                     ));
                 }
-                follow_many(who, &FOLLOW_FOREVER)?;
+                follow_many(who, &FOLLOW_FOREVER, false)?;
                 return Ok(true);
             }
             for (i, name) in wanted.iter().enumerate() {
@@ -6547,12 +6974,27 @@ fn run_terminal_verb(
             return Ok(true);
         }
         ComposeAction::Down => {
+            // ORPHANS FIRST, while the pod still exists to read membership from: `tear_down_stack`
+            // removes the pod, and after that there is nothing left to ask which boxes were its
+            // members.
+            let orphans = if o.remove_orphans {
+                remove_orphan_boxes(boxes, pod)
+            } else {
+                Vec::new()
+            };
             let all: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
             let (stopped, pod_existed) = tear_down_stack(boxes, &all, pod);
             if pod_existed {
                 println!("compose down: {stopped} box(es) stopped, pod '{pod}' removed");
             } else {
                 println!("compose down: {stopped} box(es) stopped");
+            }
+            if !orphans.is_empty() {
+                println!(
+                    "compose down: {} orphan(s) stopped: {}",
+                    orphans.len(),
+                    orphans.join(", ")
+                );
             }
             if o.remove_volumes {
                 match remove_project_volumes(boxes, pod) {
@@ -6633,7 +7075,33 @@ fn run_terminal_verb(
         // `Run` is terminal but does its work in `compose()`, where the pod name, the project
         // directory and the resolved box flags all are. It falls through here for the same reason
         // `Up` does: this function answers "did a read-only verb already finish", and it did not.
-        ComposeAction::Up | ComposeAction::Start | ComposeAction::Run => {}
+        // `cp` IS TERMINAL and is answered here, where the box names are already resolved.
+        ComposeAction::Cp => {
+            let (Some(a), Some(b)) = (services.first(), services.get(1)) else {
+                return Err(Error::Compose(format!(
+                    "cp takes two paths: `kern compose {file} cp <service>:<path> <dst>` or the \
+                     reverse"
+                )));
+            };
+            // Rewrite `<service>:<path>` to `<box>:<path>` on whichever side names one. A side with
+            // no colon is a host path and is passed through untouched; a side whose name is not a
+            // service is left alone too, so `kern cp`'s own "no box named …" still reports it.
+            let to_box = |arg: &String| -> String {
+                match arg.split_once(':') {
+                    Some((who, path)) => match boxes
+                        .iter()
+                        .find(|b| b.service_name() == who || b.name == who)
+                    {
+                        Some(b) => format!("{}:{}", b.name, path),
+                        None => arg.clone(),
+                    },
+                    None => arg.clone(),
+                }
+            };
+            crate::boxcp::cp(&to_box(a), &to_box(b))?;
+            return Ok(true);
+        }
+        ComposeAction::Up | ComposeAction::Start | ComposeAction::Run | ComposeAction::Exec => {}
     }
     Ok(false)
 }
@@ -6655,6 +7123,18 @@ pub struct ComposeOpts<'a> {
     pub run_rm: bool,
     /// `--no-deps`.
     pub no_deps: bool,
+    /// `--exit-code-from <service>`: adopt that service's status. Implies `abort_on_exit`.
+    pub exit_code_from: Option<&'a str>,
+    /// `--abort-on-container-exit`: tear the stack down as soon as any service exits.
+    pub abort_on_exit: bool,
+    /// `down --remove-orphans`.
+    pub remove_orphans: bool,
+    /// `ps -q`.
+    pub ps_quiet: bool,
+    /// `ps --services`.
+    pub ps_services: bool,
+    /// `ps --format <template|json>`.
+    pub ps_format: Option<&'a str>,
     /// `-v` on `down`: also delete the named volumes this project owns (see
     /// [`remove_project_volumes`] for the three conditions that bound what it deletes).
     pub remove_volumes: bool,

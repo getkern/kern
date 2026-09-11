@@ -34,6 +34,7 @@ const VERBS: &[&str] = &[
     "push",
     "tag",
     "build",
+    "network",
     "pod",
     "search",
     "images",

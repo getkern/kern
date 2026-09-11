@@ -177,15 +177,25 @@ fn check_linger() -> R {
         return R::Ok("could not resolve the current user name to check systemd lingering".into());
     };
     if std::path::Path::new(&format!("/var/lib/systemd/linger/{user}")).exists() {
+        // LINGERING IS NECESSARY AND NOT SUFFICIENT for a stack to come back after a REBOOT, and
+        // saying only the first half leaves a reader believing the second. Lingering starts the USER
+        // MANAGER at boot; nothing in it starts a compose stack, because kern has no daemon that
+        // owns one. The unit `kern compose <file> systemd` emits is what does, and it is the piece
+        // a migration from Docker does not know it needs: there the daemon starts at boot and
+        // restarts the containers itself.
         return R::Ok(
-            "systemd lingering is on: a detached box outlives the session that started it".into(),
+            "systemd lingering is on: a detached box outlives the session that started it (a \
+             compose STACK still needs its own unit to return after a reboot: \
+             `kern compose <file> systemd`)"
+                .into(),
         );
     }
     R::Warn(
         "systemd lingering is OFF for this user, so a DETACHED box dies when your last session ends: \
          systemd stops `user@<uid>.service` and every box scope under it, and removes the \
          /run/user/<uid> registry with it (measured on a Raspberry Pi 5: box, port and `kern logs` all \
-         gone 20 s after logout)"
+         gone 20 s after logout). It is also the first half of surviving a REBOOT: without it the \
+         user manager does not start at boot, so a unit from `kern compose <file> systemd` never runs"
             .into(),
         format!("`sudo loginctl enable-linger {user}` - one command, once per machine, and detached boxes then survive logout (this is the same requirement rootless podman documents)"),
     )

@@ -5,13 +5,94 @@ Docker Engine API. This page is the reference: what is supported, what is not, a
 differences bite.
 
 Every FIGURE on this page is measured, and the measurement is named where it matters. Statements
-about what Docker does are taken from the Compose Specification: there is no Docker daemon on the
-machine kern is developed on.
+about what Docker does are measured against **Docker 29.6.2** on a real daemon (a Jetson Orin Nano,
+aarch64) and against **podman 4.9.3** rootless on the development host; where a question was not put
+to a daemon, the line says so. docs/RUNTIME-PARITY.md carries those measurements one by one.
+
+
+## What "compose compatibility" means here, in three numbers
+
+Three different questions, three different numbers. Quoting one under another's definition is the
+mistake this project already made once and corrected (see the v0.9.32 errata in CHANGELOG.md), so
+each one carries its definition and its denominator.
+
+Corpus: 259 real compose files, one per repository, sampled across 733 repositories, listed one per
+row in `docs/compose-corpus-neutral.tsv` with the repository, the path inside it and the sha256 of
+the bytes that were measured. The commit is NOT pinned, so a file may have changed since; the hash
+is the only thing that says what was read. Binary proven to be the working tree (the script refuses
+to measure otherwise).
+
+| Question | Answer | Definition |
+|---|---|---|
+| Does kern ACCEPT the file? | **247 / 259 = 95%** | `compose config` exits 0. ACCEPTED, not executed: of 41 files taken further and actually started, 19 did not come up (images that no longer resolve, host paths this corpus cannot carry, a FIFO in a layer, DNS). The 12 kern refuses, Docker 29.6.2 refuses too, so ON THIS CORPUS there is no file Docker accepts and kern rejects. Not a claim about every compose file: kern refuses at `config` two mappings sharing one host port, which Docker accepts and fails at `up`. |
+| Is it accepted with NO difference kern names? | **198 / 259 = 76%** | zero warning lines at `config` that are a behavioural difference, BEYOND the deviations declared below. Those deviations have no per-file warning (they apply to nearly every file), so they are declared once here instead of counted 259 times. |
+| The same, on a host that permits low ports | **222 / 259 = 85%** | the identical measurement in a network namespace with `net.ipv4.ip_unprivileged_port_start=0`, which is one `sysctl` on a real host. MEASURED, not derived by subtracting a cause: `compose-compat-rate.py --with-low-port-floor` runs both and prints both. |
+
+THE FIRST NUMBER WAS 35% AND THEN 33% WHILE KERN GOT BETTER, and the reason is worth more than the
+number. It counts what kern SAYS it does differently, so it falls whenever kern learns of a
+difference it used to be silent about - `external:` networks cost two points the day they were
+measured. It rose to 72% when the default wiring changed to a network namespace per service, which
+is the arrangement Docker has: that single cause carried 135 files, 101 of them with nothing else.
+
+The gap between 95% and 76%, by cause (second column: files for which it is the ONLY cause):
+
+```
+ 38   24   a privileged host port is republished above 1024 (rootless; not kern's to fix,
+           and 0 of 24 on a host whose port floor is 0)
+ 14    1   no daemon behind /var/run/docker.sock
+  7    1   `privileged: true` needs the operator's grant
+  2    1   `runtime: nvidia`: the GPU is a device grant here
+  1 each   logging driver, ipc:, a fixed address, an out-of-range port,
+           security_opt seccomp, an unimplemented key, platform:
+```
+
+ONE CAUSE LEFT IS NOT KERN'S AND CARRIES THE REST. 24 of the 49 remaining files publish a port below
+1024, which rootless the kernel refuses to bind: podman refuses the same port and names the same
+sysctl, Docker binds it because it is root. That is the whole distance between the two numbers in
+the table above.
+
+Every one of the 259 files is wired the way Docker wires it, so the shared-loopback cause is gone
+from this table and from the runtime. `--pod` still asks for the old wiring and still says what it
+costs.
+
+Of 259 real files, the only compose KEY kern reports as unimplemented is `runtime:`, on two files. A
+key no file in the corpus uses is not covered by that sentence: it says nothing about
+`deploy.replicas`, `cgroup_parent`, `userns_mode` or `mac_address`, which no file here writes.
+
+The corpus is 259 files found by their NAME. Nine of the twelve kern refuses are not compose files
+at all (`.bak`, `.dist`, `.old`, `.md`, `-e`), and Docker refuses them for the same reason; the
+denominator keeps them because removing the files a measurement dislikes is how a rate goes up.
+
+## The perimeter
+
+kern is a substitute for `docker compose` on files that do not need:
+
+  * the Engine API behind `/var/run/docker.sock` (14 files here: Traefik's docker provider,
+    Portainer, Watchtower, CI-in-docker). A reverse proxy CONFIGURED BY FILE rather than by the
+    socket does work across projects: see the `external:` network entry below,
+  * `privileged: true` without an operator grant on the command line (7 files),
+  * `runtime:` (2 files),
+  * a host port below 1024 kept where the file wrote it. 38 files publish one; they RUN, moved and
+    announced, and `compose ps --format json` reports the real address in `Publishers`. They are
+    outside the perimeter only when the port must BE 80, which is the ACME HTTP-01 case,
+  * `--pod`, where a service that binds `127.0.0.1` does not keep it private from its peers. It is
+    no longer the default and it is no longer where a stack lands without asking; the census that
+    measured it (22 stacks read from inside, 2 with a loopback-only listener, both of them nominal)
+    is in docs/RUNTIME-PARITY.md,
+  * UDP between peers under the `--no-pod` relay wiring,
+  * files on a bind mount owned by the uid the service runs as: rootless maps them through the
+    subuid range, so a service running as 1000 writes files the host sees as 100999 (section 38),
+  * a stack that comes back after a reboot on its own: kern has no daemon, and the path is
+    `compose systemd` plus `loginctl enable-linger` (section 39),
+  * the image kern already built being reused when its context changed: kern rebuilds, Docker does
+    not without `--build`.
+
+Outside that list, on this corpus, kern accepts every file Docker accepts.
 
 | From your Docker setup | kern |
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run: multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd**, digest-pinned `@sha256:` refs **content-verified** (the manifest is checked against the pin) |
-| **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|systemd]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, **`restart:`** (`always`/`unless-stopped`/`on-failure`), `devices`, `dns`/`dns_search`/`dns_opt`, `logging` `max-size`/`max-file`, `links`, `ipc`/`pid`, `tmpfs`, `mem_reservation`, `cpu_shares`, `platform`, `volumes_from`, `shm_size`, `secrets`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}`, `${VAR:?err}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
+| **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|watch\|port\|systemd\|run\|cp]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, **`restart:`** (`always`/`unless-stopped`/`on-failure`), `devices`, `dns`/`dns_search`/`dns_opt`, `logging` `max-size`/`max-file`, `links`, `ipc`/`pid`, `tmpfs`, `mem_reservation`, `cpu_shares`, `platform`, `volumes_from`, `shm_size`, `secrets`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}`, `${VAR:?err}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
 | **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage** (+ `target:`), `COPY --from=…` (a build stage **or** an external image), **COPY globs**, BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: `docker load`-compatible |
@@ -26,17 +107,30 @@ machine kern is developed on.
 
 kern picks the wiring from the file, and says which one it picked.
 
-**One shared namespace (the default).** Services reach each other by name on `127.0.0.1`: no bridge,
-no IPAM, no DNS server, and a stack that starts in milliseconds. Two services cannot both listen on
-the same container port here, so a file that asks for it gets the other wiring instead; under an
-explicit `--pod` kern refuses the stack and names both. `net.*` sysctls belong to the namespace and
-therefore to the whole stack.
+**A namespace per service, meeting on a bridge (the default, from two services up).** This is
+Docker's arrangement: each service keeps its own `127.0.0.1`, so a port it binds on the loopback is
+private to it, two services can both listen on the same container port, and peers are reached by
+name over a real network. A single-service stack keeps the shared namespace, having no peer to be
+separated from.
 
-**A namespace per service.** Chosen automatically when the file's `networks:` leave two services with
-nothing in common, or when two services claim the same internal port; `--no-pod` forces it and
-`--pod` forces the shared namespace. Peers are reached through per-service loopback aliases
-(`127.0.0.2` upward) carried by relays, so a namespace still holds only `lo` with no routes. The cost
-is a relay hop: measured at -34% bulk throughput and -16% connection rate.
+WHAT IT COSTS, MEASURED end to end on `up -d` with warm images, alternated against `--pod`: +17 ms
+for 2 services, +23 ms for 4, +27 ms for 8. It is nearly flat because the two things that made it
+per-service are gone - a veth peer is now created directly inside the member's namespace instead of
+being moved into it, which saves a full RCU grace period (14-22 ms) per service, and every NAT is
+attached concurrently before any service is released instead of one at a time (about 17 ms each).
+Before those two, the same eight-service stack cost +239 ms.
+
+**One shared namespace (`--pod`).** Services reach each other by name on `127.0.0.1`: no bridge, no
+IPAM, no DNS server, and a bring-up flat in the number of services. Two services cannot both listen
+on the same container port here, and kern refuses such a stack rather than running it with one of
+them dead. `net.*` sysctls belong to the namespace and therefore to the whole stack. A port a service
+binds on the loopback is reachable by every peer, which under Docker it would not be.
+
+**A namespace per service with relays (`--no-pod`).** Chosen automatically when the file's
+`networks:` leave two services with nothing in common, because one bridge would put them back on one
+network and drop the separation the file asked for. Peers are reached through per-service loopback
+aliases (`127.0.0.2` upward) carried by relays, so a namespace still holds only `lo` with no routes.
+The cost is a relay hop: measured at -34% bulk throughput and -16% connection rate.
 
 **`networks:` is enforced in that wiring and inert in a pod.** Two services with no network in common
 get no relay and no `/etc/hosts` entry, so the peer's name does not resolve at all. The boundary is
@@ -45,10 +139,33 @@ with no `networks:` key is on the implicit `default` network and is therefore se
 that name one; measured over 240 real files, 52 have at least one pair that loses an edge and 40 are
 exactly that mixed case, so `up` names every cut pair before starting anything.
 
-**A shared namespace is one network trust domain.** The host's loopback is not reachable from inside
-it, so the boundary is between the stack and the host rather than between the services of one stack.
-Put a service you do not trust with its peers in its own stack. What that costs is the first entry
-under *Differences that bite*.
+**A network shared BETWEEN projects (`external: true`).** A compose file declares it, `kern network
+create <name>` makes it, and services of different files on it resolve and reach each other by name -
+the reverse-proxy pattern. A file naming one that does not exist is REFUSED, measured against the
+reference: `docker compose up` answers `network X declared as external, but could not be found` and
+`docker compose config` renders the file anyway, which is what kern does too.
+
+IT IS RELAYS AND NOT A SHARED BRIDGE, and that is a property of rootless Linux rather than a choice.
+Measured, each refusal against a control that rules out the tool: from the initial user namespace,
+joining another holder's network namespace is EPERM (entering its user namespace first works); from
+inside one pod's user namespace, creating a veth whose peer lands in a sibling pod's network
+namespace is EPERM (both ends inside one pod works). Joining a network namespace needs
+`CAP_SYS_ADMIN` in the caller's own user namespace, and placing a link needs `CAP_NET_ADMIN` in the
+one that owns the target; a sibling has neither. A relay needs neither, because its two halves each
+enter only their own box. What that costs is a TCP hop and TCP only, and a peer answers on a port the
+file DECLARES, exactly as inside a `--no-pod` stack.
+
+EACH MEMBER GETS ONE ADDRESS ON THE NETWORK, `127.1.<network>.<member>`, which every other member
+binds locally to reach it and which it uses as its own source address. Those cannot collide with a
+stack's own peer aliases, which live in `127.0.0.2` through `127.0.0.254`. A stack that joins later
+is wired into the boxes already running - relays into them, and their `/etc/hosts` updated in place -
+and `down` takes both away again.
+
+**The host is outside the stack under every wiring.** A listener on the host's own loopback is not
+reachable from a service, bridged or podded, and that is asserted with a positive control. Inside the
+stack the wirings differ and that difference is the point: the default separates the services'
+loopbacks as Docker does, and `--pod` puts them in one trust domain, where a service you do not trust
+with its peers does not belong.
 
 ## Egress
 

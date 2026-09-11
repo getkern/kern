@@ -329,6 +329,23 @@ pub enum Command {
     PodRemove {
         names: Vec<String>,
     },
+    /// `kern network create <name>` / `network ls [--json]` / `network rm <name>`: a network shared
+    /// BETWEEN projects, which is what `networks: {x: {external: true}}` in a compose file names.
+    ///
+    /// EXPLICIT, LIKE DOCKER'S. `docker compose up` refuses a file naming an external network that
+    /// does not exist, and so does kern: inferring it would turn a typo in a network name into a
+    /// second, empty network whose members resolve nothing, which is the failure the key exists to
+    /// prevent.
+    NetworkCreate {
+        name: String,
+    },
+    NetworkList {
+        /// `--json`: the same scan as the table, machine-readable, like every other read verb here.
+        json: bool,
+    },
+    NetworkRemove {
+        names: Vec<String>,
+    },
     /// Hidden: the pod namespace holder process (spawned by `pod create`, not user-facing).
     PodHolder,
     /// Hidden: owns a `--no-pod` stack's peer relays until killed. Argument is the stack's
@@ -554,6 +571,25 @@ pub enum Command {
         run_rm: bool,
         /// `--no-deps`: do not bring the target's `depends_on` up first.
         no_deps: bool,
+        /// `--exit-code-from <service>`: adopt that service's exit status as kern's.
+        ///
+        /// MEASURED on Docker 29.6.2, three cases: with `tests` exiting 3 it exits 3 and leaves no
+        /// container running; `--abort-on-container-exit` alone exits 3 the same way; and
+        /// `--exit-code-from db`, where `db` never exits on its own, exits **137**, because the
+        /// abort is what ended it. Naming a service the file does not define is refused there
+        /// ("no such service") and here.
+        exit_code_from: Option<String>,
+        /// `--abort-on-container-exit`: stop the whole stack as soon as any service exits.
+        abort_on_exit: bool,
+        /// `down --remove-orphans`: also stop this project's boxes the file no longer names.
+        remove_orphans: bool,
+        /// `ps -q`: print ids only, for `for c in $(compose ps -q)`.
+        ps_quiet: bool,
+        /// `ps --services`: print this stack's service NAMES, one per line.
+        ps_services: bool,
+        /// `ps --format <template|json>`: threaded to `kern ps`, the renderer the compose view
+        /// already shares, so the two can never disagree about a column.
+        ps_format: Option<String>,
         /// `-v`/`--volumes` on `down`: also delete the named volumes this project owns.
         ///
         /// kern DOES create named volumes and never removed them, so a stack torn down and started
@@ -793,6 +829,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `pod create <name> [-p …]` / `pod ls` / `pod rm <name>…`: shared-network pods.
         Some("pod") => parse_pod(&rest)?,
+        Some("network" | "net") => parse_network(&rest)?,
         // Hidden: the pod namespace holder (spawned by `pod create`).
         Some("__pod-holder") => Command::PodHolder,
         // Hidden: the relay holder (spawned by `compose up --no-pod`).
@@ -1362,6 +1399,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut remove_volumes = false;
             let mut wait_ready = false;
             let mut wait_timeout: Option<u64> = None;
+            let mut exit_code_from: Option<String> = None;
+            let mut abort_on_exit = false;
+            let mut remove_orphans = false;
+            let mut ps_quiet = false;
+            let mut ps_services = false;
+            let mut ps_format: Option<String> = None;
             let mut run_cmd: Vec<String> = Vec::new();
             let mut run_rm = false;
             let mut no_deps = false;
@@ -1371,7 +1414,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 // `run <service> <command…>`: ONCE THE SERVICE IS NAMED, THE REST IS THE COMMAND,
                 // flags and all. Without this, `run web sh -c 'exit 7'` has `-c` read as a kern
                 // flag and the invocation from every project README is a usage error.
-                if action == Some(commands::ComposeAction::Run) && !services.is_empty() {
+                if matches!(
+                    action,
+                    Some(commands::ComposeAction::Run) | Some(commands::ComposeAction::Exec)
+                ) && !services.is_empty()
+                {
                     run_cmd.push((*a).to_string());
                     continue;
                 }
@@ -1448,8 +1495,44 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // running entry either way, so this is accepted and honoured rather than
                     // refused on a technicality.
                     "--rm" if action == Some(commands::ComposeAction::Run) => run_rm = true,
-                    "-T" if action == Some(commands::ComposeAction::Run) => {}
+                    // `-T` disables the TTY under Docker. kern's `exec` allocates one only when it
+                    // is asked to, so the flag names what already happens and is taken silently.
+                    "-T" | "--no-TTY"
+                        if matches!(
+                            action,
+                            Some(commands::ComposeAction::Run)
+                                | Some(commands::ComposeAction::Exec)
+                        ) => {}
                     "--no-deps" => no_deps = true,
+                    // `up --exit-code-from S`: the CI line that turns a test service's status into
+                    // the job's. MEASURED on Docker 29.6.2: it implies `--abort-on-container-exit`,
+                    // the whole stack is torn down when ANY service exits, and the status reported
+                    // is the NAMED service's, which is 137 when the abort is what killed it.
+                    "--exit-code-from" => {
+                        exit_code_from = Some(
+                            it.next()
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("compose --exit-code-from <service>"))?,
+                        );
+                        abort_on_exit = true;
+                    }
+                    "--abort-on-container-exit" => abort_on_exit = true,
+                    // `down --remove-orphans`: stop this project's boxes whose service the file no
+                    // longer names, which is what a renamed service leaves behind.
+                    "--remove-orphans" => remove_orphans = true,
+                    // `ps` FORMATTING, threaded straight to `kern ps`, which is the renderer the
+                    // compose view already uses. These are the three spellings a deploy script
+                    // reaches for: `ps -q` for a loop over ids, `--services` for a loop over names,
+                    // `--format json` for anything that parses.
+                    "-q" | "--quiet" => ps_quiet = true,
+                    "--services" => ps_services = true,
+                    "--format" => {
+                        ps_format = Some(
+                            it.next()
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("compose ps --format <template|json>"))?,
+                        );
+                    }
                     "--wait-timeout" => {
                         wait_timeout = Some(
                             it.next()
@@ -1527,6 +1610,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_cmd,
                 run_rm,
                 no_deps,
+                exit_code_from,
+                abort_on_exit,
+                remove_orphans,
+                ps_quiet,
+                ps_services,
+                ps_format,
                 tail,
                 follow,
                 all,
@@ -1572,6 +1661,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_cmd: Vec::new(),
                 run_rm: false,
                 no_deps: rest.contains(&"--no-deps"),
+                exit_code_from: None,
+                abort_on_exit: false,
+                remove_orphans: rest.contains(&"--remove-orphans"),
+                ps_quiet: false,
+                ps_services: false,
+                ps_format: None,
                 tail: None,
                 follow: false,
                 all: false,
@@ -3242,6 +3337,50 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
     }
 }
 
+/// `kern network create|ls|rm`: the object behind an `external: true` compose network.
+///
+/// THE SHAPE IS `kern pod`'s, DELIBERATELY. The two are the same kind of thing to an operator - a
+/// named object a stack joins - and giving them different verb spellings would be a second grammar
+/// to learn for no reason. `net` is accepted as well because `docker network` has no short form and
+/// people type one anyway.
+fn parse_network(rest: &[&str]) -> Result<Command, Error> {
+    match rest.get(1).copied() {
+        Some("create" | "new") => {
+            reject_unknown_flags("network create", &rest[1..], &[])?;
+            let name = rest
+                .iter()
+                .skip(2)
+                .find(|a| !a.starts_with('-'))
+                .ok_or(Error::Usage("network create <name>"))?;
+            Ok(Command::NetworkCreate {
+                name: (*name).to_string(),
+            })
+        }
+        Some("ls" | "list") => {
+            reject_unknown_flags("network ls", &rest[1..], &["--json"])?;
+            Ok(Command::NetworkList {
+                json: rest[1..].contains(&"--json"),
+            })
+        }
+        Some("rm" | "remove") => {
+            reject_unknown_flags("network rm", &rest[1..], &[])?;
+            let names: Vec<String> = rest
+                .iter()
+                .skip(2)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect();
+            if names.is_empty() {
+                return Err(Error::Usage("network rm <name>..."));
+            }
+            Ok(Command::NetworkRemove { names })
+        }
+        _ => Err(Error::Usage(
+            "network create <name> | network ls [--json] | network rm <name>",
+        )),
+    }
+}
+
 /// What to say about a flag `kern compose` does not accept.
 ///
 /// IT USED TO SAY NOTHING. Every unknown flag returned the same usage dump, which does not contain
@@ -3700,6 +3839,13 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             }
         }
         Command::PodRemove { names } => crate::pod::remove(&names),
+        Command::NetworkCreate { name } => {
+            crate::network::create(&name)?;
+            println!("created network '{name}'");
+            Ok(())
+        }
+        Command::NetworkList { json } => crate::network::print_list(json),
+        Command::NetworkRemove { names } => crate::network::remove_many(&names),
         Command::PodHolder => crate::pod::run_holder(),
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
         Command::EgressProxy { sock, allow } => crate::egress::proxy_reexec(&sock, &allow),
@@ -3742,7 +3888,17 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             all,
             filters,
             format,
-        } => commands::ps(json, quiet, all, &filters, format.as_deref()),
+        } => commands::ps(
+            if json {
+                commands::JsonShape::Array
+            } else {
+                commands::JsonShape::No
+            },
+            quiet,
+            all,
+            &filters,
+            format.as_deref(),
+        ),
         Command::Stats { json, names } => commands::stats(json, &names),
         Command::Logs { name, tail, follow } => commands::logs(&name, tail, follow),
         Command::Inspect { name, json } => commands::inspect(&name, json),
@@ -3790,6 +3946,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             run_cmd,
             run_rm,
             no_deps,
+            exit_code_from,
+            abort_on_exit,
+            remove_orphans,
+            ps_quiet,
+            ps_services,
+            ps_format,
             tail,
             follow,
             all,
@@ -3812,6 +3974,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             run_cmd: &run_cmd,
             run_rm,
             no_deps,
+            exit_code_from: exit_code_from.as_deref(),
+            abort_on_exit,
+            remove_orphans,
+            ps_quiet,
+            ps_services,
+            ps_format: ps_format.as_deref(),
             tail,
             follow,
             all,
@@ -4100,6 +4268,82 @@ mod tests {
         assert!(
             p(&["compose", "stack.yml", "logs", "web", "-c", "x"]).is_err(),
             "outside `run`, an unknown flag is still a usage error"
+        );
+    }
+
+    /// `--exit-code-from` implies the abort, and both reach the command.
+    ///
+    /// MEASURED on Docker 29.6.2 before it was written: `--exit-code-from tests` and
+    /// `--abort-on-container-exit` both exit 3 on a stack whose `tests` exits 3, and both leave no
+    /// container running, so the first flag cannot be the second one's weaker cousin.
+    #[test]
+    fn exit_code_from_implies_the_abort() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let (_, cmd) = p(&["compose", "s.yml", "up", "--exit-code-from", "tests"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match cmd {
+            Command::Compose {
+                exit_code_from,
+                abort_on_exit,
+                ..
+            } => {
+                assert_eq!(exit_code_from.as_deref(), Some("tests"));
+                assert!(
+                    abort_on_exit,
+                    "naming a service implies aborting on an exit"
+                );
+            }
+            other => panic!("must be a compose up: {other:?}"),
+        }
+        // The abort ALONE names nobody, and that is the difference between the two flags.
+        let (_, alone) = p(&["compose", "s.yml", "up", "--abort-on-container-exit"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match alone {
+            Command::Compose {
+                exit_code_from,
+                abort_on_exit,
+                ..
+            } => {
+                assert!(abort_on_exit);
+                assert_eq!(exit_code_from, None);
+            }
+            other => panic!("must be a compose up: {other:?}"),
+        }
+        assert!(
+            p(&["compose", "s.yml", "up", "--exit-code-from"]).is_err(),
+            "the flag needs a service name"
+        );
+    }
+
+    /// The three `ps` spellings a deploy script reaches for all arrive, and none of them turns on
+    /// either of the others.
+    #[test]
+    fn compose_ps_carries_quiet_services_and_format() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let got = |args: &[&str]| match p(args).unwrap_or_else(|e| panic!("{e}")).1 {
+            Command::Compose {
+                ps_quiet,
+                ps_services,
+                ps_format,
+                ..
+            } => (ps_quiet, ps_services, ps_format),
+            other => panic!("must be a compose command: {other:?}"),
+        };
+        assert_eq!(got(&["compose", "s.yml", "ps", "-q"]), (true, false, None));
+        assert_eq!(
+            got(&["compose", "s.yml", "ps", "--services"]),
+            (false, true, None)
+        );
+        assert_eq!(
+            got(&["compose", "s.yml", "ps", "--format", "json"]),
+            (false, false, Some("json".to_string()))
+        );
+        // DISCRIMINATOR: a plain `ps` turns none of them on, or the assertions above would pass on
+        // a parser that hardcodes all three.
+        assert_eq!(got(&["compose", "s.yml", "ps"]), (false, false, None));
+        assert!(
+            p(&["compose", "s.yml", "ps", "--format"]).is_err(),
+            "--format needs its argument"
         );
     }
 

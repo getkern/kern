@@ -179,9 +179,25 @@ impl Error {
             // The right hint depends on *why* the pull failed - telling someone whose image name is
             // wrong to "install curl and tar" sends them down the wrong path. Branch on the message.
             Error::Oci(msg) => Some(oci_hint(msg)),
-            Error::Compose(_) => {
-                Some("compose: `[box.NAME]` tables with image/rootfs, command, depends_on".into())
-            }
+            // THE HINT USED TO DESCRIBE THE WRONG FILE FORMAT. kern reads two kinds of stack: a
+            // `docker-compose.yml` and its own TOML. The hint named only the TOML
+            // (``compose: `[box.NAME]` tables with image/rootfs, command, depends_on``), so every
+            // refusal of a YAML file - which is almost all of them - ended with advice about a
+            // syntax the reader is not writing. MEASURED on `services:` written as a list: the
+            // message said the block was empty (wrong, and fixed at the parser) and the hint then
+            // sent the reader to TOML. Two wrong directions under one mistake.
+            //
+            // SUPPRESSED WHEN THE MESSAGE ALREADY CARRIES ITS REPAIR, which is the rule `Volume`
+            // above already follows and `oci_hint` below: a generic pointer printed under a
+            // paste-ready instruction is noise, and noise under an instruction is how an
+            // instruction gets skipped. A backtick is the marker, because that is how this codebase
+            // writes a key or a command inside a sentence, and a newline is the other (a
+            // multi-line message brought its own fix).
+            Error::Compose(msg) => (!msg.contains('`') && !msg.contains('\n')).then(|| {
+                "compose: a stack is a `docker-compose.yml` (`services:` with `image:` or \
+                 `build:`) or a kern TOML (`[box.NAME]` with image/rootfs, command, depends_on)"
+                    .into()
+            }),
             // A build-history lookup miss (`build logs|inspect <id>`) is not a Dockerfile problem, so
             // point it at the list - not the FROM/COPY hint, which would mislead. Same message-shape
             // routing as `oci_hint`.

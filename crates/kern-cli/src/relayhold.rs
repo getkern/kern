@@ -1273,7 +1273,20 @@ pub(crate) fn holder_pid(dir: &Path) -> Option<i32> {
 /// Best-effort and idempotent. A non-positive pid is never signalled, and a pid that is not alive is
 /// not signalled either, so a recycled pid belonging to someone else is never killed.
 pub(crate) fn kill_holder(dir: &Path) {
+    // THE NATs FIRST, AND UNCONDITIONALLY, because they are not the holder's.
+    //
+    // Each box's NAT is recorded under `outbound/<service>/` in this same directory, and it is
+    // attached whatever the stack's WIRING is: a pod stack and a bridge stack have no relay holder
+    // at all, and a relay stack whose holder file cannot be read still has its NATs. Placed after
+    // the read below - which is where it went first - this ran for exactly one of the three cases,
+    // and the integration test caught two NATs surviving a `down` on a stack that had no holder to
+    // find. See `pod::stop_stack_outbound_nats`.
+    let _ = crate::pod::stop_stack_outbound_nats(dir);
     let Ok(text) = std::fs::read_to_string(holder_path(dir)) else {
+        // No holder: a pod or bridge stack, or a second `down`. The NATs above are stopped either
+        // way; the rest of this function is about a process that is not there.
+        let _ = std::fs::remove_dir_all(dir.join("outbound"));
+        let _ = std::fs::remove_dir(dir);
         return;
     };
     let Ok(pid) = text.trim().parse::<i32>() else {

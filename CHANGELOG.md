@@ -7,6 +7,449 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A pod holder stops holding when its pod stops existing.** A holder keeps one pod's user and net
+namespaces alive and is addressed through the pod's directory; when that directory goes, nothing can
+name the pod, join it or remove it, and the holder went on holding anyway - forever, with its `pasta`
+beside it. MEASURED on the development machine: 140 orphan holders and 116 NAT processes, the oldest
+alive for 5.8 hours, all from test runs that pointed `XDG_RUNTIME_DIR` at a temporary tree and
+removed it without tearing the pods down. A user whose runtime directory is cleaned on logout reaches
+the same state. The holder now polls for its own directory and exits when it is definitely gone, and
+every uncertainty resolves to "keep holding": no recorded directory means the old `pause()` forever,
+an unreadable directory is not a missing one, and absence must hold across two polls a full interval
+apart so a rename is never mistaken for a removal.
+
+**`down` stops a stack's NATs instead of deleting the files that identify them.** Teardown removed
+the `outbound/` subtree with `remove_dir_all`, and that subtree is where each box's `pasta.pid` and
+`pasta.id` live: the processes were never signalled and the only records that could find them again
+went in the same call. It hid behind the healthy case - a NAT that keeps its netns watch exits by
+itself, so repeated `up`/`down` cycles showed no drift - and leaked the other population: a host that
+refuses the netns-directory open makes pasta fall back to `--no-netns-quit`, and that one waits for a
+signal through the pid file that had just been deleted. 27 such processes were found on this machine,
+every one from a box running as a non-root user, which is precisely where that open is refused.
+
+`kern gc` reaps the rest: a `pasta` in kern's own directory layout whose watched namespace no longer
+exists is terminated, which cleans debris left by any earlier crash. Three conditions decide a
+victim, and a pasta whose namespace is gone is doing nothing for anyone by definition.
+
+**A dependency cycle is reported in the file's own words.** `dependency cycle detected among:
+fuzzc-06f7c969-a, fuzzc-06f7c969-b` named the boxes kern invented for a file that says `a` and `b`.
+Both graph walks built that string separately; there is one function now, and it uses the service
+name.
+
+**A `services:` block of the wrong shape is named for what it is.** Written as a LIST - one of the
+commonest ways a compose file is mistyped by hand - it produced no services, fell through to the
+emptiness check and answered "`services:` is empty" about a file holding two entries. Measured on the
+reference, `docker compose config` answers `services must be a mapping` for a list, a scalar and an
+empty block alike; kern now says so too, adding the shape it actually found, and keeps its own more
+specific sentence for the genuinely empty case.
+
+**A compose refusal no longer ends with advice about the other file format.** Every compose error
+printed ``compose: `[box.NAME]` tables with image/rootfs, command, depends_on``, which is kern's TOML
+syntax: a refused `docker-compose.yml`, which is nearly every refusal, ended with instructions for a
+language the reader is not writing. The hint now names both formats, and is suppressed entirely when
+the message already carries its own repair - the rule the volume and OCI errors already follow.
+
+**`kern ps` and `kern top` measure the NAME column instead of assuming it.** It was a fixed sixteen
+characters. `ps` pushed every column after a longer name out of line; `top` truncated, which is
+worse - a relay-wired compose stack rendered as `psbug-749cf899-f`, `psbug-749cf899-s` and
+`psbug-749cf899-a`, three services told apart by one letter in the column whose only job is to tell
+them apart. Both now size the column to the names in the table, floored at sixteen so short output is
+unchanged and ceilinged at forty-eight so one pathological name cannot push STATUS off the terminal.
+Names are never truncated: the name is what `kern stop` takes.
+
+**The SDK's missing-binary error gives the command instead of a link.** `pip install kern-sandbox`
+installs the wrapper, not the runtime it drives, and the moment a user meets that fact is this
+exception. It answered with a repository URL; it now answers with the installer line the README leads
+with, and says which of the two things was installed.
+
+**`scripts/launch-dryrun.py`: the end-to-end rehearsal.** Ten real-world stacks (Postgres+Redis,
+Node+Mongo, WordPress+MariaDB, two backends on one port, RabbitMQ, memcached, Adminer, a
+`service_healthy` gate, a shared named volume, segregated networks) brought up for real, probed from
+INSIDE each stack by reaching a peer by name, and torn down - with every phase bracketed by a census
+of boxes, pods, NAT processes, relay directories, cgroups and host veth interfaces that must return
+to exactly where it started. Plus Ctrl+C on an attached `up` through a real controlling terminal,
+SIGKILL of `up` mid-bring-up, and the Python SDK with and without a binary on PATH.
+
+**A network shared BETWEEN projects: `external: true` works.** A compose file declares it,
+`kern network create <name>` makes it, and services of different files on that network resolve and
+reach each other by name - the reverse-proxy pattern (Traefik or nginx in one stack, the applications
+in others). A file naming a network that does not exist is REFUSED, which is what the reference does:
+measured on Docker 29.6.2 with compose plugin v5.3.1, `up` answers `network X declared as external,
+but could not be found` while `config` renders the file, and kern now matches both, naming
+`kern network create` in the refusal. It was the largest remaining cause that was kern's to close: 13
+files of 259 declared one, 9 with nothing else between them and a clean run.
+
+IT IS RELAYS AND NOT A SHARED BRIDGE, because rootless Linux does not offer the bridge. Two refusals,
+each checked against a control that rules out the tool: from the initial user namespace, joining
+another holder's network namespace is EPERM (entering its user namespace first works); from inside
+one pod's user namespace, creating a veth whose peer lands in a sibling pod's namespace is EPERM
+(both ends inside one pod works). Joining a network namespace needs `CAP_SYS_ADMIN` in the caller's
+OWN user namespace and placing a link needs `CAP_NET_ADMIN` in the one that owns the target, and a
+sibling has neither. kern's peer relay needs neither, because its two halves each enter only their
+own box - which was verified end to end before any of this was designed, with a hand-written plan
+naming one box from each of two separately started stacks.
+
+EACH MEMBER GETS ONE ADDRESS, `127.1.<network>.<member>`, allocated when it joins and released when
+it leaves: every other member binds it to reach that member, and that member uses it as its own
+source. A per-joiner numbering would have been unsound with three projects, and the `127.1` prefix
+cannot collide with a stack's own peer aliases in `127.0.0.2`-`127.0.0.254`. A stack joining later is
+wired into the boxes already running - relays into them, and their `/etc/hosts` written in place,
+which was measured to be visible inside immediately and needs no resolver process - and `down` takes
+both directions away again and leaves the network.
+
+**A compose stack gets a network namespace PER SERVICE by default, which is what Docker does.** From
+two services up, each one keeps its own `127.0.0.1` and they meet on the stack's bridge; a port a
+service binds on its loopback is now private to it. The old wiring - one shared namespace for the
+whole stack, where every peer could reach that port - is `--pod` and prints what it costs. A
+single-service stack still gets the shared namespace, having no peer to be separated from, and a
+file whose `networks:` separate two services still gets the relay wiring, because one bridge would
+put them back on one network.
+
+It was the largest remaining difference from Docker on the neutral corpus: 135 files of 259 carried
+the warning and 101 carried nothing else, so the compatibility rate moved from 87 files to 188
+(33% to 72%). The measured case for the pod was good and is kept in docs/RUNTIME-PARITY.md section
+30 - 22 stacks read from inside, 2 loopback-only listeners, both nominal, 0 collisions - and the
+default changed anyway: a runtime whose reason is confinement does not ship a boundary weaker than
+the reference by default, and "nothing found in 22 stacks" is not "nothing there", since 94 of the
+136 affected files could not be started from that corpus at all.
+
+**The bridge stopped costing 30 ms a service.** It cost +239 ms on an eight-service stack and costs
++27 ms now, and neither cause was the bridge:
+
+  * A veth end MOVED between network namespaces waits a full RCU grace period in the kernel, 14-22 ms
+    measured against 1-2 ms to create the peer directly inside the target namespace by naming it in
+    the CREATE message. kern moved it, once per service. A bridged member went from 16-30 ms to 5-6,
+    against a pod member's 4. A kernel that ignored the attribute would leave the peer behind and the
+    member would fail to start, so the fallback checks by LOOKING rather than by the return value,
+    and was verified by deleting the attribute: the stack still comes up, 20 ms a service slower.
+  * Every NAT was attached one at a time, about 17 ms each, inside the loop that releases services in
+    dependency order. They do not depend on each other - every box is prepared and held at its
+    pre-exec gate before any is released - so they now run concurrently, before the first release.
+    The ordering guarantee is unchanged and stronger: no service is released until every NAT is up.
+
+Eight services on a bridge with no NAT at all (`internal: true`) come up in 173 ms against the pod's
+171: the bridge itself was free, and the two serial waits were the whole bill. `scripts/wiring-cost.py`
+takes the number, paired and alternated, and refuses to conclude on a loaded machine or when a sample
+did not actually bring the stack up.
+
+**The compatibility rate now reports the rootless port floor as a second MEASURED number.** 198 of 259
+on this host, 222 of 259 in a network namespace whose `net.ipv4.ip_unprivileged_port_start` is 0,
+which is one `sysctl` on a real host. The 22 files between them publish a port below 1024: rootless,
+the kernel refuses the bind, so kern moves the port and says so, podman refuses it outright and names
+the same sysctl, and Docker binds it because it is root. It is measured by re-running the whole
+corpus in that namespace rather than by subtracting a cause from the first number, because a derived
+figure printed beside a measured one is how this project has produced wrong numbers before, and
+because the subtraction assumes the causes are disjoint - which the second run is what checks.
+
+**The relay wiring reaches into a service that runs as a non-root user.** It could not, and the
+message blamed the wrong thing: a stack whose `networks:` segregate died with
+`peer relay: binding 127.0.0.2:5432 inside the calling box: errno 13`, and nothing had been bound.
+
+THE CAUSE, measured with a positive control that changes nothing but the flag: a credential change
+clears `PR_SET_DUMPABLE`, and a process that is not dumpable has its `/proc/<pid>/ns/*` refused
+EACCES to every caller, including the uid that owns it - `open ns/user` answers OK at `dumpable=1`
+and `Permission denied` at `dumpable=0`, same uid in both arms. A relay enters a box by opening
+exactly those two files, and it does so while the box is HELD AT ITS PRE-EXEC GATE, which is after
+the uid switch and before the `execve` that would put the flag back. The window the gate creates for
+correctness was the window in which the box could not be entered.
+
+The box now restores the flag itself, immediately after the uid switch. That gives nothing away:
+`execve` recomputes `dumpable` from the new credentials a moment later, so the only interval this
+changes is the one in which kern's own setup code is the only thing running; and the classic reason
+to leave a uid-changed process undumpable is a setuid `execve` afterwards, which `PR_SET_NO_NEW_PRIVS`
+already makes inert - the same reasoning this tree records for the `nosuid` remount being defence in
+depth rather than load-bearing.
+
+Found on `khaanh112/SkyTimeHub`, the only image-only file in the 259-file neutral corpus that kern
+wires with relays: it was the entire runnable sample of that wiring, and it was failing. It now comes
+up with all four services and the non-root service reaches its peer by name, three runs out of three.
+
+**And the relay says which step failed when one does.** The status pipe carries the step in the sign
+of the value it already sent, so entering the box and binding inside it are no longer reported with
+one sentence and an invented errno.
+
+**An anonymous volume in LONG form is mounted, not dropped.** `{type: volume, target: /app/node_modules}`
+with no `source:` is the same request as the short `- /app/node_modules`, which kern has honoured
+since it was measured breaking a real project: Docker makes a fresh volume, names it itself and
+reuses it for that service and path. The long form was skipped with a warning, which is the one
+outcome the file cannot mean - the mount exists to stop a bind mount of the project directory from
+hiding what the image built, so dropping it hands the service the empty directory it was written to
+avoid. Both spellings go through the same naming function, so a file that switches between them gets
+one volume and not two.
+
+**`compose exec` runs the command instead of explaining where to run it.** It used to be read as a
+service name ("no service 'exec'"), then as a Docker verb kern does not have ("run
+`kern exec <box>`"): two wrong answers to the same question, because the reader knows `web` and not
+`<project>-<hash>-web`, and looking the box up by hand is the step that sends people back to Docker.
+It now resolves the service, refuses a stopped one by naming both `up -d` and `run` for a one-off,
+and exits with the COMMAND's status: `exec -T a sh -c 'exit 7'` exits 7 here and under Docker
+29.6.2.
+
+**A reboot is named where it is decided, not discovered the next day.** A service with `restart:` in
+a pod got a note that said it would not survive a reboot and offered only "run it as a standalone
+box", which trades the pod away: no peer-by-name, no shared egress, `depends_on` stops meaning
+anything. The note now prints the three commands that keep the stack, filled in with this project's
+own unit name, and `doctor` says the other half: lingering being ON is necessary and NOT sufficient,
+because nothing in the user manager starts a compose stack without the unit. Docker survives a
+reboot because its daemon starts at boot and owns the containers; kern has no daemon, so the unit is
+that job.
+
+**`runtime:` is answered by its VALUE.** It is the only key the neutral corpus reports as
+unimplemented, on two files, and both write `runtime: nvidia`. A generic "ignored (unsupported)" was
+wrong twice: it said nothing about what would happen, and what happens is a CUDA or driver error
+inside the service that reads as a broken driver on the host. `nvidia` now names the device-grant
+path and predicts that failure; any other value is told that kern IS the runtime and cannot hand the
+container to another one. The two are separate answers because they are opposite requests.
+
+**A near-miss service key is named.** After `runtime:` was answered, ONE file was left in the
+generic bucket and its key is `depend-on:`, a typo for `depends_on` that costs the file an ordering
+constraint and that Docker ignores just as silently. A key one edit away from a known one now says
+which, with hyphens and underscores folded first so `depend-on` reaches `depends_on`. The radius
+stops at one edit: `enviroment` gets `environment`, `enviroments` gets nothing, and a key that is
+nothing like ours gets no suggestion at all, because a suggester that reaches too far sends a reader
+to change a line that was never the problem.
+
+**A compose service got no swap, and that decision rested on a premise a third runtime disproves.**
+`memory.swap.max = 0` was chosen as "stricter, and said so", believing a rootless runtime had to.
+Measured on the same host: podman 4.9.3, rootless, gives `max` and `max` with no memory key and
+`256m`/`256m` with `--memory 256m`, exactly as Docker 29.6.2 does. It did not have to. And kern's
+own ceiling with nothing written is the HOST'S RAM, not a small number, so the box was never bounded
+either: not strict, not Docker, and carrying no warning, which is the one combination this project
+refuses. A workload that would have swapped and survived under both references was OOM-killed here.
+
+Three rules now, each the measured behaviour of the two references: nothing written gets the host's
+own `SwapTotal`, which is the same decision the build path already took; `mem_limit: 256m` alone
+gets a 256m allowance, so a file tuned against Docker's 2x total keeps its headroom; `memswap_limit`
+is untouched, since the parser already turns Docker's TOTAL into the v2 swap-only figure by
+subtraction. A host with no swap gets no flag, because writing `0` would restate the defect.
+
+The RUNTIME-PARITY row that read "kern deviates: STRICTER" is withdrawn rather than reworded.
+
+**kern names the sysctl that keeps a privileged port where the file wrote it.** podman refuses the
+same port with "you can add 'net.ipv4.ip_unprivileged_port_start=80' to /etc/sysctl.conf (currently
+1024)", which tells the reader how to make their file work unchanged. kern moved the port and
+offered only `privileged_port = "refuse"`: the two options it named were "different" and "broken",
+and the one that gives the file what it asked for was missing. The floor in the sentence is read
+from the host, so the number is this machine's.
+
+**Three deviations that had no warning and were therefore not in the rate.** An outside reviewer
+attacked the definition of the "no named difference" figure: it counts warning lines, and a
+difference kern knows about but does not warn about is not in it. Three were found, measured, and
+declared:
+
+  * A service with NO memory key gets `memory.max` = the host's RAM and `memory.swap.max` = **0**,
+    where Docker 29.6.2 gives `max` and `max`. The cap at host RAM is inert; the zero swap is not, a
+    workload that would have swapped and survived is OOM-killed here. It has no warning because it
+    applies to nearly every file.
+  * A service running as `user: "1000:1000"` writes files a rootful Docker leaves owned by 1000 and
+    kern leaves owned by **100999**, through the subuid range. Visible on the first `ls -la ./data`.
+  * Nothing brings a stack back after a reboot: kern has no daemon, and `compose systemd` plus
+    `loginctl enable-linger` is the path. Docker's daemon restarts its containers at boot.
+
+The rate is now defined as "no difference BEYOND the declared deviations", and the declared list is
+complete rather than partial. Counting the three per file instead would put a warning on almost
+every file in the corpus and make the number describe nothing.
+
+**`compose ps --format json` carries `Publishers`.** Measured shape on Docker 29.6.2:
+`[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":18080,"Protocol":"tcp"}]`. It is the field a
+script reads to find where a service actually answers, and on a rootless runtime that is the one
+thing it cannot assume: a file that writes `80:80` is published on **8080**, and the field says so.
+`Image`, `Mounts` and `Size` stay absent because the registry holds no value for them.
+
+**The acceptance claim carries its corpus.** "No file Docker accepts and kern refuses" is true on
+these 259 files and is not a claim about the class: kern refuses at `config` two mappings that share
+one host port, which Docker accepts and fails at `up`, half-started. The 95% is ACCEPTANCE and not
+execution: of 41 files taken further and started, 19 did not come up for reasons that are the
+corpus's, not kern's.
+
+**`scripts/build-corpus-census.py`** is the only way left to close the shared-loopback question, and
+it is built rather than described. 83 of the 136 files that carry the note declare `build:` and say
+nothing about their bind addresses: the address lives in the image's `CMD` or an application
+default, so neither the file nor a cached corpus can answer. This clones the repository the corpus
+filename encodes, builds, runs the stack and applies the SAME probe the image-only census uses
+(imported, not copied, so the two cannot drift into measuring different things), and reports its own
+denominator: a repository that is gone, private, fails to build or does not come up lands in its own
+bucket and is never read as clean.
+
+IT IS NOT RUN BY ANY GATE AND REFUSES TO RUN WITHOUT `--yes-build-foreign-code`, because building a
+Dockerfile written by a stranger executes that stranger's `RUN` lines on the machine that runs it.
+The plumbing is verified end to end on a synthetic repository that cannot be cloned, which exercises
+every step except the build itself. Whether to point it at 83 real repositories is a decision for
+whoever owns the machine.
+
+**The wiring answer no longer depends on which images a machine happens to hold.** kern reads an
+image's `EXPOSE` set to find two services claiming one internal port, and read it from the local
+cache only, so the same file answered `pod` before a pull and `bridge` after one. `kern_oci` now
+exposes `fetch_image_config`, which resolves the manifest through the SAME prologue `pull` uses
+(the digest pin on a pinned reference, the exact-arch selection with no fallback, the verification
+of the sub-manifest against the digest the index named: extracted without a line changed, so the two
+callers cannot come to verify different things) and then fetches the config blob and stops. No layer
+is downloaded and nothing is written to the image store, which would otherwise read as "this image
+is present" to every other caller and fail the next `kern box --image` on a rootfs nobody extracted.
+
+Measured over the neutral corpus: the files whose wiring was decided without reading an image go
+from **90 to 2**, the two being images that cannot be fetched at all, and two consecutive runs now
+produce identical numbers.
+
+**The fetch is opt-in, and the measurement is why.** A config blob costs ~2 s per uncached image
+when the registry answers and EIGHTY SECONDS for a two-service file whose registry does not resolve,
+because the timeouts on that path are 10 s connect and 30 s total across several requests. A dry run
+that can take eighty seconds is not a dry run, and Docker's `config` never touches the network. So
+`config` keeps answering in 2 ms and declaring what it could not read, and
+`KERN_COMPOSE_FETCH_IMAGE_CONFIG=1` buys the exact answer for callers that need it.
+`compose-compat-rate.py` sets it, because a published number must not depend on a local cache. `up`
+never needs it: it resolves its images through the ordinary pull path before deciding.
+
+The answers are memoised in a directory of their own (`$XDG_CACHE_HOME/kern/expose`), holding port
+numbers and nothing else, so a second `config` on the same file is offline. A pulled image always
+wins over the memo, so a `pull` that changes what a tag means takes effect at once. The filename is
+the reference with unsafe characters replaced, which is many-to-one, so each file carries the
+reference it was written for and a read that does not match is discarded: a collision costs a
+refetch, never a wrong answer.
+
+**The first `up` on a machine that had never pulled an image could break the stack, and the second
+one fixed it.** kern reads each image's `EXPOSE` set to find two services claiming one internal
+port, and that finding decides the wiring. The read happens before anything is pulled, so on a cold
+cache it finds nothing, the stack goes into one namespace, and a service that cannot bind dies.
+Measured on two services sharing `memcached:1.6.34-alpine`, whose collision exists only in the
+image and nowhere in the file:
+
+```
+cold cache, up -d   ->  wiring: pod     ->  "1 service(s) died within 150ms of starting: a"
+warm cache, up -d   ->  wiring: bridge  ->  both services up
+```
+
+The same command, twice, two outcomes. An outside reviewer predicted the shape from the `config`
+behaviour and asked which side of the pull the decision falls on; it fell on the wrong one. The
+verbs that are about to start boxes now resolve the images BEFORE deciding, which is also what
+Docker does (measured on 29.6.2: every `Pulling` line precedes the first `Creating`). `config` is
+unchanged and still a dry run that declares what it could not read.
+
+**The collision axis of `loopback-census.py` was blind, and its zero meant nothing.** A collision is
+a bind that FAILED, and the process that lost it exits, so it owns no socket: two services on
+`0.0.0.0:7777` in one namespace leave ONE listener in `/proc/net/tcp`, indistinguishable from a
+single service. The script had a positive control for the loopback axis and none for this one,
+which is exactly the empty green this repo hunts elsewhere. It now reads the axis from the service
+that DIED, through its own log, and carries four controls: a real collision is reported
+(`nc: bind: Address in use`), the same stack on two different ports is not, a UDP listener on
+loopback is caught (`/proc/net/udp` was not being read at all), and a bind that happens after the
+settle is missed, which is printed as a bound on the claim rather than left for a reader to assume.
+A settle was added for the same reason: `up -d` waits 150 ms, and a loser that binds two seconds
+later was being called clean.
+
+**`scripts/declared-bind-census.py`** answers the half no runtime census can reach. 94 of the 136
+shared-loopback files declare `build:` and carry no context in this corpus, so they cannot run
+here; what they DECLARE can still be read. On those 94: **0 declare a collision, 0 declare a
+loopback bind, 11 declare `0.0.0.0` explicitly, 83 say nothing** and are only reachable by
+building. Its own first defect is recorded in it: it reported a collision on a file kern correctly
+wires as a pod, because the colliding pair sits behind a `profiles:` nobody enabled.
+
+**`compose ps --format json` emits Docker's field names beside kern's.** Matching NDJSON and then
+emitting `{"name": …}` would still break the line every deploy script contains,
+`compose ps --format json | jq -r .Service`. The object now carries `Name`, `Service`, `Project`,
+`State`, `Health`, `ExitCode` and `Command` alongside kern's lowercase keys: different spellings,
+no collision, and neither consumer has to know about the other. `Image`, `Publishers`, `Mounts` and
+`Size` are absent rather than invented, so a script reading `.Publishers[0]` fails loudly instead of
+reading a zero.
+
+**`compose config` was not a pure function of the file, and the rate inherited it.** kern reads each
+image's `EXPOSE` set to find two services claiming one internal port, and that finding decides the
+WIRING. It reads with `PullPolicy::Never`, so an image that is not in the local cache is not read,
+and the same file answers differently either side of a pull. Measured on one corpus file, one
+command apart:
+
+```
+image in the cache      config -> wiring: bridge
+kern rmi <image>        config -> wiring: pod
+```
+
+Two files moved between the buckets of the published rate that way, silently, between two runs on
+the same binary. Pulling to answer a `config` would be worse, so the dependence stays and is now
+NAMED: `config` prints `wiring-images-unread: N (service (image), …)` and a note saying the answer
+can change after a pull, and `compose-compat-rate.py` prints how many files of the corpus are in
+that state. On the neutral corpus it is **96 of 259**, which is the bound on how reproducible that
+rate is across machines, and nothing said so before.
+
+**The third number: what the shared loopback actually changes.** The largest cause between the
+corpus and a clean rate is kern's "services share 127.0.0.1" note, on 136 files, 107 of them
+carrying nothing else. Two reviewers asked independently whether the wiring default should change,
+and both answered that it cannot be decided until somebody measures which of those files are
+actually affected. `scripts/loopback-census.py` measures it from inside the running stacks, on two
+observables: a service binding `127.0.0.1`/`[::1]` only, which Docker keeps private and one shared
+namespace does not, and a collision on a port no service declares, which Docker allows and one
+namespace cannot.
+
+Of the 136, 94 declare `build:` and cannot start from this corpus, which carries no build contexts.
+Of the 41 image-only files, 22 came up. **2 of the 22 have services that bind loopback only**:
+LinguaLeap on `127.0.0.1:9000`, kafka-cli-app on `127.0.0.1:9093` and `:9094`. Under Docker those
+ports are private to their container; under one shared namespace every peer reaches them.
+
+THE FIRST RUN OF THIS CENSUS SAID 0 OF 19 AND WAS WRONG, which is recorded here rather than
+quietly replaced: that probe had no settle (a service that binds two seconds in was read as
+clean) and no way to see a collision at all. The number is 9% of what could be measured, below the
+10% and 15% thresholds two independent reviewers set for changing the wiring default and above the
+zero first published. Against the cost as it stood then (about 30 ms a service, turning a flat
+172 ms bring-up into 402 ms at eight services), it did not move the default. It says nothing about
+the 94 `build:` files.
+
+THE DEFAULT MOVED LATER ANYWAY, and this paragraph is kept rather than rewritten because the
+reasoning is the record: the census was the case FOR the pod and it held. What changed was the other
+side of the trade. The entry at the top of this section has the argument and the numbers, and the
+cost it was weighed against is now +27 ms at eight services rather than +239.
+
+**`up --exit-code-from <service>` and `--abort-on-container-exit`.** The CI line that turns a test
+service's status into the job's. Docker's three cases, measured on 29.6.2 and reproduced: with
+`tests` exiting 3, `--exit-code-from tests` exits 3 and leaves nothing running; the abort alone
+exits 3 the same way; and `--exit-code-from db`, where `db` never exits on its own, exits **137**,
+because the abort is what ended it. The logs stream while it waits, through the same multiplexer an
+attached `up` uses, stopped at the FIRST exit rather than the last. A service the file does not
+define is refused, as Docker refuses it.
+
+**`down --remove-orphans`.** A service renamed in the file leaves its old box running, still holding
+its published ports, and the next `up` fails on a bind conflict against something the file no longer
+mentions. The scope is the project's POD, so another project's `db` is never in range however it is
+named, and orphans are stopped BEFORE the pod is removed, because after that there is no membership
+left to read.
+
+**`compose ps -q`, `--services` and `--format json`.** The three spellings a deploy script reaches
+for. `-q` and `--format` are threaded to `kern ps`, the renderer the compose view already shares, so
+the two can never disagree about a column; `--format json` is mapped onto `kern ps --json` rather
+than duplicated. `--services` answers from the FILE and not from the registry, which is Docker's
+behaviour and the only useful one: the list a script iterates must not depend on whether the stack
+happens to be up. The human-readable degraded-edge notes are suppressed under all three, since a
+script parsing NDJSON must not be handed a sentence.
+
+**`compose cp <service>:<path> <dst>`.** The same copier `kern cp` uses, with the SERVICE name
+resolved to the box name it now has. That resolution is the point: a reader of a compose file knows
+`web`, not `<project>-<hash>-web`, and looking it up by hand is the step that sends people to
+`exec … | tar`.
+
+### Corrected
+
+**The v0.9.32 entry "Docker Compose compatibility went from 14% to 94%" reported the ceiling under
+the definition of a different number.** That entry defines its figure as "the share of files kern
+runs with no behavioural difference from what the file says". Measured today on the same neutral
+corpus (259 files, one per repository), the same verb (`config`) and a binary proven to be the
+current tree, that share is **35%** (91 of 259). The 94% matches the OTHER number the same
+measurement produces, the ceiling: files kern accepts and could run clean if every named difference
+were closed, today **95%** (247 of 259).
+
+Both numbers, with the definition each one answers:
+
+  * `config-accepted` (the ceiling): 247 of 259 = **95%**. The 12 it excludes are refused, and
+    Docker 29.6.2 refuses all twelve, so this bound is the corpus and not kern's parser.
+  * `config-clean` (no named difference): 91 of 259 = **35%**. The dominant cause is the shared
+    loopback (135 files, 106 of them carrying nothing else).
+  * `e2e-semantic` (observables inside live boxes): 7 of 7 probes.
+
+The 14% is NOT reproducible: no corpus, verb or binary is recorded for it, and nothing in this tree
+recomputes it. It is withdrawn rather than restated.
+
+The released entry is left as it was, with one line added pointing here: a number corrected in place
+in a shipped release is a worse record than one whose correction can be found from where the error
+is. Both figures are produced by `scripts/compose-compat-rate.py`, which now refuses to run against
+a binary that is not the working tree and fails when any warning it counts is unclassified.
+
 **`compose run`.** The step 2 of nearly every project README (`run --rm web python manage.py
 migrate`, `run --rm app npm test`), and the verb two independent reviewers each put first among
 what kern was missing. It takes a service's definition, runs it once in the foreground with a
@@ -511,7 +954,8 @@ from the host. `[kern] publish_bind` in `kern.toml` is a ceiling no file can wid
 
 **Docker Compose compatibility went from 14% to 94%**, measured before and after on the same neutral
 corpus of 259 files, one per repository, sampled across 733 repositories: the share of files kern
-runs with no behavioural difference from what the file says. What remains is dominated by keys asking
+runs with no behavioural difference from what the file says. [CORRECTED: see "Corrected" under
+Unreleased. 94% is the ceiling, not this definition, which measures 35% on the same corpus.] What remains is dominated by keys asking
 kern to be less confining than it is (`privileged: true`, `security_opt`) and by `network_mode: host`,
 which one namespace per stack cannot express. The earlier "15% irreducible" was an artefact of a
 corpus weighted toward those keys.

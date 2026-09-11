@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.1.42"
+__version__ = "0.1.43"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -805,13 +805,20 @@ def _find_kern() -> str:
             raise SandboxError(
                 "the `kern` binary was not found on PATH, and this is macOS: kern is Linux-only "
                 "(no namespaces, no cgroups on a Mac), so there is no macOS build to find. "
-                "Run inside a Linux VM (colima, Lima, OrbStack, UTM), where kern installs "
-                "normally, or set $KERN_BIN to a kern reachable from here. "
-                "https://github.com/getkern/kern"
+                "Run inside a Linux VM (colima, Lima, OrbStack, UTM) and install it there with:\n"
+                "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n"
+                "or set $KERN_BIN to a kern reachable from here."
             )
+        # THE COMMAND, NOT A LINK. `pip install kern-sandbox` does NOT bring the binary: this
+        # package is a wrapper around a process it does not ship, and the moment a user meets that
+        # fact is this exception. It used to answer with a repository URL, which asks someone who is
+        # one paste away from working to go and read a page first. The installer is the same line
+        # the project's README leads with, so the two cannot drift apart in what they recommend.
         raise SandboxError(
-            "the `kern` binary was not found on PATH - install it "
-            "(https://github.com/getkern/kern) or set $KERN_BIN"
+            "the `kern` binary was not found on PATH. `pip install kern-sandbox` installs this "
+            "wrapper, not the runtime it drives - install kern with:\n"
+            "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n"
+            "or point $KERN_BIN at a kern you already have."
         )
     return found
 

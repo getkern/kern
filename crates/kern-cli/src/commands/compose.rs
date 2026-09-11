@@ -145,6 +145,7 @@ fn dead_service_port_notes(
 fn apply_memory_policy(
     boxes: &mut [crate::compose::ComposeBox],
     (ceiling, host_ram): (Option<u64>, Option<u64>),
+    host_swap: Option<u64>,
 ) -> Option<String> {
     let mut moved: Vec<String> = Vec::new();
     for b in boxes.iter_mut() {
@@ -157,6 +158,13 @@ fn apply_memory_policy(
         // applied, which is the false-alarm class that teaches people to skip the line that matters.
         if ceiling.is_some() && crate::commands::ceiling_moved(before.as_deref(), &b.memory) {
             moved.push(b.service_name().to_string());
+        }
+        // THE SWAP ALLOWANCE, for the same reason and from the same facts. See
+        // `service_swap_allowance`: zero was a choice taken on a premise that podman disproves, and
+        // it is the difference that turns a workload which survives under Docker into an OOM here.
+        if b.swap_max.is_none() {
+            b.swap_max =
+                crate::commands::service_swap_allowance(None, before.as_deref(), host_swap);
         }
     }
     let named: Vec<&str> = moved.iter().map(String::as_str).collect();
@@ -350,11 +358,19 @@ fn resolve_box_names(
         if !b.net_aliases.contains(&svc) {
             b.net_aliases.push(svc.clone());
         }
+        // EVERY EDGE THAT NAMES A SERVICE, and `degraded_health` is one. It was added later and
+        // missed here once: the parser records SERVICE names, this rewrite makes everything else
+        // speak BOX names, and the settler then looked up `svc` in a map keyed by
+        // `<project>-<hash>-svc` and found nothing. The gate it was restoring stayed degraded, with
+        // the warning saying the image had no healthcheck when it had one. A field that reaches the
+        // struct but not this loop is dropped in silence, which is the same class the merge guard
+        // in `kern-compose` exists to catch.
         for d in b
             .depends_on
             .iter_mut()
             .chain(b.depends_healthy.iter_mut())
             .chain(b.depends_completed.iter_mut())
+            .chain(b.degraded_health.iter_mut())
         {
             *d = box_name(d);
         }
@@ -437,9 +453,7 @@ fn default_override_for(files: &[String]) -> Option<String> {
 fn docker_only_verb_hint(word: &str, on_box: Option<&str>) -> Option<String> {
     let target = on_box.unwrap_or("<box>");
     let what = match word {
-        "exec" => format!("`kern exec {target} <command>`"),
         "kill" => format!("`kern kill {target}`"),
-        "cp" => format!("`kern cp {target}:<path> <path>`"),
         "wait" => format!("`kern wait {target}`"),
         "top" => "`kern top`".to_string(),
         "stats" => "`kern stats`".to_string(),
@@ -462,6 +476,40 @@ fn docker_only_verb_hint(word: &str, on_box: Option<&str>) -> Option<String> {
          {what}. kern compose takes: {}.",
         verbs.join(", ")
     ))
+}
+
+/// Fetch every service's image before the wiring is decided, for the verbs that are about to start
+/// boxes.
+///
+/// See the call site for the measurement: without this, the FIRST `up` on a machine that has never
+/// pulled an image decides the wiring blind and can put two services that both EXPOSE one port into
+/// a single namespace, where the second one dies. The second `up` then succeeds, which is the worst
+/// shape a defect can take: it repairs itself for whoever is watching.
+///
+/// A `build:` service is skipped. Its image does not exist yet by definition, and asking a registry
+/// for a tag that is about to be built locally is a request that can only fail, slowly.
+///
+/// DISTINCT IMAGES ONLY, in file order: a stack of eight services on one image resolves it once.
+fn ensure_images_for_wiring(boxes: &[crate::compose::ComposeBox]) {
+    if boxes.len() < 2 {
+        return; // one service cannot collide with another, so nothing here changes an answer
+    }
+    let mut done: Vec<&str> = Vec::with_capacity(boxes.len());
+    for b in boxes {
+        if b.build.is_some() {
+            continue;
+        }
+        let Some(img) = b.image.as_deref() else {
+            continue;
+        };
+        if done.contains(&img) {
+            continue;
+        }
+        done.push(img);
+        // Best effort by design: the launch path reports a fetch failure with the service that
+        // wanted the image, which is a better message than anything this loop could produce.
+        let _ = crate::commands::resolve_image_depth(img, 0, crate::commands::PullPolicy::Missing);
+    }
 }
 
 /// Scope a project's NAMED volumes to that project, as Docker names them `<project>_<volume>`.
@@ -561,6 +609,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         run_cmd,
         run_rm,
         no_deps,
+        exit_code_from,
+        abort_on_exit,
+        remove_orphans,
+        ps_quiet,
+        ps_services,
+        ps_format,
         tail,
         follow,
         all,
@@ -760,6 +814,68 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         .collect();
     let services = &services[..];
 
+    // AN `external: true` NETWORK MUST EXIST BEFORE A STACK MAY USE IT, which is what Docker does.
+    //
+    // The key means "this network is not mine, somebody else made it and other projects are on it".
+    // Creating it here would turn a typo in the name into a second, empty network whose members
+    // resolve nothing - the exact failure the key exists to prevent - and it would do so silently,
+    // because an empty network looks just like one whose peers have not come up yet.
+    //
+    // REFUSED FOR EVERY VERB THAT WOULD WIRE THE STACK, and NOT for `config`: a dry run answers what
+    // the file means, and a file is not wrong because a network has not been created on THIS machine
+    // yet. `config` names the missing network as a difference instead, which is what the
+    // compatibility measurement reads.
+    let external_nets: Vec<String> = {
+        let mut v: Vec<String> = boxes
+            .iter()
+            .flat_map(|b| b.external_networks.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let missing_nets: Vec<&String> = external_nets
+        .iter()
+        .filter(|n| !crate::network::exists(n))
+        .collect();
+    if !missing_nets.is_empty() {
+        if matches!(
+            action,
+            ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart | ComposeAction::Run
+        ) {
+            return Err(Error::Compose(format!(
+                "network {} declared `external: true`, which means this file does not create it: \
+                 make it first with `kern network create {}`. Docker refuses the same file for the \
+                 same reason",
+                missing_nets
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                missing_nets
+                    .iter()
+                    .map(|n| (*n).clone())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )));
+        }
+        eprintln!(
+            "kern: warning: compose: network {} is declared `external: true` and does not exist on \
+             this machine; `up` would refuse the stack, as Docker does. `kern network create {}` \
+             makes it",
+            missing_nets
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            missing_nets
+                .iter()
+                .map(|n| (*n).clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+
     // NAMED VOLUMES BELONG TO THE PROJECT, as they do under Docker. Done here, before the verbs
     // split, so `config` prints the name that will be mounted and `down -v` removes the name that
     // was. See `scope_named_volumes` for the measurement that made this necessary.
@@ -787,7 +903,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // an unknown service, which sends the reader to look for a service that was never meant to exist.
     // Only the first positional is a name here; the arm itself validates the port, and does it as a
     // port.
+    // `cp` IS THE OTHER VERB WHOSE POSITIONALS ARE NOT SERVICE NAMES: they are `<service>:<path>`
+    // and `<host path>`, neither of which can match a service, so running them through this check
+    // refused every `cp` with "no service 'web:/etc/nginx.conf'" - a sentence about a service
+    // nobody wrote. The arm itself resolves the service half and hands the rest to `kern cp`, which
+    // reports a name that is not a box.
     let to_validate: &[String] = if action == ComposeAction::Port {
+        services.get(..1).unwrap_or(&[])
+    } else if action == ComposeAction::Cp {
+        &[]
+    } else if action == ComposeAction::Exec {
+        // Only the FIRST positional is a service; everything after it is the command, which the
+        // parser has already split off into `run_cmd`. Validating the rest would report a shell
+        // word as a missing service.
         services.get(..1).unwrap_or(&[])
     } else {
         services
@@ -862,6 +990,39 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // exists to remove, so the collision now SELECTS the wiring that expresses it instead of ending
     // the run. `--pod` still gets the refusal, which is the right answer for someone who asked for
     // one namespace.
+    // THE IMAGES COME FIRST WHEN A BRING-UP IS ABOUT TO HAPPEN, because the decision below reads
+    // them and a decision taken without them is taken wrong.
+    //
+    // MEASURED, and this is a RUNTIME defect and not a cosmetic one. Two services on
+    // `memcached:1.6.34-alpine`, whose collision exists only in the image's EXPOSE and nowhere in
+    // the file. On a machine that has never pulled it:
+    //
+    // ```text
+    // up -d   ->  wiring: pod  ->  "1 service(s) died within 150ms of starting: a"
+    // up -d   ->  wiring: bridge (the image is now cached)  ->  both services up
+    // ```
+    //
+    // The same command, twice, two outcomes: the first `up` on a clean machine breaks the stack and
+    // the second one fixes it. An outside reviewer predicted exactly this shape from the `config`
+    // behaviour and asked which side of the pull the decision falls on. It falls on the wrong one.
+    //
+    // Pulling here is also what Docker does: MEASURED on 29.6.2, `docker compose up -d` on a cold
+    // cache prints every `Pulling` line before the first `Creating`, so the images are resolved as a
+    // phase and the containers are made afterwards. The bytes are the same bytes the launch loop
+    // would have fetched moments later.
+    //
+    // NOT for `config`, which must stay a dry run: there the answer is left provisional and SAID so
+    // (`wiring-images-unread:`). Best effort: an image that cannot be fetched leaves the decision
+    // where it was, and the launch reports the failure with the service that wanted it.
+    if matches!(
+        action,
+        ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart | ComposeAction::Run
+    ) {
+        ensure_images_for_wiring(&boxes);
+    }
+    // NOW THAT IMAGES CAN BE READ, the health gates the parser deferred are decided. Before the
+    // wiring note below, so a reader sees the gate's fate next to the rest of the stack's plan.
+    crate::commands::settle_deferred_health_gates(&mut boxes);
     let collides = crate::commands::pod_would_collide(&boxes)
         // THE SAME KNOWLEDGE THE WARNING HAS. A collision between two IMAGES' exposed ports is a
         // collision: kern named it and then ran the stack in one namespace anyway, where the second
@@ -906,10 +1067,79 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // other is a file that diverges ON PURPOSE and must not be counted as anything to fix. A census
     // taken after the change would otherwise not be comparable with one taken before it.
     let wiring_from_flag = no_pod || want_bridge || force_pod;
-    let auto_bridge = !no_pod && !force_pod && !segregates && (collides || hosts_collide);
+    // THE DEFAULT WIRING, AND THE ONE LINE THAT CHANGES IT.
+    //
+    // A bridge gives every service its OWN network namespace and therefore its own `127.0.0.1`,
+    // which is Docker's arrangement. A pod gives the stack one shared namespace, which is faster and
+    // is a WEAKER boundary than the reference: a service that binds loopback is private under Docker
+    // and reachable by every peer here.
+    //
+    // WHAT IT COSTS, MEASURED: alternated runs of this binary, whole `up -d`, images warm, medians
+    // of five (`scripts/wiring-cost.py`). A pod is FLAT at about 172 ms for 1, 4 or 8 services (paid
+    // once, and the bring-up is concurrent per level); a bridge is 190 ms for 2, 195 for 4, 202 for
+    // 8. It is nearly flat too, because the two things that made it per-service are gone: a veth
+    // peer is created directly inside the member's namespace instead of being MOVED there, which
+    // saves a full RCU grace period (14-22 ms) each, and every NAT is attached concurrently before
+    // any service is released instead of one at a time (about 17 ms each). Before those two the same
+    // eight-service stack cost +239 ms instead of +27.
+    //
+    // WHAT IT BUYS, MEASURED: on the neutral corpus 135 files carry the shared-loopback note and 101
+    // carry nothing else, so the wiring is the single largest difference from Docker that remains.
+    // A census of 22 of those stacks, read from inside with a probe that discriminates on both axes,
+    // found 2 with a loopback-only listener and 0 with a collision; both of the 2 were then
+    // classified NOMINAL (one publishes the port to the host itself, the other binds its own service
+    // name, which a pod resolves to 127.0.0.1 and which Docker's peers reach just as well).
+    //
+    // So the benefit on the measured sample is silence, not correctness, and the cost is real. The
+    // default is nevertheless the ARRANGEMENT THE REFERENCE HAS, because a runtime whose reason is
+    // confinement does not ship a weaker boundary than the reference by default to save 20 ms,
+    // and because "no exposure in 22 stacks" is not "no exposure".
+    //
+    // ONE SERVICE KEEPS THE POD: it has no peer to be separated from, so a bridge would buy nothing
+    // and cost a namespace. `--pod` restores the old wiring for anyone who prefers the speed.
+    let auto_bridge =
+        !no_pod && !force_pod && !segregates && (collides || hosts_collide || boxes.len() >= 2);
     let want_bridge = want_bridge || auto_bridge;
     let auto_no_pod = !no_pod && !force_pod && segregates;
-    if auto_no_pod || auto_bridge {
+    // THE DEFAULT ARM SPEAKS FOR ITSELF, and does not borrow the sentence below.
+    //
+    // That sentence is built for a file that ASKS for something one namespace cannot give, and its
+    // last clause ("`--pod` refuses the stack rather than running it with the separation dropped")
+    // is TRUE only there: with `--pod` a colliding or segregating file is refused, and a file whose
+    // only property is having two services is wired as a pod and run. Splicing the default case into
+    // that frame printed a threat kern does not carry out, which is the class of defect this file
+    // spends the most comment on. The default arm therefore prints its own line, and the `if` below
+    // sees only the three cases the frame was written for.
+    let default_bridge = auto_bridge && !collides && !hosts_collide;
+    // ONLY WHERE THE WIRING IS ABOUT TO BE BUILT, OR ASKED FOR.
+    //
+    // The three arms below fire on a property of the FILE and are rare (a collision, a segregation,
+    // an `extra_hosts:` self-address): about twenty files in 259. This one fires on "two services",
+    // which is 71% of them, and it is emitted from the shared decision path every verb goes through
+    // - so before this line `kern compose ... ps` and `... logs` printed a paragraph about bridges
+    // above the output the reader asked for, on almost every stack. A note whose reader has already
+    // seen it twice is a note that stops being read.
+    //
+    // `Config` is in the list because a dry run is where the question is asked on purpose.
+    let wiring_is_the_subject = matches!(
+        action,
+        ComposeAction::Up
+            | ComposeAction::Start
+            | ComposeAction::Restart
+            | ComposeAction::Run
+            | ComposeAction::Config
+    );
+    if default_bridge && wiring_is_the_subject {
+        eprintln!(
+            "kern: note: compose: each of this stack's {} services gets its own network namespace \
+             on a bridge, which is the arrangement Docker has: a port a service binds on its \
+             127.0.0.1 stays private to it. That costs about 20 ms for the stack, nearly flat in \
+             the number of services; `--pod` puts the whole stack in ONE namespace instead, which \
+             is faster still and makes every loopback port reachable by every peer",
+            boxes.len()
+        );
+    }
+    if auto_no_pod || (auto_bridge && !default_bridge) {
         let why = if segregates {
             "separates services with `networks:`"
         } else if collides {
@@ -928,7 +1158,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // bridge instead of one per member would buy back 12 ms a service and not the other 17.
         let how = if auto_bridge {
             "so kern gives each service its own network namespace on a bridge, which is Docker's \
-             arrangement. That costs about 30 ms a service at start"
+             arrangement. That costs about 20 ms for the stack"
         } else {
             "so kern gives each service its own network namespace (as `--no-pod` does). That costs \
              a relay hop between peers"
@@ -1009,7 +1239,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // BEFORE THE VERB DISPATCH, so `config` shows the caps `up` applies. This file has paid three
     // times for a decision taken inside the `up` branch.
-    if let Some(note) = apply_memory_policy(&mut boxes, crate::commands::compose_memory_policy()) {
+    if let Some(note) = apply_memory_policy(
+        &mut boxes,
+        crate::commands::compose_memory_policy(),
+        crate::commands::host_meminfo_bytes("SwapTotal:"),
+    ) {
         eprintln!("kern: note: compose: {note}");
     }
     // THE DIFFERENCES FROM DOCKER THAT BREAK NOTHING AND THEREFORE SAY NOTHING.
@@ -1094,11 +1328,23 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                     } else {
                         ""
                     };
+                    // THE REMEDY THAT KEEPS THE FILE AS WRITTEN, named because a rootless peer
+                    // names it and kern did not. podman refuses the same port with
+                    // "you can add 'net.ipv4.ip_unprivileged_port_start=80' to /etc/sysctl.conf
+                    // (currently 1024)", which tells the reader how to make their compose file work
+                    // unchanged. kern moved the port and offered only `privileged_port = "refuse"`,
+                    // which turns a moved port into a failed one: the two options it named were
+                    // "different" and "broken", and the one that gives the file what it asked for
+                    // was missing. The floor is read from the host, so the number in the sentence is
+                    // this machine's and not a constant.
                     eprintln!(
                         "kern: note: this host binds from {floor} upward, so kern publishes these \
                          on a port it can bind: {list}. The service still listens where its own \
-                         config says it does; set `[kern] privileged_port = \"refuse\"` to fail \
-                         instead of moving them.{acme}"
+                         config says it does. To keep the port the file asks for, lower the floor on \
+                         this host: `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80` (add it \
+                         to /etc/sysctl.conf to survive a reboot), which is what a rootless daemon \
+                         needs too. Set `[kern] privileged_port = \"refuse\"` to fail instead of \
+                         moving them.{acme}"
                     );
                 }
             }
@@ -1193,6 +1439,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             relay_wiring: no_pod && !want_bridge,
             allow_device_grants,
             remove_volumes,
+            remove_orphans,
+            ps_quiet,
+            ps_services,
+            ps_format,
         },
     )? {
         return Ok(());
@@ -1431,6 +1681,40 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
 
     // `run` DIVERGES HERE, after the builds and the bind resolution and before the bring-up: it
     // needs a service's fully resolved definition and none of the stack-wide launch that follows.
+    // `exec` DIVERGES HERE for the same reason `run` does: it needs a service resolved to its box
+    // and none of the stack-wide launch below. It is answered before the bring-up, not in the
+    // terminal-verb function, because that function has no access to `run_cmd`.
+    if action == ComposeAction::Exec {
+        let Some(target) = services.first() else {
+            return Err(Error::Compose(format!(
+                "exec needs a service: `kern compose {file} exec <service> <command…>`"
+            )));
+        };
+        let Some(b) = boxes.iter().find(|b| &b.name == target) else {
+            return Err(Error::Compose(format!(
+                "exec: no service '{target}' in {file}"
+            )));
+        };
+        if registry::find_ref(&b.name).is_none() {
+            return Err(Error::NotRunning(format!(
+                "service '{}' is not running; `kern compose {file} up -d {}` first, or use \
+                 `kern compose {file} run {} <command…>` for a one-off",
+                b.service_name(),
+                b.service_name(),
+                b.service_name()
+            )));
+        }
+        // `exec` REPLACES THIS PROCESS'S STATUS with the command's (it calls `process::exit` with
+        // the code), which is Docker's behaviour: `compose exec -T web sh -c 'exit 7'` exits 7 there
+        // and here. The service's own working directory is used, as Docker uses the container's.
+        return crate::commands::exec(
+            &b.name,
+            run_cmd,
+            &[],
+            b.workdir.as_deref(),
+            unsafe { libc::isatty(0) } == 1,
+        );
+    }
     if action == ComposeAction::Run {
         return compose_run(
             &mut boxes,
@@ -1716,14 +2000,25 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // that exposes it, and being consistent with an existing gap is not the same as it being
     // acceptable, so the operator is told rather than left to discover it after a reboot.
     if use_pod {
+        // The unit name the `systemd` verb suggests, so the two commands can be pasted.
+        let project_slug = pod.trim_start_matches("kern-");
         for b in boxes.iter().filter(|b| b.restart_always) {
+            // THE PATH THAT KEEPS THE STACK, named first. This used to offer only "run it as a
+            // standalone box", which trades the pod away: no peer-by-name, no shared egress, and
+            // the file's `depends_on` stops meaning anything. The mechanism that keeps all of it is
+            // the unit the `systemd` verb already emits, and the unit's own header prints the same
+            // two commands. Docker survives a reboot because its daemon starts at boot and owns the
+            // containers; kern has no daemon, so the unit IS the daemon's job.
             eprintln!(
                 "kern: note: service '{}' sets `restart:` and is a pod member - kern supervises it \
-                 in-process (restarted on ANY exit) but it does NOT survive a reboot, because a \
-                 systemd unit cannot re-join the pod's network namespace. For reboot-survival run it \
-                 as a standalone box: `kern box <name> --restart unless-stopped` (no pod, so no pod \
-                 egress either)",
-                b.name
+                 in-process (restarted on ANY exit) but NOTHING brings it back after a REBOOT, \
+                 because kern has no daemon that starts at boot. To keep this stack across reboots: \
+                 `kern compose {file} systemd > ~/.config/systemd/user/kern-{}.service`, then \
+                 `systemctl --user daemon-reload && systemctl --user enable --now kern-{}.service`, \
+                 and `loginctl enable-linger` so the user manager starts without a login. A single \
+                 service that needs no pod can instead be a standalone box: `kern box <name> \
+                 --restart unless-stopped`.",
+                b.name, project_slug, project_slug
             );
         }
     }
@@ -1977,6 +2272,48 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // stacks on a small board). A normal stack (≤cap services in a level) runs fully parallel as a
     // single chunk; a huge level is barriered into cap-sized chunks. I/O-bound starts want generous
     // concurrency (kern handles 200 parallel boxes), so cap = 4×CPUs clamped to [8, 32].
+    // THE FOREIGN PEERS, READ BEFORE ANY BOX EXISTS, because their names have to be in
+    // `/etc/hosts` from the first instruction the workload runs. Our OWN membership cannot be
+    // registered yet - a member record whose box is not in the registry is pruned on the next read,
+    // by us as much as by anyone - so the two halves of joining a network happen at two different
+    // moments, and this is the first: read who is already there.
+    //
+    // A PEER'S ADDRESS IS STABLE FOR AS LONG AS IT IS ON THE NETWORK, so reading it before our boxes
+    // exist is not a race with its owner: it was allocated when that box joined and is released only
+    // when it leaves.
+    let cross_hosts: std::collections::HashMap<String, Vec<String>> = {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        if !external_nets.is_empty() {
+            let peers = crate::network::peers_of(&external_nets, &pod);
+            for b in &boxes {
+                if b.external_networks.is_empty() || b.net {
+                    // A service on the HOST network resolves what the host resolves; pointing its
+                    // peers at a loopback alias would break that, which is the same reason the
+                    // intra-stack hosts entries skip it.
+                    continue;
+                }
+                let mut entries: Vec<String> = peers
+                    .iter()
+                    .filter(|(net, _, _)| b.external_networks.iter().any(|n| n == net))
+                    .map(|(_, m, addr)| {
+                        format!("{}:{}", m.service, std::net::Ipv4Addr::from(*addr))
+                    })
+                    .collect();
+                entries.sort();
+                entries.dedup();
+                if !entries.is_empty() {
+                    map.insert(b.name.clone(), entries);
+                }
+            }
+        }
+        map
+    };
+    // A SHARED REFERENCE, because the workers below are `move` closures: moving a map into one of
+    // them would take it from every other worker and from the join step after the loop. The same
+    // shape `address_plan` already uses, and for the same reason.
+    let cross_hosts = &cross_hosts;
+
     let start_cap = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -2116,6 +2453,16 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                 for e in
                                     crate::nopod::link_host_args(&b.links, address_plan, use_pod)
                                 {
+                                    cmd.arg("--add-host").arg(e);
+                                }
+                            }
+                            // AND THE PEERS ON AN `external:` NETWORK, which are services of OTHER
+                            // projects. Their addresses are their identity on that network and were
+                            // allocated when they joined it, so they are known before this box
+                            // exists; the relay that makes each one answer is built below, while
+                            // every box is still held at its gate.
+                            if !b.net {
+                                for e in cross_hosts.get(&b.name).into_iter().flatten() {
                                     cmd.arg("--add-host").arg(e);
                                 }
                             }
@@ -2303,8 +2650,74 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // The holder is a detached process that OWNS the relays: `up` exits, and relays forked here would
     // die with it through their own PDEATHSIG. `down` kills the holder, and every relay goes with it.
-    if !use_pod && !address_plan.is_empty() {
-        let relays = crate::nopod::relay_plan(&address_plan);
+    // JOIN EVERY `external:` NETWORK AND WIRE BOTH DIRECTIONS, in the same window: every box of this
+    // stack exists and is held at its pre-exec gate, so its PID 1 is recorded and no workload has run.
+    //
+    // WHY BOTH DIRECTIONS ARE OURS. A relay is two forked halves, each entering only its OWN box, so
+    // building one INTO another project's box needs nothing from that project - measured before any
+    // of this was written: two stacks brought up separately, a plan naming one box from each, and the
+    // box in the second project read the first project's listener through an alias on its own
+    // loopback. The other project's holder is never asked to adopt anything, and when this stack
+    // goes down its relays go with it, which is right, because what they reached is going away too.
+    //
+    // MERGED INTO THE STACK'S OWN PLAN rather than given a second holder. One holder per stack is
+    // what `down` kills and what heals a box that restarted; a second one would be a process nothing
+    // in the teardown path knows about.
+    let cross = if external_nets.is_empty()
+        || !matches!(
+            action,
+            ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart
+        ) {
+        crate::network::CrossPlan::default()
+    } else {
+        let mine: Vec<crate::network::Joining> = boxes
+            .iter()
+            .filter(|b| !b.external_networks.is_empty() && !b.net)
+            .filter(|b| registry::find(&b.name).is_some())
+            .map(|b| crate::network::Joining {
+                box_name: b.name.clone(),
+                service: b.service_name().to_string(),
+                // TCP ONLY, and the same derivation the intra-stack plan uses: a relay carries TCP,
+                // so a UDP port would be a peer that resolves and answers nothing. The intra-stack
+                // path names those per service; here the set simply does not include them.
+                ports: declared_container_ports(b)
+                    .into_iter()
+                    .filter(|(_, udp)| !*udp)
+                    .map(|(p, _)| p)
+                    .collect(),
+                networks: b.external_networks.clone(),
+            })
+            .collect();
+        crate::network::join_and_plan(&mine, &pod)?
+    };
+    for net in &cross.alone_on {
+        eprintln!(
+            "kern: note: compose: this stack is the only project on network '{net}' right \
+             now, so there is nothing else to resolve yet. A stack that joins later is \
+             wired to these services when it comes up"
+        );
+    }
+    if !cross.foreign_hosts.is_empty() {
+        // THE OTHER PROJECT'S BOXES LEARN OUR NAMES, written into the `/etc/hosts` they are already
+        // running with. MEASURED: a write through `/proc/<pid1>/root/etc/hosts` is visible inside
+        // immediately and `getent hosts` answers the new name on the next call, so no resolver and
+        // no restart of the other stack is needed.
+        for (box_name, line) in &cross.foreign_hosts {
+            if let Err(e) = crate::network::add_foreign_host(box_name, line, &pod) {
+                eprintln!(
+                    "kern: warning: compose: '{box_name}' could not be told this stack's names                      ({e}); it can be reached from here, and cannot reach back by name"
+                );
+            }
+        }
+    }
+
+    if !use_pod && !address_plan.is_empty() || !cross.relays.is_empty() {
+        let mut relays = if address_plan.is_empty() || use_pod {
+            Vec::new()
+        } else {
+            crate::nopod::relay_plan(&address_plan)
+        };
+        relays.extend(cross.relays.iter().cloned());
         if !relays.is_empty() {
             let dir = crate::relayhold::stack_dir(&pod)?;
             let report = crate::relayhold::spawn_holder(&dir, &relays)?;
@@ -2381,6 +2794,104 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 ))
             }
         };
+        // EVERY NAT, BEFORE ANY RELEASE, AND ALL AT ONCE.
+        //
+        // OUTBOUND IS ATTACHED WHILE THE BOX IS STILL HELD, and that ordering is the whole
+        // correctness argument. pasta configures an interface INSIDE the box's network namespace
+        // from outside it; a workload that had already started would observe a namespace with no
+        // route one instant and a route the next, which is precisely the half-built network the gate
+        // exists to make impossible. Held at the gate, PID 1 has every namespace built, has run no
+        // instruction, and its pid cannot be recycled. That held when this ran inside the release
+        // loop and it holds harder here: no box in the stack is released until every NAT is up.
+        //
+        // WHY IT MOVED OUT OF THE LOOP, MEASURED. Attaching a NAT costs about 17 ms: pasta is spawned
+        // and daemonizes, and its pidfile is polled for. Done once per service in a loop that is
+        // sequential by construction, a stack of eight services spent about 140 ms of its bring-up
+        // waiting for eight processes to say they were ready - which after the veth fix below was
+        // the ENTIRE remaining cost of the bridge wiring, to the millisecond: eight services on a
+        // bridge whose network is `internal: true` and takes no NAT came up in 173 ms against the
+        // pod's 171, and with the NATs in 314.
+        //
+        // THE ATTACHES DO NOT DEPEND ON EACH OTHER: every box is prepared and held before this block
+        // runs, so every PID 1 already exists, and each attach writes only into its own service's
+        // directory. `depends_on` orders RELEASES, which is the loop below, and never orders the
+        // wiring - a dependency waits for its dependency's health, and health needs a workload, and
+        // no workload has run yet.
+        //
+        // THE WARNINGS ARE COLLECTED AND PRINTED IN FILE ORDER rather than as they happen, because
+        // the order threads finish in is not a fact about the stack and a reader who ran the same
+        // command twice would see the same failures in a different order.
+        let mut outbound_warnings: Vec<String> = Vec::new();
+        if !outbound_for.is_empty() {
+            let attach = |b: &crate::compose::ComposeBox| -> Option<String> {
+                let Some(pid1) = registry::find(&b.name).and_then(|i| i.live_pid1()) else {
+                    return Some(format!(
+                        "kern: warning: service '{}': no outbound - its PID 1 is not recorded yet, \
+                         so there was no namespace to attach the NAT to",
+                        b.service
+                    ));
+                };
+                // The stack's own directory, which `down` already removes: the NAT's pid file and
+                // identity record go with the stack rather than into a second lifetime somebody has
+                // to own.
+                let dir = match crate::relayhold::stack_dir(&pod) {
+                    Ok(d) => d.join("outbound").join(&b.service),
+                    Err(e) => {
+                        return Some(format!(
+                            "kern: warning: service '{}': no outbound - the stack directory is \
+                             unavailable ({e})",
+                            b.service
+                        ))
+                    }
+                };
+                // A FAILURE HERE IS NAMED AND NOT FATAL. The stack without egress is the behaviour
+                // `--no-pod` had before this existed, so refusing to start would take away more than
+                // the failure did; but a service that cannot reach the internet fails later, inside
+                // its own code, where the reason is invisible - so it is said here, once, per box.
+                crate::pod::attach_box_outbound(&dir, pid1)
+                    .err()
+                    .map(|why| {
+                        format!(
+                        "kern: warning: service '{}': no outbound - {why}. The box starts, and \
+                         reaches its peers; it cannot reach the internet",
+                        b.service
+                    )
+                    })
+            };
+            let subject: Vec<&crate::compose::ComposeBox> = boxes
+                .iter()
+                .filter(|b| outbound_for.contains(&b.name))
+                .filter(|b| released.iter().any(|(n, _)| n == &b.name))
+                .collect();
+            // ONE THREAD EACH, SCOPED, so nothing outlives this block and no pool has to be owned.
+            // A single subject is done inline: a thread to serialise on would be pure overhead, and
+            // most stacks that get here have two or three services.
+            if subject.len() < 2 {
+                outbound_warnings.extend(subject.iter().filter_map(|b| attach(b)));
+            } else {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> =
+                        subject.iter().map(|b| scope.spawn(|| attach(b))).collect();
+                    for h in handles {
+                        // A PANIC IN ONE ATTACH IS NOT SILENCE. `join` returns `Err` only if the
+                        // thread panicked, and swallowing that would turn a bug into a stack with
+                        // no egress and no reason given.
+                        match h.join() {
+                            Ok(Some(w)) => outbound_warnings.push(w),
+                            Ok(None) => {}
+                            Err(_) => outbound_warnings.push(
+                                "kern: warning: a NAT attachment panicked; that service has no \
+                                 outbound"
+                                    .to_string(),
+                            ),
+                        }
+                    }
+                });
+            }
+        }
+        for w in &outbound_warnings {
+            eprintln!("{w}");
+        }
         for level in &levels {
             for name in level {
                 let Some(b) = boxes.iter().find(|b| &b.name == name) else {
@@ -2392,49 +2903,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 // The wait can fail (a dependency that died, a timeout). Returning here drops
                 // `released`, which closes every remaining write end, and every still-prepared box
                 // reads EOF and refuses to exec. The stack does not come up half-released.
-                // OUTBOUND IS ATTACHED WHILE THE BOX IS STILL HELD, and that ordering is the whole
-                // correctness argument. pasta configures an interface INSIDE the box's network
-                // namespace from outside it; a workload that had already started would observe a
-                // namespace with no route one instant and a route the next, which is precisely the
-                // half-built network the gate exists to make impossible. Held at the gate, PID 1 has
-                // every namespace built, has run no instruction, and its pid cannot be recycled.
-                //
-                // A FAILURE HERE IS NAMED AND NOT FATAL. The stack without egress is the behaviour
-                // `--no-pod` had before this existed, so refusing to start would take away more than
-                // the failure did; but a service that cannot reach the internet fails later, inside
-                // its own code, where the reason is invisible - so it is said here, once, per box.
-                if outbound_for.contains(&b.name) {
-                    match registry::find(&b.name).and_then(|i| i.live_pid1()) {
-                        Some(pid1) => {
-                            // The stack's own directory, which `down` already removes: the NAT's
-                            // pid file and identity record go with the stack rather than into a
-                            // second lifetime somebody has to own.
-                            let dir = match crate::relayhold::stack_dir(&pod) {
-                                Ok(d) => d.join("outbound").join(&b.service),
-                                Err(e) => {
-                                    eprintln!(
-                                        "kern: warning: service '{}': no outbound - the stack \
-                                         directory is unavailable ({e})",
-                                        b.service
-                                    );
-                                    continue;
-                                }
-                            };
-                            if let Err(why) = crate::pod::attach_box_outbound(&dir, pid1) {
-                                eprintln!(
-                                    "kern: warning: service '{}': no outbound - {why}. The box \
-                                     starts, and reaches its peers; it cannot reach the internet",
-                                    b.service
-                                );
-                            }
-                        }
-                        None => eprintln!(
-                            "kern: warning: service '{}': no outbound - its PID 1 is not recorded \
-                             yet, so there was no namespace to attach the NAT to",
-                            b.service
-                        ),
-                    }
-                }
+                // Every NAT was attached above, before this loop, and the ordering argument that
+                // used to live here is made there instead.
                 wait_for_conditions(b, &pod, &up_token)?;
                 if !gate_release(fd) {
                     return Err(Error::Compose(format!(
@@ -2509,6 +2979,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // CI job that asked to wait must have waited by the time this call returns either way.
     if wait_ready {
         wait_until_ready(&mine, wait_timeout)?;
+    }
+    // `--abort-on-container-exit` / `--exit-code-from` take over from here: they wait for an exit
+    // rather than returning, and they tear the stack down themselves, so neither `--wait` nor the
+    // attach below has anything left to do.
+    if abort_on_exit {
+        return watch_and_abort(&mine, &boxes, &pod, exit_code_from);
     }
     if !detach {
         if should_attach(detach, unsafe { libc::isatty(1) } == 1) {
@@ -2637,6 +3113,116 @@ fn compose_run(
     match st.code() {
         Some(0) | None => Ok(()),
         Some(code) => Err(Error::Workload(code)),
+    }
+}
+
+/// `--abort-on-container-exit` / `--exit-code-from S`: tear the stack down when a service exits,
+/// and adopt a status.
+///
+/// THE CI LINE THIS EXISTS FOR is `up --exit-code-from tests`, which turns a test service's status
+/// into the job's. MEASURED on Docker 29.6.2, three cases, all reproduced here:
+///
+///  * `--exit-code-from tests` with `tests` exiting 3: exit 3, and NO container left running.
+///  * `--abort-on-container-exit` alone, same file: exit 3. The service that ended decides.
+///  * `--exit-code-from db`, where `db` never exits on its own and `tests` exits 3: exit **137**.
+///    The abort is what ended `db`, and 137 is what the abort left behind. The flag reports the
+///    NAMED service's status, not the one that triggered the teardown.
+///
+/// A name the file does not define is refused, as Docker refuses it ("no such service").
+///
+/// THE LOGS ARE STREAMED while it waits, through the same multiplexer `up` attaches with, stopped
+/// at the FIRST exit rather than the last. Streaming here cannot hang a script the way a plain
+/// attached `up` could: this loop ends when a service exits, which is the flag's whole contract.
+fn watch_and_abort(
+    mine: &[&crate::compose::ComposeBox],
+    all: &[crate::compose::ComposeBox],
+    pod: &str,
+    exit_code_from: Option<&str>,
+) -> Result<(), Error> {
+    // The named service must be one of the ones this invocation started.
+    let named: Option<&crate::compose::ComposeBox> = match exit_code_from {
+        Some(s) => {
+            let found = mine
+                .iter()
+                .find(|b| b.service_name() == s || b.name == s)
+                .copied();
+            if found.is_none() {
+                return Err(Error::Compose(format!(
+                    "no such service: {s}. `--exit-code-from` names a service this `up` started: {}",
+                    mine.iter()
+                        .map(|b| b.service_name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            found
+        }
+        None => None,
+    };
+
+    // Stream until the first service ends. A service that has already gone contributes its log and
+    // ends the follow on the first pass.
+    let mut who = Vec::with_capacity(mine.len());
+    for b in mine {
+        let Some(ins) = registry::find_ref(&b.name) else {
+            continue;
+        };
+        match crate::commands::Followed::open(
+            b.service_name().to_string(),
+            b.name.clone(),
+            ins.pid,
+            None,
+        ) {
+            Ok(Some(f)) => who.push(f),
+            Ok(None) => {}
+            Err(e) => eprintln!("kern: warning: {}: {e}", b.service_name()),
+        }
+    }
+    if who.is_empty() {
+        // NO LOG TO FOLLOW IS NOT A REASON TO ABORT AT ONCE. Every box could have been launched in
+        // a way that left no log file, and tearing the stack down on the first pass would report a
+        // status for a service that had not run. Poll the registry instead, which is the same
+        // observable `follow_many` uses to decide a service is done.
+        while mine
+            .iter()
+            .all(|b| crate::registry::find_ref(&b.name).is_some())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    } else {
+        crate::commands::follow_many(who, &crate::commands::FOLLOW_FOREVER, true)?;
+    }
+
+    // Whoever is gone now is who ended it. Read BEFORE the teardown, or every service looks exited.
+    let first_gone: Option<String> = mine
+        .iter()
+        .find(|b| registry::find_ref(&b.name).is_none())
+        .map(|b| b.name.clone());
+
+    println!("compose up: a service exited, stopping the stack");
+    let selected: Vec<String> = mine.iter().map(|b| b.name.clone()).collect();
+    // KEEPING THE EXIT RECORDS, because the status being adopted may be one this very teardown is
+    // about to produce: `--exit-code-from db`, where `db` never exits on its own, reports the 137
+    // the stop leaves behind. Reaping inside the teardown made every one of these exit 0.
+    let ((stopped, _pod_existed), names) =
+        crate::commands::tear_down_stack_keeping(all, &selected, pod, false);
+    println!("compose down: {stopped} box(es) stopped");
+
+    // The status: the NAMED service's if one was named (137 when the teardown is what ended it),
+    // otherwise the one that exited first.
+    let want = named.map(|b| b.name.clone()).or(first_gone);
+    let code = want.as_ref().and_then(|w| {
+        crate::registry::list_exited()
+            .into_iter()
+            .find(|e| &e.name == w)
+            .map(|e| e.code)
+    });
+    // The reap the teardown did not do. After this the stack is as `down` leaves it, so
+    // `compose ps -a` is empty either way.
+    crate::registry::clear_waitexit_pod(pod, &names);
+    match code {
+        Some(0) | None => Ok(()),
+        Some(c) => Err(Error::Workload(c)),
     }
 }
 
@@ -2779,7 +3365,7 @@ fn attach_to_stack(
         "kern: attached to {} service(s) - Ctrl-C stops the stack (`-d` returns instead)",
         who.len()
     );
-    crate::commands::follow_many(who, stop)?;
+    crate::commands::follow_many(who, stop, false)?;
     if !stop.load(std::sync::atomic::Ordering::Acquire) {
         // Every service exited on its own. Docker leaves the containers in place and returns 0; so
         // does kern, and `compose ps -a` still shows them.
@@ -3123,7 +3709,10 @@ mod tests {
         // NO CEILING: every service gets the host's RAM unless its file named a limit, and nothing
         // is reported, because kern then does what Docker does.
         let mut b = vec![svc("free", None), svc("asked", Some("256m"))];
-        assert_eq!(apply_memory_policy(&mut b, (None, Some(64 * MIB))), None);
+        assert_eq!(
+            apply_memory_policy(&mut b, (None, Some(64 * MIB)), None),
+            None
+        );
         assert_eq!(b[0].memory.as_deref(), Some("67108864"));
         assert_eq!(b[1].memory.as_deref(), Some("256m"), "verbatim");
 
@@ -3134,7 +3723,7 @@ mod tests {
             svc("big", Some("8g")),
             svc("small", Some("32m")),
         ];
-        let note = apply_memory_policy(&mut b, (Some(64 * MIB), Some(999 * MIB)))
+        let note = apply_memory_policy(&mut b, (Some(64 * MIB), Some(999 * MIB)), None)
             .expect("a ceiling that moved two services owes a sentence");
         assert_eq!(b[0].memory.as_deref(), Some("67108864"));
         assert_eq!(b[1].memory.as_deref(), Some("67108864"));
@@ -3147,13 +3736,16 @@ mod tests {
 
         // A ceiling nothing sits above is a ceiling that moved nothing: silent.
         let mut b = vec![svc("small", Some("32m"))];
-        assert_eq!(apply_memory_policy(&mut b, (Some(64 * MIB), None)), None);
+        assert_eq!(
+            apply_memory_policy(&mut b, (Some(64 * MIB), None), None),
+            None
+        );
 
         // NEITHER CEILING NOR READABLE HOST: no `--memory` at all, so the box keeps its own default.
         // This is exactly what kern did before any of this, so an unreadable host never fails in a
         // new way.
         let mut b = vec![svc("free", None)];
-        assert_eq!(apply_memory_policy(&mut b, (None, None)), None);
+        assert_eq!(apply_memory_policy(&mut b, (None, None), None), None);
         assert_eq!(b[0].memory, None);
     }
 

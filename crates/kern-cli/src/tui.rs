@@ -3172,8 +3172,28 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
             spark(&host.box_starts_spark)
         ));
     }
+    // THE NAME COLUMN IS MEASURED, for the reason the comment further down already gives about pod
+    // members and which applied one case over. A box with no pod has an empty `pod` field, so
+    // `display_box_name` returns its WHOLE name and a fixed sixteen then cut it: a relay-wired
+    // compose stack rendered as `psbug-749cf899-f`, `psbug-749cf899-s`, `psbug-749cf899-a` - three
+    // services distinguished by one letter each, in the column whose job is to tell them apart.
+    // Truncation is worse than overflow here: an overflowing table is ugly and an over-truncated one
+    // is wrong.
+    //
+    // FLOORED AT 16 so a table of short names is exactly what it has always been, and CEILINGED at
+    // 48 so one pathological name cannot push STATUS off a terminal.
+    let nw = rows
+        .iter()
+        .map(|r| {
+            crate::ui::display_box_name(&r.name, &r.pod).chars().count()
+                + if r.pod.is_empty() { 0 } else { 3 } // the tree connector shares this cell
+        })
+        .chain(std::iter::once(16))
+        .max()
+        .unwrap_or(16)
+        .min(48);
     s.push_str(&format!(
-        "    {b}{:<16}  {:>7}  {:>8}  {:>8}  {:>5}  {:>4}  {:<9}  {:<14}  STATUS{z}\n",
+        "    {b}{:<nw$}  {:>7}  {:>8}  {:>8}  {:>5}  {:>4}  {:<9}  {:<14}  STATUS{z}\n",
         "NAME", "PID", "UPTIME", "MEM", "CPU%", "PIDS", "HEALTH", "PORTS"
     ));
     if rows.is_empty() {
@@ -3211,7 +3231,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         let shown = crate::ui::display_box_name(&r.name, &r.pod);
         let name_cell = format!(
             "{connector}{}",
-            trunc(shown, 16usize.saturating_sub(connector.chars().count()))
+            trunc(shown, nw.saturating_sub(connector.chars().count()))
         );
 
         let mem = r.mem.map_or("-".into(), human_bytes);
@@ -3249,7 +3269,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         };
         let (lead, name_col) = sel_marker(p, i == sel);
         s.push_str(&format!(
-            "  {lead}{name_col}{:<16}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}{iso}{sec}\n",
+            "  {lead}{name_col}{:<nw$}{z}  {:>7}  {:>8}  {:>8}  {:>4.0}%  {:>4}  {health}  {ports}  {status}{iso}{sec}\n",
             name_cell,
             r.pid,
             fmt_uptime(r.uptime),
@@ -3759,6 +3779,99 @@ mod tests {
     /// Drive one key through `handle_nav` on the Boxes tab, returning the resulting mode and
     /// selection. The signature is long and every argument is a live list, so a helper keeps the
     /// cases below about the KEY rather than about the plumbing.
+    /// A BOX NAME IS NEVER CUT DOWN TO A PREFIX EVERY ROW SHARES.
+    ///
+    /// The NAME cell was a fixed sixteen characters and the name was truncated into it. For a pod
+    /// member that is harmless - the pod prefix is stripped first, so what is shown is the short
+    /// service name - and the comment in `boxes_table` records exactly that fix. A box with NO pod
+    /// has an empty `pod` field, so nothing is stripped and the full, project-scoped name met the
+    /// cut: MEASURED on a relay-wired compose stack, three services rendered as
+    /// `psbug-749cf899-f`, `psbug-749cf899-s` and `psbug-749cf899-a`, told apart by one letter in
+    /// the column whose only job is to tell them apart.
+    ///
+    /// TRUNCATION IS WORSE THAN OVERFLOW HERE, which is why this asserts the name is WHOLE rather
+    /// than that the table is narrow: an overflowing table is ugly, an over-truncated one is wrong,
+    /// and the name is what `kern stop` takes.
+    ///
+    /// THE CONTROL IS THE SHORT-NAME CASE in the same assertion: a table of short names must still
+    /// lay out at the old width, or this would pass on a renderer that simply padded everything to
+    /// some new constant.
+    #[test]
+    fn the_boxes_table_never_truncates_a_name_into_a_shared_prefix() {
+        let row = |name: &str, pod: &str, pid: i32| Row {
+            name: name.to_string(),
+            pid,
+            uptime: 3,
+            mem: Some(1024),
+            cpu_pct: 0.0,
+            tasks: Some(1),
+            paused: false,
+            health: String::new(),
+            ports: String::new(),
+            pod: pod.to_string(),
+            iso: String::new(),
+            sec: String::new(),
+        };
+        let p = Palette::plain();
+        let host = HostStats::default();
+        // Three no-pod boxes whose names share the first fifteen characters, which is the shape a
+        // relay-wired compose stack produces.
+        let long = vec![
+            row("psbug-749cf899-front", "", 101),
+            row("psbug-749cf899-secret", "", 102),
+            row("psbug-749cf899-api", "", 103),
+        ];
+        let out = boxes_table(&p, &long, 10, 0, &host);
+        for whole in [
+            "psbug-749cf899-front",
+            "psbug-749cf899-secret",
+            "psbug-749cf899-api",
+        ] {
+            assert!(
+                out.contains(whole),
+                "the table cut '{whole}' down to a prefix its neighbours share:\n{out}"
+            );
+        }
+        // AND THE COLUMNS LINE UP. Anchored on the LAST column rather than on the pid: every field
+        // between them is fixed-width, so if STATUS starts at one offset for every row then so does
+        // everything before it. Searching for the pid digits instead was the first attempt and it
+        // matched a digit inside the NAME (`psbug-749cf899-…`), which made the test fail on a table
+        // that was correctly aligned.
+        // CHARACTER OFFSETS AND NOT BYTE OFFSETS. The selection marker is `\u{203a}`, three bytes and
+        // one column, so `str::find` reported the selected row two further right than the others and
+        // failed a table that was correctly aligned. What a reader sees is columns, so columns are
+        // what this counts.
+        let offsets: Vec<usize> = out
+            .lines()
+            .filter(|l| l.contains("psbug-"))
+            .filter_map(|l| l.find("running").map(|byte| l[..byte].chars().count()))
+            .collect();
+        assert_eq!(offsets.len(), 3, "three rows carry a status:\n{out}");
+        assert!(
+            offsets.iter().all(|o| *o == offsets[0]),
+            "the STATUS column starts at {offsets:?}, which is not one column:\n{out}"
+        );
+
+        // THE CONTROL: short names keep the layout they have always had, sixteen wide.
+        let short = vec![row("a", "", 201), row("b", "", 202)];
+        let out = boxes_table(&p, &short, 10, 0, &host);
+        let header = out
+            .lines()
+            .find(|l| l.contains("NAME"))
+            .unwrap_or_default()
+            .to_string();
+        let name_at = header.find("NAME").unwrap_or(0);
+        let pid_at = header.find("PID").unwrap_or(0);
+        // 16 for the NAME cell, two spaces, then `PID` right-aligned in a seven-wide field, so its
+        // `P` sits four in: 16 + 2 + 4. Written as the arithmetic rather than as `22` so a change to
+        // any of the three is readable here instead of being a number nobody can check.
+        assert_eq!(
+            pid_at - name_at,
+            16 + 2 + 4,
+            "a table of short names must lay out exactly as it always has: {header:?}"
+        );
+    }
+
     fn press(key: &[u8], rows: &[Row], sel_in: usize) -> (Mode, usize, bool) {
         let mut tab = TAB_BOXES;
         let mut sel = sel_in;

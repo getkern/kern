@@ -219,6 +219,11 @@ pub(crate) fn parse_with_env(
     let secret_files = collect_secret_files(&root);
     let secret_envs = collect_secret_envs(&root);
     let internal_networks = collect_internal_networks(&root);
+    // WHICH NETWORKS THIS FILE DOES NOT OWN. The parser only collects them; the DRIVER decides what
+    // to do, because the answer depends on state no parser can see - whether the network exists and
+    // which boxes of other projects are on it right now. It used to warn here that kern had no such
+    // thing, which is no longer true.
+    let external_networks = collect_external_networks(&root);
     let network_subnets = collect_network_subnets(&root);
     // Collected first for the same reason as the secrets above: `volumes:` may sit below `services:`
     // in the file, and a service that mounts an external volume has to be marked whichever order the
@@ -239,6 +244,42 @@ pub(crate) fn parse_with_env(
         match key.as_str() {
             "services" => {
                 have_services = true;
+                // THE SHAPE BEFORE THE CONTENTS, because a wrongly shaped block has no contents and
+                // the emptiness check far below would then report the wrong noun.
+                //
+                // MEASURED, and it is why this exists: `services:` written as a LIST
+                // (`- web`, `- db`) produced no children, fell through to the emptiness check, and
+                // kern answered "`services:` is empty" about a file holding two entries. The reader
+                // is told their block is missing when it is present and mis-shaped, which is the
+                // commonest way a compose file is written wrong by hand.
+                //
+                // THE REFERENCE'S WORDING IS ADOPTED, measured on Docker 29.6.2 / compose v5.3.1,
+                // which answers `services must be a mapping` for a list, for a scalar and for an
+                // empty block alike. kern keeps its own, more specific sentence for the genuinely
+                // empty mapping (see the emptiness check below), because that one names a different
+                // repair; for the two mis-shaped cases there is nothing to add to Docker's words
+                // except the shape actually found, so that is what is added.
+                if !node.items.is_empty() {
+                    return Err(format!(
+                        "`services:` must be a mapping of service names to their definitions, and \
+                         this one is a LIST of {} item(s). Write `services:` then `  <name>:` \
+                         indented under it, not `  - <name>`",
+                        node.items.len()
+                    ));
+                }
+                if node.children.is_empty() {
+                    if let Some(scalar) = node
+                        .scalar
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                    {
+                        return Err(format!(
+                            "`services:` must be a mapping of service names to their definitions, \
+                             and this one is the value '{scalar}'"
+                        ));
+                    }
+                }
                 for (name, svc) in &node.children {
                     // A duplicate service key is a real authoring mistake (two blocks, same name) -
                     // reject it rather than launch two boxes with the same name (which then collide at
@@ -391,6 +432,26 @@ pub(crate) fn parse_with_env(
     // AFTER the `volumes_from` inheritance above: an inherited mount of an external volume is still a
     // mount of an external volume, and marking before this pass would miss exactly those.
     mark_external_volumes(&mut boxes, &external_volumes);
+    // AND THE EXTERNAL NETWORKS EACH SERVICE IS ON, which is the intersection of two blocks that may
+    // appear in either order: the top-level `networks:` says which are external, each service's own
+    // `networks:` says which it joined. Done here, after every service exists, for the same reason
+    // the volume marking above is.
+    //
+    // A SERVICE THAT NAMES NO NETWORK IS ON `default` AND THEREFORE ON NO EXTERNAL ONE. That is not
+    // a shortcut: `default` is a network the FILE owns, so a service that never opted in is not
+    // published to other projects by omission. The compose specification says the same thing, and
+    // the alternative - treating "no networks key" as "every network" - would put a database on a
+    // proxy network because its author never wrote the key.
+    if !external_networks.is_empty() {
+        for b in &mut boxes {
+            b.external_networks = b
+                .networks
+                .iter()
+                .filter(|n| external_networks.iter().any(|e| e == *n))
+                .cloned()
+                .collect();
+        }
+    }
     // SAID AFTER THE LOOP, because it is a fact about the WHOLE file. `internal: true` is
     // all-or-nothing under one namespace: it is honoured when every service is confined to internal
     // networks, and dropped otherwise. Deciding it per service would print "not applied" on a file
@@ -492,14 +553,28 @@ fn degrade_orphan_health_gates(boxes: &mut [ComposeBox]) {
         .filter(|b| !b.has_health())
         .map(|b| b.name.clone())
         .collect();
+    // WHICH TARGETS HAVE AN IMAGE, and therefore a `HEALTHCHECK` this parser cannot read. The
+    // decision for those is DEFERRED, not taken: see `ComposeBox::degraded_health`.
+    let has_image: std::collections::HashSet<String> = boxes
+        .iter()
+        .filter(|b| b.image.is_some())
+        .map(|b| b.name.clone())
+        .collect();
     for b in boxes.iter_mut() {
         let mut kept = Vec::new();
         for dep in std::mem::take(&mut b.depends_healthy) {
             if no_health.contains(&dep) {
-                warn(&format!(
-                    "service '{}': dependency '{dep}' has no usable healthcheck → its `service_healthy` gate is degraded to start-order (depends_on); verify that's acceptable",
-                    b.name
-                ));
+                // A target with an image may still be healthy-gateable: its `HEALTHCHECK` lives in
+                // the image config, which only a caller that can resolve images may read. Recorded
+                // and left unwarned; the CLI restores the gate or reports it, with the facts.
+                if !has_image.contains(&dep) {
+                    warn(&format!(
+                        "service '{}': dependency '{dep}' has no usable healthcheck → its `service_healthy` gate is degraded to start-order (depends_on); verify that's acceptable",
+                        b.name
+                    ));
+                } else {
+                    b.degraded_health.push(dep.clone());
+                }
                 if !b.depends_on.contains(&dep) {
                     b.depends_on.push(dep);
                 }
@@ -2749,6 +2824,28 @@ fn collect_network_subnets(root: &Node) -> Vec<(String, String)> {
     out
 }
 
+/// The networks this file declares `external: true`, which under Docker are shared BETWEEN projects.
+///
+/// MEASURED, and silent until now: two files each declaring `networks: {proxy: {external: true}}`,
+/// one service in each. Under Docker they meet on that network and resolve each other by name; it
+/// is the reverse-proxy pattern (Traefik or nginx-proxy in one stack, the applications in others).
+/// Under kern the second service printed `NON_RISOLVE` and nothing said why: a kern stack's network
+/// is its POD, and a pod belongs to one project.
+///
+/// Named rather than fixed, because sharing one namespace across projects is a different design and
+/// not a message. The line says what will happen, so the reader does not debug DNS.
+fn collect_external_networks(root: &Node) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(nets) = root.child("networks") {
+        for (name, def) in &nets.children {
+            if def.child("external").is_some_and(scalar_is_true) {
+                out.push(name.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
 fn collect_internal_networks(root: &Node) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     if let Some(nets) = root.child("networks") {
@@ -3948,6 +4045,44 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     )),
                 }
             }
+            // `runtime:` NAMES THE RUNTIME, AND KERN IS ONE. It is the only key the whole neutral
+            // corpus of 259 files reports as unimplemented, on two files, and BOTH write
+            // `runtime: nvidia`. A generic "ignored (unsupported)" is the wrong answer twice: it
+            // says nothing about what will happen, and the thing that WILL happen is a CUDA or
+            // driver error inside the service that reads as a driver problem on the host.
+            //
+            // `nvidia` and `runc` are answered separately because they mean opposite things. `runc`
+            // asks kern to be a different runtime, which is the one position this project refuses;
+            // `nvidia` asks for hardware, which is a device grant and has a spelling in the file.
+            "runtime" => {
+                let v = node
+                    .scalar
+                    .as_deref()
+                    .map(scalar_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let v = v.as_str();
+                if v.eq_ignore_ascii_case("nvidia") {
+                    warn(&format!(
+                        "service '{name}': `runtime: nvidia` is NOT applied - kern is the runtime \
+                         and does not delegate to another one. The GPU is a DEVICE GRANT here: \
+                         name the devices the service needs under `devices:` and pass \
+                         `--allow-device-grants` to `kern compose`, which is the operator's half \
+                         that a file cannot give itself. WHAT YOU WILL SEE without it: the service \
+                         starts and then fails inside with a CUDA or driver error, which reads as a \
+                         broken driver on the host rather than as this line"
+                    ));
+                } else if v.is_empty() {
+                    warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
+                } else {
+                    warn(&format!(
+                        "service '{name}': `runtime: {v}` is NOT applied - kern IS the runtime and \
+                         cannot hand the container to another one. There is no kern equivalent: a \
+                         workload that needs {v} needs the engine that ships it"
+                    ));
+                }
+            }
             "configs" | "extends" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
@@ -4046,9 +4181,7 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             // ignoring them is not a difference from Docker and reporting one is a false alarm. On
             // the corpus, `cpu_count` was the ONLY difference two files had.
             "cpu_count" | "cpu_percent" | "cpus_shares" | "isolation" => {}
-            other => warn(&format!(
-                "service '{name}': '{other}:' ignored (unsupported)"
-            )),
+            other => warn(&unknown_service_key_note(name, other)),
         }
     }
     // Compose entrypoint + command AFTER the loop (order-independent). Docker's rule depends on the
@@ -5117,7 +5250,7 @@ fn volumes_value(node: &Node, tmpfs: &mut Vec<String>, service: &str) -> Vec<Str
         .into_iter()
         .filter_map(|item| {
             if item.trim_start().starts_with('{') {
-                reconstruct_volume_item(&item, tmpfs)
+                reconstruct_volume_item(&item, tmpfs, service)
             } else {
                 Some(anonymous_volume(&item, service))
             }
@@ -5169,7 +5302,7 @@ fn anonymous_volume(item: &str, service: &str) -> String {
 /// `S:T[:ro]`. An anonymous volume (no `source`) or an unsupported shape is dropped with a warning
 /// rather than forwarded as a malformed `-v`. `type: tmpfs` has no `source`; we don't map it here
 /// (kern has `--tmpfs`), so it's warned-and-skipped.
-fn reconstruct_volume_item(item: &str, tmpfs: &mut Vec<String>) -> Option<String> {
+fn reconstruct_volume_item(item: &str, tmpfs: &mut Vec<String>, service: &str) -> Option<String> {
     let inner = item.trim().trim_start_matches('{').trim_end_matches('}');
     let (mut source, mut target, mut read_only, mut vtype) =
         (String::new(), String::new(), false, String::new());
@@ -5215,6 +5348,24 @@ fn reconstruct_volume_item(item: &str, tmpfs: &mut Vec<String>) -> Option<String
         }
         tmpfs.push(spec);
         return None;
+    }
+    // THE LONG FORM OF AN ANONYMOUS VOLUME, which the short form has handled since it was measured
+    // breaking a real project. `{type: volume, target: /usr/src/app/node_modules}` with no source is
+    // the SAME request as `- /usr/src/app/node_modules`: Docker makes a fresh volume, names it
+    // itself, mounts it there, and reuses it for that service and path on the next `up`. It was
+    // dropped here, which is the one outcome the file cannot mean - the mount exists to stop a bind
+    // mount of the project directory from hiding what the image built, so dropping it hands the
+    // service the empty directory it was written to avoid.
+    //
+    // THE SAME FUNCTION AS THE SHORT FORM, not a second naming scheme. Both spellings of one request
+    // must land on one volume, or a file that switches between them silently gets two.
+    if source.is_empty() && !target.is_empty() && (vtype.is_empty() || vtype == "volume") {
+        let synthesised = anonymous_volume(&target, service);
+        return Some(if read_only {
+            format!("{synthesised}:ro")
+        } else {
+            synthesised
+        });
     }
     if target.is_empty() || source.is_empty() {
         warn(&format!(
@@ -5624,6 +5775,140 @@ fn resolve_net_share(boxes: &[ComposeBox]) -> SharedNamespaces {
     }
     out
 }
+
+/// What to say about a service key kern does not know, naming a NEAR MISS when there is one.
+///
+/// MEASURED on the neutral corpus: after `runtime:` was answered by value, ONE file was left in the
+/// generic bucket, and its key is `depend-on:`. That is a typo for `depends_on`, and "ignored
+/// (unsupported)" is true and useless: the file loses an ordering constraint and the line that
+/// reports it does not say the reader meant something real. Docker ignores it too, so nothing else
+/// on either runtime will mention it again.
+///
+/// ONE EDIT AWAY, AND NO FURTHER. The distance is bounded at one insertion, deletion or substitution
+/// so a suggestion is only made when it is nearly certain: `depend-on` to `depends_on` is two edits
+/// by characters but one once the separators are folded, which is why that fold happens before the
+/// comparison. Without it the one key this exists for would get no suggestion, and with a larger
+/// radius `dns` would suggest `dns_search`, which is a different key and a worse answer.
+fn unknown_service_key_note(service: &str, key: &str) -> String {
+    match nearest_service_key(key) {
+        Some(near) => format!(
+            "service '{service}': '{key}:' ignored (unsupported) - did you mean `{near}:`? They \
+             differ by one character, and the key as written does nothing here or under Docker"
+        ),
+        None => format!("service '{service}': '{key}:' ignored (unsupported)"),
+    }
+}
+
+/// Test-visible wrapper for [`nearest_service_key`]: the suggester is the behaviour, and a decision
+/// taken inside a private helper can be asserted by nothing.
+#[cfg(test)]
+pub(crate) fn nearest_service_key_pub(key: &str) -> Option<&'static str> {
+    nearest_service_key(key)
+}
+
+/// The known service key one edit away from `key`, or `None`.
+///
+/// Hyphens and underscores are folded together first: the compose vocabulary uses the underscore
+/// and people type the hyphen, so `depend-on` and `depends_on` are one deletion apart once the two
+/// separators agree.
+fn nearest_service_key(key: &str) -> Option<&'static str> {
+    let fold = |s: &str| s.to_ascii_lowercase().replace('-', "_");
+    let want = fold(key);
+    KNOWN_SERVICE_KEYS
+        .iter()
+        .find(|k| edit_distance_at_most_one(&want, &fold(k)))
+        .copied()
+}
+
+/// Is the edit distance between `a` and `b` at most one? No allocation, no matrix: the answer only
+/// needs one pass, because a single edit means the strings agree on both sides of one position.
+fn edit_distance_at_most_one(a: &str, b: &str) -> bool {
+    if a == b {
+        return false; // an exact match is not a near miss; it would have been handled already
+    }
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (long, short) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut edits = 0usize;
+    while i < long.len() && j < short.len() {
+        if long[i] == short[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        edits += 1;
+        if edits > 1 {
+            return false;
+        }
+        // A substitution advances both; an insertion advances only the longer one.
+        if long.len() == short.len() {
+            i += 1;
+            j += 1;
+        } else {
+            i += 1;
+        }
+    }
+    edits + (long.len() - i) + (short.len() - j) <= 1
+}
+
+/// The service keys a near miss is measured against: every key this parser acts on, plus the ones it
+/// deliberately ignores, because a typo for an ignored key is still a typo worth naming.
+const KNOWN_SERVICE_KEYS: [&str; 46] = [
+    "image",
+    "build",
+    "command",
+    "entrypoint",
+    "environment",
+    "env_file",
+    "ports",
+    "expose",
+    "volumes",
+    "volumes_from",
+    "depends_on",
+    "healthcheck",
+    "restart",
+    "networks",
+    "network_mode",
+    "user",
+    "working_dir",
+    "hostname",
+    "container_name",
+    "labels",
+    "profiles",
+    "secrets",
+    "tmpfs",
+    "cap_add",
+    "cap_drop",
+    "devices",
+    "dns",
+    "dns_search",
+    "extra_hosts",
+    "init",
+    "ipc",
+    "pid",
+    "privileged",
+    "read_only",
+    "security_opt",
+    "shm_size",
+    "stdin_open",
+    "stop_grace_period",
+    "stop_signal",
+    "sysctls",
+    "tty",
+    "ulimits",
+    "mem_limit",
+    "memswap_limit",
+    "cpus",
+    "runtime",
+];
 
 /// Emit a compat warning to stderr. Prefixed so it's clearly kern's compose-import voice, and so the
 /// user sees exactly which part of their compose didn't map 1:1.
@@ -9524,5 +9809,61 @@ services:
         // control for the lookahead - refusing every bare `!!str` would fail here.
         parse(&svc("    command: !!str\n    entrypoint: /bin/sh\n"))
             .expect("`!!str` with nothing after it is an empty string, not a collection");
+    }
+}
+
+#[cfg(test)]
+mod services_shape_tests {
+    use super::super::parse;
+
+    /// A `services:` BLOCK OF THE WRONG SHAPE IS NAMED FOR WHAT IT IS, not called empty.
+    ///
+    /// MEASURED before this was fixed: `services:` written as a list of names produced no service
+    /// children, fell through to the emptiness check and answered "`services:` is empty" about a
+    /// file holding two entries. Writing the block as a list is one of the commonest ways a compose
+    /// file is mistyped by hand, and the reader was sent to look for a block that was right there.
+    ///
+    /// THE REFERENCE SAYS `services must be a mapping` for a list, a scalar AND an empty block
+    /// alike (measured on Docker 29.6.2, compose plugin v5.3.1). kern keeps a more specific sentence
+    /// for the genuinely empty case, because that one names a different repair, and adopts the
+    /// reference's meaning for the two mis-shaped ones while adding the shape it actually found.
+    ///
+    /// THE CONTROL IS THE EMPTY CASE, which must NOT be reported as mis-shaped: without it this
+    /// test would pass on a parser that called every `services:` block a list.
+    #[test]
+    fn a_services_block_of_the_wrong_shape_is_named_for_what_it_is() {
+        let list = parse("services:\n  - web\n  - db\n");
+        let Err(msg) = list else {
+            panic!("a list-shaped `services:` must be refused")
+        };
+        assert!(
+            msg.contains("must be a mapping") && msg.contains("LIST of 2"),
+            "the refusal must name the shape found and how many entries it holds: {msg}"
+        );
+        assert!(
+            !msg.contains("is empty"),
+            "the CONTROL failed: a block with two entries must never be called empty: {msg}"
+        );
+
+        let scalar = parse("services: hello\n");
+        let Err(msg) = scalar else {
+            panic!("a scalar `services:` must be refused")
+        };
+        assert!(
+            msg.contains("must be a mapping") && msg.contains("'hello'"),
+            "a scalar must be quoted back so the reader sees what was read: {msg}"
+        );
+
+        // THE OTHER CONTROL: a genuinely empty block keeps its own, different sentence. A file with
+        // no services at all is a different mistake from a file whose services are mis-shaped.
+        let empty = parse("services:\n");
+        let Err(msg) = empty else {
+            panic!("an empty `services:` must be refused")
+        };
+        assert!(
+            !msg.contains("LIST"),
+            "an empty block is not a list, and saying so would be the same wrong noun in reverse: \
+             {msg}"
+        );
     }
 }

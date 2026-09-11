@@ -19,7 +19,11 @@ release binary said `ge479dff` while `HEAD` was `6452ea8`, one commit behind, wi
 looked perfectly fresh.
 
 The date is still consulted, but only where the hash cannot answer: a build from a dirty tree
-identifies a commit and not the edits on top of it, so there the newest source file decides.
+identifies a commit and not the edits on top of it, so there the newest MODIFIED source decides.
+Modified is git's answer, not the filesystem's: a file whose content equals HEAD's cannot differ
+from what a build of HEAD contains, however recent its timestamp, and timestamps move for reasons
+that are not edits (`gates-selftest.py` mutates a real source to prove a gate can go red and then
+restores it byte-for-byte; `cargo fmt` rewrites a file that is already formatted).
 
 Both fall back to "cannot tell" rather than to "fine": no git, no `git describe` in the binary (a
 source tarball answers `0.0.0`), or an unreadable version string report that they could not check,
@@ -40,19 +44,51 @@ def _run(args, cwd=None):
     return p.stdout.strip() if p.returncode == 0 else None
 
 
+def _dirty_sources(root):
+    """The source files git reports as MODIFIED, or None when git cannot answer.
+
+    WHY THE DATE CHECK IS RESTRICTED TO THESE. A file whose content equals HEAD's cannot differ from
+    what a build of HEAD contains, whatever its timestamp says, and timestamps move for reasons that
+    are not edits: `gates-selftest.py` injects a defect into a REAL source to prove each gate can go
+    red and then restores it byte-for-byte, and `cargo fmt` rewrites a file that is already
+    formatted. Both leave an mtime newer than the binary and a file identical to what was built.
+
+    Without this, every `gates-selftest` run left the corpus gate and the rate refusing to measure
+    until a rebuild that had nothing to rebuild.
+    """
+    out = _run(["git", "status", "--porcelain", "--", "*.rs"], cwd=str(root))
+    if out is None:
+        return None
+    files = []
+    for line in out.splitlines():
+        # `XY <path>`, and for a rename `XY <old> -> <new>`: the path after the arrow is the one
+        # that exists now.
+        path = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip('"')
+        if path.endswith(".rs"):
+            files.append(root / path)
+    return files
+
+
 def _newer_sources(built_at, root):
-    """Source files modified after `built_at`, which is what a stale build looks like by date."""
+    """Source files that are BOTH modified and newer than the build, which is what stale means."""
+    dirty = _dirty_sources(root)
+    if dirty is None:
+        # No git: fall back to every source, since nothing else can say which ones changed.
+        dirty = []
+        for sub in ("crates", "bindings"):
+            d = root / sub
+            if d.is_dir():
+                dirty.extend(d.rglob("*.rs"))
     out = []
-    for sub in ("crates", "bindings"):
-        d = root / sub
-        if not d.is_dir():
+    for p in dirty:
+        try:
+            if p.is_file() and p.stat().st_mtime > built_at:
+                out.append(p)
+        except OSError:
             continue
-        for p in d.rglob("*.rs"):
-            try:
-                if p.is_file() and p.stat().st_mtime > built_at:
-                    out.append(p)
-            except OSError:
-                continue
     return out
 
 

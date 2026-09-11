@@ -5634,18 +5634,26 @@ fn compose_port_prints_the_published_address_and_fails_when_there_is_none() {
     let _ = fs::remove_file(&toml);
 }
 
-/// A STACK IS ONE NETWORK TRUST DOMAIN, AND THE HOST IS OUTSIDE IT.
+/// THE DEFAULT WIRING SEPARATES TWO SERVICES' LOOPBACKS; `--pod` SHARES THEM; NEITHER REACHES THE
+/// HOST.
 ///
-/// Both halves of the same fact, because the docs stated only the inconvenient one (two services
-/// cannot share a container port) and left the security-relevant one unwritten: services in a pod
-/// share a loopback, so a peer reaches a port that was never published. The other half is the part
-/// that has to hold: the HOST's loopback is not reachable from inside, so the boundary sits between
-/// the stack and the host rather than between the services of one stack.
+/// THE SAME FILE IS RUN TWICE AND THE ANSWERS MUST DIFFER, which is the only form in which this can
+/// be asserted at all. A test that ran one wiring would pass on a kern that always answers the same
+/// thing, and that is not hypothetical: this test existed for the pod alone, and when the default
+/// became the bridge it failed with `Connection refused` - the RIGHT answer for the new wiring,
+/// under a name that promised the old one.
 ///
-/// The host side is asserted with a positive control, a port this test opens on the host itself, so
-/// "unreachable" cannot be a listener that was never there.
+/// PEER is the axis that moved. In a pod the stack is one network namespace, so a port a service
+/// binds and never publishes is reachable by every peer - convenient, and a weaker boundary than the
+/// reference. On the bridge each service holds its own namespace and its own 127.0.0.1, so the same
+/// port is private to the service that bound it, which is what Docker does.
+///
+/// HOST is the axis that must NOT move, and it is the one that matters for confinement: under both
+/// wirings a listener on the host's own loopback is unreachable from inside. It is asserted against
+/// a positive control, a port this test holds open on the host, so "unreachable" cannot be a
+/// listener that was never there.
 #[test]
-fn a_pod_shares_loopback_between_services_and_not_with_the_host() {
+fn the_default_wiring_separates_loopbacks_a_pod_shares_them_and_neither_reaches_the_host() {
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -5682,41 +5690,64 @@ fn a_pod_shares_loopback_between_services_and_not_with_the_host() {
     )
     .unwrap();
 
-    let up = kern()
-        .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["compose", toml.to_str().unwrap(), "up"])
-        .output()
-        .expect("run kern");
-    let err = String::from_utf8_lossy(&up.stderr).to_string();
-    if err.contains("user namespaces") || err.contains("newuidmap") {
-        eprintln!("skip: the stack could not start here");
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&xdg);
-        let _ = fs::remove_file(&toml);
-        return;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(3500));
-    let logs = kern()
-        .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["compose", toml.to_str().unwrap(), "logs", "nosy"])
-        .output()
-        .expect("run kern");
-    let seen = String::from_utf8_lossy(&logs.stdout).to_string();
-    kern()
-        .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["compose", toml.to_str().unwrap(), "down"])
-        .output()
-        .ok();
+    // ONE RUN OF THE STACK, under whatever wiring the caller names, returning `nosy`'s log or
+    // `None` when this machine cannot start the stack at all. A closure and not two copies: the two
+    // runs differ in exactly one argument, and that is the whole experiment.
+    let run_once = |extra: &[&str]| -> Option<String> {
+        let mut c = kern();
+        c.env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", toml.to_str().unwrap(), "up"]);
+        for a in extra {
+            c.arg(a);
+        }
+        let up = c.output().expect("run kern");
+        let err = String::from_utf8_lossy(&up.stderr).to_string();
+        if err.contains("user namespaces") || err.contains("newuidmap") {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        let logs = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", toml.to_str().unwrap(), "logs", "nosy"])
+            .output()
+            .expect("run kern");
+        let seen = String::from_utf8_lossy(&logs.stdout).to_string();
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", toml.to_str().unwrap(), "down"])
+            .output()
+            .ok();
+        Some(seen)
+    };
+
+    let (bridged, podded) = match (run_once(&[]), run_once(&["--pod"])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            eprintln!("skip: the stack could not start here");
+            drop(listener);
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&xdg);
+            let _ = fs::remove_file(&toml);
+            return;
+        }
+    };
 
     assert!(
-        seen.contains("PEER=yes"),
-        "a stack is one network domain: a peer's unpublished port is reachable, and saying otherwise \
-         in the docs would be the lie this test exists to prevent: {seen}"
+        bridged.contains("PEER=no"),
+        "the default wiring gives each service its own 127.0.0.1, so a port a peer bound and never \
+         published must NOT answer there, which is what Docker does: {bridged}"
     );
     assert!(
-        seen.contains("HOST=no"),
-        "and the host is OUTSIDE that domain: a listener on the host's own loopback must not be \
-         reachable from a service (control: this test is holding port {host_port} open): {seen}"
+        podded.contains("PEER=yes"),
+        "the CONTROL failed: `--pod` is one network namespace for the whole stack, so the same \
+         unpublished port MUST answer. Without this half the assertion above would pass on a kern \
+         whose networking is simply broken: {podded}"
+    );
+    assert!(
+        bridged.contains("HOST=no") && podded.contains("HOST=no"),
+        "and the host is OUTSIDE the stack under BOTH wirings: a listener on the host's own \
+         loopback must not be reachable from a service (control: this test is holding port \
+         {host_port} open): bridge={bridged} pod={podded}"
     );
 
     drop(listener);
@@ -10663,5 +10694,634 @@ fn an_unraisable_ulimit_is_clamped_and_named_not_fatal() {
     assert!(
         granted || stderr.contains("cannot raise a hard limit"),
         "the clamp must be NAMED, or the difference is silent: {stderr:?}"
+    );
+}
+
+/// THE RELAY WIRING REACHES INTO A SERVICE THAT RUNS AS A NON-ROOT USER.
+///
+/// IT DID NOT, AND THE MESSAGE BLAMED THE WRONG THING. A stack whose `networks:` segregate gets the
+/// relay wiring, and there `up` died with
+/// `peer relay: binding 127.0.0.2:5432 inside the calling box: errno 13`. Nothing had been bound:
+/// the relay never got into the box. Both facts in that sentence were wrong, and a reader debugs
+/// the port and the address, neither of which is the cause.
+///
+/// THE CAUSE, measured with a positive control that changes nothing but the flag: a credential
+/// change clears `PR_SET_DUMPABLE`, and a process that is not dumpable has its `/proc/<pid>/ns/*`
+/// refused EACCES to every caller, including the uid that owns it. `open ns/user` answers OK at
+/// `dumpable=1` and `Permission denied` at `dumpable=0`, same uid in both arms. A relay enters a box
+/// by opening exactly those two files, and it does so while the box is HELD AT ITS PRE-EXEC GATE -
+/// after the uid switch and before the `execve` that would put the flag back. So the window the gate
+/// creates for correctness was the window in which the box could not be entered.
+///
+/// FOUND ON `khaanh112/SkyTimeHub`, the only image-only file in a 259-file corpus that kern wires
+/// with relays, so it was the entire runnable sample of that wiring, failing.
+///
+/// WHAT THIS ASSERTS is the property, not the message: the stack comes up AND the non-root service
+/// reaches its peer by name. A test on the wording would have gone green again the moment the
+/// sentence was reworded, and this defect deserves better than a string comparison.
+///
+/// THE NON-ROOT SERVICE IS THE CALLER, and that is the shape that matters. A relay has two halves in
+/// two boxes: the LISTENER lives in the box that calls, the CONNECTOR in the box it calls. So the
+/// peer exposes the port and the non-root service does not.
+///
+/// THE CONTROL IS `--pod`, which needs no relay at all and must come up either way: without it this
+/// would pass on a kern that cannot run the file by any route.
+#[test]
+fn the_relay_wiring_reaches_into_a_service_that_runs_as_a_non_root_user() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-it-relayuser-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir");
+    // `networks:` that SEGREGATE, which is what sends a stack to the relay wiring: `out` names no
+    // network, so it is on the implicit `default` and shares none with the other two.
+    //
+    // AN IMAGE AND NOT A `rootfs:`, which every other stack fixture in this file uses to stay off
+    // the network. It cannot be one here: dropping to uid 5050 needs a uid RANGE mapped into the
+    // box, kern asks for one when the stack runs OCI images that drop privilege, and a bare
+    // `rootfs:` service does not get it - measured, `cannot drop to the target gid - it isn't
+    // mapped into the box`. The skips below cover a host that has neither the image nor `newuidmap`.
+    //
+    // Built line by line so the indentation is visible in the source: a YAML fixture IS its
+    // indentation, and this file already records a key that drifted to column 0 and was then read
+    // as a second service.
+    let doc = [
+        "services:".to_string(),
+        "  caller:".to_string(),
+        "    image: alpine".to_string(),
+        "    user: \"5050:5050\"".to_string(),
+        "    networks: [n1]".to_string(),
+        "    command: [\"sleep\", \"30\"]".to_string(),
+        "  peer:".to_string(),
+        "    image: alpine".to_string(),
+        "    networks: [n1]".to_string(),
+        "    expose: [\"7000\"]".to_string(),
+        "    command: [\"sh\", \"-c\", \"nc -l -p 7000\"]".to_string(),
+        "  out:".to_string(),
+        "    image: alpine".to_string(),
+        "    command: [\"sleep\", \"30\"]".to_string(),
+        "networks:".to_string(),
+        "  n1: {}".to_string(),
+        String::new(),
+    ]
+    .join("\n");
+    fs::write(dir.join("docker-compose.yml"), doc).expect("write compose");
+    let xdg = std::env::temp_dir().join(format!("kern-it-relayuser-x-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let up = |extra: &[&str]| -> (String, bool) {
+        let mut c = kern();
+        c.current_dir(&dir).env("XDG_RUNTIME_DIR", &xdg).args([
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "up",
+            "-d",
+        ]);
+        for a in extra {
+            c.arg(a);
+        }
+        let out = c.output().expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.success(),
+        )
+    };
+    let down = |extra: &[&str]| {
+        let mut d = kern();
+        d.current_dir(&dir).env("XDG_RUNTIME_DIR", &xdg).args([
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "down",
+        ]);
+        for a in extra {
+            d.arg(a);
+        }
+        let _ = d.output();
+    };
+
+    let (relayed, relay_ok) = up(&[]);
+    // Does the non-root CALLER resolve its peer's name and reach the port behind it? This is what
+    // the relay is for, and "the stack came up" alone would not prove the relay exists.
+    let reach = kern()
+        .current_dir(&dir)
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "exec",
+            "-T",
+            "caller",
+            "sh",
+            "-c",
+            "nc -w2 peer 7000 </dev/null && echo REACH=yes || echo REACH=no",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    down(&[]);
+    let (podded, pod_ok) = up(&["--pod"]);
+    down(&["--pod"]);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&xdg);
+
+    let unavailable = |t: &str| {
+        t.contains("newuidmap")
+            || t.contains("isn't mapped into the box")
+            || t.contains("user namespaces")
+            || t.contains("could not resolve")
+            || t.contains("no such image")
+            // NOT a bare "connect": it matches kern's ordinary relay prose and skipped this test on
+            // a host where everything worked, which is the failure mode a skip must never have.
+            || t.contains("could not connect to")
+    };
+    if unavailable(&relayed) || unavailable(&podded) {
+        eprintln!(
+            "skip: this host cannot run the fixture (no `alpine` in the cache, or no uid range to \
+             drop to 5050 with)"
+        );
+        return;
+    }
+    assert!(
+        pod_ok,
+        "the CONTROL failed: `--pod` puts the stack in one namespace and needs no relay, so it must \
+         come up. Without it the assertions below would pass on a kern that cannot run this file at \
+         all:\n{podded}"
+    );
+    assert!(
+        relay_ok,
+        "a stack whose `networks:` segregate is wired with relays, and a service running as a \
+         non-root user must not stop those relays being built - the box is unreadable only between \
+         its uid switch and its exec, which is exactly when the gate holds it:\n{relayed}"
+    );
+    assert!(
+        reach.contains("REACH=yes"),
+        "and the relay must actually carry: the non-root caller resolves its peer by name and \
+         reaches the port the file declares. Got: {reach:?}\n{relayed}"
+    );
+}
+
+/// TWO PROJECTS MEET ON AN `external:` NETWORK, IN BOTH DIRECTIONS, AND STOP MEETING WHEN ONE LEAVES.
+///
+/// WHAT THE KEY MEANS. A network declared `external: true` is one the compose file does not own:
+/// another project created it and is on it, which is how a reverse proxy in one file reaches the
+/// applications in another. kern's own network is a stack's pod and belongs to one project, so this
+/// used to resolve nothing and reach nothing, and kern only said so.
+///
+/// WHY IT IS RELAYS AND NOT A BRIDGE, MEASURED BEFORE IT WAS BUILT. A shared layer-2 bridge between
+/// two rootless pods is not available: joining a network namespace needs `CAP_SYS_ADMIN` in the
+/// caller's OWN user namespace, which an unprivileged process lacks in the initial one, and placing
+/// a veth in another namespace needs `CAP_NET_ADMIN` in the user namespace that owns it, which a
+/// process inside a sibling lacks. Both refusals were checked against a control that rules out the
+/// tool. A relay needs neither: its two halves each enter only their own box.
+///
+/// FOUR THINGS ARE ASSERTED, and each is a different way this could be broken while looking fine:
+///
+///   1. THE CONTROL, FIRST: with the network NOT created, `up` must REFUSE, as Docker does. Without
+///      it the rest could pass on a kern that ignores the key entirely and wires nothing, since two
+///      stacks that cannot see each other also fail no assertion about seeing each other.
+///   2. The joiner reaches the stack that was already there.
+///   3. The stack that was already there reaches the JOINER - the direction that does not exist
+///      unless relays were built into a running box of another project, and hosts lines written
+///      into it after it started.
+///   4. After that joiner goes down, the name it published stops resolving in the other project's
+///      box. A feature that only adds is one that leaves a stack resolving peers that are gone.
+#[test]
+fn two_projects_meet_on_an_external_network_and_stop_when_one_leaves() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "xnet");
+    let rootfs = root.to_str().unwrap();
+    let base = std::env::temp_dir().join(format!("kern-it-xnet-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let (a_dir, b_dir) = (base.join("back"), base.join("front"));
+    fs::create_dir_all(&a_dir).expect("mkdir back");
+    fs::create_dir_all(&b_dir).expect("mkdir front");
+    let xdg = base.join("xdg");
+    let _ = fs::create_dir_all(&xdg);
+    // A NETWORK NAME UNIQUE TO THIS PROCESS: the network registry is shared by every kern on the
+    // machine, and a fixed name would make two runs of this suite each other's peers.
+    let net = format!("xnet{}", std::process::id());
+
+    // Each side serves a banner on its own port and declares it, because a relay is built per
+    // DECLARED port - the same rule as inside a stack.
+    let doc = |svc: &str, port: u16| {
+        [
+            "services:".to_string(),
+            format!("  {svc}:"),
+            format!("    rootfs: \"{rootfs}\""),
+            format!("    networks: [{net}]"),
+            format!("    expose: [\"{port}\"]"),
+            format!(
+                "    command: [\"/bin/busybox\", \"sh\", \"-c\", \"while true; do echo \
+                 {}-OK | /bin/busybox nc -l -p {port}; done\"]",
+                svc.to_uppercase()
+            ),
+            "networks:".to_string(),
+            format!("  {net}:"),
+            "    external: true".to_string(),
+            String::new(),
+        ]
+        .join("\n")
+    };
+    fs::write(a_dir.join("docker-compose.yml"), doc("api", 8000)).expect("write back");
+    fs::write(b_dir.join("docker-compose.yml"), doc("proxy", 9000)).expect("write front");
+
+    let compose = |dir: &std::path::Path, args: &[&str]| -> (String, bool) {
+        let mut c = kern();
+        c.current_dir(dir).env("XDG_RUNTIME_DIR", &xdg).args([
+            "compose",
+            "-f",
+            "docker-compose.yml",
+        ]);
+        for a in args {
+            c.arg(a);
+        }
+        let out = c.output().expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.success(),
+        )
+    };
+    let net_cmd = |args: &[&str]| -> (String, bool) {
+        let mut c = kern();
+        c.env("XDG_RUNTIME_DIR", &xdg).arg("network");
+        for a in args {
+            c.arg(a);
+        }
+        let out = c.output().expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.success(),
+        )
+    };
+    let cleanup = |base: &std::path::Path, root: &std::path::Path| {
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(root);
+    };
+
+    // 1. THE CONTROL. The network does not exist yet, so `up` must refuse - and name the remedy.
+    let (refused, refused_ok) = compose(&a_dir, &["up", "-d"]);
+    if refused.contains("user namespaces") || refused.contains("newuidmap") {
+        eprintln!("skip: the stack could not start here");
+        cleanup(&base, &root);
+        return;
+    }
+    assert!(
+        !refused_ok && refused.contains("network create"),
+        "a file naming an `external: true` network that does not exist must be REFUSED, as Docker \
+         refuses it, and the refusal must name the command that fixes it:\n{refused}"
+    );
+
+    let (created, create_ok) = net_cmd(&["create", &net]);
+    assert!(create_ok, "the network must be creatable:\n{created}");
+
+    // 2. The stack that is already there, then the joiner.
+    let (a_up, a_ok) = compose(&a_dir, &["up", "-d"]);
+    assert!(
+        a_ok,
+        "the first stack must come up once the network exists:\n{a_up}"
+    );
+    let (b_up, b_ok) = compose(&b_dir, &["up", "-d"]);
+    assert!(b_ok, "the joining stack must come up:\n{b_up}");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    // 3. BOTH DIRECTIONS. The joiner reaching the incumbent proves the hosts entries it was born
+    // with and the relays it hosts; the incumbent reaching the JOINER proves relays were built into
+    // a box that was already running, and its hosts file written after it started.
+    let probe = |dir: &std::path::Path, svc: &str, peer: &str, port: u16| -> String {
+        let (out, _) = compose(
+            dir,
+            &[
+                "exec",
+                "-T",
+                svc,
+                "/bin/busybox",
+                "sh",
+                "-c",
+                &format!("/bin/busybox nc -w3 {peer} {port}"),
+            ],
+        );
+        out
+    };
+    let joiner_sees = probe(&b_dir, "proxy", "api", 8000);
+    let incumbent_sees = probe(&a_dir, "api", "proxy", 9000);
+
+    // 4. TEARDOWN: the joiner leaves, and the name it published must stop resolving in the other
+    // project's box.
+    let _ = compose(&b_dir, &["down"]);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let (after, _) = compose(
+        &a_dir,
+        &[
+            "exec",
+            "-T",
+            "api",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "/bin/busybox grep -c proxy /etc/hosts || echo GONE",
+        ],
+    );
+    let (listed, _) = net_cmd(&["ls"]);
+    let _ = compose(&a_dir, &["down"]);
+    let (_, removed_ok) = net_cmd(&["rm", &net]);
+    cleanup(&base, &root);
+
+    assert!(
+        joiner_sees.contains("API-OK"),
+        "the joining project must reach a service of the project already on the network:\n{joiner_sees}"
+    );
+    assert!(
+        incumbent_sees.contains("PROXY-OK"),
+        "and the project already there must reach the JOINER, which only works if relays were built \
+         into its running boxes and their hosts files written after they started:\n{incumbent_sees}"
+    );
+    assert!(
+        after.contains("GONE") || after.trim_end().ends_with('0'),
+        "after the joiner's `down`, the name it published must stop resolving in the other \
+         project's box, or a stack is left naming peers that are gone:\n{after}"
+    );
+    assert!(
+        listed.contains(&net),
+        "the network must still exist while a member is on it:\n{listed}"
+    );
+    assert!(
+        removed_ok,
+        "and it must be removable once every member has gone"
+    );
+}
+
+/// `down` STOPS A STACK'S NATs INSTEAD OF DELETING WHAT IDENTIFIES THEM.
+///
+/// Teardown removed the `outbound/` subtree with `remove_dir_all`, and that subtree is where every
+/// box's `pasta.pid` and `pasta.id` live: the processes were never signalled, and the only records
+/// that could have found them again went in the same call.
+///
+/// IT HID BEHIND THE HEALTHY CASE. A NAT that keeps its netns watch exits by itself when the box's
+/// namespace goes, so a stack whose NATs all had the watch looked clean, and MEASURED cycles of
+/// `up`/`down` showed no drift. The population that leaked is the other one: a host that refuses the
+/// netns-DIRECTORY open makes pasta fall back to `--no-netns-quit`, and that process has no watch
+/// and waits for a signal through the pid file teardown had just deleted. MEASURED on this machine
+/// before the fix: 27 such processes, some hours old, every one from a box running as a non-root
+/// user - the case where that open is refused.
+///
+/// WHAT THIS ASSERTS is the property and not the mechanism: after `down`, no `pasta` anywhere on the
+/// machine still names this stack's directory in its `-P` argument. It counts by reading `/proc`,
+/// which is the only place that answers truthfully once the pid files are gone.
+///
+/// THE CONTROL IS THE COUNT WHILE THE STACK IS UP: at least one NAT must be attached, or the
+/// assertion below would hold on a kern that never created any and the test would prove nothing.
+#[test]
+fn compose_down_stops_the_stack_s_nats_and_does_not_merely_delete_their_pidfiles() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-it-natdown-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir");
+    let xdg = dir.join("xdg");
+    let _ = fs::create_dir_all(&xdg);
+    // `networks:` that segregate, so the stack is wired per service and each one gets its OWN NAT
+    // under `relays/<stack>/outbound/<service>/` - which is the tree this test is about. A pod
+    // stack has a single NAT in `pods/<name>/` and would exercise the other path.
+    let doc = [
+        "services:".to_string(),
+        "  one:".to_string(),
+        "    image: alpine".to_string(),
+        "    networks: [n1]".to_string(),
+        "    command: [\"sleep\", \"60\"]".to_string(),
+        "  two:".to_string(),
+        "    image: alpine".to_string(),
+        "    networks: [n1]".to_string(),
+        "    command: [\"sleep\", \"60\"]".to_string(),
+        "  out:".to_string(),
+        "    image: alpine".to_string(),
+        "    command: [\"sleep\", \"60\"]".to_string(),
+        "networks:".to_string(),
+        "  n1: {}".to_string(),
+        String::new(),
+    ]
+    .join("\n");
+    fs::write(dir.join("docker-compose.yml"), doc).expect("write compose");
+
+    // Every `pasta` whose `-P` pidfile argument mentions `needle`, read from `/proc` because the
+    // pid files themselves are gone by the time this matters.
+    let nats_naming = |needle: &str| -> usize {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return 0;
+        };
+        let mut n = 0;
+        for e in entries.filter_map(Result::ok) {
+            let Some(pid) = e.file_name().to_str().and_then(|f| f.parse::<i32>().ok()) else {
+                continue;
+            };
+            let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let argv: Vec<String> = raw
+                .split(|c| *c == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            let Some(first) = argv.first() else { continue };
+            if !first.ends_with("pasta") && !first.ends_with("passt") {
+                continue;
+            }
+            if argv
+                .iter()
+                .any(|a| a.contains(needle) && a.ends_with("pasta.pid"))
+            {
+                n += 1;
+            }
+        }
+        n
+    };
+    let compose = |args: &[&str]| -> String {
+        let mut c = kern();
+        c.current_dir(&dir).env("XDG_RUNTIME_DIR", &xdg).args([
+            "compose",
+            "-f",
+            "docker-compose.yml",
+        ]);
+        for a in args {
+            c.arg(a);
+        }
+        let out = c.output().expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    let up = compose(&["up", "-d"]);
+    if up.contains("user namespaces")
+        || up.contains("newuidmap")
+        || up.contains("could not resolve")
+    {
+        eprintln!("skip: the stack could not start here");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    // The stack's own runtime tree is what a NAT's pidfile path carries; the temp XDG dir's name is
+    // unique to this process, so it cannot match another run's.
+    let needle = xdg.to_string_lossy().into_owned();
+    let while_up = nats_naming(&needle);
+    let _ = compose(&["down"]);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let after_down = nats_naming(&needle);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        while_up > 0,
+        "the CONTROL failed: a per-service stack must attach at least one NAT, or the assertion \
+         below would hold on a kern that never created one:\n{up}"
+    );
+    assert_eq!(
+        after_down, 0,
+        "`down` left {after_down} NAT(s) of this stack running. They are unreachable now: the pid \
+         files that identified them were deleted by the same teardown"
+    );
+}
+
+/// THE `ps` TABLE STAYS ALIGNED WHEN A NAME IS LONGER THAN THE COLUMN USED TO BE.
+///
+/// NAME was a fixed sixteen characters, and every name past that pushed PID, UPTIME, HEALTH and
+/// PORTS out of line for the whole table. It is not a corner: a compose box is named
+/// `<project>-<hash8>-<service>`, which passes sixteen for any service name at all, so the views a
+/// person watches during a demo were exactly the ones that broke. MEASURED on a real stack:
+/// `psbug-749cf899-secret` is 21 characters and shifted every column after it.
+///
+/// ASSERTED BY COLUMN OFFSET AND NOT BY EYE: the PID field of every row must begin at the same
+/// character offset as `PID` does in the header. That is the property alignment IS, and it holds
+/// whatever the widths turn out to be.
+///
+/// THE CONTROL IS A SHORT NAME in the same run: the table must not have started padding everything
+/// to some new constant, which would pass an offset check while making the short output wrong.
+#[test]
+fn the_ps_table_stays_aligned_when_a_box_name_is_long() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "psalign");
+    let rootfs = root.to_str().unwrap_or_default();
+    let xdg = std::env::temp_dir().join(format!("kern-it-psalign-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    // One long name and one short one, in the same table.
+    let long = format!("averylongboxname-{}-with-suffix", std::process::id());
+    let short = format!("s{}", std::process::id() % 1000);
+    let start = |name: &str| {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                rootfs,
+                "-d",
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "sleep 30",
+            ])
+            .output()
+            .expect("run kern")
+    };
+    let a = start(&long);
+    let b = start(&short);
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&a.stderr),
+        String::from_utf8_lossy(&b.stderr)
+    );
+    let listed = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["ps"])
+        .output()
+        .expect("run kern");
+    let table = String::from_utf8_lossy(&listed.stdout).to_string();
+    for n in [&long, &short] {
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", n])
+            .output();
+    }
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    if err.contains("user namespaces") || err.contains("newuidmap") {
+        eprintln!("skip: boxes could not start here");
+        return;
+    }
+    let mut lines = table.lines();
+    let Some(header) = lines.next() else {
+        panic!("`ps` printed nothing:\n{table}")
+    };
+    let Some(pid_col) = header.find("PID") else {
+        panic!("the header has no PID column:\n{table}")
+    };
+    let mut checked = 0;
+    for line in lines {
+        // Only the rows for the two boxes this test started; any other stack on this machine is
+        // filtered out by its own runtime directory already, but a pod header line is not a row.
+        if !line.starts_with(long.as_str()) && !line.starts_with(short.as_str()) {
+            continue;
+        }
+        // The row's pid is the first run of digits after the name; where it BEGINS is the claim.
+        let Some(digit_at) = line.char_indices().find_map(|(i, c)| {
+            (c.is_ascii_digit() && i > 0 && line.as_bytes()[i - 1] == b' ').then_some(i)
+        }) else {
+            panic!("no pid on this row: {line:?}")
+        };
+        // The PID column is right-aligned in a 7-wide field, so a pid shorter than 7 starts LATER
+        // than the header's `PID`; what must hold is that it ends where the field ends.
+        let field_end = pid_col + 3;
+        let pid_end = line[digit_at..]
+            .find(' ')
+            .map_or(line.len(), |o| digit_at + o);
+        assert_eq!(
+            pid_end, field_end,
+            "the PID field of {line:?} ends at {pid_end} and the header's ends at {field_end}: a \
+             name longer than the column used to be has pushed every column after it out of \
+             line\n{table}"
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 2,
+        "the CONTROL failed: both the long-named and the short-named box must appear, or this test \
+         asserts alignment about a table it never saw:\n{table}"
     );
 }

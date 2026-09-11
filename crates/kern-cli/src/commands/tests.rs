@@ -6,6 +6,76 @@
 //! A child module still reaches its ancestors' private items, so the tests assert on exactly the
 //! internals they did before, without widening one item's visibility.
 
+/// THE SWAP ALLOWANCE A SERVICE GETS, and the retraction of a decision taken on a false premise.
+///
+/// `memory.swap.max = 0` was chosen as "stricter, and said so", believing a rootless runtime had to.
+/// MEASURED: podman 4.9.3, rootless, gives `max`/`max` with no memory key and `256m`/`256m` with
+/// `--memory 256m`, exactly as Docker 29.6.2 does. It did not have to. And kern's own ceiling is the
+/// host's RAM, so the box was never bounded either: not strict, not Docker, and silent, since no
+/// warning names it.
+///
+/// The three rules are the two references' measured behaviour, and the fourth case is the host that
+/// has no swap to give.
+#[test]
+fn a_service_gets_the_swap_allowance_docker_and_podman_give_it() {
+    use crate::commands::service_swap_allowance;
+    const HOST_SWAP: u64 = 25_322_442_752;
+
+    // Nothing written: the machine's own swap, which is the bound Docker's `max` amounts to and the
+    // same decision the build path already took.
+    assert_eq!(
+        service_swap_allowance(None, None, Some(HOST_SWAP)),
+        Some(HOST_SWAP.to_string())
+    );
+    // `mem_limit: 256m` and nothing else: the allowance EQUALS the limit, which is the 2x total
+    // Docker gives, so a file tuned against Docker keeps its headroom.
+    assert_eq!(
+        service_swap_allowance(None, Some("256m"), Some(HOST_SWAP)),
+        Some((256 * 1024 * 1024).to_string())
+    );
+    // `memswap_limit` written: untouched, because the parser has already turned Docker's TOTAL into
+    // the v2 swap-only figure by subtraction.
+    assert_eq!(
+        service_swap_allowance(Some("512m"), Some("256m"), Some(HOST_SWAP)),
+        None
+    );
+    // A host with no swap has nothing to allow. Writing `0` here would restate the defect.
+    assert_eq!(service_swap_allowance(None, None, Some(0)), None);
+    assert_eq!(service_swap_allowance(None, None, None), None);
+    // An unparseable `mem_limit` is left alone rather than guessed at: the box's own flag parser
+    // reports it, which is a better error than anything this function could invent.
+    assert_eq!(
+        service_swap_allowance(None, Some("not-a-size"), Some(HOST_SWAP)),
+        None
+    );
+}
+
+/// THE MEMO FILENAME IS MANY-TO-ONE, AND THE FILE KNOWS IT.
+///
+/// `expose_memo_name` maps an image reference onto a filename by replacing every character that is
+/// not safe in one, so the cache of EXPOSE sets stays readable by a person debugging a wiring
+/// decision. Two different references can land on the same name (`a/b:1` and `a_b_1`), which is why
+/// the memo's first line is the reference it was written for and a read that does not match it is
+/// discarded. This pins both halves: the mapping is stable, and the collision it admits is real
+/// rather than hypothetical, so the guard cannot be removed as unnecessary.
+#[test]
+fn the_expose_memo_name_is_safe_and_its_collisions_are_real() {
+    use crate::commands::expose_memo_name;
+    assert_eq!(
+        expose_memo_name("docker.io/library/redis:7.2-alpine"),
+        "docker.io_library_redis_7.2-alpine"
+    );
+    assert_eq!(expose_memo_name("alpine:3.19"), "alpine_3.19");
+    // Nothing that could leave the directory survives the mapping.
+    assert_eq!(expose_memo_name("../../etc/passwd"), ".._.._etc_passwd");
+    assert!(!expose_memo_name("a/b:1").contains('/'));
+    assert_eq!(
+        expose_memo_name("a/b:1"),
+        expose_memo_name("a_b_1"),
+        "two references share a filename, so the memo must carry the reference it belongs to"
+    );
+}
+
 /// Does an unwritable directory actually block the unlink of what it holds?
 ///
 /// It does for a normal user, and NOT for root: `CAP_DAC_OVERRIDE` ignores the permission bits, so a

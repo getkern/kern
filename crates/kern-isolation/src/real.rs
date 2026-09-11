@@ -1622,6 +1622,34 @@ fn set_user(uid: u32, gid: u32, extra_gids: &[u32]) -> Result<(), Error> {
                  image's own USER; add newuidmap/newgidmap + an /etc/subuid allocation, or use --uid-range)",
             ));
         }
+        // PUT `dumpable` BACK, BECAUSE THE KERNEL JUST CLEARED IT AND THE `execve` BELOW WILL SET IT
+        // ANYWAY.
+        //
+        // A credential change clears `PR_SET_DUMPABLE`, and a process that is not dumpable has its
+        // `/proc/<pid>/ns/*` refused with EACCES - to EVERY caller, including the uid that owns it.
+        // MEASURED, same uid in both arms and nothing but this flag between them: `open
+        // /proc/<pid>/ns/user` answers OK at `dumpable=1` and `Permission denied` at `dumpable=0`.
+        //
+        // WHAT IT BROKE. kern's peer relay enters a box by opening exactly those two files, and it
+        // does so while every box is still HELD AT ITS PRE-EXEC GATE - which is the whole
+        // correctness argument for the gate: no workload has run, so no workload can observe a
+        // half-built network. Between this `setuid` and the workload's `execve` the box is therefore
+        // unreadable, and a stack whose `networks:` segregate died with
+        // `peer relay: ... errno 13` for every service that runs as a non-root user. On the neutral
+        // corpus that was the ONLY image-only file kern wires with relays, so it was the whole
+        // runnable sample of that wiring.
+        //
+        // WHY RESTORING IT GIVES NOTHING AWAY. `execve` recomputes `dumpable` from the new
+        // credentials, so the only interval this changes is the one between here and that exec, and
+        // in that interval the only code running is kern's own box setup. The classic reason to
+        // leave a uid-changed process undumpable is a setuid `execve` afterwards; kern arms
+        // `PR_SET_NO_NEW_PRIVS` before the workload runs (seccomp requires it), which makes the
+        // setuid bit inert process-wide - the same reasoning already recorded for the `nosuid`
+        // remount being defence in depth rather than load-bearing.
+        //
+        // NOT FATAL: a box that cannot be entered by a relay is still a box that runs. The relay
+        // says so itself, by name, and that message is the one that used to blame a bind.
+        libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
     }
     Ok(())
 }
@@ -5594,8 +5622,21 @@ pub fn mask_of(prefix: u8) -> std::net::Ipv4Addr {
 /// A FORKED HELPER DOES THE WORK IN THE HOLDER'S NAMESPACE, because both ends of a `veth` are born
 /// where it is created and one of them has to be born next to the bridge. The helper `setns`es into
 /// the holder's network namespace (legal: the member is already in the pod's USER namespace, which
-/// owns it), builds the pair, attaches one end to the bridge and hands the other back by this
-/// process's pid. The caller then renames it and gives it its address, in its own namespace.
+/// owns it), builds the pair with THIS process's namespace named for the far end, and attaches the
+/// near end to the bridge. The caller then renames it and gives it its address, in its own
+/// namespace.
+///
+/// THE FAR END IS BORN HERE, NOT MOVED HERE, and that is worth about 20 ms per service. Moving an
+/// interface between network namespaces waits a full RCU grace period inside the kernel;
+/// [`crate::netlink::add_veth_peer_in_netns`] names the target namespace in the CREATE message and
+/// the kernel registers the peer there directly. Measured, five pairs each, in a user namespace:
+/// 14-22 ms to move, 1-2 ms to create in place. End to end that took a bridged member from 16-30 ms
+/// down to the pod member's own cost, and it is the reason the bridge can be the default wiring.
+///
+/// THE MOVE IS STILL THERE AS A FALLBACK. The create-time form has been in the kernel for as long
+/// as `veth` has, but this is the one step in a box's setup that has no alternative if it fails: a
+/// member that cannot attach cannot start at all. So a refusal falls back to build-then-move, which
+/// is what every kern before this did, and the box comes up 20 ms slower instead of not at all.
 fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
     let me = std::process::id() as i32;
     let vname = format!("kv{me}");
@@ -5624,26 +5665,57 @@ fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
             // SAFETY: `fd` is a namespace file just opened.
             } else if unsafe { libc::setns(fd, libc::CLONE_NEWNET) } != 0 {
                 3
-            } else if crate::netlink::add_veth(&vname, &pname).is_err() {
-                4
             } else {
-                match (
-                    crate::netlink::index_of(&vname),
-                    crate::netlink::index_of(POD_BRIDGE),
-                    crate::netlink::index_of(&pname),
-                ) {
-                    (Some(v), Some(b), Some(p)) => {
-                        if crate::netlink::set_master(v, b).is_err() {
-                            6
-                        } else if !iface_up(&vname) {
-                            7
-                        } else if crate::netlink::move_to_netns(p, me).is_err() {
-                            9
-                        } else {
-                            0
+                // THE FAST FORM FIRST: the peer is created already inside the member's namespace,
+                // so nothing is ever moved. `born_far` records which form succeeded, because the
+                // two leave the helper's namespace in different states and the steps below differ.
+                //
+                // AND IT IS CONFIRMED BY LOOKING, NOT BY THE RETURN VALUE. A kernel that did not
+                // read `IFLA_NET_NS_PID` inside the peer's nest would create the pair, answer with
+                // a perfectly good ack, and leave the far end HERE - and a fallback keyed on the
+                // error would never fire, so the member would find nothing to rename and fail to
+                // start. MEASURED by deleting that one attribute: the box did not come up. The
+                // check is one `if_nametoindex` and it turns a fallback that reads well into one
+                // that works.
+                //
+                // THE THREE STATES ARE NOT TWO, and reading them as two is a defect this fallback
+                // had until the mutation above was actually run. `made` says a pair exists;
+                // `born_far` says the far end is where it belongs. A fast form that succeeded but
+                // ignored the namespace has `made` true and `born_far` false, and calling
+                // `add_veth` again for it fails with `EEXIST` - which is what happened, and turned
+                // the rescue into a second way to fail.
+                let fast = crate::netlink::add_veth_peer_in_netns(&vname, &pname, me).is_ok();
+                let born_far = fast && crate::netlink::index_of(&pname).is_none();
+                let made = fast || crate::netlink::add_veth(&vname, &pname).is_ok();
+                if !made {
+                    4
+                } else {
+                    match (
+                        crate::netlink::index_of(&vname),
+                        crate::netlink::index_of(POD_BRIDGE),
+                    ) {
+                        (Some(v), Some(b)) => {
+                            if crate::netlink::set_master(v, b).is_err() {
+                                6
+                            } else if !iface_up(&vname) {
+                                7
+                            } else if born_far {
+                                // Nothing left to do here: the far end is already where it belongs.
+                                0
+                            } else {
+                                // The fallback. The peer is still in THIS namespace - either
+                                // because the fast form was refused, or because it silently ignored
+                                // the target namespace - and has to make the trip, paying the grace
+                                // period the fast form avoids.
+                                match crate::netlink::index_of(&pname) {
+                                    Some(p) if crate::netlink::move_to_netns(p, me).is_ok() => 0,
+                                    Some(_) => 9,
+                                    None => 5,
+                                }
+                            }
                         }
+                        _ => 5,
                     }
-                    _ => 5,
                 }
             }
         };
@@ -5792,8 +5864,84 @@ pub fn run_pod_holder() -> ! {
             libc::close(libc::STDOUT_FILENO);
         }
     }
+    hold_until_the_pod_is_gone();
+}
+
+/// Block for the life of the pod, and no longer.
+///
+/// WHY THIS IS NOT `pause()` ANY MORE. A holder exists to keep one pod's user and net namespaces
+/// alive, and it is addressed through the pod's directory under the registry: that directory holds
+/// its pid file, its `hosts`, its `resolv.conf`. When the directory goes, nothing can name the pod,
+/// nothing can join it and `kern pod rm` cannot find it - but the holder went on holding, forever,
+/// and so did the `pasta` watching its namespace.
+///
+/// MEASURED on this machine: 140 orphan holders and 116 `pasta` processes, the oldest alive for
+/// 5.8 hours, every one of them from an integration test that set `XDG_RUNTIME_DIR` to a temporary
+/// directory and removed it at the end without tearing the pod down. A user who deletes their
+/// runtime directory - or whose `/run/user/<uid>` is cleaned on logout - reaches the same state.
+///
+/// FAIL-SAFE TOWARD STAYING ALIVE, WHICH IS THE WHOLE DESIGN. Exiting wrongly kills a running
+/// stack's network, so every uncertainty resolves to "keep holding":
+///
+///   * no `KERN_POD_DIR` in the environment (a holder spawned by an older kern, or by hand) leaves
+///     this function in the exact `pause()` loop it replaced, forever;
+///   * only a definite ABSENCE counts. `try_exists` answers `Ok(false)` for ENOENT alone; a
+///     permission error, an I/O error or an unmounted filesystem answer `Err`, and `Err` is treated
+///     as "still there";
+///   * and absence has to hold across TWO consecutive checks a full interval apart, so a directory
+///     being replaced by a rename is never mistaken for one that is gone.
+///
+/// THE INTERVAL IS LONG ON PURPOSE. This costs one `stat` every 30 seconds for the life of a pod,
+/// which is nothing, and the requirement it serves is only that a leaked holder stops existing in
+/// under a minute rather than in hours.
+fn hold_until_the_pod_is_gone() -> ! {
+    let dir = match std::env::var_os("KERN_POD_DIR") {
+        Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        // Nothing to watch: hold forever, which is what every kern before this did.
+        _ => loop {
+            // SAFETY: `pause` takes no arguments and only blocks this thread until a signal.
+            unsafe { libc::pause() };
+        },
+    };
+    /// One poll. Long enough to be free, short enough that a leak is measured in seconds.
+    const POLL: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut missing_in_a_row = 0u8;
     loop {
-        unsafe { libc::pause() };
+        std::thread::sleep(POLL);
+        let (next, release) = pod_holder_verdict(missing_in_a_row, dir.try_exists());
+        missing_in_a_row = next;
+        if release {
+            // SAFETY: leaving a detached daemon with no handlers of its own to run. The namespaces
+            // this process held are released by the kernel as it goes, and the `pasta` watching
+            // them exits on its own netns watch.
+            unsafe { libc::_exit(0) };
+        }
+    }
+}
+
+/// One poll of [`hold_until_the_pod_is_gone`]: the new strike count, and whether to let the pod go.
+///
+/// PURE, BECAUSE THE LOOP AROUND IT CANNOT BE TESTED WITHOUT WAITING A MINUTE AND THE DANGEROUS
+/// BRANCH IS NOT THE SLOW ONE. Releasing wrongly takes the network away from a running stack, so the
+/// branch that must never fire is `Err` - a directory that could not be stat'ed, which is not a
+/// directory that is gone. Written inline it was three arms inside a sleeping loop, reachable only
+/// by a test that sleeps; written here every arm is one call.
+///
+/// `probe` is [`std::path::Path::try_exists`]'s answer, whose whole value is that it distinguishes
+/// ENOENT (`Ok(false)`) from every other failure (`Err`).
+///
+/// TWO STRIKES, A FULL INTERVAL APART, so a directory being replaced by a rename is never read as
+/// one that is gone. The counter saturates rather than wrapping: a `u8` rolling over to 0 after 256
+/// consecutive absences would make a long-gone pod immortal again, which is the exact bug this
+/// function exists to end.
+fn pod_holder_verdict(missing_in_a_row: u8, probe: std::io::Result<bool>) -> (u8, bool) {
+    match probe {
+        Ok(true) => (0, false),
+        Ok(false) => {
+            let n = missing_in_a_row.saturating_add(1);
+            (n, n >= 2)
+        }
+        Err(_) => (0, false),
     }
 }
 
@@ -7856,5 +8004,47 @@ mod id_map_tests {
         );
         // Count zero maps nothing and is not a range either.
         assert!(!map_text_is_ranged("0 1000 0\n"));
+    }
+}
+
+#[cfg(test)]
+mod pod_holder_watchdog_tests {
+    use super::pod_holder_verdict;
+
+    /// A HOLDER LETS ITS POD GO ONLY ON A DEFINITE, REPEATED ABSENCE.
+    ///
+    /// The holder keeps a pod's user and net namespaces alive. Releasing them while the pod is
+    /// running takes the network away from every service in it, so the failure this guards is not
+    /// "leaks a process" but "kills a live stack", and the arms are asserted one at a time.
+    ///
+    /// MEASURED end to end on the real thing, once, by hand: a pod created, its directory removed
+    /// underneath it, and the holder gone within 70 seconds - two polls of 30. That measurement is
+    /// not repeated in the suite, because a minute of sleeping per run buys nothing this function
+    /// does not decide.
+    #[test]
+    fn a_pod_holder_releases_only_on_a_repeated_definite_absence() {
+        let enoent = || Ok(false);
+        let present = || Ok(true);
+        let unreadable = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+
+        // ONE absence is not enough: a directory can be replaced by a rename.
+        assert_eq!(pod_holder_verdict(0, enoent()), (1, false));
+        // TWO in a row is.
+        assert_eq!(pod_holder_verdict(1, enoent()), (2, true));
+
+        // THE DANGEROUS ARM. An unreadable directory is not a missing one, and it must reset the
+        // count rather than advance it: a permission or I/O error on a live pod's directory would
+        // otherwise be two strikes away from killing the stack.
+        assert_eq!(pod_holder_verdict(1, unreadable()), (0, false));
+        assert_eq!(pod_holder_verdict(0, unreadable()), (0, false));
+
+        // And a directory that is there resets the count too, so an absence followed by a return
+        // does not carry a strike forward.
+        assert_eq!(pod_holder_verdict(1, present()), (0, false));
+        assert_eq!(pod_holder_verdict(0, present()), (0, false));
+
+        // THE COUNTER SATURATES. Wrapping would make a pod that has been gone for 256 polls look
+        // freshly absent and immortal again, which is the bug this whole function exists to end.
+        assert_eq!(pod_holder_verdict(u8::MAX, enoent()), (u8::MAX, true));
     }
 }

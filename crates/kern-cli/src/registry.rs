@@ -425,7 +425,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 10] = [
+const AUTHORITATIVE_DIRS: [&str; 11] = [
     "instances",
     "claims",
     "exit",
@@ -462,6 +462,14 @@ const AUTHORITATIVE_DIRS: [&str; 10] = [
     // quoted text inside the braces, so an example written with quotes here becomes a phantom
     // authoritative directory. It counted nine with eight entries until this line was rewritten.
     "mounts",
+    // A network shared BETWEEN PROJECTS: which boxes are on it, with the service name and the ports
+    // each one answers on. AUTHORITATIVE, and for a sharper reason than the others: this directory is
+    // the ONLY thing that decides which boxes of OTHER projects a stack builds relays into and puts
+    // in its hosts file. A box able to write a line here names a peer that another project's
+    // services will resolve and connect to, which is the forgery vector in its purest form. It is
+    // also read by a stack whose own compose file never mentioned the box in question, so nothing
+    // downstream can sanity-check the entry against a file the operator wrote.
+    "networks",
 ];
 
 /// Registry children that are OPAQUE box DATA kern never interprets: mounting one is access to a peer

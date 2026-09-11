@@ -194,14 +194,29 @@ impl ImageHealthcheck {
 /// Pull `image` into `dest` (created if needed), producing a usable rootfs, and return its OCI
 /// runtime config (entrypoint/cmd/env/workdir/user). Progress is reported to **stderr** (so stdout
 /// stays clean) - the user always sees what's happening, never a silent hang.
-pub fn pull(
+/// Resolve a reference to the ARCH-SPECIFIC manifest, with every content-address check on the way.
+///
+/// EXTRACTED FROM [`pull`] WITHOUT A LINE CHANGED, so the two callers cannot come to verify
+/// different things. It is the whole security-relevant prologue: the digest pin on a pinned
+/// reference, the exact-arch selection with no fallback, and the verification of the sub-manifest
+/// against the digest the index named.
+///
+/// The second caller is [`fetch_image_config`], which needs the manifest to find the config blob and
+/// must NOT download a single layer to get it.
+///
+/// `announce` prints the resolving line. `pull` wants it; a `config` that is answering a question
+/// about a file does not, and printing it would put registry traffic in the middle of a dry run's
+/// output with no explanation.
+fn resolve_manifest(
     image: &str,
-    dest: &Path,
     platform: Option<&Platform>,
-) -> Result<ImageConfig, OciError> {
+    announce: bool,
+) -> Result<(String, String, String, Auth), OciError> {
     let host = Platform::host();
     let want = platform.unwrap_or(&host);
-    kern_common::progress!("→ resolving {image} ({}/{})", want.os, want.arch);
+    if announce {
+        kern_common::progress!("→ resolving {image} ({}/{})", want.os, want.arch);
+    }
     let (registry, repo, reference) = parse_ref(image)?;
     let auth = discover_auth(&registry, &repo)?;
 
@@ -236,6 +251,41 @@ pub fn pull(
     } else {
         manifest
     };
+    Ok((registry, repo, manifest, auth))
+}
+
+/// An image's runtime CONFIG, fetched WITHOUT downloading a layer.
+///
+/// WHAT IT IS FOR. kern reads an image's `EXPOSE` set to find two services claiming one internal
+/// port, and that finding decides how a compose stack is wired. Reading it from the local cache only
+/// made the answer depend on what happened to be pulled: measured, the same file answered `pod`
+/// before a pull and `bridge` after one, and on a cold cache the first `up` put two services that
+/// both EXPOSE a port into one namespace, where the second died.
+///
+/// The config is a JSON document of a few kilobytes named by the manifest, not a layer. Fetching it
+/// is the same registry round-trip `pull` already makes, minus every byte that costs anything: on a
+/// 400 MB image it is three requests and single-digit kilobytes.
+///
+/// THE BLOB IS WRITTEN TO A CALLER-OWNED DIRECTORY AND NOT TO THE IMAGE STORE. An image store entry
+/// with a config and no layers would read as "this image is present" to every other caller, and the
+/// next `kern box --image` would fail on a rootfs that was never extracted. The caller passes a
+/// scratch directory and owns its lifetime.
+pub fn fetch_image_config(
+    image: &str,
+    scratch: &Path,
+    platform: Option<&Platform>,
+) -> Result<ImageConfig, OciError> {
+    let (registry, repo, manifest, auth) = resolve_manifest(image, platform, false)?;
+    std::fs::create_dir_all(scratch).map_err(|e| OciError::Extract(e.to_string()))?;
+    Ok(fetch_config(&registry, &repo, &manifest, &auth, scratch))
+}
+
+pub fn pull(
+    image: &str,
+    dest: &Path,
+    platform: Option<&Platform>,
+) -> Result<ImageConfig, OciError> {
+    let (registry, repo, manifest, auth) = resolve_manifest(image, platform, true)?;
 
     let layers = layer_digests(&manifest);
     if layers.is_empty() {

@@ -46,6 +46,17 @@ BENIGN = [
     (r"this file separates services with `networks:`", "announces the wiring that matches Docker"),
     (r"puts two services on the same internal port", "announces the wiring that matches Docker"),
     (r"gives a service's own name a fixed address with `extra_hosts:`", "announces the wiring that matches Docker"),
+    # THE DEFAULT WIRING, ANNOUNCED. It belongs beside the three lines above and not in the table
+    # below, and the test is the same one they pass: does the sentence report kern doing something
+    # DIFFERENT from Docker, or kern doing what Docker does? It says each service gets its own
+    # namespace and its own 127.0.0.1, which is Docker's arrangement exactly.
+    #
+    # THE CONTROL THAT KEEPS THIS HONEST is two lines down in the other table: `this stack runs in
+    # ONE shared network namespace` is still counted as a difference, so a file wired as a pod - by
+    # `--pod`, or because it has one service - still costs a point. A classifier that had simply been
+    # taught to ignore wiring sentences would have had to move that line too.
+    (r"gets its own network namespace on a bridge, which is the arrangement Docker has",
+     "announces the wiring that matches Docker"),
     (r"--no-pod gives each service its own network namespace", "announces the chosen wiring"),
     (r"and with a namespace per service kern ENFORCES it", "`internal:` is honoured, and this says how"),
     # `network_mode: service:X` asks for one namespace, and in a pod the stack IS one namespace.
@@ -68,6 +79,43 @@ BENIGN = [
     # loopback and a peer that hard-codes it reaches the service, which is what the file asked for.
     # The per-service arm of the same sentence is a difference and is listed below.
     (r"`ipv4_address:` is applied here", "the address a peer hard-codes reaches the service"),
+    # THE PER-SERVICE ARM OF THE SAME KEY, and the outcome Docker gives: on a bridge each service
+    # holds its own namespace and takes the literal address the file names, so a peer that hard-codes
+    # it reaches exactly the service the file meant. It appeared the day the wiring decision stopped
+    # depending on the image cache: a file whose EXPOSE collision was previously invisible is now
+    # wired per service, and the sentence changed with the wiring. The gate caught it, which is what
+    # the gate is for.
+    (r"`ipv4_address:` is honoured exactly here", "the literal address is the service's own, as under Docker"),
+    # NOT A DIFFERENCE FROM DOCKER: a statement about what kern could read. kern decides the wiring
+    # partly from each image's EXPOSE set, which it will not pull to answer a `config`, so an
+    # uncached image leaves the answer provisional and the line says so. Docker has no equivalent
+    # because every container has its own namespace there and the question does not arise.
+    #
+    # IT IS ALSO WHY THIS RATE DECLARES ITS CACHE STATE below: the same file answers `pod` before a
+    # pull and `bridge` after one, measured one `kern rmi` apart, and two files moved between the
+    # buckets of this very number that way.
+    (r"the wiring above was decided WITHOUT reading", "a caveat about kern's own knowledge"),
+    # NOT A DIFFERENCE: the gate is HONOURED, and the line says where the check came from. Docker
+    # reads the image's `HEALTHCHECK` for a service that declares none, and so does kern now; the
+    # note exists because the parser had to defer the decision to a caller that can open an image.
+    (r"but its IMAGE carries one, so the `service_healthy` gate is honoured",
+     "the image supplies the healthcheck, as under Docker"),
+    # NOT A DIFFERENCE: DOCKER REFUSES THE SAME FILE, MEASURED. An `external: true` network is one
+    # the file does not create, and a file naming one that does not exist cannot run on either
+    # runtime. Measured on the reference daemon (Docker 29.6.2, compose plugin v5.3.1):
+    #
+    #   docker compose config  ->  renders the file, says nothing
+    #   docker compose up      ->  "network X declared as external, but could not be found"
+    #
+    # kern does the same: `config` renders and WARNS, `up` refuses and names `kern network create`.
+    # The warning is the courtesy half - Docker leaves you to find out at `up` - and a courtesy is
+    # not a behavioural difference, which is the same reading the "empty list item" line above gets.
+    #
+    # THE LINE THIS REPLACES COUNTED A REAL DIFFERENCE, and it was real right up until the feature
+    # landed: kern had no cross-project network at all, so these files ran with peers that resolved
+    # nothing. What changed is the runtime, not the classifier's standard.
+    (r"is declared `external: true` and does not exist on this machine",
+     "Docker refuses the same file for the same reason, measured"),
 ]
 
 # Everything else counts as a difference. Named here only so `--verbose` can group the output; an
@@ -95,6 +143,18 @@ KNOWN_DIFFERENCES = [
     # rootless, publishes :8080, so the service is not where the file says - but it was counting
     # under a label that named nothing, which is the state that makes a bucket look mysterious.
     (r"binds from 1024 upward", "a privileged host port is republished above 1024"),
+    # THE `external:` NETWORK LINE IS GONE FROM THIS TABLE because the difference is gone: kern
+    # implements a network shared between projects (`kern network create`, relays in both
+    # directions, hosts entries written into the other project's running boxes). What remains is the
+    # BENIGN line above, which reports a network that has not been created on this machine - a state
+    # Docker refuses the file in too.
+    # `runtime:` USED TO FALL INTO "a key kern does not implement", which named the key and nothing
+    # else. Both corpus files that write it write `runtime: nvidia`, and the two values mean opposite
+    # things: `nvidia` asks for hardware (a device grant, which has a spelling in the file), any
+    # other value asks kern to delegate to a different runtime, which is the position this project
+    # refuses. Two labels because they are two answers.
+    (r"`runtime: nvidia` is NOT applied", "`runtime: nvidia`: the GPU is a device grant here"),
+    (r"`runtime: [^`]+` is NOT applied", "`runtime:` names another runtime, and kern is one"),
     (r"output is captured", "a `logging:` driver kern cannot provide"),
     (r"label=[^:]*: kern sets no SELinux label", "an SELinux label other than `disable`"),
     (r"seccomp=unconfined", "the file asks for NO seccomp filter, which kern does not take from a file"),
@@ -142,6 +202,10 @@ def main():
     ap.add_argument("corpus", type=pathlib.Path)
     ap.add_argument("--kern", default="target/release/kern")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--with-low-port-floor", action="store_true",
+        help="also measure this corpus on a host that permits low ports, in a namespace of our own",
+    )
     args = ap.parse_args()
 
     # The shared check: identity first (`kern --version` carries the commit), date only where a
@@ -150,23 +214,89 @@ def main():
     if rc:
         return rc
 
+    # THE SECOND NUMBER, MEASURED AND NOT DERIVED.
+    #
+    # The largest remaining difference on this corpus is a host property and not kern's: rootless,
+    # the kernel refuses a bind below `net.ipv4.ip_unprivileged_port_start`, which is 1024 almost
+    # everywhere, so a file publishing :80 gets :8080 and is not where it says it is. podman refuses
+    # the same port outright and names the same sysctl; Docker rootful binds it because it is root.
+    #
+    # IT IS A PER-NAMESPACE SETTING, so the difference does not have to be argued about: this re-runs
+    # the whole measurement inside a network namespace of our own with the floor at 0, and kern reads
+    # the floor from that namespace like any other process. Two measured numbers, one command, and
+    # the only thing between them is one `sysctl`.
+    #
+    # SUBTRACTING THE CAUSE FROM THE FIRST NUMBER WOULD HAVE BEEN A DERIVATION, and a derived figure
+    # printed beside a measured one is how this project has produced its wrong numbers before. It
+    # also assumes the causes are disjoint, which nothing here guarantees - and which this run is
+    # what actually checks.
+    #
+    # THE NESTED RUN HAS NO NETWORK, which matters for one line of the report: an uncached image
+    # config cannot be fetched there, so CACHE-DEPENDENT is printed by both runs and the two numbers
+    # are comparable only while it is unchanged. Say so rather than hide it.
+    if args.with_low_port_floor and not os.environ.get("KERN_RATE_LOW_FLOOR"):
+        inner = (
+            "echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start || exit 3; "
+            f"exec {sys.executable} {os.path.abspath(__file__)} "
+            f"{os.path.abspath(str(args.corpus))} --kern {os.path.abspath(args.kern)}"
+        )
+        try:
+            second = subprocess.run(
+                ["unshare", "-rn", "sh", "-c", inner],
+                capture_output=True, text=True,
+                env=dict(os.environ, KERN_RATE_LOW_FLOOR="1"),
+                timeout=3600,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"could not measure the low-floor case: {e}", file=sys.stderr)
+            second = None
+        if second is not None and second.returncode == 0:
+            for line in second.stdout.splitlines():
+                if line.startswith("ZERO differences"):
+                    low_floor_line = line.split("    ", 1)[-1].strip()
+                    break
+            else:
+                low_floor_line = ""
+        else:
+            why = (second.stderr.strip()[-160:] if second is not None else "not run")
+            low_floor_line = ""
+            print(f"the low-floor measurement did not complete: {why}", file=sys.stderr)
+    else:
+        low_floor_line = ""
+
     files = sorted(p for p in args.corpus.iterdir() if p.is_file())
     if not files:
         print(f"no compose files under {args.corpus}", file=sys.stderr)
         return 2
 
     clean, causes, dirty, refused = 0, Counter(), [], []
+    # Files whose WIRING was decided without reading an image that is not cached. Reported with the
+    # rate because it bounds how reproducible the rate is: pulling those images can move a file
+    # between `pod` and `bridge`, and with it between the buckets below.
+    provisional = 0
     # THE COUNT IS PER FILE AND THE HEADING SAYS SO, because it used to say so while counting LINES.
     # MEASURED: the `ipv4_address` cause printed 230 next to the words "by files affected" on a
     # 240-file corpus, which reads as almost every file in the corpus. The true figure is 63 files;
     # the 230 was warning lines, one per service. A measurement that misreports its own unit is worse
     # than no measurement, because the number looks answerable and nobody re-derives it.
     only_cause = {}  # cause -> files where it is the ONLY thing standing between them and clean
+    # THE EXACT WIRING ANSWER, PAID FOR HERE AND NOWHERE ELSE. kern decides the wiring partly from
+    # each image's EXPOSE set; an image that is not in the local cache leaves the answer provisional,
+    # and a published number must not depend on which images this machine happens to hold. With this
+    # set, kern fetches the CONFIG BLOB (kilobytes, no layers) for an uncached image. Measured: the
+    # cache-dependent count over this corpus goes from 90 files to 2, the two being images that
+    # cannot be fetched at all.
+    #
+    # It is not kern's default because a dry run must not be slow: measured 2 ms without it and
+    # 2084 ms per uncached image with it, and eighty seconds for a file whose registry does not
+    # resolve. `up` never needs it, since it resolves its images before deciding anyway.
+    env = dict(os.environ, KERN_COMPOSE_FETCH_IMAGE_CONFIG="1")
     for f in files:
         run = subprocess.run(
             [args.kern, "compose", "-f", str(f), "config"],
             capture_output=True,
             text=True,
+            env=env,
         )
         # A REFUSED FILE IS NOT A CLEAN ONE, and counting it as clean is how a rate goes UP by
         # rejecting more. The warning scan below sees only `kern: …` lines, so a hard `error:` would
@@ -177,6 +307,8 @@ def main():
         if run.returncode != 0:
             refused.append(f.name)
             continue
+        if "the wiring above was decided WITHOUT reading" in run.stderr:
+            provisional += 1
         diffs = differences(run.stderr)
         if diffs:
             dirty.append((f.name, diffs))
@@ -215,6 +347,15 @@ def main():
           f"{pct(shapes['networks'])} declare `networks:`, "
           f"{pct(shapes['healthcheck'])} a healthcheck; median services/file {median}")
     print(f"ZERO differences    {clean} = {clean * 100 // total}%")
+    if low_floor_line:
+        print(
+            f"  same corpus, host that permits low ports: {low_floor_line}\n"
+            f"                      (MEASURED in a network namespace of our own with "
+            f"net.ipv4.ip_unprivileged_port_start=0,\n"
+            f"                      which is one `sysctl` on a real host. The difference is the "
+            f"rootless port floor\n                      and nothing else: podman refuses the same "
+            f"ports, Docker binds them because it is root.)"
+        )
     if refused:
         print(
         f"REFUSED             {len(refused)} (not counted as clean; MEASURED on Docker 29.6.2: it "
@@ -222,6 +363,11 @@ def main():
     )
         for name in refused:
             print(f"                      {name}")
+    print(
+        f"CACHE-DEPENDENT     {provisional} file(s) whose wiring was decided without reading an "
+        f"uncached image;\n                      pulling those images can move them between "
+        f"buckets"
+    )
     # THE CEILING, so the rate is read against what closing every remaining difference could buy
     # rather than against 100%. A refused file is not reachable by closing a difference: it never
     # rendered, and only the corpus gate can say whether the refusal is right.

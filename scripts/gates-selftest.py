@@ -29,6 +29,7 @@ Exit:   0 every gate turned red on its case, 1 if any stayed green (or the tree 
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -307,10 +308,24 @@ def check_no_gate_writes(failures: list[str], keep: Path) -> None:
             "      invocation as the check, because bare is what a sweep and a habit will use."
         )
         for rel in wrote:
+            # The same timestamp reasoning as the mutation loop below: a file put back the way it
+            # was should look the way it was, or the next gate refuses to measure.
+            target = REPO / rel
+            stamp = None
+            try:
+                st = target.stat()
+                stamp = (st.st_atime_ns, st.st_mtime_ns)
+            except OSError:
+                stamp = None
             if rel in saved:
-                (REPO / rel).write_bytes(saved[rel].read_bytes())
+                target.write_bytes(saved[rel].read_bytes())
             else:
                 subprocess.run(["git", "checkout", "--", rel], cwd=REPO)
+            if stamp is not None:
+                try:
+                    os.utime(target, ns=stamp)
+                except OSError:
+                    pass
         # Re-read, so the next gate is measured against the restored tree and not against this one's
         # damage, which would otherwise blame every gate that follows.
         before = content_state()
@@ -351,11 +366,38 @@ def main(argv: list[str]) -> int:
             continue
         keep = backup / f"{i:02d}-{path.name}"
         keep.write_text(original, encoding="utf-8")
+        # THE TIMESTAMP IS PART OF THE RESTORE, and leaving it out is not cosmetic.
+        #
+        # Other gates in this same run refuse to measure with a binary older than a source that
+        # git reports as MODIFIED. This phase writes into REAL sources, including
+        # `crates/kern-cli/src/commands/mod.rs`, and restores them byte for byte - but with a new
+        # mtime. For a file that is also uncommitted, which is the normal state of a tree this is
+        # meant to be run in, the next gate then sees a source newer than the binary and refuses:
+        # MEASURED, `compose-corpus` failed with "target/debug/kern is older than 1 source file"
+        # immediately after a build that had nothing left to do.
+        #
+        # `kernbin.py` already carries half of this reasoning ("timestamps move for reasons that are
+        # not edits") and fixed it from its own side by only looking at modified files, which is
+        # exactly the case that still breaks. The other half belongs here: a restore that claims to
+        # be byte for byte should leave nothing behind, and an mtime is something behind.
+        stamp = None
+        try:
+            st = path.stat()
+            stamp = (st.st_atime_ns, st.st_mtime_ns)
+        except OSError:
+            stamp = None
         try:
             path.write_text(mutated, encoding="utf-8")
             rc = run_gate(gate)
         finally:
             path.write_text(original, encoding="utf-8")
+            if stamp is not None:
+                try:
+                    os.utime(path, ns=stamp)
+                except OSError:
+                    # Not fatal: the content is what correctness depends on, and a gate that then
+                    # asks for a rebuild is inconvenient rather than wrong.
+                    pass
         if rc == 0:
             failures.append(f"{gate}: stayed GREEN on '{what}' in {rel}")
         elif verbose:

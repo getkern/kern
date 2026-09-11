@@ -200,6 +200,37 @@ pub fn add_veth(name: &str, peer: &str) -> io::Result<()> {
     send_newlink(&p, NLM_F_CREATE | NLM_F_EXCL)
 }
 
+/// Create a `veth` pair whose PEER END IS BORN in the network namespace of process `pid`.
+///
+/// WHY THIS EXISTS AND [`add_veth`] + [`move_to_netns`] IS NOT ENOUGH. Moving an existing interface
+/// between network namespaces calls `synchronize_net()` in the kernel, which waits a full RCU grace
+/// period. MEASURED on this machine, five pairs each, in a user namespace: the move costs 14-22 ms
+/// and creating the peer directly in the target costs 1-2 ms. That difference is paid ONCE PER
+/// SERVICE and it is serial, so it was the whole per-service cost of the bridge wiring: a stack of
+/// eight services spent about 180 ms of its 400 waiting for eight grace periods.
+///
+/// THE SHAPE IS [`add_veth`]'s WITH ONE MORE ATTRIBUTE, `IFLA_NET_NS_PID` inside the peer's own
+/// nested `ifinfomsg`. The kernel reads it while registering the peer and registers it THERE, so no
+/// interface ever changes namespace and there is nothing to synchronize. It is the same message
+/// `ip link add X type veth peer name Y netns <pid>` sends.
+///
+/// `pid` IS READ IN THE CALLER'S PID NAMESPACE, like every other `IFLA_NET_NS_PID`.
+pub fn add_veth_peer_in_netns(name: &str, peer: &str, pid: i32) -> io::Result<()> {
+    let mut p = ifinfomsg(0).to_vec();
+    push_attr(&mut p, IFLA_IFNAME, &cstr(name));
+    let li = open_nest(&mut p, IFLA_LINKINFO);
+    push_attr(&mut p, IFLA_INFO_KIND, &cstr("veth"));
+    let data = open_nest(&mut p, IFLA_INFO_DATA);
+    let peer_nest = open_nest(&mut p, VETH_INFO_PEER);
+    p.extend_from_slice(&ifinfomsg(0));
+    push_attr(&mut p, IFLA_IFNAME, &cstr(peer));
+    push_attr(&mut p, IFLA_NET_NS_PID, &pid.to_ne_bytes());
+    close_nest(&mut p, peer_nest);
+    close_nest(&mut p, data);
+    close_nest(&mut p, li);
+    send_newlink(&p, NLM_F_CREATE | NLM_F_EXCL)
+}
+
 /// Attach `index` to the bridge with index `master`.
 pub fn set_master(index: i32, master: i32) -> io::Result<()> {
     let mut p = ifinfomsg(index).to_vec();
@@ -361,6 +392,164 @@ mod tests {
         assert_eq!(
             code, 0,
             "a netlink message the kernel refused (see the code table in this test)"
+        );
+    }
+
+    /// THE PEER IS BORN IN THE OTHER NAMESPACE, and this proves it rather than timing it.
+    ///
+    /// WHY IT IS NOT A BENCHMARK. The reason this message exists is speed: moving an interface
+    /// between network namespaces waits an RCU grace period, measured at 14-22 ms against 1-2 ms to
+    /// create the peer in place, and that difference is paid once per service. A test that asserted
+    /// milliseconds would fail on a loaded machine and pass on a kern that quietly fell back to the
+    /// move, so it asserts the PROPERTY the speed comes from: no interface changes namespace.
+    ///
+    /// THREE OBSERVATIONS, AND ALL THREE ARE NEEDED:
+    ///   - the near end is HERE, so the pair was really created;
+    ///   - the far end is NOT here, which is the thing that distinguishes this from [`add_veth`];
+    ///   - the far end IS in the target namespace, read from INSIDE it by a process that `setns`es
+    ///     there. Without this third one the test would pass on a kernel that accepted the message
+    ///     and created only one end.
+    ///
+    /// The CONTROL is [`add_veth`] in the same namespace moments later: both of ITS ends are here.
+    /// Without it, "the far end is not here" would also be satisfied by a veth that was never made.
+    #[test]
+    fn a_veth_peer_can_be_born_in_another_namespace() {
+        // SAFETY: fork in a test binary; the child only unshares, sends netlink messages and exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let code = || -> i32 {
+                // SAFETY: unshare on the freshly forked child.
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+                    return 10; // no unprivileged user namespaces on this host
+                }
+                let _ = std::fs::write("/proc/self/setgroups", b"deny");
+                let _ = std::fs::write("/proc/self/uid_map", b"0 0 1");
+                let _ = std::fs::write("/proc/self/gid_map", b"0 0 1");
+                // A SECOND NETWORK NAMESPACE TO AIM AT, held open by a child that does nothing else.
+                //
+                // AND A PIPE, BECAUSE THE FORK ALONE IS A RACE THIS TEST ALREADY LOST. Without the
+                // handshake the message below is sent while the grandchild may not have reached its
+                // `unshare` yet; the pid then still names THIS namespace, the kernel does exactly
+                // what it was asked and creates the peer here, and the test reports that the feature
+                // does not work. It looked like a kernel that ignores the attribute and it was a
+                // test that did not wait.
+                let mut sync: [libc::c_int; 2] = [-1, -1];
+                // SAFETY: `sync` is a live two-element array; `pipe` writes both slots or neither.
+                if unsafe { libc::pipe(sync.as_mut_ptr()) } != 0 {
+                    return 11;
+                }
+                // SAFETY: fork from the same single-threaded child.
+                let target = unsafe { libc::fork() };
+                if target < 0 {
+                    return 11;
+                }
+                if target == 0 {
+                    // SAFETY: the grandchild unshares its own network namespace, says so on the
+                    // pipe, and then waits to be killed; it touches nothing shared.
+                    unsafe {
+                        libc::close(sync[0]);
+                        if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                            libc::_exit(1);
+                        }
+                        let byte: [u8; 1] = [1];
+                        libc::write(sync[1], byte.as_ptr().cast(), 1);
+                        libc::sleep(30);
+                        libc::_exit(0);
+                    }
+                }
+                // SAFETY: the read end is this process's; a one-byte read on a pipe whose only
+                // writer is the grandchild returns 1 after the unshare, or 0 if it died first.
+                let ready = unsafe {
+                    libc::close(sync[1]);
+                    let mut byte = [0u8; 1];
+                    let n = libc::read(sync[0], byte.as_mut_ptr().cast(), 1);
+                    libc::close(sync[0]);
+                    n == 1
+                };
+                if !ready {
+                    return 11; // the target never got a namespace of its own
+                }
+                let verdict = {
+                    if add_veth_peer_in_netns("kvf", "kpf", target).is_err() {
+                        12
+                    } else if index_of("kvf").is_none() {
+                        13 // the near end must be here: the pair was not created at all
+                    } else if index_of("kpf").is_some() {
+                        14 // the far end is HERE, so it was not born in the target namespace
+                    } else {
+                        // READ FROM INSIDE THE TARGET. A third process, because `setns` would move
+                        // this one and every check after it.
+                        // SAFETY: fork from the same single-threaded child.
+                        let reader = unsafe { libc::fork() };
+                        if reader < 0 {
+                            15
+                        } else if reader == 0 {
+                            let path = format!("/proc/{target}/ns/net\0");
+                            // SAFETY: the path is NUL-terminated above; the fd is only `setns`ed.
+                            let code = unsafe {
+                                let fd = libc::open(
+                                    path.as_ptr().cast::<libc::c_char>(),
+                                    libc::O_RDONLY | libc::O_CLOEXEC,
+                                );
+                                if fd < 0 {
+                                    1
+                                } else if libc::setns(fd, libc::CLONE_NEWNET) != 0 {
+                                    2
+                                } else if index_of("kpf").is_none() {
+                                    3
+                                } else {
+                                    0
+                                }
+                            };
+                            // SAFETY: leaving the forked reader without the parent's handlers.
+                            unsafe { libc::_exit(code) };
+                        } else {
+                            let mut st = 0i32;
+                            // SAFETY: waiting on the reader just forked.
+                            if unsafe { libc::waitpid(reader, &mut st, 0) } != reader {
+                                16
+                            } else if !libc::WIFEXITED(st) || libc::WEXITSTATUS(st) != 0 {
+                                17 // the far end is not in the target namespace either
+                            } else if add_veth("kvc", "kpc").is_err() {
+                                18
+                            } else if index_of("kvc").is_none() || index_of("kpc").is_none() {
+                                19 // the CONTROL failed: an ordinary pair must leave both ends here
+                            } else {
+                                0
+                            }
+                        }
+                    }
+                };
+                // SAFETY: the grandchild is this process's own child and is still sleeping.
+                unsafe {
+                    libc::kill(target, libc::SIGKILL);
+                    let mut st = 0i32;
+                    libc::waitpid(target, &mut st, 0);
+                }
+                verdict
+            }();
+            // SAFETY: exiting the forked child without running the parent's atexit handlers.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0i32;
+        // SAFETY: waiting on the child just forked.
+        assert!(
+            unsafe { libc::waitpid(pid, &mut status, 0) } == pid,
+            "waitpid"
+        );
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        if code == 10 {
+            eprintln!("skipping: this host does not allow unprivileged user namespaces");
+            return;
+        }
+        assert_eq!(
+            code, 0,
+            "the peer end was not born in the target namespace (see the code table in this test)"
         );
     }
 

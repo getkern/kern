@@ -657,11 +657,30 @@ fn compose_config_prints_the_wiring_as_a_field() {
     let plain = field(&[], "wiring");
     let bridged = field(&["--bridge"], "wiring");
     let separated = field(&["--no-pod"], "wiring");
+    let podded = field(&["--pod"], "wiring");
     // THE PROVENANCE, which is a second token so the first one can stay stable. `--bridge` and a
     // file that kern bridges by itself both print `bridge`, and only this line tells them apart:
-    // one is a wiring the operator asked for, the other is kern diverging from the pod default.
+    // one is a wiring the operator asked for, the other is the default for two or more services.
     let plain_src = field(&[], "wiring-source");
     let bridged_src = field(&["--bridge"], "wiring-source");
+    let podded_src = field(&["--pod"], "wiring-source");
+    // A SINGLE SERVICE KEEPS THE POD, and it is the control for the default: without it this test
+    // would pass on a kern that has forgotten how to build a pod at all.
+    std::fs::write(
+        dir.join("one.yml"),
+        concat!("services:\n", "  a:\n", "    image: alpine\n"),
+    )
+    .expect("write compose");
+    let lone = kern()
+        .current_dir(&dir)
+        .args(["compose", "-f", "one.yml", "config"])
+        .output()
+        .expect("run kern");
+    let lone_out = String::from_utf8_lossy(&lone.stdout).to_string();
+    let lone_wiring = lone_out
+        .lines()
+        .find_map(|l| l.strip_prefix("  wiring: ").map(str::to_string))
+        .unwrap_or_default();
     // A file that COLLIDES gets the bridge without anyone typing it.
     std::fs::write(
         dir.join("collide.yml"),
@@ -692,11 +711,24 @@ fn compose_config_prints_the_wiring_as_a_field() {
     let (auto_wiring, auto_src) = (line("wiring"), line("wiring-source"));
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(plain, "pod", "two services with nothing to separate them");
+    assert_eq!(
+        plain, "bridge",
+        "two services get a namespace each by default, which is the arrangement Docker has"
+    );
+    assert_eq!(
+        lone_wiring, "pod",
+        "the CONTROL failed: one service has no peer to be separated from and keeps the pod, so \
+         this test cannot pass on a kern that always answers `bridge`"
+    );
     assert_eq!(bridged, "bridge", "--bridge is a namespace per service");
     assert_eq!(separated, "relay", "--no-pod reaches peers through relays");
-    assert_eq!(plain_src, "auto", "nobody typed the pod default");
+    assert_eq!(
+        podded, "pod",
+        "--pod asks for the one shared namespace and gets it"
+    );
+    assert_eq!(plain_src, "auto", "nobody typed the bridge default");
     assert_eq!(bridged_src, "flag", "--bridge was typed");
+    assert_eq!(podded_src, "flag", "--pod was typed");
     assert_eq!(
         (auto_wiring.as_str(), auto_src.as_str()),
         ("bridge", "auto"),
@@ -868,5 +900,60 @@ fn a_bridge_member_has_a_route_out_and_still_reaches_its_peers() {
     assert!(
         peer.contains("due"),
         "the second interface must not cost the member its peers: {peer:?}"
+    );
+}
+
+/// A COMPOSE REFUSAL DOES NOT END WITH ADVICE ABOUT THE OTHER FILE FORMAT.
+///
+/// kern reads two kinds of stack, a `docker-compose.yml` and its own TOML, and every compose error
+/// used to print the same closing hint: ``compose: `[box.NAME]` tables with image/rootfs, command,
+/// depends_on``. That is TOML syntax, so a refused YAML file - which is nearly every refusal - ended
+/// with instructions for a language the reader is not writing.
+///
+/// TWO THINGS ARE ASSERTED, and the second is what stops the fix from becoming a deletion:
+///   1. a message that already carries its own repair gets NO generic hint under it, because a
+///      pointer printed beneath a paste-ready instruction is how the instruction gets skipped;
+///   2. a message that does NOT carry one still gets a hint, and that hint names BOTH formats.
+#[test]
+fn a_compose_refusal_does_not_advise_the_other_file_format() {
+    let dir = std::env::temp_dir().join(format!("kern-it-hint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let run = |body: &str, name: &str| -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, body).expect("write");
+        let out = kern()
+            .args(["compose", "-f", p.to_str().unwrap_or_default(), "config"])
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    // Carries its own repair (it names the keys to write): no generic hint.
+    let shaped = run("services:\n  - web\n  - db\n", "a.yml");
+    // Carries none: the hint appears, and covers both formats.
+    let dup = run(
+        "services:\n  a:\n    image: alpine\n  a:\n    image: busybox\n",
+        "b.yml",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !shaped.contains("hint:"),
+        "a refusal that already tells the reader what to write must not carry a generic hint \
+         too:\n{shaped}"
+    );
+    assert!(
+        dup.contains("hint:"),
+        "the CONTROL failed: a refusal with no repair of its own must still point somewhere, or \
+         this test would pass on a kern that simply stopped hinting:\n{dup}"
+    );
+    assert!(
+        dup.contains("docker-compose.yml") && dup.contains("[box.NAME]"),
+        "and the hint must name BOTH formats kern reads, since the refusal cannot know which one \
+         the reader is writing:\n{dup}"
     );
 }

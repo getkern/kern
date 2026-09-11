@@ -7,8 +7,79 @@
 
 use super::*;
 
+/// The `Publishers` array `docker compose ps --format json` emits, built from kern's `ports` string.
+///
+/// WHY THIS FIELD AND NOT THE OTHER ABSENT ONES. It is how a script discovers where a service is
+/// actually reachable, and on a rootless runtime that is the one thing it cannot assume: kern
+/// republishes a privileged port above 1024 (`:80` becomes `:8080`), so a script that hardcodes the
+/// file's number is wrong and a script that reads this field is right. `Image`, `Mounts` and `Size`
+/// stay absent because the registry holds no value for them and an invented one is worse than a
+/// missing one; this one kern knows exactly.
+///
+/// SHAPE MEASURED on Docker 29.6.2, not recalled:
+/// `[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":18080,"Protocol":"tcp"}]`. Docker emits one
+/// entry per address family (a second with `"URL":"::"`); kern emits the addresses it actually
+/// bound, which is one entry per mapping.
+///
+/// The input is the registry's own `ports` text, `0.0.0.0:18080->80, 0.0.0.0:18443->443`. A mapping
+/// that does not parse is SKIPPED rather than guessed: a `Publishers` entry with an invented port
+/// would send a script to the wrong address, which is the failure this field exists to prevent.
+fn publishers_json(ports: &str) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    for spec in ports.split(',') {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        let Some((host_side, target)) = spec.split_once("->") else {
+            continue;
+        };
+        // `<addr>:<published>` or a bare `<published>`.
+        let (url, published) = match host_side.rsplit_once(':') {
+            Some((addr, port)) => (addr, port),
+            None => ("0.0.0.0", host_side),
+        };
+        let (target, proto) = match target.split_once('/') {
+            Some((t, p)) => (t, p),
+            None => (target, "tcp"),
+        };
+        let (Ok(published), Ok(target)) = (published.parse::<u32>(), target.parse::<u32>()) else {
+            continue;
+        };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&format!(
+            "{{\"URL\":{},\"TargetPort\":{target},\"PublishedPort\":{published},\"Protocol\":{}}}",
+            json_str(url),
+            json_str(proto)
+        ));
+    }
+    out.push(']');
+    out
+}
+
+/// How `ps` renders a machine-readable listing.
+///
+/// AN ENUM AND NOT A SECOND BOOLEAN, because the two shapes are one decision with three outcomes,
+/// and `ps(true, true, …)` at a call site says nothing about which of them was meant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JsonShape {
+    /// Not JSON: the human table, or a `--format` template.
+    No,
+    /// ONE ARRAY, which is `kern ps --json`'s documented shape and stays byte-for-byte what it was.
+    Array,
+    /// ONE OBJECT PER LINE. What `docker compose ps --format json` emits since Compose 2.21 (it was
+    /// an array before), so a script that reads it line by line works against kern too. The FIELD
+    /// NAMES are still kern's and are not Docker's; that difference is recorded in
+    /// docs/RUNTIME-PARITY.md rather than papered over by matching only the framing.
+    Lines,
+}
+
 pub fn ps(
-    json: bool,
+    shape: JsonShape,
     quiet: bool,
     all: bool,
     filters: &[(String, String)],
@@ -169,7 +240,7 @@ pub fn ps(
         }
         return Ok(());
     }
-    if json {
+    if shape != JsonShape::No {
         let mut items: Vec<String> = boxes
             .iter()
             .map(|b| {
@@ -200,9 +271,77 @@ pub fn ps(
                 json_str("exited"),
             ));
         }
-        // Frame through the shared helper (the sole owner of the `[ , ]` array grammar), so a live-only
-        // listing stays byte-for-byte what it was before `-a` existed and this isn't a re-rolled array.
-        println!("{}", kern_common::json_array(&items, |s| s.clone()));
+        if shape == JsonShape::Lines {
+            // ONE OBJECT PER LINE, and the keys `docker compose ps --format json` uses ALONGSIDE
+            // kern's own. Two spellings in one object, not a translation: kern's keys are lowercase
+            // (`name`, `command`, `health`) and Docker's are capitalised (`Name`, `Command`,
+            // `Health`), so nothing collides and neither consumer has to know about the other.
+            //
+            // WHY THE NAMES MATTER MORE THAN THE FRAMING. Matching NDJSON and then emitting
+            // `{"name": …}` would still break the line every deploy script actually contains,
+            // `compose ps --format json | jq -r .Service`. An outside reviewer put this exactly:
+            // the field names are the contract a script reads, and this is a NEW surface, so they
+            // cost nothing to get right.
+            //
+            // ONLY WHAT THE REGISTRY CAN ANSWER TRUTHFULLY. `Image`, `Publishers`, `Mounts` and
+            // `Size` are Docker keys kern has no value for here, and inventing a shape for them
+            // would be worse than their absence: a script reading `.Publishers[0].PublishedPort`
+            // must fail loudly, not read a zero.
+            //
+            // `Service` is derived from the box name by stripping the project prefix, which is how
+            // kern built it (`<project>-<service>`). A box renamed by `container_name:` has no
+            // prefix to strip and reports its own name, which is the same thing Docker reports for
+            // a container named by hand.
+            for (i, it) in items.iter().enumerate() {
+                let docker = match boxes.get(i) {
+                    Some(b) => {
+                        let service = b
+                            .name
+                            .strip_prefix(&format!("{}-", b.pod))
+                            .unwrap_or(&b.name);
+                        format!(
+                            ",\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":0,\"Command\":{},\"Publishers\":{}",
+                            json_str(&b.name),
+                            json_str(service),
+                            json_str(&b.pod),
+                            json_str("running"),
+                            json_str(&registry::health_of(&b.name, b.pid)),
+                            json_str(&b.command),
+                            publishers_json(&b.ports),
+                        )
+                    }
+                    None => match exited.get(i.saturating_sub(boxes.len())) {
+                        Some(e) => {
+                            let service = e
+                                .name
+                                .strip_prefix(&format!("{}-", e.pod))
+                                .unwrap_or(&e.name);
+                            format!(
+                                ",\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":{},\"Command\":{}",
+                                json_str(&e.name),
+                                json_str(service),
+                                json_str(&e.pod),
+                                json_str("exited"),
+                                json_str("exited"),
+                                e.code,
+                                json_str(&e.command),
+                            )
+                        }
+                        None => String::new(),
+                    },
+                };
+                // Splice before the closing brace, so the object stays one object.
+                match it.strip_suffix('}') {
+                    Some(head) => println!("{head}{docker}}}"),
+                    None => println!("{it}"),
+                }
+            }
+        } else {
+            // Frame through the shared helper (the sole owner of the `[ , ]` array grammar), so a
+            // live-only listing stays byte-for-byte what it was before `-a` existed and this isn't a
+            // re-rolled array.
+            println!("{}", kern_common::json_array(&items, |s| s.clone()));
+        }
     } else {
         // Build rows first so the PORTS column can size to its widest value (a published mapping
         // like `127.0.0.1:8080->80` is wider than the "PORTS" header) - keeps COMMAND aligned.
@@ -228,6 +367,26 @@ pub fn ps(
             .chain(std::iter::once(5)) // len("PORTS")
             .max()
             .unwrap_or(5);
+        // THE NAME COLUMN IS MEASURED, NOT ASSUMED. It was a fixed 16, and every name longer than
+        // that pushed PID, UPTIME, HEALTH and PORTS out of line for the whole table. A compose box is
+        // named `<project>-<hash8>-<service>`, which passes 16 for any service name at all, so the
+        // stack views - the ones a person looks at while a demo is running - were the ones that
+        // broke. MEASURED: `psbug-749cf899-secret` is 21 characters and shifted every column after
+        // it.
+        //
+        // FLOORED AT 16 so the short output this has always produced is byte-for-byte what it was,
+        // and CEILINGED at 48 rather than truncating: the name is the identity `kern stop` takes,
+        // and a table that is pretty because it hid the argument someone needs is not an
+        // improvement. Past the ceiling a row overflows exactly as it always did, which is the
+        // honest failure for a name nobody can shorten.
+        let nw = rows
+            .iter()
+            .map(|(b, _, _, _)| crate::ui::display_box_name(&b.name, &b.pod).chars().count())
+            .chain(exited.iter().map(|e| e.name.chars().count()))
+            .chain(std::iter::once(16))
+            .max()
+            .unwrap_or(16)
+            .min(48);
         // On a TTY, truncate COMMAND to the remaining width so a long command never wraps (like
         // `docker ps`); piped/non-TTY prints it whole so scripts get the full line.
         let tty = std::io::stdout().is_terminal();
@@ -235,9 +394,9 @@ pub fn ps(
         let p = crate::ui::Palette::detect();
         // The visible width before COMMAND is fixed (16+1+7+1+7+2+9+1+pw+1 = 45+pw), so the budget
         // is computed arithmetically - colour codes never enter the count.
-        let prefix_w = 45 + pw;
+        let prefix_w = nw + 29 + pw;
         println!(
-            "{d}{:<16} {:>7} {:>7}  {:<9} {:<pw$} COMMAND{z}",
+            "{d}{:<nw$} {:>7} {:>7}  {:<9} {:<pw$} COMMAND{z}",
             "NAME",
             "PID",
             "UPTIME",
@@ -285,7 +444,7 @@ pub fn ps(
                     z = p.z,
                     b = p.b,
                     c = p.c,
-                    nw = 16usize.saturating_sub(cw),
+                    nw = nw.saturating_sub(cw),
                 );
                 let hc = match health {
                     "healthy" => p.g,
@@ -343,7 +502,7 @@ pub fn ps(
             for e in &exited {
                 let hc = if e.code == 0 { p.g } else { p.r };
                 // name is already scrubbed at the source (`list_exited`), so it is safe in the cell.
-                let name = format!("{b}{c}{:<16}{z}", e.name, b = p.b, c = p.c, z = p.z);
+                let name = format!("{b}{c}{:<nw$}{z}", e.name, b = p.b, c = p.c, z = p.z);
                 let status_cell = format!("{hc}{:<9}{}", format!("exit {}", e.code), p.z);
                 emit_row(
                     &name,

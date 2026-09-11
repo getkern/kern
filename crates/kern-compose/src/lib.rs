@@ -129,6 +129,27 @@ pub struct ComposeBox {
     /// with `depends_on` is NOT required - a `depends_healthy` entry implies the ordering edge too
     /// (see `all_deps`), so you don't have to repeat the name in `depends_on`.
     pub depends_healthy: Vec<String>,
+    /// `service_healthy` gates this parser DOWNGRADED because the target declares no healthcheck in
+    /// the FILE, recorded for a caller that can read image configs and knows better.
+    ///
+    /// THE PARSER CANNOT SEE AN IMAGE'S `HEALTHCHECK`. A service with no `healthcheck:` whose image
+    /// carries one is healthy-gateable under Docker and was being downgraded to start-order here,
+    /// silently: MEASURED with an image whose check flips at 6 s, the dependent started at 0 s. That
+    /// turns `condition: service_healthy` into another name for `service_started` on every file that
+    /// relies on the image, which is most of them for postgres, rabbitmq and traefik.
+    ///
+    /// The parser records instead of deciding when the target has an image; the CLI resolves images
+    /// and makes the call, so the decision is taken where the facts are.
+    pub degraded_health: Vec<String>,
+
+    /// Set when the IMAGE supplies this service's healthcheck and the file does not.
+    ///
+    /// `has_health()` answers about the FILE, which is the only thing the parser can see. A caller
+    /// that resolved the image sets this, and everything downstream that asks "is this service
+    /// healthy-gateable" must consult both: the validator refused a restored gate with "declares no
+    /// `health_cmd`" while the box was already reporting `starting` from the image's own check.
+    pub health_from_image: bool,
+
     /// Dependencies this box waits to RUN TO SUCCESSFUL COMPLETION (exit 0) before it starts
     /// (Docker's `condition: service_completed_successfully`) - the init-container / migration-job
     /// pattern. Implies the ordering edge, like `depends_healthy`.
@@ -468,6 +489,19 @@ pub struct ComposeBox {
     /// no network in common get no relay and no hosts entry for each other, which is segregation
     /// enforced by construction rather than by a firewall rule someone has to keep correct.
     pub networks: Vec<String>,
+    /// The subset of [`Self::networks`] the FILE declares `external: true`: networks this compose
+    /// file does not own, shared with other projects.
+    ///
+    /// PER SERVICE AND NOT PER FILE, because that is the granularity the decision needs. A file may
+    /// declare an external `proxy` network and put only its web service on it; the database is not a
+    /// peer anyone in another project should resolve, and a file-level list would make it one.
+    ///
+    /// CARRIED RATHER THAN RE-DERIVED. The external-ness lives in the top-level `networks:` block
+    /// and the membership in each service's own `networks:` key, so the join is a fact about the
+    /// whole document that the driver cannot recompute from a `ComposeBox` alone. Deriving it at the
+    /// call site would be a second definition of "is this network external", which is the class of
+    /// duplication this file already carries scars from.
+    pub external_networks: Vec<String>,
     /// Every network this service declares is marked `internal: true`, and it declares at least one.
     ///
     /// POSITIVE EVIDENCE, and the shape is the point. kern gives a stack ONE network namespace, so
@@ -998,9 +1032,10 @@ pub const fn wiring_note(net: StackNet, service_count: usize) -> Option<&'static
 pub const POD_SHARED_LOOPBACK: &str =
     "this stack runs in ONE shared network namespace, so its services share 127.0.0.1: a port a \
      service binds on the loopback is reachable from every other service in the stack, which under \
-     Docker it would not be. `--bridge` gives each service its own namespace and its own loopback, \
-     meeting on a bridge as Docker does, for about 30 ms a service at start; `--no-pod` also \
-     separates them but reaches peers through a relay per ordered pair per port";
+     Docker it would not be. Dropping `--pod` gives each service its own namespace and its own \
+     loopback, meeting on a bridge as Docker does, for about 20 ms for the whole stack (measured: \
+     +17 ms for two services, +27 ms for eight); `--no-pod` also separates them but reaches peers \
+     through a relay per ordered pair per port";
 
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     parse_with_env(text, &DotEnv::default(), StackNet::Pod)
@@ -1868,18 +1903,33 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
         // Name the services still in the cycle (indegree never reached 0) - like Docker's
         // "dependency cycle detected: a -> b -> a", this points the user at the offending set instead
         // of just "there's a cycle somewhere". File order, so it's deterministic.
-        let mut stuck: Vec<&str> = boxes
-            .iter()
-            .map(|b| b.name.as_str())
-            .filter(|n| indeg[n] > 0)
-            .collect();
-        stuck.sort_by_key(|n| boxes.iter().position(|b| b.name == *n));
-        return Err(format!(
-            "dependency cycle detected among: {}",
-            stuck.join(", ")
-        ));
+        return Err(cycle_message(boxes, &indeg));
     }
     Ok(order)
+}
+
+/// The services still inside a `depends_on` cycle, named AS THE FILE NAMES THEM.
+///
+/// THE BOX NAME IS NOT THE SERVICE NAME, and printing it here was the defect. By the time the graph
+/// is walked, `resolve_box_names` has rewritten `name` to `<project>-<hash>-<service>`, so a file
+/// with `a` depending on `b` depending on `a` reported `dependency cycle detected among:
+/// fuzzc-06f7c969-a, fuzzc-06f7c969-b`. The reader wrote `a`. They now have to find their own file
+/// inside a hash they did not choose, to be told something they could have been told in their own
+/// words - the same defect this tree already fixed for `compose exec`, where the answer was that the
+/// reader knows `web` and not `<project>-<hash>-web`.
+///
+/// ONE FUNCTION FOR BOTH WALKS. The flat topological sort and the levelled one each built this
+/// string, which is two places for the next correction to be applied to one of.
+///
+/// THE GRAPH KEEPS USING THE BOX NAME: it is the unique key the edges were built from, and two
+/// services in different files can share a service name. Only the DISPLAY changes.
+fn cycle_message(boxes: &[ComposeBox], indeg: &std::collections::HashMap<&str, usize>) -> String {
+    let stuck: Vec<&str> = boxes
+        .iter()
+        .filter(|b| indeg.get(b.name.as_str()).copied().unwrap_or(0) > 0)
+        .map(ComposeBox::service_name)
+        .collect();
+    format!("dependency cycle detected among: {}", stuck.join(", "))
 }
 
 /// `wanted`, plus everything those boxes depend on, transitively.
@@ -1969,16 +2019,7 @@ pub fn topo_levels(boxes: &[ComposeBox]) -> Result<Vec<Vec<String>>, String> {
         level = next;
     }
     if placed != boxes.len() {
-        let mut stuck: Vec<&str> = boxes
-            .iter()
-            .map(|b| b.name.as_str())
-            .filter(|n| indeg[n] > 0)
-            .collect();
-        stuck.sort_by_key(|n| pos(n));
-        return Err(format!(
-            "dependency cycle detected among: {}",
-            stuck.join(", ")
-        ));
+        return Err(cycle_message(boxes, &indeg));
     }
     Ok(levels)
 }
@@ -2293,6 +2334,57 @@ mod tests {
         // topo_levels rejects the same bad graphs.
         assert!(topo_levels(&parse(cyc).unwrap()).is_err());
         assert!(topo_levels(&parse(unknown).unwrap()).is_err());
+    }
+
+    /// A CYCLE IS REPORTED IN THE NAMES THE FILE USES, not in the names kern invented.
+    ///
+    /// By the time either graph walk runs, `resolve_box_names` has rewritten every box's `name` to
+    /// `<project>-<hash>-<service>`. MEASURED before this was fixed: a file whose `a` and `b` depend
+    /// on each other reported `dependency cycle detected among: fuzzc-06f7c969-a,
+    /// fuzzc-06f7c969-b`, so the reader had to find their own two services inside a hash they never
+    /// chose, to be told something expressible in their own words.
+    ///
+    /// THE CONTROL IS THE NEGATIVE HALF, and without it this test would pass on a message that
+    /// printed both spellings: the box name must NOT appear. Both walks are asserted, because the
+    /// string used to be built twice and a fix applied to one of them is the failure mode this
+    /// guards.
+    #[test]
+    fn a_dependency_cycle_is_reported_with_the_file_s_own_service_names() {
+        // `service` is what a compose file's own name lands in; `name` is what the CLI rewrites it
+        // to. Set both, differently, which is exactly the state the walks see at bring-up.
+        let doc = "[box.proj_abc123_a]\nimage=\"x\"\ndepends_on=[\"proj_abc123_b\"]\n\
+                   [box.proj_abc123_b]\nimage=\"x\"\ndepends_on=[\"proj_abc123_a\"]";
+        let mut boxes = match parse(doc) {
+            Ok(b) => b,
+            Err(e) => panic!("the fixture must parse, or this test asserts nothing: {e}"),
+        };
+        // The rename the CLI performs before either walk runs: `name` becomes the box's, `service`
+        // keeps the file's. Done here by hand because `resolve_box_names` lives in the CLI crate.
+        for b in &mut boxes {
+            b.service = b.name.trim_start_matches("proj_abc123_").to_string();
+        }
+        assert_eq!(boxes.len(), 2, "two services in the fixture");
+        for (what, err) in [
+            ("topo_order", topo_order(&boxes).err()),
+            ("topo_levels", topo_levels(&boxes).err()),
+        ] {
+            let Some(msg) = err else {
+                panic!("{what} must refuse a cycle");
+            };
+            assert!(
+                msg.contains("a") && msg.contains("b"),
+                "{what} must name both services: {msg}"
+            );
+            assert!(
+                !msg.contains("proj_abc123"),
+                "the CONTROL failed: {what} printed the box name kern invented, which is the \
+                 defect this test exists for: {msg}"
+            );
+            assert_eq!(
+                msg, "dependency cycle detected among: a, b",
+                "{what} must say it in the file's own words, in file order"
+            );
+        }
     }
 
     #[test]
@@ -2842,6 +2934,47 @@ mod compat_field_tests {
         );
         assert_eq!(a.ports, ["1:1", "2:2"], "sequences append, override last");
         assert_eq!(a.env, ["X=1", "Y=2"]);
+    }
+
+    /// A TYPO IN A SERVICE KEY IS NAMED, and only when it really is one.
+    ///
+    /// MEASURED on the neutral corpus: after `runtime:` was answered by value, ONE file was left in
+    /// the generic "unsupported" bucket and its key is `depend-on:`, a typo for `depends_on`. The
+    /// file loses an ordering constraint, Docker ignores it just as silently, and "ignored
+    /// (unsupported)" is true and useless.
+    ///
+    /// The radius is ONE edit, after folding hyphens and underscores together, and the negative
+    /// cases are the point: a key that is merely SHORT (`dns`) must not be told it meant
+    /// `dns_search`, and a key that is nothing like one of ours gets no suggestion at all. A
+    /// suggester that suggests too much is worse than none, because it sends a reader to change a
+    /// line that was never the problem.
+    #[test]
+    fn a_near_miss_service_key_is_named_and_a_distant_one_is_not() {
+        let near = crate::yaml::nearest_service_key_pub;
+        assert_eq!(near("depend-on"), Some("depends_on"));
+        assert_eq!(near("comand"), Some("command"));
+        assert_eq!(near("imagee"), Some("image"));
+        // `enviroment` is ONE insertion from `environment` and is the most common spelling slip
+        // there is, so it is a near miss and the suggester says so. The assertion here was wrong
+        // before this line was measured against the function.
+        assert_eq!(near("enviroment"), Some("environment"));
+        // TWO edits is not: an insertion AND a deletion. The radius has to stop somewhere, and a
+        // suggester that reaches this far starts pointing at keys the reader never meant.
+        assert_eq!(
+            near("enviroments"),
+            None,
+            "two edits away is not a near miss"
+        );
+        assert_eq!(near("totally_unknown_key"), None);
+        assert_eq!(
+            near("dns"),
+            None,
+            "an exact key is not a near miss for a longer one"
+        );
+        assert_eq!(near("x"), None);
+        // An EXACT match is not a near miss: those keys never reach this path, and answering one
+        // here would make the message contradict itself.
+        assert_eq!(near("command"), None);
     }
 
     /// A REPEAT IS NOT TWICE, and Docker's own reader proves it in both places kern can produce one.
@@ -3752,6 +3885,25 @@ mod contract_tests {
                  resolve_box_names() rewrites `name` to the box name",
             ),
             ("command", "the trailing `-- <command>`"),
+            (
+                "degraded_health",
+                "settle_deferred_health_gates (kern-cli): the `service_healthy` gates this parser \
+                 could not decide, because the target's healthcheck may live in its IMAGE. The CLI \
+                 resolves images and either restores the gate or reports it",
+            ),
+            (
+                "external_networks",
+                "compose() (kern-cli): the networks this service shares with OTHER projects. It is \
+                 not a box flag - a box has no concept of a cross-project network - it decides \
+                 which members the driver registers on `kern network` and which foreign peers it \
+                 builds relays to",
+            ),
+            (
+                "health_from_image",
+                "validate_conditions (kern-cli): set by settle_deferred_health_gates when the image \
+                 supplies the healthcheck the file omits, so a restored gate is not refused as \
+                 `declares no health_cmd` on a box already reporting `starting`",
+            ),
             (
                 "depends_on",
                 "topo_order / all_deps: start ordering, compose-only",

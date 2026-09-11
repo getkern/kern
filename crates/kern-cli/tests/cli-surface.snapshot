@@ -47,18 +47,25 @@ COMMANDS:
     history [-n N]                                                 Recently-run boxes
 
   Multi-box
-    compose <file> [up|down|stop|start|restart|ps|logs|build|pull|config|watch|port|systemd|run] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+    compose <file> [up|down|stop|start|restart|ps|logs|build|pull|config|watch|port|systemd|run|cp|exec] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
     up [--no-pod|--pod|--bridge] [-d] / down                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared; default: split only when `networks:` separate two services)
                                                                      With --bridge each service keeps its own namespace and its own 127.0.0.1
                                                                      Two services may then share a container port, and no relay is built
     compose <file> watch [service...]                              Rebuild + restart ONE service when its `build:` context changes
     compose <file> port <service> <container-port>                 Print the host address serving that box port (non-zero if none)
     compose <file> run [--rm] [--no-deps] <service> [cmd...]       One-off box from a service definition, in the foreground; its exit code is kern's
-    up [-d] [--wait [--wait-timeout N]] / down [-v]                  --wait holds until every service is ready; down -v also deletes this project's named volumes
+    compose <file> cp <service>:<path> <dst> | <src> <service>:<path> Copy a file in or out, naming the SERVICE rather than the box
+    compose <file> exec [-T] <service> <cmd...>                     Run a command in a RUNNING service; its exit code is kern's
+    compose <file> ps [-q] [--services] [--format json]            Ids only, service names from the file, or NDJSON for a script
+    up [-d] [--wait [--wait-timeout N]] / down [-v] [--remove-orphans]  --wait holds until every service is ready; down -v deletes this project's named volumes
+    up [--abort-on-container-exit] [--exit-code-from <service>]        Stop the stack when a service exits, and adopt that service's status
     pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>] Shared-network pod: peers reach each other by name.
                                                                      With --bridge each member keeps its own namespace and a
                                                                      127.0.0.1 no peer can reach, meeting on a bridge
     pod ls [--json] | pod rm <name>                                List pods, or remove one
+    network create <name> | network ls [--json] | network rm <name>  A network shared BETWEEN projects, which is what a
+                                                                     compose file names with `external: true`. Services of
+                                                                     DIFFERENT files on one resolve and reach each other by name
 
   Config & storage
     config [list [--json]|edit|setup|probe|clear]                  List resource profiles; manage kern.toml
