@@ -42,11 +42,23 @@ step "cargo test" env -u KERN_BIN cargo test --all
 # not compile AT ALL on the board target. CI caught it; a release cut before CI would have published
 # the x86 asset and no ARM one, which is exactly how v0.9.31 went out broken. A type check is
 # seconds and covers the whole class.
-if rustup target list --installed 2>/dev/null | grep -q aarch64-unknown-linux-musl; then
-    step "cargo check (aarch64)" cargo check --target aarch64-unknown-linux-musl --all-targets
+#
+# IT RUNS CLIPPY, NOT `check`, because CI runs clippy under `-D warnings` and the difference is not
+# academic: the first repair of the `c_char` bug compiled cleanly on both targets and then failed
+# aarch64 anyway, on `clippy::unnecessary_cast` - the cast that is real on x86_64 is a no-op on the
+# port where the type already matches. A gate that runs a weaker check than CI is a gate that lets
+# the same class through twice.
+#
+# THE TARGET IS `-gnu`, BECAUSE THAT IS WHAT CI USES: its aarch64 job runs on a native
+# `ubuntu-24.04-arm` runner with the host's default toolchain. Checking `-musl` instead reports
+# `unnecessary_cast` on the RLIMIT table, which is correct on musl (the type is already `c_int`) and
+# wrong as a gate, since it fires on code that is green on `main` and in CI. A gate aimed at a
+# target nobody builds manufactures its own failures.
+if rustup target list --installed 2>/dev/null | grep -q aarch64-unknown-linux-gnu; then
+    step "cargo clippy (aarch64)" cargo clippy --target aarch64-unknown-linux-gnu --all-targets
 else
-    printf '  %-34s %s\n' "cargo check (aarch64)" \
-        "SKIP  target not installed: rustup target add aarch64-unknown-linux-musl"
+    printf '  %-34s %s\n' "cargo clippy (aarch64)" \
+        "SKIP  target not installed: rustup target add aarch64-unknown-linux-gnu"
 fi
 echo "docs"
 for g in flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \

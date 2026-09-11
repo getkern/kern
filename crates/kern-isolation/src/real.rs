@@ -2232,21 +2232,21 @@ fn set_clean_env(hostname: &str, extra: &[(String, String)]) -> Result<(), Error
     // sets it, and a check that reads it (Airflow's scheduler probe passes `"$${HOSTNAME}"` to
     // `airflow jobs check`) is comparing against an empty string. Reading it back from the UTS
     // namespace we are already in cannot drift from whatever actually set it.
-    // `c_char` IS NOT THE SAME TYPE ON EVERY ARCHITECTURE, and this line is where it bit: it is
-    // `i8` on x86_64 and `u8` on aarch64, so `[0i8; 256]` compiles here and fails to compile at all
-    // on the board targets. Caught by CI on aarch64 and by nothing local, because the gate builds
-    // for the host only while the release ships an aarch64 binary too. Naming the libc type is the
-    // portable spelling, and `as u8` below is a no-op on the port where it already is one.
+    // `c_char` IS NOT THE SAME TYPE ON EVERY ARCHITECTURE, and this line is where it bit twice. It
+    // is `i8` on x86_64 and `u8` on aarch64, so `[0i8; 256]` compiled here and did not compile at
+    // all on the board targets; naming the libc type fixed that and then a per-byte `as u8` became
+    // a no-op cast on aarch64, which `-D warnings` rejects in turn. Both are the same mistake:
+    // hand-rolling what `CStr` already does portably. It reads the NUL-terminated buffer the kernel
+    // just wrote, on every port, with no cast to be wrong about.
     let mut buf = [0 as libc::c_char; 256];
     let live = if hostname.is_empty()
         && unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len() - 1) } == 0
     {
-        let bytes: Vec<u8> = buf
-            .iter()
-            .take_while(|b| **b != 0)
-            .map(|b| *b as u8)
-            .collect();
-        String::from_utf8(bytes).unwrap_or_default()
+        // SAFE: `gethostname` returned 0, and `buf.len() - 1` left the final byte as the NUL it was
+        // initialised to, so the buffer is NUL-terminated within its own bounds either way.
+        unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
     } else {
         String::new()
     };

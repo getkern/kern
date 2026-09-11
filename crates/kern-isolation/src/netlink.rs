@@ -337,9 +337,17 @@ mod tests {
                 if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
                     return 10; // no unprivileged user namespaces on this host
                 }
+                // PROBE ALL THE WAY DOWN. These three writes were ignored, and the namespace
+                // succeeding was read as "this host can do it". An Ubuntu 23.10+ host GRANTS the
+                // namespace and REFUSES the map, so the child went on with no capabilities in it
+                // and every netlink message after this point failed - reported as "the kernel
+                // refused message X" on a host where the kernel was never asked with authority.
                 let _ = std::fs::write("/proc/self/setgroups", b"deny");
-                let _ = std::fs::write("/proc/self/uid_map", b"0 0 1");
-                let _ = std::fs::write("/proc/self/gid_map", b"0 0 1");
+                if std::fs::write("/proc/self/uid_map", b"0 0 1").is_err()
+                    || std::fs::write("/proc/self/gid_map", b"0 0 1").is_err()
+                {
+                    return 19; // the namespace was granted and its map refused
+                }
                 if add_bridge("kbr0").is_err() {
                     return 11;
                 }
@@ -389,6 +397,13 @@ mod tests {
             eprintln!("skipping: this host does not allow unprivileged user namespaces");
             return;
         }
+        if code == 19 {
+            eprintln!(
+                "skipping: this host grants the user namespace and refuses its id map, so nothing \
+                 in it has the capability these messages need"
+            );
+            return;
+        }
         assert_eq!(
             code, 0,
             "a netlink message the kernel refused (see the code table in this test)"
@@ -423,9 +438,17 @@ mod tests {
                 if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
                     return 10; // no unprivileged user namespaces on this host
                 }
+                // PROBE ALL THE WAY DOWN. These three writes were ignored, and the namespace
+                // succeeding was read as "this host can do it". An Ubuntu 23.10+ host GRANTS the
+                // namespace and REFUSES the map, so the child went on with no capabilities in it
+                // and every netlink message after this point failed - reported as "the kernel
+                // refused message X" on a host where the kernel was never asked with authority.
                 let _ = std::fs::write("/proc/self/setgroups", b"deny");
-                let _ = std::fs::write("/proc/self/uid_map", b"0 0 1");
-                let _ = std::fs::write("/proc/self/gid_map", b"0 0 1");
+                if std::fs::write("/proc/self/uid_map", b"0 0 1").is_err()
+                    || std::fs::write("/proc/self/gid_map", b"0 0 1").is_err()
+                {
+                    return 19; // the namespace was granted and its map refused
+                }
                 // A SECOND NETWORK NAMESPACE TO AIM AT, held open by a child that does nothing else.
                 //
                 // AND A PIPE, BECAUSE THE FORK ALONE IS A RACE THIS TEST ALREADY LOST. Without the
@@ -545,6 +568,13 @@ mod tests {
         };
         if code == 10 {
             eprintln!("skipping: this host does not allow unprivileged user namespaces");
+            return;
+        }
+        if code == 19 {
+            eprintln!(
+                "skipping: this host grants the user namespace and refuses its id map, so nothing \
+                 in it has the capability these messages need"
+            );
             return;
         }
         assert_eq!(
