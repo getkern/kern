@@ -11325,3 +11325,166 @@ fn the_ps_table_stays_aligned_when_a_box_name_is_long() {
          asserts alignment about a table it never saw:\n{table}"
     );
 }
+
+/// `network_mode: service:X` GETS THE NAMESPACE IT ASKS FOR, AND THE NOTE SAYS WHICH ONE IT GOT.
+///
+/// THE KEY IS THE TIGHTEST COUPLING COMPOSE CAN EXPRESS: the service wants the named one's loopback,
+/// its interfaces, its published ports and its route out. It is how a client is put behind a VPN
+/// container, which is one of the most common files there is.
+///
+/// IT REGRESSED WHEN THE DEFAULT WIRING CHANGED, and it regressed SILENTLY, which is worse than
+/// loudly. MEASURED on a three-service file: the stack was wired on a bridge, `client` came up on
+/// 10.89.0.3 with `vpn` on 10.89.0.2, `nc 127.0.0.1 8080` from the client reached nothing, and the
+/// traffic the file put behind a VPN went out directly. There WAS a warning, and it was the pod arm
+/// of the note: `every service in this stack shares ONE network namespace`, printed one line under
+/// `wiring: bridge`. Two independent defects in one output - a dropped key, and a sentence asserting
+/// the opposite of what happened.
+///
+/// TWO THINGS ARE ASSERTED, and the second is why the first cannot be faked:
+///   1. by DEFAULT the key is honoured: the client reaches the peer's listener on its OWN 127.0.0.1,
+///      which is only possible if the two share a namespace;
+///   2. under an explicit `--bridge` the note switches to the arm that says the key is NOT given,
+///      because there the namespaces really are separate. A single-armed message would pass the
+///      first assertion and lie in exactly the configuration this defect appeared in.
+#[test]
+fn network_mode_service_gets_a_shared_namespace_and_the_note_says_which() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "netshare");
+    let rootfs = root.to_str().unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!("kern-it-netshare-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir");
+    let xdg = dir.join("xdg");
+    let _ = fs::create_dir_all(&xdg);
+    // `web` is the third service that makes this a MIXED stack: two coupled, one ordinary. A file
+    // with only the coupled pair would not distinguish "the key is honoured" from "every stack is
+    // still a pod".
+    let doc = [
+        "services:".to_string(),
+        "  vpn:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    command: [\"/bin/busybox\", \"sh\", \"-c\", \"while true; do echo VPN-SIDE | \
+         /bin/busybox nc -l -p 8080; done\"]"
+            .to_string(),
+        "  client:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    network_mode: \"service:vpn\"".to_string(),
+        "    depends_on: [vpn]".to_string(),
+        "    command: [\"/bin/busybox\", \"sh\", \"-c\", \"sleep 60\"]".to_string(),
+        "  web:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    command: [\"/bin/busybox\", \"sh\", \"-c\", \"sleep 60\"]".to_string(),
+        String::new(),
+    ]
+    .join("\n");
+    fs::write(dir.join("docker-compose.yml"), doc).expect("write compose");
+
+    let run = |args: &[&str]| -> String {
+        let mut c = kern();
+        c.current_dir(&dir).env("XDG_RUNTIME_DIR", &xdg).args([
+            "compose",
+            "-f",
+            "docker-compose.yml",
+        ]);
+        for a in args {
+            c.arg(a);
+        }
+        let out = c.output().expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    let default_cfg = run(&["config"]);
+    let bridged_cfg = run(&["config", "--bridge"]);
+    // THE THIRD CASE, AND THE ONE THE CORPUS GATE CAUGHT: the same key on a stack whose two
+    // services declare the SAME container port. One namespace cannot hold both, so the pod is not
+    // available, and the answer must be the bridge with an honest note rather than a refusal.
+    let collide_doc = [
+        "services:".to_string(),
+        "  vpn:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    expose: [\"8118\"]".to_string(),
+        "    command: [\"/bin/busybox\", \"sh\", \"-c\", \"sleep 60\"]".to_string(),
+        "  proxy:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    network_mode: \"service:vpn\"".to_string(),
+        "    expose: [\"8118\"]".to_string(),
+        "    command: [\"/bin/busybox\", \"sh\", \"-c\", \"sleep 60\"]".to_string(),
+        String::new(),
+    ]
+    .join("\n");
+    fs::write(dir.join("collide.yml"), collide_doc).expect("write collide");
+    let collide_cfg = {
+        let out = kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", "-f", "collide.yml", "config"])
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let up = run(&["up", "-d"]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let reach = run(&[
+        "exec",
+        "-T",
+        "client",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "/bin/busybox nc -w3 127.0.0.1 8080",
+    ]);
+    let _ = run(&["down"]);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&root);
+
+    if up.contains("user namespaces") || up.contains("newuidmap") {
+        eprintln!("skip: the stack could not start here");
+        return;
+    }
+    assert!(
+        default_cfg.contains("wiring: pod"),
+        "a file asking for a shared namespace must be wired as one, whatever the default is for \
+         files that do not ask:\n{default_cfg}"
+    );
+    assert!(
+        reach.contains("VPN-SIDE"),
+        "the client must reach the service it named on its OWN 127.0.0.1, which is only possible \
+         if the two share a namespace:\n{reach}\n{up}"
+    );
+    assert!(
+        default_cfg.contains("is satisfied here"),
+        "and the note must say the key was satisfied:\n{default_cfg}"
+    );
+    assert!(
+        bridged_cfg.contains("wiring: bridge")
+            && bridged_cfg.contains("is NOT given a shared namespace"),
+        "the CONTROL failed: under an explicit `--bridge` the namespaces really are separate, so \
+         the note must say the key is NOT given. A message with one arm would pass every assertion \
+         above and lie here, which is the configuration this defect appeared in:\n{bridged_cfg}"
+    );
+    assert!(
+        collide_cfg.contains("wiring: bridge")
+            && collide_cfg.contains("is NOT given a shared namespace")
+            && !collide_cfg.contains("error:"),
+        "a stack that asks for a shared namespace AND collides on a container port cannot be a pod, \
+         and must not be REFUSED for it: Docker accepts such a file and lets the second bind fail \
+         at run time. It gets the bridge and is told the key is not given. The first version of \
+         this fix forced the pod unconditionally and turned five real corpus files into \
+         refusals:\n{collide_cfg}"
+    );
+}

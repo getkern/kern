@@ -1097,8 +1097,39 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // ONE SERVICE KEEPS THE POD: it has no peer to be separated from, so a bridge would buy nothing
     // and cost a namespace. `--pod` restores the old wiring for anyone who prefers the speed.
-    let auto_bridge =
-        !no_pod && !force_pod && !segregates && (collides || hosts_collide || boxes.len() >= 2);
+    // A FILE THAT ASKS FOR A SHARED NAMESPACE GETS ONE. `network_mode: service:X` is not a nicety
+    // about naming, it is the tightest coupling compose can express: the service wants X's loopback,
+    // X's interfaces, X's published ports and X's route out, which is how every gluetun-and-client
+    // file on the internet puts one service behind another's VPN.
+    //
+    // MEASURED, AND IT IS WHY THIS CLAUSE EXISTS. Before the default became a namespace per service,
+    // such a file got the pod and the key was satisfied. After, it was wired on a bridge: `client`
+    // came up on 10.89.0.3 with `vpn` on 10.89.0.2, `nc 127.0.0.1 8080` from the client reached
+    // nothing, and the traffic the file put behind a VPN went out directly. Silently: there WAS a
+    // warning, and it was the pod arm of the note, claiming the key was satisfied.
+    //
+    // ONE NAMESPACE FOR THE WHOLE STACK IS COARSER THAN DOCKER, which puts only the naming service
+    // in the named one and leaves the rest apart. It is what kern can express today, it is what
+    // these files had until the default changed, and it satisfies the key rather than dropping it.
+    // The note says which of the two a stack got, and `--bridge` still asks for the other and is
+    // then told, truthfully, what it does not get.
+    // ONLY WHEN ONE NAMESPACE IS ACTUALLY POSSIBLE, and that clause was added after the corpus gate
+    // went red. Forcing the pod unconditionally turned five real files into REFUSALS: a stack whose
+    // services collide on a container port cannot be a pod at all - kern says so at `config` and has
+    // always said so - and `network_mode: service:` files are full of exactly that shape, because
+    // the client and the VPN container in front of it routinely declare the same port. Docker
+    // accepts those files and lets the second bind fail at run time.
+    //
+    // So the order is: honour the key when the wiring that honours it can be built, and otherwise
+    // keep the bridge and SAY the key is not given, which the note's other arm does. Refusing the
+    // file is the one answer that is worse than both, because it is the one Docker does not give.
+    let wants_shared_netns = boxes.iter().any(|b| b.net_share.is_some());
+    let shared_netns_is_possible = wants_shared_netns && !collides && !hosts_collide;
+    let auto_bridge = !no_pod
+        && !force_pod
+        && !segregates
+        && !shared_netns_is_possible
+        && (collides || hosts_collide || boxes.len() >= 2);
     let want_bridge = want_bridge || auto_bridge;
     let auto_no_pod = !no_pod && !force_pod && segregates;
     // THE DEFAULT ARM SPEAKS FOR ITSELF, and does not borrow the sentence below.
@@ -1213,8 +1244,17 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 .any(|o| o.service == *target || o.name == *target)
         })
         .collect();
+    // WHICH ARM OF THE NOTE IS TRUE DEPENDS ON THE NAMESPACES, NOT ON WHETHER A POD EXISTS. A
+    // bridge-wired stack IS in a pod - the bridge lives in the pod's namespace - so asking `no_pod`
+    // read `--bridge` as "one shared namespace" and printed the arm that says the key is satisfied
+    // about a stack where every service has its own loopback. MEASURED: `wiring: bridge` printed
+    // beside "every service in this stack shares ONE network namespace", with the two services on
+    // 10.89.0.2 and 10.89.0.3 and nothing answering on the client's 127.0.0.1.
+    //
+    // `want_bridge` is read AFTER the automatic decision above has been folded into it, so this is
+    // the wiring the stack will actually get and not the flag someone typed.
     if let Some(note) = crate::compose::net_share_note(
-        if no_pod {
+        if no_pod || want_bridge {
             crate::compose::StackNet::PerService
         } else {
             crate::compose::StackNet::Pod

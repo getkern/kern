@@ -471,7 +471,20 @@ def run_stack(kern, env, report, name, doc, probe_svc, probe_cmd, expect, base):
             # A missing image is the host's state, not a defect: say so and move on, rather than
             # reporting a failure the reader cannot act on.
             if "could not resolve" in out or "no such image" in out or "manifest" in out:
-                report.skip(name, "an image is not in this machine's cache")
+                # NAME THE IMAGE. A generic "an image is missing" reads the same whether the host
+                # lacks a cached layer or this file has a typo in a fixture, and only one of those is
+                # the reader's problem.
+                missing = [
+                    l.split("image:")[1].strip()
+                    for l in doc.splitlines()
+                    if l.strip().startswith("image:")
+                ]
+                report.skip(
+                    name,
+                    "an image is not in this machine's cache (this stack wants: "
+                    + ", ".join(sorted(set(missing)))
+                    + ")",
+                )
                 compose(kern, work, env, ["down"])
                 return
             report.fail(name, f"`up` failed: {out.strip().splitlines()[-1][:160] if out.strip() else 'no output'}")
@@ -690,6 +703,39 @@ def main():
         return rc
     kern = os.path.abspath(args.kern)
     env = dict(os.environ)
+
+    # WHICH BINARY WAS CERTIFIED, SAID BY THE INSTRUMENT RATHER THAN REMEMBERED BY WHOEVER RAN IT.
+    #
+    # `kernbin` already refuses a binary older than the working tree. It cannot refuse a binary built
+    # with a DIFFERENT PROFILE from the same tree, and that is the gap that matters here: the release
+    # workflow builds `x86_64-unknown-linux-musl` with `-Z build-std`, `optimize_for_size` and
+    # `panic=immediate-abort`, while `cargo build --release` produces a glibc host binary. They are
+    # not the same program - musl resolves names and reads `/etc/passwd` through a different libc -
+    # so a rehearsal that passes on the host build has certified something nobody downloads.
+    #
+    # This does not refuse the host build: running against it is useful while iterating. It prints
+    # what it tested, so a green run can never be quoted about the wrong artifact.
+    shape = "host build (glibc)"
+    try:
+        with open(kern, "rb") as fh:
+            head = fh.read(20)
+        out = subprocess.run(["file", "-b", kern], capture_output=True, text=True, timeout=30).stdout
+        if "static-pie" in out or "statically linked" in out:
+            shape = "RELEASE SHAPE (static-pie, the artifact the installer fetches)"
+        del head
+    except (OSError, subprocess.SubprocessError):
+        pass
+    digest = ""
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        with open(kern, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        digest = h.hexdigest()[:16]
+    except OSError:
+        digest = "unreadable"
+    print(f"binary\n  {kern}\n  sha256:{digest}  {shape}\n")
 
     report = Report(args.keep_going)
     print("baseline")

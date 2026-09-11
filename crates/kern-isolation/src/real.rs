@@ -5910,7 +5910,23 @@ fn hold_until_the_pod_is_gone() -> ! {
         std::thread::sleep(POLL);
         let (next, release) = pod_holder_verdict(missing_in_a_row, dir.try_exists());
         missing_in_a_row = next;
-        if release {
+        // AND THE MEMBERS DECIDE, NOT ONLY THE DIRECTORY.
+        //
+        // A reviewer found the case this needs: on a systemd host WITHOUT `loginctl enable-linger`,
+        // logind removes `/run/user/<uid>` on the last logout while leaving the user's processes
+        // running (the default `KillUserProcesses=no`). The pod's directory is then genuinely gone,
+        // the rule above is satisfied, and the holder would release the namespaces of a stack that
+        // is still serving traffic. Before this watchdog existed the stack survived a logout with
+        // its network intact; that must not become a 60-second fuse.
+        //
+        // The holder's reason to exist is its MEMBERS, not its directory. If any other process is
+        // still inside this network namespace, there is something to hold for, whatever the
+        // filesystem says. The orphan population this watchdog was written for - a pod whose boxes
+        // are long dead and whose directory was deleted by a harness - has no members, so it is
+        // still reaped.
+        //
+        // Paid only when the directory is already missing, which on a healthy host is never.
+        if release && !this_netns_has_other_processes() {
             // SAFETY: leaving a detached daemon with no handlers of its own to run. The namespaces
             // this process held are released by the kernel as it goes, and the `pasta` watching
             // them exits on its own netns watch.
@@ -5934,6 +5950,43 @@ fn hold_until_the_pod_is_gone() -> ! {
 /// one that is gone. The counter saturates rather than wrapping: a `u8` rolling over to 0 after 256
 /// consecutive absences would make a long-gone pod immortal again, which is the exact bug this
 /// function exists to end.
+/// Is any process other than this one inside this process's network namespace?
+///
+/// THE HOLDER'S MEMBERS, ASKED OF THE KERNEL rather than of a file. `/proc/<pid>/ns/net` is a link
+/// whose target names the namespace, so two processes share one exactly when their links match.
+/// Compared by the link TEXT (`net:[4026534073]`), which is the namespace's inode and is what the
+/// kernel prints; no parsing, no assumption about the format beyond equality.
+///
+/// UNREADABLE ANSWERS "YES". A `/proc` this process cannot walk, a pid that exits mid-scan, a link
+/// that cannot be read: none of those is evidence that the namespace is empty, and the only use of
+/// this function is to decide whether to release it. Every uncertainty keeps the holder alive, which
+/// is the same rule the directory probe follows.
+fn this_netns_has_other_processes() -> bool {
+    let Ok(mine) = std::fs::read_link("/proc/self/ns/net") else {
+        return true; // cannot tell: hold
+    };
+    let me = std::process::id().to_string();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true; // cannot tell: hold
+    };
+    for e in entries.filter_map(Result::ok) {
+        let Ok(name) = e.file_name().into_string() else {
+            continue;
+        };
+        if name == me || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A pid that vanishes between the listing and the read is not a member; a link that cannot
+        // be read for any other reason is not evidence either way, and there is no way to tell the
+        // two apart from here. Skipping is safe because the DIRECTORY probe is the other half of
+        // the decision: a namespace with real members almost never has every one of them unreadable.
+        if std::fs::read_link(format!("/proc/{name}/ns/net")).is_ok_and(|t| t == mine) {
+            return true;
+        }
+    }
+    false
+}
+
 fn pod_holder_verdict(missing_in_a_row: u8, probe: std::io::Result<bool>) -> (u8, bool) {
     match probe {
         Ok(true) => (0, false),
@@ -8046,5 +8099,89 @@ mod pod_holder_watchdog_tests {
         // THE COUNTER SATURATES. Wrapping would make a pod that has been gone for 256 polls look
         // freshly absent and immortal again, which is the bug this whole function exists to end.
         assert_eq!(pod_holder_verdict(u8::MAX, enoent()), (u8::MAX, true));
+    }
+
+    /// A NAMESPACE WITH MEMBERS IS NOT AN EMPTY ONE, AND THE HOLDER ASKS BEFORE IT RELEASES.
+    ///
+    /// THE CASE THIS EXISTS FOR, found in review: on a systemd host without `loginctl
+    /// enable-linger`, logind removes `/run/user/<uid>` on the last logout while leaving the user's
+    /// processes running. The pod's directory is then genuinely gone and the directory rule alone
+    /// would release the namespaces of a stack that is still serving. Before the watchdog, a logout
+    /// left such a stack with its network intact; that must not become a sixty-second fuse.
+    ///
+    /// BOTH DIRECTIONS, because either one alone is satisfied by a constant: a namespace holding
+    /// only this process must answer false, or the orphan population the watchdog was written for is
+    /// never reaped; a namespace holding one more must answer true, or the logout case is still
+    /// live. Run in a child that unshares its own network namespace, because the test binary's own
+    /// namespace is the machine's and shares it with everything.
+    #[test]
+    fn a_holder_sees_whether_anything_else_is_in_its_network_namespace() {
+        // SAFETY: fork in a test binary; the child only unshares, forks, reads /proc and exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let code = || -> i32 {
+                // SAFETY: unshare on the freshly forked child.
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+                    return 10; // no unprivileged user namespaces on this host
+                }
+                let _ = std::fs::write("/proc/self/setgroups", b"deny");
+                let _ = std::fs::write("/proc/self/uid_map", b"0 0 1");
+                // ALONE: this process is the only one in the namespace it just made.
+                if super::this_netns_has_other_processes() {
+                    return 11;
+                }
+                // SAFETY: fork from the same single-threaded child; the grandchild stays in this
+                // network namespace and sleeps until it is killed.
+                let member = unsafe { libc::fork() };
+                if member < 0 {
+                    return 12;
+                }
+                if member == 0 {
+                    // SAFETY: the grandchild waits to be killed and touches nothing shared.
+                    unsafe {
+                        libc::sleep(30);
+                        libc::_exit(0);
+                    }
+                }
+                // NOT ALONE any more, and the answer must change.
+                let answer = super::this_netns_has_other_processes();
+                // SAFETY: the grandchild is this process's own child.
+                unsafe {
+                    libc::kill(member, libc::SIGKILL);
+                    let mut st = 0i32;
+                    libc::waitpid(member, &mut st, 0);
+                }
+                i32::from(!answer) * 13
+            }();
+            // SAFETY: exiting the forked child without running the parent's atexit handlers.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0i32;
+        // SAFETY: waiting on the child just forked.
+        assert!(
+            unsafe { libc::waitpid(pid, &mut status, 0) } == pid,
+            "waitpid"
+        );
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        if code == 10 {
+            eprintln!("skipping: this host does not allow unprivileged user namespaces");
+            return;
+        }
+        assert_ne!(
+            code, 11,
+            "a namespace holding only this process must answer FALSE, or a pod whose boxes are all \
+             gone is never reaped and the watchdog does nothing"
+        );
+        assert_ne!(
+            code, 13,
+            "a namespace holding one more process must answer TRUE, or a logout that removes the \
+             runtime directory releases the network of a stack that is still serving"
+        );
+        assert_eq!(code, 0, "the probe failed for another reason (12 = fork)");
     }
 }

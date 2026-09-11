@@ -7,6 +7,25 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`network_mode: service:X` gets the namespace it asks for, and the note says which one it got.**
+The key is the tightest coupling compose can express - the service wants the named one's loopback,
+its interfaces, its published ports and its route out, which is how a client is put behind a VPN
+container. When the default wiring changed it regressed, and silently: MEASURED on a three-service
+file, the stack was wired on a bridge, `client` came up on 10.89.0.3 with `vpn` on 10.89.0.2,
+`nc 127.0.0.1 8080` from the client reached nothing, and the traffic the file put behind a VPN went
+out directly. There WAS a warning, and it was the pod arm of the note - `every service in this stack
+shares ONE network namespace` - printed one line under `wiring: bridge`. Two defects in one output:
+a dropped key, and a sentence asserting the opposite of what happened.
+
+A file that asks for a shared namespace now gets the pod, WHEN one can be built. It cannot when two
+services collide on a container port, which is exactly the shape these files have (a client and the
+VPN in front of it routinely declare the same port); forcing it there turned five real corpus files
+into refusals, which the corpus gate caught, and Docker accepts them and lets the second bind fail at
+run time. So the order is: honour the key when the wiring that honours it exists, otherwise keep the
+bridge and SAY the key is not given. The note's arm is now chosen from the wiring the stack will
+actually get, not from whether a pod object exists: a bridge-wired stack IS in a pod, which is why
+asking that question printed the wrong arm.
+
 **A pod holder stops holding when its pod stops existing.** A holder keeps one pod's user and net
 namespaces alive and is addressed through the pod's directory; when that directory goes, nothing can
 name the pod, join it or remove it, and the holder went on holding anyway - forever, with its `pasta`
@@ -17,6 +36,13 @@ the same state. The holder now polls for its own directory and exits when it is 
 every uncertainty resolves to "keep holding": no recorded directory means the old `pause()` forever,
 an unreadable directory is not a missing one, and absence must hold across two polls a full interval
 apart so a rename is never mistaken for a removal.
+
+AND ITS MEMBERS DECIDE, NOT ONLY ITS DIRECTORY. On a systemd host without `loginctl enable-linger`,
+logind removes `/run/user/<uid>` on the last logout while leaving the user's processes running: the
+directory rule alone would then release the namespaces of a stack that is still serving, turning
+what used to be a logout a stack survived into a sixty-second fuse. The holder exists for its
+members, so it asks the kernel whether anything else is in its network namespace and holds if
+anything is. The orphan population this was written for has none, so it is still reaped.
 
 **`down` stops a stack's NATs instead of deleting the files that identify them.** Teardown removed
 the `outbound/` subtree with `remove_dir_all`, and that subtree is where each box's `pasta.pid` and
