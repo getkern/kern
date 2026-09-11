@@ -141,6 +141,19 @@ case ":${PATH}:" in
     ;;
   *) printf "${DIM}    ${bindir} is not on your PATH - add:  export PATH=\"${bindir}:\$PATH\"${ZZ}\n" ;;
 esac
+# THE ONE HOST POLICY THAT MAKES THE NEXT COMMAND FAIL, said HERE rather than left for the reader to
+# discover from a syscall name. Ubuntu 23.10+ ships `kernel.apparmor_restrict_unprivileged_userns=1`,
+# which grants the user namespace and refuses its rootless id map, so no box starts at all. MEASURED
+# on a stock Ubuntu 24.04.4 cloud image: install succeeds, and the first command in the README fails.
+# The installer cannot fix it (the remedies need root, and this script may be piped into a plain sh),
+# but a reader who is told before trying loses a minute instead of an evening.
+if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+  printf "\n${DIM}    note: this host restricts unprivileged user namespaces (Ubuntu 23.10+ default),${ZZ}\n"
+  printf "${DIM}    which lets the namespace be created and refuses its uid map - no box can start yet.${ZZ}\n"
+  printf "${DIM}    install the profile kern carries, which keeps the restriction on for everything else:${ZZ}\n"
+  printf "      ${bindir}/kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null && sudo apparmor_parser -r /etc/apparmor.d/kern\n"
+  printf "${DIM}    then \`${bindir}/kern doctor\` should say ready. Full explanation: \`kern doctor\`.${ZZ}\n\n"
+fi
 # Optional Docker drop-in: invoked as `docker` / `docker-compose`, kern rewrites the argv (no daemon,
 # no docker.sock). NOT created automatically - a `docker` symlink would SHADOW a real Docker install.
 # Opt in deliberately (typically on a box with no Docker):

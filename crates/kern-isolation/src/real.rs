@@ -1044,6 +1044,29 @@ fn child_setup_and_exec(
     let gate = gate_fd();
     let mut t = PhaseTimer::new();
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        // NAME THE CAUSE, NOT THE SYSCALL. Reaching here without the capability to unshare a mount
+        // namespace means this process sits in a user namespace whose id map was never applied: the
+        // namespace was granted and the map refused, which is precisely what Ubuntu 23.10+ ships by
+        // default (`kernel.apparmor_restrict_unprivileged_userns=1`).
+        //
+        // MEASURED on a stock Ubuntu 24.04.4 cloud image: `kern box t1 --image alpine -- echo ok`
+        // printed `unshare(CLONE_NEWNS) failed: Operation not permitted` and a hint that named four
+        // possible causes and told the reader to run `kern doctor`. `doctor` then diagnosed it
+        // exactly and handed over the two remedies. The information existed the whole time, one
+        // sysctl read away, and was not at the place where the reader was standing. That is the
+        // first command in the README, on the distribution most readers run.
+        if std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .is_ok_and(|v| v.trim() == "1")
+        {
+            return Err(Error::Unsupported(
+                "unprivileged user namespaces are restricted here - this host allows the namespace \
+                 and refuses its rootless uid map (Ubuntu 23.10+ ships \
+                 kernel.apparmor_restrict_unprivileged_userns=1), so no box can start. \
+                 `kern doctor` prints the AppArmor profile to install; \
+                 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts it for the \
+                 whole machine until reboot",
+            ));
+        }
         return Err(Error::last("unshare(CLONE_NEWNS)"));
     }
     // Own cgroup namespace: make the box's OWN cgroup the root of the `cgroup2` hierarchy it mounts
@@ -2209,7 +2232,12 @@ fn set_clean_env(hostname: &str, extra: &[(String, String)]) -> Result<(), Error
     // sets it, and a check that reads it (Airflow's scheduler probe passes `"$${HOSTNAME}"` to
     // `airflow jobs check`) is comparing against an empty string. Reading it back from the UTS
     // namespace we are already in cannot drift from whatever actually set it.
-    let mut buf = [0i8; 256];
+    // `c_char` IS NOT THE SAME TYPE ON EVERY ARCHITECTURE, and this line is where it bit: it is
+    // `i8` on x86_64 and `u8` on aarch64, so `[0i8; 256]` compiles here and fails to compile at all
+    // on the board targets. Caught by CI on aarch64 and by nothing local, because the gate builds
+    // for the host only while the release ships an aarch64 binary too. Naming the libc type is the
+    // portable spelling, and `as u8` below is a no-op on the port where it already is one.
+    let mut buf = [0 as libc::c_char; 256];
     let live = if hostname.is_empty()
         && unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len() - 1) } == 0
     {
@@ -6494,7 +6522,16 @@ pub fn exec_in_box(
             // before this fork; nothing here reads the environment.
             match unplaceable {
                 Unplaceable::Refuse => {
-                    const MSG: &[u8] = b"kern: exec: refusing: the command could not be placed in the box's cgroup, so it would run outside its --memory/--pids caps. Either the box is at its --pids-limit, or this host runs kern outside the cgroup tree it delegates and no exec can join a box here; `kern doctor` reports which cap path this host takes, and KERN_ALLOW_UNCAPPED=1 runs it anyway.\n";
+                    // THE REMEDY THAT KEEPS THE CAPS IS NAMED HERE, not only in `kern doctor`.
+                    // MEASURED on four cloud images (Ubuntu 24.04, Fedora 44, Debian 13, Rocky
+                    // 10.2): an ordinary `ssh` session sits outside the systemd user manager on all
+                    // four, so `kern compose exec` refused on every one of them while the stack
+                    // itself was up and correctly capped. That is not an exotic host shape, it is
+                    // what "ssh into a server" is, and the reader who hits it was being handed
+                    // `KERN_ALLOW_UNCAPPED=1` (drop the caps) or a pointer to another command. The
+                    // fix that costs nothing and keeps the caps enforced is one line, so it goes
+                    // where the refusal is read.
+                    const MSG: &[u8] = b"kern: exec: refusing: the command could not be placed in the box's cgroup, so it would run outside its --memory/--pids caps. Either the box is at its --pids-limit, or this host runs kern outside the cgroup tree it delegates and no exec can join a box here - an ordinary ssh session is outside it on most distributions. Re-enter once with `systemd-run --user --scope bash` and run kern in that shell: caps stay enforced and exec works. `kern doctor` reports which cap path this host takes, and KERN_ALLOW_UNCAPPED=1 runs the command uncapped instead.\n";
                     unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
                     unsafe { libc::_exit(126) };
                 }

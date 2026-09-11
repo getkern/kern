@@ -2458,12 +2458,21 @@ fn prepare_ssh(
 
 /// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]` - run a command inside an
 /// already-running box, joining its namespaces. Defaults to `/bin/sh`. Propagates the exit code.
+///
+/// `as_workload` picks WHOSE identity the command runs under, and the two callers want opposite
+/// answers. `kern exec <box>` stays box-root: it is the operator's way in, and with no `--user` flag
+/// on a frozen CLI surface, defaulting it to the workload would leave no way back to root at all.
+/// `kern compose <file> exec <service>` passes `true`, because Docker's `compose exec` runs as the
+/// service's configured user and a script that reads `whoami` must not get a different answer here.
+/// The escape hatch needs no new flag and already exists: a compose service IS a box with a name, so
+/// `kern exec <that name>` is the root way in.
 pub fn exec(
     name: &str,
     command: &[String],
     env: &[String],
     workdir: Option<&str>,
     tty: bool,
+    as_workload: bool,
 ) -> Result<(), Error> {
     let name = BoxName::parse(name).map_err(Error::InvalidBox)?;
     let env = parse_envs(env)?;
@@ -2559,10 +2568,12 @@ pub fn exec(
             sock_parent: parent,
             retarget: crate::pty::retarget_resize,
         }),
-        // `kern exec` stays BOX-ROOT: see the parameter's doc on `exec_in_box`. The health probe is
-        // the one caller that passes the workload's own identity.
-        None,
-        &[],
+        // WHOSE IDENTITY: see `as_workload` on this function. `kern exec` stays box-root; compose's
+        // `exec` re-enters as the service's own uid/gid, read from the SAME registry entry that gave
+        // us `pid1`, so a box recreated under this name is entered as itself rather than as whoever
+        // held the name before.
+        if as_workload { inst.run_as } else { None },
+        if as_workload { &inst.extra_gids } else { &[] },
     );
 
     if let Some(prev) = saved.as_ref() {

@@ -3799,7 +3799,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env,
             workdir,
             tty,
-        } => commands::exec(&name, &command, &env, workdir.as_deref(), tty),
+        } => commands::exec(&name, &command, &env, workdir.as_deref(), tty, false),
         Command::Build {
             tag,
             file,

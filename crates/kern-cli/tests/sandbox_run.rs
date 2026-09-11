@@ -160,6 +160,30 @@ fn userns_plausible() -> bool {
     }
 }
 
+/// Does this text say the HOST could not build a box, rather than that kern got it wrong?
+///
+/// WHY IT IS NOT A LIST OF SUBSTRINGS. Each test that needed this grew its own list of phrases, and
+/// every list was written from the failures the author's machine could produce. The GitHub runner
+/// produced one none of them had: `unshare(CLONE_NEWNS) failed: Operation not permitted`, which is
+/// what an Ubuntu 23.10+ host says when `apparmor_restrict_unprivileged_userns=1` grants the
+/// namespace and refuses its id map. Four tests FAILED there instead of skipping, on a branch whose
+/// `main` was green, and the finding was "my tests assert my machine" for the fifth time.
+///
+/// So this matches the marker kern ITSELF emits for the condition - the hint it attaches to every
+/// box that could not be constructed - plus the two mapping refusals that reach the caller before a
+/// box exists at all. A new host-side refusal that kern words differently will still carry that
+/// hint, because the hint is attached by the error type and not by the call site.
+///
+/// It deliberately does NOT match "connection refused" or other RUNTIME failures: a box that starts
+/// and then misbehaves is the thing these tests exist to catch, and a skip there would hide it.
+fn host_cannot_build_a_box(text: &str) -> bool {
+    text.contains("could not be BUILT")
+        || text.contains("user namespaces are restricted here")
+        || text.contains("could not map the pod user namespace")
+        || text.contains("unprivileged user namespaces may be unavailable")
+        || text.contains("newuidmap")
+}
+
 /// Build a minimal rootfs: `bin/busybox` + `/proc` mountpoint. `tag` keeps the path unique per
 /// test, since the suite runs tests in parallel (a shared path would race).
 fn build_rootfs(busybox: &Path, tag: &str) -> PathBuf {
@@ -1464,13 +1488,30 @@ fn a_health_probe_cannot_read_what_the_workload_cannot() {
 
     let out = start("pr-secret", "test -r /secret");
     let err = String::from_utf8_lossy(&out.stderr).to_string();
-    if err.contains("user namespaces") || err.contains("newuidmap") || err.contains("subuid") {
+    if err.contains("user namespaces")
+        || err.contains("subuid")
+        // `--user 1000:1000` needs a second uid mapped, so this test is the first to feel a host
+        // that refuses the map - and it felt it on the runner as an empty health verdict rather
+        // than as a start failure, because the box never came up to be probed.
+        || host_cannot_build_a_box(&err)
+    {
         eprintln!("skip: this host cannot map a second uid: {err}");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&xdg);
         return;
     }
-    let _ = start("pr-public", "test -r /public");
+    // THE SECOND BOX'S START WAS DISCARDED, and it is the one the CONTROL reads. On the runner the
+    // control failed with an empty verdict - no health record at all, which is what a box that
+    // never started leaves - and the test reported it as "probes never run" instead of "this host
+    // did not build the box". The same guard, on the same output, for both.
+    let pub_out = start("pr-public", "test -r /public");
+    let pub_err = String::from_utf8_lossy(&pub_out.stderr).to_string();
+    if host_cannot_build_a_box(&pub_err) {
+        eprintln!("skip: this host cannot build the control box: {pub_err}");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
     let secret_health = settle("pr-secret");
     let public_health = settle("pr-public");
 
@@ -10842,6 +10883,9 @@ fn the_relay_wiring_reaches_into_a_service_that_runs_as_a_non_root_user() {
             // NOT a bare "connect": it matches kern's ordinary relay prose and skipped this test on
             // a host where everything worked, which is the failure mode a skip must never have.
             || t.contains("could not connect to")
+            // AND the marker kern attaches to any box the HOST could not construct. The ad-hoc list
+            // above was written from this machine's failures and missed the runner's entirely.
+            || host_cannot_build_a_box(t)
     };
     if unavailable(&relayed) || unavailable(&podded) {
         eprintln!(
@@ -10984,7 +11028,7 @@ fn two_projects_meet_on_an_external_network_and_stop_when_one_leaves() {
 
     // 1. THE CONTROL. The network does not exist yet, so `up` must refuse - and name the remedy.
     let (refused, refused_ok) = compose(&a_dir, &["up", "-d"]);
-    if refused.contains("user namespaces") || refused.contains("newuidmap") {
+    if refused.contains("user namespaces") || host_cannot_build_a_box(&refused) {
         eprintln!("skip: the stack could not start here");
         cleanup(&base, &root);
         return;
@@ -11000,6 +11044,14 @@ fn two_projects_meet_on_an_external_network_and_stop_when_one_leaves() {
 
     // 2. The stack that is already there, then the joiner.
     let (a_up, a_ok) = compose(&a_dir, &["up", "-d"]);
+    // A POD IS WHERE THIS ONE MEETS THE HOST. The refusal above is served before any namespace is
+    // built, so a host that grants the namespace and refuses its map passes the control and fails
+    // HERE, which is exactly what the GitHub runner did. The skip belongs on both sides of it.
+    if host_cannot_build_a_box(&a_up) {
+        eprintln!("skip: this host cannot build a pod (the namespace is granted, its map refused)");
+        cleanup(&base, &root);
+        return;
+    }
     assert!(
         a_ok,
         "the first stack must come up once the network exists:\n{a_up}"
@@ -11180,8 +11232,10 @@ fn compose_down_stops_the_stack_s_nats_and_does_not_merely_delete_their_pidfiles
 
     let up = compose(&["up", "-d"]);
     if up.contains("user namespaces")
-        || up.contains("newuidmap")
         || up.contains("could not resolve")
+        // The runner's shape: the namespace is granted, its map refused, and no box is built. The
+        // three phrases above were this machine's failures and did not include it.
+        || host_cannot_build_a_box(&up)
     {
         eprintln!("skip: the stack could not start here");
         let _ = fs::remove_dir_all(&dir);

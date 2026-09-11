@@ -1747,12 +1747,20 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // `exec` REPLACES THIS PROCESS'S STATUS with the command's (it calls `process::exit` with
         // the code), which is Docker's behaviour: `compose exec -T web sh -c 'exit 7'` exits 7 there
         // and here. The service's own working directory is used, as Docker uses the container's.
+        //
+        // AND THE SERVICE'S OWN USER, which is the same rule applied to the same question. Docker's
+        // `compose exec` runs as the user the service declares; this entered as box root, so a file
+        // written from an `exec` landed owned by root inside a box whose workload runs as someone
+        // else, and `whoami` answered differently here than there. MEASURED on a service with
+        // `user: "5050"`: the workload reported 5050 and `compose exec ... id -u` reported 0.
+        // `kern exec <box>` is unchanged and remains the root way in.
         return crate::commands::exec(
             &b.name,
             run_cmd,
             &[],
             b.workdir.as_deref(),
             unsafe { libc::isatty(0) } == 1,
+            true,
         );
     }
     if action == ComposeAction::Run {

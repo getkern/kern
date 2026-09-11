@@ -37,6 +37,17 @@ echo "rust  (RUSTFLAGS=$RUSTFLAGS, $(cargo clippy --version))"
 step "cargo fmt --check" cargo fmt --all --check
 step "cargo clippy" cargo clippy --all-targets --all-features
 step "cargo test" env -u KERN_BIN cargo test --all
+# AARCH64 IS SHIPPED AND WAS NEVER BUILT HERE. `libc::c_char` is `i8` on x86_64 and `u8` on aarch64,
+# so `[0i8; 256]` handed to `gethostname` compiled clean on this machine, passed every gate, and did
+# not compile AT ALL on the board target. CI caught it; a release cut before CI would have published
+# the x86 asset and no ARM one, which is exactly how v0.9.31 went out broken. A type check is
+# seconds and covers the whole class.
+if rustup target list --installed 2>/dev/null | grep -q aarch64-unknown-linux-musl; then
+    step "cargo check (aarch64)" cargo check --target aarch64-unknown-linux-musl --all-targets
+else
+    printf '  %-34s %s\n' "cargo check (aarch64)" \
+        "SKIP  target not installed: rustup target add aarch64-unknown-linux-musl"
+fi
 echo "docs"
 for g in flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \
          registry-classified stale-numbers test-count progress-is-tty-gated gates-selftest; do
