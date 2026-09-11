@@ -917,10 +917,31 @@ def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
     # and `--tmpfs /dev/shm` is refused by kern because it would shadow the hardened `/dev`. So it is
     # a writable, memory-backed, unbounded path that this SDK cannot bound. That is a runtime gap,
     # not an SDK one, and it is pinned here so it stops being invisible.
-    assert writable() == {("/tmp", "tmpfs"), ("/workspace", "ext4"), ("/dev/shm", "tmpfs")}
+    #
+    # `/dev/mqueue` WAS ADDED TO THIS PIN WITH EVIDENCE, NOT TO MAKE IT QUIET. The runtime mounts it
+    # for parity with Docker and runc, so `mq_open(3)` resolves names instead of failing; the pin
+    # predates that and only stayed green because the suite was finding an OLD `kern` on PATH (0.9.2)
+    # rather than the tree's. Running it against the tree's own binary is what surfaced the drift.
+    #
+    # It is pinned as ACCEPTABLE because it is isolated, and that was measured rather than assumed:
+    # the host's IPC namespace read `ipc:[4026531839]` and the box's `ipc:[4026534108]`, and a queue
+    # created inside the box (`/dev/mqueue/probe-box`) left the host's `/dev/mqueue` empty.
+    # `/dev/mqueue` is a per-IPC-namespace filesystem, the box has its own, so writable here reaches
+    # nothing outside. A future kern that stopped unsharing the IPC namespace would make this line
+    # wrong, and this is where it would be caught.
+    assert writable() == {
+        ("/tmp", "tmpfs"),
+        ("/workspace", "ext4"),
+        ("/dev/shm", "tmpfs"),
+        ("/dev/mqueue", "mqueue"),
+    }
     # The bundle: the scratch is NOT added on top of it. This is the assertion that would have caught
     # the widening without anyone predicting it.
-    assert writable(security_profile="untrusted") == {("/workspace", "ext4"), ("/dev/shm", "tmpfs")}
+    assert writable(security_profile="untrusted") == {
+        ("/workspace", "ext4"),
+        ("/dev/shm", "tmpfs"),
+        ("/dev/mqueue", "mqueue"),
+    }
     # The capability axis, with its own positive control: if `cap_drop=()` does not move the pinned
     # value, the pin is reading the request instead of the result.
     assert caps() == "0000000000000000", "the default drops everything"
@@ -936,7 +957,10 @@ def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
 
     # ...and a caller who asks for scratch under the bundle still gets it: their decision, not ours.
     assert writable(security_profile="untrusted", tmpfs={"/tmp": "8m"}) == {
-        ("/tmp", "tmpfs"), ("/workspace", "ext4"), ("/dev/shm", "tmpfs")
+        ("/tmp", "tmpfs"),
+        ("/workspace", "ext4"),
+        ("/dev/shm", "tmpfs"),
+        ("/dev/mqueue", "mqueue"),
     }
     # The discriminant the union version could not express: a bind at /dev/shm SHADOWS kern's tmpfs,
     # so the same set of paths is a materially different box and the pin now says so.
@@ -944,7 +968,10 @@ def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
     shm_host = _t.mkdtemp(prefix="kern-shm-pin-")
     try:
         assert writable(mounts={shm_host: "/dev/shm"}) == {
-            ("/tmp", "tmpfs"), ("/workspace", "ext4"), ("/dev/shm", "ext4")
+            ("/tmp", "tmpfs"),
+            ("/workspace", "ext4"),
+            ("/dev/shm", "ext4"),
+            ("/dev/mqueue", "mqueue"),
         }
     finally:
         shutil.rmtree(shm_host, ignore_errors=True)
