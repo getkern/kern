@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.42";
+const VERSION = "0.1.43";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -594,12 +594,21 @@ function findKern() {
     throw new SandboxError(
       "the `kern` binary was not found on PATH, and this is macOS: kern is Linux-only " +
         "(no namespaces, no cgroups on a Mac), so there is no macOS build to find. " +
-        "Run inside a Linux VM (colima, Lima, OrbStack, UTM), where kern installs normally, " +
-        "or set $KERN_BIN to a kern reachable from here. https://github.com/getkern/kern",
+        "Run inside a Linux VM (colima, Lima, OrbStack, UTM) and install it there with:\n" +
+        "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n" +
+        "or set $KERN_BIN to a kern reachable from here.",
     );
+  // THE COMMAND, NOT A LINK. `npm install kern-sandbox` does NOT bring the binary: this package is a
+  // wrapper around a process it does not ship, and the moment a user meets that fact is this error.
+  // It used to answer with a repository URL, which asks someone one paste away from working to go
+  // and read a page first. The same sentence the Python binding gives, deliberately: two wrappers
+  // around one runtime must not disagree about how to get it, and the installer line is the one the
+  // project's README leads with.
   throw new SandboxError(
-    "the `kern` binary was not found on PATH - install it " +
-      "(https://github.com/getkern/kern) or set $KERN_BIN",
+    "the `kern` binary was not found on PATH. `npm install kern-sandbox` installs this wrapper, " +
+      "not the runtime it drives - install kern with:\n" +
+      "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n" +
+      "or point $KERN_BIN at a kern you already have.",
   );
 }
 
