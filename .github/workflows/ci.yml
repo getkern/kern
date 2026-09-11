@@ -6,7 +6,13 @@ on:
     # name says something untrue about what is being built. Add the branch back, in the same push
     # that creates it, whenever work leaves `main` again. It is back for the SDK scratch work
     # (a writable /tmp and the tmpfs knob); remove it again when that lands on main.
-    branches: [main, dev]
+    #
+    # `compose-compat_2026-09-10_0740` carries the pre-launch work an external reviewer is being
+    # asked to certify: the per-service namespace default, cross-project networks, and the compose
+    # verbs (`exec`, `cp`, `run`, `ps --format json`). It is pushed so the reviewer can build the
+    # exact commit, which means it must also be a branch CI tests: a reviewer running an artifact
+    # nothing tested is the situation this list exists to prevent. Remove the name when it lands.
+    branches: [main, dev, compose-compat_2026-09-10_0740]
   pull_request:
   workflow_dispatch: {}
 
