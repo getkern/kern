@@ -7,6 +7,24 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`compose exec`/`run` accept the `--` every Docker user types.** `kern compose f.yml exec -T web --
+echo hi` tried to execute a file named `--` and died with `execvp failed: No such file or directory`,
+while the same line without the separator worked, and `kern exec <box> -- echo hi` had always worked:
+the two verbs disagreed with each other and with the reference, which accepts it and drops it. Found
+by an external reviewer running the commands. Only a leading `--` is dropped, so a later one stays
+with the command (`sh -c 'git log --'`).
+
+**The help line for the default wiring described the old default.** It said the stack is split "only
+when `networks:` separate two services", which stopped being true when the per-service namespace
+became the default: a two-service file with no `networks:` key is wired on a bridge, and the help and
+the runtime note said different things about the same stack. The behaviour is unchanged; the sentence
+now states the rule the code applies, including the single-service and the segregated cases.
+
+**`docs/INSTALL.md` names the Ubuntu 23.10+ userns policy where a Linux reader will find it.** It was
+documented only inside the macOS/colima walkthrough, and only with the machine-wide sysctl. The
+requirements section now carries both remedies, says which one is narrow, and states plainly that
+both need root once: on such a host a user who cannot get root even once cannot run a box.
+
 **`network_mode: service:X` gets the namespace it asks for, and the note says which one it got.**
 The key is the tightest coupling compose can express - the service wants the named one's loopback,
 its interfaces, its published ports and its route out, which is how a client is put behind a VPN

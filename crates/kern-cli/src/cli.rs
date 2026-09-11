@@ -1594,6 +1594,19 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             if files.is_empty() {
                 return Err(Error::Usage(usage));
             }
+            // `--` AFTER THE SERVICE IS A SEPARATOR, NOT THE PROGRAM TO RUN. The loop above sends
+            // everything after the service name into the command, flags and all, which is what makes
+            // `run web sh -c 'exit 7'` work. It also swallowed the `--` that people type out of habit
+            // and that `docker compose` accepts and drops, so `exec -T web -- echo hi` tried to
+            // execute a file called `--` and died with `execvp failed: No such file or directory`.
+            // MEASURED before the fix: without `--` it printed `hi`, with it exit 127 and that error;
+            // `kern exec <box> -- echo hi` has always worked, so the two verbs disagreed.
+            //
+            // ONLY THE FIRST TOKEN, and only when it is exactly `--`: a later one belongs to the
+            // command (`sh -c 'git log --'`) and is none of kern's business.
+            if run_cmd.first().is_some_and(|a| a == "--") {
+                run_cmd.remove(0);
+            }
             let _ = file;
             Command::Compose {
                 files,
@@ -4312,6 +4325,49 @@ mod tests {
         assert!(
             p(&["compose", "s.yml", "up", "--exit-code-from"]).is_err(),
             "the flag needs a service name"
+        );
+    }
+
+    /// A `--` AFTER THE SERVICE IS THE SEPARATOR EVERY DOCKER USER TYPES, and it must not become the
+    /// program to run.
+    ///
+    /// FOUND BY AN EXTERNAL REVIEWER, executing: `compose f.yml exec -T web -- echo hi` died with
+    /// `execvp failed: No such file or directory` and exit 127, while the same line without `--`
+    /// printed `hi`. `docker compose` accepts it and drops it, and `kern exec <box> -- cmd` has
+    /// always worked, so the two kern verbs disagreed with each other and with the reference.
+    ///
+    /// The last case is the one that makes this a rule rather than a strip: only the FIRST token,
+    /// and only when it is exactly `--`. A later one belongs to the command.
+    #[test]
+    fn compose_run_and_exec_drop_a_leading_double_dash_before_the_command() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let cmd = |args: &[&str]| match p(args).unwrap_or_else(|e| panic!("{e}")).1 {
+            Command::Compose { run_cmd, .. } => run_cmd,
+            other => panic!("must be a compose command: {other:?}"),
+        };
+        assert_eq!(
+            cmd(&["compose", "s.yml", "exec", "-T", "web", "--", "echo", "hi"]),
+            vec!["echo", "hi"]
+        );
+        assert_eq!(
+            cmd(&["compose", "s.yml", "run", "--rm", "web", "--", "echo", "hi"]),
+            vec!["echo", "hi"]
+        );
+        // CONTROL: without the separator nothing changes, or the assertions above would hold for a
+        // parser that drops the first token whatever it is.
+        assert_eq!(
+            cmd(&["compose", "s.yml", "exec", "-T", "web", "echo", "hi"]),
+            vec!["echo", "hi"]
+        );
+        // And a `--` the COMMAND owns survives, at the front of its own argv and in the middle.
+        assert_eq!(
+            cmd(&["compose", "s.yml", "exec", "web", "sh", "-c", "git log --"]),
+            vec!["sh", "-c", "git log --"]
+        );
+        assert_eq!(
+            cmd(&["compose", "s.yml", "exec", "web", "--", "--", "x"]),
+            vec!["--", "x"],
+            "only the separator goes: a second one is the command's own"
         );
     }
 

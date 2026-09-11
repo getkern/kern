@@ -249,6 +249,29 @@ kern trades breadth for a small, honest core. What it needs, and what it deliber
 **Requires:**
 - A **Linux kernel** with **unprivileged user namespaces** + **cgroup v2**. On Windows it runs under
   WSL2; there is no native macOS/Windows port ([Roadmap](../ROADMAP.md)).
+- **On Ubuntu 23.10 and newer, one root command before the first box.** That release began shipping
+  `kernel.apparmor_restrict_unprivileged_userns=1`, which allows the namespace and refuses its
+  rootless uid map, so **no box starts at all** until it is dealt with. kern says so by name when it
+  happens, and `kern doctor` lists it first. Two ways, and they are not equivalent:
+
+  ```sh
+  # NARROW: teach AppArmor about kern, leaving the restriction on for every other program.
+  kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null
+  sudo apparmor_parser -r /etc/apparmor.d/kern
+  ```
+
+  ```sh
+  # BROAD: lift the restriction machine-wide until reboot. Works everywhere, protects nothing.
+  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+  ```
+
+  The profile attaches **by path**, and covers the three places kern normally lives
+  (`/usr/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin`); a binary you moved elsewhere needs
+  that path added to its attachment line. `apparmor_parser -r` is not optional: AppArmor attaches at
+  `exec`, so a kern already running cannot see a profile loaded afterwards.
+
+  **Both need root once.** Stated plainly because it is a real limit rather than an inconvenience:
+  on such a host, a user who cannot get root even once cannot run a box, and no flag changes that.
 - Hard `--memory`/`--cpus`/`--pids-limit` caps need a **delegated cgroup** (a systemd user manager, or root);
   without one they degrade to best-effort and kern says so. Pass `--require-limits` (`KERN_REQUIRE_LIMITS`)
   to refuse to start instead of running uncapped, or `--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) to accept

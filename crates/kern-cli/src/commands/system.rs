@@ -85,9 +85,13 @@ fn help_text(p: &crate::ui::Palette) -> String {
 
   {d}Multi-box{z}
     {c}compose{z} <file> [{cv}] Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
-    {c}up{z} [--no-pod|--pod|--bridge] [-d] / {c}down{z}                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared; default: split only when `networks:` separate two services)
-                                                                     With --bridge each service keeps its own namespace and its own 127.0.0.1
-                                                                     Two services may then share a container port, and no relay is built
+    {c}up{z} [--no-pod|--pod|--bridge] [-d] / {c}down{z}                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared)
+                                                                     DEFAULT: a namespace per service, as soon as the stack has two of them.
+                                                                     They meet on the pod's bridge, which is Docker's own arrangement.
+                                                                     `--bridge` asks for exactly that, explicitly.
+                                                                     One service alone keeps a single namespace.
+                                                                     When `networks:` SEPARATE two services, relays are built instead.
+                                                                     Each service then has its own 127.0.0.1, so two may share a port
     {c}compose{z} <file> {c}watch{z} [service...]                              Rebuild + restart ONE service when its `build:` context changes
     {c}compose{z} <file> {c}port{z} <service> <container-port>                 Print the host address serving that box port (non-zero if none)
     {c}compose{z} <file> {c}run{z} [--rm] [--no-deps] <service> [cmd...]       One-off box from a service definition, in the foreground; its exit code is kern's
