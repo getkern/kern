@@ -823,15 +823,80 @@ def _find_kern() -> str:
     return found
 
 
+# The mount points a box needs to be a box, refused as TARGETS. Two sets, because the rule is not the
+# same for both, and collapsing them broke a documented feature within the hour.
+#
+# REFUSED AT THE POINT ITSELF. Mounting over one of these replaces the thing the box is built on: `/`
+# is the box, and `/proc`, `/sys` and `/dev` are what the kernel put there for it.
+_BOX_ESSENTIAL_MOUNTS = ("/", "/proc", "/sys", "/dev")
+
+# REFUSED ANYWHERE INSIDE, TOO. `/proc` and `/sys` are kernel interfaces whose individual entries are
+# read by the box, by its runtime and by kern itself; a bind over one of them shadows a fact rather
+# than adding a file. The exact-match check that shipped before let every one of these through:
+# `/proc` was refused and `/proc/self`, `/proc/1/environ` and `/sys/fs/cgroup` were accepted. Found in
+# review, with the command that shows it.
+#
+# `/dev` IS NOT IN THIS SET, and that is not an oversight. `/dev/shm` is the one lever this SDK has on
+# shared memory - kern refuses `--tmpfs /dev/shm`, so a bind is the only way - and it is documented,
+# measured and covered by three tests, all of which went red when the first version of this fix
+# refused everything under `/dev`. A device node bound over by a caller is a foot-gun in their own
+# box, not a way out of it.
+#
+# `/etc` is in neither set: a config file at `/etc/myapp.conf` is an ordinary thing to mount. What is
+# dangerous there is the SOURCE, and that is where the sensitive-host-path set does its work.
+_BOX_ESSENTIAL_SUBTREES = ("/proc", "/sys")
+
+
+def _is_inside(path: str, root: str) -> bool:
+    """Is `path` the directory `root` itself, or anything beneath it? Both are already normalised.
+
+    STRING COMPARISON ON NORMALISED PATHS, deliberately, and not `os.path.commonpath`: this runs on a
+    target that does not exist yet, inside a filesystem that does not exist yet, so there is nothing to
+    resolve against. The separator is appended before the prefix test so `/sysfoo` is not read as being
+    inside `/sys`.
+
+    `/` IS ITSELF AND NOT EVERYTHING. Read as a prefix it contains every path there is, and the first
+    version of this function did exactly that: every mount was refused, including `/data`. The root is
+    an essential mount because mounting OVER it replaces the box; mounting inside it is what a mount
+    is.
+    """
+    if root == "/":
+        return path == "/"
+    return path == root or path.startswith(root + "/")
+
+
 def _validate_mount(source: str, target: str) -> tuple[str, str]:
     """Validate one host->box mount; refuse unsafe sources/targets. Returns (abs_real_source, target)."""
+    # A NUL CANNOT REACH THE OS LAYER AS A ValueError. Every other refusal here is `MountRefused`,
+    # which is a `SandboxError`, and a caller's `except SandboxError` is the documented way to handle
+    # a bad mount. `os.path.realpath` on a string with an embedded NUL raises `ValueError` instead, so
+    # one input in the set escaped the exception type the API promises and took the caller's process
+    # down. Found in review. Checked before anything touches the OS layer.
+    for label, value in (("source", source), ("target", target)):
+        if "\x00" in value:
+            raise MountRefused(f"mount {label} must not contain a NUL byte: {value!r}")
+        # A NEWLINE IS REFUSED FOR THE SAME REASON A NUL IS, one layer up: it is legal in a Linux path
+        # and it poisons every line-oriented reader downstream - kern's own argv is fine, `list_files`
+        # and any log a caller greps are not. No legitimate mount needs one.
+        if "\n" in value or "\r" in value:
+            raise MountRefused(f"mount {label} must not contain a newline: {value!r}")
     if not target.startswith("/"):
         raise MountRefused(f"mount target must be an absolute path in the box, got {target!r}")
     if any(c == ".." for c in target.split("/")):
         raise MountRefused(f"mount target must not contain '..': {target!r}")
     norm_target = "/" + "/".join(c for c in target.split("/") if c and c != ".")
-    if norm_target in ("/", "/proc", "/sys", "/dev"):
-        raise MountRefused(f"cannot mount over the box essential mount {norm_target!r}")
+    if norm_target in _BOX_ESSENTIAL_MOUNTS:
+        raise MountRefused(
+            f"cannot mount over the box essential mount {norm_target!r}: the box needs it to be "
+            "what the kernel put there"
+        )
+    for essential in _BOX_ESSENTIAL_SUBTREES:
+        if _is_inside(norm_target, essential):
+            raise MountRefused(
+                f"cannot mount inside {essential!r} (got {norm_target!r}): its entries are kernel "
+                "state the box, its runtime and kern all read, and a bind there shadows a fact "
+                "rather than adding a file"
+            )
     src = Path(source)
     if not src.is_absolute():
         raise MountRefused(f"mount source must be an absolute host path, got {source!r}")

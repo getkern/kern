@@ -81,12 +81,18 @@ sandbox acted:
 
 A box that fails to **start** raises `SandboxError` instead, because the code never ran.
 
-## Use it from Claude Desktop or Cursor (MCP)
+## Use it from an MCP client (Cursor, Claude Desktop, anything that speaks MCP)
 
 The package ships **`kern-mcp`**, a dependency-free
 [Model Context Protocol](https://modelcontextprotocol.io) stdio server that gives the model a local
 code interpreter: it writes code, kern runs it on your machine, and charts come back as images the
 model can see.
+
+**Where it runs matters, because kern is Linux-only.** MCP's stdio transport spawns the server where
+the CLIENT runs, so the config below works when your client is on Linux. From macOS or Windows the
+same server is one hop away and the config is still one line: `"command": "wsl"` on Windows,
+`"command": "ssh"` to a Linux VM or a board. Both forms, with what the hop costs, are in
+[docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
 
 ```json
 {

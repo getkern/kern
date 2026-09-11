@@ -11,6 +11,14 @@ images the client can render.
 { "mcpServers": { "kern": { "command": "kern-mcp" } } }
 ```
 
+**This config works when the client and kern are on the same machine, which means a Linux one.** The
+stdio transport spawns `kern-mcp` where the CLIENT runs, and `kern-mcp` needs a `kern` binary beside
+it: kern is Linux-only, because it is namespaces and cgroups. A client running on macOS or on Windows
+therefore cannot use the line above as written - it would spawn a command that is not there - and
+needs a transport into a Linux machine instead. Both are one line and both are below: `wsl` from
+Windows, `ssh` to a VM or a board from anywhere. The SDK says the same thing at the point it bites:
+on macOS its missing-binary error names the VM rather than an installer.
+
 To run it without installing anything, name the package, not the command: `uvx kern-mcp` fails,
 because the command and the package have different names and there is no `kern-mcp` on PyPI.
 

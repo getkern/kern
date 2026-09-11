@@ -413,6 +413,68 @@ def test_dangerous_mounts_refused(mounts):
         _cfg(mounts=mounts)
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        # THE HOLE REVIEW FOUND. The essentials check compared the target for EQUALITY, so `/proc`
+        # was refused and everything INSIDE it was not. Reported with the command that shows it:
+        # `Sandbox(mounts={tmp: "/proc/self"})` started a box.
+        "/proc/self",
+        "/proc/1/environ",
+        "/sys/fs/cgroup",
+        "/sys/kernel/security",
+        # And the roots themselves, which were already refused and must stay so.
+        "/", "/proc", "/sys", "/dev",
+    ],
+)
+def test_a_mount_inside_a_box_essential_is_refused_not_only_the_essential_itself(target, tmp_path):
+    with pytest.raises(MountRefused):
+        _cfg(mounts={str(tmp_path): target})
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        # THE CONTROL, and it is not decoration: the first version of the fix read `/` as a PREFIX of
+        # every path and refused every mount there is, including the one the SDK exists to make. Each
+        # of these must be ACCEPTED, and `/sysfoo` is here because a prefix test without the
+        # separator would call it part of `/sys`.
+        "/data",
+        "/workspace/sub",
+        "/etc/myapp.conf",
+        "/sysfoo",
+        "/procfoo",
+        "/devices",
+        "/data/./sub",
+        # INSIDE `/dev` IS ALLOWED, and this is the case that says why the rule is two sets rather
+        # than one. `/dev/shm` is the only lever this SDK has on shared memory (kern refuses
+        # `--tmpfs /dev/shm`), it is documented and measured, and three tests went red when the first
+        # version of this fix refused everything under `/dev`.
+        "/dev/shm",
+        "/dev/null",
+    ],
+)
+def test_an_ordinary_mount_target_is_still_accepted(target, tmp_path):
+    _cfg(mounts={str(tmp_path): target})
+
+
+@pytest.mark.parametrize(
+    "source,target",
+    [
+        # A NUL used to escape as `ValueError` from `os.path.realpath`, which is not a `SandboxError`,
+        # so a caller's `except SandboxError` missed it and the agent's process died. Found in review.
+        ("/tmp/x\x00y", "/data"),
+        ("/tmp/x", "/data\x00y"),
+        # A NEWLINE is legal in a Linux path and poisons every line-oriented reader downstream.
+        ("/tmp/x", "/data\nname"),
+        ("/tmp/x\ny", "/data"),
+    ],
+)
+def test_a_mount_path_with_a_nul_or_a_newline_is_refused_as_a_sandbox_error(source, target):
+    with pytest.raises(MountRefused):
+        _cfg(mounts={source: target})
+
+
 def test_home_mount_refused():
     with pytest.raises(MountRefused):
         _cfg(mounts={os.path.expanduser("~"): "/home-x"})

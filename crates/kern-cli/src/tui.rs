@@ -306,6 +306,16 @@ struct Row {
     /// Extra-confinement badge: `egress` and/or `landlock` (0.6.7 policies), empty when neither applies.
     /// Unlike `iso` (which flags LESS-confined boxes), this marks the MORE-confined ones.
     sec: String,
+    /// The supervisor is dead and the box's PID 1 is not: `kern ps` calls this `orphaned`.
+    ///
+    /// CARRIED BECAUSE THE TWO VIEWS MUST NOT DISAGREE ABOUT ONE BOX. `ps` routes its column through
+    /// `box_status`, which the CLI documents as the single source of truth and which answers
+    /// `orphaned` before it answers anything else. This table asked `health_of` directly, which is a
+    /// second definition of a box's state and had drifted: MEASURED by SIGKILLing three boxes'
+    /// supervisors, `kern ps` printed `orphaned` and `kern top` printed `running` for the same three
+    /// pids, in the same second. A dashboard that contradicts the list is worse than either alone,
+    /// because the reader has no way to tell which one is lying.
+    orphaned: bool,
 }
 
 /// Restores the terminal on drop: leave the alternate screen, show the cursor, re-enable line
@@ -1978,6 +1988,7 @@ fn collect_rows(prev: &HashMap<i32, (u64, Instant)>) -> (Vec<Row>, HashMap<i32, 
             pod: b.pod,
             iso,
             sec,
+            orphaned: b.orphaned,
         });
     }
     // Group for the pod-tree view: standalone boxes first, then each pod's members contiguous (pods in
@@ -3236,7 +3247,16 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
 
         let mem = r.mem.map_or("-".into(), human_bytes);
         let tasks = r.tasks.map_or("-".into(), |n| n.to_string());
-        let status = if r.paused {
+        // ORPHANED WINS, exactly as it does in `box_status`. It is a lifecycle state and not a health
+        // verdict, so in this table it belongs to STATUS rather than to HEALTH - `kern ps` has one
+        // column and puts it there; here there are two, and putting it in the same place as `ps`
+        // would have said a box with a healthcheck is unhealthy, which it is not.
+        //
+        // YELLOW, NOT RED: the box is running and reachable, and the thing that died is the process
+        // that would have restarted it. Red would read as "the workload failed".
+        let status = if r.orphaned {
+            format!("{y}orphaned{z}")
+        } else if r.paused {
             format!("{d}paused{z}")
         } else {
             format!("{g}running{z}")
@@ -3482,6 +3502,47 @@ mod tests {
         }
     }
 
+    /// `kern top` AND `kern ps` MUST NOT DISAGREE ABOUT ONE BOX.
+    ///
+    /// A box whose SUPERVISOR was killed while its PID 1 lives is `orphaned`: still running, still
+    /// holding its ports, and with nothing left to restart it. `kern ps` routes its column through
+    /// `box_status`, which the CLI documents as the single source of truth and which answers
+    /// `orphaned` ahead of everything else. This table asked `health_of` directly - a second
+    /// definition of a box's state - and it had drifted: MEASURED by SIGKILLing three supervisors,
+    /// `ps` printed `orphaned` and `top` printed `running` for the same three pids in the same
+    /// second.
+    ///
+    /// THE CONTROLS ARE THE OTHER TWO STATES, because a table that printed `orphaned` for everything
+    /// would pass an assertion that only looked for the word.
+    #[test]
+    fn the_boxes_table_reports_an_orphaned_box_as_orphaned_and_not_as_running() {
+        let p = Palette::plain();
+        let host = HostStats::default();
+        let mut orphan = row("gone", false);
+        orphan.orphaned = true;
+        let out = boxes_table(&p, &[orphan], 10, 0, &host);
+        assert!(
+            out.contains("orphaned"),
+            "a box whose supervisor is dead must say so here, as `kern ps` does:\n{out}"
+        );
+        assert!(
+            !out.contains("running"),
+            "and it must not ALSO be called running: a dashboard that contradicts the list leaves \
+             the reader no way to tell which one is lying:\n{out}"
+        );
+        // THE CONTROLS. An ordinary box is running; a paused one is paused; neither is orphaned.
+        let live = boxes_table(&p, &[row("live", false)], 10, 0, &host);
+        assert!(
+            live.contains("running") && !live.contains("orphaned"),
+            "the CONTROL failed: an ordinary box must still read as running:\n{live}"
+        );
+        let held = boxes_table(&p, &[row("held", true)], 10, 0, &host);
+        assert!(
+            held.contains("paused") && !held.contains("orphaned"),
+            "the CONTROL failed: a paused box must still read as paused:\n{held}"
+        );
+    }
+
     fn row(name: &str, paused: bool) -> Row {
         Row {
             name: name.into(),
@@ -3496,6 +3557,7 @@ mod tests {
             pod: String::new(),
             iso: String::new(),
             sec: String::new(),
+            orphaned: false,
         }
     }
 
@@ -3811,6 +3873,7 @@ mod tests {
             pod: pod.to_string(),
             iso: String::new(),
             sec: String::new(),
+            orphaned: false,
         };
         let p = Palette::plain();
         let host = HostStats::default();
