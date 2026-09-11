@@ -5013,6 +5013,13 @@ fn read_cap_bnd() -> Result<u64, Error> {
 /// The unit column is not decoration. `--ulimit memlock=-1` on this host clamps to 4183130112, while
 /// the `ulimit -l` the message sends the operator to prints 4085088: the same limit in KILOBYTES.
 /// A number offered for comparison against a command that scales it differently is a wrong number.
+// THE CAST IS REAL ON ONE LIBC AND A NO-OP ON ANOTHER, so exactly one of them is always going to
+// call it unnecessary. `RLIMIT_*` is `u32` under glibc and already `c_int` under musl: dropping the
+// cast stops the build on glibc, keeping it makes clippy fail the musl target under `-D warnings`,
+// and the release SHIPS musl. CI lints the gnu target, so this divergence was invisible there and
+// showed up the first time the shipped target was linted: 17 errors, on code that is correct.
+// One allow, on the one table where the platform types meet, is the whole fix.
+#[allow(clippy::unnecessary_cast)]
 pub const ULIMITS: &[(&str, i32, char, &str)] = &[
     ("core", libc::RLIMIT_CORE as i32, 'c', "bytes"),
     ("cpu", libc::RLIMIT_CPU as i32, 't', "seconds"),
@@ -5112,9 +5119,11 @@ fn apply_ulimits(limits: &[(i32, u64, u64)]) -> Result<(), Error> {
                 // three-node compose file died with "memory locking requested ... but memory is not
                 // locked". Saying only "less headroom" would describe that as a degradation when it
                 // is a refusal.
-                let locking = if resource == libc::RLIMIT_MEMLOCK as i32
-                    && hard as libc::rlim_t == libc::RLIM_INFINITY
-                {
+                // Same platform split as `ULIMITS`: `RLIMIT_MEMLOCK` is `u32` under glibc and
+                // `c_int` under musl, so the cast is required on one and redundant on the other.
+                #[allow(clippy::unnecessary_cast)]
+                let is_memlock = resource == libc::RLIMIT_MEMLOCK as i32;
+                let locking = if is_memlock && hard as libc::rlim_t == libc::RLIM_INFINITY {
                     " A process that calls `mlockall` counts its whole reserved address space \
                      against this, not the memory it is using, so a workload that REQUIRES memory \
                      locking (Elasticsearch's `bootstrap.memory_lock`) refuses to start here rather \
