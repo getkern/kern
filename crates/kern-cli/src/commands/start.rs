@@ -1260,9 +1260,40 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                  instead (e.g. -p 8080:80), or have the machine's owner lower that sysctl"
             )));
         }
-        return Err(Error::AlreadyRunning(format!(
-            "cannot publish host port {hp}: {e} - already in use (another box, or a non-kern process)"
-        )));
+        // NAME THE HOLDER WHEN KERN CAN. The registry records every running box's published ports,
+        // so "another box, or a non-kern process" is a shrug in the one case kern can answer: two
+        // stacks competing for a port is the commonest way this fires, and "which one" is the whole
+        // question. MEASURED on two projects publishing 18099: the message named the port and left
+        // the reader to find the holder with `kern ps` and their own eyes.
+        //
+        // STILL A SHRUG WHEN IT HAS TO BE. A port held by something that is not a kern box - another
+        // runtime, a dev server, systemd - is invisible from here, and claiming otherwise would be
+        // worse than the shrug. The two cases get two different sentences.
+        let holder = crate::registry::list().into_iter().find(|b| {
+            b.ports
+                .split(',')
+                .filter_map(|p| p.split("->").next())
+                .filter_map(|a| a.rsplit(':').next())
+                .any(|p| p.trim().parse::<u16>() == Ok(hp))
+        });
+        return Err(Error::AlreadyRunning(match holder {
+            Some(b) if b.pod.is_empty() => format!(
+                "cannot publish host port {hp}: {e} - box '{}' is already publishing it. \
+                 `kern stop {}` frees it, or publish this one on another port",
+                b.name, b.name
+            ),
+            Some(b) => format!(
+                "cannot publish host port {hp}: {e} - service '{}' of stack '{}' is already \
+                 publishing it. Take that stack down, or publish this one on another port",
+                crate::ui::display_box_name(&b.name, &b.pod),
+                b.pod
+            ),
+            None => format!(
+                "cannot publish host port {hp}: {e} - and no running kern box is publishing it, so \
+                 it is held by something else on this machine (another runtime, a dev server, a \
+                 systemd unit). `ss -ltnp | grep :{hp}` names it"
+            ),
+        }));
     }
     // `--hostname`: validate before it reaches `sethostname`. `--tmpfs`: parse the Docker-style
     // specs (blocking a tmpfs over the hardened mounts). `--user`: parse UID[:GID].

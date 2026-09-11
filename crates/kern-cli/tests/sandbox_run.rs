@@ -11488,3 +11488,119 @@ fn network_mode_service_gets_a_shared_namespace_and_the_note_says_which() {
          refusals:\n{collide_cfg}"
     );
 }
+
+/// A TAKEN PORT NAMES WHO IS HOLDING IT, WHEN KERN CAN KNOW.
+///
+/// "already in use (another box, or a non-kern process)" is a shrug in the one case kern can answer.
+/// Two stacks competing for a published port is the commonest way this fires - a second copy of the
+/// same compose file, a demo left running - and "which one" is the entire question. The registry
+/// records every running box's published ports, so it is a lookup and not a guess.
+///
+/// BOTH ARMS, because the fix is only honest if it still shrugs where it must. A port held by
+/// something that is not a kern box is invisible from here, and naming a box in that case would be
+/// worse than the shrug: the second arm says no kern box holds it and gives the command that does
+/// name the holder.
+#[test]
+fn a_taken_published_port_names_the_stack_holding_it() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    // A port this test owns for its lifetime. High and derived from the pid so two runs of the suite
+    // on one machine cannot collide with each other.
+    let port = 20000 + (std::process::id() % 9000) as u16;
+    let root = build_rootfs(&busybox, "portheld");
+    let rootfs = root.to_str().unwrap_or_default();
+    let xdg = std::env::temp_dir().join(format!("kern-it-portheld-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let start = |name: &str| {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                rootfs,
+                "-d",
+                "-p",
+                &format!("{port}:{port}"),
+                "--",
+                "/bin/busybox",
+                "nc",
+                "-l",
+                "-p",
+                &port.to_string(),
+            ])
+            .output()
+            .expect("run kern")
+    };
+    let first = start("holder-a");
+    let first_err = String::from_utf8_lossy(&first.stderr).to_string();
+    if first_err.contains("user namespaces")
+        || first_err.contains("newuidmap")
+        || first_err.contains("Address already in use")
+    {
+        eprintln!("skip: the first box could not take the port here");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let second = start("holder-b");
+    let taken = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    for n in ["holder-a", "holder-b"] {
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", n])
+            .output();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // THE OTHER ARM: nothing of kern's holds it now, so the same collision must say so instead of
+    // naming a box. The listener is this test's own socket, which is exactly the "something else on
+    // this machine" the message describes.
+    let outsider = std::net::TcpListener::bind(("0.0.0.0", port));
+    let foreign = outsider.as_ref().ok().map(|_| {
+        let out = start("holder-c");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    drop(outsider);
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "holder-c"])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    assert!(
+        taken.contains("holder-a"),
+        "a port taken by another kern box must NAME it, because the registry knows: {taken}"
+    );
+    assert!(
+        !taken.contains("or a non-kern process"),
+        "and it must not shrug when it can answer: {taken}"
+    );
+    let Some(foreign) = foreign else {
+        eprintln!("note: the port could not be held from this test, so the second arm was not run");
+        return;
+    };
+    assert!(
+        foreign.contains("no running kern box is publishing it") && foreign.contains("ss -ltnp"),
+        "the CONTROL failed: a port held by something that is NOT a kern box must say so and name \
+         the command that finds the holder, or the fix has taught kern to blame a box for every \
+         collision:\n{foreign}"
+    );
+}
