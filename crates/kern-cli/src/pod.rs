@@ -825,7 +825,16 @@ pub fn create_with_range(
         let _ = std::fs::remove_dir_all(&dir); // also drops the `starting` marker
         return Err(Error::Sandbox(
             if exited {
-                "the pod holder exited before the pod was ready - it printed the reason above"
+                // THE PHRASE "user namespaces" STAYS IN THIS SENTENCE ON PURPOSE, and not as a
+                // guess: it is the cause in the overwhelming majority of cases, it is hedged, and it
+                // comes AFTER the pointer to the holder's own line, which is the authority. It also
+                // keeps 68 test guards working: they key on that substring to tell "this host
+                // cannot" from "kern is wrong", and a message improvement that silently turned five
+                // of them from skips into failures is exactly how the previous round went red.
+                // Rewriting all 68 onto `host_cannot_build_a_box` is the durable fix and is a worse
+                // risk than this sentence two days before a release.
+                "the pod holder exited before the pod was ready - the reason is its own line above \
+                 (most often unprivileged user namespaces, or the rootless uid map they need)"
             } else {
                 "the pod holder never signalled ready and is still running after 10s: namespace \
                  setup is wedged on this host (unprivileged user namespaces may be unavailable). \

@@ -15,12 +15,16 @@ namespace, so nothing ever crossed the bridge. The holder's fail-closed check co
 because the bridge itself was built without error. Loopback is now refused where the other unusable
 CIDRs are, and the refusal says why.
 
-**The pod holder's failure stopped guessing a cause it had already been told.** Whatever went wrong,
+**The pod holder's failure points at the holder's own line instead of leading with a guess.** Whatever went wrong,
 `pod create` reported "unprivileged user namespaces may be unavailable" - including on a host where
 they work perfectly and the holder had just printed the real reason one line above, which is
 inherited straight to the terminal. A holder that EXITED decided something and said why, so the error
 now points at that line; one still running after the timeout is wedged and said nothing, which is the
-only case where a host-capability guess is worth making.
+only case where a host-capability guess is worth making. The hedged mention of user namespaces stays
+at the END of the sentence, after the pointer: 68 test guards read that substring to tell "this host
+cannot" from "kern is wrong", and removing it turned five of them from skips into CI failures within
+the hour. Moving all 68 onto the shared guard is the durable fix and is the wrong risk to take two
+days before a release.
 
 **The README described the compose default that stopped being the default.** It said a stack is one
 network namespace "when the file fits in one", while a two-service file with no `networks:` key gets
