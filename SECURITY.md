@@ -418,6 +418,19 @@ where other local processes are hostile is not one to hand a secret to through a
   **`kern save -o <file>`** applies the same destination guard.
 - **`kern pause`/`unpause`** write only the box's own cgroup and refuse when it has none.
   **`kern attach`** is read-only.
+- **What kern RENDERS is sanitised; what the WORKLOAD wrote is not.** Two different questions, and the
+  answer differs on purpose. A box NAME cannot carry a control character at all (refused at the parse
+  boundary: letters, digits, `_`, `.`, `-`), and the strings kern renders about a box in `ps`, `top` and
+  `inspect` have their escape and carriage-return bytes removed, so a command line carrying
+  `\x1b]0;title\x07` cannot retitle the window of whoever runs `kern ps`. Measured with `cat -v`: the
+  ESC bytes are gone and the CR is a space. `ps --json` keeps them encoded, because that output is for a
+  program.
+  **`kern logs` passes the workload's own bytes through**, exactly as `docker logs` does: they are the
+  program's output and the operator asked to see them. So a hostile workload CAN colour, retitle and
+  overwrite lines in the terminal that reads its log, and that is the same exposure as any `cat` of an
+  untrusted file. Where those bytes go to a MODEL rather than a terminal, the bindings neutralise them
+  (the LangChain renderer and the MCP server both strip ANSI, control characters and their own
+  framing), because there the text is a channel the model uses to decide.
 
 ## OCI pull, build and push
 

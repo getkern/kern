@@ -237,6 +237,25 @@ def main() -> int:
         result("a crash is not a sandbox fault", None, fault_of(r))
         result("a crash carries its signal in the code", 139, r.exit_code)
 
+    # THE PROTOCOL BYTES MUST BE OUT OF REACH, because the whole taxonomy rests on them: if a cell could
+    # write to the `KERN_STARTED_FD` or `KERN_ALIVE_FD` pipe it could forge its own verdict. `shed_inherited_fds`
+    # closes every inherited descriptor >= 3 before the workload runs, so the box must see only its own
+    # stdio. Measured rather than read: the cell enumerates `/proc/self/fd` and tries to write to
+    # everything it finds.
+    with Sandbox(image=IMAGE, memory_mb=256, timeout_s=30) as s:
+        r = s.run_code(
+            "import os\n"
+            "fds = sorted(int(x) for x in os.listdir('/proc/self/fd') if x.isdigit())\n"
+            "wrote = []\n"
+            "for fd in fds:\n"
+            "    if fd < 3: continue\n"
+            "    try:\n"
+            "        os.write(fd, b'FORGED'); wrote.append(fd)\n"
+            "    except OSError: pass\n"
+            "print('WROTE', wrote)\n"
+        )
+        result("a cell cannot write the protocol bytes", "WROTE []", (r.stdout or "").strip())
+
     # THE PAIR THAT NEEDS kern's FOURTH BYTE: the same exit code as a SIGKILL, chosen by the workload.
     # Without the signal byte these came back `killed` and `escape_blocked`, both invented.
     with Sandbox(image="alpine", memory_mb=256, timeout_s=30) as s:
