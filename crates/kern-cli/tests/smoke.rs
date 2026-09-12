@@ -459,6 +459,50 @@ fn a_box_killed_by_its_cap_says_why() {
     );
 }
 
+/// Did this host refuse to BUILD a box at all, as opposed to running one and disagreeing with us?
+///
+/// THE DISTINCTION IS THE WHOLE POINT, and getting it wrong has cost this project in both directions.
+/// A test that skips whenever its expectation is unmet is a permanent no-op (the test below used to be
+/// one). A test that asserts unconditionally reports the developer's machine: the GitHub runner allows
+/// the user namespace and refuses its rootless uid map (Ubuntu 23.10+ ships
+/// `kernel.apparmor_restrict_unprivileged_userns=1`), so NO box starts there and a hard assertion about
+/// a box's exit code fails for a reason that has nothing to do with what is being tested. Measured: CI
+/// red on x86 and aarch64 within minutes of the unconditional version.
+///
+/// So the skip keys on kern's OWN setup diagnostic, which is printed by the parent before any box
+/// exists, and never on the value under test.
+fn host_cannot_build_a_box(stderr: &str) -> bool {
+    stderr.contains("unprivileged user namespaces are restricted")
+        || stderr.contains("sandbox setup failed")
+        || stderr.contains("the box could not be BUILT")
+}
+
+/// The guard above, against the message the runner ACTUALLY produced.
+///
+/// The fixture is copied verbatim from the failing x86 job (run 34689720520), because a guard written
+/// from memory of what the runner says is a guard that stops matching the day the wording moves, and
+/// the failure mode is silent: the test stops skipping and starts asserting on a host that cannot
+/// answer. The positive control is the other half: an ordinary box failure must NOT be read as a host
+/// that cannot build one, or every real defect would skip itself.
+#[test]
+fn the_host_capability_guard_matches_what_the_runner_prints() {
+    let from_ci = "kern: sandbox setup failed: unprivileged user namespaces are restricted here - \
+                   this host allows the namespace and refuses its rootless uid map (Ubuntu 23.10+ \
+                   ships kernel.apparmor_restrict_unprivileged_userns=1), so no box can start. \
+                   `kern doctor` prints the AppArmor profile to install\nhint: the box could not be \
+                   BUILT, which is a host capability rather than a wrong command";
+    assert!(host_cannot_build_a_box(from_ci));
+    // POSITIVE CONTROL: the failures a test is SUPPOSED to catch must not be mistaken for a host that
+    // cannot run one.
+    assert!(!host_cannot_build_a_box(""));
+    assert!(!host_cannot_build_a_box(
+        "kern: the workload was killed by the kernel's OOM killer against this box's own memory cap."
+    ));
+    assert!(!host_cannot_build_a_box(
+        "kern: cannot start '/x/bad.bin' in box: Exec format error (os error 8)"
+    ));
+}
+
 /// The other half, on the box path: a 137 that is not the cap must not be blamed on it. A version that
 /// latched unconditionally, or printed on every 137, would pass the test above and fail this one.
 ///
@@ -487,13 +531,16 @@ fn a_box_that_exits_137_without_an_oom_is_not_blamed_on_the_cap() {
         ])
         .output()
         .expect("run kern");
+    let err = String::from_utf8_lossy(&out.stderr);
+    if host_cannot_build_a_box(&err) {
+        eprintln!("SKIP: this host cannot build a box, so it has no 137 to explain ({err})");
+        return;
+    }
     assert_eq!(
         out.status.code(),
         Some(137),
-        "the box did not propagate the chosen exit code; stderr: {:?}",
-        String::from_utf8_lossy(&out.stderr)
+        "the box did not propagate the chosen exit code; stderr: {err:?}"
     );
-    let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !err.contains("OOM killer"),
         "an exit 137 with no OOM behind it was blamed on the cap: {err:?}"
