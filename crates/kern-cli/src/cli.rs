@@ -663,6 +663,25 @@ fn bad_size(flag: &str, v: &str) -> String {
          file wrote rather than one you typed"
     )
 }
+/// The message for a memory cap that PARSED but is too small for a box to start.
+///
+/// Separate from [`bad_size`] because the reader's mistake is different: the value is a well-formed
+/// size, so telling them how to write a size answers a question they did not ask. What they did was
+/// omit the unit, and a bare number is bytes. MEASURED before this existed: `--memory 64` exits 137 in
+/// 3 ms on every box, with kern's OOM message advising a bigger cap; a reader who then writes `128`
+/// gets the identical failure. The floor and the measurement behind it are
+/// [`kern_common::MIN_MEMORY_CAP_BYTES`].
+fn cap_below_floor(flag: &str, v: &str, bytes: u64) -> String {
+    format!(
+        "{flag} '{v}' is {bytes} bytes, below the {floor} KiB a box needs to start. A BARE NUMBER IS \
+         BYTES: `{flag} 64` caps the box at 64 bytes, not at 64 MiB. Write the unit ({flag} 64m, \
+         {flag} 1g), or a byte count of at least {min}. A compose file's `mem_limit:`, \
+         `memswap_limit:` or `deploy.resources.limits.memory:` reaches this flag, so this may be a \
+         value your compose file wrote rather than one you typed",
+        floor = kern_common::MIN_MEMORY_CAP_BYTES / 1024,
+        min = kern_common::MIN_MEMORY_CAP_BYTES,
+    )
+}
 const USAGE_CPUS: &str = "--cpus <n> (e.g. 1.5 = 1½ cores, 2)";
 const USAGE_CPUSET: &str = "--cpuset-cpus <list> (e.g. 0-3, 0,2,4)";
 const USAGE_SWAP_MAX: &str = "--memory-swap-max <size> (e.g. 1g, 512m)";
@@ -1257,9 +1276,18 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "update <box> [--memory M] [--cpus N] [--pids-limit P]",
                 ))?;
             let memory = match flag_value(&rest, "-m").or_else(|| flag_value(&rest, "--memory")) {
-                Some(v) => Some(kern_common::parse_binary_size(&v).ok_or(Error::Usage(
-                    "update: --memory expects a size (e.g. 512m, 1g)",
-                ))?),
+                Some(v) => {
+                    let b = kern_common::parse_binary_size(&v).ok_or(Error::Usage(
+                        "update: --memory expects a size (e.g. 512m, 1g)",
+                    ))?;
+                    // The SAME floor as `box`/`run`: lowering a live box's cap to 64 bytes would have
+                    // the kernel OOM-kill it the moment the write lands, which is a box destroyed by a
+                    // missing unit rather than a cap changed.
+                    if kern_common::memory_cap_below_floor(b) {
+                        return Err(Error::Cli(cap_below_floor("--memory", &v, b)));
+                    }
+                    Some(b)
+                }
                 None => None,
             };
             let cpus = match flag_value(&rest, "--cpus") {
@@ -2729,6 +2757,9 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     match rest.get(i) {
                         None => return Err(Error::Usage(USAGE_MEMORY)),
                         Some(v) => match parse_size(v) {
+                            Some(b) if kern_common::memory_cap_below_floor(b) => {
+                                return Err(Error::Cli(cap_below_floor("--memory", v, b)))
+                            }
                             Some(b) => memory = Some(b),
                             None => return Err(Error::Cli(bad_size("--memory", v))),
                         },
@@ -3022,6 +3053,9 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
                 match rest.get(i) {
                     None => return Err(Error::Usage(USAGE_MEMORY)),
                     Some(v) => match parse_size(v) {
+                        Some(b) if kern_common::memory_cap_below_floor(b) => {
+                            return Err(Error::Cli(cap_below_floor("--memory", v, b)))
+                        }
                         Some(b) => memory = Some(b),
                         None => return Err(Error::Cli(bad_size("--memory", v))),
                     },
@@ -4844,6 +4878,50 @@ mod tests {
             }
             other => panic!("a malformed --memory must be refused with the value named: {other:?}"),
         }
+        // A BARE NUMBER IS BYTES, and a cap of 64 bytes cannot start a box. MEASURED before this
+        // refusal existed: `--memory 64` exits 137 in 3 ms on every box, with kern's own OOM message
+        // advising a bigger cap - so a reader who writes `128` next gets the identical failure, and the
+        // output never mentions the unit. The refusal names it.
+        for v in ["64", "4096", "65536", "131071"] {
+            match parse(&["box".into(), "x".into(), "--memory".into(), v.into()]) {
+                Err(Error::Cli(msg)) => {
+                    assert!(msg.contains(v), "the message must quote the value: {msg}");
+                    assert!(
+                        msg.contains("BARE NUMBER IS BYTES"),
+                        "and name the actual mistake: {msg}"
+                    );
+                    assert!(msg.contains("64m"), "and show the unit it wants: {msg}");
+                }
+                other => panic!("--memory {v} (bytes) must be refused: {other:?}"),
+            }
+        }
+        // POSITIVE CONTROL, and it is what keeps this from becoming docker's 6 MiB minimum: every cap
+        // at or above the floor still parses, including the 384 KiB at which a real shell was measured
+        // to run and the bare byte counts a compose file writes.
+        for (v, want) in [
+            ("131072", 131_072_u64),
+            ("393216", 393_216),
+            ("384k", 384 * 1024),
+            ("268435456", 268_435_456),
+            ("512m", 512 * 1024 * 1024),
+        ] {
+            let cmd = parse(&["box".into(), "x".into(), "--memory".into(), v.into()])
+                .map(|p| p.1)
+                .unwrap_or_else(|e| panic!("--memory {v} must be accepted: {e:?}"));
+            assert!(
+                matches!(cmd, Command::BoxRun { memory: Some(m), .. } if m == want),
+                "--memory {v} must parse to {want} bytes"
+            );
+        }
+        // And the floor is not applied to sizes that are legitimately small: a 64 KiB tmpfs or
+        // shm-size is a size, not a cap, and only a CAP is impossible at that value.
+        assert!(parse(&[
+            "box".into(),
+            "x".into(),
+            "--shm-size".into(),
+            "65536".into()
+        ])
+        .is_ok());
         // `--ip` IS REFUSED AT THE BOUNDARY, WITH THE VALUE AND ITS ORIGIN NAMED. The value comes
         // from a compose file's `ipv4_address:` far more often than from a keyboard, so an error
         // that only printed the flag's grammar would be addressed to the wrong person.

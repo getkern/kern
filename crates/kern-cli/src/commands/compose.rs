@@ -593,6 +593,44 @@ fn legacy_volume_notes(owned: &[String], project: &str) -> Vec<String> {
     notes
 }
 
+/// Removes a pod THIS invocation created when the bring-up leaves it holding nothing.
+///
+/// MEASURED: `kern compose <file> up` on a stack whose first box refuses to start printed
+/// `created pod '<p>'`, failed, and left the pod behind - `up` with 0 boxes. `kern ps` cannot show it
+/// (that lists boxes) and `kern pod ls` gains one per attempt, so a reader fixing a typo in a
+/// `mem_limit:` accumulates debris they were never told about. Reproduced on 0.9.32-37-g02ecedf with a
+/// refusal that binary already had, so it predates the memory floor that exposed it.
+///
+/// EMPTY IS THE CONDITION, and deliberately not "the function returned `Err`". A partial bring-up
+/// leaves already-started peers running on purpose (Docker does the same), and those peers are the
+/// pod's reason to exist; a pod with no members is debris on every path, success or failure. So this
+/// can never remove a pod that holds a box, and it needs no disarming across the twenty-odd `?`
+/// between the pod's creation and the end of the bring-up.
+///
+/// Drop, not a cleanup call per error path: those `?`s are the reason the leak existed.
+struct EmptyPodGuard<'a> {
+    pod: &'a str,
+}
+
+impl Drop for EmptyPodGuard<'_> {
+    fn drop(&mut self) {
+        // The registry is the authority on membership, and it is what `pod::teardown` counts too, so
+        // the two cannot disagree about whether this pod holds anything.
+        if crate::registry::list().iter().any(|i| i.pod == self.pod) {
+            return;
+        }
+        let (removed, _) = crate::pod::teardown(self.pod);
+        if removed {
+            // The creation was announced on stderr, so the removal is announced too: a pod that
+            // appears in the output and then silently vanishes is the same half-told story.
+            eprintln!(
+                "kern: note: removed pod '{}' again: no service started, so it held nothing",
+                self.pod
+            );
+        }
+    }
+}
+
 pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let ComposeOpts {
         files,
@@ -1965,6 +2003,10 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // from the type system rather than from remembering to clean up on eleven error paths.
     let gates: std::sync::Mutex<Vec<(String, std::os::fd::OwnedFd)>> =
         std::sync::Mutex::new(Vec::new());
+    // Armed only in the branch that CREATES the pod, so an `up` onto a pod that already existed can
+    // never remove it. Declared out here because the guard has to outlive that branch: it is the whole
+    // bring-up that can fail. See `EmptyPodGuard`.
+    let mut _pod_guard: Option<EmptyPodGuard> = None;
     if use_pod && crate::pod::holder_pid(&pod).is_none() {
         // Map a uid RANGE into the pod's shared user ns when ANY member needs it (`wants_uid_range`,
         // the single statement of that rule). A pod member setns's into the holder's user ns and writes
@@ -1997,6 +2039,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // that used to be ignored.
         let stack_is_internal = kern_compose::stack_is_internal_only(&boxes);
         crate::pod::create_with_range(&pod, !stack_is_internal, pod_needs_range, bridge_cidr)?;
+        _pod_guard = Some(EmptyPodGuard { pod: &pod });
         // Feedback-first, and the counterpart of the rule just above: the pod's user namespace has ONE
         // map, the holder's, so a member that asked for the narrow one does not get it when a peer needs
         // the range. That is structural, not a bug to fix, but silently handing a service a WIDER map

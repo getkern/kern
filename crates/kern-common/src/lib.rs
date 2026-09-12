@@ -72,11 +72,44 @@ impl BoxName {
     }
 }
 
+/// The smallest memory cap kern accepts, and it exists because A BARE NUMBER IS BYTES.
+///
+/// `--memory 64` caps the box at 64 bytes, not at 64 MiB. Every box given it dies in ~3 ms with
+/// kern's own OOM message, which tells the reader to raise the cap: they raise it to `128`, and it
+/// happens again. The message is true and it sends the reader in a circle, because the mistake is the
+/// missing unit and nothing in the output says so.
+///
+/// MEASURED on this host (x86_64, kernel 7.0, `--image alpine`), which is where the number comes
+/// from rather than from another runtime's choice:
+///
+/// | cap | what starts |
+/// |---|---|
+/// | 4 KiB, 64 KiB, 128 KiB | nothing: exit 137 with the OOM message |
+/// | 256 KiB | `/bin/true`, but not a shell |
+/// | 384 KiB | `/bin/sh -c 'echo hi'` and `busybox ls` |
+///
+/// So the floor sits AT the largest measured value where nothing ran, and the refusal is `< FLOOR`:
+/// it can only ever reject a cap that cannot start a box, and never one that measurably works. It is
+/// deliberately NOT docker's 6 MiB minimum, which would refuse the 384 KiB case that runs here.
+pub const MIN_MEMORY_CAP_BYTES: u64 = 128 * 1024;
+
+/// Is this memory cap below the floor a box needs to start? See [`MIN_MEMORY_CAP_BYTES`]. One
+/// definition, so the CLI flag, a compose file's keys and a profile's `memory` field cannot disagree
+/// about which caps are impossible.
+#[must_use]
+pub fn memory_cap_below_floor(bytes: u64) -> bool {
+    bytes < MIN_MEMORY_CAP_BYTES
+}
+
 /// Parse a binary size like `512m`, `1g`, `512mb`, `2t`, or a bare byte count (`268435456`) into
 /// bytes. Units are binary (`k`=1024). An optional trailing `b` is accepted (`mb`==`m`), as is
 /// surrounding whitespace. Returns `None` on a malformed, zero, or overflowing value - callers layer
 /// their own upper cap / `Result` / error message. One source of truth for `--memory`, `--size`,
 /// vdisk sizes and profile size fields, so they can never disagree on what `512m` means.
+///
+/// NO FLOOR HERE, on purpose: a 64 KiB `--tmpfs` or `--shm-size` is a legitimate size, and only a
+/// memory CAP is impossible that small. The floor is [`memory_cap_below_floor`], applied by the
+/// callers that parse a cap.
 pub fn parse_binary_size(s: &str) -> Option<u64> {
     const K: u64 = 1024;
     let lower = s.trim().to_ascii_lowercase();

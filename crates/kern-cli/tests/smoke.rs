@@ -1051,6 +1051,110 @@ fn a_bridge_member_has_a_route_out_and_still_reaches_its_peers() {
     );
 }
 
+/// A stack whose FIRST service is refused must not leave its pod behind.
+///
+/// MEASURED before the guard existed, on 0.9.32-37-g02ecedf: `compose up` printed
+/// `created pod '<project>-<hash>'`, the first box's start was refused, and the pod stayed - `up` with
+/// 0 boxes. `kern ps` cannot show it, because that lists boxes, so the only place it appears is
+/// `kern pod ls`, one more per attempt. A reader fixing a typo in a `mem_limit:` accumulates debris
+/// nothing told them about.
+///
+/// The refusal used here is a `mem_limit:` below the floor a box needs to start, which is the shortest
+/// way to a failure that happens BEFORE any box is registered. It is one of several ways in (an image
+/// that cannot be pulled, a flag the CLI rejects) and the guard keys on the pod being empty, not on
+/// which error occurred.
+#[test]
+fn a_refused_first_service_leaves_no_pod_behind() {
+    let dir = std::env::temp_dir().join(format!("kern-it-podleak-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("SKIP: could not create a temp project dir");
+        return;
+    }
+    let xdg = std::env::temp_dir().join(format!("kern-it-podleak-xdg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> (String, String, Option<i32>) {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+        {
+            Ok(out) => (
+                String::from_utf8_lossy(&out.stdout).to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+                out.status.code(),
+            ),
+            Err(e) => (String::new(), e.to_string(), None),
+        }
+    };
+    let write = |body: &str| std::fs::write(dir.join("compose.yml"), body);
+
+    // THE CONTROL FIRST, and it decides whether this host can answer at all: the same stack with a
+    // unit on the cap must come up, put its pod in `pod ls`, and have `down` remove it. Without it,
+    // every assertion below would also pass on a host that cannot create a pod in the first place.
+    if write(concat!(
+        "services:\n",
+        "  web:\n",
+        "    image: alpine\n",
+        "    mem_limit: 64m\n",
+        "    command: [\"sleep\", \"60\"]\n",
+    ))
+    .is_err()
+    {
+        eprintln!("SKIP: could not write the compose file");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let (_, up_err, _) = run(&["compose", "-f", "compose.yml", "-p", "leakctl", "up", "-d"]);
+    let (pods_up, _, _) = run(&["pod", "ls"]);
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "leakctl", "down"]);
+    let (pods_down, _, _) = run(&["pod", "ls"]);
+    if !pods_up.contains("leakctl") {
+        eprintln!("SKIP: this host did not bring the control stack up, so it cannot show the leak ({up_err})");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert!(
+        !pods_down.contains("leakctl"),
+        "the CONTROL failed: `compose down` left the pod behind, so this test cannot tell a leak from \
+         ordinary teardown: {pods_down:?}"
+    );
+
+    // THE CASE: a cap of 64 BYTES. The service cannot start, and nothing is ever registered.
+    if write(concat!(
+        "services:\n",
+        "  web:\n",
+        "    image: alpine\n",
+        "    mem_limit: 64\n",
+        "    command: [\"sleep\", \"60\"]\n",
+    ))
+    .is_err()
+    {
+        eprintln!("SKIP: could not rewrite the compose file");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&xdg);
+        return;
+    }
+    let (_, err, code) = run(&["compose", "-f", "compose.yml", "-p", "leakcase", "up", "-d"]);
+    let (pods, _, _) = run(&["pod", "ls"]);
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "leakcase", "down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+
+    assert_ne!(code, Some(0), "a refused service must fail the up: {err:?}");
+    assert!(
+        err.contains("BARE NUMBER IS BYTES"),
+        "the refusal must name the actual mistake: {err:?}"
+    );
+    assert!(
+        !pods.contains("leakcase"),
+        "the pod outlived the stack that could not start: {pods:?}"
+    );
+}
+
 /// A COMPOSE REFUSAL DOES NOT END WITH ADVICE ABOUT THE OTHER FILE FORMAT.
 ///
 /// kern reads two kinds of stack, a `docker-compose.yml` and its own TOML, and every compose error
