@@ -66,12 +66,21 @@ pub(crate) fn read_log_reason(path: &std::path::Path) -> Option<String> {
 fn log_carries_a_reason(tail: &str) -> bool {
     tail.lines().any(|line| {
         let l = line.trim_start();
-        l.starts_with("kern:")
-            && !l.starts_with("kern: note:")
-            && !l.starts_with("kern: warning:")
-            && !l.starts_with("kern: security-profile=")
+        l.starts_with("kern:") && !BENIGN_KERN_LINES.iter().any(|b| l.starts_with(b))
     })
 }
+
+/// The `kern:` lines that are NOT a failure reason, in one place because they are a set that grows.
+///
+/// A box that starts perfectly well can print all three: the posture banner (`print_box_status`), a
+/// `warning:` about caps it could not enforce, and a `note:` about the wiring it chose. Anything else
+/// carrying kern's prefix is the supervisor saying why the box did not start. A new benign kind added
+/// to the product and not to this list would end the reason-wait early and report a warning as the
+/// cause; a new FAILURE kind needs no change here, which is the asymmetry to preserve.
+///
+/// The Python binding holds the same three under the same reasoning (`_KERN_DIAGNOSTICS`). Two
+/// processes in two languages cannot share a constant, so what they share is the rule and this note.
+const BENIGN_KERN_LINES: [&str; 3] = ["kern: note:", "kern: warning:", "kern: security-profile="];
 
 /// Per-file cap on a box's captured log. A single-generation ring (`<log>` + `<log>.1`) keeps at most
 /// `2 * BOX_LOG_MAX_BYTES` on disk. The runtime dir is a small tmpfs (systemd default `size=` = 10% of

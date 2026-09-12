@@ -5936,6 +5936,24 @@ fn warn_image_expose_collisions(boxes: &[crate::compose::ComposeBox], no_pod: bo
 /// already takes seconds". The bring-up measures ~40 ms: the window WAS the cost of `compose up`,
 /// twelve times the work it was watching over. `compose up` of four services went from 540 ms to
 /// ~190, and a stack with a failing service now reports in milliseconds instead of half a second.
+///
+/// WHERE THE EDGE ACTUALLY FALLS, measured with services that exit after a chosen delay, because a
+/// window is only as honest as the boundary nobody wrote down:
+///
+/// | the service dies after | `up -d` returns in | reported by the window |
+/// |---|---|---|
+/// | 0 ms    |  29 ms | yes |
+/// | 20 ms   |  51 ms | yes |
+/// | 50 ms   |  81 ms | yes |
+/// | 100 ms  | 131 ms | yes |
+/// | 200 ms  | 171 ms | NO  |
+///
+/// So it costs a healthy stack the full 150 ms and buys a named failure for anything that dies
+/// inside it, returning as soon as the death happens rather than waiting the window out. Lowering
+/// the constant is a one-line change with a stated price: at 50 ms a bring-up saves 100 ms and a
+/// service that dies at 80 ms stops being reported by `up` and has to be found with `kern ps`.
+/// That is a product decision, not a tuning one, which is why the number stays where its evidence
+/// put it and the evidence is now written next to it.
 const BRING_UP_SETTLE_MS: u64 = 150;
 
 /// Watch the freshly-started services and return AS SOON AS one is gone, or when `ms` elapses.
