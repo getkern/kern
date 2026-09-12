@@ -648,8 +648,14 @@ def test_classify_sigkill_is_oom_only_when_kern_reported_the_oom():
     # cell exits 137, so it came back `oom`, and an agent branching on the fault retries with MORE MEMORY
     # a kill that had nothing to do with memory.
     capped = _cfg(memory_mb=256)
-    assert capped._classify(137, _KERN_OOM_LINE, False).type == "oom"
-    assert capped._classify(-signal.SIGKILL, _KERN_OOM_LINE, False).type == "oom"
+    # `kern_wrote_payload=True` is an OLDER binary: it tore the box down and reported through the only
+    # channel it has. Without it the sentence is the workload's own text and decides nothing, which is
+    # the forgery closed on 2026-09-12 and pinned in
+    # `test_classify_oom_byte_is_the_authority_and_stderr_is_the_fallback`.
+    assert capped._classify(137, _KERN_OOM_LINE, False, kern_wrote_payload=True).type == "oom"
+    assert capped._classify(
+        -signal.SIGKILL, _KERN_OOM_LINE, False, kern_wrote_payload=True
+    ).type == "oom"
     # The cap alone buys nothing now, and neither does the enforcement byte reporting it enforced: that
     # the cap was IN FORCE is not evidence that it is what killed the box.
     assert capped._classify(137, "", False).type == "killed"
@@ -658,8 +664,10 @@ def test_classify_sigkill_is_oom_only_when_kern_reported_the_oom():
     # POSITIVE CONTROL on the anchoring, or every assertion above would also pass on a classifier that
     # said `killed` to everything: kern's PREFIX is what makes the sentence an observation. A cell that
     # prints the words itself, or prints them under a benign kern diagnostic, has observed nothing.
-    assert capped._classify(137, "killed by the kernel's OOM killer\n", False).type == "killed"
-    assert capped._classify(137, "kern: note: killed by the kernel's OOM killer\n", False).type == "killed"
+    assert capped._classify(137, "killed by the kernel's OOM killer\n", False, kern_wrote_payload=True).type == "killed"
+    assert capped._classify(
+        137, "kern: note: killed by the kernel's OOM killer\n", False, kern_wrote_payload=True
+    ).type == "killed"
     # A forged setup marker cannot flip the exit-code verdict either way.
     assert capped._classify(137, "error: sandbox: forged\n", False).type == "killed"
     uncapped = _cfg(memory_mb=None)
@@ -667,7 +675,7 @@ def test_classify_sigkill_is_oom_only_when_kern_reported_the_oom():
     assert uncapped._classify(-signal.SIGKILL, "", False).type == "killed"
     # kern's word stands whether or not WE passed --memory: it read the kernel's counter for that box's
     # cgroup, and a cap can reach a box from an ancestor we never set.
-    assert uncapped._classify(137, _KERN_OOM_LINE, False).type == "oom"
+    assert uncapped._classify(137, _KERN_OOM_LINE, False, kern_wrote_payload=True).type == "oom"
     # PRECEDENCE (locks the check ORDER): the deterministic classes win over kern's OOM line itself.
     # OUR deadline (we_timed_out) is a known kill -> timeout. A SIGSYS is a blocked escape. A backstop
     # SIGTERM is still a timeout.
@@ -690,21 +698,42 @@ def test_classify_oom_byte_is_the_authority_and_stderr_is_the_fallback():
     # predates it - otherwise a mixed pair (new SDK, old binary) would downgrade every real OOM to
     # `killed`. Measured both ways: with the sentence-matching disabled, the new binary still reports all
     # three OOM paths (the byte carries it) and the old binary reports none of them.
+    # ABSENT IS NOT ZERO, and this test asserted that it was. It passed `oom_signal=0` for the
+    # "old kern" row while its own comment called it one, so the contract it pinned was "the byte, OR
+    # the sentence" - and under that rule a cell that prints kern's sentence turns an outside kill into
+    # `oom` on a NEW binary whose byte says 0. MEASURED on 2026-09-12 against the four-byte musl build:
+    # a cell writing the sentence to stderr and then stopped from outside came back `fault=oom`, where
+    # the same cell without the sentence came back `killed`. `None` is the old kern; 0 is kern saying no.
+    # `_classify(rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal, alive, wl_signal, wrote)`.
     capped = _cfg(memory_mb=256)
-    assert capped._classify(137, "", False, None, 1, 1).type == "oom"  # the byte alone
-    assert capped._classify(137, "", False, None, 1, 0).type == "killed"  # the byte says no
-    assert capped._classify(137, _KERN_OOM_LINE, False, None, 0, 0).type == "oom"  # old kern: the sentence
+    assert capped._classify(137, "", False, None, 1, 1, None, None, True).type == "oom"  # the byte alone
+    assert capped._classify(137, "", False, None, 1, 0, None, None, True).type == "killed"  # byte says no
+    # THE FORGERY, and it is the reason this test grew. The byte says 0 and the workload wrote kern's own
+    # sentence to the stream it shares with kern: the text must lose.
+    fk = capped._classify(137, _KERN_OOM_LINE, False, None, 1, 0, None, None, True)
+    assert fk.type == "killed"
+    # AND THE CASE THE FIRST REPAIR MISSED. An outside kill takes the box before kern's teardown, so
+    # there is NO byte even from a new binary - and kern printed no sentence there either, so an OOM line
+    # in this stderr is the workload's. MEASURED against the four-byte musl build: a cell that printed the
+    # sentence and was then `kern stop`ped came back `oom`, where the same cell without it came back
+    # `killed`. `kern_wrote_payload=False` is that run.
+    assert capped._classify(137, _KERN_OOM_LINE, False, None, 0, None, None, None, False).type == "killed"
+    # An older binary that DID tear down reports through the only channel it has, and is believed.
+    assert capped._classify(137, _KERN_OOM_LINE, False, None, 0, None, None, None, True).type == "oom"
+    assert capped._classify(137, "", False, None, 0, None, None, None, True).type == "killed"
     # The byte does not outrank the classes decided by exit code either.
-    assert capped._classify(159, "", False, None, 1, 1).type == "escape_blocked"
-    assert capped._classify(137, "", True, None, 1, 1).type == "timeout"
+    assert capped._classify(159, "", False, None, 1, 1, None, None, True).type == "escape_blocked"
+    assert capped._classify(137, "", True, None, 1, 1, None, None, True).type == "timeout"
     # A box with no cap of OURS that the kernel still OOM-killed (a ceiling from an ancestor) is reported
     # as what kern observed, not as what we asked for.
-    assert _cfg(memory_mb=None)._classify(137, "", False, None, 0, 1).type == "oom"
-    # Same two rules on the resident-kernel path: (err, cap_signal, oom_signal).
+    assert _cfg(memory_mb=None)._classify(137, "", False, None, 0, 1, None, None, True).type == "oom"
+    # Same rules on the resident-kernel path: (err, cap_signal, oom_signal, wl_signal, kern_wrote).
     k = Kernel(capped, timeout_s=5)
-    assert k._kernel_death_fault("", 1, 1)[0] == "oom"
-    assert k._kernel_death_fault("", 1, 0)[0] == "killed"
-    assert k._kernel_death_fault(_KERN_OOM_LINE, 0, 0)[0] == "oom"
+    assert k._kernel_death_fault("", 1, 1, None, True)[0] == "oom"
+    assert k._kernel_death_fault("", 1, 0, None, True)[0] == "killed"
+    assert k._kernel_death_fault(_KERN_OOM_LINE, 1, 0, None, True)[0] == "killed"  # byte said no
+    assert k._kernel_death_fault(_KERN_OOM_LINE, 0, None, None, False)[0] == "killed"  # kern wrote nothing
+    assert k._kernel_death_fault(_KERN_OOM_LINE, 0, None, None, True)[0] == "oom"  # old kern, torn down
     # The byte wins over the box-did-not-start heuristic too: a box that reached the OOM killer ran.
     assert k._kernel_death_fault("error: sandbox: could not map uid 1000\n", 1, 1)[0] == "oom"
 
@@ -741,8 +770,9 @@ def test_classify_signal_exit_codes():
     assert s._classify(-15, "", False).type == "timeout"
     assert s._classify(137, "", False).type == "killed"  # SIGKILL, no OOM reported = external kill
     assert s._classify(-9, "", False).type == "killed"
-    assert s._classify(137, _KERN_OOM_LINE, False).type == "oom"  # the same code, with kern's word
-    assert s._classify(-9, _KERN_OOM_LINE, False).type == "oom"
+    # kern's word counts when kern wrote its teardown payload; see `_oom_verdict` for the three states.
+    assert s._classify(137, _KERN_OOM_LINE, False, kern_wrote_payload=True).type == "oom"
+    assert s._classify(-9, _KERN_OOM_LINE, False, kern_wrote_payload=True).type == "oom"
     assert s._classify(159, "", False).type == "escape_blocked"  # SIGSYS
     assert s._classify(139, "", False) is None  # SIGSEGV = user code crash, not a fault
     assert s._classify(1, "", False) is None  # ordinary non-zero user exit
@@ -1829,7 +1859,7 @@ def test_kernel_death_is_oom_only_when_kern_reported_the_oom():
     # `_classify` - it has no per-cell exit code - so the whole verdict lives in `_kernel_death_fault`.
     # Same rule as the one-shot path, from the same shared predicate: only kern's OOM sentence is `oom`.
     capped = Kernel(_cfg(memory_mb=256), timeout_s=5)
-    assert capped._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
+    assert capped._kernel_death_fault(_KERN_OOM_LINE, kern_wrote_payload=True)[0] == "oom"
     assert capped._kernel_death_fault("")[0] == "killed"  # a cap is not evidence of an OOM
     assert capped._kernel_death_fault("some traceback\n")[0] == "killed"
     assert capped._kernel_death_fault("", cap_signal=1)[0] == "killed"  # nor is an enforced cap
@@ -1837,7 +1867,7 @@ def test_kernel_death_is_oom_only_when_kern_reported_the_oom():
     assert capped._kernel_death_fault(marker)[0] == "startup_failed"  # a box that never really started
     uncapped = Kernel(_cfg(memory_mb=None), timeout_s=5)
     assert uncapped._kernel_death_fault("")[0] == "killed"
-    assert uncapped._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
+    assert uncapped._kernel_death_fault(_KERN_OOM_LINE, kern_wrote_payload=True)[0] == "oom"
     # cap_signal no longer decides the type; a 2 (cap requested, NOT enforced here) still says so.
     unenforced = capped._kernel_death_fault("", cap_signal=2)
     assert unenforced[0] == "killed" and "not enforced here" in unenforced[1]
@@ -1855,14 +1885,14 @@ def test_kernel_oom_is_not_read_as_a_box_that_never_started():
     assert kern._kern_reported_oom(_KERN_OOM_LINE)
     assert not kern._looks_like_startup_failure(_KERN_OOM_LINE)
     k = Kernel(_cfg(memory_mb=64), timeout_s=5)
-    assert k._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
+    assert k._kernel_death_fault(_KERN_OOM_LINE, kern_wrote_payload=True)[0] == "oom"
     # POSITIVE CONTROLS, or this passes on a predicate that answers False to everything: a real setup
     # marker is still a startup failure, and an OOM line ALONGSIDE one still reports the OOM (the box
     # ran, so it cannot have failed to start, and the startup text is then the less specific claim).
     setup = "error: sandbox: could not map uid 1000\n"
     assert kern._looks_like_startup_failure(setup)
     assert k._kernel_death_fault(setup)[0] == "startup_failed"
-    assert k._kernel_death_fault(setup + _KERN_OOM_LINE)[0] == "oom"
+    assert k._kernel_death_fault(setup + _KERN_OOM_LINE, kern_wrote_payload=True)[0] == "oom"
     # The words without kern's prefix are a cell's prose, not kern's observation.
     assert not kern._kern_reported_oom("my job was killed by the kernel's OOM killer, I think\n")
 
@@ -3212,7 +3242,8 @@ def test_a_kernel_killed_by_its_spawning_thread_says_so():
     # because kern observed the OOM and the thread is only an inference about a kill nobody observed.
     k._spawn_thread = dead
     assert k._kernel_death_fault("", oom_signal=1)[0] == "oom"
-    assert k._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
+    # and the same through an older binary's only channel: its sentence, on a box it tore down itself
+    assert k._kernel_death_fault(_KERN_OOM_LINE, kern_wrote_payload=True)[0] == "oom"
 
 
 def test_a_binary_that_identifies_itself_but_runs_nothing_is_not_a_success():

@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -606,7 +606,7 @@ _ALIVE_IN_SETUP = "in-setup"      # kern acknowledged the channel and is still B
 _ALIVE_UNKNOWN = "unknown"        # nothing on the pipe: a kern that predates this channel
 
 
-def _parse_started_bytes(sig: bytes) -> "tuple[bool, int, int, int | None]":
+def _parse_started_bytes(sig: bytes) -> "tuple[bool, int, int | None, int | None]":
     """kern's KERN_STARTED_FD payload, as ``(box_started, cap_signal, oom_signal, workload_signal)``.
 
     THE WIRE FORMAT IS SPELLED HERE AND NOWHERE ELSE, because it has grown twice in one day (the OOM
@@ -618,20 +618,72 @@ def _parse_started_bytes(sig: bytes) -> "tuple[bool, int, int, int | None]":
     byte 2 = the OOM outcome: 1 iff the kernel's OOM killer fired against this box's own cgroup
     byte 3 = the signal that terminated the workload, 0 if it exited on its own
 
-    A SHORT read is an OLDER kern, not a malformed one: every absent byte reads as its "undetermined"
-    value (0, and `None` for the signal, which must stay distinguishable from "nothing killed it").
+    A SHORT read is an OLDER kern, not a malformed one, and the two OUTCOME bytes read `None` when
+    absent rather than 0, because for them "kern did not say" and "kern said no" are different facts and
+    a caller acts differently on each. The enforcement byte keeps 0 for absent: it already spells
+    "undetermined" as a value of its own.
+
+    THE OOM BYTE LEARNED THIS THE EXPENSIVE WAY. It returned 0 for both cases, so the only way to keep
+    an older binary working was to consult the stderr sentence whenever the byte was not 1 - which meant
+    consulting it against a binary that had just said 0. A cell printing kern's own OOM sentence then
+    turned an outside kill into `fault=oom`. See :func:`_oom_verdict`.
     """
     return (
         len(sig) >= 1 and sig[0] == 1,
         sig[1] if len(sig) >= 2 else 0,
-        sig[2] if len(sig) >= 3 else 0,
+        sig[2] if len(sig) >= 3 else None,
         sig[3] if len(sig) >= 4 else None,
     )
 
 
-def _read_teardown_bytes(fd: int, wait_s: float = 2.0) -> "tuple[int, int, int | None]":
-    """kern's teardown bytes off a KERN_STARTED_FD read end, as ``(cap_signal, oom_signal,
-    workload_signal)``. ``(0, 0, None)`` on EOF, timeout or any error.
+def _oom_verdict(oom_signal: "int | None", stderr: str, *, kern_wrote_payload: bool) -> bool:
+    """Did the kernel's OOM killer take this box? The ONE place the byte and the sentence are combined.
+
+    Three states, and each one names what the SUBJECT did rather than what we hope:
+
+    1. the byte arrived: it decides, and the stderr sentence is not read at all;
+    2. no byte and kern wrote NOTHING: kern never reached its teardown, so it printed no sentence there
+       either, and an OOM line in this stderr is the workload's own text. Not an OOM;
+    3. no byte but kern DID write a payload: a binary older than the byte, reporting through the only
+       channel it has. The sentence decides.
+
+    MEASURED on 2026-09-12 with the four-byte binary, when these were combined by `or`: a cell that
+    wrote kern's own OOM sentence to its stderr and was then stopped from outside came back `fault=oom`
+    while kern's third byte said 0. That is the inverted verdict the byte was introduced to close,
+    re-opened by the sandboxed code in one line: an agent reading it retries with more memory a kill
+    that had nothing to do with memory.
+
+    AND THE FIRST REPAIR OF THAT WAS NOT ENOUGH, which is why case 2 exists. Preferring the byte is not
+    the same as knowing whether there is one: an outside kill takes the box before teardown, so the new
+    binary ALSO arrives here with no byte, and the forgery still worked. The fact that separates them
+    travels on the same wire: kern's payload starts with the byte that says a box ran, so "kern wrote
+    nothing" is knowable without asking the binary its version.
+
+    The bound that remains is the old binary's and it is narrow: a kern that writes no third byte, on a
+    run it DID tear down, takes its verdict from text the workload can also write. Both outcomes are
+    sandbox faults, and timeout / blocked-escape are decided by exit code before any text is read, so the
+    worst case is a caller misleading itself about its own kill.
+    """
+    if oom_signal is not None:
+        return oom_signal == 1
+    if not kern_wrote_payload:
+        # kern wrote NOTHING at its teardown, so it never reached the place where it would have printed
+        # the sentence either: an OOM line in this stderr cannot have come from kern. MEASURED, and this
+        # is what the first repair missed: an outside `kern stop` kills the box before teardown, so the
+        # NEW binary also arrives here with no byte, and a cell that had printed the sentence in advance
+        # still turned its own `killed` into `oom`.
+        return False
+    return _kern_reported_oom(stderr)
+
+
+def _read_teardown_bytes(fd: int, wait_s: float = 2.0) -> "tuple[bool, int, int | None, int | None]":
+    """kern's teardown bytes off a KERN_STARTED_FD read end, parsed as
+    :func:`_parse_started_bytes` does, ``(False, 0, None, None)`` on EOF, timeout or any error.
+
+    THE FIRST ELEMENT IS WHETHER KERN WROTE AT ALL, and it is returned because a caller needs it: kern
+    writes this payload at its teardown, so nothing on the pipe means kern never got there (killed from
+    outside), and everything kern would have PRINTED at that moment is absent too. A reader that
+    discarded this could not tell that from an older binary.
 
     ONE READER FOR ONE PROTOCOL. There were two, a few lines apart and identical but for what they
     returned, and when kern grew a fourth byte only one of them was updated: the other kept asking for
@@ -643,16 +695,15 @@ def _read_teardown_bytes(fd: int, wait_s: float = 2.0) -> "tuple[int, int, int |
     ``None`` for the signal is not a zero: it means this kern does not report it.
     """
     if fd < 0:
-        return 0, 0, None
+        return False, 0, None, None
     try:
         ready, _, _ = select.select([fd], [], [], wait_s)
         if not ready:
-            return 0, 0, None
+            return False, 0, None, None
         sig = os.read(fd, 4)
     except OSError:
-        return 0, 0, None
-    _, cap, oom, wl = _parse_started_bytes(sig)
-    return cap, oom, wl
+        return False, 0, None, None
+    return _parse_started_bytes(sig)
 
 
 def _alive_state(fd: int) -> str:
@@ -1850,7 +1901,7 @@ class Sandbox:
         child_env["KERN_ALIVE_FD"] = str(alive_w)
         box_started = False
         cap_signal = 0  # 2nd started byte: 0 undetermined/old-kern, 1 memory cap enforced, 2 not enforced
-        oom_signal = 0  # 3rd started byte: 1 = the kernel OOM-killed this box's own cgroup, 0 = it did not
+        oom_signal = None  # 3rd started byte: 1 = OOM-killed, 0 = not, None = this kern does not say
         # None = never asked (we did not time out); otherwise one of the three `_ALIVE_*` states.
         alive_state: "str | None" = None
         # None = this kern does not report it. 0 = the workload exited on its own; otherwise the signal
@@ -1943,7 +1994,8 @@ class Sandbox:
         if rc < 0:
             rc = 128 + (-rc)
         fault = self._classify(
-            rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal, alive_state, workload_signal
+            rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal, alive_state, workload_signal,
+            box_started,
         )
         # IDENTIFYING ITSELF IS NOT BEHAVING, and this is the layer that says so. `_verify_is_kern`
         # refuses a binary that does not answer `kern <version>`; a stub that DOES answer it and then
@@ -2050,9 +2102,10 @@ class Sandbox:
         we_timed_out: bool,
         timeout_s: "int | float | None" = None,
         cap_signal: int = 0,
-        oom_signal: int = 0,
+        oom_signal: "int | None" = None,
         alive_state: "str | None" = None,
         workload_signal: "int | None" = None,
+        kern_wrote_payload: bool = False,
     ) -> SandboxFault | None:
         # ORDER IS A SECURITY PROPERTY. The classes that are DETERMINISTIC by exit code are decided
         # FIRST, BEFORE we ever look at stderr - because stderr is a channel the workload controls, and
@@ -2123,7 +2176,7 @@ class Sandbox:
             # that branch still covered every case. Hence no inference at all. kern has printed the
             # OOM sentence since 2026-09-04; against a kern older than that a real OOM now reads
             # `killed`, wrong in the direction that costs nothing - the agent does not retry memory.
-            if oom_signal == 1 or _kern_reported_oom(stderr):
+            if _oom_verdict(oom_signal, stderr, kern_wrote_payload=kern_wrote_payload):
                 return SandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL)"
                                     + self._scratch_note())
             # `cap_signal` (kern's UNFORGEABLE enforcement byte: 1 = the cap was enforced, 2 =
@@ -2856,8 +2909,8 @@ class Kernel:
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            cap_sig, oom_sig, wl_sig = self._read_cap_signal()
-            fault, default = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig)
+            wrote, cap_sig, oom_sig, wl_sig = self._read_cap_signal()
+            fault, default = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig, wrote)
             return self._teardown_result(fault, err.strip() or default, started)
         try:
             reply = self._q.get(timeout=eff)
@@ -2869,12 +2922,12 @@ class Kernel:
             )
         if reply is None:
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            cap_sig, oom_sig, wl_sig = self._read_cap_signal()
-            fault, default = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig)
+            wrote, cap_sig, oom_sig, wl_sig = self._read_cap_signal()
+            fault, default = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig, wrote)
             return self._teardown_result(fault, err.strip() or default, started)
         return self._result_from_reply(reply, started)
 
-    def _read_cap_signal(self) -> "tuple[int, int, int | None]":
+    def _read_cap_signal(self) -> "tuple[bool, int, int | None, int | None]":
         """kern's teardown bytes for the resident box, read ONCE on kernel death. See
         :func:`_read_teardown_bytes`, which is the one reader of that wire format: kern writes it only at
         the box's teardown (a resident box exits when a cell kills it), so this is called from the death
@@ -2882,7 +2935,8 @@ class Kernel:
         return _read_teardown_bytes(self._started_r)
 
     def _kernel_death_fault(
-        self, err: str, cap_signal: int = 0, oom_signal: int = 0, workload_signal: "int | None" = None
+        self, err: str, cap_signal: int = 0, oom_signal: "int | None" = None,
+        workload_signal: "int | None" = None, kern_wrote_payload: bool = False,
     ) -> "tuple[str, str]":
         """Why the resident kernel box died mid-cell, and a default message. The ``run_code`` counterpart
         of the one-shot :meth:`_classify` SIGKILL branch: a kernel death has no per-cell exit code, so the
@@ -2901,7 +2955,7 @@ class Kernel:
         SIGKILL on a capped box is not evidence of an OOM, whatever the byte says - but a 2 still earns a
         sentence, because "your cap was not in force here" is the one thing the caller cannot find out for
         itself."""
-        if oom_signal == 1 or _kern_reported_oom(err):
+        if _oom_verdict(oom_signal, err, kern_wrote_payload=kern_wrote_payload):
             return "oom", "the kernel box exceeded its memory cap and was OOM-killed"
         if _looks_like_startup_failure(err):
             return "startup_failed", "the kernel box failed to start"
@@ -3310,13 +3364,13 @@ class _WarmBox:
                 "", "", self._exit_code(), started, before,
                 fault=SandboxFault(type="timeout", message=msg or "the code exceeded its deadline"),
             )
-        cap_signal, oom_signal = self._read_cap_signal()
+        kern_wrote, cap_signal, oom_signal = self._read_cap_signal()
         self.retire()
         # Same order, and for the same measured reason, as `_kernel_death_fault`: kern's OOM sentence
         # carries the `kern:` prefix that `_looks_like_startup_failure` matches on, so asking about the
         # start SECOND is what keeps a pool box's OOM from being raised as a box that never came up. The
         # unforgeable byte is preferred over the sentence here too.
-        if oom_signal == 1 or _kern_reported_oom(err):
+        if _oom_verdict(oom_signal, err, kern_wrote_payload=kern_wrote):
             fault, default = "oom", "the box exceeded its memory cap and was OOM-killed"
         elif _looks_like_startup_failure(err):
             raise SandboxError(err.strip() or "the box failed to start")
@@ -3340,12 +3394,12 @@ class _WarmBox:
             fault=SandboxFault(type=fault, message=err.strip() or default),  # type: ignore[arg-type]
         )
 
-    def _read_cap_signal(self) -> "tuple[int, int]":
+    def _read_cap_signal(self) -> "tuple[bool, int, int | None]":
         """kern's cap-enforcement and OOM-outcome bytes, read once on death. The pool has no use for the
         workload's signal (it classifies from the box's own exit code through `_classify`), but the read
         itself is shared: see :func:`_read_teardown_bytes` for why there is exactly one."""
-        cap, oom, _ = _read_teardown_bytes(self._started_r)
-        return cap, oom
+        wrote, cap, oom, _ = _read_teardown_bytes(self._started_r)
+        return wrote, cap, oom
 
     def _result(
         self,

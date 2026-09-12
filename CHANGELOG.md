@@ -7,6 +7,41 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern-sandbox 0.2.1: a cell could forge the `oom` verdict in one line, and 0.2.0 shipped with it.**
+MEASURED against the four-byte musl build, on a host where the cap bites: a cell that wrote kern's own
+OOM sentence to its stderr and was then stopped from outside came back `fault=oom`, where the same
+cell without that line came back `killed`. So the inverted verdict closed earlier in this release was
+re-openable by the sandboxed code itself, which is the one place a verdict about the sandbox must not
+come from. An agent reading `oom` retries with more memory a kill that had nothing to do with memory.
+
+The byte was already documented as the authority and the sentence as the fallback for an older
+binary. The code combined them with `or`, so the sentence was consulted even against a binary that
+had just reported no OOM. Both facts collapsed into the same value: the third byte read 0 for "kern
+says no" AND for "this kern does not write that byte", so believing the byte was impossible without
+first knowing there was one.
+
+Two changes, and the second is the one the first repair missed:
+
+- the outcome bytes now read absent as `null`/`None` rather than 0, the same distinction the
+  workload-signal byte already made, so "kern did not say" is a value of its own;
+- and an outside kill takes the box BEFORE kern's teardown, so a NEW binary also arrives with no
+  byte. Preferring the byte therefore did not close the forgery on its own. The missing fact travels
+  on the same wire: kern's payload begins with the byte that says a box ran, so a caller can tell
+  "kern wrote nothing" from "kern is too old to write this" without asking the binary its version.
+  When kern wrote nothing it never reached the point where it prints that sentence either, so an OOM
+  line in that stderr is the workload's own text. Not an OOM.
+
+The three call sites now share one predicate, `_oom_verdict` / `oomVerdict`, in both bindings.
+Measured after, on the same host: the forged run reports `killed`, all three real OOM paths (one-shot,
+resident kernel, prewarmed) still report `oom`, and against the PUBLISHED 0.9.32 binary a real OOM
+still reports `oom` through the sentence, which is the only channel that binary has. The battery
+carries the case, it needs no memory cap, and it passes on both binaries: 23 ok on the four-byte
+build, 20 ok and 3 skipped on the two-byte one.
+
+The bound that remains is narrow and stated in the code: a kern that writes no third byte, on a run
+it DID tear down, still takes its verdict from text the workload can also write. Both outcomes are
+sandbox faults, and timeout / blocked-escape are decided by exit code before any text is read.
+
 **kern-sandbox 0.2.0, a MINOR bump, because `fault.type` changes value for the same event.** The
 Python and Node bindings go from 0.1.43 to 0.2.0 rather than to a patch, and the three reasons are
 each a contract a caller can have written code against: an external `kern stop` during a cell used to

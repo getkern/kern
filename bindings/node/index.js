@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -962,15 +962,37 @@ const KERN_OOM_MARKER = "killed by the kernel's OOM killer";
  *   byte 2 = the OOM outcome: 1 iff the kernel's OOM killer fired against this box's own cgroup
  *   byte 3 = the signal that terminated the workload, 0 if it exited on its own
  *
- * A SHORT buffer is an OLDER kern, not a malformed one: every absent byte reads as its "undetermined"
- * value (0, and `null` for the signal, which must stay distinguishable from "nothing killed it").
- * Mirrors `_parse_started_bytes`. */
+ * A SHORT buffer is an OLDER kern, not a malformed one, and the two OUTCOME bytes read `null` when
+ * absent rather than 0: for them "kern did not say" and "kern said no" are different facts and a caller
+ * acts differently on each. The enforcement byte keeps 0, which already spells "undetermined".
+ *
+ * THE OOM BYTE LEARNED THIS THE EXPENSIVE WAY: it returned 0 for both, so an older binary could only be
+ * supported by reading the stderr sentence whenever the byte was not 1, including against a binary that
+ * had just said 0. See `oomVerdict`. Mirrors `_parse_started_bytes`. */
+/** Did the kernel's OOM killer take this box? The ONE place the byte and the sentence are combined.
+ *
+ * Three states, each naming what the SUBJECT did: the byte arrived, so it decides and the sentence is
+ * not read; no byte and kern wrote NOTHING, so kern never reached the teardown where it would have
+ * printed the sentence either and an OOM line in this stderr is the workload's own text; no byte but a
+ * payload was written, so this is a binary older than the byte reporting through its only channel.
+ *
+ * MEASURED on 2026-09-12 with the four-byte binary, when these were combined by `||`: a cell that wrote
+ * kern's own OOM sentence to stderr and was then stopped from outside came back `fault=oom` while the
+ * third byte said 0 - the inverted verdict the byte exists to close, re-opened by the sandboxed code in
+ * one line. Preferring the byte was not enough on its own: an outside kill takes the box BEFORE
+ * teardown, so a new binary also arrives with no byte. Mirrors `_oom_verdict`. */
+function oomVerdict(oomSignal, stderr, kernWrotePayload) {
+  if (oomSignal !== null && oomSignal !== undefined) return oomSignal === 1;
+  if (!kernWrotePayload) return false;
+  return kernReportedOom(stderr);
+}
+
 function parseStartedBytes(buf) {
   const b = buf || Buffer.alloc(0);
   return {
     boxStarted: b.length >= 1 && b[0] === 1,
     capSignal: b.length >= 2 ? b[1] : 0,
-    oomSignal: b.length >= 3 ? b[2] : 0,
+    oomSignal: b.length >= 3 ? b[2] : null,
     workloadSignal: b.length >= 4 ? b[3] : null,
   };
 }
@@ -1569,7 +1591,7 @@ class Sandbox {
       let child;
       let boxStarted = false;
       let capSignal = 0; // 2nd started byte: 0 undetermined/old-kern, 1 memory cap enforced, 2 not enforced
-      let oomSignal = 0; // 3rd started byte: 1 = the kernel OOM-killed this box's own cgroup, 0 = it did not
+      let oomSignal = null; // 3rd started byte: 1 = OOM-killed, 0 = not, null = this kern does not say
       let workloadSignal = null; // 4th started byte: the signal that killed the workload, 0 = it exited
       try {
         // detached: own process group, so we can signal the box + kern as a unit (killpg).
@@ -1650,6 +1672,7 @@ class Sandbox {
         const rc = toRc(code, signal);
         let fault = this._classify(
           rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal, aliveState, workloadSignal,
+          boxStarted,
         );
         const execFail = execFailureBinary(stderr);
         if (execFail !== null && rc !== 0) {
@@ -1749,8 +1772,8 @@ class Sandbox {
   }
 
   _classify(
-    rc, signal, stderr, timedOut, timeoutS, capSignal = 0, oomSignal = 0, aliveState = ALIVE_UNKNOWN,
-    workloadSignal = null,
+    rc, signal, stderr, timedOut, timeoutS, capSignal = 0, oomSignal = null, aliveState = ALIVE_UNKNOWN,
+    workloadSignal = null, kernWrotePayload = false,
   ) {
     // ORDER IS A SECURITY PROPERTY: deterministic-by-exit-code classes are decided BEFORE the stderr
     // heuristic, because stderr is a channel the workload controls.
@@ -1795,7 +1818,7 @@ class Sandbox {
       // memory.oom.group=1, so the whole box goes at once). MEASURED: `kern stop` during a cell returns
       // 137, so it came back `oom`, and an agent branching on the fault would retry with MORE MEMORY a
       // kill that had nothing to do with memory. A confident wrong answer is worse than no answer.
-      if (oomSignal === 1 || kernReportedOom(stderr))
+      if (oomVerdict(oomSignal, stderr, kernWrotePayload))
         return sandboxFault(
           "oom",
           "the box exceeded its memory cap and was OOM-killed (SIGKILL, exit 137)" + this._scratchNote(),
@@ -2569,8 +2592,8 @@ class Kernel {
    * `capSignal` is kern's unforgeable enforcement byte (0 = old kern / undetermined, 1 = cap enforced, 2 =
    * requested but NOT enforced). It no longer decides the TYPE, and a 2 still earns a sentence, because
    * "your cap was not in force here" is the one thing the caller cannot find out for itself. */
-  _kernelDeathFault(err, capSignal = 0, oomSignal = 0) {
-    if (oomSignal === 1 || kernReportedOom(err)) return ["oom", "the kernel box exceeded its memory cap and was OOM-killed"];
+  _kernelDeathFault(err, capSignal = 0, oomSignal = null, kernWrotePayload = false) {
+    if (oomVerdict(oomSignal, err, kernWrotePayload)) return ["oom", "the kernel box exceeded its memory cap and was OOM-killed"];
     if (looksLikeStartupFailure(err)) return ["startup_failed", "the kernel box failed to start"];
     if (capSignal === 2)
       return [
@@ -2593,7 +2616,7 @@ class Kernel {
    * falls back to kern's stderr sentence. */
   async _readCapSignal() {
     const ch = this._child && this._child.stdio && this._child.stdio[3];
-    if (!ch) return [0, 0];
+    if (!ch) return [0, null, false];
     if (this._startedSig.length < 3 && !ch.destroyed) {
       await new Promise((res) => {
         const t = setTimeout(res, 1000);
@@ -2601,8 +2624,8 @@ class Kernel {
         ch.once("error", () => { clearTimeout(t); res(); });
       });
     }
-    const { capSignal, oomSignal } = parseStartedBytes(this._startedSig);
-    return [capSignal, oomSignal];
+    const { boxStarted, capSignal, oomSignal } = parseStartedBytes(this._startedSig);
+    return [capSignal, oomSignal, boxStarted];
   }
 
   _teardownResult(type, message, started) {
@@ -2965,14 +2988,14 @@ class WarmBox {
         fault: { type: "timeout", message: msg || "the code exceeded its deadline" },
       });
     }
-    const { capSignal, oomSignal } = parseStartedBytes(this._startedSig);
+    const { boxStarted, capSignal, oomSignal } = parseStartedBytes(this._startedSig);
     this.retire();
     let type = "killed";
     let dflt = "the box exited before the code finished";
     // Same order, and for the same measured reason, as `_kernelDeathFault`: kern's OOM sentence carries
     // the `kern:` prefix that `looksLikeStartupFailure` matches on, so asking about the start SECOND is
     // what keeps a pool box's OOM from being thrown as a box that never came up.
-    if (oomSignal === 1 || kernReportedOom(err)) {
+    if (oomVerdict(oomSignal, err, boxStarted)) {
       type = "oom";
       dflt = "the box exceeded its memory cap and was OOM-killed";
     } else if (looksLikeStartupFailure(err)) {
