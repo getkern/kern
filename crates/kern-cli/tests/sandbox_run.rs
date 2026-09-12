@@ -2057,6 +2057,57 @@ fn box_run_isolates_and_propagates_exit_code() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// PODS MUST RESOLVE THEIR DIRECTORY THE WAY EVERY OTHER RUNTIME CHILD DOES.
+///
+/// MEASURED on Alpine 3.21 with OpenRC, where there is no systemd and no elogind so `/run/user/<uid>`
+/// is never created: `kern box` worked (the registry walks a third candidate, `/tmp/kern-<uid>`) and
+/// EVERY pod died with `pod dir: No such file or directory`, a bare errno naming an internal
+/// directory. Both compose wirings that use a pod were dead on that distribution and `--no-pod`, the
+/// SLOW one, was the only one that ran.
+///
+/// `/proc/...` IS THE DISCRIMINATOR because it cannot be CREATED. A missing directory under `/tmp` is
+/// simply made by the shared resolution, so the old hand-rolled path and the new one both succeed
+/// there and the test passes either way: the first version of this assertion did exactly that.
+///
+/// Asserted through a CHILD process. An earlier version set `XDG_RUNTIME_DIR` in the test process
+/// under the shared lock and put it back, which is still a global mutation, and a sibling test that
+/// reads the pods root concurrently went red because it built its fixture under one root and looked
+/// for it under another.
+#[test]
+fn the_pods_root_falls_back_when_the_runtime_dir_cannot_be_created() {
+    let dead = format!("/proc/kern-pods-{}", std::process::id());
+    let name = format!("podsroot-{}", std::process::id());
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &dead)
+        .args(["pod", "create", &name])
+        .output();
+    let Ok(out) = out else {
+        eprintln!("skip: could not run the kern binary");
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &dead)
+        .args(["pod", "rm", &name])
+        .output();
+    if err.contains("user namespace") || err.contains("Operation not permitted") {
+        eprintln!(
+            "skip: this host cannot create a pod at all: {}",
+            err.lines().next().unwrap_or("")
+        );
+        return;
+    }
+    assert!(
+        !err.contains("pod dir:"),
+        "an unusable runtime dir must fall back, not fail with a bare errno naming an internal \
+         directory: {err}"
+    );
+    assert!(
+        out.status.success(),
+        "pod create must succeed by falling back the way every other runtime child does: {err}"
+    );
+}
+
 /// `--wait-timeout N` MUST BOUND THE `depends_on` GATE, and it used to be ignored there.
 ///
 /// MEASURED before: a stack whose dependency never resolves its health check took 120 seconds to

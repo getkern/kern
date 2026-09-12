@@ -2102,40 +2102,6 @@ mod tests {
     }
 
     #[test]
-    fn the_pods_root_is_the_shared_runtime_resolution_and_not_a_second_one() {
-        let _g = crate::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let saved = std::env::var_os("XDG_RUNTIME_DIR");
-
-        // THE DISCRIMINATOR HAS TO BE A RUNTIME DIR THAT CANNOT BE CREATED, not merely one that is
-        // absent. A missing directory under `/tmp` is made on the spot by the shared resolution, so
-        // both the old code and the new one would succeed and the test would pass either way - the
-        // first version of this test did exactly that and its positive control stayed green.
-        // Nothing may be created under `/proc`, which is the same dead end Alpine's missing
-        // `/run/user/<uid>` is for a non-root user.
-        let dead = std::path::PathBuf::from(format!("/proc/kern-pods-{}", std::process::id()));
-        std::env::set_var("XDG_RUNTIME_DIR", &dead);
-
-        let root = pods_root();
-        assert!(
-            !root.starts_with(&dead),
-            "a runtime dir that cannot be created must not be the answer: got {}",
-            root.display()
-        );
-        assert!(
-            root.is_dir(),
-            "callers join a pod name onto this and create THAT, so it must already exist: {}",
-            root.display()
-        );
-
-        match saved {
-            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
-        }
-    }
-
-    #[test]
     fn pod_names_reject_traversal_and_bad_chars() {
         for ok in ["web", "my-app", "db_1", "v1.2"] {
             assert!(validate_name(ok).is_ok(), "{ok} should be valid");
