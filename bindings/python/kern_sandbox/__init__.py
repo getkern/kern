@@ -928,12 +928,13 @@ class _CappedReader(threading.Thread):
 # not the path alone: a `kern` REPLACED between two calls is a different program and must be checked
 # again. Bounded by how many distinct binaries one process can point at, which is one in every real
 # program and a handful in the test suite.
-_VERIFIED_KERN: "dict[tuple, None]" = {}
+_VERIFIED_KERN: "dict[tuple, str]" = {}  # identity -> the version line it answered with
 _VERIFIED_KERN_LOCK = threading.Lock()
 
 
-def _verify_is_kern(path: str) -> None:
-    """Refuse a binary that does not IDENTIFY ITSELF as kern. Raises :class:`SandboxError` if it does not.
+def _verify_is_kern(path: str) -> str:
+    """Refuse a binary that does not IDENTIFY ITSELF as kern, and return the version line it answered
+    with. Raises :class:`SandboxError` if it does not identify itself.
 
     MEASURED, AND IT WAS FOUND BY A REVIEWER RUNNING MY OWN POSITIVE CONTROL: with ``KERN_BIN=/bin/true``
     a call returned ``success=True, exit_code=0, fault=None`` and an empty stdout. The code never ran and
@@ -960,7 +961,7 @@ def _verify_is_kern(path: str) -> None:
         raise SandboxError(f"could not stat the kern binary at '{path}': {e}") from e
     with _VERIFIED_KERN_LOCK:
         if key in _VERIFIED_KERN:
-            return
+            return _VERIFIED_KERN[key]
     hint = (
         "If this is not the kern you meant, set $KERN_BIN to the right path. To install kern:\n"
         "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh"
@@ -989,7 +990,8 @@ def _verify_is_kern(path: str) -> None:
             f"never run. {hint}"
         )
     with _VERIFIED_KERN_LOCK:
-        _VERIFIED_KERN[key] = None
+        _VERIFIED_KERN[key] = first
+    return first
 
 
 def _find_kern() -> str:
@@ -1606,6 +1608,7 @@ class Sandbox:
                 "domain allowlist for run_code, network=True gives the full host network"
             )
         self._kern = _find_kern()
+        self._kern_version = _verify_is_kern(self._kern)
 
     # -- lifecycle -----------------------------------------------------------------------------------
 
@@ -1942,6 +1945,33 @@ class Sandbox:
         fault = self._classify(
             rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal, alive_state, workload_signal
         )
+        # IDENTIFYING ITSELF IS NOT BEHAVING, and this is the layer that says so. `_verify_is_kern`
+        # refuses a binary that does not answer `kern <version>`; a stub that DOES answer it and then
+        # exits 0 got through, and the call came back `success=True, exit_code=0, fault=None` with an
+        # empty stdout - the original defect, one layer down. MEASURED with a two-line shell script.
+        #
+        # The invariant that closes it: a kern that ran a box WRITES the started byte, and has done so
+        # since v0.9.2 (`f5494ab`). So `exit 0` with no byte, no stdout and no stderr is not a box that
+        # ran silently: it is nothing having happened at all.
+        #
+        # A FAULT AND NOT A RAISE, deliberately. On a host where that byte somehow did not arrive, a
+        # raise would break a legitimate silent command; a fault leaves the caller a result to read and
+        # still refuses to call it a success. All four conditions are required for the same reason: any
+        # output, any non-zero code, or the byte itself is evidence that something ran.
+        if (
+            fault is None
+            and rc == 0
+            and not box_started
+            and not stdout.strip()
+            and not stderr.strip()
+        ):
+            fault = SandboxFault(
+                "startup_failed",
+                f"'{self._kern}' reported '{self._kern_version}' but never signalled that a box "
+                f"started, and produced no output: the code did not run. kern has written that signal "
+                f"since v0.9.2, so this is either a binary older than that or one that only looks like "
+                f"kern. Refusing to report an empty run as a success",
+            )
         exec_fail = _exec_failure_binary(stderr)
         if exec_fail is not None and rc != 0:
             # BEFORE the suppression below, which would erase it: the box started, so that branch

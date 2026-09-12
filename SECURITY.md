@@ -388,8 +388,19 @@ where other local processes are hostile is not one to hand a secret to through a
   The registry holds a peer box's `ssh/` host keys, `secret`s, and `instances/` capability/seccomp
   posture records: a box able to READ them steals a peer's secrets, and one able to WRITE them forges a
   peer's recorded posture to elevate that peer's `kern exec`.
-- **`-p [ip:]host:box`** binds **`127.0.0.1` by default**. `-p 0.0.0.0:H:B` exposes the service to
-  the LAN, a deliberate and warned-about choice. The forwarder runs in the host network namespace,
+- **`-p [ip:]host:box`** binds **`0.0.0.0` by default**, which is every interface, which is the LAN.
+  That is Docker's default and kern matches it, and this file said the opposite for as long as it has
+  existed: it claimed `127.0.0.1`, the safer-sounding answer, while `kern box --help` and
+  [docs/CONFIG.md](docs/CONFIG.md) both said `0.0.0.0`. MEASURED, because a sentence in a security
+  document is worth exactly what a command says: `-p 18081:80` listens on `0.0.0.0:18081`,
+  `-p 127.0.0.1:18082:80` listens on `127.0.0.1:18082`. A reader who trusted this paragraph published a
+  service to their network believing it was loopback-only.
+  **For loopback only, one of two things**: write the address in the spec (`-p 127.0.0.1:H:B`), or set
+  `publish_bind = "127.0.0.1"` under `[kern]` in `kern.toml`, which is a CEILING rather than a default:
+  it NARROWS even a spec that explicitly writes `0.0.0.0`, and says how many it narrowed, because a
+  policy a downloaded compose file could defeat by writing an address would not be a policy. Measured:
+  with that key set, `-p 0.0.0.0:18093:80` listens on `127.0.0.1:18093` and kern prints the override.
+  It is read from the DEFAULT config only, never from a `--config` a compose file chose. The forwarder runs in the host network namespace,
   the box stays in its own.
 - **`kern exec`** is restricted to the user who started the box. The exec'd process gets the same
   always-on seccomp filter, **fail-closed**, and the same dropped-cap baseline. A box's custom

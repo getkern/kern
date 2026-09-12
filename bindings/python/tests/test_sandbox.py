@@ -3213,3 +3213,39 @@ def test_a_kernel_killed_by_its_spawning_thread_says_so():
     k._spawn_thread = dead
     assert k._kernel_death_fault("", oom_signal=1)[0] == "oom"
     assert k._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
+
+
+def test_a_binary_that_identifies_itself_but_runs_nothing_is_not_a_success():
+    """Answering `kern <version>` is not behaving like kern, and this is the layer that says so.
+
+    MEASURED, and found by a reviewer attacking the design of the gate rather than the code: a two-line
+    script that prints `kern v9.9.9-fake` for `--version` and then exits 0 passed `_verify_is_kern` and
+    the call came back `success=True, exit_code=0, fault=None` with an empty stdout. The original defect,
+    one layer down.
+
+    The invariant that closes it: a kern that ran a box WRITES the started byte, and has done so since
+    v0.9.2 (`f5494ab`). So exit 0 with no byte, no stdout and no stderr is not a box that ran silently,
+    it is nothing having happened. All four conditions are required: any output, any non-zero code, or
+    the byte itself is evidence that something ran.
+    """
+    d = Path(os.environ.get("TMPDIR", "/tmp")) / f"kern-idonly-{uuid.uuid4().hex[:8]}"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "kern"
+    p.write_text('#!/bin/sh\ncase "$1" in --version) echo "kern v9.9.9-fake" ; exit 0 ;; esac\nexit 0\n')
+    p.chmod(0o755)
+    prev = os.environ.get("KERN_BIN")
+    os.environ["KERN_BIN"] = str(p)
+    try:
+        with Sandbox(image="x", timeout_s=5) as sbx:
+            r = sbx.run_code("print('never ran')")
+        assert r.fault is not None, "an empty successful result for code that never ran"
+        assert r.fault.type == "startup_failed", f"got {r.fault.type!r}"
+        assert not r.success
+        assert "never signalled that a box started" in r.fault.message
+        assert "v9.9.9-fake" in r.fault.message, "the message must quote what the binary claimed to be"
+        assert "v0.9.2" in r.fault.message, "and when kern started signalling, so an old kern is named"
+    finally:
+        if prev is None:
+            os.environ.pop("KERN_BIN", None)
+        else:
+            os.environ["KERN_BIN"] = prev

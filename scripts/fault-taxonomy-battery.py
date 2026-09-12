@@ -126,6 +126,27 @@ def main() -> int:
     finally:
         os.environ["KERN_BIN"] = prev
 
+    # THE SECOND LAYER OF THE GATE, and a reviewer found it by attacking the design rather than the code:
+    # answering `kern <version>` is not behaving like kern. A two-line script that prints a kern-looking
+    # version and then exits 0 passed the identity check and produced `success=True` with an empty stdout.
+    # The invariant that closes it is the started byte, written by every kern since v0.9.2.
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix="kern-idonly-")
+    stub = os.path.join(d, "kern")
+    with open(stub, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\ncase "$1" in --version) echo "kern v9.9.9-fake" ; exit 0 ;; esac\nexit 0\n')
+    os.chmod(stub, 0o755)
+    os.environ["KERN_BIN"] = stub
+    try:
+        with Sandbox(image="x", timeout_s=5) as sbx:
+            r = sbx.run_code("print('never ran')")
+        result("a binary that only IDENTIFIES itself", "startup_failed", fault_of(r))
+    except SandboxError as e:
+        result("a binary that only IDENTIFIES itself", "startup_failed", f"RAISED {str(e)[:60]}")
+    finally:
+        os.environ["KERN_BIN"] = prev
+
     # Can this host build a box at all? Everything below needs one, and a host that cannot say so must
     # skip rather than fail: the CI runner allows the namespace and refuses the rootless uid map.
     probe = subprocess.run([kern, "box", f"taxprobe-{os.getpid()}", "--image", "alpine", "--", "/bin/true"],
@@ -153,6 +174,21 @@ def main() -> int:
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=30) as s:
         r = s.run_code("print(1)", language="node")
         result("missing interpreter", "exec_failed", fault_of(r))
+    # A CELL CANNOT FABRICATE A BLOCKED ESCAPE, and the reason is the kernel rather than anything here:
+    # the box's workload is pid 1 of its own pid namespace, and the kernel does not deliver an unhandled
+    # fatal signal to a namespace's init from INSIDE it. So `os.kill(os.getpid(), SIGSYS)` is swallowed
+    # and the cell simply finishes. A reviewer supposed this route reopened the forgery that the fourth
+    # byte closed from the exit-code side; measured, it does not exist. The same property is why
+    # `kill -9 $$` cannot end a box from inside.
+    with Sandbox(image=IMAGE, memory_mb=256, timeout_s=30) as s:
+        r = s.run_code("import os, signal\nos.kill(os.getpid(), signal.SIGSYS)")
+        result("a cell cannot fabricate escape_blocked", None, fault_of(r))
+        # And a real crash of the workload is the USER's failure, reported with its signal in the code:
+        # 139 = 128 + SIGSEGV. Not a fault, because the sandbox did nothing.
+        r = s.run_code("import ctypes; ctypes.string_at(0)")
+        result("a crash is not a sandbox fault", None, fault_of(r))
+        result("a crash carries its signal in the code", 139, r.exit_code)
+
     # THE PAIR THAT NEEDS kern's FOURTH BYTE: the same exit code as a SIGKILL, chosen by the workload.
     # Without the signal byte these came back `killed` and `escape_blocked`, both invented.
     with Sandbox(image="alpine", memory_mb=256, timeout_s=30) as s:
