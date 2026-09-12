@@ -97,7 +97,7 @@ privilege-escalation bug is an escape.
   real overlay by `overlay_lower_is_shared_ro_across_boxes` in CI: what one box writes is invisible to
   a fresh box from the same image. After the pivot neither box can reach the lower's host path either (`/proc/kcore` and
   `open_by_handle_at` are the two ways to escape a pivoted root to a host inode; the first is masked,
-  the second `ENOSYS`, so a leaked file handle cannot be opened).
+  the second `ENOSYS`, so a leaked file handle cannot be opened). **What masked looks like from inside**, because a reviewer had to work it out: the path is still THERE, bound over with `/dev/null`, so it reads as a character device of size 0 rather than as a missing file. A check that expects the path to be absent will report a hole that is not there.
 - **Least-privilege capabilities**: 16 never-needed dangerous caps (module load, raw I/O, `SYS_TIME`,
   `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, `SYS_PTRACE`, `NET_ADMIN` and
   `SYS_ADMIN`, the same default set Docker and Podman drop) are dropped from the effective, permitted,

@@ -81,6 +81,47 @@ def running(kern: str) -> set:
         return set()
 
 
+def kern_procs(kern: str) -> set:
+    """PIDs running THE BINARY UNDER TEST, by its path. Not `grep kern`, which also matches kern-mcp,
+    a `kern-pi` extension and this script's own command line."""
+    ps = subprocess.run(["ps", "-eo", "pid,args", "-u", str(os.getuid())],
+                        capture_output=True, text=True, check=False)
+    out = set()
+    for line in ps.stdout.splitlines()[1:]:
+        pid, _, args = line.strip().partition(" ")
+        if kern in args and "fault-taxonomy" not in args and pid.isdigit():
+            out.add(int(pid))
+    return out
+
+
+def memory_cap_bites(kern: str) -> "tuple[bool, str]":
+    """Does a `--memory` cap actually BIND on this host? Returns (verdict, the evidence for it).
+
+    ASKED ONCE, AND ASKED OF THE BOX. The three OOM cases below are the only ones that need a cap to
+    fire, and on a host with no cgroup delegation they cannot fire at all: kern accepts the write and
+    the kernel never enforces it. The first version of this script decided that per case, by looking for
+    the words "not enforced" in the fault MESSAGE, and that was the very mistake this file lectures
+    about: a skip must key on the HOST's capability, not on a string. It cost a reviewer a false red,
+    because that sentence only appears when kern's enforcement byte is exactly 2, so the one-shot path
+    skipped while the resident-kernel and prewarm paths failed for the same host.
+
+    The evidence is `memory.max` read from INSIDE a capped box, which is the same question the feature
+    depends on, so the skip cannot hide the defect.
+    """
+    probe = subprocess.run(
+        [kern, "box", f"taxcap-{os.getpid()}", "--image", "alpine", "--memory", "64m", "--",
+         "/bin/sh", "-c",
+         "cat /sys/fs/cgroup$(awk -F: '/^0::/{print $3}' /proc/self/cgroup)/memory.max 2>/dev/null"],
+        capture_output=True, text=True, check=False,
+    )
+    seen = (probe.stdout or "").strip() or "(nothing)"
+    if probe.returncode != 0:
+        return False, f"the probe box did not run (exit {probe.returncode})"
+    if seen in ("", "max", "(nothing)"):
+        return False, f"memory.max inside a box capped at 64m reads {seen!r}"
+    return True, f"memory.max inside a box capped at 64m reads {seen!r}"
+
+
 def stop_new(kern: str, before: set) -> list:
     """Stop only boxes that appeared AFTER the snapshot, so a concurrent session is never touched."""
     out = []
@@ -106,6 +147,11 @@ def main() -> int:
     print(f"version: {(ver.stdout or ver.stderr).strip()}")
     print(f"sha256 : {sha.stdout.split()[0] if sha.stdout else '?'}")
     print(f"image  : {IMAGE}")
+
+    # THE BASELINE FIRST, so the residue check below is a delta and never a count of what was already
+    # on the machine.
+    baseline_procs = kern_procs(kern)
+    before = running(kern)
 
     from kern_sandbox import Sandbox, SandboxError  # noqa: E402  (after KERN_BIN is set)
 
@@ -157,13 +203,15 @@ def main() -> int:
         print(f"\n{ok} ok, {bad} failed, {skipped} skipped")
         return 0 if bad == 0 else 1
 
+    caps_bite, cap_evidence = memory_cap_bites(kern)
+    print(f"host   : memory cap {'BITES' if caps_bite else 'does NOT bite'} ({cap_evidence})")
+
     print("one-shot path:")
-    with Sandbox(image=IMAGE, memory_mb=64, timeout_s=90) as s:
-        r = s.run_code(HOG)
-        if fault_of(r) == "killed" and "not enforced" in (r.fault.message or ""):
-            skip("real OOM", "no cgroup delegation here, so the cap cannot fire and kern says so")
-        else:
-            result("real OOM", "oom", fault_of(r))
+    if caps_bite:
+        with Sandbox(image=IMAGE, memory_mb=64, timeout_s=90) as s:
+            result("real OOM", "oom", fault_of(s.run_code(HOG)))
+    else:
+        skip("real OOM", f"a memory cap does not bind here: {cap_evidence}")
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=3) as s:
         result("our deadline", "timeout", fault_of(s.run_code(SLEEP)))
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=30) as s:
@@ -194,27 +242,26 @@ def main() -> int:
     with Sandbox(image="alpine", memory_mb=256, timeout_s=30) as s:
         for code in (137, 159, 143):
             result(f"chosen exit {code} is not a signal", None, fault_of(s.run(["/bin/sh", "-c", f"exit {code}"])))
-    before = running(kern)
+    snap = running(kern)
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=90) as s:
-        threading.Timer(2.5, lambda: stop_new(kern, before)).start()
+        threading.Timer(2.5, lambda: stop_new(kern, snap)).start()
         result("external kill", "killed", fault_of(s.run_code(SLEEP)))
 
     print("resident-kernel path:")
-    with Sandbox(image=IMAGE, memory_mb=64, timeout_s=90) as s:
-        with s.kernel() as k:
-            try:
-                r = k.run_code(HOG)
-                if fault_of(r) == "killed" and "not enforced" in (r.fault.message or ""):
-                    skip("real OOM", "no cgroup delegation here")
-                else:
-                    result("real OOM", "oom", fault_of(r))
-            except SandboxError as e:
-                # This is the shape the inversion had: a real OOM raised instead of returning `oom`.
-                result("real OOM", "oom", f"RAISED {str(e)[:70]}")
-    before = running(kern)
+    if caps_bite:
+        with Sandbox(image=IMAGE, memory_mb=64, timeout_s=90) as s:
+            with s.kernel() as k:
+                try:
+                    result("real OOM", "oom", fault_of(k.run_code(HOG)))
+                except SandboxError as e:
+                    # The shape the inversion had: a real OOM raised instead of returning `oom`.
+                    result("real OOM", "oom", f"RAISED {str(e)[:70]}")
+    else:
+        skip("real OOM", f"a memory cap does not bind here: {cap_evidence}")
+    snap = running(kern)
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=90) as s:
         with s.kernel() as k:
-            threading.Timer(2.5, lambda: stop_new(kern, before)).start()
+            threading.Timer(2.5, lambda: stop_new(kern, snap)).start()
             try:
                 result("external kill", "killed", fault_of(k.run_code(SLEEP)))
             except SandboxError as e:
@@ -227,23 +274,24 @@ def main() -> int:
             result("user error is not a fault", None, fault_of(k.run_code("raise ValueError('mine')")))
 
     print("prewarm path:")
-    with Sandbox(image=IMAGE, memory_mb=64, timeout_s=90, prewarm=1) as s:
-        time.sleep(0.5)  # let the pool claim one, or this measures the cold path instead
-        r = s.run_code(HOG)
-        if fault_of(r) == "killed" and "not enforced" in (r.fault.message or ""):
-            skip("real OOM", "no cgroup delegation here")
-        else:
-            result("real OOM", "oom", fault_of(r))
+    if caps_bite:
+        with Sandbox(image=IMAGE, memory_mb=64, timeout_s=90, prewarm=1) as s:
+            time.sleep(0.5)  # let the pool claim one, or this measures the cold path instead
+            result("real OOM", "oom", fault_of(s.run_code(HOG)))
+    else:
+        skip("real OOM", f"a memory cap does not bind here: {cap_evidence}")
 
-    # THE RESIDUE, because a correct verdict left behind a box is still a defect. Counted from the
-    # registry and from the process table by the binary's own PATH, not by the string "kern", which also
-    # matches kern-mcp and this script's own harness.
+    # THE RESIDUE, because a correct verdict that leaves a box behind is still a defect. A DELTA against
+    # the baseline taken before anything ran, never an absolute count: a reviewer got a false red here
+    # because he had his own box up while the battery ran, and a suite that fails on someone else's
+    # process is measuring the machine rather than itself. Counted by the binary's own PATH and not by
+    # the string "kern", which also matches kern-mcp and this script's harness.
     print("residue:")
     left = running(kern) - before
-    ps = subprocess.run(["ps", "-eo", "args", "-u", str(os.getuid())], capture_output=True, text=True, check=False)
-    procs = [l for l in ps.stdout.splitlines() if kern in l and "fault-taxonomy" not in l]
+    now = kern_procs(kern)
+    leaked = sorted(now - baseline_procs)
     result("no box left behind", [], sorted(left))
-    result("no kern process left behind", 0, len(procs), f"({procs[:2]})" if procs else "")
+    result("no kern process left behind", [], leaked, "(pids this run started and did not reap)")
 
     print(f"\n{ok} ok, {bad} failed, {skipped} skipped")
     return 0 if bad == 0 else 1
