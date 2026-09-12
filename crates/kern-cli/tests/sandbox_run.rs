@@ -2057,6 +2057,100 @@ fn box_run_isolates_and_propagates_exit_code() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A FIFO OR SOCKET AS A VOLUME SOURCE MUST BE REFUSED, NOT MOUNTED AND THEN OPENED FOREVER.
+///
+/// MEASURED before the refusal: `-v <fifo>:/x` bound successfully (the mount appears in the box's
+/// `mountinfo`), and the setup pass that follows opened the target with `O_WRONLY|O_CREAT` - now a
+/// FIFO with no reader - and blocked in `wait_for_partner`. The process was still alive after 404
+/// seconds and did not die on SIGTERM. Through the SDK it surfaced as `fault=timeout`, a TRANSIENT
+/// class an agent retries forever.
+///
+/// The watchdog is the point of the test as much as the assertion: a regression here HANGS, and a
+/// test that hangs teaches nothing until someone reads the CI timeout. This one kills the child and
+/// fails with a sentence.
+#[test]
+fn a_fifo_or_socket_volume_source_is_refused_rather_than_hanging_the_box() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-it-fifo-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let fifo = dir.join("f");
+    let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes().to_vec());
+    let made = match &c {
+        Ok(path) => (unsafe { libc::mkfifo(path.as_ptr(), 0o600) }) == 0,
+        Err(_) => false,
+    };
+    if !made {
+        eprintln!("skip: could not create a FIFO to test with");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let mut child = kern()
+        .args([
+            "box",
+            &format!("fifo-{}", std::process::id()),
+            "--image",
+            "alpine",
+            "-v",
+            &format!("{}:/x", fifo.display()),
+            "--",
+            "true",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn kern");
+
+    // Bounded wait, by hand: `std::process::Child` has no timed wait, and the failure this pins is
+    // exactly "never returns".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&dir);
+            panic!("a FIFO volume source hung the box for 60s instead of being refused");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = fs::remove_dir_all(&dir);
+
+    if err.contains("could not be BUILT") || err.contains("user namespace") {
+        eprintln!(
+            "skip: this host cannot build a box at all: {}",
+            err.lines().next().unwrap_or("")
+        );
+        return;
+    }
+    assert!(
+        err.contains("FIFO"),
+        "the refusal must name what the source IS, or the operator looks at the target: {err}"
+    );
+    if let Some(st) = status {
+        assert_eq!(
+            st.code(),
+            Some(125),
+            "a box that never started is 125, kern's own and Docker's convention: {err}"
+        );
+    }
+}
+
 /// THE POD HOLDER MUST NOT CARRY A SECRET IT HAS NO USE FOR, and it has the longest life here.
 ///
 /// MEASURED before the scrub, with `KERN_SECRET_tok` set and one box joined to a pod: the value was

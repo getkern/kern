@@ -1905,7 +1905,25 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // started - without parsing kern's stderr, which a workload can forge. The `Err` arm never
             // writes, so its EOF is an unforgeable "did not start". EINTR-safe: a lost byte would read as
             // EOF and mislabel a healthy box as startup_failed.
-            if let Some(fd) = started_fd {
+            // 125 IS "THE BOX DID NOT START", AND THIS ARM USED TO CLAIM THE OPPOSITE. The docstring
+            // above says kern reaches `Ok` only when setup SUCCEEDED, and that was not true: a setup
+            // failure inside the box's own namespaces (a mount the kernel refuses, a uid map, seccomp)
+            // is reported by the child as exit 125 and arrives here as `Ok(125)`, so the unforgeable
+            // "started" byte was written for a box that never existed.
+            //
+            // MEASURED end to end with `-v <fifo>:/x`: kern wrote `[1, 0]` and exited 125, and the
+            // Python SDK - correctly trusting a signal kern documents as unforgeable - used it to
+            // ERASE its own `startup_failed` classification, handing the caller `fault=None`. An agent
+            // branching on `fault` reads that as its own code failing. The same erasure hit
+            // `mount(volume bind) failed: Not a directory`, so this was never about one flag.
+            //
+            // WHY 125 IS THE RIGHT DISCRIMINATOR AND COSTS NOTHING. It is kern's own convention for
+            // box-not-started (`box_start_exit_code`), and Docker's. A workload that CHOSE to exit 125
+            // now gets no byte either, and that is harmless: with no byte the SDK falls back to its
+            // stderr heuristic, which requires one of kern's own markers, and a workload's own 125
+            // carries none - so it is classified exactly as it is today, a normal non-zero result.
+            // The enforcement byte is lost in this case too, which is correct: there was no box to cap.
+            if let Some(fd) = started_fd.filter(|_| code != 125) {
                 // TWO bytes, written atomically (a pipe write of <= PIPE_BUF is all-or-nothing):
                 //   byte 0 = `1`, the unchanged "box started" signal - an SDK that reads only ONE byte
                 //           (every 0.1.x binding) still sees exactly `0x01` and is unaffected;

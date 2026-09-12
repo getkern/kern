@@ -7,6 +7,30 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A FIFO as a volume source hung the box forever, and the SDK called it a timeout.** MEASURED with
+`-v <fifo>:/x`: the bind succeeds (the mount is in the box's `mountinfo`), and the setup pass that
+follows opens the target with `O_WRONLY|O_CREAT` - a FIFO with no reader - and blocks in
+`wait_for_partner`. The process was still there after 404 seconds and did not die on SIGTERM. Through
+the SDK the whole thing arrived as `fault=timeout`, which is a TRANSIENT class: an agent retries a
+transient failure, so it would have retried this one until a human noticed. FIFOs and sockets are now
+refused by name before anything is opened. Character and block devices are not: `-v /dev/zero:/x`
+works, and is measured.
+
+**And kern claimed a box had started when it had not.** The `KERN_STARTED_FD` byte is documented as
+the unforgeable "the box exists and your code ran" signal, and the arm that writes it says it is
+reached only when setup succeeded. That was not true: a setup failure inside the box's own namespaces
+exits 125 and arrives as `Ok(125)`, so the byte went out for a box that never existed. The Python SDK
+- correctly trusting the signal - used it to ERASE its own `startup_failed` classification and handed
+the caller `fault=None`, which an agent reads as its own code failing. This hit every in-namespace
+setup refusal, not just the new one: `mount(volume bind) failed: Not a directory` had the same
+outcome. 125 is kern's own box-not-started convention, and Docker's, so the byte is now withheld for
+it. A workload that CHOOSES to exit 125 is unaffected: with no byte the SDK falls back to its stderr
+heuristic, which requires one of kern's own markers, and a workload's 125 carries none - measured,
+`fault=None`, a normal result, exactly as before.
+
+Both refusals now RAISE through the SDK with the reason in the message, instead of returning a hollow
+result with no fault.
+
 **A pod bridge on top of a route the host already has killed the box's network, in silence.** MEASURED
 with `--bridge 192.168.1.0/24` on a host whose LAN is that network: the bridge took `192.168.1.1`,
 which is the host's own default gateway, the box ended up with two routes for the same network, and

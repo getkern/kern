@@ -1992,7 +1992,38 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             ));
             break;
         }
-        let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        // A FIFO OR A SOCKET AS A VOLUME SOURCE HANGS THE BOX FOREVER, and the hang is POSIX rather
+        // than a bug to fix elsewhere. MEASURED with `-v /tmp/fifo:/x`: the bind itself succeeds (the
+        // mount appears in the box's `mountinfo`), and the setup pass that follows opens the target
+        // with `O_WRONLY|O_CREAT` - now a FIFO with no reader - and blocks in `wait_for_partner`.
+        // The process was still there after 404 seconds and did NOT die on the SIGTERM a `timeout`
+        // sent it. Through the SDK the whole thing surfaced as `fault=timeout`, which is a
+        // TRANSIENT class: an agent retries a transient failure, so it would retry this one until
+        // someone noticed.
+        //
+        // Refused rather than made non-blocking. `O_NONBLOCK` would turn the hang into an ENXIO,
+        // which is better, but it would still leave a box holding a FIFO end that nothing on the
+        // host is reading: the operator's intent cannot be satisfied either way, and a named refusal
+        // is the only answer that says so. Character and block devices are NOT refused - `-v
+        // /dev/zero:/x` works and is measured - because those a box can actually use.
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
+            unsafe { libc::close(src_fd) };
+            let what = if kind == libc::S_IFIFO {
+                "a FIFO"
+            } else {
+                "a socket"
+            };
+            result = Err(Error::Spec(format!(
+                "-v {}:{}: the source is {what}, which a box cannot be given: binding it succeeds \
+                 and then opening it inside the box blocks forever, because nothing on the host \
+                 holds the other end. Bind the directory that contains it and have the workload \
+                 open it itself, or pass the data on stdin.",
+                v.source, v.target
+            )));
+            break;
+        }
+        let is_dir = kind == libc::S_IFDIR;
         let tgt_fd = match open_in_root(root_fd, &v.target, is_dir) {
             Ok(fd) => fd,
             Err(e) => {
