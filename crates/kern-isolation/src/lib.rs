@@ -97,6 +97,10 @@ pub use cgroup::apply_limits as apply_cgroup_limits;
 pub use cgroup::box_cgroup_dir;
 /// Did the box this process supervised die to its own memory cap? See [`cgroup::box_was_oom_killed`].
 pub use cgroup::box_was_oom_killed;
+/// The signal that terminated the box's workload, or 0 if it exited on its own. See
+/// [`cgroup::box_workload_signal`]: kern's own exit code cannot carry this, because propagating
+/// `128 + N` makes a killed workload and one that called `exit(137)` indistinguishable.
+pub use cgroup::box_workload_signal;
 /// Which family of capped cgroup leaf an [`apply_cgroup_limits`] call creates, and why the two must
 /// not share a directory name. See [`cgroup::Leaf`].
 pub use cgroup::Leaf as CgroupLeaf;

@@ -70,6 +70,40 @@ pub fn latch_box_oom(dir: &std::path::Path) {
     }
 }
 
+/// The signal that TERMINATED the box's workload, or 0 if it exited of its own accord. Latched at the
+/// reap, for the same reason as [`BOX_WAS_OOM_KILLED`]: the status is only in hand there.
+///
+/// IT EXISTS BECAUSE KERN PROPAGATES THE CODE AND THEREBY ERASES ITS ORIGIN. kern exits with the
+/// workload's status as `128 + N` (a shell's convention, and docker's), so a workload SIGKILLed by the
+/// kernel and a workload that called `exit(137)` are BOTH a normal exit 137 of kern, and no caller can
+/// tell them apart from the outside. MEASURED through the Python binding: a cell doing `sys.exit(137)`
+/// came back `fault = killed` with a message about an external kill, and `exit(159)` came back
+/// `escape_blocked`, which is a security event a cell can fabricate in one line. The exit code is the
+/// right thing to PROPAGATE and the wrong thing to classify from.
+static BOX_WORKLOAD_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Latch the signal that terminated the workload, from the raw `wait` status. Called right after the
+/// reap, beside [`latch_box_oom`]. A status that says "exited" leaves it 0, which is the honest answer:
+/// nothing signalled this workload.
+pub fn latch_workload_signal(status: i32) {
+    // `WTERMSIG` is only meaningful when `WIFSIGNALED`, and a signal number does not fit a `u8` on
+    // paper (it does in practice: 1..=64), so it is clamped rather than cast blindly.
+    if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status);
+        if let Ok(n) = u8::try_from(sig) {
+            BOX_WORKLOAD_SIGNAL.store(n, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// The signal that terminated the box's workload, or 0 if it exited on its own. See
+/// [`latch_workload_signal`]. Read once at teardown for the FOURTH byte of the `KERN_STARTED_FD`
+/// signal, which is the only place a caller can learn it: kern's own exit code cannot carry it.
+#[must_use]
+pub fn box_workload_signal() -> u8 {
+    BOX_WORKLOAD_SIGNAL.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Did the box this process supervised die to its own memory cap? See [`latch_box_oom`].
 ///
 /// Read TWICE at teardown, for two different readers: kern's own stderr sentence, and the THIRD byte of

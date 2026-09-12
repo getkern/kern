@@ -6,6 +6,23 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+// The double IMPERSONATES kern's identity contract, because the binding now refuses a binary that does
+// not: with `KERN_BIN=/bin/true` a call was measured returning `success: true, exitCode: 0, fault: null`
+// and an empty stdout, for code that never ran. Everything else about the double stays what /bin/true
+// was, an immediate clean exit, which is all these unit tests depend on (they assert the argv the binding
+// BUILDS). A double that could not satisfy the contract would force an escape hatch into the product, and
+// an escape hatch is a flag an agent framework can set.
+const FAKE_KERN = (() => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), `kern-fake-${process.pid}-`));
+  const p = path.join(d, "kern");
+  fs.writeFileSync(
+    p,
+    '#!/bin/sh\ncase "$1" in\n  --version) echo "kern v0.0.0-test-double" ; exit 0 ;;\nesac\nexit 0\n',
+  );
+  fs.chmodSync(p, 0o755);
+  return p;
+})();
+
 const kern = require("../index.js");
 const { Sandbox, withSandbox, runCode, SandboxError, MountRefused } = kern;
 
@@ -55,7 +72,7 @@ test("capabilities are dropped by default and the opt-out is explicit", () => {
   // namespace, on the one code path whose purpose is running code nobody has read. Measured before
   // this change: a box held CapEff 00000110bdacffff, and with the flag it holds 0000000000000000.
   const prev = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true";
+  process.env.KERN_BIN = FAKE_KERN;
   try {
     const argv = new Sandbox()._baseArgv("n", { network: false, timeoutS: 30 });
     assert.ok(argv.includes("--cap-drop"), "the default must drop capabilities");
@@ -102,7 +119,7 @@ test("capabilities are dropped by default and the opt-out is explicit", () => {
 
 test("apparmor profile reaches the argv and bad names are refused", () => {
   const prev = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true";
+  process.env.KERN_BIN = FAKE_KERN;
   try {
     const argv = new Sandbox({ apparmor: "docker-default" })._baseArgv("n", {
       network: false,
@@ -137,7 +154,7 @@ test("apparmor profile reaches the argv and bad names are refused", () => {
 test("profiles validated and placed in argv", () => {
   // valid vcpu:/vgpio:/vdisk: profiles land as positional tokens (fake kern so the ctor completes)
   const prev = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true";
+  process.env.KERN_BIN = FAKE_KERN;
   try {
     const s = new Sandbox({ profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"] });
     const argv = s._baseArgv("n", { network: false, timeoutS: s.timeoutS });
@@ -155,7 +172,7 @@ test("profiles validated and placed in argv", () => {
 
 test("egressAllow validated and scoped to run boxes", () => {
   const prev = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true";
+  process.env.KERN_BIN = FAKE_KERN;
   try {
     const s = new Sandbox({ egressAllow: ["pypi.org", "files.pythonhosted.org"] });
     const run = s._baseArgv("n", { network: false, timeoutS: 30, isSetup: false });
@@ -175,7 +192,7 @@ test("egressAllow validated and scoped to run boxes", () => {
 test("snapshot/restore roundtrips and rejects hostile archives", async () => {
   const zlib = require("node:zlib");
   const prev = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true"; // file ops are host-side; no real box is run
+  process.env.KERN_BIN = FAKE_KERN; // file ops are host-side; no real box is run
   const tmp = () => path.join(os.tmpdir(), "kt-" + Math.random().toString(36).slice(2));
   try {
     const snap = tmp() + ".tgz";
@@ -238,7 +255,7 @@ test("snapshot/restore roundtrips and rejects hostile archives", async () => {
 test("restore refuses a member routed through a planted symlink, and a negative-size tar", async () => {
   const zlib = require("node:zlib");
   const prev = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true";
+  process.env.KERN_BIN = FAKE_KERN;
   const wsdir = () => {
     const d = path.join(os.tmpdir(), "kt-" + Math.random().toString(36).slice(2));
     fs.mkdirSync(d);
@@ -307,7 +324,7 @@ test("restore refuses a member routed through a planted symlink, and a negative-
 test("restore rejects a malformed ustar header (bad checksum, non-octal or over-long size)", async () => {
   const zlib = require("node:zlib");
   const prev = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true";
+  process.env.KERN_BIN = FAKE_KERN;
   const wsdir = () => {
     const d = path.join(os.tmpdir(), "kt-" + Math.random().toString(36).slice(2));
     fs.mkdirSync(d);
@@ -356,7 +373,7 @@ test("restore rejects a malformed ustar header (bad checksum, non-octal or over-
 
 test("snapshot/restore fails closed when KERN_SANDBOX_SNAPSHOT is unset", async () => {
   const prevKern = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true";
+  process.env.KERN_BIN = FAKE_KERN;
   const prevSnap = process.env.KERN_SANDBOX_SNAPSHOT;
   delete process.env.KERN_SANDBOX_SNAPSHOT;
   try {
@@ -379,7 +396,7 @@ test("snapshot/restore fails closed when KERN_SANDBOX_SNAPSHOT is unset", async 
 test("restore rejects a dir member colliding with a planted symlink, and a dir with non-zero size", async () => {
   const zlib = require("node:zlib");
   const prevKern = process.env.KERN_BIN;
-  process.env.KERN_BIN = "/bin/true";
+  process.env.KERN_BIN = FAKE_KERN;
   const wsdir = () => {
     const d = path.join(os.tmpdir(), "kt-" + Math.random().toString(36).slice(2));
     fs.mkdirSync(d);
@@ -1173,6 +1190,66 @@ test("a reply without a usable exit code is a fault, not a success", () => {
   assert.equal(bad.success, false);
   assert.equal(bad.exitCode, 3);
   assert.equal(bad.fault, null);
+});
+
+test("a binary that is not kern is refused before any code runs", async () => {
+  // MEASURED, and found by an external reviewer running the positive control this project wrote for him:
+  // with `KERN_BIN=/bin/true` a call returned `success: true, exitCode: 0, fault: null` and an empty
+  // stdout. The code never ran and the caller was told it had. Both bindings did it.
+  const prev = process.env.KERN_BIN;
+  try {
+    for (const bin of ["/bin/true", "/bin/echo", "/bin/false"]) {
+      if (!fs.existsSync(bin)) continue;
+      process.env.KERN_BIN = bin;
+      assert.throws(() => new Sandbox(), (e) => {
+        assert.ok(e instanceof SandboxError, `${bin}: wrong error type: ${e}`);
+        assert.match(e.message, /is not kern|did not answer/);
+        assert.ok(e.message.includes(bin), `the refusal must name the binary: ${e.message}`);
+        assert.match(e.message, /KERN_BIN/); // and how to point it elsewhere
+        return true;
+      }, `${bin} must be refused`);
+    }
+    // POSITIVE CONTROL: the double, which answers the identity question and nothing else, is ACCEPTED.
+    // Without it every assertion above would also pass on a binding that refused everything.
+    process.env.KERN_BIN = FAKE_KERN;
+    new Sandbox();
+    // Memoised per binary identity, so a pool of boxes does not pay `--version` per box.
+    const t0 = Date.now();
+    for (let i = 0; i < 50; i++) new Sandbox();
+    const perCall = (Date.now() - t0) / 50;
+    assert.ok(perCall < 1.0, `constructing a Sandbox costs ${perCall} ms: the identity check is not memoised`);
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});
+
+test("a chosen exit code is not a signal", () => {
+  // The OOM inversion one level down: kern propagates the workload's status as `128 + N`, so a cell doing
+  // `sys.exit(137)` and a cell the kernel killed are the same number downstream. MEASURED through the
+  // Python binding: the first came back `killed` with a message about an external kill that never
+  // happened, and `sys.exit(159)` came back `escape_blocked`, a security event a cell could fabricate in
+  // one line. Args: (rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal, aliveState,
+  // workloadSignal).
+  const s = new Sandbox({ memoryMb: 256 });
+  const U = "unknown";
+  // The signal really happened: kern says which one, the class holds.
+  assert.strictEqual(s._classify(159, null, "", false, 30, 0, 0, U, 31).type, "escape_blocked");
+  assert.strictEqual(s._classify(137, null, "", false, 30, 0, 1, U, 9).type, "oom");
+  assert.strictEqual(s._classify(137, null, "", false, 30, 0, 0, U, 9).type, "killed");
+  assert.strictEqual(s._classify(143, null, "", false, 30, 0, 0, U, 15).type, "timeout");
+  // The workload chose the number: no signal, so no sandbox fault.
+  assert.strictEqual(s._classify(159, null, "", false, 30, 0, 0, U, 0), null);
+  assert.strictEqual(s._classify(137, null, "", false, 30, 0, 0, U, 0), null);
+  assert.strictEqual(s._classify(143, null, "", false, 30, 0, 0, U, 0), null);
+  assert.strictEqual(s._classify(137, null, KERN_OOM_LINE, false, 30, 0, 0, U, 0), null);
+  // COMPATIBILITY: a kern that does not report the signal keeps the old verdict on every code.
+  assert.strictEqual(s._classify(159, null, "", false, 30).type, "escape_blocked");
+  assert.strictEqual(s._classify(137, null, "", false, 30).type, "killed");
+  assert.strictEqual(s._classify(143, null, "", false, 30).type, "timeout");
+  // kern ITSELF being signalled is a different question and is unaffected by the byte.
+  assert.strictEqual(s._classify(null, "SIGKILL", "", false, 30, 0, 0, U, 0).type, "killed");
+  assert.strictEqual(s._classify(null, "SIGSYS", "", false, 30, 0, 0, U, 0).type, "escape_blocked");
 });
 
 test("a box still in setup at the deadline is not a timeout", () => {

@@ -579,7 +579,8 @@ fn started_bytes(args: &[&str]) -> (Option<i32>, Vec<u8>) {
     (out.status.code(), got)
 }
 
-/// The `KERN_STARTED_FD` signal is THREE bytes, and the third one is the OOM verdict.
+/// The `KERN_STARTED_FD` signal is FOUR bytes: the OOM verdict is the third, the workload's SIGNAL the
+/// fourth.
 ///
 /// WHY THE THIRD BYTE EXISTS. An SDK had only the exit code and the enforcement byte, and 137 plus "the
 /// cap was enforced" is also what `kern stop` of a capped box looks like. Measured through the Python
@@ -588,10 +589,17 @@ fn started_bytes(args: &[&str]) -> (Option<i32>, Vec<u8>) {
 /// reads the box's own `memory.events` for the stderr sentence - and this puts that same observation on
 /// a channel the workload cannot write, where stderr is a stream the workload shares.
 ///
+/// WHY THE FOURTH BYTE, and two reviewers found it from opposite directions: kern propagates the
+/// workload's status as `128 + N`, so a workload the kernel SIGKILLed and one that called `exit(137)` are
+/// BOTH a normal exit 137 of kern. MEASURED through the Python binding: `sys.exit(137)` was reported
+/// `fault = killed` (an external kill that never happened) and `sys.exit(159)` was reported
+/// `escape_blocked`, a security event a cell could fabricate in one line. The code is the right thing to
+/// propagate and the wrong thing to classify from.
+///
 /// THE DISCRIMINATOR IS THE PAIR, not either run alone: a byte that were always 1 would pass the OOM
 /// half, and one that were always 0 would pass the external-kill half. Both exit 137.
 #[test]
-fn the_started_signal_carries_the_oom_verdict_in_its_third_byte() {
+fn the_started_signal_carries_the_oom_verdict_and_the_workload_signal() {
     let (code, sig) = started_bytes(&[
         "box",
         "sigtest-ok",
@@ -643,12 +651,18 @@ fn the_started_signal_carries_the_oom_verdict_in_its_third_byte() {
     );
     assert_eq!(
         sig.len(),
-        3,
-        "a started box must write all three bytes: {sig:?}"
+        4,
+        "a started box must write all four bytes: {sig:?}"
     );
     assert_eq!(
         sig[2], 0,
         "an exit 137 with no OOM behind it was reported as an OOM: {sig:?}"
+    );
+    // THE ONE THE REVIEWERS FOUND: the same exit code as the OOM below, and nothing signalled this
+    // workload. Without this byte a cell could fabricate `fault = killed` with one `exit 137`.
+    assert_eq!(
+        sig[3], 0,
+        "a workload that CHOSE exit 137 was reported as killed by a signal: {sig:?}"
     );
 
     if !enforced {
@@ -676,12 +690,19 @@ fn the_started_signal_carries_the_oom_verdict_in_its_third_byte() {
     }
     assert_eq!(
         sig.len(),
-        3,
-        "a started box must write all three bytes: {sig:?}"
+        4,
+        "a started box must write all four bytes: {sig:?}"
     );
     assert_eq!(
         sig[2], 1,
         "a box taken by the OOM killer against its own cap reported no OOM: {sig:?}"
+    );
+    // The pair that makes the fourth byte load-bearing: the SAME exit 137 as the chosen one above, with
+    // a signal behind it this time.
+    assert_eq!(
+        sig[3], 9,
+        "a workload the kernel SIGKILLed must be reported as signalled, or it cannot be told from one \
+         that chose 137: {sig:?}"
     );
 }
 

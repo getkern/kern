@@ -1930,7 +1930,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // carries none - so it is classified exactly as it is today, a normal non-zero result.
             // The enforcement byte is lost in this case too, which is correct: there was no box to cap.
             if let Some(fd) = started_fd.filter(|_| code != 125) {
-                // THREE bytes, written atomically (a pipe write of <= PIPE_BUF is all-or-nothing):
+                // FOUR bytes, written atomically (a pipe write of <= PIPE_BUF is all-or-nothing):
                 //   byte 0 = `1`, the unchanged "box started" signal - an SDK that reads only ONE byte
                 //           (every 0.1.x binding) still sees exactly `0x01` and is unaffected;
                 //   byte 1 = the memory-cap ENFORCEMENT signal (0 undetermined, 1 enforced, 2 requested
@@ -1938,7 +1938,17 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 //           a plain kill where the cap never bound. An OLDER kern wrote one byte, so a
                 //           newer SDK reads EOF for byte 1 and treats enforcement as undetermined;
                 //   byte 2 = the OOM OUTCOME (1 = the kernel's OOM killer fired against this box's OWN
-                //           cgroup, 0 = it did not, or nothing was read).
+                //           cgroup, 0 = it did not, or nothing was read);
+                //   byte 3 = the SIGNAL that terminated the workload, or 0 if it exited on its own.
+                //
+                // WHY BYTE 3, and it is the same defect one level down. kern propagates the workload's
+                // status as `128 + N`, so a workload the kernel SIGKILLed and a workload that called
+                // `exit(137)` both leave kern exiting 137 normally: the origin is erased by the very
+                // convention that makes the code useful. MEASURED through the Python binding: a cell
+                // doing `sys.exit(137)` was reported `fault = killed` (an external kill that never
+                // happened), and `sys.exit(159)` was reported `escape_blocked`, which is a security
+                // event a cell can fabricate in one line. The exit code is the right thing to propagate
+                // and the wrong thing to classify from, so the classifier gets the signal itself.
                 //
                 // WHY BYTE 2 EXISTS, and it is a correctness fix rather than a convenience. Enforcement
                 // is not an outcome: byte 1 says a ceiling was in force, which every `kern stop` of a
@@ -1955,6 +1965,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     1u8,
                     kern_isolation::memory_cap_signal(),
                     u8::from(kern_isolation::box_was_oom_killed()),
+                    kern_isolation::box_workload_signal(),
                 ];
                 loop {
                     let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };

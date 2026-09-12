@@ -29,7 +29,10 @@ import pytest
 from kern_sandbox import ExecutionResult, FileInfo, Result, SandboxError, SandboxFault
 from kern_sandbox import mcp as M
 
-_FAKE_KERN = shutil.which("true") or "/bin/true"
+# The double IMPERSONATES kern's identity contract: the binding refuses a binary that does not,
+# after `KERN_BIN=/bin/true` was measured returning a successful, empty result for code that never
+# ran. See tests/_fake_kern.py.
+from _fake_kern import FAKE_KERN as _FAKE_KERN
 
 
 # ---------------------------------------------------------------------------

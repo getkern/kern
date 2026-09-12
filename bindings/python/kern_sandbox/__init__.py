@@ -875,12 +875,83 @@ class _CappedReader(threading.Thread):
                 pass
 
 
+# Binaries already identified as kern, keyed by (path, device, inode, size, mtime_ns). The identity and
+# not the path alone: a `kern` REPLACED between two calls is a different program and must be checked
+# again. Bounded by how many distinct binaries one process can point at, which is one in every real
+# program and a handful in the test suite.
+_VERIFIED_KERN: "dict[tuple, None]" = {}
+_VERIFIED_KERN_LOCK = threading.Lock()
+
+
+def _verify_is_kern(path: str) -> None:
+    """Refuse a binary that does not IDENTIFY ITSELF as kern. Raises :class:`SandboxError` if it does not.
+
+    MEASURED, AND IT WAS FOUND BY A REVIEWER RUNNING MY OWN POSITIVE CONTROL: with ``KERN_BIN=/bin/true``
+    a call returned ``success=True, exit_code=0, fault=None`` and an empty stdout. The code never ran and
+    the caller was told it had. Any `kern` on PATH that is not kern does this: a leftover wrapper, a
+    shim, a no-op someone dropped earlier in the search order. An agent loop reads `success` and moves
+    on, and every subsequent conclusion it draws is about a program that never executed.
+
+    POSITIVE IDENTIFICATION, not inference from a missing signal. "No started byte" cannot carry this:
+    a kern old enough to predate `KERN_STARTED_FD` writes nothing either, and refusing it would break a
+    user whose only sin is an old binary. `kern --version` prints `kern <version>` on stdout, and that
+    prefix is asserted by a test in kern's own suite (`version_prints_and_succeeds`), so this keys on a
+    contract rather than on a hope. `/bin/true` prints nothing and is refused; every kern ever released
+    passes.
+
+    Memoised per binary IDENTITY, so the cost is one `--version` (measured at 0.7 ms) per distinct
+    binary per process, and zero for every call after the first. Fail-closed: a binary that cannot be
+    run, times out, or answers something else is refused, because an unverifiable runtime is exactly the
+    case this exists for.
+    """
+    try:
+        st = os.stat(path)
+        key = (os.path.realpath(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError as e:
+        raise SandboxError(f"could not stat the kern binary at '{path}': {e}") from e
+    with _VERIFIED_KERN_LOCK:
+        if key in _VERIFIED_KERN:
+            return
+    hint = (
+        "If this is not the kern you meant, set $KERN_BIN to the right path. To install kern:\n"
+        "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh"
+    )
+    try:
+        # Generous on purpose: a loaded machine must not be told its kern is fake. `--version` does no
+        # I/O beyond writing one line, so a binary that cannot answer in ten seconds is not one to trust
+        # with a box.
+        out = subprocess.run(  # noqa: S603 - argv list, no shell
+            [path, "--version"], capture_output=True, timeout=10, check=False
+        )
+    except subprocess.TimeoutExpired as e:
+        raise SandboxError(
+            f"'{path}' did not answer `--version` within 10s, so it cannot be identified as kern. {hint}"
+        ) from e
+    except OSError as e:
+        raise SandboxError(f"could not run '{path} --version': {e}. {hint}") from e
+    line = (out.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+    first = line[0] if line else ""
+    if out.returncode != 0 or not first.startswith("kern "):
+        shown = first[:120] if first else "(no output)"
+        raise SandboxError(
+            f"'{path}' is not kern: `{path} --version` exited {out.returncode} and printed {shown!r}, "
+            f"where kern prints a line beginning 'kern '. Refusing to run code, because a binary that "
+            f"is not kern would return an EMPTY, SUCCESSFUL result for every call and the code would "
+            f"never run. {hint}"
+        )
+    with _VERIFIED_KERN_LOCK:
+        _VERIFIED_KERN[key] = None
+
+
 def _find_kern() -> str:
-    """Locate ``kern``: ``$KERN_BIN`` if set, else the first ``kern`` on ``$PATH``."""
+    """Locate ``kern``: ``$KERN_BIN`` if set, else the first ``kern`` on ``$PATH``. The result is also
+    IDENTIFIED as kern (see :func:`_verify_is_kern`), because being executable and being named `kern` are
+    not the same as being kern."""
     env = os.environ.get("KERN_BIN")
     if env:
         if not (Path(env).is_file() and os.access(env, os.X_OK)):
             raise SandboxError(f"$KERN_BIN='{env}' is not an executable file")
+        _verify_is_kern(env)
         return env
     found = shutil.which("kern")
     if not found:
@@ -906,6 +977,7 @@ def _find_kern() -> str:
             "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n"
             "or point $KERN_BIN at a kern you already have."
         )
+    _verify_is_kern(found)
     return found
 
 
@@ -1729,6 +1801,9 @@ class Sandbox:
         oom_signal = 0  # 3rd started byte: 1 = the kernel OOM-killed this box's own cgroup, 0 = it did not
         # None = never asked (we did not time out); otherwise one of the three `_ALIVE_*` states.
         alive_state: "str | None" = None
+        # None = this kern does not report it. 0 = the workload exited on its own; otherwise the signal
+        # number that terminated it.
+        workload_signal: "int | None" = None
         try:
             try:
                 # start_new_session so the box + kern share a process group we can signal as a unit.
@@ -1777,13 +1852,17 @@ class Sandbox:
             # this box's OWN cgroup. Enforcement is not an outcome, which is the distinction the whole
             # `oom` vs `killed` split rests on, and this byte is the only place the answer arrives where
             # the workload cannot write it.
+            # Byte 3 (a NEWER kern still) = the SIGNAL that terminated the workload, or 0 if it exited
+            # on its own. `None` here means the byte did not arrive at all, which is a DIFFERENT thing
+            # from a zero: an older kern, or a kern our own teardown killed before it could write.
             try:
-                sig = os.read(started_r, 3)
+                sig = os.read(started_r, 4)
             except OSError:
                 sig = b""
             box_started = len(sig) >= 1 and sig[0] == 1
             cap_signal = sig[1] if len(sig) >= 2 else 0
             oom_signal = sig[2] if len(sig) >= 3 else 0
+            workload_signal = sig[3] if len(sig) >= 4 else None
         finally:
             # Every exit path, including the two SandboxErrors above: kern has read the file by the time
             # it exits, and leaving it behind would accrete one per call in a persistent workspace.
@@ -1815,7 +1894,7 @@ class Sandbox:
         if rc < 0:
             rc = 128 + (-rc)
         fault = self._classify(
-            rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal, alive_state
+            rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal, alive_state, workload_signal
         )
         exec_fail = _exec_failure_binary(stderr)
         if exec_fail is not None and rc != 0:
@@ -1897,6 +1976,7 @@ class Sandbox:
         cap_signal: int = 0,
         oom_signal: int = 0,
         alive_state: "str | None" = None,
+        workload_signal: "int | None" = None,
     ) -> SandboxFault | None:
         # ORDER IS A SECURITY PROPERTY. The classes that are DETERMINISTIC by exit code are decided
         # FIRST, BEFORE we ever look at stderr - because stderr is a channel the workload controls, and
@@ -1928,10 +2008,22 @@ class Sandbox:
                     "stalled disk - and the remedy is that path, not a longer timeout",
                 )
             return SandboxFault("timeout", f"exceeded the {limit}s time limit (killed by the binding)")
-        if rc == _EXIT_SIGSYS:
-            # A seccomp-denied syscall. Decided by exit code, so no stderr content can mask it.
+        # THE EXIT CODE IS THE RIGHT THING TO PROPAGATE AND THE WRONG THING TO CLASSIFY FROM, which is
+        # what `_killed_by` exists for: kern reports `128 + N` as its own status, so a workload the kernel
+        # killed and one that called `exit(137)` are the same number. MEASURED: a cell doing
+        # `sys.exit(137)` was reported `fault = killed` with a message about an external kill that never
+        # happened, and `sys.exit(159)` was reported `escape_blocked`, a security event a cell could
+        # fabricate in one line. kern's 4th started-byte carries the signal, so the three signal-derived
+        # classes below ask for it. `None` (an older kern, or a kern our teardown killed before it could
+        # write) keeps the old exit-code reading: absence of evidence is not evidence.
+        def _killed_by(sig: int) -> bool:
+            return workload_signal is None or workload_signal == sig
+
+        if rc == _EXIT_SIGSYS and _killed_by(signal.SIGSYS):
+            # A seccomp-denied syscall. Decided by exit code plus kern's signal byte, so neither stderr
+            # content nor a chosen exit code can mask it or fake it.
             return SandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)")
-        if rc == _EXIT_SIGKILL or rc == -signal.SIGKILL:
+        if (rc == _EXIT_SIGKILL and _killed_by(signal.SIGKILL)) or rc == -signal.SIGKILL:
             # SIGKILL not from our deadline: exit 137 (128+9), or subprocess's -9 if kern itself was
             # signalled. `oom` is claimed only on kern's own OBSERVATION of the kernel's counter for this
             # box's cgroup, from the UNFORGEABLE byte first and its stderr sentence second.
@@ -1976,7 +2068,7 @@ class Sandbox:
                     "not the box exceeding its own memory",
                 )
             return SandboxFault("killed", "the box was killed (SIGKILL); no memory cap was set to attribute it to OOM")
-        if rc in (_EXIT_SIGTERM, -signal.SIGTERM):
+        if (rc == _EXIT_SIGTERM and _killed_by(signal.SIGTERM)) or rc == -signal.SIGTERM:
             # SIGTERM without our deadline firing = kern's OWN --timeout backstop reaped the box (it
             # SIGTERMs, then SIGKILLs after a grace). The box exceeded its time limit; label it timeout,
             # noting the backstop caught it rather than our own wait.

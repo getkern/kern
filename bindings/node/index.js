@@ -415,6 +415,12 @@ while True:
 const EXIT_SIGKILL = 137; // SIGKILL: timeout backstop or OOM (indistinguishable without cgroup)
 const EXIT_SIGSYS = 159; // SIGSYS: a seccomp-denied syscall = a blocked escape attempt
 const EXIT_SIGTERM = 143; // SIGTERM: kern's --timeout backstop reaping the box
+// The signal NUMBERS behind those codes, for kern's 4th started-byte. Spelled out rather than derived
+// from the code, because `128 + N` is the convention being checked and deriving N from it would make the
+// check circular.
+const SIG_KILL = 9;
+const SIG_TERM = 15;
+const SIG_SYS = 31;
 
 // Per-call kwargs that DEFAULT to the Sandbox value: UNSET means "inherit the constructor's", whereas
 // an explicit `null` means "disable" (used for onStdout/onStderr overrides).
@@ -562,7 +568,59 @@ function sandboxFault(type, message) {
   return { type, message };
 }
 
-/** Locate `kern`: $KERN_BIN if set, else the first `kern` on $PATH. */
+/** Binaries already identified as kern, keyed by identity and not by path: a `kern` REPLACED between two
+ * calls is a different program and gets checked again. */
+const VERIFIED_KERN = new Set();
+
+/** Refuse a binary that does not IDENTIFY ITSELF as kern. Throws `SandboxError` if it does not.
+ *
+ * MEASURED, and found by an external reviewer running the positive control this project wrote for him:
+ * with `KERN_BIN=/bin/true` a call returned `success: true, exitCode: 0, fault: null` and an empty
+ * stdout. The code never ran and the caller was told it had. Any `kern` earlier in `PATH` that is not
+ * kern does this: a leftover wrapper, a shim, a no-op. An agent loop reads `success` and every
+ * conclusion after that is about a program that never executed.
+ *
+ * POSITIVE IDENTIFICATION, not inference from a missing signal: a kern old enough to predate
+ * `KERN_STARTED_FD` writes no bytes either, and refusing it would punish an old binary rather than a
+ * fake one. `kern --version` prints `kern <version>`, a prefix kern's own suite asserts.
+ *
+ * Memoised per binary identity, so it costs one `--version` (measured at 0.9 ms) per distinct binary
+ * per process and nothing afterwards. Fail-closed: unrunnable, slow or unrecognised is refused, because
+ * an unverifiable runtime is the case this exists for. Mirrors `_verify_is_kern`. */
+function verifyIsKern(bin) {
+  let key;
+  try {
+    const st = fs.statSync(bin);
+    key = [fs.realpathSync(bin), st.dev, st.ino, st.size, st.mtimeMs].join("|");
+  } catch (e) {
+    throw new SandboxError(`could not stat the kern binary at '${bin}': ${e.message}`);
+  }
+  if (VERIFIED_KERN.has(key)) return;
+  const hint =
+    "If this is not the kern you meant, set $KERN_BIN to the right path. To install kern:\n" +
+    "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh";
+  // Generous on purpose: a loaded machine must not be told its kern is fake. `--version` writes one
+  // line, so a binary that cannot answer in ten seconds is not one to trust with a box.
+  const out = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 10000 });
+  if (out.error && out.error.code === "ETIMEDOUT")
+    throw new SandboxError(
+      `'${bin}' did not answer \`--version\` within 10s, so it cannot be identified as kern. ${hint}`,
+    );
+  if (out.error) throw new SandboxError(`could not run '${bin} --version': ${out.error.message}. ${hint}`);
+  const first = String(out.stdout || "").trim().split("\n")[0] || "";
+  if (out.status !== 0 || !first.startsWith("kern ")) {
+    const shown = first ? JSON.stringify(first.slice(0, 120)) : "(no output)";
+    throw new SandboxError(
+      `'${bin}' is not kern: \`${bin} --version\` exited ${out.status} and printed ${shown}, where kern ` +
+        "prints a line beginning 'kern '. Refusing to run code, because a binary that is not kern would " +
+        `return an EMPTY, SUCCESSFUL result for every call and the code would never run. ${hint}`,
+    );
+  }
+  VERIFIED_KERN.add(key);
+}
+
+/** Locate `kern`: $KERN_BIN if set, else the first `kern` on $PATH. The result is also IDENTIFIED as
+ * kern (see `verifyIsKern`): being executable and being named `kern` are not the same as being kern. */
 function findKern() {
   const env = process.env.KERN_BIN;
   if (env) {
@@ -572,6 +630,7 @@ function findKern() {
     } catch {
       throw new SandboxError(`$KERN_BIN='${env}' is not an executable file`);
     }
+    verifyIsKern(env);
     return env;
   }
   const exts = [""];
@@ -581,7 +640,10 @@ function findKern() {
       const cand = path.join(d, "kern" + ext);
       try {
         fs.accessSync(cand, fs.constants.X_OK);
-        if (fs.statSync(cand).isFile()) return cand;
+        if (fs.statSync(cand).isFile()) {
+          verifyIsKern(cand);
+          return cand;
+        }
       } catch {
         /* keep looking */
       }
@@ -1484,6 +1546,7 @@ class Sandbox {
       let boxStarted = false;
       let capSignal = 0; // 2nd started byte: 0 undetermined/old-kern, 1 memory cap enforced, 2 not enforced
       let oomSignal = 0; // 3rd started byte: 1 = the kernel OOM-killed this box's own cgroup, 0 = it did not
+      let workloadSignal = null; // 4th started byte: the signal that killed the workload, 0 = it exited
       try {
         // detached: own process group, so we can signal the box + kern as a unit (killpg).
         // The 4th stdio slot is fd 3: the child (kern) writes the started byte, the parent reads it.
@@ -1536,6 +1599,9 @@ class Sandbox {
           if (sig.length >= 1 && sig[0] === 1) boxStarted = true;
           if (sig.length >= 2) capSignal = sig[1];
           if (sig.length >= 3) oomSignal = sig[2];
+          // Byte 3 = the SIGNAL that terminated the workload, 0 if it exited on its own. `null` here is
+          // NOT zero: it means the byte never arrived (an older kern, or a kern our teardown killed).
+          if (sig.length >= 4) workloadSignal = sig[3];
         });
         startedCh.on("error", () => {});
       }
@@ -1562,7 +1628,9 @@ class Sandbox {
         const stdout = out.buffer().toString("utf8");
         const stderr = err.buffer().toString("utf8");
         const rc = toRc(code, signal);
-        let fault = this._classify(rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal, aliveState);
+        let fault = this._classify(
+          rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal, aliveState, workloadSignal,
+        );
         const execFail = execFailureBinary(stderr);
         if (execFail !== null && rc !== 0) {
           // BEFORE the suppression below, which would erase it: the box started, so that branch
@@ -1660,7 +1728,10 @@ class Sandbox {
     }
   }
 
-  _classify(rc, signal, stderr, timedOut, timeoutS, capSignal = 0, oomSignal = 0, aliveState = ALIVE_UNKNOWN) {
+  _classify(
+    rc, signal, stderr, timedOut, timeoutS, capSignal = 0, oomSignal = 0, aliveState = ALIVE_UNKNOWN,
+    workloadSignal = null,
+  ) {
     // ORDER IS A SECURITY PROPERTY: deterministic-by-exit-code classes are decided BEFORE the stderr
     // heuristic, because stderr is a channel the workload controls.
     if (timedOut) {
@@ -1684,9 +1755,18 @@ class Sandbox {
         `exceeded the ${timeoutS ?? this.timeoutS}s time limit (killed by the binding)`,
       );
     }
-    if (rc === EXIT_SIGSYS || signal === "SIGSYS")
+    // THE EXIT CODE IS THE RIGHT THING TO PROPAGATE AND THE WRONG THING TO CLASSIFY FROM: kern reports
+    // the workload's status as `128 + N`, so a workload the kernel killed and one that called `exit(137)`
+    // are the same number. MEASURED through the Python binding: `sys.exit(137)` came back `killed` with a
+    // message about an external kill that never happened, and `sys.exit(159)` came back `escape_blocked`,
+    // a security event a cell could fabricate in one line. kern's 4th started-byte carries the signal.
+    // `null` (an older kern, or a kern our teardown killed first) keeps the old exit-code reading:
+    // absence of evidence is not evidence. `signal === "SIG..."` is a different question, kern ITSELF
+    // being signalled, and stays as it was.
+    const killedBy = (n) => workloadSignal === null || workloadSignal === n;
+    if ((rc === EXIT_SIGSYS && killedBy(SIG_SYS)) || signal === "SIGSYS")
       return sandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)");
-    if (rc === EXIT_SIGKILL || signal === "SIGKILL") {
+    if ((rc === EXIT_SIGKILL && killedBy(SIG_KILL)) || signal === "SIGKILL") {
       // Only kern's own OOM sentence buys the `oom` label (`kernReportedOom`, the one definition shared
       // with the resident-kernel and pool death paths).
       //
@@ -1716,7 +1796,7 @@ class Sandbox {
         );
       return sandboxFault("killed", "the box was killed (SIGKILL); no memory cap was set to attribute it to OOM");
     }
-    if (rc === EXIT_SIGTERM || signal === "SIGTERM")
+    if ((rc === EXIT_SIGTERM && killedBy(SIG_TERM)) || signal === "SIGTERM")
       return sandboxFault("timeout", "the box exceeded its time limit (reaped by kern's timeout backstop)");
     // Box-not-started: a non-zero exit whose stderr carries kern's OWN setup markers (printed by the
     // PARENT before the box runs). kern's box-not-started paths BOTH exit 125 AND print a `kern:` marker,

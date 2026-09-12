@@ -23,7 +23,10 @@ import pytest
 import kern_sandbox as kern
 from kern_sandbox import ExecutionResult, Kernel, MountRefused, Result, Sandbox, SandboxError
 
-_FAKE_KERN = shutil.which("true") or "/bin/true"
+# The double IMPERSONATES kern's identity contract: the binding refuses a binary that does not,
+# after `KERN_BIN=/bin/true` was measured returning a successful, empty result for code that never
+# ran. See tests/_fake_kern.py.
+from _fake_kern import FAKE_KERN as _FAKE_KERN
 
 # The line kern really prints when the kernel's OOM killer takes a box against its own cap, captured
 # verbatim from `kern box --memory 64 --image python:3.11-alpine` on 2026-09-12. The classifier's
@@ -233,7 +236,7 @@ def test_both_bindings_produce_THE_SAME_tmpfs_argv_for_one_corpus():
 
     script = (
         f"const {{Sandbox}} = require({json.dumps(str(node_src))});\n"
-        "process.env.KERN_BIN = '/bin/true';\n"
+        f"process.env.KERN_BIN = {_FAKE_KERN!r};\n"
         f"const C = {json.dumps([n for _, n in corpus])};\n"
         "const out = C.map(function (o) {\n"
         "  return [false, true].map(function (isSetup) {\n"
@@ -288,10 +291,12 @@ def test_both_bindings_agree_on_every_apparmor_input_behaviourally():
             return False
 
     # Node: validate each input via the SAME path the SDK uses - the Sandbox constructor calls
-    # validateApparmor. KERN_BIN=/bin/true lets construction complete for an ACCEPTED value.
+    # validateApparmor. The kern DOUBLE lets construction complete for an ACCEPTED value: the
+    # binding refuses a binary that cannot identify itself as kern, so /bin/true no longer works
+    # here (and that refusal is the fix for a call that returned success for code that never ran).
     script = (
         f"const {{Sandbox}} = require({json.dumps(str(node_src))});\n"
-        "process.env.KERN_BIN = '/bin/true';\n"
+        f"process.env.KERN_BIN = {_FAKE_KERN!r};\n"
         f"const V = {json.dumps(vectors)};\n"
         "console.log(JSON.stringify(V.map(function (v) {"
         " try { new Sandbox({ apparmor: v }); return true; } catch (e) { return false; } })));\n"
@@ -2953,7 +2958,13 @@ def _stub_kern(body: str) -> str:
     d = Path(os.environ.get("TMPDIR", "/tmp")) / f"kern-stub-{uuid.uuid4().hex[:8]}"
     d.mkdir(parents=True, exist_ok=True)
     p = d / "kern"
-    p.write_text("#!/bin/sh\n" + body)
+    # EVERY stub answers the identity question first, because the binding refuses a binary that cannot:
+    # `KERN_BIN=/bin/true` was measured returning a successful, empty result for code that never ran. A
+    # double that skipped this would be testing the refusal instead of the state it is here for.
+    p.write_text(
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"kern v0.0.0-test-double\" ; exit 0 ;;\nesac\n"
+        + body
+    )
     p.chmod(0o755)
     return str(p)
 
@@ -3067,3 +3078,99 @@ def test_the_alive_probe_never_invents_a_startup_failure():
     os.close(r)
     os.close(w)
     assert kern._alive_state(r) == kern._ALIVE_UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# A BINARY THAT IS NOT KERN MUST BE REFUSED, not silently succeeded
+# ---------------------------------------------------------------------------
+
+
+def test_a_binary_that_is_not_kern_is_refused_before_any_code_runs():
+    """`KERN_BIN` pointing at anything that is not kern must RAISE, never return a clean result.
+
+    MEASURED, and found by an external reviewer running the positive control this project wrote for
+    him: with `KERN_BIN=/bin/true` a call returned `success=True, exit_code=0, fault=None` and an empty
+    stdout. The code never ran and the caller was told it had. Both bindings did it. Any `kern` earlier
+    in `PATH` that is not kern reaches this: a leftover wrapper, a shim, a no-op. An agent loop reads
+    `success` and every conclusion after that is about a program that never executed.
+
+    The check is a POSITIVE identification (`kern --version` prints a line beginning `kern `, asserted
+    by kern's own suite) and not an inference from a missing signal: a kern old enough to predate
+    `KERN_STARTED_FD` writes no bytes either, and refusing it would punish an old binary rather than a
+    fake one.
+    """
+    prev = os.environ.get("KERN_BIN")
+    try:
+        for path, why in [
+            ("/bin/true", "exits 0 and prints coreutils' own version"),
+            ("/bin/echo", "prints something that is not a kern version"),
+            ("/bin/false", "exits non-zero"),
+        ]:
+            if not os.access(path, os.X_OK):
+                continue
+            os.environ["KERN_BIN"] = path
+            with pytest.raises(SandboxError) as ei:
+                Sandbox()
+            msg = str(ei.value)
+            assert "is not kern" in msg or "did not answer" in msg, f"{path} ({why}): {msg}"
+            assert path in msg, f"the refusal must name the binary it refused: {msg}"
+            assert "KERN_BIN" in msg, f"and how to point it elsewhere: {msg}"
+        # A binary that hangs on `--version` is refused too, and BOUNDED: this asserts the refusal
+        # exists, not the ten-second wait, so it uses a stub that exits rather than one that sleeps.
+        # POSITIVE CONTROL: the test double, which answers the identity question and nothing else, is
+        # ACCEPTED. Without it every assertion above would also pass on a binding that refused
+        # everything, which is the failure mode this whole file exists to avoid.
+        os.environ["KERN_BIN"] = _FAKE_KERN
+        Sandbox()  # must not raise
+        # And the verdict is memoised per binary identity, so the cost is paid once: a second Sandbox
+        # on the same binary must not re-run `--version`. Measured by timing, because the memo is not
+        # observable any other way.
+        t0 = time.monotonic()
+        for _ in range(50):
+            Sandbox()
+        per_call_ms = (time.monotonic() - t0) * 1000 / 50
+        assert per_call_ms < 1.0, (
+            f"constructing a Sandbox costs {per_call_ms:.3f} ms, so the identity check is not memoised: "
+            "it would be paid on every box in a prewarm pool"
+        )
+    finally:
+        if prev is None:
+            os.environ.pop("KERN_BIN", None)
+        else:
+            os.environ["KERN_BIN"] = prev
+
+
+def test_a_chosen_exit_code_is_not_a_signal():
+    """A workload that CALLS `exit(137)` did not get SIGKILLed, and must not be reported as if it had.
+
+    MEASURED, and it is the OOM inversion one level down: kern propagates the workload's status as
+    `128 + N`, so a cell doing `sys.exit(137)` and a cell the kernel killed are the same number to
+    everyone downstream. The binding reported the first as `fault = killed` with a message about an
+    external kill that never happened, and `sys.exit(159)` as `escape_blocked`, which is a security event
+    a cell could fabricate in one line. kern's 4th started-byte carries the signal, and these three
+    classes now ask for it.
+
+    `workload_signal=None` is NOT zero: it means this kern does not report it (or our own teardown killed
+    kern before it could), and then the old exit-code reading stands. Absence of evidence is not evidence,
+    and treating it as one would relabel every signalled box on every released binary.
+    """
+    s = _cfg(memory_mb=256)
+    # The signal really happened: kern says which one, and the class holds.
+    assert s._classify(159, "", False, workload_signal=signal.SIGSYS).type == "escape_blocked"
+    assert s._classify(137, "", False, oom_signal=1, workload_signal=signal.SIGKILL).type == "oom"
+    assert s._classify(137, "", False, workload_signal=signal.SIGKILL).type == "killed"
+    assert s._classify(143, "", False, workload_signal=signal.SIGTERM).type == "timeout"
+    # The workload chose the number: no signal, so no sandbox fault. The exit code is still reported.
+    assert s._classify(159, "", False, workload_signal=0) is None
+    assert s._classify(137, "", False, workload_signal=0) is None
+    assert s._classify(143, "", False, workload_signal=0) is None
+    # A chosen 137 with a forged OOM line is still not an OOM, because the signal says nobody killed it.
+    assert s._classify(137, _KERN_OOM_LINE, False, workload_signal=0) is None
+    # COMPATIBILITY, and it is the direction that matters: a kern that does not report the signal keeps
+    # the old verdict on every one of those codes.
+    assert s._classify(159, "", False).type == "escape_blocked"
+    assert s._classify(137, "", False).type == "killed"
+    assert s._classify(143, "", False).type == "timeout"
+    # And our own kill of kern (a negative returncode) is ours to interpret whatever the byte says, since
+    # no byte can arrive when kern dies before its teardown.
+    assert s._classify(-signal.SIGKILL, "", False, workload_signal=None).type == "killed"

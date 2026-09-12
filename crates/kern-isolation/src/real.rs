@@ -4681,6 +4681,11 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
         return Err(Error::last("waitpid"));
     }
     let code = wait_code(status);
+    // LATCH WHETHER A SIGNAL DID IT, unconditionally and before anything else reads the status. kern is
+    // about to propagate `128 + N` as its own exit code, which erases the difference between a workload
+    // the kernel killed and one that called `exit(137)`: both leave kern exiting 137 normally. A caller
+    // cannot recover that from the outside, so it is recorded here and handed over on the started-fd.
+    crate::cgroup::latch_workload_signal(status);
     // LATCH THE OOM VERDICT HERE, the one point where it can still be read: the box is reaped, so its
     // counter is final, and `cg`'s `Drop` (which removes that directory) has not run yet. The caller
     // decides what to print only after this function returns, by which time the directory is gone -
