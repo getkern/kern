@@ -7,6 +7,103 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern-sandbox 0.2.0, a MINOR bump, because `fault.type` changes value for the same event.** The
+Python and Node bindings go from 0.1.43 to 0.2.0 rather than to a patch, and the three reasons are
+each a contract a caller can have written code against: an external `kern stop` during a cell used to
+arrive as `oom` and now arrives as `killed`, a workload that chooses `exit 137` used to arrive as
+`killed` and now arrives as no fault at all, and a `KERN_BIN` that is not kern used to report success
+and now raises. Each is below.
+
+**The `oom` verdict was inverted, in both bindings.** MEASURED with a probe rather than by reading the
+code: `kern stop <box>` while a cell was running arrived as `fault=oom`, and a real OOM inside a
+resident `Kernel` RAISED instead of classifying. The binding was reading the SECOND byte of
+`KERN_STARTED_FD`, which states whether the memory cap is ENFORCED (`1` enforced, `2` requested and
+not enforced, `0` undetermined). Enforcement is a property of the host, not an outcome of the run, so
+on every host where the cap works the answer to "is the cap real" was being read as the answer to
+"did this die of it". kern now writes the outcome as a THIRD byte, latched from the box's own cgroup
+at the reap, and both bindings read that. The byte and not kern's stderr sentence, because stderr is a
+stream the workload also writes: a binding that classified an OOM by matching the sentence would
+accept a forgery about the box's own death, and that forgery is one of the cases in
+`scripts/fault-taxonomy-battery.py`.
+
+**A workload that CHOOSES `exit 137` was reported as killed, and one line of Python could fabricate
+`escape_blocked`.** 137 is what a shell reports for a SIGKILL, so a binding inferring the signal from
+the status cannot tell the kernel killing a box from `sys.exit(137)` inside it. `exit 159` did the
+same for SIGSYS, which is the seccomp class: `import sys; sys.exit(159)` was enough to make the SDK
+report that kern had blocked an escape that never happened. kern now writes the workload's terminating
+SIGNAL as a FOURTH byte, `0` when the workload exited on its own, so a chosen 137 is a normal result
+carrying no fault.
+
+**`KERN_BIN` pointing at a program that is not kern reported success for code that never ran.**
+MEASURED in BOTH bindings with `KERN_BIN=/bin/true`: no output, exit 0, `success=True`, `fault=None`.
+The positive control this project had written for that case said to expect zero faults, so the control
+blessed the defect; the correct expectation is a REFUSAL. There are two layers now. The binding
+identifies the binary positively with `--version` and refuses anything whose version line is not
+kern's, memoised on `(realpath, dev, ino, size, mtime_ns)` so the cost is paid once per binary. And
+because identifying is not behaving (a stub that prints `kern v9.9.9-fake` and exits 0 passes the
+first layer), a run that produced no output, exited 0 and never signalled that a box started is
+`startup_failed`, naming the version the binary claimed.
+
+**A deadline that expired while kern was still BUILDING the box was reported as the user's timeout.**
+The two are different faults for an agent: one means the code is slow and a longer deadline is
+sensible, the other means the box never existed and retrying changes nothing. kern now exposes a
+readiness channel, `KERN_ALIVE_FD`, and answers it with an ack byte when the box's setup is entered.
+The four states a caller can observe: the ack and then nothing, still building; the ack and then EOF,
+the workload ran (the child's descriptor closes on `execvp` through `FD_CLOEXEC`, so the EOF is the
+exec itself); the ack and then a byte, setup failed; nothing at all, a kern older than the channel. A
+deadline reached in the first state is `startup_failed`, not `timeout`.
+
+**A kernel that died because the thread that spawned it exited now says so.** `PR_SET_PDEATHSIG` fires
+on the death of the creating THREAD on Linux, not of the process, so a `Kernel` created in a worker
+thread dies when that thread returns even though the process is alive and the object still looks
+usable. The binding records the spawning thread and, when the kernel is found dead and that thread is
+gone, names that cause instead of reporting a generic teardown.
+
+**`--memory 64` caps a box at 64 BYTES, and the message that followed sent the reader in a circle.** A
+bare number is bytes, so a box given `--memory 64` dies in ~3 ms with kern's own OOM message, which
+correctly tells the reader to raise the cap. They raise it to `128`, and it happens again. The mistake
+is the missing unit and nothing in the output said so. MEASURED on this host with `--image alpine`: 4
+KiB, 64 KiB and 128 KiB start nothing, 256 KiB runs `/bin/true` but not a shell, 384 KiB runs `/bin/sh
+-c 'echo hi'`. The floor sits AT the largest cap where nothing ran, 128 KiB, and the refusal is
+`< floor`, so it can only reject a cap that cannot start a box and never one that measurably works. It
+is deliberately not Docker's 6 MiB minimum, which would refuse the 384 KiB case that runs here. The
+refusal names the unit and says the value may have come from a compose file's `mem_limit:`,
+`memswap_limit:` or `deploy.resources.limits.memory:` rather than from something typed.
+
+**A refused first service left an empty pod behind.** `compose up` creates the pod before the first
+service starts, so a service kern refuses (a cap below the floor, a FIFO volume, an image that is not
+there) left a pod with no members in the registry, and the next `up` of the same project inherited it.
+The pod this invocation created is now removed on the way out when the registry shows it has no
+members. A pod that was already there is left alone.
+
+**`scripts/fault-taxonomy-battery.py`: 22 cases that decide the taxonomy on the host in front of
+you.** Every fault class on all three execution paths (one-shot, resident kernel, prewarmed), both
+forgery cases, the two layers of the binary gate, and the descriptor-reach case. Two disciplines are
+in it because both were paid for here: a case skips on a HOST CAPABILITY that it probes and prints
+(`memory_cap_bites()` shows the `memory.max` it read), never on what the test expects, since a skip
+keyed on the expectation is a no-op that reports green; and residue is a DELTA against a baseline
+taken before the run, not an absolute count, which failed on an outside reviewer's own machine. It
+reports 22 ok on this desktop against both the glibc and the musl build, inside a WSL2 Alpine distro,
+and on an aarch64 Jetson Orin Nano.
+
+**`SECURITY.md` said `-p 8080:80` binds to loopback, and kern binds `0.0.0.0`.** A reader hardening a
+host against the document would have believed a published port was unreachable from the network when
+it was reachable. The document now states the default kern has, shows what a masked path looks like
+from inside a box, splits sanitisation by channel (kern's own rendering strips control bytes, `kern
+logs` passes the workload's bytes through as written), and says how to verify that the binary the SDK
+is about to run is kern.
+
+**`scripts/docker-vocabulary.py`: the words a Docker user TYPES have to be findable, whatever the
+answer is.** Twice in one day a capability shipped finished, tested and invisible, because the
+documentation described it in the project's own words rather than the words someone arrives with:
+`extra_hosts` with `host-gateway` shipped with a test and an example while `host.docker.internal`
+appeared in no `.md` at all, and `kern login` is a real verb in the parser while `docker login`
+appeared nowhere. A reader whose container cannot reach the host searches for the string, finds
+nothing, and concludes kern cannot do it. The gate holds twelve words, each with the reason it earns
+its row, and a "no" is a fine answer as long as the word that leads to it is in the text: `--gpus` is
+on the list and kern ships no GPU cap. The controls run first, so a finder that matches everything or
+nothing cannot report a green.
+
 **A typo in a service's command cost three seconds, every time.** MEASURED: `kern box -d --image
 alpine -- /nonexistent-binary` took 3.035 SECONDS, and `kern compose up -d` on a stack with one such
 service took 3.037. The same command in the FOREGROUND took 5 ms, which is what said the cost was in
