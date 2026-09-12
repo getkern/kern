@@ -47,6 +47,13 @@ jobs:
           python3 scripts/no-ai-slop.py
           python3 scripts/stale-numbers.py
           python3 scripts/test-count.py
+          # THE WORDS A DOCKER USER TYPES, which is `stale-numbers` applied to the question instead of
+          # the answer. Twice in one day a capability was finished, tested and invisible because the
+          # docs used the project's words: `extra_hosts`+`host-gateway` shipped with a test while
+          # `host.docker.internal` appeared in no `.md`, and `kern login` is a real verb that lived only
+          # in `--help`, where someone evaluating kern before installing cannot look. A "no" is a fine
+          # answer; a word that leads nowhere is not.
+          python3 scripts/docker-vocabulary.py
           # Every child under the runtime registry root must be CLASSIFIED (authoritative dir / box-data
           # dir / sibling tree / cosmetic file) at COMPILE time, not just when a constructor is exercised
           # at runtime: `runstats` builds `<runtime>/kern/runstats` WITHOUT the runtime chokepoint, the

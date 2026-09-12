@@ -328,9 +328,56 @@ manual on purpose.
 | `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
 | `commit` | `commit` | box → reusable image (warm start) |
 | `start` (resume a stopped container) | *(none)* | a box runs as long as you want and its volumes persist; what is not supported is resuming one you already stopped. Launch a fresh box against the same volume |
+| `login` / `logout` | `login` / `logout` | `kern login [registry] [--username U]`, and see below |
 
 What needs a daemon does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything
-that attaches to it.
+that attaches to it. Nor does `--gpus`: kern ships no GPU cap and says why in
+[GPU-CLAIMS.md](GPU-CLAIMS.md), so a workload that needs the whole card gets the whole card and there
+is no quota to ask for.
+
+### Reaching the host from inside a box: `host.docker.internal`
+
+Docker resolves that name inside a container to the host. kern does not invent the name, it gives you
+the mapping and lets you spell it, which is the same thing Docker does when you write it yourself:
+
+```yaml
+services:
+  app:
+    image: python:3.12-slim
+    extra_hosts: ["host.docker.internal:host-gateway"]
+```
+
+or on a box:
+
+```sh
+kern box app --image python:3.12-slim --add-host host.docker.internal:host-gateway -- python3 app.py
+```
+
+`host-gateway` is the keyword, resolved to the address the box reaches the host on; the NAME beside it
+is yours, so `host.docker.internal`, `dockerhost` and `gateway` all work and all mean the same thing.
+Three spellings are accepted for the compose key (`extra_hosts`, and the `--add-host` flag, and
+`add_host = [...]` in a `kern.toml`), and [examples/add-host.sh](../examples/add-host.sh) runs it.
+
+**A box is on its own network namespace by default**, so nothing reaches the host until you say so:
+that mapping IS the saying so.
+
+### A private registry: `docker login`
+
+`kern login` is the same verb with the same shape:
+
+```sh
+kern login                      # Docker Hub
+kern login ghcr.io              # any registry, prompted for the credentials
+kern login registry.example.com --username alice
+kern logout ghcr.io
+```
+
+It follows the standard registry-v2 challenge, so any compliant registry works, and the credentials
+never touch `argv`: they are stored `0600` in a `0700` directory and handed to `curl` through a stdin
+config, so no same-uid process can read them from `/proc/<pid>/cmdline`. A Bearer challenge only sends
+them to the advertised token realm when that host is the registry host or a subdomain of its parent
+domain (the CVE-2020-15157 class), and otherwise fetches the token anonymously and says so. The full
+model is in [SECURITY.md](../SECURITY.md#registry-authentication).
 
 ## Building and publishing images
 

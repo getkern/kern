@@ -61,7 +61,7 @@ else
         "SKIP  target not installed: rustup target add aarch64-unknown-linux-gnu"
 fi
 echo "docs"
-for g in flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \
+for g in docker-vocabulary flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \
          registry-classified stale-numbers test-count progress-is-tty-gated gates-selftest; do
     step "$g" python3 "scripts/$g.py"
 done
