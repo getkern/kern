@@ -122,6 +122,52 @@ def memory_cap_bites(kern: str) -> "tuple[bool, str]":
     return True, f"memory.max inside a box capped at 64m reads {seen!r}"
 
 
+def signal_protocol_width(kern: str) -> "tuple[int, str]":
+    """How many bytes does THIS binary write to `KERN_STARTED_FD`? Returns (width, the evidence).
+
+    ASKED OF THE BINARY, for the same reason `memory_cap_bites` is asked of the host. The three
+    chosen-exit cases need the FOURTH byte, the workload's terminating signal, and a kern that predates
+    it cannot answer them: MEASURED against v0.9.32, which writes two bytes, a CORRECT SDK reports
+    `killed` for a chosen `exit 137`, because nothing on the wire says otherwise and 137 is what a shell
+    reports for a SIGKILL. Failing there would tell a reader who installed the current release that the
+    SDK is broken, when what they measured is their binary's age. The reverse skew is already covered by
+    the parser: a byte kern has not grown yet reads as undetermined.
+
+    The probe IS the protocol: kern writes the payload at teardown, so a box running `/bin/true` with a
+    pipe on the descriptor returns exactly the bytes this binary speaks. The read end is non-blocking
+    with a deadline, because a descriptor a lingering supervisor still holds would otherwise hang the
+    probe instead of answering it.
+    """
+    r, w = os.pipe()
+    try:
+        os.set_blocking(r, False)
+        p = subprocess.run(
+            [kern, "box", f"taxsig-{os.getpid()}", "--image", "alpine", "--", "/bin/true"],
+            capture_output=True, text=True, check=False, pass_fds=(w,),
+            env=dict(os.environ, KERN_STARTED_FD=str(w)),
+        )
+        os.close(w)
+        w = -1
+        if p.returncode != 0:
+            return 0, f"did not run a probe box (exit {p.returncode})"
+        got = b""
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                chunk = os.read(r, 8)
+            except BlockingIOError:
+                time.sleep(0.02)
+                continue
+            if not chunk:
+                break
+            got += chunk
+        return len(got), f"wrote {len(got)} byte(s) to KERN_STARTED_FD: {list(got)}"
+    finally:
+        if w != -1:
+            os.close(w)
+        os.close(r)
+
+
 def stop_new(kern: str, before: set) -> list:
     """Stop only boxes that appeared AFTER the snapshot, so a concurrent session is never touched."""
     out = []
@@ -205,6 +251,9 @@ def main() -> int:
 
     caps_bite, cap_evidence = memory_cap_bites(kern)
     print(f"host   : memory cap {'BITES' if caps_bite else 'does NOT bite'} ({cap_evidence})")
+    sig_width, sig_evidence = signal_protocol_width(kern)
+    print(f"proto  : this binary {'speaks' if sig_width >= 4 else 'does NOT speak'} the "
+          f"workload-signal byte ({sig_evidence})")
 
     print("one-shot path:")
     if caps_bite:
@@ -256,11 +305,18 @@ def main() -> int:
         )
         result("a cell cannot write the protocol bytes", "WROTE []", (r.stdout or "").strip())
 
-    # THE PAIR THAT NEEDS kern's FOURTH BYTE: the same exit code as a SIGKILL, chosen by the workload.
-    # Without the signal byte these came back `killed` and `escape_blocked`, both invented.
-    with Sandbox(image="alpine", memory_mb=256, timeout_s=30) as s:
+    # THE TRIO THAT NEEDS kern's FOURTH BYTE: the same exit code as a signal, chosen by the workload.
+    # Without the signal byte these came back `killed`, `escape_blocked` and `timeout`, all invented.
+    # The skip keys on the BINARY's protocol width, measured above, not on what this file expects: a kern
+    # that writes two bytes cannot answer this, and 19 ok with three named skips is the honest report.
+    if sig_width >= 4:
+        with Sandbox(image="alpine", memory_mb=256, timeout_s=30) as s:
+            for code in (137, 159, 143):
+                result(f"chosen exit {code} is not a signal", None, fault_of(s.run(["/bin/sh", "-c", f"exit {code}"])))
+    else:
         for code in (137, 159, 143):
-            result(f"chosen exit {code} is not a signal", None, fault_of(s.run(["/bin/sh", "-c", f"exit {code}"])))
+            skip(f"chosen exit {code} is not a signal",
+                 f"it needs the workload-signal byte, and this binary {sig_evidence}")
     snap = running(kern)
     with Sandbox(image=IMAGE, memory_mb=256, timeout_s=90) as s:
         threading.Timer(2.5, lambda: stop_new(kern, snap)).start()
