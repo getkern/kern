@@ -606,6 +606,55 @@ _ALIVE_IN_SETUP = "in-setup"      # kern acknowledged the channel and is still B
 _ALIVE_UNKNOWN = "unknown"        # nothing on the pipe: a kern that predates this channel
 
 
+def _parse_started_bytes(sig: bytes) -> "tuple[bool, int, int, int | None]":
+    """kern's KERN_STARTED_FD payload, as ``(box_started, cap_signal, oom_signal, workload_signal)``.
+
+    THE WIRE FORMAT IS SPELLED HERE AND NOWHERE ELSE, because it has grown twice in one day (the OOM
+    outcome, then the workload's signal) and each time a reader that had its own copy of the layout was
+    left behind: one still asked for three bytes where kern wrote four, silently leaving one in the pipe.
+
+    byte 0 = the box started (kern reached the `Ok` arm with a code that is not 125)
+    byte 1 = the memory-cap enforcement signal: 0 undetermined, 1 enforced, 2 requested but not enforced
+    byte 2 = the OOM outcome: 1 iff the kernel's OOM killer fired against this box's own cgroup
+    byte 3 = the signal that terminated the workload, 0 if it exited on its own
+
+    A SHORT read is an OLDER kern, not a malformed one: every absent byte reads as its "undetermined"
+    value (0, and `None` for the signal, which must stay distinguishable from "nothing killed it").
+    """
+    return (
+        len(sig) >= 1 and sig[0] == 1,
+        sig[1] if len(sig) >= 2 else 0,
+        sig[2] if len(sig) >= 3 else 0,
+        sig[3] if len(sig) >= 4 else None,
+    )
+
+
+def _read_teardown_bytes(fd: int, wait_s: float = 2.0) -> "tuple[int, int, int | None]":
+    """kern's teardown bytes off a KERN_STARTED_FD read end, as ``(cap_signal, oom_signal,
+    workload_signal)``. ``(0, 0, None)`` on EOF, timeout or any error.
+
+    ONE READER FOR ONE PROTOCOL. There were two, a few lines apart and identical but for what they
+    returned, and when kern grew a fourth byte only one of them was updated: the other kept asking for
+    three and left a byte in the pipe for whoever read next. Two readers of one wire format is the same
+    defect shape as two lists that must agree, and this file already carries that lesson twice.
+
+    Bounded by `select`, because kern writes these only at the box's TEARDOWN: called while the box is
+    live it would block, and called after our own kill it answers for a process we already reaped. The
+    ``None`` for the signal is not a zero: it means this kern does not report it.
+    """
+    if fd < 0:
+        return 0, 0, None
+    try:
+        ready, _, _ = select.select([fd], [], [], wait_s)
+        if not ready:
+            return 0, 0, None
+        sig = os.read(fd, 4)
+    except OSError:
+        return 0, 0, None
+    _, cap, oom, wl = _parse_started_bytes(sig)
+    return cap, oom, wl
+
+
 def _alive_state(fd: int) -> str:
     """Where was kern when this was called, read off the `KERN_ALIVE_FD` pipe. Never blocks.
 
@@ -1859,10 +1908,7 @@ class Sandbox:
                 sig = os.read(started_r, 4)
             except OSError:
                 sig = b""
-            box_started = len(sig) >= 1 and sig[0] == 1
-            cap_signal = sig[1] if len(sig) >= 2 else 0
-            oom_signal = sig[2] if len(sig) >= 3 else 0
-            workload_signal = sig[3] if len(sig) >= 4 else None
+            box_started, cap_signal, oom_signal, workload_signal = _parse_started_bytes(sig)
         finally:
             # Every exit path, including the two SandboxErrors above: kern has read the file by the time
             # it exits, and leaving it behind would accrete one per call in a persistent workspace.
@@ -2704,6 +2750,19 @@ class Kernel:
         # teardown (the box exits), i.e. when a cell kills the kernel - so it is read ONCE, bounded, on
         # death (see `_read_cap_signal`), never while the box is live (that would block).
         self._started_r = -1
+        # THE THREAD THAT WILL START THE BOX, kept so a death can be ATTRIBUTED rather than guessed.
+        #
+        # kern arms `PR_SET_PDEATHSIG(SIGKILL)` on a foreground box so a hard-killed launcher leaves no
+        # orphan, and on Linux that signal fires when the creating THREAD dies, not when the process does.
+        # So a kernel started inside a short-lived thread is SIGKILLed the moment that thread returns, and
+        # the next cell sees an external kill it cannot explain. MEASURED here: a cell run after the
+        # spawning thread exited came back `fault = killed` with a message naming three causes, none of
+        # them the real one. Before the OOM work of 2026-09-12 the same death was labelled `oom`.
+        #
+        # Recording the thread makes the diagnosis an OBSERVATION: if it is no longer alive when the box
+        # dies, that IS the cause. The one-shot path needs none of this, because a call cannot outlive the
+        # thread that is blocked inside it.
+        self._spawn_thread = threading.current_thread()
 
     def __enter__(self) -> "Kernel":
         sbx = self._sbx
@@ -2767,7 +2826,8 @@ class Kernel:
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            fault, default = self._kernel_death_fault(err, *self._read_cap_signal())
+            cap_sig, oom_sig, wl_sig = self._read_cap_signal()
+            fault, default = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig)
             return self._teardown_result(fault, err.strip() or default, started)
         try:
             reply = self._q.get(timeout=eff)
@@ -2779,32 +2839,21 @@ class Kernel:
             )
         if reply is None:
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            fault, default = self._kernel_death_fault(err, *self._read_cap_signal())
+            cap_sig, oom_sig, wl_sig = self._read_cap_signal()
+            fault, default = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig)
             return self._teardown_result(fault, err.strip() or default, started)
         return self._result_from_reply(reply, started)
 
-    def _read_cap_signal(self) -> "tuple[int, int]":
-        """kern's cap-enforcement and OOM-outcome bytes for the resident box, read ONCE on kernel death, as
-        ``(cap_signal, oom_signal)``. kern writes the KERN_STARTED_FD signal only at the box's teardown (a
-        resident box exits when a cell kills it), so this is called from the death paths above and NEVER
-        while the box is live (that read would block). Bounded: `select` waits up to 2 s for kern to reap
-        the box and close the fd, then reads. Returns ``(0, 0)`` on EOF (an older kern), timeout or any
-        error, so a missing signal only ever falls back to kern's stderr sentence, never blocks or raises.
+    def _read_cap_signal(self) -> "tuple[int, int, int | None]":
+        """kern's teardown bytes for the resident box, read ONCE on kernel death. See
+        :func:`_read_teardown_bytes`, which is the one reader of that wire format: kern writes it only at
+        the box's teardown (a resident box exits when a cell kills it), so this is called from the death
+        paths above and never while the box is live."""
+        return _read_teardown_bytes(self._started_r)
 
-        BOTH bytes come from one read because they arrive in one atomic write; reading them separately
-        would leave the second read to a pipe that the first call may already have drained."""
-        if self._started_r < 0:
-            return 0, 0
-        try:
-            ready, _, _ = select.select([self._started_r], [], [], 2.0)
-            if not ready:
-                return 0, 0
-            sig = os.read(self._started_r, 3)
-        except OSError:
-            return 0, 0
-        return (sig[1] if len(sig) >= 2 else 0), (sig[2] if len(sig) >= 3 else 0)
-
-    def _kernel_death_fault(self, err: str, cap_signal: int = 0, oom_signal: int = 0) -> "tuple[str, str]":
+    def _kernel_death_fault(
+        self, err: str, cap_signal: int = 0, oom_signal: int = 0, workload_signal: "int | None" = None
+    ) -> "tuple[str, str]":
         """Why the resident kernel box died mid-cell, and a default message. The ``run_code`` counterpart
         of the one-shot :meth:`_classify` SIGKILL branch: a kernel death has no per-cell exit code, so the
         whole verdict is made here from what kern wrote.
@@ -2826,6 +2875,19 @@ class Kernel:
             return "oom", "the kernel box exceeded its memory cap and was OOM-killed"
         if _looks_like_startup_failure(err):
             return "startup_failed", "the kernel box failed to start"
+        # THE ONE CAUSE THIS PATH CAN NAME EXACTLY, before the honest-but-vague ones below. kern arms
+        # PDEATHSIG on a foreground box, that signal fires on the death of the creating THREAD on Linux,
+        # and a kernel started inside a short-lived thread is therefore SIGKILLed when that thread
+        # returns. If the thread is gone, this is not one of three possible external kills: it is that
+        # one, and the remedy is a thread that outlives the box rather than a retry.
+        if not self._spawn_thread.is_alive():
+            return (
+                "killed",
+                "the kernel box was killed because the thread that started it has exited: kern arms "
+                "PR_SET_PDEATHSIG on the box, and on Linux that signal fires when the CREATING THREAD "
+                "dies, not when the process does. Start the kernel from the main thread, or from a "
+                "thread that lives at least as long as the session",
+            )
         if cap_signal == 2:
             return (
                 "killed",
@@ -2838,6 +2900,17 @@ class Kernel:
                 "the kernel box was killed and the kernel reported no OOM against its memory cap: an "
                 "external kill (`kern stop`, a signal, or the host running out of memory), not the box "
                 "exceeding its own memory",
+            )
+        # NOBODY KILLED IT, and kern's fourth byte is what allows saying so. A resident kernel whose
+        # driver exits on its own (it crashed, or something inside the box killed it) is not an external
+        # kill, and a message that says "killed" with no cause is the vague answer this file keeps
+        # replacing with named ones. `None` means this kern does not report it, and then the old wording
+        # stands rather than a claim the byte did not support.
+        if workload_signal == 0:
+            return (
+                "killed",
+                "the kernel box exited on its own (no signal killed it), so its interpreter is gone: a "
+                "crash inside the box, or something in the box ending PID 1",
             )
         return "killed", "the kernel box exited"
 
@@ -3238,19 +3311,11 @@ class _WarmBox:
         )
 
     def _read_cap_signal(self) -> "tuple[int, int]":
-        """kern's cap-enforcement and OOM-outcome bytes, read once on death, as ``(cap_signal,
-        oom_signal)``. Bounded by a 2 s select and returns ``(0, 0)`` on EOF, timeout or error, so a
-        missing signal only ever falls back to kern's stderr sentence."""
-        if self._started_r < 0:
-            return 0, 0
-        try:
-            ready, _, _ = select.select([self._started_r], [], [], 2.0)
-            if not ready:
-                return 0, 0
-            sig = os.read(self._started_r, 3)
-        except OSError:
-            return 0, 0
-        return (sig[1] if len(sig) >= 2 else 0), (sig[2] if len(sig) >= 3 else 0)
+        """kern's cap-enforcement and OOM-outcome bytes, read once on death. The pool has no use for the
+        workload's signal (it classifies from the box's own exit code through `_classify`), but the read
+        itself is shared: see :func:`_read_teardown_bytes` for why there is exactly one."""
+        cap, oom, _ = _read_teardown_bytes(self._started_r)
+        return cap, oom
 
     def _result(
         self,

@@ -951,6 +951,30 @@ function isKernDiagnostic(line) {
  * reporting `killed` - wrong in the safe direction, still wrong. Mirrors `_KERN_OOM_MARKER`. */
 const KERN_OOM_MARKER = "killed by the kernel's OOM killer";
 
+/** kern's KERN_STARTED_FD payload, as `{ boxStarted, capSignal, oomSignal, workloadSignal }`.
+ *
+ * THE WIRE FORMAT IS SPELLED HERE AND NOWHERE ELSE, because it grew twice in one day (the OOM outcome,
+ * then the workload's signal) and each time a reader with its own copy of the layout was left behind.
+ * Three places in this file read those bytes; they now all read them through this.
+ *
+ *   byte 0 = the box started (kern reached its `Ok` arm with a code that is not 125)
+ *   byte 1 = the memory-cap enforcement signal: 0 undetermined, 1 enforced, 2 requested but not enforced
+ *   byte 2 = the OOM outcome: 1 iff the kernel's OOM killer fired against this box's own cgroup
+ *   byte 3 = the signal that terminated the workload, 0 if it exited on its own
+ *
+ * A SHORT buffer is an OLDER kern, not a malformed one: every absent byte reads as its "undetermined"
+ * value (0, and `null` for the signal, which must stay distinguishable from "nothing killed it").
+ * Mirrors `_parse_started_bytes`. */
+function parseStartedBytes(buf) {
+  const b = buf || Buffer.alloc(0);
+  return {
+    boxStarted: b.length >= 1 && b[0] === 1,
+    capSignal: b.length >= 2 ? b[1] : 0,
+    oomSignal: b.length >= 3 ? b[2] : 0,
+    workloadSignal: b.length >= 4 ? b[3] : null,
+  };
+}
+
 /** The byte kern writes to `KERN_ALIVE_FD` the moment it accepts the descriptor, before any box setup.
  * It is what tells "the setup has not finished" from "this binary does not speak the protocol": an older
  * kern never writes to that pipe AND never closes it, so the pipe is open and silent in both cases.
@@ -1590,18 +1614,14 @@ class Sandbox {
         // (a NEWER kern still) = the OOM OUTCOME: 1 iff the kernel's OOM killer fired against this box's
         // OWN cgroup. Enforcement is not an outcome, and this byte is the only place the outcome arrives
         // on a channel the workload cannot write.
-        // ACCUMULATED rather than read off one chunk: kern's write is atomic, so the three bytes arrive
-        // together in practice, but a stream that split them would silently cost us the last byte - and a
-        // lost OOM byte reads as "no OOM", which is the wrong answer arrived at invisibly.
+        // ACCUMULATED rather than read off one chunk: kern's write is atomic, so all four bytes arrive
+        // together in practice, but a stream that split them would silently cost us the last one - and a
+        // lost OOM byte reads as "no OOM", a lost signal byte as "nothing killed it", both wrong answers
+        // arrived at invisibly.
         let sig = Buffer.alloc(0);
         startedCh.on("data", (b) => {
           sig = Buffer.concat([sig, b]);
-          if (sig.length >= 1 && sig[0] === 1) boxStarted = true;
-          if (sig.length >= 2) capSignal = sig[1];
-          if (sig.length >= 3) oomSignal = sig[2];
-          // Byte 3 = the SIGNAL that terminated the workload, 0 if it exited on its own. `null` here is
-          // NOT zero: it means the byte never arrived (an older kern, or a kern our teardown killed).
-          if (sig.length >= 4) workloadSignal = sig[3];
+          ({ boxStarted, capSignal, oomSignal, workloadSignal } = parseStartedBytes(sig));
         });
         startedCh.on("error", () => {});
       }
@@ -2581,8 +2601,8 @@ class Kernel {
         ch.once("error", () => { clearTimeout(t); res(); });
       });
     }
-    const sig = this._startedSig;
-    return [sig.length >= 2 ? sig[1] : 0, sig.length >= 3 ? sig[2] : 0];
+    const { capSignal, oomSignal } = parseStartedBytes(this._startedSig);
+    return [capSignal, oomSignal];
   }
 
   _teardownResult(type, message, started) {
@@ -2945,8 +2965,7 @@ class WarmBox {
         fault: { type: "timeout", message: msg || "the code exceeded its deadline" },
       });
     }
-    const capSignal = this._startedSig.length >= 2 ? this._startedSig[1] : 0;
-    const oomSignal = this._startedSig.length >= 3 ? this._startedSig[2] : 0;
+    const { capSignal, oomSignal } = parseStartedBytes(this._startedSig);
     this.retire();
     let type = "killed";
     let dflt = "the box exited before the code finished";

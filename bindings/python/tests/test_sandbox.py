@@ -11,6 +11,7 @@ import errno
 import json
 import re
 import signal
+import threading
 from pathlib import Path
 import os
 import shutil
@@ -3174,3 +3175,41 @@ def test_a_chosen_exit_code_is_not_a_signal():
     # And our own kill of kern (a negative returncode) is ours to interpret whatever the byte says, since
     # no byte can arrive when kern dies before its teardown.
     assert s._classify(-signal.SIGKILL, "", False, workload_signal=None).type == "killed"
+
+
+def test_a_kernel_killed_by_its_spawning_thread_says_so():
+    """A kernel started inside a short-lived thread is SIGKILLed when that thread returns, and the SDK
+    must name THAT rather than offer three external kills of which none is the cause.
+
+    kern arms `PR_SET_PDEATHSIG(SIGKILL)` on a foreground box so a hard-killed launcher leaves no orphan,
+    and on Linux that signal fires on the death of the CREATING THREAD, not of the process. MEASURED end
+    to end: a cell run after the spawning thread exited returned `fault = killed` with a message naming
+    host memory, `kern stop` and a signal, and the real cause was the thread. Before the OOM work of
+    2026-09-12 the same death was labelled `oom`, which is how this class first cost a day.
+
+    The attribution is an OBSERVATION, not a guess: the thread object is recorded at construction and
+    `is_alive()` answers exactly.
+    """
+    k = Kernel(_cfg(memory_mb=256), timeout_s=5)
+    # A thread that has finished, which is precisely the condition.
+    dead = threading.Thread(target=lambda: None)
+    dead.start()
+    dead.join()
+    k._spawn_thread = dead
+    kind, msg = k._kernel_death_fault("")
+    assert kind == "killed"
+    assert "thread that started it has exited" in msg
+    assert "PDEATHSIG" in msg, f"the message must name the mechanism, or it cannot be acted on: {msg}"
+    assert "main thread" in msg, f"and the remedy: {msg}"
+    # POSITIVE CONTROL: with a LIVE spawning thread the same death keeps the honest general message, or
+    # this would blame the thread for every kill in the world.
+    k._spawn_thread = threading.current_thread()
+    kind, msg = k._kernel_death_fault("")
+    assert kind == "killed"
+    assert "thread" not in msg, f"a live thread must not be blamed: {msg}"
+    assert "external kill" in msg
+    # And it does not outrank the causes that are KNOWN: a real OOM stays an OOM even if the thread died,
+    # because kern observed the OOM and the thread is only an inference about a kill nobody observed.
+    k._spawn_thread = dead
+    assert k._kernel_death_fault("", oom_signal=1)[0] == "oom"
+    assert k._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
