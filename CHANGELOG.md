@@ -38,9 +38,11 @@ still reports `oom` through the sentence, which is the only channel that binary 
 carries the case, it needs no memory cap, and it passes on both binaries: 23 ok on the four-byte
 build, 20 ok and 3 skipped on the two-byte one.
 
-The bound that remains is narrow and stated in the code: a kern that writes no third byte, on a run
-it DID tear down, still takes its verdict from text the workload can also write. Both outcomes are
-sandbox faults, and timeout / blocked-escape are decided by exit code before any text is read.
+The bound that remains is narrow, stated in the code, and measured rather than reasoned: against the
+published v0.9.32, a cell that writes the sentence and then chooses `exit 137` reports `oom`, where the
+same cell without the sentence reports `killed`. That is a run kern DID tear down, where its sentence is
+the only channel that binary has. Both outcomes are sandbox faults, and timeout / blocked-escape are
+decided by exit code before any text is read.
 
 **kern-sandbox 0.2.0, a MINOR bump, because `fault.type` changes value for the same event.** The
 Python and Node bindings go from 0.1.43 to 0.2.0 rather than to a patch, and the three reasons are

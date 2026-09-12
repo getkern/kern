@@ -980,7 +980,9 @@ const KERN_OOM_MARKER = "killed by the kernel's OOM killer";
  * kern's own OOM sentence to stderr and was then stopped from outside came back `fault=oom` while the
  * third byte said 0 - the inverted verdict the byte exists to close, re-opened by the sandboxed code in
  * one line. Preferring the byte was not enough on its own: an outside kill takes the box BEFORE
- * teardown, so a new binary also arrives with no byte. Mirrors `_oom_verdict`. */
+ * teardown, so a new binary also arrives with no byte. The remaining bound is measured: against v0.9.32
+ * a cell that writes the sentence and then chooses `exit 137` reports `oom`, and without the sentence
+ * `killed`. Mirrors `_oom_verdict`. */
 function oomVerdict(oomSignal, stderr, kernWrotePayload) {
   if (oomSignal !== null && oomSignal !== undefined) return oomSignal === 1;
   if (!kernWrotePayload) return false;

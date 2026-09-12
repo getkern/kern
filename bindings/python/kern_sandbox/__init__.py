@@ -659,10 +659,12 @@ def _oom_verdict(oom_signal: "int | None", stderr: str, *, kern_wrote_payload: b
     travels on the same wire: kern's payload starts with the byte that says a box ran, so "kern wrote
     nothing" is knowable without asking the binary its version.
 
-    The bound that remains is the old binary's and it is narrow: a kern that writes no third byte, on a
-    run it DID tear down, takes its verdict from text the workload can also write. Both outcomes are
-    sandbox faults, and timeout / blocked-escape are decided by exit code before any text is read, so the
-    worst case is a caller misleading itself about its own kill.
+    The bound that remains is the old binary's and it is narrow, and it is MEASURED rather than reasoned:
+    against kern v0.9.32, a cell that writes the sentence and then chooses `exit 137` reports `oom`,
+    where the same cell without the sentence reports `killed`. That is case 3, a run kern DID tear down,
+    where the sentence is the only channel that binary has. Both outcomes are sandbox faults, and
+    timeout / blocked-escape are decided by exit code before any text is read, so the worst case is a
+    caller misleading itself about its own kill.
     """
     if oom_signal is not None:
         return oom_signal == 1
