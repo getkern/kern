@@ -620,6 +620,36 @@ def test_fault_is_named_in_the_tail(monkeypatch):
     assert r["result"]["isError"] is True
 
 
+def test_fault_reason_travels_with_the_type(monkeypatch):
+    """The TYPE alone is not always actionable, and the one that prompted this is `killed`.
+
+    MEASURED on this channel before the reason was carried: an externally stopped box gave the model
+    `(no output)` and `[exit 137, sandbox fault: killed]`, nothing more, while a real OOM gave it kern's
+    whole sentence on stderr. The binding knows the difference and says so in the message.
+    """
+    msg = ("the box was SIGKILLed and the kernel reported no OOM against its memory cap: this is an "
+           "external kill (`kern stop`, a signal, or the host's own OOM killer), not the box exceeding "
+           "its own memory")
+    s = _server(_FakeSession(result=_res(exit_code=137, fault=SandboxFault(type="killed", message=msg))))
+    text = _text_of(_one(s, _call("run_code", code="x"), monkeypatch))
+    assert "sandbox fault: killed: the box was SIGKILLed" in text
+    assert "external kill" in text
+    # BOUNDED, and newline-free: the tail is one line the model reads after the output, and it is exempt
+    # from the aggregate budget precisely because it must never be clipped away.
+    long_fault = SandboxFault(type="killed", message="x" * 5_000 + "\nsecond line")
+    text = _text_of(_one(_server(_FakeSession(result=_res(exit_code=137, fault=long_fault))),
+                         _call("run_code", code="x"), monkeypatch))
+    tail = text.rsplit("\n\n", 1)[-1]
+    assert len(tail) < M._MAX_FAULT_REASON + 120, f"the tail is unbounded: {len(tail)} chars"
+    assert "\n" not in tail
+    # POSITIVE CONTROL: a fault with no message still names its type, and a clean run grows no reason.
+    bare = _text_of(_one(_server(_FakeSession(result=_res(exit_code=137, fault=SandboxFault(type="killed", message="")))),
+                         _call("run_code", code="x"), monkeypatch))
+    assert "[exit 137, sandbox fault: killed]" in bare
+    clean = _text_of(_one(_server(_FakeSession(result=_res())), _call("run_code", code="x"), monkeypatch))
+    assert clean.rstrip().endswith("[exit 0]")
+
+
 def test_no_output_is_stated_not_empty(monkeypatch):
     s = _server(_FakeSession(result=_res()))
     assert "(no output)" in _text_of(_one(s, _call("run_code", code="x"), monkeypatch))

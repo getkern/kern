@@ -1924,14 +1924,32 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // carries none - so it is classified exactly as it is today, a normal non-zero result.
             // The enforcement byte is lost in this case too, which is correct: there was no box to cap.
             if let Some(fd) = started_fd.filter(|_| code != 125) {
-                // TWO bytes, written atomically (a pipe write of <= PIPE_BUF is all-or-nothing):
+                // THREE bytes, written atomically (a pipe write of <= PIPE_BUF is all-or-nothing):
                 //   byte 0 = `1`, the unchanged "box started" signal - an SDK that reads only ONE byte
                 //           (every 0.1.x binding) still sees exactly `0x01` and is unaffected;
                 //   byte 1 = the memory-cap ENFORCEMENT signal (0 undetermined, 1 enforced, 2 requested
                 //           but not enforced), so a NEWER SDK can tell an OOM against a real ceiling from
                 //           a plain kill where the cap never bound. An OLDER kern wrote one byte, so a
-                //           newer SDK reads EOF for byte 1 and treats enforcement as undetermined.
-                let buf = [1u8, kern_isolation::memory_cap_signal()];
+                //           newer SDK reads EOF for byte 1 and treats enforcement as undetermined;
+                //   byte 2 = the OOM OUTCOME (1 = the kernel's OOM killer fired against this box's OWN
+                //           cgroup, 0 = it did not, or nothing was read).
+                //
+                // WHY BYTE 2 EXISTS, and it is a correctness fix rather than a convenience. Enforcement
+                // is not an outcome: byte 1 says a ceiling was in force, which every `kern stop` of a
+                // capped box also satisfies. An SDK that read `SIGKILL + cap enforced` as "OOM" was
+                // MEASURED reporting `kern stop` during a cell as `oom`, sending an agent to retry with
+                // more memory a kill that had nothing to do with memory. The only honest source is the
+                // kernel's own counter for the box's own cgroup, which kern already latches
+                // (`latch_box_oom`) and prints on stderr. STDERR IS NOT ENOUGH: the workload writes to
+                // the same stream, so a binding keying off the sentence accepts a forgery about the
+                // box's own death. This byte carries the same observation where the workload cannot
+                // reach it, and each byte stays ONE fact - overloading byte 1 with a value 3 would make
+                // "was the cap enforced" a question with two right answers.
+                let buf = [
+                    1u8,
+                    kern_isolation::memory_cap_signal(),
+                    u8::from(kern_isolation::box_was_oom_killed()),
+                ];
                 loop {
                     let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
                     if n < 0

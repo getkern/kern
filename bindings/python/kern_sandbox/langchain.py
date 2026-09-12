@@ -98,7 +98,7 @@ _LANGUAGES = {
 #
 # And the framing below is OURS. `[sandbox: oom]` means the sandbox acted; a box that prints that
 # string forges a verdict about itself, byte for byte, in the one channel the model uses to decide
-# whether to trust the run. kern went to the trouble of an unforgeable fd signal to tell oom from
+# whether to trust the run. kern went to the trouble of an unforgeable fd byte to tell oom from
 # killed, and handing the forgery back for free at the text layer would undo it. So the marker is
 # neutralised wherever the code, and not this module, produced it. Same for the truncation marker,
 # which is a claim about completeness.

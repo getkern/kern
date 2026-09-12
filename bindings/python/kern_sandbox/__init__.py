@@ -588,6 +588,44 @@ class Result:
 # start. Those two must agree by construction; when they were separate lists they did not have to.
 _KERN_DIAGNOSTICS = ("kern: security-profile=", "kern: warning:", "kern: note:")
 
+# The sentence kern prints when it has READ the kernel's OOM counter for this box's own cgroup, as
+# opposed to anything the SDK could infer from an exit code. Kept as one constant because it is a
+# contract between two programs: if kern rewords it, this stops recognising a real OOM and starts
+# reporting `killed`, which is wrong in the safe direction but still wrong.
+_KERN_OOM_MARKER = "killed by the kernel's OOM killer"
+
+
+def _kern_reported_oom(stderr: str) -> bool:
+    """True iff KERN said the kernel's OOM killer took this box against its own memory cap.
+
+    The ONE definition of "this was an OOM", used by all three death paths (the one-shot exit-code
+    classifier, the resident kernel's death, and a pool box that died) so they cannot drift into
+    disagreeing about the same box. It is an OBSERVATION - kern reads `memory.events` and says so -
+    where the SDK can only infer, and the inference it replaced was measured wrong in both
+    directions: `kern stop` during a cell was reported `oom`, while a real OOM on the resident
+    kernel was reported as a box that failed to start.
+
+    Anchored on kern's own `kern:` line prefix, which the real line carries (measured verbatim:
+    `kern: the workload was killed by the kernel's OOM killer against this box's own memory cap.`),
+    so a cell that merely PRINTS about OOM killers in prose does not match. MINUS the benign
+    diagnostics, which a positive control caught: `kern: note: <anything the note mentions>` starts
+    with the prefix too, and a note that quotes the sentence is kern TALKING about an OOM, not
+    reporting one. Same subtraction, from the same one list, as `_looks_like_startup_failure`.
+
+    THE FALLBACK, NOT THE AUTHORITY. Against a kern that writes the 3rd KERN_STARTED_FD byte the
+    verdict comes from there instead, on a pipe the workload never holds. This is what covers an older
+    binary, and it is forgeable in exactly one direction: a workload that writes the whole
+    `kern:`-prefixed sentence itself turns its own `killed` into `oom`. Both are sandbox faults, and
+    timeout / blocked-escape are decided by exit code before any text is read, so the worst case is a
+    caller misleading itself about its own kill. Same bound, for the same reason, as
+    `_looks_like_startup_failure` and `_exec_failure`.
+    """
+    for line in stderr.splitlines():
+        s = line.lstrip()
+        if s.startswith("kern:") and not s.startswith(_KERN_DIAGNOSTICS) and _KERN_OOM_MARKER in s:
+            return True
+    return False
+
 
 @dataclass
 class ExecutionResult:
@@ -1630,6 +1668,7 @@ class Sandbox:
         child_env["KERN_STARTED_FD"] = str(started_w)
         box_started = False
         cap_signal = 0  # 2nd started byte: 0 undetermined/old-kern, 1 memory cap enforced, 2 not enforced
+        oom_signal = 0  # 3rd started byte: 1 = the kernel OOM-killed this box's own cgroup, 0 = it did not
         try:
             try:
                 # start_new_session so the box + kern share a process group we can signal as a unit.
@@ -1668,12 +1707,17 @@ class Sandbox:
             # kern has exited, so its write end is closed. Byte 0 = the box started (setup succeeded,
             # command ran); EOF (empty) = it never started, or an old kern that does not signal. Byte 1
             # (a NEWER kern only) = the memory-cap enforcement signal; absent (EOF) = undetermined.
+            # Byte 2 (a NEWER kern still) = the OOM OUTCOME: 1 iff the kernel's OOM killer fired against
+            # this box's OWN cgroup. Enforcement is not an outcome, which is the distinction the whole
+            # `oom` vs `killed` split rests on, and this byte is the only place the answer arrives where
+            # the workload cannot write it.
             try:
-                sig = os.read(started_r, 2)
+                sig = os.read(started_r, 3)
             except OSError:
                 sig = b""
             box_started = len(sig) >= 1 and sig[0] == 1
             cap_signal = sig[1] if len(sig) >= 2 else 0
+            oom_signal = sig[2] if len(sig) >= 3 else 0
         finally:
             # Every exit path, including the two SandboxErrors above: kern has read the file by the time
             # it exits, and leaving it behind would accrete one per call in a persistent workspace.
@@ -1703,7 +1747,7 @@ class Sandbox:
         # this aligns the number for code that does not.
         if rc < 0:
             rc = 128 + (-rc)
-        fault = self._classify(rc, stderr, we_timed_out, timeout_s, cap_signal)
+        fault = self._classify(rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal)
         exec_fail = _exec_failure_binary(stderr)
         if exec_fail is not None and rc != 0:
             # BEFORE the suppression below, which would erase it: the box started, so that branch
@@ -1782,6 +1826,7 @@ class Sandbox:
         we_timed_out: bool,
         timeout_s: "int | float | None" = None,
         cap_signal: int = 0,
+        oom_signal: int = 0,
     ) -> SandboxFault | None:
         # ORDER IS A SECURITY PROPERTY. The classes that are DETERMINISTIC by exit code are decided
         # FIRST, BEFORE we ever look at stderr - because stderr is a channel the workload controls, and
@@ -1800,24 +1845,47 @@ class Sandbox:
             return SandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)")
         if rc == _EXIT_SIGKILL or rc == -signal.SIGKILL:
             # SIGKILL not from our deadline: exit 137 (128+9), or subprocess's -9 if kern itself was
-            # signalled. A memory-capped box SIGKILLed is the cgroup OOM-killer - precisely what a
-            # breached `memory.max` does (kern sets `memory.oom.group=1`, so the whole box dies at once).
-            # `cap_signal` is kern's UNFORGEABLE per-box enforcement byte (2nd byte of KERN_STARTED_FD, so
-            # not the workload's stderr - the order-is-a-security-property discipline holds): 1 = the cap
-            # was enforced, 2 = requested but NOT enforced here (no cgroup delegation), 0 = undetermined
-            # (an older kern, or no `--memory`). We claim `oom` when a `--memory` cap was set AND kern did
-            # not report it unenforced (`cap_signal != 2`): enforced (1) is a certain cgroup OOM, and
-            # undetermined (0) keeps the pre-signal heuristic for older kerns. When kern reports the cap
-            # did NOT bind (2), a SIGKILL cannot be attributed to the box's cgroup - it is host memory
-            # pressure or an external kill - so we do not overclaim `oom` and keep the honest `killed`.
-            if self.memory_mb is not None and cap_signal != 2:
+            # signalled. `oom` is claimed only on kern's own OBSERVATION of the kernel's counter for this
+            # box's cgroup, from the UNFORGEABLE byte first and its stderr sentence second.
+            #
+            # THE BYTE IS THE AUTHORITY, THE SENTENCE IS FOR AN OLDER KERN. The 3rd byte of
+            # KERN_STARTED_FD is written to a pipe the workload never holds, so it cannot be forged or
+            # suppressed; the sentence goes to the stream the workload also writes, so a cell could print
+            # it and relabel its own `killed` as `oom`. A kern that predates the byte still reports the
+            # OOM in text, so the fallback is what keeps a mixed pair (new SDK, old binary) correct
+            # instead of quietly downgrading every real OOM to `killed`.
+            #
+            # WHAT THIS REPLACED, because the replaced version read as sound: a SIGKILL of a
+            # memory-capped box was called the cgroup OOM-killer, which is what a breached
+            # `memory.max` does (kern sets `memory.oom.group=1`, so the whole box goes at once).
+            # MEASURED: `kern stop` during a cell returns 137, so it came back `oom`, and an agent
+            # branching on the fault would retry with MORE MEMORY a kill that had nothing to do with
+            # memory. A confident wrong answer is worse than an unclassified one.
+            #
+            # The first repair kept the inference for `cap_signal == 0` ("an older kern that cannot
+            # tell"), which changed nothing: MEASURED, the byte is 0 on this host for every run, so
+            # that branch still covered every case. Hence no inference at all. kern has printed the
+            # OOM sentence since 2026-09-04; against a kern older than that a real OOM now reads
+            # `killed`, wrong in the direction that costs nothing - the agent does not retry memory.
+            if oom_signal == 1 or _kern_reported_oom(stderr):
                 return SandboxFault("oom", "the box exceeded its memory cap and was OOM-killed (SIGKILL)"
                                     + self._scratch_note())
+            # `cap_signal` (kern's UNFORGEABLE enforcement byte: 1 = the cap was enforced, 2 =
+            # requested but NOT enforced here, 0 = undetermined) no longer decides the TYPE, and a 2
+            # still earns its own sentence: that the cap never bound is the one thing the caller
+            # cannot discover for itself, and it explains why no OOM was reported against it.
             if cap_signal == 2:
                 return SandboxFault(
                     "killed",
-                    "the box was SIGKILLed, but its memory cap was not enforced here (no cgroup "
-                    "delegation), so it is not attributed to a cgroup OOM",
+                    "the box was SIGKILLed, and its memory cap was not enforced here (no cgroup "
+                    "delegation), so no memory limit was in force to attribute it to",
+                )
+            if self.memory_mb is not None:
+                return SandboxFault(
+                    "killed",
+                    "the box was SIGKILLed and the kernel reported no OOM against its memory cap: "
+                    "this is an external kill (`kern stop`, a signal, or the host's own OOM killer), "
+                    "not the box exceeding its own memory",
                 )
             return SandboxFault("killed", "the box was killed (SIGKILL); no memory cap was set to attribute it to OOM")
         if rc in (_EXIT_SIGTERM, -signal.SIGTERM):
@@ -2519,7 +2587,7 @@ class Kernel:
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            fault, default = self._kernel_death_fault(err, self._read_cap_signal())
+            fault, default = self._kernel_death_fault(err, *self._read_cap_signal())
             return self._teardown_result(fault, err.strip() or default, started)
         try:
             reply = self._q.get(timeout=eff)
@@ -2531,46 +2599,65 @@ class Kernel:
             )
         if reply is None:
             err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            fault, default = self._kernel_death_fault(err, self._read_cap_signal())
+            fault, default = self._kernel_death_fault(err, *self._read_cap_signal())
             return self._teardown_result(fault, err.strip() or default, started)
         return self._result_from_reply(reply, started)
 
-    def _read_cap_signal(self) -> int:
-        """kern's memory-cap enforcement byte for the resident box, read ONCE on kernel death. kern
-        writes the two-byte KERN_STARTED_FD signal only at the box's teardown (a resident box exits when
-        a cell kills it), so this is called from the death paths above and NEVER while the box is live
-        (that read would block). Bounded: `select` waits up to 2 s for kern to reap the box and close the
-        fd, then reads. Returns 0 (undetermined -> the memory_mb heuristic stands) on EOF (an older kern),
-        timeout, or any error, so a missing signal only ever falls back, never blocks or raises."""
+    def _read_cap_signal(self) -> "tuple[int, int]":
+        """kern's cap-enforcement and OOM-outcome bytes for the resident box, read ONCE on kernel death, as
+        ``(cap_signal, oom_signal)``. kern writes the KERN_STARTED_FD signal only at the box's teardown (a
+        resident box exits when a cell kills it), so this is called from the death paths above and NEVER
+        while the box is live (that read would block). Bounded: `select` waits up to 2 s for kern to reap
+        the box and close the fd, then reads. Returns ``(0, 0)`` on EOF (an older kern), timeout or any
+        error, so a missing signal only ever falls back to kern's stderr sentence, never blocks or raises.
+
+        BOTH bytes come from one read because they arrive in one atomic write; reading them separately
+        would leave the second read to a pipe that the first call may already have drained."""
         if self._started_r < 0:
-            return 0
+            return 0, 0
         try:
             ready, _, _ = select.select([self._started_r], [], [], 2.0)
             if not ready:
-                return 0
-            sig = os.read(self._started_r, 2)
+                return 0, 0
+            sig = os.read(self._started_r, 3)
         except OSError:
-            return 0
-        return sig[1] if len(sig) >= 2 else 0
+            return 0, 0
+        return (sig[1] if len(sig) >= 2 else 0), (sig[2] if len(sig) >= 3 else 0)
 
-    def _kernel_death_fault(self, err: str, cap_signal: int = 0) -> "tuple[str, str]":
-        """Why the resident kernel box died mid-cell, and a default message. A kern setup marker on
-        stderr means it never came up (``startup_failed``). Otherwise this is the ``run_code`` counterpart
-        of the one-shot :meth:`_classify` SIGKILL branch - a kernel death has no per-cell exit code, so
-        the OOM attribution lives here. ``cap_signal`` is kern's UNFORGEABLE enforcement byte (0 = old
-        kern / undetermined, 1 = memory cap enforced, 2 = requested but NOT enforced): with a ``--memory``
-        cap in force AND not-reported-unenforced (``!= 2``), the cgroup OOM-killer is the cause -> ``oom``;
-        when kern reports the cap did not bind (``2``) the kill cannot be attributed to the box's cgroup
-        -> ``killed``; uncapped is also ``killed``."""
+    def _kernel_death_fault(self, err: str, cap_signal: int = 0, oom_signal: int = 0) -> "tuple[str, str]":
+        """Why the resident kernel box died mid-cell, and a default message. The ``run_code`` counterpart
+        of the one-shot :meth:`_classify` SIGKILL branch: a kernel death has no per-cell exit code, so the
+        whole verdict is made here from what kern wrote.
+
+        ORDER, and it was measured wrong before: the OOM is asked about FIRST, because kern's sentence is
+        `kern:`-prefixed and so was also matching the box-did-not-start heuristic below. A real OOM on a
+        resident kernel therefore came back as ``startup_failed``, which :meth:`_teardown_result` RAISES -
+        so the flagship path could not produce an ``oom`` fault at all, while an external ``kern stop``
+        DID produce one from the ``memory_mb`` inference. Two defects pointing opposite ways.
+
+        ``oom_signal`` is kern's UNFORGEABLE OOM-outcome byte (3rd of KERN_STARTED_FD, 1 = the kernel's
+        OOM killer fired against this box's own cgroup) and is the authority; the stderr sentence is the
+        fallback for a kern that predates the byte. ``cap_signal`` is the enforcement byte (0 = old kern /
+        undetermined, 1 = cap enforced, 2 = requested but NOT enforced): it does NOT decide the type - a
+        SIGKILL on a capped box is not evidence of an OOM, whatever the byte says - but a 2 still earns a
+        sentence, because "your cap was not in force here" is the one thing the caller cannot find out for
+        itself."""
+        if oom_signal == 1 or _kern_reported_oom(err):
+            return "oom", "the kernel box exceeded its memory cap and was OOM-killed"
         if _looks_like_startup_failure(err):
             return "startup_failed", "the kernel box failed to start"
-        if self._sbx.memory_mb is not None and cap_signal != 2:
-            return "oom", "the kernel box was OOM-killed (it exceeded its memory cap)"
         if cap_signal == 2:
             return (
                 "killed",
-                "the kernel box was SIGKILLed, but its memory cap was not enforced here (no cgroup "
-                "delegation), so it is not attributed to a cgroup OOM",
+                "the kernel box was killed, and its memory cap was not enforced here (no cgroup "
+                "delegation), so no memory limit was in force to attribute it to",
+            )
+        if self._sbx.memory_mb is not None:
+            return (
+                "killed",
+                "the kernel box was killed and the kernel reported no OOM against its memory cap: an "
+                "external kill (`kern stop`, a signal, or the host running out of memory), not the box "
+                "exceeding its own memory",
             )
         return "killed", "the kernel box exited"
 
@@ -2940,17 +3027,28 @@ class _WarmBox:
                 "", "", self._exit_code(), started, before,
                 fault=SandboxFault(type="timeout", message=msg or "the code exceeded its deadline"),
             )
-        cap_signal = self._read_cap_signal()
+        cap_signal, oom_signal = self._read_cap_signal()
         self.retire()
-        if _looks_like_startup_failure(err):
+        # Same order, and for the same measured reason, as `_kernel_death_fault`: kern's OOM sentence
+        # carries the `kern:` prefix that `_looks_like_startup_failure` matches on, so asking about the
+        # start SECOND is what keeps a pool box's OOM from being raised as a box that never came up. The
+        # unforgeable byte is preferred over the sentence here too.
+        if oom_signal == 1 or _kern_reported_oom(err):
+            fault, default = "oom", "the box exceeded its memory cap and was OOM-killed"
+        elif _looks_like_startup_failure(err):
             raise SandboxError(err.strip() or "the box failed to start")
-        if self._sbx.memory_mb is not None and cap_signal != 2:
-            fault, default = "oom", "the box was OOM-killed (it exceeded its memory cap)"
         elif cap_signal == 2:
             fault, default = (
                 "killed",
-                "the box was SIGKILLed, but its memory cap was not enforced here (no cgroup "
-                "delegation), so it is not attributed to a cgroup OOM",
+                "the box was killed, and its memory cap was not enforced here (no cgroup delegation), "
+                "so no memory limit was in force to attribute it to",
+            )
+        elif self._sbx.memory_mb is not None:
+            fault, default = (
+                "killed",
+                "the box was killed and the kernel reported no OOM against its memory cap: an external "
+                "kill (`kern stop`, a signal, or the host running out of memory), not the box exceeding "
+                "its own memory",
             )
         else:
             fault, default = "killed", "the box exited before the code finished"
@@ -2959,19 +3057,20 @@ class _WarmBox:
             fault=SandboxFault(type=fault, message=err.strip() or default),  # type: ignore[arg-type]
         )
 
-    def _read_cap_signal(self) -> int:
-        """kern's memory-cap enforcement byte, read once on death. Bounded by a 2 s select and returns 0
-        (undetermined) on EOF, timeout or error, so a missing signal only ever falls back."""
+    def _read_cap_signal(self) -> "tuple[int, int]":
+        """kern's cap-enforcement and OOM-outcome bytes, read once on death, as ``(cap_signal,
+        oom_signal)``. Bounded by a 2 s select and returns ``(0, 0)`` on EOF, timeout or error, so a
+        missing signal only ever falls back to kern's stderr sentence."""
         if self._started_r < 0:
-            return 0
+            return 0, 0
         try:
             ready, _, _ = select.select([self._started_r], [], [], 2.0)
             if not ready:
-                return 0
-            sig = os.read(self._started_r, 2)
+                return 0, 0
+            sig = os.read(self._started_r, 3)
         except OSError:
-            return 0
-        return sig[1] if len(sig) >= 2 else 0
+            return 0, 0
+        return (sig[1] if len(sig) >= 2 else 0), (sig[2] if len(sig) >= 3 else 0)
 
     def _result(
         self,
@@ -3315,9 +3414,15 @@ def _looks_like_startup_failure(stderr: str) -> bool:
     # `--security-profile` posture banner, and `warning:`/`note:` lines. They start with `kern:` too, so
     # without this skip a workload that merely exits non-zero WHILE one is on stderr (e.g. code run under
     # `security_profile="untrusted"` that hits a network error) would be mislabeled `startup_failed`.
+    #
+    # The OOM sentence is skipped for a sharper reason: it is a report about a box that RAN, and it is
+    # `kern:`-prefixed, so it used to satisfy this predicate. MEASURED, that is how a real OOM on a
+    # resident kernel came back as `startup_failed` and was RAISED instead of returning an `oom` fault.
+    # A workload that prints the sentence itself and exits non-zero now reads as its own failure rather
+    # than a startup failure, the same accepted bound as `_exec_failure`.
     for line in stderr.splitlines():
         s = line.lstrip()
-        if s.startswith(_KERN_DIAGNOSTICS):
+        if s.startswith(_KERN_DIAGNOSTICS) or _kern_reported_oom(line):
             continue
         if "sandbox setup failed" in s or any(s.startswith(m) for m in markers):
             return True

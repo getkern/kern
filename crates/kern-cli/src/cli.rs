@@ -4053,14 +4053,14 @@ mod tests {
         }
         // The name is case-insensitive and space-tolerant, as it was before the table moved.
         let mixed = parse_ulimit(" MemLock =-1").expect("case and spaces are tolerated");
-        assert_eq!(
-            mixed,
-            (
-                libc::RLIMIT_MEMLOCK as i32,
-                libc::RLIM_INFINITY,
-                libc::RLIM_INFINITY
-            )
-        );
+        // COMPARED THROUGH i64, not `as i32`, because the constant's TYPE differs between libcs: an
+        // unsigned `__rlimit_resource_t` on glibc, a plain `c_int` on musl. Any conversion to `i32` is
+        // redundant on exactly one of them, and `-D warnings` against the musl target - which is what
+        // kern actually SHIPS - turned that redundancy into the only error in the tree. Widening both
+        // sides is correct on both, and says what the comparison is about: the resource NUMBER.
+        assert_eq!(i64::from(mixed.0), libc::RLIMIT_MEMLOCK as i64);
+        assert_eq!(mixed.1, libc::RLIM_INFINITY);
+        assert_eq!(mixed.2, libc::RLIM_INFINITY);
     }
 
     /// A flag the read-only config verbs do not take must be REFUSED. `kern config list --json`

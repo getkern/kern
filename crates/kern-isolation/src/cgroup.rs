@@ -71,6 +71,11 @@ pub fn latch_box_oom(dir: &std::path::Path) {
 }
 
 /// Did the box this process supervised die to its own memory cap? See [`latch_box_oom`].
+///
+/// Read TWICE at teardown, for two different readers: kern's own stderr sentence, and the THIRD byte of
+/// the `KERN_STARTED_FD` signal. The byte exists because stderr is a stream the workload also writes,
+/// so a binding that classified an OOM by reading the sentence would accept a forgery about the box's
+/// own death; an SDK reading this byte cannot be lied to by the code it is sandboxing.
 #[must_use]
 pub fn box_was_oom_killed() -> bool {
     BOX_WAS_OOM_KILLED.load(std::sync::atomic::Ordering::Acquire)

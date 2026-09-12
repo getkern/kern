@@ -25,6 +25,16 @@ from kern_sandbox import ExecutionResult, Kernel, MountRefused, Result, Sandbox,
 
 _FAKE_KERN = shutil.which("true") or "/bin/true"
 
+# The line kern really prints when the kernel's OOM killer takes a box against its own cap, captured
+# verbatim from `kern box --memory 64 --image python:3.11-alpine` on 2026-09-12. The classifier's
+# contract is with kern's OUTPUT, so the tests use the real sentence: a paraphrase would keep passing
+# while the anchoring rotted, which is the failure mode the whole taxonomy exists to avoid.
+_KERN_OOM_LINE = (
+    "kern: the workload was killed by the kernel's OOM killer against this box's own memory cap. "
+    'Raise it with `--memory <size>` (or `memory = "<size>"` in a vcpu: profile) if the workload '
+    "needs more.\n"
+)
+
 
 def _cfg(**kw):
     """Construct a Sandbox with a fake kern, restoring the real $KERN_BIN so integration tests still
@@ -612,38 +622,85 @@ def test_classify_order_escape_not_masked_by_stderr_marker():
     s = _cfg()
     forged = "error: sandbox: totally not a real kern setup error\n"
     assert s._classify(159, forged, False).type == "escape_blocked"  # SIGSYS wins over the marker
-    assert s._classify(137, forged, False).type == "oom"  # SIGKILL wins over the marker (capped box: OOM)
+    assert s._classify(137, forged, False).type == "killed"  # SIGKILL wins over the marker
     assert s._classify(1, forged, False).type == "startup_failed"  # plain non-zero: marker heuristic
     assert s._classify(1, "boom\n", False) is None  # non-zero, no marker: user code, no fault
+    # The same order holds for the OTHER sentence a workload could forge: kern's OOM line is the only
+    # text that buys `oom`, and it still cannot mask a class decided by exit code.
+    assert s._classify(159, _KERN_OOM_LINE, False).type == "escape_blocked"
+    assert s._classify(143, _KERN_OOM_LINE, False).type == "timeout"
+    assert s._classify(137, _KERN_OOM_LINE, True).type == "timeout"  # our deadline, before any text
+    # The accepted bound, pinned rather than described: forging that sentence on an ordinary non-zero
+    # exit downgrades `startup_failed` to "the user's code failed", masking no fault class.
+    assert s._classify(1, _KERN_OOM_LINE, False) is None
 
 
-def test_classify_sigkill_is_oom_only_when_a_memory_cap_was_set():
-    # A SIGKILL (137 or -9) of a MEMORY-CAPPED box is the cgroup OOM-killer: kern sets
-    # memory.oom.group=1, so a breached memory.max takes the WHOLE box. The signal is the `--memory`
-    # flag WE set (self.memory_mb), never the workload's stderr, so it keeps the same
-    # order-is-a-security-property discipline as the classes above. Uncapped, the cause is ambiguous
-    # (host memory pressure, an external kill) and stays `killed`.
+def test_classify_sigkill_is_oom_only_when_kern_reported_the_oom():
+    # A SIGKILL is `oom` ONLY when KERN said the kernel's OOM killer took the box against its own cap.
+    # It replaces an inference that read as sound - a SIGKILL of a memory-capped box IS what a breached
+    # memory.max does, since kern sets memory.oom.group=1 - and was MEASURED wrong: `kern stop` during a
+    # cell exits 137, so it came back `oom`, and an agent branching on the fault retries with MORE MEMORY
+    # a kill that had nothing to do with memory.
     capped = _cfg(memory_mb=256)
-    assert capped._classify(137, "", False).type == "oom"
-    assert capped._classify(-signal.SIGKILL, "", False).type == "oom"
-    # A forged stderr marker cannot flip the exit-code verdict either way.
-    assert capped._classify(137, "error: sandbox: forged\n", False).type == "oom"
+    assert capped._classify(137, _KERN_OOM_LINE, False).type == "oom"
+    assert capped._classify(-signal.SIGKILL, _KERN_OOM_LINE, False).type == "oom"
+    # The cap alone buys nothing now, and neither does the enforcement byte reporting it enforced: that
+    # the cap was IN FORCE is not evidence that it is what killed the box.
+    assert capped._classify(137, "", False).type == "killed"
+    assert capped._classify(-signal.SIGKILL, "", False).type == "killed"
+    assert capped._classify(137, "", False, cap_signal=1).type == "killed"
+    # POSITIVE CONTROL on the anchoring, or every assertion above would also pass on a classifier that
+    # said `killed` to everything: kern's PREFIX is what makes the sentence an observation. A cell that
+    # prints the words itself, or prints them under a benign kern diagnostic, has observed nothing.
+    assert capped._classify(137, "killed by the kernel's OOM killer\n", False).type == "killed"
+    assert capped._classify(137, "kern: note: killed by the kernel's OOM killer\n", False).type == "killed"
+    # A forged setup marker cannot flip the exit-code verdict either way.
+    assert capped._classify(137, "error: sandbox: forged\n", False).type == "killed"
     uncapped = _cfg(memory_mb=None)
     assert uncapped._classify(137, "", False).type == "killed"
     assert uncapped._classify(-signal.SIGKILL, "", False).type == "killed"
-    # PRECEDENCE (locks the check ORDER): even with a cap set, the more specific deterministic classes
-    # win over oom. OUR deadline (we_timed_out) is a known kill -> timeout, never oom. A SIGSYS is a
-    # blocked escape -> escape_blocked, never oom. A backstop SIGTERM is still a timeout.
-    assert capped._classify(137, "", True).type == "timeout"  # our deadline beats oom
-    assert capped._classify(159, "", False).type == "escape_blocked"  # SIGSYS beats oom
-    assert capped._classify(143, "", False).type == "timeout"  # kern's --timeout backstop, not oom
-    # cap_signal (kern's UNFORGEABLE enforcement byte) refines the SIGKILL verdict: 1 = enforced -> a
-    # certain cgroup OOM; 2 = requested-but-not-enforced -> not attributable to the box's cgroup, so we
-    # do NOT overclaim oom (honest `killed`); 0 = undetermined (older kern) -> the memory_mb heuristic.
-    assert capped._classify(137, "", False, cap_signal=1).type == "oom"  # enforced: certain OOM
-    assert capped._classify(137, "", False, cap_signal=2).type == "killed"  # not enforced: no overclaim
-    assert capped._classify(137, "", False, cap_signal=0).type == "oom"  # undetermined: heuristic stands
+    # kern's word stands whether or not WE passed --memory: it read the kernel's counter for that box's
+    # cgroup, and a cap can reach a box from an ancestor we never set.
+    assert uncapped._classify(137, _KERN_OOM_LINE, False).type == "oom"
+    # PRECEDENCE (locks the check ORDER): the deterministic classes win over kern's OOM line itself.
+    # OUR deadline (we_timed_out) is a known kill -> timeout. A SIGSYS is a blocked escape. A backstop
+    # SIGTERM is still a timeout.
+    assert capped._classify(137, _KERN_OOM_LINE, True).type == "timeout"
+    assert capped._classify(159, _KERN_OOM_LINE, False).type == "escape_blocked"
+    assert capped._classify(143, _KERN_OOM_LINE, False).type == "timeout"
+    # cap_signal no longer decides the TYPE. A 2 (requested but NOT enforced here) still earns its own
+    # sentence: that the cap never bound is the one thing the caller cannot discover for itself.
+    unenforced = capped._classify(137, "", False, cap_signal=2)
+    assert unenforced.type == "killed" and "not enforced here" in unenforced.message
     assert capped._classify(-signal.SIGKILL, "", False, cap_signal=2).type == "killed"
+    # And the honest message on the plain capped kill names the alternatives instead of guessing one.
+    assert "external kill" in capped._classify(137, "", False).message
+
+
+def test_classify_oom_byte_is_the_authority_and_stderr_is_the_fallback():
+    # The 3rd byte of KERN_STARTED_FD is written to a pipe the workload never holds: it cannot be forged
+    # or suppressed by the code being sandboxed, where kern's stderr sentence can (the workload writes to
+    # the same stream). So the byte decides when present, and the sentence only covers a kern that
+    # predates it - otherwise a mixed pair (new SDK, old binary) would downgrade every real OOM to
+    # `killed`. Measured both ways: with the sentence-matching disabled, the new binary still reports all
+    # three OOM paths (the byte carries it) and the old binary reports none of them.
+    capped = _cfg(memory_mb=256)
+    assert capped._classify(137, "", False, None, 1, 1).type == "oom"  # the byte alone
+    assert capped._classify(137, "", False, None, 1, 0).type == "killed"  # the byte says no
+    assert capped._classify(137, _KERN_OOM_LINE, False, None, 0, 0).type == "oom"  # old kern: the sentence
+    # The byte does not outrank the classes decided by exit code either.
+    assert capped._classify(159, "", False, None, 1, 1).type == "escape_blocked"
+    assert capped._classify(137, "", True, None, 1, 1).type == "timeout"
+    # A box with no cap of OURS that the kernel still OOM-killed (a ceiling from an ancestor) is reported
+    # as what kern observed, not as what we asked for.
+    assert _cfg(memory_mb=None)._classify(137, "", False, None, 0, 1).type == "oom"
+    # Same two rules on the resident-kernel path: (err, cap_signal, oom_signal).
+    k = Kernel(capped, timeout_s=5)
+    assert k._kernel_death_fault("", 1, 1)[0] == "oom"
+    assert k._kernel_death_fault("", 1, 0)[0] == "killed"
+    assert k._kernel_death_fault(_KERN_OOM_LINE, 0, 0)[0] == "oom"
+    # The byte wins over the box-did-not-start heuristic too: a box that reached the OOM killer ran.
+    assert k._kernel_death_fault("error: sandbox: could not map uid 1000\n", 1, 1)[0] == "oom"
 
 
 def test_exit_125_startup_failure_requires_the_kern_marker_not_a_bare_125():
@@ -676,8 +733,10 @@ def test_classify_signal_exit_codes():
     s = _cfg()
     assert s._classify(143, "", False).type == "timeout"  # SIGTERM = kern backstop reap
     assert s._classify(-15, "", False).type == "timeout"
-    assert s._classify(137, "", False).type == "oom"  # SIGKILL + default memory cap = cgroup OOM
-    assert s._classify(-9, "", False).type == "oom"
+    assert s._classify(137, "", False).type == "killed"  # SIGKILL, no OOM reported = external kill
+    assert s._classify(-9, "", False).type == "killed"
+    assert s._classify(137, _KERN_OOM_LINE, False).type == "oom"  # the same code, with kern's word
+    assert s._classify(-9, _KERN_OOM_LINE, False).type == "oom"
     assert s._classify(159, "", False).type == "escape_blocked"  # SIGSYS
     assert s._classify(139, "", False) is None  # SIGSEGV = user code crash, not a fault
     assert s._classify(1, "", False) is None  # ordinary non-zero user exit
@@ -1759,26 +1818,47 @@ def test_a_reply_without_a_usable_exit_code_is_a_fault_not_a_success():
     assert not bad.success and bad.exit_code == 3 and bad.fault is None
 
 
-def test_kernel_death_is_oom_only_when_a_memory_cap_was_set():
+def test_kernel_death_is_oom_only_when_kern_reported_the_oom():
     # A resident kernel that dies mid-cell (an OOM-killed cell, a crash) does NOT flow through
-    # `_classify` - it has no per-cell exit code - so its OOM attribution lives in `_kernel_death_fault`,
-    # the run_code counterpart of the one-shot SIGKILL branch. Capped -> oom (the cgroup OOM-killer took
-    # the kernel), uncapped -> killed (ambiguous), a kern setup marker on stderr -> startup_failed. The
-    # signal is the --memory flag WE set, not the box's (workload-influenceable) stderr.
+    # `_classify` - it has no per-cell exit code - so the whole verdict lives in `_kernel_death_fault`.
+    # Same rule as the one-shot path, from the same shared predicate: only kern's OOM sentence is `oom`.
     capped = Kernel(_cfg(memory_mb=256), timeout_s=5)
-    assert capped._kernel_death_fault("")[0] == "oom"
-    assert capped._kernel_death_fault("some traceback\n")[0] == "oom"  # workload stderr does not flip it
+    assert capped._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
+    assert capped._kernel_death_fault("")[0] == "killed"  # a cap is not evidence of an OOM
+    assert capped._kernel_death_fault("some traceback\n")[0] == "killed"
+    assert capped._kernel_death_fault("", cap_signal=1)[0] == "killed"  # nor is an enforced cap
     marker = "kern: sandbox setup failed: --apparmor demo: could not enter the profile\n"
     assert capped._kernel_death_fault(marker)[0] == "startup_failed"  # a box that never really started
     uncapped = Kernel(_cfg(memory_mb=None), timeout_s=5)
     assert uncapped._kernel_death_fault("")[0] == "killed"
-    # cap_signal (kern's unforgeable enforcement byte) refines it, same as the one-shot path: enforced
-    # (1) -> oom, requested-but-not-enforced (2) -> killed (no overclaim), undetermined (0) -> heuristic.
-    assert capped._kernel_death_fault("", cap_signal=1)[0] == "oom"
-    assert capped._kernel_death_fault("", cap_signal=2)[0] == "killed"
-    assert capped._kernel_death_fault("", cap_signal=0)[0] == "oom"
+    assert uncapped._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
+    # cap_signal no longer decides the type; a 2 (cap requested, NOT enforced here) still says so.
+    unenforced = capped._kernel_death_fault("", cap_signal=2)
+    assert unenforced[0] == "killed" and "not enforced here" in unenforced[1]
     # A startup marker still wins over the enforcement byte (the box never came up).
     assert capped._kernel_death_fault(marker, cap_signal=2)[0] == "startup_failed"
+
+
+def test_kernel_oom_is_not_read_as_a_box_that_never_started():
+    # REGRESSION, measured against kern 0.9.32-37-g02ecedf: kern's OOM sentence carries the `kern:`
+    # prefix that `_looks_like_startup_failure` matches on, and `_kernel_death_fault` asked about the
+    # start FIRST. So a real OOM on a resident kernel came back `startup_failed`, which
+    # `_teardown_result` RAISES - `sbx.kernel()` could not produce an `oom` fault at all, while an
+    # external `kern stop` produced one from the inference. The two defects pointed opposite ways: the
+    # path reported `oom` exactly when it was not one, and raised when it was.
+    assert kern._kern_reported_oom(_KERN_OOM_LINE)
+    assert not kern._looks_like_startup_failure(_KERN_OOM_LINE)
+    k = Kernel(_cfg(memory_mb=64), timeout_s=5)
+    assert k._kernel_death_fault(_KERN_OOM_LINE)[0] == "oom"
+    # POSITIVE CONTROLS, or this passes on a predicate that answers False to everything: a real setup
+    # marker is still a startup failure, and an OOM line ALONGSIDE one still reports the OOM (the box
+    # ran, so it cannot have failed to start, and the startup text is then the less specific claim).
+    setup = "error: sandbox: could not map uid 1000\n"
+    assert kern._looks_like_startup_failure(setup)
+    assert k._kernel_death_fault(setup)[0] == "startup_failed"
+    assert k._kernel_death_fault(setup + _KERN_OOM_LINE)[0] == "oom"
+    # The words without kern's prefix are a cell's prose, not kern's observation.
+    assert not kern._kern_reported_oom("my job was killed by the kernel's OOM killer, I think\n")
 
 
 @integration

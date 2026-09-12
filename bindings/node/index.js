@@ -884,7 +884,38 @@ function isKernDiagnostic(line) {
   return KERN_DIAGNOSTICS.some((p) => s.startsWith(p));
 }
 
+/** The sentence kern prints when it has READ the kernel's OOM counter for this box's own cgroup. A
+ * contract between two programs: if kern rewords it, this stops recognising a real OOM and starts
+ * reporting `killed` - wrong in the safe direction, still wrong. Mirrors `_KERN_OOM_MARKER`. */
+const KERN_OOM_MARKER = "killed by the kernel's OOM killer";
 
+/** True iff KERN said the kernel's OOM killer took this box against its own memory cap.
+ *
+ * The ONE definition of "this was an OOM", used by all three death paths (the one-shot exit-code
+ * classifier, the resident kernel's death, and a pool box that died) so they cannot drift into
+ * disagreeing about the same box. It is an OBSERVATION - kern reads `memory.events` and says so -
+ * where the SDK can only infer, and the inference it replaced was MEASURED wrong in both directions:
+ * `kern stop` during a cell was reported `oom`, while a real OOM on the resident kernel was reported
+ * as a box that failed to start (and raised).
+ *
+ * Anchored on kern's `kern:` line prefix, which the real line carries (measured verbatim: `kern: the
+ * workload was killed by the kernel's OOM killer against this box's own memory cap.`), MINUS the
+ * benign diagnostics - `kern: note: <quoting the sentence>` is kern TALKING about an OOM, not
+ * reporting one.
+ *
+ * THE FALLBACK, NOT THE AUTHORITY. Against a kern that writes the 3rd KERN_STARTED_FD byte the verdict
+ * comes from there instead, on a pipe the workload never holds. This covers an older binary, and it is
+ * forgeable in exactly one direction: a workload that writes the whole prefixed sentence itself turns its
+ * own `killed` into `oom`. Both are sandbox faults, and timeout / blocked-escape are decided by exit code
+ * before any text is read, so the worst case is a caller misleading itself about its own kill.
+ * Mirrors `_kern_reported_oom`. */
+function kernReportedOom(stderr) {
+  for (const line of String(stderr || "").split("\n")) {
+    const s = line.replace(/^\s+/, "");
+    if (s.startsWith("kern:") && !isKernDiagnostic(s) && s.includes(KERN_OOM_MARKER)) return true;
+  }
+  return false;
+}
 
 function looksLikeStartupFailure(stderr) {
   const markers = [
@@ -898,9 +929,13 @@ function looksLikeStartupFailure(stderr) {
     "error: oci:",
     "error: image:",
   ];
+  // The OOM sentence is skipped for a sharper reason than the benign notes: it is a report about a box
+  // that RAN, and it is `kern:`-prefixed, so it used to satisfy this predicate. MEASURED, that is how a
+  // real OOM on a resident kernel came back as `startup_failed` and was THROWN instead of returning an
+  // `oom` fault.
   for (const line of stderr.split("\n")) {
     const s = line.replace(/^\s+/, "");
-    if (isKernDiagnostic(s)) continue;
+    if (isKernDiagnostic(s) || kernReportedOom(s)) continue;
     if (s.includes("sandbox setup failed") || markers.some((m) => s.startsWith(m))) return true;
   }
   return false;
@@ -1430,6 +1465,7 @@ class Sandbox {
       let child;
       let boxStarted = false;
       let capSignal = 0; // 2nd started byte: 0 undetermined/old-kern, 1 memory cap enforced, 2 not enforced
+      let oomSignal = 0; // 3rd started byte: 1 = the kernel OOM-killed this box's own cgroup, 0 = it did not
       try {
         // detached: own process group, so we can signal the box + kern as a unit (killpg).
         // The 4th stdio slot is fd 3: the child (kern) writes the started byte, the parent reads it.
@@ -1446,10 +1482,19 @@ class Sandbox {
       const startedCh = child.stdio[3];
       if (startedCh) {
         // Byte 0 (0x01) = the box started; stream end with no byte = never started / old kern. Byte 1
-        // (a NEWER kern only, same atomic write) = the memory-cap enforcement signal; absent = 0.
+        // (a NEWER kern only, same atomic write) = the memory-cap enforcement signal; absent = 0. Byte 2
+        // (a NEWER kern still) = the OOM OUTCOME: 1 iff the kernel's OOM killer fired against this box's
+        // OWN cgroup. Enforcement is not an outcome, and this byte is the only place the outcome arrives
+        // on a channel the workload cannot write.
+        // ACCUMULATED rather than read off one chunk: kern's write is atomic, so the three bytes arrive
+        // together in practice, but a stream that split them would silently cost us the last byte - and a
+        // lost OOM byte reads as "no OOM", which is the wrong answer arrived at invisibly.
+        let sig = Buffer.alloc(0);
         startedCh.on("data", (b) => {
-          if (b.length && b[0] === 1) boxStarted = true;
-          if (b.length >= 2) capSignal = b[1];
+          sig = Buffer.concat([sig, b]);
+          if (sig.length >= 1 && sig[0] === 1) boxStarted = true;
+          if (sig.length >= 2) capSignal = sig[1];
+          if (sig.length >= 3) oomSignal = sig[2];
         });
         startedCh.on("error", () => {});
       }
@@ -1476,7 +1521,7 @@ class Sandbox {
         const stdout = out.buffer().toString("utf8");
         const stderr = err.buffer().toString("utf8");
         const rc = toRc(code, signal);
-        let fault = this._classify(rc, signal, stderr, timedOut, timeoutS, capSignal);
+        let fault = this._classify(rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal);
         const execFail = execFailureBinary(stderr);
         if (execFail !== null && rc !== 0) {
           // BEFORE the suppression below, which would erase it: the box started, so that branch
@@ -1574,7 +1619,7 @@ class Sandbox {
     }
   }
 
-  _classify(rc, signal, stderr, timedOut, timeoutS, capSignal = 0) {
+  _classify(rc, signal, stderr, timedOut, timeoutS, capSignal = 0, oomSignal = 0) {
     // ORDER IS A SECURITY PROPERTY: deterministic-by-exit-code classes are decided BEFORE the stderr
     // heuristic, because stderr is a channel the workload controls.
     if (timedOut)
@@ -1585,22 +1630,32 @@ class Sandbox {
     if (rc === EXIT_SIGSYS || signal === "SIGSYS")
       return sandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)");
     if (rc === EXIT_SIGKILL || signal === "SIGKILL") {
-      // A memory-capped box SIGKILLed is the cgroup OOM-killer - what a breached memory.max does (kern
-      // sets memory.oom.group=1, so the whole box dies at once). `capSignal` is kern's UNFORGEABLE
-      // enforcement byte (2nd byte of KERN_STARTED_FD, not the workload's stderr): 1 = enforced, 2 =
-      // requested but NOT enforced here, 0 = undetermined (old kern / no --memory). Claim `oom` when a
-      // --memory cap was set AND kern did not report it unenforced (capSignal !== 2): enforced (1) is a
-      // certain cgroup OOM, undetermined (0) keeps the pre-signal heuristic. When kern reports the cap did
-      // not bind (2), a SIGKILL cannot be attributed to the box's cgroup - keep the honest `killed`.
-      if (this.memoryMb !== null && capSignal !== 2)
+      // Only kern's own OOM sentence buys the `oom` label (`kernReportedOom`, the one definition shared
+      // with the resident-kernel and pool death paths).
+      //
+      // WHAT THIS REPLACED, because the replaced version read as sound: a SIGKILL of a memory-capped box
+      // was called the cgroup OOM-killer, which is what a breached memory.max does (kern sets
+      // memory.oom.group=1, so the whole box goes at once). MEASURED: `kern stop` during a cell returns
+      // 137, so it came back `oom`, and an agent branching on the fault would retry with MORE MEMORY a
+      // kill that had nothing to do with memory. A confident wrong answer is worse than no answer.
+      if (oomSignal === 1 || kernReportedOom(stderr))
         return sandboxFault(
           "oom",
           "the box exceeded its memory cap and was OOM-killed (SIGKILL, exit 137)" + this._scratchNote(),
         );
+      // `capSignal` (kern's UNFORGEABLE enforcement byte: 1 = enforced, 2 = requested but NOT enforced
+      // here, 0 = undetermined) no longer decides the TYPE - a SIGKILL on a capped box is not evidence of
+      // an OOM, whatever the byte says - and a 2 still earns its own sentence, because "your cap was not
+      // in force here" is the one thing the caller cannot find out for itself.
       if (capSignal === 2)
         return sandboxFault(
           "killed",
-          "the box was SIGKILLed, but its memory cap was not enforced here (no cgroup delegation), so it is not attributed to a cgroup OOM",
+          "the box was SIGKILLed, and its memory cap was not enforced here (no cgroup delegation), so no memory limit was in force to attribute it to",
+        );
+      if (this.memoryMb !== null)
+        return sandboxFault(
+          "killed",
+          "the box was SIGKILLed and the kernel reported no OOM against its memory cap: this is an external kill (`kern stop`, a signal, or the host's own OOM killer), not the box exceeding its own memory",
         );
       return sandboxFault("killed", "the box was killed (SIGKILL); no memory cap was set to attribute it to OOM");
     }
@@ -2164,10 +2219,12 @@ class Kernel {
     this._waiters = []; // FIFO of { resolve, timer }; one reply per request keeps them in order
     this._stderr = Buffer.alloc(0);
     this._dead = false;
-    // kern's memory-cap enforcement byte (2nd byte of KERN_STARTED_FD). For a RESIDENT box kern writes
-    // it only at box teardown (a cell kills the kernel), so it arrives ~concurrent with the death we
-    // detect on stdout; read once, bounded, on death (`_readCapSignal`). 0 = undetermined / old kern.
-    this._capSignal = 0;
+    // kern's KERN_STARTED_FD bytes for a RESIDENT box: the enforcement byte (2nd) and the OOM-outcome
+    // byte (3rd). kern writes them only at box teardown (a cell kills the kernel), so they arrive
+    // ~concurrent with the death we detect on stdout; read once, bounded, on death (`_readCapSignal`).
+    // Kept as the raw buffer because the bytes arrive in ONE atomic write and a stream is free to deliver
+    // it in pieces. Absent bytes read as 0 = undetermined / old kern.
+    this._startedSig = Buffer.alloc(0);
   }
 
   async _open() {
@@ -2194,7 +2251,7 @@ class Kernel {
     });
     const startedCh = this._child.stdio[3];
     if (startedCh) {
-      startedCh.on("data", (b) => { if (b.length >= 2) this._capSignal = b[1]; });
+      startedCh.on("data", (b) => { this._startedSig = Buffer.concat([this._startedSig, b]); });
       startedCh.on("error", () => {});
     }
     this._child.on("error", () => { this._dead = true; this._flush(null); });
@@ -2295,7 +2352,7 @@ class Kernel {
       return this._teardownResult("killed", `the kernel reply exceeded the ${this._cap}-byte cap`, started);
     if (reply === null) {
       const err = this._stderr.toString("utf8");
-      const [kind, dflt] = this._kernelDeathFault(err, await this._readCapSignal());
+      const [kind, dflt] = this._kernelDeathFault(err, ...(await this._readCapSignal()));
       return this._teardownResult(kind, err.trim() || dflt, started);
     }
     return this._resultFromReply(reply, started);
@@ -2342,41 +2399,53 @@ class Kernel {
     });
   }
 
-  /** Why the resident kernel box died mid-cell, as `[type, defaultMessage]`. A kern setup marker on
-   * stderr means it never came up (startup_failed). Otherwise this is the runCode counterpart of the
-   * one-shot _classify SIGKILL branch - a kernel death has no per-cell exit code. `capSignal` is kern's
-   * unforgeable enforcement byte (0 = old kern / undetermined, 1 = memory cap enforced, 2 = requested
-   * but NOT enforced): with a memoryMb cap AND not-reported-unenforced (`!== 2`), the cgroup OOM-killer
-   * is the cause -> `oom`; when kern reports the cap did not bind (2), the kill is not attributable to
-   * the box's cgroup -> `killed`; uncapped is also `killed`. */
-  _kernelDeathFault(err, capSignal = 0) {
+  /** Why the resident kernel box died mid-cell, as `[type, defaultMessage]`. The runCode counterpart of
+   * the one-shot _classify SIGKILL branch: a kernel death has no per-cell exit code, so the whole verdict
+   * is made here from what kern wrote.
+   *
+   * ORDER, and it was measured wrong before: kern's OOM sentence is asked about FIRST, because it is
+   * `kern:`-prefixed and so was also matching the box-did-not-start heuristic below. A real OOM on a
+   * resident kernel therefore came back `startup_failed`, which `_teardownResult` THROWS - so the
+   * flagship path could not produce an `oom` fault at all, while an external `kern stop` DID produce one
+   * from the memoryMb inference. Two defects pointing opposite ways.
+   *
+   * `capSignal` is kern's unforgeable enforcement byte (0 = old kern / undetermined, 1 = cap enforced, 2 =
+   * requested but NOT enforced). It no longer decides the TYPE, and a 2 still earns a sentence, because
+   * "your cap was not in force here" is the one thing the caller cannot find out for itself. */
+  _kernelDeathFault(err, capSignal = 0, oomSignal = 0) {
+    if (oomSignal === 1 || kernReportedOom(err)) return ["oom", "the kernel box exceeded its memory cap and was OOM-killed"];
     if (looksLikeStartupFailure(err)) return ["startup_failed", "the kernel box failed to start"];
-    if (this._sbx.memoryMb !== null && capSignal !== 2)
-      return ["oom", "the kernel box was OOM-killed (it exceeded its memory cap)"];
     if (capSignal === 2)
       return [
         "killed",
-        "the kernel box was SIGKILLed, but its memory cap was not enforced here (no cgroup delegation), so it is not attributed to a cgroup OOM",
+        "the kernel box was killed, and its memory cap was not enforced here (no cgroup delegation), so no memory limit was in force to attribute it to",
+      ];
+    if (this._sbx.memoryMb !== null)
+      return [
+        "killed",
+        "the kernel box was killed and the kernel reported no OOM against its memory cap: an external kill (`kern stop`, a signal, or the host running out of memory), not the box exceeding its own memory",
       ];
     return ["killed", "the kernel box exited"];
   }
 
-  /** kern's memory-cap enforcement byte for the resident box, read ONCE on kernel death. kern writes
-   * the two-byte KERN_STARTED_FD signal only at box teardown (a resident box exits when a cell kills it),
-   * ~concurrent with the death detected on stdout. The fd-3 `data` handler in `_open` records the byte
-   * as it arrives; this awaits a BOUNDED window (the fd's own `end`, or 1 s) so the read is deterministic
-   * rather than a race, then returns the byte (0 = EOF / old kern / not yet -> the memoryMb heuristic). */
+  /** kern's enforcement and OOM-outcome bytes for the resident box, read ONCE on kernel death, as
+   * `[capSignal, oomSignal]`. kern writes the KERN_STARTED_FD signal only at box teardown (a resident box
+   * exits when a cell kills it), ~concurrent with the death detected on stdout. The fd-3 `data` handler in
+   * `_open` accumulates the bytes as they arrive; this awaits a BOUNDED window (the fd's own `end`, or
+   * 1 s) so the read is deterministic rather than a race. `[0, 0]` on EOF / an old kern / not yet, which
+   * falls back to kern's stderr sentence. */
   async _readCapSignal() {
     const ch = this._child && this._child.stdio && this._child.stdio[3];
-    if (!ch) return 0;
-    if (this._capSignal === 0 && !ch.destroyed) {
+    if (!ch) return [0, 0];
+    if (this._startedSig.length < 3 && !ch.destroyed) {
       await new Promise((res) => {
         const t = setTimeout(res, 1000);
         ch.once("end", () => { clearTimeout(t); res(); });
         ch.once("error", () => { clearTimeout(t); res(); });
       });
     }
-    return this._capSignal;
+    const sig = this._startedSig;
+    return [sig.length >= 2 ? sig[1] : 0, sig.length >= 3 ? sig[2] : 0];
   }
 
   _teardownResult(type, message, started) {
@@ -2512,7 +2581,7 @@ class WarmBox {
     this._born = Date.now();
     this._spent = false;
     this._rc = null;
-    this._capSignal = 0;
+    this._startedSig = Buffer.alloc(0); // KERN_STARTED_FD bytes: [started, cap enforcement, OOM outcome]
     this._stderr = Buffer.alloc(0);
     this._chunks = [];
     this._total = 0;
@@ -2554,7 +2623,7 @@ class WarmBox {
     }
     const startedCh = this._child.stdio[3];
     if (startedCh) {
-      startedCh.on("data", (b) => { if (b.length >= 2) this._capSignal = b[1]; });
+      startedCh.on("data", (b) => { this._startedSig = Buffer.concat([this._startedSig, b]); });
       startedCh.on("error", () => {});
     }
     this._child.on("error", () => { this._dead = true; this._flush(null); });
@@ -2739,18 +2808,27 @@ class WarmBox {
         fault: { type: "timeout", message: msg || "the code exceeded its deadline" },
       });
     }
-    const capSignal = this._capSignal;
+    const capSignal = this._startedSig.length >= 2 ? this._startedSig[1] : 0;
+    const oomSignal = this._startedSig.length >= 3 ? this._startedSig[2] : 0;
     this.retire();
-    if (looksLikeStartupFailure(err)) throw new SandboxError(err.trim() || "the box failed to start");
     let type = "killed";
     let dflt = "the box exited before the code finished";
-    if (this._sbx.memoryMb !== null && this._sbx.memoryMb !== undefined && capSignal !== 2) {
+    // Same order, and for the same measured reason, as `_kernelDeathFault`: kern's OOM sentence carries
+    // the `kern:` prefix that `looksLikeStartupFailure` matches on, so asking about the start SECOND is
+    // what keeps a pool box's OOM from being thrown as a box that never came up.
+    if (oomSignal === 1 || kernReportedOom(err)) {
       type = "oom";
-      dflt = "the box was OOM-killed (it exceeded its memory cap)";
+      dflt = "the box exceeded its memory cap and was OOM-killed";
+    } else if (looksLikeStartupFailure(err)) {
+      throw new SandboxError(err.trim() || "the box failed to start");
     } else if (capSignal === 2) {
       dflt =
-        "the box was SIGKILLed, but its memory cap was not enforced here (no cgroup delegation), " +
-        "so it is not attributed to a cgroup OOM";
+        "the box was killed, and its memory cap was not enforced here (no cgroup delegation), " +
+        "so no memory limit was in force to attribute it to";
+    } else if (this._sbx.memoryMb !== null && this._sbx.memoryMb !== undefined) {
+      dflt =
+        "the box was killed and the kernel reported no OOM against its memory cap: an external kill " +
+        "(`kern stop`, a signal, or the host running out of memory), not the box exceeding its own memory";
     }
     return this._result("", "", this._exitCode(), started, before, {
       fault: { type, message: err.trim() || dflt },

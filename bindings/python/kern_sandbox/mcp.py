@@ -54,6 +54,7 @@ _MAX_IMAGE_B64 = 6_000_000        # skip a SINGLE image result larger than ~4.5 
 _MAX_REPLY_IMG = 8 * 1024 * 1024  # AGGREGATE image budget for one reply (N small images can't sum to GBs)
 _MAX_TOTAL_TEXT = 64_000          # AGGREGATE text budget for one reply (unbounded rich-result COUNT can't blow up)
 _MAX_FRAME = 8 * 1024 * 1024      # max chars of one inbound JSON-RPC line; bounds a no-newline stdin flood
+_MAX_FAULT_REASON = 300           # chars of the fault MESSAGE carried in the tail next to the fault type
 
 # `_READ_CAP` bounds what the HOST loads; this bounds what the REPLY carries. They are different limits:
 # without the second one a read_file on a 16 MiB workspace file answered with 16 MiB of text in a single
@@ -558,9 +559,24 @@ class _Server:
                 take("[rich result]\n" + _clip(rich, _MAX_RICH))
         # tail + notes are appended AFTER the budget, so the exit code and the truncation notes can never
         # be clipped away in the high-output case (exactly when they matter most).
+        # THE REASON TRAVELS WITH THE TYPE, because the type alone is not always actionable. MEASURED on
+        # this channel: an externally stopped box (a `kern stop`, a signal, the host out of memory) gave
+        # the model `(no output)` and `[exit 137, sandbox fault: killed]` and nothing else, while a real
+        # OOM gave it kern's whole sentence on stderr. The binding knows why in both cases, and the
+        # message is where it says so - naming the alternatives for `killed`, the limit for `timeout`,
+        # the scratch charge for `oom`. Appended for EVERY type rather than for the one that prompted
+        # this: a per-type branch here is a second place to keep in step with the taxonomy.
         tail = f"[exit {r.exit_code}"
         if r.fault:
             tail += f", sandbox fault: {r.fault.type}"
+            # Bounded, and inside the tail that is deliberately exempt from the aggregate budget: the
+            # reason is worth less than the output it must never displace.
+            # Whitespace-collapsed AFTER the clip, not before: `_clip` puts its own
+            # "...[truncated N chars]" annotation on a NEW line, which would split the tail in two and
+            # leave the model a note that reads like output.
+            reason = " ".join(_clip(" ".join((r.fault.message or "").split()), _MAX_FAULT_REASON).split())
+            if reason:
+                tail += f": {reason}"
         tail += "]"
         notes = [tail]
         if omitted:
@@ -576,8 +592,10 @@ def main() -> None:
     # Non-fatal kern notes (the uncapped-caps warning, the overlayfs-scratch note) are diagnostics for a
     # human at a terminal; on the MCP channel they would land in the model's run_code output as if the
     # cell had printed them. Default them off (KERN_QUIET) so tools/call returns only the cell's own
-    # stdout/stderr. The unforgeable machine signal the SDK reads for oom/killed is untouched, so fault
-    # classification still holds. Set KERN_MCP_QUIET=0 to restore the notes.
+    # stdout/stderr. Fault classification survives it because the signals it rests on are not notes: the
+    # `oom` verdict comes from the 3rd byte of KERN_STARTED_FD (a pipe the workload never holds), and the
+    # OOM sentence it falls back to on an older kern is printed on the SIGKILL path regardless of
+    # KERN_QUIET - measured both ways on this host. Set KERN_MCP_QUIET=0 to restore the notes.
     if os.environ.get("KERN_MCP_QUIET", "1").strip().lower() not in ("0", "false", "no", ""):
         os.environ["KERN_QUIET"] = "1"
     server = _Server()

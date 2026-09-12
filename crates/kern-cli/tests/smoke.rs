@@ -459,34 +459,182 @@ fn a_box_killed_by_its_cap_says_why() {
     );
 }
 
-/// The other half, on the box path: a SIGKILL that is not the cap must not be blamed on it. A version
-/// that latched unconditionally, or printed on every 137, would pass the test above and fail this one.
+/// The other half, on the box path: a 137 that is not the cap must not be blamed on it. A version that
+/// latched unconditionally, or printed on every 137, would pass the test above and fail this one.
+///
+/// IT USED TO SKIP ON EVERY HOST, which is a green that guards nothing. The workload was
+/// `sh -c "kill -9 $$"`, and the box's shell is pid 1 of its own pid namespace: the kernel does not
+/// deliver an unhandled SIGKILL to a namespace's init from inside it, so the shell survived and exited 0
+/// and the assertion below was never reached. Measured: `kern run` (no pid namespace of its own for the
+/// shell) exits 137 there, `kern box` exits 0 - which is why the `kern run` twin of this test did run.
+///
+/// A workload CHOOSING exit 137 reaches the same branch (kern only sees the code) and is the sharper
+/// case anyway: 137 without a signal behind it is exactly the ambiguity the message must not guess at.
 #[test]
-fn a_box_sigkilled_by_itself_is_not_blamed_on_the_cap() {
+fn a_box_that_exits_137_without_an_oom_is_not_blamed_on_the_cap() {
     let out = kern()
         .args([
             "box",
             "captest-kill",
             "--image",
             "alpine",
+            "--memory",
+            "128m",
             "--",
             "/bin/sh",
             "-c",
-            "kill -9 $$",
+            "exit 137",
         ])
         .output()
         .expect("run kern");
-    if out.status.code() != Some(137) {
-        eprintln!(
-            "SKIP: the shell did not die of SIGKILL here (exit {:?})",
-            out.status.code()
-        );
-        return;
-    }
+    assert_eq!(
+        out.status.code(),
+        Some(137),
+        "the box did not propagate the chosen exit code; stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !err.contains("OOM killer"),
-        "a self-inflicted SIGKILL was blamed on the cap: {err:?}"
+        "an exit 137 with no OOM behind it was blamed on the cap: {err:?}"
+    );
+}
+
+/// Run `kern box` with a pipe on `KERN_STARTED_FD` and return `(exit code, the bytes it wrote)`.
+///
+/// The pipe is made with `libc::pipe` rather than `std::process::Command`'s own plumbing because kern
+/// takes the fd NUMBER from the environment: a descriptor created without `O_CLOEXEC` is inherited with
+/// its number intact, so no `pre_exec` is needed. The parent closes the write end before reading, or the
+/// read would never see EOF and this test would hang instead of failing.
+fn started_bytes(args: &[&str]) -> (Option<i32>, Vec<u8>) {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (r, w) = (fds[0], fds[1]);
+    let child = kern()
+        .args(args)
+        .env("KERN_STARTED_FD", w.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn kern");
+    assert_eq!(unsafe { libc::close(w) }, 0, "close the parent's write end");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 8];
+    loop {
+        let n = unsafe { libc::read(r, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n as usize]);
+    }
+    unsafe { libc::close(r) };
+    let out = child.wait_with_output().expect("wait for kern");
+    (out.status.code(), got)
+}
+
+/// The `KERN_STARTED_FD` signal is THREE bytes, and the third one is the OOM verdict.
+///
+/// WHY THE THIRD BYTE EXISTS. An SDK had only the exit code and the enforcement byte, and 137 plus "the
+/// cap was enforced" is also what `kern stop` of a capped box looks like. Measured through the Python
+/// binding: stopping a box during a cell was reported as `fault.type == "oom"`, which sends an agent to
+/// retry with more memory a kill that had nothing to do with memory. kern already knows the answer - it
+/// reads the box's own `memory.events` for the stderr sentence - and this puts that same observation on
+/// a channel the workload cannot write, where stderr is a stream the workload shares.
+///
+/// THE DISCRIMINATOR IS THE PAIR, not either run alone: a byte that were always 1 would pass the OOM
+/// half, and one that were always 0 would pass the external-kill half. Both exit 137.
+#[test]
+fn the_started_signal_carries_the_oom_verdict_in_its_third_byte() {
+    let (code, sig) = started_bytes(&[
+        "box",
+        "sigtest-ok",
+        "--image",
+        "alpine",
+        "--memory",
+        "128m",
+        "--",
+        "/bin/true",
+    ]);
+    if code != Some(0) || sig.len() < 3 {
+        eprintln!(
+            "SKIP: no box with a started signal here (exit {code:?}, {} bytes)",
+            sig.len()
+        );
+        return;
+    }
+    assert_eq!(
+        sig[0], 1,
+        "byte 0 must stay the unchanged `box started` signal: {sig:?}"
+    );
+    assert_eq!(
+        sig[2], 0,
+        "a box that exited cleanly was reported OOM-killed: {sig:?}"
+    );
+    let enforced = sig[1] == 1;
+
+    // A 137 THAT IS NOT AN OOM, and it is a workload CHOOSING that exit code rather than a signal:
+    // `kill -9 $$` cannot be used here, because the box's shell is pid 1 of its own pid namespace and
+    // the kernel does not deliver an unhandled SIGKILL to a namespace's init from inside it - measured,
+    // the shell survives and exits 0, which is also why the neighbouring test above only ever SKIPS.
+    // A chosen 137 is the sharper case anyway: it is exactly the ambiguity the byte exists to remove.
+    let (code, sig) = started_bytes(&[
+        "box",
+        "sigtest-kill",
+        "--image",
+        "alpine",
+        "--memory",
+        "128m",
+        "--",
+        "/bin/sh",
+        "-c",
+        "exit 137",
+    ]);
+    assert_eq!(
+        code,
+        Some(137),
+        "the box did not propagate the chosen exit code"
+    );
+    assert_eq!(
+        sig.len(),
+        3,
+        "a started box must write all three bytes: {sig:?}"
+    );
+    assert_eq!(
+        sig[2], 0,
+        "an exit 137 with no OOM behind it was reported as an OOM: {sig:?}"
+    );
+
+    if !enforced {
+        eprintln!(
+            "SKIP: the cap is not enforced here (byte 1 = {}), so no OOM can fire",
+            sig[1]
+        );
+        return;
+    }
+    let (code, sig) = started_bytes(&[
+        "box",
+        "sigtest-oom",
+        "--image",
+        "python:3.12-slim",
+        "--memory",
+        "128m",
+        "--",
+        "python3",
+        "-c",
+        "bytearray(400*1024*1024)",
+    ]);
+    if code != Some(137) {
+        eprintln!("SKIP: the box was not SIGKILLed here (exit {code:?})");
+        return;
+    }
+    assert_eq!(
+        sig.len(),
+        3,
+        "a started box must write all three bytes: {sig:?}"
+    );
+    assert_eq!(
+        sig[2], 1,
+        "a box taken by the OOM killer against its own cap reported no OOM: {sig:?}"
     );
 }
 

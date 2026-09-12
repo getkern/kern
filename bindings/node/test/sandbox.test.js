@@ -41,6 +41,15 @@ test("version is exported", () => {
   assert.strictEqual(typeof kern.version, "string");
 });
 
+// The line kern really prints when the kernel's OOM killer takes a box against its own cap, captured
+// verbatim from `kern box --memory 64 --image python:3.11-alpine` on 2026-09-12. The classifier's
+// contract is with kern's OUTPUT, so these tests use the real sentence rather than a paraphrase: a
+// paraphrase would keep passing while the anchoring rotted.
+const KERN_OOM_LINE =
+  "kern: the workload was killed by the kernel's OOM killer against this box's own memory cap. " +
+  'Raise it with `--memory <size>` (or `memory = "<size>"` in a vcpu: profile) if the workload needs more.\n';
+
+
 test("capabilities are dropped by default and the opt-out is explicit", () => {
   // kern always drops 14 dangerous capabilities; the rest were held over the box's own user
   // namespace, on the one code path whose purpose is running code nobody has read. Measured before
@@ -465,33 +474,76 @@ test("exit 125 startup failure requires the kern marker, not a bare 125", () => 
   assert.strictEqual(s._classify(3, null, marker, false).type, "startup_failed");
 });
 
-test("SIGKILL is oom only when a memory cap was set", () => {
-  // A SIGKILL (exit 137, or signal "SIGKILL") of a MEMORY-CAPPED box is the cgroup OOM-killer: kern
-  // sets memory.oom.group=1, so a breached memory.max takes the WHOLE box. The signal is the --memory
-  // flag WE set (this.memoryMb), never the workload's stderr, so it keeps the same
-  // order-is-a-security-property discipline as the classes above. Uncapped, the cause is ambiguous
-  // (host memory pressure, an external kill) and stays `killed`.
+test("a SIGKILL is oom only when kern reported the OOM", () => {
+  // A SIGKILL is `oom` ONLY when KERN said the kernel's OOM killer took the box against its own cap. It
+  // replaces an inference that read as sound - a SIGKILL of a memory-capped box IS what a breached
+  // memory.max does, since kern sets memory.oom.group=1 - and was MEASURED wrong: `kern stop` during a
+  // cell exits 137, so it came back `oom`, and an agent branching on the fault retries with MORE MEMORY a
+  // kill that had nothing to do with memory.
   const capped = new Sandbox({ memoryMb: 256 });
-  assert.strictEqual(capped._classify(137, null, "", false).type, "oom");
-  assert.strictEqual(capped._classify(null, "SIGKILL", "", false).type, "oom");
-  // A forged stderr marker cannot flip the exit-code verdict.
-  assert.strictEqual(capped._classify(137, null, "error: sandbox: forged\n", false).type, "oom");
+  assert.strictEqual(capped._classify(137, null, KERN_OOM_LINE, false).type, "oom");
+  assert.strictEqual(capped._classify(null, "SIGKILL", KERN_OOM_LINE, false).type, "oom");
+  // The cap alone buys nothing now, and neither does the enforcement byte reporting it enforced: that the
+  // cap was IN FORCE is not evidence that it is what killed the box. (capSignal is the 6th arg, timeoutS
+  // the 5th - pass null for timeoutS.)
+  assert.strictEqual(capped._classify(137, null, "", false).type, "killed");
+  assert.strictEqual(capped._classify(null, "SIGKILL", "", false).type, "killed");
+  assert.strictEqual(capped._classify(137, null, "", false, null, 1).type, "killed");
+  // POSITIVE CONTROL on the anchoring, or every assertion above would also pass on a classifier that
+  // said `killed` to everything: kern's PREFIX is what makes the sentence an observation, and a
+  // `kern: note:` that quotes it is kern talking about an OOM rather than reporting one.
+  assert.strictEqual(capped._classify(137, null, "killed by the kernel's OOM killer\n", false).type, "killed");
+  assert.strictEqual(
+    capped._classify(137, null, "kern: note: killed by the kernel's OOM killer\n", false).type,
+    "killed",
+  );
+  // A forged setup marker cannot flip the exit-code verdict either way.
+  assert.strictEqual(capped._classify(137, null, "error: sandbox: forged\n", false).type, "killed");
   const uncapped = new Sandbox({ memoryMb: null });
   assert.strictEqual(uncapped._classify(137, null, "", false).type, "killed");
   assert.strictEqual(uncapped._classify(null, "SIGKILL", "", false).type, "killed");
-  // PRECEDENCE (locks the check ORDER): even with a cap set, the more specific deterministic classes
-  // win over oom. OUR deadline (timedOut) is a known kill -> timeout. A SIGSYS is a blocked escape ->
-  // escape_blocked. A backstop SIGTERM is still a timeout.
-  assert.strictEqual(capped._classify(137, null, "", true).type, "timeout"); // our deadline beats oom
-  assert.strictEqual(capped._classify(159, null, "", false).type, "escape_blocked"); // SIGSYS beats oom
-  assert.strictEqual(capped._classify(143, null, "", false).type, "timeout"); // kern's backstop, not oom
-  // capSignal (kern's unforgeable enforcement byte) refines the SIGKILL verdict: 1 = enforced -> oom, 2
-  // = requested-but-not-enforced -> killed (no overclaim), 0 = undetermined (old kern) -> heuristic.
-  // NB: capSignal is the 6th arg (timeoutS is the 5th) - pass null for timeoutS.
-  assert.strictEqual(capped._classify(137, null, "", false, null, 1).type, "oom"); // enforced: certain OOM
-  assert.strictEqual(capped._classify(137, null, "", false, null, 2).type, "killed"); // not enforced: no overclaim
-  assert.strictEqual(capped._classify(137, null, "", false, null, 0).type, "oom"); // undetermined: heuristic
+  // kern's word stands whether or not WE passed --memory: it read the kernel's counter for that box's
+  // cgroup, and a cap can reach a box from an ancestor we never set.
+  assert.strictEqual(uncapped._classify(137, null, KERN_OOM_LINE, false).type, "oom");
+  // PRECEDENCE (locks the check ORDER): the classes decided by exit code win over kern's OOM line
+  // itself. OUR deadline (timedOut) is a known kill -> timeout. A SIGSYS is a blocked escape. A backstop
+  // SIGTERM is still a timeout.
+  assert.strictEqual(capped._classify(137, null, KERN_OOM_LINE, true).type, "timeout");
+  assert.strictEqual(capped._classify(159, null, KERN_OOM_LINE, false).type, "escape_blocked");
+  assert.strictEqual(capped._classify(143, null, KERN_OOM_LINE, false).type, "timeout");
+  // capSignal no longer decides the TYPE. A 2 (requested but NOT enforced here) still earns its own
+  // sentence: that the cap never bound is the one thing the caller cannot discover for itself.
+  const unenforced = capped._classify(137, null, "", false, null, 2);
+  assert.strictEqual(unenforced.type, "killed");
+  assert.match(unenforced.message, /not enforced here/);
   assert.strictEqual(capped._classify(null, "SIGKILL", "", false, null, 2).type, "killed");
+  // And the honest message on the plain capped kill names the alternatives instead of guessing one.
+  assert.match(capped._classify(137, null, "", false).message, /external kill/);
+});
+
+test("the OOM byte is the authority and the stderr sentence is the fallback", () => {
+  // The 3rd byte of KERN_STARTED_FD is written to a pipe the workload never holds: it cannot be forged
+  // or suppressed by the code being sandboxed, where kern's stderr sentence can (the workload writes to
+  // the same stream). So the byte decides when present, and the sentence only covers a kern that
+  // predates it - otherwise a mixed pair (new SDK, old binary) would downgrade every real OOM to
+  // `killed`. Args: (rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal).
+  const capped = new Sandbox({ memoryMb: 256 });
+  assert.strictEqual(capped._classify(137, null, "", false, null, 1, 1).type, "oom"); // byte alone
+  assert.strictEqual(capped._classify(137, null, "", false, null, 1, 0).type, "killed"); // byte says no
+  assert.strictEqual(capped._classify(137, null, KERN_OOM_LINE, false, null, 0, 0).type, "oom"); // old kern
+  // The byte does not outrank the classes decided by exit code either.
+  assert.strictEqual(capped._classify(159, null, "", false, null, 1, 1).type, "escape_blocked");
+  assert.strictEqual(capped._classify(137, null, "", true, null, 1, 1).type, "timeout");
+  // A box with no cap that the kernel still OOM-killed (an ancestor cap we never set) is reported as
+  // what kern observed, not as what we asked for.
+  assert.strictEqual(new Sandbox({ memoryMb: null })._classify(137, null, "", false, null, 0, 1).type, "oom");
+  // Same two rules on the resident-kernel path: (err, capSignal, oomSignal).
+  const k = new kern.Kernel(capped, 5);
+  assert.strictEqual(k._kernelDeathFault("", 1, 1)[0], "oom");
+  assert.strictEqual(k._kernelDeathFault("", 1, 0)[0], "killed");
+  assert.strictEqual(k._kernelDeathFault(KERN_OOM_LINE, 0, 0)[0], "oom");
+  // The byte wins over the box-did-not-start heuristic too: a box that reached the OOM killer ran.
+  assert.strictEqual(k._kernelDeathFault("error: sandbox: could not map uid 1000\n", 1, 1)[0], "oom");
 });
 
 test("sensitive mount source is refused", () => {
@@ -1123,24 +1175,35 @@ test("a reply without a usable exit code is a fault, not a success", () => {
   assert.equal(bad.fault, null);
 });
 
-test("kernel death is oom only when a memory cap was set", () => {
-  // A resident kernel that dies mid-cell has no per-cell exit code, so it does NOT flow through
-  // _classify; its OOM attribution lives in _kernelDeathFault, the runCode counterpart of the one-shot
-  // SIGKILL branch. Capped -> oom, uncapped -> killed, a kern setup marker -> startup_failed. The
-  // signal is the --memory flag WE set, not the box's (workload-influenceable) stderr.
+test("a resident kernel's OOM is not read as a box that never started", () => {
+  // A resident kernel that dies mid-cell has no per-cell exit code, so the whole verdict lives in
+  // _kernelDeathFault. Same rule as the one-shot path, from the same shared predicate: only kern's OOM
+  // sentence is `oom`.
+  //
+  // REGRESSION: that sentence is `kern:`-prefixed, which is exactly what looksLikeStartupFailure matches
+  // on, and this asked about the start FIRST. So a real OOM on a resident kernel came back
+  // `startup_failed`, which _teardownResult THROWS - the path could not produce an `oom` fault at all,
+  // while an external kill produced one from the memoryMb inference. Opposite directions, same branch.
   const capped = new kern.Kernel(new Sandbox({ memoryMb: 256 }), 5);
-  assert.strictEqual(capped._kernelDeathFault("")[0], "oom");
-  assert.strictEqual(capped._kernelDeathFault("some traceback\n")[0], "oom"); // stderr does not flip it
-  const marker = "kern: sandbox setup failed: --apparmor demo: could not enter the profile\n";
-  assert.strictEqual(capped._kernelDeathFault(marker)[0], "startup_failed");
+  assert.strictEqual(capped._kernelDeathFault(KERN_OOM_LINE)[0], "oom");
+  assert.strictEqual(capped._kernelDeathFault("")[0], "killed"); // a cap is not evidence of an OOM
+  assert.strictEqual(capped._kernelDeathFault("some traceback\n")[0], "killed");
+  assert.strictEqual(capped._kernelDeathFault("", 1)[0], "killed"); // nor is an enforced cap
+  assert.match(capped._kernelDeathFault("")[1], /external kill/);
   const uncapped = new kern.Kernel(new Sandbox({ memoryMb: null }), 5);
   assert.strictEqual(uncapped._kernelDeathFault("")[0], "killed");
-  // capSignal refines it, same as the one-shot path: enforced (1) -> oom, not-enforced (2) -> killed
-  // (no overclaim), undetermined (0) -> heuristic. A startup marker still wins over the byte.
-  assert.strictEqual(capped._kernelDeathFault("", 1)[0], "oom");
-  assert.strictEqual(capped._kernelDeathFault("", 2)[0], "killed");
-  assert.strictEqual(capped._kernelDeathFault("", 0)[0], "oom");
+  assert.strictEqual(uncapped._kernelDeathFault(KERN_OOM_LINE)[0], "oom");
+  // POSITIVE CONTROLS, or this passes on a predicate that answers False to everything: a real setup
+  // marker is still a startup failure, and an OOM line ALONGSIDE one still reports the OOM - the box ran,
+  // so it cannot have failed to start, and the startup text is then the less specific claim.
+  const marker = "kern: sandbox setup failed: --apparmor demo: could not enter the profile\n";
+  assert.strictEqual(capped._kernelDeathFault(marker)[0], "startup_failed");
+  assert.strictEqual(capped._kernelDeathFault(marker + KERN_OOM_LINE)[0], "oom");
   assert.strictEqual(capped._kernelDeathFault(marker, 2)[0], "startup_failed");
+  // capSignal no longer decides the type; a 2 (cap requested, NOT enforced here) still says so.
+  const unenforced = capped._kernelDeathFault("", 2);
+  assert.strictEqual(unenforced[0], "killed");
+  assert.match(unenforced[1], /not enforced here/);
 });
 
 test("concurrent calls on one Sandbox do not fight over the env file", exec, async () => {

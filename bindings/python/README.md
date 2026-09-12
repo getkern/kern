@@ -74,8 +74,8 @@ sandbox acted:
 | `fault.type` | what happened |
 |---|---|
 | `timeout` | the call exceeded `timeout_s`; the binding owns that deadline |
-| `oom` | SIGKILL **and** a memory cap that actually bound (kern reports enforcement on an unforgeable per-box channel, not on the workload's stderr) |
-| `killed` | SIGKILL that is **not** attributable to the box's own ceiling: host pressure, or a cap that did not bind here |
+| `oom` | kern reported that the kernel's OOM killer took the box against its own memory cap, on a channel the code in the box cannot write (a third byte on kern's own descriptor). An observation of the kernel's counter, not a guess from the exit code |
+| `killed` | the box was SIGKILLed with **no** OOM reported against its cap: an external kill (`kern stop`, a signal, the host running out of memory), or a cap that did not bind here. A memory cap being set is not, by itself, evidence that memory is what killed the box |
 | `escape_blocked` | a syscall the seccomp filter refused (SIGSYS) |
 | `exec_failed` | the box started, the command did not exist in the image; the message names both the binary and the image |
 

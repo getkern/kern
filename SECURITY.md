@@ -31,6 +31,23 @@ Released binaries carry a `.sha256` next to the `.tar.gz`:
 sha256sum -c kern-x86_64-unknown-linux-musl.tar.gz.sha256
 ```
 
+### Verifying what the SDK will run
+
+`pip install kern-sandbox` (or `npm i kern-sandbox`) installs the BINDING, not kern: the binding is
+pure source and ships no binary, and it executes the `kern` already on your `PATH` (or the one named by
+`KERN_BIN`). So the thing to verify is that binary, not the wheel:
+
+```sh
+python3 -c "import kern_sandbox, shutil, os; print(os.environ.get('KERN_BIN') or shutil.which('kern'))"
+sha256sum "$(command -v kern)"      # compare against the .sha256 of the asset you installed
+kern --version                      # the version is the TAG, so it names the release to compare with
+```
+
+The wheel and the npm tarball are served over TLS by registries that publish their own digests; that
+bounds tampering in transit and says nothing about the binary the binding will call, which is where
+the isolation actually lives. A binding from the registry paired with a `kern` of unknown provenance
+is the case to avoid, and the first command above is how you see which one you have.
+
 ## Threat model
 
 The structured view - assets, entry points, and the two trust levels (a kernel-enforced boundary

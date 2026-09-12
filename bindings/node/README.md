@@ -133,8 +133,8 @@ LangChain tool and the MCP server already use it.
 |---|---|
 | `timeout` | the call exceeded `timeoutS`; the binding killed the box |
 | `escape_blocked` | a syscall was blocked by the seccomp filter (SIGSYS) |
-| `oom` | the box was SIGKILLed and a `memoryMb` cap was **in force**: a breached `memory.max` is the cgroup OOM-killer (`memory.oom.group=1` kills the whole box). kern reports whether the cap actually bound on an unforgeable per-box channel (2nd byte of `KERN_STARTED_FD`), so this is an *enforced-cap* OOM |
-| `killed` | a SIGKILL **not** attributed to a cgroup OOM: no `memoryMb` cap was set, or kern reported the cap did not bind here (no cgroup delegation), so it is host pressure / an external kill. Older kern (no enforcement byte) falls back to `oom` when a cap was set |
+| `oom` | kern reported that the kernel's OOM killer took the box against its own memory cap: a breached `memory.max` takes the whole box, since kern sets `memory.oom.group=1`. Reported on a channel the code in the box cannot write (a third byte on kern's own descriptor), so it is an observation of the kernel's counter rather than a guess from the exit code |
+| `killed` | the box was SIGKILLed with **no** OOM reported against its cap: an external kill (`kern stop`, a signal, the host running out of memory), or a cap that did not bind here (no cgroup delegation, which the message names). A `memoryMb` cap being set is not, by itself, evidence that memory is what killed the box |
 
 | `exec_failed` | the box started but the command did not exist inside it. `runCode(code, {language:"node"})` on an image with no `node` is the ordinary way to reach it; the message names the binary AND the image, because the remedy is a different `language` or a different `image`. The `language` enum is a convenience, not a promise about the image: the default `python:3.12-slim` carries `python` and `bash`. A shell's own `command not found` inside your script stays an ordinary non-zero exit |
 
