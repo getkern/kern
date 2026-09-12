@@ -2934,3 +2934,136 @@ class TestTheStderrSplitAtItsEdges:
         r.code_stderr
         one = time.perf_counter() - start
         assert one < 2.0, f"one scan of 200k lines took {one:.2f}s: the split is no longer linear"
+
+
+# ---------------------------------------------------------------------------
+# THE SETUP THAT BLOCKS: a stuck box start is not a timeout
+# ---------------------------------------------------------------------------
+
+
+def _stub_kern(body: str) -> str:
+    """Write an executable stand-in for kern that does `body`, and return its path.
+
+    A STUB AND NOT A REAL BOX, because the condition under test cannot be produced on demand: it needs a
+    filesystem whose `lstat` blocks (a dead NFS export, a FUSE with no daemon), and a host that has one
+    is not something a test suite can arrange. What CAN be reproduced exactly is what kern's readiness
+    pipe looks like from the caller's side in each of the three states, which is the whole of what the
+    binding decides on.
+    """
+    d = Path(os.environ.get("TMPDIR", "/tmp")) / f"kern-stub-{uuid.uuid4().hex[:8]}"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "kern"
+    p.write_text("#!/bin/sh\n" + body)
+    p.chmod(0o755)
+    return str(p)
+
+
+def _spawn_with(stub: str, timeout_s: float = 1.0):
+    """Run one `run_code` against a stub kern and hand back the result, faults included."""
+    prev = os.environ.get("KERN_BIN")
+    os.environ["KERN_BIN"] = stub
+    try:
+        with Sandbox(image="x", timeout_s=timeout_s, prewarm=0) as sbx:
+            return sbx.run_code("print(1)")
+    finally:
+        if prev is None:
+            os.environ.pop("KERN_BIN", None)
+        else:
+            os.environ["KERN_BIN"] = prev
+
+
+def test_a_box_still_in_setup_at_the_deadline_is_not_a_timeout():
+    """A deadline that fires while kern is STILL BUILDING the box is `startup_failed`, not `timeout`.
+
+    The two are indistinguishable from the exit code: both are our own SIGKILL of a kern that had not
+    finished. kern's readiness pipe (`KERN_ALIVE_FD`) separates them, and this asserts the binding reads
+    every state it can carry. MEASURED as the class behind a FIFO volume source: a box sat in
+    `wait_for_partner` past 404 seconds and the binding called it `timeout`, which an agent retries
+    forever because that class is transient.
+
+    The stubs write the protocol by hand through python, not through a shell redirection, because
+    closing a numbered descriptor from a variable is not portable across `sh` implementations (dash read
+    `eval "exec ${FD}>&-"` as a command named 14).
+    """
+    ack = 'import os; os.write(int(os.environ["KERN_ALIVE_FD"]), b"A")'
+
+    # 1) STILL IN SETUP: kern acknowledged the channel and then blocked before reaching the workload.
+    #    This is the shape a blocking `lstat` produces; the only difference is that this one is bounded.
+    stuck = _stub_kern(f'exec python3 -c \'{ack}; import time; time.sleep(30)\'\n')
+    r = _spawn_with(stuck)
+    assert r.fault is not None and r.fault.type == "startup_failed", (
+        f"a box that never started was reported as {r.fault and r.fault.type!r}"
+    )
+    assert "never started" in r.fault.message
+    assert "NFS" in r.fault.message or "FUSE" in r.fault.message, (
+        "the message must name what actually does this, since a longer timeout will not help: "
+        f"{r.fault.message}"
+    )
+
+    # 2) THE WORKLOAD RAN and then overran: the ack, then the close a real `execvp` performs through
+    #    FD_CLOEXEC. This MUST stay `timeout`, or the fix relabels every ordinary slow cell as a broken
+    #    host.
+    slow = _stub_kern(
+        f'exec python3 -c \'{ack}; os.close(int(os.environ["KERN_ALIVE_FD"])); import time; time.sleep(30)\'\n'
+    )
+    r = _spawn_with(slow)
+    assert r.fault is not None and r.fault.type == "timeout", (
+        f"a workload that ran and overran must stay a timeout, got {r.fault and r.fault.type!r}"
+    )
+
+    # 3) SETUP FAILED, the pipe's other byte: kern is past the phase that blocks, so not the new class.
+    failed = _stub_kern(
+        f'exec python3 -c \'{ack}; os.write(int(os.environ["KERN_ALIVE_FD"]), b"x"); import time; time.sleep(30)\'\n'
+    )
+    r = _spawn_with(failed)
+    assert r.fault is not None and r.fault.type == "timeout", (
+        f"a kern that reported a setup failure is past the blocking phase, got {r.fault and r.fault.type!r}"
+    )
+
+    # 4) AN OLDER KERN: it does not know the variable, so it neither writes the ack NOR closes the
+    #    descriptor - the pipe is open and silent for the whole life of the box. Without the ack these
+    #    two cases are the same observation, and every slow workload on every released binary would come
+    #    back `startup_failed`. Measured against 0.9.32-37-g02ecedf, which says nothing on that pipe.
+    old = _stub_kern('exec python3 -c \'import time; time.sleep(30)\'\n')
+    r = _spawn_with(old)
+    assert r.fault is not None and r.fault.type == "timeout", (
+        f"a kern that does not speak this protocol must keep the old verdict, got "
+        f"{r.fault and r.fault.type!r}"
+    )
+
+
+def test_the_alive_probe_never_invents_a_startup_failure():
+    """`_alive_state` answers UNKNOWN on anything it cannot measure, so only kern's own ack can produce
+    the new class, and a failed poll can only ever leave the old verdict standing."""
+    assert kern._alive_state(-1) == kern._ALIVE_UNKNOWN
+    r, w = os.pipe()
+    try:
+        os.close(w)  # EOF: the workload exec'd
+        assert kern._alive_state(r) == kern._ALIVE_PAST_SETUP
+    finally:
+        os.close(r)
+    r, w = os.pipe()
+    try:
+        assert kern._alive_state(r) == kern._ALIVE_UNKNOWN  # open, silent, no ack: an older kern
+    finally:
+        os.close(r)
+        os.close(w)
+    r, w = os.pipe()
+    try:
+        os.write(w, b"A")  # acked and still building: the only state that changes a verdict
+        assert kern._alive_state(r) == kern._ALIVE_IN_SETUP
+    finally:
+        os.close(r)
+        os.close(w)
+    r, w = os.pipe()
+    try:
+        os.write(w, b"Ax")  # acked, then kern's setup-failure byte
+        assert kern._alive_state(r) == kern._ALIVE_PAST_SETUP
+    finally:
+        os.close(r)
+        os.close(w)
+    # A closed descriptor cannot be polled, and that must read as UNKNOWN, not as a new class.
+    r, w = os.pipe()
+    os.close(r)
+    os.close(w)
+    assert kern._alive_state(r) == kern._ALIVE_UNKNOWN

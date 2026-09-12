@@ -666,6 +666,91 @@ fn started_signal_fd() -> Option<i32> {
     Some(fd)
 }
 
+/// The `KERN_ALIVE_FD` write end a caller passes to learn WHEN the box stopped being a setup and
+/// started being a workload, or `None`.
+///
+/// WHAT IT ANSWERS, AND WHY THE OTHER SIGNALS CANNOT. `KERN_STARTED_FD` is written at TEARDOWN, so it
+/// says "the box ran" only once the box is over; an SDK whose own deadline fires first kills kern
+/// before that write and reads nothing. So a call that overran has two indistinguishable causes: the
+/// workload was slow, or kern never reached `execvp` because its setup blocked. MEASURED through the
+/// Python binding: a box whose volume source was a FIFO sat in `wait_for_partner` past 404 seconds and
+/// surfaced as `fault=timeout`, a TRANSIENT class an agent retries forever. That FIFO is refused by
+/// type now, and the class behind it is not: an `lstat` on a dead NFS mount or a FUSE whose daemon is
+/// gone blocks the same way and is not a FIFO.
+///
+/// THIS IS THE READINESS PIPE, not a new protocol: it becomes the box's `ready_fd`, which already
+/// carries three states the `-d` launcher has used since it existed - EOF when the workload `execvp`s
+/// (the child marks it `FD_CLOEXEC`), one byte when setup or exec failed, and a `READY_PREPARED` byte
+/// for a gated box. A reader that sees NEITHER by its own deadline is looking at a box still in setup,
+/// which is the fact nothing could observe before.
+///
+/// Validated exactly like [`started_signal_fd`] (`> 2`, a live descriptor) and NOT marked CLOEXEC
+/// here: the box child needs to inherit it and sets `FD_CLOEXEC` itself post-fork, which is also why a
+/// `systemd-run --scope` re-exec (which drops CLOEXEC descriptors) must not find it marked.
+/// The byte kern writes to `KERN_ALIVE_FD` as soon as it has accepted the descriptor, before any box
+/// setup begins.
+///
+/// IT EXISTS BECAUSE SILENCE IS AMBIGUOUS, and the first version of this shipped without it. An OLDER
+/// kern does not know the variable, so it never closes the descriptor either: the pipe stays open and
+/// silent for the whole life of the box. A reader that took "open and silent" for "still in setup" would
+/// report `startup_failed` for an ordinary slow workload on every older binary. This byte is the
+/// difference between "the setup has not finished" and "nobody is speaking this protocol", which are the
+/// same observation without it.
+pub(crate) const ALIVE_ACK: u8 = b'A';
+
+/// The `KERN_ALIVE_FD` write end a caller passes to learn WHEN the box stopped being a setup and
+/// started being a workload, or `None`.
+///
+/// WHAT IT ANSWERS, AND WHY THE OTHER SIGNALS CANNOT. `KERN_STARTED_FD` is written at TEARDOWN, so it
+/// says "the box ran" only once the box is over; an SDK whose own deadline fires first kills kern
+/// before that write and reads nothing. So a call that overran has two indistinguishable causes: the
+/// workload was slow, or kern never reached `execvp` because its setup blocked. MEASURED through the
+/// Python binding: a box whose volume source was a FIFO sat in `wait_for_partner` past 404 seconds and
+/// surfaced as `fault=timeout`, a TRANSIENT class an agent retries forever. That FIFO is refused by
+/// type now, and the class behind it is not: an `lstat` on a dead NFS mount or a FUSE whose daemon is
+/// gone blocks the same way and is not a FIFO.
+///
+/// THIS IS THE READINESS PIPE, not a new protocol: it becomes the box's `ready_fd`, which already
+/// carries the states the `-d` launcher has used since it existed - EOF when the workload `execvp`s
+/// (the box child marks it `FD_CLOEXEC`), and one byte when setup or exec failed. [`ALIVE_ACK`] is
+/// written here, first, so a reader can tell those states from an older binary that says nothing at
+/// all. Four states, one descriptor: `A` then nothing = still building, `A` then EOF = the workload
+/// ran, `A` then a byte = setup failed, nothing = a kern that predates this.
+///
+/// Validated exactly like [`started_signal_fd`] (`> 2`, a live descriptor) and NOT marked CLOEXEC
+/// here: the box child needs to inherit it and sets `FD_CLOEXEC` itself post-fork, which is also why a
+/// `systemd-run --scope` re-exec (which drops CLOEXEC descriptors) must not find it marked.
+///
+/// A FAILED ACK DROPS THE CHANNEL (`None`), fail-closed in the direction of the old behaviour: a reader
+/// that gets no `A` keeps its previous verdict, where a half-open channel would have it guess.
+fn alive_signal_fd() -> Option<i32> {
+    let fd = std::env::var("KERN_ALIVE_FD")
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    if fd <= 2 {
+        return None;
+    }
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return None;
+    }
+    // EINTR-safe, like the started-fd write: a lost ack would read as "an older kern" and cost the
+    // caller the very distinction this descriptor exists to make.
+    let buf = [ALIVE_ACK];
+    loop {
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), 1) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if n != 1 {
+            return None;
+        }
+        break;
+    }
+    Some(fd)
+}
+
 /// Mark the started-fd **FD_CLOEXEC** in the FINAL process - after the `systemd-run --scope` re-exec,
 /// which inherits a plain fd but drops a CLOEXEC one. From here the box's execvp closes it, so the
 /// workload can never inherit or write it (a byte it wrote would spoof or suppress the signal).

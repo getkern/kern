@@ -135,8 +135,8 @@ LangChain tool and the MCP server already use it.
 | `escape_blocked` | a syscall was blocked by the seccomp filter (SIGSYS) |
 | `oom` | kern reported that the kernel's OOM killer took the box against its own memory cap: a breached `memory.max` takes the whole box, since kern sets `memory.oom.group=1`. Reported on a channel the code in the box cannot write (a third byte on kern's own descriptor), so it is an observation of the kernel's counter rather than a guess from the exit code |
 | `killed` | the box was SIGKILLed with **no** OOM reported against its cap: an external kill (`kern stop`, a signal, the host running out of memory), or a cap that did not bind here (no cgroup delegation, which the message names). A `memoryMb` cap being set is not, by itself, evidence that memory is what killed the box |
-
 | `exec_failed` | the box started but the command did not exist inside it. `runCode(code, {language:"node"})` on an image with no `node` is the ordinary way to reach it; the message names the binary AND the image, because the remedy is a different `language` or a different `image`. The `language` enum is a convenience, not a promise about the image: the default `python:3.12-slim` carries `python` and `bash`. A shell's own `command not found` inside your script stays an ordinary non-zero exit |
+| `startup_failed` | returned as data, not thrown, in one case: your `timeoutS` fired while kern was still BUILDING the box, so the code never ran. kern reports on a separate descriptor whether it reached your workload, which is what tells this from a slow cell. A host path that blocks does it: a bind source on a dead NFS export, a FUSE mount whose daemon is gone. A longer timeout does not help |
 
 **An enforced `pids` cap produces no fault, and that is deliberate.** When `pids` binds, the refused
 `fork` returns `EAGAIN`. Code that catches it exits 0, so the call reports `fault: null, success:

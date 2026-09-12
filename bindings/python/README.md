@@ -78,6 +78,7 @@ sandbox acted:
 | `killed` | the box was SIGKILLed with **no** OOM reported against its cap: an external kill (`kern stop`, a signal, the host running out of memory), or a cap that did not bind here. A memory cap being set is not, by itself, evidence that memory is what killed the box |
 | `escape_blocked` | a syscall the seccomp filter refused (SIGSYS) |
 | `exec_failed` | the box started, the command did not exist in the image; the message names both the binary and the image |
+| `startup_failed` | returned, not raised, in one case: your `timeout_s` fired while kern was still BUILDING the box, so the code never ran. kern reports on a separate descriptor whether it reached your workload, which is what tells this from a slow cell. A host path that blocks does it: a bind source on a dead NFS export, a FUSE mount whose daemon is gone. A longer timeout does not help |
 
 A box that fails to **start** raises `SandboxError` instead, because the code never ran.
 

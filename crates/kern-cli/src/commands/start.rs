@@ -1812,9 +1812,15 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // on every start (measured with 61 entries in the slice, 7.4% of a 2.6 ms box). Here it overlaps
     // the workload rather than delaying it, and the slice is still swept once per box start.
     kern_isolation::sweep_orphans_off_hot_path();
+    // THE READINESS PIPE ON THE FOREGROUND PATH, when a caller asked for it with `KERN_ALIVE_FD`.
+    // `-d` builds its own (the launcher blocks on it to print a truthful "started"), and this path had
+    // no reader, so it passed `None`. An SDK is a reader: it needs to tell "the workload was slow" from
+    // "kern never reached `execvp`", and those are the same overrun without this fd. See
+    // `alive_signal_fd`. `None` when unset or unusable, which is byte-for-byte the old behaviour.
+    let alive_fd = alive_signal_fd();
     let result = run_in_sandbox_with(
         &spec,
-        None,
+        alive_fd,
         |pid1| {
             feed_timeout_pid(timeout_wd, pid1);
             if let Some((inst, path)) = reg_state.as_mut() {

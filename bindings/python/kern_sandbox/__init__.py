@@ -595,6 +595,54 @@ _KERN_DIAGNOSTICS = ("kern: security-profile=", "kern: warning:", "kern: note:")
 _KERN_OOM_MARKER = "killed by the kernel's OOM killer"
 
 
+# kern writes this byte to `KERN_ALIVE_FD` the moment it accepts the descriptor, before any box setup.
+# It is what tells "the setup has not finished" from "this binary does not speak the protocol": an older
+# kern never writes to that pipe AND never closes it, so the pipe is open and silent in both cases.
+_ALIVE_ACK = b"A"
+
+# The three answers `_alive_state` can give, spelled once so a caller cannot invent a fourth.
+_ALIVE_PAST_SETUP = "past-setup"  # the workload ran (EOF at execvp), or kern reported setup failed
+_ALIVE_IN_SETUP = "in-setup"      # kern acknowledged the channel and is still BUILDING the box
+_ALIVE_UNKNOWN = "unknown"        # nothing on the pipe: a kern that predates this channel
+
+
+def _alive_state(fd: int) -> str:
+    """Where was kern when this was called, read off the `KERN_ALIVE_FD` pipe. Never blocks.
+
+    ``_ALIVE_PAST_SETUP`` when the pipe is at EOF (the box child's ``FD_CLOEXEC`` closed it at
+    ``execvp``, so the workload was running) or carries a byte beyond the ack (kern reported that setup
+    or exec failed). Either way kern is past the phase that can block.
+
+    ``_ALIVE_IN_SETUP`` when the ack arrived and nothing else did. That is the state nothing could
+    observe before, and the only one that changes a verdict.
+
+    ``_ALIVE_UNKNOWN`` when the pipe is silent: an older kern, which neither writes nor closes it. That
+    case must keep the caller's previous verdict, and conflating it with ``_ALIVE_IN_SETUP`` would have
+    reported every slow workload on an older binary as a box that never started.
+
+    CALLED WHILE KERN IS ALIVE. After the teardown every write end is closed and the answer would be
+    EOF for a box that never started, which is the wrong answer arrived at by asking too late. Anything
+    that cannot be measured answers ``_ALIVE_UNKNOWN``, so a failed poll can only ever leave the old
+    verdict standing.
+    """
+    if fd < 0:
+        return _ALIVE_UNKNOWN
+    acked = False
+    try:
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0)
+            if not ready:
+                return _ALIVE_IN_SETUP if acked else _ALIVE_UNKNOWN
+            chunk = os.read(fd, 64)
+            if chunk == b"":
+                return _ALIVE_PAST_SETUP  # EOF: the workload exec'd
+            if chunk.replace(_ALIVE_ACK, b""):
+                return _ALIVE_PAST_SETUP  # a byte beyond the ack: kern said setup failed
+            acked = True
+    except OSError:
+        return _ALIVE_UNKNOWN
+
+
 def _kern_reported_oom(stderr: str) -> bool:
     """True iff KERN said the kernel's OOM killer took this box against its own memory cap.
 
@@ -1666,15 +1714,27 @@ class Sandbox:
         # and the stderr heuristic stands (backward compatible).
         started_r, started_w = os.pipe()
         child_env["KERN_STARTED_FD"] = str(started_w)
+        # A SECOND, LIVE channel, because the first one is post-mortem. kern writes KERN_STARTED_FD at the
+        # box's TEARDOWN, so when OUR deadline fires we kill kern before that write and learn nothing: a
+        # workload that was slow and a kern whose SETUP blocked are the same overrun. KERN_ALIVE_FD is the
+        # box's readiness pipe: EOF when the workload `execvp`s (the box child marks it FD_CLOEXEC), one
+        # byte when setup or exec failed, and NEITHER while kern is still building the box. That third
+        # state is the one nothing could observe, and it is what separates a `timeout` from a box that
+        # never started. MEASURED as the class behind a FIFO volume source: 404 seconds inside
+        # `wait_for_partner`, reported as `timeout`, which is the class an agent retries forever.
+        alive_r, alive_w = os.pipe()
+        child_env["KERN_ALIVE_FD"] = str(alive_w)
         box_started = False
         cap_signal = 0  # 2nd started byte: 0 undetermined/old-kern, 1 memory cap enforced, 2 not enforced
         oom_signal = 0  # 3rd started byte: 1 = the kernel OOM-killed this box's own cgroup, 0 = it did not
+        # None = never asked (we did not time out); otherwise one of the three `_ALIVE_*` states.
+        alive_state: "str | None" = None
         try:
             try:
                 # start_new_session so the box + kern share a process group we can signal as a unit.
                 proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
                     argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env,
-                    start_new_session=True, pass_fds=(started_w,),
+                    start_new_session=True, pass_fds=(started_w, alive_w),
                 )
             except FileNotFoundError as e:
                 raise SandboxError(f"could not execute kern: {e}") from e
@@ -1684,6 +1744,7 @@ class Sandbox:
                 raise SandboxError(f"could not spawn the box: {e}") from e
             finally:
                 os.close(started_w)  # the parent never writes; closing lets the read side see EOF
+                os.close(alive_w)  # same reason: with our copy open, EOF could never arrive
             out = _CappedReader(proc.stdout, self.max_output_bytes, cb_out)
             err = _CappedReader(proc.stderr, self.max_output_bytes, cb_err)
             out.start()
@@ -1694,6 +1755,11 @@ class Sandbox:
             # still an unreaped zombie and its pid therefore cannot have been recycled under us.
             we_timed_out = not _wait_for_exit(proc, timeout_s)
             if we_timed_out:
+                # BEFORE THE KILL, and that ordering IS the measurement. Our teardown kills kern, every
+                # copy of the alive fd closes with it, and the read end then shows EOF whatever the box was
+                # doing - so asking afterwards always answers "it started". Asked here, while kern is
+                # still alive, the pipe separates the two overruns.
+                alive_state = _alive_state(alive_r)
                 self._teardown(proc, name, child_env)
             # Join readers, but BOUNDED: a CPU-bound box can survive our signals and hold the pipe open
             # until kern's own --timeout backstop reaps it a few seconds later; never hang the caller on it.
@@ -1726,10 +1792,11 @@ class Sandbox:
                 self._release(os.path.basename(self._env_path(name)))
             except OSError:
                 pass
-            try:
-                os.close(started_r)
-            except OSError:
-                pass
+            for fd in (started_r, alive_r):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         wall_ms = int((time.monotonic() - started) * 1000)
         stdout = out.buf.decode("utf-8", "replace")
         stderr = err.buf.decode("utf-8", "replace")
@@ -1747,7 +1814,9 @@ class Sandbox:
         # this aligns the number for code that does not.
         if rc < 0:
             rc = 128 + (-rc)
-        fault = self._classify(rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal)
+        fault = self._classify(
+            rc, stderr, we_timed_out, timeout_s, cap_signal, oom_signal, alive_state
+        )
         exec_fail = _exec_failure_binary(stderr)
         if exec_fail is not None and rc != 0:
             # BEFORE the suppression below, which would erase it: the box started, so that branch
@@ -1827,6 +1896,7 @@ class Sandbox:
         timeout_s: "int | float | None" = None,
         cap_signal: int = 0,
         oom_signal: int = 0,
+        alive_state: "str | None" = None,
     ) -> SandboxFault | None:
         # ORDER IS A SECURITY PROPERTY. The classes that are DETERMINISTIC by exit code are decided
         # FIRST, BEFORE we ever look at stderr - because stderr is a channel the workload controls, and
@@ -1839,6 +1909,24 @@ class Sandbox:
         if we_timed_out:
             # OUR deadline fired and we killed the box - a known fact, never guessed.
             limit = self.timeout_s if timeout_s is None else timeout_s
+            # AND THE DEADLINE ALONE DOES NOT SAY WHOSE FAULT IT WAS. `reached_workload is False` is
+            # kern's own answer, read off the readiness pipe while kern was still alive: the box was
+            # still being BUILT, so the code never ran and calling this a `timeout` would tell the caller
+            # their workload was slow. That class was measured with a FIFO volume source (404 seconds in
+            # `wait_for_partner`), and the shapes behind it - an `lstat` on a dead NFS mount, a FUSE whose
+            # daemon is gone - are not FIFOs and cannot be refused by type.
+            #
+            # Every other state keeps the old verdict: `_ALIVE_PAST_SETUP` because the code really did
+            # run, and `_ALIVE_UNKNOWN` (an older kern, a failed poll) because absence of evidence is
+            # not evidence. This reports `startup_failed` only on kern's own positive answer.
+            if alive_state == _ALIVE_IN_SETUP:
+                return SandboxFault(
+                    "startup_failed",
+                    f"the box never started: kern was still setting it up when the {limit}s deadline "
+                    "fired, so the code never ran. A host path that blocks is what does this - a bind "
+                    "source on a dead NFS or a FUSE mount whose daemon is gone, an image layer on a "
+                    "stalled disk - and the remedy is that path, not a longer timeout",
+                )
             return SandboxFault("timeout", f"exceeded the {limit}s time limit (killed by the binding)")
         if rc == _EXIT_SIGSYS:
             # A seccomp-denied syscall. Decided by exit code, so no stderr content can mask it.

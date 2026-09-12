@@ -1202,6 +1202,129 @@ fn a_refused_first_service_leaves_no_pod_behind() {
     );
 }
 
+/// Run `kern box` with a pipe on `KERN_ALIVE_FD` and report what that pipe said, bounded.
+///
+/// Returns `(exit code, state)` with the SAME three states the bindings decide on, because a test that
+/// modelled the protocol differently would pass while they broke:
+///   * `"past-setup"`: EOF (the workload `execvp`'d, so the child's `FD_CLOEXEC` closed it) or a byte
+///     beyond the ack (kern reported setup or exec failed).
+///   * `"in-setup"`: the ack arrived and nothing else did, within the window.
+///   * `"unknown"`: nothing at all, which is what a kern predating this channel does.
+///
+/// The window is what makes this a test and not a hang: a box that reaches neither end state would
+/// otherwise block the suite forever.
+fn alive_state(args: &[&str], window: std::time::Duration) -> (Option<i32>, &'static str) {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return (None, "open");
+    }
+    let (r, w) = (fds[0], fds[1]);
+    let child = kern()
+        .args(args)
+        .env("KERN_ALIVE_FD", w.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let Ok(mut child) = child else {
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+        return (None, "open");
+    };
+    // The parent's own copy must go, or the read end can never see EOF: kern's child and this process
+    // would both hold a write end. Same reason the `-d` launcher closes its copy.
+    unsafe { libc::close(w) };
+    let mut pfd = libc::pollfd {
+        fd: r,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(window.as_millis()).unwrap_or(i32::MAX);
+    // Drain until an end state or the window closes: kern writes its ack FIRST, so the first readable
+    // event is a byte on every path and a single read cannot tell the three states apart.
+    let mut acked = false;
+    let state = loop {
+        pfd.revents = 0;
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n <= 0 {
+            break if acked { "in-setup" } else { "unknown" };
+        }
+        let mut b = [0u8; 64];
+        let got = unsafe { libc::read(r, b.as_mut_ptr().cast(), b.len()) };
+        if got <= 0 {
+            break "past-setup"; // EOF: the workload exec'd
+        }
+        let read = usize::try_from(got).unwrap_or(0);
+        if b[..read].iter().any(|c| *c != b'A') {
+            break "past-setup"; // a byte beyond the ack: kern said setup failed
+        }
+        acked = true;
+    };
+    unsafe { libc::close(r) };
+    let code = match child.wait() {
+        Ok(st) => st.code(),
+        Err(_) => None,
+    };
+    let _ = child.stderr.take();
+    (code, state)
+}
+
+/// `KERN_ALIVE_FD` distinguishes a box that REACHED its workload from one that did not.
+///
+/// WHY IT EXISTS. `KERN_STARTED_FD` is written at teardown, so an SDK whose own deadline fires first
+/// kills kern before that write and learns nothing: "the workload was slow" and "kern never reached
+/// `execvp` because its setup blocked" are the same overrun. MEASURED through the Python binding
+/// before this: a box whose volume source was a FIFO sat in `wait_for_partner` past 404 seconds and
+/// came back `fault=timeout`, a TRANSIENT class an agent retries forever. The FIFO is refused by type
+/// now; an `lstat` on a dead NFS mount or a FUSE with no daemon blocks identically and is not a FIFO.
+///
+/// This is the readiness pipe the `-d` launcher already used, handed to the caller instead of being
+/// built internally, so the three states are the ones that path has relied on for releases.
+#[test]
+fn the_alive_fd_tells_a_started_workload_from_a_box_still_in_setup() {
+    let window = std::time::Duration::from_secs(20);
+    // A healthy box: the workload execs, `FD_CLOEXEC` closes the descriptor, the reader sees EOF.
+    let (code, state) = alive_state(
+        &[
+            "box",
+            "alivetest-ok",
+            "--image",
+            "alpine",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo hi",
+        ],
+        window,
+    );
+    if code != Some(0) {
+        eprintln!("SKIP: this host could not run a plain box (exit {code:?}), so it has no exec to observe");
+        return;
+    }
+    assert_eq!(
+        state, "past-setup",
+        "a box whose workload ran must close the alive fd, or an SDK cannot tell it from a stuck setup"
+    );
+    // THE OTHER STATE, and without it the assertion above would also pass on a kern that closed the fd
+    // unconditionally: a command that does not exist fails INSIDE the box, after the fork, so the child
+    // writes the failure byte rather than reaching exec.
+    let (code, state) = alive_state(
+        &["box", "alivetest-127", "--image", "alpine", "--", "/nope"],
+        window,
+    );
+    assert_eq!(
+        code,
+        Some(127),
+        "a missing command must still be the workload's own 127"
+    );
+    assert_eq!(
+        state, "past-setup",
+        "a box whose command could not be started is past the setup phase, so it must not read as a box \
+         still building"
+    );
+}
+
 /// A COMPOSE REFUSAL DOES NOT END WITH ADVICE ABOUT THE OTHER FILE FORMAT.
 ///
 /// kern reads two kinds of stack, a `docker-compose.yml` and its own TOML, and every compose error

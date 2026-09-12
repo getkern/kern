@@ -1175,6 +1175,30 @@ test("a reply without a usable exit code is a fault, not a success", () => {
   assert.equal(bad.fault, null);
 });
 
+test("a box still in setup at the deadline is not a timeout", () => {
+  // The two overruns are indistinguishable from the exit code: both are our own SIGKILL of a kern that
+  // had not finished. kern's readiness pipe separates them, and the ack byte is what separates a kern
+  // that is still BUILDING from one that does not speak the protocol at all - an older binary neither
+  // writes to that pipe nor closes it, so without the ack every slow workload on a released kern would
+  // come back `startup_failed`. Args: (rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal,
+  // aliveState).
+  const s = new Sandbox({ memoryMb: 256 });
+  const f = s._classify(137, null, "", true, 30, 0, 0, "in-setup");
+  assert.strictEqual(f.type, "startup_failed");
+  assert.match(f.message, /never started/);
+  assert.match(f.message, /NFS|FUSE/); // a longer timeout will not help, so the message names what will
+  // Every other state keeps the old verdict.
+  assert.strictEqual(s._classify(137, null, "", true, 30, 0, 0, "past-setup").type, "timeout");
+  assert.strictEqual(s._classify(137, null, "", true, 30, 0, 0, "unknown").type, "timeout");
+  assert.strictEqual(s._classify(137, null, "", true, 30).type, "timeout"); // default: unknown
+  // ORDER: the deadline is still decided before any stderr is read, so a forged marker cannot turn a
+  // stuck setup into something else, and a real OOM line cannot outrank our own kill.
+  assert.strictEqual(
+    s._classify(137, null, KERN_OOM_LINE, true, 30, 1, 1, "in-setup").type,
+    "startup_failed",
+  );
+});
+
 test("a resident kernel's OOM is not read as a box that never started", () => {
   // A resident kernel that dies mid-cell has no per-cell exit code, so the whole verdict lives in
   // _kernelDeathFault. Same rule as the one-shot path, from the same shared predicate: only kern's OOM

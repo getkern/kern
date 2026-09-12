@@ -889,6 +889,18 @@ function isKernDiagnostic(line) {
  * reporting `killed` - wrong in the safe direction, still wrong. Mirrors `_KERN_OOM_MARKER`. */
 const KERN_OOM_MARKER = "killed by the kernel's OOM killer";
 
+/** The byte kern writes to `KERN_ALIVE_FD` the moment it accepts the descriptor, before any box setup.
+ * It is what tells "the setup has not finished" from "this binary does not speak the protocol": an older
+ * kern never writes to that pipe AND never closes it, so the pipe is open and silent in both cases.
+ * Mirrors `_ALIVE_ACK`. */
+const ALIVE_ACK = 0x41; // 'A'
+
+/** Where kern was when the deadline fired, read off the `KERN_ALIVE_FD` pipe. Spelled once so a caller
+ * cannot invent a fourth answer. Mirrors the `_ALIVE_*` constants in the Python binding. */
+const ALIVE_PAST_SETUP = "past-setup"; // the workload ran (EOF at execvp), or kern reported setup failed
+const ALIVE_IN_SETUP = "in-setup"; // kern acknowledged the channel and is still BUILDING the box
+const ALIVE_UNKNOWN = "unknown"; // nothing on the pipe: a kern that predates this channel
+
 /** True iff KERN said the kernel's OOM killer took this box against its own memory cap.
  *
  * The ONE definition of "this was an OOM", used by all three death paths (the one-shot exit-code
@@ -1459,6 +1471,12 @@ class Sandbox {
     // OLD kern never writes it, `boxStarted` stays false, and the stderr heuristic stands (backward
     // compatible).
     childEnv.KERN_STARTED_FD = "3";
+    // A SECOND, LIVE channel, because the first one is post-mortem. kern writes KERN_STARTED_FD at the
+    // box's TEARDOWN, so when OUR deadline fires we kill kern before that write and learn nothing: a
+    // workload that was slow and a kern whose SETUP blocked are the same overrun. fd 4 carries kern's
+    // readiness pipe: the ack byte on acceptance, EOF when the workload `execvp`s (the box child marks it
+    // FD_CLOEXEC), one byte if setup or exec failed, and nothing at all from a kern that predates it.
+    childEnv.KERN_ALIVE_FD = "4";
 
     const started = process.hrtime.bigint();
     return new Promise((resolve, reject) => {
@@ -1472,13 +1490,36 @@ class Sandbox {
         child = spawn(argv[0], argv.slice(1), {
           env: childEnv,
           detached: true,
-          stdio: ["ignore", "pipe", "pipe", "pipe"],
+          stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"],
         });
       } catch (e) {
         this._removeEnvFile(name);
         return reject(new SandboxError(`could not spawn the box: ${e.message}`));
       }
 
+      // The alive channel's state, updated as the pipe speaks. Read at the deadline, BEFORE the kill:
+      // the teardown closes every write end, so afterwards the pipe reads EOF whatever the box was doing
+      // and the question answers itself wrongly.
+      let aliveState = ALIVE_UNKNOWN;
+      const aliveCh = child.stdio[4];
+      if (aliveCh) {
+        aliveCh.on("data", (b) => {
+          if (aliveState === ALIVE_PAST_SETUP) return;
+          for (const byte of b) {
+            if (byte === ALIVE_ACK) {
+              if (aliveState === ALIVE_UNKNOWN) aliveState = ALIVE_IN_SETUP;
+            } else {
+              aliveState = ALIVE_PAST_SETUP; // a byte beyond the ack: kern said setup failed
+              return;
+            }
+          }
+        });
+        // EOF: the box child's FD_CLOEXEC closed it at `execvp`, so the workload ran.
+        aliveCh.on("end", () => {
+          aliveState = ALIVE_PAST_SETUP;
+        });
+        aliveCh.on("error", () => {});
+      }
       const startedCh = child.stdio[3];
       if (startedCh) {
         // Byte 0 (0x01) = the box started; stream end with no byte = never started / old kern. Byte 1
@@ -1521,7 +1562,7 @@ class Sandbox {
         const stdout = out.buffer().toString("utf8");
         const stderr = err.buffer().toString("utf8");
         const rc = toRc(code, signal);
-        let fault = this._classify(rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal);
+        let fault = this._classify(rc, signal, stderr, timedOut, timeoutS, capSignal, oomSignal, aliveState);
         const execFail = execFailureBinary(stderr);
         if (execFail !== null && rc !== 0) {
           // BEFORE the suppression below, which would erase it: the box started, so that branch
@@ -1619,14 +1660,30 @@ class Sandbox {
     }
   }
 
-  _classify(rc, signal, stderr, timedOut, timeoutS, capSignal = 0, oomSignal = 0) {
+  _classify(rc, signal, stderr, timedOut, timeoutS, capSignal = 0, oomSignal = 0, aliveState = ALIVE_UNKNOWN) {
     // ORDER IS A SECURITY PROPERTY: deterministic-by-exit-code classes are decided BEFORE the stderr
     // heuristic, because stderr is a channel the workload controls.
-    if (timedOut)
+    if (timedOut) {
+      // AND THE DEADLINE ALONE DOES NOT SAY WHOSE FAULT IT WAS. `ALIVE_IN_SETUP` is kern's own answer,
+      // read off the readiness pipe while kern was still alive: the box was still being BUILT, so the
+      // code never ran and calling this a `timeout` would tell the caller their workload was slow. That
+      // class was measured with a FIFO volume source (404 seconds in `wait_for_partner`), and the shapes
+      // behind it - an `lstat` on a dead NFS mount, a FUSE whose daemon is gone - are not FIFOs and
+      // cannot be refused by type. Every other state keeps the old verdict, `ALIVE_UNKNOWN` (an older
+      // kern) included: absence of evidence is not evidence.
+      if (aliveState === ALIVE_IN_SETUP)
+        return sandboxFault(
+          "startup_failed",
+          `the box never started: kern was still setting it up when the ${timeoutS ?? this.timeoutS}s ` +
+            "deadline fired, so the code never ran. A host path that blocks is what does this - a bind " +
+            "source on a dead NFS or a FUSE mount whose daemon is gone, an image layer on a stalled " +
+            "disk - and the remedy is that path, not a longer timeout",
+        );
       return sandboxFault(
         "timeout",
         `exceeded the ${timeoutS ?? this.timeoutS}s time limit (killed by the binding)`,
       );
+    }
     if (rc === EXIT_SIGSYS || signal === "SIGSYS")
       return sandboxFault("escape_blocked", "a syscall was blocked by the seccomp filter (SIGSYS)");
     if (rc === EXIT_SIGKILL || signal === "SIGKILL") {
