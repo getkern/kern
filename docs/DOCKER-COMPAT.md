@@ -274,8 +274,31 @@ own and are used directly. A `tmpfs` size cap is honoured and charged to the box
 
 `vgpio` is gated: a profile name means different hardware on different hosts, so `kern compose <file>
 config` prints what each name resolves to here, and `--allow-device-grants` (or the operator's own
-`kern.toml`) is required before it runs. A profile kind this build does not have is named as absent
-rather than treated as a typo.
+`kern.toml`) is required before it runs.
+
+**A profile kind this build does not have is named as absent rather than treated as a typo, and the
+difference is the whole point of the sentence.** There is exactly one such kind here:
+`x-kern-vgpu:`. It is recognised, it is not available in this build, and a file carrying it runs
+without it:
+
+```
+kern: warning: compose: service 'app': 'x-kern-vgpu:' names the 'vgpu' profile kind, which this
+build of kern does not have - the key is ignored, and the service runs without it
+```
+
+A MISSPELLED key gets a different sentence, because it is a different problem: telling the author of
+`x-kern-vgpu` to check their spelling would be false, and telling the author of `x-kern-vgpi` that
+their key belongs to another build would be worse:
+
+```
+kern: warning: compose: service 'app': 'x-kern-vgpi:' is not read by this build - kern reads
+x-kern-vcpu, x-kern-vdisk, x-kern-vgpio, and x-kern-security-profile
+```
+
+Both are warnings and neither stops the stack: the specification requires every runtime to ignore an
+`x-` key, so refusing one would be the incompatibility this whole mechanism exists to avoid. What
+must never happen is silence, because a key nobody read is a CPU slice or a device the author
+believes they attached.
 
 ## Starting a stack at boot
 

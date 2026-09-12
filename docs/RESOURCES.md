@@ -100,7 +100,23 @@ reads and writes. The full schema, every field, the 7-layer precedence and `exte
 They compose: `run` inside `box`. Both ship today.
 
 **Both carry a default memory cap of 512 MiB where the host can hold one**, plus no swap and a
-ceiling of 512 tasks. Where kern's delegated `kern.slice` is usable, both write those three caps
+ceiling of 512 tasks.
+
+**`kern compose` answers the same question differently, and both answers are deliberate.** They are
+in one table here because a reader who meets them one at a time concludes that one of them is a bug:
+
+| what you ran | memory ceiling with no flag or key | why |
+|---|---|---|
+| `kern box` / `kern run` | **512 MiB** | kern's own default: a sandbox for something you are about to run is capped until you say otherwise |
+| a `kern compose` service with no `mem_limit:` | **the host's RAM** | compose parity. Docker does not cap a service by default, and a file that behaves differently here than under Docker is the thing `kern compose` exists to avoid |
+
+Measured, on a host with 33465040896 bytes of RAM: `kern box --image alpine -- cat
+/sys/fs/cgroup/memory.max` prints `536870912`, and the same read inside a compose service with no
+keys prints `33465040896`. The compose case is a ceiling, not an absence of one: the box still has a
+`memory.max` and `oom.group = 1`, so a failure stays attributable to its own cgroup rather than the
+host OOM killer picking a victim. `[kern] compose_memory_max` puts a strict ceiling back and caps a
+larger `mem_limit:` too ([CONFIG.md](CONFIG.md), and [DOCKER-COMPAT.md](DOCKER-COMPAT.md) for the
+parity argument). Where kern's delegated `kern.slice` is usable, both write those three caps
 straight into a cgroup of their own; where it is not, they re-exec into a transient systemd scope that
 carries the same three. A workload past the ceiling is OOM-killed and kern names `--memory` as the
 fix. Two ways to change it, and they are not the same:
