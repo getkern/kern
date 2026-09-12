@@ -4049,7 +4049,12 @@ mod box_env_tests {
     #[test]
     fn a_recorded_environment_survives_every_shape_a_value_can_take() {
         let name = format!("kern-envtest-{}", std::process::id());
-        let pid = 424_242;
+        // A LIVE PID, and the fake one it replaces cost a false red. This writes into the developer's
+        // real runtime dir, and any concurrent kern invocation is entitled to prune a record whose pid
+        // is dead: a battery running boxes in another terminal pruned this one between the write and the
+        // read, so the suite reported a product defect that was its own housekeeping. Serial CI never
+        // saw it. This process's own pid is alive for the whole test, so there is nothing to prune.
+        let pid = std::process::id() as i32;
         let env: Vec<(String, String)> = vec![
             ("PATH".into(), "/opt/rabbitmq/sbin:/usr/bin".into()),
             // A value carrying the separator of any line-based format.
