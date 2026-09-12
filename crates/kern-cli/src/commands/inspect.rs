@@ -244,8 +244,20 @@ pub fn ps(
         let mut items: Vec<String> = boxes
             .iter()
             .map(|b| {
+                // `status` IS NOT `health`, and leaving it out made `--json` the only blind channel.
+                // MEASURED on one paused box: the table said `paused`, `--format '{{.Status}}'` said
+                // `paused`, `--filter status=paused` matched it, and `--json` said `"health":""`.
+                // Same for an orphaned box, whose supervisor is dead while its workload still holds
+                // the port: the table says `orphaned` and the JSON said nothing at all. The channel
+                // that loses the fact is the one scripts and agents read.
+                //
+                // ADDED rather than folded into `health`, because they are two different facts (a box
+                // can be orphaned AND unhealthy) and because `--json` is declared additive: consumers
+                // ignore unknown fields, and no existing one changes meaning here. The string comes
+                // from `box_status`, the same function the table and `--format` use, so the four
+                // channels cannot drift again.
                 format!(
-                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{}}}",
+                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{},\"status\":{}}}",
                     json_str(&b.name),
                     b.pid,
                     json_str(&b.pod),
@@ -254,6 +266,7 @@ pub fn ps(
                     b.started,
                     json_str(&b.ports),
                     json_str(&registry::health_of(&b.name, b.pid)),
+                    json_str(&super::box_status(b, "running")),
                 )
             })
             .collect();
@@ -261,13 +274,18 @@ pub fn ps(
         // are gone with the box, so they are simply absent rather than emitted as a lie.
         for e in &exited {
             items.push(format!(
-                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"exit_code\":{},\"exited_ago\":{},\"health\":{}}}",
+                // `status` here too, with the same value `health` already carried, so a consumer can
+                // read ONE key across live and exited rows instead of knowing that a dead box spells
+                // its state in the health field. `health` keeps saying `exited` because something may
+                // already read it.
+                "{{\"name\":{},\"pid\":{},\"pod\":{},\"command\":{},\"exit_code\":{},\"exited_ago\":{},\"health\":{},\"status\":{}}}",
                 json_str(&e.name),
                 e.pid,
                 json_str(&e.pod),
                 json_str(&e.command),
                 e.code,
                 e.exited_ago,
+                json_str("exited"),
                 json_str("exited"),
             ));
         }
@@ -299,12 +317,30 @@ pub fn ps(
                             .name
                             .strip_prefix(&format!("{}-", b.pod))
                             .unwrap_or(&b.name);
+                        // `State` WAS THE LITERAL "running" FOR EVERY LIVE BOX, which is not a gap
+                        // but a wrong answer: a PAUSED box reported itself as running to every
+                        // Docker-shaped consumer, and `docker compose ps --format json` does emit
+                        // `paused` for a paused container. MEASURED before the fix: the table said
+                        // `paused`, `--format '{{.Status}}'` said `paused`, `--filter status=paused`
+                        // matched, and this line said `running`.
+                        //
+                        // DOCKER'S VOCABULARY IN DOCKER'S KEY, kern's in kern's. Docker has no word
+                        // for `orphaned` - the container IS running as far as that model goes - so
+                        // `State` says `running` there and the kern-native `status` above carries
+                        // the distinction. Inventing a state Docker consumers cannot parse would be
+                        // the same mistake as inventing a `Publishers` shape.
+                        let kern_status = super::box_status(b, "running");
+                        let docker_state = if kern_status == "paused" {
+                            "paused"
+                        } else {
+                            "running"
+                        };
                         format!(
                             ",\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":0,\"Command\":{},\"Publishers\":{}",
                             json_str(&b.name),
                             json_str(service),
                             json_str(&b.pod),
-                            json_str("running"),
+                            json_str(docker_state),
                             json_str(&registry::health_of(&b.name, b.pid)),
                             json_str(&b.command),
                             publishers_json(&b.ports),

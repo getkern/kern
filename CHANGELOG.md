@@ -7,6 +7,20 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`ps --json` was the only channel that could not say a box is paused or orphaned.** MEASURED on one
+paused box: the table printed `paused`, `--format '{{.Status}}'` printed `paused`,
+`--filter status=paused` matched it, and `--json` carried `"health":""` and no status at all. Same
+for an orphaned box, whose supervisor is dead while its workload still runs and still holds the host
+port. Four channels, and the blind one is what scripts and agents read. A `status` field is now
+emitted, from the same `box_status` the other three use, so they cannot drift again; `health` is
+untouched, because a box can be orphaned AND unhealthy and because `--json` is declared additive.
+
+**The Docker-shaped NDJSON reported `running` for a paused container.** `compose ps --format json`
+hardcoded the literal `"State":"running"` for every live box, which is not a gap but a wrong answer:
+`docker compose ps --format json` emits `paused` there. Docker's vocabulary now goes in Docker's key
+and kern's in kern's, so `orphaned`, which Docker has no word for, appears as `running` in `State`
+and as `orphaned` in `status`.
+
 **Every pod failed on a host with no systemd and no elogind, and the error named an internal
 directory.** MEASURED on Alpine 3.21 with OpenRC: `kern box` worked and every pod died with
 `pod dir: No such file or directory (os error 2)`, so the two compose wirings that use a pod were

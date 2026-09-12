@@ -2057,6 +2057,130 @@ fn box_run_isolates_and_propagates_exit_code() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// THE FOUR CHANNELS THAT REPORT A BOX'S STATE MUST NOT DISAGREE, and `--json` was the one that did.
+///
+/// MEASURED on one paused box before the fix: the table printed `paused`, `--format '{{.Status}}'`
+/// printed `paused`, `--filter status=paused` matched it, and `ps --json` carried `"health":""` and
+/// no status at all. Same for an orphaned box, whose supervisor is dead while its workload still
+/// runs and still holds the port: the table says `orphaned`, the JSON said nothing. The channel that
+/// lost the fact is the one scripts and agents read, which is the worst one to lose it in.
+///
+/// `status` was ADDED rather than folded into `health`: they are different facts (a box can be
+/// orphaned AND unhealthy) and `--json` is declared additive.
+#[test]
+fn ps_json_carries_the_same_state_the_table_and_the_format_template_show() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "psjson");
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-psjson-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let name = format!("psjson-{}", std::process::id());
+
+    let started = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            &name,
+            "--rootfs",
+            &rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "60",
+        ])
+        .output()
+        .expect("run kern");
+    if !started.status.success() {
+        eprintln!(
+            "skip: this host cannot start a box: {}",
+            String::from_utf8_lossy(&started.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    let json_status = || -> String {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "--json"])
+            .output()
+            .expect("run kern");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        // Deliberately not a JSON parser: the point is that the KEY is present with the value the
+        // other channels show, and a substring check cannot be fooled into passing by a missing key.
+        for field in text.split("\"status\":\"").skip(1) {
+            if let Some(v) = field.split('"').next() {
+                return v.to_string();
+            }
+        }
+        String::new()
+    };
+    let fmt_status = || -> String {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "--format", "{{.Status}}"])
+            .output()
+            .expect("run kern");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let mut running = String::new();
+    for _ in 0..40 {
+        running = json_status();
+        if !running.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        running, "running",
+        "a live box must report `running` in --json, not an absent key"
+    );
+    assert_eq!(fmt_status(), running, "--format and --json must agree");
+
+    // PAUSED. The freezer may be unavailable on a host without a delegated cgroup, and that is a
+    // skip rather than a failure: the assertion below is about AGREEMENT, and there is nothing to
+    // agree about if the pause did not happen.
+    let paused = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["pause", &name])
+        .output()
+        .expect("run kern");
+    if paused.status.success() && fmt_status() == "paused" {
+        assert_eq!(
+            json_status(),
+            "paused",
+            "the table and --format say `paused`; --json must not say `running`"
+        );
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["unpause", &name])
+            .output();
+    } else {
+        eprintln!(
+            "skip: this host could not freeze the box, so there is no paused state to compare"
+        );
+    }
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", &name])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
 #[test]
 fn box_detached_appears_in_ps_then_prunes() {
     let Some(busybox) = static_busybox() else {
