@@ -38,15 +38,39 @@ pub(crate) fn read_log_reason(path: &std::path::Path) -> Option<String> {
     // present, so the worst case is a less-detailed message, never a wrong verdict.
     for _ in 0..150 {
         let tail = read_log_tail(path, 1024);
-        if tail
-            .as_deref()
-            .is_some_and(|t| t.contains("box failed to start") || t.contains("user namespaces"))
-        {
+        if tail.as_deref().is_some_and(log_carries_a_reason) {
             return tail;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     read_log_tail(path, 1024)
+}
+
+/// Does this log tail already carry the supervisor's REASON, whatever shape it took?
+///
+/// THE PREDICATE USED TO BE TWO LITERAL STRINGS, and the commonest user error matched neither. It
+/// waited for `box failed to start` or `user namespaces`; a command that does not exist makes the
+/// supervisor write `kern: cannot start '<cmd>' in box: No such file or directory`, which contains
+/// neither. MEASURED: `kern box -d --image alpine -- /nonexistent-binary` took 3.035 SECONDS, all of
+/// it in this loop, and then printed a message that had been in the file since the first poll. The
+/// same command in the FOREGROUND took 5 ms, which is what told me the cost was here and not in the
+/// box. `kern compose up -d` on a stack with one such service paid the same three seconds.
+///
+/// ANCHORED ON kern'S OWN PREFIX, MINUS ITS BENIGN ONES, which is the discipline the Python binding
+/// already applies to the same question (`_looks_like_startup_failure`): the workload cannot forge a
+/// verdict, because a `kern:` line here is written by the supervisor before the workload's output
+/// reaches this file, and the three benign kinds - the posture banner, `warning:` and `note:` - are
+/// exactly the lines that are NOT a reason. Matching on the prefix rather than on a sentence means
+/// the next failure message kern grows is covered on the day it is written, instead of quietly
+/// costing three seconds until someone measures it.
+fn log_carries_a_reason(tail: &str) -> bool {
+    tail.lines().any(|line| {
+        let l = line.trim_start();
+        l.starts_with("kern:")
+            && !l.starts_with("kern: note:")
+            && !l.starts_with("kern: warning:")
+            && !l.starts_with("kern: security-profile=")
+    })
 }
 
 /// Per-file cap on a box's captured log. A single-generation ring (`<log>` + `<log>.1`) keeps at most
@@ -907,5 +931,54 @@ mod rotation_tests {
                 files: 2
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod reason_predicate_tests {
+    use super::log_carries_a_reason;
+
+    /// THE PREDICATE THAT COST THREE SECONDS PER TYPO.
+    ///
+    /// It waited for one of two literal sentences, and the commonest failure in the product - a
+    /// command that does not exist - writes neither. MEASURED before the fix: `kern box -d --image
+    /// alpine -- /nonexistent-binary` took 3.035 s and then printed a message that had been in the
+    /// log since the first poll; the same command in the foreground took 5 ms. After: 8 ms.
+    ///
+    /// The cases below are the LOG LINES the supervisor actually writes, copied from a real run, not
+    /// invented shapes.
+    #[test]
+    fn a_kern_failure_line_is_a_reason_and_a_benign_one_is_not() {
+        // Every one of these must END the wait.
+        for reason in [
+            "kern: cannot start '/nonexistent-binary' in box: No such file or directory (os error 2)",
+            "kern: sandbox setup failed: -v /tmp/f:/x: the source is a FIFO",
+            "kern: box failed to start: unprivileged user namespaces are unavailable",
+            "kern: pod: could not map the pod user namespace",
+        ] {
+            assert!(
+                log_carries_a_reason(reason),
+                "this is the supervisor's reason and the wait must end here: {reason}"
+            );
+        }
+        // And every one of these must NOT: they are the three benign kinds kern prints on a box that
+        // is starting perfectly well. Treating one as a reason would end the wait before the real
+        // line lands and report a warning as the cause, which is the defect the loop exists to avoid.
+        for benign in [
+            "kern: note: this file separates services with `networks:`",
+            "kern: warning: resource caps could not be enforced here",
+            "kern: security-profile=untrusted seccomp=allowlist",
+            "some workload output that mentions kern: in passing",
+            "",
+        ] {
+            assert!(
+                !log_carries_a_reason(benign),
+                "this must not end the wait: {benign}"
+            );
+        }
+        // A tail is many lines: a benign line FIRST must not mask the reason that follows it.
+        assert!(log_carries_a_reason(
+            "kern: warning: resource caps could not be enforced here\nkern: cannot start 'x' in box: No such file"
+        ));
     }
 }

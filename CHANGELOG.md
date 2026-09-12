@@ -7,6 +7,27 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A typo in a service's command cost three seconds, every time.** MEASURED: `kern box -d --image
+alpine -- /nonexistent-binary` took 3.035 SECONDS, and `kern compose up -d` on a stack with one such
+service took 3.037. The same command in the FOREGROUND took 5 ms, which is what said the cost was in
+the launcher rather than in the box.
+
+All of it was one poll. After a failed start the launcher waits for the box's log to carry the
+supervisor's reason, because the asynchronous log pump can lag the failure signal. That wait ended on
+one of two literal sentences, and the commonest failure in the product writes neither: a command that
+does not exist produces `kern: cannot start '<cmd>' in box: No such file or directory`. So the loop
+always ran its full budget and then printed a message that had been in the file since the first poll.
+The message was never wrong. It was late, by 3 seconds, on the error people make most.
+
+The wait now ends on kern's own prefix minus its three benign kinds - the posture banner, `warning:`
+and `note:` - which is the same discipline the Python binding already applies to the same question.
+Matching a prefix rather than a sentence also means the next failure message kern grows is covered on
+the day it is written, instead of quietly costing three seconds until someone measures it.
+
+After: 8 ms for the box, 21 ms for the stack, with the message unchanged. A healthy stack and a
+service that exits non-zero are unaffected (169 ms and 31 ms, inside the run-to-run noise of the 166
+and 27 they measured before).
+
 **`--wait-timeout N` did not bound the `depends_on` gate, only the readiness check.** MEASURED on a
 stack whose dependency never resolves its health check: `--wait-timeout 5` returned after 120
 seconds, and so did `--wait-timeout 12`, because that gate used a fixed 120s constant and never saw

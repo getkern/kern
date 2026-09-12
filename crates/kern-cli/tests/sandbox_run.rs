@@ -2057,6 +2057,75 @@ fn box_run_isolates_and_propagates_exit_code() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A TYPO IN THE COMMAND MUST NOT COST THREE SECONDS.
+///
+/// MEASURED: `kern box -d --image alpine -- /nonexistent-binary` took 3.035 SECONDS, all of it in a
+/// poll waiting for the box log to contain one of two literal sentences. The supervisor writes
+/// `kern: cannot start '<cmd>' in box: No such file or directory`, which contains neither, so the
+/// commonest failure in the product always paid the full budget and then printed a message that had
+/// been in the file since the first poll. The SAME command in the foreground took 5 ms, which is
+/// what said the cost was in the launcher and not in the box. After: 8 ms.
+///
+/// The assertion is on TIME, because the message was never wrong: only late.
+#[test]
+fn a_command_that_does_not_exist_is_reported_at_once_and_not_after_a_timeout() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "fastfail");
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-fastfail-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let name = format!("fastfail-{}", std::process::id());
+
+    let started = std::time::Instant::now();
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            &name,
+            "--rootfs",
+            &rootfs,
+            "-d",
+            "--",
+            "/nonexistent-binary",
+        ])
+        .output()
+        .expect("run kern");
+    let elapsed = started.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", &name])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    if err.contains("could not be BUILT") || err.contains("user namespace") {
+        eprintln!(
+            "skip: this host cannot build a box: {}",
+            err.lines().next().unwrap_or("")
+        );
+        return;
+    }
+    assert!(
+        err.contains("nonexistent-binary"),
+        "the reason must still name the command that could not be started: {err}"
+    );
+    // 1s is far above the 8ms this takes and far below the 3s it used to take, so the assertion is
+    // about the DEFECT and not about this machine's speed.
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "reported after {elapsed:?}: the launcher is waiting out a timeout for a reason that is \
+         already in the log"
+    );
+}
+
 /// PODS MUST RESOLVE THEIR DIRECTORY THE WAY EVERY OTHER RUNTIME CHILD DOES.
 ///
 /// MEASURED on Alpine 3.21 with OpenRC, where there is no systemd and no elogind so `/run/user/<uid>`
