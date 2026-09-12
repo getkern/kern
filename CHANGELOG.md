@@ -7,6 +7,21 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A pod bridge on top of a route the host already has killed the box's network, in silence.** MEASURED
+with `--bridge 192.168.1.0/24` on a host whose LAN is that network: the bridge took `192.168.1.1`,
+which is the host's own default gateway, the box ended up with two routes for the same network, and
+from inside it reached NEITHER the LAN (a machine at `.104`, pingable from the host) NOR the internet.
+Everything succeeded and produced a box with no network at all, which is the same shape as the
+loopback bridge refused above and the reason to look for it.
+
+A WARNING, NOT A REFUSAL: the caller named that network and may mean it, so the decision stays
+theirs. What was wrong was saying nothing. The note names the interface and the route it collides
+with, and points at the range kern uses by default. The overlap rule is read from `/proc/net/route`
+rather than from `ip`, because a check that only works where iproute2 is installed goes quiet exactly
+on the minimal hosts that need it, and its decision is a pure function a test can ask about: two
+mutations (comparing under the route's mask instead of the wider one, and not skipping the default
+route) each turn it red.
+
 **The pod holder carried a secret it has no use for, for the pod's whole life.** A secret declared
 with `--secret-env` or a compose `environment:` source reaches kern in its own environment, and the
 holder inherited the whole of it: MEASURED, `KERN_SECRET_tok` sat in `/proc/<holder>/environ` until

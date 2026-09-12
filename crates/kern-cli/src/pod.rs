@@ -708,6 +708,50 @@ fn starter_alive(dir: &std::path::Path) -> bool {
 /// Publish a service with `-p` on its member box. `uid_range` maps a subordinate uid RANGE into the
 /// pod's shared user namespace (via the holder) instead of the single-uid self-map - needed when the
 /// pod hosts OCI images that drop privilege in their entrypoint (postgres/redis/…). `kern compose`
+/// The host route this bridge network would sit on top of, if any, as `<iface> <cidr>`.
+///
+/// READ FROM `/proc/net/route`, WHICH IS THE KERNEL'S ANSWER and needs no `ip` binary: BusyBox hosts
+/// and minimal images have no iproute2, and a check that only works where a tool is installed is a
+/// check that goes quiet exactly on the hosts that need it most. Fields are hex, little-endian, and
+/// the default route (mask 0) is skipped: it overlaps everything by definition and saying so about
+/// every bridge would be noise.
+///
+/// Overlap, not containment: two networks collide when either contains the other's base, so the
+/// comparison is made under the WIDER of the two masks.
+fn host_route_overlapping(cidr: &str) -> Option<String> {
+    let (net, prefix) = cidr.split_once('/')?;
+    let want: std::net::Ipv4Addr = net.trim().parse().ok()?;
+    let want_prefix: u32 = prefix.trim().parse().ok()?;
+    let want_bits = u32::from_be_bytes(want.octets());
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    route_overlapping(&text, want_bits, want_prefix)
+}
+
+/// The overlap decision, PURE, so a test can ask it about a host it does not have. The impure half
+/// above only reads the file: every rule that can be wrong lives here.
+fn route_overlapping(text: &str, want_bits: u32, want_prefix: u32) -> Option<String> {
+    for line in text.lines().skip(1) {
+        let mut f = line.split_whitespace();
+        let iface = f.next()?;
+        let dest = u32::from_str_radix(f.next()?, 16).ok()?.swap_bytes();
+        let _gw = f.next();
+        for _ in 0..4 {
+            f.next()?;
+        }
+        let mask = u32::from_str_radix(f.next()?, 16).ok()?.swap_bytes();
+        if mask == 0 {
+            continue; // the default route overlaps everything; it is not what this is about
+        }
+        let want_mask = u32::MAX.checked_shl(32 - want_prefix).unwrap_or(0);
+        let common = mask & want_mask; // the wider of the two
+        if dest & common == want_bits & common {
+            let len = mask.count_ones();
+            return Some(format!("{iface} {}/{len}", std::net::Ipv4Addr::from(dest)));
+        }
+    }
+    None
+}
+
 /// passes `ImageDefault` when the stack has image boxes and `Requested` when a service asked in as
 /// many words; a pod of root-only services stays single-uid (faster, more isolated).
 pub fn create_with_range(
@@ -717,6 +761,23 @@ pub fn create_with_range(
     bridge: Option<&str>,
 ) -> Result<(), Error> {
     validate_name(name)?;
+    if let Some(cidr) = bridge {
+        if let Some(route) = host_route_overlapping(cidr) {
+            // NOT A REFUSAL. The caller named this network, and someone who knows their topology may
+            // mean it; refusing would take a decision that is theirs. But the silence was the defect:
+            // MEASURED with `--bridge 192.168.1.0/24` on a host whose LAN is that network, the bridge
+            // took 192.168.1.1 (the host's own default gateway), the box ended up with two routes for
+            // the same network, and from inside it NEITHER the LAN (192.168.1.104) nor the internet
+            // (8.8.8.8) was reachable. Everything succeeded and the result was a box with no network,
+            // which is the same shape as the loopback bridge refused above.
+            eprintln!(
+                "kern: warning: pod: the bridge network {cidr} overlaps a route this host already \
+                 has ({route}). Members will get addresses from it and reach neither that network \
+                 nor, if it carries the default route, the internet: their own bridge answers for \
+                 it first. Pick a range nothing else uses (10.89.0.0/24 is kern's own default)."
+            );
+        }
+    }
     let dir = pod_dir(name);
     let _ = std::fs::create_dir_all(pods_root()); // ensure the parent exists (recursive)
 
@@ -1993,6 +2054,53 @@ mod tests {
     /// Asserting the two agree, rather than asserting a particular path, is deliberate: the point
     /// is that there is ONE resolution, so a later change to the candidate list cannot leave pods
     /// behind again.
+    /// A BRIDGE ON TOP OF A ROUTE THE HOST ALREADY HAS KILLS THE BOX'S NETWORK, IN SILENCE.
+    ///
+    /// MEASURED with `--bridge 192.168.1.0/24` on a host whose LAN is that network: the bridge took
+    /// 192.168.1.1, which is the host's own default gateway, the box ended up with two routes for
+    /// the same network, and from inside it reached NEITHER the LAN (a host at .104, pingable from
+    /// the host) NOR the internet. Everything succeeded and produced a box with no network, which is
+    /// the same shape as the loopback bridge this file already refuses.
+    ///
+    /// A WARNING AND NOT A REFUSAL: the caller named the network and may mean it. What was wrong was
+    /// saying nothing.
+    #[test]
+    fn a_bridge_that_overlaps_a_host_route_is_named() {
+        // `/proc/net/route` as the kernel writes it: hex, little-endian, tab-separated. The default
+        // route (mask 0) is in here on purpose: it overlaps everything and must be ignored, or every
+        // bridge on every host would warn and the warning would mean nothing.
+        let routes = concat!(
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n",
+            "wlp4s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n",
+            "wlp4s0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n",
+            "enp5s0\t0064A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n",
+        );
+        let net = |a: u32, b: u32, c: u32, d: u32| (a << 24) | (b << 16) | (c << 8) | d;
+
+        // The wifi LAN, exactly: named, with the interface, so the reader knows which route it is.
+        let hit = route_overlapping(routes, net(192, 168, 1, 0), 24)
+            .expect("192.168.1.0/24 overlaps the wifi route");
+        assert!(
+            hit.contains("wlp4s0") && hit.contains("192.168.1.0/24"),
+            "{hit}"
+        );
+        // The wired LAN, a different interface.
+        assert!(route_overlapping(routes, net(192, 168, 100, 0), 24).is_some());
+        // A /26 INSIDE the LAN: containment either way is an overlap, and the comparison has to be
+        // made under the wider mask or this case reads as disjoint.
+        assert!(route_overlapping(routes, net(192, 168, 1, 64), 26).is_some());
+        // And a /16 that CONTAINS the LAN, which is the same rule from the other side.
+        assert!(route_overlapping(routes, net(192, 168, 0, 0), 16).is_some());
+
+        // CONTROL, and without it every assertion above would hold for a function that always
+        // answers yes: kern's own default must be silent on this host, and so must a neighbour one
+        // octet away from the wired LAN.
+        assert!(route_overlapping(routes, net(10, 89, 0, 0), 24).is_none());
+        assert!(route_overlapping(routes, net(192, 168, 101, 0), 24).is_none());
+        // The default route is present in the fixture and must not be what matches.
+        assert!(route_overlapping(routes, net(172, 30, 0, 0), 16).is_none());
+    }
+
     #[test]
     fn the_pods_root_is_the_shared_runtime_resolution_and_not_a_second_one() {
         let _g = crate::TEST_ENV_LOCK
