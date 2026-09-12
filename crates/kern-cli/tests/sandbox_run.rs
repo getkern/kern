@@ -2057,6 +2057,87 @@ fn box_run_isolates_and_propagates_exit_code() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// THE POD HOLDER MUST NOT CARRY A SECRET IT HAS NO USE FOR, and it has the longest life here.
+///
+/// MEASURED before the scrub, with `KERN_SECRET_tok` set and one box joined to a pod: the value was
+/// in `/proc/<holder>/environ` and stayed for the pod's whole life, while the box supervisor that
+/// delivers it keeps it only as long as it runs. Nothing was broken by that - the promise
+/// `--secret-env` makes is about ARGV and it held (`argv=0` everywhere, nothing in `inspect --json`,
+/// nothing in the state files, the file inside the box mode 0400) - but the holder is the one
+/// process with no reason to hold it, so it is scrubbed rather than justified.
+///
+/// The assertion reads the holder's environment through `/proc`, which is the channel an attacker
+/// with the same uid would read, rather than asking kern what it passed.
+#[test]
+fn the_pod_holder_does_not_inherit_a_secret_from_the_environment() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let xdg = std::env::temp_dir().join(format!("kern-it-holdsec-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let pod = format!("holdsec-{}", std::process::id());
+    let value = format!("HOLDSEC-{}-canary", std::process::id());
+
+    let made = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .env("KERN_SECRET_tok", &value)
+        .args(["pod", "create", &pod])
+        .output()
+        .expect("run kern");
+    if !made.status.success() {
+        eprintln!(
+            "skip: this host cannot create a pod: {}",
+            String::from_utf8_lossy(&made.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+
+    // The holder's pid is recorded in the pod directory; find it by reading every `kern` process
+    // whose argv names the holder, and keep the ones whose environment we can read (ours).
+    let mut checked = 0usize;
+    let mut carrying = 0usize;
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let p = e.path();
+            let Ok(cmdline) = fs::read(p.join("cmdline")) else {
+                continue;
+            };
+            if !String::from_utf8_lossy(&cmdline).contains("__pod-holder") {
+                continue;
+            }
+            let Ok(environ) = fs::read(p.join("environ")) else {
+                continue;
+            };
+            checked += 1;
+            if String::from_utf8_lossy(&environ).contains(&value) {
+                carrying += 1;
+            }
+        }
+    }
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["pod", "rm", &pod])
+        .output();
+    let _ = fs::remove_dir_all(&xdg);
+
+    // CONTROL: if no holder's environment was readable at all, this test asserted nothing, and
+    // saying so beats a green that measured no process.
+    if checked == 0 {
+        eprintln!("skip: no pod holder process was readable, so there was nothing to check");
+        return;
+    }
+    assert_eq!(
+        carrying, 0,
+        "{checked} holder(s) readable and {carrying} carried the secret in /proc/<pid>/environ"
+    );
+}
+
 /// THE FOUR CHANNELS THAT REPORT A BOX'S STATE MUST NOT DISAGREE, and `--json` was the one that did.
 ///
 /// MEASURED on one paused box before the fix: the table printed `paused`, `--format '{{.Status}}'`

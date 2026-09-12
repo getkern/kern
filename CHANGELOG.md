@@ -7,6 +7,17 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**The pod holder carried a secret it has no use for, for the pod's whole life.** A secret declared
+with `--secret-env` or a compose `environment:` source reaches kern in its own environment, and the
+holder inherited the whole of it: MEASURED, `KERN_SECRET_tok` sat in `/proc/<holder>/environ` until
+the pod went away, while the box supervisors that actually deliver it keep it only as long as they
+run. Nothing was broken by this and the promise held - `argv=0` on every kern process, nothing in
+`inspect --json`, nothing in the state files, the file inside the box mode 0400, and
+`/proc/<pid>/environ` is readable only by the box's own uid - but the holder is the one process with
+no reason to hold it and the widest window, so it is scrubbed before the fork rather than justified.
+The prefix it scrubs by is now a constant the naming derives from, because a scrub keyed on a
+different string than the one secrets are named with would be worse than none: it would look done.
+
 **`ps --json` was the only channel that could not say a box is paused or orphaned.** MEASURED on one
 paused box: the table printed `paused`, `--format '{{.Status}}'` printed `paused`,
 `--filter status=paused` matched it, and `--json` carried `"health":""` and no status at all. Same

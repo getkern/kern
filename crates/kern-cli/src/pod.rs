@@ -794,6 +794,22 @@ pub fn create_with_range(
                            // nothing can name, address or remove, for the life of the session. MEASURED: 140 such holders
                            // and 116 `pasta` beside them, the oldest 5.8 hours old. See `hold_until_the_pod_is_gone`, which
                            // treats a missing variable as "hold forever" so an older holder keeps its old behaviour.
+                           // THE HOLDER HAS NO USE FOR A SECRET AND THE LONGEST LIFE OF ANYTHING HERE. A secret declared
+                           // with a compose `environment:` source, or `--secret-env`, reaches kern in this process's
+                           // environment, and a child inherits the whole of it: MEASURED with a two-service stack, the
+                           // value was in `/proc/<holder>/environ` and stayed there for the pod's entire life, while the
+                           // box supervisors that actually deliver it keep it only as long as they run.
+                           //
+                           // Nothing is broken by this - the promise `--secret-env` makes is about ARGV, and it holds:
+                           // measured `argv=0` on every kern process, nothing in `inspect --json`, nothing in the state
+                           // files, and the file inside the box mode 0400. `/proc/<pid>/environ` is readable only by the
+                           // same uid, which is the box owner. But the holder is the one process that has no reason to
+                           // carry it at all, and the window is the widest, so it is scrubbed rather than justified.
+    for (k, _) in std::env::vars_os()
+        .filter(|(k, _)| k.to_string_lossy().starts_with(crate::secret::ENV_PREFIX))
+    {
+        cmd.env_remove(k);
+    }
     cmd.env("KERN_POD_DIR", pod_dir(name));
     if uid_range.is_on() {
         // Tell the holder to map a subordinate uid range (so member OCI images can drop privilege),

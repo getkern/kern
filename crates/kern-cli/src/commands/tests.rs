@@ -6343,6 +6343,14 @@ fn a_secret_from_the_environment_is_read_from_the_environment_and_refused_when_a
 
     // The variable name is DERIVED, so the driver and the box cannot look in two different places.
     assert_eq!(secret_env_var("db_password"), "KERN_SECRET_db_password");
+    // THE PREFIX THE HOLDER SCRUBS BY MUST BE THE ONE SECRETS ARE NAMED WITH. `pod create` strips
+    // every `KERN_SECRET_*` from the holder's environment before forking it, because the holder has
+    // no use for a secret and the longest life of anything in a stack. A scrub keyed on a DIFFERENT
+    // string than the naming would be worse than no scrub at all: it would look done.
+    assert!(
+        secret_env_var("x").starts_with(crate::secret::ENV_PREFIX),
+        "the naming and the prefix the holder scrubs by have drifted apart"
+    );
 
     // Absent variable: an ERROR, not an empty secret. A service reading a password file would take
     // the empty string as the password and fail somewhere else entirely.

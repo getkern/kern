@@ -45,8 +45,14 @@ pub const DEFAULT_SECRET_MODE: libc::mode_t = 0o400;
 /// variable the workload happens to have cannot be mistaken for a secret's content.
 #[must_use]
 pub(crate) fn secret_env_var(name: &str) -> String {
-    format!("KERN_SECRET_{name}")
+    format!("{ENV_PREFIX}{name}")
 }
+
+/// The prefix every secret-content variable carries, as a constant rather than a literal repeated
+/// where it is needed: the pod holder scrubs by this prefix before forking, and a holder that
+/// scrubbed a DIFFERENT string than the one secrets are named with would be worse than one that
+/// scrubbed nothing, because it would look done.
+pub(crate) const ENV_PREFIX: &str = "KERN_SECRET_";
 
 /// `--secret-env <name>`: a secret whose CONTENT comes from this process's environment.
 ///
