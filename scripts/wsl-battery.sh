@@ -41,13 +41,11 @@ fi
 echo "== identity"
 "$KERNBIN" --version
 if command -v sha256sum >/dev/null 2>&1; then sha256sum "$KERNBIN"; fi
-if command -v ldd >/dev/null 2>&1; then
-    if ldd "$KERNBIN" 2>&1 | grep -q "not a dynamic executable\|statically"; then
-        echo "  (static, which is what Alpine needs)"
-    else
-        echo "  WARNING: this binary is dynamically linked. On Alpine you want the musl build." >&2
-    fi
-fi
+# NO `ldd` CHECK HERE, and it was here and it lied. On Alpine, musl's `ldd` answers a STATIC binary
+# with something that matches neither "not a dynamic executable" nor "statically", so the check printed
+# "this binary is dynamically linked" about a correct musl build. The step above already settles it: a
+# glibc binary on Alpine cannot run at all, so if `--version` printed a version, the binary is right.
+# A check that can fire on a correct input, next to a step that already proves the point, is noise.
 
 echo "== python3"
 if ! command -v python3 >/dev/null 2>&1; then
