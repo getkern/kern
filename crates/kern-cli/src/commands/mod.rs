@@ -4199,12 +4199,25 @@ fn wait_for_conditions(
     b: &crate::compose::ComposeBox,
     pod: &str,
     token: &str,
+    wait_timeout: Option<u64>,
 ) -> Result<(), Error> {
     use std::time::{Duration, Instant};
     if b.depends_healthy.is_empty() && b.depends_completed.is_empty() {
         return Ok(());
     }
-    let deadline = Instant::now() + Duration::from_secs(COMPOSE_CONDITION_TIMEOUT_SECS);
+    // `--wait-timeout N` BOUNDS THIS GATE TOO, and it used not to. MEASURED before: a stack whose
+    // dependency never resolves its health check (a `test` that always fails under a long
+    // `start_period`, so the status stays `starting`) took 120 SECONDS to fail with
+    // `--wait-timeout 5`, and the same 120 with `--wait-timeout 12`. The flag exists for a CI job
+    // that has said how long it is willing to wait; waiting 24x that is the same defect as ignoring
+    // it outright.
+    //
+    // The constant stays as the DEFAULT for a caller who named no limit, which is every attached
+    // `up`. It bounds each dependency's wait rather than their sum: the sum would need one deadline
+    // computed at bring-up and threaded through a per-box call, and per-dependency is both the
+    // smaller change and the one that makes the flag mean "fail fast" where it did not before.
+    let limit = wait_timeout.unwrap_or(COMPOSE_CONDITION_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(limit);
     let key_of = |dep: &str| exit_key(pod, token, dep);
 
     // `depends_healthy`: poll each dep's health sidecar until healthy. Abort on unhealthy, on the dep
@@ -4241,10 +4254,14 @@ fn wait_for_conditions(
             }
             if Instant::now() >= deadline {
                 return Err(Error::Compose(format!(
-                    "box '{}': timed out after {COMPOSE_CONDITION_TIMEOUT_SECS}s waiting for '{dep}' \
+                    "box '{}': timed out after {limit}s waiting for '{dep}' \
                      to become healthy (last status: '{}')",
                     b.name,
-                    if status.is_empty() { "none yet" } else { &status }
+                    if status.is_empty() {
+                        "none yet"
+                    } else {
+                        &status
+                    }
                 )));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -4267,8 +4284,7 @@ fn wait_for_conditions(
             }
             if Instant::now() >= deadline {
                 return Err(Error::Compose(format!(
-                    "box '{}': timed out after {COMPOSE_CONDITION_TIMEOUT_SECS}s waiting for '{dep}' \
-                     to complete",
+                    "box '{}': timed out after {limit}s waiting for '{dep}' to complete",
                     b.name
                 )));
             }

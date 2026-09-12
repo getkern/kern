@@ -2057,6 +2057,115 @@ fn box_run_isolates_and_propagates_exit_code() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// `--wait-timeout N` MUST BOUND THE `depends_on` GATE, and it used to be ignored there.
+///
+/// MEASURED before: a stack whose dependency never resolves its health check took 120 seconds to
+/// fail with `--wait-timeout 5`, and the same 120 with `--wait-timeout 12`, because the gate used a
+/// fixed constant. The flag exists for a CI job that has stated how long it will wait; waiting 24x
+/// that is the same defect as ignoring it.
+///
+/// The watchdog is part of the assertion: a regression makes this take two minutes, and a test that
+/// merely goes red after two minutes is one nobody runs locally.
+#[test]
+fn wait_timeout_bounds_the_depends_on_gate_and_not_only_the_readiness_check() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-it-waitto-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let file = dir.join("stack.yml");
+    // The health check can never pass and `start_period` keeps the status at `starting`, so nothing
+    // but a timeout can end this wait: that is what isolates the flag from the check's own retries.
+    let yml = concat!(
+        "services:\n",
+        "  db:\n",
+        "    image: alpine\n",
+        "    command: sh -c \"sleep 3000\"\n",
+        "    healthcheck:\n",
+        "      test: [\"CMD\", \"false\"]\n",
+        "      interval: 2s\n",
+        "      retries: 10000\n",
+        "      start_period: 3000s\n",
+        "  app:\n",
+        "    image: alpine\n",
+        "    command: sleep 60\n",
+        "    depends_on:\n",
+        "      db: { condition: service_healthy }\n",
+    );
+    if fs::write(&file, yml).is_err() {
+        eprintln!("skip: could not write the fixture");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let mut child = kern()
+        .args([
+            "compose",
+            &file.to_string_lossy(),
+            "up",
+            "-d",
+            "--wait",
+            "--wait-timeout",
+            "3",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn kern");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+                .args(["compose", &file.to_string_lossy(), "down"])
+                .output();
+            let _ = fs::remove_dir_all(&dir);
+            panic!("`--wait-timeout 3` had not returned after 45s: the gate is ignoring the flag");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    let elapsed = started.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::process::Command::new(env!("CARGO_BIN_EXE_kern"))
+        .args(["compose", &file.to_string_lossy(), "down"])
+        .output();
+    let _ = fs::remove_dir_all(&dir);
+
+    if err.contains("could not be BUILT")
+        || err.contains("user namespace")
+        || err.contains("no such image")
+    {
+        eprintln!(
+            "skip: this host cannot run the fixture: {}",
+            err.lines().next().unwrap_or("")
+        );
+        return;
+    }
+    assert!(
+        err.contains("timed out after 3s"),
+        "the message must state the limit the CALLER gave, not a built-in one: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "returned after {elapsed:?}, so the flag did not bound the wait"
+    );
+}
+
 /// A FIFO OR SOCKET AS A VOLUME SOURCE MUST BE REFUSED, NOT MOUNTED AND THEN OPENED FOREVER.
 ///
 /// MEASURED before the refusal: `-v <fifo>:/x` bound successfully (the mount appears in the box's

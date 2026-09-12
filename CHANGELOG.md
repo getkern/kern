@@ -7,6 +7,15 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`--wait-timeout N` did not bound the `depends_on` gate, only the readiness check.** MEASURED on a
+stack whose dependency never resolves its health check: `--wait-timeout 5` returned after 120
+seconds, and so did `--wait-timeout 12`, because that gate used a fixed 120s constant and never saw
+the flag. The flag exists for a CI job that has stated how long it is willing to wait, and waiting
+24x that is the same defect as ignoring it outright. The caller's limit now bounds the gate, the
+constant remains the default for a caller who named none, and the timeout message states the limit
+that actually applied instead of the built-in one. Measured after: 5s and 12s respectively, and a
+healthy stack is unchanged.
+
 **A FIFO as a volume source hung the box forever, and the SDK called it a timeout.** MEASURED with
 `-v <fifo>:/x`: the bind succeeds (the mount is in the box's `mountinfo`), and the setup pass that
 follows opens the target with `O_WRONLY|O_CREAT` - a FIFO with no reader - and blocks in

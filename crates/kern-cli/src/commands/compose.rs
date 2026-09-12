@@ -2419,7 +2419,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // is performed in the release loop, in dependency order, which is where
                             // "start only after the dependency is healthy" actually means something.
                             if !gate_active {
-                                wait_for_conditions(b, pod, up_token)?;
+                                wait_for_conditions(b, pod, up_token, wait_timeout)?;
                             }
                             let n = started.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             let dep = if b.depends_on.is_empty() {
@@ -2953,7 +2953,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 // reads EOF and refuses to exec. The stack does not come up half-released.
                 // Every NAT was attached above, before this loop, and the ordering argument that
                 // used to live here is made there instead.
-                wait_for_conditions(b, &pod, &up_token)?;
+                wait_for_conditions(b, &pod, &up_token, wait_timeout)?;
                 if !gate_release(fd) {
                     return Err(Error::Compose(format!(
                         "service '{}': the box was prepared but could not be released (it is no \
