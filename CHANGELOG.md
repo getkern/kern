@@ -7,6 +7,17 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**Every pod failed on a host with no systemd and no elogind, and the error named an internal
+directory.** MEASURED on Alpine 3.21 with OpenRC: `kern box` worked and every pod died with
+`pod dir: No such file or directory (os error 2)`, so the two compose wirings that use a pod were
+dead on that distribution while `--no-pod`, the SLOW one, was the only one that ran. `pods_root`
+was the single place in kern that built its own runtime path (`$XDG_RUNTIME_DIR` or
+`/run/user/<uid>`, joined without asking whether either existed) instead of using the shared
+resolution, which walks a third candidate, `/tmp/kern-<uid>`, and takes the first it can create.
+That is why boxes worked and pods did not: the registry already walked it. Alpine is not a corner
+case here; the same shape is any container, any minimal image, and any `ssh` into a system without
+a user manager.
+
 **A pod bridge in the loopback range was accepted and silently isolated every member.** MEASURED:
 `kern pod create --bridge 127.0.0.0/8` succeeded, two members joined with `--pod-bridge 127.0.0.5/8`
 and `127.0.0.6/8`, both started and got those addresses on `eth0`, and then neither could reach the

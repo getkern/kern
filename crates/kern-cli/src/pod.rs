@@ -18,11 +18,26 @@ use std::path::PathBuf;
 
 /// `<XDG_RUNTIME_DIR|/run/user/uid>/kern/pods`.
 pub(crate) fn pods_root() -> PathBuf {
+    // THE SAME RESOLUTION EVERY OTHER RUNTIME CHILD USES, and this was the one place that had its
+    // own. `runtime_subdir` walks `$XDG_RUNTIME_DIR` -> `/run/user/<uid>` -> `/tmp/kern-<uid>`,
+    // taking the first it can create; this function stopped at the second and joined a path under
+    // it without ever asking whether it existed.
+    //
+    // MEASURED on Alpine 3.21 with OpenRC, where there is no systemd and no elogind, so
+    // `/run/user/<uid>` is never created: `kern box` worked (the registry falls back to
+    // `/tmp/kern-<uid>`) and EVERY pod failed with `pod dir: No such file or directory`, a bare
+    // errno naming an internal directory the reader has never heard of. Both compose wirings that
+    // use a pod were dead on that distribution and `--no-pod` was the only one that worked, which
+    // is a strange shape to debug from the outside: the relay is the SLOW wiring.
+    //
+    // Infallible by contract (callers join names onto it), so a resolution failure falls through
+    // to the same last candidate `runtime_subdir` would have tried, rather than to a path under a
+    // directory that is not there.
+    if let Ok(p) = crate::registry::runtime_subdir_public("pods") {
+        return p;
+    }
     crate::registry::assert_registry_child("pods"); // classification chokepoint (see registry.rs)
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
-    base.join("kern/pods")
+    PathBuf::from(format!("/tmp/kern-{}/pods", unsafe { libc::getuid() }))
 }
 
 /// A pod's private directory (`…/pods/<name>`): holds the `holder` pid file and the shared `hosts`.
@@ -1948,6 +1963,53 @@ fn validate_name(name: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PODS RESOLVE THEIR DIRECTORY THE WAY EVERY OTHER RUNTIME CHILD DOES, and the regression this
+    /// pins is a SECOND resolution existing at all.
+    ///
+    /// `pods_root` used to build its own path: `$XDG_RUNTIME_DIR` or `/run/user/<uid>`, joined
+    /// without asking whether either was there. `runtime_subdir` walks a third candidate,
+    /// `/tmp/kern-<uid>`, and takes the first it can create. On a host with no systemd and no
+    /// elogind there IS no `/run/user/<uid>`: MEASURED on Alpine 3.21 with OpenRC, `kern box`
+    /// worked and every pod died with `pod dir: No such file or directory`, so the two compose
+    /// wirings that use a pod were dead there while `--no-pod` ran.
+    ///
+    /// Asserting the two agree, rather than asserting a particular path, is deliberate: the point
+    /// is that there is ONE resolution, so a later change to the candidate list cannot leave pods
+    /// behind again.
+    #[test]
+    fn the_pods_root_is_the_shared_runtime_resolution_and_not_a_second_one() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+
+        // THE DISCRIMINATOR HAS TO BE A RUNTIME DIR THAT CANNOT BE CREATED, not merely one that is
+        // absent. A missing directory under `/tmp` is made on the spot by the shared resolution, so
+        // both the old code and the new one would succeed and the test would pass either way - the
+        // first version of this test did exactly that and its positive control stayed green.
+        // Nothing may be created under `/proc`, which is the same dead end Alpine's missing
+        // `/run/user/<uid>` is for a non-root user.
+        let dead = std::path::PathBuf::from(format!("/proc/kern-pods-{}", std::process::id()));
+        std::env::set_var("XDG_RUNTIME_DIR", &dead);
+
+        let root = pods_root();
+        assert!(
+            !root.starts_with(&dead),
+            "a runtime dir that cannot be created must not be the answer: got {}",
+            root.display()
+        );
+        assert!(
+            root.is_dir(),
+            "callers join a pod name onto this and create THAT, so it must already exist: {}",
+            root.display()
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
 
     #[test]
     fn pod_names_reject_traversal_and_bad_chars() {
