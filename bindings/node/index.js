@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.1";
+const VERSION = "0.2.2";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -1471,6 +1471,16 @@ class Sandbox {
    * that will never exist would both litter the workspace and collide with itself. A dry argv is for
    * COMPARING, never for running. */
   _baseArgv(name, { network, timeoutS, isSetup = false, dry = false }) {
+    // IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and an external reviewer is the reason. He
+    // overwrote the verified binary IN PLACE with `/bin/true` while a Sandbox was open: the next call
+    // correctly refused to call an empty run a success, and the message it refused with quoted the
+    // version from the FIRST verification - stating that a file which now prints `true (GNU coreutils)
+    // 9.4` had "reported 'kern v0.9.32-48-gb578943'". The verdict was right and the sentence was false.
+    // Re-verifying here rather than repairing the sentence: the binary about to run was no longer the
+    // binary that was checked. The memo is keyed on (realpath, dev, ino, size, mtimeMs), so an unchanged
+    // file costs one stat and a map lookup, and a changed one pays a `--version` and is refused by name.
+    // Mirrors the same call in `_base_argv`.
+    if (!dry) verifyIsKern(this._kern);
     const argv = [
       this._kern, "box", name, "--image", this.image, "--ro",
       "-v", `${this._ws}:${WORKSPACE}`, "--workdir", WORKSPACE,

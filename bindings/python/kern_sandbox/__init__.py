@@ -66,7 +66,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1727,6 +1727,22 @@ class Sandbox:
         which is what the prewarm pool needs: it compares postures, and a comparison that created a file
         named after a box that will never exist would both litter the workspace and collide with itself.
         A dry argv is for COMPARING, never for running."""
+        if not dry:
+            # IDENTITY IS RE-ASSERTED PER BOX, not once per Sandbox, and an external reviewer is the
+            # reason. He overwrote the verified binary IN PLACE with `/bin/true` while a Sandbox was
+            # open: the next call correctly refused to report an empty run as a success, and the message
+            # it refused with quoted the version from the FIRST verification - so it stated that a file
+            # which now prints `true (GNU coreutils) 9.4` had "reported 'kern v0.9.32-48-gb578943'", and
+            # then offered two explanations, neither of them the truth. The verdict was right and the
+            # sentence was false, which is this project's most expensive class of defect.
+            #
+            # Re-verifying here rather than repairing that sentence, because the sentence was only the
+            # symptom: the binary about to run was no longer the binary that was checked. The memo is
+            # keyed on `(realpath, dev, ino, size, mtime_ns)`, so an unchanged file costs one `os.stat`
+            # and a dict lookup: MEASURED at 10.1 us over 20000 calls, against a box that costs ~4 ms,
+            # so 0.25%. A file that HAS changed pays one `--version` (0.44 ms) and is refused by name if
+            # it is no longer kern.
+            self._kern_version = _verify_is_kern(self._kern)
         argv = [self._kern, "box", name, "--image", self.image, "--ro", "-v", f"{self._ws}:{_WORKSPACE}",
                 "--workdir", _WORKSPACE]
         # deps_readonly: mount <workspace>/.deps read-only OVER the writable workspace for run_code boxes

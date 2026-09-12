@@ -7,6 +7,23 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern-sandbox 0.2.2: the refusal message named a version the binary no longer had.** FOUND BY AN
+EXTERNAL REVIEWER attacking the identity memo: he overwrote the verified binary IN PLACE with
+`/bin/true` while a Sandbox was open. The verdict held, which is the part that matters, and he could
+not get `success=True` for code that never ran. But the message it refused with quoted the version
+from the FIRST verification, so it stated that a file which now prints `true (GNU coreutils) 9.4` had
+"reported 'kern v0.9.32-48-gb578943'", and then offered two explanations, neither of them the truth.
+A true verdict with a false sentence is still a defect, because the sentence is what a reader acts on.
+
+The repair is not a better sentence: the binary about to run was no longer the binary that had been
+checked. Identity is now re-asserted for every box that is actually started, in both bindings, which
+is the only moment it could have changed. The memo is keyed on `(realpath, dev, ino, size, mtime_ns)`,
+so an unchanged file costs one `stat` and a dict lookup, MEASURED at 10.1 us over 20000 calls against
+a box that costs ~4 ms, and a changed one pays one `--version` (0.44 ms) and is refused by name.
+Measured after, on the same swap: `SandboxError: '<path>' is not kern: ... printed 'true (GNU
+coreutils) 9.4'`, which is what the file says NOW. A dry argv, which the prewarm pool builds to
+compare postures rather than to run anything, is not charged and does not refuse.
+
 **kern-sandbox 0.2.1: a cell could forge the `oom` verdict in one line, and 0.2.0 shipped with it.**
 MEASURED against the four-byte musl build, on a host where the cap bites: a cell that wrote kern's own
 OOM sentence to its stderr and was then stopped from outside came back `fault=oom`, where the same

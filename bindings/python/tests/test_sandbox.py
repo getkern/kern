@@ -738,6 +738,48 @@ def test_classify_oom_byte_is_the_authority_and_stderr_is_the_fallback():
     assert k._kernel_death_fault("error: sandbox: could not map uid 1000\n", 1, 1)[0] == "oom"
 
 
+def test_the_binary_identity_is_re_asserted_per_box_not_once_per_sandbox(tmp_path):
+    """The binary about to run must be the binary that was checked, and it was not.
+
+    FOUND BY AN EXTERNAL REVIEWER attacking the memoisation: he overwrote the verified binary IN PLACE
+    with `/bin/true` while a Sandbox was open. The verdict held (no `success=True` for code that never
+    ran) but the refusal MESSAGE quoted the version from the first verification, so it stated that a file
+    which now prints `true (GNU coreutils) 9.4` had "reported 'kern v0.9.32-48-gb578943'", and then
+    offered two explanations, neither of them the truth. A true verdict with a false sentence is still a
+    defect: the sentence is what a reader acts on.
+
+    The repair is not a better sentence. Identity is re-asserted for every box that is actually started,
+    which is where it could have changed, and the memo key `(realpath, dev, ino, size, mtime_ns)` makes
+    that cost one stat when nothing moved (MEASURED at 10.1 us over 20000 calls, against a ~4 ms box).
+    """
+    stub = tmp_path / "kern"
+    stub.write_text("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'kern v9.9.9-stub'; fi\nexit 0\n")
+    stub.chmod(0o755)
+    prev = os.environ.get("KERN_BIN")
+    os.environ["KERN_BIN"] = str(stub)
+    try:
+        s = Sandbox()
+        assert s._base_argv("n", network=False, timeout_s=30)[0] == str(stub)
+        # Replaced IN PLACE, under a live Sandbox, with something that is not kern.
+        stub.write_text("#!/bin/sh\necho 'true (GNU coreutils) 9.4'\nexit 0\n")
+        stub.chmod(0o755)
+        with pytest.raises(SandboxError) as excinfo:
+            s._base_argv("n2", network=False, timeout_s=30)
+        msg = str(excinfo.value)
+        assert "is not kern" in msg
+        # WHAT IT PRINTS NOW, which is the whole point: the cached label would have been a lie.
+        assert "true (GNU coreutils) 9.4" in msg
+        assert "9.9.9-stub" not in msg
+        # A DRY argv is a COMPARISON (the prewarm pool matches postures) and must neither pay for the
+        # check nor refuse: nothing is about to run.
+        assert s._base_argv("", network=False, timeout_s=0, dry=True)[0] == str(stub)
+    finally:
+        if prev is None:
+            os.environ.pop("KERN_BIN", None)
+        else:
+            os.environ["KERN_BIN"] = prev
+
+
 def test_exit_125_startup_failure_requires_the_kern_marker_not_a_bare_125():
     # kern's box-not-started paths exit 125 (Docker's convention) AND print a `kern:` marker. The marker
     # is REQUIRED: a workload that ITSELF exits 125 (the code ran and chose 125) has no kern marker and

@@ -583,6 +583,43 @@ test("the OOM byte is the authority and the stderr sentence is the fallback", ()
   assert.strictEqual(k._kernelDeathFault("error: sandbox: could not map uid 1000\n", 1, 1)[0], "oom");
 });
 
+test("the binary identity is re-asserted per box, not once per Sandbox", () => {
+  // FOUND BY AN EXTERNAL REVIEWER attacking the memoisation: he overwrote the verified binary IN PLACE
+  // with `/bin/true` while a Sandbox was open. The verdict held (no success for code that never ran) but
+  // the refusal MESSAGE quoted the version from the FIRST verification, so it stated that a file now
+  // printing `true (GNU coreutils) 9.4` had "reported 'kern v0.9.32-48-gb578943'". A true verdict with a
+  // false sentence is still a defect: the sentence is what a reader acts on. So identity is re-checked
+  // for every box actually started, which the memo key (realpath, dev, ino, size, mtimeMs) makes cheap.
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), `kern-swap-${process.pid}-`));
+  const stub = path.join(d, "kern");
+  fs.writeFileSync(stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'kern v9.9.9-stub'; fi\nexit 0\n");
+  fs.chmodSync(stub, 0o755);
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = stub;
+  try {
+    const s = new Sandbox();
+    assert.strictEqual(s._baseArgv("n", { network: false, timeoutS: 30 })[0], stub);
+    // Replaced IN PLACE, under a live Sandbox, with something that is not kern.
+    fs.writeFileSync(stub, "#!/bin/sh\necho 'true (GNU coreutils) 9.4'\nexit 0\n");
+    fs.chmodSync(stub, 0o755);
+    assert.throws(
+      () => s._baseArgv("n2", { network: false, timeoutS: 30 }),
+      (e) =>
+        e instanceof SandboxError &&
+        /is not kern/.test(e.message) &&
+        // WHAT IT PRINTS NOW: the cached label would have been a lie.
+        /true \(GNU coreutils\) 9\.4/.test(e.message) &&
+        !/9\.9\.9-stub/.test(e.message),
+    );
+    // A DRY argv is a COMPARISON (the pool matches postures): nothing runs, so nothing is checked.
+    assert.strictEqual(s._baseArgv("", { network: false, timeoutS: 0, dry: true })[0], stub);
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test("sensitive mount source is refused", () => {
   assert.throws(() => new Sandbox({ mounts: { "/etc": "/host-etc" } }), MountRefused);
   assert.throws(() => new Sandbox({ mounts: { "/": "/root-fs" } }), MountRefused);
