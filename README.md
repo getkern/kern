@@ -204,10 +204,14 @@ depends_on = ["db"]
 ```
 
 ```sh
-kern compose stack.toml up          # or point it at your compose.yaml instead
-kern compose stack.toml watch       # rebuild + restart a service when its build context changes
-kern compose stack.toml port web 80 # the host address serving that port, read from the running box
+kern compose stack.toml up            # or point it at your compose.yaml instead
+kern compose stack.toml ps            # what is running, and what each service publishes
+kern compose stack.toml port web 8080 # the host address serving that port, read from the running box
 ```
+
+`kern compose <file> watch` is the fourth one, left out of the block above because it needs a service
+with a `build:` context and the file here has none: pointed at a stack that builds, it rebuilds and
+restarts that one service when its context changes.
 
 Both official images start, `web` reaches `db` by service name, and the port is published. A compose
 file can also name kern's own things in the spec's extension namespace (`x-kern-vcpu`,
@@ -247,6 +251,7 @@ bare process, with the same token. Three kinds: `vcpu:` (CPU and memory), `vdisk
 scratch disk) and `vgpio:` (device nodes).
 
 ```toml
+# ~/.config/kern/kern.toml - declared once, attached by name
 [[cpu]]                     # the host budget a slice is carved from
 id    = "cpu:0"
 cores = 8.0
@@ -256,6 +261,15 @@ name    = "heavy"
 backend = "cpu:0"
 cpus    = 1.5
 memory  = "512m"
+
+[[disk]]                    # the physical disk a scratch slice is carved from
+id   = "data"
+path = "/var/lib/kern/volumes"
+
+[[vdisk]]                   # 2 GiB of scratch  ->  attach as  vdisk:scratch
+name    = "scratch"
+backend = "data"
+size    = "2g"
 ```
 
 ```sh

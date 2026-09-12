@@ -148,7 +148,19 @@ cat <<EOF
         curl -sL https://github.com/getkern/kern/releases/download/$VERSION/kern-x86_64-unknown-linux-musl.tar.gz | tar xz -O kern | wc -c
         ./kern --version     # must print $VERSION, not a -dirty or a -N-g suffix
 
-   3. WHAT \`install.sh\` ACTUALLY SERVES, which is a different question from step 2. The installer
+   3. THE DOCUMENTATION'S OWN COMMANDS, run the way a reader runs them:
+        python3 scripts/readme-blocks.py target/release/kern
+      It executes the shell blocks of README/INSTALL/MCP in order, carrying state, with HOME inside
+      a temporary tree so it cannot touch this machine. It found two blocks that could not work with
+      the file printed right above them, the day it was written. Its own control:
+        python3 scripts/readme-blocks.py target/release/kern /dev/stdin <<'EOF'
+        \`\`\`sh
+        kern compose does-not-exist.yml up
+        \`\`\`
+        EOF
+      must exit 1.
+
+   4. WHAT \`install.sh\` ACTUALLY SERVES, which is a different question from step 2. The installer
       follows \`releases/latest\`, and \`latest\` skips a release marked PRE-RELEASE: mark this one by
       mistake and every reader keeps getting the previous binary, with a checksum that verifies,
       because the old \`.sha256\` is the one they fetch too. Nothing about that looks wrong.
@@ -161,7 +173,7 @@ cat <<EOF
       Do this BEFORE announcing anywhere. A post that describes a version the install line does not
       deliver is the one launch failure no amount of testing prevents.
 
-   4. Provenance, which is NOT automatic:
+   5. Provenance, which is NOT automatic:
         sh provenance/make-provenance.sh $VERSION
         git add provenance/$VERSION.provenance.txt provenance/$VERSION.provenance.txt.ots
         git commit -m 'chore(provenance): anchor $VERSION' && git push origin main
