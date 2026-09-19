@@ -22,6 +22,12 @@ r = kern.run_code("import sys; print(sys.version)")
 print(r.stdout, r.success)
 ```
 
+That first call is the slow one on a machine that has never run it: it pulls `python:3.12-slim`
+before it can start a box. Every call after it reads the cached image, and the
+[`startup_failed`](https://github.com/getkern/kern/blob/main/bindings/python/README.md#your-loop-reads-a-field-not-a-stack-trace)
+row has the measured cost of that first read, which on a slow machine is large enough to trip a short
+`timeout_s`.
+
 Network off, capabilities dropped, a deny-by-default seccomp allowlist, memory and PID caps, and a
 wall-clock deadline applied from **outside** the box, so code that hangs cannot outlive it. What that
 is worth on your machine is in [Safe by default](https://github.com/getkern/kern/blob/main/bindings/python/README.md#safe-by-default), and what it costs is in

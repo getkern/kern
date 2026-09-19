@@ -73,6 +73,11 @@ cargo install --git https://github.com/getkern/kern getkern --locked
 kern needs a Linux kernel with unprivileged user namespaces + cgroup v2. On Windows it runs under WSL2.
 Node 18+.
 
+The first call on a machine that has never run it is the slow one: it pulls `python:3.12-slim` before
+it can start a box. Every call after that reads the cached image, and the `startup_failed` row below
+has the measured cost of that first read, which on a slow machine is large enough to trip a short
+`timeoutS`.
+
 **On a Mac this package installs but cannot run**, and it says so rather than sending you after a
 download that does not exist: kern is Linux-only, because macOS has no namespaces and no cgroups. Run
 inside a Linux VM (colima, Lima, OrbStack, UTM), install `kern` and this package there, and it behaves

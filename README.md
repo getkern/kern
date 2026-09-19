@@ -315,16 +315,25 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 ## Performance
 
 Intel i7-14700KF, Linux 7.0.0, the release binary, alternating batches on an idle machine.
+The CPU governor is stated because it moves these numbers: `powersave`, averaging 3160 MHz
+against a 5500 MHz ceiling.
 
 | | kern | bubblewrap | runc | podman | docker |
 |---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.4 ms** | ~2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
+| Cold start (bare box) | ~2.4 ms | ~2.2-2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
 | 200 boxes in parallel | **~0.11 s** | ~0.13 s | ~0.29 s | ~43.1 s | ~16.7 s |
 
-kern is ahead of bubblewrap by about 9%, and that gap is small enough that it only holds up under a
-method: **[BENCHMARKS.md](BENCHMARKS.md)** has the alternation, the 240 batches, the aarch64 boards,
-why the release binary and not a local build, and every caveat. The gap that means something is the
-one to the engines, two orders of magnitude above.
+Neither kern nor bubblewrap wins single-shot latency outright, and this line used to claim kern was
+about 9% ahead. Re-measured on 2026-09-19, core-pinned and alternated sample by sample, five replicas
+with the start order inverted: kern ~2.43 ms against bubblewrap ~2.24 ms, the OPPOSITE of the earlier
+run. Both are honest readings of different machine states rather than a regression - the same binary
+that reads 2.43 here is 90 us faster than the released one, turning the cgroup cap off makes kern
+slower not faster, and the two bubblewrap package builds are indistinguishable. kern also forks two
+processes where bubblewrap forks one, so part of any margin is scheduling and not code. Treat the top
+tier as one band. What does NOT move is the row below, where kern leads at every concurrency above one,
+and the distance to the engines two orders of magnitude above.
+**[BENCHMARKS.md](BENCHMARKS.md)** has the alternation, the batches, the aarch64 boards, why the
+release binary and not a local build, and every caveat.
 
 ## Security
 
