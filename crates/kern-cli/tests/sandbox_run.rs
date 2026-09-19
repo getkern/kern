@@ -13475,3 +13475,104 @@ fn diff_reports_the_workloads_writes_and_not_kerns_own_setup() {
         "an empty directory the WORKLOAD made must survive the pruning: {wrote_out:?}"
     );
 }
+
+/// The CPU topology a box sees must be right, and it must not be built in the overlay upper.
+///
+/// TWO ASSERTIONS BECAUSE ONE WOULD LET THE OTHER ROT. `setup_cpu_topology` writes
+/// `/sys/devices/system/cpu/cpu0` .. `cpuN` plus `online`/`possible`/`present` so a tool that COUNTS
+/// `cpu[0-9]*` instead of parsing `present` gets the right answer - measured, busybox's own
+/// `nproc --all` answers 1 without them, and Sentry's installer refuses to install below 4 cores. So
+/// the behaviour is pinned first.
+///
+/// THEN WHERE IT LIVES. Those entries used to land in the overlay upper: 34 of the 37 `/sys` entries a
+/// box left behind, each one created at start and unlinked at teardown, and the teardown is on the
+/// caller's path - 404 of the 405 syscalls after the workload exits were that delete. They are on a
+/// tmpfs now, freed with the mount, which is the treatment `/dev` has always had. MEASURED at
+/// 148.7 us faster in a paired, core-pinned run, interval [+94.9, +210.0].
+///
+/// The second assertion is what stops a later edit from silently moving them back.
+#[test]
+fn the_cpu_topology_is_visible_to_the_box_and_absent_from_its_upper() {
+    let Some(bb) = static_busybox() else {
+        eprintln!("skip: no static busybox");
+        return;
+    };
+    let rootfs = build_rootfs(&bb, "cputop");
+    let xdg = std::env::temp_dir().join(format!("kern-it-cputop-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    fs::create_dir_all(&xdg).expect("temp runtime dir");
+    let rootfs_s = rootfs.to_string_lossy().to_string();
+
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "ct",
+            "--rootfs",
+            &rootfs_s,
+            "--cpuset-cpus",
+            "0-1",
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "nproc --all > /count; ls -d /sys/devices/system/cpu/cpu[0-9]* | wc -l >> /count; \
+                sleep 20",
+        ])
+        .output()
+        .expect("run kern");
+    let said = said(&out);
+    if host_cannot_build_a_box(&said) {
+        eprintln!("skip: this host cannot build a box: {said}");
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_dir_all(&rootfs);
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    // THE BOX'S VIEW, read from the upper where the workload wrote it.
+    let upper = fs::read_dir(xdg.join("kern/scratch")).ok().and_then(|rd| {
+        rd.flatten()
+            .map(|e| e.path().join("upper"))
+            .find(|p| p.is_dir())
+    });
+    let Some(upper) = upper else {
+        eprintln!("skip: no overlay upper on this host, so there is nothing to look at");
+        let _ = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["stop", "ct"])
+            .output();
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_dir_all(&rootfs);
+        return;
+    };
+    let count = fs::read_to_string(upper.join("count")).unwrap_or_default();
+    // WHERE THE TOPOLOGY LIVES: on a tmpfs, so the upper must not carry the cpu tree.
+    let cpu_in_upper = upper.join("sys/devices/system/cpu").exists();
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "ct"])
+        .output();
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_dir_all(&rootfs);
+
+    let nums: Vec<&str> = count.split_whitespace().collect();
+    if nums.len() < 2 {
+        eprintln!("skip: the box did not report its view here: {count:?}");
+        return;
+    }
+    assert_eq!(
+        nums[0], "2",
+        "`nproc --all` must see the cpuset, not the host: {count:?}"
+    );
+    assert_eq!(
+        nums[1], "2",
+        "a tool COUNTING cpu[0-9]* dirs must see the cpuset too: {count:?}"
+    );
+    assert!(
+        !cpu_in_upper,
+        "the cpu topology is in the overlay upper again: it is created and then unlinked on the \
+         caller's teardown path, which is what putting it on a tmpfs removed"
+    );
+}

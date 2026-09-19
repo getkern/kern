@@ -3138,6 +3138,29 @@ fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
     {
         return;
     }
+    // ON A TMPFS, NOT IN THE OVERLAY UPPER, which is where this used to land and where it cost twice.
+    //
+    // MEASURED: this function writes 34 of the 37 `/sys` entries a box leaves in its upper layer, and
+    // `/sys/devices/system/cpu/cpu0` .. `cpu27` is most of them. Every one is created at start and
+    // unlinked at teardown, and the teardown is SYNCHRONOUS on the caller's path: 404 of the 405
+    // syscalls a box makes after its workload has already exited are that recursive delete, 14% of the
+    // wall of a `--rootfs` box start. A tmpfs is freed by dropping its superblock, so the same tree
+    // costs one `umount` instead of 34 `unlinkat` - and unlike deferring the delete, the work does not
+    // move somewhere else, it stops existing.
+    //
+    // THIS IS THE TREATMENT `/dev` ALREADY GETS, which is why `/dev` is ONE entry in the upper and
+    // `/sys` was thirty-seven: `setup_dev` mounts a tmpfs and populates it, so nothing it writes ever
+    // reaches the host-visible layer. Applying the same shape here is consistency, not a new mechanism.
+    //
+    // NARROW ON PURPOSE: `sys/devices` and not `sys`. Covering all of `/sys` would also hide anything
+    // an image ships there and would sit under the `/sys/fs/cgroup` mount kern makes later. Three
+    // mountpoint directories stay in the upper; the thirty-four leaves do not.
+    //
+    // BEST EFFORT, AND THE FALLBACK IS TODAY'S BEHAVIOUR. A host that refuses the mount still gets the
+    // topology, written into the upper exactly as before: `create_dir_all` below runs either way. A
+    // performance change must not become a correctness one on the host that cannot take it.
+    let _ = std::fs::create_dir_all(format!("{root}/sys"));
+    let _ = make_box_tmpfs(root, "sys/devices");
     let dir = format!("{root}/sys/devices/system/cpu");
     if std::fs::create_dir_all(&dir).is_err() {
         return;

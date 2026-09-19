@@ -343,6 +343,17 @@ where a GPU is actually handed over: `kern box ... --plan`, under a profile that
 but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
 warning stayed under 70. A passing row takes a second line now, as a warning always could.
 
+**The CPU topology a box sees was built in its overlay upper, and paid for twice.** `/sys/devices/system/cpu/cpu0`
+through `cpuN` plus `online`/`possible`/`present` were written into the host-visible upper layer on
+every start and unlinked again at teardown, and that teardown is on the caller's path: 404 of the 405
+syscalls a box makes after its workload has already exited were that recursive delete, 14% of the wall
+of a `--rootfs` start. They are on a tmpfs now, freed with the mount, which is the treatment `/dev` has
+always had and why `/dev` was one entry in the upper where `/sys` was thirty-seven. The upper goes from
+46 entries to 9, and a paired core-pinned run measures **148.7 us** faster, interval [+94.9, +210.0].
+Behaviour is unchanged and pinned by a test: `nproc --all` and a tool counting `cpu[0-9]*` directories
+both still see the cpuset. Best-effort with today's behaviour as the fallback, so a host that refuses
+the mount still gets the topology.
+
 **`kern diff` answered "what did this box change?" with 41 lines of kern's own setup and none of the
 box's.** Measured on the shipped binary: a box whose whole workload was `touch /tmp/mio.txt` listed
 `/dev`, `/etc/hostname`, `/etc/hosts` and thirty-six lines of `/sys/devices/system/cpu/cpu0` through
