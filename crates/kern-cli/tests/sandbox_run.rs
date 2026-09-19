@@ -13381,3 +13381,97 @@ fn history_tells_two_boxes_apart_when_their_names_share_a_long_prefix() {
          part that told them apart: {text}"
     );
 }
+
+/// `kern diff` on a box that wrote nothing must print nothing.
+///
+/// THE UNIT TESTS BESIDE `strip_scaffolding` PIN A LIST, and a list drifts: the day someone adds a
+/// file to the box setup, they are still green and `diff` starts lying again. This asserts the
+/// PROPERTY against a real box, so the next piece of scaffolding turns it red by existing.
+///
+/// MEASURED BEFORE THE FILTER: a box whose whole workload was `touch /tmp/mio.txt` printed 41 lines,
+/// none of them that file. Thirty-eight were `setup_cpu_topology`'s fake
+/// `/sys/devices/system/cpu/cpu0` .. `cpu27`; the real write went to a tmpfs and never reached the
+/// overlay upper at all.
+///
+/// THE SECOND HALF IS THE CONTROL. A filter that printed nothing ever would pass the first assertion
+/// forever, so a second box writes a file AND an empty directory and both must appear - the empty one
+/// because the pruning drops a directory only when every child it HAD was scaffolding, and a
+/// workload's own `mkdir` never had any.
+#[test]
+fn diff_reports_the_workloads_writes_and_not_kerns_own_setup() {
+    let Some(bb) = static_busybox() else {
+        eprintln!("skip: no static busybox");
+        return;
+    };
+    let rootfs = build_rootfs(&bb, "diffscaf");
+    let xdg = std::env::temp_dir().join(format!("kern-it-diffscaf-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    fs::create_dir_all(&xdg).expect("temp runtime dir");
+    let rootfs_s = rootfs.to_string_lossy().to_string();
+
+    let start = |name: &str, script: &str| -> std::process::Output {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                name,
+                "--rootfs",
+                &rootfs_s,
+                "-d",
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                script,
+            ])
+            .output()
+            .expect("run kern")
+    };
+    let diff = |name: &str| -> String {
+        String::from_utf8_lossy(
+            &kern()
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .args(["diff", name])
+                .output()
+                .expect("run kern diff")
+                .stdout,
+        )
+        .to_string()
+    };
+
+    let quiet = start("dq", "sleep 20");
+    let said = said(&quiet);
+    if host_cannot_build_a_box(&said) {
+        eprintln!("skip: this host cannot build a box: {said}");
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_dir_all(&rootfs);
+        return;
+    }
+    let _ = start("dw", "mkdir -p /vuota; touch /reale.txt; sleep 20");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let (quiet_out, wrote_out) = (diff("dq"), diff("dw"));
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", "dq", "dw"])
+        .output();
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_dir_all(&rootfs);
+
+    if quiet_out.contains("no running box") || wrote_out.contains("no running box") {
+        eprintln!("skip: the boxes did not stay up long enough on this host to be diffed");
+        return;
+    }
+    assert!(
+        quiet_out.trim().is_empty(),
+        "a box that wrote nothing must diff empty; kern's own setup is not its change: {quiet_out:?}"
+    );
+    // THE CONTROL: the filter must not be "print nothing".
+    assert!(
+        wrote_out.contains("/reale.txt"),
+        "a file the workload wrote must appear: {wrote_out:?}"
+    );
+    assert!(
+        wrote_out.contains("/vuota"),
+        "an empty directory the WORKLOAD made must survive the pruning: {wrote_out:?}"
+    );
+}

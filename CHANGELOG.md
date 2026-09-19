@@ -343,6 +343,18 @@ where a GPU is actually handed over: `kern box ... --plan`, under a profile that
 but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
 warning stayed under 70. A passing row takes a second line now, as a warning always could.
 
+**`kern diff` answered "what did this box change?" with 41 lines of kern's own setup and none of the
+box's.** Measured on the shipped binary: a box whose whole workload was `touch /tmp/mio.txt` listed
+`/dev`, `/etc/hostname`, `/etc/hosts` and thirty-six lines of `/sys/devices/system/cpu/cpu0` through
+`cpu27`, written by the CPU-topology setup on every start. The one real write went to a tmpfs and
+never reached the overlay upper, so the signal was not buried, it was absent: the verb was 100% noise.
+The upper is now stripped of what kern itself writes, and then of any directory left childless BY THAT
+REMOVAL, so the lone `C /etc` a naive filter leaves behind goes too. `/etc` is not treated as kern's:
+a workload writing `/etc/passwd` is a real change and still appears, and so does an empty directory the
+workload made, because a directory is dropped only when every child it HAD was scaffolding. A test
+asserts the property against a real box rather than the list, so the next piece of setup turns it red
+by existing.
+
 **The SDK paid a quarter of every cold box for a uid range its own posture made useless.** `kern box
 --image` maps a sub-uid range by default, so that an image degrading privilege in its entrypoint
 (postgres, nginx, apt's `_apt`) works; mapping it forks the two setuid helpers `newuidmap` and

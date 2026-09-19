@@ -2892,6 +2892,56 @@ fn walk_diff(
     }
 }
 
+/// The paths kern's OWN box setup writes into the overlay upper, which are not the box's changes.
+///
+/// MEASURED, and the number is the argument: a box whose entire workload was `touch /tmp/mio.txt`
+/// produced 41 diff lines, **none of them that file**. Thirty-eight were
+/// `/sys/devices/system/cpu/cpu0` through `cpu27` plus `online`/`possible`/`present`, written by
+/// `setup_cpu_topology` on every start; the rest were `/dev`, `/etc/hostname`, `/etc/hosts` and the
+/// `/sys` parents. The one real write went to a tmpfs and never reached the upper at all. A verb whose
+/// whole job is "what did this box change" answered with 100% noise and 0% signal.
+///
+/// PREFIXES FOR WHAT KERN OWNS ENTIRELY, exact paths for what it writes INTO a directory the image
+/// also owns. `/etc` is not a prefix: a workload writing `/etc/passwd` is a real change and must
+/// still appear, so only the two files kern itself writes are named.
+fn is_kern_scaffolding(inbox: &str) -> bool {
+    const OWNED: [&str; 2] = ["/dev", "/sys"];
+    const WRITTEN: [&str; 3] = ["/etc/hostname", "/etc/hosts", "/etc/resolv.conf"];
+    OWNED
+        .iter()
+        .any(|p| inbox == *p || inbox.starts_with(&format!("{p}/")))
+        || WRITTEN.contains(&inbox)
+}
+
+/// Drop kern's scaffolding from a collected diff, then drop any directory left childless BY THAT
+/// REMOVAL.
+///
+/// THE SECOND HALF IS WHY THIS IS NOT A FILTER. Removing `/etc/hostname` and `/etc/hosts` leaves a
+/// bare `C /etc` with nothing under it, which is the same noise one level up. A directory is pruned
+/// only when it HAD children and every one of them was scaffolding: a workload's own empty `mkdir
+/// /foo` had none to begin with and survives, which is the case a blunter rule would have eaten.
+fn strip_scaffolding(out: Vec<(char, String)>) -> Vec<(char, String)> {
+    let dropped: Vec<&String> = out
+        .iter()
+        .filter(|(_, p)| is_kern_scaffolding(p))
+        .map(|(_, p)| p)
+        .collect();
+    let kept: Vec<(char, String)> = out
+        .iter()
+        .filter(|(_, p)| !is_kern_scaffolding(p))
+        .cloned()
+        .collect();
+    kept.iter()
+        .filter(|(_, p)| {
+            let prefix = format!("{p}/");
+            let had_dropped_child = dropped.iter().any(|d| d.starts_with(&prefix));
+            let has_kept_child = kept.iter().any(|(_, k)| k.starts_with(&prefix));
+            !(had_dropped_child && !has_kept_child)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Print one `kern events` line: `<unix-seconds> box <action> <name> (pid <pid>)`, with `from <old>`
 /// appended for a rename. Unix seconds (not a localized clock) keeps it timezone-unambiguous and
 /// dependency-free.
@@ -9031,6 +9081,88 @@ mod tmpfs_devpts_message {
             "/devpts",
         ] {
             assert!(!is_dev_pts_path(p), "{p} must keep the generic refusal");
+        }
+    }
+}
+
+#[cfg(test)]
+mod diff_scaffolding_tests {
+    use super::{is_kern_scaffolding, strip_scaffolding};
+
+    /// `kern diff` answered "what did this box change?" with 41 lines of kern's own setup and not one
+    /// line of the box's write.
+    ///
+    /// MEASURED on the shipped binary: a box whose whole workload was `touch /tmp/mio.txt` listed
+    /// `/dev`, `/etc`, `/etc/hostname`, `/etc/hosts`, `/sys` and 36 lines of
+    /// `/sys/devices/system/cpu/cpu0` .. `cpu27` with `online`/`possible`/`present`. Thirty-eight of
+    /// the forty-one came from `setup_cpu_topology`, which runs on every start. The one real write
+    /// landed on a tmpfs and never reached the overlay upper, so the signal was not merely buried, it
+    /// was absent.
+    #[test]
+    fn kerns_own_setup_is_not_reported_as_the_boxs_changes() {
+        let real = vec![
+            ('C', "/dev".into()),
+            ('C', "/etc".into()),
+            ('C', "/etc/hostname".into()),
+            ('C', "/etc/hosts".into()),
+            ('C', "/sys".into()),
+            ('C', "/sys/devices/system/cpu/cpu0".into()),
+            ('C', "/sys/devices/system/cpu/possible".into()),
+        ];
+        assert!(
+            strip_scaffolding(real).is_empty(),
+            "a box that wrote nothing must diff empty"
+        );
+    }
+
+    /// The pruning must not eat a directory the WORKLOAD created empty, which is the case a blunter
+    /// "drop childless directories" rule gets wrong. A directory is dropped only when it HAD children
+    /// and every one of them was scaffolding.
+    #[test]
+    fn a_workloads_own_empty_directory_survives_the_pruning() {
+        let out = vec![
+            ('C', "/etc".into()),
+            ('C', "/etc/hostname".into()), // scaffolding: /etc becomes childless and goes
+            ('C', "/vuota".into()),        // the workload's own mkdir, no children ever
+            ('C', "/reale.txt".into()),
+            ('D', "/cancellato".into()), // a whiteout is a real deletion and stays
+        ];
+        let kept: Vec<String> = strip_scaffolding(out).into_iter().map(|(_, p)| p).collect();
+        assert_eq!(kept, vec!["/vuota", "/reale.txt", "/cancellato"]);
+    }
+
+    /// `/etc` is NOT owned by kern, so only the two files kern writes are named. A workload editing
+    /// `/etc/passwd` is a real change and must survive, and so must its parent.
+    #[test]
+    fn a_write_into_etc_by_the_workload_is_still_reported() {
+        let out = vec![
+            ('C', "/etc".into()),
+            ('C', "/etc/hostname".into()),
+            ('C', "/etc/passwd".into()),
+        ];
+        let kept: Vec<String> = strip_scaffolding(out).into_iter().map(|(_, p)| p).collect();
+        assert_eq!(kept, vec!["/etc", "/etc/passwd"]);
+    }
+
+    /// The predicate itself, in both directions: a prefix must not match a sibling that merely starts
+    /// with the same letters.
+    #[test]
+    fn the_predicate_does_not_match_a_lookalike_path() {
+        for owned in ["/dev", "/dev/null", "/sys", "/sys/devices/system/cpu/cpu9"] {
+            assert!(is_kern_scaffolding(owned), "{owned} is kern's own");
+        }
+        for theirs in [
+            "/development",
+            "/system",
+            "/etc/passwd",
+            "/devil",
+            "/sysadmin",
+            "/home/dev",
+        ] {
+            assert!(
+                !is_kern_scaffolding(theirs),
+                "{theirs} belongs to the workload"
+            );
         }
     }
 }

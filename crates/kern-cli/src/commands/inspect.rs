@@ -1201,6 +1201,9 @@ pub fn diff(name: &str, json: bool) -> Result<(), Error> {
         (true, Some(u)) if u.is_dir() => {
             let mut out: Vec<(char, String)> = Vec::new();
             walk_diff(&u, &u, 0, &mut out);
+            // kern's own setup writes into the same upper the box does; those lines are not the box's
+            // changes and drowned the ones that were.
+            out = strip_scaffolding(out);
             out.sort_by(|a, b| a.1.cmp(&b.1));
             if out.len() >= DIFF_MAX_ENTRIES {
                 eprintln!("kern: diff truncated at {DIFF_MAX_ENTRIES} entries (upper too large)");
