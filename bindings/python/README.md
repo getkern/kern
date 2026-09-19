@@ -414,10 +414,8 @@ size.
 `run_code` runs *Python*, so it pays the interpreter boot on top of the box: that is a Python cost, not
 kern's, and it is why 14.3 rather than 4.3.
 
-**The prewarm row has a CONDITION, and one number without it would be a lie by omission.** A prewarmed
-box is a box already at its interpreter prompt, so a call that gets one pays almost nothing; the pool
-refills in the background, and refilling costs what a cold start costs. Measured three usage shapes in
-one run on the machine above, which is the only honest way to give this number:
+**That row has a condition.** A prewarmed box is already at its interpreter prompt, so a call that
+gets one pays almost nothing; refilling the pool costs what a cold start costs. Three shapes, one run:
 
 | shape | p50 |
 |---|---|
@@ -425,10 +423,9 @@ one run on the machine above, which is the only honest way to give this number:
 | 16 calls in a tight loop with `prewarm=8` | first 8: **0.70 ms**, next 8: **13.70 ms** |
 | one call every 2 s with `prewarm=4`, an agent's pace | **0.86 ms** (max 1.10) |
 
-So: sub-millisecond for as long as the pool keeps up, and it keeps up comfortably at the rate an agent
-actually calls. A loop that fires faster than the pool refills falls back to the cold number, and the
-fall is a cliff rather than a slope. Quoting a single p50 over a mixed run reads **12.6 ms**, which is
-the average of two different regimes and describes neither.
+Sub-millisecond while the pool keeps up, which it does at the rate an agent calls. A loop that outruns
+it falls back to the cold number, and the fall is a cliff. A single p50 over a mixed run reads 12.6 ms
+and describes neither regime.
 
 **The host and the image are part of the claim.** The same call reads ~40 ms on WSL2 and ~17 ms on
 `python:3.12-alpine`, whose interpreter starts slower. Quote the row that matches yours.
