@@ -50,8 +50,9 @@ r.fault.type      # 'timeout'      the sandbox stopped it
 r.success         # False
 ```
 
-Every call returns an `ExecutionResult`:
+Every call returns an `ExecutionResult`, whose definition is:
 
+<!-- readme-block: reference -->
 ```python
 @dataclass
 class ExecutionResult:
@@ -361,9 +362,13 @@ pip install 'kern-sandbox[langchain]'
 ```python
 from kern_sandbox.langchain import kern_code_tool
 
-tool = kern_code_tool(memory_mb=512, timeout_s=30)
-agent = create_agent(model, [tool])
+tool = kern_code_tool(memory_mb=512, timeout_s=30)   # a StructuredTool named `run_python`
+print(tool.invoke({"code": "print(6 * 7)"}))         # 42
 ```
+
+`tool` then goes wherever your framework wants a tool. The agent constructor is deliberately not shown
+running here: the extra above installs `langchain-core` only, on purpose, so `create_agent` and friends
+are not importable from it. Add the umbrella `langchain` yourself if that is the framework you use.
 
 One session, so a file written by one call is there for the next, and each call still runs in a fresh
 box. What comes back is written for a model to act on: stdout, the value of a trailing expression, and

@@ -73,6 +73,13 @@ jobs:
           # ones need the network and npmjs.com answers 403 to a runner, and a gate that fails on
           # someone else's bot filter teaches people to ignore it.
           python3 scripts/md-links.py
+          # AND THE BLOCKS THEMSELVES, because a reader pastes them. The LangChain block used
+          # `create_agent(model, ...)` with neither name imported nor assigned, under an install
+          # line that pulls `langchain-core` only, so the import would not have existed either. An
+          # external reviewer found it by pasting all thirteen, which is what a launch audience
+          # does and what nobody here had done. Static (undefined names, in reading order with an
+          # accumulating scope) so it needs no binary, no network and no image pull: milliseconds.
+          python3 scripts/readme-blocks-complete.py
           # Every child under the runtime registry root must be CLASSIFIED (authoritative dir / box-data
           # dir / sibling tree / cosmetic file) at COMPILE time, not just when a constructor is exercised
           # at runtime: `runstats` builds `<runtime>/kern/runstats` WITHOUT the runtime chokepoint, the
