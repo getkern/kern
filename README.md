@@ -317,16 +317,15 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 Intel i7-14700KF, Linux 7.0.0, the release binary, alternating batches on an idle machine,
 `powersave` governor.
 
-| | kern | bubblewrap | runc | podman | docker |
-|---|---:|---:|---:|---:|---:|
-| Cold start (bare box) | ~2.4 ms | ~2.2-2.6 ms | ~13.1 ms | ~297 ms | ~288 ms |
-| 200 boxes in parallel | **~0.11 s** | ~0.13 s | ~0.29 s | ~43.1 s | ~16.7 s |
+| | kern | runc | podman | docker |
+|---|---:|---:|---:|---:|
+| Cold start (bare box) | **~2.4 ms** | ~13.1 ms | ~297 ms | ~288 ms |
+| 200 boxes in parallel | **~0.11 s** | ~0.29 s | ~43.1 s | ~16.7 s |
 
-The two rows time different amounts of work: a process bubblewrap starts stays in the caller's cgroup
-with no `memory.max`, while kern's box reads its own cap back from inside. Nobody wins single-shot
-latency outright, the top tier sits inside its own noise, and kern leads at every concurrency above
-one. The distance that means something is the one to the engines.
-**[BENCHMARKS.md](BENCHMARKS.md)** has the method and every caveat.
+These are engines, and the distance to them is the one that means something. The near neighbours that
+do LESS than a box start - bubblewrap leaves the process in the caller's cgroup with no `memory.max` -
+are a different comparison, and it lives with its method in
+**[BENCHMARKS.md](BENCHMARKS.md)** rather than on a front page.
 
 ## Security
 

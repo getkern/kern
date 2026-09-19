@@ -38,7 +38,9 @@ Faster than the first cut in 24 of 24 paired batches, and faster than v0.9.0 in 
 
 Those are the paired harness. `bench-idle.sh`, which is what the published figure quotes, reads the
 shipped v0.9.1 at **2.411 and 2.398 ms** free and **1.780 and 1.810** pinned, ahead of bubblewrap by
-8.6% to 11.7% and faster in 20 of 20 in all four replicas. **The published number stays 2.4 ms**: the
+8.6% to 11.7% and faster in 20 of 20 in all four replicas. That comparison was re-run on 2026-09-19
+and came out the other way in all three scheduling conditions: see "NOT settled" below before quoting
+any margin from this paragraph. **The published number stays 2.4 ms**: the
 release is measurably faster than v0.9.0 and the margin is smaller than the rounding, so moving the
 headline to 2.3 would be quoting the friendlier of two harnesses.
 
@@ -97,15 +99,16 @@ on the one path where the supervisor's own cgroup is the one being armed. The ta
 file is the result.
 
 
-## kern against bubblewrap, settled
+## kern against bubblewrap: NOT settled, and the reversal is measured
 
 The table above is one session. This is the same question asked 23 times, because the answer moved
 with how it was asked and the size of the margin was never stable enough to quote.
 
 **35 replicas, 116,000 box starts, on a machine measured idle** (CPU busy read from `/proc/stat` over
-two seconds, not from a load average that carries a minute of history). **The direction has never once
-flipped**: kern led in 457 of 460 batches over the first 23, and in **238 of 240** over the twelve most
-recent.
+two seconds, not from a load average that carries a minute of history). Through 2026-09-03 the
+direction never flipped: kern led in 457 of 460 batches over the first 23, and in **238 of 240** over
+the twelve most recent. It flipped on 2026-09-19, and the measurement is below rather than the
+sentence that used to be here.
 
 The four most recent were run against the **binary attached to the release**, downloaded and
 checksummed, rather than a local build, and that turned out to matter:
@@ -114,6 +117,34 @@ checksummed, rather than a local build, and that turned out to matter:
 |---|---:|---:|---:|
 | free | **2.35 ms** | 2.60 ms | +9.6% |
 | pinned to one core | **1.76 ms** | 1.89 ms | +7.3% |
+
+**THOSE NUMBERS DID NOT REPRODUCE ON 2026-09-19, ON THE SAME MACHINE AND THE SAME RELEASE BINARY.**
+Eight paired runs, sample-by-sample alternation, start order inverted, in all three scheduling
+conditions this file uses:
+
+| scheduler | kern | bubblewrap | margin |
+|---|---:|---:|---:|
+| free | 3.11 ms | **2.87 ms** | -7.7% |
+| pinned to five cores, the row above | 2.41 ms | **2.26 ms** | -6.0% |
+| pinned to one core | 2.53 ms | **2.24 ms** | -11.4% |
+
+Not one interval touched zero, and the direction held across both start orders. Five explanations were
+tested and every one of them failed:
+
+- **not a kern regression**: the build from today's `main` is 90 us FASTER than the released binary in
+  a paired run, so the released one would read worse still;
+- **not the cgroup cap**: `KERN_NO_SCOPE=1` makes kern 150 us SLOWER, so the cap is not the cost;
+- **not a bubblewrap update**: the package was reinstalled on 2026-09-17, so both `.deb` builds were
+  extracted and raced against each other - 6.8 us apart with the interval spanning zero;
+- **not the CPU clock**: loading eight cores to force the governor up WIDENED the gap, and a core was
+  observed at 5514 MHz against a 5500 MHz nominal ceiling, so nothing was throttled;
+- **not the pinning width**: five cores, which is what the row above used, narrows the gap and does not
+  flip it.
+
+What remains unexplained is the absolute level: this machine read kern at 1.76 ms pinned in the run
+above and 2.41 today, and bubblewrap 1.89 against 2.26. Both moved, kern by more. Until that is
+understood, **there is no margin to quote in either direction**, and the sentences below that quote one
+are the old measurement rather than a current claim.
 
 **Which binary is a variable, and it was hiding inside the spread.** The four replicas before these
 read +5.3, +5.1, +6.7 and +5.2 free, on a `cargo build --release --target ...-musl` that was two days
@@ -163,7 +194,7 @@ Same `/bin/true`, `--bind-rootfs` in both kern columns, medians of 12 alternatin
 | Jetson Orin Nano | **4.6 ms** | 14.9 ms | 5.8 ms |
 | Arduino UNO Q | **11.6 ms** | 60.3 ms | 14.9 ms |
 
-At equal work kern is 21% faster than bubblewrap on both boards. The default is slower because it
+At equal work kern is 21% faster than bubblewrap on both boards. That is aarch64 and it has NOT been re-run since the x86 reversal above: it is a measurement from a different machine class, not a counter-example to it. The default is slower because it
 spends a `systemd-run --user --scope` per box (10 ms on the Jetson, 49 ms on the UNO Q) to get a
 cgroup cap bubblewrap never applies. Measured over SSH, where the login cgroup sits outside
 `user@<uid>.service` and a `memory.max` write into kern's delegated slice is denied, so the scope
