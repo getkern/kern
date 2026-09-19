@@ -428,18 +428,58 @@ fn the_opt_out_that_drops_the_default_cap_says_so() {
 /// if a plain `kern run` is not capped here (no cgroup delegation, no systemd, a container), then the
 /// cap cannot fire and there is nothing to report. `memory.max` inside the box answers that, and it
 /// is the same question the feature depends on, so the skip cannot hide the defect.
+///
+/// EXIT 137 IS NOT THE QUESTION, and believing it was made this test fail a release on a runner that
+/// had done nothing wrong. 137 means the workload was SIGKILLed by SOMEBODY - the box's own cgroup
+/// hitting its ceiling, or the HOST's OOM killer picking a victim while a shared runner allocates
+/// 900 MB alongside other jobs, or anything else with a signal. kern already draws that line
+/// deliberately (`start.rs` writes an OOM-outcome byte that is 1 only when "the kernel's OOM killer
+/// fired against this box's OWN cgroup") and correctly says NOTHING when the kill came from
+/// elsewhere. So the old assertion demanded a sentence whose absence was the right answer, and it
+/// read exit 137 with an empty stderr as a defect in the message. MEASURED: green 12/12 here in both
+/// host shapes, red once on a runner, on a commit that changed four version strings and no Rust.
+///
+/// THE QUESTION IS ASKED OF THE KERNEL, not of kern's stderr, which is the channel under test: the
+/// `oom_kill` counter in `memory.events` of the slice the run's cgroup lives under, read before and
+/// after. It is hierarchical, so it counts a kill in any descendant. No increment means no cgroup OOM
+/// happened, and then there is nothing for kern to have explained.
 #[test]
 fn a_box_killed_by_its_memory_cap_says_why() {
-    let cap = kern()
-        .args(["run", "--", "sh", "-c",
-               "cat /sys/fs/cgroup$(awk -F: '/^0::/{print $3}' /proc/self/cgroup)/memory.max 2>/dev/null"])
+    // The box's own cgroup path AND its ceiling, from one run: the path is what locates the counter,
+    // and asking for it separately would name a different, already-gone per-run cgroup.
+    let probe = kern()
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "cg=$(awk -F: '/^0::/{print $3}' /proc/self/cgroup); echo $cg; \
+                cat /sys/fs/cgroup$cg/memory.max 2>/dev/null",
+        ])
         .output()
         .expect("run kern");
-    let cap = String::from_utf8_lossy(&cap.stdout).trim().to_string();
+    let probe = String::from_utf8_lossy(&probe.stdout);
+    let mut lines = probe.lines();
+    let cg = lines.next().unwrap_or("").trim().to_string();
+    let cap = lines.next().unwrap_or("").trim().to_string();
     if cap.is_empty() || cap == "max" {
         eprintln!("SKIP: no memory cap is in force here (memory.max = {cap:?}), so none can fire");
         return;
     }
+    // The PARENT of the per-run cgroup: that one is created and removed per run, its parent is where
+    // every run lands and where a hierarchical `oom_kill` accumulates.
+    let slice = match cg.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => format!("/sys/fs/cgroup{parent}/memory.events"),
+        _ => String::new(),
+    };
+    let kills = |p: &str| -> Option<u64> {
+        std::fs::read_to_string(p).ok()?.lines().find_map(|l| {
+            l.strip_prefix("oom_kill ")
+                .and_then(|v| v.trim().parse().ok())
+        })
+    };
+    let before = kills(&slice);
+
     // Ask for more than the cap. `bytearray` touches every page, so the kernel has to back it.
     let out = kern()
         .args(["run", "--", "python3", "-c", "bytearray(900*1024*1024)"])
@@ -452,10 +492,34 @@ fn a_box_killed_by_its_memory_cap_says_why() {
         );
         return;
     }
+    // WAS IT THIS CGROUP'S OOM? Only then is there a message to demand. Unreadable counters skip too:
+    // a test that cannot ask the kernel must not convict kern on the strength of an exit code.
+    let seen = kills(&slice);
+    match (before, seen) {
+        (Some(b), Some(a)) if a > b => {}
+        (Some(b), Some(a)) => {
+            eprintln!(
+                "SKIP: SIGKILLed but this cgroup recorded no OOM ({} -> {} in {slice}), so the kill \
+                 came from outside the box and kern is right to say nothing",
+                b, a
+            );
+            return;
+        }
+        _ => {
+            eprintln!("SKIP: cannot read {slice}, so there is no independent judge of the kill");
+            return;
+        }
+    }
     let err = String::from_utf8_lossy(&out.stderr);
+    // THE NUMBERS GO IN THE MESSAGE, because the first version of this assertion said only "nothing
+    // said about why" and a CI failure was then indistinguishable between two very different causes:
+    // kern failing to report a real cgroup OOM, and kern's own before/after pair disagreeing with this
+    // one (the file it reads from documents that exact intermittency, "two unrelated counters").
+    // A red that cannot name its own cause costs the next reader the whole investigation.
     assert!(
         err.contains("OOM killer"),
-        "exit 137 with nothing said about why. stderr: {err:?}"
+        "exit 137, this cgroup DID record an OOM ({before:?} -> {seen:?} in {slice}), and kern said \
+         nothing about why. stderr: {err:?}"
     );
     // And the message must stay honest about what it measured: a subtree, not the process.
     assert!(
