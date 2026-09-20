@@ -27,26 +27,7 @@ use super::*;
 fn publishers_json(ports: &str) -> String {
     let mut out = String::from("[");
     let mut first = true;
-    for spec in ports.split(',') {
-        let spec = spec.trim();
-        if spec.is_empty() {
-            continue;
-        }
-        let Some((host_side, target)) = spec.split_once("->") else {
-            continue;
-        };
-        // `<addr>:<published>` or a bare `<published>`.
-        let (url, published) = match host_side.rsplit_once(':') {
-            Some((addr, port)) => (addr, port),
-            None => ("0.0.0.0", host_side),
-        };
-        let (target, proto) = match target.split_once('/') {
-            Some((t, p)) => (t, p),
-            None => (target, "tcp"),
-        };
-        let (Ok(published), Ok(target)) = (published.parse::<u32>(), target.parse::<u32>()) else {
-            continue;
-        };
+    for (url, published, target, proto) in parse_port_mappings(ports) {
         if !first {
             out.push(',');
         }
@@ -59,6 +40,112 @@ fn publishers_json(ports: &str) -> String {
     }
     out.push(']');
     out
+}
+
+/// Decode the registry's `ports` text into `(host addr, published, target, proto)` per mapping.
+///
+/// THE SOLE PARSER of that grammar, so the two documents built from it cannot come to disagree
+/// about which port a service is on. The input is kern's own
+/// `0.0.0.0:18080->80, 0.0.0.0:18443->443/udp`; a mapping that does not parse is SKIPPED rather
+/// than guessed, because an invented port number sends a caller to the wrong address, which is the
+/// failure both consumers of this exist to prevent.
+pub(crate) fn parse_port_mappings(ports: &str) -> impl Iterator<Item = (&str, u32, u32, &str)> {
+    ports.split(',').filter_map(|spec| {
+        let (host_side, target) = spec.trim().split_once("->")?;
+        // `<addr>:<published>` or a bare `<published>`.
+        let (url, published) = match host_side.rsplit_once(':') {
+            Some((addr, port)) => (addr, port),
+            None => ("0.0.0.0", host_side),
+        };
+        let (target, proto) = match target.split_once('/') {
+            Some((t, p)) => (t, p),
+            None => (target, "tcp"),
+        };
+        Some((url, published.parse().ok()?, target.parse().ok()?, proto))
+    })
+}
+
+/// Docker's `NetworkSettings.Ports` map, built from the same mappings [`publishers_json`] reads.
+///
+/// SHAPE MEASURED on Docker 29.6.2, not recalled:
+/// `{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"18080"}]}`. Three details are load-bearing and all
+/// three are the kind a from-memory implementation gets wrong. The KEY is the port INSIDE the
+/// container with its protocol suffix, not the published one. The value is an ARRAY, because one
+/// container port can be published on several addresses, and a caller doing `.["80/tcp"][0]`
+/// breaks on an object. `HostPort` is a STRING, not a number.
+///
+/// A container port with no publication maps to `null` in Docker; kern's registry records only what
+/// it actually bound, so every key here has an array and none has `null`. That is a narrower
+/// document, never a contradicting one.
+pub(crate) fn network_ports_json(ports: &str) -> String {
+    // Grouped by container port, because two publications of one port share a key and appending
+    // them as two keys would produce a document whose second entry silently replaces the first in
+    // every JSON parser that reads it.
+    let mut keys: Vec<String> = Vec::new();
+    let mut binds: Vec<Vec<String>> = Vec::new();
+    for (url, published, target, proto) in parse_port_mappings(ports) {
+        let key = format!("{target}/{proto}");
+        let bind = format!(
+            "{{\"HostIp\":{},\"HostPort\":{}}}",
+            json_str(url),
+            json_str(&published.to_string())
+        );
+        match keys.iter().position(|k| *k == key) {
+            Some(i) => binds[i].push(bind),
+            None => {
+                keys.push(key);
+                binds.push(vec![bind]);
+            }
+        }
+    }
+    let body: Vec<String> = keys
+        .iter()
+        .zip(&binds)
+        .map(|(k, v)| format!("{}:[{}]", json_str(k), v.join(",")))
+        .collect();
+    format!("{{{}}}", body.join(","))
+}
+
+/// Split the registry's comma-joined `k=v` label field into pairs.
+///
+/// THE SOLE READER of that grammar, as `--filter label=` is its sole matcher, so a label that
+/// filters cannot be a label that does not print. A segment with no `=` is SKIPPED rather than
+/// emitted with an empty value: `--label` requires the `=` at parse time, so such a segment can only
+/// come from a corrupted record, and inventing a key for it would put a name into a document that
+/// nothing ever set.
+pub(crate) fn label_pairs(field: &str) -> impl Iterator<Item = (&str, &str)> {
+    field
+        .split(',')
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split_once('='))
+}
+
+/// The registry's label field as a JSON object, Docker's `Config.Labels` shape.
+///
+/// `{}` and not `null` for a box with no labels: a consumer that does `.labels.foo` gets "absent"
+/// either way, and one that iterates gets an empty loop instead of a type error. Docker emits
+/// `null` there, and this is the one place the shape deliberately differs, because the value a
+/// script reads is the same and the failure mode is not.
+pub(crate) fn labels_json(field: &str) -> String {
+    let mut out = String::from("{");
+    for (i, (k, v)) in label_pairs(field).enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{}:{}", json_str(k), json_str(v)));
+    }
+    out.push('}');
+    out
+}
+
+/// The value of ONE label, or `None` when the box does not carry that key.
+///
+/// The distinction is the whole point of returning an `Option`: `{{.Label "app"}}` on a box with no
+/// `app` label must be able to print an empty string the way Docker does, WITHOUT that being
+/// confusable with a label whose value is genuinely empty. Both print nothing; only the caller that
+/// asks for the Option can tell them apart.
+pub(crate) fn label_value<'a>(field: &'a str, key: &str) -> Option<&'a str> {
+    label_pairs(field).find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
 /// The two presentation knobs `docker ps` has that are not about WHICH boxes are listed.
@@ -365,8 +452,12 @@ pub fn ps(
                 // ignore unknown fields, and no existing one changes meaning here. The string comes
                 // from `box_status`, the same function the table and `--format` use, so the four
                 // channels cannot drift again.
+                // `labels` is the field a caller could SET and FILTER on but never read back: the
+                // box carried it, `--filter label=` matched it, and no output surface printed it.
+                // An object rather than the registry's comma-joined text, because a consumer that
+                // has to re-split a string is doing the parsing this document exists to avoid.
                 format!(
-                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"health\":{},\"status\":{}}}",
+                    "{{\"name\":{},\"pid\":{},\"pod\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"ports\":{},\"labels\":{},\"health\":{},\"status\":{}}}",
                     json_str(&b.name),
                     b.pid,
                     json_str(&b.pod),
@@ -374,6 +465,7 @@ pub fn ps(
                     json_str(&b.command),
                     b.started,
                     json_str(&b.ports),
+                    labels_json(&b.labels),
                     json_str(&registry::health_of(&b.name, b.pid)),
                     json_str(&super::box_status(b, "running")),
                 )
@@ -938,8 +1030,41 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
             "State.ExitCode" => Some(exited.as_ref().map_or(0, |e| e.code).to_string()),
             "Name" => Some(format!("/{name}")),
             "Config.Image" | "Image" => b.as_ref().map(|i| i.rootfs.clone()),
+            // Every label as a JSON object, which is the shape `{{json .Config.Labels}}` asks for
+            // and the only shape a caller can feed to a parser. A box past its exit has none: the
+            // instance record that held them is pruned, so `{}` here is the honest empty and not a
+            // lost value.
+            "Config.Labels" => Some(labels_json(b.as_ref().map_or("", |i| i.labels.as_str()))),
+            // Docker's published-port map. THE FIELD A HARNESS READS to learn where a service it
+            // just started is actually reachable, and on a rootless runtime it is the one thing it
+            // cannot assume: kern republishes a privileged port above 1024, so a caller that trusts
+            // the number it asked for is wrong and one that reads this is right.
+            "NetworkSettings.Ports" => Some(network_ports_json(
+                b.as_ref().map_or("", |i| i.ports.as_str()),
+            )),
             _ => None,
         }
+    };
+    // `{{.Label "key"}}`: ONE label, the only key here that takes an argument, so it is resolved
+    // before the table lookup rather than inside it. Absent prints empty (Docker's behaviour, and
+    // the token exists to be paired with `--filter label=`, which has already proven the key is
+    // there); a missing quote is still an error, because that is a typo and not an absent label.
+    let labelled = |key: &str| -> Option<Result<String, Error>> {
+        let arg = key.strip_prefix("Label ")?.trim();
+        Some(
+            match arg
+                .strip_prefix('"')
+                .and_then(|k| k.strip_suffix('"'))
+                .filter(|k| !k.is_empty())
+            {
+                Some(k) => Ok(label_value(b.as_ref().map_or("", |i| i.labels.as_str()), k)
+                    .unwrap_or_default()
+                    .to_string()),
+                None => Err(Error::Usage(
+                    "inspect --format: {{.Label \"key\"}} needs a quoted key",
+                )),
+            },
+        )
     };
     let mut out = String::with_capacity(tmpl.len());
     let mut rest = tmpl;
@@ -951,7 +1076,23 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
                 "inspect --format: an unterminated `{{` is not a template",
             ));
         };
-        let key = after[..close].trim().trim_start_matches('.');
+        // `{{json .X}}`: Go's template pipeline as Docker exposes it, and the form every generated
+        // command line uses for a field that is not a scalar. It is accepted and IGNORED as a
+        // wrapper, because the two keys it is ever applied to (`.Config.Labels`,
+        // `.NetworkSettings.Ports`) already render as JSON documents here and quoting them again
+        // would hand the caller a string where it asked for an object. A scalar under `json` is the
+        // one case that would differ from Docker, and it is not a shape any caller asks for.
+        let raw = after[..close].trim();
+        let key = raw
+            .strip_prefix("json ")
+            .unwrap_or(raw)
+            .trim()
+            .trim_start_matches('.');
+        if let Some(v) = labelled(key) {
+            out.push_str(&v?);
+            rest = &after[close + 2..];
+            continue;
+        }
         match field(key) {
             Some(v) => out.push_str(&v),
             None => {
@@ -1011,7 +1152,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         // agree word for word: `running`, `paused`, `exited`.
         let status = box_lifecycle_status(&b);
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"pids_max\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"pids_max\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1021,6 +1162,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             b.started,
             up,
             json_str(&b.ports),
+            labels_json(&b.labels),
             json_str(&health),
             num(mem),
             num(cpu),

@@ -32,6 +32,31 @@ not. Two of them land here.
     passing both is a usage error rather than a precedence rule: a line that says two things about
     one box has no reading that is not a guess.
 
+**A label went in, could be filtered on, and never came back out.** `--label k=v` was recorded, and
+`--filter label=` matched it on `ps`, but no surface printed it: `ps --json` and `inspect --json`
+carried no such field and `--format` had no token for it. A caller could therefore tag a box and
+then be unable to read its own tag back, which is the write-only half of a round trip.
+
+  * `ps --json` and `inspect --json` now carry `labels` as an OBJECT, not the registry's
+    comma-joined text: a consumer that has to re-split a string is doing the parsing the document
+    exists to avoid. `{}` where Docker emits `null`, so an iterating caller gets an empty loop
+    instead of a type error.
+  * `ps --format` and `inspect --format` take `{{.Label "key"}}` and `{{.Labels}}`. An ABSENT key
+    prints empty, as Docker's does, because the token exists to be paired with `--filter label=`,
+    which has already proven the key is there; a missing quote is still an error, because that is a
+    typo and not an absent label. Exited boxes keep no labels (the instance record is pruned and
+    the breadcrumb carries only name/pod/command), so the token renders empty there rather than
+    failing the row.
+
+**`inspect --format` answers `{{json .NetworkSettings.Ports}}` and `{{json .Config.Labels}}`.** The
+published-port map is how a caller learns where a service it just started is actually reachable, and
+on a rootless runtime it is the one thing it cannot assume: kern republishes a privileged port above
+1024, so a caller that trusts the number it asked for is wrong. The shape was MEASURED on Docker
+29.6.2 rather than recalled, and three of its details are the kind an implementation from memory
+gets wrong: the key is the port INSIDE the box with its protocol suffix (`"80/tcp"`), the value is
+an ARRAY because one container port can be published on several addresses, and `HostPort` is a
+string. The `{{json …}}` pipeline is accepted as a wrapper on both.
+
 **This release changes two flags that already existed, so it is a MINOR and not a patch.** The
 stability note above says an incompatible change to a verb, a flag or a `--json` shape lands only on
 a minor bump, and only after a deprecation entry one release earlier. There was no such entry and

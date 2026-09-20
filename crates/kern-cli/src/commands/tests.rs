@@ -650,6 +650,139 @@ mod ps_exited_tests {
         );
     }
 
+    /// `NetworkSettings.Ports` is the ONE document here whose shape is dictated from outside, so
+    /// what it is pinned against is the measured reference shape rather than a convenient one. The
+    /// three details that a from-memory implementation gets wrong: the key is the port INSIDE the
+    /// box with its protocol, the value is an ARRAY, and `HostPort` is a STRING.
+    #[test]
+    fn network_ports_json_matches_the_measured_docker_shape() {
+        use crate::commands::inspect::network_ports_json;
+        assert_eq!(
+            network_ports_json("0.0.0.0:18080->80"),
+            r#"{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"18080"}]}"#
+        );
+        // A bare published port defaults to 0.0.0.0, and an explicit proto is carried into the key.
+        assert_eq!(
+            network_ports_json("18080->80/udp"),
+            r#"{"80/udp":[{"HostIp":"0.0.0.0","HostPort":"18080"}]}"#
+        );
+        // TWO PUBLICATIONS OF ONE CONTAINER PORT SHARE A KEY. Appended as two keys instead, the
+        // second would silently replace the first in every JSON parser that read the document.
+        assert_eq!(
+            network_ports_json("127.0.0.1:18080->80, 192.168.1.5:18081->80"),
+            r#"{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"18080"},{"HostIp":"192.168.1.5","HostPort":"18081"}]}"#
+        );
+        // Two different ports stay two keys.
+        assert_eq!(
+            network_ports_json("0.0.0.0:18080->80, 0.0.0.0:18443->443"),
+            r#"{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"18080"}],"443/tcp":[{"HostIp":"0.0.0.0","HostPort":"18443"}]}"#
+        );
+        // A box with no published ports is an empty OBJECT: a caller iterating it gets an empty
+        // loop, where `null` would be a type error halfway through a script.
+        assert_eq!(network_ports_json(""), "{}");
+        // A mapping that does not parse is SKIPPED, never guessed at: an invented port number sends
+        // a caller to the wrong address, which is what this field exists to prevent.
+        assert_eq!(network_ports_json("garbage, 0.0.0.0:x->80"), "{}");
+        assert_eq!(
+            network_ports_json("garbage, 0.0.0.0:18080->80"),
+            r#"{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"18080"}]}"#
+        );
+    }
+
+    /// Labels went IN and never came out: the box carried them, `--filter label=` matched them, and
+    /// no surface printed them. These pin the two readers against the filter's own splitting rule.
+    #[test]
+    fn labels_are_readable_back_out() {
+        use crate::commands::inspect::{label_value, labels_json};
+        assert_eq!(labels_json(""), "{}");
+        assert_eq!(labels_json("app=web"), r#"{"app":"web"}"#);
+        assert_eq!(
+            labels_json("app=web,tier=front"),
+            r#"{"app":"web","tier":"front"}"#
+        );
+        // A label whose VALUE is empty is a real label and keeps its key.
+        assert_eq!(labels_json("app="), r#"{"app":""}"#);
+        // A segment with no `=` cannot come from `--label` (which requires it) and is skipped
+        // rather than given an invented empty value.
+        assert_eq!(labels_json("app=web,junk"), r#"{"app":"web"}"#);
+        // A value containing the separator survives the round trip through JSON quoting.
+        assert_eq!(labels_json(r#"a=x"y"#), r#"{"a":"x\"y"}"#);
+        // ABSENT and EMPTY are different facts, and only the Option can tell them apart.
+        assert_eq!(label_value("app=web", "app"), Some("web"));
+        assert_eq!(label_value("app=", "app"), Some(""));
+        assert_eq!(label_value("app=web", "nope"), None);
+        // A bare key must not be satisfied by a prefix of another: `app` is not `apple`.
+        assert_eq!(label_value("apple=1", "app"), None);
+    }
+
+    /// `{{.Label "k"}}` is the only `ps --format` token that takes an argument, and the only one
+    /// that is deliberately permissive about a miss: an absent key prints empty (Docker's
+    /// behaviour, and the token is meant to be paired with `--filter label=`), while a malformed
+    /// token is still an error because that is a typo and not an absent label.
+    #[test]
+    fn ps_format_renders_labels() {
+        // A stub row rather than a full `registry::Instance`: the unit under test is the RENDERER,
+        // and a literal with thirty unrelated fields would say that the label handling depends on
+        // them.
+        struct Row(&'static str);
+        impl PsRow for Row {
+            fn ps_name(&self) -> &str {
+                "web"
+            }
+            fn ps_pid(&self) -> i32 {
+                100
+            }
+            fn ps_image(&self) -> String {
+                String::new()
+            }
+            fn ps_command(&self) -> String {
+                String::new()
+            }
+            fn ps_ports(&self) -> &str {
+                ""
+            }
+            fn ps_pod(&self) -> &str {
+                ""
+            }
+            fn ps_running_for(&self, _now: u64) -> String {
+                String::new()
+            }
+            fn ps_status(&self) -> String {
+                String::new()
+            }
+            fn ps_labels(&self) -> &str {
+                self.0
+            }
+        }
+        let b = Row("app=web,tier=front,blank=");
+        assert_eq!(
+            render_ps_format(r#"{{.Label "app"}}"#, &b, 0).unwrap(),
+            "web"
+        );
+        assert_eq!(
+            render_ps_format(r#"[{{.Label "blank"}}]"#, &b, 0).unwrap(),
+            "[]"
+        );
+        assert_eq!(
+            render_ps_format(r#"[{{.Label "nope"}}]"#, &b, 0).unwrap(),
+            "[]"
+        );
+        assert_eq!(
+            render_ps_format("{{.Labels}}", &b, 0).unwrap(),
+            "app=web,tier=front,blank="
+        );
+        // A missing quote is a typo in the template, not an absent label.
+        assert!(render_ps_format("{{.Label app}}", &b, 0).is_err());
+        assert!(render_ps_format(r#"{{.Label ""}}"#, &b, 0).is_err());
+        // An exited box kept no labels, so the token renders empty rather than erroring: the row
+        // still prints, which is what `ps -a --format` is for.
+        let e = dead("web", 0, "stack");
+        assert_eq!(
+            render_ps_format(r#"[{{.Label "app"}}]"#, &e, 0).unwrap(),
+            "[]"
+        );
+    }
+
     /// The exited filter mirrors `ps_matches`: `status=exited|dead` accept it, `status=running`
     /// rejects it, `name` is a substring, `pod` is exact, and `label=` (not retained) matches nothing.
     #[test]

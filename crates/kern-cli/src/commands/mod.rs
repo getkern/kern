@@ -2618,11 +2618,21 @@ trait PsRow {
     fn ps_pod(&self) -> &str;
     fn ps_running_for(&self, now: u64) -> String;
     fn ps_status(&self) -> String;
+    /// The registry's comma-joined `k=v` label field, EMPTY for an exited box.
+    ///
+    /// Empty there is a fact and not a placeholder: the labels lived in the instance record, which
+    /// is pruned at exit, and the `waitexit` breadcrumb carries only name/pod/command. `ps -a
+    /// --filter label=` already prints a note saying so, and `{{.Label …}}` on an exited row
+    /// prints nothing for the same reason rather than pretending the key was absent.
+    fn ps_labels(&self) -> &str;
 }
 
 impl PsRow for registry::Instance {
     fn ps_name(&self) -> &str {
         &self.name
+    }
+    fn ps_labels(&self) -> &str {
+        &self.labels
     }
     fn ps_pid(&self) -> i32 {
         self.pid
@@ -2650,6 +2660,9 @@ impl PsRow for registry::Instance {
 impl PsRow for registry::ExitedBox {
     fn ps_name(&self) -> &str {
         &self.name
+    }
+    fn ps_labels(&self) -> &str {
+        ""
     }
     fn ps_pid(&self) -> i32 {
         self.pid
@@ -2698,10 +2711,38 @@ fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Err
             ".Pod" => out.push_str(b.ps_pod()),
             ".RunningFor" => out.push_str(&b.ps_running_for(now)),
             ".Status" => out.push_str(&b.ps_status()),
+            // `{{.Labels}}`: every label, Docker's comma-joined `k=v` rendering, which is what the
+            // registry already holds. Scrubbed like the other untrusted columns: a label value is
+            // caller-supplied text heading for a terminal.
+            ".Labels" => out.push_str(&crate::ui::scrub(b.ps_labels())),
+            // `{{.Label "key"}}`: ONE label, and the only token here that takes an argument.
+            //
+            // An ABSENT key prints the empty string rather than erroring, which is the one place
+            // this renderer is deliberately permissive and it is Docker's behaviour: the whole
+            // point of the token is `ps --filter label=x --format '{{.Label "x"}}'`, where the
+            // filter has already guaranteed the key is there, and a box legitimately carrying an
+            // empty value must render the same as Docker renders it. A MALFORMED token (no quotes)
+            // is still an error, because that is a typo and not an absent label.
+            t if t.starts_with(".Label ") => {
+                let arg = t[".Label ".len()..].trim();
+                let Some(key) = arg
+                    .strip_prefix('"')
+                    .and_then(|k| k.strip_suffix('"'))
+                    .filter(|k| !k.is_empty())
+                else {
+                    return Err(Error::Usage(
+                        "ps --format: {{.Label \"key\"}} needs a quoted key (e.g. '{{.Label \"app\"}}')",
+                    ));
+                };
+                if let Some(v) = inspect::label_value(b.ps_labels(), key) {
+                    out.push_str(&crate::ui::scrub(v));
+                }
+            }
             _ => {
                 return Err(Error::Usage(
                     "ps --format: unsupported token (supported: {{.Names}} {{.Pid}} {{.Image}} \
-                     {{.Command}} {{.Ports}} {{.Pod}} {{.Status}} {{.RunningFor}}; use --json for more)",
+                     {{.Command}} {{.Ports}} {{.Pod}} {{.Status}} {{.RunningFor}} {{.Labels}} \
+                     {{.Label \"key\"}}; use --json for more)",
                 ))
             }
         }
