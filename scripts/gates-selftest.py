@@ -99,6 +99,18 @@ CASES: list[Case] = [
      lambda t: t + "\n# " + DASH + "\n"),
     ("no-ai-slop", "an em-dash in a manifest", "Cargo.toml",
      lambda t: t + "\n# " + DASH + "\n"),
+    # --- og-card-matches-readme: the card is a PNG, so nothing else in this repo can read it ---
+    # Three shapes, because the card went stale in two different ways and could go stale in a third:
+    # the README moves and the picture does not, the picture moves and the README does not, and a
+    # phrase banned from every surface comes back through an image where no text gate looks.
+    ("og-card-matches-readme", "the README's first line moves and the card does not", "README.md",
+     lambda t: t.replace("container runtime and sandbox", "virtual resource runtime", 1)),
+    ("og-card-matches-readme", "the card's headline moves and the README does not",
+     "assets/make-og-card.py",
+     lambda t: t.replace('"container runtime and sandbox"', '"resource slicer"', 1)),
+    ("og-card-matches-readme", "a banned absolute comes back inside the picture",
+     "assets/make-og-card.py",
+     lambda t: t.replace("Run workloads,", "For any workload,", 1)),
     # --- progress-is-tty-gated: both crates, and the multi-line shape that escaped the manual pass ---
     ("progress-is-tty-gated", "a bare eprintln! progress line", "crates/kern-oci/src/pull.rs",
      lambda t: t + '\nfn _selftest() { eprintln!("\u2192 pulling something"); }\n'),

@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Regenerate the social card, because for two months it had no source and went stale twice.
+
+WHY THIS FILE EXISTS
+    `og-image.png` is what every share of this project on X, LinkedIn or Slack renders. It is also
+    the only surface no gate can read: `scripts/stale-numbers.py` walks tracked `.md` files, and a
+    claim baked into pixels is invisible to it. Twice now the card has outlived the text it quotes.
+    On 2026-09-07 it still said "2.0 ms - daemonless - ~1.6 MB" while the site said 3.5 ms
+    everywhere, and someone with a large following posted it, so their screenshot carried two
+    different latencies in one image. On 2026-09-20 it still said "For any workload, including
+    untrusted and AI-generated code" after BOTH of those phrases had been removed from every other
+    surface for being indefensible: "any workload" is refuted by this repository's own INSTALL.md
+    and FAQ.md, and "untrusted" promises more than a shared kernel gives.
+
+    Each time, the card was rebuilt by hand from a transcript, because there was no generator. This
+    is the generator. The strings below are the source of truth for what the card says, which is
+    what lets `scripts/og-card-matches-readme.py` compare them against the README's own first line.
+
+HOW IT WORKS, AND WHY IT STARTS FROM THE OLD PNG
+    It repaints three bands and copies everything else pixel for pixel: the wordmark, the pill, the
+    platform line, the install command and the footer are lifted from the existing card rather than
+    redrawn. The wordmark is a piece of custom lettering with no vector source in this tree, so
+    redrawing it would mean approximating it; copying it means it cannot drift.
+
+    The typography was not guessed. It was recovered from the existing PNG by rendering candidate
+    fonts and sizes and scoring the pixel overlap (intersection over union) against the original ink,
+    aligned by bounding box: Lato Black at 78 px scored 0.879 for the headline against 0.776 for the
+    next candidate, and Lato Semibold at 31 px scored 1.000 for the sub-line. The headline drops to
+    74 px here only because the new second line is wider than the space between the left margin and
+    the right edge of the install box at 78 px.
+
+USAGE
+    python3 assets/make-og-card.py <base.png> <out.png>
+
+    The output must be published under a NEW NAME. The card is served with
+    `cache-control: public, max-age=31536000, immutable`, so overwriting the old name does not
+    propagate; the deploy writes the same bytes to the old names as well, so that no URL already in
+    a cache serves a card that disagrees with this one.
+"""
+
+from __future__ import annotations
+
+import sys
+
+from PIL import Image, ImageDraw, ImageFont
+
+# WHAT THE CARD SAYS. These are checked against README.md by scripts/og-card-matches-readme.py, so a
+# tagline change that forgets the card turns a gate red instead of surviving in an image nobody reads.
+HEADLINE = ("A fast, rootless", "container runtime and sandbox")
+SUBLINE = "Built on virtual resources. Run workloads, including LLM-generated code."
+
+FONTS = "/usr/share/fonts/truetype/lato"
+INK = (31, 35, 40)  # the headline colour sampled from the original
+MUTED = (110, 118, 129)  # the sub-line colour sampled from the original
+
+# Where the ink STARTS in the original, not where the text origin is: the bands are matched by
+# bounding box so the new text sits on the same grid as the parts that were copied.
+LEFT = 71
+Y_LINE1, Y_LINE2, Y_SUB = 215, 299, 380
+BAND = (0, 200, 1200, 425)  # cleared before repainting: below the wordmark, above the platform line
+
+
+def _ink_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
+    return img.convert("L").point(lambda v: 255 if v < 200 else 0).getbbox()
+
+
+def draw_at(base: Image.Image, text: str, font: ImageFont.FreeTypeFont, xy: tuple[int, int], fill) -> None:
+    """Draw so that the INK lands at `xy`, whatever the font's internal side bearings are."""
+    scratch = Image.new("RGB", base.size, "white")
+    ImageDraw.Draw(scratch).text((0, 0), text, font=font, fill=fill)
+    box = _ink_bbox(scratch)
+    if box is None:
+        return
+    base.paste(scratch.crop(box), xy)
+
+
+def build(base_path: str, out_path: str) -> None:
+    card = Image.open(base_path).convert("RGB")
+    ImageDraw.Draw(card).rectangle(BAND, fill="white")
+
+    head = ImageFont.truetype(f"{FONTS}/Lato-Black.ttf", 74)
+    sub = ImageFont.truetype(f"{FONTS}/Lato-Semibold.ttf", 31)
+
+    draw_at(card, HEADLINE[0], head, (LEFT, Y_LINE1), INK)
+    draw_at(card, HEADLINE[1], head, (LEFT, Y_LINE2), INK)
+    draw_at(card, SUBLINE, sub, (LEFT + 4, Y_SUB), MUTED)
+
+    card.save(out_path, "PNG", optimize=True)
+    print(f"{out_path}: {card.size[0]}x{card.size[1]}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit(__doc__.strip().splitlines()[-1])
+    build(sys.argv[1], sys.argv[2])

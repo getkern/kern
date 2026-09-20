@@ -64,7 +64,7 @@ step "unit tests, CI host shape" sh scripts/as-ci-host.sh cargo test -q -p getke
 step "clippy -D warnings"      env RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features
 for g in no-ai-slop stale-numbers docker-vocabulary md-links flat-continuation \
          test-env-lock progress-is-tty-gated injection-declared registry-classified \
-         tracked-paths-sane readme-blocks-complete; do
+         tracked-paths-sane readme-blocks-complete og-card-matches-readme; do
     step "$g" python3 "scripts/$g.py"
 done
 # NO SEPARATE EM-DASH STEP, and the reason is the whole point of this file. The first version had

@@ -80,6 +80,12 @@ jobs:
           # does and what nobody here had done. Static (undefined names, in reading order with an
           # accumulating scope) so it needs no binary, no network and no image pull: milliseconds.
           python3 scripts/readme-blocks-complete.py
+          # The social card is the one surface no text gate can read, and it has gone stale twice:
+          # once quoting 2.0 ms while the site said 3.5, once still saying "any workload" and
+          # "untrusted" after both were removed everywhere else for being indefensible. Neither
+          # time did anything go red. This compares the generator's strings, which are the card's
+          # only readable source, against the README's first line.
+          python3 scripts/og-card-matches-readme.py
           # Every child under the runtime registry root must be CLASSIFIED (authoritative dir / box-data
           # dir / sibling tree / cosmetic file) at COMPILE time, not just when a constructor is exercised
           # at runtime: `runstats` builds `<runtime>/kern/runstats` WITHOUT the runtime chokepoint, the

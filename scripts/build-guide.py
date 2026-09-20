@@ -144,7 +144,7 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "") -> str:
 <meta property="og:url" content="{SITE}{BASE}/{page}">
 <meta property="og:title" content="{html.escape(title)}">
 <meta property="og:description" content="{desc}">
-<meta property="og:image" content="{SITE}/og-image-v3.png">
+<meta property="og:image" content="{SITE}/og-image-v4.png">
 <style>{CSS}</style>
 </head>
 <body>
