@@ -1968,6 +1968,17 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         registry::unregister(path);
     }
     pt.mark("parent:teardown");
+    // CLOSE THE PROFILE, naming what the marks above do NOT cover. Every phase here is a delta
+    // between two marks, so the sum describes only the span from the first mark onwards: the
+    // binary's own startup and the argv parse happen before this timer exists, and anything between
+    // two marks that nobody labelled is invisible by construction. Measured on 2026-09-20 that
+    // remainder was about 1140 us of a ~3930 us `--image` box, 29%, and larger than every labelled
+    // phase except the id mapping. A reader summing the marks would have concluded the box was
+    // 2790 us and gone looking for savings inside the wrong ones.
+    //
+    // The total comes from `runstats`' process-entry stamp, which `kern run` already measures its
+    // setup against, rather than a second clock read here that would drift from it.
+    pt.summary("parent:accounted", crate::runstats::since_start_us());
     match result {
         // Propagate the sandboxed command's exit code as kern's, like `docker run`. This is the
         // one place a non-0/1 exit code is produced - a deliberate terminal action.

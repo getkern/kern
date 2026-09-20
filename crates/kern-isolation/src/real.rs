@@ -954,6 +954,15 @@ fn exec(argv: &[CString], ready_fd: Option<libc::c_int>, gate: Option<libc::c_in
 pub struct PhaseTimer {
     on: bool,
     last: libc::timespec,
+    /// Sum of every interval this timer has PRINTED, so it can state its own coverage.
+    ///
+    /// A PROFILER THAT CANNOT SAY WHAT IT MISSED reports the phases it happens to have and reads as
+    /// if they were the whole box. The marks do not lie; the absence of a total lets a reader sum
+    /// them and believe the sum is the box.
+    marked_us: i64,
+    /// Time spent PRINTING the marks, which is the profiler observing itself. Kept out of the
+    /// phases (see [`mark`](Self::mark)) and reported by [`summary`](Self::summary).
+    observed_us: i64,
 }
 
 impl Default for PhaseTimer {
@@ -972,9 +981,28 @@ impl PhaseTimer {
         if on {
             unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut last) };
         }
-        Self { on, last }
+        Self {
+            on,
+            last,
+            marked_us: 0,
+            observed_us: 0,
+        }
     }
 
+    /// Close one phase and print it.
+    ///
+    /// ⏱️ THE CLOCK RESTARTS AFTER THE PRINT, NOT BEFORE IT, so a phase never carries the cost of
+    /// announcing the PREVIOUS one. The correction is small and is not sold as more than it is:
+    /// MEASURED on 2026-09-20, printing a mark costs about 2 us with stderr on `/dev/null`, so the
+    /// parent's eleven marks are roughly 21 us of a ~3000 us box. [`summary`](Self::summary) prints
+    /// that figure rather than leaving it to be assumed.
+    ///
+    /// ⚠️ THE PROFILER IS NOT A 15% TAX, and this note exists because that is what a bad measurement
+    /// said first. Comparing `kern box …` against `env KERN_TIMING=1 kern box …` read +467.7 us with
+    /// a tight interval, which is the extra `env` PROCESS in one column and not the instrument:
+    /// `ab-measure.py` lists that exact trap in its own header, and it was walked into anyway. With
+    /// `env` on BOTH sides the difference is -15.2 us, interval [-41.6, +28.2] at n=250, which does
+    /// not distinguish the two. `KERN_TIMING` costs what this docstring says and no more.
     pub fn mark(&mut self, label: &str) {
         if !self.on {
             return;
@@ -987,7 +1015,72 @@ impl PhaseTimer {
         let us =
             (now.tv_sec - self.last.tv_sec) * 1_000_000 + (now.tv_nsec - self.last.tv_nsec) / 1000;
         eprintln!("kern-timing: {label}: {us} us");
-        self.last = now;
+        self.marked_us += us;
+        let mut after = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut after) };
+        self.observed_us +=
+            (after.tv_sec - now.tv_sec) * 1_000_000 + (after.tv_nsec - now.tv_nsec) / 1000;
+        self.last = after;
+    }
+
+    /// Is `KERN_TIMING` on? Lets a caller skip building a summary nobody will print.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.on
+    }
+
+    /// Everything this timer has printed, in microseconds.
+    #[must_use]
+    pub fn marked_us(&self) -> i64 {
+        self.marked_us
+    }
+
+    /// Close the profile: print what the marks cover against a total the CALLER measured, and name
+    /// the remainder.
+    ///
+    /// `total_us` comes from the caller because the honest total is measured from PROCESS ENTRY, and
+    /// this timer is constructed well after it: in `box_run`, past the argv parse and the binary's
+    /// own startup. `kern` already stamps entry for `kern run`'s setup metric, so the caller passes
+    /// that same stamp rather than taking a second one that would drift from it.
+    ///
+    /// THE REMAINDER IS THE POINT, and it is reported as a number rather than left to subtraction.
+    /// It holds the binary's startup, the argv parse, and whatever sits between two marks that
+    /// nobody has labelled yet: on 2026-09-20 that was about 1140 us of an `--image` box, larger
+    /// than any single labelled phase except the id mapping.
+    ///
+    /// Marks from a box's CHILD are printed by the child's own timer in its own process, so they are
+    /// not in this sum. The summary says so, to stop a reader adding two profiles together.
+    pub fn summary(&self, label: &str, total_us: Option<u128>) {
+        if !self.on {
+            return;
+        }
+        match total_us {
+            Some(total) => {
+                let marked = self.marked_us.max(0) as u128;
+                let unmarked = total.saturating_sub(marked);
+                // `checked_div` rather than a `> 0` guard: same answer, and it is the form
+                // clippy accepts. A zero total means nothing was measured, so 0% is the honest
+                // rendering of "no percentage to give".
+                let pct = unmarked.saturating_mul(100).checked_div(total).unwrap_or(0);
+                eprintln!(
+                    "kern-timing: {label}: total {total} us from process entry, \
+                     {marked} us in marks above, {unmarked} us unmarked ({pct}%), \
+                     {} us of it spent printing this profile \
+                     [child phases are printed by the child, not counted here]",
+                    self.observed_us
+                );
+            }
+            // `mark_start` never ran, so there is no honest total. Say that, rather than print a
+            // zero that would read as "nothing unmarked".
+            None => eprintln!(
+                "kern-timing: {label}: {} us in marks above; no process-entry stamp, \
+                 so the unmarked remainder is unknown",
+                self.marked_us
+            ),
+        }
     }
 }
 

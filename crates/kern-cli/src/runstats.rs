@@ -39,6 +39,17 @@ pub fn mark_start() {
     let _ = START.set(std::time::Instant::now());
 }
 
+/// Microseconds since process entry, or `None` if [`mark_start`] never ran.
+///
+/// The SAME stamp `kern run` already measures its setup against, reused rather than taken a second
+/// time: a second clock read at a second point would drift from this one and the two would disagree
+/// about the same box. `None` rather than zero, because "not stamped" and "took no time" are
+/// different facts and a profiler that renders them the same is the class of defect this exists to
+/// measure.
+pub fn since_start_us() -> Option<u128> {
+    START.get().map(|s| s.elapsed().as_micros())
+}
+
 /// `$XDG_RUNTIME_DIR/kern/runstats` (falling back to `/run/user/<uid>` then `/tmp/kern-<uid>`), the
 /// same runtime-dir resolution as the box registry - so writer (`kern run`) and reader (`kern top`)
 /// agree on the file without a shared constant. `pub(crate)` so the volume guard can add this FILE's
