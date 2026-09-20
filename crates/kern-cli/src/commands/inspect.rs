@@ -1987,7 +1987,7 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
         if survivors.contains(pod) {
             continue;
         }
-        let named_directly = !all && names.iter().any(|n| n == pod);
+        let named_directly = names.iter().any(|n| n == pod);
         if !all && !named_directly && crate::pod::is_explicit(pod) {
             continue;
         }

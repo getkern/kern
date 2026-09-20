@@ -776,8 +776,6 @@ pub fn narrate_to_stderr() -> bool {
         || crate::global_env("KERN_NARRATE_STDERR").is_some()
 }
 
-/// passes `ImageDefault` when the stack has image boxes and `Requested` when a service asked in as
-/// many words; a pod of root-only services stays single-uid (faster, more isolated).
 /// Marker file: this pod was created by `kern pod create`, in as many words, rather than derived
 /// from a compose stack. Empty, because its existence is the fact, in the shape `pasta.watched`
 /// already uses.
@@ -803,24 +801,28 @@ pub fn is_explicit(name: &str) -> bool {
     pod_dir(name).join(EXPLICIT_MARKER).exists()
 }
 
+/// Who asked for this pod, which is the one thing [`EXPLICIT_MARKER`] records.
+///
+/// A TYPE RATHER THAN A `bool` because the parameter would sit next to `want_outbound` in the same
+/// signature, and two adjacent booleans are swappable without the compiler noticing. Here each call
+/// site has to name which one it means.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PodOrigin {
+    /// The operator typed `kern pod create`. Survives being emptied; `pod rm` removes it.
+    Named,
+    /// Derived from a compose stack. Torn down when its last member stops, as it always has been.
+    Derived,
+}
+
+/// `uid_range`: compose passes `ImageDefault` when the stack has image boxes and `Requested` when a
+/// service asked in as many words; a pod of root-only services stays single-uid (faster, more
+/// isolated).
 pub fn create_with_range(
     name: &str,
     want_outbound: bool,
     uid_range: kern_isolation::UidRange,
     bridge: Option<&str>,
-) -> Result<(), Error> {
-    create_with_range_explicit(name, want_outbound, uid_range, bridge, false)
-}
-
-/// [`create_with_range`] plus the one bit that says who asked. `explicit` is true only on the
-/// `kern pod create` path; compose derives its pod and passes false, so a stack keeps the cleanup it
-/// has always had.
-pub fn create_with_range_explicit(
-    name: &str,
-    want_outbound: bool,
-    uid_range: kern_isolation::UidRange,
-    bridge: Option<&str>,
-    explicit: bool,
+    origin: PodOrigin,
 ) -> Result<(), Error> {
     validate_name(name)?;
     if let Some(cidr) = bridge {
@@ -890,7 +892,7 @@ pub fn create_with_range_explicit(
     // stack. A write that FAILS is ignored on purpose. `is_explicit` then answers false and the pod
     // keeps the teardown it had before this existed, which leaks nothing; the opposite failure
     // direction, a pod outliving its members because a write failed, leaks a holder process.
-    if explicit {
+    if origin == PodOrigin::Named {
         let _ = std::fs::write(dir.join(EXPLICIT_MARKER), b"");
     }
     // First after the claim, and nothing fallible may be inserted above it: see `record_pod_boot`,

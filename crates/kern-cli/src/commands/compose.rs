@@ -2144,7 +2144,15 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // stack that silently loses the internet fails in a way nobody attributes to a compose key
         // that used to be ignored.
         let stack_is_internal = kern_compose::stack_is_internal_only(&boxes);
-        crate::pod::create_with_range(&pod, !stack_is_internal, pod_needs_range, bridge_cidr)?;
+        // DERIVED, not named: this pod exists because a stack does, so it is torn down when its last
+        // member stops, exactly as it was before the marker existed. `compose down` stays the verb.
+        crate::pod::create_with_range(
+            &pod,
+            !stack_is_internal,
+            pod_needs_range,
+            bridge_cidr,
+            crate::pod::PodOrigin::Derived,
+        )?;
         _pod_guard = Some(EmptyPodGuard {
             pod: &pod,
             started: std::cell::Cell::new(0),
