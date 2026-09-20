@@ -2491,9 +2491,22 @@ fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
         // forms Docker supports. Matching is over the comma-joined field, so a bare key must not be
         // satisfied by a mere substring of another key (`app` must not match `apple=1`): compare the
         // key segment up to its `=`.
-        "label" => registry::decode_labels(&b.labels).iter().any(|l| {
-            l == v || (!v.contains('=') && l.split_once('=').map(|(k, _)| k) == Some(v.as_str()))
-        }),
+        // TWO READERS OF ONE GRAMMAR MUST USE ONE EQUALITY. This compared the raw stored segment,
+        // while every renderer goes through `label_pairs`, which normalises a BARE KEY to `(k, "")`.
+        // The two disagreed on exactly one input: a box labelled `--label noequals` was found by
+        // `--filter label=noequals` and NOT by `--filter label=noequals=`, though its own document
+        // says `"noequals":""`. MEASURED: docker 29.1.3 and podman both match it under both
+        // spellings. Asked of the same pairs the document is built from, so the filter and the
+        // renderer can no longer answer differently about one label.
+        "label" => {
+            let pairs = inspect::label_pairs(&b.labels);
+            match v.split_once('=') {
+                // `label=k=v`: the exact pair, with `label=k=` matching an empty value.
+                Some((k, val)) => pairs.iter().any(|(pk, pv)| pk == k && pv == val),
+                // `label=k`: the key, whatever its value.
+                None => pairs.iter().any(|(pk, _)| pk == v),
+            }
+        }
         "id" => b.pid.to_string() == *v,
         // `health=` READS THE VERDICT, not the merged status column: a paused box with a passing
         // healthcheck is `paused` there and still `healthy` here, and a readiness loop wants the

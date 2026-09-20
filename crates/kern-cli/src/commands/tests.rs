@@ -712,6 +712,10 @@ mod ps_exited_tests {
         assert_eq!(label_value("app=web", "nope"), None);
         // A bare key must not be satisfied by a prefix of another: `app` is not `apple`.
         assert_eq!(label_value("apple=1", "app"), None);
+        // A BARE KEY READS AS AN EMPTY VALUE, which is what the filter must agree with: the
+        // document says `{"noequals":""}`, so `label=noequals=` has to match it. It did not, and
+        // both reference implementations do.
+        assert_eq!(label_value("noequals", "noequals").as_deref(), Some(""));
     }
 
     /// THE LABEL GRAMMAR, round-tripped, with the case that was a defect on 0.9.35 first.

@@ -17,6 +17,25 @@ and cost what borrowed names cost: a benchmark on this machine measured kern, pu
 `docker run --rm  4.2 ms`, and put it beside a real podman at 285 ms. A `docker` symlink now simply
 runs kern, with kern's grammar and kern's errors.
 
+**`--mount type=bind` created a missing source and started a box whose mount was empty.** The
+distinction is the whole reason the named form exists: MEASURED on Docker 29.1.3, `-v /tmp/typo:/m`
+creates the directory and runs, while `--mount type=bind,src=/tmp/typo,dst=/m` fails with `bind
+source path does not exist`. `--mount` is reached for precisely to catch that typo, and kern
+translated both onto the create-it path. `-v` is unchanged.
+
+⚠️ An earlier round reported this and it was recorded as falsified. That was wrong, and the way it
+was wrong is worth keeping: the probe used `/nonexistent-xyz`, directly under `/`, where the process
+cannot create anything, so the refusal that came back was a PERMISSION failure read as a policy
+decision. A probe has to sit where the process can write, or it measures the filesystem instead of
+the code.
+
+**`--filter label=k=` did not match a label stored with an empty value.** A box labelled
+`--label noequals` reports `{"noequals":""}` in its own document and was found by
+`--filter label=noequals`, but not by `--filter label=noequals=`. Both reference implementations
+match it under both spellings. The cause was two readers of one grammar with two equalities: the
+filter compared raw stored segments while every renderer goes through the pair normaliser. The
+filter now asks the same pairs the document is built from.
+
 **`--mount readonly=1` mounted the path WRITABLE, silently.** The value was compared against the
 literal `true`, so every other spelling the reference honours fell through to writable with no
 error. MEASURED value by value on Docker 29.1.3: `readonly=1`, `readonly=t`, `readonly=TRUE`,

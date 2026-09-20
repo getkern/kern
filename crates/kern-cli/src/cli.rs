@@ -2553,6 +2553,14 @@ fn valid_apparmor_name(s: &str) -> bool {
 enum MountSpec {
     /// A `-v` spec: `src:dst` or `src:dst:ro`.
     Volume(String),
+    /// A `type=bind` spec, carrying its SOURCE separately so the caller can require it to exist.
+    ///
+    /// THE DISTINCTION IS THE WHOLE REASON `--mount` EXISTS. `-v` creates a missing bind source;
+    /// `--mount` refuses it. MEASURED on Docker 29.1.3: `-v /tmp/typo:/m` creates `/tmp/typo` and
+    /// runs, while `--mount type=bind,src=/tmp/typo,dst=/m` fails with `bind source path does not
+    /// exist`. Collapsing both onto the `-v` path made kern create the directory and start a box
+    /// whose mount was empty, which is exactly the typo `--mount` is reached for to catch.
+    Bind { spec: String, src: String },
     /// A `--tmpfs` spec: `dst` or `dst:size`.
     Tmpfs(String),
 }
@@ -2765,11 +2773,16 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
                     "--mount type=volume needs a volume NAME as src, not a path (use type=bind)",
                 ));
             }
-            Ok(MountSpec::Volume(if ro {
+            let spec = if ro {
                 format!("{src}:{dst}:ro")
             } else {
                 format!("{src}:{dst}")
-            }))
+            };
+            if kind == "bind" {
+                Ok(MountSpec::Bind { spec, src })
+            } else {
+                Ok(MountSpec::Volume(spec))
+            }
         }
         _ => Err(USAGE),
     }
@@ -3389,6 +3402,21 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     match parse_mount_spec(v)? {
                         MountSpec::Volume(s) => volumes.push(s),
                         MountSpec::Tmpfs(s) => tmpfs.push(s),
+                        // THE SOURCE MUST ALREADY BE THERE. Checked here rather than inside
+                        // `parse_mount_spec`, which stays pure and therefore testable without a
+                        // filesystem. The `-v` path is untouched: it still creates what it can,
+                        // which is what `-v` means on every runtime.
+                        MountSpec::Bind { spec, src } => {
+                            if !std::path::Path::new(&src).exists() {
+                                return Err(Error::Cli(format!(
+                                    "--mount type=bind,src={src}: the source does not exist. \
+                                     `--mount` refuses a missing bind source (that is what it is \
+                                     for: catching the typo); `-v {src}:...` creates it where it \
+                                     can. Create the path, or use -v if you meant that"
+                                )));
+                            }
+                            volumes.push(spec);
+                        }
                     }
                 }
                 // `--name <box>`: Docker's spelling for the name kern takes positionally. The SAME
@@ -7070,13 +7098,17 @@ mod tests {
     fn mount_spec_translates_to_the_volume_flag() {
         let v = |s: &str| parse_mount_spec(s).unwrap();
         // The two `-v` shapes, by both key spellings Docker accepts.
+        let bind = |spec: &str, src: &str| MountSpec::Bind {
+            spec: spec.into(),
+            src: src.into(),
+        };
         assert_eq!(
             v("type=bind,src=/srv/app,dst=/app"),
-            MountSpec::Volume("/srv/app:/app".into())
+            bind("/srv/app:/app", "/srv/app")
         );
         assert_eq!(
             v("type=bind,source=/srv/app,target=/app"),
-            MountSpec::Volume("/srv/app:/app".into())
+            bind("/srv/app:/app", "/srv/app")
         );
         assert_eq!(
             v("type=volume,src=data,destination=/data"),
@@ -7091,13 +7123,13 @@ mod tests {
         for ro in ["ro", "readonly", "readonly=true", "read-only"] {
             assert_eq!(
                 v(&format!("type=bind,src=/a,dst=/b,{ro}")),
-                MountSpec::Volume("/a:/b:ro".into()),
+                bind("/a:/b:ro", "/a"),
                 "{ro} should be read-only"
             );
         }
         assert_eq!(
             v("type=bind,src=/a,dst=/b,readonly=false"),
-            MountSpec::Volume("/a:/b".into()),
+            bind("/a:/b", "/a"),
             "readonly=false must NOT make the mount read-only"
         );
         // tmpfs is the other flag, and `--tmpfs`'s own `path[:size]` grammar.
@@ -7114,19 +7146,23 @@ mod tests {
     // so a path with a comma could not be mounted through this flag at all.
     #[test]
     fn mount_spec_parses_quoted_fields() {
+        let bind = |spec: &str, src: &str| MountSpec::Bind {
+            spec: spec.into(),
+            src: src.into(),
+        };
         assert_eq!(
             parse_mount_spec(r#"type=bind,"src=/tmp/a,b",dst=/x"#).unwrap(),
-            MountSpec::Volume("/tmp/a,b:/x".into())
+            bind("/tmp/a,b:/x", "/tmp/a,b")
         );
         // The quote wraps the whole `key=value`, so it is stripped before the `=` split.
         assert_eq!(
             parse_mount_spec(r#""type=bind","source=/a","target=/b""#).unwrap(),
-            MountSpec::Volume("/a:/b".into())
+            bind("/a:/b", "/a")
         );
         // An unquoted comma still separates: the quoting must not swallow ordinary specs.
         assert_eq!(
             parse_mount_spec("type=bind,src=/a,dst=/b,ro").unwrap(),
-            MountSpec::Volume("/a:/b:ro".into())
+            bind("/a:/b:ro", "/a")
         );
         // And the NEGATIVE: a comma inside quotes is NOT a separator, so this is one field with a
         // bad key rather than two fields, and it is refused instead of half-parsed.
@@ -7139,8 +7175,12 @@ mod tests {
     #[test]
     fn mount_readonly_parses_the_whole_boolean_set() {
         let ro = |v: &str| {
-            parse_mount_spec(&format!("type=bind,src=/a,dst=/b,{v}"))
-                .map(|m| m == MountSpec::Volume("/a:/b:ro".into()))
+            parse_mount_spec(&format!("type=bind,src=/a,dst=/b,{v}")).map(|m| {
+                m == MountSpec::Bind {
+                    spec: "/a:/b:ro".into(),
+                    src: "/a".into(),
+                }
+            })
         };
         // Read-only, every spelling the reference honours.
         for v in [
@@ -7173,6 +7213,54 @@ mod tests {
         assert!(parse_mount_spec("type=tmpfs,dst=/x").is_ok());
         // An anonymous volume is a real Docker shape kern has no answer for.
         assert!(parse_mount_spec("type=volume,dst=/data").is_err());
+    }
+
+    // `--mount type=bind` REFUSES A MISSING SOURCE WHERE `-v` CREATES IT, and that distinction is
+    // the whole reason the named form exists. Measured on Docker 29.1.3: `-v /tmp/typo:/m` creates
+    // the directory and runs; `--mount type=bind,src=/tmp/typo,dst=/m` fails. kern created it and
+    // started a box whose mount was empty, which is exactly the typo `--mount` is reached for.
+    //
+    // ⚠️ AN EARLIER ROUND "FALSIFIED" THIS REPORT AND WAS WRONG. It probed `/nonexistent-xyz`,
+    // directly under `/`, where kern cannot create anything, and read the resulting refusal as a
+    // policy decision. It was a permission failure wearing a policy's clothes. The probe has to be
+    // somewhere the process CAN write, or it measures the filesystem instead of the code.
+    #[test]
+    fn mount_bind_requires_its_source_to_exist_where_v_would_create_it() {
+        let run = |flag: &str, spec: &str| {
+            let owned: Vec<String> = ["box", "w", "--image", "alpine", flag, spec, "--", "true"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            parse(&owned)
+        };
+        let missing = format!("{}/kern-mount-probe-absent", std::env::temp_dir().display());
+        assert!(
+            !std::path::Path::new(&missing).exists(),
+            "the probe path must not exist"
+        );
+        // WRITABLE PARENT: the refusal here is the policy, not the filesystem.
+        assert!(
+            run("--mount", &format!("type=bind,src={missing},dst=/m")).is_err(),
+            "--mount must refuse a missing bind source"
+        );
+        // THE NEGATIVE, and the half that must NOT change: `-v` still accepts it, because creating
+        // a missing source is what `-v` means on every runtime.
+        assert!(
+            run("-v", &format!("{missing}:/m")).is_ok(),
+            "-v must keep accepting a missing source"
+        );
+        // A source that DOES exist passes `--mount`, or the check is just a blanket refusal.
+        let there = std::env::temp_dir();
+        assert!(
+            run(
+                "--mount",
+                &format!("type=bind,src={},dst=/m", there.display())
+            )
+            .is_ok(),
+            "--mount must accept a source that is there"
+        );
+        // And a named volume is not a path, so it is not subject to the check at all.
+        assert!(run("--mount", "type=volume,src=data,dst=/m").is_ok());
     }
 
     // THE POSITIONAL MUST NOT BE A FLAG'S VALUE. `images --filter dangling=false alpine` listed
