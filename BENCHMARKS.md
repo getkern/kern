@@ -17,6 +17,22 @@ taken today across two different harnesses, a Python loop and a bare shell loop,
 4.06 ms. The shell loop reads HIGHER than the Python one, so the harness is not inflating it. An
 earlier draft of this table published 3.8, the low end, which is the error this file exists to stop.
 
+**The same box costs 2.6 ms in a pod, and the reason is one syscall nobody repeats.** An
+`--image` box maps a sub-uid range so an official image can drop privilege in its entrypoint, and
+rootless the only way to write a range is the setuid helpers `newuidmap`/`newgidmap`. Measured, that
+phase is 886 us of the 3.9. A pod created with `--uid-range` owns one mapped namespace and every
+member inherits it, so the phase reads **zero** and the box measures **2.59 ms**, paired delta
+-1.185 ms [-1208, -1166]. The range is fully there: `chown` to a non-root uid works inside a member
+exactly as in a standalone box, which is the test that separates this from `--no-uid-range`, where
+the same `chown` fails. One command, before the burst:
+
+```sh
+kern pod create fast --uid-range
+kern box job --image alpine --pod fast -- ./work
+```
+
+It is not the default because it needs a holder process to stay alive, and kern ships no daemon.
+
 **Method.** Each runtime starts one container running `/bin/true` and tears it down, caches warm,
 and the figure is total time divided by runs rather than a per-call timer, which at this scale costs
 more than the thing it measures. Five replicas of five batches of 200, medians of medians, all in one
