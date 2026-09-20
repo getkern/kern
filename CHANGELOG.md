@@ -17,6 +17,36 @@ and cost what borrowed names cost: a benchmark on this machine measured kern, pu
 `docker run --rm  4.2 ms`, and put it beside a real podman at 285 ms. A `docker` symlink now simply
 runs kern, with kern's grammar and kern's errors.
 
+**`--mount` is parsed with the reference's CSV grammar, not a quote toggler.** The value is parsed
+by the reference with Go's `encoding/csv` at default strictness, and kern toggled a boolean on every
+quote. Four divergences, each measured on Docker 29.1.3:
+
+```text
+  type=bind,"src=/d/a""b",dst=/m    reference mounts /d/a"b ; kern mounted /d/ab
+  type=bind,"src=/d"junk,dst=/m     reference REFUSES      ; kern accepted
+  type=bind,"src=/d,dst=/m          reference REFUSES      ; kern accepted
+  type=bind,src=/d",dst=/m          reference REFUSES      ; kern accepted
+  type=bind,,src=/d,dst=/m          reference REFUSES      ; kern skipped the field
+  type=bind,src=/d,dst=/m,          reference REFUSES      ; kern skipped the field
+```
+
+The first is the one that matters: a caller wrote one path and mounted another, with no error. The
+other five are refusals kern was not making. All nine cases now answer identically to the reference,
+checked side by side.
+
+**`--mount` keys are case-insensitive, and paths are not.** `TYPE=BIND,SRC=/d,DST=/m` mounts on the
+reference and kern refused it as an unknown key. The key is folded and so is the `type` value, since
+`BIND` is accepted there too; `src=` and `dst=` keep their values verbatim, because a path is
+case-sensitive on every filesystem this runs on.
+
+**`pull --quiet` printed a status word.** It suppressed the orientation lines and kept
+`already cached <ref>`, coloured, in a stream a script is reading, so `ref=$(kern pull -q x)`
+returned neither the reference nor a clean parse. It now prints the resolved reference and nothing
+else, which is the shape the flag means everywhere. The VALUE is kern's own reference
+(`alpine` yields `alpine:latest`), not the reference implementation's fully-qualified form, because
+kern's cache is keyed on the reference as given and printing the other would name a key kern does
+not have.
+
 **`--mount type=bind` created a missing source and started a box whose mount was empty.** The
 distinction is the whole reason the named form exists: MEASURED on Docker 29.1.3, `-v /tmp/typo:/m`
 creates the directory and runs, while `--mount type=bind,src=/tmp/typo,dst=/m` fails with `bind

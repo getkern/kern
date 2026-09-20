@@ -22,6 +22,7 @@ COMMANDS:
   Images
     search <query> [--json]                                        Search Docker Hub for images
     pull <image> [-q|--quiet]                                      Fetch an image into the cache (`--image` uses it)
+                                                                     -q prints the resolved reference and nothing else, for `ref=$(kern pull -q X)`
     pull <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
     push <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     tag <src> <dst>                                                Give a cached image a second name

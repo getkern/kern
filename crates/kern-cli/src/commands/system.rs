@@ -59,6 +59,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
   {d}Images{z}
     {c}search{z} <query> [--json]                                        Search Docker Hub for images
     {c}pull{z} <image> [-q|--quiet]                                      Fetch an image into the cache (`--image` uses it)
+                                                                     -q prints the resolved reference and nothing else, for `ref=$(kern pull -q X)`
     {c}pull{z} <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}tag{z} <src> <dst>                                                Give a cached image a second name

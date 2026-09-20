@@ -428,15 +428,31 @@ fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
     // the pull itself uses, so the message cannot claim a hit the resolver treated as a miss.
     let had = cache_entry_complete(&cache_dir(), &key);
     let (path, _cfg) = resolve_image_depth(image, 0, PullPolicy::Missing)?;
+    // `-q` PRINTS THE REFERENCE AND NOTHING ELSE, which is the shape the flag means everywhere.
+    //
+    // MEASURED on Docker 29.1.3: `docker pull --quiet alpine:3.18` prints exactly one line,
+    // `docker.io/library/alpine:3.18`, on a miss and on a hit alike, with no status word. A first
+    // version of this flag here suppressed the three orientation lines and KEPT `already cached
+    // alpine:3.18`, which is a status word and a colour code in a stream a script is reading, and
+    // a caller doing `ref=$(kern pull -q x)` got neither the reference nor a clean parse.
+    //
+    // ⚠️ THE REFERENCE PRINTED IS KERN'S, NOT DOCKER'S. `normalize_ref` adds the default tag and
+    // nothing else, so `alpine` yields `alpine:latest`, where Docker yields
+    // `docker.io/library/alpine:latest`. Printing Docker's fully-qualified form would name a cache
+    // key kern does not have: the cache is keyed on the reference as given. The SHAPE matches (one
+    // line, the reference, no decoration); the VALUE is the one this runtime can be asked about
+    // afterwards, which is the half a script actually uses.
+    if quiet {
+        println!("{}", kern_oci::normalize_ref(image));
+        return Ok(());
+    }
     println!(
         "{g}{}{z} {image}",
         if had { "already cached" } else { "pulled" },
         g = p.g,
         z = p.z
     );
-    // The orientation lines are for a person at a terminal; `-q` is for a script, which wants the
-    // reference and nothing to strip.
-    if !quiet {
+    {
         println!(
             "{d}  run it:  kern box <name> --image {image} -- /bin/sh{z}",
             d = p.d,

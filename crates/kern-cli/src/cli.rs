@@ -2565,30 +2565,94 @@ enum MountSpec {
     Tmpfs(String),
 }
 
-/// Split a `--mount` spec into its comma-separated fields, honouring double quotes.
+/// Split a `--mount` spec into its comma-separated fields, with the reference's CSV grammar.
 ///
-/// A PLAIN `split(',')` IS NOT THE GRAMMAR. The reference implementation parses this value as CSV,
-/// so a field may quote itself to carry a comma, and
-/// `--mount 'type=bind,"src=/a,b",dst=/x'` is valid there. MEASURED on Docker 29.1.3: it is
-/// accepted and the mount is made. kern split on every comma and answered the generic usage error,
-/// so a path with a comma in it could not be mounted through this flag at all, and the message did
-/// not say why.
+/// A TOGGLER IS NOT A CSV PARSER, and the difference is not academic: it silently changed the path
+/// being mounted. The reference parses this value with Go's `encoding/csv` at its default strictness
+/// (no lazy quotes), and the four rules below were each MEASURED on Docker 29.1.3 rather than read:
 ///
-/// The quote is a FIELD quote, not a value quote: `"src=/a,b"` quotes the whole `key=value`, which
-/// is why quotes are stripped here, before the `=` split, and not inside it.
-fn csv_fields(spec: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    for c in spec.chars() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => out.push(std::mem::take(&mut cur)),
-            other => cur.push(other),
+/// ```text
+///   type=bind,"src=/d/a""b",dst=/m    ACCEPTED, mounts `/d/a"b`   ("" is one literal quote)
+///   type=bind,"src=/d"junk,dst=/m     REFUSED  (text after a closing quote)
+///   type=bind,"src=/d,dst=/m          REFUSED  (quote never closed)
+///   type=bind,src=/d",dst=/m          REFUSED  (bare quote in an unquoted field)
+///   type=bind,,src=/d,dst=/m          REFUSED  (an empty field is not a key=value pair)
+///   type=bind,src=/d,dst=/m,          REFUSED  (so is a trailing one)
+/// ```
+///
+/// The previous toggler answered the first case with `/d/ab`, a DIFFERENT PATH, and accepted the
+/// next three. Three of the four are refusals kern was not making, and the first is the one that
+/// matters: a caller wrote one path and got another, with no error anywhere.
+///
+/// The empty-field rule lives in the caller, which knows what a field must look like; everything
+/// here is purely the quoting grammar. Returns `Err` rather than a partial parse, because a spec
+/// this function cannot read is one whose meaning it must not guess at.
+///
+/// Char-by-char rather than byte indexing: `,` and `"` are ASCII, but a path is not, and slicing a
+/// `&str` at a computed byte offset is a panic this function has no reason to risk. Allocation is
+/// acceptable here because argument parsing runs once per process, not on a box-start path.
+fn csv_fields(spec: &str) -> Result<Vec<String>, Error> {
+    const UNCLOSED: Error = Error::Usage(
+        "--mount: a double quote is never closed. A field may be quoted to carry a comma \
+         (`\"src=/a,b\"`), and the quote has to be closed before the field ends",
+    );
+    const AFTER_QUOTE: Error = Error::Usage(
+        "--mount: text after a closing double quote. A quoted field must be followed by a comma \
+         or the end of the spec; to put a quote INSIDE a quoted field, write it twice",
+    );
+    const BARE_QUOTE: Error = Error::Usage(
+        "--mount: a double quote inside an unquoted field. Quote the WHOLE field \
+         (`\"src=/a\"b\"`) so the quote can be escaped by doubling it",
+    );
+    let mut out: Vec<String> = Vec::new();
+    let mut it = spec.chars().peekable();
+    loop {
+        let mut cur = String::new();
+        if it.peek() == Some(&'"') {
+            // QUOTED FIELD. The opening quote is consumed and not stored; a doubled quote inside is
+            // one literal quote; the first single quote ends the field.
+            let _ = it.next();
+            loop {
+                match it.next() {
+                    None => return Err(UNCLOSED),
+                    Some('"') => {
+                        if it.peek() == Some(&'"') {
+                            let _ = it.next();
+                            cur.push('"');
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(c) => cur.push(c),
+                }
+            }
+            // Only a separator or the end may follow a closing quote.
+            match it.next() {
+                None => {
+                    out.push(cur);
+                    return Ok(out);
+                }
+                Some(',') => out.push(cur),
+                Some(_) => return Err(AFTER_QUOTE),
+            }
+        } else {
+            // UNQUOTED FIELD. A quote here is a malformed spec, not data: the reference reports it
+            // rather than accepting a field whose quoting is ambiguous.
+            loop {
+                match it.next() {
+                    None => {
+                        out.push(cur);
+                        return Ok(out);
+                    }
+                    Some(',') => break,
+                    Some('"') => return Err(BARE_QUOTE),
+                    Some(c) => cur.push(c),
+                }
+            }
+            out.push(cur);
         }
+        // Every arm above consumed at least the separator, so the loop cannot spin.
     }
-    out.push(cur);
-    out
 }
 
 /// Parse one Docker `--mount type=…,src=…,dst=…` spec into the `-v`/`--tmpfs` spec it means.
@@ -2628,20 +2692,33 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
         false,
         String::new(),
     );
-    for field in csv_fields(spec) {
-        let field = field.trim().to_string();
-        let field = field.as_str();
+    for field in csv_fields(spec)? {
+        let field = field.trim();
+        // AN EMPTY FIELD IS NOT A KEY=VALUE PAIR, and skipping it was wrong in both directions:
+        // `type=bind,,src=/a,dst=/b` and a trailing `dst=/b,` are both refused by the reference
+        // (measured), and both were accepted here. A spec with a stray comma is a spec whose author
+        // meant something, and guessing which half to drop is the guess this parser exists to avoid.
         if field.is_empty() {
-            continue;
+            return Err(Error::Usage(
+                "--mount: an empty field. Every field is a `key=value` pair (or a bare `ro`); a \
+                 doubled or trailing comma is a typo, not an omitted option",
+            ));
         }
-        // A bare `ro`/`readonly` is a flag, not a pair. Docker accepts both spellings and also the
-        // `readonly=true` pair form, so all three land here.
-        let (key, value) = match field.split_once('=') {
+        // A bare `ro`/`readonly` is a flag, not a pair. The reference accepts both spellings and
+        // also the `readonly=true` pair form, so all three land here.
+        //
+        // THE KEY IS CASE-INSENSITIVE, the value is NOT. Measured: `TYPE=BIND,SRC=/d,DST=/m` mounts
+        // on the reference, and kern refused it as an unknown key. A path, by contrast, is
+        // case-sensitive on every filesystem this runs on, so `src=` keeps its value verbatim; only
+        // `type=` has its value folded, because `BIND` is accepted there too.
+        let (raw_key, value) = match field.split_once('=') {
             Some((k, v)) => (k.trim(), v.trim()),
             None => (field, ""),
         };
+        let lowered = raw_key.to_ascii_lowercase();
+        let key = lowered.as_str();
         match key {
-            "type" => kind = value.to_string(),
+            "type" => kind = value.to_ascii_lowercase(),
             "src" | "source" => src = value.to_string(),
             "dst" | "destination" | "target" => dst = value.to_string(),
             // THE VALUE IS A Go BOOLEAN, AND READING ONLY `true` WAS A SILENT READ-ONLY BYPASS.
@@ -7140,6 +7217,71 @@ mod tests {
         );
     }
 
+    // THE CSV GRAMMAR, every rule measured on Docker 29.1.3 and asserted in both directions. The
+    // toggler this replaced answered the first case with a DIFFERENT PATH and accepted the next
+    // four, so three of these are refusals kern was not making and one is a silent misread.
+    #[test]
+    fn csv_fields_follows_the_reference_grammar() {
+        let f = |s: &str| csv_fields(s);
+        let ok = |s: &str| f(s).unwrap_or_else(|_| vec!["<ERR>".into()]);
+        // Plain fields.
+        assert_eq!(ok("a,b,c"), vec!["a", "b", "c"]);
+        // A quoted field carries the separator, and the quotes are not part of the value.
+        assert_eq!(ok(r#"a,"b,c",d"#), vec!["a", "b,c", "d"]);
+        assert_eq!(ok(r#""a","b""#), vec!["a", "b"]);
+        // `""` INSIDE A QUOTED FIELD IS ONE LITERAL QUOTE. This is the case that silently changed
+        // the mounted path: the toggler produced `ab`.
+        assert_eq!(ok(r#""a""b""#), vec![r#"a"b"#]);
+        assert_eq!(ok(r#""src=/d/a""b""#), vec![r#"src=/d/a"b"#]);
+        // A quoted field may be empty, and a doubled quote may be the whole value.
+        assert_eq!(ok(r#""""#), vec![""]);
+        assert_eq!(ok(r#""""""#), vec!["\""]);
+        // Empty fields are PRODUCED here and refused by the caller, which knows what a field must
+        // look like; this function is only the quoting grammar.
+        assert_eq!(ok("a,,b"), vec!["a", "", "b"]);
+        assert_eq!(ok("a,"), vec!["a", ""]);
+        assert_eq!(ok(""), vec![""]);
+        // THE FOUR REFUSALS.
+        assert!(f(r#""a"junk"#).is_err(), "text after a closing quote");
+        assert!(f(r#""a"#).is_err(), "quote never closed");
+        assert!(
+            f(r#""a,b"#).is_err(),
+            "quote never closed, separator inside"
+        );
+        assert!(f(r#"a"b"#).is_err(), "bare quote in an unquoted field");
+        assert!(f(r#"a,b"c"#).is_err(), "bare quote in a later field");
+        // Non-ASCII survives: the scan is by char, so a multi-byte path cannot be split mid-char.
+        assert_eq!(ok("src=/d/caffè,dst=/m"), vec!["src=/d/caffè", "dst=/m"]);
+        assert_eq!(
+            ok(r#""src=/d/caffè,x",dst=/m"#),
+            vec!["src=/d/caffè,x", "dst=/m"]
+        );
+    }
+
+    // The key is case-insensitive and the `type` value with it; a PATH is not, on every filesystem
+    // this runs on. Measured: `TYPE=BIND,SRC=/d,DST=/m` mounts on the reference and kern refused it
+    // as an unknown key.
+    #[test]
+    fn mount_keys_are_case_insensitive_but_paths_are_not() {
+        let bind = |spec: &str, src: &str| MountSpec::Bind {
+            spec: spec.into(),
+            src: src.into(),
+        };
+        assert_eq!(
+            parse_mount_spec("TYPE=BIND,SRC=/A,DST=/b").unwrap(),
+            bind("/A:/b", "/A"),
+            "the key folds, the path does not"
+        );
+        assert_eq!(
+            parse_mount_spec("Type=Bind,Source=/A,Target=/b,ReadOnly=TRUE").unwrap(),
+            bind("/A:/b:ro", "/A")
+        );
+        // An empty field is a typo, in either position.
+        assert!(parse_mount_spec("type=bind,,src=/a,dst=/b").is_err());
+        assert!(parse_mount_spec("type=bind,src=/a,dst=/b,").is_err());
+        assert!(parse_mount_spec("").is_err());
+    }
+
     // CSV, NOT `split(',')`. The reference implementation parses this value as CSV, so a field may
     // quote itself to carry a comma; MEASURED on Docker 29.1.3, `--mount 'type=bind,"src=/a,b",
     // dst=/x'` is accepted there. kern split on every comma and answered the generic usage error,
@@ -7213,6 +7355,25 @@ mod tests {
         assert!(parse_mount_spec("type=tmpfs,dst=/x").is_ok());
         // An anonymous volume is a real Docker shape kern has no answer for.
         assert!(parse_mount_spec("type=volume,dst=/data").is_err());
+    }
+
+    // `-q` PRINTS THE REFERENCE AND NOTHING ELSE. Measured: the reference prints one line with the
+    // resolved ref and no status word, on a miss and a hit alike. The flag must reach the command
+    // as a fact, because the decision it drives is two files away.
+    #[test]
+    fn pull_quiet_reaches_the_command() {
+        let quiet_of = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            match parse(&owned).map(|(_, c)| c) {
+                Ok(Command::Pull { quiet, .. }) => quiet,
+                other => panic!("expected Pull, got {other:?}"),
+            }
+        };
+        assert!(quiet_of(&["pull", "--quiet", "alpine"]));
+        assert!(quiet_of(&["pull", "-q", "alpine"]));
+        assert!(quiet_of(&["pull", "alpine", "-q"]));
+        // THE NEGATIVE: without the flag the orientation lines stay, which is what a person wants.
+        assert!(!quiet_of(&["pull", "alpine"]));
     }
 
     // `--mount type=bind` REFUSES A MISSING SOURCE WHERE `-v` CREATES IT, and that distinction is
