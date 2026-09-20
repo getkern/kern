@@ -17,9 +17,12 @@ per-request functions, dev sandboxes, edge and ARM. The full compatibility matri
 
 bubblewrap is a sandbox **launcher**; kern is a **runtime**. bwrap has no OCI image pull, no lifecycle
 (`ps`/`stop`/`exec`/`stats`), no resource profiles, no Python/Node SDK, no faults-as-data, no compose,
-and a simpler seccomp posture. At namespace parity kern is about 15% faster, but that is not the point:
-the value is the runtime around the namespaces, not the raw primitive. If all you need is to unshare a
-few namespaces and exec, bwrap is a fine, smaller tool.
+and a simpler seccomp posture. At namespace parity the two are in the same speed class and the margin
+has not been stable: it has read anywhere from bubblewrap 11% ahead to kern 13% ahead on the same
+machine depending on the scheduler, the fixture and the harness, so
+[BENCHMARKS.md](../BENCHMARKS.md) publishes the range rather than a number. Speed is not the point
+anyway: the value is the runtime around the namespaces, not the raw primitive. If all you need is to
+unshare a few namespaces and exec, bwrap is a fine, smaller tool.
 
 ## kern vs youki / runc?
 
