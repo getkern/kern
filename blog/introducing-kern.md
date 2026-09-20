@@ -1,7 +1,7 @@
 # Introducing kern: a container runtime that does less, on purpose
 
-*A fast, rootless sandbox and virtual resource runtime for workloads, including untrusted and
-AI-generated code. One static binary, one Rust dependency (`libc`), no daemon. It starts a
+*A fast, rootless container runtime and sandbox, built on virtual resources. Run workloads in a
+real container, including untrusted and AI-generated code. One static binary, one Rust dependency (`libc`), no daemon. It starts a
 real, kernel-enforced box in 2.3 ms, embeds from Python or Rust, and runs the same on a laptop, in
 CI, or on a Raspberry Pi.*
 
