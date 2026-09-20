@@ -830,8 +830,13 @@ pub fn print_inspect(name: &str, json: bool, format: Option<&str>) -> Result<(),
                     None => out.push_str("[]"),
                 },
                 "Containers" => out.push_str(&containers()),
+                // `Error::Cli`, NOT `NotRunning`. A template typo is a usage mistake, and the
+                // other renderer for the same kind of input (`images --format`) already answers
+                // with a usage class; routing it through the "box not running" variant meant a
+                // misspelt key and an absent network exited with the same class and read as the
+                // same problem.
                 _ => {
-                    return Err(Error::NotRunning(format!(
+                    return Err(Error::Cli(format!(
                         "network inspect --format names '{{{{.{key}}}}}', which kern cannot answer \
                          - refusing rather than printing something a script would read as the \
                          answer. kern's networks carry a name, a subnet and their members; \

@@ -293,6 +293,13 @@ pub enum Command {
         dest: Option<String>,
         /// `--platform os/arch`: fetch a specific arch from a multi-arch index (default: this host).
         platform: Option<String>,
+        /// `-q`/`--quiet`: print the reference and nothing else.
+        ///
+        /// A FLAG THAT PARSES AND DOES NOTHING IS THE ONE THING THIS CLI REFUSES ELSEWHERE, and
+        /// it was added to the accepted list without being carried anywhere. It suppresses the
+        /// three orientation lines (`run it:`, `cached at`, the refresh hint), which are for a
+        /// person at a terminal, and keeps the reference, which is what a script reads.
+        quiet: bool,
     },
     /// `kern push <local-ref> [as <remote-ref>]`: publish a cached image to a registry.
     Push {
@@ -1125,19 +1132,41 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             // `--filter reference=REPO`. Mapped onto that rather than given a field of its own, so
             // the two spellings cannot come to select different images. Giving both is refused:
             // `images alpine --filter reference=nginx` has named two different sets.
-            if let Some(repo) = rest.iter().skip(1).find(|a| !a.starts_with('-')) {
-                let positional_is_a_value = rest
-                    .iter()
-                    .position(|a| a == repo)
-                    .is_some_and(|at| at > 0 && matches!(rest[at - 1], "--filter" | "--format"));
-                if !positional_is_a_value {
-                    if filters.iter().any(|(k, _)| k == "reference") {
-                        return Err(Error::Usage(
-                            "images <repo> and --filter reference= are the same filter; pass one",
-                        ));
+            // THE POSITIONAL IS FOUND BY SKIPPING FLAG VALUES, not by looking backwards from the
+            // first bare token. The earlier version asked "is the token I found preceded by a
+            // value-taking flag?" and, when the answer was yes, STOPPED instead of continuing:
+            // `images --filter dangling=false alpine` and `images --format '{{.Tag}}' alpine`
+            // both dropped `alpine` and listed the whole cache, with no error. One scan, the same
+            // one `login` uses, so there is a single answer in this file to "which token is the
+            // positional".
+            let positionals: Vec<&str> = {
+                let mut out = Vec::new();
+                let mut i = 1;
+                while i < rest.len() {
+                    match rest[i] {
+                        "--filter" | "--format" => i += 2,
+                        a if a.starts_with('-') => i += 1,
+                        a => {
+                            out.push(a);
+                            i += 1;
+                        }
                     }
-                    filters.push(("reference".to_string(), (*repo).to_string()));
                 }
+                out
+            };
+            // Docker takes ONE repository here and refuses more. Two names are two listings.
+            if positionals.len() > 1 {
+                return Err(Error::Usage(
+                    "images takes one <repo>; pass one name, or --filter reference= for a pattern",
+                ));
+            }
+            if let Some(repo) = positionals.first() {
+                if filters.iter().any(|(k, _)| k == "reference") {
+                    return Err(Error::Usage(
+                        "images <repo> and --filter reference= are the same filter; pass one",
+                    ));
+                }
+                filters.push(("reference".to_string(), (*repo).to_string()));
             }
             Command::Images {
                 json: rest.contains(&"--json"),
@@ -2607,9 +2636,31 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
             "type" => kind = value.to_string(),
             "src" | "source" => src = value.to_string(),
             "dst" | "destination" | "target" => dst = value.to_string(),
-            // `readonly=false` is an explicit NO and must not turn the mount read-only: reading any
-            // `readonly` key as "yes" would make the one spelling that disables it enable it.
-            "ro" | "readonly" | "read-only" => ro = value.is_empty() || value == "true",
+            // THE VALUE IS A Go BOOLEAN, AND READING ONLY `true` WAS A SILENT READ-ONLY BYPASS.
+            //
+            // MEASURED on Docker 29.1.3: `readonly=1`, `readonly=t`, `readonly=TRUE` and a bare
+            // `readonly` all mount READ-ONLY, `readonly=false` mounts writable, and `readonly=yes`
+            // is refused outright (`invalid argument`). kern compared against the literal `true`,
+            // so a caller who wrote `readonly=1` got a WRITABLE mount and no error at all. That is
+            // the worst shape a compatibility gap can take: the flag that asks for less privilege
+            // is the one that silently grants more.
+            //
+            // Go's `strconv.ParseBool` set, and anything outside it is REFUSED rather than read as
+            // false, because a value this parser does not understand is a value whose intent it
+            // cannot honour.
+            "ro" | "readonly" | "read-only" => {
+                ro = match value {
+                    "" | "1" | "t" | "T" | "TRUE" | "true" | "True" => true,
+                    "0" | "f" | "F" | "FALSE" | "false" | "False" => false,
+                    other => {
+                        return Err(Error::Cli(format!(
+                            "--mount readonly={other}: not a boolean. Use true/false (or 1/0), \
+                             or `ro` on its own; anything else would be read as writable, which \
+                             is the opposite of what the key asks for"
+                        )))
+                    }
+                }
+            }
             "tmpfs-size" => size = value.to_string(),
             // A REAL DOCKER KEY WITH NOWHERE TO GO. `volume-label=` labels the volume at creation,
             // and kern's volumes carry a quota and a creation time and nothing else. Refused BY
@@ -2658,6 +2709,19 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
                     "--mount type=tmpfs takes no src= (a tmpfs is empty by definition)",
                 ));
             }
+            // A READ-ONLY TMPFS IS HONOURED BY DOCKER AND DROPPED HERE, so it is refused.
+            // MEASURED: `--mount type=tmpfs,dst=/x,readonly` mounts read-only on Docker 29.1.3,
+            // and kern's `--tmpfs` spec is `path[:size]` with no read-only form, so the flag was
+            // parsed and thrown away. This file's own rule for `volume-label=` applies here and
+            // was not applied: a mount option silently dropped is one the caller believes is in
+            // force. It can be accepted the day `--tmpfs` grows `:ro`, and not before.
+            if ro {
+                return Err(Error::Usage(
+                    "--mount type=tmpfs with ro/readonly: kern's --tmpfs has no read-only form, \
+                     so this would be silently dropped. Drop the key, or mount a read-only bind \
+                     instead",
+                ));
+            }
             Ok(MountSpec::Tmpfs(if size.is_empty() {
                 dst.to_string()
             } else {
@@ -2666,6 +2730,18 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
         }
         "bind" | "volume" => {
             if src.is_empty() {
+                // AN ANONYMOUS VOLUME IS A REAL DOCKER SHAPE, not a malformed spec: `type=volume`
+                // with no `src` gives the container a fresh volume with a generated name. kern's
+                // volumes are named by the caller and nothing generates one, so this is refused
+                // BY NAME rather than through the grammar dump, which would leave the reader
+                // hunting for which of nine fields was wrong.
+                if kind == "volume" {
+                    return Err(Error::Usage(
+                        "--mount type=volume with no src=: kern has no anonymous volumes (every \
+                         volume is named and outlives the box). Name one, or use type=tmpfs for \
+                         scratch space that goes with the box",
+                    ));
+                }
                 return Err(USAGE);
             }
             if !size.is_empty() {
@@ -4235,6 +4311,7 @@ fn parse_pull(rest: &[&str]) -> Option<Command> {
         image: img.to_string(),
         dest,
         platform,
+        quiet: rest.contains(&"--quiet") || rest.contains(&"-q"),
     })
 }
 
@@ -4344,13 +4421,13 @@ fn parse_network(rest: &[&str]) -> Result<Command, Error> {
         // `network::print_inspect` for what is deliberately absent and why.
         Some("inspect") => {
             reject_unknown_flags("network inspect", &rest[1..], &["--json", "--format", "-f"])?;
-            let name = rest
-                .iter()
-                .skip(2)
-                .find(|a| !a.starts_with('-'))
+            // FLAG-FIRST IS AN ORDER DOCKER ACCEPTS, and the bare `find` read the template as the
+            // network: `network inspect -f '{{.Name}}' proxy` inspected a network called
+            // `{{.Name}}` and failed with "no network", which names the wrong thing entirely.
+            let name = positional_after_flags(&rest[1..], &["--format", "-f"])
                 .ok_or(Error::Usage("network inspect <name> [--json] [-f T]"))?;
             Ok(Command::NetworkInspect {
-                name: (*name).to_string(),
+                name,
                 json: rest[1..].contains(&"--json"),
                 format: flag_value(&rest[1..], "--format").or_else(|| flag_value(&rest[1..], "-f")),
             })
@@ -5004,7 +5081,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             image,
             dest,
             platform,
-        } => commands::pull(&image, dest.as_deref(), platform.as_deref()),
+            quiet,
+        } => commands::pull(&image, dest.as_deref(), platform.as_deref(), quiet),
         Command::Push { local, remote } => commands::push(&local, remote.as_deref()),
         Command::Tag { src, dst } => commands::tag(&src, &dst),
         Command::Commit { box_ref, image } => commands::commit(&box_ref, &image),
@@ -5980,7 +6058,7 @@ mod tests {
         .expect("the documented spelling still parses")
         .1;
         assert!(
-            matches!(&cmd, Command::Pull { image, dest: Some(d), platform: Some(pl) }
+            matches!(&cmd, Command::Pull { image, dest: Some(d), platform: Some(pl), .. }
                      if image == "alpine:3.19" && d == "/tmp/x" && pl == "linux/arm64"),
             "the correct spelling must be unaffected: {cmd:?}"
         );
@@ -6002,7 +6080,7 @@ mod tests {
             .expect("parses")
             .1;
         assert!(
-            matches!(&cmd, Command::Pull { image, dest: None, platform: Some(pl) }
+            matches!(&cmd, Command::Pull { image, dest: None, platform: Some(pl), .. }
                      if image == "alpine" && pl == "linux/arm64"),
             "platform without dest must reach the command layer intact: {cmd:?}"
         );
@@ -7053,6 +7131,106 @@ mod tests {
         // And the NEGATIVE: a comma inside quotes is NOT a separator, so this is one field with a
         // bad key rather than two fields, and it is refused instead of half-parsed.
         assert!(parse_mount_spec(r#"type=bind,"nope=/a,dst=/b""#).is_err());
+    }
+
+    // THE READ-ONLY VALUE, WHICH WAS A SILENT BYPASS. Comparing against the literal `true` meant
+    // `readonly=1` produced a WRITABLE mount and no error: the flag that asks for less privilege
+    // silently granted more. Measured against Docker 29.1.3, value by value.
+    #[test]
+    fn mount_readonly_parses_the_whole_boolean_set() {
+        let ro = |v: &str| {
+            parse_mount_spec(&format!("type=bind,src=/a,dst=/b,{v}"))
+                .map(|m| m == MountSpec::Volume("/a:/b:ro".into()))
+        };
+        // Read-only, every spelling the reference honours.
+        for v in [
+            "ro",
+            "readonly",
+            "readonly=1",
+            "readonly=t",
+            "readonly=TRUE",
+            "readonly=true",
+        ] {
+            assert!(ro(v).unwrap(), "{v} must be read-only");
+        }
+        // THE NEGATIVES: an explicit false must not become read-only.
+        for v in [
+            "readonly=0",
+            "readonly=f",
+            "readonly=FALSE",
+            "readonly=false",
+        ] {
+            assert!(!ro(v).unwrap(), "{v} must NOT be read-only");
+        }
+        // AND THE REFUSAL: a value outside the set is refused, never read as writable. The
+        // reference errors on `readonly=yes` too.
+        for v in ["readonly=yes", "readonly=no", "readonly=2", "ro=maybe"] {
+            assert!(ro(v).is_err(), "{v} must be refused, not read as writable");
+        }
+        // A read-only TMPFS is honoured by the reference and has no form in `--tmpfs`, so it is
+        // refused rather than dropped.
+        assert!(parse_mount_spec("type=tmpfs,dst=/x,readonly").is_err());
+        assert!(parse_mount_spec("type=tmpfs,dst=/x").is_ok());
+        // An anonymous volume is a real Docker shape kern has no answer for.
+        assert!(parse_mount_spec("type=volume,dst=/data").is_err());
+    }
+
+    // THE POSITIONAL MUST NOT BE A FLAG'S VALUE. `images --filter dangling=false alpine` listed
+    // the entire cache, silently, because the scan stopped at the first bare token instead of
+    // skipping past the flag that consumed it.
+    #[test]
+    fn images_positional_survives_a_flag_before_it() {
+        let filters = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            parse(&owned).map(|(_, c)| match c {
+                Command::Images { filters, .. } => filters,
+                other => panic!("expected Images, got {other:?}"),
+            })
+        };
+        let has_ref = |args: &[&str]| {
+            filters(args)
+                .unwrap()
+                .iter()
+                .any(|(k, v)| k == "reference" && v == "alpine")
+        };
+        assert!(has_ref(&["images", "alpine"]));
+        assert!(has_ref(&["images", "--filter", "dangling=false", "alpine"]));
+        assert!(has_ref(&["images", "--format", "{{.Tag}}", "alpine"]));
+        assert!(has_ref(&["images", "alpine", "--format", "{{.Tag}}"]));
+        // THE NEGATIVES: a flag's value is never mistaken for the positional, and two names are
+        // two listings.
+        assert!(!filters(&["images", "--format", "{{.Tag}}"])
+            .unwrap()
+            .iter()
+            .any(|(k, _)| k == "reference"));
+        assert!(parse(&["images", "alpine", "nginx"].map(String::from)).is_err());
+        assert!(
+            parse(&["images", "alpine", "--filter", "reference=nginx"].map(String::from)).is_err()
+        );
+    }
+
+    // Flag-first is an order the reference accepts, and the bare scan read the TEMPLATE as the
+    // network: `network inspect -f '{{.Name}}' proxy` inspected a network called `{{.Name}}`.
+    #[test]
+    fn network_inspect_name_survives_a_flag_before_it() {
+        let name_of = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            parse(&owned).map(|(_, c)| match c {
+                Command::NetworkInspect { name, .. } => name,
+                other => panic!("expected NetworkInspect, got {other:?}"),
+            })
+        };
+        for args in [
+            vec!["network", "inspect", "proxy", "-f", "{{.Name}}"],
+            vec!["network", "inspect", "-f", "{{.Name}}", "proxy"],
+            vec!["network", "inspect", "--format", "{{.Name}}", "proxy"],
+            vec!["network", "inspect", "--json", "proxy"],
+        ] {
+            assert_eq!(name_of(&args).unwrap(), "proxy", "{args:?}");
+        }
+        // THE NEGATIVE: with only a flag and its value, there is no network named and it is a
+        // usage error rather than an inspection of the template.
+        assert!(name_of(&["network", "inspect", "-f", "{{.Name}}"]).is_err());
     }
 
     // `--rm` and `--restart` are a contradiction, and until this check both applied: a box

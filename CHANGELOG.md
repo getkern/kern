@@ -17,6 +17,40 @@ and cost what borrowed names cost: a benchmark on this machine measured kern, pu
 `docker run --rm  4.2 ms`, and put it beside a real podman at 285 ms. A `docker` symlink now simply
 runs kern, with kern's grammar and kern's errors.
 
+**`--mount readonly=1` mounted the path WRITABLE, silently.** The value was compared against the
+literal `true`, so every other spelling the reference honours fell through to writable with no
+error. MEASURED value by value on Docker 29.1.3: `readonly=1`, `readonly=t`, `readonly=TRUE`,
+`readonly=true` and a bare `readonly` all mount read-only, `readonly=false` mounts writable, and
+`readonly=yes` is refused outright. kern honoured exactly one of them. This is the worst shape a
+compatibility gap can take: the flag that asks for LESS privilege is the one that silently granted
+more. The whole Go boolean set is now read, and a value outside it is refused rather than taken as
+false.
+
+**`--mount type=tmpfs,dst=/x,readonly` mounted writable.** Docker honours it; kern's `--tmpfs` spec
+is `path[:size]` with no read-only form, so the key was parsed and dropped. Refused by name, which
+is the rule this same release applied to `volume-label=` and had not applied here.
+
+**`images <repo>` was dropped whenever a flag came first.** `images --filter dangling=false alpine`
+and `images --format '{{.Tag}}' alpine` listed the ENTIRE cache with no error, because the scan
+stopped at the first bare token instead of skipping past the flag that consumed it. It now uses the
+same one-positional scan `login` uses, and a second name is refused as Docker refuses it.
+
+**`network inspect -f '{{.Name}}' proxy` inspected a network called `{{.Name}}`.** Flag-first is an
+order the reference accepts and the name scan did not skip flag values.
+
+**`inspect --format` printed a label's control bytes raw, where `ps --format` strips them.** Two
+renderers of one caller-supplied value disagreed about whether it reaches the terminal intact; one
+of them was a terminal-injection surface.
+
+**`{{json .Name}}` printed `/web` where Docker prints `"/web"`.** The `json` pipeline was stripped
+as a wrapper for every key, including the scalars, so a value that should be JSON was not. An
+earlier comment dismissed this as a shape nobody asks for, which was wrong: `{{json .State.Status}}`
+is a common one, and the failure lands on the parser downstream rather than on the eye.
+
+**`pull --quiet` parsed and did nothing.** It was added to the accepted-flag list and carried
+nowhere, which is the no-op flag this CLI refuses everywhere else. It now suppresses the three
+orientation lines and keeps the reference.
+
 **A label whose value contained a comma became two labels, and the filter was wrong in both
 directions.** The registry stores labels as one comma-joined `k=v` field, and the join was
 unescaped, so `--label 'a=b,c=d'` was indistinguishable from two labels. MEASURED against both
@@ -139,10 +173,10 @@ so the line now names all three instead of picking one.
 published-port map is how a caller learns where a service it just started is actually reachable, and
 on a rootless runtime it is the one thing it cannot assume: kern republishes a privileged port above
 1024, so a caller that trusts the number it asked for is wrong. The shape was MEASURED on Docker
-29.6.2 rather than recalled, and three of its details are the kind an implementation from memory
+29.1.3 rather than recalled, and four of its details are the kind an implementation from memory
 gets wrong: the key is the port INSIDE the box with its protocol suffix (`"80/tcp"`), the value is
-an ARRAY because one container port can be published on several addresses, and `HostPort` is a
-string. The `{{json …}}` pipeline is accepted as a wrapper on both.
+an ARRAY because one container port can be published on several addresses, `HostPort` is a string,
+and the capitalisation is `HostIp` with a lower-case `p`. The `{{json …}}` pipeline is accepted as a wrapper on both.
 
 **This release changes two flags that already existed, so it is a MINOR and not a patch.** The
 stability note above says an incompatible change to a verb, a flag or a `--json` shape lands only on

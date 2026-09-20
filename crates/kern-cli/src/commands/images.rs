@@ -36,14 +36,21 @@ fn render_image_format(tmpl: &str, e: &ImageEntry) -> Result<String, Error> {
         match after[..close].trim() {
             ".Repository" => out.push_str(&crate::ui::scrub(repo)),
             ".Tag" => out.push_str(&crate::ui::scrub(tag)),
+            // `.ID` RENDERS THE REFERENCE, AND THAT IS NOT AN IDENTITY. Docker's ID is a content
+            // digest, so two tags of one image share it and a script can deduplicate by it; kern's
+            // cache is keyed by reference, so the same image under two tags yields two different
+            // values here. Kept because a template carrying `{{.ID}}` should print something
+            // rather than fail, and NAMED in the unsupported-token message below, which used to
+            // say the cache holds no image ID while this line was handing one out.
             ".Reference" | ".ID" | ".Id" => out.push_str(&crate::ui::scrub(&e.name)),
             ".Size" => out.push_str(&kern_common::fmt_bytes(e.size)),
             ".Dangling" => out.push_str(&e.dangling.to_string()),
             _ => {
                 return Err(Error::Usage(
                     "images --format: unsupported token (supported: {{.Repository}} {{.Tag}} \
-                     {{.Reference}} {{.Size}} {{.Dangling}}; kern's cache holds no image ID and \
-                     no creation date, only when this machine pulled it - use --json for that)",
+                     {{.Reference}} {{.Size}} {{.Dangling}}; {{.ID}} is accepted and renders the \
+                     REFERENCE, not a content digest, so two tags of one image differ there. kern \
+                     keeps no creation date, only when this machine pulled it - use --json)",
                 ))
             }
         }
@@ -350,7 +357,12 @@ pub fn search(query: &str, json: bool) -> Result<(), Error> {
 /// The cache fill goes through [`resolve_image_depth`], the same function `box --image` uses, so
 /// there is ONE definition of the cache path, the lock, the staging swap, the `.ok` completeness
 /// sentinel and the `.image` config sidecar. A second implementation here would be free to drift.
-pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(), Error> {
+pub fn pull(
+    image: &str,
+    dest: Option<&str>,
+    platform: Option<&str>,
+    quiet: bool,
+) -> Result<(), Error> {
     // `--platform` cannot go to the cache: the cache key is `sanitize_ref(image)`, derived from the
     // REFERENCE alone with no platform component, and the cache path fetches the host arch. Storing a
     // foreign-arch rootfs under a host-arch key is cache poisoning, a class already fixed once in this
@@ -365,7 +377,7 @@ pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(
         ));
     }
     let Some(d) = dest else {
-        return pull_into_cache(image);
+        return pull_into_cache(image, quiet);
     };
     let dest = PathBuf::from(d);
     // `--platform os/arch`: fetch a specific arch from a multi-arch index (default = this host). A
@@ -404,7 +416,7 @@ pub fn pull(image: &str, dest: Option<&str>, platform: Option<&str>) -> Result<(
 /// transfers). Re-fetching bytes already on disk is the wrong default for a tool whose argument is
 /// that it does not waste anything, and "make sure it is cached" is what a pull is for. A deliberate
 /// refresh is `kern box --image <ref> --pull always`, which the message points at.
-fn pull_into_cache(image: &str) -> Result<(), Error> {
+fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     // Was it already there? Asked BEFORE the fetch, so the message can distinguish "downloaded" from
     // "already had it" rather than guessing from a timing or a side effect.
@@ -422,16 +434,20 @@ fn pull_into_cache(image: &str) -> Result<(), Error> {
         g = p.g,
         z = p.z
     );
-    println!(
-        "{d}  run it:  kern box <name> --image {image} -- /bin/sh{z}",
-        d = p.d,
-        z = p.z
-    );
-    println!(
-        "{d}  cached at {path}  ·  `kern images` lists it  ·  refresh with `--pull always`{z}",
-        d = p.d,
-        z = p.z
-    );
+    // The orientation lines are for a person at a terminal; `-q` is for a script, which wants the
+    // reference and nothing to strip.
+    if !quiet {
+        println!(
+            "{d}  run it:  kern box <name> --image {image} -- /bin/sh{z}",
+            d = p.d,
+            z = p.z
+        );
+        println!(
+            "{d}  cached at {path}  ·  `kern images` lists it  ·  refresh with `--pull always`{z}",
+            d = p.d,
+            z = p.z
+        );
+    }
     Ok(())
 }
 

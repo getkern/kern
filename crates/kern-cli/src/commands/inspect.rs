@@ -120,11 +120,17 @@ pub(crate) fn network_ports_json(ports: &str) -> String {
 
 /// Split the registry's comma-joined `k=v` label field into pairs.
 ///
-/// THE SOLE READER of that grammar, as `--filter label=` is its sole matcher, so a label that
-/// filters cannot be a label that does not print. A segment with no `=` is SKIPPED rather than
-/// emitted with an empty value: `--label` requires the `=` at parse time, so such a segment can only
-/// come from a corrupted record, and inventing a key for it would put a name into a document that
-/// nothing ever set.
+/// ⚠️ NOT the sole reader: `ps_matches` decodes the same field to answer `--filter label=`, and
+/// compares the raw `k=v` segments rather than going through here. An earlier version of this
+/// comment claimed sole ownership, which was already false when it was written. The two agree
+/// because they share [`registry::decode_labels`]; what they do NOT share is the bare-key
+/// normalisation below, and that difference is real: `--filter label=noequals=` does not match a
+/// box labelled `--label noequals`, where it would if the filter came through here.
+///
+/// A segment with no `=` is a label with an EMPTY VALUE, not corruption. Measured on the reference
+/// implementation: `--label noequals` renders `{"noequals":""}`. An earlier version of this comment
+/// said such a segment was skipped, which stopped being true when `--label` started accepting a
+/// bare key and was left behind.
 pub(crate) fn label_pairs(field: &str) -> Vec<(String, String)> {
     registry::decode_labels(field)
         .into_iter()
@@ -1081,9 +1087,15 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
                 .and_then(|k| k.strip_suffix('"'))
                 .filter(|k| !k.is_empty())
             {
-                Some(k) => Ok(label_value(b.as_ref().map_or("", |i| i.labels.as_str()), k)
-                    .unwrap_or_default()
-                    .to_string()),
+                // SCRUBBED, as `ps --format` scrubs the same value. It was not, and the two
+                // renderers therefore disagreed about whether a label reaches the terminal raw:
+                // MEASURED with a label carrying ESC, `ps --format` printed `[31mred` and
+                // `inspect --format` printed the escape intact. A label is caller-supplied text
+                // and one of the two paths was a terminal-injection surface.
+                Some(k) => Ok(crate::ui::scrub(
+                    &label_value(b.as_ref().map_or("", |i| i.labels.as_str()), k)
+                        .unwrap_or_default(),
+                )),
                 None => Err(Error::Usage(
                     "inspect --format: {{.Label \"key\"}} needs a quoted key",
                 )),
@@ -1107,18 +1119,32 @@ pub fn inspect_formatted(name: &str, json: bool, format: Option<&str>) -> Result
         // would hand the caller a string where it asked for an object. A scalar under `json` is the
         // one case that would differ from Docker, and it is not a shape any caller asks for.
         let raw = after[..close].trim();
+        let jsonified = raw.starts_with("json ");
         let key = raw
             .strip_prefix("json ")
             .unwrap_or(raw)
             .trim()
             .trim_start_matches('.');
+        // WHICH KEYS ARE ALREADY DOCUMENTS. Everything else under `json` is a SCALAR and Docker
+        // quotes it: `docker inspect --format '{{json .Name}}'` prints `"/web"`, and kern printed
+        // `/web`. An earlier comment here dismissed that as a shape nobody asks for, which is
+        // wrong twice: `{{json .State.Status}}` is a common one, and a value that should be JSON
+        // and is not breaks the parser on the other end of the pipe rather than the eye.
+        let already_json = matches!(key, "Config.Labels" | "NetworkSettings.Ports");
+        let quoted = |v: String| {
+            if jsonified && !already_json {
+                json_str(&v)
+            } else {
+                v
+            }
+        };
         if let Some(v) = labelled(key) {
-            out.push_str(&v?);
+            out.push_str(&quoted(v?));
             rest = &after[close + 2..];
             continue;
         }
         match field(key) {
-            Some(v) => out.push_str(&v),
+            Some(v) => out.push_str(&quoted(v)),
             None => {
                 return Err(Error::NotRunning(format!(
                     "inspect --format names '{{{{.{key}}}}}', which kern cannot answer - refusing rather than printing something a script would read as the answer. `kern inspect {name} --json` prints what kern knows"

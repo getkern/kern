@@ -7709,7 +7709,7 @@ fn run_terminal_verb(
                     never += 1;
                     continue;
                 }
-                match pull(img, None, None) {
+                match pull(img, None, None, true) {
                     Ok(()) => pulled += 1,
                     // A service that declares `build:` is ALWAYS tolerated here (its image is
                     // produced locally); `--ignore-pull-failures` extends that to every service,
