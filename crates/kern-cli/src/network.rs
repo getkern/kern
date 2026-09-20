@@ -737,6 +737,156 @@ pub fn remove_many(names: &[String]) -> Result<(), Error> {
     }
 }
 
+/// The CIDR a network's members are addressed from: `127.1.<network index>.0/24`.
+///
+/// A REAL SUBNET AND NOT A DECORATION, which is why it can be reported at all. [`member_addr`]
+/// hands out `127.1.<net>.<member + 1>` and `.0` is left unbound as the network address, so the
+/// block is exactly a `/24` and every member is inside it. `None` for a network whose index cannot
+/// be read, which is the same condition under which it has no addresses to report.
+fn subnet(name: &str) -> Option<String> {
+    let ni = net_index(name)?;
+    Some(format!("127.1.{ni}.0/24"))
+}
+
+/// `kern network inspect <name>`: what kern actually holds about one network.
+///
+/// ⛔ THE FIELDS DOCKER HAS AND KERN DOES NOT ARE ABSENT, NOT EMPTY. There is no `Gateway`, because
+/// there is no bridge: members reach each other over loopback aliases, so nothing routes and no
+/// address forwards. There is no `Driver` and no `Options`. Emitting them as `""` would answer a
+/// script's question with a value it would act on, and the value would be a guess.
+///
+/// `IPAM.Config` IS answered, because it is the one Docker field kern has a true value for: the
+/// `/24` above is the block the addresses actually come from. It is rendered as Docker's array of
+/// objects (`[{"Subnet":"…"}]`) so a caller doing `.[0].Subnet` reads what it expects; the
+/// `Gateway` key Docker puts beside it is left out rather than filled, for the reason above.
+pub fn print_inspect(name: &str, json: bool, format: Option<&str>) -> Result<(), Error> {
+    if !exists(name) {
+        // NAMED AND REFUSED, not reported as an empty network. `docker network inspect bridge` is a
+        // reflex a script carries across, and kern has no `bridge`: its networks are created by
+        // name and nothing exists until someone does. Answering with an empty document would let a
+        // wait loop conclude the network is there and carry on.
+        return Err(Error::Sandbox(format!(
+            "no network '{}': kern creates networks by name and has no default `bridge` \
+             (`kern network ls` lists them, `kern network create {}` makes one)",
+            crate::ui::scrub(name),
+            crate::ui::scrub(name)
+        )));
+    }
+    let live = members(name);
+    let cidr = subnet(name);
+    // Each member with the address it actually holds, which is the fact a peer resolves it by.
+    let addressed: Vec<(&Member, Option<String>)> = live
+        .iter()
+        .map(|m| {
+            (
+                m,
+                net_index(name)
+                    .and_then(|ni| member_addr(ni, m.index))
+                    .map(ipv4),
+            )
+        })
+        .collect();
+    if let Some(tmpl) = format {
+        let containers = || {
+            let body: Vec<String> = addressed
+                .iter()
+                .filter_map(|(m, a)| {
+                    let a = a.as_ref()?;
+                    Some(format!(
+                        "{}:{{\"Name\":{},\"IPv4Address\":{}}}",
+                        kern_common::json_str(&m.box_name),
+                        kern_common::json_str(&m.box_name),
+                        kern_common::json_str(&format!("{a}/24"))
+                    ))
+                })
+                .collect();
+            format!("{{{}}}", body.join(","))
+        };
+        let mut out = String::with_capacity(tmpl.len());
+        let mut rest = tmpl;
+        while let Some(open) = rest.find("{{") {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 2..];
+            let Some(close) = after.find("}}") else {
+                return Err(Error::Usage(
+                    "network inspect --format: an unterminated `{{` is not a template",
+                ));
+            };
+            let raw = after[..close].trim();
+            let key = raw
+                .strip_prefix("json ")
+                .unwrap_or(raw)
+                .trim()
+                .trim_start_matches('.');
+            match key {
+                "Name" => out.push_str(&crate::ui::scrub(name)),
+                "IPAM.Config" => match &cidr {
+                    Some(c) => {
+                        out.push_str(&format!("[{{\"Subnet\":{}}}]", kern_common::json_str(c)))
+                    }
+                    // The index is unreadable, so there is no block to report. An empty ARRAY and
+                    // not an invented one: a caller doing `.[0].Subnet` gets nothing rather than a
+                    // subnet no address came from.
+                    None => out.push_str("[]"),
+                },
+                "Containers" => out.push_str(&containers()),
+                _ => {
+                    return Err(Error::NotRunning(format!(
+                        "network inspect --format names '{{{{.{key}}}}}', which kern cannot answer \
+                         - refusing rather than printing something a script would read as the \
+                         answer. kern's networks carry a name, a subnet and their members; \
+                         `kern network inspect {} --json` prints all of it",
+                        crate::ui::scrub(name)
+                    )))
+                }
+            }
+            rest = &after[close + 2..];
+        }
+        out.push_str(rest);
+        println!("{out}");
+        return Ok(());
+    }
+    if json {
+        let peers: Vec<String> = addressed
+            .iter()
+            .map(|(m, a)| {
+                let ports: Vec<String> = m.ports.iter().map(u16::to_string).collect();
+                format!(
+                    "{{\"box\":{},\"service\":{},\"project\":{},\"address\":{},\"ports\":[{}]}}",
+                    kern_common::json_str(&m.box_name),
+                    kern_common::json_str(&m.service),
+                    kern_common::json_str(&m.project),
+                    a.as_ref()
+                        .map_or_else(|| "null".to_string(), |s| kern_common::json_str(s)),
+                    ports.join(",")
+                )
+            })
+            .collect();
+        println!(
+            "{{\"name\":{},\"subnet\":{},\"members\":[{}]}}",
+            kern_common::json_str(name),
+            cidr.as_ref()
+                .map_or_else(|| "null".to_string(), |c| kern_common::json_str(c)),
+            peers.join(",")
+        );
+        return Ok(());
+    }
+    let p = crate::ui::Palette::detect();
+    println!("{}{}{}{}", p.b, p.c, crate::ui::scrub(name), p.z);
+    let row = |k: &str, v: &str| println!("{d}{k:<8}{z} {v}", d = p.d, z = p.z);
+    row("subnet", cidr.as_deref().unwrap_or("-"));
+    row("members", &live.len().to_string());
+    for (m, a) in &addressed {
+        println!(
+            "         {:<20} {:<16} {}",
+            crate::ui::scrub(&m.box_name),
+            a.as_deref().unwrap_or("-"),
+            crate::ui::scrub(&m.service)
+        );
+    }
+    Ok(())
+}
+
 /// `kern network ls`, as a table or as JSON.
 ///
 /// THE MEMBER COUNT IS THE LIVE ONE, which is the only number worth printing: a network's directory

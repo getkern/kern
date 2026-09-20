@@ -38,6 +38,7 @@ const VERBS: &[&str] = &[
     "pod",
     "search",
     "images",
+    "image",
     "builds",
     "save",
     "load",

@@ -34,6 +34,14 @@ pub enum Command {
     },
     /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-- cmd...]`: run in a sandbox.
     BoxRun {
+        /// `--rm`: leave no exit record behind, as Docker's `--rm` leaves no container.
+        ///
+        /// A BOX IS ALREADY THROWN AWAY: its scratch and its registry entry go at teardown, and the
+        /// only residue is the transient `waitexit` breadcrumb `kern ps -a` reads for an hour. This
+        /// flag drops that too, which is the whole difference between kern's default and Docker's
+        /// flag. `kern wait` then has nothing to read, exactly as `docker wait` has nothing to read
+        /// for a container that removed itself.
+        rm: bool,
         name: String,
         rootfs: Option<String>,
         image: Option<String>,
@@ -354,6 +362,14 @@ pub enum Command {
     NetworkList {
         /// `--json`: the same scan as the table, machine-readable, like every other read verb here.
         json: bool,
+    },
+    /// `network inspect <name>`: one network's subnet and its live members.
+    NetworkInspect {
+        name: String,
+        json: bool,
+        /// `-f`/`--format`: the Docker keys kern has a true value for (`.Name`, `.IPAM.Config`,
+        /// `.Containers`). Any other is refused rather than rendered empty.
+        format: Option<String>,
     },
     NetworkRemove {
         names: Vec<String>,
@@ -922,6 +938,49 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `pod create <name> [-p …]` / `pod ls` / `pod rm <name>…`: shared-network pods.
         Some("pod") => parse_pod(&rest)?,
         Some("network" | "net") => parse_network(&rest)?,
+        // `image <sub>`: the noun-verb grouping Docker moved its image commands into, mapped onto
+        // the verbs kern already has.
+        //
+        // A REWRITE AND NOT A SECOND SET OF PARSERS. Each arm renames the first token and re-enters
+        // this function, so `image ls --json` and `images --json` cannot come to accept different
+        // flags or render different output: there is one parser per verb and this only chooses
+        // which one. The cost of the alternative is measured elsewhere in this file, where two
+        // paths answering one input differently is the divergence class treated as a defect.
+        Some("image") => {
+            let sub = rest.get(1).copied().unwrap_or_default();
+            let mapped = match sub {
+                "inspect" => "inspect",
+                "ls" | "list" => "images",
+                "rm" | "remove" => "rmi",
+                "pull" => "pull",
+                "push" => "push",
+                "tag" => "tag",
+                "history" => "history",
+                "save" => "save",
+                "load" => "load",
+                "build" => "build",
+                // `image prune` is NOT mapped to `gc --images`, which is the nearest thing kern
+                // has and is not the same operation: Docker prunes DANGLING images by default and
+                // `gc --images` clears what no box references. Aliasing them would delete more
+                // than the caller asked for on a verb whose whole risk is deleting too much.
+                "prune" => {
+                    return Err(Error::Usage(
+                        "image prune has no alias: `kern gc --images` frees images no box \
+                         references, which is a wider sweep than Docker's dangling-only default. \
+                         Run it deliberately, or `kern rmi <image>` for one",
+                    ))
+                }
+                "" => return Err(Error::Usage("image ls|inspect|rm|pull|push|tag|history|save|load|build")),
+                other => {
+                    return Err(Error::Cli(format!(
+                        "image {other}: not a kern verb (image ls|inspect|rm|pull|push|tag|history|save|load|build)"
+                    )))
+                }
+            };
+            let mut rewritten: Vec<String> = vec![mapped.to_string()];
+            rewritten.extend(args.iter().skip(2).cloned());
+            return parse(&rewritten);
+        }
         // Hidden: the pod namespace holder (spawned by `pod create`).
         Some("__pod-holder") => Command::PodHolder,
         // Hidden: the relay holder (spawned by `compose up --no-pod`).
@@ -2551,6 +2610,7 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
 /// real sandbox. Without a rootfs/image it still routes to `BoxRun` (which reports the missing
 /// source); `--plan` previews instead of running.
 fn parse_box(rest: &[&str]) -> Result<Command, Error> {
+    let mut rm = false;
     let mut name: Option<&str> = None;
     let mut rootfs: Option<String> = None;
     let mut image: Option<String> = None;
@@ -3159,6 +3219,9 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // field, so giving both is refused rather than resolved by a precedence rule nobody
                 // would remember: `kern box web --name api` has said two things about one box, and
                 // silently picking either would name it something the command line also denies.
+                // `--rm`: drop the exit breadcrumb too. See `Command::BoxRun::rm` for why this is
+                // the only thing left for the flag to do.
+                "--rm" => rm = true,
                 "--name" => {
                     i += 1;
                     match rest.get(i) {
@@ -3583,6 +3646,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
         }
     } else {
         Command::BoxRun {
+            rm,
             // The name is optional (Docker-style): omit it and kern assigns `box-<pid>`, so a quick
             // `kern box --image alpine -- sh` needs no invented name.
             name: name
@@ -4163,6 +4227,22 @@ fn parse_network(rest: &[&str]) -> Result<Command, Error> {
                 json: rest[1..].contains(&"--json") || fmt.is_some(),
             })
         }
+        // `network inspect <name>`: the verb a script ported from Docker reaches for to learn a
+        // network's subnet. Only the keys kern holds a true value for are rendered; see
+        // `network::print_inspect` for what is deliberately absent and why.
+        Some("inspect") => {
+            reject_unknown_flags("network inspect", &rest[1..], &["--json", "--format", "-f"])?;
+            let name = rest
+                .iter()
+                .skip(2)
+                .find(|a| !a.starts_with('-'))
+                .ok_or(Error::Usage("network inspect <name> [--json] [-f T]"))?;
+            Ok(Command::NetworkInspect {
+                name: (*name).to_string(),
+                json: rest[1..].contains(&"--json"),
+                format: flag_value(&rest[1..], "--format").or_else(|| flag_value(&rest[1..], "-f")),
+            })
+        }
         Some("rm" | "remove") => {
             reject_unknown_flags("network rm", &rest[1..], &[])?;
             let names: Vec<String> = rest
@@ -4177,7 +4257,8 @@ fn parse_network(rest: &[&str]) -> Result<Command, Error> {
             Ok(Command::NetworkRemove { names })
         }
         _ => Err(Error::Usage(
-            "network create <name> | network ls [--json] | network rm <name>",
+            "network create <name> | network ls [--json] | network inspect <name> [--json] [-f T] \
+             | network rm <name>",
         )),
     }
 }
@@ -4609,7 +4690,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             quiet,
             verbose,
             profiles,
+            rm,
         } => commands::box_run(commands::BoxRunArgs {
+            rm,
             name: &name,
             rootfs: rootfs.as_deref(),
             image: image.as_deref(),
@@ -4773,6 +4856,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             Ok(())
         }
         Command::NetworkList { json } => crate::network::print_list(json),
+        Command::NetworkInspect { name, json, format } => {
+            crate::network::print_inspect(&name, json, format.as_deref())
+        }
         Command::NetworkRemove { names } => crate::network::remove_many(&names),
         Command::PodHolder => crate::pod::run_holder(),
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
@@ -6880,6 +6966,92 @@ mod tests {
             named(&["box", "web", "--name", "api", "--image", "alpine", "--", "true"]).is_err(),
             "the positional name and --name are one field; both is a contradiction"
         );
+    }
+
+    // `image <sub>` is a REWRITE onto the verb kern already has, so what must hold is that it
+    // reaches the SAME command the direct spelling reaches. If the two ever parsed differently,
+    // there would be two grammars for one operation and only one of them under test.
+    #[test]
+    fn image_group_rewrites_onto_the_existing_verbs() {
+        let cmd = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            parse(&owned).map(|(_, c)| format!("{c:?}"))
+        };
+        for (grouped, direct) in [
+            (
+                vec!["image", "inspect", "alpine"],
+                vec!["inspect", "alpine"],
+            ),
+            (vec!["image", "ls", "--json"], vec!["images", "--json"]),
+            (vec!["image", "rm", "alpine"], vec!["rmi", "alpine"]),
+            (vec!["image", "pull", "alpine"], vec!["pull", "alpine"]),
+            (vec!["image", "tag", "a", "b"], vec!["tag", "a", "b"]),
+        ] {
+            assert_eq!(
+                cmd(&grouped).unwrap(),
+                cmd(&direct).unwrap(),
+                "`kern {}` must reach the same command as `kern {}`",
+                grouped.join(" "),
+                direct.join(" ")
+            );
+        }
+        // `image prune` is NOT aliased onto `gc --images`: Docker prunes DANGLING images by
+        // default and `gc --images` clears what no box references, which is a wider sweep. On a
+        // verb whose whole risk is deleting too much, the nearest thing is not the same thing.
+        assert!(cmd(&["image", "prune"]).is_err());
+        assert!(cmd(&["image", "frobnicate"]).is_err());
+        assert!(cmd(&["image"]).is_err());
+    }
+
+    // `--rm` must reach the command as a FACT, because everything it does happens far from here:
+    // the foreground sweep and the supervisor's skipped write both read this one field.
+    #[test]
+    fn rm_flag_reaches_the_command() {
+        let rm_of = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            match parse(&owned).map(|(_, c)| c) {
+                Ok(Command::BoxRun { rm, .. }) => rm,
+                other => panic!("expected BoxRun, got {other:?}"),
+            }
+        };
+        assert!(rm_of(&[
+            "box", "w", "--rm", "--image", "alpine", "--", "true"
+        ]));
+        assert!(rm_of(&[
+            "box", "w", "-d", "--rm", "--image", "alpine", "--", "true"
+        ]));
+        assert!(!rm_of(&["box", "w", "--image", "alpine", "--", "true"]));
+    }
+
+    // `network inspect` carries its name and its two output knobs. `-f` and `--format` are the same
+    // field, as they are on `inspect`.
+    #[test]
+    fn network_inspect_parses_its_knobs() {
+        let cmd = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            parse(&owned).map(|(_, c)| c)
+        };
+        assert!(matches!(
+            cmd(&["network", "inspect", "proxy"]),
+            Ok(Command::NetworkInspect { ref name, json: false, format: None }) if name == "proxy"
+        ));
+        assert!(matches!(
+            cmd(&["network", "inspect", "proxy", "--json"]),
+            Ok(Command::NetworkInspect { json: true, .. })
+        ));
+        for spelling in [["--format"], ["-f"]] {
+            assert!(
+                matches!(
+                    cmd(&["network", "inspect", "proxy", spelling[0], "{{.Name}}"]),
+                    Ok(Command::NetworkInspect { format: Some(ref f), .. }) if f == "{{.Name}}"
+                ),
+                "{} must carry the template",
+                spelling[0]
+            );
+        }
+        // A network is named, never defaulted: `network inspect` with nothing to inspect is a
+        // usage error and not an inspection of some implicit network.
+        assert!(cmd(&["network", "inspect"]).is_err());
     }
 
     // The 0.5 CPU/RAM knob set is frozen: `--cpuset-cpus` (pinning) and `--memory-swap-max` (swap

@@ -32,6 +32,7 @@ COMMANDS:
                                                                      -t is repeatable: one build, every name applied (layers shared, not copied)
     images [--json] [--filter K=V]                                  List pulled (cached) images
                                                                      --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
+    image ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs under Docker's noun-first grouping (one parser each, not a second)
     rmi <image>...                                                 Remove cached images (frees unshared layers)
     save <image> [-o file]                                         Export an image to a tar (docker load-compatible)
     load [-i file]                                                 Import an image from a tar (docker save format)
@@ -84,7 +85,7 @@ COMMANDS:
                                                                      With --bridge each member keeps its own namespace and a
                                                                      127.0.0.1 no peer can reach, meeting on a bridge
     pod ls [--json] | pod rm <name>                                List pods, or remove one
-    network create <name> | network ls [--json] | network rm <name>  A network shared BETWEEN projects, which is what a
+    network create <name> | network ls [--json] | network inspect <name> [--json] [-f T] | network rm <name>  A network shared BETWEEN projects, which is what a
                                                                      compose file names with `external: true`. Services of
                                                                      DIFFERENT files on one resolve and reach each other by name (alias: net)
 
@@ -122,6 +123,9 @@ OPTIONS for box:
                         ro|readonly, tmpfs-size=<sz>. A type= that disagrees with its src is
                         refused rather than reinterpreted
     --name <box>        Name the box (the same field as the positional name; pass one, not both)
+    --rm                Leave no exit record: `kern ps -a` will not list it and `kern wait` has
+                        nothing to read. A box is already thrown away at teardown; this drops the
+                        hour-long breadcrumb too
     -e, --env K=V       Set an environment variable (repeatable)
     -w, --workdir <dir> Working directory inside the box
         --entrypoint <a> Replace the image's ENTRYPOINT (repeat for an exec-form list;

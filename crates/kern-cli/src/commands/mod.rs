@@ -208,6 +208,8 @@ fn resolve_seccomp_mode(
 /// Arguments for [`box_run`]. A struct (not a long parameter list) keeps the call site readable
 /// as box options grow (`-v`, `--env`, `--workdir`, `--net`).
 pub struct BoxRunArgs<'a> {
+    /// `--rm`: leave no exit record behind. See `cli::Command::BoxRun::rm`.
+    pub rm: bool,
     pub name: &'a str,
     pub rootfs: Option<&'a str>,
     pub image: Option<&'a str>,

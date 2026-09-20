@@ -48,6 +48,36 @@ then be unable to read its own tag back, which is the write-only half of a round
     the breadcrumb carries only name/pod/command), so the token renders empty there rather than
     failing the row.
 
+**`box --rm`, `network inspect` and the `image` verb group.** The rest of the measured gap.
+
+  * `--rm` leaves no exit record: `kern ps -a` will not list the box and `kern wait` has nothing to
+    read, exactly as `docker wait` has nothing to read for a container that removed itself. A box
+    was ALREADY thrown away (its scratch and registry entry go at teardown); the hour-long
+    `waitexit` breadcrumb was the only residue, and this drops it. On a detached box the supervisor
+    does not write it at all rather than writing and deleting it, because that box outlives the
+    command and a record that exists for a while is one `kern ps -a` can report. The compose exit
+    key is NOT suppressed: it is a different record, read by `compose up`, and a one-off's `--rm`
+    must not make a stack lose a service's status.
+  * `network inspect <name> [--json] [-f T]` reports what kern actually holds: the `/24` its members
+    are addressed from, and who is on it. `{{json .IPAM.Config}}` is answered because that block is
+    real. `Gateway`, `Driver` and `Options` are ABSENT and not empty, because members reach each
+    other over loopback aliases and nothing routes; emitting them as `""` would answer a script's
+    question with a guess. A name that does not exist is REFUSED and named, so a script reaching for
+    a default `bridge` (which kern has none of) fails instead of reading an empty document as an
+    empty network.
+  * `image ls|inspect|rm|pull|push|tag|history|save|load|build` is Docker's noun-first grouping,
+    rewritten onto the verbs kern already has, so there is one parser per operation and this only
+    chooses which. `image prune` is deliberately NOT aliased onto `kern gc --images`: Docker prunes
+    dangling images by default and `gc --images` clears what no box references, which is a wider
+    sweep, and on a verb whose whole risk is deleting too much the nearest thing is not the same
+    thing.
+
+**`kern wait` was diagnosing a cause it could not know.** A box that left no exit record was
+reported as "a foreground or -it box has no supervisor to capture one". With `--rm` that assertion
+became wrong: a caller who had explicitly asked for no record was told its box ran in the
+foreground. There are three causes and the record that would say which is the one that is missing,
+so the line now names all three instead of picking one.
+
 **`inspect --format` answers `{{json .NetworkSettings.Ports}}` and `{{json .Config.Labels}}`.** The
 published-port map is how a caller learns where a service it just started is actually reachable, and
 on a rootless runtime it is the one thing it cannot assume: kern republishes a privileged port above

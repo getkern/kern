@@ -69,6 +69,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      -t is repeatable: one build, every name applied (layers shared, not copied)
     {c}images{z} [--json] [--filter K=V]                                  List pulled (cached) images
                                                                      --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
+    {c}image{z} ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs under Docker's noun-first grouping (one parser each, not a second)
     {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
     {c}save{z} <image> [-o file]                                         Export an image to a tar (docker load-compatible)
     {c}load{z} [-i file]                                                 Import an image from a tar (docker save format)
@@ -121,7 +122,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      With --bridge each member keeps its own namespace and a
                                                                      127.0.0.1 no peer can reach, meeting on a bridge
     {c}pod{z} ls [--json] | {c}pod{z} rm <name>                                List pods, or remove one
-    {c}network{z} create <name> | {c}network{z} ls [--json] | {c}network{z} rm <name>  A network shared BETWEEN projects, which is what a
+    {c}network{z} create <name> | {c}network{z} ls [--json] | {c}network{z} inspect <name> [--json] [-f T] | {c}network{z} rm <name>  A network shared BETWEEN projects, which is what a
                                                                      compose file names with `external: true`. Services of
                                                                      DIFFERENT files on one resolve and reach each other by name (alias: net)
 
@@ -159,6 +160,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         ro|readonly, tmpfs-size=<sz>. A type= that disagrees with its src is
                         refused rather than reinterpreted
     --name <box>        Name the box (the same field as the positional name; pass one, not both)
+    --rm                Leave no exit record: `kern ps -a` will not list it and `kern wait` has
+                        nothing to read. A box is already thrown away at teardown; this drops the
+                        hour-long breadcrumb too
     -e, --env K=V       Set an environment variable (repeatable)
     -w, --workdir <dir> Working directory inside the box
         --entrypoint <a> Replace the image's ENTRYPOINT (repeat for an exec-form list;

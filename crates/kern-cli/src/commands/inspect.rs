@@ -1311,11 +1311,21 @@ pub fn wait(names: &[String]) -> Result<(), Error> {
         match registry::box_exit(inst.pid, inst.starttime) {
             Some(code) => println!("{code}"),
             None => {
-                // Gone but no recorded code: a foreground/-it box (no supervisor to capture it), or a
-                // crash/OOM that killed the supervisor before it could record. Name the likely cause so
-                // the empty stdout reads as expected, not a bug; don't invent a 0.
+                // Gone but no recorded code. THREE causes, and this cannot tell them apart: a
+                // foreground/-it box (no supervisor to capture one), a box started with `--rm`
+                // (whose whole purpose is to leave no record), or a crash that killed the
+                // supervisor before it could write. The record that would say which is the record
+                // that is missing, and the instance entry went with the box.
+                //
+                // SO IT NAMES ALL THREE rather than asserting one. It used to assert the first,
+                // and `--rm` made that assertion wrong: a caller reading the line was told its
+                // box ran in the foreground when it had explicitly asked for no record. A
+                // diagnosis with more than one cause does not get to declare one.
                 eprintln!(
-                    "kern: box '{}' exited without a recorded exit code (a foreground or -it box has no supervisor to capture one)",
+                    "kern: box '{}' exited without a recorded exit code. One of: it ran in the \
+                     foreground or under -it (no supervisor to capture one), it was started with \
+                     `--rm` (which leaves no record by design), or its supervisor died before it \
+                     could write one",
                     inst.name
                 );
             }

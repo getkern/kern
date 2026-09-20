@@ -1714,6 +1714,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     if args.detached {
         return run_detached(
             &name,
+            args.rm,
             spec,
             scratch,
             ports,
@@ -2063,6 +2064,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                         );
                     }
                 }
+            }
+            // `--rm`: leave no exit record. AFTER THE FACT AND BEST EFFORT, the same shape (and the
+            // same function) `compose run --rm` already uses, because a foreground box may not have
+            // written one at all and the command's status is the workload's either way. Scoped to
+            // this box's pod AND its name, so a foreign record is never touched.
+            if args.rm {
+                registry::clear_waitexit_pod(
+                    args.pod.unwrap_or(""),
+                    std::slice::from_ref(&args.name.to_string()),
+                );
             }
             std::process::exit(code)
         }
@@ -2916,7 +2927,10 @@ fn should_restart(
 /// re-run in place (the second `unshare` would `EINVAL`); the supervisor stays un-namespaced and
 /// just waits. Readiness is signalled only on the first attempt (the launcher already returned by
 /// the time a restart happens). `inst` is re-registered with each attempt's box PID 1.
+#[allow(clippy::too_many_arguments)]
 fn supervise_box(
+    // `--rm`: skip the exit breadcrumb entirely. See `run_detached`.
+    rm: bool,
     name: &BoxName,
     spec: &SandboxSpec,
     have_pipe: bool,
@@ -3282,14 +3296,21 @@ fn supervise_box(
     // keyed `<name>-<pid>` (our own pid = the registered pid). Written LAST here, and this whole call
     // returns BEFORE the caller unregisters the instance file, so a `wait` that sees the box leave
     // `list()` finds the code. If compose is also waiting, record it under its stack+run-scoped key too.
-    registry::set_box_exit(
-        std::process::id() as i32,
-        inst.starttime,
-        final_code,
-        &inst.name,
-        &inst.pod,
-        &inst.command,
-    );
+    // `--rm` LEAVES NOTHING, which is the one thing Docker's flag asks for that kern did not
+    // already do. `kern wait` then has nothing to read for this box, exactly as `docker wait` has
+    // nothing to read for a container that removed itself. The compose exit key below is NOT
+    // suppressed: it is a different record, scoped to a stack and read by `compose up`, and a
+    // one-off's `--rm` must not make a stack lose a service's status.
+    if !rm {
+        registry::set_box_exit(
+            std::process::id() as i32,
+            inst.starttime,
+            final_code,
+            &inst.name,
+            &inst.pod,
+            &inst.command,
+        );
+    }
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
     }
@@ -3298,6 +3319,11 @@ fn supervise_box(
 #[allow(clippy::too_many_arguments)]
 fn run_detached(
     name: &BoxName,
+    // `--rm`: the supervisor writes no exit record at all. NOT WRITTEN rather than written and
+    // deleted, because this box outlives the command that started it: there is no later moment in
+    // the launcher at which to sweep, and a record that exists for a while is one `kern ps -a` can
+    // report.
+    rm: bool,
     spec: SandboxSpec,
     scratch: Option<PathBuf>,
     ports: &[kern_isolation::PortMap],
@@ -3417,6 +3443,7 @@ fn run_detached(
     // Run the box (re-registering with its PID 1 so `kern exec` can find it), restarting it per
     // `--restart`. Blocks for the box's whole lifetime.
     supervise_box(
+        rm,
         name,
         &spec,
         have_pipe,
