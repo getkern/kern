@@ -2623,6 +2623,26 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
                      with --label, which kern does record and filter on",
                 ))
             }
+            // THE REST OF DOCKER'S `--mount` KEYS, REFUSED BY NAME AND NOT BY THE TYPO ERROR.
+            //
+            // Each of these is valid where the caller copied it from, and kern has no knob behind
+            // any of them. They were already refused, by the generic usage message, which is the
+            // right OUTCOME reached with the wrong sentence: the reader is told the whole grammar
+            // and left to diff it by eye against what they wrote, exactly the failure the compose
+            // flag messages elsewhere in this file were rewritten to stop doing. A refusal that
+            // does not name what it refused reads as "one of these nine things is wrong".
+            //
+            // Kept separate from the unknown-key arm below so a genuine typo (`dest=`) still gets
+            // the grammar, which is what a typo needs.
+            "bind-propagation" | "bind-nonrecursive" | "volume-nocopy" | "volume-driver"
+            | "volume-opt" | "tmpfs-mode" | "consistency" => {
+                return Err(Error::Cli(format!(
+                    "--mount {key}=: a real Docker key that kern has no equivalent for, so it is \
+                     refused rather than ignored (a mount option silently dropped is one the \
+                     caller believes is in force). kern's --mount carries type=, src=, dst= and \
+                     ro; `kern box --help` lists what shapes the mount instead"
+                )))
+            }
             // An unknown key is refused, not skipped: `type=bind,src=/a,dest=/b` (a real typo, the
             // key is `dst` or `destination`) would otherwise parse as a mount with NO destination.
             _ => return Err(USAGE),
@@ -7148,6 +7168,34 @@ mod tests {
                 "--mount {bad:?} should be refused, not translated"
             );
         }
+        // DOCKER'S OTHER KEYS ARE REFUSED BY NAME, NOT BY THE TYPO ERROR. Each is valid where it
+        // was copied from and kern has no knob behind it; a mount option silently dropped is one
+        // the caller believes is in force. The test that matters is that the message NAMES the
+        // key, because the generic grammar dump was already a refusal and was not an answer.
+        for key in [
+            "bind-propagation=rslave",
+            "bind-nonrecursive=true",
+            "volume-nocopy=true",
+            "volume-driver=local",
+            "volume-opt=o=bind",
+            "tmpfs-mode=1777",
+            "consistency=cached",
+            "volume-label=a=b",
+        ] {
+            let name = key.split('=').next().unwrap();
+            let err = parse_mount_spec(&format!("type=bind,src=/a,dst=/b,{key}"))
+                .expect_err("must be refused");
+            assert!(
+                format!("{err}").contains(name),
+                "the refusal of {key:?} must name {name:?}, got: {err}"
+            );
+        }
+        // AND THE NEGATIVE: a genuine typo still gets the grammar, which is what a typo needs.
+        let typo = parse_mount_spec("type=bind,src=/a,dest=/b").expect_err("must be refused");
+        assert!(
+            format!("{typo}").contains("type=bind|volume|tmpfs"),
+            "a typo should get the grammar, got: {typo}"
+        );
     }
 
     // `--name` is the SAME field as the positional name, and the parser must treat it as one: both

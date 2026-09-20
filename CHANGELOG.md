@@ -48,6 +48,13 @@ a field may quote itself to carry a comma, and `--mount 'type=bind,"src=/a,b",ds
 there (measured on Docker 29.1.3). kern answered the generic usage error, so a path containing a
 comma could not be mounted through this flag at all.
 
+**Docker's other `--mount` keys are refused BY NAME.** `bind-propagation`, `bind-nonrecursive`,
+`volume-nocopy`, `volume-driver`, `volume-opt`, `tmpfs-mode` and `consistency` are each valid where
+a caller copied them from, and kern has no knob behind any of them. They were already refused, by
+the generic grammar dump, which is the right outcome reached with the wrong sentence: the reader was
+handed the whole grammar and left to diff it by eye against what they wrote. A genuine typo still
+gets the grammar, which is what a typo needs.
+
 **`kern create` now names the route instead of only the missing verb.** `docker create` + `cp` +
 `start` is how people seed files into a container before anything runs, and kern has no stopped box
 to copy into, because `kern cp` enters the namespaces of a live PID 1. The hint points at `-v`,
