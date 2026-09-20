@@ -154,6 +154,11 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --read-only         Read-only root (default is a writable overlay)
     -v, --volume S:D[:ro]   Mount into the box (repeatable). S = a host path, a named volume
                         (auto-created; see `kern volume`), or nfs://|smb://|sshfs:// URL
+    --mount type=…,src=…,dst=…  The same mount, written with named fields (repeatable).
+                        type=bind|volume|tmpfs, src=|source=, dst=|destination=|target=,
+                        ro|readonly, tmpfs-size=<sz>. A type= that disagrees with its src is
+                        refused rather than reinterpreted
+    --name <box>        Name the box (the same field as the positional name; pass one, not both)
     -e, --env K=V       Set an environment variable (repeatable)
     -w, --workdir <dir> Working directory inside the box
         --entrypoint <a> Replace the image's ENTRYPOINT (repeat for an exec-form list;

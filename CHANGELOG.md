@@ -17,6 +17,21 @@ and cost what borrowed names cost: a benchmark on this machine measured kern, pu
 `docker run --rm  4.2 ms`, and put it beside a real podman at 285 ms. A `docker` symlink now simply
 runs kern, with kern's grammar and kern's errors.
 
+**`box --mount` and `box --name`, measured rather than guessed at.** The argv that an agent-sandbox
+harness builds around a container runtime was read off a real one and each flag EXECUTED against the
+published binary: of fifteen, twelve were already accepted under the same spelling and three were
+not. Two of them land here.
+
+  * `--mount type=bind|volume|tmpfs,src=…,dst=…[,ro]` is the named-field spelling of `-v` and
+    `--tmpfs`, which is the form generated command lines emit. It is a TRANSLATION into those two
+    flags and not a second mount path, so a `--mount` and the `-v` it equals cannot start behaving
+    differently. A `type=` that disagrees with its `src` is REFUSED rather than reinterpreted:
+    `type=bind,src=data,dst=/app` would have mounted an empty auto-created named volume, silently,
+    because a bare source is a volume name and not a path.
+  * `--name <box>` is Docker's spelling for the name kern takes positionally. The same field, so
+    passing both is a usage error rather than a precedence rule: a line that says two things about
+    one box has no reading that is not a guess.
+
 **This release changes two flags that already existed, so it is a MINOR and not a patch.** The
 stability note above says an incompatible change to a verb, a flag or a `--json` shape lands only on
 a minor bump, and only after a deprecation entry one release earlier. There was no such entry and

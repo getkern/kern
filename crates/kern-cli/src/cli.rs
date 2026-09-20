@@ -2427,6 +2427,127 @@ fn valid_apparmor_name(s: &str) -> bool {
             .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
 }
 
+/// What one `--mount` spec turned into: the `-v` string it is equivalent to, or a `--tmpfs` one.
+///
+/// TWO OUTPUTS AND NOT ONE, because `--mount` spans two of kern's flags. `type=bind` and
+/// `type=volume` are both `-v` (the source tells them apart, which is [`crate::volume::classify`]'s
+/// job and not this function's); `type=tmpfs` has no source at all and is `--tmpfs`. Collapsing
+/// them into one string would put a tmpfs spec through the volume resolver, which would read the
+/// empty source as a named volume and create a directory on disk for it.
+#[derive(Debug, PartialEq, Eq)]
+enum MountSpec {
+    /// A `-v` spec: `src:dst` or `src:dst:ro`.
+    Volume(String),
+    /// A `--tmpfs` spec: `dst` or `dst:size`.
+    Tmpfs(String),
+}
+
+/// Parse one Docker `--mount type=…,src=…,dst=…` spec into the `-v`/`--tmpfs` spec it means.
+///
+/// WHY THIS EXISTS AS A TRANSLATION AND NOT A SECOND MOUNT PATH. Everything `--mount` can express,
+/// `-v` and `--tmpfs` already express; what it has that they do not is a NAME for each field, which
+/// is why generated command lines and orchestrators emit this form. Parsing it into the existing
+/// spec strings means the mount reaches exactly one resolver, so a `--mount` and the `-v` it is
+/// equivalent to cannot start to behave differently.
+///
+/// GRAMMAR, comma-separated `key=value` pairs, Docker's own key aliases accepted:
+///
+/// ```text
+///   type=bind|volume|tmpfs     default volume, as Docker's
+///   src=|source=               the host path or volume name
+///   dst=|destination=|target=  the path inside the box
+///   ro|readonly|readonly=true  read-only
+///   tmpfs-size=<size>          type=tmpfs only
+/// ```
+///
+/// ⛔ THE ONE CASE THAT IS REFUSED RATHER THAN TRANSLATED, and it is the reason this is not a
+/// three-line `split(',')`: `type=bind,src=data,dst=/app`. `-v data:/app` is a NAMED VOLUME, because
+/// the source is not absolute and does not start with `./`. Passed through, a caller who wrote
+/// `bind` and meant "the `data` directory next to me" would get an empty auto-created volume, the
+/// box would start, and the mount would be empty with no error anywhere. Docker refuses the same
+/// input. The check is `volume::classify`, so the rule that decides it is the same one the resolver
+/// applies later and the two cannot drift.
+fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
+    const USAGE: Error = Error::Usage(
+        "--mount type=bind|volume|tmpfs,src=<source>,dst=<path>[,ro] \
+         (e.g. --mount type=bind,src=/srv/app,dst=/app,ro)",
+    );
+    let (mut kind, mut src, mut dst, mut ro, mut size) = ("volume", "", "", false, "");
+    for field in spec.split(',') {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        // A bare `ro`/`readonly` is a flag, not a pair. Docker accepts both spellings and also the
+        // `readonly=true` pair form, so all three land here.
+        let (key, value) = match field.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (field, ""),
+        };
+        match key {
+            "type" => kind = value,
+            "src" | "source" => src = value,
+            "dst" | "destination" | "target" => dst = value,
+            // `readonly=false` is an explicit NO and must not turn the mount read-only: reading any
+            // `readonly` key as "yes" would make the one spelling that disables it enable it.
+            "ro" | "readonly" | "read-only" => ro = value.is_empty() || value == "true",
+            "tmpfs-size" => size = value,
+            // An unknown key is refused, not skipped: `type=bind,src=/a,dest=/b` (a real typo, the
+            // key is `dst` or `destination`) would otherwise parse as a mount with NO destination.
+            _ => return Err(USAGE),
+        }
+    }
+    if dst.is_empty() {
+        return Err(USAGE);
+    }
+    match kind {
+        "tmpfs" => {
+            if !src.is_empty() {
+                return Err(Error::Usage(
+                    "--mount type=tmpfs takes no src= (a tmpfs is empty by definition)",
+                ));
+            }
+            Ok(MountSpec::Tmpfs(if size.is_empty() {
+                dst.to_string()
+            } else {
+                format!("{dst}:{size}")
+            }))
+        }
+        "bind" | "volume" => {
+            if src.is_empty() {
+                return Err(USAGE);
+            }
+            if !size.is_empty() {
+                return Err(Error::Usage(
+                    "--mount tmpfs-size= applies to type=tmpfs only",
+                ));
+            }
+            // THE REFUSAL DOCUMENTED ABOVE. Asked of the resolver's own classifier, both ways: a
+            // `bind` whose source is not a path would become a volume, and a `volume` whose source
+            // is a path would become a bind. Either way the caller named one thing and would get
+            // the other, silently.
+            let named = crate::volume::classify(src) == crate::volume::SourceKind::Named;
+            if kind == "bind" && named {
+                return Err(Error::Usage(
+                    "--mount type=bind needs an absolute or ./-relative src (a bare name is a \
+                     named volume, which would mount an empty directory instead)",
+                ));
+            }
+            if kind == "volume" && !named {
+                return Err(Error::Usage(
+                    "--mount type=volume needs a volume NAME as src, not a path (use type=bind)",
+                ));
+            }
+            Ok(MountSpec::Volume(if ro {
+                format!("{src}:{dst}:ro")
+            } else {
+                format!("{src}:{dst}")
+            }))
+        }
+        _ => Err(USAGE),
+    }
+}
+
 /// real sandbox. Without a rootfs/image it still routes to `BoxRun` (which reports the missing
 /// source); `--plan` previews instead of running.
 fn parse_box(rest: &[&str]) -> Result<Command, Error> {
@@ -3022,6 +3143,36 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         volumes.push((*v).to_string());
                     }
                 }
+                // `--mount type=…,src=…,dst=…`: the long form of `-v`/`--tmpfs`, translated into
+                // them by `parse_mount_spec` so one resolver serves both spellings.
+                "--mount" => {
+                    i += 1;
+                    let Some(v) = rest.get(i) else {
+                        return Err(Error::Usage("--mount type=…,src=…,dst=… (see --help)"));
+                    };
+                    match parse_mount_spec(v)? {
+                        MountSpec::Volume(s) => volumes.push(s),
+                        MountSpec::Tmpfs(s) => tmpfs.push(s),
+                    }
+                }
+                // `--name <box>`: Docker's spelling for the name kern takes positionally. The SAME
+                // field, so giving both is refused rather than resolved by a precedence rule nobody
+                // would remember: `kern box web --name api` has said two things about one box, and
+                // silently picking either would name it something the command line also denies.
+                "--name" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) if !v.is_empty() && !v.starts_with('-') => {
+                            if name.is_some() {
+                                return Err(Error::Usage(
+                                    "--name and the positional name are the same field; pass one",
+                                ));
+                            }
+                            name = Some(v);
+                        }
+                        _ => return Err(Error::Usage("--name <box> (e.g. --name web)")),
+                    }
+                }
                 "-e" | "--env" => {
                     i += 1;
                     if let Some(v) = rest.get(i) {
@@ -3527,10 +3678,11 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
 /// Flags that belong to `box` and cannot mean anything on `run`, because `run` has no image and no
 /// namespaces. Every entry is checked against the `box` parser by
 /// `every_box_only_flag_is_really_a_box_flag`, so the redirect can never name a flag `box` does not
-/// take. `--rm` and `--name` are deliberately absent: they are Docker reflexes that `box` does not
-/// have either (a box is named positionally and is thrown away by default), so pointing at `box`
-/// for them would trade one wrong answer for another.
+/// take. `--rm` is deliberately absent: `run` is a foreground one-shot that leaves nothing behind,
+/// so pointing at `box` for it would trade one wrong answer for another.
 const BOX_ONLY_FLAGS: &[&str] = &[
+    "--mount",
+    "--name",
     "--image",
     "--rootfs",
     "--bind-rootfs",
@@ -6629,6 +6781,105 @@ mod tests {
                 "BOX_ONLY_FLAGS names {flag}, which the box parser does not accept"
             );
         }
+    }
+
+    // `--mount` is a TRANSLATION into `-v`/`--tmpfs`, so what it must be pinned against is the spec
+    // string it produces: if the two ever stopped agreeing, a `--mount` and the `-v` it is
+    // documented to equal would resolve differently and nothing else would notice.
+    #[test]
+    fn mount_spec_translates_to_the_volume_flag() {
+        let v = |s: &str| parse_mount_spec(s).unwrap();
+        // The two `-v` shapes, by both key spellings Docker accepts.
+        assert_eq!(
+            v("type=bind,src=/srv/app,dst=/app"),
+            MountSpec::Volume("/srv/app:/app".into())
+        );
+        assert_eq!(
+            v("type=bind,source=/srv/app,target=/app"),
+            MountSpec::Volume("/srv/app:/app".into())
+        );
+        assert_eq!(
+            v("type=volume,src=data,destination=/data"),
+            MountSpec::Volume("data:/data".into())
+        );
+        // `type=` DEFAULTS to volume, as Docker's does.
+        assert_eq!(
+            v("src=data,dst=/data"),
+            MountSpec::Volume("data:/data".into())
+        );
+        // Read-only, in all three spellings, and `readonly=false` is an explicit NO.
+        for ro in ["ro", "readonly", "readonly=true", "read-only"] {
+            assert_eq!(
+                v(&format!("type=bind,src=/a,dst=/b,{ro}")),
+                MountSpec::Volume("/a:/b:ro".into()),
+                "{ro} should be read-only"
+            );
+        }
+        assert_eq!(
+            v("type=bind,src=/a,dst=/b,readonly=false"),
+            MountSpec::Volume("/a:/b".into()),
+            "readonly=false must NOT make the mount read-only"
+        );
+        // tmpfs is the other flag, and `--tmpfs`'s own `path[:size]` grammar.
+        assert_eq!(v("type=tmpfs,dst=/run"), MountSpec::Tmpfs("/run".into()));
+        assert_eq!(
+            v("type=tmpfs,dst=/run,tmpfs-size=64m"),
+            MountSpec::Tmpfs("/run:64m".into())
+        );
+    }
+
+    // THE REFUSALS, which are the reason this is a parser and not a `split(',')`. Each of these
+    // would otherwise start a box whose mounts are not the ones the caller wrote.
+    #[test]
+    fn mount_spec_refuses_what_it_cannot_translate_faithfully() {
+        for bad in [
+            // A `bind` whose source is a bare name: `-v data:/app` is a NAMED VOLUME, so this would
+            // silently mount an empty auto-created directory instead of the caller's data.
+            "type=bind,src=data,dst=/app",
+            // And the mirror: a `volume` whose source is a path would become a bind mount.
+            "type=volume,src=/srv/data,dst=/data",
+            // A typo'd key would parse as a mount with no destination at all.
+            "type=bind,src=/a,dest=/b",
+            // Missing halves.
+            "type=bind,src=/a",
+            "type=bind,dst=/b",
+            "",
+            // A tmpfs has no source, and a size belongs only to a tmpfs.
+            "type=tmpfs,src=/a,dst=/b",
+            "type=bind,src=/a,dst=/b,tmpfs-size=64m",
+            // An unknown type.
+            "type=nfs,src=/a,dst=/b",
+        ] {
+            assert!(
+                parse_mount_spec(bad).is_err(),
+                "--mount {bad:?} should be refused, not translated"
+            );
+        }
+    }
+
+    // `--name` is the SAME field as the positional name, and the parser must treat it as one: both
+    // spellings land in the same place, and a command line carrying both is refused.
+    #[test]
+    fn name_flag_is_the_positional_name() {
+        let named = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            parse(&owned).map(|(_, c)| match c {
+                Command::BoxRun { name, .. } => name,
+                other => panic!("expected BoxRun, got {other:?}"),
+            })
+        };
+        assert_eq!(
+            named(&["box", "--name", "web", "--image", "alpine", "--", "true"]).unwrap(),
+            "web"
+        );
+        assert_eq!(
+            named(&["box", "web", "--image", "alpine", "--", "true"]).unwrap(),
+            "web"
+        );
+        assert!(
+            named(&["box", "web", "--name", "api", "--image", "alpine", "--", "true"]).is_err(),
+            "the positional name and --name are one field; both is a contradiction"
+        );
     }
 
     // The 0.5 CPU/RAM knob set is frozen: `--cpuset-cpus` (pinning) and `--memory-swap-max` (swap
