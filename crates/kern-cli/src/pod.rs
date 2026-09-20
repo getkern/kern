@@ -778,11 +778,49 @@ pub fn narrate_to_stderr() -> bool {
 
 /// passes `ImageDefault` when the stack has image boxes and `Requested` when a service asked in as
 /// many words; a pod of root-only services stays single-uid (faster, more isolated).
+/// Marker file: this pod was created by `kern pod create`, in as many words, rather than derived
+/// from a compose stack. Empty, because its existence is the fact, in the shape `pasta.watched`
+/// already uses.
+///
+/// WHAT IT DECIDES is one asymmetry and nothing else. `stop` tears a pod down once its last member
+/// stops, which is right for a stack (it mirrors `compose down`) and wrong for a pod the operator
+/// named into existence and can name out of it with `pod rm`. Measured before this existed: a pod
+/// whose last member EXITED ON ITS OWN survived, and the same pod whose last member was stopped did
+/// not, so the same end state (no members) had two outcomes depending on how it was reached.
+///
+/// It does not make a pod immortal. `kern pod rm` removes it, `kern stop <pod-name>` names it
+/// directly and removes it, and `stop --all` sweeps it. Only being EMPTIED as a side effect is now
+/// survivable, and only for a pod that was asked for explicitly.
+const EXPLICIT_MARKER: &str = "explicit";
+
+/// True when this pod was created by `kern pod create` rather than derived from a stack.
+///
+/// An unreadable or absent marker answers FALSE, which is the pre-existing behaviour: a pod from an
+/// older kern, or one whose marker could not be written, is torn down on empty exactly as before.
+/// The failure direction is deliberate - a pod that outlives its members forever because a write
+/// failed is a leak, and the holder is a process.
+pub fn is_explicit(name: &str) -> bool {
+    pod_dir(name).join(EXPLICIT_MARKER).exists()
+}
+
 pub fn create_with_range(
     name: &str,
     want_outbound: bool,
     uid_range: kern_isolation::UidRange,
     bridge: Option<&str>,
+) -> Result<(), Error> {
+    create_with_range_explicit(name, want_outbound, uid_range, bridge, false)
+}
+
+/// [`create_with_range`] plus the one bit that says who asked. `explicit` is true only on the
+/// `kern pod create` path; compose derives its pod and passes false, so a stack keeps the cleanup it
+/// has always had.
+pub fn create_with_range_explicit(
+    name: &str,
+    want_outbound: bool,
+    uid_range: kern_isolation::UidRange,
+    bridge: Option<&str>,
+    explicit: bool,
 ) -> Result<(), Error> {
     validate_name(name)?;
     if let Some(cidr) = bridge {
@@ -840,6 +878,20 @@ pub fn create_with_range(
         } else {
             return Err(Error::Sandbox(format!("pod dir: {e}")));
         }
+    }
+
+    // AFTER the directory is settled, and that ordering is the whole of it. The `AlreadyExists` arm
+    // above `remove_dir_all`s a stale pod dir and recreates it, so a marker written before this
+    // point is deleted by the very path that makes the directory usable. Written here it survives
+    // both arms: the fresh-create one, and the one that reclaimed a dead pod's directory.
+    //
+    // It also lands BEFORE the holder is spawned, which is what matters for the decision it feeds: a
+    // pod whose last member stopped before the marker existed would be torn down as if it were a
+    // stack. A write that FAILS is ignored on purpose. `is_explicit` then answers false and the pod
+    // keeps the teardown it had before this existed, which leaks nothing; the opposite failure
+    // direction, a pod outliving its members because a write failed, leaks a holder process.
+    if explicit {
+        let _ = std::fs::write(dir.join(EXPLICIT_MARKER), b"");
     }
     // First after the claim, and nothing fallible may be inserted above it: see `record_pod_boot`,
     // which owns that argument so it cannot be separated from the call again.

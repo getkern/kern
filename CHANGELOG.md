@@ -7,6 +7,17 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**Stopping a pod's last member removed the pod, and letting that member exit on its own did not.**
+The same end state, no members left, had two outcomes depending on how it was reached: `kern stop`
+on the last member tore the pod down, its holder, its network namespace and its shared files, while
+the identical pod whose last member ran to completion stayed up. `kern pod create` is a verb that
+makes a thing and `kern pod rm` is the verb that removes it; a `stop` that also removed it made the
+second one optional by accident. A pod created by name now survives being emptied. Three paths still
+tear one down, and they are the three where removal is what was asked for: `stop --all`, naming the
+pod itself (`kern stop <pod>`), and a pod DERIVED from a compose stack, which carries no marker and
+cleans up on `compose down` exactly as before. `pentest/pentest-pod-boundary.sh` asserts all four in
+one section, because the fix is only correct if the three that should still remove still do.
+
 **A `chown` to a non-root uid failed inside a pod, and nothing said why.** `kern pod create` mapped a
 single uid unless `--uid-range` was passed, so a member running an official image that drops
 privilege in its entrypoint (postgres, mysql, nginx) failed closed, silently, until something

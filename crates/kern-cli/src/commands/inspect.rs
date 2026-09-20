@@ -1973,12 +1973,27 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
         .filter(|b| !b.pod.is_empty() && !target_pids.contains(&b.pid))
         .map(|b| b.pod.as_str())
         .collect();
+    // A pod the operator CREATED BY NAME is not torn down merely because its last member stopped.
+    // Before this, the same end state had two outcomes depending on how it was reached: a pod whose
+    // last member exited on its own survived, and the same pod whose last member was STOPPED did
+    // not. `kern pod create` is a verb that makes a thing, and `kern pod rm` is the verb that
+    // removes it; a `stop` that also removed it made the second verb optional by accident.
+    //
+    // THREE WAYS STILL TEAR ONE DOWN, and they are the three where removal is what was asked for:
+    // `--all` sweeps everything by definition; naming the pod itself (`kern stop <pod>`) is a
+    // request about the pod and not about a box inside it; and a pod DERIVED from a stack has no
+    // explicit marker, so `compose down` and a stack emptied by `stop` clean up exactly as before.
     for pod in stopped_pods {
-        if !survivors.contains(pod) {
-            let (existed, _) = crate::pod::teardown(pod);
-            if existed {
-                println!("removed pod '{pod}'");
-            }
+        if survivors.contains(pod) {
+            continue;
+        }
+        let named_directly = !all && names.iter().any(|n| n == pod);
+        if !all && !named_directly && crate::pod::is_explicit(pod) {
+            continue;
+        }
+        let (existed, _) = crate::pod::teardown(pod);
+        if existed {
+            println!("removed pod '{pod}'");
         }
     }
     // Don't silently ignore refs that matched no running box (and no managed unit). A ref matched a

@@ -5136,7 +5136,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             uid_range,
             no_uid_range,
             bridge,
-        } => crate::pod::create_with_range(
+        } => crate::pod::create_with_range_explicit(
             &name,
             outbound,
             // THE DEFAULT MAPS THE RANGE, which is the same default a standalone `--image` box has.
@@ -5157,6 +5157,10 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 kern_isolation::UidRange::ImageDefault
             },
             bridge.as_deref(),
+            // EXPLICIT: the operator typed `kern pod create`. It changes one thing, in `stop`: a pod
+            // named into existence is not torn down merely because its last member stopped, the way
+            // a stack's derived pod is. `kern pod rm` is the verb that removes it.
+            true,
         ),
         Command::PodList { json } => {
             if json {
