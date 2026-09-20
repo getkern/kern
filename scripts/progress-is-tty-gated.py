@@ -52,7 +52,20 @@ ALLOWED = ("kern: ", "error:", "hint:")
 
 
 def _test_spans(src: str):
-    """Byte ranges of `#[cfg(test)]` items, which are not shipped and may print however they like."""
+    """Byte ranges of `#[cfg(test)]` items, which are not shipped and may print however they like.
+
+    BRACES INSIDE STRING LITERALS ARE NOT BRACES, and counting them was a blind spot rather than a
+    false alarm: an unbalanced one inside a test made the depth never return to zero, so the span
+    ran to the END OF THE FILE and every call after it was skipped as "test code". The selftest
+    found it the only way it could be found, by sabotaging a file whose test module happened to
+    contain `"{{.Repository}"` - a deliberately malformed template, which is exactly the kind of
+    string a test for a template renderer holds. The gate reported green on its own violation.
+
+    Handles `"..."` with backslash escapes and `r"..."`/`r#"..."#` raw strings, which is what Rust
+    source actually contains here. Char literals are not tracked: `'{'` is legal Rust and would
+    unbalance the count, but a brace char literal inside a test module is not a shape this tree
+    has, and pretending to a completeness this function does not have would be the worse error.
+    """
     spans = []
     for m in re.finditer(r"#\[cfg\(test\)\]", src):
         brace = src.find("{", m.end())
@@ -60,9 +73,21 @@ def _test_spans(src: str):
             continue
         i, depth = brace, 0
         while i < len(src):
-            if src[i] == "{":
+            c = src[i]
+            if c == "r" and (m2 := re.match(r'r(#*)"', src[i:])):
+                # Raw string: no escapes, terminated by `"` + the same number of `#`.
+                end = src.find('"' + m2.group(1), i + len(m2.group(0)))
+                i = len(src) if end < 0 else end + 1 + len(m2.group(1))
+                continue
+            if c == '"':
+                i += 1
+                while i < len(src) and src[i] != '"':
+                    i += 2 if src[i] == "\\" else 1
+                i += 1
+                continue
+            if c == "{":
                 depth += 1
-            elif src[i] == "}":
+            elif c == "}":
                 depth -= 1
                 if depth == 0:
                     break
