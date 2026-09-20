@@ -4,7 +4,7 @@
 
 **kern:** a fast, rootless container runtime and sandbox, built on virtual resources. Run workloads in a real container, including an agent's tool-call or LLM-generated code.
 
-**A real, kernel-enforced container in ~3.9 ms, out of one static binary with no daemon.**
+**A real, kernel-enforced container in a few milliseconds, out of one static binary with no daemon.**
 
 <p align="center">
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.9 ms against docker run's 294 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0, where your hardware differs and you should measure your own.">
@@ -52,7 +52,7 @@ kern compose up -d
 ```
 
 - **A real container.** Real OCI images: `pull`, `build` from a `Containerfile` or `Dockerfile`,
-  `commit`, `push`, `save`/`load`. A box from an image starts in ~3.4 ms.
+  `commit`, `push`, `save`/`load`. A box from an image starts in single-digit milliseconds.
 - **Run LLM-generated code in a sandbox, one per call.** The snippet a model just wrote, the command an
   agent just decided to run, a notebook cell, a CI step. kern starts a box, runs it, deletes it,
   fast enough that per-call isolation is the default. Network off unless you ask, memory and PID
@@ -295,16 +295,14 @@ device node grants that node and nothing else. [docs/RESOURCES.md](docs/RESOURCE
 
 ## What a container costs, and what kern does not have
 
-All three columns measured on one host, same workload, same day: an Intel i7-14700KF running Linux
-7.0.0, with the method in [BENCHMARKS.md](BENCHMARKS.md).
+Properties, not timings: what each one IS, where a reader can check the answer without a stopwatch.
+The timings are in [BENCHMARKS.md](BENCHMARKS.md), measured on one host, same workload, same day.
 
 | | kern | Docker | Podman |
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **2.7 ms** | 294 ms | 288 ms |
-| Cold start, from an OCI image | **3.9 ms** | 294 ms | 288 ms |
-| Stop a service (init handles SIGTERM) | **~2.3 ms** | ~162 ms | ~194 ms |
+| Cold start | **milliseconds** | hundreds of ms | hundreds of ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one static binary** | daemon stack | multi-binary install |
 | OCI images, pull / build / push | yes | yes | yes |
@@ -314,18 +312,25 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 
 ## Performance
 
-Intel i7-14700KF, Linux 7.0.0, the release binary, alternating batches on an idle machine,
-`powersave` governor.
+**The numbers are in [BENCHMARKS.md](BENCHMARKS.md), with the machine, the method and the date, and
+they are not repeated here.** A figure on a front page is read as a promise about the reader's
+machine, and it is the one thing on this page nobody can check without running it. It also drifts:
+the same binary, on the same machine, spreads several percent across one afternoon for the same box,
+so any single digit published here would be wrong for most readers most of the time, in one
+direction or the other.
 
-| | kern | runc | podman | docker |
-|---|---:|---:|---:|---:|
-| Cold start (bare box) | **2.7 ms** | 13.2 ms | 288 ms | 294 ms |
-| 200 boxes in parallel | **0.10 s** | 0.32 s | 43.6 s | 16.6 s |
+What is stable enough to state without a number: kern starts a container in **single-digit
+milliseconds** and the engines take **hundreds**, which is two orders of magnitude and survives any
+day's drift. kern is faster **in parallel** than serially compared to them, because a daemon
+serialises what a daemonless runtime forks. And the near neighbours that do LESS than a box start,
+like bubblewrap leaving the process in the caller's cgroup with no `memory.max`, are a different
+comparison that belongs with its method rather than on a front page.
 
-These are engines, and the distance to them is the one that means something. The near neighbours that
-do LESS than a box start - bubblewrap leaves the process in the caller's cgroup with no `memory.max` -
-are a different comparison, and it lives with its method in
-**[BENCHMARKS.md](BENCHMARKS.md)** rather than on a front page.
+Run it on your own hardware, against whatever you have installed:
+
+```sh
+python3 examples/benchmark.py --runs 200 --conc 200
+```
 
 ## Security
 

@@ -7,6 +7,23 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**The README no longer publishes a latency figure, and the canonical one moved to BENCHMARKS.md.**
+A number on a front page is read as a promise about the reader's machine, has no method, machine or
+date beside it, and is the one claim on that page nobody can check without running it. It also
+drifts more than it looks: measured across eight replicas on one afternoon, the same binary read
+3.93 to 4.24 ms for the same box, so "under 4 ms" would have been false in 8 cases out of 8, while
+"3.9 ms" was true only at the favourable end of the same day. The headline now says "a few
+milliseconds", the feature bullet says "single-digit milliseconds", the comparison table states
+properties rather than timings, and the Performance section says where the numbers live and why they
+are not repeated there.
+
+The README had already drifted from itself: the headline said `~3.9 ms` while a bullet forty lines
+below said `~3.4 ms`, the value from before an August re-measurement. `stale-numbers.py` could not
+see it, because its anchor matched one phrasing and that bullet used another, so it stood while six
+other files were corrected. The anchor is now the `box --image` row of BENCHMARKS.md, which carries
+the machine, the method and the date in the same file and is therefore the only claimant a reader
+can check; the failure message says not to put a figure back in the README to satisfy the check.
+
 **Every box leaked its environment sidecar, and only `stop` ever cleaned one up.** kern records a
 box's environment in `$XDG_RUNTIME_DIR/kern/env/<name>-<pid>` so `kern exec` and the healthcheck can
 read an environment that `/proc/<pid1>/environ` no longer gives them once the box drops privilege.

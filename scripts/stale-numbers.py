@@ -569,7 +569,7 @@ def gpu_claims_agree() -> list[str]:
 
 
 def latency_claims_agree() -> list[str]:
-    """The OCI-image cold start claimed anywhere must equal the one the README states.
+    """The OCI-image cold start claimed anywhere must equal the one BENCHMARKS.md measures.
 
     The twin of [`size_claims_agree`], for the same reason and after the same failure: on 2026-08-22
     that figure read 3.4 ms in the README headline, the GIF generator, both binding READMEs, the FAQ
@@ -582,13 +582,25 @@ def latency_claims_agree() -> list[str]:
     the number is measured again - only the README has to be edited, and every other claimant is then
     checked against it.
     """
-    readme = re.search(
-        r"kernel-enforced container in\s+~?([\d.]+)\s*ms", open("README.md", encoding="utf-8").read()
+    # THE ANCHOR MOVED OUT OF THE README ON 2026-09-20, and the reason is the point of this check.
+    # It used to read the README headline, on the argument that "the README holds the one right
+    # answer". It does not: a front page states a figure with no machine, no method and no date
+    # beside it, so it is the one claimant that cannot be checked by the reader and the one most
+    # likely to be stale. MEASURED that afternoon, the same binary read 3.93 to 4.24 ms for the same
+    # box across eight replicas, so ANY single digit on a front page is wrong for most readers.
+    #
+    # The README now states an order of magnitude and points here. The canonical figure is the row
+    # in BENCHMARKS.md, which carries the machine, the method and the date in the same file, and is
+    # therefore the only claimant a reader can check.
+    source = "BENCHMARKS.md"
+    anchor = re.search(
+        r"\|\s*\*\*kern\*\*\s*`box --image`\s*\|\s*\*\*~?([\d.]+)\s*ms\*\*",
+        open(source, encoding="utf-8").read(),
     )
-    if not readme:
-        return ["README.md no longer states the image cold start in its headline, so nothing can be "
-                "checked against it. Restore the claim or drop this check."]
-    canonical = readme.group(1)
+    if not anchor:
+        return [f"{source} no longer states the image cold start in its table, so nothing can be "
+                "checked against it. Restore the row or drop this check."]
+    canonical = anchor.group(1)
     claim = re.compile(
         r'KERN_MS\s*=\s*"~?([\d.]+)\s*ms"'
         r'|from an OCI image in ~?([\d.]+)\s*ms'
@@ -619,7 +631,7 @@ def latency_claims_agree() -> list[str]:
                 if said != canonical:
                     bad.append(
                         f"{path}:{lineno} claims a {said} ms image cold start, "
-                        f"README.md says {canonical} ms"
+                        f"{source} says {canonical} ms"
                     )
     return bad
 
@@ -691,9 +703,10 @@ def main(argv: list[str]) -> int:
     for problem in latency_claims_agree():
         total += 1
         print(f"\n{problem}")
-        print("       one measurement, several homes: the headline is canonical and every other "
-              "claimant is checked against it. Edit README.md first, then the others; if the GIF "
-              "generator moved, re-run it: python3 assets/make-demo-gif.py")
+        print("       one measurement, several homes: the BENCHMARKS.md table is canonical and every "
+              "other claimant is checked against it. Edit BENCHMARKS.md first, then the others; if "
+              "the GIF generator moved, re-run it: python3 assets/make-demo-gif.py. The README "
+              "deliberately states no figure, so do not put one back to satisfy this check.")
     for problem in no_binary_size_claim():
         total += 1
         print(f"\n{problem}")
