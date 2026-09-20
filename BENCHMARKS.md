@@ -42,6 +42,27 @@ workloads you would already put in one pod, and the wrong number to compare with
 which is a box with all seven namespaces of its own. It is not the default for the same reason, plus
 one more: the fast path needs a holder process alive, and kern ships no daemon.
 
+**The largest number on this page is not the box, and it is not kern.** A `run_code` call that
+imports two stdlib modules measures **46.8 ms** on `python:3.12-slim`, against 13.8 ms for one that
+imports nothing. The reason is in the image: that tag ships **164 `.py` files in the standard library
+and 9 `.pyc`**, so every import compiles its source. `-X importtime` attributes 29.5 ms to `re` and
+34.0 cumulative to `json`. Precompiling the bytecode is one line, and it is worth more than every
+runtime optimisation on this page put together:
+
+```dockerfile
+FROM python:3.12-slim
+RUN python3 -m compileall -q -j 0 /usr/local/lib/python3.12
+```
+
+| `run_code` | `python:3.12-slim` | precompiled | |
+|---|---:|---:|---:|
+| `print(1)` | 13.82 ms | 12.27 ms | -1.55 |
+| `import json,re` | **46.82 ms** | **17.66 ms** | **-29.15** |
+
+For comparison, the whole box is 3.9 ms and the entire uid-range phase this page spends a paragraph
+on is 0.886. Two interpreter flags were measured on the same image and are not worth shipping:
+`-S` is worth -1.7 ms and `-I` is worth nothing, and neither touches the import cost.
+
 **Method.** Each runtime starts one container running `/bin/true` and tears it down, caches warm,
 and the figure is total time divided by runs rather than a per-call timer, which at this scale costs
 more than the thing it measures. Five replicas of five batches of 200, medians of medians, all in one

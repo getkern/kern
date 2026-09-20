@@ -168,6 +168,28 @@ with kern.Sandbox() as sbx, sbx.kernel() as k:
 A refused mount raises `MountRefused` rather than the generic `SandboxError`, so a caller can tell
 "this sandbox will not do that" from "the sandbox broke".
 
+## The image decides more than the runtime does
+
+`run_code` that imports two standard-library modules measures **46.8 ms** on the default
+`python:3.12-slim`, against 13.8 ms for one that imports nothing. That tag ships 164 `.py` files in
+the standard library and 9 `.pyc`, so every import compiles its source. Precompiling the bytecode is
+one line and is worth **29 ms**, which is more than the box, the interpreter start and every runtime
+flag combined:
+
+```dockerfile
+FROM python:3.12-slim
+RUN python3 -m compileall -q -j 0 /usr/local/lib/python3.12
+```
+
+| `run_code` | `python:3.12-slim` | precompiled |
+|---|---:|---:|
+| `print(1)` | 13.82 ms | 12.27 ms |
+| `import json,re` | **46.82 ms** | **17.66 ms** |
+
+Build it once and pass it: `run_code(..., image="my-python")`. The default stays the stock tag,
+because an SDK that silently required a custom image would be worse than one that costs 29 ms and
+says so. Measured on an Intel i7-14700KF, Linux 7.0.0, idle; [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md) has the method.
+
 ## Prewarming: a box ready before the call arrives
 
 `prewarm=N` keeps N boxes started in advance, each holding a booted interpreter that has run nothing,
