@@ -7,6 +7,52 @@
 
 use super::*;
 
+/// Render one cached image through an `images --format` template.
+///
+/// THE FIELDS THE CACHE HOLDS AND NO OTHERS. Docker's table has `{{.Repository}}`, `{{.Tag}}`,
+/// `{{.ID}}`, `{{.Size}}` and `{{.CreatedSince}}`, and kern's cache has a reference, a byte size
+/// and a pull time; there is no image ID here and no creation date, only the moment this machine
+/// fetched it. An unknown token is REFUSED rather than rendered empty, the same rule `ps --format`
+/// and `inspect --format` follow, because a template silently producing blank columns is a listing
+/// a script reads as "these images have no tag".
+///
+/// `{{.Repository}}` and `{{.Tag}}` SPLIT THE REFERENCE at the last colon, and only when what
+/// follows carries no `/`: `localhost:5000/app` is a host and a path, not a repository and a tag,
+/// and splitting it there would name a repository that does not exist. A reference with no tag
+/// renders `latest`, which is the tag it resolves to.
+fn render_image_format(tmpl: &str, e: &ImageEntry) -> Result<String, Error> {
+    let (repo, tag) = match e.name.rsplit_once(':') {
+        Some((r, t)) if !t.contains('/') => (r, t),
+        _ => (e.name.as_str(), "latest"),
+    };
+    let mut out = String::with_capacity(tmpl.len());
+    let mut rest = tmpl;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let close = after
+            .find("}}")
+            .ok_or(Error::Usage("images --format: unterminated `{{`"))?;
+        match after[..close].trim() {
+            ".Repository" => out.push_str(&crate::ui::scrub(repo)),
+            ".Tag" => out.push_str(&crate::ui::scrub(tag)),
+            ".Reference" | ".ID" | ".Id" => out.push_str(&crate::ui::scrub(&e.name)),
+            ".Size" => out.push_str(&kern_common::fmt_bytes(e.size)),
+            ".Dangling" => out.push_str(&e.dangling.to_string()),
+            _ => {
+                return Err(Error::Usage(
+                    "images --format: unsupported token (supported: {{.Repository}} {{.Tag}} \
+                     {{.Reference}} {{.Size}} {{.Dangling}}; kern's cache holds no image ID and \
+                     no creation date, only when this machine pulled it - use --json for that)",
+                ))
+            }
+        }
+        rest = &after[close + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// Does cached image `r` (with its dangling flag) pass every `--filter`?
 ///
 /// `reference=` is a GLOB on the reference as `kern images` prints it, with `*` standing for any run
@@ -100,7 +146,7 @@ fn glob_match(pattern: &str, subject: &str) -> bool {
     p[pi..].iter().all(|c| *c == b'*')
 }
 
-pub fn images(json: bool, filters: &[(String, String)]) -> Result<(), Error> {
+pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) -> Result<(), Error> {
     // FILTERED ONCE, BEFORE EITHER RENDERER, so the human table and `--json` describe the same set
     // by construction - the property a script comparing the two would otherwise take on trust.
     let all = image_entries();
@@ -129,6 +175,17 @@ pub fn images(json: bool, filters: &[(String, String)]) -> Result<(), Error> {
         })
         .collect();
 
+    // `--format T` BEFORE either renderer, because it answers a different question from both: the
+    // table is for a reader and `--json` is a document, while this is one line per image in the
+    // caller's own shape. An empty result prints NOTHING here rather than the table's "no images"
+    // sentence: a caller piping this into a loop must get zero lines, not one line of prose it
+    // would then try to parse as an image name.
+    if let Some(tmpl) = format {
+        for e in &rows {
+            println!("{}", render_image_format(tmpl, e)?);
+        }
+        return Ok(());
+    }
     if json {
         let out = kern_common::json_array(&rows, |e| {
             format!(
@@ -669,7 +726,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod glob_tests {
-    use super::glob_match;
+    use super::{glob_match, render_image_format, ImageEntry};
 
     /// TOTALITY AND TERMINATION: no pattern makes the matcher loop or panic, and backtracking is
     /// bounded.
@@ -732,5 +789,39 @@ mod glob_tests {
         ] {
             assert_eq!(glob_match(pat, subj), want, "{pat:?} vs {subj:?}");
         }
+    }
+
+    /// The reference split is the part that gets silently wrong: a registry PORT looks exactly like
+    /// a tag, and splitting there would name a repository that does not exist. These pin both sides.
+    #[test]
+    fn image_format_splits_reference_into_repository_and_tag() {
+        let row = |name: &str| ImageEntry {
+            name: name.to_string(),
+            size: 7_340_032,
+            pulled: 0,
+            dangling: false,
+        };
+        let r = |name: &str, t: &str| render_image_format(t, &row(name)).unwrap();
+        assert_eq!(r("alpine:3.19", "{{.Repository}}:{{.Tag}}"), "alpine:3.19");
+        // NO TAG resolves to `latest`, which is the tag it actually resolves to.
+        assert_eq!(r("alpine", "{{.Repository}}:{{.Tag}}"), "alpine:latest");
+        // A REGISTRY PORT IS NOT A TAG: what follows the last colon carries a `/`, so the whole
+        // thing is the repository.
+        assert_eq!(
+            r("localhost:5000/app", "{{.Repository}}:{{.Tag}}"),
+            "localhost:5000/app:latest"
+        );
+        assert_eq!(
+            r("localhost:5000/app:1.0", "{{.Repository}}|{{.Tag}}"),
+            "localhost:5000/app|1.0"
+        );
+        // The other tokens, and literal text around them.
+        assert_eq!(r("alpine:3.19", "[{{.Reference}}]"), "[alpine:3.19]");
+        assert_eq!(r("alpine:3.19", "{{.Dangling}}"), "false");
+        assert!(r("alpine:3.19", "{{.Size}}").contains('M'));
+        // An unknown token is REFUSED, not rendered empty: blank columns read as "this image has
+        // no tag" to whatever parses the line.
+        assert!(render_image_format("{{.CreatedSince}}", &row("alpine")).is_err());
+        assert!(render_image_format("{{.Repository}", &row("alpine")).is_err());
     }
 }

@@ -58,7 +58,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
 
   {d}Images{z}
     {c}search{z} <query> [--json]                                        Search Docker Hub for images
-    {c}pull{z} <image>                                                   Fetch an image into the cache (`--image` uses it)
+    {c}pull{z} <image> [-q|--quiet]                                      Fetch an image into the cache (`--image` uses it)
     {c}pull{z} <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
     {c}push{z} <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
@@ -67,7 +67,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}build{z} --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that Dockerfile, and build NOTHING
                                                                      Exit 0 if it builds here; the lines kern does not act on are marked `dropped`
                                                                      -t is repeatable: one build, every name applied (layers shared, not copied)
-    {c}images{z} [--json] [--filter K=V]                                  List pulled (cached) images
+    {c}images{z} [<repo>] [--json] [--filter K=V] [--format T]             List pulled (cached) images (<repo> = --filter reference=<repo>)
                                                                      --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
     {c}image{z} ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs under Docker's noun-first grouping (one parser each, not a second)
     {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)

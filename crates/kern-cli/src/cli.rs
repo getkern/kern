@@ -407,8 +407,12 @@ pub enum Command {
     Images {
         json: bool,
         /// `--filter reference=<pattern>` / `--filter dangling=<bool>`, repeatable and ANDed. The
-        /// two keys kern's cache can answer; any other is refused at parse time by name.
+        /// two keys kern's cache can answer; any other is refused at parse time by name. A
+        /// positional `images <repo>` lands here too, as `reference=<repo>`.
         filters: Vec<(String, String)>,
+        /// `--format T`: one line per image through a Go-style template. The fields the cache
+        /// holds and no others; an unknown token is refused rather than rendered empty.
+        format: Option<String>,
     },
     /// `kern rmi <image>...`: remove cached images by ref (or sanitized stem), reclaiming any layers
     /// left referenced by no other image.
@@ -1010,7 +1014,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // spelling mistake. Thirty other verbs already refuse unknown flags; `pull` and `push` were
         // the two that did not.
         Some("pull") => {
-            reject_unknown_flags("pull", &rest, &["--dest", "--platform"])?;
+            // `--quiet`/`-q` suppresses the progress output. Docker's own flag, accepted here
+            // because the caller that passes it is asking for the one thing kern's progress writer
+            // already knows how to not do; the image reference it prints on success is the point of
+            // the verb and stays.
+            reject_unknown_flags("pull", &rest, &["--dest", "--platform", "--quiet", "-q"])?;
             let cmd = parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?;
             if let Command::Pull { image, .. } = &cmd {
                 check_reference(image, "pull")?;
@@ -1082,7 +1090,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // `images`: list pulled (cached) images.
         Some("images") => {
-            reject_unknown_flags("images", &rest, &["--json", "--filter"])?;
+            reject_unknown_flags("images", &rest, &["--json", "--filter", "--format"])?;
             // `--filter` with the two keys a cache actually has an answer for. Docker's other keys
             // (`before=`, `since=`, `label=`) need per-image metadata kern's cache does not keep, so
             // they are refused BY NAME rather than accepted and ignored: a filter that silently
@@ -1113,9 +1121,28 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 }
                 i += 1;
             }
+            // `images REPO` is Docker's positional name filter, and it means exactly
+            // `--filter reference=REPO`. Mapped onto that rather than given a field of its own, so
+            // the two spellings cannot come to select different images. Giving both is refused:
+            // `images alpine --filter reference=nginx` has named two different sets.
+            if let Some(repo) = rest.iter().skip(1).find(|a| !a.starts_with('-')) {
+                let positional_is_a_value = rest
+                    .iter()
+                    .position(|a| a == repo)
+                    .is_some_and(|at| at > 0 && matches!(rest[at - 1], "--filter" | "--format"));
+                if !positional_is_a_value {
+                    if filters.iter().any(|(k, _)| k == "reference") {
+                        return Err(Error::Usage(
+                            "images <repo> and --filter reference= are the same filter; pass one",
+                        ));
+                    }
+                    filters.push(("reference".to_string(), (*repo).to_string()));
+                }
+            }
             Command::Images {
                 json: rest.contains(&"--json"),
                 filters,
+                format: flag_value(&rest, "--format"),
             }
         }
         // `rmi <image>...`: delete cached images (the counterpart to `pull`).
@@ -2551,6 +2578,18 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
             // `readonly` key as "yes" would make the one spelling that disables it enable it.
             "ro" | "readonly" | "read-only" => ro = value.is_empty() || value == "true",
             "tmpfs-size" => size = value,
+            // A REAL DOCKER KEY WITH NOWHERE TO GO. `volume-label=` labels the volume at creation,
+            // and kern's volumes carry a quota and a creation time and nothing else. Refused BY
+            // NAME rather than by the generic unknown-key error, because the caller wrote something
+            // valid and deserves to be told which half kern lacks; and refused rather than dropped,
+            // because a label silently discarded is a label a later `--filter` will never match.
+            "volume-label" => {
+                return Err(Error::Usage(
+                    "--mount volume-label=: kern's named volumes carry no labels (only a size \
+                     quota), so this would be silently discarded. Drop the key, or label the BOX \
+                     with --label, which kern does record and filter on",
+                ))
+            }
             // An unknown key is refused, not skipped: `type=bind,src=/a,dest=/b` (a real typo, the
             // key is `dst` or `destination`) would otherwise parse as a mount with NO destination.
             _ => return Err(USAGE),
@@ -4870,7 +4909,11 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ready_fd,
         } => crate::egress::pump_reexec(read_fd, box_port, &sock, ready_fd),
         Command::Search { query, json } => commands::search(&query, json),
-        Command::Images { json, filters } => commands::images(json, &filters),
+        Command::Images {
+            json,
+            filters,
+            format,
+        } => commands::images(json, &filters, format.as_deref()),
         Command::Rmi { images } => commands::image_rm(&images),
         Command::Save { image, out } => commands::save(&image, out.as_deref()),
         Command::Load { input } => commands::load(input.as_deref()),

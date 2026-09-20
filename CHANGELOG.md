@@ -72,6 +72,20 @@ then be unable to read its own tag back, which is the write-only half of a round
     sweep, and on a verb whose whole risk is deleting too much the nearest thing is not the same
     thing.
 
+**`images <repo>`, `images --format`, `pull --quiet`.** The last of the surface a caller arriving
+from Docker types. `images <repo>` is the positional name filter, mapped onto
+`--filter reference=<repo>` rather than given a field of its own, so the two spellings cannot select
+different images; giving both is refused, because that command line has named two sets.
+`images --format` renders the fields the cache holds and refuses the rest by name: there is no image
+ID here and no creation date, only when this machine pulled it. `{{.Repository}}`/`{{.Tag}}` split
+at the last colon only when what follows carries no `/`, so `localhost:5000/app` stays one
+repository instead of becoming a repository and a tag that do not exist.
+
+**`--mount volume-label=` is refused by name, not dropped.** It is a real Docker key, and kern's
+named volumes carry a size quota and a creation time and nothing else. A label accepted and
+discarded is one a later `--filter` will never match, so the message says which half is missing and
+points at `--label`, which kern does record and filter on.
+
 **`kern wait` was diagnosing a cause it could not know.** A box that left no exit record was
 reported as "a foreground or -it box has no supervisor to capture one". With `--rm` that assertion
 became wrong: a caller who had explicitly asked for no record was told its box ran in the

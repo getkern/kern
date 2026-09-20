@@ -21,7 +21,7 @@ COMMANDS:
 
   Images
     search <query> [--json]                                        Search Docker Hub for images
-    pull <image>                                                   Fetch an image into the cache (`--image` uses it)
+    pull <image> [-q|--quiet]                                      Fetch an image into the cache (`--image` uses it)
     pull <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
     push <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     tag <src> <dst>                                                Give a cached image a second name
@@ -30,7 +30,7 @@ COMMANDS:
     build --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that Dockerfile, and build NOTHING
                                                                      Exit 0 if it builds here; the lines kern does not act on are marked `dropped`
                                                                      -t is repeatable: one build, every name applied (layers shared, not copied)
-    images [--json] [--filter K=V]                                  List pulled (cached) images
+    images [<repo>] [--json] [--filter K=V] [--format T]             List pulled (cached) images (<repo> = --filter reference=<repo>)
                                                                      --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
     image ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs under Docker's noun-first grouping (one parser each, not a second)
     rmi <image>...                                                 Remove cached images (frees unshared layers)
