@@ -354,6 +354,17 @@ Behaviour is unchanged and pinned by a test: `nproc --all` and a tool counting `
 both still see the cpuset. Best-effort with today's behaviour as the fallback, so a host that refuses
 the mount still gets the topology.
 
+**That same loop then re-resolved a ten-deep path once per CPU.** Every `cpu<N>` directory was created
+through an absolute path, so a 28-way host made the kernel walk
+`/run/user/1000/kern/scratch/<box>/merged/sys/devices/system/cpu` twenty-eight times and allocated a
+string for each one. The directory is opened once now and each name goes to `mkdirat` from that
+descriptor, written into a fixed buffer with no allocation: `mkdir` calls per box start go from 51 to
+23, and a paired core-pinned run measures **10.6 us** faster, interval [+3.8, +16.8]. The old form
+costs more the more cores a host has, since it pays that walk once per CPU. A host where the open
+fails still gets the previous path. Behaviour is unchanged and pinned by a test that reads from inside
+a box: a list cpuset of `0,2,4-6` yields exactly `cpu0 cpu2 cpu4 cpu5 cpu6`, no gaps filled and no
+extras.
+
 **`kern diff` answered "what did this box change?" with 41 lines of kern's own setup and none of the
 box's.** Measured on the shipped binary: a box whose whole workload was `touch /tmp/mio.txt` listed
 `/dev`, `/etc/hostname`, `/etc/hosts` and thirty-six lines of `/sys/devices/system/cpu/cpu0` through

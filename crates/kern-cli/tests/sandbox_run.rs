@@ -13576,3 +13576,57 @@ fn the_cpu_topology_is_visible_to_the_box_and_absent_from_its_upper() {
          caller's teardown path, which is what putting it on a tmpfs removed"
     );
 }
+
+/// A `--cpuset-cpus` LIST, not a range, must produce exactly those cpu directories and no others.
+///
+/// The loop that makes them now issues `mkdirat` against a directory fd with a name built in a fixed
+/// buffer, instead of `create_dir(format!("{dir}/cpu{id}"))`. The unit tests beside `cpu_dir_name`
+/// pin the bytes; this pins that the multi-part parse still drives it, because a comma list is the
+/// input shape where an off-by-one produces a directory for a CPU the box may NOT run on - which is
+/// a wrong answer to `nproc`, not a slow one.
+#[test]
+fn a_cpuset_list_produces_exactly_those_cpu_directories() {
+    let Some(bb) = static_busybox() else {
+        eprintln!("skip: no static busybox");
+        return;
+    };
+    let rootfs = build_rootfs(&bb, "cpulist");
+    let xdg = std::env::temp_dir().join(format!("kern-it-cpulist-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    fs::create_dir_all(&xdg).expect("temp runtime dir");
+    let rootfs_s = rootfs.to_string_lossy().to_string();
+
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            "cl",
+            "--rootfs",
+            &rootfs_s,
+            "--cpuset-cpus",
+            "0,2,4-6",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "ls -d /sys/devices/system/cpu/cpu[0-9]* | sed 's|.*/||' | sort | tr '\\n' ' '",
+        ])
+        .output()
+        .expect("run kern");
+    let said = said(&out);
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::remove_dir_all(&rootfs);
+    if host_cannot_build_a_box(&said) {
+        eprintln!("skip: this host cannot build a box: {said}");
+        return;
+    }
+    let listed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if listed.is_empty() {
+        eprintln!("skip: the box produced no listing here: {said}");
+        return;
+    }
+    assert_eq!(
+        listed, "cpu0 cpu2 cpu4 cpu5 cpu6",
+        "a list cpuset must yield exactly its own ids, no gaps filled and no extras"
+    );
+}

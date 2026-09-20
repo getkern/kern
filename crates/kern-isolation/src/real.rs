@@ -3118,6 +3118,7 @@ fn setup_tmpfs(root: &str, entries: &[TmpfsMount]) -> Result<(), Error> {
 /// Best-effort in every branch, like its neighbours: a box that cannot be given these still starts,
 /// exactly as it did before they existed.
 fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
+    use std::os::fd::{AsRawFd, FromRawFd};
     // The range the box may run on. A `--cpuset-cpus` is already validated as a CPU list by the CLI;
     // without one, the host's own `possible` line is the truthful answer, and `0` is the floor for a
     // host that will not say (a machine always has at least one CPU, and an EMPTY file is what the
@@ -3186,8 +3187,59 @@ fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
     // 3.5 ms path. The cap is the count, not the ids - every id below it keeps its own directory, so
     // the answer stays exact for every machine anyone runs a sandbox on.
     const MAX_CPU_DIRS: usize = 4096;
+
+    // ONE PATH RESOLUTION FOR THE WHOLE LOOP, AND NO ALLOCATION INSIDE IT.
+    //
+    // The loop used to call `create_dir(format!("{dir}/cpu{id}"))` per id, which costs a heap
+    // allocation and makes the kernel re-resolve every component of an absolute path that is ten deep
+    // (`/run/user/1000/kern/scratch/<box>-<pid>/merged/sys/devices/system/cpu`) once per CPU. A
+    // directory fd resolves it once and `mkdirat` then walks a single component.
+    //
+    // TWO MEASUREMENTS, AND THE SMALLER ONE IS THE CLAIM. An isolated C benchmark over the same tree
+    // depth, 28 ids and 200 replicas, reads 42.8 us for the absolute-path form against 23.0 us for
+    // `open` + `mkdirat`. The BOX START does not see all of that: paired, core-pinned, alternated
+    // sample by sample against the unchanged binary it is +10.6 us with a 95% interval of
+    // [+3.8, +16.8]. At n=300 the same comparison could not resolve it at all (+5.3, interval
+    // [-14.0, +23.9], spanning zero), so the number here is the one that survived n=800 and not the
+    // microbenchmark's. The gap between the two is the real path now sitting on the tmpfs this
+    // function mounts, which is shallower than the benchmark's tree.
+    //
+    // It scales with the core count, which is the number that grows: a 128-way host pays the old form
+    // 128 times, each one re-resolving ten components.
+    //
+    // This is the shape `setup_etc_identity` below already uses for the same reason ("the symlink-safe
+    // descent to `etc` is walked ONCE and each file is then opened with a single `openat` from that
+    // directory fd"), so it is consistency rather than a new mechanism.
+    //
+    // THE FALLBACK IS THE OLD PATH, taken when the directory cannot be opened: the topology still gets
+    // written, one absolute `mkdir` at a time. A performance change must not become a correctness one
+    // on a host that refuses the open.
+    //
+    // THE DESCRIPTOR IS OWNED, NOT CLOSED BY HAND, and that is a deliberate difference from the raw
+    // `libc::close` its neighbours use. The first version of this loop closed the fd on the one exit
+    // path it had and said so in a comment; sabotaging it - turning the cap's `break 'parts` into a
+    // `return` - produced a leak that compiled clean, so the guarantee was a CONVENTION and not a
+    // property. An `Option<OwnedFd>` makes it a property: every exit from this function closes it,
+    // including one a later edit adds. It is niche-optimised to a single `i32`, so the guarantee is
+    // free.
+    let dirfd = match cstr(&dir) {
+        Ok(c) => {
+            let raw = unsafe {
+                libc::open(
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            // SAFETY: `raw` is a descriptor this call just opened and nothing else owns it, so
+            // handing it to `OwnedFd` transfers a valid, exclusive ownership. A negative return is
+            // the failure signal, never a descriptor, and takes the `None` arm instead.
+            (raw >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+        }
+        Err(_) => None,
+    };
+
     let mut made = 0usize;
-    for part in range.split(',') {
+    'parts: for part in range.split(',') {
         let (lo, hi) = match part.split_once('-') {
             Some((a, b)) => (a.trim().parse::<u32>(), b.trim().parse::<u32>()),
             None => {
@@ -3200,12 +3252,59 @@ fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
         };
         for id in lo..=hi.min(lo.saturating_add(MAX_CPU_DIRS as u32)) {
             if made >= MAX_CPU_DIRS {
-                return;
+                break 'parts;
             }
-            let _ = std::fs::create_dir(format!("{dir}/cpu{id}"));
+            match &dirfd {
+                Some(fd) => {
+                    // `cpu` + at most ten decimal digits (u32::MAX) + NUL = 14 bytes, so the buffer
+                    // cannot overflow by construction and no bound is checked at runtime.
+                    let mut name = [0u8; 16];
+                    let len = cpu_dir_name(&mut name, id);
+                    if len > 0 {
+                        unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr().cast(), 0o755) };
+                    }
+                }
+                None => {
+                    let _ = std::fs::create_dir(format!("{dir}/cpu{id}"));
+                }
+            }
             made += 1;
         }
     }
+}
+
+/// Write `cpu<id>\0` into `buf` and return the length WITHOUT the NUL, or 0 if it would not fit.
+///
+/// No allocation and no panic: the digits are produced into a fixed array by repeated division, then
+/// reversed in place. `u32::MAX` is ten digits, so `cpu` + 10 + NUL = 14 bytes always fits a 16-byte
+/// buffer and the `0` return is unreachable for a `u32` - it is there so the function stays total if
+/// the buffer is ever made smaller.
+fn cpu_dir_name(buf: &mut [u8; 16], id: u32) -> usize {
+    const PREFIX: &[u8; 3] = b"cpu";
+    let mut digits = [0u8; 10];
+    let mut n = 0usize;
+    let mut v = id;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+        if v == 0 || n == digits.len() {
+            break;
+        }
+    }
+    let total = PREFIX.len() + n;
+    if total + 1 > buf.len() {
+        return 0;
+    }
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut w = PREFIX.len();
+    while n > 0 {
+        n -= 1;
+        buf[w] = digits[n];
+        w += 1;
+    }
+    buf[w] = 0;
+    total
 }
 
 /// Write the two `/etc` files a container runtime owns: `/etc/hosts` and `/etc/hostname`.
@@ -8393,5 +8492,83 @@ mod pod_holder_watchdog_tests {
              runtime directory releases the network of a stack that is still serving"
         );
         assert_eq!(code, 0, "the probe failed for another reason (12 = fork)");
+    }
+}
+
+#[cfg(test)]
+mod cpu_dir_name_tests {
+    use super::cpu_dir_name;
+
+    /// A non-zero fill, and that is the whole point of it.
+    ///
+    /// These tests were first written with `[0u8; 16]`. Deleting the `buf[w] = 0` from the function
+    /// under test then left all three of them GREEN, because the terminator the function had failed
+    /// to write was already there from the initialiser. `mkdirat` reads a C string, so a missing NUL
+    /// is a read past the end of the name and not a cosmetic slip. Filling with a non-zero byte
+    /// first makes the terminator something the code has to produce.
+    const POISON: u8 = 0xAA;
+
+    fn rendered(id: u32) -> String {
+        let mut buf = [POISON; 16];
+        let len = cpu_dir_name(&mut buf, id);
+        assert_eq!(
+            Some(len),
+            buf.iter().position(|b| *b == 0),
+            "id {id}: cpu_dir_name must NUL-terminate at len, mkdirat reads a C string"
+        );
+        String::from_utf8_lossy(&buf[..len]).into_owned()
+    }
+
+    /// The name handed to `mkdirat` must be byte-for-byte what `format!("cpu{id}")` produced before.
+    ///
+    /// The loop it serves used a `format!` per id, which allocated on a box-start path and made the
+    /// kernel re-resolve a ten-deep absolute path per CPU. Replacing it with a fixed buffer is only
+    /// safe if the bytes are identical, so this compares against the thing it replaced rather than
+    /// against a hand-written expectation.
+    #[test]
+    fn it_renders_exactly_what_the_format_it_replaced_rendered() {
+        for id in 0..=1024u32 {
+            assert_eq!(rendered(id), format!("cpu{id}"), "id {id}");
+        }
+        for id in [4095u32, 4096, 65535, 99999, 1_000_000, u32::MAX / 2] {
+            assert_eq!(rendered(id), format!("cpu{id}"), "id {id}");
+        }
+    }
+
+    /// `u32::MAX` is ten digits, so `cpu` + 10 + NUL = 14 bytes. The buffer is 16, which means the
+    /// "does not fit" arm is unreachable for a `u32` - asserted here so a later widening of the id
+    /// type cannot silently start returning 0 and skipping directories.
+    #[test]
+    fn the_widest_id_still_fits_the_fixed_buffer() {
+        assert_eq!(rendered(u32::MAX), format!("cpu{}", u32::MAX));
+        assert_eq!(rendered(u32::MAX).len(), 13, "cpu + 10 digits");
+        let mut buf = [POISON; 16];
+        assert_eq!(cpu_dir_name(&mut buf, u32::MAX), 13);
+        assert_eq!(buf[13], 0, "the widest name must still be terminated");
+    }
+
+    /// No panic on any input: the function is total, which is why the loop can call it without a
+    /// guard. An index out of bounds here would abort a box start, not return an error.
+    #[test]
+    fn it_never_panics_across_the_boundaries_of_the_digit_loop() {
+        for id in [
+            0u32,
+            1,
+            9,
+            10,
+            99,
+            100,
+            999,
+            1000,
+            9999,
+            10000,
+            u32::MAX - 1,
+            u32::MAX,
+        ] {
+            let mut buf = [POISON; 16];
+            let len = cpu_dir_name(&mut buf, id);
+            assert!(len > 0 && len < buf.len(), "id {id} produced len {len}");
+            assert_eq!(buf[len], 0, "id {id} must be NUL-terminated for mkdirat");
+        }
     }
 }
