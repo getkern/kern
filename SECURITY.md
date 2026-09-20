@@ -277,6 +277,49 @@ after the namespace is set up, and refused outright as real root, where a relaxe
 the host-global `/proc/sys` knobs. Rootless, those knobs stay unwritable regardless: a `--privileged`
 box can read `/proc/sys` but not write it, verified against `core_pattern`.
 
+### Pods share three namespaces, and one of them is the identity domain
+
+A pod exists so its members can reach each other by name, and that is a boundary decision, not a
+networking convenience. Read from `/proc/self/ns` in two members of one pod, the shared set is:
+
+| namespace | in a pod | standalone |
+|---|---|---|
+| **user** | **shared** | private |
+| **network** | **shared** | private |
+| **uts** | **shared** | private |
+| mount, PID, IPC, cgroup | private | private |
+
+The user namespace is the one to weigh. Members are one identity and capability domain rather than
+separate ones: root in one member and root in another are the same mapped authority, and a
+capability held over that namespace is held over it by all of them. Their mount, PID, IPC and cgroup
+namespaces stay private, so no member can see another's processes or mounts by looking, and the
+private PID namespace is what removes the obvious handle, since `/proc` inside a box does not list a
+sibling and there is no descriptor to pass to `setns`. That is a reachability property rather than a
+refusal by the kernel: a descriptor that arrives by another route is usable, because the capability
+check that would stop it is evaluated in a namespace they share.
+
+The shared network namespace is a route. Members share `127.0.0.1` and the abstract socket
+namespace, which is exactly what makes a pod useful and also means a listener on loopback in one
+member is reachable from another. Measured, not argued:
+
+```sh
+kern pod create p --uid-range
+kern box srv --image alpine --pod p -d -- sh -c 'echo secret | nc -l -p 9999 -s 127.0.0.1'
+kern box cli --image alpine --pod p    -- nc -w 2 127.0.0.1 9999    # prints: secret
+```
+
+The same command from a box outside the pod reaches nothing.
+
+**So: put workloads in one pod when you would have put them in one trust boundary anyway**, which is
+what a compose stack is. Do not reach for a pod to make a box start faster, even though it does
+([BENCHMARKS.md](BENCHMARKS.md) measures 2.59 ms against 3.89): the millisecond is real and so is the
+shared identity domain that buys it. For two workloads that must not reach each other, use two boxes
+and no pod.
+
+`--uid-range` on `kern pod create` changes what the shared user namespace maps, not how much is
+shared. Without it a member gets the single-uid map and `chown` to a non-root uid fails inside it,
+which is the same trade `--no-uid-range` makes on a standalone box.
+
 ## Resource caps
 
 Inside the systemd **user** manager's tree, `kern box` caps directly in its delegated `kern.slice`;

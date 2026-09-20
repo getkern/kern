@@ -17,21 +17,30 @@ taken today across two different harnesses, a Python loop and a bare shell loop,
 4.06 ms. The shell loop reads HIGHER than the Python one, so the harness is not inflating it. An
 earlier draft of this table published 3.8, the low end, which is the error this file exists to stop.
 
-**The same box costs 2.6 ms in a pod, and the reason is one syscall nobody repeats.** An
-`--image` box maps a sub-uid range so an official image can drop privilege in its entrypoint, and
-rootless the only way to write a range is the setuid helpers `newuidmap`/`newgidmap`. Measured, that
-phase is 886 us of the 3.9. A pod created with `--uid-range` owns one mapped namespace and every
-member inherits it, so the phase reads **zero** and the box measures **2.59 ms**, paired delta
--1.185 ms [-1208, -1166]. The range is fully there: `chown` to a non-root uid works inside a member
-exactly as in a standalone box, which is the test that separates this from `--no-uid-range`, where
-the same `chown` fails. One command, before the burst:
+**The same box costs 2.6 ms in a pod, and the row below it is NOT the same job.** An `--image` box
+maps a sub-uid range so an official image can drop privilege in its entrypoint, and rootless the only
+way to write a range is the setuid helpers `newuidmap`/`newgidmap`: measured, 886 us of the 3.9. A pod
+created with `--uid-range` maps one namespace once and every member uses it, so that phase reads zero
+and the box measures **2.59 ms**, a paired delta of -1.185 ms [-1208, -1166]. The range is genuinely
+there, not skipped: `chown` to a non-root uid succeeds inside a member exactly as in a standalone box,
+where `--no-uid-range` makes the same `chown` fail.
+
+**What a pod member gives up for it, measured rather than reasoned.** Members share three namespaces,
+read from `/proc/self/ns` in two members of one pod: the **user** namespace, so they are one identity
+and capability domain rather than separate ones; the **network** namespace, so they share `127.0.0.1`
+and the abstract socket namespace; and **uts**. Mount, PID, IPC and cgroup stay private to each box. A
+sibling reading the other's loopback is not a hypothesis:
 
 ```sh
-kern pod create fast --uid-range
-kern box job --image alpine --pod fast -- ./work
+kern pod create p --uid-range
+kern box srv --image alpine --pod p -d -- sh -c 'echo secret | nc -l -p 9999 -s 127.0.0.1'
+kern box cli --image alpine --pod p    -- nc -w 2 127.0.0.1 9999    # prints: secret
 ```
 
-It is not the default because it needs a holder process to stay alive, and kern ships no daemon.
+The same command from a box outside the pod reaches nothing. So the 2.59 ms is the right number for
+workloads you would already put in one pod, and the wrong number to compare with the 3.9 ms row above,
+which is a box with all seven namespaces of its own. It is not the default for the same reason, plus
+one more: the fast path needs a holder process alive, and kern ships no daemon.
 
 **Method.** Each runtime starts one container running `/bin/true` and tears it down, caches warm,
 and the figure is total time divided by runs rather than a per-call timer, which at this scale costs
