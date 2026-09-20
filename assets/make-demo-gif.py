@@ -14,10 +14,10 @@ COMMITTED GIF still showed `~3.6`: someone had edited the source and never re-ru
 file that exists to keep the picture honest had itself gone stale. **Editing a constant here is half
 the job; regenerate and commit the .gif in the same change.**
 
-⛔ ON 2026-09-20 THE MILLISECOND FIGURE CAME OUT ALTOGETHER, here and on the README, because it went
-stale twice in this one asset and was not reproducible on the third look: the same binary read 4.101
-to 4.239 ms across eight replicas in one afternoon, against the 3.9 the picture was showing. See the
-constants below before putting a number back.
+⛔ THE FIGURE CAME OUT ON 2026-09-20 AND WENT BACK IN THE SAME DAY, re-measured on the command this
+frame actually shows rather than on a neighbouring one. That is the rule this asset now follows: the
+number here is measured on THIS command, with replicas, and it is not written unless the replicas
+support it. The README publishes no figure at all; see the constants below before changing this.
 
 Usage:  python3 assets/make-demo-gif.py [-o assets/kern-demo.gif]
 Needs:  Pillow.
@@ -30,25 +30,25 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-# --- the claims -------------------------------------------------------------------------------
-# ⛔ NO MILLISECOND FIGURE HERE ANY MORE, and putting one back would undo the reason this file was
-# written twice. The docstring above records the number going stale twice: the GIF claiming ~2 ms
-# against a README saying ~3.7, then a constant reading ~3.3 against a committed GIF showing ~3.6.
-# Both were caught. The third time would not have been, because a figure painted into pixels is the
-# one claim in this repository that `grep` cannot find and `stale-numbers.py` can only check through
-# this constant.
+# --- the claims, measured ------------------------------------------------------------------------
+# BOTH NUMBERS OR NEITHER: the contrast is what the frame is for, and a bare "milliseconds against
+# hundreds" reads as a claim someone was afraid to put a figure on.
 #
-# AND IT IS NOT REPRODUCIBLE ANYWAY. MEASURED 2026-09-20, eight replicas of 150 starts on one
-# machine in one afternoon: 4.101 to 4.239 ms, with 3.93 earlier the same day. The GIF said 3.9,
-# which was true at the favourable end of one day's drift and false for most readers on most days.
-# The README stopped publishing a figure for exactly this reason; a picture saying one is the same
-# claim, harder to correct.
+# MEASURED 2026-09-20 on the COMMAND THIS FRAME SHOWS, which is the rule that keeps the two honest:
+# six replicas of 150 starts of `box --image alpine`, median of medians 3.91 ms, min 3.88, max 4.31.
+# Docker on the same machine in the same session: 294.66 ms serial, and 17.245 s for 200 in parallel
+# against kern's 0.134.
 #
-# The contrast is what the frame is FOR, and it survives without digits: milliseconds against
-# hundreds of them is two orders of magnitude and holds on any machine. The measured numbers, with
-# the host, the method and the date beside them, live in BENCHMARKS.md.
-KERN_SPEED = "milliseconds"
-DOCKER_SPEED = "hundreds of ms"
+# ⛔ 3.8 WAS CONSIDERED AND IS NOT WRITTEN HERE: zero of those six replicas came in under it. A
+# figure is only worth painting into an image if it survives the replicas it came from, because this
+# is the one claim in the repository that `grep` cannot find and that needs an asset regenerated to
+# correct. It has already gone stale twice; see the docstring.
+#
+# The README deliberately publishes NO figure (a front page has no machine, method or date beside
+# it). This frame does, and can, because the footer names the host and tells the reader to measure
+# their own. The full numbers with their method live in BENCHMARKS.md.
+KERN_MS = "3.9 ms"
+DOCKER_MS = "294 ms"
 HOST = "Intel i7-14700KF, Linux 7.0"
 
 COMMAND = 'kern box app --image alpine -- echo "hello from a real container"'
@@ -118,11 +118,11 @@ def render(font: ImageFont.FreeTypeFont) -> list[Image.Image]:
         if show_output:
             d.text((X0 + int(cw * 2), ROWS["out"]), OUTPUT, font=font, fill=TEXT)
         if show_stats:
-            left = f"kern started in {KERN_SPEED}"
+            left = f"kern started in {KERN_MS}"
             d.text((X0, ROWS["stat"]), left, font=font, fill=ACCENT)
             d.text(
                 (X0 + int(cw * (len(left) + 6)), ROWS["stat"]),
-                f"docker run: {DOCKER_SPEED}",
+                f"docker run: {DOCKER_MS}",
                 font=font,
                 fill=TEXT,
             )
