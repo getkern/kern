@@ -1166,11 +1166,23 @@ def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
     # `/dev/mqueue` is a per-IPC-namespace filesystem, the box has its own, so writable here reaches
     # nothing outside. A future kern that stopped unsharing the IPC namespace would make this line
     # wrong, and this is where it would be caught.
+    # `/sys/devices` JOINED THE SET ON 2026-09-20, from the runtime and not from this binding: the
+    # CPU topology the box reports is now built on a tmpfs mounted there, which is what stops an
+    # `--image` box copying 46 sysfs entries into its overlay upper (it went to 9). This test went
+    # red on that commit and nobody saw it, because `gate.sh` does not run the bindings' suites.
+    #
+    # PINNED AS ACCEPTABLE ON THE SAME EVIDENCE THE `/dev/mqueue` LINE USES, measured rather than
+    # assumed: inside a box `/sys/devices` reads `tmpfs` and holds one entry (`system`), a file
+    # created there succeeds, and the HOST's `/sys/devices` is still `sysfs` with 40 entries and does
+    # not contain it. It is a private tmpfs, so writable here reaches nothing outside. A future kern
+    # that bound the host's real sysfs there instead would make this line wrong, and this is where it
+    # would be caught.
     assert writable() == {
         ("/tmp", "tmpfs"),
         ("/workspace", "ext4"),
         ("/dev/shm", "tmpfs"),
         ("/dev/mqueue", "mqueue"),
+        ("/sys/devices", "tmpfs"),
     }
     # The bundle: the scratch is NOT added on top of it. This is the assertion that would have caught
     # the widening without anyone predicting it.
@@ -1178,6 +1190,11 @@ def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
         ("/workspace", "ext4"),
         ("/dev/shm", "tmpfs"),
         ("/dev/mqueue", "mqueue"),
+        # Same tmpfs as above, and checked SEPARATELY under this profile rather than assumed to
+        # follow: measured, the box reads `tmpfs` with one entry, a write there succeeds, and the
+        # host's `/sys/devices` does not contain it. `untrusted` takes `/tmp` away and leaves this,
+        # which is the shape to notice if the profile ever stops removing what it claims to remove.
+        ("/sys/devices", "tmpfs"),
     }
     # The capability axis, with its own positive control: if `cap_drop=()` does not move the pinned
     # value, the pin is reading the request instead of the result.
@@ -1198,6 +1215,7 @@ def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
         ("/workspace", "ext4"),
         ("/dev/shm", "tmpfs"),
         ("/dev/mqueue", "mqueue"),
+        ("/sys/devices", "tmpfs"),  # the CPU-topology tmpfs; see the first assertion
     }
     # The discriminant the union version could not express: a bind at /dev/shm SHADOWS kern's tmpfs,
     # so the same set of paths is a materially different box and the pin now says so.
@@ -1209,6 +1227,7 @@ def test_every_security_profile_has_a_PINNED_set_of_writable_paths():
             ("/workspace", "ext4"),
             ("/dev/shm", "ext4"),
             ("/dev/mqueue", "mqueue"),
+            ("/sys/devices", "tmpfs"),  # the CPU-topology tmpfs; see the first assertion
         }
     finally:
         shutil.rmtree(shm_host, ignore_errors=True)

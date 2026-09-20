@@ -1418,6 +1418,46 @@ class Sandbox {
     if (!(this.timeoutS > 0)) throw new SandboxError("timeoutS must be a positive number of seconds");
     if (!(this.maxOutputBytes > 0)) throw new SandboxError("maxOutputBytes must be positive");
 
+    // SHAPE GUARDS BEFORE ANYTHING CONSUMES THESE, the twin of the Python binding's and added after
+    // the same outside review swept the constructor argument by argument.
+    //
+    // THE JS FAILURE IS WORSE THAN THE PYTHON ONE, which is why this is not just symmetry. Python
+    // raises `AttributeError: 'list' object has no attribute 'items'` - useless, but obviously a
+    // type error. `Object.entries()` does NOT throw on an array or a string: it hands back index
+    // keys. MEASURED, `mounts: ["/tmp:/x"]` reached the mount validator as source `"0"` and reported
+    // `mount source must be an absolute host path, got "0"`, naming a value the caller never wrote,
+    // and `mounts: "/tmp:/x"` walked the string character by character and reported `cannot mount
+    // over the box essential mount "/"`. Both refuse, so nothing unsafe happened; both send the
+    // reader to look at a "0" or a "/" that exists nowhere in their code.
+    //
+    // `tmpfs` is deliberately NOT here: it documents an array form (a list of paths) and already
+    // refuses a bare string by name.
+    for (const [name, value] of [
+      ["mounts", this.mounts],
+      ["env", this.env],
+    ]) {
+      if (value === null || value === undefined) continue;
+      if (typeof value !== "object" || Array.isArray(value)) {
+        const example = name === "env" ? `{ KEY: "value" }` : `{ "/host/path": "/in/box" }`;
+        throw new SandboxError(
+          `${name} must be a plain object, not ${Array.isArray(value) ? "an array" : typeof value}: ` +
+            `write ${name}: ${example}`,
+        );
+      }
+    }
+    // A CALLBACK THAT IS NOT A FUNCTION is never called and says nothing, so the caller sees a
+    // sandbox that produces no output and has nothing to debug.
+    for (const [name, cb] of [
+      ["onStdout", this.onStdout],
+      ["onStderr", this.onStderr],
+    ]) {
+      if (cb !== null && cb !== undefined && typeof cb !== "function") {
+        throw new SandboxError(
+          `${name} must be a function (it is handed one chunk at a time), not ${typeof cb}`,
+        );
+      }
+    }
+
     this._mountArgs = [];
     const boundTargets = new Set();
     if (this.mounts) {

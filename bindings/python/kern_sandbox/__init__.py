@@ -51,6 +51,7 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Sequence
@@ -1103,8 +1104,14 @@ class _CappedReader(threading.Thread):
 
     If ``on_data`` is given, every chunk is also delivered live (``read1`` returns as soon as any bytes
     are available, so it's prompt, not batched). The full (capped) buffer is STILL captured, so a caller
-    can both stream and read ``result.stdout``. A callback exception is swallowed: it must never kill the
-    drain, or the box would deadlock on a full pipe."""
+    can both stream and read ``result.stdout``.
+
+    A CALLBACK EXCEPTION IS SWALLOWED AND REPORTED, which are two decisions and not one. Swallowed,
+    because it must never kill the drain: the box would then block on a full pipe and hang. REPORTED,
+    because it used to be swallowed in silence, so a caller whose callback raised on its first line
+    got a run that succeeded, output that looked complete, and no indication their code never ran.
+    An outside review found exactly that. One `warnings.warn` per reader, not per chunk, so a
+    callback that raises on every line says it once."""
 
     def __init__(self, pipe, cap: int, on_data=None) -> None:
         super().__init__(daemon=True)
@@ -1113,6 +1120,7 @@ class _CappedReader(threading.Thread):
         self._on_data = on_data
         self.buf = bytearray()
         self.truncated = False
+        self.callback_failed = False
 
     def run(self) -> None:
         # read1 (vs read) hands back each chunk as it arrives instead of blocking for a full 64 KiB, so
@@ -1126,8 +1134,17 @@ class _CappedReader(threading.Thread):
                 if self._on_data is not None:
                     try:
                         self._on_data(bytes(chunk))
-                    except Exception:  # noqa: BLE001 - a user callback must not break the drain
-                        pass
+                    except Exception as e:  # noqa: BLE001 - a user callback must not break the drain
+                        if not self.callback_failed:
+                            self.callback_failed = True
+                            warnings.warn(
+                                f"the on_stdout/on_stderr callback raised "
+                                f"{type(e).__name__}: {e}. The box kept running and its output was "
+                                f"still captured, but this callback is not seeing it. Exceptions "
+                                f"after the first are not reported.",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
                 room = self._cap - len(self.buf)
                 if room > 0:
                     self.buf += chunk[:room]
@@ -1846,6 +1863,40 @@ class Sandbox:
             raise SandboxError("timeout_s must be a positive number of seconds")
         if self.max_output_bytes <= 0:
             raise SandboxError("max_output_bytes must be positive")
+        # SHAPE GUARDS FIRST, BEFORE ANYTHING CONSUMES THESE ARGUMENTS, and the position is the whole
+        # of it. `setup` and `cap_drop` already refused the wrong shape by name; `mounts` did not, and
+        # a list or a string produced a raw `AttributeError: 'list' object has no attribute 'items'`
+        # out of the middle of this class, naming neither the argument nor the shape it wanted. An
+        # outside review found it by sweeping the constructor one argument at a time.
+        #
+        # The first attempt at this fix put the check 80 lines lower, next to the other guards, where
+        # `self.mounts.items()` had already run and raised: a guard AFTER the use is not a guard, and
+        # only the test caught it.
+        #
+        # ⛔ `tmpfs` IS DELIBERATELY NOT HERE, and that is the second thing the tests caught. It
+        # already has a RICHER validator of its own that names the mistake it sees: an int, a bool, a
+        # bare string and a list each get their own sentence, down to
+        # `Did you mean tmpfs={'/tmp': '256m'}`. A generic "must be a dict" placed here ran FIRST and
+        # replaced all of them with something worse. A guard is only an improvement where there is no
+        # better one already; nine tests said so.
+        for _name, _value in (
+            ("mounts", self.mounts),
+            ("env", self.env),
+        ):
+            if _value is not None and not hasattr(_value, "items"):
+                _example = {"KEY": "value"} if _name == "env" else {"/host/path": "/in/box"}
+                raise SandboxError(
+                    f"{_name} must be a dict, not {type(_value).__name__}: write "
+                    f"{_name}={_example!r}"
+                )
+        # A CALLBACK THAT IS NOT CALLABLE is never called and says nothing, so the caller sees a
+        # sandbox that simply produces no output and has nothing to debug. Refused by name instead.
+        for _name, _cb in (("on_stdout", self.on_stdout), ("on_stderr", self.on_stderr)):
+            if _cb is not None and not callable(_cb):
+                raise SandboxError(
+                    f"{_name} must be callable (it is handed one line at a time), "
+                    f"not {type(_cb).__name__}"
+                )
         self._mount_args = []
         bound_targets = set()
         if self.mounts:
