@@ -32,7 +32,7 @@ from PIL import Image, ImageDraw, ImageFont
 # `--image` costs more than a prepared rootfs (~2 ms) because kern maps a uid RANGE for it, which
 # is what lets an official image drop privilege in its entrypoint. The command shown here is the
 # image one, so the number shown here has to be the image one.
-KERN_MS = "3.8 ms"
+KERN_MS = "3.9 ms"
 DOCKER_MS = "294 ms"
 HOST = "Intel i7-14700KF, Linux 7.0"
 
