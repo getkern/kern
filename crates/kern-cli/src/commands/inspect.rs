@@ -120,17 +120,24 @@ pub(crate) fn network_ports_json(ports: &str) -> String {
 
 /// Split the registry's comma-joined `k=v` label field into pairs.
 ///
-/// ⚠️ NOT the sole reader: `ps_matches` decodes the same field to answer `--filter label=`, and
-/// compares the raw `k=v` segments rather than going through here. An earlier version of this
-/// comment claimed sole ownership, which was already false when it was written. The two agree
-/// because they share [`registry::decode_labels`]; what they do NOT share is the bare-key
-/// normalisation below, and that difference is real: `--filter label=noequals=` does not match a
-/// box labelled `--label noequals`, where it would if the filter came through here.
+/// THE ONE PLACE THE FIELD BECOMES PAIRS, and every reader of a label goes through it: the renderers
+/// (`{{.Labels}}`, `{{.Label "k"}}`, `labels_json`) and `ps_matches`, which answers
+/// `--filter label=`. That last one is the reason this matters rather than a tidiness note. It used
+/// to compare the raw stored segments, so it shared the decoder but not the bare-key normalisation
+/// below, and the two readers disagreed about exactly one input: a box labelled `--label noequals`
+/// was found by `--filter label=noequals` and NOT by `--filter label=noequals=`, while its own
+/// document said `"noequals":""`. Both now ask this function, and MEASURED against the reference on
+/// 2026-09-20, all four spellings (`noequals`, `noequals=`, `empty`, `empty=`) match in kern exactly
+/// as they match in docker 29.1.3.
 ///
 /// A segment with no `=` is a label with an EMPTY VALUE, not corruption. Measured on the reference
-/// implementation: `--label noequals` renders `{"noequals":""}`. An earlier version of this comment
-/// said such a segment was skipped, which stopped being true when `--label` started accepting a
-/// bare key and was left behind.
+/// implementation: `--label noequals` renders `{"noequals":""}`.
+///
+/// ⚠️ THIS COMMENT HAS BEEN WRONG TWICE, both times the same way: it described the state before a
+/// change that landed beside it. Once when `--label` began accepting a bare key and the "skipped"
+/// sentence was left behind, and once when `ps_matches` started reading through here and the
+/// sentence about the two readers differing was left behind. The claim to check first, if it ever
+/// reads oddly again, is WHO CALLS THIS, because that is the part that keeps moving.
 pub(crate) fn label_pairs(field: &str) -> Vec<(String, String)> {
     registry::decode_labels(field)
         .into_iter()

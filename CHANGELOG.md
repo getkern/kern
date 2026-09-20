@@ -7,6 +7,21 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**`ps -a` promised recently-exited boxes and lists only the detached ones.** The exit note is
+written by the detached supervisor, so a box run in the foreground leaves none and never appears
+there. Measured, the discriminant is foreground/detached and NOT the exit status: a `-d` box exiting
+0 is listed and a foreground box exiting 7 is not. The behaviour is unchanged, because matching
+Docker here would mean one row per SDK call (`run_code` runs its box in the foreground, measured:
+five calls, zero new rows). What changed is that `--help` now says which boxes those rows are,
+instead of letting a reader conclude their foreground box was lost.
+
+**Two comments in one codebase disagreed about the label filter, and the measurement settled it.**
+`label_pairs` still described `--filter label=` as comparing raw stored segments, which stopped
+being true when the filter started reading through it: the note was left behind by the fix that
+landed beside it, the second time that same comment has described a state the code had already left.
+Verified against the reference rather than reasoned about: `noequals`, `noequals=`, `empty` and
+`empty=` all match in kern exactly as they match in docker 29.1.3.
+
 **Stopping a pod's last member removed the pod, and letting that member exit on its own did not.**
 The same end state, no members left, had two outcomes depending on how it was reached: `kern stop`
 on the last member tore the pod down, its holder, its network namespace and its shared files, while

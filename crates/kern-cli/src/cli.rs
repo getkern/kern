@@ -467,6 +467,12 @@ pub enum Command {
         keep: usize,
     },
     /// `kern ps [-a] [--json]`: list running boxes (`-a`/`--all` also lists recently-exited ones).
+    ///
+    /// The exited rows are DETACHED boxes only, and that is a consequence rather than a policy: the
+    /// exit note is written by the detached supervisor, and a foreground box has none. Measured
+    /// 2026-09-20, the discriminant is foreground/detached and NOT the exit status: a `-d` box
+    /// exiting 0 is listed, a foreground box exiting 7 is not. Docker lists both, and matching it
+    /// would mean one row per SDK call, since `run_code` runs a box in the foreground.
     Ps {
         json: bool,
         quiet: bool,
