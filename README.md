@@ -2,7 +2,7 @@
 
 <img src="assets/brand/kern-logo.png" width="260" alt="kern">
 
-**kern:** a fast, rootless sandbox and virtual resource runtime. Run your workloads in a real container, including an agent's tool-call or LLM-generated code.
+**kern:** a fast, rootless sandbox and virtual resource runtime. Run workloads in a real container, including an agent's tool-call or LLM-generated code.
 
 **A real, kernel-enforced container in ~3.5 ms, out of one static binary with no daemon.**
 
