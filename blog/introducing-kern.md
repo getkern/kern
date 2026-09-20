@@ -1,10 +1,9 @@
 # Introducing kern: a container runtime that does less, on purpose
 
-*Run a program, a Docker image or a whole docker-compose file, each in its own real container, with
-the share of CPU, memory and disk you choose. One static binary,
-one Rust dependency (`libc`), no daemon. It starts a box in 2.3 ms on the machine and date the table
-below declares, embeds from Python or Rust, and runs the same on a laptop, in CI, or on a Raspberry
-Pi.*
+*A fast, rootless sandbox and virtual resource runtime for any workload, including untrusted and
+AI-generated code. One static binary, one Rust dependency (`libc`), no daemon. It starts a
+real, kernel-enforced box in 2.3 ms, embeds from Python or Rust, and runs the same on a laptop, in
+CI, or on a Raspberry Pi.*
 
 Most container tooling is built around a daemon. You install a service that stays resident, holds the
 image store and the network, and every `run` is a round-trip to it. That buys a lot of features, and

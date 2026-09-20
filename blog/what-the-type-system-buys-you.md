@@ -150,8 +150,7 @@ and every future contributor, doesn't have to.
 
 ---
 
-*kern runs a program, a Docker image or a whole docker-compose file, each in its own real container,
-with the share of CPU, memory and disk you choose. One static binary, one Rust dependency (`libc`),
-no daemon. The
+*kern is a fast, rootless sandbox and virtual resource runtime for any workload, including untrusted
+and AI-generated code: one static binary, one Rust dependency (`libc`), no daemon. The
 mount-ordering typestate is `Rootfs<S>` in the `kern-isolation` crate. Code, benchmarks, and an honest account of the security boundary:
 [github.com/getkern/kern](https://github.com/getkern/kern).*
