@@ -2033,6 +2033,17 @@ class Sandbox:
             # `workspace="~/.aws/ws"` CREATED a directory under a credential directory and only then
             # refused to mount it. Nothing the lexical half asks needs the directory to be there.
             _validate_mount_lexical(self.workspace, _WORKSPACE)
+            # A WORKSPACE THAT IS A FILE is the one case `exist_ok=True` does not cover: `mkdir`
+            # raises `FileExistsError: [Errno 17] File exists: '/etc/hostname'` straight out of
+            # pathlib, which names the path but not the ARGUMENT, and reads like kern tried to
+            # overwrite something. Found by the same constructor sweep that found the `mounts` guard,
+            # and it is the same defect: an OS error escaping where a sentence belongs.
+            if os.path.exists(self.workspace) and not os.path.isdir(self.workspace):
+                raise SandboxError(
+                    f"workspace must be a directory, and {self.workspace!r} is a file. The "
+                    f"workspace is the box's persistent state and is created if it does not exist; "
+                    f"pass a directory path, or None for a temporary one"
+                )
             Path(self.workspace).mkdir(parents=True, exist_ok=True)
             _validate_mount(self.workspace, _WORKSPACE)
             self._ws = os.path.realpath(self.workspace)
