@@ -7,6 +7,24 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A box that drops every capability no longer pays for a uid range it cannot use: 937 us, a quarter
+of a cold `--image` box.** Mapping the subordinate range forks `newuidmap` and `newgidmap`, and that
+phase is 876 us of a 4 ms box against 22 us without it. Under `--cap-drop ALL` it bought nothing,
+measured rather than argued: `chown` to another uid fails inside the box whether the range is mapped
+or not, and an identity change is refused identically both ways. The control that makes this mean
+something is the other direction: without `--cap-drop ALL` the same `chown` SUCCEEDS with the range
+and fails without it, so the range is doing real work in the default posture and keeps it.
+`kern box --image alpine --cap-drop ALL` goes 3956 -> 3013 us, paired, interval [-959, -912] at
+n=300.
+
+Any `--cap-add` cancels the skip, and that case decided the rule rather than illustrating it:
+`--cap-drop ALL --cap-add CHOWN` chowns successfully WITH the range and fails without, so a
+capability handed back is one that can use the range. Any add at all is treated as keeping it, which
+is the conservative reading. `--uid-range`, a non-root `--user` and `--ssh` are requests and outrank
+the skip, unchanged. The Python SDK has done this since 0.2.29 and the CLI did not; the rule now
+lives in the one function both the real run and the `--show-config` dry run already called, so the
+dry run cannot describe a range the box will not get.
+
 **`ps -a` promised recently-exited boxes and lists only the detached ones.** The exit note is
 written by the detached supervisor, so a box run in the foreground leaves none and never appears
 there. Measured, the discriminant is foreground/detached and NOT the exit status: a `-d` box exiting

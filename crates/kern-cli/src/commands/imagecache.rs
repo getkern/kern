@@ -15,8 +15,54 @@ use super::*;
 /// box? The single statement of that rule on the box side: the real run and the `--show-config` dry
 /// run both call it, so the dry run cannot report a range the box will not get, or miss one it will.
 /// It reported `uid_range: false` for every image box for exactly as long as this was written twice.
+///
+/// The `will_be_single_uid` heads-up in `start` reads this too, which is the other reason the third
+/// condition belongs HERE and not at a call site: a box that silently stopped getting the range
+/// would otherwise keep the warning that says it is getting one.
 pub(crate) fn image_default_uid_range(args: &BoxRunArgs) -> bool {
-    args.image.is_some() && !args.no_uid_range
+    args.image.is_some() && !args.no_uid_range && !range_buys_nothing(args)
+}
+
+/// Would the sub-uid range buy this box anything at all, given the capabilities it will actually
+/// hold? When it would not, the default is dropped and the box skips two setuid helper execs.
+///
+/// WHAT IT IS WORTH. `parent:idmap` is 876 us with the range and 22 us without, and the whole box
+/// goes 4008 -> 3029 us: a paired difference of 985 us, 25%, interval [-1025, -931] at n=300,
+/// measured on 2026-09-20. It is the largest single item in a cold image box, and it is why
+/// `--rootfs` (which never maps a range) starts a millisecond ahead of `--image`.
+///
+/// THE RULE, and both halves were measured rather than argued:
+///
+///   * `ALL` among the dropped capabilities means the thing the range exists for is already refused.
+///     Inside a box, `chown` to another uid FAILS under `--cap-drop ALL` whether the range is mapped
+///     or not, and an identity change is refused identically both ways. Without `--cap-drop ALL` the
+///     same `chown` SUCCEEDS with the range and fails without it, which is the control that makes
+///     the first half mean something: the range is doing real work in the default posture.
+///   * ANY `--cap-add` puts it back. `--cap-drop ALL --cap-add CHOWN` is the discriminating case:
+///     measured, that `chown` succeeds with the range and fails without. A capability handed back is
+///     a capability that can use the range, so any add at all cancels this, which is the
+///     conservative reading rather than the precise one. Being wrong here costs a silent failure in
+///     someone's entrypoint; being conservative costs 985 us on a command nobody has typed yet.
+///
+/// `--security-profile=untrusted` promotes itself to `cap-drop ALL` in `start`, and is spelled out
+/// again here because this function runs BEFORE that promotion. The two must agree: a test pins them
+/// together, because a profile that stopped implying the drop would silently re-cost the millisecond.
+///
+/// THE `CAP_` PREFIX IS DELIBERATELY NOT STRIPPED, which is where the SDK's version of this rule and
+/// this one legitimately differ. The Python binding normalises `CAP_ALL` because a caller can pass
+/// any string; this CLI does not have that problem, because `caps::resolve` REFUSES `CAP_ALL` by
+/// name (measured: all of `CAP_ALL`, `cap_all` and `Cap_All` exit 1 with "unknown capability"). So
+/// the only spellings that can reach here are `ALL` and `all`, and matching more would advertise a
+/// form the flag rejects. Same comparison as the profile promotion in `start`, on purpose.
+///
+/// ⛔ NOT A SECURITY BOUNDARY, and nothing here relaxes one. The box gets the same capabilities
+/// either way; what changes is whether kern spends a millisecond installing a mapping that the
+/// capability set makes unusable. An explicit `--uid-range`, `--user <non-root>` or `--ssh` asks for
+/// the range in as many words and wins over this, because those are requests and this is a default.
+fn range_buys_nothing(args: &BoxRunArgs) -> bool {
+    let drops_all = matches!(args.security_profile, Some(SecurityProfile::Untrusted))
+        || args.cap_drop.iter().any(|d| d.eq_ignore_ascii_case("ALL"));
+    drops_all && args.cap_add.is_empty()
 }
 
 /// Resolve the box's effective command from the user's `-- CMD` and the image's OCI config, docker-

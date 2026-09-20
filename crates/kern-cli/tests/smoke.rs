@@ -360,6 +360,94 @@ fn show_config_reports_the_uid_range_the_box_will_actually_get() {
     let rootfs = ["box", "t", "--rootfs", "/tmp"];
     assert_eq!(field(&rootfs, "uid_range"), "false");
     assert_eq!(field(&rootfs, "uid_range_source"), "-");
+
+    // DROPPING `ALL` DROPS THE DEFAULT WITH IT, because the capability the range serves is already
+    // refused: measured inside a box, `chown` to another uid fails under `--cap-drop ALL` whether
+    // the range is mapped or not. Worth 937 us of the 3956 on this path. The dry run has to say so,
+    // or a caller reading it would opt out of something they no longer have.
+    let dropped = ["box", "t", "--image", "alpine", "--cap-drop", "ALL"];
+    assert_eq!(field(&dropped, "uid_range"), "false");
+    assert_eq!(field(&dropped, "uid_range_source"), "-");
+
+    // `all` is the same flag: the comparison is case-insensitive, as it is where the profile below
+    // promotes itself. `CAP_ALL` is NOT tested, because `caps::resolve` refuses that spelling by
+    // name, which is why the rule does not strip the prefix.
+    let lower = ["box", "t", "--image", "alpine", "--cap-drop", "all"];
+    assert_eq!(field(&lower, "uid_range"), "false");
+
+    // ANY `--cap-add` PUTS IT BACK, and this is the case that decides the rule rather than
+    // illustrating it: measured, `--cap-drop ALL --cap-add CHOWN` chowns successfully WITH the range
+    // and fails without it. A capability handed back can use the range, so any add at all cancels
+    // the skip - the conservative reading, since being wrong here is a silent failure in an
+    // entrypoint while being conservative costs under a millisecond.
+    let added = [
+        "box",
+        "t",
+        "--image",
+        "alpine",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "CHOWN",
+    ];
+    assert_eq!(field(&added, "uid_range"), "true");
+    assert_eq!(field(&added, "uid_range_source"), "image-default");
+
+    // A NARROWER DROP IS NOT `ALL`. Dropping one capability leaves the rest, so the range still
+    // works and the default stands.
+    let narrow = ["box", "t", "--image", "alpine", "--cap-drop", "NET_ADMIN"];
+    assert_eq!(field(&narrow, "uid_range"), "true");
+
+    // AN EXPLICIT REQUEST OUTRANKS THE SKIP, in both of its spellings. These are the caller asking
+    // in as many words, and the skip is only ever a default being dropped.
+    let asked_anyway = [
+        "box",
+        "t",
+        "--image",
+        "alpine",
+        "--cap-drop",
+        "ALL",
+        "--uid-range",
+    ];
+    assert_eq!(field(&asked_anyway, "uid_range"), "true");
+    assert_eq!(field(&asked_anyway, "uid_range_source"), "request");
+    let as_user = [
+        "box",
+        "t",
+        "--image",
+        "alpine",
+        "--cap-drop",
+        "ALL",
+        "--user",
+        "5000",
+    ];
+    assert_eq!(field(&as_user, "uid_range"), "true");
+
+    // THE PROFILE AND THE FLAG ARE PINNED TOGETHER. `--security-profile=untrusted` promotes itself
+    // to `cap-drop ALL` inside `start`, and the rule spells that promotion out a second time because
+    // it runs before it. If the profile ever stopped implying the drop, this is what would catch it:
+    // the two must answer identically, including when an add cancels them.
+    let profile = [
+        "box",
+        "t",
+        "--image",
+        "alpine",
+        "--security-profile",
+        "untrusted",
+    ];
+    assert_eq!(field(&profile, "uid_range"), field(&dropped, "uid_range"));
+    assert_eq!(field(&profile, "uid_range"), "false");
+    let profile_added = [
+        "box",
+        "t",
+        "--image",
+        "alpine",
+        "--security-profile",
+        "untrusted",
+        "--cap-add",
+        "CHOWN",
+    ];
+    assert_eq!(field(&profile_added, "uid_range"), "true");
 }
 
 /// `KERN_NO_SCOPE=1` drops kern's own DEFAULT memory cap, and has to say so.
