@@ -308,7 +308,7 @@ namespace, which is exactly what makes a pod useful and also means a listener on
 member is reachable from another. Measured, not argued:
 
 ```sh
-kern pod create p --uid-range
+kern pod create p
 kern box srv --image alpine --pod p -d -- sh -c 'echo secret | nc -l -p 9999 -s 127.0.0.1'
 kern box cli --image alpine --pod p    -- nc -w 2 127.0.0.1 9999    # prints: secret
 ```
@@ -321,9 +321,10 @@ what a compose stack is. Do not reach for a pod to make a box start faster, even
 shared identity domain that buys it. For two workloads that must not reach each other, use two boxes
 and no pod.
 
-`--uid-range` on `kern pod create` changes what the shared user namespace maps, not how much is
-shared. Without it a member gets the single-uid map and `chown` to a non-root uid fails inside it,
-which is the same trade `--no-uid-range` makes on a standalone box.
+A pod maps a sub-uid range into its shared user namespace by default, the same default a standalone
+`--image` box has, because the mapping costs nothing per member once the holder has done it.
+`--no-uid-range` asks for the single-uid map instead: tighter, and the same trade the flag makes on a
+standalone box. Neither flag changes how much is shared, only what the shared namespace maps.
 
 ## Resource caps
 

@@ -338,12 +338,18 @@ pub enum Command {
         /// `build.target:`).
         target: Option<String>,
     },
-    /// `kern pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>]` / `pod ls` / `pod rm
+    /// `kern pod create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>]` / `pod ls` / `pod rm
     /// <name>`: a pod is a shared network, either one namespace or one bridge.
     PodCreate {
         name: String,
         outbound: bool,
+        /// `--uid-range`: the caller asking in as many words, so an unmet request is REPORTED.
+        /// Distinct from the default, which attempts the same mapping and degrades silently.
         uid_range: bool,
+        /// `--no-uid-range`: opt OUT of the range the pod now maps by default. Single-uid is the
+        /// tighter map, and it is a choice to make deliberately rather than to arrive at because a
+        /// flag was forgotten.
+        no_uid_range: bool,
         /// `--bridge <cidr>`: hold a bridge instead of a shared loopback, so every member gets its
         /// own network namespace and its own `127.0.0.1` while still reaching its peers.
         bridge: Option<String>,
@@ -4439,23 +4445,27 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
             reject_unknown_flags(
                 "pod create",
                 &rest[1..],
-                &["--no-outbound", "--uid-range", "--bridge"],
+                &["--no-outbound", "--uid-range", "--no-uid-range", "--bridge"],
             )?;
             let name = rest
                 .iter()
                 .skip(2)
                 .find(|a| !a.starts_with('-'))
                 .ok_or(Error::Usage(
-                    "pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>]",
+                    "pod create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>]",
                 ))?;
             Ok(Command::PodCreate {
                 name: name.to_string(),
                 bridge: flag_value(rest, "--bridge"),
                 outbound: !rest.contains(&"--no-outbound"),
-                // Map a subordinate uid range into the pod's shared user namespace, so member OCI
-                // images that drop privilege / chown to a fixed uid (postgres, mysql, …) work inside
-                // the pod. Without it the holder maps a single uid and such entrypoints fail closed.
+                // A subordinate uid range is mapped into the pod's shared user namespace BY DEFAULT,
+                // so member OCI images that drop privilege or chown to a fixed uid (postgres, mysql)
+                // work inside a pod the way they work in a standalone `--image` box, which has had
+                // the range by default for as long as it has had images. These two flags only move
+                // off that default: `--uid-range` turns a silent attempt into a reported request,
+                // `--no-uid-range` asks for the single-uid map instead.
                 uid_range: rest.contains(&"--uid-range"),
+                no_uid_range: rest.contains(&"--no-uid-range"),
             })
         }
         Some("ls" | "list" | "ps") => {
@@ -4478,7 +4488,7 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
             Ok(Command::PodRemove { names })
         }
         _ => Err(Error::Usage(
-            "pod create <name> [--no-outbound] [--uid-range] [--bridge <cidr>] | pod ls | pod rm <name>",
+            "pod create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>] | pod ls | pod rm <name>",
         )),
     }
 }
@@ -5124,15 +5134,27 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             name,
             outbound,
             uid_range,
+            no_uid_range,
             bridge,
         } => crate::pod::create_with_range(
             &name,
             outbound,
-            // `kern pod create --uid-range` is the caller asking in as many words.
-            if uid_range {
+            // THE DEFAULT MAPS THE RANGE, which is the same default a standalone `--image` box has.
+            // A pod that did not was the shape of a trap: the range costs nothing inside a pod, since
+            // the holder maps it once for every member, and a member without it fails a `chown` to a
+            // non-root uid silently until something chowns. There is no latency argument for the old
+            // default and there never was one.
+            //
+            // `--no-uid-range` WINS over `--uid-range` when both are given. The two contradict, and a
+            // contradiction resolves toward the tighter map rather than the wider one: a caller who
+            // typed both gets the single uid and can see they did, where the other order would hand
+            // them 65536 mapped ids off a flag they also tried to switch off.
+            if no_uid_range {
+                kern_isolation::UidRange::Off
+            } else if uid_range {
                 kern_isolation::UidRange::Requested
             } else {
-                kern_isolation::UidRange::Off
+                kern_isolation::UidRange::ImageDefault
             },
             bridge.as_deref(),
         ),

@@ -19,8 +19,8 @@ earlier draft of this table published 3.8, the low end, which is the error this 
 
 **The same box costs 2.6 ms in a pod, and the row below it is NOT the same job.** An `--image` box
 maps a sub-uid range so an official image can drop privilege in its entrypoint, and rootless the only
-way to write a range is the setuid helpers `newuidmap`/`newgidmap`: measured, 886 us of the 3.9. A pod
-created with `--uid-range` maps one namespace once and every member uses it, so that phase reads zero
+way to write a range is the setuid helpers `newuidmap`/`newgidmap`: measured, 886 us of the 3.9. A pod maps
+one namespace once and every member uses it, so that phase reads zero
 and the box measures **2.59 ms**, a paired delta of -1.185 ms [-1208, -1166]. The range is genuinely
 there, not skipped: `chown` to a non-root uid succeeds inside a member exactly as in a standalone box,
 where `--no-uid-range` makes the same `chown` fail.
@@ -32,7 +32,7 @@ identity and capability domain rather than separate ones, and the **network** na
 box. A sibling reading the other's loopback is not a hypothesis:
 
 ```sh
-kern pod create p --uid-range
+kern pod create p
 kern box srv --image alpine --pod p -d -- sh -c 'echo secret | nc -l -p 9999 -s 127.0.0.1'
 kern box cli --image alpine --pod p    -- nc -w 2 127.0.0.1 9999    # prints: secret
 ```

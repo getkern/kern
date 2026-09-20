@@ -703,7 +703,7 @@ fn starter_alive(dir: &std::path::Path) -> bool {
     }
 }
 
-/// `kern pod create <name> [--no-outbound] [--uid-range]` - spawn the pod's namespace holder + seed its
+/// `kern pod create <name> [--no-outbound] [--no-uid-range]` - spawn the pod's namespace holder + seed its
 /// hosts, and (unless `--no-outbound`, and if pasta is installed) attach pasta for internet egress.
 /// Publish a service with `-p` on its member box. `uid_range` maps a subordinate uid RANGE into the
 /// pod's shared user namespace (via the holder) instead of the single-uid self-map - needed when the

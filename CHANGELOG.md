@@ -7,6 +7,31 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A `chown` to a non-root uid failed inside a pod, and nothing said why.** `kern pod create` mapped a
+single uid unless `--uid-range` was passed, so a member running an official image that drops
+privilege in its entrypoint (postgres, mysql, nginx) failed closed, silently, until something
+chowned. A standalone `kern box --image` has mapped the range by default for as long as it has had
+images; the pod did not, and there was no argument for the difference. The range costs nothing per
+member inside a pod, because the holder maps it ONCE for every member: measured, `parent:idmap` is
+886 us in a standalone box and zero in a pod member.
+
+**This inverts a default, so it is a MINOR and not a patch**, and it lands without the deprecation
+entry the stability note asks for, under the exception that note names: the old default was a defect,
+and announcing a defect for a release before fixing it leaves the broken one in the field on purpose.
+`kern pod create` maps the range now. `--no-uid-range` asks for the single-uid map instead, which is
+the tighter one and the same trade that flag already makes on a box. `--uid-range` still exists and
+now means "report it if the host cannot", where the default attempts the same mapping and degrades
+silently on a host without `newuidmap` or `/etc/subuid`. Passing both resolves to `--no-uid-range`:
+a contradiction settles toward the tighter map rather than toward 65536 mapped ids.
+
+**What a pod shares is now asserted rather than described.** `pentest/pentest-pod-boundary.sh` pins
+the set with a negative control on every line, and it found the documentation wrong on its first run:
+SECURITY.md and BENCHMARKS.md said members share the uts namespace. They do not. That claim came from
+reading namespace inodes off boxes that ran one after another, and the kernel reuses an inode once
+its namespace is gone, so the comparison was of numbers a dead box had handed back. Read from four
+boxes alive at the same time, the shared set is the user and network namespaces, and mount, PID, IPC,
+uts and cgroup are private to each member.
+
 **kern no longer answers to `docker`.** A symlink named `docker` or `docker-compose` used to make
 this binary rewrite a Docker command line into kern's own and run it. That is gone, with the 1330
 lines behind it. The compatibility kern offers is with the FORMAT and the FLAGS, which is untouched:
