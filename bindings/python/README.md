@@ -2,6 +2,12 @@
 
 **Run LLM-generated code in a fast, real sandbox, one fresh box per call.**
 
+Fast means milliseconds, and it is two numbers rather than one: the box is the cheap part, and an
+interpreter starting inside it costs more than the box does. Both depend on your machine, so they are
+measured under [Prewarming](#prewarming-a-box-ready-before-the-call-arrives) with the machine and the
+method beside them, and the runtime's own are in
+[BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
+
 `kern-sandbox` is the Python binding for **[kern](https://getkern.dev)**: a rootless,
 kernel-enforced sandbox out of one static binary, with no daemon, no VM and no cloud. An agent's
 tool-call, a model's generated snippet, a notebook cell, a CI step: code that runs before anyone
