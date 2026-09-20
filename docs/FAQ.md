@@ -6,7 +6,7 @@ Short, honest answers to the questions that come up first. The threat model in f
 ## Is kern a Docker replacement?
 
 Partly. kern speaks Docker's **formats** (OCI images, `docker-compose.yml`, Dockerfiles), not its API.
-It starts a real, kernel-enforced container from an OCI image in ~3.5 ms against `docker run`'s ~297 ms,
+It starts a real, kernel-enforced container from an OCI image in ~3.8 ms against `docker run`'s ~294 ms,
 with no daemon, rootless by default, and 0 RAM at rest. It has no overlay networks, no plugin
 ecosystem and no Swarm; it does not implement CRI (for Kubernetes, use containerd or CRI-O). Reach for
 kern where the daemon, the root, and the hundreds of milliseconds hurt: agent tool-calls, CI jobs,
@@ -17,11 +17,10 @@ per-request functions, dev sandboxes, edge and ARM. The full compatibility matri
 
 bubblewrap is a sandbox **launcher**; kern is a **runtime**. bwrap has no OCI image pull, no lifecycle
 (`ps`/`stop`/`exec`/`stats`), no resource profiles, no Python/Node SDK, no faults-as-data, no compose,
-and a simpler seccomp posture. At namespace parity the two are in the same speed class and the margin
-has not been stable: it has read anywhere from bubblewrap 11% ahead to kern 13% ahead on the same
-machine depending on the scheduler, the fixture and the harness, so
-[BENCHMARKS.md](../BENCHMARKS.md) publishes the range rather than a number. Speed is not the point
-anyway: the value is the runtime around the namespaces, not the raw primitive. If all you need is to
+and a simpler seccomp posture. They are in the same speed class: measured together in one session
+they read 2.7 ms each, and kern is applying a memory and PID cap there that bwrap does not apply at
+all ([BENCHMARKS.md](../BENCHMARKS.md)). Speed is not the point anyway: the value is the runtime
+around the namespaces, not the raw primitive. If all you need is to
 unshare a few namespaces and exec, bwrap is a fine, smaller tool.
 
 ## kern vs youki / runc?

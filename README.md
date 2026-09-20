@@ -4,7 +4,7 @@
 
 **kern:** a fast, rootless container runtime and sandbox, built on virtual resources. Run workloads in a real container, including an agent's tool-call or LLM-generated code.
 
-**A real, kernel-enforced container in ~3.5 ms, out of one static binary with no daemon.**
+**A real, kernel-enforced container in ~3.8 ms, out of one static binary with no daemon.**
 
 <p align="center">
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">
@@ -302,8 +302,8 @@ All three columns measured on one host, same workload, same day: an Intel i7-147
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Rootless | **yes**, always | opt-in | yes |
-| Cold start, bare box | **~2.4 ms** | ~288 ms | ~297 ms |
-| Cold start, from an OCI image | **~3.4 ms** | ~288 ms | ~297 ms |
+| Cold start, bare box | **2.7 ms** | 294 ms | 288 ms |
+| Cold start, from an OCI image | **3.8 ms** | 294 ms | 288 ms |
 | Stop a service (init handles SIGTERM) | **~2.3 ms** | ~162 ms | ~194 ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Footprint | **one static binary** | daemon stack | multi-binary install |
@@ -319,8 +319,8 @@ Intel i7-14700KF, Linux 7.0.0, the release binary, alternating batches on an idl
 
 | | kern | runc | podman | docker |
 |---|---:|---:|---:|---:|
-| Cold start (bare box) | **~2.4 ms** | ~13.1 ms | ~297 ms | ~288 ms |
-| 200 boxes in parallel | **~0.11 s** | ~0.29 s | ~43.1 s | ~16.7 s |
+| Cold start (bare box) | **2.7 ms** | 13.2 ms | 288 ms | 294 ms |
+| 200 boxes in parallel | **0.10 s** | 0.32 s | 43.6 s | 16.6 s |
 
 These are engines, and the distance to them is the one that means something. The near neighbours that
 do LESS than a box start - bubblewrap leaves the process in the caller's cgroup with no `memory.max` -

@@ -596,12 +596,18 @@ def latency_claims_agree() -> list[str]:
         r'|~?([\d.]+)\s*ms with `--image`'
     )
     bad = []
+    # `blog/` IS NOT A CLAIMANT, and that is a decision rather than an oversight. A post carries the
+    # date it was measured on and a table beside the sentence ("on 2026-08-22 with the machine below
+    # 0.4 load"), so its figures are a record of that day and not a claim about today. Rewriting them
+    # every time the current number moves would make each post lie about when it was written, and
+    # would quietly rewrite history to look like it always agreed with the present. The rule this
+    # protects is the one about the CURRENT claim: a page that states a number WITHOUT a measurement
+    # date is claiming it is true now, and must agree with the README.
     for path in (
         "assets/make-demo-gif.py",
         "docs/FAQ.md",
         "bindings/python/README.md",
         "bindings/node/README.md",
-        "blog/introducing-kern.md",
     ):
         try:
             text = open(path, encoding="utf-8").read()
