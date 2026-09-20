@@ -7,6 +7,19 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**Every box leaked its environment sidecar, and only `stop` ever cleaned one up.** kern records a
+box's environment in `$XDG_RUNTIME_DIR/kern/env/<name>-<pid>` so `kern exec` and the healthcheck can
+read an environment that `/proc/<pid1>/environ` no longer gives them once the box drops privilege.
+That file was dropped on the `stop` path and nowhere else, so a box that simply EXITED left it
+behind forever: every foreground box, and every SDK call. Measured after one day of benchmarking:
+**4433 files and 13 MB with zero boxes alive**, in a tmpfs, so resident memory that never comes back.
+It is removed in the box teardown now, beside the `unregister` that drops the instance file for the
+same reason, and `prune` sweeps the directory for the box whose supervisor was killed before
+reaching that line. The sweep already covered `logs`, `health`, `waitexit` and `claims`; `env` was
+the fifth sidecar and the only one it did not know about, which is also why the shared key helper is
+no longer called `health_key`. `prune`'s own `--help` line now lists the environment among what it
+removes.
+
 **A box that drops every capability no longer pays for a uid range it cannot use: 937 us, a quarter
 of a cold `--image` box.** Mapping the subordinate range forks `newuidmap` and `newgidmap`, and that
 phase is 876 us of a 4 ms box against 22 us without it. Under `--cap-drop ALL` it bought nothing,

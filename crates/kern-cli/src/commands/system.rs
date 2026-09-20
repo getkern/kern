@@ -94,7 +94,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}wait{z} <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
     {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D)
     {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
-    {c}prune{z}                                                          Remove a stopped box's leftovers: logs, health, and the recorded exit code
+    {c}prune{z}                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     {c}gc{z} [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
     {c}recover{z}                                                        Reclaim orphaned scratch of dead boxes (also done by gc)
     {c}history{z} [-n N]                                                 Recently-run boxes

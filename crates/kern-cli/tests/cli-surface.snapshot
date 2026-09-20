@@ -57,7 +57,7 @@ COMMANDS:
     wait <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
     diff <box> [--json]                                            List filesystem changes vs the image (C/D)
     events                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
-    prune                                                          Remove a stopped box's leftovers: logs, health, and the recorded exit code
+    prune                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     gc [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
     recover                                                        Reclaim orphaned scratch of dead boxes (also done by gc)
     history [-n N]                                                 Recently-run boxes

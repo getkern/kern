@@ -1967,6 +1967,20 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     if let Some((_, Some(path))) = &reg_state {
         registry::unregister(path);
     }
+    // THE ENVIRONMENT SIDECAR GOES WITH THE BOX. `set_box_env` writes `env/<name>-<pid>` for every
+    // box so `kern exec` and the healthcheck can read an environment they cannot get from
+    // `/proc/<pid1>/environ` (unreadable once the box drops privilege). Only `stop` dropped it, so a
+    // box that simply EXITED - which is every foreground box, and every SDK call - left the file
+    // behind forever. MEASURED on 2026-09-20: 4433 files and 13 MB in that directory with zero boxes
+    // alive, in tmpfs, so resident memory that never returns.
+    //
+    // Here rather than beside `set_box_env`'s other callers, because this is the one place every
+    // foreground box passes through on its way out, next to the `unregister` that drops the instance
+    // file for the same reason. `prune` sweeps the directory too, for the box whose supervisor was
+    // killed before reaching this line.
+    if let Some((_, Some(_))) = &reg_state {
+        registry::clear_box_env(name.as_str(), launcher_pid);
+    }
     pt.mark("parent:teardown");
     // CLOSE THE PROFILE, naming what the marks above do NOT cover. Every phase here is a delta
     // between two marks, so the sum describes only the span from the first mark onwards: the

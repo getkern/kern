@@ -2377,7 +2377,24 @@ pub fn prune() -> (usize, u64) {
     sweep_orphans(logs_dir(), log_key, &live, inst, &mut removed, &mut freed);
     sweep_orphans(
         health_dir(),
-        health_key,
+        sidecar_key,
+        &live,
+        inst,
+        &mut removed,
+        &mut freed,
+    );
+    // THE ENV SIDECAR WAS THE ONE THIS SWEEP DID NOT KNOW ABOUT, and it is the one that grows
+    // fastest: `set_box_env` writes `<name>-<pid>` for EVERY box, where a health file only exists
+    // for a box with a healthcheck. MEASURED on 2026-09-20 after a day of benchmarking: 4433 files
+    // and 13 MB in `env/` with ZERO boxes alive, none of which any code path would ever have
+    // removed. It is tmpfs, so that is resident memory that never comes back.
+    //
+    // `clear_box_env` drops it on the normal exit path, which is the fix at the source; this is the
+    // net beneath it, for the box whose supervisor was SIGKILLed and never ran its teardown. Both
+    // are needed for the same reason `logs` and `health` have both.
+    sweep_orphans(
+        env_dir(),
+        sidecar_key,
         &live,
         inst,
         &mut removed,
@@ -2432,11 +2449,16 @@ fn log_key(fname: &str) -> Option<&str> {
     base.strip_suffix(".log")
 }
 
-/// The box key a file in the health dir belongs to: the whole name.
+/// The box key a PLAIN `<name>-<pid>` sidecar belongs to: the whole file name.
 ///
-/// A stray `.log` there is not a health key and is skipped rather than force-removed - the dirs are
+/// Shared by the `health` and `env` dirs, which name their files identically. It was called
+/// `health_key` while only one caller existed, and the name is why the `env` dir spent a release
+/// outside [`prune`]: the sweep read as health-specific machinery rather than as the rule for every
+/// sidecar keyed this way.
+///
+/// A stray `.log` here is not such a key and is skipped rather than force-removed - the dirs are
 /// separate, and a file in the wrong one is a symptom to leave visible, not to delete.
-fn health_key(fname: &str) -> Option<&str> {
+fn sidecar_key(fname: &str) -> Option<&str> {
     (!fname.ends_with(".log")).then_some(fname)
 }
 
@@ -4202,7 +4224,7 @@ mod tests {
 
 #[cfg(test)]
 mod sweep_key_tests {
-    use super::{health_key, log_key};
+    use super::{log_key, sidecar_key};
 
     /// Every file the log pump can leave behind maps back to the box key that owns it.
     ///
@@ -4228,9 +4250,11 @@ mod sweep_key_tests {
         assert_eq!(log_key("notes.txt"), None);
         assert_eq!(log_key("web-1234.logged"), None);
 
-        // The health dir is keyed by the whole name, and a stray log there is not a health key.
-        assert_eq!(health_key("web-1234"), Some("web-1234"));
-        assert_eq!(health_key("web-1234.log"), None);
+        // The health AND env dirs are keyed by the whole name, and a stray log in either is not
+        // such a key. Both sweeps call this one function: `env` spent a release outside `prune`
+        // while the helper was named as if it belonged to health alone.
+        assert_eq!(sidecar_key("web-1234"), Some("web-1234"));
+        assert_eq!(sidecar_key("web-1234.log"), None);
     }
 }
 
