@@ -2,9 +2,14 @@
 
 <img src="assets/brand/kern-logo.png" width="260" alt="kern">
 
-**kern:** a fast, rootless sandbox and virtual resource runtime. Run any workload in a real container, including an agent's tool-call or LLM-generated code.
+**kern:** run a program, a Docker image or a whole docker-compose file, each in its own real container, with the share of CPU, memory and disk you choose. One small binary that runs as your own user, with no daemon and no VM to boot.
 
-**A real, kernel-enforced container in ~3.5 ms, out of one static binary with no daemon.**
+**A real container in ~3.5 ms, out of one static binary with no daemon.**
+
+*Real* means the Linux kernel enforces it: namespaces, a `pivot_root`, a seccomp allowlist and cgroup
+limits, rather than a chroot or an interpreter jail. It also means the kernel is **shared**, so code
+that is deliberately hostile belongs in a microVM and not here. [SECURITY.md](SECURITY.md) says where
+each boundary is real and where it is cooperative.
 
 <p align="center">
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.5 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0.">

@@ -582,8 +582,12 @@ def latency_claims_agree() -> list[str]:
     the number is measured again - only the README has to be edited, and every other claimant is then
     checked against it.
     """
+    # Anchored on "real container in ~N ms", which is the headline sentence. It used to be
+    # "kernel-enforced container in ~N ms"; that word moved into the paragraph below the headline,
+    # where it explains what "real" means instead of asserting it in passing, and the anchor followed
+    # the text rather than the text being held in place by the gate.
     readme = re.search(
-        r"kernel-enforced container in\s+~?([\d.]+)\s*ms", open("README.md", encoding="utf-8").read()
+        r"real container in\s+~?([\d.]+)\s*ms", open("README.md", encoding="utf-8").read()
     )
     if not readme:
         return ["README.md no longer states the image cold start in its headline, so nothing can be "
