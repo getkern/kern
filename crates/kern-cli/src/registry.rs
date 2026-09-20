@@ -2288,6 +2288,73 @@ pub fn proc_starttime(pid: i32) -> u64 {
 }
 
 /// Collapse newlines so one entry stays on its own lines.
+/// Join `--label k=v` pairs into the registry's ONE label field, escaping the separator.
+///
+/// THE UNESCAPED JOIN WAS A DEFECT, and a two-sided one. `--label 'a=b,c=d'` is ONE label whose
+/// value contains a comma, and joining the list with a bare `,` made it indistinguishable from two
+/// labels. MEASURED against the reference implementations, which agree with each other and not with
+/// what kern did:
+///
+/// ```text
+///   docker 29.1.3 inspect --format '{{json .Config.Labels}}'   {"a":"b,c=d"}
+///   podman         inspect --format '{{json .Config.Labels}}'   {"a":"b,c=d"}
+///   kern 0.9.35    ps --json .labels                            {"a":"b","c":"d"}
+/// ```
+///
+/// ⭐ AND THE FILTER WAS WRONG IN BOTH DIRECTIONS, which is worse than the read-back: on 0.9.35,
+/// `--filter label=c=d` MATCHED a box that had never carried that label, and
+/// `--filter label=a=b,c=d` (the label it actually had) matched nothing. A filter that reports a
+/// false positive is one an operator acts on.
+///
+/// `\` first, then `,`, so decoding is unambiguous. Newlines go too: the registry record is
+/// line-delimited and `one_line` flattens them to spaces, which would silently rewrite a label's
+/// value rather than preserve it.
+pub fn encode_labels(labels: &[String]) -> String {
+    labels
+        .iter()
+        .map(|l| {
+            l.replace('\\', "\\\\")
+                .replace(',', "\\,")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Split the registry's label field back into the labels that were passed in.
+///
+/// THE SOLE DECODER of what [`encode_labels`] writes, so the filter and every renderer read one
+/// grammar. A trailing lone backslash (only reachable from a corrupted record) is dropped rather
+/// than used to escape the terminator, which would swallow the next label.
+pub fn decode_labels(field: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = field.chars();
+    let mut any = false;
+    while let Some(c) = chars.next() {
+        any = true;
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => cur.push('\n'),
+                Some('r') => cur.push('\r'),
+                Some(other) => cur.push(other),
+                None => {}
+            },
+            ',' => {
+                out.push(std::mem::take(&mut cur));
+            }
+            other => cur.push(other),
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    // An empty field is no labels, not one empty label.
+    out.retain(|l| !l.is_empty());
+    out
+}
+
 fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }

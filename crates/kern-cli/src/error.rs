@@ -73,6 +73,17 @@ impl Error {
                 "start" => "kern has no `start`: a box is created and started in one step, with \
                             `kern box <name> --image <image>`"
                     .into(),
+                // THE HABIT BEHIND `create` IS NOT ONLY A REFERENCE HOLDER. `docker create` +
+                // `docker cp` + `docker start` is how people seed files into a container before
+                // anything in it runs, and kern has no stopped box to copy into: `kern cp` enters
+                // the namespaces of a live PID 1. Naming only the missing verb would leave that
+                // person with a refusal and no route, so the hint names the routes: the content
+                // goes in at start, through the flags that place it.
+                "create" => "kern has no `create`: a box is created and started in one step. To \
+                             put files in before the workload runs, place them at start with `-v \
+                             <host>:<path>`, `--tmpfs <path>` or `--secret`, rather than copying \
+                             into a stopped box (`kern cp` needs a running one)"
+                    .into(),
                 "restart" => "kern has no `restart`: `kern stop <name>` and start it again, or \
                               give the box `--restart` so kern supervises it"
                     .into(),

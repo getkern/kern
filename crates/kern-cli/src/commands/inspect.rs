@@ -67,16 +67,28 @@ pub(crate) fn parse_port_mappings(ports: &str) -> impl Iterator<Item = (&str, u3
 
 /// Docker's `NetworkSettings.Ports` map, built from the same mappings [`publishers_json`] reads.
 ///
-/// SHAPE MEASURED on Docker 29.6.2, not recalled:
-/// `{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"18080"}]}`. Three details are load-bearing and all
-/// three are the kind a from-memory implementation gets wrong. The KEY is the port INSIDE the
-/// container with its protocol suffix, not the published one. The value is an ARRAY, because one
-/// container port can be published on several addresses, and a caller doing `.["80/tcp"][0]`
-/// breaks on an object. `HostPort` is a STRING, not a number.
+/// SHAPE MEASURED on Docker 29.1.3 on this machine, not recalled. A container published on
+/// `127.0.0.1:18401->80` and additionally EXPOSEing 9999:
 ///
-/// A container port with no publication maps to `null` in Docker; kern's registry records only what
-/// it actually bound, so every key here has an array and none has `null`. That is a narrower
-/// document, never a contradicting one.
+/// ```text
+///   {"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"18401"}],"9999/tcp":null}
+///   and once stopped:  {}
+/// ```
+///
+/// FOUR details are load-bearing, and each is the kind a from-memory implementation gets wrong.
+/// The KEY is the port INSIDE the container with its protocol suffix, not the published one. The
+/// value is an ARRAY, because one container port can be published on several addresses, and a
+/// caller doing `.["80/tcp"][0]` breaks on an object. `HostPort` is a STRING, not a number. And the
+/// capitalisation is `HostIp`, with a lower-case `p`: `HostIP` would parse as absent in every
+/// reader. An earlier version of this comment listed three of the four and named the wrong Docker
+/// version, which is the class of error this file exists to avoid.
+///
+/// ⚠️ ONE KEY KERN NEVER EMITS. Docker maps a port that is EXPOSEd but not published to `null`,
+/// which is how a caller tells "the image declares this port" from "nothing declares it". kern's
+/// registry records what it actually BOUND and has no notion of a declared-but-unpublished port, so
+/// every key here carries an array and none is `null`. A caller iterating the map therefore sees
+/// fewer keys here than Docker would show, never a different answer for the same key. A stopped box
+/// yields `{}`, which is what Docker yields too.
 pub(crate) fn network_ports_json(ports: &str) -> String {
     // Grouped by container port, because two publications of one port share a key and appending
     // them as two keys would produce a document whose second entry silently replaces the first in
@@ -113,11 +125,20 @@ pub(crate) fn network_ports_json(ports: &str) -> String {
 /// emitted with an empty value: `--label` requires the `=` at parse time, so such a segment can only
 /// come from a corrupted record, and inventing a key for it would put a name into a document that
 /// nothing ever set.
-pub(crate) fn label_pairs(field: &str) -> impl Iterator<Item = (&str, &str)> {
-    field
-        .split(',')
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| l.split_once('='))
+pub(crate) fn label_pairs(field: &str) -> Vec<(String, String)> {
+    registry::decode_labels(field)
+        .into_iter()
+        .filter_map(|l| {
+            // Docker and podman both accept a BARE KEY (`--label x`) and store an empty value,
+            // MEASURED: podman renders `{"noequals":""}`. A segment with no `=` is therefore a
+            // real label and not corruption, and dropping it here would lose one the caller set.
+            let (k, v) = match l.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (l, String::new()),
+            };
+            (!k.is_empty()).then_some((k, v))
+        })
+        .collect()
 }
 
 /// The registry's label field as a JSON object, Docker's `Config.Labels` shape.
@@ -128,11 +149,11 @@ pub(crate) fn label_pairs(field: &str) -> impl Iterator<Item = (&str, &str)> {
 /// script reads is the same and the failure mode is not.
 pub(crate) fn labels_json(field: &str) -> String {
     let mut out = String::from("{");
-    for (i, (k, v)) in label_pairs(field).enumerate() {
+    for (i, (k, v)) in label_pairs(field).into_iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        out.push_str(&format!("{}:{}", json_str(k), json_str(v)));
+        out.push_str(&format!("{}:{}", json_str(&k), json_str(&v)));
     }
     out.push('}');
     out
@@ -144,8 +165,11 @@ pub(crate) fn labels_json(field: &str) -> String {
 /// `app` label must be able to print an empty string the way Docker does, WITHOUT that being
 /// confusable with a label whose value is genuinely empty. Both print nothing; only the caller that
 /// asks for the Option can tell them apart.
-pub(crate) fn label_value<'a>(field: &'a str, key: &str) -> Option<&'a str> {
-    label_pairs(field).find(|(k, _)| *k == key).map(|(_, v)| v)
+pub(crate) fn label_value(field: &str, key: &str) -> Option<String> {
+    label_pairs(field)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
 }
 
 /// The two presentation knobs `docker ps` has that are not about WHICH boxes are listed.
@@ -1142,6 +1166,11 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         .and_then(|d| std::fs::read_to_string(d.join("memory.max")).ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
     if json {
+        // ⚠️ ONE OBJECT, WHERE `docker inspect` EMITS AN ARRAY of one. Measured: Docker's document
+        // opens with `[`. kern's opens with `{`, deliberately and from before this, because
+        // `kern inspect` names exactly one box; but the habit a caller brings is `jq '.[0].x'`,
+        // and that reads `null` here rather than failing. Said out loud at the point the shape is
+        // produced, because a reader of this function is the one who would otherwise assume.
         // `null` (not 0) for a resource the box has no dedicated cgroup to read - "unknown".
         let num = json_num;
         // THE ONE FIELD A SCRIPT ASKS FOR FIRST WAS NOT THERE. The document carried `health`, which

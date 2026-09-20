@@ -2528,6 +2528,32 @@ enum MountSpec {
     Tmpfs(String),
 }
 
+/// Split a `--mount` spec into its comma-separated fields, honouring double quotes.
+///
+/// A PLAIN `split(',')` IS NOT THE GRAMMAR. The reference implementation parses this value as CSV,
+/// so a field may quote itself to carry a comma, and
+/// `--mount 'type=bind,"src=/a,b",dst=/x'` is valid there. MEASURED on Docker 29.1.3: it is
+/// accepted and the mount is made. kern split on every comma and answered the generic usage error,
+/// so a path with a comma in it could not be mounted through this flag at all, and the message did
+/// not say why.
+///
+/// The quote is a FIELD quote, not a value quote: `"src=/a,b"` quotes the whole `key=value`, which
+/// is why quotes are stripped here, before the `=` split, and not inside it.
+fn csv_fields(spec: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in spec.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => out.push(std::mem::take(&mut cur)),
+            other => cur.push(other),
+        }
+    }
+    out.push(cur);
+    out
+}
+
 /// Parse one Docker `--mount type=…,src=…,dst=…` spec into the `-v`/`--tmpfs` spec it means.
 ///
 /// WHY THIS EXISTS AS A TRANSLATION AND NOT A SECOND MOUNT PATH. Everything `--mount` can express,
@@ -2558,9 +2584,16 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
         "--mount type=bind|volume|tmpfs,src=<source>,dst=<path>[,ro] \
          (e.g. --mount type=bind,src=/srv/app,dst=/app,ro)",
     );
-    let (mut kind, mut src, mut dst, mut ro, mut size) = ("volume", "", "", false, "");
-    for field in spec.split(',') {
-        let field = field.trim();
+    let (mut kind, mut src, mut dst, mut ro, mut size) = (
+        String::from("volume"),
+        String::new(),
+        String::new(),
+        false,
+        String::new(),
+    );
+    for field in csv_fields(spec) {
+        let field = field.trim().to_string();
+        let field = field.as_str();
         if field.is_empty() {
             continue;
         }
@@ -2571,13 +2604,13 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
             None => (field, ""),
         };
         match key {
-            "type" => kind = value,
-            "src" | "source" => src = value,
-            "dst" | "destination" | "target" => dst = value,
+            "type" => kind = value.to_string(),
+            "src" | "source" => src = value.to_string(),
+            "dst" | "destination" | "target" => dst = value.to_string(),
             // `readonly=false` is an explicit NO and must not turn the mount read-only: reading any
             // `readonly` key as "yes" would make the one spelling that disables it enable it.
             "ro" | "readonly" | "read-only" => ro = value.is_empty() || value == "true",
-            "tmpfs-size" => size = value,
+            "tmpfs-size" => size = value.to_string(),
             // A REAL DOCKER KEY WITH NOWHERE TO GO. `volume-label=` labels the volume at creation,
             // and kern's volumes carry a quota and a creation time and nothing else. Refused BY
             // NAME rather than by the generic unknown-key error, because the caller wrote something
@@ -2598,7 +2631,7 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
     if dst.is_empty() {
         return Err(USAGE);
     }
-    match kind {
+    match kind.as_str() {
         "tmpfs" => {
             if !src.is_empty() {
                 return Err(Error::Usage(
@@ -2624,7 +2657,7 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
             // `bind` whose source is not a path would become a volume, and a `volume` whose source
             // is a path would become a bind. Either way the caller named one thing and would get
             // the other, silently.
-            let named = crate::volume::classify(src) == crate::volume::SourceKind::Named;
+            let named = crate::volume::classify(&src) == crate::volume::SourceKind::Named;
             if kind == "bind" && named {
                 return Err(Error::Usage(
                     "--mount type=bind needs an absolute or ./-relative src (a bare name is a \
@@ -2936,15 +2969,23 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         None => return Err(Error::Usage("--stop-timeout <seconds>")),
                     };
                 }
-                // `-l/--label k=v`: descriptive metadata. Requires the `=` (Docker's own rule) so a
-                // typo can't silently register a key with an empty value that no filter will match.
+                // `-l/--label k=v`, or a BARE KEY for an empty value.
+                //
+                // THE COMMENT HERE USED TO SAY THE `=` WAS "Docker's own rule", AND IT IS NOT.
+                // MEASURED on the reference implementation: `--label noequals` is accepted and
+                // renders `{"noequals":""}` in `inspect --format '{{json .Config.Labels}}'`.
+                // kern refused it, so a command line that works everywhere else failed here with
+                // a message citing a rule that does not exist. What IS refused is a leading `=`
+                // (an empty key), which names nothing and no filter can match.
                 "-l" | "--label" => {
                     i += 1;
                     match rest.get(i) {
-                        Some(v) if v.contains('=') && !v.starts_with('=') => {
+                        Some(v) if !v.is_empty() && !v.starts_with('=') => {
                             labels.push((*v).to_string())
                         }
-                        _ => return Err(Error::Usage("--label k=v (e.g. --label app=web)")),
+                        _ => return Err(Error::Usage(
+                            "--label k=v (e.g. --label app=web), or a bare key for an empty value",
+                        )),
                     }
                 }
                 // `--sysctl KEY=VALUE`: a namespaced kernel knob, Docker's spelling.
@@ -3669,6 +3710,18 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     // (`CMD-SHELL` and `CMD`), so a command line carrying both has said two different things about
     // one probe and there is no reading of it that is not a guess. Refusing costs a retyped line;
     // picking one silently would run a check the caller did not write.
+    // `--rm` AND `--restart` ARE A CONTRADICTION, and until this check they both applied: a box
+    // was supervised to restart forever AND asked to leave no trace of ever having exited.
+    // MEASURED on the reference implementation, which refuses the pair:
+    // `the --rm option conflicts with --restart, when the restartPolicy is not "" and "no"`.
+    // kern accepted `box --rm -d --restart always` and printed `restart=always - survives reboot`,
+    // which is the opposite of what `--rm` asks for.
+    if rm && !matches!(restart, commands::RestartPolicy::No) {
+        return Err(Error::Usage(
+            "--rm and --restart are contradictory: one says throw the box away when it ends, the \
+             other says bring it back. Pass one of them.",
+        ));
+    }
     if health_cmd.is_some() && !health_cmd_argv.is_empty() {
         return Err(Error::Usage(
             "--health-cmd and --health-cmd-argv are the two forms of ONE check (shell and exec); \
@@ -6955,6 +7008,117 @@ mod tests {
             v("type=tmpfs,dst=/run,tmpfs-size=64m"),
             MountSpec::Tmpfs("/run:64m".into())
         );
+    }
+
+    // CSV, NOT `split(',')`. The reference implementation parses this value as CSV, so a field may
+    // quote itself to carry a comma; MEASURED on Docker 29.1.3, `--mount 'type=bind,"src=/a,b",
+    // dst=/x'` is accepted there. kern split on every comma and answered the generic usage error,
+    // so a path with a comma could not be mounted through this flag at all.
+    #[test]
+    fn mount_spec_parses_quoted_fields() {
+        assert_eq!(
+            parse_mount_spec(r#"type=bind,"src=/tmp/a,b",dst=/x"#).unwrap(),
+            MountSpec::Volume("/tmp/a,b:/x".into())
+        );
+        // The quote wraps the whole `key=value`, so it is stripped before the `=` split.
+        assert_eq!(
+            parse_mount_spec(r#""type=bind","source=/a","target=/b""#).unwrap(),
+            MountSpec::Volume("/a:/b".into())
+        );
+        // An unquoted comma still separates: the quoting must not swallow ordinary specs.
+        assert_eq!(
+            parse_mount_spec("type=bind,src=/a,dst=/b,ro").unwrap(),
+            MountSpec::Volume("/a:/b:ro".into())
+        );
+        // And the NEGATIVE: a comma inside quotes is NOT a separator, so this is one field with a
+        // bad key rather than two fields, and it is refused instead of half-parsed.
+        assert!(parse_mount_spec(r#"type=bind,"nope=/a,dst=/b""#).is_err());
+    }
+
+    // `--rm` and `--restart` are a contradiction, and until this check both applied: a box
+    // supervised to restart forever AND asked to leave no trace of having exited. The reference
+    // implementation refuses the pair; kern printed `restart=always - survives reboot`.
+    #[test]
+    fn rm_and_restart_are_refused_together() {
+        let cmd = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            parse(&owned).map(|(_, c)| c)
+        };
+        assert!(cmd(&[
+            "box",
+            "w",
+            "-d",
+            "--rm",
+            "--restart",
+            "always",
+            "--image",
+            "alpine",
+            "--",
+            "true"
+        ])
+        .is_err());
+        assert!(cmd(&[
+            "box",
+            "w",
+            "-d",
+            "--rm",
+            "--restart",
+            "on-failure",
+            "--image",
+            "alpine",
+            "--",
+            "true"
+        ])
+        .is_err());
+        // THE NEGATIVES, so the refusal is not just "anything with --rm": each alone is fine, and
+        // `--restart no` is the absence of a policy rather than one.
+        assert!(cmd(&["box", "w", "--rm", "--image", "alpine", "--", "true"]).is_ok());
+        assert!(cmd(&[
+            "box",
+            "w",
+            "-d",
+            "--restart",
+            "always",
+            "--image",
+            "alpine",
+            "--",
+            "true"
+        ])
+        .is_ok());
+        assert!(cmd(&[
+            "box",
+            "w",
+            "--rm",
+            "--restart",
+            "no",
+            "--image",
+            "alpine",
+            "--",
+            "true"
+        ])
+        .is_ok());
+    }
+
+    // A BARE KEY is a label with an empty value, measured on the reference implementation
+    // (`--label noequals` renders `{"noequals":""}`). kern refused it while citing a rule it
+    // attributed to Docker, and Docker has no such rule.
+    #[test]
+    fn label_accepts_a_bare_key_and_refuses_an_empty_one() {
+        let labels_of = |arg: &str| {
+            let owned: Vec<String> = ["box", "w", "--label", arg, "--image", "alpine"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            parse(&owned).map(|(_, c)| match c {
+                Command::BoxRun { labels, .. } => labels,
+                other => panic!("expected BoxRun, got {other:?}"),
+            })
+        };
+        assert_eq!(labels_of("noequals").unwrap(), vec!["noequals".to_string()]);
+        assert_eq!(labels_of("a=b,c=d").unwrap(), vec!["a=b,c=d".to_string()]);
+        // THE NEGATIVES: an empty key names nothing and no filter can match it.
+        assert!(labels_of("=v").is_err());
+        assert!(labels_of("").is_err());
     }
 
     // THE REFUSALS, which are the reason this is a parser and not a `split(',')`. Each of these

@@ -702,17 +702,76 @@ mod ps_exited_tests {
         );
         // A label whose VALUE is empty is a real label and keeps its key.
         assert_eq!(labels_json("app="), r#"{"app":""}"#);
-        // A segment with no `=` cannot come from `--label` (which requires it) and is skipped
-        // rather than given an invented empty value.
-        assert_eq!(labels_json("app=web,junk"), r#"{"app":"web"}"#);
+        // A bare key IS a label with an empty value, measured on the reference implementation.
+        assert_eq!(labels_json("app=web,junk"), r#"{"app":"web","junk":""}"#);
         // A value containing the separator survives the round trip through JSON quoting.
         assert_eq!(labels_json(r#"a=x"y"#), r#"{"a":"x\"y"}"#);
         // ABSENT and EMPTY are different facts, and only the Option can tell them apart.
-        assert_eq!(label_value("app=web", "app"), Some("web"));
-        assert_eq!(label_value("app=", "app"), Some(""));
+        assert_eq!(label_value("app=web", "app").as_deref(), Some("web"));
+        assert_eq!(label_value("app=", "app").as_deref(), Some(""));
         assert_eq!(label_value("app=web", "nope"), None);
         // A bare key must not be satisfied by a prefix of another: `app` is not `apple`.
         assert_eq!(label_value("apple=1", "app"), None);
+    }
+
+    /// THE LABEL GRAMMAR, round-tripped, with the case that was a defect on 0.9.35 first.
+    ///
+    /// A label whose VALUE contains the separator was stored with a bare join and read back as two
+    /// labels. Measured against the reference implementations, which agree with each other:
+    /// `--label 'a=b,c=d'` is ONE label, `{"a":"b,c=d"}`. kern answered `{"a":"b","c":"d"}`, and
+    /// the filter was wrong in BOTH directions, which is the half that an operator acts on.
+    #[test]
+    fn label_round_trip_survives_the_separator() {
+        use crate::commands::inspect::{label_pairs, labels_json};
+        use crate::registry::{decode_labels, encode_labels};
+        let enc =
+            |v: &[&str]| encode_labels(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+
+        // THE DEFECT: one label, one pair, value intact.
+        let one = enc(&["a=b,c=d"]);
+        assert_eq!(decode_labels(&one), vec!["a=b,c=d".to_string()]);
+        assert_eq!(labels_json(&one), r#"{"a":"b,c=d"}"#);
+        // And the NEGATIVE that the old code got wrong: `c=d` is not a label this box carries.
+        assert_eq!(label_pairs(&one).len(), 1);
+        assert_eq!(label_pairs(&one)[0].0, "a");
+
+        // Two real labels still decode as two.
+        let two = enc(&["a=b", "c=d"]);
+        assert_eq!(
+            decode_labels(&two),
+            vec!["a=b".to_string(), "c=d".to_string()]
+        );
+        assert_eq!(labels_json(&two), r#"{"a":"b","c":"d"}"#);
+
+        // A backslash is escaped too, or it would swallow the next separator.
+        let bs = enc(&[r"a=b", "c=d"]);
+        assert_eq!(
+            decode_labels(&bs),
+            vec![r"a=b".to_string(), "c=d".to_string()]
+        );
+
+        // Newlines: the registry record is line-delimited, so a raw one would corrupt it.
+        let nl = enc(&["a=one
+two"]);
+        assert!(
+            !nl.contains('\n'),
+            "an encoded label must not carry a raw newline"
+        );
+        assert_eq!(
+            decode_labels(&nl),
+            vec!["a=one
+two"
+            .to_string()]
+        );
+
+        // A BARE KEY is a real label with an empty value, measured on the reference
+        // (`{"noequals":""}`); it must not be dropped as corruption.
+        assert_eq!(labels_json(&enc(&["noequals"])), r#"{"noequals":""}"#);
+        // Only the FIRST `=` splits: `k=v=w` is one key and the value `v=w`.
+        assert_eq!(labels_json(&enc(&["k=v=w"])), r#"{"k":"v=w"}"#);
+        // An empty field is NO labels, not one empty label.
+        assert_eq!(decode_labels(""), Vec::<String>::new());
+        assert_eq!(labels_json(""), "{}");
     }
 
     /// `{{.Label "k"}}` is the only `ps --format` token that takes an argument, and the only one

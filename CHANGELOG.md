@@ -17,6 +17,42 @@ and cost what borrowed names cost: a benchmark on this machine measured kern, pu
 `docker run --rm  4.2 ms`, and put it beside a real podman at 285 ms. A `docker` symlink now simply
 runs kern, with kern's grammar and kern's errors.
 
+**A label whose value contained a comma became two labels, and the filter was wrong in both
+directions.** The registry stores labels as one comma-joined `k=v` field, and the join was
+unescaped, so `--label 'a=b,c=d'` was indistinguishable from two labels. MEASURED against both
+reference implementations on this machine, which agree with each other and not with what kern did:
+
+```text
+  docker 29.1.3  inspect --format '{{json .Config.Labels}}'   {"a":"b,c=d"}
+  podman         inspect --format '{{json .Config.Labels}}'   {"a":"b,c=d"}
+  kern 0.9.35    ps --json .labels                            {"a":"b","c":"d"}
+```
+
+The read-back is the harmless half. `kern ps --filter label=c=d` MATCHED a box that had never
+carried that label, and `--filter label=a=b,c=d`, the label it did carry, matched nothing. A filter
+that reports a false positive is one an operator acts on. The separator and backslashes are now
+escaped on the way in and decoded on the way out by one encoder and one decoder, and newlines go
+with them because the registry record is line-delimited.
+
+**`--label <bare key>` is accepted, and the message that refused it cited a rule that does not
+exist.** The code required the `=` and called it "Docker's own rule". Measured: the reference
+accepts `--label noequals` and renders `{"noequals":""}`. What is still refused is a leading `=`, an
+empty key that names nothing and no filter can match.
+
+**`--rm` and `--restart` were both applied.** `kern box --rm -d --restart always` started a box
+supervised to come back forever and printed `restart=always - survives reboot`, which is the
+opposite of what `--rm` asks for. The reference refuses the pair; so does kern now.
+
+**`--mount` is parsed as CSV, not split on every comma.** The reference parses this value as CSV, so
+a field may quote itself to carry a comma, and `--mount 'type=bind,"src=/a,b",dst=/x'` is valid
+there (measured on Docker 29.1.3). kern answered the generic usage error, so a path containing a
+comma could not be mounted through this flag at all.
+
+**`kern create` now names the route instead of only the missing verb.** `docker create` + `cp` +
+`start` is how people seed files into a container before anything runs, and kern has no stopped box
+to copy into, because `kern cp` enters the namespaces of a live PID 1. The hint points at `-v`,
+`--tmpfs` and `--secret`, which is where that content goes here.
+
 **`box --mount` and `box --name`, measured rather than guessed at.** The argv that an agent-sandbox
 harness builds around a container runtime was read off a real one and each flag EXECUTED against the
 published binary: of fifteen, twelve were already accepted under the same spelling and three were

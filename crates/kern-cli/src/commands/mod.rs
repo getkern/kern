@@ -2491,9 +2491,8 @@ fn ps_matches(b: &registry::Instance, filters: &[(String, String)]) -> bool {
         // forms Docker supports. Matching is over the comma-joined field, so a bare key must not be
         // satisfied by a mere substring of another key (`app` must not match `apple=1`): compare the
         // key segment up to its `=`.
-        "label" => b.labels.split(',').filter(|l| !l.is_empty()).any(|l| {
-            l == v.as_str()
-                || (!v.contains('=') && l.split_once('=').map(|(k, _)| k) == Some(v.as_str()))
+        "label" => registry::decode_labels(&b.labels).iter().any(|l| {
+            l == v || (!v.contains('=') && l.split_once('=').map(|(k, _)| k) == Some(v.as_str()))
         }),
         "id" => b.pid.to_string() == *v,
         // `health=` READS THE VERDICT, not the merged status column: a paused box with a passing
@@ -2716,7 +2715,15 @@ fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Err
             // `{{.Labels}}`: every label, Docker's comma-joined `k=v` rendering, which is what the
             // registry already holds. Scrubbed like the other untrusted columns: a label value is
             // caller-supplied text heading for a terminal.
-            ".Labels" => out.push_str(&crate::ui::scrub(b.ps_labels())),
+            // DECODED, not the stored field: the storage escapes its own separator, and printing
+            // it raw would show a caller `a=b\,c=d` for a label they wrote as `a=b,c=d`. Rendered
+            // as Docker renders it, `k=v` joined by commas, which carries Docker's own ambiguity
+            // for a value containing one and is the shape a reader expects.
+            ".Labels" => {
+                let pairs = inspect::label_pairs(b.ps_labels());
+                let joined: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                out.push_str(&crate::ui::scrub(&joined.join(",")));
+            }
             // `{{.Label "key"}}`: ONE label, and the only token here that takes an argument.
             //
             // An ABSENT key prints the empty string rather than erroring, which is the one place
@@ -2737,7 +2744,7 @@ fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Err
                     ));
                 };
                 if let Some(v) = inspect::label_value(b.ps_labels(), key) {
-                    out.push_str(&crate::ui::scrub(v));
+                    out.push_str(&crate::ui::scrub(&v));
                 }
             }
             _ => {
