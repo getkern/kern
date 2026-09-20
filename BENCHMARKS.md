@@ -25,11 +25,11 @@ and the box measures **2.59 ms**, a paired delta of -1.185 ms [-1208, -1166]. Th
 there, not skipped: `chown` to a non-root uid succeeds inside a member exactly as in a standalone box,
 where `--no-uid-range` makes the same `chown` fail.
 
-**What a pod member gives up for it, measured rather than reasoned.** Members share three namespaces,
-read from `/proc/self/ns` in two members of one pod: the **user** namespace, so they are one identity
-and capability domain rather than separate ones; the **network** namespace, so they share `127.0.0.1`
-and the abstract socket namespace; and **uts**. Mount, PID, IPC and cgroup stay private to each box. A
-sibling reading the other's loopback is not a hypothesis:
+**What a pod member gives up for it, measured rather than reasoned.** Members share two namespaces,
+read from `/proc/self/ns` in four boxes alive at the same time: the **user** namespace, so they are one
+identity and capability domain rather than separate ones, and the **network** namespace, so they share
+`127.0.0.1` and the abstract socket namespace. Mount, PID, IPC, uts and cgroup stay private to each
+box. A sibling reading the other's loopback is not a hypothesis:
 
 ```sh
 kern pod create p --uid-range

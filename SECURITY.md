@@ -280,14 +280,19 @@ box can read `/proc/sys` but not write it, verified against `core_pattern`.
 ### Pods share three namespaces, and one of them is the identity domain
 
 A pod exists so its members can reach each other by name, and that is a boundary decision, not a
-networking convenience. Read from `/proc/self/ns` in two members of one pod, the shared set is:
+networking convenience. Read from `/proc/self/ns` in four boxes that are alive AT THE SAME TIME, the shared set is:
 
 | namespace | in a pod | standalone |
 |---|---|---|
 | **user** | **shared** | private |
 | **network** | **shared** | private |
-| **uts** | **shared** | private |
-| mount, PID, IPC, cgroup | private | private |
+| mount, PID, IPC, uts, cgroup | private | private |
+
+Four boxes at once, rather than four in a row, because a namespace inode is freed when its last
+member exits and the kernel reuses the number. An earlier version of this table said `uts` was shared
+too, read off boxes that had run one after another: with all four alive it is private, and the runs
+that said otherwise were comparing an inode a dead box had handed back. `pentest/pentest-pod-boundary.sh`
+asserts the whole set with that constraint built in.
 
 The user namespace is the one to weigh. Members are one identity and capability domain rather than
 separate ones: root in one member and root in another are the same mapped authority, and a
