@@ -7,7 +7,7 @@
 **A real, kernel-enforced container in a few milliseconds, out of one static binary with no daemon.**
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in 3.9 ms against docker run's 294 ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0, where your hardware differs and you should measure your own.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern started in milliseconds against docker run's hundreds of ms. A real OCI image, rootless, a static binary, no daemon, on an Intel i7-14700KF, Linux 7.0, where your hardware differs and you should measure your own.">
 </p>
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>

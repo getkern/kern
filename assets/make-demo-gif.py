@@ -6,16 +6,18 @@ next to them. When the binary grew and the image path got its uid-range map, the
 ~2 ms and 1.6 MB, and the README three lines below it said ~3.7 ms and ~1.8 MB. Nobody had lied:
 there was simply nothing to edit when the facts moved.
 
-Every claim the frame makes is a constant at the top of this file, so changing a number is a diff
-rather than a re-recording.
+Every claim the frame makes is a constant at the top of this file, so changing one is a diff rather
+than a re-recording.
 
-That is necessary and it was not sufficient. On 2026-08-01 the constant below read `~3.3 ms` while
-the COMMITTED GIF still showed `~3.6`: someone had edited the source and never re-run the script, so
-the file that exists to keep the picture honest had itself gone stale. **Editing a constant here is
-half the job; regenerate and commit the .gif in the same change.** Keep them measured:
+That is necessary and it was not sufficient. On 2026-08-01 the constant read `~3.3 ms` while the
+COMMITTED GIF still showed `~3.6`: someone had edited the source and never re-run the script, so the
+file that exists to keep the picture honest had itself gone stale. **Editing a constant here is half
+the job; regenerate and commit the .gif in the same change.**
 
-    kern box app --image alpine -- true      # the image path, uid-range map included
-    ls -l target/x86_64-unknown-linux-musl/release/kern
+⛔ ON 2026-09-20 THE MILLISECOND FIGURE CAME OUT ALTOGETHER, here and on the README, because it went
+stale twice in this one asset and was not reproducible on the third look: the same binary read 4.101
+to 4.239 ms across eight replicas in one afternoon, against the 3.9 the picture was showing. See the
+constants below before putting a number back.
 
 Usage:  python3 assets/make-demo-gif.py [-o assets/kern-demo.gif]
 Needs:  Pillow.
@@ -28,12 +30,25 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-# --- the claims, all measured ----------------------------------------------------------------
-# `--image` costs more than a prepared rootfs (~2 ms) because kern maps a uid RANGE for it, which
-# is what lets an official image drop privilege in its entrypoint. The command shown here is the
-# image one, so the number shown here has to be the image one.
-KERN_MS = "3.9 ms"
-DOCKER_MS = "294 ms"
+# --- the claims -------------------------------------------------------------------------------
+# ⛔ NO MILLISECOND FIGURE HERE ANY MORE, and putting one back would undo the reason this file was
+# written twice. The docstring above records the number going stale twice: the GIF claiming ~2 ms
+# against a README saying ~3.7, then a constant reading ~3.3 against a committed GIF showing ~3.6.
+# Both were caught. The third time would not have been, because a figure painted into pixels is the
+# one claim in this repository that `grep` cannot find and `stale-numbers.py` can only check through
+# this constant.
+#
+# AND IT IS NOT REPRODUCIBLE ANYWAY. MEASURED 2026-09-20, eight replicas of 150 starts on one
+# machine in one afternoon: 4.101 to 4.239 ms, with 3.93 earlier the same day. The GIF said 3.9,
+# which was true at the favourable end of one day's drift and false for most readers on most days.
+# The README stopped publishing a figure for exactly this reason; a picture saying one is the same
+# claim, harder to correct.
+#
+# The contrast is what the frame is FOR, and it survives without digits: milliseconds against
+# hundreds of them is two orders of magnitude and holds on any machine. The measured numbers, with
+# the host, the method and the date beside them, live in BENCHMARKS.md.
+KERN_SPEED = "milliseconds"
+DOCKER_SPEED = "hundreds of ms"
 HOST = "Intel i7-14700KF, Linux 7.0"
 
 COMMAND = 'kern box app --image alpine -- echo "hello from a real container"'
@@ -103,11 +118,11 @@ def render(font: ImageFont.FreeTypeFont) -> list[Image.Image]:
         if show_output:
             d.text((X0 + int(cw * 2), ROWS["out"]), OUTPUT, font=font, fill=TEXT)
         if show_stats:
-            left = f"kern started in {KERN_MS}"
+            left = f"kern started in {KERN_SPEED}"
             d.text((X0, ROWS["stat"]), left, font=font, fill=ACCENT)
             d.text(
                 (X0 + int(cw * (len(left) + 6)), ROWS["stat"]),
-                f"docker run: {DOCKER_MS}",
+                f"docker run: {DOCKER_SPEED}",
                 font=font,
                 fill=TEXT,
             )
