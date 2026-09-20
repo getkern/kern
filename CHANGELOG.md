@@ -94,10 +94,11 @@ gets the grammar, which is what a typo needs.
 to copy into, because `kern cp` enters the namespaces of a live PID 1. The hint points at `-v`,
 `--tmpfs` and `--secret`, which is where that content goes here.
 
-**`box --mount` and `box --name`, measured rather than guessed at.** The argv that an agent-sandbox
-harness builds around a container runtime was read off a real one and each flag EXECUTED against the
-published binary: of fifteen, twelve were already accepted under the same spelling and three were
-not. Two of them land here.
+**`box --mount` and `box --name`, measured rather than guessed at.** Both are among the flags most
+typed at a container runtime, and neither was accepted. They were found the way the rest of this
+release was: by taking the full flag surface of `docker run` and EXECUTING each one against the
+published binary instead of reading the help text. 24 of the 24 most-used flags were already
+accepted under the same spelling; these two were not.
 
   * `--mount type=bind|volume|tmpfs,src=…,dst=…[,ro]` is the named-field spelling of `-v` and
     `--tmpfs`, which is the form generated command lines emit. It is a TRANSLATION into those two
