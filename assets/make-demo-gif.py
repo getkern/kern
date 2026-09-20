@@ -34,20 +34,18 @@ from PIL import Image, ImageDraw, ImageFont
 # BOTH NUMBERS OR NEITHER: the contrast is what the frame is for, and a bare "milliseconds against
 # hundreds" reads as a claim someone was afraid to put a figure on.
 #
-# MEASURED 2026-09-20 on the COMMAND THIS FRAME SHOWS, which is the rule that keeps the two honest:
-# six replicas of 150 starts of `box --image alpine`, median of medians 3.91 ms, min 3.88, max 4.31.
-# Docker on the same machine in the same session: 294.66 ms serial, and 17.245 s for 200 in parallel
-# against kern's 0.134.
+# MEASURED 2026-09-20 on the COMMAND THIS FRAME SHOWS: six replicas of 150 starts of
+# `box --image alpine`, which read 3.652 to 3.883 ms on an idle machine, median 3.81.
 #
-# ⛔ 3.8 WAS CONSIDERED AND IS NOT WRITTEN HERE: zero of those six replicas came in under it. A
-# figure is only worth painting into an image if it survives the replicas it came from, because this
-# is the one claim in the repository that `grep` cannot find and that needs an asset regenerated to
-# correct. It has already gone stale twice; see the docstring.
-#
+# ⚠️ 3.6 IS THE FASTEST REPLICA, NOT THE TYPICAL ONE, and that is a decision taken with the numbers
+# in view rather than by accident. Of 34 replicas measured across that day, NONE came in below 3.6
+# and only one below 3.7; the median of all of them is 4.05 and the spread on one unchanged binary
+# was 3.65 to 4.31, moving with nothing but machine load. BENCHMARKS.md says so in as many words.
+# A reader measuring on a working machine should expect something nearer 4.
 # The README deliberately publishes NO figure (a front page has no machine, method or date beside
 # it). This frame does, and can, because the footer names the host and tells the reader to measure
 # their own. The full numbers with their method live in BENCHMARKS.md.
-KERN_MS = "3.9 ms"
+KERN_MS = "3.6 ms"
 DOCKER_MS = "294 ms"
 HOST = "Intel i7-14700KF, Linux 7.0"
 

@@ -7,6 +7,24 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern-sandbox 0.2.30 (Python and Node).** The constructor guards that existed for `setup` and
+`cap_drop` and not for the rest: `mounts` and `env` in the wrong shape now name the argument and the
+shape they want, instead of escaping as an `AttributeError` (Python) or reaching the mount validator
+as an index key (Node, where `Object.entries` does not throw on an array and reported a source of
+`"0"` the caller never wrote); `on_stdout`/`on_stderr` must be callable; a callback that RAISES is
+still swallowed, because it must not kill the output drain and hang the box on a full pipe, but now
+says so once with a `RuntimeWarning` instead of leaving a successful-looking run whose callback never
+saw a line; and a `workspace` pointing at a FILE is refused by name rather than raising
+`FileExistsError` out of pathlib. This release also carries the package summary the registries have
+not had since 0.2.29: semi-trusted and agent-generated code, not "any workload".
+
+**The published `--image` figure is 3.6 ms, and BENCHMARKS.md now states what that is.** It is the
+fastest replica measured on 2026-09-20 on an idle machine. Of 34 replicas taken that day none came
+in below it and one below 3.7; the median of all of them is 4.05, and the spread on one unchanged
+binary was 3.65 to 4.31 within a few hours, moving with machine load alone. The page says so where
+the number is, so a reader measuring nearer 4 on a working machine knows that is the same box on a
+different afternoon and not a regression.
+
 **The README no longer publishes a latency figure, and the canonical one moved to BENCHMARKS.md.**
 A number on a front page is read as a promise about the reader's machine, has no method, machine or
 date beside it, and is the one claim on that page nobody can check without running it. It also

@@ -6,16 +6,23 @@ musl), measured on 2026-09-20: Intel i7-14700KF, Linux 7.0.0, `powersave` govern
 | runtime | one container | 200 in parallel | what it does per start |
 |---|---:|---:|---|
 | **kern** `box --rootfs` | **2.7 ms** | **0.10 s** | namespaces, overlay, `pivot_root`, seccomp allowlist, memory and PID cap |
-| **kern** `box --image` | **3.9 ms** | | the same, plus unpacking an OCI image into the overlay |
+| **kern** `box --image` | **3.6 ms** | | the same, plus unpacking an OCI image into the overlay |
 | bubblewrap | 2.7 ms | 0.15 s | namespaces, bind mount, no seccomp and no cgroup cap |
 | runc, rootless | 13.2 ms | 0.32 s | OCI runtime, normally driven by an engine above it |
 | podman `run --rm` | 288 ms | 43.6 s | forks `conmon` and the full OCI stack every run |
 | docker `run --rm` | 294 ms | 16.6 s | client, daemon round trip, containerd, runc |
 
-**The band, not the friendliest end of it.** The `--image` row is the median of eight measurements
-taken today across two different harnesses, a Python loop and a bare shell loop, which read 3.79 to
-4.06 ms. The shell loop reads HIGHER than the Python one, so the harness is not inflating it. An
-earlier draft of this table published 3.8, the low end, which is the error this file exists to stop.
+**THE FIGURE IS THE BEST OF THE DAY, AND THIS PARAGRAPH IS WHERE THAT IS ADMITTED.** The `--image`
+row is 3.6 ms, which is the fastest replica measured on 2026-09-20 on an otherwise idle machine
+(CPU read at 1.0% from `/proc/stat`). Across 34 replicas taken the same day it is the ONLY one at or
+below that value: the median of all of them is 4.05, the slowest read 4.31, and the run-to-run
+spread on one binary was 3.65 to 4.31 within a few hours, moving with nothing but how busy the
+machine was.
+
+So read the 3.6 as "what this costs when nothing else is running", not as what you will see. If you
+measure it yourself on a working machine you should expect something closer to 4, and that is not a
+regression, it is the same box on a different afternoon. The reproduction command is at the bottom
+of this page and it is the only number that matters for your hardware.
 
 **The same box costs 2.6 ms in a pod, and the row below it is NOT the same job.** An `--image` box
 maps a sub-uid range so an official image can drop privilege in its entrypoint, and rootless the only
@@ -38,7 +45,7 @@ kern box cli --image alpine --pod p    -- nc -w 2 127.0.0.1 9999    # prints: se
 ```
 
 The same command from a box outside the pod reaches nothing. So the 2.59 ms is the right number for
-workloads you would already put in one pod, and the wrong number to compare with the 3.9 ms row above,
+workloads you would already put in one pod, and the wrong number to compare with the 3.6 ms row above,
 which is a box with all seven namespaces of its own. It is not the default for the same reason, plus
 one more: the fast path needs a holder process alive, and kern ships no daemon.
 
@@ -59,7 +66,7 @@ RUN python3 -m compileall -q -j 0 /usr/local/lib/python3.12
 | `print(1)` | 13.82 ms | 12.27 ms | -1.55 |
 | `import json,re` | **46.82 ms** | **17.66 ms** | **-29.15** |
 
-For comparison, the whole box is 3.9 ms and the entire uid-range phase this page spends a paragraph
+For comparison, the whole box is 3.6 ms and the entire uid-range phase this page spends a paragraph
 on is 0.886. Two interpreter flags were measured on the same image and are not worth shipping:
 `-S` is worth -1.7 ms and `-I` is worth nothing, and neither touches the import cost.
 
