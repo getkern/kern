@@ -33,6 +33,13 @@ in the footer rather than hidden.
 up. A loop that outruns the refill falls back to the default bar, and the fall is a cliff. Eight
 calls against a pool of eight is exactly the regime the bar claims, not a best-of.
 
+⚠️ `print(1)` IS THE WORKLOAD THAT FLATTERS THIS CHART MOST, raised by an outside review and measured
+rather than argued: a call that does some work narrows the distance, because the engines pay their
+start once and then run the same code as everyone else. MEASURED the same night, same arms,
+`import json, re`: **47.3 ms here against 320.8 for docker, which is 7x rather than 20x.** The page
+carries that sentence under the image, because a chart whose workload is chosen by the author and
+not stated is the shape that gets taken apart in a comment thread.
+
 Usage:  python3 assets/make-tool-call-chart.py [out.png]
 """
 

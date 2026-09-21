@@ -30,7 +30,7 @@ has read it should not run in your home directory.
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 
 # the API: in a virtual environment, because most distributions refuse a system-wide pip (PEP 668)
-python3 -m venv .venv && . .venv/bin/activate
+python3 -m venv .venv && . .venv/bin/activate   # Debian/Ubuntu ship this separately: apt install python3-venv
 pip install kern-sandbox
 ```
 
@@ -48,7 +48,9 @@ print(r.stdout, r.success)
 say otherwise), ran the code inside it with **no network**, dangerous capabilities dropped, a
 deny-by-default seccomp allowlist, memory and PID caps and a wall-clock deadline applied from
 **outside**, and the container was gone by the time the call returned. The next call gets a new one,
-so nothing the code leaves inside is there the second time.
+so nothing the code leaves inside is there the second time. A call the sandbox STOPPED leaves an exit
+record behind, readable with `kern ps -a`, which is how you read the verdict later: a record, not a
+box. A call that simply ended leaves nothing at all.
 
 kern calls that container a **box**, and so does the rest of this page.
 
@@ -268,11 +270,16 @@ clock around the whole call, p50 after a discarded warm-up.
   <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-vs.png" width="880" alt="Horizontal bar chart on a log scale, milliseconds per call: kern-sandbox with a prewarm pool 0.7 ms, kern-sandbox 14.5 ms, llm-sandbox with its session kept alive 77 ms, podman run --rm 286 ms, docker run --rm 292.8 ms, and Docker Sandboxes (sbx) into an already running sandbox 421 ms. Measured on an Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21.">
 </p>
 
-<sub>**docker and podman are engines, not sandbox products**: one `run` per tool-call is the
-do-it-yourself baseline, and it is in the chart because it is what a reader is probably on today.
-`llm-sandbox` drives docker underneath. The two session-based arms keep their session **alive**,
-which is the arm most favourable to them: `sbx create` is paid once and cost 5067 ms here. Your
-hardware will differ: measure your own, and take the **p50 rather than the best run**.</sub>
+<sub>**The number to quote is 14.5 ms, the default path.** The 0.7 is a prewarm burst, eight calls
+into a pool of eight, and a loop that outruns the refill falls back to 14.5. **docker and podman are
+engines, not sandbox products**: one `run` per tool-call is the do-it-yourself baseline, and it is in
+the chart because it is what a reader is probably on today. `llm-sandbox` drives docker underneath.
+The two session-based arms keep their session **alive**, the arm most favourable to them: `sbx
+create` is paid once and cost 5067 ms here. **And `print(1)` is the workload that flatters this
+chart most**: a call that does some work narrows the distance, because the engines pay their start
+once and then run the same code. `import json,re` measures **47.3 ms here against 320.8**, which is
+7x rather than 20x. Your hardware will differ: measure your own, and take the p50 rather than the
+best run.</sub>
 
 **Two numbers, not one.** The box is the cheap part: `run(["true"])`, a box with no interpreter in
 it, measures **4.9 ms** on the same machine, so most of the 14.5 is CPython starting inside. That is
