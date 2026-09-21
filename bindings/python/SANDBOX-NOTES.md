@@ -209,3 +209,73 @@ SAME `workspace=`, which is the cheap move rather than the expensive one: MEASUR
 first session paid 16.2 s for the pip install, and the second and third sessions on that workspace
 started in 364 ms and 756 ms because `.deps` was already there and `setup=` could be omitted. The file
 state persisting is what makes the retry cheap.
+
+## Moved here on 2026-09-21, so the README's first screen is a landing page
+
+The four measurements the package README now points at instead of carrying. Every one of them is a
+reason a number on that page is written the way it is.
+
+**The prewarm pool speeds up `run_code` and leaves `run()` alone.** A prewarmed box holds a BOOTED
+INTERPRETER, so what the pool removes is the interpreter's cost and not the box's. Measured:
+`run(["true"])` reads **4.74 ms with the pool against 4.67 ms without it**, which is the same number
+twice. Time the wrong call and prewarming looks like a no-op.
+
+**The pool covers a burst, not a rate**, and it refills on a worker thread. Measured on
+`python:3.12-slim`, three shapes in one run:
+
+| shape | p50 |
+|---|---|
+| 8 calls with `prewarm=8`, all served by the pool | **0.81 ms** (min 0.61, max 1.54) |
+| 16 calls in a tight loop with `prewarm=8` | first 8: **0.70 ms**, next 8: **13.70 ms** |
+| one call every 2 s with `prewarm=4`, an agent's pace | **0.86 ms** (max 1.10) |
+
+Four calls with `prewarm=4` read a p50 of 0.6 ms and twenty read 13.6 ms, which is the default cost;
+constructing and calling immediately reads 13.7 ms until the boxes have started. So the fall is a
+cliff rather than a slope, and a single p50 over a mixed run reads 12.6 ms and describes neither
+regime.
+
+**`egress_allow` is route-level, and here is what that looks like from inside.** Measured in the box:
+a raw socket to an IP returns `ENETUNREACH`, DNS does not resolve at all, and an HTTP request to a
+domain outside the list comes back `Tunnel connection failed: 403 Forbidden`, while the same socket
+under `network=True` connects. Nothing leaves except through the proxy, which is why a client that
+does not speak to an HTTP proxy (Postgres, MySQL, Redis) has no path out at all.
+
+**Twice the performance table published a MINIMUM and called it the number**, and both times the
+mistake flattered us. The bare-box row read **3.9 ms** until the host was checked: it was the minimum,
+and the machine had **300 orphaned box processes** on it from test runs. It then read **4.3 ms** until
+it was measured again on 2026-09-19 and the p50 of three separate runs came out **4.60, 4.94 and
+5.00**: 4.3 had been sitting between the min and the p25, which is the same mistake in a smaller size.
+The row says 4.9 today, and the rule it now carries is **p50 rather than the best run**, with the
+machine named beside it.
+
+**The full mount refusal list, and what is deliberately NOT on it.** The README names the three groups
+and the reason; this is the enumeration, read from the shipped code.
+
+- Absolute sources: `/`, `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/sys`, `/run/docker.sock`,
+  `/var/run/docker.sock`.
+- Credential directories, refused as a COMPONENT anywhere in the source, because they live under a
+  per-user home: `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`, `.azure`, `.oci`, `.terraform.d`,
+  `.password-store`, `.netrc`, `.git-credentials`, `.pypirc`, `.npmrc`, `.databrickscfg`, `.boto`,
+  `.s3cfg`, `.rclone.conf`.
+- Under `.config`, refused as a consecutive pair because the child name alone is too generic to match
+  (`~/projects/gh/src` is ordinary work): `gcloud`, `gh`, `doctl`, `rclone`.
+- kern's own state: `$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, and the data dir that
+  holds every named volume, each resolved per call from the environment so a moved `XDG_RUNTIME_DIR`
+  moves the refusal.
+
+The absolute set alone refused `$HOME` and ACCEPTED `$HOME/.ssh`: measured, a box mounted with
+`mounts={"~/.ssh": "/x"}` listed `id_ed25519` and `authorized_keys`. Refusing the parent while allowing
+its most sensitive child is the wrong way round, and it is the exact path a prompt-injected agent gets
+steered down ("read ~/.aws"). The component rule is that fix.
+
+**Deliberately NOT refused: `.cargo`, `.m2`, `.gem`.** Each holds one credential file next to a package
+cache people legitimately mount, such as `~/.cargo/registry` for an offline build, so refusing the
+directory would break a real use and push callers off the guard entirely. Naming the residual gap beats
+a refusal nobody keeps: mounting `~/.cargo` still exposes `credentials.toml`, and closing that needs a
+different mechanism than a path component.
+
+**The first image read is not small.** Measured on a Raspberry Pi 5, an arm64 image pulled and unpacked
+for the first time took **38 s** against **0.1 s** once warm. That is the usual cause of a
+`startup_failed` whose `stderr` shows kern still building the box: a short `timeout_s` fires while the
+pull is running. Run it again; if the second call is fast it was the cold read, and if it is not, look
+for a bind source on a dead NFS export.

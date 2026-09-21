@@ -1,17 +1,11 @@
 # kern-sandbox
 
-**Run LLM-generated code in a fast, real sandbox, one fresh box per call.**
+**Every piece of code your model writes gets its own Linux container, destroyed when the call
+returns.**
 
-Fast means milliseconds, and it is two numbers rather than one: the box is the cheap part, and an
-interpreter starting inside it costs more than the box does. Both depend on your machine, so they are
-measured under [Prewarming](#prewarming-a-box-ready-before-the-call-arrives) with the machine and the
-method beside them, and the runtime's own are in
-[BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
-
-`kern-sandbox` is the Python binding for **[kern](https://getkern.dev)**: a rootless,
-kernel-enforced sandbox out of one static binary, with no daemon, no VM and no cloud. An agent's
-tool-call, a model's generated snippet, a notebook cell, a CI step: code that runs before anyone
-reads it gets its own box, and the box is thrown away after.
+An agent's tool-call, a generated snippet, a notebook cell, a CI step: code that runs before anyone
+has read it should not run in your home directory. It runs on **your** machine, with no daemon, no
+VM, no cloud and no account.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # the runtime
@@ -19,7 +13,7 @@ pip install kern-sandbox                                                        
 ```
 
 Two lines because they are two things: the isolation is the binary's, and this package is the API in
-front of it. `$KERN_BIN` says where to find one you already have.
+front of it. `$KERN_BIN` says where to find a kern you already have.
 
 ```python
 import kern_sandbox as kern
@@ -28,21 +22,22 @@ r = kern.run_code("import sys; print(sys.version)")
 print(r.stdout, r.success)
 ```
 
-That first call is the slow one on a machine that has never run it: it pulls `python:3.12-slim`
-before it can start a box. Every call after it reads the cached image, and the
-[`startup_failed`](https://github.com/getkern/kern/blob/main/bindings/python/README.md#your-loop-reads-a-field-not-a-stack-trace)
-row has the measured cost of that first read, which on a slow machine is large enough to trip a short
-`timeout_s`.
+**What that one call did.** It started a container from an OCI image (`python:3.12-slim` unless you
+say otherwise), ran the code inside it with **no network**, dangerous capabilities dropped, a
+deny-by-default seccomp allowlist, memory and PID caps and a wall-clock deadline applied from
+**outside**, and the container was gone by the time the call returned. The next call gets a new one,
+so nothing the code leaves inside is there the second time.
 
-Network off, capabilities dropped, a deny-by-default seccomp allowlist, memory and PID caps, and a
-wall-clock deadline applied from **outside** the box, so code that hangs cannot outlive it. What that
-is worth on your machine is in [Safe by default](https://github.com/getkern/kern/blob/main/bindings/python/README.md#safe-by-default), and what it costs is in
-[Performance](https://github.com/getkern/kern/blob/main/bindings/python/README.md#performance); both are measured rather than asserted.
+kern calls that container a **box**, and so does the rest of this page.
 
-The runtime this drives, its tests, the pentest suites and the other bindings are one repository:
-**[github.com/getkern/kern](https://github.com/getkern/kern)**. Node and TypeScript get the same
-binding on npm: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox) (the MCP server below is
-this package's).
+One thing before you time it: the **first** call on a machine that has never run it pulls the image,
+so it is the slow one. Every call after it reads the cache.
+
+`kern-sandbox` is the Python binding for **[kern](https://getkern.dev)**, a rootless container
+runtime in one static binary. Node and TypeScript get the same API on npm:
+[`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox). The runtime, its tests, the pentest
+suites and the other bindings are one repository:
+**[github.com/getkern/kern](https://github.com/getkern/kern)**.
 
 ## Your loop reads a field, not a stack trace
 
@@ -86,7 +81,7 @@ sandbox acted:
 | `killed` | SIGKILL with **no** OOM reported: an external kill (`kern stop`, a signal, the host out of memory), or a cap that did not bind here. A cap being set is not evidence that memory is what killed the box |
 | `escape_blocked` | a syscall the seccomp filter refused (SIGSYS) |
 | `exec_failed` | the box started, the command did not exist in the image; the message names both |
-| `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeout_s` fired while kern was still BUILDING the box (run it again: if the second call is fast it was a cold image read, and if it is not, look for a bind source on a dead NFS export), or kern refused to build it at all (an image that cannot be pulled, a mount it will not make). The cold read is the FIRST call on a new machine and it is not small: 38 s for an arm64 image on a Raspberry Pi 5 here, against 0.1 s warm |
+| `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeout_s` fired while kern was still BUILDING the box, or kern refused to build it at all (an image that cannot be pulled, a mount it will not make). The first shape is usually the cold image read, which on a slow machine is large enough to trip a short `timeout_s`: [measured](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md) at 38 s on a Raspberry Pi 5 against 0.1 s warm |
 
 `startup_failed` is **returned** by `run_code`/`run`, because each call is its own box and the result
 carries the verdict: measured on a typo'd image tag, `exit_code` 1, `success` False, `fault.type`
@@ -201,14 +196,11 @@ and refills on a worker thread while your agent thinks. Measured on `python:3.12
 | default | 30.9 ms | 14.2 ms |
 | `prewarm=4` | 0.9 ms | **0.8 ms** |
 
-**The number is `run_code`, not `run()`.** A prewarmed box holds a BOOTED INTERPRETER, so what the
-pool removes is the interpreter's cost and not the box's. `run(["true"])` starts a fresh box either
-way and reads the same either way: measured, 4.74 ms with the pool against 4.67 ms without it. Time
-the wrong call and prewarming looks like a no-op.
-
-**The pool covers a burst, not a rate**, and it fills on that worker thread: measured, four calls with
-`prewarm=4` read a p50 of 0.6 ms and twenty read 13.6 ms, which is the default. Constructing and calling
-immediately reads 13.7 ms until the boxes have started.
+**It speeds up `run_code`, not `run()`.** A prewarmed box holds a BOOTED INTERPRETER, so what the
+pool removes is the interpreter's cost and not the box's, and `run(["true"])` reads the same with the
+pool as without it. **And it covers a burst, not a rate**: a loop that outruns the refill falls back
+to the default cost. Both are measured in
+[SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
 
 Each prewarmed box still serves ONE call and is thrown away, so the isolation is unchanged: only the
 moment of creation moves. That is the difference from `kernel()`, which shares one process across cells
@@ -278,13 +270,13 @@ kern.Sandbox(
 ```
 
 **Mounts over sensitive sources are refused even if you ask for them**, and so is a `tmpfs` that would
-cover a `mounts` bind. Three groups: the host's own (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`,
-`/dev`, `$HOME`, the docker socket), anything with a **credential directory** in its path (`.ssh`, `.aws`,
-`.gnupg`, `.kube`, `.docker`, `.azure`, `.oci`, `.terraform.d`, `.password-store`, `.netrc`,
-`.git-credentials`, `.pypirc`, `.npmrc`, `.databrickscfg`, `.boto`, `.s3cfg`, `.rclone.conf`, and under
-`.config`: `gcloud`, `gh`, `doctl`, `rclone`), and **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, the data
-dir that holds every named volume): that last
-one is the sandbox's control plane, so handing it to the code in a box defeats the box.
+cover a `mounts` bind. Three groups, with the refusal naming which one it is: **the host's own** (`/`,
+`/etc`, `/root`, `/proc`, `/sys`, `/dev`, `$HOME`, the docker socket), **anything with a credential
+directory in its path** (`.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker` and a dozen more, listed in
+[SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md)), and
+**kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, the data dir that
+holds every named volume), which is the sandbox's control plane: handing it to the code in a box
+defeats the box. There is no opt-out; mount a copy of what the code actually needs.
 
 **`setup=` output is read-only to your code.** A cell cannot change what the next cell imports.
 `deps_readonly=False` reopens it, and a write then gets `EROFS` rather than failing silently.
@@ -308,12 +300,11 @@ proxy. Mutually exclusive with `network=True`. Otherwise the network is on **onl
 a separate box that dies when setup ends.
 
 It is a **route-level** boundary, not a set of proxy variables a program can ignore, and that cuts both
-ways. Measured inside an `egress_allow` box: a raw socket to an IP returns `ENETUNREACH`, DNS does not
-resolve at all, and an HTTP request to a domain outside the list comes back `Tunnel connection failed:
-403 Forbidden`, while the same socket under `network=True` connects. Nothing leaves except through the
-proxy. So a client that does not speak to an HTTP proxy has **no path out**: a Postgres, MySQL or Redis
-connection under `egress_allow` fails to resolve its host, and that is the design rather than a bug. If
-the job needs a database, the network setting for it today is `network=True`.
+ways: nothing leaves except through the proxy, so a client that does not speak to an HTTP proxy has
+**no path out**. A Postgres, MySQL or Redis connection under `egress_allow` fails to resolve its host,
+and that is the design rather than a bug. If the job needs a database, the setting for it today is
+`network=True`. The raw socket, the DNS and the proxy refusal are each measured in
+[SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
 
 **`memory_mb` bounds the cgroup, not the workload's usable memory**, and `/dev/shm` is not bounded at
 all: measured, 200 MiB written there under `memory_mb=128` OOM-kills the box, while the same 200 MiB to
@@ -375,13 +366,9 @@ alone, because each opens and closes one for you.
 - `Sandbox(...).run(argv_list)`, an arbitrary command (an **argv list**, never a shell string).
 - `Sandbox(...).write_file(path, data)` takes `bytes` or `str`, **`.read_file(path)` returns `bytes`**
   (a chart or a pickle is not text, so `.decode()` when you want a string), and
-  `.list_files(subdir="")` returns `FileInfo` records. Workspace
-  I/O, confined to `/workspace`, `..`-safe, every path component opened `O_NOFOLLOW`, opened
-  `O_NONBLOCK`, and a descriptor that is not a REGULAR file is refused. A symlink is not the only
-  thing a box can leave at a name: `mkfifo out.png` used to make `read_file("out.png")` wait for a
-  writer that never came, with no timeout, so the box chose how long the host's call took. The flag
-  alone would have been worse, since a non-blocking read of a writer-less FIFO returns zero bytes and
-  the call would have reported an empty file.
+  `.list_files(subdir="")` returns `FileInfo` records. Workspace I/O, confined to `/workspace`,
+  `..`-safe: every path component is opened `O_NOFOLLOW`, and a descriptor that is not a REGULAR file
+  is refused, so neither a symlink nor a FIFO the box left at a name can redirect the read or hang it.
 - `Sandbox(...).snapshot(dest)` / `.restore(src)`, a portable `.tar.gz` FILESYSTEM checkpoint of the
   workspace. `restore` refuses absolute, `..` and symlink members.
 
@@ -431,11 +418,10 @@ is "how fast kern is". The runtime's own numbers are in
 
 One x86_64 desktop (i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), `python:3.12-slim`, the
 released musl binary, p50 after a discarded warm-up. Your hardware will differ: measure and claim your
-own number, and take the p50 rather than the best run. The bare-box row read 3.9 here until the host
-was checked: it was the MINIMUM, and the machine had 300 orphaned box processes on it from test runs.
-It read 4.3 until it was measured again on 2026-09-19 and the p50 of three separate runs came out
-4.60, 4.94 and 5.00: 4.3 sat between the min and the p25, which is the same mistake in a smaller
-size.
+own number, and take the **p50 rather than the best run**. This table published a minimum twice before
+it learned that, and
+[SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md) keeps
+the two occasions, because both times the number flattered us.
 
 | call (p50) | kern-sandbox | docker |
 |---|---|---|
@@ -444,20 +430,14 @@ size.
 | `run_code("print(1)")`, `prewarm=` pool keeping up | **0.9 ms** | |
 
 `run_code` runs *Python*, so it pays the interpreter boot on top of the box: that is a Python cost, not
-kern's, and it is why 14.3 rather than 4.3.
+kern's, and it is why 14.3 rather than 4.9.
 
-**That row has a condition.** A prewarmed box is already at its interpreter prompt, so a call that
-gets one pays almost nothing; refilling the pool costs what a cold start costs. Three shapes, one run:
-
-| shape | p50 |
-|---|---|
-| 8 calls with `prewarm=8`, all served by the pool | **0.81 ms** (min 0.61, max 1.54) |
-| 16 calls in a tight loop with `prewarm=8` | first 8: **0.70 ms**, next 8: **13.70 ms** |
-| one call every 2 s with `prewarm=4`, an agent's pace | **0.86 ms** (max 1.10) |
-
-Sub-millisecond while the pool keeps up, which it does at the rate an agent calls. A loop that outruns
-it falls back to the cold number, and the fall is a cliff. A single p50 over a mixed run reads 12.6 ms
-and describes neither regime.
+**The last row has a condition.** A prewarmed box is already at its interpreter prompt, so a call that
+gets one pays almost nothing, while refilling the pool costs what a cold start costs. It stays
+sub-millisecond at the rate an agent calls; a loop that outruns the refill falls back to the cold
+number, and the fall is a cliff rather than a slope. A single p50 over a mixed run reads 12.6 ms and
+describes neither regime. The three shapes are measured in
+[SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
 
 **The host and the image are part of the claim.** The same call reads ~40 ms on WSL2 and ~17 ms on
 `python:3.12-alpine`, whose interpreter starts slower. Quote the row that matches yours.
