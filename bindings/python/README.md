@@ -265,12 +265,14 @@ environment running `python:3.12-slim` and get its stdout back. Same machine, sa
 clock around the whole call, p50 after a discarded warm-up.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-vs.png" width="880" alt="Horizontal bar chart on a log scale, milliseconds per call: kern-sandbox with a prewarm pool 0.7 ms, kern-sandbox 14.5 ms, podman run --rm 286 ms, docker run --rm 292.8 ms, and sbx exec into an already running sandbox 421 ms. Measured on an Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21.">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-vs.png" width="880" alt="Horizontal bar chart on a log scale, milliseconds per call: kern-sandbox with a prewarm pool 0.7 ms, kern-sandbox 14.5 ms, llm-sandbox with its session kept alive 77 ms, podman run --rm 286 ms, docker run --rm 292.8 ms, and sbx exec into an already running sandbox 421 ms. Measured on an Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21.">
 </p>
 
-<sub>Your hardware will differ: measure your own, and take the **p50 rather than the best run**. The
-`sbx` bar is the arm most favourable to it, into a sandbox that is **already running**, because that
-product is built around a session: `sbx create` cost 5067 ms here and is paid once.</sub>
+<sub>**docker and podman are engines, not sandbox products**: one `run` per tool-call is the
+do-it-yourself baseline, and it is in the chart because it is what a reader is probably on today.
+`llm-sandbox` drives docker underneath. The two session-based arms keep their session **alive**,
+which is the arm most favourable to them: `sbx create` is paid once and cost 5067 ms here. Your
+hardware will differ: measure your own, and take the **p50 rather than the best run**.</sub>
 
 **Two numbers, not one.** The box is the cheap part: `run(["true"])`, a box with no interpreter in
 it, measures **4.9 ms** on the same machine, so most of the 14.5 is CPython starting inside. That is

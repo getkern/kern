@@ -11,9 +11,16 @@ can run:
 
     kern-sandbox, prewarm=8   0.70 ms   8 calls, all served by the pool (min 0.64, max 1.46)
     kern-sandbox, default    14.50 ms   n=15 (min 11.4, max 23.5)
+    llm-sandbox              77.0  ms   n=10, session kept alive, docker backend (60.7 to 86.1)
     podman run --rm         286.0  ms   n=15
     docker run --rm         292.8  ms   n=15
     sbx exec                421    ms   7 calls into an ALREADY RUNNING sandbox (393 to 506)
+
+THREE CATEGORIES, AND THE LABELS SAY WHICH, because the question "are docker and podman sandboxes?"
+is the right one to ask of this chart. They are ENGINES: one `run` per tool-call is the
+do-it-yourself baseline a reader is probably on today, not a product competing with this one. The
+sandbox PRODUCTS here are `sbx` and `llm-sandbox`, and `llm-sandbox` drives docker underneath, which
+is why keeping its session alive lands it between the engines and a box.
 
 ⚠️ THE sbx BAR IS THE ARM MOST FAVOURABLE TO IT, and that is deliberate. Docker Sandboxes is built
 around a session: `sbx create` cost **5067 ms** here and is paid once, so charging it to every call
@@ -43,14 +50,18 @@ THEIRS = "#3a4652"
 BARS = [
     ("kern-sandbox, prewarm pool keeping up", 0.70, True),
     ("kern-sandbox", 14.5, True),
-    ("podman run --rm", 286.0, False),
-    ("docker run --rm", 292.8, False),
+    ("llm-sandbox, session kept alive", 77.0, False),
+    ("podman run --rm, one per call", 286.0, False),
+    ("docker run --rm, one per call", 292.8, False),
     ("sbx exec, sandbox already running", 421.0, False),
 ]
 
-FOOT = ("one tool-call: print(1) in python:3.12-slim, p50, wall clock around the whole call\n"
-        "Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21. sbx create is paid once and cost "
-        "5067 ms; it is not in its bar.")
+FOOT = ("one tool-call: print(1) in python:3.12-slim, p50, wall clock around the whole call. "
+        "Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21.\n"
+        "docker and podman are ENGINES, not sandbox products: one run per call is the "
+        "do-it-yourself baseline. llm-sandbox drives docker underneath.\n"
+        "The two session-based arms keep their session alive, which is the arm most favourable to "
+        "them: sbx create is paid once and cost 5067 ms here.")
 
 
 def main() -> int:
@@ -59,7 +70,7 @@ def main() -> int:
     values = [b[1] for b in BARS][::-1]
     colours = [OURS if b[2] else THEIRS for b in BARS][::-1]
 
-    fig, ax = plt.subplots(figsize=(9.2, 3.6), dpi=150)
+    fig, ax = plt.subplots(figsize=(9.2, 4.0), dpi=150)
     fig.patch.set_facecolor(BG)
     ax.set_facecolor(BG)
     ax.barh(labels, values, color=colours, height=0.62)
@@ -78,8 +89,8 @@ def main() -> int:
         lbl.set_color(TEXT if "kern" in lbl.get_text() else DIM)
     # The footer sits INSIDE the canvas. Placed below it with `bbox_inches="tight"`, matplotlib grew
     # the figure to contain it and left a band of dead background between the axis and the text.
-    fig.subplots_adjust(left=0.30, right=0.98, top=0.97, bottom=0.30)
-    fig.text(0.012, 0.115, FOOT, color=DIM, fontsize=7.6, va="top")
+    fig.subplots_adjust(left=0.30, right=0.98, top=0.97, bottom=0.33)
+    fig.text(0.012, 0.145, FOOT, color=DIM, fontsize=7.6, va="top")
     fig.savefig(out, facecolor=BG)
     print(f"wrote {out}")
     return 0
