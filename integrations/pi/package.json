@@ -38,7 +38,7 @@
     "prepublishOnly": "rm -rf dist && tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "kern-sandbox": "^0.2.12"
+    "kern-sandbox": "^0.2.31"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.4",
