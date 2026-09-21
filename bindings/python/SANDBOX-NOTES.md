@@ -279,3 +279,59 @@ for the first time took **38 s** against **0.1 s** once warm. That is the usual 
 `startup_failed` whose `stderr` shows kern still building the box: a short `timeout_s` fires while the
 pull is running. Run it again; if the second call is fast it was the cold read, and if it is not, look
 for a bind source on a dead NFS export.
+
+## Moved here on 2026-09-21 in the second pass, when the README was cut in half
+
+**The image decides more than the runtime does.** `run_code` importing two standard-library modules
+measures **46.8 ms** on the default `python:3.12-slim` against 13.8 ms for one that imports nothing:
+that tag ships 164 `.py` files in the standard library and 9 `.pyc`, so every import compiles its
+source. Precompiling is one line and is worth **29 ms**, more than the box, the interpreter start and
+every runtime flag combined.
+
+```dockerfile
+FROM python:3.12-slim
+RUN python3 -m compileall -q -j 0 /usr/local/lib/python3.12
+```
+
+| `run_code` | `python:3.12-slim` | precompiled |
+|---|---:|---:|
+| `print(1)` | 13.82 ms | 12.27 ms |
+| `import json,re` | **46.82 ms** | **17.66 ms** |
+
+Build it once and pass it: `run_code(..., image="my-python")`. The default stays the stock tag,
+because an SDK that silently required a custom image would be worse than one that costs 29 ms and
+says so. Measured on an Intel i7-14700KF, Linux 7.0.0, idle.
+
+**The two cases that RAISE instead of returning a `startup_failed` result.** Every other refusal is a
+value on the result, because each call is its own box and the result carries the verdict: measured on
+a typo'd image tag, `exit_code` 1, `success` False, `fault.type` `startup_failed`, and kern's
+`error: registry: ... manifest unknown` in `stderr`. The two exceptions are kern exiting **125**, its
+box-not-started code, with its own diagnostic (a refused mount at runtime, an unmappable `--user`, a
+seccomp/AppArmor/cgroup setup error), and **any** failure to start a `kernel()`, where the box is the
+session rather than one call, so there is nothing to return a result about.
+
+**`stderr` is one stream shared by kern and your code**, so a note about an undelegated cgroup
+arrives interleaved with the program's own output. Right for a human at a terminal, wrong for
+anything that puts `stderr` into a prompt. `code_stderr` is the same string without kern's own lines,
+`runtime_notes` holds exactly what was taken out, and `stderr` still holds both in order. The
+LangChain tool and the MCP server use `code_stderr`.
+
+**File state persists, processes do not.** A `/workspace` directory is shared into every box, so a
+file written in one call is there in the next, while `x = 40` is gone. That is what keeps the density
+of hundreds of ephemeral boxes instead of hundreds of resident interpreters, and `kernel()` is the
+one place the trade is reversed.
+
+**`/dev/shm` and the workspace, measured.** 200 MiB written to `/dev/shm` under `memory_mb=128`
+OOM-kills the box, while the same 200 MiB to `/tmp` returns `ENOSPC` and the box lives; Python's
+`multiprocessing` uses `/dev/shm` by default, so this is not a corner. And a cell writing in chunks
+put 400 MB on the host under `memory_mb=128`, because a memory cap only stops the version that builds
+the payload in RAM first.
+
+**Resource profiles** attach slices defined once in `~/.config/kern/kern.toml`: `vcpu:` (CPU and
+memory), `vdisk:` (a size-capped scratch disk), `vgpio:` (a device set, the **only** way to give a
+box hardware). An explicit flag beats a profile, so pass `memory_mb=None` to let a `vcpu:` profile's
+own `memory=` apply.
+
+**The prewarm pool's key** includes the image, the caps and the profiles, so a session never receives
+a box built for another one. Each prewarmed box still serves ONE call and is thrown away: only the
+moment of creation moves, which is the difference from `kernel()`.
