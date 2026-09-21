@@ -260,20 +260,23 @@ There is also a shell execution policy for LangChain's shell middleware, with it
 
 ## Performance
 
-One x86_64 desktop (i7-14700KF, Linux 7.0.0, rootless, cgroup delegated), `python:3.12-slim`, the
-released musl binary, p50 after a discarded warm-up. Your hardware will differ: measure your own, and
-take the **p50 rather than the best run**.
+One tool-call, the job an agent loop does a thousand times: hand `print(1)` to an isolated
+environment running `python:3.12-slim` and get its stdout back. Same machine, same afternoon, wall
+clock around the whole call, p50 after a discarded warm-up.
 
-| call (p50) | kern-sandbox | docker |
-|---|---|---|
-| `run(["true"])`, bare box | **4.9 ms** | |
-| `run_code("print(1)")`, plus the CPython start | **14.3 ms** | ~290 ms |
-| `run_code("print(1)")`, `prewarm=` pool keeping up | **0.9 ms** | |
+<p align="center">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-vs.png" width="880" alt="Horizontal bar chart on a log scale, milliseconds per call: kern-sandbox with a prewarm pool 0.7 ms, kern-sandbox 14.5 ms, podman run --rm 286 ms, docker run --rm 292.8 ms, and sbx exec into an already running sandbox 421 ms. Measured on an Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21.">
+</p>
 
-**Two numbers, not one.** The box is the cheap part, and the interpreter starting inside it costs
-more than the box does, which is why 14.3 rather than 4.9. **The last row has a condition**: a
-prewarmed box is already at its prompt, and a loop that outruns the refill falls back to the cold
-number, a cliff rather than a slope.
+<sub>Your hardware will differ: measure your own, and take the **p50 rather than the best run**. The
+`sbx` bar is the arm most favourable to it, into a sandbox that is **already running**, because that
+product is built around a session: `sbx create` cost 5067 ms here and is paid once.</sub>
+
+**Two numbers, not one.** The box is the cheap part: `run(["true"])`, a box with no interpreter in
+it, measures **4.9 ms** on the same machine, so most of the 14.5 is CPython starting inside. That is
+a Python cost, not kern's. **And the prewarm bar has a condition**: it is what a call gets while the
+pool keeps up, and a loop that outruns the refill falls back to the bar above it, a cliff rather
+than a slope.
 
 **The host and the image are part of the claim.** The same call reads ~40 ms on WSL2 and ~17 ms on
 `python:3.12-alpine`. And the image decides more than the runtime does: `import json,re` costs
