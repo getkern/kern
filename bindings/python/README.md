@@ -4,8 +4,7 @@
 
 # kern-sandbox
 
-**Every piece of code your model writes gets its own Linux container, destroyed when the call
-returns.**
+**Run the code your model just wrote in a throwaway container, one per call, on your own machine.**
 
 [![PyPI](https://img.shields.io/pypi/v/kern-sandbox?label=PyPI&color=0b7285)](https://pypi.org/project/kern-sandbox/)
 [![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm&color=0b7285)](https://www.npmjs.com/package/kern-sandbox)
@@ -24,7 +23,7 @@ returns.**
 </div>
 
 An agent's tool-call, a generated snippet, a notebook cell, a CI step: code that runs before anyone
-has read it should not run in your home directory. It runs on **your** machine instead.
+has read it should not run in your home directory.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # the runtime
@@ -64,11 +63,12 @@ A timeout, an OOM-kill, a blocked syscall or a missing interpreter each arrive a
 the result**, beside stdout and the exit code. The agent branches on a value instead of parsing a
 traceback to work out whether the sandbox stopped the run or the code did.
 
-```python
-r = kern.run_code("while True: pass", timeout_s=5)
-r.fault.type      # 'timeout'      the sandbox stopped it
-r.success         # False
-```
+<p align="center">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-faults.png" width="860" alt="A Python session: run_code returns ('4950', 0, None); a call with timeout_s=3 returns fault.type 'timeout' and exit 137; a call allocating 400 MB under memory_mb=128 returns 'oom' and 137; and a call that opens a URL with the network off returns fault None and exit 1, because the code raised and the sandbox did nothing.">
+</p>
+
+Every one of those four endings was captured by running it. The last is the one an agent loop gets
+wrong: the network was off, so the **code** raised, the sandbox did nothing, and `fault` is `None`.
 
 Every call returns an `ExecutionResult`, whose definition is:
 
@@ -256,6 +256,13 @@ with kern.Sandbox(setup="pip install pandas matplotlib") as sbx:
     r = sbx.run_code("import pandas as pd; pd.read_csv('data.csv').describe()")
     r.results[0].html          # the DataFrame as an HTML table
 ```
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-chart.png" width="760" alt="A damped sine curve on a dark background, titled 'drawn inside the box, returned as an image'. The figure was drawn by matplotlib running inside a sandbox with the network off and came back as result.results[0].png.">
+</p>
+
+<sub>That figure is not a mockup: matplotlib drew it inside a box with the network off, and it came
+back as `result.results[0].png`. No `savefig`, no shared directory, no Jupyter.</sub>
 
 Capture never touches `stdout`, `stderr` or `exit_code`. Pass `on_stdout` / `on_stderr` to stream as
 output arrives (best-effort: a slow callback drops chunks rather than stalling the box).
