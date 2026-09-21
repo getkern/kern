@@ -22,6 +22,9 @@
 # install the release binary (static, checksum-verified by the script)
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 
+# what THIS host can enforce, and the one command to fix it if something is missing
+kern doctor
+
 # a throwaway shell in a real OCI image: rootless, kernel-enforced, a few ms
 kern box dev --image alpine -it -- sh
 ```
@@ -35,6 +38,7 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 # macOS, two steps: a Linux VM, then kern inside it
 brew install colima && colima start && colima ssh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # inside the VM
+kern doctor    # run this first inside the VM: it names anything the guest still needs
 ```
 
 <sub>Runs on Linux and ARM boards directly, on Windows through WSL2 and on a Mac through colima, Lima or OrbStack: the same binary and the same CLI under a Linux kernel. [Install](#install).</sub>

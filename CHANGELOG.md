@@ -7,6 +7,16 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**kern-sandbox 0.2.31: the version the Node code reported was a release behind, and both bindings
+move together to fix it.** `package.json` said 0.2.30 while `index.js` still said 0.2.29, so anyone
+reading `require("kern-sandbox").version` off the published 0.2.30 got the previous number. The Node
+suite has a test for exactly that (`the version in the code matches the one in package.json`) and it
+was RED; it did not stop the release because `gate.sh` does not run the bindings' suites, and
+`scripts/pre-push.sh`, which does and says so in its own header, was not the gate that was run.
+Python was unaffected, having had both of its places raised and the same test, but goes to 0.2.31
+too so that the four version strings and the two registries all read the same. npm cannot unpublish,
+so the 0.2.30 that reports 0.2.29 stays on the registry and 0.2.31 is the correction.
+
 **kern-sandbox 0.2.30 (Python and Node).** The constructor guards that existed for `setup` and
 `cap_drop` and not for the rest: `mounts` and `env` in the wrong shape now name the argument and the
 shape they want, instead of escaping as an `AttributeError` (Python) or reaching the mount validator
