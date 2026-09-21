@@ -10,14 +10,12 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 Four days of work since v0.9.35, and 99 commits. Each line is the change; how a defect was found and
 why the fix is shaped that way is in the commit it came from (`git log v0.9.35..v0.10.0`).
 
-**Read these first if you are upgrading.** Three things change behaviour you may depend on. **kern no
-longer answers to `docker`**: the shim is gone, and compatibility is the FORMAT and the FLAGS, never
-the binary name. **A pod maps the sub-uid range by default**, as an `--image` box already did, so a
-member running an official image that drops privilege in its entrypoint works without `--uid-range`;
-`--no-uid-range` is the opt-out. And **`ps --last N` now answers Docker's question**, the N most
-recent across live and exited, newest first.
+**Read these first if you are upgrading.** The binary answers to `kern` and to nothing else. **A pod
+maps the sub-uid range by default**, as an `--image` box already did, so a member running an image
+that drops privilege in its entrypoint works without `--uid-range`; `--no-uid-range` is the opt-out.
+**`ps --last N`** lists the N most recent boxes across live and exited, newest first.
 
-### The Docker CLI surface, accepted where kern has the same knob
+### Flags and verbs, accepted where kern has the same knob
 
 `box --mount` and `--name`, `--rm`, `network inspect`, the `image` verb group, `images <repo>` with
 `--format` and `pull --quiet`, `inspect --format` answering `{{json .NetworkSettings.Ports}}` and
@@ -31,12 +29,12 @@ compatibility gap can take, the flag asking for less privilege granting more. `-
 with the reference's CSV grammar rather than a quote toggler, which had changed the path being
 mounted; its keys are case-insensitive and its paths are not; `type=bind` with a missing source is
 refused instead of creating it and starting a box whose mount is empty; `type=tmpfs,...,readonly`
-mounts read-only; and Docker's keys kern has no equivalent for are refused BY NAME rather than by a
+mounts read-only; and the keys kern has no equivalent for are refused BY NAME rather than by a
 grammar dump. `--filter label=k=` matches a label stored with an empty value. `--rm` and `--restart`
 are no longer both applied. `images <repo>` is no longer dropped when a flag comes first.
 `network inspect -f '{{.Name}}' proxy` no longer inspects a network called `{{.Name}}`.
-`{{json .Name}}` prints `"/web"` as Docker does. A label that went in and could be filtered on now
-comes back out.
+`{{json .Name}}` prints `"/web"`, quoted. A label that went in and could be filtered on now comes
+back out.
 
 ### Compose
 
