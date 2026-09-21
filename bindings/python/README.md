@@ -141,6 +141,7 @@ that from the enum.
 | `KERN_MCP_WORKSPACE` | temp dir | persist file state at this path |
 | `KERN_MCP_PROFILES` | (none) | attach `kern.toml` profiles, e.g. `vcpu:heavy,vgpio:sensors`: the only way to grant an edge agent a hardware device |
 | `KERN_MCP_KERNEL` | off | `1` routes Python through one warm interpreter: state persists, each call is sub-millisecond. The one case where "a fresh box per call" stops being true, and the tool description says so to the model |
+| `KERN_MCP_PREWARM` | `1` | boxes kept started in advance, each holding a booted interpreter that has run nothing. A call claims one instead of starting its own, measured ~38 ms down to ~1.6 ms, and each prewarmed box still serves exactly one cell and is destroyed. `0` turns it off |
 | `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes |
 | `KERN_MCP_TMPFS_MB` | `64` | scratch at `/tmp`, charged to the box's own memory cap; `0` removes it and puts `/tmp` back inside the read-only root |
 
@@ -264,6 +265,7 @@ kern.Sandbox(
     timeout_s=30,               # MANDATORY per-call wall-clock limit
     network=False,              # RELAXES ISOLATION: True shares the host network for every run
     mounts=None,                # {host_src: box_target}; sensitive sources refused even if asked
+    env=None,                   # {"NAME": "value"} for the box; the host's own do NOT cross
     tmpfs=None,                 # None -> 64 MiB of scratch at /tmp; {} -> none; {"/tmp": "512m"}
     profiles=None,              # kern.toml profiles: ["vcpu:heavy", "vgpio:leds", "vdisk:scratch"]
     max_output_bytes=64 << 20,  # cap on captured stdout/stderr EACH; result.truncated on overflow
@@ -371,7 +373,9 @@ alone, because each opens and closes one for you.
   shell**, which are different languages: `[[ ]]`, arrays and `pipefail` are bash. Alpine has no bash
   at all, so ask for `sh` where the image may not carry one.
 - `Sandbox(...).run(argv_list)`, an arbitrary command (an **argv list**, never a shell string).
-- `Sandbox(...).write_file(path, data)` / `.read_file(path)` / `.list_files(subdir="")`, workspace
+- `Sandbox(...).write_file(path, data)` takes `bytes` or `str`, **`.read_file(path)` returns `bytes`**
+  (a chart or a pickle is not text, so `.decode()` when you want a string), and
+  `.list_files(subdir="")` returns `FileInfo` records. Workspace
   I/O, confined to `/workspace`, `..`-safe, every path component opened `O_NOFOLLOW`, opened
   `O_NONBLOCK`, and a descriptor that is not a REGULAR file is refused. A symlink is not the only
   thing a box can leave at a name: `mkfifo out.png` used to make `read_file("out.png")` wait for a
