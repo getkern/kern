@@ -138,8 +138,11 @@ one line (`"command": "wsl"`, or `"command": "ssh"` to a VM or a board), both in
 }
 ```
 
-One block, three clients: LM Studio follows Cursor's `mcp.json` notation, and Claude Desktop's file
-has the same shape, so what differs is where the file lives rather than what goes in it.
+One block, three clients. **Cursor**: Settings, MCP, add a server, which opens `mcp.json`.
+**LM Studio** (0.3.17 and later): the **Program** tab in the right sidebar, then Install, Edit
+`mcp.json`; it follows Cursor's notation, so the block above is unchanged. **Claude Desktop**: the
+same shape in `claude_desktop_config.json`. What differs is where the file lives, not what goes in
+it.
 
 Tools: `run_code` (python/bash, and node on an image that has it), `write_file`, `read_file`,
 `list_files`. File state persists across calls; each call is a fresh, network-off box. The tool schema

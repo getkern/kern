@@ -1796,3 +1796,49 @@ class TestTheSchemaAndTheGuardCannotDisagree:
         srv = mcp.__dict__["Server"] if "Server" in mcp.__dict__ else None
         assert srv is not None or True  # the message is asserted through the module constant below
         assert "sh" in mcp._RUN_CODE_LANGUAGES
+
+
+def test_the_default_scratch_is_expressed_by_saying_nothing(monkeypatch):
+    """Unset must reach the SDK as `tmpfs=None`, not as the same number spelled out.
+
+    The two are not equivalent and the difference is a whole phase: the SDK skips ITS OWN default
+    tmpfs on the setup box, because an install puts its build tree in TMPDIR and 64 MiB turns a
+    working `pip install` into `OSError [Errno 28] No space left on device`. An EXPLICIT `tmpfs=`
+    is the caller's decision and applies to every box, setup included. This server spelled the
+    default out, so it opted out of that exemption by construction, and the configuration block in
+    the package README (`KERN_MCP_SETUP: pip install numpy pandas matplotlib`) failed exactly that
+    way on 0.2.31.
+
+    Asserting on `_env_cap` alone could not see it: the knob was right and the ARGUMENT was wrong.
+    So this reads what the server hands to `Sandbox(...)`.
+    """
+    captured = {}
+
+    class _Capture:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(M, "Sandbox", _Capture)
+
+    monkeypatch.delenv("KERN_MCP_TMPFS_MB", raising=False)
+    M._Server()._session()
+    assert captured["tmpfs"] is None, (
+        f"unset must reach the SDK as None so the setup box keeps its exemption, "
+        f"got {captured['tmpfs']!r}"
+    )
+
+    captured.clear()
+    monkeypatch.setenv("KERN_MCP_TMPFS_MB", "512")
+    M._Server()._session()
+    assert captured["tmpfs"] == {"/tmp": "512m"}, captured["tmpfs"]
+
+    captured.clear()
+    monkeypatch.setenv("KERN_MCP_TMPFS_MB", "0")
+    M._Server()._session()
+    assert captured["tmpfs"] == {}, f"0 must still mean no scratch at all, got {captured['tmpfs']!r}"

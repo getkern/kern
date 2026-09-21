@@ -4,6 +4,15 @@ Claude Desktop, Cursor, LM Studio, Windsurf, Goose: the config below is the same
 because LM Studio follows Cursor's `mcp.json` notation and the others share its shape. What differs
 is where the file lives, not what goes in it.
 
+| client | where the block goes |
+|---|---|
+| **Cursor** | Settings, MCP, add a server. The editor opens `mcp.json`. |
+| **LM Studio** 0.3.17+ | the **Program** tab in the right sidebar, then Install, Edit `mcp.json`. LM Studio's own documentation says it follows Cursor's notation, so the block is identical. |
+| **Claude Desktop** | `claude_desktop_config.json`, same shape. |
+
+Each of them spawns the command **where the client runs**, so a client on macOS or Windows needs the
+`wsl` or `ssh` line further down rather than the block below.
+
 `kern-mcp` ships in the Python package (`pip install kern-sandbox`) and speaks
 [Model Context Protocol](https://modelcontextprotocol.io) over stdio, newline-delimited JSON-RPC 2.0.
 It is dependency-free: it imports the standard library and `kern_sandbox`, nothing else.

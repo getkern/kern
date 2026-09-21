@@ -326,8 +326,22 @@ class _Server:
             # old shape back; anything else is a MiB size charged to the box's own memory cap.
             # `_env_cap` and not `_env_int`: `0` has to mean "none at all" rather than fall back to the
             # default, and it is the same sentinel (and the same garbage handling) the memory knob uses.
-            tmpfs_mb = _env_cap("KERN_MCP_TMPFS_MB", 64)
-            tmpfs = {"/tmp": f"{tmpfs_mb}m"} if tmpfs_mb is not None else {}
+            #
+            # UNSET MEANS UNSET, and passing the same number explicitly is not the same thing. The
+            # SDK skips ITS OWN default tmpfs on the setup box, because an install puts its build
+            # tree in TMPDIR and 64 MiB turns a working `pip install` into `OSError [Errno 28] No
+            # space left on device`; an EXPLICIT `tmpfs=` is the caller's decision and applies to
+            # every box, setup included. This server used to spell the default out, so it opted out
+            # of that protection by construction, and the configuration block in the package README
+            # (`KERN_MCP_SETUP: pip install numpy pandas matplotlib`) FAILED exactly that way.
+            # MEASURED on the published 0.2.31: that install fails here in 8 s and succeeds through
+            # the SDK in 17.8 s with the same default, and succeeds here with KERN_MCP_TMPFS_MB=512.
+            # So the default is now expressed by saying NOTHING, which is what reaches the exemption.
+            if os.environ.get("KERN_MCP_TMPFS_MB") is None:
+                tmpfs = None  # the SDK's own default: 64 MiB for cells, exempt on the setup box
+            else:
+                tmpfs_mb = _env_cap("KERN_MCP_TMPFS_MB", 64)
+                tmpfs = {"/tmp": f"{tmpfs_mb}m"} if tmpfs_mb is not None else {}
             env = {"MPLCONFIGDIR": "/tmp"}  # matplotlib needs a writable cache in the read-only box
             # Prewarming is ON by default HERE, and off in the SDK, because this server is the case where
             # the trade is already decided: an MCP session holds one box's worth of memory for its whole
