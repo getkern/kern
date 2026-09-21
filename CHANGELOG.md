@@ -5,811 +5,135 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## Unreleased
-
-**kern-sandbox 0.2.31: the version the Node code reported was a release behind, and both bindings
-move together to fix it.** `package.json` said 0.2.30 while `index.js` still said 0.2.29, so anyone
-reading `require("kern-sandbox").version` off the published 0.2.30 got the previous number. The Node
-suite has a test for exactly that (`the version in the code matches the one in package.json`) and it
-was RED; it did not stop the release because `gate.sh` does not run the bindings' suites, and
-`scripts/pre-push.sh`, which does and says so in its own header, was not the gate that was run.
-Python was unaffected, having had both of its places raised and the same test, but goes to 0.2.31
-too so that the four version strings and the two registries all read the same. npm cannot unpublish,
-so the 0.2.30 that reports 0.2.29 stays on the registry and 0.2.31 is the correction.
-
-**kern-sandbox 0.2.30 (Python and Node).** The constructor guards that existed for `setup` and
-`cap_drop` and not for the rest: `mounts` and `env` in the wrong shape now name the argument and the
-shape they want, instead of escaping as an `AttributeError` (Python) or reaching the mount validator
-as an index key (Node, where `Object.entries` does not throw on an array and reported a source of
-`"0"` the caller never wrote); `on_stdout`/`on_stderr` must be callable; a callback that RAISES is
-still swallowed, because it must not kill the output drain and hang the box on a full pipe, but now
-says so once with a `RuntimeWarning` instead of leaving a successful-looking run whose callback never
-saw a line; and a `workspace` pointing at a FILE is refused by name rather than raising
-`FileExistsError` out of pathlib. This release also carries the package summary the registries have
-not had since 0.2.29: semi-trusted and agent-generated code, not "any workload".
-
-**The published `--image` figure is 3.6 ms, and BENCHMARKS.md now states what that is.** It is the
-fastest replica measured on 2026-09-20 on an idle machine. Of 34 replicas taken that day none came
-in below it and one below 3.7; the median of all of them is 4.05, and the spread on one unchanged
-binary was 3.65 to 4.31 within a few hours, moving with machine load alone. The page says so where
-the number is, so a reader measuring nearer 4 on a working machine knows that is the same box on a
-different afternoon and not a regression.
-
-**The README no longer publishes a latency figure, and the canonical one moved to BENCHMARKS.md.**
-A number on a front page is read as a promise about the reader's machine, has no method, machine or
-date beside it, and is the one claim on that page nobody can check without running it. It also
-drifts more than it looks: measured across eight replicas on one afternoon, the same binary read
-3.93 to 4.24 ms for the same box, so "under 4 ms" would have been false in 8 cases out of 8, while
-"3.9 ms" was true only at the favourable end of the same day. The headline now says "a few
-milliseconds", the feature bullet says "single-digit milliseconds", the comparison table states
-properties rather than timings, and the Performance section says where the numbers live and why they
-are not repeated there.
-
-The README had already drifted from itself: the headline said `~3.9 ms` while a bullet forty lines
-below said `~3.4 ms`, the value from before an August re-measurement. `stale-numbers.py` could not
-see it, because its anchor matched one phrasing and that bullet used another, so it stood while six
-other files were corrected. The anchor is now the `box --image` row of BENCHMARKS.md, which carries
-the machine, the method and the date in the same file and is therefore the only claimant a reader
-can check; the failure message says not to put a figure back in the README to satisfy the check.
-
-**Every box leaked its environment sidecar, and only `stop` ever cleaned one up.** kern records a
-box's environment in `$XDG_RUNTIME_DIR/kern/env/<name>-<pid>` so `kern exec` and the healthcheck can
-read an environment that `/proc/<pid1>/environ` no longer gives them once the box drops privilege.
-That file was dropped on the `stop` path and nowhere else, so a box that simply EXITED left it
-behind forever: every foreground box, and every SDK call. Measured after one day of benchmarking:
-**4433 files and 13 MB with zero boxes alive**, in a tmpfs, so resident memory that never comes back.
-It is removed in the box teardown now, beside the `unregister` that drops the instance file for the
-same reason, and `prune` sweeps the directory for the box whose supervisor was killed before
-reaching that line. The sweep already covered `logs`, `health`, `waitexit` and `claims`; `env` was
-the fifth sidecar and the only one it did not know about, which is also why the shared key helper is
-no longer called `health_key`. `prune`'s own `--help` line now lists the environment among what it
-removes.
-
-**A box that drops every capability no longer pays for a uid range it cannot use: 937 us, a quarter
-of a cold `--image` box.** Mapping the subordinate range forks `newuidmap` and `newgidmap`, and that
-phase is 876 us of a 4 ms box against 22 us without it. Under `--cap-drop ALL` it bought nothing,
-measured rather than argued: `chown` to another uid fails inside the box whether the range is mapped
-or not, and an identity change is refused identically both ways. The control that makes this mean
-something is the other direction: without `--cap-drop ALL` the same `chown` SUCCEEDS with the range
-and fails without it, so the range is doing real work in the default posture and keeps it.
-`kern box --image alpine --cap-drop ALL` goes 3956 -> 3013 us, paired, interval [-959, -912] at
-n=300.
-
-Any `--cap-add` cancels the skip, and that case decided the rule rather than illustrating it:
-`--cap-drop ALL --cap-add CHOWN` chowns successfully WITH the range and fails without, so a
-capability handed back is one that can use the range. Any add at all is treated as keeping it, which
-is the conservative reading. `--uid-range`, a non-root `--user` and `--ssh` are requests and outrank
-the skip, unchanged. The Python SDK has done this since 0.2.29 and the CLI did not; the rule now
-lives in the one function both the real run and the `--show-config` dry run already called, so the
-dry run cannot describe a range the box will not get.
-
-**`ps -a` promised recently-exited boxes and lists only the detached ones.** The exit note is
-written by the detached supervisor, so a box run in the foreground leaves none and never appears
-there. Measured, the discriminant is foreground/detached and NOT the exit status: a `-d` box exiting
-0 is listed and a foreground box exiting 7 is not. The behaviour is unchanged, because matching
-Docker here would mean one row per SDK call (`run_code` runs its box in the foreground, measured:
-five calls, zero new rows). What changed is that `--help` now says which boxes those rows are,
-instead of letting a reader conclude their foreground box was lost.
-
-**Two comments in one codebase disagreed about the label filter, and the measurement settled it.**
-`label_pairs` still described `--filter label=` as comparing raw stored segments, which stopped
-being true when the filter started reading through it: the note was left behind by the fix that
-landed beside it, the second time that same comment has described a state the code had already left.
-Verified against the reference rather than reasoned about: `noequals`, `noequals=`, `empty` and
-`empty=` all match in kern exactly as they match in docker 29.1.3.
-
-**Stopping a pod's last member removed the pod, and letting that member exit on its own did not.**
-The same end state, no members left, had two outcomes depending on how it was reached: `kern stop`
-on the last member tore the pod down, its holder, its network namespace and its shared files, while
-the identical pod whose last member ran to completion stayed up. `kern pod create` is a verb that
-makes a thing and `kern pod rm` is the verb that removes it; a `stop` that also removed it made the
-second one optional by accident. A pod created by name now survives being emptied. Three paths still
-tear one down, and they are the three where removal is what was asked for: `stop --all`, naming the
-pod itself (`kern stop <pod>`), and a pod DERIVED from a compose stack, which carries no marker and
-cleans up on `compose down` exactly as before. `pentest/pentest-pod-boundary.sh` asserts all four in
-one section, because the fix is only correct if the three that should still remove still do.
-
-**A `chown` to a non-root uid failed inside a pod, and nothing said why.** `kern pod create` mapped a
-single uid unless `--uid-range` was passed, so a member running an official image that drops
-privilege in its entrypoint (postgres, mysql, nginx) failed closed, silently, until something
-chowned. A standalone `kern box --image` has mapped the range by default for as long as it has had
-images; the pod did not, and there was no argument for the difference. The range costs nothing per
-member inside a pod, because the holder maps it ONCE for every member: measured, `parent:idmap` is
-886 us in a standalone box and zero in a pod member.
-
-**This inverts a default, so it is a MINOR and not a patch**, and it lands without the deprecation
-entry the stability note asks for, under the exception that note names: the old default was a defect,
-and announcing a defect for a release before fixing it leaves the broken one in the field on purpose.
-`kern pod create` maps the range now. `--no-uid-range` asks for the single-uid map instead, which is
-the tighter one and the same trade that flag already makes on a box. `--uid-range` still exists and
-now means "report it if the host cannot", where the default attempts the same mapping and degrades
-silently on a host without `newuidmap` or `/etc/subuid`. Passing both resolves to `--no-uid-range`:
-a contradiction settles toward the tighter map rather than toward 65536 mapped ids.
-
-**What a pod shares is now asserted rather than described.** `pentest/pentest-pod-boundary.sh` pins
-the set with a negative control on every line, and it found the documentation wrong on its first run:
-SECURITY.md and BENCHMARKS.md said members share the uts namespace. They do not. That claim came from
-reading namespace inodes off boxes that ran one after another, and the kernel reuses an inode once
-its namespace is gone, so the comparison was of numbers a dead box had handed back. Read from four
-boxes alive at the same time, the shared set is the user and network namespaces, and mount, PID, IPC,
-uts and cgroup are private to each member.
-
-**kern no longer answers to `docker`.** A symlink named `docker` or `docker-compose` used to make
-this binary rewrite a Docker command line into kern's own and run it. That is gone, with the 1330
-lines behind it. The compatibility kern offers is with the FORMAT and the FLAGS, which is untouched:
-`kern box` still takes `-p`, `-e`, `-v`, `-it`, `-m` and `--cpus`, and `kern compose` still reads a
-`docker-compose.yml` unchanged, which is what Sentry's 57 services and Supabase's 13 run on. What
-went is borrowing the other tool's name, which added nothing a caller could not get by typing `kern`
-and cost what borrowed names cost: a benchmark on this machine measured kern, published the row as
-`docker run --rm  4.2 ms`, and put it beside a real podman at 285 ms. A `docker` symlink now simply
-runs kern, with kern's grammar and kern's errors.
-
-**`--mount` is parsed with the reference's CSV grammar, not a quote toggler.** The value is parsed
-by the reference with Go's `encoding/csv` at default strictness, and kern toggled a boolean on every
-quote. Four divergences, each measured on Docker 29.1.3:
-
-```text
-  type=bind,"src=/d/a""b",dst=/m    reference mounts /d/a"b ; kern mounted /d/ab
-  type=bind,"src=/d"junk,dst=/m     reference REFUSES      ; kern accepted
-  type=bind,"src=/d,dst=/m          reference REFUSES      ; kern accepted
-  type=bind,src=/d",dst=/m          reference REFUSES      ; kern accepted
-  type=bind,,src=/d,dst=/m          reference REFUSES      ; kern skipped the field
-  type=bind,src=/d,dst=/m,          reference REFUSES      ; kern skipped the field
-```
-
-The first is the one that matters: a caller wrote one path and mounted another, with no error. The
-other five are refusals kern was not making. All nine cases now answer identically to the reference,
-checked side by side.
-
-**`--mount` keys are case-insensitive, and paths are not.** `TYPE=BIND,SRC=/d,DST=/m` mounts on the
-reference and kern refused it as an unknown key. The key is folded and so is the `type` value, since
-`BIND` is accepted there too; `src=` and `dst=` keep their values verbatim, because a path is
-case-sensitive on every filesystem this runs on.
-
-**`pull --quiet` printed a status word.** It suppressed the orientation lines and kept
-`already cached <ref>`, coloured, in a stream a script is reading, so `ref=$(kern pull -q x)`
-returned neither the reference nor a clean parse. It now prints the resolved reference and nothing
-else, which is the shape the flag means everywhere. The VALUE is kern's own reference
-(`alpine` yields `alpine:latest`), not the reference implementation's fully-qualified form, because
-kern's cache is keyed on the reference as given and printing the other would name a key kern does
-not have.
-
-**`--mount type=bind` created a missing source and started a box whose mount was empty.** The
-distinction is the whole reason the named form exists: MEASURED on Docker 29.1.3, `-v /tmp/typo:/m`
-creates the directory and runs, while `--mount type=bind,src=/tmp/typo,dst=/m` fails with `bind
-source path does not exist`. `--mount` is reached for precisely to catch that typo, and kern
-translated both onto the create-it path. `-v` is unchanged.
-
-⚠️ An earlier round reported this and it was recorded as falsified. That was wrong, and the way it
-was wrong is worth keeping: the probe used `/nonexistent-xyz`, directly under `/`, where the process
-cannot create anything, so the refusal that came back was a PERMISSION failure read as a policy
-decision. A probe has to sit where the process can write, or it measures the filesystem instead of
-the code.
-
-**`--filter label=k=` did not match a label stored with an empty value.** A box labelled
-`--label noequals` reports `{"noequals":""}` in its own document and was found by
-`--filter label=noequals`, but not by `--filter label=noequals=`. Both reference implementations
-match it under both spellings. The cause was two readers of one grammar with two equalities: the
-filter compared raw stored segments while every renderer goes through the pair normaliser. The
-filter now asks the same pairs the document is built from.
-
-**`--mount readonly=1` mounted the path WRITABLE, silently.** The value was compared against the
-literal `true`, so every other spelling the reference honours fell through to writable with no
-error. MEASURED value by value on Docker 29.1.3: `readonly=1`, `readonly=t`, `readonly=TRUE`,
-`readonly=true` and a bare `readonly` all mount read-only, `readonly=false` mounts writable, and
-`readonly=yes` is refused outright. kern honoured exactly one of them. This is the worst shape a
-compatibility gap can take: the flag that asks for LESS privilege is the one that silently granted
-more. The whole Go boolean set is now read, and a value outside it is refused rather than taken as
-false.
-
-**`--mount type=tmpfs,dst=/x,readonly` mounted writable.** Docker honours it; kern's `--tmpfs` spec
-is `path[:size]` with no read-only form, so the key was parsed and dropped. Refused by name, which
-is the rule this same release applied to `volume-label=` and had not applied here.
-
-**`images <repo>` was dropped whenever a flag came first.** `images --filter dangling=false alpine`
-and `images --format '{{.Tag}}' alpine` listed the ENTIRE cache with no error, because the scan
-stopped at the first bare token instead of skipping past the flag that consumed it. It now uses the
-same one-positional scan `login` uses, and a second name is refused as Docker refuses it.
-
-**`network inspect -f '{{.Name}}' proxy` inspected a network called `{{.Name}}`.** Flag-first is an
-order the reference accepts and the name scan did not skip flag values.
-
-**`inspect --format` printed a label's control bytes raw, where `ps --format` strips them.** Two
-renderers of one caller-supplied value disagreed about whether it reaches the terminal intact; one
-of them was a terminal-injection surface.
-
-**`{{json .Name}}` printed `/web` where Docker prints `"/web"`.** The `json` pipeline was stripped
-as a wrapper for every key, including the scalars, so a value that should be JSON was not. An
-earlier comment dismissed this as a shape nobody asks for, which was wrong: `{{json .State.Status}}`
-is a common one, and the failure lands on the parser downstream rather than on the eye.
-
-**`pull --quiet` parsed and did nothing.** It was added to the accepted-flag list and carried
-nowhere, which is the no-op flag this CLI refuses everywhere else. It now suppresses the three
-orientation lines and keeps the reference.
-
-**A label whose value contained a comma became two labels, and the filter was wrong in both
-directions.** The registry stores labels as one comma-joined `k=v` field, and the join was
-unescaped, so `--label 'a=b,c=d'` was indistinguishable from two labels. MEASURED against both
-reference implementations on this machine, which agree with each other and not with what kern did:
-
-```text
-  docker 29.1.3  inspect --format '{{json .Config.Labels}}'   {"a":"b,c=d"}
-  podman         inspect --format '{{json .Config.Labels}}'   {"a":"b,c=d"}
-  kern 0.9.35    ps --json .labels                            {"a":"b","c":"d"}
-```
-
-The read-back is the harmless half. `kern ps --filter label=c=d` MATCHED a box that had never
-carried that label, and `--filter label=a=b,c=d`, the label it did carry, matched nothing. A filter
-that reports a false positive is one an operator acts on. The separator and backslashes are now
-escaped on the way in and decoded on the way out by one encoder and one decoder, and newlines go
-with them because the registry record is line-delimited.
-
-**`--label <bare key>` is accepted, and the message that refused it cited a rule that does not
-exist.** The code required the `=` and called it "Docker's own rule". Measured: the reference
-accepts `--label noequals` and renders `{"noequals":""}`. What is still refused is a leading `=`, an
-empty key that names nothing and no filter can match.
-
-**`--rm` and `--restart` were both applied.** `kern box --rm -d --restart always` started a box
-supervised to come back forever and printed `restart=always - survives reboot`, which is the
-opposite of what `--rm` asks for. The reference refuses the pair; so does kern now.
-
-**`--mount` is parsed as CSV, not split on every comma.** The reference parses this value as CSV, so
-a field may quote itself to carry a comma, and `--mount 'type=bind,"src=/a,b",dst=/x'` is valid
-there (measured on Docker 29.1.3). kern answered the generic usage error, so a path containing a
-comma could not be mounted through this flag at all.
-
-**Docker's other `--mount` keys are refused BY NAME.** `bind-propagation`, `bind-nonrecursive`,
-`volume-nocopy`, `volume-driver`, `volume-opt`, `tmpfs-mode` and `consistency` are each valid where
-a caller copied them from, and kern has no knob behind any of them. They were already refused, by
-the generic grammar dump, which is the right outcome reached with the wrong sentence: the reader was
-handed the whole grammar and left to diff it by eye against what they wrote. A genuine typo still
-gets the grammar, which is what a typo needs.
-
-**`kern create` now names the route instead of only the missing verb.** `docker create` + `cp` +
-`start` is how people seed files into a container before anything runs, and kern has no stopped box
-to copy into, because `kern cp` enters the namespaces of a live PID 1. The hint points at `-v`,
-`--tmpfs` and `--secret`, which is where that content goes here.
-
-**`box --mount` and `box --name`, measured rather than guessed at.** Both are among the flags most
-typed at a container runtime, and neither was accepted. They were found the way the rest of this
-release was: by taking the full flag surface of `docker run` and EXECUTING each one against the
-published binary instead of reading the help text. 24 of the 24 most-used flags were already
-accepted under the same spelling; these two were not.
-
-  * `--mount type=bind|volume|tmpfs,src=…,dst=…[,ro]` is the named-field spelling of `-v` and
-    `--tmpfs`, which is the form generated command lines emit. It is a TRANSLATION into those two
-    flags and not a second mount path, so a `--mount` and the `-v` it equals cannot start behaving
-    differently. A `type=` that disagrees with its `src` is REFUSED rather than reinterpreted:
-    `type=bind,src=data,dst=/app` would have mounted an empty auto-created named volume, silently,
-    because a bare source is a volume name and not a path.
-  * `--name <box>` is Docker's spelling for the name kern takes positionally. The same field, so
-    passing both is a usage error rather than a precedence rule: a line that says two things about
-    one box has no reading that is not a guess.
-
-**A label went in, could be filtered on, and never came back out.** `--label k=v` was recorded, and
-`--filter label=` matched it on `ps`, but no surface printed it: `ps --json` and `inspect --json`
-carried no such field and `--format` had no token for it. A caller could therefore tag a box and
-then be unable to read its own tag back, which is the write-only half of a round trip.
-
-  * `ps --json` and `inspect --json` now carry `labels` as an OBJECT, not the registry's
-    comma-joined text: a consumer that has to re-split a string is doing the parsing the document
-    exists to avoid. `{}` where Docker emits `null`, so an iterating caller gets an empty loop
-    instead of a type error.
-  * `ps --format` and `inspect --format` take `{{.Label "key"}}` and `{{.Labels}}`. An ABSENT key
-    prints empty, as Docker's does, because the token exists to be paired with `--filter label=`,
-    which has already proven the key is there; a missing quote is still an error, because that is a
-    typo and not an absent label. Exited boxes keep no labels (the instance record is pruned and
-    the breadcrumb carries only name/pod/command), so the token renders empty there rather than
-    failing the row.
-
-**`box --rm`, `network inspect` and the `image` verb group.** The rest of the measured gap.
-
-  * `--rm` leaves no exit record: `kern ps -a` will not list the box and `kern wait` has nothing to
-    read, exactly as `docker wait` has nothing to read for a container that removed itself. A box
-    was ALREADY thrown away (its scratch and registry entry go at teardown); the hour-long
-    `waitexit` breadcrumb was the only residue, and this drops it. On a detached box the supervisor
-    does not write it at all rather than writing and deleting it, because that box outlives the
-    command and a record that exists for a while is one `kern ps -a` can report. The compose exit
-    key is NOT suppressed: it is a different record, read by `compose up`, and a one-off's `--rm`
-    must not make a stack lose a service's status.
-  * `network inspect <name> [--json] [-f T]` reports what kern actually holds: the `/24` its members
-    are addressed from, and who is on it. `{{json .IPAM.Config}}` is answered because that block is
-    real. `Gateway`, `Driver` and `Options` are ABSENT and not empty, because members reach each
-    other over loopback aliases and nothing routes; emitting them as `""` would answer a script's
-    question with a guess. A name that does not exist is REFUSED and named, so a script reaching for
-    a default `bridge` (which kern has none of) fails instead of reading an empty document as an
-    empty network.
-  * `image ls|inspect|rm|pull|push|tag|history|save|load|build` is Docker's noun-first grouping,
-    rewritten onto the verbs kern already has, so there is one parser per operation and this only
-    chooses which. `image prune` is deliberately NOT aliased onto `kern gc --images`: Docker prunes
-    dangling images by default and `gc --images` clears what no box references, which is a wider
-    sweep, and on a verb whose whole risk is deleting too much the nearest thing is not the same
-    thing.
-
-**`images <repo>`, `images --format`, `pull --quiet`.** The last of the surface a caller arriving
-from Docker types. `images <repo>` is the positional name filter, mapped onto
-`--filter reference=<repo>` rather than given a field of its own, so the two spellings cannot select
-different images; giving both is refused, because that command line has named two sets.
-`images --format` renders the fields the cache holds and refuses the rest by name: there is no image
-ID here and no creation date, only when this machine pulled it. `{{.Repository}}`/`{{.Tag}}` split
-at the last colon only when what follows carries no `/`, so `localhost:5000/app` stays one
-repository instead of becoming a repository and a tag that do not exist.
-
-**`--mount volume-label=` is refused by name, not dropped.** It is a real Docker key, and kern's
-named volumes carry a size quota and a creation time and nothing else. A label accepted and
-discarded is one a later `--filter` will never match, so the message says which half is missing and
-points at `--label`, which kern does record and filter on.
-
-**`kern wait` was diagnosing a cause it could not know.** A box that left no exit record was
-reported as "a foreground or -it box has no supervisor to capture one". With `--rm` that assertion
-became wrong: a caller who had explicitly asked for no record was told its box ran in the
-foreground. There are three causes and the record that would say which is the one that is missing,
-so the line now names all three instead of picking one.
-
-**`inspect --format` answers `{{json .NetworkSettings.Ports}}` and `{{json .Config.Labels}}`.** The
-published-port map is how a caller learns where a service it just started is actually reachable, and
-on a rootless runtime it is the one thing it cannot assume: kern republishes a privileged port above
-1024, so a caller that trusts the number it asked for is wrong. The shape was MEASURED on Docker
-29.1.3 rather than recalled, and four of its details are the kind an implementation from memory
-gets wrong: the key is the port INSIDE the box with its protocol suffix (`"80/tcp"`), the value is
-an ARRAY because one container port can be published on several addresses, `HostPort` is a string,
-and the capitalisation is `HostIp` with a lower-case `p`. The `{{json …}}` pipeline is accepted as a wrapper on both.
-
-**This release changes two flags that already existed, so it is a MINOR and not a patch.** The
-stability note above says an incompatible change to a verb, a flag or a `--json` shape lands only on
-a minor bump, and only after a deprecation entry one release earlier. There was no such entry and
-there could not have been: both behaviours were defects, and announcing a defect for a release
-before fixing it would leave the broken one in the field on purpose. The two:
-
-  * **`-i` no longer allocates a pseudo-terminal**, on `box` and on `exec`. `-t`/`-it` do. A script
-    that used `-i` to get a terminal must now say `-t`; every script that used it the way docker
-    means it - `exec -i <box> psql … < file.sql` - stops hanging.
-  * **`inspect --format` refuses a name kern holds no record of**, where it used to print `exited`
-    and exit 0. A wait loop testing for `exited` ended immediately on a misspelled service and the
-    script carried on as though the step had completed.
-
-Everything else here is additive: new verbs, new flags, and fields added to `--json` documents that
-consumers already have to ignore when unknown.
-
-**A registry could reorder the line kern printed, without using a single control character.** The
-three filters that scrub remote text before it reaches a terminal all tested `char::is_control()`,
-which is the `Cc` category: C0, DEL and C1. The bidirectional overrides are `Cf`. Measured against a
-hostile registry on loopback: `kern pull` carried U+202E, U+200B, U+200E and U+200F from the token
-endpoint's `message` straight to the terminal, while correctly dropping ESC and carriage return. A
-filter written against escape sequences, defeated by something that is not one. U+202E moves no
-cursor; it reverses the order the characters after it are drawn in, which is enough to make a
-refusal read as something else. One predicate now decides the rule for all three, and it names what
-it removes rather than dropping a whole Unicode category.
-
-The same body also had no length: 1 MB of a registry's own text reached the terminal, and curl's cap
-allows eight. A diagnosis is a sentence, so it is capped at 200 characters with the overflow
-announced, because a silently truncated message reads as the registry's whole answer.
-
-`sh pentest/pentest-hostile-registry.sh` is the reproducer and is now part of `run-all.sh`. It found
-this where a unit test could not: a test asserting "a registry message cannot inject terminal
-escapes" had passed for as long as it existed, because it listed the characters somebody had thought
-of. The suite is verified in both directions, red against the previous binary.
-
-**A trailing backslash in a `command:` deleted a character, and sometimes an argument.** `command:
-myapp C:\dir\` ran `myapp` with `C:dir` - the final backslash was read as an escape with nothing to
-escape and dropped, and a `command:` that ENDED in a lone backslash lost that word entirely. POSIX
-leaves the case unspecified because a shell reading a terminal asks for another line; there is no
-next line in a compose file, and dash, bash and busybox ash all treat it as a literal. kern now
-does too. FOUND BY AN ORACLE, not by a test: the exhaustive loop over 46656 inputs asserted only
-that the splitter terminates, which no wrong split can violate, so the whole space is now put to
-`/bin/sh` itself and compared word for word - 17523 of the inputs are valid shell and every one of
-them must agree. The hand-written assertion for this case had encoded the wrong answer, and only an
-authority outside the test could say so.
-
-**`compose push` exited 0 having published nothing.** A service is pushed only when it declares
-both `build:` and `image:`, which is right; every service that did not was announced as skipped and
-the verb still reported success, so `compose push && deploy` deployed after publishing nothing. A
-run that publishes at least one image is still a success even if it skips others. A run that
-publishes NONE now says so with a status, and names the rule it applied.
-
-**`ps --last N` printed the newest box last.** The flag asks a question about recency and the rows
-came back oldest-first: the cut was made on one ordering and the rows were then rendered in
-another, the registry's. Boxes created inside the same kernel tick also fell back to whatever order
-the directory was read in. `--last` now renders newest-first and breaks a tie on the name, so the
-same boxes give the same order every time. Plain `ps` is unchanged and still lists oldest-first.
-The resolution is the kernel's: two boxes started within one tick are not ordered by this flag, and
-nothing here claims otherwise.
-
-**A pod name reaching the JOIN path was not validated, only the one reaching CREATE.** `pod create`
-has always checked the name against the shared resource-name rule, because it becomes a directory;
-`--pod <name>` took it straight from argv and handed it to `pods_root().join(name)` with nothing in
-between, and `--network <name>` gave that path a second entrance. Nothing escapes in practice - the
-join then requires `<dir>/holder` to hold a live pid AND `<dir>/netns` to match that process's
-namespace inode, a conjunction an arbitrary directory does not satisfy - so this closes an asymmetry
-rather than a hole. It is worth closing anyway: a name that cannot NAME a pod should be refused as a
-name rather than as a lookup that happened to find nothing.
-
-**`compose images` takes `--format json`, as `compose ps` does, and stopped calling an image nobody
-has ever pulled "dangling".** The two verbs sit next to each other and a script reading one reads the
-other, so a table where the other has JSON is the gap `ps --format` already closed once. The state is
-now named: `cached`, `dangling`, `absent`, or `build` for a service with no `image:` to name. The
-order of those three questions was wrong and had been: `image_stat` answers "dangling" for an image
-with no payload, and an image that was never pulled has no payload either, so a ref nobody had
-fetched was reported as a BROKEN local image - sending a reader to `rmi` something that does not
-exist instead of to `pull` something that does.
-
-**`kern build --check`: what kern does with a Dockerfile, without building it.** `compose config`'s
-sibling. It parses the file the way a real build resolves it (Containerfile first, the same
-`-f`/`--build-arg`) and prints a verdict per instruction: honoured, or DROPPED with what happens
-instead. Nothing is pulled, no box starts, and the exit code is the answer - 0 if the file builds
-here, non-zero carrying the refusal, so it can gate somebody else's CI. The question it answers is
-the one nobody could answer without reading kern's source: "will my Dockerfile build here, and is
-there a line kern will quietly not act on?" - and a build answers it only after downloading a base
-image and running half the file.
-
-A `COPY` from the context is CHECKED and not merely listed, because "this builds here" has to mean
-it: the first version reported `builds here, and every line it contains has an effect` for a file
-whose opening `COPY ../../etc/passwd` the build then refused, which is the one answer a gate must
-never give. The rule is the copier's own, lifted out of it so the dry run can ask the question
-without performing the copy. A glob and a `COPY --from` are left to the build: one names no file
-until a directory is read, the other a filesystem that does not exist until that stage is built, and
-refusing something that works is the worse of the two errors.
-
-The report comes from the PARSER'S OWN instruction list, never from a second scan: a separate
-scanner would be a second opinion about what a Dockerfile says, and two opinions drift. That is also
-why `VOLUME` now leaves a trace instead of vanishing - it was dropped in the parser with a comment
-and no output, so the build said nothing, the image said nothing, and only kern's source recorded
-that the line had no effect. A real build now says it too, one line, at the step.
-
-**`compose down -v` could not remove the one volume every stack has.** A volume carries the
-ownership of whatever wrote it, which rootless means a SUBUID: `postgres:17` writes its data
-directory as uid 999 inside the box, 100998 on the host, and an unprivileged caller cannot unlink
-inside a directory that uid owns. `kern volume rm` has used the id-mapped remover for exactly this,
-in a comment naming exactly this case, since before `down -v` existed; `down -v` used a plain
-`remove_dir_all`. Two removers, one rule, and the one on the path everybody uses had drifted.
-MEASURED on a ten-service stack: `down -v` answered `Permission denied (os error 13)` on
-`<project>_postgres_data` and the error ended the loop, so the three volumes after it survived too -
-a `reset.sh` reporting a reset that had removed nothing, and the next `up` reusing the old database,
-which is the exact failure project-scoped volumes were introduced to end.
-
-**An image's `LABEL`s are read, on both paths that produce an image.** The pull path did not parse
-`config.Labels` and the build path discarded `LABEL` at the parser with a comment saying "metadata -
-parsed and ignored", which described a gap rather than a decision: `docker images --filter label=`
-cannot answer for an image whose labels were thrown away, and `org.opencontainers.image.*` is where
-a build records its source and its version. `MAINTAINER` is recorded as `LABEL maintainer=`, which is
-what Docker does with it. `images --filter` now takes all five of Docker's keys: `reference=`,
-`dangling=`, `label=`, and `before=`/`since=`, the last two relative to another image's cache time -
-the same value the PULLED column prints, so the filter and the column cannot disagree.
-
-**`compose push` would have published images the file did not build.** The first version pushed
-every service carrying an `image:`, which on an ordinary stack means `postgres:17` and
-`rabbitmq:3-management` - images the file merely names and the cache merely pulled. MEASURED on a
-two-service file: it went straight at `postgres:17` and got as far as squashing it before failing for
-an unrelated reason; with credentials and a writable namespace it would have succeeded, publishing
-somebody else's image under your name from a verb whose author expected it to publish theirs. `push`
-now publishes what the file BUILDS: `build:` says the bytes are this project's, `image:` says where
-they go, and a service with one and not the other is named as skipped.
-
-**`compose wait` exited 0 whatever the service did.** The entire use of the verb is
-`docker compose wait tests` in a CI job that branches on the status, which Docker documents as the
-exit code of the first container to stop; printing the numbers and exiting 0 reports every failing
-suite as a pass. The services are now polled together rather than in file order, since "first to
-stop" is not "first in the file". `kern wait <box>` still prints and exits 0: it is older, its
-contract is frozen with the CLI, and a script already reading its stdout is correct. The two are
-spelled differently on purpose.
-
-**`ps --last N` answered a different question from Docker's.** It ordered on "how long ago did this
-box last do something" - `now - started` for a live one, `exited_ago` for a dead one - which are two
-questions wearing one name: a box created an hour ago and finished a second ago came out NEWER than
-one created a second ago. It now orders on the kernel start-time, the one clock both records hold and
-the one that means CREATED, so `-n 2` is the two most recently created across both lists.
-
-**`images --filter reference=alpine` matched nothing while `kern images` listed three.** A pattern
-naming no tag now matches any tag; one that names a tag is still matched whole. Stated as kern's
-rule rather than Docker's: this was not put to a daemon, and the reference filter's exact behaviour
-there is not something this repository has measured.
-
-**`up --no-deps` waited out its whole timeout on a dependency that had already completed.** A
-condition is keyed to the run that satisfies it, which is right for an ordinary `up` and impossible
-under `--no-deps`: the caller has said the dependencies will not be started, so requiring a
-completion under THIS run's token asks for something that can never happen. MEASURED on the line a
-real rebuild script runs, `up -d --build --force-recreate --no-deps <service>` against a stack
-already up: kern waited 120 seconds and reported `timed out waiting for 'setup' to complete` about a
-service that had completed minutes earlier and was sitting in `kern ps -a` with exit 0. Under
-`--no-deps` the question is now "has it completed, ever, as far as kern still knows", answered from
-the same exit record `kern ps -a` and `kern wait` read; and a condition that nothing in this
-invocation can satisfy is refused AT ONCE, naming the flag, instead of being waited out.
-
-**A new gate runs a real deployment's command shapes against a real stack.**
-`scripts/deployment-cli-battery.py` brings up a three-service stack and runs the 42 distinct
-command lines one deployment's scripts, `package.json` and CI actually contain - verbatim, because
-a green line means the script needed no edit - plus the four `build:` shapes a compose file declares
-and the token chain a real rebuild script wraps around them,
-checking each one's exit code and output. It exists because the compose-compat rate measures what
-kern does with a FILE, and every defect this release fixes was in the commands wrapped AROUND the
-file, where no corpus was looking. It found one on its first run, the `--no-deps` timeout above.
-
-**Eight `docker compose` verbs that did not exist: `wait`, `events`, `images`, `push`, `rm`, `top`,
-`version`, and `kill`.** Seven are the box-level verb kern already had, scoped to one stack, which is
-the shape `compose ps` established; `kill` is `stop` under the name Docker gives the harder one, and
-inherits kern's existing statement that the grace comes from `--stop-timeout` rather than being
-skipped. `top` reads the CGROUP rather than running a `ps` inside the box, so it answers for a
-distroless or `FROM scratch` service too. `rm` removes what kern actually has to remove, the exit
-record that keeps a finished service in `kern ps -a`, and refuses while a selected service is still
-running. `create` and `scale` are now refused BY NAME with the reason the concept is absent: both
-used to fall through and be read as a service name, so `compose f.yml create` answered "no such
-service: create" and sent the reader to look for a service nobody wrote.
-
-**`logs --since` and `--until`, on a box and on a stack.** The window is read from the timestamp
-index `logs -t` already prints from, and takes the three spellings Docker takes: a duration back from
-now (`30s`, `1h30m`), unix seconds, or RFC3339 UTC - the last of which is exactly what kern's own
-`logs -t` prints, so its output feeds straight back in. A line the index cannot place in time is
-KEPT: the index buckets from 100 ms and a log written before it existed has no marks at all, so
-discarding what cannot be placed would silently lose real output. A value that does not parse is
-refused with the three forms named, because a misread time shows the wrong window and wrong output
-looks like output. `compose logs` also gains `-t` and `--no-log-prefix`; `-t` is two flags there and
-the verb decides which, as it does under Docker (`logs -t` is timestamps, `down -t 30` is a grace).
-
-**`ps --filter health=`, `ps --no-trunc`, `ps --last N`, `images --filter`, `stats --no-stream`.**
-`health=` is the one a readiness loop writes, and it reads the health VERDICT rather than the merged
-status column, so a paused box with a passing check is still `healthy` here; `none` is the box that
-declares no healthcheck, which an empty string cannot express in a `k=v` filter. `--last N` counts
-across live AND exited boxes on one ordering, because "the last N containers" is one question, and it
-implies `-a`. `images --filter` takes the two keys the cache can answer (`reference=` with `*`,
-`dangling=`) and refuses the others by name rather than accepting a filter that silently matches
-everything. `stats --no-stream` names what kern has always done: a daemonless runtime has no stream
-to tail, and `kern top` is the live view. `volume ls` and `network ls` take `--format json` as a
-second spelling of `--json`; any other template is refused rather than printing a human table to a
-caller that asked for fields. `cp -a/--archive` is refused with its reason: it preserves uid/gid, and
-a rootless copy crosses a subuid range where the box's uid 999 is the host's 100998.
-
-**`kern inspect --json` carries `status`, and one function decides that word everywhere.** The
-document held `health`, which is empty for the majority of boxes, and not the field a script reaches
-for first. `ps`, `inspect` and `inspect -f` now read one function for the word, which fixes what none
-of them said before: a PAUSED box reported `running` from `inspect` while `kern ps` reported
-`paused`, because `inspect` tested the health verdict for a word the health verdict never contains.
-
-`inspect` still reports a box WHILE IT RUNS. A box that has exited is refused, by name and with its
-code, pointing at `kern ps -a`; the value a script wants from it is served by `inspect -f
-'{{.State.ExitCode}}'`, which reads the same exit record.
-
-**`kern rmi` charged the image you named for somebody else's debris.** The orphan-layer sweep is
-cache-wide, because that is the only way to find a layer whose last referrer has just gone, and every
-byte it reclaimed was added to the "freed N" line. MEASURED on a working cache: one image built under
-two names, `rmi` of the first printed `freed 140.3M`, `rmi` of the second printed `freed 140.3M`
-again, and `du` on the layer store was unchanged across both - 280 MB claimed, nothing reclaimed. The
-sweep still takes every orphan it finds, because the cache's health is not the caller's arithmetic;
-only the layers the named image's own manifest listed are charged to it. With `-t` now repeatable,
-two names for one image is the ordinary case on every release.
-
-**`kern box --network <name>` joins a running pod, which is what a stack is.** `docker run --rm
---network <stack-net> <image> <cmd>` is how a one-off talks to a running stack: generate a token,
-seed a database, run a migration. kern answered `--network <host|none>`, a usage line naming neither
-of the two joinable things it has. A name now reaches the same slot `--pod` fills, and what the name
-IS gets decided where the registry is already being read rather than in the parser: a running pod is
-joined, a `kern network` is named as the different object it is (a compose file declares it
-`external: true`; a single box cannot join one), and a name that is neither lists the pods that are
-running.
-
-**The teardown note contradicted the line four rows above it.** A stack whose services start and then
-exit printed `compose up: 2 box(es) started.` and then `removed pod 'x' again: no service started, so
-it held nothing`. The guard's condition is "does the pod hold anything NOW" and its sentence said
-"nothing ever started", which are different statements that agree only when nothing did start. The
-bring-up now tells the guard how many it started, so the two cases are said separately: nothing came
-up, which sends a reader to the errors above, or everything that came up has already finished, which
-sends them to `kern ps -a`.
-
-**`up --force-recreate`, `up --no-recreate` and `up -V/--renew-anon-volumes` are honoured.** They
-were refused, and the first of them ends a real rebuild script on its own line
-(`up -d --build --force-recreate --no-deps <service>`, after a step wrote a file the definition does
-not hash). kern's `up` compares a fingerprint and leaves a service whose definition still matches
-running, which is Docker's default and the right one; these are the two overrides of that comparison,
-and both are total, so neither can be defeated by a box that carries no fingerprint. Writing both at
-once is refused by name rather than resolved by precedence. `-V` discards the anonymous volumes of
-the services this `up` STARTS, not of the ones it leaves running: kern names an anonymous volume from
-the service and its mount path instead of a random id, which is what makes it persist across `up`,
-and the wider reading would delete storage from under a service nobody asked to touch.
-
-**`kern compose <verb>` finds the file, like `kern up` already did.** `docker compose up -d` is
-written from the directory that holds the file, and the verb form answered a usage dump naming a
-positional `<file>` it did not have to require. The same four Docker names plus `kern.toml` are
-searched, and the refusal when none is there now lists every name it tried (the hand-written sentence
-had already drifted and omitted `docker-compose.yaml`). A bare `kern compose` still prints usage:
-discovery answers which file, not which verb.
-
-**`kern port <box> [<container-port>]`.** The compose form has answered this for a stack for some
-time and the bare one did not exist, so a script holding a box name had nowhere to ask. It reads the
-RUNNING box rather than the file, so it reports what was actually bound, which on a rootless runtime
-is the whole point (a privileged port is republished above 1024). With no port it lists every mapping
-in Docker's `<port>/<proto> -> <address>` form; `/tcp` or `/udp` narrows to exactly that protocol.
-The compose verb now shares its selection code, so the two cannot drift.
-
-**`inspect -f` is accepted, and no longer answers for a box that does not exist.** `--format` was
-implemented and `-f`, the spelling every wait loop uses, was `unknown flag`. Worse, the lookup was
-"is it running?", so every name that was not running rendered `.State.Status` as `exited` with exit
-status 0: `until [ "$(kern inspect -f '{{.State.Status}}' setup)" = exited ]` ENDED IMMEDIATELY on a
-misspelled service and the script carried on as though the step had completed. A name kern holds no
-record of is now refused, and `.State.ExitCode` was added, since the question after "did it finish?"
-is "did it finish well?".
-
-**`kern login` checks the credentials before it stores them, and has a real `--password-stdin`.** It
-stored whatever it was given and printed `logged in`: a deliberately wrong password for Docker Hub
-was accepted and written over the existing entry, which holds one credential per registry. Two things
-followed, and both were live: a CI job that pipes a token in continues on exit 0 and discovers an
-expired one several steps later at the `push`, and a typo replaces a working credential with a broken
-one. The pair is now verified against the registry through the same challenge the pull path uses, the
-registry's own diagnosis is carried through, and nothing is written unless it is accepted. Login's
-flags are also checked now: `--password-stdin` was read by nothing and appeared to work because stdin
-is read anyway when it is not a terminal, so a misspelling would have behaved identically.
-
-**A `command:` carrying an escaped quote was silently truncated.** Inside a quoted string the
-splitter had no case for a backslash, so `\"` ENDED the string instead of escaping a quote in it, and
-everything after it was split on whitespace and handed to `sh` as positional parameters instead of as
-part of its `-c` script. A real stack found it: a service whose script prints
-`echo \"…retry $i…\"` and then runs `nginx -g 'daemon off;'` printed the first two words, exited 0,
-and never started nginx, with no warning at any layer. The backslash now follows POSIX in each of the
-three contexts it means something different in: unquoted it escapes the next character and continues
-a line, inside single quotes nothing is special, and inside double quotes it escapes exactly `$`,
-`` ` ``, `"`, `\` and a newline while staying literal before anything else, so `"C:\path"` and
-`"\n"` still reach the workload unchanged.
-
-**`exec -i` allocated a pseudo-terminal, so `exec -i <box> psql … < file.sql` never returned.** `-i`
-and `-t` were one flag. A PTY echoes its input, rewrites `\n` as `\r\n`, and never receives the EOF a
-redirected file cannot send, so the canonical way to feed SQL, a migration or a fixture into a
-running service hung and corrupted its own output on the way. They are now two flags, as they are on
-docker: `-t`/`-it` allocate the terminal, `-i` keeps stdin attached and allocates nothing. stdin was
-always inherited, so `-i` names what already happens and nothing else changes. `kern box` takes the
-same split, for `run -i img < file`.
-
-**`build -t a -t b` kept only the last name.** Both flags parsed, the second won, nothing was said.
-A release pipeline writes `build -t repo:$VERSION -t repo:latest .` and pushes each name, so the
-`push repo:$VERSION` on the next line failed on an image that had never existed. `-t` is now
-repeatable and every name is applied to the finished image through the same content-shared path
-`kern tag` uses, which references layers rather than copying them: N names cost one build and one
-manifest write each. Every name is validated when it is read, so an invalid fourth `-t` is refused
-before the build is paid for, and a name that cannot be applied fails the command rather than
-warning, because the caller's next line is a `push` of exactly that name.
-**`kern compose --help` ended with two lines about networks.** They are the tail of `network create`
-in the full reference, and they were printed under `compose ps` as though they described it, because
-the per-verb filter read a line's first word before its indentation and that continuation begins
-"compose file names with `external: true`". A per-verb help now carries only lines that belong to the
-verb, and three signatures that lacked the double space separating a command from its description
-got it, so `kern box --help` no longer shows `compose cp` for ending its sentence with "the box".
-
-**The GPU row in `kern doctor` is no longer a warning, and fits on the screen.** It fired on every
-host with any DRM node, which on a Raspberry Pi or a Jetson is a display core, and carried four lines
-of MIG and SR-IOV vocabulary about the strength of a cap this binary has no flag to request. The card
-and its tier are one line now with the qualification under it, and the full statement is printed
-where a GPU is actually handed over: `kern box ... --plan`, under a profile that grants a render node.
-
-**Three other `doctor` rows were a paragraph wide.** A passing row had nowhere to put a qualification
-but the first line, so SELinux and systemd lingering ran to 169 and 181 characters while every
-warning stayed under 70. A passing row takes a second line now, as a warning always could.
-
-**The CPU topology a box sees was built in its overlay upper, and paid for twice.** `/sys/devices/system/cpu/cpu0`
-through `cpuN` plus `online`/`possible`/`present` were written into the host-visible upper layer on
-every start and unlinked again at teardown, and that teardown is on the caller's path: 404 of the 405
-syscalls a box makes after its workload has already exited were that recursive delete, 14% of the wall
-of a `--rootfs` start. They are on a tmpfs now, freed with the mount, which is the treatment `/dev` has
-always had and why `/dev` was one entry in the upper where `/sys` was thirty-seven. The upper goes from
-46 entries to 9, and a paired core-pinned run measures **148.7 us** faster, interval [+94.9, +210.0].
-Behaviour is unchanged and pinned by a test: `nproc --all` and a tool counting `cpu[0-9]*` directories
-both still see the cpuset. Best-effort with today's behaviour as the fallback, so a host that refuses
-the mount still gets the topology.
-
-**That same loop then re-resolved a ten-deep path once per CPU.** Every `cpu<N>` directory was created
-through an absolute path, so a 28-way host made the kernel walk
-`/run/user/1000/kern/scratch/<box>/merged/sys/devices/system/cpu` twenty-eight times and allocated a
-string for each one. The directory is opened once now and each name goes to `mkdirat` from that
-descriptor, written into a fixed buffer with no allocation: `mkdir` calls per box start go from 51 to
-23, and a paired core-pinned run measures **10.6 us** faster, interval [+3.8, +16.8]. The old form
-costs more the more cores a host has, since it pays that walk once per CPU. A host where the open
-fails still gets the previous path. Behaviour is unchanged and pinned by a test that reads from inside
-a box: a list cpuset of `0,2,4-6` yields exactly `cpu0 cpu2 cpu4 cpu5 cpu6`, no gaps filled and no
-extras.
-
-**`kern diff` answered "what did this box change?" with 41 lines of kern's own setup and none of the
-box's.** Measured on the shipped binary: a box whose whole workload was `touch /tmp/mio.txt` listed
-`/dev`, `/etc/hostname`, `/etc/hosts` and thirty-six lines of `/sys/devices/system/cpu/cpu0` through
-`cpu27`, written by the CPU-topology setup on every start. The one real write went to a tmpfs and
-never reached the overlay upper, so the signal was not buried, it was absent: the verb was 100% noise.
-The upper is now stripped of what kern itself writes, and then of any directory left childless BY THAT
-REMOVAL, so the lone `C /etc` a naive filter leaves behind goes too. `/etc` is not treated as kern's:
-a workload writing `/etc/passwd` is a real change and still appears, and so does an empty directory the
-workload made, because a directory is dropped only when every child it HAD was scaffolding. A test
-asserts the property against a real box rather than the list, so the next piece of setup turns it red
-by existing.
-
-**The SDK paid a quarter of every cold box for a uid range its own posture made useless.** `kern box
---image` maps a sub-uid range by default, so that an image degrading privilege in its entrypoint
-(postgres, nginx, apt's `_apt`) works; mapping it forks the two setuid helpers `newuidmap` and
-`newgidmap`. Measured: `parent:idmap` is 22 us with a single-uid map and ~1048 us with the range, and a
-box on the SDK's own argv goes 4298 to 3234 us, a paired core-pinned difference of **1083 us (25%)**,
-interval [-1184, -952]. It bought that box nothing, and that is measured rather than argued:
-`os.setuid(1000)` inside a cell is refused either way once `ALL` is dropped, EPERM with the range and
-EINVAL without, because the capability the range serves is already gone. `pip install --target` with
-network on installs the same files either way, and an image whose files are not root-owned
-(`postgres:16-alpine`, `node:20-slim`) reads the same. So both bindings now pass `--no-uid-range`,
-CONDITIONALLY: only when `ALL` is among the dropped capabilities, which is the default. `cap_drop=()`
-is a documented choice that keeps the capabilities, and there the range does work, so it is kept - a
-narrower set is treated the same way. A test fails if the two bindings stop agreeing on the condition.
-
-**The SDK mount guard refused AWS and Azure and accepted Google Cloud.** The list of credential
-directories a `mounts=` source may not contain covered eleven names and missed the third major cloud,
-plus the GitHub CLI's token directory. Measured on the published 0.2.27 with each directory created
-first, which is the step that matters: the first sweep read `~/.config/gcloud` as covered when the
-real answer was "source does not exist" on a host that has no gcloud, and a refusal that is really a
-missing path is a skip wearing a pass. Ten candidates were accepted once they existed. Added: `.oci`,
-`.terraform.d`, `.databrickscfg`, `.boto`, `.s3cfg`, `.rclone.conf`, and, matched only under
-`.config`, `gcloud`, `gh`, `doctl` and `rclone` - only under `.config`, because a bare `gh` component
-would refuse `~/projects/gh/src`, and a guard that fires on ordinary work is one somebody turns off.
-Deliberately NOT added, and said out loud rather than left implied: `.cargo`, `.m2` and `.gem` each
-hold one credential file beside a package cache people legitimately mount, so refusing the directory
-would break a real use; mounting `~/.cargo` still exposes `credentials.toml`. Both bindings carry the
-same list and a test now fails if they drift. This is a guard rail against an agent being steered
-into asking for the mount, not a sandbox boundary: the caller still has to ask.
-
-**`kern network ls` and `kern pod ls` printed a name off disk without stripping terminal escapes.**
-Both walk a state directory and render every entry verbatim, so what they show is what is on disk and
-not what `create` accepted: the creation-time name check does not cover them, and the REFUSAL for the
-same name two functions away already scrubbed it. Measured with a planted directory, both printed the
-ESC and BEL bytes intact and the terminal obeyed them. Not reachable from inside a box - planting the
-directory needs write access to kern's runtime dir, and `-v` refuses to mount that into a box by name
-- so this is the layer under that refusal rather than a hole in it. `--json` was already correct on
-both. The entry is still LISTED, neutralised, because hiding a directory kern acts on would be worse
-than showing it safely. Found by running every list verb against the same planted name instead of
-inspecting the one already known broken, which is what turned one table into two.
-
-**Four tables had a fixed NAME width, and `kern history` printed two different boxes as one line.**
-`kern ps` was widened to fit its longest name some releases ago; `stats`, `history`, `volume ls` and
-`network ls` were not, each with its own number. The three that do not truncate (`stats` 16,
-`network ls` 24, `volume ls` 28) shifted PID, MEM, CPU, SIZE, QUOTA and MEMBERS for the whole table
-on any longer name, header included, so the header lined up with no row in it; 16 is passed by every
-box the sandbox SDK starts, and 28 by a volume a compose stack leaves behind. `history` truncates
-instead, and a project scope is 17 of its 20 characters: a stack with services `worker` and
-`workqueue` gave two rows both reading `…-wo…`, different pids, no way to tell which log was which.
-One rule for all five now, floored at each table's old width so short output is unchanged and
-ceilinged rather than truncating, because the name is the identity `kern stop` and `kern logs` take.
-
-**A piped `kern top` reported every box at 0% CPU.** The pane's per-box CPU% is a delta between two
-samples, and the one-shot form a pipe selects took only one, so every box read `0%` unconditionally.
-Measured: a box pegging a full core read `0%` across 24 consecutive snapshots while its own cgroup
-`cpu.stat` and its workload's `/proc/<pid>/stat` ticks both said 100%, and the interactive tab said
-`100%` at the same moment. The same call dropped the box-START rate, which is the only place an SDK
-firing ~ms boxes shows up at all - the live list is empty by the time you read it. Both now take
-their earlier sample before the 120 ms the function already sleeps for the host CPU%, so `kern top |
-…` answers what the terminal answers. A wrong number costs more than a missing one here: the piped
-form is what a script, a CI step or an agent reads, and `0%` does not look like a placeholder.
-
-**The Boxes tab of `kern top` says what it lists.** Every other list pane has a caption and the row
-budget reserves one for all of them, so this tab was spending the line on nothing; it now names the
-pane, the word containers, and the command that makes one.
-
-**`kern top` could not reach past the first screenful of any list.** Every pane drew its rows from
-index zero, so on a host with 309 cached images the Images tab showed 25 and `… 284 more`, and no key
-reached the 284: the selection walked off the bottom of the screen and the window never followed it.
-Images, Builds, Boxes and Storage all had it. The drawn window now follows the selection, moving as
-little as it can, and one status line reports what is hidden above AND below with the position in the
-list. One line, because the frame budget reserves exactly one row for it and a second would push a
-full tab past the terminal.
-
-**A shifted key acts on the whole tab, after asking.** `D` deletes every cached image, every build
-record, or every volume and its data; `S` stops every running box. Each one arms a confirmation whose
-prompt names HOW MANY and what is lost, because "delete all?" says nothing about the blast radius of
-the key about to be pressed. The targets are captured when the key is pressed rather than re-derived
-on confirm, so what was on screen is what gets acted on, and a bulk action runs to the end and reports
-how many of how many failed instead of stopping at the first.
-
-
-**A cell could forge a sandbox verdict with one leading space.** The neutralisation that stops a box
-printing `[sandbox: oom]` or `[exit 137]` and having a model read it as the sandbox's own verdict was
-anchored at column 0, so ` [sandbox: oom]` (one space, a tab, a NBSP, a zero-width space or a BOM in
-front) sailed through unlabelled - and a model reads the leading space as nothing. The anchor now
-allows a run of invisible characters before the marker, on every surface that neutralises framing
-(the MCP server, the LangChain renderer, the Pi extension). A marker with a WORD in front of it is
-still left alone, because that is a sentence mentioning the frame rather than forging it.
-
-
-**`kern build` reads a `Containerfile`.** Without `-f`, it looks for that name first and for
-`Dockerfile` second, which is the order podman and buildah use. Both are read and neither is
-deprecated: a build file is an input, and refusing to open one someone already has, because of what
-it is called, would be a position rather than a behaviour. The order matters only in a context
-holding both, which is a repository saying something about itself, and there the neutral name wins.
+## v0.10.0 - 2026-09-21
+
+Four days of work since v0.9.35, and 99 commits. Each line is the change; how a defect was found and
+why the fix is shaped that way is in the commit it came from (`git log v0.9.35..v0.10.0`).
+
+**Read these first if you are upgrading.** Three things change behaviour you may depend on. **kern no
+longer answers to `docker`**: the shim is gone, and compatibility is the FORMAT and the FLAGS, never
+the binary name. **A pod maps the sub-uid range by default**, as an `--image` box already did, so a
+member running an official image that drops privilege in its entrypoint works without `--uid-range`;
+`--no-uid-range` is the opt-out. And **`ps --last N` now answers Docker's question**, the N most
+recent across live and exited, newest first.
+
+### The Docker CLI surface, accepted where kern has the same knob
+
+`box --mount` and `--name`, `--rm`, `network inspect`, the `image` verb group, `images <repo>` with
+`--format` and `pull --quiet`, `inspect --format` answering `{{json .NetworkSettings.Ports}}` and
+`{{json .Config.Labels}}`, `kern port`, `logs --since/--until`, `ps --filter health=`, `--no-trunc`,
+`images --filter`, `stats --no-stream`, and `build` reading a `Containerfile` so a project need not
+carry another project's name.
+
+Six of the twelve commits that built this surface are FIXES the reviews found in it, and one was
+live on 0.9.35: **`--mount readonly=1` mounted the path WRITABLE**, which is the worst shape a
+compatibility gap can take, the flag asking for less privilege granting more. `--mount` is now parsed
+with the reference's CSV grammar rather than a quote toggler, which had changed the path being
+mounted; its keys are case-insensitive and its paths are not; `type=bind` with a missing source is
+refused instead of creating it and starting a box whose mount is empty; `type=tmpfs,...,readonly`
+mounts read-only; and Docker's keys kern has no equivalent for are refused BY NAME rather than by a
+grammar dump. `--filter label=k=` matches a label stored with an empty value. `--rm` and `--restart`
+are no longer both applied. `images <repo>` is no longer dropped when a flag comes first.
+`network inspect -f '{{.Name}}' proxy` no longer inspects a network called `{{.Name}}`.
+`{{json .Name}}` prints `"/web"` as Docker does. A label that went in and could be filtered on now
+comes back out.
+
+### Compose
+
+`compose push` exited 0 having published nothing, and would have published images the file did not
+build. `compose wait` exited 0 whatever the service did. `compose down -v` could not remove the one
+volume every stack has. `up --no-deps` waited out its whole timeout on a dependency that had already
+completed. `up --force-recreate`, `--no-recreate` and `-V/--renew-anon-volumes` are honoured.
+`kern compose <verb>` finds the file the way `kern up` already did. A trailing backslash in a
+`command:` deleted a character and sometimes an argument; an escaped quote truncated it silently.
+`kern box --network <name>` joins a running pod, which is what a stack is. A new gate runs a real
+deployment's command shapes against a real stack.
+
+### The SDK
+
+**kern-sandbox 0.2.31.** The constructor guards that existed for `setup` and `cap_drop` and not for
+the rest: `mounts` and `env` in the wrong shape name the argument and the shape they want, instead
+of escaping as an `AttributeError` in Python or reaching the mount validator as an index key in Node,
+where `Object.entries` does not throw on an array and reported a source of `"0"` the caller never
+wrote. `on_stdout`/`on_stderr` must be callable. A callback that RAISES is still swallowed, because
+it must not kill the output drain and hang the box on a full pipe, but says so once with a
+`RuntimeWarning` instead of leaving a successful-looking run whose callback never saw a line. A
+`workspace` pointing at a FILE is refused by name rather than raising `FileExistsError` out of
+pathlib.
+
+The mount guard refused AWS and Azure and accepted Google Cloud, which is the asymmetry that made it
+visible. `kern-pi`'s lock pinned an SDK nineteen releases old while its own range resolved to the
+current one on the registry.
+
+0.2.30 was published with `package.json` raised and the version constant in `index.js` left behind,
+so the package reported the previous release; 0.2.31 corrects it. npm cannot unpublish, so 0.2.30
+stays on the registry reporting 0.2.29.
+
+### Boxes, pods and lifecycle
+
+**Stopping a pod's last member removed the pod, and letting that member exit on its own did not** -
+the same end state with two outcomes depending on how it was reached. A pod created by name now
+survives being emptied; `stop --all`, naming the pod itself, and a pod derived from a stack still
+tear one down. What a pod shares is asserted rather than described: members share the **user** and
+**network** namespaces and nothing else, with mount, pid, ipc, uts and cgroup private to each, each
+assertion carrying a negative control.
+
+**Every box leaked its environment sidecar.** kern records a box's environment so `kern exec` and the
+healthcheck can read what `/proc/<pid1>/environ` stops giving them once the box drops privilege, and
+only `stop` ever removed it: a box that simply EXITED left it behind forever, which is every
+foreground box and every SDK call. Measured after one day of benchmarking, 4433 files and 13 MB in a
+tmpfs with zero boxes alive. Removed in the teardown now, and `prune` sweeps the directory for the
+box whose supervisor was killed first.
+
+`kern wait` was diagnosing a cause it could not know. `kern rmi` charged the image you named for
+somebody else's debris. A pod name reaching the JOIN path was not validated, only the one reaching
+CREATE. `kern login` checks credentials before storing them and has a real `--password-stdin`.
+`exec -i` no longer allocates a pseudo-terminal, so `exec -i <box> psql … < file.sql` reaches EOF
+instead of hanging. `build -t a -t b` keeps both names. `kern build --check` reports what kern does
+with a Dockerfile without building it.
+
+### What the output says
+
+**A cell could forge a sandbox verdict with one leading space**, and the fix is a prefix at column
+zero plus two witnesses. **A registry could reorder the line kern printed** without using a single
+control character. `kern network ls` and `kern pod ls` printed a name off disk without stripping
+terminal escapes; `inspect --format` printed a label's control bytes raw where `ps --format` strips
+them. Four tables had a fixed NAME width and `kern history` printed two different boxes as one line.
+A piped `kern top` reported every box at 0% CPU. `kern top` can reach past the first screenful, says
+what its Boxes tab lists, and a shifted key acts on the whole tab after asking. Three `doctor` rows
+were a paragraph wide, and the GPU row is no longer a warning. `ps -a`'s help says the exited rows
+are DETACHED boxes, because the exit note is written by the supervisor and a foreground box has none.
+
+### Performance
+
+**A box that drops every capability stops paying for a uid range it cannot use: 937 us**, a quarter
+of a cold `--image` box, measured paired at n=300 with an interval of [-959, -912]. Mapping the range
+forks two setuid helpers, and under `--cap-drop ALL` it buys nothing: `chown` to another uid fails
+inside the box either way. Any `--cap-add` cancels the skip, which is the conservative reading, and
+`--uid-range`, a non-root `--user` and `--ssh` still outrank it.
+
+The CPU topology a box sees was built in its overlay upper and paid for twice; that same loop
+re-resolved a ten-deep path once per CPU.
+
+### Measurement and the pages
+
+The README publishes **no latency figure** at all: a front page states a number with no machine,
+method or date beside it, and it is the one claim there nobody can check without running something.
+The canonical figure is the `box --image` row of BENCHMARKS.md, which carries all three, and
+`stale-numbers.py` checks every other claimant against it. That figure is **3.6 ms**, and the page
+says what it is: the fastest replica of an idle machine, where of 34 replicas taken the same day none
+came in below it, the median of all was 4.05, and one unchanged binary spread 3.65 to 4.31 within a
+few hours. A reader measuring nearer 4 on a working machine is seeing the same box on a different
+afternoon.
+
+`kern doctor` is now the first command after install, on Linux and inside the macOS VM. The note that
+Ubuntu 23.10+ needs one root command first was already in the README, two hundred lines below the
+install block, arriving after the moment it is needed.
+
+The timing instrument could not state its own coverage, so a reader summed its phases and believed
+the sum was the box; it now closes with the total from process entry, what the marks cover, and the
+remainder as a number. Two comments in one codebase disagreed about the label filter, and the
+measurement settled it.
 
 ## v0.9.35 - 2026-09-17
 
