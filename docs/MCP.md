@@ -13,7 +13,7 @@ is where the file lives, not what goes in it.
 Each of them spawns the command **where the client runs**, so a client on macOS or Windows needs the
 `wsl` or `ssh` line further down rather than the block below.
 
-`kern-mcp` ships in the Python package (`pip install kern-sandbox`) and speaks
+`kern-mcp` ships in the Python package and speaks
 [Model Context Protocol](https://modelcontextprotocol.io) over stdio, newline-delimited JSON-RPC 2.0.
 It is dependency-free: it imports the standard library and `kern_sandbox`, nothing else.
 
@@ -32,8 +32,10 @@ needs a transport into a Linux machine instead. Both are one line and both are b
 Windows, `ssh` to a VM or a board from anywhere. The SDK says the same thing at the point it bites:
 on macOS its missing-binary error names the VM rather than an installer.
 
-To run it without installing anything, name the package, not the command: `uvx kern-mcp` fails,
-because the command and the package have different names and there is no `kern-mcp` on PyPI.
+**A `pip install` into a virtual environment is invisible to the client**, which spawns `kern-mcp`
+from its own PATH. `pipx install kern-sandbox` puts it somewhere the client can see. Or install
+nothing at all, and name the package rather than the command: `uvx kern-mcp` fails, because the two
+have different names and there is no `kern-mcp` on PyPI.
 
 ```json
 { "mcpServers": { "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] } } }

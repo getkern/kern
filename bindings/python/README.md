@@ -26,12 +26,16 @@ An agent's tool-call, a generated snippet, a notebook cell, a CI step: code that
 has read it should not run in your home directory.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # the runtime
-pip install kern-sandbox                                                        # the API
+# the runtime: one static binary, checksum-verified by the script
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+
+# the API: in a virtual environment, because most distributions refuse a system-wide pip (PEP 668)
+python3 -m venv .venv && . .venv/bin/activate
+pip install kern-sandbox
 ```
 
-Two lines because they are two things: the isolation is the binary's, and this package is the API in
-front of it. `$KERN_BIN` says where to find a kern you already have.
+Two things, not one: the isolation is the binary's, and this package is the API in front of it.
+`$KERN_BIN` says where to find a kern you already have.
 
 ```python
 import kern_sandbox as kern
@@ -136,6 +140,14 @@ one line (`"command": "wsl"`, or `"command": "ssh"` to a VM or a board), both in
     }
   }
 }
+```
+
+**The client spawns `kern-mcp` from ITS PATH**, so a package installed into a virtual environment is
+invisible to it. Either install it where the client can see it (`pipx install kern-sandbox`), or ask
+for it without installing anything:
+
+```json
+{ "mcpServers": { "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] } } }
 ```
 
 One block, three clients. **Cursor**: Settings, MCP, add a server, which opens `mcp.json`.

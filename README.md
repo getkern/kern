@@ -131,6 +131,7 @@ the Windows and Mac guests step by step, and what the resource caps do on a defa
 [npm](https://www.npmjs.com/package/kern-sandbox)) needs the binary above, so install that first:
 
 ```sh
+python3 -m venv .venv && . .venv/bin/activate   # most distributions refuse a system-wide pip (PEP 668)
 pip install kern-sandbox
 npm  install kern-sandbox
 ```
