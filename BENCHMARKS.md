@@ -6,7 +6,7 @@ musl), measured on 2026-09-20: Intel i7-14700KF, Linux 7.0.0, `powersave` govern
 | runtime | one container | 200 in parallel | what it does per start |
 |---|---:|---:|---|
 | **kern** `box --rootfs` | **2.7 ms** | **0.10 s** | namespaces, overlay, `pivot_root`, seccomp allowlist, memory and PID cap |
-| **kern** `box --image` | **3.6 ms** | | the same, plus unpacking an OCI image into the overlay |
+| **kern** `box --image` | **3.6 ms** | **0.12 s** | the same, plus unpacking an OCI image into the overlay |
 | bubblewrap | 2.7 ms | 0.15 s | namespaces, bind mount, no seccomp and no cgroup cap |
 | runc, rootless | 13.2 ms | 0.32 s | OCI runtime, normally driven by an engine above it |
 | podman `run --rm` | 288 ms | 43.6 s | forks `conmon` and the full OCI stack every run |
@@ -23,6 +23,12 @@ So read the 3.6 as "what this costs when nothing else is running", not as what y
 measure it yourself on a working machine you should expect something closer to 4, and that is not a
 regression, it is the same box on a different afternoon. The reproduction command is at the bottom
 of this page and it is the only number that matters for your hardware.
+
+**The parallel cell on the `--image` row is a day later and a different build**, measured 2026-09-21
+on kern **v0.10.0-2-gdcb1d1a**, built the same way: three replicas of 200 starts fanned out at once,
+alternating with docker, 0.10 / 0.12 / 0.12 s with 200 of 200 succeeding in every replica. The 0.12
+published is the MEDIAN of the three and not the best of them. Docker in that same session read 16.69
+s (16.36 to 16.93), which is the 16.6 in the row above, measured again on a different afternoon.
 
 **The same box costs 2.6 ms in a pod, and the row below it is NOT the same job.** An `--image` box
 maps a sub-uid range so an official image can drop privilege in its entrypoint, and rootless the only

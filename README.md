@@ -18,6 +18,13 @@
 
 </div>
 
+| `/bin/true` in an `alpine` image | kern | docker |
+|---|---:|---:|
+| one container | **3.6 ms** | 294 ms |
+| **200 containers at once**, wall clock until all 200 have exited | **0.12 s** | 16.69 s |
+
+<sub>Intel i7-14700KF, Linux 7.0, 200 of 200 succeeded on both sides. The distance is wider in parallel because a daemon serialises what a daemonless runtime forks. [Every runtime, the method, the date, and the one command that measures your own hardware](BENCHMARKS.md).</sub>
+
 ```sh
 # install the release binary (static, checksum-verified by the script)
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
@@ -316,12 +323,12 @@ The timings are in [BENCHMARKS.md](BENCHMARKS.md), measured on one host, same wo
 
 ## Performance
 
-**The numbers are in [BENCHMARKS.md](BENCHMARKS.md), with the machine, the method and the date, and
-they are not repeated here.** A figure on a front page is read as a promise about the reader's
-machine, and it is the one thing on this page nobody can check without running it. It also drifts:
-the same binary, on the same machine, spreads several percent across one afternoon for the same box,
-so any single digit published here would be wrong for most readers most of the time, in one
-direction or the other.
+**The two figures at the top of this page are one machine on one day, and everything else is in
+[BENCHMARKS.md](BENCHMARKS.md): the machine, the method, the date, and the runtimes nearer than the
+engines.** Read them as an order of magnitude rather than as a promise about your hardware. The same
+binary on the same machine spreads several percent across one afternoon for the same box, the single
+start is the best replica of an idle machine and that page says so where the number is, and the
+parallel figure is the median of three.
 
 What is stable enough to state without a number: kern starts a container in **single-digit
 milliseconds** and the engines take **hundreds**, which is two orders of magnitude and survives any

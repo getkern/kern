@@ -589,9 +589,15 @@ def latency_claims_agree() -> list[str]:
     # likely to be stale. MEASURED that afternoon, the same binary read 3.93 to 4.24 ms for the same
     # box across eight replicas, so ANY single digit on a front page is wrong for most readers.
     #
-    # The README now states an order of magnitude and points here. The canonical figure is the row
-    # in BENCHMARKS.md, which carries the machine, the method and the date in the same file, and is
-    # therefore the only claimant a reader can check.
+    # The canonical figure is the row in BENCHMARKS.md, which carries the machine, the method and the
+    # date in the same file, and is therefore the only claimant a reader can check.
+    #
+    # THE README IS A CLAIMANT AGAIN SINCE 2026-09-21, and the anchor did NOT move back with it. The
+    # owner put a two-row table under the demo on the front page, because the demo already showed a
+    # figure and the page above it said "a few milliseconds": one screen, two answers. So the README
+    # states the number again and is CHECKED against BENCHMARKS.md rather than trusted to hold it.
+    # That is the whole difference from the arrangement this comment describes above, and it is the
+    # one that survives: a front page may carry a figure, it may not be the place the figure lives.
     source = "BENCHMARKS.md"
     anchor = re.search(
         r"\|\s*\*\*kern\*\*\s*`box --image`\s*\|\s*\*\*~?([\d.]+)\s*ms\*\*",
@@ -606,6 +612,9 @@ def latency_claims_agree() -> list[str]:
         r'|from an OCI image in ~?([\d.]+)\s*ms'
         r'|starts in \*\*~?([\d.]+)\s*ms\*\* from an OCI image'
         r'|~?([\d.]+)\s*ms with `--image`'
+        # The README's table row. Anchored on the row LABEL rather than on the table, so moving the
+        # table, restyling it or adding a column cannot make this quietly stop reading anything.
+        r'|\|\s*one container\s*\|\s*\*\*~?([\d.]+)\s*ms\*\*'
     )
     bad = []
     # `blog/` IS NOT A CLAIMANT, and that is a decision rather than an oversight. A post carries the
@@ -616,6 +625,7 @@ def latency_claims_agree() -> list[str]:
     # protects is the one about the CURRENT claim: a page that states a number WITHOUT a measurement
     # date is claiming it is true now, and must agree with the README.
     for path in (
+        "README.md",
         "assets/make-demo-gif.py",
         "docs/FAQ.md",
         "bindings/python/README.md",
@@ -704,9 +714,9 @@ def main(argv: list[str]) -> int:
         total += 1
         print(f"\n{problem}")
         print("       one measurement, several homes: the BENCHMARKS.md table is canonical and every "
-              "other claimant is checked against it. Edit BENCHMARKS.md first, then the others; if "
-              "the GIF generator moved, re-run it: python3 assets/make-demo-gif.py. The README "
-              "deliberately states no figure, so do not put one back to satisfy this check.")
+              "other claimant is checked against it, the README's table under the demo included. "
+              "Edit BENCHMARKS.md first, then the others; if the GIF generator moved, re-run it: "
+              "python3 assets/make-demo-gif.py")
     for problem in no_binary_size_claim():
         total += 1
         print(f"\n{problem}")
