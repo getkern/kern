@@ -15,6 +15,8 @@ can run:
     podman run --rm         286.0  ms   n=15
     docker run --rm         292.8  ms   n=15
     sbx exec                421    ms   7 calls into an ALREADY RUNNING sandbox (393 to 506)
+                                       `sbx` IS Docker Sandboxes, v0.43.0, and the bar says so:
+                                       nobody recognises the binary name on its own
 
 THREE CATEGORIES, AND THE LABELS SAY WHICH, because the question "are docker and podman sandboxes?"
 is the right one to ask of this chart. They are ENGINES: one `run` per tool-call is the
@@ -53,7 +55,7 @@ BARS = [
     ("llm-sandbox, session kept alive", 77.0, False),
     ("podman run --rm, one per call", 286.0, False),
     ("docker run --rm, one per call", 292.8, False),
-    ("sbx exec, sandbox already running", 421.0, False),
+    ("Docker Sandboxes (sbx), already running", 421.0, False),
 ]
 
 FOOT = ("one tool-call: print(1) in python:3.12-slim, p50, wall clock around the whole call. "
@@ -86,7 +88,7 @@ def main() -> int:
         ax.text(v * 1.15, y, f"{v:g} ms", va="center", color=TEXT if c == OURS else DIM,
                 fontsize=10, fontweight="bold" if c == OURS else "normal")
     for lbl in ax.get_yticklabels():
-        lbl.set_color(TEXT if "kern" in lbl.get_text() else DIM)
+        lbl.set_color(TEXT if lbl.get_text().startswith("kern-sandbox") else DIM)
     # The footer sits INSIDE the canvas. Placed below it with `bbox_inches="tight"`, matplotlib grew
     # the figure to contain it and left a band of dead background between the axis and the text.
     fig.subplots_adjust(left=0.30, right=0.98, top=0.97, bottom=0.33)
