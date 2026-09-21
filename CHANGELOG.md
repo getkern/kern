@@ -5,6 +5,18 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## kern-sandbox 0.2.32 - 2026-09-21
+
+The bindings are released on their own clock, so this section carries a package version rather than
+a runtime tag. It needs no new binary: v0.10.0 runs it.
+
+**The MCP server starved its own setup box.** It always passed an explicit
+`tmpfs`, and the SDK skips only its OWN default there, so `KERN_MCP_SETUP="pip install numpy pandas
+matplotlib"`, the block printed in the package README, failed with `OSError [Errno 28] No space left
+on device`. Unset now reaches the SDK as `tmpfs=None`: cells still get 64 MiB, an explicit value
+still applies to every box, `0` still means none. The test that covered this asserted the knob and
+not the argument, so the new one reads what the server hands to `Sandbox(...)`.
+
 ## v0.10.0 - 2026-09-21
 
 Four days of work since v0.9.35, and 99 commits. Each line is the change; how a defect was found and
