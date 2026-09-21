@@ -2374,32 +2374,23 @@ pub fn prune() -> (usize, u64) {
     let mut freed = 0u64;
     let instances = dir().ok(); // for the concurrent-start re-check in the sweep
     let inst = instances.as_deref();
+    // `logs` keys differently (a generation and an index suffix), so it sweeps on its own.
     sweep_orphans(logs_dir(), log_key, &live, inst, &mut removed, &mut freed);
-    sweep_orphans(
-        health_dir(),
-        sidecar_key,
-        &live,
-        inst,
-        &mut removed,
-        &mut freed,
-    );
-    // THE ENV SIDECAR WAS THE ONE THIS SWEEP DID NOT KNOW ABOUT, and it is the one that grows
-    // fastest: `set_box_env` writes `<name>-<pid>` for EVERY box, where a health file only exists
-    // for a box with a healthcheck. MEASURED on 2026-09-20 after a day of benchmarking: 4433 files
-    // and 13 MB in `env/` with ZERO boxes alive, none of which any code path would ever have
-    // removed. It is tmpfs, so that is resident memory that never comes back.
+    // EVERY PLAIN `<name>-<pid>` SIDECAR, IN ONE LIST, because that is what `sidecar_key` means and
+    // a list is the only shape that makes the next one hard to forget.
+    //
+    // `env` was missing from this sweep for a release while `health` was in it, and the helper being
+    // called `health_key` is a fair part of why: the rule read as health-specific machinery. It is
+    // also the one that grows fastest, since `set_box_env` writes a file for EVERY box where a
+    // health file only exists for a box with a healthcheck. MEASURED on 2026-09-20 after a day of
+    // benchmarking: 4433 files and 13 MB in `env/` with ZERO boxes alive, which no code path would
+    // ever have removed. It is tmpfs, so that was resident memory that never came back.
     //
     // `clear_box_env` drops it on the normal exit path, which is the fix at the source; this is the
-    // net beneath it, for the box whose supervisor was SIGKILLed and never ran its teardown. Both
-    // are needed for the same reason `logs` and `health` have both.
-    sweep_orphans(
-        env_dir(),
-        sidecar_key,
-        &live,
-        inst,
-        &mut removed,
-        &mut freed,
-    );
+    // net beneath it, for the box whose supervisor was SIGKILLed and never ran its teardown.
+    for target in [health_dir(), env_dir()] {
+        sweep_orphans(target, sidecar_key, &live, inst, &mut removed, &mut freed);
+    }
     // `kern wait` exit sidecars of boxes whose supervisor is gone (dead-pid). Reaped here too, not
     // only in `gc`, so `prune` - the routine cleanup - bounds this dir (it would otherwise leak one
     // tiny file per never-waited detached box). A wait consumes its own sidecar within ~100 ms of the
