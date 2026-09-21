@@ -29,8 +29,10 @@ has read it should not run in your home directory.
 # the runtime: one static binary, checksum-verified by the script
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 
-# the API: in a virtual environment, because most distributions refuse a system-wide pip (PEP 668)
-python3 -m venv .venv && . .venv/bin/activate   # Debian/Ubuntu ship this separately: apt install python3-venv
+# the API, in a virtual environment: most distributions refuse a system-wide pip (PEP 668),
+# and Debian and Ubuntu ship venv separately, so install it first if the next line fails:
+#     sudo apt install python3-venv
+python3 -m venv .venv && . .venv/bin/activate
 pip install kern-sandbox
 ```
 
