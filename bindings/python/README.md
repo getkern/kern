@@ -54,6 +54,11 @@ box. A call that simply ended leaves nothing at all.
 
 kern calls that container a **box**, and so does the rest of this page.
 
+**Two modes break the one-box-per-call rule on purpose, and both say so where they are offered**: a
+`kernel()` shares one warm interpreter across cells, and the MCP server's `KERN_MCP_KERNEL` does the
+same for a model. A prewarm pool does not: each box it holds still serves exactly one call and is
+destroyed.
+
 One thing before you time it: the **first** call on a machine that has never run it pulls the image,
 so it is the slow one. Every call after it reads the cache.
 

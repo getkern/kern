@@ -70,7 +70,9 @@ FOOT = ("one tool-call: print(1) in python:3.12-slim, p50, wall clock around the
         "docker and podman are ENGINES, not sandbox products: one run per call is the "
         "do-it-yourself baseline. llm-sandbox drives docker underneath.\n"
         "The two session-based arms keep their session alive, which is the arm most favourable to "
-        "them: sbx create is paid once and cost 5067 ms here.")
+        "them: sbx create is paid once and cost 5067 ms here.\n"
+        "n=15 unless stated. Spread: kern 11.4 to 23.5, prewarm 0.64 to 1.46, docker 273 to 305, "
+        "sbx 393 to 506. A heavier call narrows the distance: import json,re is 47.3 against 320.8.")
 
 
 def main() -> int:
@@ -79,7 +81,7 @@ def main() -> int:
     values = [b[1] for b in BARS][::-1]
     colours = [OURS if b[2] else THEIRS for b in BARS][::-1]
 
-    fig, ax = plt.subplots(figsize=(9.2, 4.0), dpi=150)
+    fig, ax = plt.subplots(figsize=(9.2, 4.2), dpi=150)
     fig.patch.set_facecolor(BG)
     ax.set_facecolor(BG)
     ax.barh(labels, values, color=colours, height=0.62)
@@ -98,8 +100,8 @@ def main() -> int:
         lbl.set_color(TEXT if lbl.get_text().startswith("kern-sandbox") else DIM)
     # The footer sits INSIDE the canvas. Placed below it with `bbox_inches="tight"`, matplotlib grew
     # the figure to contain it and left a band of dead background between the axis and the text.
-    fig.subplots_adjust(left=0.30, right=0.98, top=0.97, bottom=0.33)
-    fig.text(0.012, 0.145, FOOT, color=DIM, fontsize=7.6, va="top")
+    fig.subplots_adjust(left=0.30, right=0.98, top=0.97, bottom=0.36)
+    fig.text(0.012, 0.165, FOOT, color=DIM, fontsize=7.6, va="top")
     fig.savefig(out, facecolor=BG)
     print(f"wrote {out}")
     return 0
