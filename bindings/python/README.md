@@ -4,7 +4,7 @@
 
 # Kern Sandbox
 
-**Run AI-generated code in a container, not in your home directory.**
+**Your model writes the code. This runs it where it cannot touch your machine.**
 
 [![PyPI](https://img.shields.io/pypi/v/kern-sandbox?label=PyPI&color=0b7285)](https://pypi.org/project/kern-sandbox/)
 [![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm&color=0b7285)](https://www.npmjs.com/package/kern-sandbox)
@@ -22,8 +22,8 @@
 
 </div>
 
-An agent's tool-call, a generated snippet, a notebook cell: code that runs before anyone has read it
-should not run next to your SSH keys.
+An agent's tool-call, a generated snippet, a notebook cell, a CI step: it arrives, you run it, and
+nobody has read it first.
 
 ```bash
 # the runtime: one static binary, checksum-verified by the script
@@ -49,22 +49,19 @@ front of it.
 
 ## The result says who stopped the run
 
-A timeout, an OOM-kill or a blocked syscall arrives as a **typed field**, so your loop branches on a
-value instead of parsing a traceback. Every row below was run:
+`docker run` gives you exit 137 and leaves you to guess whether that was your timeout, the OOM killer
+or something else. This tells you. Every row was run:
 
-| the call | `r.fault.type` | `r.exit_code` |
+| the code | `fault.type` | `exit_code` |
 |---|---|---|
-| `run_code("print(sum(range(100)))")` | `None` | 0 |
-| `run_code("while True: pass", timeout_s=3)` | **`timeout`** | 137 |
-| `run_code("x = bytearray(400*1024*1024)", memory_mb=128)` | **`oom`** | 137 |
-| `run_code("urlopen('https://pypi.org')")`, network off | `None` | 1 |
+| `print(sum(range(100)))` | `None` | 0 |
+| `while True: pass`, `timeout_s=3` | **`timeout`** | 137 |
+| `bytearray(400*1024*1024)`, `memory_mb=128` | **`oom`** | 137 |
+| `urlopen(...)`, network off | `None` | 1 |
 
-**The last row is the one an agent loop gets wrong.** The network was off, so the **code** raised and
-the sandbox did nothing: `fault` is `None` and the failure is the program's own. The other values are
-`killed`, `escape_blocked`, `exec_failed` and `startup_failed`.
-
-`fault` is read from a pipe kern writes, not from stdout, so code that prints `[exit 0]` cannot fake
-it. **Branch on `fault`, not on `exit_code`**: a box that never ran exits 1 like a script that did.
+The last row is the one a loop gets wrong: the network was off, so the **code** raised and the
+sandbox did nothing. `fault` is read from a pipe kern writes rather than from stdout, so code that
+prints `[exit 0]` cannot fake it. Also `killed`, `escape_blocked`, `exec_failed`, `startup_failed`.
 
 ## Works with
 
@@ -89,15 +86,12 @@ A bare `Sandbox()` has no network, no host mounts, seccomp on, capabilities drop
 **mandatory** timeout. Every relaxation is a named argument (`image`, `setup`, `memory_mb`, `cpus`,
 `timeout_s`, `network`, `mounts`, `workspace`, `prewarm`, and a dozen more).
 
-Three that have surprised people, all measured:
+Two that have surprised people, both measured:
 
 - **Mounts over sensitive sources are refused even if you ask**: the host's own directories, anything
   with `.ssh`/`.aws`/`.kube` in its path, and kern's own state. No opt-out. Mount a copy.
 - **`network=True` includes the host's loopback**, where unauthenticated services live. A test read
   the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the middle setting and is route-level.
-- **The caps bind only where your host delegates a cgroup.** A desktop session has one; a bare root
-  shell or WSL2 without systemd often does not, and there `memory_mb` is accepted and never bites.
-  `kern doctor` says which you have; `require_limits=True` makes it fatal instead of quiet.
 
 ## How fast
 
@@ -121,17 +115,23 @@ than 20x. Measure your own machine and take the p50.</sub>
 | **a microVM (Firecracker, Kata) or gVisor** | a stronger boundary than this one, and the right answer when the code is actively hostile. It costs what a machine costs: about half a second per command |
 | **E2B, Modal, Daytona** | the same job in someone else's cloud, with an account and your code leaving the machine |
 
-## What it is not
+## Current limitations
 
-kern is a **kernel-boundary** sandbox for your own or semi-trusted code: namespaces, cgroups and
-seccomp, not a microVM. If your code is actively hostile, or belongs to someone else, use a microVM
-(Firecracker, Kata) or gVisor. That is a different job and costs what a machine costs: about half a
-second per command there against 14.5 ms here. Full statement:
-[SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
-
-**`pip install kern-sandbox` does not install the sandbox.** It drives a `kern` binary on `PATH` or
-in `$KERN_BIN`, and that is a second thing to keep current. If a verdict looks wrong, print
-`kern --version` first.
+- **Not a boundary against deliberately hostile code.** This is namespaces, cgroups and seccomp: a
+  kernel boundary, for your own or semi-trusted code. If the code is actively hostile, or belongs to
+  someone else, use a microVM (Firecracker, Kata) or gVisor. That is a different job and costs what a
+  machine costs: about half a second per command there against 14.5 ms here. Full statement in
+  [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
+- **Linux only.** Windows works through WSL2; on a Mac the package installs and refuses to run,
+  because macOS has no namespaces and no cgroups. Use a Linux VM.
+- **The caps bind only where your host delegates a cgroup.** `kern doctor` says whether yours does,
+  and `require_limits=True` turns a silent no into a refusal to start.
+- **Nothing bounds the workspace.** It is a host directory, so a job can fill your disk. Point
+  `workspace=` at a filesystem you have sized.
+- **No `--user`**, so an image that refuses to run as root (postgres, some databases) has no answer
+  here yet.
+- **`pip install kern-sandbox` does not install the sandbox.** It drives a `kern` binary on `PATH` or
+  in `$KERN_BIN`, a second thing to keep current. If a verdict looks wrong, print `kern --version`.
 
 ## More
 
@@ -139,8 +139,5 @@ Charts and mime-typed results without a Jupyter kernel, the full API, `kernel()`
 interpreter, snapshots, and the measured sharp edges:
 [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
 
-Linux with unprivileged user namespaces and cgroup v2, Python 3.9+. Windows via WSL2. On a Mac it
-installs but cannot run, and says so: use a Linux VM.
-[Install notes](https://github.com/getkern/kern/blob/main/docs/INSTALL.md).
-
-Apache-2.0.
+Requires unprivileged user namespaces and cgroup v2, and Python 3.9+:
+[install notes](https://github.com/getkern/kern/blob/main/docs/INSTALL.md). Apache-2.0.
