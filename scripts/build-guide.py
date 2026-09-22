@@ -197,6 +197,29 @@ def main(argv: list[str]) -> int:
         (out / out_name(md)).write_text(render(src, title, nav, token), encoding="utf-8")
         written.append(out_name(md))
 
+    # AN INDEX, BECAUSE A DIRECTORY WITHOUT ONE IS A 403. Measured on 2026-09-22: the home links
+    # straight to /guide/install.html, so nothing pointed at /guide/ itself and nobody noticed that
+    # trimming the URL, which is what a reader does to look for the contents, hit nginx refusing to
+    # list a directory. Built from PAGES through the same `render` as everything else, so a page
+    # added there cannot go missing from here and the index cannot drift into its own style.
+    body = "# kern guide\n\nInstalling, configuring and understanding kern.\n\n" + "\n".join(
+        # The MARKDOWN name, not the html one: `rewrite_links` maps a sibling `.md` to its rendered
+        # page and sends everything else to GitHub, so linking `install.html` here fell through to
+        # the repo branch and the index pointed at eight files that do not exist there. Caught by
+        # reading the SERVED page, not the generator.
+        f"- [{title}]({md})" for md, title in PAGES
+    ) + (
+        "\n\nThese pages are rendered from `docs/` in the "
+        "[repository](https://github.com/getkern/kern), which is where the same material lives.\n"
+    )
+    tmp = out / "_index.md"
+    tmp.write_text(body, encoding="utf-8")
+    (out / "index.html").write_text(
+        render(tmp, "kern guide: installing and configuring kern", nav, token), encoding="utf-8"
+    )
+    tmp.unlink()
+    written.append("index.html")
+
     urls = "\n".join(
         f"  <url><loc>{SITE}{BASE}/{p}</loc></url>" for p in written
     )
