@@ -72,6 +72,28 @@ RUN python3 -m compileall -q -j 0 /usr/local/lib/python3.12
 | `print(1)` | 13.82 ms | 12.27 ms | -1.55 |
 | `import json,re` | **46.82 ms** | **17.66 ms** | **-29.15** |
 
+## A hundred calls, so "one container per call" has a price on it
+
+The usual objection to per-call isolation is that a hundred prompts means a hundred containers, and
+that sounds like waste. Measured, 2026-09-22, kern 0.20.0, one hundred sequential `run_code` calls
+in one process, each printing a different value so nothing can be served from a cache:
+
+| image | 100 calls, wall | per call | CPU the children burned | left behind |
+|---|---:|---:|---:|---|
+| `python:3.12-slim` | **1.36 s** | 13.6 ms | 1.30 s | nothing |
+| precompiled | **1.15 s** | 11.5 ms | 1.10 s | nothing |
+
+The last column is the one that is easy to assume and worth measuring: the kern state directory was
+**90266 bytes in 336 files before the hundred calls and byte for byte the same after**, and
+`kern ps -a` listed zero boxes. Peak RSS of the largest child was 15.9 MiB, because a box is a
+process tree and not a machine. At the `docker run --rm` figure in the table above, the same hundred
+calls would cost about 29 s.
+
+So the container is the unit of a call rather than a thing you provision, and per call is the
+default because it is cheaper than the bookkeeping to avoid it. Where state genuinely has to carry,
+a `Sandbox()` kept open shares `/workspace` across those fresh boxes, and `kernel()` holds one warm
+interpreter: both are measured in [docs/SANDBOX.md](docs/SANDBOX.md).
+
 ## Against nono, by model rather than by verb
 
 [nono](https://github.com/nolabs-ai/nono) fences the environment you already have with Landlock;

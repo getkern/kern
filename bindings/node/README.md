@@ -10,7 +10,9 @@ runtime's own are in [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/B
 `kern-sandbox` is the Node and TypeScript binding for **[kern](https://getkern.dev)**: a rootless,
 kernel-enforced sandbox out of one static binary, with no daemon, no VM and no cloud. An agent's
 tool-call, a model's generated snippet, a CI step: code that runs before anyone reads it gets its own
-box, and the box is thrown away after.
+box, and the box is thrown away after. A hundred calls are a hundred boxes and 1.4 s in total, with
+nothing left behind, and when state has to carry across them there is
+[a session](#a-session-files-persist-processes-are-ephemeral) and a warm interpreter.
 
 Network off, memory and PID caps the kernel enforces **where your host delegates them**,
 capabilities dropped, a deny-by-default seccomp allowlist, and a wall-clock deadline the binding

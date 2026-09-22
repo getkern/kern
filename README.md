@@ -66,8 +66,11 @@ kern compose up -d
 - **A real container.** Real OCI images: `pull`, `build` from a `Containerfile` or `Dockerfile`,
   `commit`, `push`, `save`/`load`. A box from an image starts in single-digit milliseconds.
 - **Run LLM-generated code in a sandbox, one per call.** The snippet a model just wrote, the command an
-  agent just decided to run, a notebook cell, a CI step. kern starts a box, runs it, deletes it,
-  fast enough that per-call isolation is the default. Network off unless you ask, memory and PID
+  agent just decided to run, a notebook cell, a CI step. kern starts a box, runs it, deletes it: a
+  hundred calls are a hundred boxes and **1.4 s in total**, with nothing left behind, so per-call
+  isolation is the default rather than something you ration ([measured](BENCHMARKS.md), and when
+  state has to carry, a session shares its workspace and a warm interpreter is one argument away).
+  Network off unless you ask, memory and PID
   caps the kernel enforces where your host delegates them (`kern doctor` says whether yours does, and
   `--require-limits` refuses to start rather than give you an uncapped box), capabilities dropped,
   seccomp deny-by-default, timeout applied from the outside.

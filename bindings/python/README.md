@@ -43,10 +43,11 @@ print(r.stdout, r.fault)   # 4950  None
 ```
 
 That call started a container from an OCI image, ran the code with **no network**, memory and PID
-caps and a deadline applied from outside, and threw the container away before returning. The next
-call gets a new one, and you choose how much survives in between: nothing, or a shared workspace so
-files carry while processes do not, or `kernel()` for one warm interpreter where variables carry
-too. Two things, not one: the isolation is the binary's, this package is the API in
+caps and a deadline applied from outside, and threw the container away before returning. A hundred
+calls are a hundred containers: **1.4 s in total** on this machine, and the state directory the same
+size after as before. And per call is the default, not the only setting: a `Sandbox()` you keep open
+shares `/workspace` across those fresh containers, and `kernel()` holds one warm interpreter where
+variables carry too. Two things, not one: the isolation is the binary's, this package is the API in
 front of it.
 
 ## When you would use this
@@ -85,8 +86,9 @@ prints `[exit 0]` can't fake it. Also `killed`, `escape_blocked`, `exec_failed`,
 ## Works with
 
 - **Any MCP client**: Cursor, Claude Code, Claude Desktop, LM Studio, Zed, Windsurf. The package
-  ships `kern-mcp`, a stdio server, and charts come back as images the model can see:
-  [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
+  ships `kern-mcp`, a stdio server, and charts come back as images the model can see. One session
+  backs the connection, so files carry between tool calls and variables do not, unless
+  `KERN_MCP_KERNEL=1`: [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
 - **LangChain**: `kern_code_tool()` is a `StructuredTool`, and a fault comes back labelled for the
   model. There is a shell policy too:
   [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md).

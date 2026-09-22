@@ -1,7 +1,8 @@
 # Kern Sandbox: running a model's code from Python or Node
 
 Your model writes the code. This runs it where it can't touch your machine: a real Linux container
-per call, thrown away when the call returns.
+per call, and a hundred of them cost 1.4 s in total. How much survives between calls is
+[your choice](#choose-how-much-survives-between-calls).
 
 `kern-sandbox` is the SDK in front of the `kern` binary. Two things, not one: the isolation is the
 binary's, the package is the API. The same API ships for Python and for Node.
@@ -24,7 +25,8 @@ print(r.stdout, r.fault)   # 4950  None
 
 That call started a container from an OCI image, ran the code with **no network**, memory and PID
 caps and a deadline applied from outside, and threw the container away before returning. The next
-call gets a new one.
+call gets a new one, and you can [keep state across them](#choose-how-much-survives-between-calls)
+when you want it.
 
 ## When you would use this
 
@@ -101,6 +103,11 @@ Measured on an Intel i7-14700KF with a
 each. On the stock `python:3.12-slim` the first two rows cost about three times as much and the
 third does not change, because there the interpreter starts once.
 
+Pick the top row unless you need the others. A hundred one-shot calls are a hundred containers and
+**1.36 s in total** on the stock image, after which `kern ps -a` lists nothing and the state
+directory is the same size it was: the reason to move down the table is that you want the state, not
+that you are avoiding a cost.
+
 ## From an MCP client
 
 The package ships `kern-mcp`, a dependency-free stdio server, so the model writes code, kern runs it
@@ -114,6 +121,12 @@ Claude Code, Claude Desktop, LM Studio, Zed, Windsurf.
 A client spawns the server from **its own** PATH, so a venv is invisible to it: `uvx` above installs
 nothing, `pipx install kern-sandbox` is the other way. Per-client config, every `KERN_MCP_*`
 variable and the remote form are in [the MCP page](MCP.md).
+
+**The server is the middle row of the table above**, and the choice is already made for you: one
+session backs the whole connection, so a file one tool call writes the next one finds, while each
+call is still a fresh box and variables are gone with it. `KERN_MCP_KERNEL=1` makes it the bottom
+row, and the tool description tells the model which of the two is in force, so it does not have to
+guess whether to re-import.
 
 ## What it is not
 
