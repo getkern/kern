@@ -54,7 +54,8 @@ front of it.
 
 **Your model just wrote a script and you are about to run it.** Paste it into `run_code` instead of
 your terminal. It runs in a container built from an image, so there is no home directory of yours in
-there to delete and no key to read: a hallucinated `rm -rf ~` removes the container's own `/root`.
+there to delete and no key to read. A hallucinated `rm -rf ~` resolves to the container's own
+`/root`, which is mounted read-only, so it fails there too.
 
 **An agent writing and running code in a loop.** Give it the LangChain tool or the MCP server.
 Nothing step 3 left behind is waiting for step 12, and a step that hangs or runs out of memory comes
@@ -66,7 +67,7 @@ comes back labelled, so you can tell a bug in the code from the sandbox stopping
 ## The result says who stopped the run
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-demo.gif" width="860" alt="A Python session: run_code returns ('4950', None); the same call on an infinite loop with timeout_s=3 returns fault.type 'timeout' and exit 137; and a 400 MiB allocation under memory_mb=128 returns 'oom' and 137. One box per call, no network, caps and a deadline, gone when it returns.">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-demo.gif" width="860" alt="A Python session, five calls. run_code returns ('4950', None); an infinite loop under timeout_s=3 returns fault.type 'timeout' and exit 137; a 400 MiB allocation under memory_mb=128 returns 'oom' and 137; a urlopen with the network off returns fault None and exit 1, so the code raised and the sandbox stopped nothing; and os.remove('/root/.bashrc') comes back OSError [Errno 30] Read-only file system. One box per call, no network, caps and a deadline, gone when it returns.">
 </p>
 
 `docker run` gives you exit 137 and leaves you to guess whether that was your timeout, the OOM killer

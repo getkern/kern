@@ -32,7 +32,8 @@ when you want it.
 
 **Your model just wrote a script and you are about to run it.** Paste it into `run_code` instead of
 your terminal. It runs in a container built from an image, so there is no home directory of yours in
-there to delete and no key to read: a hallucinated `rm -rf ~` removes the container's own `/root`.
+there to delete and no key to read. A hallucinated `rm -rf ~` resolves to the container's own
+`/root`, which is mounted read-only, so it fails there too.
 
 **An agent writing and running code in a loop.** Give it the LangChain tool or the MCP server. Each
 step gets its own container, so nothing step 3 left behind is waiting for step 12, and a step that
