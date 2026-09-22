@@ -50,17 +50,20 @@ CSS = """
 --link:#4493f8;--panel:#161b22}}
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;margin:0;
-padding:2rem 1rem 4rem}
-main{max-width:52rem;margin:0 auto}
-nav{max-width:52rem;margin:0 auto 2rem;border-bottom:1px solid var(--line);font-size:.9rem;
-display:flex;align-items:center;justify-content:space-between;gap:1rem;height:4rem}
-nav .links{display:flex;align-items:center;gap:1.1rem;flex-wrap:wrap}
+padding:0 0 4rem}
+.wrap{max-width:46rem;margin:0 auto;padding:0 1.5rem}
+header{border-bottom:1px solid var(--line);margin-bottom:2rem}
+header .wrap{display:flex;align-items:center;justify-content:space-between;gap:1rem;height:4rem}
+main{max-width:46rem;margin:0 auto;padding:0 1.5rem}
+nav{font-size:.9rem;display:flex;align-items:center;gap:1.1rem;flex-wrap:wrap}
 nav a{white-space:nowrap;color:var(--dim)}
-nav a:hover{color:var(--link)}
+nav a:hover{color:var(--ink)}
 nav a.here{color:var(--ink);font-weight:600}
-nav a.home img{height:26px;width:auto;display:block}
-@media(prefers-color-scheme:dark){nav a.home img{filter:invert(1) hue-rotate(180deg)}}
-@media(max-width:46rem){nav{height:auto;padding:1rem 0;flex-direction:column;align-items:flex-start}}
+.logo img{height:26px;width:auto;display:block}
+.logo img.dark{display:none}
+@media(prefers-color-scheme:dark){.logo img.light{display:none}.logo img.dark{display:block}}
+@media(max-width:46rem){header .wrap{height:auto;padding-top:1rem;padding-bottom:1rem;
+flex-direction:column;align-items:flex-start}}
 a{color:var(--link);text-decoration:none}
 a:hover{text-decoration:underline}
 h1{font-size:1.9rem;line-height:1.25;margin:.2rem 0 1rem}
@@ -155,7 +158,15 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "") -> str:
 <style>{CSS}</style>
 </head>
 <body>
-<nav>{nav}</nav>
+<header>
+  <div class="wrap">
+    <a class="logo" href="/" aria-label="kern">
+      <img class="light" src="/img/kern-logo.png" alt="kern" width="876" height="342">
+      <img class="dark"  src="/img/kern-logo-dark.png" alt="kern" width="876" height="342">
+    </a>
+    <nav>{nav}</nav>
+  </div>
+</header>
 <main>
 {body}
 </main>
@@ -219,10 +230,7 @@ def main(argv: list[str]) -> int:
             label = LABELS.get(md, md[:-3].title())
             here = ' class="here" aria-current="page"' if md == current else ""
             out_links.append(f'<a href="{out_name(md)}"{here}>{label}</a>')
-        return (
-            '<a class="home" href="/"><img src="/img/kern-logo.png" alt="kern" height="26"></a>'
-            f'<span class="links">{" ".join(out_links)}</span>'
-        )
+        return " ".join(out_links)
 
     written = []
     for md, title in PAGES:
