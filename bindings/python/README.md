@@ -55,9 +55,9 @@ front of it.
 your terminal. It runs in a container built from an image, so there is no home directory of yours in
 there to delete and no key to read: a hallucinated `rm -rf ~` removes the container's own `/root`.
 
-**An agent writing and running code in a loop.** Give it the LangChain tool or the MCP server. Each
-step gets its own container, so nothing step 3 left behind is waiting for step 12, and a step that
-hangs or runs out of memory comes back as a value your loop can branch on.
+**An agent writing and running code in a loop.** Give it the LangChain tool or the MCP server.
+Nothing step 3 left behind is waiting for step 12, and a step that hangs or runs out of memory comes
+back as a value your loop can branch on.
 
 **Analysis you did not write.** A chart comes back as an image the model can see, and a failure
 comes back labelled, so you can tell a bug in the code from the sandbox stopping it.
@@ -85,16 +85,14 @@ prints `[exit 0]` can't fake it. Also `killed`, `escape_blocked`, `exec_failed`,
 ## Works with
 
 - **Any MCP client**: Cursor, Claude Code, Claude Desktop, LM Studio, Zed, Windsurf. The package
-  ships `kern-mcp`, a dependency-free stdio server: the model writes code, kern runs it here, and
-  charts come back as images it can see. Per-client config in
+  ships `kern-mcp`, a stdio server, and charts come back as images the model can see:
   [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
-- **LangChain**: `kern_code_tool()` is a `StructuredTool` your agent can call, and a sandbox fault
-  comes back labelled for the model. There is a shell execution policy too:
+- **LangChain**: `kern_code_tool()` is a `StructuredTool`, and a fault comes back labelled for the
+  model. There is a shell policy too:
   [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md).
-- **[pi](https://github.com/earendil-works/pi)**:
-  [`kern-pi`](https://www.npmjs.com/package/kern-pi) routes its `bash`, `read`, `write`, `edit`,
-  `ls`, `grep` and `find` into a box, your working directory at `/workspace`.
-- **Python and Node**: the same API on both registries, `pip install kern-sandbox` and
+- **[pi](https://github.com/earendil-works/pi)**: [`kern-pi`](https://www.npmjs.com/package/kern-pi)
+  routes its file and shell tools into a box, your working directory at `/workspace`.
+- **Python and Node**: the same API on both, `pip install kern-sandbox` and
   [`npm i kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
 
 ```json
@@ -105,17 +103,15 @@ prints `[exit 0]` can't fake it. Also `killed`, `escape_blocked`, `exec_failed`,
 }
 ```
 
-A client spawns the server from **its own** PATH, so a venv is invisible to it: `uvx` above installs
-nothing, `pipx install kern-sandbox` is the other way. From macOS or Windows the client is one hop
-away and it is still one line (`"command": "wsl"`, or `"command": "ssh"` to a VM or a board).
+A client spawns the server from **its own** PATH, so a venv is invisible to it: `uvx` installs
+nothing, `pipx install kern-sandbox` is the other way. From macOS or Windows swap the command for
+`wsl` or `ssh`.
 
 ## Safe by default
 
 A bare `Sandbox()` has no network, no host mounts, seccomp on, capabilities dropped and a
-**mandatory** timeout. Every relaxation is a named argument (`image`, `setup`, `memory_mb`, `cpus`,
-`timeout_s`, `network`, `mounts`, `workspace`, `prewarm`, and a dozen more).
-
-Two that have surprised people, both measured:
+**mandatory** timeout. Every relaxation is a named argument. Two have surprised people, both
+measured:
 
 - **Mounts over sensitive sources are refused even if you ask**: the host's own directories, anything
   with `.ssh`/`.aws`/`.kube` in its path, and kern's own state. No opt-out. Mount a copy.
@@ -145,8 +141,8 @@ cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms aga
   Landlock, so your own tools are there and state carries between commands. This builds a new
   one from an image instead. Measured both ways in
   [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
-- **bubblewrap and nsjail** are the building blocks kern uses. They don't resolve images, don't
-  apply cgroup caps, and give you no verdict: you get an exit code and work out the rest.
+- **bubblewrap and nsjail** are the building blocks kern uses: no images, no cgroup caps, and no
+  verdict, so you get an exit code and work out the rest.
 - **a microVM (Firecracker, Kata) or gVisor** is a stronger boundary than this one, and the right
   answer when the code is actively hostile. It costs what a machine costs.
 - **E2B, Modal, Daytona** do the same job in someone else's cloud, with an account and your code
@@ -155,11 +151,10 @@ cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms aga
 ## Current limitations
 
 - **Not a boundary against deliberately hostile code.** Namespaces, cgroups and seccomp, for your
-  own or semi-trusted code. If the code is hostile or someone else's, use a microVM or gVisor: a
-  different job, at about half a second per command against 14.5 ms here.
+  own or semi-trusted code. If it is hostile or someone else's, use a microVM or gVisor:
   [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
-- **Caps bind only where your host delegates a cgroup.** `kern doctor` says whether yours does, and
-  `require_limits=True` turns a silent no into a refusal to start.
+- **Caps bind only where your host delegates a cgroup.** `kern doctor` says whether yours does;
+  `require_limits=True` refuses to start rather than run uncapped.
 - **Nothing bounds the workspace.** It is a host directory, so a job can fill your disk.
 - **No `--user`**, so an image that refuses to run as root has no answer here yet.
 - **`pip install kern-sandbox` does not install the sandbox.** It drives a `kern` binary on `PATH`
