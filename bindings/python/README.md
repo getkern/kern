@@ -67,7 +67,7 @@ comes back labelled, so you can tell a bug in the code from the sandbox stopping
 ## The result says who stopped the run
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-demo.gif" width="860" alt="A Python session, five calls. run_code returns ('4950', None); an infinite loop under timeout_s=3 returns fault.type 'timeout' and exit 137; a 400 MiB allocation under memory_mb=128 returns 'oom' and 137; a urlopen with the network off returns fault None and exit 1, so the code raised and the sandbox stopped nothing; and os.remove('/root/.bashrc') comes back OSError [Errno 30] Read-only file system. One box per call, no network, caps and a deadline, gone when it returns.">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-demo.gif" width="860" alt="A scrolling Python session, seven calls. run_code returns ('4950', None); an infinite loop under timeout_s=3 returns fault.type 'timeout' and exit 137; a 400 MiB allocation under memory_mb=128 returns 'oom' and 137; a urlopen with the network off returns fault None and exit 1, so the code raised and the sandbox stopped nothing; os.remove('/root/.bashrc') comes back OSError [Errno 30] Read-only file system; print(1) on alpine:3.19 returns 'exec_failed' and 127 because alpine ships no python3; and print(1) on an image that does not exist returns 'startup_failed' and 1. A box per call, a hundred of them cost 1.4 s and leave nothing.">
 </p>
 
 `docker run` gives you exit 137 and leaves you to guess whether that was your timeout, the OOM killer
@@ -79,10 +79,12 @@ or something else. This tells you. Every row was run:
 | `while True: pass`, `timeout_s=3` | **`timeout`** | 137 |
 | `bytearray(400<<20)`, `memory_mb=128` | **`oom`** | 137 |
 | `urlopen(...)`, network off | `None` | 1 |
+| `print(1)` on `alpine:3.19`, no python3 | **`exec_failed`** | 127 |
+| `print(1)` on an image that is not there | **`startup_failed`** | 1 |
 
-The last row is the one a loop gets wrong: the network was off, so the **code** raised and the
+The fourth row is the one a loop gets wrong: the network was off, so the **code** raised and the
 sandbox did nothing. `fault` is read from a pipe kern writes rather than from stdout, so code that
-prints `[exit 0]` can't fake it. Also `killed`, `escape_blocked`, `exec_failed`, `startup_failed`.
+prints `[exit 0]` can't fake it. Also `killed` and `escape_blocked`.
 
 ## Works with
 
