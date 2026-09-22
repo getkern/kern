@@ -47,6 +47,19 @@ caps and a deadline applied from outside, and threw the container away before re
 call gets a new one. Two things, not one: the isolation is the binary's, this package is the API in
 front of it.
 
+## When you would use this
+
+**Your model just wrote a script and you are about to run it.** Paste it into `run_code` instead of
+your terminal. It runs in a container built from an image, so there is no home directory of yours in
+there to delete and no key to read: a hallucinated `rm -rf ~` removes the container's own `/root`.
+
+**An agent writing and running code in a loop.** Give it the LangChain tool or the MCP server. Each
+step gets its own container, so nothing step 3 left behind is waiting for step 12, and a step that
+hangs or runs out of memory comes back as a value your loop can branch on.
+
+**Analysis you did not write.** A chart comes back as an image the model can see, and a failure
+comes back labelled, so you can tell a bug in the code from the sandbox stopping it.
+
 ## The result says who stopped the run
 
 <p align="center">
