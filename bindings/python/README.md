@@ -4,7 +4,7 @@
 
 # Kern Sandbox
 
-**Your model writes the code. This runs it where it cannot touch your machine.**
+**Your model writes the code. This runs it where it can't touch your machine.**
 
 [![PyPI](https://img.shields.io/pypi/v/kern-sandbox?label=PyPI&color=0b7285)](https://pypi.org/project/kern-sandbox/)
 [![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm&color=0b7285)](https://www.npmjs.com/package/kern-sandbox)
@@ -60,12 +60,12 @@ or something else. This tells you. Every row was run:
 |---|---|---|
 | `print(sum(range(100)))` | `None` | 0 |
 | `while True: pass`, `timeout_s=3` | **`timeout`** | 137 |
-| `bytearray(400*1024*1024)`, `memory_mb=128` | **`oom`** | 137 |
+| `bytearray(400<<20)`, `memory_mb=128` | **`oom`** | 137 |
 | `urlopen(...)`, network off | `None` | 1 |
 
 The last row is the one a loop gets wrong: the network was off, so the **code** raised and the
 sandbox did nothing. `fault` is read from a pipe kern writes rather than from stdout, so code that
-prints `[exit 0]` cannot fake it. Also `killed`, `escape_blocked`, `exec_failed`, `startup_failed`.
+prints `[exit 0]` can't fake it. Also `killed`, `escape_blocked`, `exec_failed`, `startup_failed`.
 
 ## Works with
 
@@ -115,7 +115,7 @@ than 20x. Measure your own machine and take the p50.</sub>
 |---|---|
 | **a venv** | isolates imports, not the process: the code still has your files, your keys and your network |
 | **`docker run` per call** | the same idea with a daemon and a socket in front of it, at 292.8 ms against 14.5 ms on the same machine. That socket is root-equivalent |
-| **bubblewrap, nsjail** | the building blocks kern uses. They do not resolve images, do not apply cgroup caps, and give you no verdict: you get an exit code and work out the rest |
+| **bubblewrap, nsjail** | the building blocks kern uses. They don't resolve images, don't apply cgroup caps, and give you no verdict: you get an exit code and work out the rest |
 | **a microVM (Firecracker, Kata) or gVisor** | a stronger boundary than this one, and the right answer when the code is actively hostile. It costs what a machine costs: about half a second per command |
 | **E2B, Modal, Daytona** | the same job in someone else's cloud, with an account and your code leaving the machine |
 
