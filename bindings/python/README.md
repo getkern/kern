@@ -50,18 +50,21 @@ front of it.
 ## The result says who stopped the run
 
 A timeout, an OOM-kill or a blocked syscall arrives as a **typed field**, so your loop branches on a
-value instead of parsing a traceback.
+value instead of parsing a traceback. Every row below was run:
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-faults.png" width="860" alt="A Python session: run_code returns ('4950', 0, None); a call with timeout_s=3 returns fault.type 'timeout' and exit 137; a call allocating 400 MB under memory_mb=128 returns 'oom' and 137; and a call that opens a URL with the network off returns fault None and exit 1, because the code raised and the sandbox did nothing.">
-</p>
+| the call | `r.fault.type` | `r.exit_code` |
+|---|---|---|
+| `run_code("print(sum(range(100)))")` | `None` | 0 |
+| `run_code("while True: pass", timeout_s=3)` | **`timeout`** | 137 |
+| `run_code("x = bytearray(400*1024*1024)", memory_mb=128)` | **`oom`** | 137 |
+| `run_code("urlopen('https://pypi.org')")`, network off | `None` | 1 |
 
-`fault` is `None` when the **code** failed and the sandbox did nothing, which is the case an agent
-loop usually gets wrong. It is set for `timeout`, `oom`, `killed`, `escape_blocked`, `exec_failed`
-and `startup_failed`. Read from a pipe kern writes rather than from stdout, so code that prints
-`[exit 0]` cannot fake it.
+**The last row is the one an agent loop gets wrong.** The network was off, so the **code** raised and
+the sandbox did nothing: `fault` is `None` and the failure is the program's own. The other values are
+`killed`, `escape_blocked`, `exec_failed` and `startup_failed`.
 
-**Branch on `fault`, not on `exit_code`**: a box that never ran exits 1 like a script that did.
+`fault` is read from a pipe kern writes, not from stdout, so code that prints `[exit 0]` cannot fake
+it. **Branch on `fault`, not on `exit_code`**: a box that never ran exits 1 like a script that did.
 
 ## Works with
 
@@ -107,6 +110,16 @@ i7-14700KF. The box itself is 4.9 ms; most of the rest is CPython starting insid
 cost. The 0.7 ms bar is a prewarm burst and falls back to 14.5 when the pool cannot keep up. And
 `print(1)` flatters every runtime here: `import json,re` measures 47.3 ms against 320.8, 7x rather
 than 20x. Measure your own machine and take the p50.</sub>
+
+## Compared to what you are probably doing
+
+| | |
+|---|---|
+| **a venv** | isolates imports, not the process: the code still has your files, your keys and your network |
+| **`docker run` per call** | the same idea with a daemon and a socket in front of it, at 292.8 ms against 14.5 ms on the same machine. That socket is root-equivalent |
+| **bubblewrap, nsjail** | the building blocks kern uses. They do not resolve images, do not apply cgroup caps, and give you no verdict: you get an exit code and work out the rest |
+| **a microVM (Firecracker, Kata) or gVisor** | a stronger boundary than this one, and the right answer when the code is actively hostile. It costs what a machine costs: about half a second per command |
+| **E2B, Modal, Daytona** | the same job in someone else's cloud, with an account and your code leaving the machine |
 
 ## What it is not
 
