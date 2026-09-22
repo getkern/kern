@@ -44,7 +44,9 @@ print(r.stdout, r.fault)   # 4950  None
 
 That call started a container from an OCI image, ran the code with **no network**, memory and PID
 caps and a deadline applied from outside, and threw the container away before returning. The next
-call gets a new one. Two things, not one: the isolation is the binary's, this package is the API in
+call gets a new one, and you choose how much survives in between: nothing, or a shared workspace so
+files carry while processes do not, or `kernel()` for one warm interpreter where variables carry
+too. Two things, not one: the isolation is the binary's, this package is the API in
 front of it.
 
 ## When you would use this
@@ -165,8 +167,8 @@ cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms aga
 
 ## More
 
-Charts and mime-typed results without a Jupyter kernel, the full API, `kernel()` for a warm
-interpreter, snapshots, and the measured sharp edges:
+Charts and mime-typed results without a Jupyter kernel, the full API, snapshots, and the measured
+sharp edges:
 [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
 
 Runs on Linux, with unprivileged user namespaces and cgroup v2, and Python 3.9+. Windows through
