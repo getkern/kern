@@ -72,6 +72,12 @@ RUN python3 -m compileall -q -j 0 /usr/local/lib/python3.12
 | `print(1)` | 13.82 ms | 12.27 ms | -1.55 |
 | `import json,re` | **46.82 ms** | **17.66 ms** | **-29.15** |
 
+**The same workload against docker, because `print(1)` flatters every runtime.** Measured
+2026-09-22 on this host, `python:3.12-slim` pre-pulled in both, alternated call by call, p50 of 24
+each: `import json,re` reads **45.4 ms** through kern-sandbox against **329.7 ms** through
+`docker run --rm`, which is **7.3x** rather than the 20x that `print(1)` produces. A call that does
+some work narrows the distance, because the engines pay their start once and then run the same code.
+
 For comparison, the whole box is 3.6 ms and the entire uid-range phase this page spends a paragraph
 on is 0.886. Two interpreter flags were measured on the same image and are not worth shipping:
 `-S` is worth -1.7 ms and `-I` is worth nothing, and neither touches the import cost.

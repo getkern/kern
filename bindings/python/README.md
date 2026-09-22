@@ -83,7 +83,11 @@ prints `[exit 0]` can't fake it. Also `killed`, `escape_blocked`, `exec_failed`,
   [`npm i kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
 
 ```json
-{ "mcpServers": { "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] } } }
+{
+  "mcpServers": {
+    "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] }
+  }
+}
 ```
 
 A client spawns the server from **its own** PATH, so a venv is invisible to it: `uvx` above installs
@@ -112,8 +116,9 @@ Two that have surprised people, both measured:
 <sub>**The number to quote is 14.5 ms, the default path**, one tool-call end to end on an
 i7-14700KF. The box itself is 4.9 ms; most of the rest is CPython starting inside, which is a Python
 cost. The 0.7 ms bar is a prewarm burst and falls back to 14.5 when the pool cannot keep up. And
-`print(1)` flatters every runtime here: `import json,re` measures 47.3 ms against 320.8, 7x rather
-than 20x. Measure your own machine and take the p50.</sub>
+`print(1)` flatters every runtime here: `import json,re` measures 45.4 ms against docker's 329.7,
+which is 7x rather than 20x ([BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md)).
+Measure your own machine and take the p50.</sub>
 
 ## Compared to what you are probably doing
 
