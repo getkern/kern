@@ -67,7 +67,7 @@ comes back labelled, so you can tell a bug in the code from the sandbox stopping
 ## The result says who stopped the run
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-demo.gif" width="860" alt="A scrolling Python session, seven calls. run_code returns ('4950', None); an infinite loop under timeout_s=3 returns fault.type 'timeout' and exit 137; a 400 MiB allocation under memory_mb=128 returns 'oom' and 137; a urlopen with the network off returns fault None and exit 1, so the code raised and the sandbox stopped nothing; os.remove('/root/.bashrc') comes back OSError [Errno 30] Read-only file system; print(1) on alpine:3.19 returns 'exec_failed' and 127 because alpine ships no python3; and print(1) on an image that does not exist returns 'startup_failed' and 1. A box per call, a hundred of them cost 1.4 s and leave nothing.">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-demo.gif" width="860" alt="A scrolling Python session, seven calls. run_code returns ('4950', None); an infinite loop under timeout_s=3 returns fault.type 'timeout' and exit 137; a 400 MiB allocation under memory_mb=128 returns 'oom' and 137; a urlopen with the network off returns fault None and exit 1, so the code raised and the sandbox stopped nothing; os.remove('/root/.bashrc') comes back OSError [Errno 30] Read-only file system; print(1) on alpine:3.19 returns 'exec_failed' and 127 because alpine ships no python3; and print(1) on an image that does not exist returns 'startup_failed' and 1. Exit 137 does not say which of those it was; the fault field does.">
 </p>
 
 `docker run` gives you exit 137 and leaves you to guess whether that was your timeout, the OOM killer

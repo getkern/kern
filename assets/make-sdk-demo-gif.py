@@ -116,7 +116,10 @@ BEATS = [
     ),
 ]
 
-CLOSING = "a box per call. a hundred cost 1.4 s, and leave nothing."
+# The closing line lands what the ANIMATION argued, which is the fault taxonomy. It used to
+# carry the per-call economics instead: true, already in the README's opening paragraph, and
+# off-topic for what a viewer just watched for forty seconds.
+CLOSING = "exit 137 doesn't say which. the fault field does."
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont:
