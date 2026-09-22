@@ -14,8 +14,93 @@ pub fn version() -> Result<(), Error> {
 pub fn help() -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     println!("{}", crate::ui::logo(&p));
-    println!("{}", help_text(&p));
+    println!("{}", help_overview(&p));
     Ok(())
+}
+
+/// Is this reference line a CONTINUATION of the verb above it, rather than a signature?
+///
+/// ONE RULE, ONE SPELLING. The reference distinguishes the two by INDENTATION and by nothing else,
+/// and that decision cost a bug: a content-based rule ("a continuation starts with a word") read
+/// the tail of `network create` as a signature and printed it under `compose ps`. By the time the
+/// root overview was added on 2026-09-22 the comparison was written out in three places with the
+/// magic 8 in each, and a fourth used `!= 4` for the same idea from the other side. A rule spelled
+/// four times is four chances to fix three of them.
+///
+/// A signature sits at four spaces. Anything out at the description column is prose about the verb
+/// above it. `flat` must be the line with the colour escapes already removed: comparing the raw
+/// line would stop matching the day the palette changes, and it would stop matching in the
+/// direction that looks like success.
+fn is_continuation(flat: &str, trimmed: &str) -> bool {
+    !trimmed.is_empty() && flat.len() - trimmed.len() > 8
+}
+
+/// The root view: every verb, and none of their options.
+///
+/// WHAT THIS FIXES. `kern --help` printed the WHOLE reference: 258 non-empty lines, of which 141
+/// were the `OPTIONS for box` and `OPTIONS for run` blocks that `kern box --help` and
+/// `kern run --help` already serve, byte for byte, and another 31 were continuation notes under
+/// single verbs (`ps` has four, `logs` three). Five screens scrolling past the first command
+/// somebody types after installing, to answer a question they have not asked yet: not "what can
+/// this do" but "what are every flag of box".
+///
+/// NOTHING IS LOST AND THERE IS STILL ONE TEXT. This is the same filter idea as [`help_for`],
+/// pointed the other way: that one keeps a verb's options, this one drops every verb's options and
+/// every continuation. Both read [`help_text`], so the reference cannot drift from the views of it.
+/// What this hides, `kern <verb> --help` shows, which is where someone asking about a verb looks.
+fn help_overview(p: &crate::ui::Palette) -> String {
+    let (b, c, d, z) = (p.b, p.c, p.d, p.z);
+    let full = help_text(p);
+    let mut out: Vec<String> = Vec::new();
+    let mut in_commands = false;
+    let mut skipping_verb_options = false;
+    for line in full.lines() {
+        let flat = strip_ansi(line);
+        let trimmed = flat.trim_start();
+        if flat.contains("COMMANDS:") {
+            in_commands = true;
+            out.push(line.to_string());
+            continue;
+        }
+        if trimmed.starts_with("OPTIONS for ") {
+            in_commands = false;
+            if !skipping_verb_options {
+                skipping_verb_options = true;
+                out.push(String::new());
+                out.push(format!(
+                    "{b}OPTIONS:{z}\n    {d}Per verb, where you are asking about it:{z} \
+                     {c}kern <verb> --help{z}{d} (box, run, compose, pod, volume, image, config, top){z}"
+                ));
+            }
+            continue;
+        }
+        if trimmed.starts_with("OPTIONS:") {
+            // The reference's own OPTIONS block (-V, -h) folds into the one written above.
+            skipping_verb_options = true;
+            in_commands = false;
+            continue;
+        }
+        if skipping_verb_options {
+            // EVERYTHING to the end is option bodies and their continuations, except the footer.
+            // Keeping "lines that are not a flag" was tried first and leaked: an option's second
+            // and third lines are prose at the description column, indistinguishable from any
+            // other prose by shape. The footer is the one line that has to survive, so it is the
+            // one line named.
+            if flat.contains("Docs & issues") {
+                out.push(String::new());
+                out.push(line.to_string());
+            }
+            continue;
+        }
+        // A CONTINUATION IS RECOGNISED BY INDENTATION, the same rule `help_for` settled on after a
+        // content-based one put `network create`'s tail under `compose ps`. A signature sits at four
+        // spaces; anything out at the description column is prose about the verb above it.
+        if in_commands && is_continuation(&flat, trimmed) {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
 }
 
 /// The full reference as a STRING, so `kern <verb> --help` can serve a slice of the very same text.
@@ -33,7 +118,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     let cv = compose_verbs_help();
     format!(
         "\
-  {b}kern {ver}{z}{d}: a fast, rootless sandbox & virtual resource runtime{z}
+  {b}kern {ver}{z}{d}: {tag}{z}
 
 {b}USAGE:{z}
     kern <COMMAND> [ARGS]
@@ -297,7 +382,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     -h, --help     Print this help
 
 {d}Docs & issues: {z}{c}https://github.com/getkern/kern{z}",
-        ver = kern_common::VERSION
+        ver = kern_common::VERSION,
+        tag = kern_common::TAGLINE
     )
 }
 
@@ -409,6 +495,9 @@ pub fn help_for(verb: &str) -> Result<(), Error> {
         // which is the tail of `network create` in the reference, printed under `compose ps` as if
         // it described it. Being pushed also set `carry`, which then dragged the line after it in.
         // A signature sits at four spaces; anything out at the description column is prose.
+        // NOT `!is_continuation(..)`: that helper answers false for a blank line, so the negation
+        // would call a line of spaces a signature. The two are the same question only on lines that
+        // have content, and this one is asked before that is known.
         let is_signature = flat.len() - trimmed.len() <= 8;
         if in_commands && is_signature && line_declares_verb(trimmed, verb) {
             out.push(line.to_string());
@@ -427,7 +516,7 @@ pub fn help_for(verb: &str) -> Result<(), Error> {
         // says is a word, exactly like a verb, so "starts with a letter" excluded all five of `up`'s
         // lines while letting nothing useful through. `carry` is cleared by any line that declares a
         // verb, so a continuation can never attach to a verb other than the one it follows.
-        if in_commands && carry && !trimmed.is_empty() && flat.len() - trimmed.len() > 8 {
+        if in_commands && carry && is_continuation(&flat, trimmed) {
             out.push(line.to_string());
             continue;
         }

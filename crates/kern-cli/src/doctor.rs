@@ -113,27 +113,17 @@ fn check_scope_toll() -> R {
     if once().is_none() {
         return R::ok(NO_SCOPE.into());
     }
-    let mut s: Vec<f64> = (0..3).filter_map(|_| once()).collect();
+    let s: Vec<f64> = (0..3).filter_map(|_| once()).collect();
     if s.is_empty() {
         return R::ok(NO_SCOPE.into());
     }
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let ms = s[s.len() / 2];
-    // A CEILING ON THE INTERPRETATION, not on the number. The median of three warm runs is still a
-    // measurement of THIS MACHINE RIGHT NOW, and on a loaded host it measures the load: nothing here
-    // stopped it printing "at least 8472.3 ms" as though that were the cost of a systemd scope.
-    // Raised in review on 2026-08-28. The number is still printed, because suppressing a measurement
-    // because it is inconvenient is the opposite of this codebase's rule; what is added is the fact
-    // that it is far outside every host ever measured, so a reader does not carry it away as the
-    // toll. 250 ms is six times the worst of them, an Arduino UNO Q's Android kernel at ~39 ms.
-    const ABSURD_MS: f64 = 250.0;
-    let caveat = if ms > ABSURD_MS {
-        ". That is far above every machine this was measured on (~4 ms on an x86 desktop, ~9 on a \
-         Raspberry Pi 5, ~39 on an Arduino UNO Q), so it is most likely measuring load on this host \
-         rather than the scope: re-run on an idle machine before quoting it"
-    } else {
-        ""
-    };
+    // THE RUNS STILL GATE THIS ROW; THE SORT DID NOT SURVIVE THE FIGURE. Reaching a scope four
+    // times is what says one is really available here, and `s` coming back empty is the second way
+    // this row does not fire. The `sort_by` that stood here existed only to take the median for
+    // printing, and the printing went on 2026-09-22: a figure in an advisory line ages, cannot
+    // carry its method, and is not what the reader acts on. The action is the command, and the
+    // command is the same whether the toll is 4 ms or 40. Per-host numbers belong in BENCHMARKS.md,
+    // beside the machine and the method, which is the only place a figure means anything.
     R::Warn(
         "this session is outside the systemd user manager, so every box pays a transient scope"
             .into(),
@@ -149,10 +139,31 @@ fn check_scope_toll() -> R {
         // box's caps, and its own stderr is unreadable (measured: the detached supervisor's stdout
         // and stderr are one pipe nobody reads, and the box log stays 0 bytes). A consequence that
         // cannot announce itself where it happens has to be announced where it can be read.
-        format!(
-            "at least {ms:.1} ms here, on top of the box itself{caveat}. Pay it ONCE: \
-             `systemd-run --user --scope bash`, then run kern inside that shell. Caps stay enforced and boxes take the direct kern.slice path (measured: 91.9 -> 35.5 ms per box on an Arduino UNO Q, 11.7 -> 3.0 on a Raspberry Pi 5). The same boundary stops `kern exec` joining a box's cgroup here, so it refuses with 126 unless KERN_ALLOW_UNCAPPED=1 says the uncapped command is intended (its namespaces, seccomp filter and AppArmor profile still apply); a `--health-cmd` probe is never refused and runs outside the box's caps on this host"
-        ),
+        // SHORT ON PURPOSE, AND HELD TO THREE FACTS. This was a 586-character paragraph carrying
+        // two measurements taken on OTHER machines (`91.9 -> 35.5` on an Arduino UNO Q,
+        // `11.7 -> 3.0` on a Raspberry Pi 5) and the phrase "the direct kern.slice path". Read on
+        // WSL by someone who had just installed kern, that is a debug dump about somebody else's
+        // hardware: the boards say nothing on Windows and the implementation detail is not
+        // something the reader acts on. A doctor row says what is wrong and what to type.
+        //
+        // WHAT IT MUST STILL NAME are `kern exec`, `KERN_ALLOW_UNCAPPED` and the health
+        // probe, and a test holds it to them. The probe's reason is the one worth remembering: it
+        // does NOT refuse, it runs outside the box's caps, and its own stderr goes nowhere
+        // (measured: a marker written to fd 2 inside it appears in a foreground `kern exec` and not
+        // in `kern logs`, whose file stays 0 bytes). A consequence that cannot announce itself
+        // where it happens has to be announced where it can be read, and this is that place.
+        //
+        // What was cut instead: two measurements taken on OTHER machines (an Arduino UNO Q and a
+        // Raspberry Pi 5), this host's own figure, and the phrase "the direct kern.slice path".
+        // The boards say nothing to someone on WSL, the figure ages and cannot carry its method,
+        // and the slice is an implementation detail the reader does not act on. 640 characters to
+        // about 350, with all three facts still in it.
+        "every box pays an extra startup cost here. Pay it once instead: \
+         `systemd-run --user --scope bash`, then run kern in that shell. Caps are enforced either \
+         way. On this host `kern exec` also refuses with 126 unless KERN_ALLOW_UNCAPPED=1 says the \
+         uncapped command is intended (namespaces, seccomp and AppArmor still apply), and a \
+         `--health-cmd` probe is never refused but runs outside the box's caps."
+            .into(),
     )
 }
 
@@ -307,9 +318,10 @@ pub fn doctor() -> Result<(), Error> {
     println!();
     if fail == 0 {
         println!(
-            "{g}ready{z} - {ok} ok, {warn} warning(s). `kern box` will run here.",
+            "{g}ready{z} - {tally}. `kern box` will run here.",
             g = p.g,
-            z = p.z
+            z = p.z,
+            tally = tally(ok, warn, fail)
         );
         println!(
             "  {d}try it:{z} {b}kern box hello --image alpine -- echo 'hello from a box'{z}",
@@ -319,12 +331,38 @@ pub fn doctor() -> Result<(), Error> {
         );
     } else {
         println!(
-            "{r}not ready{z} - {fail} blocker(s), {warn} warning(s), {ok} ok. Fix the ✘ items above.",
+            "{r}not ready{z} - {tally}. Fix the ✘ items above.",
             r = p.r,
-            z = p.z
+            z = p.z,
+            tally = tally(ok, warn, fail)
         );
     }
     Ok(())
+}
+
+/// The count clause of the verdict line, the last thing `kern doctor` says and the one a reader
+/// acts on.
+///
+/// Two things it does that the format string it replaced did not. It INFLECTS, because `1
+/// warning(s)` is the register of a form letter and this is the first command somebody runs after
+/// installing. And it DROPS A ZERO rather than spelling it out: `0 warnings` is a clause whose only
+/// content is that there is nothing to say, and on the happy path it was two thirds of the line.
+///
+/// A function, and not three `format!`s at the call site, because the three counts appear in two
+/// branches and the interesting cases (no warnings, several, a blocker) cannot ALL be produced on
+/// any one host: this machine has exactly one warning and no blocker, so the other shapes would
+/// ship unread. Here they are asserted instead.
+fn tally(ok: u32, warn: u32, fail: u32) -> String {
+    let s = |n: u32| if n == 1 { "" } else { "s" };
+    let mut out = String::new();
+    if fail > 0 {
+        out.push_str(&format!("{fail} blocker{}, ", s(fail)));
+    }
+    out.push_str(&format!("{ok} ok"));
+    if warn > 0 {
+        out.push_str(&format!(", {warn} warning{}", s(warn)));
+    }
+    out
 }
 
 /// `kern info` - a compact, scriptable snapshot of the runtime + host: version, arch, kernel, cgroup
@@ -1513,6 +1551,28 @@ fn which(bin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_verdict_tally_inflects_and_omits_a_zero() {
+        use super::tally;
+        // This host: 17 green, one missing sshfs, no blocker. It is the only shape a run here can
+        // produce, which is why the rest are asserted rather than eyeballed.
+        assert_eq!(tally(17, 1, 0), "17 ok, 1 warning");
+        // A clean host. `0 warnings` said nothing and was most of the line.
+        assert_eq!(tally(18, 0, 0), "18 ok");
+        assert_eq!(tally(15, 3, 0), "15 ok, 3 warnings");
+        // Blockers lead, because they are what stops the reader from running a box at all.
+        assert_eq!(tally(12, 0, 1), "1 blocker, 12 ok");
+        assert_eq!(tally(11, 2, 3), "3 blockers, 11 ok, 2 warnings");
+        // Nothing probed at all is not a sentence about warnings.
+        assert_eq!(tally(0, 0, 0), "0 ok");
+        for (o, w, f) in [(17, 1, 0), (18, 0, 0), (11, 2, 3), (0, 0, 0)] {
+            assert!(
+                !tally(o, w, f).contains("(s)"),
+                "the verdict line inflects, it does not parenthesise"
+            );
+        }
+    }
+
     /// EVERY NEGATIVE MEMORY-CAP ROW MUST NAME THE DIRECTORY IT PROBED.
     ///
     /// An outside independent test refused a release on this. doctor printed that a `--memory` write

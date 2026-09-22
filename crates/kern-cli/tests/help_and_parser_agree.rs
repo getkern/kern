@@ -321,11 +321,28 @@ fn every_verb_has_its_own_help() {
             n > 1,
             "`kern {verb} --help` printed {n} lines: it found nothing to say about the verb"
         );
+        // NOT A LINE COUNT ANY MORE, and the reason is the point. This compared the per-verb page
+        // against `kern --help` and read "as long as the page" as "it is the page". That proxy died
+        // on 2026-09-22, when `kern --help` became an OVERVIEW: it stopped printing the per-verb
+        // option blocks, so it is now SHORTER than `box --help` legitimately, because `box` really
+        // does have 130 options. The proxy would have failed a correct binary.
+        //
+        // These two assert the property the proxy stood for, and they are stronger: a per-verb page
+        // that answered with the whole reference would carry the `COMMANDS:` header, and one that
+        // leaked a neighbour would carry another verb's option block. Neither can be true of a page
+        // that is one verb's slice, at any length.
         assert!(
-            n < full_lines,
-            "`kern {verb} --help` printed {n} lines against the reference's {full_lines}: it is \
-             still answering with the whole page"
+            !text.contains("COMMANDS:"),
+            "`kern {verb} --help` carries the COMMANDS: section: it is answering with the whole page"
         );
+        for other in ["box", "run"] {
+            if other != verb {
+                assert!(
+                    !text.contains(&format!("OPTIONS for {other}:")),
+                    "`kern {verb} --help` carries `OPTIONS for {other}:`: it leaked another verb"
+                );
+            }
+        }
         assert!(
             text.contains(verb),
             "`kern {verb} --help` never names the verb it claims to describe: {text:?}"
@@ -537,15 +554,31 @@ fn the_per_verb_help_stays_per_verb_on_a_real_terminal() {
     let full = run("--help");
     assert!(
         full > 40,
-        "the full reference came back as {full} lines under a pty; the pty run itself is broken, \
+        "the overview came back as {full} lines under a pty; the pty run itself is broken, \
          so this test proves nothing"
     );
+    // The pty is what this test is FOR: with stdout captured the palette is empty, and the filter
+    // once fell back to the whole reference only when colour codes were present. So the check has
+    // to be about content, not length, for the same reason as its sibling above: `kern --help` is
+    // an overview now and is legitimately shorter than `box --help`.
+    let text_of = |args: &str| -> String {
+        Command::new("script")
+            .args(["-qec", &format!("{bin} {args}"), "/dev/null"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    };
     for verb in ["box", "run", "volume", "pod", "config", "diff"] {
-        let n = run(&format!("{verb} --help"));
+        let text = text_of(&format!("{verb} --help"));
+        let n = text.lines().count();
         assert!(
-            n > 1 && n < full,
-            "`kern {verb} --help` printed {n} lines under a pty against the reference's {full}: on \
-             a terminal it is still answering with the whole page"
+            n > 1,
+            "`kern {verb} --help` printed {n} lines under a pty: it found nothing to say"
+        );
+        assert!(
+            !text.contains("COMMANDS:"),
+            "`kern {verb} --help` carries the COMMANDS: section under a pty: it fell back to the \
+             whole reference, which is the bug an empty palette used to hide"
         );
     }
 }
