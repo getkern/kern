@@ -110,7 +110,11 @@ CASES: list[Case] = [
      lambda t: t.replace('"container runtime and sandbox"', '"resource slicer"', 1)),
     ("og-card-matches-readme", "a banned absolute comes back inside the picture",
      "assets/make-og-card.py",
-     lambda t: t.replace("Run workloads,", "For any workload,", 1)),
+     # The mutation has to bite the CURRENT sub-line, not a remembered one: on 2026-09-22 the tagline
+     # was rewritten, the constant stopped containing "Run workloads," and this case went from
+     # sabotaging the gate to sabotaging nothing. It said so and went red, which is the selftest
+     # doing its job, and it is why the case names the string it edits.
+     lambda t: t.replace("It runs workloads,", "It runs any workload,", 1)),
     # --- progress-is-tty-gated: both crates, and the multi-line shape that escaped the manual pass ---
     ("progress-is-tty-gated", "a bare eprintln! progress line", "crates/kern-oci/src/pull.rs",
      lambda t: t + '\nfn _selftest() { eprintln!("\u2192 pulling something"); }\n'),
