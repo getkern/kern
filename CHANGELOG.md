@@ -5,6 +5,52 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## Unreleased
+
+**`kern top` drew its first frame in 74.9 ms and showed no real CPU% for a full second.** Both were
+work nobody had asked for. The tab bar prints a count per tab, so every list has to be ENUMERATED on
+every frame, but only the tab on screen needs its CONTENTS read, and the two costs are nothing alike:
+on a host with 342 volumes, 316 images and 921 build records, one frame issued 2186 `open` calls and
+46085 `lstat`, almost all of it for panes that were not being drawn. Each collector now takes the
+listing it is asked for and returns the count either way, and the tab a reader switches to fills
+itself in before that frame is drawn, so there is no empty column and no flash. Sharing one
+layer-size map across an image sweep removed a second copy of the same waste: layers are shared
+between images and the on-disk sidecar is per layer, so a single listing re-read the same file once
+per referring image, 889 reads for 364 layers. The first frame is 5.6 ms, 2678 syscalls. The first
+frame with a true CPU percentage in it, which needs two samples and so cannot be immediate, is
+130 ms rather than 1011: the first wait is short and the steady one stays at a second.
+
+**`kern --help` answers "what can this do", not "what are every flag of box".** It printed the whole
+reference: 258 non-empty lines, of which 141 were the `OPTIONS for box` and `OPTIONS for run` blocks
+that `kern box --help` and `kern run --help` already serve byte for byte, and another 31 were
+continuation notes under single verbs. Five screens scrolling past the first command somebody types
+after installing. It is 95 lines now, every verb still listed, and nothing is lost: what it hides,
+`kern <verb> --help` shows, which is where someone asking about a verb looks. There is still exactly
+ONE reference text and two filtered views of it, so the views cannot drift from it.
+
+**The doctor's transient-scope row was a paragraph.** It carried two measurements taken on other
+machines (an Arduino UNO Q and a Raspberry Pi 5), the exit code `kern exec` uses, an environment
+variable and what a health probe does. Read on WSL by someone who had just installed kern, that is a
+debug dump about somebody else's hardware. It now says what is wrong and what to type. The
+per-host figure it used to print is gone too: a number in an advisory line ages, cannot carry its
+method, and is not what the reader acts on. The measurements are in BENCHMARKS.md, with the machine
+and the method beside them. The TUI's `gone in ~1 ms` goes for the same reason.
+
+**Two help gates were anchored on a line count** and would have failed a correct binary: they read
+"a per-verb page as long as `kern --help`" as "it is answering with the whole page", which stopped
+being true the moment `kern --help` became shorter than `box --help`. They now assert the property
+directly, that a per-verb page carries neither the `COMMANDS:` section nor another verb's option
+block, which is strictly stronger: sabotaged, it catches the fallback in four places.
+
+## kern-sandbox 0.2.33 - 2026-09-22
+
+**Documentation only: no code changed between 0.2.32 and this.** The package page on PyPI and npm is
+an IMPRINT of the moment it was published, not a view of the repository: 0.2.32 went out before the
+page was cut in half, before the comparison chart, and before the install block named the
+`python3-venv` package that Debian and Ubuntu ship separately. A reader arriving from the registry
+rather than from GitHub was reading yesterday's page and hitting `ensurepip is not available` with no
+hint. Republishing is the only way to move that imprint.
+
 ## kern-sandbox 0.2.32 - 2026-09-21
 
 The bindings are released on their own clock, so this section carries a package version rather than
