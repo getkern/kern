@@ -3586,6 +3586,70 @@ mod image_rm_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn image_stat_memo_reuses_a_shared_layer_without_changing_the_answer() {
+        // A LAYER IS SHARED AND THE SIDECAR IS PER-LAYER, so one listing re-read the same `.size`
+        // file once per referring image: 889 reads for 364 layers on a host with 316 images.
+        // `image_stat_memo` carries one map across the sweep. The risk of a memo is that it answers
+        // for the wrong key, so this asserts the ANSWERS first and the saving second: two images
+        // sharing a base plus one private layer each must still report their own totals, and a
+        // missing layer must still dangle even after a sibling has populated the map.
+        let tmp = std::env::temp_dir().join(format!("kern-memo-{}", std::process::id()));
+        let cache = tmp.join("images");
+        let lc = cache.join("L");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&lc).unwrap();
+
+        let layer = |key: &str, bytes: usize| {
+            std::fs::create_dir_all(lc.join(key)).unwrap();
+            std::fs::write(lc.join(key).join("blob"), vec![b'x'; bytes]).unwrap();
+        };
+        let base = "b".repeat(32);
+        let one = "1".repeat(32);
+        let two = "2".repeat(32);
+        layer(&base, 1000);
+        layer(&one, 30);
+        layer(&two, 70);
+        std::fs::write(cache.join("a.layers"), format!("ref\n{base}\n{one}\n")).unwrap();
+        std::fs::write(cache.join("b.layers"), format!("ref\n{base}\n{two}\n")).unwrap();
+        std::fs::write(
+            cache.join("c.layers"),
+            format!("ref\n{base}\n{}\n", "9".repeat(32)),
+        )
+        .unwrap();
+
+        let (want_a, want_b) = (image_stat(&cache, "a"), image_stat(&cache, "b"));
+        let want_c = image_stat(&cache, "c");
+        assert!(want_a.0 >= 1030 && !want_a.1, "unmemoised baseline for a");
+        assert!(want_b.0 >= 1070 && !want_b.1, "unmemoised baseline for b");
+        assert!(want_c.1, "c names a layer that is not there");
+
+        let mut memo = std::collections::HashMap::new();
+        assert_eq!(
+            image_stat_memo(&cache, "a", &mut memo),
+            want_a,
+            "the first image through the memo answers as it did without one"
+        );
+        assert_eq!(
+            image_stat_memo(&cache, "b", &mut memo),
+            want_b,
+            "the second image shares the base but keeps its OWN total: a memo that returned the \
+             cached IMAGE size instead of the cached LAYER size would report a's total here"
+        );
+        assert_eq!(
+            image_stat_memo(&cache, "c", &mut memo),
+            want_c,
+            "a missing layer still dangles after siblings have filled the map"
+        );
+        assert_eq!(
+            memo.len(),
+            4,
+            "one entry per DISTINCT layer (base + 2 private + the missing one), not per reference"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// `signal_box` must still deliver when the pidfd path does not.
     ///
     /// FOUND ON SOMEONE ELSE'S HOST, not on mine: a sandboxed container reported

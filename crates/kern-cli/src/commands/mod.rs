@@ -73,7 +73,7 @@ pub fn banner() -> Result<(), Error> {
     println!("{}", crate::ui::logo(&p));
     println!(
         "\
-  {b}kern {ver}{z}{d}: a fast, rootless sandbox & virtual resource runtime{z}
+  {b}kern {ver}{z}{d}: {tag}{z}
 
     {b}kern box{z} <name> --image alpine -- sh   {d}run a command in a sandbox{z}
     {b}kern box{z} app --image alpine vcpu:big -- sh  {d}attach a resource profile (make one: {z}{b}kern config{z}{d}){z}
@@ -84,7 +84,8 @@ pub fn banner() -> Result<(), Error> {
 
   {b}kern --help{z} {d}all commands{z} {d}·{z} {b}kern top{z} {d}live TUI{z} {d}·{z} {b}kern doctor{z} {d}check this host{z}
   {d}{z}{c}https://github.com/getkern/kern{z}",
-        ver = kern_common::VERSION
+        ver = kern_common::VERSION,
+        tag = kern_common::TAGLINE
     );
     Ok(())
 }
@@ -3036,8 +3037,30 @@ pub(crate) struct ImageEntry {
 /// The cached OCI images, sorted by name - the SINGLE source for both `kern images` and the `kern top`
 /// Images tab, so the CLI and TUI can never drift on which images exist, their sizes, or their health.
 pub(crate) fn image_entries() -> Vec<ImageEntry> {
+    image_entries_with(crate::listing::Detail::Read).records
+}
+
+/// [`image_entries`], with the per-image work under the caller's control.
+///
+/// MEASURED COST: on a host with 316 cached images this reads one `.ok` sentinel per image for the
+/// display name and then sizes each one, which costs one sidecar read per LAYER REFERENCE - 889 of
+/// them, because layers are shared and the on-disk memo is stamped per layer, not per image. All of
+/// that is 889 `open` calls for a pane the TUI draws on one tab out of seven. The COUNT, which the
+/// tab bar needs on every frame, falls out of the `read_dir` extension filter for free: `Skip`
+/// leaves the vec empty and reports the same total. See [`crate::listing`].
+pub(crate) fn image_entries_with(
+    detail: crate::listing::Detail,
+) -> crate::listing::Listing<ImageEntry> {
     let cache = cache_dir();
     let mut rows: Vec<ImageEntry> = Vec::new();
+    let mut total = 0usize;
+    // One layer size per PROCESS-CALL, not per referring image. `image_stat` memoises each layer on
+    // disk already, but that memo is keyed by the layer, so an image that shares a base with 12
+    // others re-reads the same sidecar 13 times in one sweep. This map is the in-process half: it
+    // lives exactly as long as this listing, so a layer that changes between two frames is still
+    // re-read on the next one.
+    let mut layers: std::collections::HashMap<std::path::PathBuf, Option<u64>> =
+        std::collections::HashMap::new();
     if let Ok(entries) = std::fs::read_dir(&cache) {
         for e in entries.flatten() {
             let path = e.path();
@@ -3047,6 +3070,10 @@ pub(crate) fn image_entries() -> Vec<ImageEntry> {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
                 continue;
             };
+            total += 1;
+            if detail == crate::listing::Detail::Skip {
+                continue;
+            }
             // Shown with its implied tag, so every row is a reference you can paste straight back
             // into `--image` or `rmi`. The sentinel records the ref as first written (`alpine` from
             // a pull, `alpine:latest` from a load), and listing the two spellings side by side made
@@ -3057,7 +3084,7 @@ pub(crate) fn image_entries() -> Vec<ImageEntry> {
                 .filter(|s| !s.is_empty())
                 .map(|s| kern_oci::normalize_ref(&s))
                 .unwrap_or_else(|| stem.clone());
-            let (size, dangling) = image_stat(&cache, &stem);
+            let (size, dangling) = image_stat_memo(&cache, &stem, &mut layers);
             let pulled = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok()
@@ -3072,7 +3099,10 @@ pub(crate) fn image_entries() -> Vec<ImageEntry> {
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    rows
+    crate::listing::Listing {
+        records: rows,
+        total,
+    }
 }
 
 /// Reclaim orphaned build layers (`L/` dirs referenced by no image). Safe and non-destructive: every

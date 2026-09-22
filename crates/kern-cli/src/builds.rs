@@ -10,6 +10,7 @@
 //! *names* must be unique; a build id can't collide - it embeds the pid). Free-text fields are
 //! newline-collapsed on write so a crafted tag/path can't forge extra record lines.
 
+use crate::listing::{Detail, Listing};
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -362,7 +363,19 @@ pub fn read_log(id: &str) -> Option<String> {
 
 /// All build records, newest first (by `started`, then id).
 pub fn list() -> Vec<Record> {
+    list_with(Detail::Read).records
+}
+
+/// [`list`], with the per-record `meta` read under the caller's control.
+///
+/// MEASURED COST, which is why the caller chooses: this host holds 921 build records, and reading
+/// them is 921 `open`/`read`/`close` triples. The TUI called the reading form on every periodic
+/// refresh, once a second, for a tab that is one of seven and usually not the one on screen. The
+/// only thing every other tab needs from this store is the COUNT in the tab bar, and a count costs
+/// one `getdents64` sweep. See [`crate::listing`] for the rule and the other collector that follows it.
+pub fn list_with(detail: Detail) -> Listing<Record> {
     let mut out = Vec::new();
+    let mut total = 0usize;
     if let Ok(entries) = std::fs::read_dir(builds_dir()) {
         for e in entries.flatten() {
             let Some(name) = e.file_name().to_str().map(String::from) else {
@@ -370,6 +383,10 @@ pub fn list() -> Vec<Record> {
             };
             if !valid_id(&name) {
                 continue; // skip anything that isn't a well-formed record dir
+            }
+            total += 1;
+            if detail == Detail::Skip {
+                continue;
             }
             if let Some(body) = read_capped(&e.path().join("meta")) {
                 if let Some(r) = parse(&body) {
@@ -379,7 +396,10 @@ pub fn list() -> Vec<Record> {
         }
     }
     out.sort_by(|a, b| b.started.cmp(&a.started).then_with(|| b.id.cmp(&a.id)));
-    out
+    Listing {
+        records: out,
+        total,
+    }
 }
 
 /// The record ids (dir names) newest-first, WITHOUT opening any `meta`. An id is `<started_unix>-<pid>`

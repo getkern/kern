@@ -31,6 +31,16 @@ use std::time::Instant;
 const TABS: [&str; 7] = [
     "Overview", "Boxes", "Runs", "Images", "Builds", "Profiles", "Storage",
 ];
+/// How long the FIRST poll waits before the first periodic refresh, in milliseconds.
+///
+/// The opening frame cannot show a host CPU% because that figure is a delta and there is no
+/// previous sample yet. This is how long the reader looks at a `0%` before the real one arrives.
+/// It matches the gap `snapshot()` leaves between its own two samples on the piped path.
+const FIRST_WAIT_MS: i32 = 120;
+
+/// The steady refresh cadence in milliseconds, used from the second wait onward.
+const STEADY_WAIT_MS: i32 = 1000;
+
 const TAB_OVERVIEW: usize = 0;
 const TAB_BOXES: usize = 1;
 const TAB_RUNS: usize = 2;
@@ -475,6 +485,8 @@ pub fn run() -> Result<(), crate::error::Error> {
     let mut runs_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the Runs tab
     let mut prev_box: Option<(u64, std::time::Instant)> = None;
     let mut box_hist: Vec<f64> = Vec::new(); // reader-side sparkline ring for the box-start rate
+                                             // Cleared by the first poll that times out; see the comment at that poll for why.
+    let mut first_wait = true;
 
     // Live wake: an inotify watch on the box registry dir so a box created/removed by ANY kern
     // process shows up INSTANTLY, with zero poll lag. Best-effort - if inotify or the dir is
@@ -495,6 +507,7 @@ pub fn run() -> Result<(), crate::error::Error> {
         &mut runs_hist,
         &mut prev_box,
         &mut box_hist,
+        tab,
     );
     loop {
         let (cols, term_rows) = term_size();
@@ -510,6 +523,28 @@ pub fn run() -> Result<(), crate::error::Error> {
             sel = list_len.saturating_sub(1);
         }
 
+        // THE STORAGE TAB REPAIRS ITS OWN LIST, HERE, and this is the only place that can be
+        // right. A tab change happens in four key handlers (`Tab`, `h`, `l`, the arrow escapes)
+        // plus the mutating actions, and asking each of them to remember the walk is asking for
+        // the one that forgets. This runs after `tab` has settled and before anything is drawn, so
+        // the frame that first shows Storage already has real sizes: no empty column, no flash.
+        //
+        // It costs one `is_none()` scan of a list that is at most a few dozen long on every other
+        // frame, and it cannot loop: after the walk every entry is `Some`.
+        if tab == TAB_STORAGE && snap.vols.iter().any(|v| v.size.is_none()) {
+            snap.vols = crate::volume::entries_with(crate::volume::Sizes::Measure);
+        }
+        // The same repair for the two count-only lists, and the condition is `total > 0` rather
+        // than `!is_empty()`: an empty store leaves the vec legitimately empty, and testing the vec
+        // alone would re-read the directory on every single frame of an empty tab.
+        if tab == TAB_BUILDS && snap.builds.is_empty() && snap.builds_total > 0 {
+            snap.set_builds(crate::builds::list_with(crate::listing::Detail::Read));
+        }
+        if tab == TAB_IMAGES && snap.images.is_empty() && snap.images_total > 0 {
+            snap.set_images(crate::commands::image_entries_with(
+                crate::listing::Detail::Read,
+            ));
+        }
         let frame = render(
             &p,
             tab,
@@ -518,7 +553,9 @@ pub fn run() -> Result<(), crate::error::Error> {
             &snap.profs,
             &snap.vols,
             &snap.builds,
+            snap.builds_total,
             &snap.images,
+            snap.images_total,
             cols,
             term_rows,
             sel,
@@ -555,7 +592,24 @@ pub fn run() -> Result<(), crate::error::Error> {
             // Only the first slot is guaranteed valid: the inotify fd is absent when the watch could
             // not be opened. Polling the whole array would hand `poll` a stale descriptor.
             let nfds = (if ino_fd >= 0 { 2 } else { 1 }).min(pfds.len());
-            if crate::eintr::poll(&mut pfds[..nfds], 1000) <= 0 {
+            // THE FIRST WAIT IS SHORT, AND ONLY THE FIRST. Host CPU% is a DELTA: the opening
+            // frame has no previous sample, so it necessarily reads 0% and stays wrong until the
+            // second refresh. With a flat 1000 ms that is a full second of a screen showing zeros,
+            // which is what the TUI felt slow for: measured, the first frame lands at 6 ms and the
+            // first TRUE one at 1011 ms. 120 ms is the interval `snapshot()` already uses between
+            // its two samples on the non-interactive path, so the two front ends agree on what a
+            // usable CPU window costs, and it is short enough to read as instant.
+            //
+            // It is not kept short: a 120 ms cadence would re-walk `/proc` eight times a second
+            // for a number that does not move that fast. After the first timeout this returns to
+            // 1000 ms for the rest of the session.
+            let timeout_ms = if first_wait {
+                FIRST_WAIT_MS
+            } else {
+                STEADY_WAIT_MS
+            };
+            if crate::eintr::poll(&mut pfds[..nfds], timeout_ms) <= 0 {
+                first_wait = false;
                 snap = refresh_full(
                     &mut prev,
                     &mut prev_cpu,
@@ -563,6 +617,7 @@ pub fn run() -> Result<(), crate::error::Error> {
                     &mut runs_hist,
                     &mut prev_box,
                     &mut box_hist,
+                    tab,
                 ); // timeout → periodic refresh (CPU% window)
                 continue;
             }
@@ -578,6 +633,7 @@ pub fn run() -> Result<(), crate::error::Error> {
                     &mut runs_hist,
                     &mut prev_box,
                     &mut box_hist,
+                    tab,
                 );
                 if pfds[0].revents & libc::POLLIN == 0 {
                     continue;
@@ -670,12 +726,14 @@ pub fn run() -> Result<(), crate::error::Error> {
             snap.rows = rows;
             snap.cfg = crate::config::load(None).unwrap_or_default();
             snap.profs = profile_rows(&snap.cfg);
-            snap.vols = crate::volume::entries();
+            snap.vols = crate::volume::entries_with(size_policy(tab));
             // Also re-read the lists whose tabs now mutate (Images `d`/`p`, Builds `d`) so a deleted row
             // disappears on the very next frame, not on the ≤1 s periodic refresh (inotify watches the
             // box registry, not the image cache / build history).
-            snap.builds = crate::builds::list();
-            snap.images = crate::commands::image_entries();
+            snap.set_builds(crate::builds::list_with(detail_policy(tab, TAB_BUILDS)));
+            snap.set_images(crate::commands::image_entries_with(detail_policy(
+                tab, TAB_IMAGES,
+            )));
         }
     }
     Ok(()) // _guard restores the terminal on drop
@@ -1899,7 +1957,9 @@ fn volume_detail(v: &crate::volume::VolInfo) -> String {
     format!(
         "volume '{}'\n\n  data used   {}\n  quota       {}\n  mount with  -v {}:/path[:ro]",
         v.name,
-        human_bytes(v.size),
+        // UNREACHABLE ON THIS TAB and still written out: the Storage tab measures before it draws.
+        // `-` rather than `0`, because an unmeasured volume and an empty one are different facts.
+        v.size.map_or_else(|| "-".to_string(), human_bytes),
         quota,
         v.name
     )
@@ -1980,7 +2040,29 @@ struct Snapshot {
     profs: Vec<ProfRow>,
     vols: Vec<crate::volume::VolInfo>,
     builds: Vec<crate::builds::Record>,
+    /// Build records ON DISK, which is what the tab bar counts. Not `builds.len()`: that is the
+    /// subset actually read, and it is empty on every tab but Builds.
+    builds_total: usize,
     images: Vec<crate::commands::ImageEntry>,
+    /// Cached images ON DISK, which is what the tab bar counts. See `builds_total`.
+    images_total: usize,
+}
+
+impl Snapshot {
+    /// Take a listing whole. The records and the total are two halves of one fact and drift
+    /// silently if set apart: a caller that assigns only the records leaves the tab bar reporting
+    /// the previous count, which is wrong in the one direction nobody checks (too high, so the
+    /// list looks truncated rather than empty). Every site that replaces a list goes through one
+    /// of these.
+    fn set_builds(&mut self, listing: crate::listing::Listing<crate::builds::Record>) {
+        self.builds = listing.records;
+        self.builds_total = listing.total;
+    }
+
+    fn set_images(&mut self, listing: crate::listing::Listing<crate::commands::ImageEntry>) {
+        self.images = listing.records;
+        self.images_total = listing.total;
+    }
 }
 
 /// One daemonless throughput lens: from a monotonic `total` and the prior `(total, instant)`, derive the
@@ -2008,9 +2090,61 @@ fn sample_rate(
     (rate, peak, hist.clone())
 }
 
+// ONE PLACE DECIDES WHAT A FRAME PAYS FOR.
+//
+// The rule is [`crate::listing`]'s: a list's EXISTENCE is needed on every frame, because the tab
+// bar prints its count; a list's CONTENTS are needed only on its own tab, and the contents are the
+// expensive half. These two say whether the frame about to be drawn is the one that needs them.
+//
+// They are functions and not an inlined `tab == TAB_x` because each answer is consumed at four call
+// sites, and four copies is four chances for one to disagree. The failure would be silent in both
+// directions: a tab that shows `-` forever, or every other tab paying a recursive walk once a
+// second.
+
+/// Does the frame about to be drawn print a volume SIZE? Measuring is a recursive tree walk.
+///
+/// Volumes have no count-only mode, and the reason is worth keeping: reading a directory's
+/// `meta.json` is what identifies it AS a volume, so skipping the read would change the count.
+/// Only the walk is optional. [`crate::volume::Sizes`] says the same at its definition.
+fn size_policy(tab: usize) -> crate::volume::Sizes {
+    if tab == TAB_STORAGE {
+        crate::volume::Sizes::Measure
+    } else {
+        crate::volume::Sizes::Skip
+    }
+}
+
+/// Does the frame about to be drawn print the RECORDS of the list that `owner` owns?
+///
+/// `owner` is the tab that displays the list: `TAB_BUILDS` for build records (one `open` each, 921
+/// on this host), `TAB_IMAGES` for cached images (one sentinel read each plus one sidecar per layer
+/// reference, 889 on the same host). Both counts come free from the directory sweep either way.
+fn detail_policy(tab: usize, owner: usize) -> crate::listing::Detail {
+    if tab == owner {
+        crate::listing::Detail::Read
+    } else {
+        crate::listing::Detail::Skip
+    }
+}
+
 /// A full refresh: re-sample everything and advance the CPU% baselines (`prev`, `prev_cpu`) - used
 /// on the 1 s tick, where the ~1 s delta gives a meaningful CPU percentage.
-#[allow(clippy::too_many_arguments)]
+///
+/// `tab` DECIDES THE COST OF THIS CALL, and this call is most of the cost of a frame. It is the tab
+/// about to be drawn, and nothing here displays it: it is here only so the three expensive
+/// collectors can be asked for the cheap half of their answer when the frame will not show the
+/// expensive half. Measured on this host, per refresh, once a second:
+///
+/// - volumes: the recursive walk of 342 volume trees was 46085 `lstat` and 12684 `getdents64`,
+///   69 ms of the 75 the first frame took. Storage tab only.
+/// - builds: one `open` per record, 921 of them. Builds tab only.
+/// - images: one sentinel read per image plus one sidecar per layer reference, 889 of them (364
+///   distinct layers shared across 316 images). Images tab only.
+///
+/// Every tab still gets each list's COUNT for the tab bar, which falls out of the directory sweep
+/// the collector makes anyway. Passing the policies in from outside was the earlier shape and it
+/// put four copies of `tab == TAB_x` at four call sites; the policy lives in `*_policy` now and the
+/// callers pass the one fact they actually have.
 fn refresh_full(
     prev: &mut HashMap<i32, (u64, Instant)>,
     prev_cpu: &mut Option<(u64, u64)>,
@@ -2018,6 +2152,7 @@ fn refresh_full(
     runs_hist: &mut Vec<f64>,
     prev_box: &mut Option<(u64, Instant)>,
     box_hist: &mut Vec<f64>,
+    tab: usize,
 ) -> Snapshot {
     let (rows, seen) = collect_rows(prev);
     *prev = seen;
@@ -2040,17 +2175,19 @@ fn refresh_full(
     host.box_starts_total = bt;
     let cfg = crate::config::load(None).unwrap_or_default();
     let profs = profile_rows(&cfg);
-    let vols = crate::volume::entries();
-    let builds = crate::builds::list();
-    let images = crate::commands::image_entries();
+    let vols = crate::volume::entries_with(size_policy(tab));
+    let builds = crate::builds::list_with(detail_policy(tab, TAB_BUILDS));
+    let images = crate::commands::image_entries_with(detail_policy(tab, TAB_IMAGES));
     Snapshot {
         rows,
         host,
         cfg,
         profs,
         vols,
-        builds,
-        images,
+        builds: builds.records,
+        builds_total: builds.total,
+        images: images.records,
+        images_total: images.total,
     }
 }
 
@@ -2389,7 +2526,11 @@ fn render(
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
+    // Records on disk. `builds` is the subset THIS frame read; see the tab bar.
+    builds_total: usize,
     images: &[crate::commands::ImageEntry],
+    // Cached images on disk, same relationship to `images` as `builds_total` to `builds`.
+    images_total: usize,
     cols: usize,
     term_rows: usize,
     sel: usize,
@@ -2432,8 +2573,11 @@ fn render(
         }
         match i {
             TAB_BOXES => format!("{} ({})", TABS[i], rows.len()),
-            TAB_IMAGES => format!("{} ({})", TABS[i], images.len()),
-            TAB_BUILDS => format!("{} ({})", TABS[i], builds.len()),
+            // The `_total`s, NOT `.len()`: these records are only read on their own tab, so the
+            // vec is empty everywhere else while the store is not. The count is a property of the
+            // store and must not change when the reader looks somewhere else.
+            TAB_IMAGES => format!("{} ({})", TABS[i], images_total),
+            TAB_BUILDS => format!("{} ({})", TABS[i], builds_total),
             TAB_PROFILES => format!("{} ({})", TABS[i], profs.len()),
             TAB_STORAGE => format!("{} ({})", TABS[i], vols.len()),
             // Runs are fire-and-forget (~1 ms) - there's no "current items" set like the other tabs,
@@ -3016,7 +3160,7 @@ fn storage_table(
         s.push_str(&format!(
             "  {lead}{col}{:<24}{z}  {:>10}  {}\n",
             trunc(&v.name, 24),
-            human_bytes(v.size),
+            v.size.map_or_else(|| "-".to_string(), human_bytes),
             quota_cell
         ));
     }
@@ -3142,7 +3286,10 @@ fn runs_table(p: &Palette, host: &HostStats) -> String {
     let row = |k: &str, v: String| format!("  {b}{:<14}{z}{v}\n", k);
     let mut s = String::new();
     s.push_str(&format!(
-        "\n  {b}Runs{z}{d} = fast, CPU/memory-capped commands - {z}{c}kern run -- <cmd>{z}{d} - with {z}{b}no sandbox{z}{d}, gone in ~1 ms.{z}\n"
+        // NO FIGURE HERE. This said "gone in ~1 ms": a number with no machine and no method beside it,
+        // in a panel that cannot carry either, and one that ages every time the runtime moves. What a
+        // reader needs from this line is what a run IS. The measurements live in BENCHMARKS.md.
+        "\n  {b}Runs{z}{d} = CPU/memory-capped commands - {z}{c}kern run -- <cmd>{z}{d} - with {z}{b}no sandbox{z}{d}.{z}\n"
     ));
     s.push_str(&format!(
         "  {d}A run is {z}{b}NOT a container{z}{d}: for an isolated box, use the {z}{c}Boxes{z}{d} tab. Runs are too fast/many to{z}\n"
@@ -3875,7 +4022,9 @@ mod tests {
                     &[],
                     &[],
                     &builds,
+                    builds.len(),
                     &images,
+                    images.len(),
                     100,
                     term_rows,
                     0,
@@ -4075,11 +4224,27 @@ mod tests {
             &[],
             &[],
             &[],
+            // The Builds count is the STORE's total, deliberately not `builds.len()`: the records
+            // are only read on the Builds tab, so on every other tab the slice is empty while the
+            // count must still be right. Passing an empty slice with a non-zero total here is the
+            // exact shape of a non-Builds frame, and it caught nothing only because it was added
+            // after the wiring - it exists so a future refactor cannot quietly re-derive the count
+            // from the slice and show `Builds (0)` on six tabs out of seven.
+            7,
             &[],
+            5,
             100,
             24,
             0,
             &Mode::Nav,
+        );
+        assert!(
+            out.contains("Builds (7)"),
+            "Builds count comes from the total, not the (empty) record slice: {out}"
+        );
+        assert!(
+            out.contains("Images (5)"),
+            "Images count comes from the total the same way: {out}"
         );
         // 3 boxes, 0 profiles, 0 volumes.
         assert!(
@@ -4104,7 +4269,9 @@ mod tests {
             &[],
             &[],
             &[],
+            7,
             &[],
+            0,
             80,
             24,
             0,
@@ -4129,13 +4296,13 @@ mod tests {
             crate::volume::VolInfo {
                 name: "boundless".into(),
                 raw: "boundless".into(),
-                size: 11,
+                size: Some(11),
                 quota: None,
             },
             crate::volume::VolInfo {
                 name: "capped".into(),
                 raw: "capped".into(),
-                size: 0,
+                size: Some(0),
                 quota: Some(2 * 1024 * 1024 * 1024),
             },
         ];

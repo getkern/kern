@@ -1,4 +1,4 @@
-//! kern - a fast, rootless sandbox & virtual resource runtime.
+//! kern - a fast, rootless container runtime and sandbox, no daemon.
 //!
 //! This binary is intentionally THIN: it parses argv into a [`cli::Command`] and dispatches.
 //! Real subcommand logic lives in `commands/`, and the sandbox in `sandbox/`. There is NO
@@ -245,6 +245,7 @@ mod egress;
 mod eintr;
 mod error;
 mod gpu;
+mod listing;
 /// Peer addressing and hosts files for a `--no-pod` stack.
 mod network;
 mod nopod;
