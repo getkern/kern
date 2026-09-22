@@ -14,6 +14,20 @@
 /// comparison of two builds into a guess. See `build.rs` for why that is not a hypothetical.
 pub const VERSION: &str = env!("KERN_VERSION");
 
+/// The one-line description of kern, as every surface that prints one must print it.
+///
+/// IT WAS WRITTEN TWICE and the copies could diverge in silence: `kern --help`'s header and the
+/// banner `kern` prints with no arguments each carried their own literal, and on 2026-09-22 both
+/// still said "a fast, rootless sandbox & virtual resource runtime", a tagline removed from the
+/// README, the site, the blog and the GitHub description two days earlier. Two strings for one
+/// fact is the defect this repository has a gate for everywhere except here, where no gate looks:
+/// a `.md` check cannot read a Rust literal. One constant cannot drift from itself.
+///
+/// KEPT SHORT because of where it is printed: a terminal header, above a usage line. The full
+/// sentence, with what a workload is and where the containers come from, is the README's first
+/// line; this is the part that fits.
+pub const TAGLINE: &str = "a fast, rootless container runtime and sandbox, no daemon";
+
 /// Registry credentials shared by `kern login`/`logout` and the OCI pull path.
 pub mod registry_auth;
 
