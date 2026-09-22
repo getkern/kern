@@ -50,6 +50,15 @@ def card_strings() -> tuple[str, str]:
     return f"{head.group(1)} {head.group(2)}", sub.group(1)
 
 
+def card_constant(name: str) -> str:
+    """One string constant out of the generator, so a figure baked into pixels has a reader."""
+    src = (ROOT / "assets" / "make-og-card.py").read_text(encoding="utf-8")
+    m = re.search(rf'{name}\s*=\s*"([^"]+)"', src)
+    if not m:
+        sys.exit(f"og-card: cannot read {name} out of assets/make-og-card.py")
+    return m.group(1)
+
+
 def readme_lede() -> str:
     for line in (ROOT / "README.md").read_text(encoding="utf-8").splitlines():
         if line.startswith("**kern:**"):
@@ -70,14 +79,35 @@ def main() -> int:
             f"    README: {lede.strip()}"
         )
 
-    clause = re.search(r"built on [a-z ]+?\.", flat)
-    if not clause:
-        problems.append("the README's first line no longer has a 'built on ...' clause for the card to echo")
-    elif not subline.lower().startswith(clause.group(0)):
+    # RULE 2 USED TO REQUIRE A "built on ..." CLAUSE, and on 2026-09-22 the tagline stopped having
+    # one: the first line became "a fast, rootless container runtime and sandbox with no daemon. It
+    # runs workloads, ...". The gate went red on a one-line prose commit, which is the gate working,
+    # but it was anchored on a PHRASE rather than on the property it defends. The property is that
+    # the card says nothing the README does not, so rule 2 is now the same shape as rule 1 and
+    # survives the next rewording.
+    if subline.lower().rstrip(".") not in flat.rstrip():
         problems.append(
-            f"the card's sub-line does not open with the README's own clause.\n"
+            f"the card's sub-line is not in the README's first line.\n"
             f"    card:   {subline}\n"
-            f"    README: {clause.group(0)}"
+            f"    README: {lede.strip()}"
+        )
+
+    # THE PILL CARRIES A FIGURE, and until 2026-09-22 it carried it with no source: it still said
+    # "3.5 ms" after BENCHMARKS.md moved to 3.6 and every page followed, because the generator copied
+    # that band pixel for pixel. It is a constant now, so this can compare it with the row
+    # stale-numbers.py already treats as canonical. A figure inside an image is worth nothing unless
+    # something can read it.
+    pill = card_constant("PILL")
+    said = re.search(r"([\d.]+)\s*ms", pill)
+    bench = (ROOT / "BENCHMARKS.md").read_text(encoding="utf-8")
+    canonical = re.search(r"\|\s*\*\*kern\*\*\s*`box --image`\s*\|\s*\*\*~?([\d.]+)\s*ms\*\*", bench)
+    if not said:
+        problems.append("the card's pill no longer states a figure this check can read")
+    elif not canonical:
+        problems.append("BENCHMARKS.md no longer states the image cold start in its table")
+    elif said.group(1) != canonical.group(1):
+        problems.append(
+            f"the card's pill says {said.group(1)} ms and BENCHMARKS.md says {canonical.group(1)} ms"
         )
 
     for phrase in BANNED:
