@@ -32,6 +32,7 @@ REPO = "https://github.com/getkern/kern"
 # `<title>` and in the nav; the file's own H1 stays as the page heading.
 PAGES = [
     ("INSTALL.md", "Install kern on Linux, WSL2, macOS and ARM boards"),
+    ("SANDBOX.md", "Kern Sandbox: run a model's code from Python or Node"),
     ("RESOURCES.md", "Virtual resources: CPU, memory, disk and device profiles"),
     ("EGRESS.md", "Egress control: what a box can reach"),
     ("CONFIG.md", "kern.toml: configuration reference"),

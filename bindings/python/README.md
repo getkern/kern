@@ -69,12 +69,18 @@ prints `[exit 0]` can't fake it. Also `killed`, `escape_blocked`, `exec_failed`,
 
 ## Works with
 
-| | |
-|---|---|
-| **Any MCP client** | Cursor, Claude Code, Claude Desktop, LM Studio, Zed, Windsurf. The package ships `kern-mcp`, a dependency-free stdio server: the model writes code, kern runs it here, charts come back as images it can see. Per-client config in [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md) |
-| **LangChain** | `kern_code_tool()` is a `StructuredTool` your agent can call, and a sandbox fault comes back labelled for the model. There is a shell execution policy too: [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md) |
-| **[pi](https://github.com/earendil-works/pi)** | [`kern-pi`](https://www.npmjs.com/package/kern-pi) routes its `bash`, `read`, `write`, `edit`, `ls`, `grep` and `find` into a box, your working directory at `/workspace`: [integrations/pi](https://github.com/getkern/kern/tree/main/integrations/pi) |
-| **Python and Node** | the same API on both registries: `pip install kern-sandbox` and [`npm i kern-sandbox`](https://www.npmjs.com/package/kern-sandbox) |
+- **Any MCP client**: Cursor, Claude Code, Claude Desktop, LM Studio, Zed, Windsurf. The package
+  ships `kern-mcp`, a dependency-free stdio server: the model writes code, kern runs it here, and
+  charts come back as images it can see. Per-client config in
+  [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
+- **LangChain**: `kern_code_tool()` is a `StructuredTool` your agent can call, and a sandbox fault
+  comes back labelled for the model. There is a shell execution policy too:
+  [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md).
+- **[pi](https://github.com/earendil-works/pi)**:
+  [`kern-pi`](https://www.npmjs.com/package/kern-pi) routes its `bash`, `read`, `write`, `edit`,
+  `ls`, `grep` and `find` into a box, your working directory at `/workspace`.
+- **Python and Node**: the same API on both registries, `pip install kern-sandbox` and
+  [`npm i kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
 
 ```json
 { "mcpServers": { "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] } } }
@@ -111,31 +117,30 @@ than 20x. Measure your own machine and take the p50.</sub>
 
 ## Compared to what you are probably doing
 
-| | |
-|---|---|
-| **a venv** | isolates imports, not the process: the code still has your files, your keys and your network |
-| **`docker run` per call** | the same idea with a daemon and a socket in front of it, at 292.8 ms against 14.5 ms on the same machine. That socket is root-equivalent |
-| **bubblewrap, nsjail** | the building blocks kern uses. They don't resolve images, don't apply cgroup caps, and give you no verdict: you get an exit code and work out the rest |
-| **a microVM (Firecracker, Kata) or gVisor** | a stronger boundary than this one, and the right answer when the code is actively hostile. It costs what a machine costs: about half a second per command |
-| **E2B, Modal, Daytona** | the same job in someone else's cloud, with an account and your code leaving the machine |
+- **a venv** isolates imports, not the process: the code still has your files, your keys and your
+  network.
+- **`docker run` per call** is the same idea with a daemon and a socket in front of it, at 292.8 ms
+  against 14.5 ms on the same machine. That socket is root-equivalent.
+- **bubblewrap and nsjail** are the building blocks kern uses. They don't resolve images, don't
+  apply cgroup caps, and give you no verdict: you get an exit code and work out the rest.
+- **a microVM (Firecracker, Kata) or gVisor** is a stronger boundary than this one, and the right
+  answer when the code is actively hostile. It costs what a machine costs.
+- **E2B, Modal, Daytona** do the same job in someone else's cloud, with an account and your code
+  leaving the machine.
 
 ## Current limitations
 
-- **Not a boundary against deliberately hostile code.** This is namespaces, cgroups and seccomp: a
-  kernel boundary, for your own or semi-trusted code. If the code is actively hostile, or belongs to
-  someone else, use a microVM (Firecracker, Kata) or gVisor. That is a different job and costs what a
-  machine costs: about half a second per command there against 14.5 ms here. Full statement in
+- **Not a boundary against deliberately hostile code.** Namespaces, cgroups and seccomp, for your
+  own or semi-trusted code. If the code is hostile or someone else's, use a microVM or gVisor: a
+  different job, at about half a second per command against 14.5 ms here.
   [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
-- **Linux only.** Windows works through WSL2; on a Mac the package installs and refuses to run,
-  because macOS has no namespaces and no cgroups. Use a Linux VM.
-- **The caps bind only where your host delegates a cgroup.** `kern doctor` says whether yours does,
-  and `require_limits=True` turns a silent no into a refusal to start.
-- **Nothing bounds the workspace.** It is a host directory, so a job can fill your disk. Point
-  `workspace=` at a filesystem you have sized.
-- **No `--user`**, so an image that refuses to run as root (postgres, some databases) has no answer
-  here yet.
-- **`pip install kern-sandbox` does not install the sandbox.** It drives a `kern` binary on `PATH` or
-  in `$KERN_BIN`, a second thing to keep current. If a verdict looks wrong, print `kern --version`.
+- **Linux only.** WSL2 on Windows; on a Mac it installs and refuses to run. Use a Linux VM.
+- **Caps bind only where your host delegates a cgroup.** `kern doctor` says whether yours does, and
+  `require_limits=True` turns a silent no into a refusal to start.
+- **Nothing bounds the workspace.** It is a host directory, so a job can fill your disk.
+- **No `--user`**, so an image that refuses to run as root has no answer here yet.
+- **`pip install kern-sandbox` does not install the sandbox.** It drives a `kern` binary on `PATH`
+  or in `$KERN_BIN`, a second thing to keep current.
 
 ## More
 
