@@ -13,7 +13,7 @@
 
 <sub>rootless · no daemon · no socket · no VM · no cloud · no account</sub>
 
-<sub>**Works with** any MCP client (Cursor · Claude Code · Claude Desktop · LM Studio · Zed · Windsurf) · LangChain · [pi](https://github.com/earendil-works/pi)</sub>
+<sub>**Works with** MCP clients · LangChain · pi · Python and Node</sub>
 
 **[The runtime](https://github.com/getkern/kern)** ·
 **[MCP server](https://github.com/getkern/kern/blob/main/docs/MCP.md)** ·
@@ -63,16 +63,22 @@ and `startup_failed`. Read from a pipe kern writes rather than from stdout, so c
 
 **Branch on `fault`, not on `exit_code`**: a box that never ran exits 1 like a script that did.
 
-## From an MCP client
+## Works with
+
+| | |
+|---|---|
+| **Any MCP client** | Cursor, Claude Code, Claude Desktop, LM Studio, Zed, Windsurf. The package ships `kern-mcp`, a dependency-free stdio server: the model writes code, kern runs it here, charts come back as images it can see. Per-client config in [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md) |
+| **LangChain** | `kern_code_tool()` is a `StructuredTool` your agent can call, and a sandbox fault comes back labelled for the model. There is a shell execution policy too: [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md) |
+| **[pi](https://github.com/earendil-works/pi)** | [`kern-pi`](https://www.npmjs.com/package/kern-pi) routes its `bash`, `read`, `write`, `edit`, `ls`, `grep` and `find` into a box, your working directory at `/workspace`: [integrations/pi](https://github.com/getkern/kern/tree/main/integrations/pi) |
+| **Python and Node** | the same API on both registries: `pip install kern-sandbox` and [`npm i kern-sandbox`](https://www.npmjs.com/package/kern-sandbox) |
 
 ```json
 { "mcpServers": { "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] } } }
 ```
 
-The model writes code, kern runs it on your machine, charts come back as images it can see. Works in
-Cursor, LM Studio and Claude Desktop. The client spawns the server from **its own** PATH, so a venv
-is invisible to it: `uvx` above installs nothing, `pipx install kern-sandbox` is the other way.
-Tools, environment variables and transports: [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
+A client spawns the server from **its own** PATH, so a venv is invisible to it: `uvx` above installs
+nothing, `pipx install kern-sandbox` is the other way. From macOS or Windows the client is one hop
+away and it is still one line (`"command": "wsl"`, or `"command": "ssh"` to a VM or a board).
 
 ## Safe by default
 
@@ -117,11 +123,8 @@ in `$KERN_BIN`, and that is a second thing to keep current. If a verdict looks w
 ## More
 
 Charts and mime-typed results without a Jupyter kernel, the full API, `kernel()` for a warm
-interpreter, snapshots, the LangChain tool and its
-[shell policy](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md), and the
-measured sharp edges:
+interpreter, snapshots, and the measured sharp edges:
 [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
-Node and TypeScript get the same API: [`kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
 
 Linux with unprivileged user namespaces and cgroup v2, Python 3.9+. Windows via WSL2. On a Mac it
 installs but cannot run, and says so: use a Linux VM.
