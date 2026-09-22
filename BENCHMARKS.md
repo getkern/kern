@@ -72,6 +72,40 @@ RUN python3 -m compileall -q -j 0 /usr/local/lib/python3.12
 | `print(1)` | 13.82 ms | 12.27 ms | -1.55 |
 | `import json,re` | **46.82 ms** | **17.66 ms** | **-29.15** |
 
+## Against nono, by model rather than by verb
+
+[nono](https://github.com/nolabs-ai/nono) fences the environment you already have with Landlock;
+kern builds a new one from an image. Comparing `nono run` with `kern box` compares the cheapest mode
+of one against the most expensive of the other, so each row below is a MODEL, measured on both.
+
+Measured 2026-09-22 on an Intel i7-14700KF, Linux 7.0.0, at a load average under 0.6. nono 0.78.0
+from its own installer, kern 0.20.0 from the release, `kern-sandbox` 0.2.34 from PyPI. Nine
+replicas, medians, arms alternated, and every arm counts its own output, because a command that
+fails exits before doing the work. `scripts/bench-nono.py` runs it.
+
+| | nono | kern |
+|---|---:|---:|
+| **one command, from cold** | 60.3 ms (59.0 to 65.4) | **15.3 ms** (12.9 to 17.7) |
+| **50 commands in an environment opened once**, per command | 7.74 ms (7.66 to 8.26) | **0.07 ms** (0.05 to 0.13) |
+
+**Read the second row as a cost, not as a ratio.** kern's figure is tens of microseconds, so a tiny
+absolute change swings the ratio: it reads 118x on the medians and moves between 61x and 161x across
+single runs. A ratio whose denominator is that small is not an invariant, and the honest number to
+quote is the per-command cost.
+
+**Why the second row is not the obvious result.** nono's fence is paid once and its own per-command
+cost after that is nothing, which is what "zero latency" means and it is true. What the row measures
+is that the fence does not make `python3` start any faster: inside it, every invocation is a fresh
+interpreter, 7.74 ms of it. kern's `kernel()` keeps one interpreter warm, so a cell is a round trip
+rather than a process start. The trade is the one that matters: a warm interpreter carries state
+between cells, and a box per call does not.
+
+**The crossover, for the mode kern is usually quoted on.** A fresh container per command costs about
+2.8 ms and nono's fence costs about 57 ms once, so below roughly 20 commands a container each is
+cheaper end to end, and above it the fence is. That is arithmetic about two designs rather than a
+verdict: nono does not offer a clean environment per command at any price, and kern does not offer
+your own tools without declaring an image.
+
 **The same workload against docker, because `print(1)` flatters every runtime.** Measured
 2026-09-22 on this host, `python:3.12-slim` pre-pulled in both, alternated call by call, p50 of 24
 each: `import json,re` reads **45.4 ms** through kern-sandbox against **329.7 ms** through

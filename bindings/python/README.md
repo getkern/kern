@@ -139,6 +139,10 @@ cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms aga
   network.
 - **`docker run` per call** is the same idea with a daemon and a socket in front of it, at 292.8 ms
   against 14.5 ms on the same machine. That socket is root-equivalent.
+- **[nono](https://github.com/nolabs-ai/nono)** fences the environment you already have with
+  Landlock, so your own tools are there and state carries between commands. This builds a new
+  one from an image instead. Measured both ways in
+  [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
 - **bubblewrap and nsjail** are the building blocks kern uses. They don't resolve images, don't
   apply cgroup caps, and give you no verdict: you get an exit code and work out the rest.
 - **a microVM (Firecracker, Kata) or gVisor** is a stronger boundary than this one, and the right
