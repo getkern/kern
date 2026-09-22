@@ -49,6 +49,10 @@ front of it.
 
 ## The result says who stopped the run
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-demo.gif" width="860" alt="A Python session: run_code returns ('4950', None); the same call on an infinite loop with timeout_s=3 returns fault.type 'timeout' and exit 137; and a 400 MiB allocation under memory_mb=128 returns 'oom' and 137. One box per call, no network, caps and a deadline, gone when it returns.">
+</p>
+
 `docker run` gives you exit 137 and leaves you to guess whether that was your timeout, the OOM killer
 or something else. This tells you. Every row was run:
 
