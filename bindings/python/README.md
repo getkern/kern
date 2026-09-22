@@ -130,7 +130,7 @@ Two that have surprised people, both measured:
 the rest CPython starting. The 0.7 ms bar is a prewarm burst that falls back to 14.5 when the pool
 cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms against docker's 329.7,
 7x rather than 20x, and that 45 is the stock image compiling its standard library, not the box, against
-17.7 ms on a precompiled one
+17.7 ms on a [precompiled one](https://github.com/getkern/kern/tree/main/examples/precompiled-image)
 ([BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md)). Measure your own, p50.</sub>
 
 ## Compared to what you are probably doing

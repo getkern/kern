@@ -36,7 +36,7 @@ calls against a pool of eight is exactly the regime the bar claims, not a best-o
 ⚠️ `print(1)` IS THE WORKLOAD THAT FLATTERS THIS CHART MOST, raised by an outside review and measured
 rather than argued: a call that does some work narrows the distance, because the engines pay their
 start once and then run the same code as everyone else. MEASURED the same night, same arms,
-`import json, re`: **47.3 ms here against 320.8 for docker, which is 7x rather than 20x.** The page
+`import json, re`: **45.4 ms here against 329.7 for docker, which is 7x rather than 20x.** The page
 carries that sentence under the image, because a chart whose workload is chosen by the author and
 not stated is the shape that gets taken apart in a comment thread.
 
@@ -72,7 +72,8 @@ FOOT = ("one tool-call: print(1) in python:3.12-slim, p50, wall clock around the
         "The two session-based arms keep their session alive, which is the arm most favourable to "
         "them: sbx create is paid once and cost 5067 ms here.\n"
         "n=15 unless stated. Spread: kern 11.4 to 23.5, prewarm 0.64 to 1.46, docker 273 to 305, "
-        "sbx 393 to 506. A heavier call narrows the distance: import json,re is 47.3 against 320.8.")
+        "sbx 393 to 506.\n"
+        "A heavier call narrows the distance: import json,re is 45.4 ms here against 329.7.")
 
 
 def main() -> int:
