@@ -1,7 +1,7 @@
 {
   "name": "kern-sandbox",
-  "version": "0.2.33",
-  "description": "kern is a fast, rootless container runtime and sandbox with no daemon; kern-sandbox is its Node/TypeScript binding. Run semi-trusted or agent-generated code (Python/JS/Bash) in a real, kernel-enforced box, one per call, with no cloud, no account and no VM. A kernel boundary, not a microVM: for deliberately hostile multi-tenant code, use one.",
+  "version": "0.2.34",
+  "description": "Run LLM-generated code in a real Linux container, one per call, on your own machine. No daemon, no VM, no cloud, no account. A kernel boundary, not a microVM: for deliberately hostile code, use one.",
   "keywords": [
     "sandbox",
     "kern",

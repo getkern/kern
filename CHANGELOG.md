@@ -42,6 +42,22 @@ being true the moment `kern --help` became shorter than `box --help`. They now a
 directly, that a per-verb page carries neither the `COMMANDS:` section nor another verb's option
 block, which is strictly stronger: sabotaged, it catches the fallback in four places.
 
+## kern-sandbox 0.2.34 - 2026-09-22
+
+**Documentation only, and published for the same reason 0.2.33 was: a registry page is an imprint of
+the moment it was published.** 0.2.33 went out at 19:00 and the launch page was rewritten for three
+hours afterwards, so PyPI and npm were serving the 2937-word version while GitHub served a 1236-word
+one. Same package, two different products depending on where a reader landed. The rule this repeats
+is its own: close the page, then publish.
+
+What the registry pages gain: the slogan, the animated demo of the three verdicts, the table
+comparing this to a venv, docker per call, bubblewrap, a microVM and the cloud services, and a
+current-limitations section that leads with what this is not a boundary against.
+
+**The package description is 198 characters instead of 343.** npm truncates at 255, so the sentence
+conceding that a kernel boundary is not a microVM was being cut off the page it belongs on, which is
+worse than a long description: a claim arriving without its caveat.
+
 ## kern-sandbox 0.2.33 - 2026-09-22
 
 **Documentation only: no code changed between 0.2.32 and this.** The package page on PyPI and npm is
