@@ -113,12 +113,12 @@ Two that have surprised people, both measured:
   <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-vs.png" width="880" alt="Horizontal bar chart on a log scale, milliseconds per call: kern-sandbox with a prewarm pool 0.7 ms, kern-sandbox 14.5 ms, llm-sandbox with its session kept alive 77 ms, podman run --rm 286 ms, docker run --rm 292.8 ms, and Docker Sandboxes (sbx) into an already running sandbox 421 ms. Measured on an Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21.">
 </p>
 
-<sub>**The number to quote is 14.5 ms, the default path**, one tool-call end to end on an
-i7-14700KF. The box itself is 4.9 ms; most of the rest is CPython starting inside, which is a Python
-cost. The 0.7 ms bar is a prewarm burst and falls back to 14.5 when the pool cannot keep up. And
-`print(1)` flatters every runtime here: `import json,re` measures 45.4 ms against docker's 329.7,
-which is 7x rather than 20x ([BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md)).
-Measure your own machine and take the p50.</sub>
+<sub>**14.5 ms is the number to quote**, one tool-call on an i7-14700KF: 4.9 ms of it is the box,
+the rest CPython starting. The 0.7 ms bar is a prewarm burst that falls back to 14.5 when the pool
+cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms against docker's 329.7,
+7x rather than 20x, and that 45 is the stock image compiling its standard library, not the box, against
+17.7 ms on a precompiled one
+([BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md)). Measure your own, p50.</sub>
 
 ## Compared to what you are probably doing
 
