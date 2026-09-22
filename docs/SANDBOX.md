@@ -74,6 +74,33 @@ The caps bind only where your host delegates a cgroup. `kern doctor` says whethe
 `require_limits=True` turns a silent no into a refusal to start. See
 [Install](INSTALL.md#requirements-and-limitations).
 
+## Choose how much survives between calls
+
+Three levels, one argument apart.
+
+| | per call | files carry | variables carry |
+|---|---:|---|---|
+| `kern.run_code(...)`, one-shot | 12.6 ms | no | no |
+| a `Sandbox()` you keep open | 6.9 ms | **yes** | no |
+| `s.kernel()` | 0.05 ms | **yes** | **yes** |
+
+The first two give every call its own container; what they share is the `/workspace` directory, so
+a file one call writes the next one finds, while `x = 41` is gone with the process. `kernel()` is
+one long-lived box with a warm interpreter, so everything persists and the calls share one process.
+
+```python
+with kern.Sandbox(image="python:3.12-slim") as s:
+    s.run_code("open('/workspace/f','w').write('ok')")   # a fresh container, file kept
+    with s.kernel() as k:
+        k.run_code("x = 41")
+        k.run_code("print(x)")                           # 41
+```
+
+Measured on an Intel i7-14700KF with a
+[precompiled image](https://github.com/getkern/kern/tree/main/examples/precompiled-image), 40 calls
+each. On the stock `python:3.12-slim` the first two rows cost about three times as much and the
+third does not change, because there the interpreter starts once.
+
 ## From an MCP client
 
 The package ships `kern-mcp`, a dependency-free stdio server, so the model writes code, kern runs it
