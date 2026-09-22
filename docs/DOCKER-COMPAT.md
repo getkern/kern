@@ -11,32 +11,22 @@ to a daemon, the line says so. [RUNTIME-PARITY.md](RUNTIME-PARITY.md) carries th
 by one.
 
 
-## What "compose compatibility" means here, in three numbers
+## What "compose compatibility" means, in three numbers
 
-Three different questions, three different numbers. Quoting one under another's definition is the
-mistake this project already made once and corrected (see the v0.9.32 errata in
-[CHANGELOG.md](../CHANGELOG.md)), so
-each one carries its definition and its denominator.
+Three questions, three numbers. Quoting one under another's definition is a mistake this project
+made once and corrected, so each carries its definition and its denominator.
 
-Corpus: 259 real compose files, one per repository, sampled across 733 repositories, listed one per
-row in `docs/compose-corpus-neutral.tsv` with the repository, the path inside it and the sha256 of
-the bytes that were measured. The commit is NOT pinned, so a file may have changed since; the hash
-is the only thing that says what was read. Binary proven to be the working tree (the script refuses
-to measure otherwise).
+**Corpus: 259 real compose files**, one per repository, sampled across 733, listed with the
+repository, the path and the sha256 of the bytes measured in `docs/compose-corpus-neutral.tsv`. The
+binary is proven to be the working tree; the script refuses to measure otherwise.
 
-| Question | Answer | Definition |
+| Question | Answer | What it means |
 |---|---|---|
-| Does kern ACCEPT the file? | **247 / 259 = 95%** | `compose config` exits 0. ACCEPTED, not executed: of 41 files taken further and actually started, 19 did not come up (images that no longer resolve, host paths this corpus cannot carry, a FIFO in a layer, DNS). The 12 kern refuses, Docker 29.6.2 refuses too, so ON THIS CORPUS there is no file Docker accepts and kern rejects. Not a claim about every compose file: kern refuses at `config` two mappings sharing one host port, which Docker accepts and fails at `up`. |
-| Is it accepted with NO difference kern names? | **198 / 259 = 76%** | zero warning lines at `config` that are a behavioural difference, BEYOND the deviations declared below. Those deviations have no per-file warning (they apply to nearly every file), so they are declared once here instead of counted 259 times. |
-| The same, on a host that permits low ports | **222 / 259 = 85%** | the identical measurement in a network namespace with `net.ipv4.ip_unprivileged_port_start=0`, which is one `sysctl` on a real host. MEASURED, not derived by subtracting a cause: `compose-compat-rate.py --with-low-port-floor` runs both and prints both. |
+| Does kern **accept** the file? | **247 / 259 = 95%** | `compose config` exits 0. Accepted, not executed. The 12 it refuses, Docker 29.6.2 refuses too |
+| Accepted with **no difference kern names**? | **198 / 259 = 76%** | no warning at `config` that is a behavioural difference, beyond the deviations declared below |
+| The same, on a host that permits **low ports** | **222 / 259 = 85%** | the identical measurement with `net.ipv4.ip_unprivileged_port_start=0`, which is one `sysctl` |
 
-THE FIRST NUMBER WAS 35% AND THEN 33% WHILE KERN GOT BETTER, and the reason is worth more than the
-number. It counts what kern SAYS it does differently, so it falls whenever kern learns of a
-difference it used to be silent about - `external:` networks cost two points the day they were
-measured. It rose to 72% when the default wiring changed to a network namespace per service, which
-is the arrangement Docker has: that single cause carried 135 files, 101 of them with nothing else.
-
-The gap between 95% and 76%, by cause (second column: files for which it is the ONLY cause):
+The gap between 95% and 76%, by cause. The second column is files where it is the ONLY cause:
 
 ```
  38   24   a privileged host port is republished above 1024 (rootless; not kern's to fix,
@@ -48,22 +38,16 @@ The gap between 95% and 76%, by cause (second column: files for which it is the 
            security_opt seccomp, an unimplemented key, platform:
 ```
 
-ONE CAUSE LEFT IS NOT KERN'S AND CARRIES THE REST. 24 of the 49 remaining files publish a port below
-1024, which rootless the kernel refuses to bind: podman refuses the same port and names the same
-sysctl, Docker binds it because it is root. That is the whole distance between the two numbers in
-the table above.
+**One cause is not kern's and carries the rest.** 24 of the 49 remaining files publish a port below
+1024, which the kernel refuses to bind rootless: podman refuses the same port and names the same
+sysctl, Docker binds it because it is root. That is the whole distance between 76% and 85%.
 
-Every one of the 259 files is wired the way Docker wires it, so the shared-loopback cause is gone
-from this table and from the runtime. `--pod` still asks for the old wiring and still says what it
-costs.
+Of 259 files, the only compose KEY kern reports as unimplemented is `runtime:`, on two files. That
+says nothing about keys no file here writes, such as `deploy.replicas` or `userns_mode`.
 
-Of 259 real files, the only compose KEY kern reports as unimplemented is `runtime:`, on two files. A
-key no file in the corpus uses is not covered by that sentence: it says nothing about
-`deploy.replicas`, `cgroup_parent`, `userns_mode` or `mac_address`, which no file here writes.
-
-The corpus is 259 files found by their NAME. Nine of the twelve kern refuses are not compose files
-at all (`.bak`, `.dist`, `.old`, `.md`, `-e`), and Docker refuses them for the same reason; the
-denominator keeps them because removing the files a measurement dislikes is how a rate goes up.
+⚠ Nine of the twelve refusals are not compose files at all (`.bak`, `.dist`, `.old`), and Docker
+refuses them too. The denominator keeps them, because removing the files a measurement dislikes is
+how a rate goes up.
 
 ## The perimeter
 
@@ -94,9 +78,9 @@ Outside that list, on this corpus, kern accepts every file Docker accepts.
 | From your Docker setup | kern |
 |------------------------|------|
 | **OCI images** (Docker Hub, GHCR, quay, Harbor, self-hosted) | ✅ pull & run: multi-arch, `WWW-Authenticate` v2 auth, gzip **+ zstd**, digest-pinned `@sha256:` refs **content-verified** (the manifest is checked against the pin) |
-| **`docker-compose.yml`** | ✅ `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|watch\|port\|systemd\|run\|cp]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, **`restart:`** (`always`/`unless-stopped`/`on-failure`), `devices`, `dns`/`dns_search`/`dns_opt`, `logging` `max-size`/`max-file`, `links`, `ipc`/`pid`, `tmpfs`, `mem_reservation`, `cpu_shares`, `platform`, `volumes_from`, `shm_size`, `secrets`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}`, `${VAR:?err}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated |
-| **Dockerfile** `build` (dry run) | ✅ `kern build --check [ctx]` parses the file and reports what kern does with every instruction, building nothing: honoured, or `dropped` with what happens instead. A `COPY` from the context is resolved against it, so a source that escapes or is missing fails the check rather than the build; a glob or a `COPY --from` is left to the build, which is where it becomes answerable. Exit 0 if it builds here, non-zero with the refusal if it does not, so it can gate a pipeline before a base image is pulled |
-| **Dockerfile** `build` | ✅ `kern build`: all common instructions, **multi-stage** (+ `target:`), `COPY --from=…` (a build stage **or** an external image), **COPY globs**, BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first |
+| **`docker-compose.yml`** | ✅ read as-is, 13 verbs, multi-file merge, `up` reconciles. Detail below |
+| **Dockerfile** `build` (dry run) | ✅ `kern build --check [ctx]`: parses and reports, builds nothing. Detail below |
+| **Dockerfile** `build` | ✅ `kern build`, daemonless: each `RUN` is a real box. Detail below |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ excluded from the build context (last-match-wins, `!` re-include, `**`) |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load`: `docker load`-compatible |
 | **`tag` / `push`** to a registry | ✅ `kern tag` / `kern push` |
@@ -105,6 +89,12 @@ Outside that list, on this corpus, kern accepts every file Docker accepts.
 | **`docker run` security flags** | ✅ `kern box`: `--apparmor <profile>`, `--cap-drop`/`--cap-add`, `--read-only`, `--tmpfs`, an opt-in `--security-profile untrusted` bundle, `--landlock-rw`; seccomp is **always on**. Not present: **SELinux** labelling, and a **default** AppArmor profile. Full posture: [SECURITY.md](../SECURITY.md) |
 | **Docker Engine API** / `docker.sock` | ❌ tools that attach to the socket will not connect |
 | **Swarm** (multi-host orchestration) | ❌ no workaround: out of scope for a single-host, daemonless runtime |
+
+**What `kern compose` reads.** `kern compose <file> [up\|down\|stop\|start\|restart\|ps\|logs\|build\|pull\|config\|watch\|port\|systemd\|run\|cp]` reads real-world files as-is: `depends_on` (+ `service_healthy`/`_completed` conditions), `healthcheck`, `deploy.resources.limits`, `ulimits`, `sysctls`, `labels`, `extra_hosts`, `init`, `stop_signal`/`stop_grace_period`, **`restart:`** (`always`/`unless-stopped`/`on-failure`), `devices`, `dns`/`dns_search`/`dns_opt`, `logging` `max-size`/`max-file`, `links`, `ipc`/`pid`, `tmpfs`, `mem_reservation`, `cpu_shares`, `platform`, `volumes_from`, `shm_size`, `secrets`, YAML **anchors/merge** (`<<: *x`), **`extends`**, `x-` extension fields, the project **`.env`**, `${VAR:-default}`, `${VAR:?err}` and bare `$VAR` interpolation, network **aliases**. Multiple files merge (`-f base.yml -f override.yml`), plus `-p`/`--env-file`/`--profile`. `up` **reconciles**: a service still matching the file is left running, a changed one is recreated
+
+**What `kern build --check` does.** `kern build --check [ctx]` parses the file and reports what kern does with every instruction, building nothing: honoured, or `dropped` with what happens instead. A `COPY` from the context is resolved against it, so a source that escapes or is missing fails the check rather than the build; a glob or a `COPY --from` is left to the build, which is where it becomes answerable. Exit 0 if it builds here, non-zero with the refusal if it does not, so it can gate a pipeline before a base image is pulled
+
+**What `kern build` supports.** `kern build`: all common instructions, **multi-stage** (+ `target:`), `COPY --from=…` (a build stage **or** an external image), **COPY globs**, BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first
 
 ## How a stack is wired
 
@@ -317,26 +307,26 @@ manual on purpose.
 
 | `docker …` | `kern …` | Notes |
 |---|---|---|
-| `run` / `create` | `box` | one verb; `-d` detaches, `-t`/`-it` for a PTY (`-i` alone keeps stdin attached without one, as on docker), `--entrypoint` replaces the image's ENTRYPOINT and discards its CMD (`--entrypoint ""` clears it). `--network <name>` joins a running POD, which is what a `kern compose` stack is, so a one-off can talk to a stack the way `docker run --network <net>` does |
-| `exec` | `exec` | joins the box's namespaces, with the box's own environment. `-t` allocates a PTY and `-i` does NOT, as on docker, so `exec -i <box> psql … < seed.sql` feeds a file in without a terminal echoing it back |
-| `ps` | `ps` | `-a`/`--all`, `-q`, `--filter name=/status=/id=/label=/pod=/health=`, `--format '{{.Field}}'`, `--json`, `--no-trunc`, `--last N`/`-n N` (counts across live and exited, implies `-a`) |
-| `logs` | `logs` | `--tail N`, `-f`/`--follow` (bounded read, cheap on GB-size logs), `-t`, `--since`/`--until`. The window is read from the same index `-t` prints from; a line the index cannot place in time is KEPT, because the index buckets from 100 ms and discarding what it cannot place would lose real output |
-| `stop` / `kill` | `stop` / `kill` | `stop` sends `--stop-signal` (SIGTERM), waits `--stop-timeout` (10 s), then SIGKILLs what is left. `kill` is an ALIAS, not Docker's immediate kill: to skip the wait use `--stop-timeout 0`. A grace that provably cannot end is skipped, not sat out |
+| `run` / `create` | `box` | one verb. `-d`, `-t`/`-it` for a PTY, `--entrypoint` replaces ENTRYPOINT and discards CMD. `--network <name>` joins a running pod, which is what a stack is |
+| `exec` | `exec` | joins the box's namespaces with its environment. `-t` allocates a PTY and `-i` does not, as on docker |
+| `ps` | `ps` | `-a`, `-q`, `--filter`, `--format`, `--json`, `--no-trunc`, `--last N` |
+| `logs` | `logs` | `--tail`, `-f`, `-t`, `--since`/`--until`. The follow is a bounded read, cheap on GB-size logs |
+| `stop` / `kill` | `stop` / `kill` | `stop` sends the stop signal, waits 10 s, then SIGKILLs. `kill` is immediate |
 | `pause` / `unpause` | `pause` / `unpause` | cgroup v2 freezer |
 | `attach` | `attach` | Ctrl-C detaches, box keeps running |
 | `cp` | `cp` | host↔box, symlinks cannot escape the box root |
-| `inspect` | `inspect` | `--json`, and `-f`/`--format` with docker's own paths: `.State.Status`, `.State.Running`, `.State.Paused`, `.State.Pid`, `.State.ExitCode`, `.State.Health.Status`, `.Name`, `.Image`. A field kern cannot answer truthfully is refused by name, and so is a box kern has no record of: a wait loop reading `exited` for a misspelled name would take it for done |
-| `stats` | `stats` | per-box CPU / memory. `--no-stream` is accepted and names what already happens: kern prints a snapshot, `kern top` is the live view |
-| `images` | `images` | `--json`, and all five of Docker's `--filter` keys: `reference=` (a pattern, `*` allowed, no tag means any tag), `dangling=`, `label=` (`k` or `k=v`), `before=`/`since=` (another image's ref). An image's `LABEL`s are read on both paths that produce one, a pull and a build |
+| `inspect` | `inspect` | `--json`, and `-f`/`--format` with docker's own paths (`.State.Status`, `.State.Pid`, `.Config.Image`) |
+| `stats` | `stats` | per-box CPU and memory. `--no-stream` prints a snapshot; `kern top` is the live view |
+| `images` | `images` | `kern images`, `--json`, `--filter`, `--digests` |
 | `top` (box processes) | `exec <box> ps` | plus `kern top`, the live TUI |
 | `rename` | `rename` | in place, pid unchanged |
 | `update` | `update` | live cgroup caps, no restart (needs a delegated cgroup) |
-| `wait` | `wait` | the code the workload exited with, including after a clean `stop`. Exact where the box has its OWN cgroup, best-effort where it does not: on a host with no delegation a clean shutdown can still record `137`. `kern doctor` says which host you are on |
+| `wait` | `wait` | blocks until the box exits and prints its status |
 | `diff` | `diff` | overlay-upper changes: `C` changed/added, `D` deleted |
 | `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
 | `commit` | `commit` | box → reusable image (warm start) |
-| `start` (resume a stopped container) | *(none)* | a box runs as long as you want and its volumes persist; what is not supported is resuming one you already stopped. Launch a fresh box against the same volume |
-| `login` / `logout` | `login` / `logout` | `kern login [registry] [--username U] [--password-stdin]`. The credentials are CHECKED against the registry before they are stored, so a bad one fails here rather than at the next push, and a failed attempt leaves a working credential in place |
+| `start` (resume a stopped container) | *(none)* | a stopped box is a record, not a paused process: `kern box` starts a new one |
+| `login` / `logout` | `login` / `logout` | credentials for a private registry, stored for the user |
 | `port` | `port` | `kern port <box> [<container-port>[/tcp\|/udp]]`: the host address serving that port, or every mapping when no port is named. Read from the running box, so it reports what was actually bound rather than what the file asked for |
 
 ### Every `docker compose` verb and flag kern accepts
