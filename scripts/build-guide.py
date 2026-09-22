@@ -136,7 +136,13 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "") -> str:
     # document itself opens with, so it cannot drift from the page.
     first = re.search(r"<p>(.*?)</p>", body, re.S)
     desc = re.sub(r"<[^>]+>", "", first.group(1)) if first else title
-    desc = html.escape(" ".join(desc.split())[:157], quote=True)
+    # Cut on a WORD boundary. A flat [:157] took eight of the ten pages mid-word ("what is
+    # supporte", "How m"), and that string is the search snippet and the social card, which is
+    # exactly where a half word reads as a broken page.
+    desc = " ".join(desc.split())
+    if len(desc) > 157:
+        desc = desc[:157].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    desc = html.escape(desc, quote=True)
     page = out_name(md_path.name)
     return f"""<!doctype html>
 <html lang="en">
