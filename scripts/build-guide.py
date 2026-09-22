@@ -57,6 +57,7 @@ display:flex;align-items:center;justify-content:space-between;gap:1rem;height:4r
 nav .links{display:flex;align-items:center;gap:1.1rem;flex-wrap:wrap}
 nav a{white-space:nowrap;color:var(--dim)}
 nav a:hover{color:var(--link)}
+nav a.here{color:var(--ink);font-weight:600}
 nav a.home img{height:26px;width:auto;display:block}
 @media(prefers-color-scheme:dark){nav a.home img{filter:invert(1) hue-rotate(180deg)}}
 @media(max-width:46rem){nav{height:auto;padding:1rem 0;flex-direction:column;align-items:flex-start}}
@@ -202,13 +203,18 @@ def main(argv: list[str]) -> int:
         "THREAT_MODEL.md": "Threat model",
         "FAQ.md": "FAQ",
     }
-    links = " ".join(
-        f'<a href="{out_name(md)}">{LABELS.get(md, md[:-3].title())}</a>' for md, _ in PAGES
-    )
-    nav = (
-        '<a class="home" href="/"><img src="/img/kern-logo.png" alt="kern" height="26"></a>'
-        f'<span class="links">{links}</span>'
-    )
+    def build_nav(current: str | None = None) -> str:
+        """The bar, with the page you are on marked. Built per page rather than once, because the
+        only honest way to say "you are here" is to know which page is being written."""
+        out_links = []
+        for md, _ in PAGES:
+            label = LABELS.get(md, md[:-3].title())
+            here = ' class="here" aria-current="page"' if md == current else ""
+            out_links.append(f'<a href="{out_name(md)}"{here}>{label}</a>')
+        return (
+            '<a class="home" href="/"><img src="/img/kern-logo.png" alt="kern" height="26"></a>'
+            f'<span class="links">{" ".join(out_links)}</span>'
+        )
 
     written = []
     for md, title in PAGES:
@@ -216,7 +222,9 @@ def main(argv: list[str]) -> int:
         if not src.exists():
             print(f"MISSING: docs/{md}", file=sys.stderr)
             return 1
-        (out / out_name(md)).write_text(render(src, title, nav, token), encoding="utf-8")
+        (out / out_name(md)).write_text(
+            render(src, title, build_nav(md), token), encoding="utf-8"
+        )
         written.append(out_name(md))
 
     # AN INDEX, BECAUSE A DIRECTORY WITHOUT ONE IS A 403. Measured on 2026-09-22: the home links
@@ -237,7 +245,8 @@ def main(argv: list[str]) -> int:
     tmp = out / "_index.md"
     tmp.write_text(body, encoding="utf-8")
     (out / "index.html").write_text(
-        render(tmp, "kern guide: installing and configuring kern", nav, token), encoding="utf-8"
+        render(tmp, "kern guide: installing and configuring kern", build_nav(), token),
+        encoding="utf-8",
     )
     tmp.unlink()
     written.append("index.html")
