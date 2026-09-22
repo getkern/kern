@@ -52,9 +52,14 @@ CSS = """
 body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;margin:0;
 padding:2rem 1rem 4rem}
 main{max-width:52rem;margin:0 auto}
-nav{max-width:52rem;margin:0 auto 2rem;padding-bottom:1rem;border-bottom:1px solid var(--line);
-font-size:.9rem}
-nav a{margin-right:1rem;white-space:nowrap}
+nav{max-width:52rem;margin:0 auto 2rem;border-bottom:1px solid var(--line);font-size:.9rem;
+display:flex;align-items:center;justify-content:space-between;gap:1rem;height:4rem}
+nav .links{display:flex;align-items:center;gap:1.1rem;flex-wrap:wrap}
+nav a{white-space:nowrap;color:var(--dim)}
+nav a:hover{color:var(--link)}
+nav a.home img{height:26px;width:auto;display:block}
+@media(prefers-color-scheme:dark){nav a.home img{filter:invert(1) hue-rotate(180deg)}}
+@media(max-width:46rem){nav{height:auto;padding:1rem 0;flex-direction:column;align-items:flex-start}}
 a{color:var(--link);text-decoration:none}
 a:hover{text-decoration:underline}
 h1{font-size:1.9rem;line-height:1.25;margin:.2rem 0 1rem}
@@ -184,9 +189,25 @@ def main(argv: list[str]) -> int:
     out = pathlib.Path(argv[1])
     out.mkdir(parents=True, exist_ok=True)
 
-    nav = ' <a href="/">kern</a> ' + " ".join(
-        f'<a href="{out_name(md)}">{md.replace(".md", "").replace("_", " ").title()}</a>'
-        for md, _ in PAGES
+    # THE LABEL IS NOT THE FILENAME. Title-casing `MCP.md` gave "Mcp" and `FAQ.md` gave "Faq",
+    # which is a product's own name spelled wrong in its own navigation, on every page.
+    LABELS = {
+        "INSTALL.md": "Install",
+        "SANDBOX.md": "Sandbox",
+        "RESOURCES.md": "Resources",
+        "EGRESS.md": "Egress",
+        "CONFIG.md": "Config",
+        "MCP.md": "MCP",
+        "DOCKER-COMPAT.md": "Docker",
+        "THREAT_MODEL.md": "Threat model",
+        "FAQ.md": "FAQ",
+    }
+    links = " ".join(
+        f'<a href="{out_name(md)}">{LABELS.get(md, md[:-3].title())}</a>' for md, _ in PAGES
+    )
+    nav = (
+        '<a class="home" href="/"><img src="/img/kern-logo.png" alt="kern" height="26"></a>'
+        f'<span class="links">{links}</span>'
     )
 
     written = []
