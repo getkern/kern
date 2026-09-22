@@ -38,8 +38,7 @@ cargo install --git https://github.com/getkern/kern getkern --locked
 ```
 
 **Offline or air-gapped.** kern is a single static binary, so copying that one file *is* the
-install. No daemon, no package, nothing on the target, which is why it runs where Docker cannot
-(see [EDGE.md](../EDGE.md)):
+install. No daemon, no package, nothing on the target, which is why it runs where Docker cannot:
 
 ```sh
 scp kern pi@raspberrypi:~/          # then:  ssh pi@raspberrypi kern box dev --image alpine -- sh
@@ -238,5 +237,3 @@ single-uid box works without them.
 
 The kernel *flavor* does not matter: kern runs even on an **Android kernel** with a Linux userland
 (the Arduino UNO Q). It does **not** run on stock Android-the-OS (Bionic, SELinux, userns off).
-Being daemonless is a large win on RAM-constrained boards, 0 resident against about 160 MB: see
-**[EDGE.md](../EDGE.md)**.

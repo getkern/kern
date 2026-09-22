@@ -54,8 +54,8 @@ measured:
   anything with `.ssh`, `.aws` or `.kube` in its path, and kern's own state. No opt-out. Mount a
   copy of what the code needs.
 - **`network=True` includes the host's loopback**, where unauthenticated services live. A test read
-  the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the middle setting and is
-  route-level, so a client that cannot speak to an HTTP proxy has no path out at all.
+  the host's SSH banner off `127.0.0.1:22`. [`egress_allow`](EGRESS.md) is the middle setting and
+  is route-level, so a client that cannot speak to an HTTP proxy has no path out at all.
 
 The caps bind only where your host delegates a cgroup. `kern doctor` says whether yours does, and
 `require_limits=True` turns a silent no into a refusal to start. See

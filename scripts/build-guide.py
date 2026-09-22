@@ -203,11 +203,19 @@ def main(argv: list[str]) -> int:
         "THREAT_MODEL.md": "Threat model",
         "FAQ.md": "FAQ",
     }
+    # NOT EVERY PAGE BELONGS IN THE BAR. Nine links is a menu to read rather than a way to move,
+    # and these three answer a question a reader arrives with rather than one they browse for: they
+    # are reached from the sentence that raises them (SANDBOX links the threat model and the egress
+    # page, FAQ links Docker compatibility) and from the guide index, which lists all of them.
+    NAV_HIDDEN = {"EGRESS.md", "THREAT_MODEL.md", "DOCKER-COMPAT.md"}
+
     def build_nav(current: str | None = None) -> str:
         """The bar, with the page you are on marked. Built per page rather than once, because the
         only honest way to say "you are here" is to know which page is being written."""
         out_links = []
         for md, _ in PAGES:
+            if md in NAV_HIDDEN:
+                continue
             label = LABELS.get(md, md[:-3].title())
             here = ' class="here" aria-current="page"' if md == current else ""
             out_links.append(f'<a href="{out_name(md)}"{here}>{label}</a>')

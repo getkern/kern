@@ -11,7 +11,7 @@ WHY THIS EXISTS
         two paragraphs later, "ENOSYS moves five syscalls", so the page offered 5 + 24 = 29 against
         its own 33, and an outside audit repeated the smaller number;
       * Docker's resident memory was re-measured at 154 to 160 MB and corrected in the README and
-        BENCHMARKS.md, while ~186 MB survived in four places in EDGE.md, in examples/README.md and
+        BENCHMARKS.md, while ~186 MB survived in four places, in examples/README.md and
         in the blog post. That one is the worst shape: a stale number that flatters us, on the page
         that carries the edge argument.
 
@@ -98,14 +98,14 @@ STALE: list[tuple[str, str, str, set[str]]] = [
         # Introduced by the very commit that was leaning the README for the launch: the sentence said
         # bubblewrap was "0.8 ms ahead" while the table two lines above it read kern 2.2 and
         # bubblewrap 3.0, so it handed a competitor a win it does not have on that machine, and an
-        # outside review repeated it back within the day. BENCHMARKS.md and EDGE.md are exempt,
-        # because on the ARM boards' DEFAULT path bubblewrap IS ahead and they say so with numbers.
+        # outside review repeated it back within the day. BENCHMARKS.md is exempt, because on
+        # the ARM boards' DEFAULT path bubblewrap IS ahead and it says so with numbers.
         r"bubblewrap is [0-9.]+\s*ms ahead",
         "0.8 ms behind, on the README's own table",
         "kern 2.2 ms against bubblewrap 3.0 on the x86 table, and ahead at the same level of work on "
         "every host where both are installed. bubblewrap leads only on the boards' default path, "
         "where kern enforces a cgroup cap and bubblewrap enforces none.",
-        {"BENCHMARKS.md", "EDGE.md"},
+        {"BENCHMARKS.md"},
     ),
     (
         # One number, two homes: BENCHMARKS.md measured 1000 boxes in 0.61 s and stated 1640 box/s in

@@ -160,7 +160,9 @@ CASES: list[Case] = [
     # blacklist numeri precisi e scattavano su affermazioni vere (un "1.7 MB" e' anche un RSS). Questa
     # pretende che la cifra stia ACCANTO alla parola che misura, quindi qualunque corrispondenza e' una
     # violazione della regola e non una cifra forse vecchia. Il caso inietta la forma vietata.
-    ("stale-numbers", "una dimensione del binario dichiarata in prosa", "EDGE.md",
+    # SOGGETTO CAMBIATO il 22/09/2026: era EDGE.md, cancellata. Serve un .md scansionato dal
+    # cancello e NON nella lista delle esenzioni, o il caso passerebbe senza misurare niente.
+    ("stale-numbers", "una dimensione del binario dichiarata in prosa", "docs/RESOURCES.md",
      append("\nThe kern binary is 1.52 MB, static.\n")),
     # --- flat-continuation: la forma VERA del difetto, con una virgola prima della corsa.
     #

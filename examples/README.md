@@ -224,8 +224,6 @@ with truncation flags, wall time). Ideal for running LLM/agent-generated code or
 |---|---|
 | [Windows via WSL2](../docs/INSTALL.md) | kern on Windows runs inside WSL2, same commands, real kernel-enforced caps, with the measured cost of crossing from PowerShell |
 
-> Edge / ARM (Jetson, Pi, …): see **[../EDGE.md](../EDGE.md)**: the daemonless footprint is the
-> killer feature on RAM-constrained boards.
 
 Every box gets: user + PID + network + UTS + IPC + mount namespaces, a pivoted root, an
 always-on seccomp allowlist, and cgroup caps (direct in kern's delegated `kern.slice`, or a transient
