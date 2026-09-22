@@ -13,6 +13,8 @@
 
 <sub>rootless · no daemon · no socket · no VM · no cloud · no account</sub>
 
+<sub>**Works with** any MCP client (Cursor · Claude Code · Claude Desktop · LM Studio · Zed · Windsurf) · LangChain · [pi](https://github.com/earendil-works/pi)</sub>
+
 **[The runtime](https://github.com/getkern/kern)** ·
 **[MCP server](https://github.com/getkern/kern/blob/main/docs/MCP.md)** ·
 **[Security model](https://github.com/getkern/kern/blob/main/SECURITY.md)** ·

@@ -9,6 +9,7 @@ is where the file lives, not what goes in it.
 | **Cursor** | Settings, MCP, add a server. The editor opens `mcp.json`. |
 | **LM Studio** 0.3.17+ | the **Program** tab in the right sidebar, then Install, Edit `mcp.json`. LM Studio's own documentation says it follows Cursor's notation, so the block is identical. |
 | **Claude Desktop** | `claude_desktop_config.json`, same shape. |
+| **Claude Code** | `claude mcp add kern -- kern-mcp`, or the same block in `.mcp.json` at the project root to share it with a repository. |
 
 Each of them spawns the command **where the client runs**, so a client on macOS or Windows needs the
 `wsl` or `ssh` line further down rather than the block below.
