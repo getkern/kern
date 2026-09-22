@@ -152,7 +152,6 @@ cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms aga
   own or semi-trusted code. If the code is hostile or someone else's, use a microVM or gVisor: a
   different job, at about half a second per command against 14.5 ms here.
   [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
-- **Linux only.** WSL2 on Windows; on a Mac it installs and refuses to run. Use a Linux VM.
 - **Caps bind only where your host delegates a cgroup.** `kern doctor` says whether yours does, and
   `require_limits=True` turns a silent no into a refusal to start.
 - **Nothing bounds the workspace.** It is a host directory, so a job can fill your disk.
@@ -166,5 +165,6 @@ Charts and mime-typed results without a Jupyter kernel, the full API, `kernel()`
 interpreter, snapshots, and the measured sharp edges:
 [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
 
-Requires unprivileged user namespaces and cgroup v2, and Python 3.9+:
+Runs on Linux, with unprivileged user namespaces and cgroup v2, and Python 3.9+. Windows through
+WSL2; on a Mac it installs but runs only inside a Linux VM.
 [install notes](https://github.com/getkern/kern/blob/main/docs/INSTALL.md). Apache-2.0.
