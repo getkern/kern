@@ -59,6 +59,8 @@ nav{font-size:.9rem;display:flex;align-items:center;gap:1.1rem;flex-wrap:wrap}
 nav a{white-space:nowrap;color:var(--dim)}
 nav a:hover{color:var(--ink)}
 nav a.here{color:var(--ink);font-weight:600}
+nav a.gh{color:var(--ink);font-weight:600;border:1px solid var(--line);border-radius:6px;padding:.2rem .65rem}
+nav a.gh:hover{border-color:var(--dim)}
 .logo img{height:26px;width:auto;display:block}
 .logo img.dark{display:none}
 @media(prefers-color-scheme:dark){.logo img.light{display:none}.logo img.dark{display:block}}
@@ -236,6 +238,12 @@ def main(argv: list[str]) -> int:
             label = LABELS.get(md, md[:-3].title())
             here = ' class="here" aria-current="page"' if md == current else ""
             out_links.append(f'<a href="{out_name(md)}"{here}>{label}</a>')
+        # THE WAY TO THE CODE, IN THE BAR. Until 2026-09-23 the only GitHub links on a guide page were
+        # in the footer, so a reader landing on the Sandbox page from a post had nowhere visible to go
+        # for the source or the star. The Sandbox page points at the SDK's README, which is what that
+        # page is about; the others at the repository.
+        gh = f"{REPO}/tree/main/bindings/python" if current == "SANDBOX.md" else REPO
+        out_links.append(f'<a class="gh" href="{gh}">&#9733; GitHub</a>')
         return " ".join(out_links)
 
     written = []
