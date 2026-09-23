@@ -42,6 +42,22 @@ being true the moment `kern --help` became shorter than `box --help`. They now a
 directly, that a per-verb page carries neither the `COMMANDS:` section nor another verb's option
 block, which is strictly stronger: sabotaged, it catches the fallback in four places.
 
+## kern-sandbox 0.2.35 - 2026-09-23
+
+**One fix, and the page.** When a box failed to start, the `SandboxError` message was the first 500
+characters of kern's stderr, and kern writes its notes and warnings before the error. Inside a
+container, the shape a Google Colab runtime has, a 391-character warning pushed the cause to
+character 557, so the message said the box "still runs" about a box that had not started. Both SDKs
+now drop kern's diagnostic lines before cutting.
+
+What the registry pages gain since 0.2.34: the price beside "one container per call" (a hundred calls,
+1.4 s, nothing left behind), which persistence level the MCP server gives, a corrected `rm -rf ~`
+claim (the root is read-only, so the delete fails), a seven-call demo, the fault table at six rows,
+and the line saying it does not run inside a container without `--privileged`.
+
+**The package description leads with the slogan** instead of "one per call", and keeps the sentence
+conceding that a kernel boundary is not a microVM. 217 characters, under npm's 255.
+
 ## kern-sandbox 0.2.34 - 2026-09-22
 
 **Documentation only, and published for the same reason 0.2.33 was: a registry page is an imprint of

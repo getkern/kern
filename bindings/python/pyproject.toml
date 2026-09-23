@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kern-sandbox"
-version = "0.2.34"
-description = "Run LLM-generated code in a real Linux container, one per call, on your own machine. No daemon, no VM, no cloud, no account. A kernel boundary, not a microVM: for deliberately hostile code, use one."
+version = "0.2.35"
+description = "Your model writes the code. This runs it where it can't touch your machine: a rootless Linux container, no daemon, no VM, no cloud, no account. A kernel boundary, not a microVM: for deliberately hostile code, use one."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
