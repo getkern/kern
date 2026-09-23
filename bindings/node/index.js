@@ -1070,6 +1070,15 @@ function isKernDiagnostic(line) {
   return KERN_DIAGNOSTICS.some((p) => s.startsWith(p));
 }
 
+/** Why the box did not start: kern's stderr with its warning and note lines dropped, capped at 500.
+ * kern writes those BEFORE the error, and inside a container (the shape Google Colab has) a ~430-
+ * character warning pushed `error: sandbox: unprivileged user namespaces are unavailable` to character
+ * 557, past a plain first-500 cut. Mirrors `_startup_failure_message` in the Python binding. */
+function startupFailureMessage(stderr) {
+  const kept = stderr.split("\n").filter((l) => !isKernDiagnostic(l)).join("\n").trim();
+  return (kept || stderr.trim()).slice(0, 500);
+}
+
 /** The sentence kern prints when it has READ the kernel's OOM counter for this box's own cgroup. A
  * contract between two programs: if kern rewords it, this stops recognising a real OOM and starts
  * reporting `killed` - wrong in the safe direction, still wrong. Mirrors `_KERN_OOM_MARKER`. */
@@ -2061,7 +2070,7 @@ class Sandbox {
     // exits 125 ITSELF (the code ran and chose 125) is NOT mislabeled. `finish` REJECTS only on rc===125;
     // a non-125 startup_failed (an older kern's 127, or a forged marker) is returned as DATA, not thrown.
     if (rc !== 0 && looksLikeStartupFailure(stderr))
-      return sandboxFault("startup_failed", stderr.trim().slice(0, 500));
+      return sandboxFault("startup_failed", startupFailureMessage(stderr));
     // Any other non-zero exit (incl. 139 SIGSEGV) is the USER's code failing - a normal Result.
     return null;
   }

@@ -642,6 +642,29 @@ def test_classify_order_escape_not_masked_by_stderr_marker():
     assert s._classify(1, _KERN_OOM_LINE, False) is None
 
 
+# kern 0.20.0's stderr, VERBATIM, run inside `docker run alpine:3.19` on 2026-09-23: the shape a Google
+# Colab runtime has. The note and the warning come first; the error starts at character 557.
+_STDERR_INSIDE_A_CONTAINER = "\n".join([
+    "kern: note: /run and /tmp are on overlayfs (container?) - using the size-capped /dev/shm for box scratch; set XDG_RUNTIME_DIR to a tmpfs/disk path for full capacity",
+    "kern: warning: resource caps could not be enforced here (memory + pids, INCLUDING their defaults) - the box runs UNCAPPED, with no OOM / fork-bomb backstop. kern could not place it in a delegated cgroup: this host does not run systemd (`/run/systemd/system` is absent). `kern doctor` shows the delegation state; `--require-limits` refuses to start uncapped, `--allow-uncapped` silences this.",
+    "error: sandbox: unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)",
+    "hint: the box could not be BUILT, which is a host capability rather than a wrong command: the mount, the uid map, the seccomp filter or the AppArmor profile. `kern doctor` reports all four, and a `--rootfs` that does not exist or is not a directory fails the same way.",
+]) + "\n"
+
+
+def test_startup_failed_message_names_the_error_not_the_warning_in_front_of_it():
+    # A user on Colab got a SandboxError reading "The box still runs and stays isolated" about a box that
+    # never started: the message was stderr[:500], and the warning alone filled it.
+    assert _STDERR_INSIDE_A_CONTAINER.index("error: sandbox:") > 500
+    f = _cfg()._classify(125, _STDERR_INSIDE_A_CONTAINER, False)
+    assert f.type == "startup_failed"
+    assert f.message.startswith("error: sandbox: unprivileged user namespaces are unavailable")
+    assert "hint: the box could not be BUILT" in f.message
+    assert "kern: warning:" not in f.message and "kern: note:" not in f.message
+    # Nothing left once the diagnostics go: the raw stderr is still better than an empty message.
+    assert kern._startup_failure_message("kern: warning: only this\n") == "kern: warning: only this"
+
+
 def test_classify_sigkill_is_oom_only_when_kern_reported_the_oom():
     # A SIGKILL is `oom` ONLY when KERN said the kernel's OOM killer took the box against its own cap.
     # It replaces an inference that read as sound - a SIGKILL of a memory-capped box IS what a breached

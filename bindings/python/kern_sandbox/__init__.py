@@ -2616,7 +2616,7 @@ class Sandbox:
         # case (the caller then knows the code never ran); an older kern that exits 127 with a marker
         # still classifies startup_failed but is returned as DATA, not raised.
         if rc != 0 and _looks_like_startup_failure(stderr):
-            return SandboxFault("startup_failed", stderr.strip()[:500])
+            return SandboxFault("startup_failed", _startup_failure_message(stderr))
         # exit 139 (SIGSEGV) and any other non-zero exit are the USER's code failing - a normal Result.
         return None
 
@@ -4353,6 +4353,21 @@ def _looks_like_startup_failure(stderr: str) -> bool:
         if line.startswith(_KERN_SPEAKING) or "sandbox setup failed" in line:
             return True
     return False
+
+
+def _startup_failure_message(stderr: str) -> str:
+    """Why the box did not start: kern's stderr with its warning and note lines dropped, capped at 500.
+
+    MEASURED 2026-09-23 with kern inside a container, the shape a Google Colab runtime has: kern wrote a
+    `kern: note:` and a ~430-character `kern: warning:` BEFORE `error: sandbox: unprivileged user
+    namespaces are unavailable`, which began at character 557. The message used to be the first 500
+    characters of stderr, so it showed the warning, which says the box "still runs", and cut the cause
+    off. The lines dropped are the ones `code_stderr` drops, by the same prefixes, so the two cannot
+    disagree about what counts as a diagnostic. If nothing else is left, the raw stderr still beats an
+    empty message.
+    """
+    kept = "\n".join(l for l in stderr.split("\n") if not l.lstrip().startswith(_KERN_DIAGNOSTICS))
+    return (kept.strip() or stderr.strip())[:500]
 
 
 def run_code(

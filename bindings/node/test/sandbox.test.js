@@ -491,6 +491,24 @@ test("exit 125 startup failure requires the kern marker, not a bare 125", () => 
   assert.strictEqual(s._classify(3, null, marker, false).type, "startup_failed");
 });
 
+test("startup_failed message names the error, not the warning in front of it", () => {
+  // kern 0.20.0's stderr VERBATIM inside `docker run alpine:3.19`, 2026-09-23, the shape a Google Colab
+  // runtime has. A Colab user got "The box still runs and stays isolated" about a box that never
+  // started: the message was the first 500 characters, and the warning alone filled them.
+  const stderr = [
+    "kern: note: /run and /tmp are on overlayfs (container?) - using the size-capped /dev/shm for box scratch; set XDG_RUNTIME_DIR to a tmpfs/disk path for full capacity",
+    "kern: warning: resource caps could not be enforced here (memory + pids, INCLUDING their defaults) - the box runs UNCAPPED, with no OOM / fork-bomb backstop. kern could not place it in a delegated cgroup: this host does not run systemd (`/run/systemd/system` is absent). `kern doctor` shows the delegation state; `--require-limits` refuses to start uncapped, `--allow-uncapped` silences this.",
+    "error: sandbox: unprivileged user namespaces are unavailable (kernel.unprivileged_userns_clone=0 or an AppArmor restriction)",
+    "hint: the box could not be BUILT, which is a host capability rather than a wrong command: the mount, the uid map, the seccomp filter or the AppArmor profile. `kern doctor` reports all four, and a `--rootfs` that does not exist or is not a directory fails the same way.",
+  ].join("\n") + "\n";
+  assert.ok(stderr.indexOf("error: sandbox:") > 500);
+  const f = new Sandbox({ timeoutS: 30 })._classify(125, null, stderr, false);
+  assert.strictEqual(f.type, "startup_failed");
+  assert.ok(f.message.startsWith("error: sandbox: unprivileged user namespaces are unavailable"), f.message);
+  assert.ok(f.message.includes("hint: the box could not be BUILT"), f.message);
+  assert.ok(!f.message.includes("kern: warning:") && !f.message.includes("kern: note:"), f.message);
+});
+
 test("a SIGKILL is oom only when kern reported the OOM", () => {
   // A SIGKILL is `oom` ONLY when KERN said the kernel's OOM killer took the box against its own cap. It
   // replaces an inference that read as sound - a SIGKILL of a memory-capped box IS what a breached
