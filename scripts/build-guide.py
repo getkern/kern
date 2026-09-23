@@ -17,10 +17,12 @@ Usage:
     python3 scripts/build-guide.py <out-dir> [analytics-token]
 """
 
+import hashlib
 import html
 import pathlib
 import re
 import sys
+import urllib.request
 
 import markdown
 
@@ -139,6 +141,47 @@ def rewrite_links(body: str) -> str:
         return f'href="{REPO}/{kind}/main/{clean}{"#" + frag if frag else ""}"'
 
     return re.sub(r'href="([^"]+)"', fix, body)
+
+
+RAW = "https://raw.githubusercontent.com/getkern/kern/main/"
+
+
+def localize_images(page: str, out: pathlib.Path) -> str:
+    """Serve every image from getkern.dev itself, because the site's policy allows nothing else.
+
+    The Content-Security-Policy says `img-src 'self' data:`. The README the Sandbox page is built
+    from loads its demo and its chart from raw.githubusercontent and its badges from shields.io,
+    which GitHub shows and the site blocks: MEASURED 2026-09-23, the served page printed the demo's
+    alt text where the animation should be. A local preview without that header showed everything,
+    which is how it shipped. Repository images are copied from the checkout on every build, so this
+    copy cannot go stale the way the home's hand-copied chart did; badges are fetched once per build,
+    and one that cannot be fetched is replaced by its label rather than left as a broken image.
+    """
+    def fix(m):
+        tag, raw = m.group(0), m.group(1)
+        src = html.unescape(raw)
+        if src.startswith(RAW):
+            rel = src[len(RAW):]
+            dst = out / "assets" / pathlib.Path(rel).name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes((ROOT / rel).read_bytes())
+            return tag.replace(raw, f"{BASE}/assets/{dst.name}")
+        if src.startswith("https://img.shields.io/"):
+            name = "badge-" + hashlib.sha1(src.encode()).hexdigest()[:10] + ".svg"
+            try:
+                req = urllib.request.Request(src, headers={"User-Agent": "curl/8"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = r.read()
+            except OSError as e:
+                print(f"badge not fetched, shown as text: {src} ({e})", file=sys.stderr)
+                alt = re.search(r'alt="([^"]*)"', tag)
+                return alt.group(1) if alt else ""
+            (out / "assets").mkdir(parents=True, exist_ok=True)
+            (out / "assets" / name).write_bytes(data)
+            return tag.replace(raw, f"{BASE}/assets/{name}")
+        return tag
+
+    return re.sub(r'<img\b[^>]*\bsrc="([^"]+)"[^>]*>', fix, page)
 
 
 def beacon(token: str) -> str:
@@ -294,7 +337,8 @@ def main(argv: list[str]) -> int:
             print(f"MISSING: docs/{md}", file=sys.stderr)
             return 1
         (out / out_name(md)).write_text(
-            render(src, title, build_nav(md), token, out_name(md)), encoding="utf-8"
+            localize_images(render(src, title, build_nav(md), token, out_name(md)), out),
+            encoding="utf-8",
         )
         written.append(out_name(md))
 
