@@ -42,13 +42,14 @@ r = kern.run_code("print(sum(range(100)))")
 print(r.stdout, r.fault)   # 4950  None
 ```
 
-That call started a container from an OCI image, ran the code with **no network**, memory and PID
-caps and a deadline applied from outside, and threw the container away before returning. A hundred
-calls are a hundred containers: **1.4 s in total** on this machine, and the state directory the same
-size after as before. And per call is the default, not the only setting: a `Sandbox()` you keep open
-shares `/workspace` across those fresh containers, and `kernel()` holds one warm interpreter where
-variables carry too. Two things, not one: the isolation is the binary's, this package is the API in
-front of it.
+That call ran the code in a fresh container from an OCI image, with **no network**, memory and PID
+caps and a deadline applied from outside, and threw the container away before returning.
+
+- **Cheap enough for every call**: a hundred calls are a hundred containers, **1.4 s** in total on
+  an i7-14700KF, and nothing is left behind.
+- **State when you want it**: a `Sandbox()` you keep open shares `/workspace`, and `kernel()` keeps
+  one warm interpreter where variables carry too.
+- **Two parts**: the `kern` binary is the isolation, this package is the API in front of it.
 
 ## When you would use this
 
