@@ -27,6 +27,32 @@ import markdown
 BASE = "/guide"
 SITE = "https://getkern.dev"
 REPO = "https://github.com/getkern/kern"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# GitHub's mark (Octicons `mark-github`, 16px), in `currentColor` so it follows the theme. The home's
+# nav carries the same markup, because the two headers are meant to be identical.
+GH_MARK = (
+    '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" '
+    'd="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 '
+    "0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 "
+    "0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 "
+    "1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61"
+    ".55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 "
+    '0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>'
+)
+
+# ONE SOURCE FOR THE SANDBOX PAGE, and it is the package README. Until 2026-09-23 the site rendered
+# `docs/SANDBOX.md`, a condensed second copy of the same page, and the two had already drifted: the
+# `rm -rf` correction and the fault table had to be made twice, and the table still stood at four rows
+# on one and six on the other. A page that is rendered from the README cannot disagree with it.
+SOURCE = {"SANDBOX.md": "bindings/python/README.md"}
+
+# The README is written for GitHub, which shows one logo on both themes; the site has a pair.
+README_LOGO = '<img src="https://raw.githubusercontent.com/getkern/kern/main/assets/brand/kern-logo.png" width="220" alt="kern">'
+SITE_LOGOS = (
+    '<img class="light" src="/img/kern-logo.png" width="220" alt="kern">'
+    '<img class="dark" src="/img/kern-logo-dark.png" width="220" alt="kern">'
+)
 
 # The documents worth a page of their own, in the order a reader meets them. `title` is what goes in
 # `<title>` and in the nav; the file's own H1 stays as the page heading.
@@ -59,8 +85,11 @@ nav{font-size:.9rem;display:flex;align-items:center;gap:1.1rem;flex-wrap:wrap}
 nav a{white-space:nowrap;color:var(--dim)}
 nav a:hover{color:var(--ink)}
 nav a.here{color:var(--ink);font-weight:600}
-nav a.gh{color:var(--ink);font-weight:600;border:1px solid var(--line);border-radius:6px;padding:.2rem .65rem}
+nav a.gh{display:inline-flex;align-items:center;gap:.4rem;color:var(--ink);font-weight:600;border:1px solid var(--line);border-radius:6px;padding:.2rem .65rem}
 nav a.gh:hover{border-color:var(--dim)}
+main img{max-width:100%;height:auto}
+main img.dark{display:none}
+@media(prefers-color-scheme:dark){main img.light{display:none}main img.dark{display:inline}}
 .logo img{height:26px;width:auto;display:block}
 .logo img.dark{display:none}
 @media(prefers-color-scheme:dark){.logo img.light{display:none}.logo img.dark{display:block}}
@@ -130,14 +159,22 @@ def beacon(token: str) -> str:
     )
 
 
-def render(md_path: pathlib.Path, title: str, nav: str, token: str = "") -> str:
+def render(md_path: pathlib.Path, title: str, nav: str, token: str = "", page: str = "") -> str:
     text = md_path.read_text(encoding="utf-8")
-    body = markdown.markdown(text, extensions=["tables", "fenced_code", "toc", "attr_list"])
+    # The package README centres its header in a raw `<div align="center">`, which Markdown passes
+    # through untouched, so its title, slogan and badges would print as literal `#` and `**`.
+    # `md_in_html` renders inside a block marked `markdown="1"`, and no other page has one.
+    text = text.replace('<div align="center">', '<div align="center" markdown="1">')
+    text = text.replace(README_LOGO, SITE_LOGOS)
+    body = markdown.markdown(
+        text, extensions=["tables", "fenced_code", "toc", "attr_list", "md_in_html"]
+    )
     body = rewrite_links(body)
-    # The description is the first paragraph, flattened. Better than a constant: it is what the
-    # document itself opens with, so it cannot drift from the page.
-    first = re.search(r"<p>(.*?)</p>", body, re.S)
-    desc = re.sub(r"<[^>]+>", "", first.group(1)) if first else title
+    # The description is the first paragraph WITH TEXT, flattened. Better than a constant: it is what
+    # the document itself opens with, so it cannot drift from the page. With text, because the
+    # README's first paragraph is its logo, which flattens to nothing.
+    paras = (re.sub(r"<[^>]+>", "", m) for m in re.findall(r"<p[^>]*>(.*?)</p>", body, re.S))
+    desc = next((d for d in paras if d.strip()), title)
     # Cut on a WORD boundary. A flat [:157] took eight of the ten pages mid-word ("what is
     # supporte", "How m"), and that string is the search snippet and the social card, which is
     # exactly where a half word reads as a broken page.
@@ -145,7 +182,11 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "") -> str:
     if len(desc) > 157:
         desc = desc[:157].rsplit(" ", 1)[0].rstrip(",;:") + "…"
     desc = html.escape(desc, quote=True)
-    page = out_name(md_path.name)
+    page = page or out_name(md_path.name)
+    # Where the page's source lives, for "this page on GitHub": the README for the Sandbox page,
+    # `docs/` for the rest. The guide index is built from a temporary file, which keeps the old form.
+    src = md_path.resolve()
+    src_rel = src.relative_to(ROOT).as_posix() if src.is_relative_to(ROOT) else f"docs/{md_path.name}"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -180,7 +221,7 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "") -> str:
 </main>
 <footer>
 <a href="{SITE}/">getkern.dev</a> &middot;
-<a href="{REPO}/blob/main/docs/{md_path.name}">this page on GitHub</a> &middot;
+<a href="{REPO}/blob/main/{src_rel}">this page on GitHub</a> &middot;
 <a href="{REPO}">source</a>
 </footer>
 {beacon(token)}</body>
@@ -243,17 +284,17 @@ def main(argv: list[str]) -> int:
         # for the source or the star. The Sandbox page points at the SDK's README, which is what that
         # page is about; the others at the repository.
         gh = f"{REPO}/tree/main/bindings/python" if current == "SANDBOX.md" else REPO
-        out_links.append(f'<a class="gh" href="{gh}">&#9733; GitHub</a>')
+        out_links.append(f'<a class="gh" href="{gh}">{GH_MARK}GitHub</a>')
         return " ".join(out_links)
 
     written = []
     for md, title in PAGES:
-        src = repo / "docs" / md
+        src = repo / SOURCE.get(md, "docs/" + md)
         if not src.exists():
             print(f"MISSING: docs/{md}", file=sys.stderr)
             return 1
         (out / out_name(md)).write_text(
-            render(src, title, build_nav(md), token), encoding="utf-8"
+            render(src, title, build_nav(md), token, out_name(md)), encoding="utf-8"
         )
         written.append(out_name(md))
 
