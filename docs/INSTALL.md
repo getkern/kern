@@ -95,6 +95,11 @@ refuses. On a Mac that privilege is inside Docker's own Linux VM, which is alrea
 against macOS; on a Linux host it is privilege on the real machine, so that recipe is a way to TRY
 kern rather than the way to run it there.
 
+It is also the only flag that is enough, measured with kern 0.20.0 inside `docker run`: Docker's
+seccomp profile refuses the user namespace, with that off its AppArmor profile refuses the first
+mount, and with both off and `--cap-add SYS_ADMIN` the box still fails on `/proc`. On Google Colab
+the box does not start either.
+
 **If it finds none, install one, and the guest matters more than the VM.** colima is the smallest
 thing that works and not the most capable: its default Ubuntu guest gives you a kern whose resource
 caps do not bite. A Fedora guest has neither problem, on the evidence of a user's own `kern doctor`

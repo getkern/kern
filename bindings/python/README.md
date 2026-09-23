@@ -162,6 +162,8 @@ cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms aga
   `require_limits=True` refuses to start rather than run uncapped.
 - **Nothing bounds the workspace.** It is a host directory, so a job can fill your disk.
 - **No `--user`**, so an image that refuses to run as root has no answer here yet.
+- **Not inside a container without `--privileged`, and not on Google Colab.** Measured:
+  [install notes](https://github.com/getkern/kern/blob/main/docs/INSTALL.md#macos).
 - **`pip install kern-sandbox` does not install the sandbox.** It drives a `kern` binary on `PATH`
   or in `$KERN_BIN`, a second thing to keep current.
 
