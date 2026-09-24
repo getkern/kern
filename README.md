@@ -97,8 +97,6 @@ shells out to the `curl` and `tar` already on the machine rather than linking a 
 
 ## Install
 
-### The binary
-
 A box is made of Linux kernel features, so kern runs where there is a Linux kernel: **Linux and ARM
 boards** directly, **Windows through WSL2** with a pre-baked rootfs and an installer that sets WSL2
 up for you, and **a Mac inside a Linux VM** (colima, Lima, OrbStack, UTM), where it is the ordinary
@@ -124,29 +122,6 @@ those, in real VMs and on the boards, before it ships.
 the Windows and Mac guests step by step, what the resource caps do on a default VM, and the one thing
 [Ubuntu 23.10 and newer needs first](docs/INSTALL.md#requirements-and-limitations), once, with root.
 
-### The SDK, to call kern from Python or Node
-
-`kern-sandbox` ([PyPI](https://pypi.org/project/kern-sandbox/),
-[npm](https://www.npmjs.com/package/kern-sandbox)) needs the binary above, so install that first:
-
-```sh
-python3 -m venv .venv && . .venv/bin/activate   # most distributions refuse a system-wide pip (PEP 668)
-pip install kern-sandbox
-npm  install kern-sandbox
-```
-
-Both packages are the wrapper alone: they find `kern` on your PATH, or wherever `$KERN_BIN` points.
-The two are released on their own clocks, so check what you have when a call does something the
-changelog says it should not:
-
-```sh
-kern --version
-python3 -c "import kern_sandbox; print(kern_sandbox.__version__)"
-```
-
-What it is for is [further down](#run-an-agents-code-python-node-langchain-mcp-pi); the
-[changelog](CHANGELOG.md) names the release each fix landed in.
-
 ## Quickstart
 
 ```sh
@@ -161,6 +136,26 @@ one flag. `kern ps` and `kern top` show what is running; every verb that lists o
 `--json`, so nothing has to parse a table. One runnable example per thing kern does:
 [examples/](examples/).
 
+To call all of that from a program, `kern-sandbox`
+([PyPI](https://pypi.org/project/kern-sandbox/), [npm](https://www.npmjs.com/package/kern-sandbox))
+is a dependency-free wrapper over the binary you just installed:
+
+```sh
+python3 -m venv .venv && . .venv/bin/activate   # most distributions refuse a system-wide pip (PEP 668)
+pip install kern-sandbox                        # Node: npm install kern-sandbox
+```
+
+```python
+from kern_sandbox import run_code
+
+r = run_code("import platform; print(platform.python_version())")
+print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
+```
+
+It finds `kern` on your PATH, or wherever `$KERN_BIN` points. Binary and wrapper ship on their own
+clocks, so `kern --version` and `kern_sandbox.__version__` are the pair to quote when a call does
+something the [changelog](CHANGELOG.md) says it should not.
+
 ## Run an agent's code: Python, Node, LangChain, MCP, pi
 
 The bindings are how **your program** calls kern. The code **inside** the box can be in any language,
@@ -169,16 +164,9 @@ different `--image`, and so does anything else that ships one.
 
 
 An agent needs somewhere to run what the model just wrote. **`kern-sandbox`** is that place: a thin,
-dependency-free wrapper over the `kern` binary, called from your own program.
-[Installed above](#the-sdk-to-call-kern-from-python-or-node); the API is in
+dependency-free wrapper over the `kern` binary, called from your own program and
+[installed in the Quickstart](#quickstart). The API is in
 [bindings/python/](bindings/python/README.md) and [bindings/node/](bindings/node/README.md).
-
-```python
-from kern_sandbox import run_code
-
-r = run_code("import platform; print(platform.python_version())")
-print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
-```
 
 Every call is a fresh isolated box: network off, memory and pid caps, capabilities dropped, output
 bounded, and a timeout the binding enforces itself. A timeout, an OOM-kill or a blocked syscall comes
