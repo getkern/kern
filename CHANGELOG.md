@@ -7,6 +7,15 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A moved tag left a cache that no longer helped and that nothing rebuilt.** The bytecode cache is
+keyed on the image's canonical reference, and a tag is mutable: `python:3.12-slim` can point at a new
+manifest tomorrow. Nothing wrong was ever run - the cache validates on the source's hash, so CPython
+rejects stale bytecode and compiles from source - but the cache kept one of its eight slots, every box
+paid the compile again, and nothing replaced it because a cache "existed". A published cache now
+records which image kern had when it was built, read from kern's own image cache, so the check costs a
+local file read and no box. A cache whose image has moved is discarded and rebuilt; one whose identity
+cannot be read, including every cache built before this, is left exactly as it was.
+
 **A cache path containing a `:` silently disabled the bytecode cache, and a mount could not carry
 one at all.** overlayfs and `-v src:dst` both separate their fields with `:`, so a host path holding
 one could not be written: `-v /tmp/a:b:/data` was reported as `unknown mount option '/data'`, naming

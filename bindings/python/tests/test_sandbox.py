@@ -4609,3 +4609,100 @@ def test_only_one_process_builds_a_given_cache(tmp_path, monkeypatch):
     kern._pyc_sweep(str(lock.parent))
     assert not lock.exists(), "a stale lock survived the sweep"
 
+def test_pyc_sanitize_ref_agrees_with_kerns_own(tmp_path):
+    """The port must name the files kern WROTE, or the identity check below silently finds nothing.
+
+    Every vector was DUMPED from `sanitize_ref` in kern-cli by a temporary test, not derived from
+    reading it, the same way the `parse_ref` table was built. If the two ever disagree, the identity
+    is read from a path that does not exist, `_pyc_source_id` answers "" and the cache is never
+    invalidated again - a silent regression to the behaviour this check exists to end.
+    """
+    wrong = [(r, e, kern._sanitize_ref(r)) for r, e in kern._SANITIZE_VECTORS if kern._sanitize_ref(r) != e]
+    assert not wrong, f"the port disagrees with kern: {wrong}"
+    # THE IMPLIED TAG IS PART OF IT: `alpine` and `alpine:latest` are ONE key for kern, and two keys
+    # here would mean two identities for one image.
+    assert kern._sanitize_ref("alpine") == kern._sanitize_ref("alpine:latest")
+    # And a digest is left alone rather than given a tag it does not have.
+    assert kern._sanitize_ref("x@sha256:ab") != kern._sanitize_ref("x@sha256:ab:latest")
+
+
+def test_pyc_a_cache_built_from_a_different_image_is_discarded_not_kept(tmp_path, monkeypatch):
+    """A tag is MUTABLE, so a cache keyed on its name can outlive the image it was built from.
+
+    Nothing wrong is executed - `CHECKED_HASH` makes CPython reject the stale bytecode and compile
+    from source - so this is not a correctness hole. It is a cache that stops helping and never says
+    so: it holds one of the eight slots and every box pays the compile again, because a cache
+    "exists" and nothing rebuilds it. MEASURED end to end on a real image: after the tag moved, the
+    stale tree was refused, discarded, rebuilt with a new identity and adopted again.
+
+    DISCARDED AND NOT MERELY REFUSED, because `os.rename` onto a NON-EMPTY directory is `ENOTEMPTY`:
+    a stale tree left in place would block its own replacement forever.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    img = "python:3.12-slim"
+    images = tmp_path / "kern" / "images"
+    images.mkdir(parents=True)
+    safe = kern._sanitize_ref(img)
+    (images / f"{safe}.image").write_bytes(b"config-v1")
+    (images / f"{safe}.ok").write_bytes(b"ok")
+    first = kern._pyc_source_id(img)
+    assert first, "the identity must be readable when kern's own files are there"
+
+    # THE BUILD WRITES IT, not the test. Writing the identity by hand would leave the write in
+    # `_pyc_build` uncovered, and the sabotage that removes it green - which is what happened.
+    dest = pathlib.Path(kern._pyc_dir_for(img))
+
+    def _fake_build(argv, timeout_s):
+        tmp = next(a for i, a in enumerate(argv) if argv[i - 1] == "-v").split(":")[0]
+        pathlib.Path(tmp, "stdlib.pyc").write_bytes(b"\x00\x00\x00\x00")
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(kern, "_run_capped", _fake_build)
+    kern._pyc_build("/bin/true", img, str(dest), 30.0)
+    cache = dest
+    assert cache.is_dir(), "the build published nothing"
+    assert (cache / kern._PYC_SOURCE_ID).read_text() == first, (
+        "the published cache does not carry the identity of the image it was built from"
+    )
+    with _cfg(image=img) as s:
+        assert s._pyc_dir == str(cache), "a cache whose identity matches must be adopted"
+
+    # THE TAG MOVES: kern re-pulls and rewrites its own files for that reference.
+    (images / f"{safe}.image").write_bytes(b"config-v2")
+    assert kern._pyc_source_id(img) != first
+    with _cfg(image=img) as s:
+        assert s._pyc_dir == "", "a cache built from another image was adopted"
+        assert s._pyc_pending == str(cache), "nothing was scheduled to replace it"
+    assert not cache.exists(), "the stale tree was left in place and would block its replacement"
+
+    # UNKNOWN COUNTS AS UNCHANGED, both ways: a cache written before this check existed has no
+    # identity file, and a host whose image kern has pruned cannot produce one. Neither may cause a
+    # rebuild loop, so both keep the cache.
+    legacy = _publish_cache(pathlib.Path(kern._pyc_dir_for(img)))
+    with _cfg(image=img) as s:
+        assert s._pyc_dir == str(legacy), "a cache with no identity file must be kept"
+    (legacy / kern._PYC_SOURCE_ID).write_text("some-identity")
+    for suffix in (".image", ".ok"):
+        (images / f"{safe}{suffix}").unlink()
+    assert kern._pyc_source_id(img) == "", "a pruned image has no identity"
+    with _cfg(image=img) as s:
+        assert s._pyc_dir == str(legacy), "an unreadable identity must not discard a good cache"
+
+
+def test_pyc_a_process_that_already_built_can_build_again(tmp_path, monkeypatch):
+    """The in-process map must not turn "built once" into "never again".
+
+    It keyed on the destination and kept the entry after the thread ended, so a second need for the
+    same destination got the FINISHED thread back and no build ran. Harmless while a cache is only
+    ever built once - and exactly wrong the moment a moved tag discards one: the stale tree went, and
+    nothing replaced it for the life of that process. Found by the end-to-end test, not by reading.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    dest = kern._pyc_dir_for("python:3.12-slim")
+    runs = []
+    monkeypatch.setattr(kern, "_run_capped", lambda argv, timeout_s: runs.append(argv) or _FakeCompleted(1))
+    for _ in range(2):
+        th = kern._pyc_start_build("/bin/true", "python:3.12-slim", dest, 5.0)
+        th.join(30)
+    assert len(runs) == 2, f"the second build never ran: {len(runs)} run(s)"
+

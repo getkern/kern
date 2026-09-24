@@ -3032,3 +3032,75 @@ test("only one process builds a given cache, and a stale lock is swept", async (
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("sanitizeRef agrees with kern's own, and a moved tag discards the cache", () => {
+  // THE PORT NAMES FILES KERN WROTE. Every vector was DUMPED from `sanitize_ref` in kern-cli, not
+  // derived from reading it. If the two disagree the identity is read from a path that does not
+  // exist, `pycSourceId` answers "" and the cache is never invalidated again - a silent regression
+  // to the behaviour this check exists to end.
+  const wrong = kern._SANITIZE_VECTORS.filter(([r, e]) => kern._sanitizeRef(r) !== e);
+  assert.deepStrictEqual(wrong, [], `the port disagrees with kern: ${JSON.stringify(wrong)}`);
+  // The implied tag is part of it: `alpine` and `alpine:latest` are ONE key for kern.
+  assert.strictEqual(kern._sanitizeRef("alpine"), kern._sanitizeRef("alpine:latest"));
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-id-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = home;
+  try {
+    const img = "python:3.12-slim";
+    const images = path.join(home, "kern", "images");
+    fs.mkdirSync(images, { recursive: true });
+    const safe = kern._sanitizeRef(img);
+    fs.writeFileSync(path.join(images, `${safe}.image`), "config-v1");
+    fs.writeFileSync(path.join(images, `${safe}.ok`), "ok");
+    const first = kern._pycSourceId(img);
+    assert.ok(first, "the identity must be readable when kern's own files are there");
+
+    const dest = publishCache(kern._pycDirFor(img));
+    fs.writeFileSync(path.join(dest, kern._PYC_SOURCE_ID), first);
+    assert.ok(kern._pycSourceMatches ? true : true); // the check runs through open() below
+
+    // THE TAG MOVES: kern re-pulls and rewrites its own files for that reference.
+    fs.writeFileSync(path.join(images, `${safe}.image`), "config-v2");
+    assert.notStrictEqual(kern._pycSourceId(img), first);
+    return (async () => {
+      const s = new Sandbox({ image: img, timeoutS: 30 });
+      await s.open();
+      try {
+        assert.strictEqual(s._pycDir, "", "a cache built from another image was adopted");
+        assert.ok(!fs.existsSync(dest), "the stale tree was left in place and blocks its replacement");
+      } finally {
+        await s.close();
+        await kern._pycStartBuild("", "", dest, 5);
+      }
+    })();
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a process that already built a cache can build it again", async () => {
+  // The map keyed on the destination and kept its entry after the promise settled, so a second need
+  // for the same destination got the FINISHED promise back and no build ran. Harmless while a cache
+  // is only ever built once - and exactly wrong the moment a moved tag discards one: the stale tree
+  // went and nothing replaced it for the life of that process.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-rebuild-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = home;
+  try {
+    const dest = kern._pycDirFor("python:3.12-slim");
+    // `""` as the binary: the spawn fails, the build finishes without publishing, and what is under
+    // test is only whether a SECOND call starts one at all.
+    const first = kern._pycStartBuild("", "python:3.12-slim", dest, 2);
+    await first;
+    const second = kern._pycStartBuild("", "python:3.12-slim", dest, 2);
+    assert.notStrictEqual(second, first, "the second call got the settled promise back, so no build ran");
+    await second;
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -69,7 +69,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.37"
+__version__ = "0.2.38"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -184,8 +184,13 @@ def _pyc_root() -> str:
     `$XDG_CACHE_HOME` when set, else `~/.cache`, which is where a cache belongs on a Linux host: it is
     reproducible from the image, so a user clearing it loses time and nothing else.
     """
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(base, "kern-sandbox", "pyc")
+    return os.path.join(_cache_home(), "kern-sandbox", "pyc")
+
+
+def _cache_home() -> str:
+    """`$XDG_CACHE_HOME`, or the default. ONE spelling, because two things read it now: this package's
+    bytecode cache and kern's own image cache, which the identity check below compares against."""
+    return os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
 
 
 # kern's own defaults, from `kern-oci/src/pull.rs`. Copied rather than derived because they cross a
@@ -253,6 +258,91 @@ def _oci_canonical_ref(image: str) -> str:
     return f"{registry}/{repo}:{reference}"
 
 
+#: The file, inside a published cache, naming the image kern had when the cache was built.
+_PYC_SOURCE_ID = ".kern-source-id"
+
+
+def _pyc_source_id(image: str) -> str:
+    """What kern's own image cache holds for `image`, as a short string, or "" if it cannot be read.
+
+    WHY A CACHE NEEDS ONE. The cache is keyed on the CANONICAL REFERENCE, which is a NAME, and a tag
+    is mutable: `python:3.12-slim` can point at a new manifest tomorrow. `CHECKED_HASH` means the old
+    bytecode is never EXECUTED - CPython rejects it and compiles from source - so this is not a
+    correctness hole. It is a cache that stops helping and never says so: it keeps one of the eight
+    slots, every box pays the compile again, and nothing rebuilds it because a cache "exists".
+
+    WHAT IDENTITY IS CHEAP ENOUGH. Adoption happens on every `__enter__` and must not start a box, so
+    asking the IMAGE is out. kern writes a config sidecar and a completion sentinel per image in its
+    own cache, and re-pulling a moved tag rewrites them: their bytes are a local read of a few hundred
+    bytes, and they change exactly when the image does.
+
+    "" MEANS "CANNOT TELL", AND THAT IS TREATED AS "UNCHANGED". A caller with a moved `$XDG_CACHE_HOME`,
+    a pruned image or a kern that names its files differently must not have the cache rebuilt on every
+    session; an identity that cannot be computed leaves behaviour exactly as it was before this check.
+    """
+    try:
+        # THE SAME RESOLUTION `_pyc_root` USES, through the same function, so a caller who moves
+        # `$XDG_CACHE_HOME` moves both the bytecode cache and the identity it is checked against.
+        root = os.path.join(_cache_home(), "kern", "images")
+        safe = _sanitize_ref(image)
+        h = hashlib.sha256()
+        for suffix in (".image", ".ok"):
+            with open(os.path.join(root, safe + suffix), "rb") as fh:
+                h.update(fh.read(4096))
+            h.update(b"\0")
+        return h.hexdigest()[:32]
+    except OSError:
+        return ""
+
+
+#: Vectors DUMPED from `sanitize_ref` in kern-cli, not derived from reading it, and asserted in the
+#: tests: this function names files kern wrote, so the two must agree about the name or the identity
+#: check below silently finds nothing and never invalidates anything.
+_SANITIZE_VECTORS = (
+    ("python:3.12-slim", "python_3_12-slim-7d2794a436662d45"),
+    ("python", "python_latest-9e0094521a5d04a4"),
+    ("alpine:3.19", "alpine_3_19-441817d3f5f11093"),
+    ("docker.io/library/python:3.12-slim", "docker_io_library_python_3_12-slim-75b604835a32490a"),
+    ("index.docker.io/python:3.12-slim", "index_docker_io_python_3_12-slim-7eaa793ab37b8560"),
+    ("ghcr.io/owner/img:v1", "ghcr_io_owner_img_v1-774c4c7639e8355e"),
+    ("localhost:5000/x:1", "localhost_5000_x_1-03406c180a22063b"),
+    ("python@sha256:abcdef0123456789", "python_sha256_abcdef0123456789-f77941d5fa12216c"),
+    ("a.b/c_d-e:f.g", "a_b_c_d-e_f_g-479120b609c12cc0"),
+    ("UPPER/Case:Tag", "UPPER_Case_Tag-543eaf57172e6242"),
+    ("x:latest", "x_latest-e9f897124d940074"),
+    ("registry-1.docker.io/library/alpine:3.19", "registry-1_docker_io_library_alpine_3_19-49727cc13d78066f"),
+    ("my_img", "my_img_latest-68dbbb774ad018b0"),
+    ("a/b/c:d", "a_b_c_d-dcc54f31688d5fa5"),
+    ("1.2.3.4:5000/p/q:r", "1_2_3_4_5000_p_q_r-f872df9eeecd4beb"),
+)
+
+
+def _fnv1a(s: str) -> int:
+    """FNV-1a 64-bit, kern's own, used ONLY to make a cache key collision-free."""
+    h = 0xCBF29CE484222325
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def _sanitize_ref(image: str) -> str:
+    """The directory name kern gives an image in its own cache. A PORT, verified against the original.
+
+    kern normalises the reference (so `alpine` and `alpine:latest` are one key), maps everything
+    outside `[A-Za-z0-9_-]` to `_`, and appends a short hash of the FULL reference so two references
+    that differ only in a mapped character cannot collide.
+
+    This is not used to build a path kern will read: it is used to FIND the files kern wrote, so the
+    cache can notice that a mutable tag now points somewhere else.
+    """
+    # The implied tag, the way kern's `normalize_ref` adds it: `alpine` and `alpine:latest` are ONE
+    # key. A digest reference already pins harder than a tag and is left alone, which is what
+    # `_oci_split_tag` reports by splitting at the digest's own colon.
+    ref = image if _oci_split_tag(image) else f"{image}:latest"
+    out = "".join(c if (c.isascii() and (c.isalnum() or c in "_-")) else "_" for c in ref)
+    return f"{out}-{_fnv1a(ref):016x}"
+
+
 def _pyc_dir_for(image: str) -> str:
     """Where this image's cache lives. Keyed on the image REFERENCE, hashed for a filesystem-safe name.
 
@@ -269,6 +359,35 @@ def _pyc_dir_for(image: str) -> str:
         _oci_canonical_ref(image).encode("utf-8", "surrogateescape")
     ).hexdigest()
     return os.path.join(_pyc_root(), key)
+
+
+def _pyc_source_matches(dest: str, image: str) -> bool:
+    """Is this cache still the one this image would produce? If not, DISCARD it so a build can replace it.
+
+    A tag is mutable, so a cache keyed on the name can outlive the image it was built from. Nothing
+    wrong is ever executed (`CHECKED_HASH` makes CPython reject the stale bytecode and compile from
+    source), but the cache stops helping and nothing rebuilds it, because a cache "exists": it holds
+    one of the eight slots and every box pays the compile again, for good.
+
+    DISCARDED AND NOT JUST REFUSED, because `os.rename` onto a NON-EMPTY directory is `ENOTEMPTY`: a
+    stale tree left in place would block its own replacement forever. Discarding renames it out of the
+    way first, which is the same atomic move the sweep uses, so no session ever mounts a half-deleted
+    tree.
+
+    UNKNOWN COUNTS AS UNCHANGED. A cache written before this check existed has no identity file, and a
+    host whose image kern has pruned cannot produce one: both answer "" and both keep the cache. The
+    check can only ever fire on two identities that are both known and different.
+    """
+    try:
+        with open(os.path.join(dest, _PYC_SOURCE_ID), encoding="utf-8") as fh:
+            stored = fh.read(128).strip()
+    except OSError:
+        return True  # built before this check, or unreadable: leave it exactly as it was
+    current = _pyc_source_id(image)
+    if not stored or not current or stored == current:
+        return True
+    _pyc_discard(dest)
+    return False
 
 
 def _pyc_has_content(dest: str) -> bool:
@@ -611,6 +730,14 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
         if r.returncode != 0:
             _pyc_report_failure(image, r.returncode, r.stderr)
         if r.returncode == 0 and any(os.scandir(tmp)) and _pyc_tree_is_publishable(tmp):
+            # WRITTEN BEFORE THE PUBLISH, so a tree that becomes visible always carries the identity
+            # of the image it was built from. Best effort: a cache without one is treated as "cannot
+            # tell", which is exactly how every cache built before this existed behaves.
+            try:
+                with open(os.path.join(tmp, _PYC_SOURCE_ID), "w", encoding="utf-8") as fh:
+                    fh.write(_pyc_source_id(image))
+            except OSError:
+                pass
             os.rename(tmp, dest)
             return
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -660,7 +787,11 @@ def _pyc_start_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> 
     """
     with _PYC_LOCK:
         running = _PYC_BUILDS.get(dest)
-        if running is not None:
+        # ALIVE, not merely present. The entry outlives the thread, so a process that had already
+        # built this destination could never build it AGAIN - which is exactly what has to happen
+        # after a moved tag invalidates the cache: the stale tree was discarded and nothing replaced
+        # it, for the life of that process. Measured.
+        if running is not None and running.is_alive():
             return running
         th = threading.Thread(
             target=_pyc_build, args=(kern_bin, image, dest, timeout_s), daemon=True,
@@ -2695,7 +2826,7 @@ class Sandbox:
             # `_pyc_has_content`, not `isdir`: an empty directory here is a cache that was swept
             # out from under a mount and recreated by kern, and adopting it silences the feature
             # for good. Refusing it sends this session down the `elif` and rebuilds the tree.
-            if dest and _pyc_has_content(dest):
+            if dest and _pyc_has_content(dest) and _pyc_source_matches(dest, self.image):
                 self._pyc_dir = dest
                 # Records the ADOPTION for the sweep's least-recently-used order. Best effort: a cache
                 # on a read-only filesystem is still perfectly usable, it just cannot be aged.

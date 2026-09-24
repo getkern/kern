@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.37";
+const VERSION = "0.2.38";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -160,8 +160,13 @@ let PYC_SWEPT = false;
 
 /** The host directory holding one bytecode cache per image: $XDG_CACHE_HOME, else ~/.cache. */
 function pycRoot() {
-  const base = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
-  return path.join(base, "kern-sandbox", "pyc");
+  return path.join(cacheHome(), "kern-sandbox", "pyc");
+}
+
+/** `$XDG_CACHE_HOME`, or the default. ONE spelling, because two things read it now: this package's
+ *  bytecode cache and kern's own image cache, which the identity check compares against. */
+function cacheHome() {
+  return process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
 }
 
 /** kern's own defaults, from `kern-oci/src/pull.rs`. Copied because they cross a process boundary. */
@@ -226,6 +231,87 @@ function ociCanonicalRef(image) {
  * cheaply. A moved tag therefore yields bytecode that no longer validates, which CPython handles by
  * recompiling: the cost of the imperfect key is a slow call, never a wrong one. Mirrors `_pyc_dir_for`.
  */
+/** Vectors DUMPED from `sanitize_ref` in kern-cli, not derived from reading it, and asserted in the
+ *  tests: this names files kern WROTE, so the two must agree or the identity check finds nothing. */
+const SANITIZE_VECTORS = [
+  ["python:3.12-slim", "python_3_12-slim-7d2794a436662d45"],
+  ["python", "python_latest-9e0094521a5d04a4"],
+  ["alpine:3.19", "alpine_3_19-441817d3f5f11093"],
+  ["docker.io/library/python:3.12-slim", "docker_io_library_python_3_12-slim-75b604835a32490a"],
+  ["index.docker.io/python:3.12-slim", "index_docker_io_python_3_12-slim-7eaa793ab37b8560"],
+  ["ghcr.io/owner/img:v1", "ghcr_io_owner_img_v1-774c4c7639e8355e"],
+  ["localhost:5000/x:1", "localhost_5000_x_1-03406c180a22063b"],
+  ["python@sha256:abcdef0123456789", "python_sha256_abcdef0123456789-f77941d5fa12216c"],
+  ["a.b/c_d-e:f.g", "a_b_c_d-e_f_g-479120b609c12cc0"],
+  ["UPPER/Case:Tag", "UPPER_Case_Tag-543eaf57172e6242"],
+  ["x:latest", "x_latest-e9f897124d940074"],
+  ["registry-1.docker.io/library/alpine:3.19", "registry-1_docker_io_library_alpine_3_19-49727cc13d78066f"],
+  ["my_img", "my_img_latest-68dbbb774ad018b0"],
+  ["a/b/c:d", "a_b_c_d-dcc54f31688d5fa5"],
+  ["1.2.3.4:5000/p/q:r", "1_2_3_4_5000_p_q_r-f872df9eeecd4beb"],
+];
+
+/** FNV-1a 64-bit, kern's own, used ONLY to keep a cache key collision-free. */
+function fnv1a(s) {
+  let h = 0xcbf29ce484222325n;
+  for (const b of Buffer.from(s, "utf8")) {
+    h = BigInt.asUintN(64, (h ^ BigInt(b)) * 0x100000001b3n);
+  }
+  return h.toString(16).padStart(16, "0");
+}
+
+/** The directory name kern gives an image in its own cache. A PORT, verified against the original. */
+function sanitizeRef(image) {
+  const ref = ociSplitTag(image) ? image : `${image}:latest`;
+  const out = [...ref].map((c) => (/[A-Za-z0-9_-]/.test(c) ? c : "_")).join("");
+  return `${out}-${fnv1a(ref)}`;
+}
+
+/** The file, inside a published cache, naming the image kern had when the cache was built. */
+const PYC_SOURCE_ID = ".kern-source-id";
+
+/** What kern's own image cache holds for `image`, or "" if it cannot be read.
+ *
+ * A tag is MUTABLE, so a cache keyed on its name can outlive the image it was built from. Nothing
+ * wrong is executed (CHECKED_HASH makes CPython reject the stale bytecode) but the cache stops
+ * helping and nothing rebuilds it, because a cache "exists". kern rewrites its own config sidecar and
+ * completion sentinel when it re-pulls a moved tag, so their bytes are an identity that costs a local
+ * read of a few hundred bytes - cheap enough for a check on every open().
+ *
+ * "" MEANS "CANNOT TELL" and is treated as unchanged, so a cache from before this check, or a host
+ * whose image kern has pruned, is never rebuilt in a loop. */
+function pycSourceId(image) {
+  try {
+    const root = path.join(cacheHome(), "kern", "images");
+    const safe = sanitizeRef(image);
+    const h = crypto.createHash("sha256");
+    for (const suffix of [".image", ".ok"]) {
+      h.update(fs.readFileSync(path.join(root, safe + suffix)).subarray(0, 4096));
+      h.update(Buffer.from([0]));
+    }
+    return h.digest("hex").slice(0, 32);
+  } catch {
+    return "";
+  }
+}
+
+/** Is this cache still the one this image would produce? If not, DISCARD it so a build can replace it.
+ *
+ * Discarded and not merely refused, because a rename onto a NON-EMPTY directory is ENOTEMPTY: a stale
+ * tree left in place would block its own replacement forever. */
+function pycSourceMatches(dest, image) {
+  let stored;
+  try {
+    stored = fs.readFileSync(path.join(dest, PYC_SOURCE_ID), "utf8").trim();
+  } catch {
+    return true; // built before this check, or unreadable: leave it exactly as it was
+  }
+  const current = pycSourceId(image);
+  if (!stored || !current || stored === current) return true;
+  pycDiscard(dest);
+  return false;
+}
+
 function pycDirFor(image) {
   // The full digest: the key is no longer load-bearing for correctness, and a truncation saved 48
   // characters of path against two images sharing a cache directory.
@@ -500,6 +586,14 @@ function pycBuild(kernBin, image, dest, timeoutS) {
         try {
           // An image without python3 leaves no cache and no trace: the next session runs as before.
           if (code === 0 && fs.readdirSync(tmp).length > 0 && pycTreeIsPublishable(tmp)) {
+            // WRITTEN BEFORE THE PUBLISH, so a tree that becomes visible always carries the identity
+            // of the image it was built from. Best effort: a cache without one reads as "cannot
+            // tell", exactly how every cache built before this existed behaves.
+            try {
+              fs.writeFileSync(path.join(tmp, PYC_SOURCE_ID), pycSourceId(image));
+            } catch {
+              /* a cache with no identity is simply never invalidated by it */
+            }
             fs.renameSync(tmp, dest);
             unlock();
             done();
@@ -541,13 +635,20 @@ function pycStartSweep(root) {
 }
 
 function pycStartBuild(kernBin, image, dest, timeoutS) {
+  // STILL IN FLIGHT, not merely once started. The entry outlives the promise, so a process that had
+  // already built this destination could never build it AGAIN - which is exactly what has to happen
+  // after a moved tag invalidates the cache: the stale tree is discarded and nothing replaces it for
+  // the life of that process. Measured on the Python side, where the map has the same shape.
   const inFlight = PYC_BUILDS.get(dest);
   if (inFlight) return inFlight;
   // `pycBuild` is already asynchronous (it spawns and returns), so there is nothing to defer. The
   // promise is returned for the tests and dropped by `open()`: a caller's first call must not wait on
   // a cache fill. A test that polled for the directory instead would be a timing race pretending to be
   // an assertion, and it would also race the test's own teardown - which is how this was found.
-  const started = pycBuild(kernBin, image, dest, timeoutS);
+  const started = pycBuild(kernBin, image, dest, timeoutS).finally(() => {
+    // Cleared when it settles, so the NEXT need for this destination starts a real build.
+    if (PYC_BUILDS.get(dest) === started) PYC_BUILDS.delete(dest);
+  });
   PYC_BUILDS.set(dest, started);
   return started;
 }
@@ -2121,7 +2222,7 @@ class Sandbox {
       if (pycMountAllowed(dest) && pycPathHasNoSymlink(dest)) {
         // pycHasContent, not existsSync: an empty directory here is a cache that was swept out
         // from under a mount and recreated by kern, and adopting it silences the feature for good.
-        if (pycHasContent(dest)) {
+        if (pycHasContent(dest) && pycSourceMatches(dest, this.image)) {
           this._pycDir = dest;
           // Records the ADOPTION for the sweep's least-recently-used order. Best effort: a cache on a
           // read-only filesystem is still usable, it just cannot be aged.
@@ -4289,6 +4390,10 @@ module.exports = {
   // The bytecode cache's internals, exported for its tests only: the mount flag and the atomic
   // publish are security properties, and a test that cannot reach them cannot assert them.
   _PYC_MOUNT: PYC_MOUNT,
+  _PYC_SOURCE_ID: PYC_SOURCE_ID,
+  _sanitizeRef: sanitizeRef,
+  _SANITIZE_VECTORS: SANITIZE_VECTORS,
+  _pycSourceId: pycSourceId,
   // Exported for the test that proves a stale lock is swept: the marks decide what the sweep
   // collects, and a lock left out of them disables an image's cache forever.
   _PYC_DEBRIS_MARKS: PYC_DEBRIS_MARKS,
