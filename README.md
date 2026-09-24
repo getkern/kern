@@ -242,26 +242,25 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 ## Status
 
 **The core is done and the CLI is frozen.** Tested on every push, clippy-clean and
-`cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q.
-
-A script written against the CLI keeps working: no verb, flag or `--json` field changes meaning
-inside a patch release. What changed in each one is in the [changelog](CHANGELOG.md).
+`cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q. No verb, flag
+or `--json` field changes meaning inside a patch release; what changed is in the
+[changelog](CHANGELOG.md).
 
 ## What kern is not
 
 - **Not a hypervisor.** The boundary is the Linux kernel, so a kernel privilege-escalation bug is an
-  escape. kern is for code you chose to run and whose blast radius you own, not for hostile code from
-  strangers on a kernel you serve other tenants from.
-- **Not free of the userns trade.** Its isolation is built on an unprivileged user namespace, a
+  escape. For code you chose to run and whose blast radius you own, not for hostile code from
+  strangers on a kernel you share.
+- **Not free of the userns trade.** The isolation is built on an unprivileged user namespace, a
   fertile source of kernel LPE bugs. [SECURITY.md](SECURITY.md) says so before any claim.
-- **Not a wall around what you mount in.** `-v $HOME:/host` gives the box your home directory.
+- **Not a wall around what you mount in.** `-v $HOME:/host` gives the box your home directory;
   `--net host` and `--privileged` are opt-outs by name.
 - **Not a Docker Engine reimplementation.** The *formats*, not the API: no overlay networks, no
   plugins, no Swarm. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 - **Not a Kubernetes runtime.** No CRI. Use containerd or CRI-O.
-- **Not shipping GPU slices.** On the [roadmap](ROADMAP.md). `kern doctor` reports what a VRAM cap
-  would be worth per GPU; on consumer hardware that is a cooperative quota,
-  NOT a boundary against malicious code. Nothing intercepts a driver call and nothing caps a GPU.
+- **Not shipping GPU slices.** On the [roadmap](ROADMAP.md). Nothing intercepts a driver call and
+  nothing caps a GPU; on consumer hardware a VRAM cap would be a cooperative quota,
+  NOT a boundary against malicious code.
 
 Known gaps: [ROADMAP.md](ROADMAP.md#known-gaps-and-what-would-settle-them).
 
