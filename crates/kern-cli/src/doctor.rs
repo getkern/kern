@@ -825,7 +825,7 @@ pub fn print_apparmor_profile() -> Result<(), Error> {
 /// MEASURED on Ubuntu 24.04: with the profile loaded, a fresh `kern doctor` reports the namespaces
 /// enabled while one started beforehand still reports the blocker. A self-check inside this run
 /// would therefore report a stale answer, which is why there is not one.
-fn no_map_hint() -> String {
+pub(crate) fn no_map_hint() -> String {
     let me = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "kern".into());

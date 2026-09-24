@@ -1151,14 +1151,15 @@ fn child_setup_and_exec(
         if std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
             .is_ok_and(|v| v.trim() == "1")
         {
-            return Err(Error::Unsupported(
-                "unprivileged user namespaces are restricted here - this host allows the namespace \
+            return Err(Error::Unsupported(concat!(
+                userns_restricted!(),
+                " - this host allows the namespace \
                  and refuses its rootless uid map (Ubuntu 23.10+ ships \
                  kernel.apparmor_restrict_unprivileged_userns=1), so no box can start. \
                  `kern doctor` prints the AppArmor profile to install; \
                  `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts it for the \
                  whole machine until reboot",
-            ));
+            )));
         }
         return Err(Error::last("unshare(CLONE_NEWNS)"));
     }
@@ -4348,11 +4349,11 @@ fn write_single_uid_map(euid: u32, egid: u32) -> Result<(), Error> {
         // and detached fail identically and the skip-graceful tests skip either way, rather than
         // leaking a bare "setgroups: Permission denied".
         if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
-            return Err(Error::Unsupported(
-                "unprivileged user namespaces are restricted here - an AppArmor \
-                 apparmor_restrict_unprivileged_userns policy allows the namespace but blocks \
-                 denying setgroups for the rootless uid map",
-            ));
+            return Err(Error::Unsupported(concat!(
+                userns_restricted!(),
+                " - an AppArmor apparmor_restrict_unprivileged_userns policy allows the namespace \
+                 but blocks denying setgroups for the rootless uid map",
+            )));
         }
         return Err(Error::Syscall("setgroups", e));
     }

@@ -174,6 +174,16 @@ impl Error {
             // THE SAME STRING THE ISOLATION CRATE PRINTS from inside the forked child, which cannot
             // reach this function. Two wordings for one condition drift, and the older one here named
             // two of the four things a setup failure is.
+            // THE REMEDY WHERE THE READER IS STANDING. On a stock Ubuntu 23.10+ as an ordinary user,
+            // the first command in the README fails here, and the message already names the cause
+            // exactly. The general hint under it then sent the reader to `kern doctor` for the fix,
+            // one more command on the distribution most readers run, while the doctor's own remedy
+            // was a paste-ready line all along. MEASURED 2026-09-24 as `nobody` on the Ubuntu 24.04
+            // VPS: the error was precise and the hint generic. This is the doctor's text, not a copy,
+            // so the two cannot come to disagree about what to run.
+            Error::Setup(msg) if msg.contains(kern_isolation::USERNS_RESTRICTED) => {
+                Some(crate::doctor::no_map_hint())
+            }
             Error::Setup(_) => Some(kern_isolation::SETUP_FAILURE_HINT.into()),
             // SUPPRESSED WHEN THE MESSAGE ALREADY CARRIES ITS REPAIR, the rule `Volume` and `Compose`
             // above follow: `inspect` now answers for an image too, and its refusal names `kern ps`,
@@ -528,6 +538,23 @@ mod tests {
             .hint()
             .expect("a non-fork setup error must still carry the general hint");
         assert_eq!(general, kern_isolation::SETUP_FAILURE_HINT);
+    }
+
+    /// A box refused by Ubuntu's AppArmor userns restriction gets the doctor's remedy, not the general
+    /// hint that sends the reader to the doctor to find it. Both error sites are covered, built from
+    /// the constant they are made of, so rewording one cannot silently drop its remedy.
+    #[test]
+    fn a_restricted_user_namespace_gets_the_apparmor_remedy_under_it() {
+        for tail in [
+            " - an AppArmor apparmor_restrict_unprivileged_userns policy allows the namespace but blocks denying setgroups for the rootless uid map",
+            " - this host allows the namespace and refuses its rootless uid map",
+        ] {
+            let msg = format!("sandbox: {}{tail}", kern_isolation::USERNS_RESTRICTED);
+            let hint = Error::Setup(msg.clone()).hint().expect("a hint");
+            assert_ne!(hint, kern_isolation::SETUP_FAILURE_HINT, "{msg}");
+            assert!(hint.contains("doctor --apparmor-profile"), "no command to paste: {hint}");
+            assert!(hint.contains("apparmor_parser -r /etc/apparmor.d/kern"), "{hint}");
+        }
     }
 
     /// A setup failure caused by EAGAIN on a fork is a process-limit problem, and the userns/rootfs

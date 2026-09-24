@@ -41,6 +41,18 @@ macro_rules! progress {
     }};
 }
 
+/// The words both "user namespaces are restricted" errors begin with, spelled ONCE. The CLI keys its
+/// AppArmor remedy on them, because a setup error crosses the fork as a plain string and its variant is
+/// gone by then; typed separately at the two sites and in the CLI, a reworded message would silently
+/// lose its remedy. `concat!` needs a literal, hence a macro and not only the constant.
+macro_rules! userns_restricted {
+    () => {
+        "unprivileged user namespaces are restricted here"
+    };
+}
+/// See [`userns_restricted!`]: what `kern-cli` matches to print the AppArmor remedy under the error.
+pub const USERNS_RESTRICTED: &str = userns_restricted!();
+
 mod cgroup;
 mod landlock;
 /// RTNETLINK: the link operations that have no ioctl form (veth, bridge, master, netns move).
