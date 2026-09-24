@@ -331,6 +331,51 @@ function pycTreeIsPublishable(root) {
  * Built into a private sibling and renamed into place, so a box mounts a complete tree or none: a
  * partial stdlib would have a box importing a truncated module. Two processes racing both build and
  * the loser's tree is removed. Mirrors `_pyc_build`. */
+/** The argv that mounts `source` at `target`, in the form that can CARRY that source.
+ *
+ * `-v src:dst[:ro]` separates its fields with `:`, so a source path holding one cannot be written in
+ * it: kern splits `-v /tmp/a:b:/data` into three and reports the TARGET as an unknown mount option. A
+ * cache home such as `/tmp/colon:cache` is enough to hit it, and the mount that broke was this
+ * package's own bytecode cache - silently, because the failure landed in a background build whose
+ * output was discarded.
+ *
+ * `--mount type=bind,src=...,dst=...[,ro]` carries each field separately and takes a `:`; a field
+ * holding a `,` is quoted, doubling any `"` inside, which is the CSV grammar kern parses.
+ *
+ * WHY NOT `--mount` FOR EVERYTHING: the two differ in a rule this package relies on. `-v` CREATES a
+ * source that is not there and `--mount` refuses it, and the eviction sweep can discard a cache under
+ * a live session - `-v` turning that into an empty directory is what makes the box fall back to
+ * compiling from source instead of failing the caller's call. */
+function mountArgs(source, target, readOnly) {
+  const plain = (s) => !s.includes(":") && !s.includes(",");
+  if (plain(source) && plain(target)) {
+    return ["-v", readOnly ? `${source}:${target}:ro` : `${source}:${target}`];
+  }
+  const field = (text) =>
+    text.includes(",") || text.includes('"') ? `"${text.replace(/"/g, '""')}"` : text;
+  const spec = `type=bind,${field(`src=${source}`)},${field(`dst=${target}`)}`;
+  return ["--mount", readOnly ? `${spec},ro` : spec];
+}
+
+/** Say, once per image, that this image got no bytecode cache and why.
+ *
+ * NOT THROWN: a missing cache is slower, never wrong, and a caller who asked to run code must not
+ * have that call fail because an optimisation could not be built. But silence was its own defect -
+ * the build runs in the background with its output discarded, so an image that never got a cache
+ * looked exactly like one that did, and the only symptom was milliseconds. */
+const PYC_REPORTED = new Set();
+function pycReportFailure(image, code, stderr) {
+  if (PYC_REPORTED.has(image)) return;
+  PYC_REPORTED.add(image);
+  const lines = String(stderr || "").trim().split("\n").filter(Boolean);
+  const tail = lines.length ? lines[lines.length - 1] : `exit ${code}`;
+  process.stderr.write(
+    `kern-sandbox: no bytecode cache for ${JSON.stringify(image)} (${tail}). Calls still run and ` +
+      `are correct, just without precompiled imports. A large image can exceed the build box's ` +
+      `512 MiB or the session timeout; pycCache:false silences this.\n`,
+  );
+}
+
 function pycBuild(kernBin, image, dest, timeoutS) {
   const tmp = `${dest}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
   try {
@@ -359,7 +404,7 @@ function pycBuild(kernBin, image, dest, timeoutS) {
     const argv = [
       "box", `kern-pyc-${crypto.randomBytes(4).toString("hex")}`,
       "--image", image, "--ro",
-      "-v", `${tmp}:${PYC_MOUNT}`,
+      ...mountArgs(tmp, PYC_MOUNT, false),
       "--env", `PYTHONPYCACHEPREFIX=${PYC_MOUNT}`,
       "--cap-drop", "ALL",
       // CAPPED LIKE ANY OTHER BOX: the command is ours, the interpreter running it is the caller's
@@ -373,15 +418,30 @@ function pycBuild(kernBin, image, dest, timeoutS) {
     // build - 1.2 s on a desktop, 5 s on the VPS - which in a server process is not a stall but an
     // outage: every request in flight waits for a cache fill. Nothing waits for this result, so there
     // is no reason for it to hold the loop at all.
-      const child = spawn(kernBin, argv, { stdio: "ignore", detached: false });
+      // STDERR IS KEPT, NOT IGNORED. A build that fails leaves no cache and the session runs as it
+      // did before this feature existed, which is correct and was also SILENT: an image that never
+      // got a cache looked exactly like one that did. The likeliest cause is this box's own caps -
+      // `compileall` walks every import root, and an image with large packages can exceed 512 MiB
+      // where a slim one never comes close.
+      const child = spawn(kernBin, argv, { stdio: ["ignore", "ignore", "pipe"], detached: false });
+      let errText = "";
+      if (child.stderr) {
+        child.stderr.setEncoding("utf8");
+        // Bounded: this is a diagnostic, and a box that floods stderr must not grow the heap.
+        child.stderr.on("data", (c) => {
+          if (errText.length < 8192) errText += c;
+        });
+      }
       const killer = setTimeout(() => child.kill("SIGKILL"), (timeoutS + 10) * 1000);
       if (typeof killer.unref === "function") killer.unref();
-      child.on("error", () => {
+      child.on("error", (e) => {
         clearTimeout(killer);
+        pycReportFailure(image, -1, e && e.message);
         finish();
       });
       child.on("close", (code) => {
         clearTimeout(killer);
+        if (code !== 0) pycReportFailure(image, code, errText);
         try {
           // An image without python3 leaves no cache and no trace: the next session runs as before.
           if (code === 0 && fs.readdirSync(tmp).length > 0 && pycTreeIsPublishable(tmp)) {
@@ -1885,7 +1945,7 @@ class Sandbox {
           ro = false;
         }
         const [real, tgt] = validateMount(source, target);
-        this._mountArgs.push("-v", ro ? `${real}:${tgt}:ro` : `${real}:${tgt}`);
+        this._mountArgs.push(...mountArgs(real, tgt, ro));
         boundTargets.add("/" + tgt.split("/").filter((c) => c && c !== ".").join("/"));
       }
     }
@@ -2126,15 +2186,21 @@ class Sandbox {
     if (!dry) verifyIsKern(this._kern);
     const argv = [
       this._kern, "box", name, "--image", this.image, "--ro",
-      "-v", `${this._ws}:${WORKSPACE}`, "--workdir", WORKSPACE,
+      ...mountArgs(this._ws, WORKSPACE, false), "--workdir", WORKSPACE,
     ];
     // The image's precompiled stdlib, read-only. Never on the setup box: that one compiles `.deps`
     // into `__pycache__`, which the prefix would redirect into a mount it cannot write.
-    if (this._pycDir && !isSetup) argv.push("-v", `${this._pycDir}:${PYC_MOUNT}:ro`);
+    // CHECKED AGAIN HERE, not only at adoption: the sweep in another process can discard this
+    // tree in between, and `--mount` refuses a source that is not there. Dropping the mount for this
+    // one call degrades to compiling from source, which is what the missing directory produced
+    // before, instead of failing the caller.
+    if (this._pycDir && !isSetup && pycHasContent(this._pycDir))
+      argv.push(...mountArgs(this._pycDir, PYC_MOUNT, true));
     if (this.depsReadonly && !isSetup) {
       const deps = path.join(this._ws, DEPS_DIR);
       try {
-        if (fs.statSync(deps).isDirectory()) argv.push("-v", `${deps}:${WORKSPACE}/${DEPS_DIR}:ro`);
+        if (fs.statSync(deps).isDirectory())
+          argv.push(...mountArgs(deps, `${WORKSPACE}/${DEPS_DIR}`, true));
       } catch {
         /* no deps yet */
       }

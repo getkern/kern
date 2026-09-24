@@ -67,6 +67,11 @@ pub enum Command {
         read_only: bool,
         /// `-v src:dst[:ro]` (repeatable): host paths bind-mounted in.
         volumes: Vec<String>,
+        /// `--mount type=…,src=…,dst=…[,ro]` (repeatable), ALREADY split into (source, target, ro).
+        ///
+        /// Apart from `volumes` because that one holds `-v` strings: turning these back into one is
+        /// what destroyed a source containing a `:`, which is the case `--mount` exists to carry.
+        mounts: Vec<(String, String, bool)>,
         /// `--env K=V` / `-e K=V` (repeatable): extra environment for the workload.
         env: Vec<String>,
         /// `--egress-allow d1,d2` (repeatable / comma-separated): outbound restricted to these domains.
@@ -2566,16 +2571,30 @@ fn valid_apparmor_name(s: &str) -> bool {
 /// empty source as a named volume and create a directory on disk for it.
 #[derive(Debug, PartialEq, Eq)]
 enum MountSpec {
-    /// A `-v` spec: `src:dst` or `src:dst:ro`.
-    Volume(String),
-    /// A `type=bind` spec, carrying its SOURCE separately so the caller can require it to exist.
+    /// A mount by FIELDS: source, target, read-only.
+    ///
+    /// It used to be a `src:dst[:ro]` STRING, re-split by the `-v` parser further down. So a source
+    /// containing a `:` - the one thing `--mount` exists to be able to carry - was destroyed by the
+    /// form meant to carry it: `--mount type=bind,src=/tmp/a:b,dst=/data` came back as
+    /// `bad -v '/tmp/a:b:/data'`. Same lesson as the overlay layer chain: a list of fields does not
+    /// become one string until something needs one string, and nothing here does.
+    Volume {
+        source: String,
+        target: String,
+        read_only: bool,
+    },
+    /// A `type=bind` mount, whose SOURCE the caller requires to exist.
     ///
     /// THE DISTINCTION IS THE WHOLE REASON `--mount` EXISTS. `-v` creates a missing bind source;
     /// `--mount` refuses it. MEASURED on Docker 29.1.3: `-v /tmp/typo:/m` creates `/tmp/typo` and
     /// runs, while `--mount type=bind,src=/tmp/typo,dst=/m` fails with `bind source path does not
     /// exist`. Collapsing both onto the `-v` path made kern create the directory and start a box
     /// whose mount was empty, which is exactly the typo `--mount` is reached for to catch.
-    Bind { spec: String, src: String },
+    Bind {
+        source: String,
+        target: String,
+        read_only: bool,
+    },
     /// A `--tmpfs` spec: `dst` or `dst:size`.
     Tmpfs(String),
 }
@@ -2865,15 +2884,19 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
                     "--mount type=volume needs a volume NAME as src, not a path (use type=bind)",
                 ));
             }
-            let spec = if ro {
-                format!("{src}:{dst}:ro")
-            } else {
-                format!("{src}:{dst}")
-            };
+
             if kind == "bind" {
-                Ok(MountSpec::Bind { spec, src })
+                Ok(MountSpec::Bind {
+                    source: src,
+                    target: dst,
+                    read_only: ro,
+                })
             } else {
-                Ok(MountSpec::Volume(spec))
+                Ok(MountSpec::Volume {
+                    source: src,
+                    target: dst,
+                    read_only: ro,
+                })
             }
         }
         _ => Err(USAGE),
@@ -2962,6 +2985,10 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut cpus: Option<f64> = None;
     let mut cpuset: Option<String> = None;
     let mut volumes: Vec<String> = Vec::new();
+    // `--mount`'s mounts, ALREADY SPLIT INTO FIELDS. Kept apart from `volumes` because that one holds
+    // `-v` STRINGS, and putting a `--mount` back into that form is exactly the defect being fixed: a
+    // source containing a `:` cannot survive the round trip.
+    let mut mounts: Vec<(String, String, bool)> = Vec::new();
     let mut env: Vec<String> = Vec::new();
     let mut egress_allow: Vec<String> = Vec::new();
     let mut landlock_rw: Vec<String> = Vec::new();
@@ -3493,22 +3520,30 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         return Err(Error::Usage("--mount type=…,src=…,dst=… (see --help)"));
                     };
                     match parse_mount_spec(v)? {
-                        MountSpec::Volume(s) => volumes.push(s),
+                        MountSpec::Volume {
+                            source,
+                            target,
+                            read_only,
+                        } => mounts.push((source, target, read_only)),
                         MountSpec::Tmpfs(s) => tmpfs.push(s),
                         // THE SOURCE MUST ALREADY BE THERE. Checked here rather than inside
                         // `parse_mount_spec`, which stays pure and therefore testable without a
                         // filesystem. The `-v` path is untouched: it still creates what it can,
                         // which is what `-v` means on every runtime.
-                        MountSpec::Bind { spec, src } => {
-                            if !std::path::Path::new(&src).exists() {
+                        MountSpec::Bind {
+                            source,
+                            target,
+                            read_only,
+                        } => {
+                            if !std::path::Path::new(&source).exists() {
                                 return Err(Error::Cli(format!(
-                                    "--mount type=bind,src={src}: the source does not exist. \
+                                    "--mount type=bind,src={source}: the source does not exist. \
                                      `--mount` refuses a missing bind source (that is what it is \
-                                     for: catching the typo); `-v {src}:...` creates it where it \
+                                     for: catching the typo); `-v {source}:...` creates it where it \
                                      can. Create the path, or use -v if you meant that"
                                 )));
                             }
-                            volumes.push(spec);
+                            mounts.push((source, target, read_only));
                         }
                     }
                 }
@@ -3969,6 +4004,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             detached,
             read_only,
             volumes,
+            mounts,
             env,
             egress_allow,
             landlock_rw,
@@ -4933,6 +4969,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             detached,
             read_only,
             volumes,
+            mounts,
             env,
             egress_allow,
             landlock_rw,
@@ -5016,6 +5053,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             detached,
             read_only,
             volumes: &volumes,
+            mounts: &mounts,
             env: &env,
             egress_allow: &egress_allow,
             landlock_rw: &landlock_rw,
@@ -7246,38 +7284,48 @@ mod tests {
     fn mount_spec_translates_to_the_volume_flag() {
         let v = |s: &str| parse_mount_spec(s).unwrap();
         // The two `-v` shapes, by both key spellings Docker accepts.
-        let bind = |spec: &str, src: &str| MountSpec::Bind {
-            spec: spec.into(),
-            src: src.into(),
+        // THE FIELDS, not a `src:dst` string: the string is what destroyed a source with a `:`.
+        let bind = |src: &str, dst: &str, ro: bool| MountSpec::Bind {
+            source: src.into(),
+            target: dst.into(),
+            read_only: ro,
         };
         assert_eq!(
             v("type=bind,src=/srv/app,dst=/app"),
-            bind("/srv/app:/app", "/srv/app")
+            bind("/srv/app", "/app", false)
         );
         assert_eq!(
             v("type=bind,source=/srv/app,target=/app"),
-            bind("/srv/app:/app", "/srv/app")
+            bind("/srv/app", "/app", false)
         );
         assert_eq!(
             v("type=volume,src=data,destination=/data"),
-            MountSpec::Volume("data:/data".into())
+            MountSpec::Volume {
+                source: "data".into(),
+                target: "/data".into(),
+                read_only: false,
+            }
         );
         // `type=` DEFAULTS to volume, as Docker's does.
         assert_eq!(
             v("src=data,dst=/data"),
-            MountSpec::Volume("data:/data".into())
+            MountSpec::Volume {
+                source: "data".into(),
+                target: "/data".into(),
+                read_only: false,
+            }
         );
         // Read-only, in all three spellings, and `readonly=false` is an explicit NO.
         for ro in ["ro", "readonly", "readonly=true", "read-only"] {
             assert_eq!(
                 v(&format!("type=bind,src=/a,dst=/b,{ro}")),
-                bind("/a:/b:ro", "/a"),
+                bind("/a", "/b", true),
                 "{ro} should be read-only"
             );
         }
         assert_eq!(
             v("type=bind,src=/a,dst=/b,readonly=false"),
-            bind("/a:/b", "/a"),
+            bind("/a", "/b", false),
             "readonly=false must NOT make the mount read-only"
         );
         // tmpfs is the other flag, and `--tmpfs`'s own `path[:size]` grammar.
@@ -7334,18 +7382,20 @@ mod tests {
     // as an unknown key.
     #[test]
     fn mount_keys_are_case_insensitive_but_paths_are_not() {
-        let bind = |spec: &str, src: &str| MountSpec::Bind {
-            spec: spec.into(),
-            src: src.into(),
+        // THE FIELDS, not a `src:dst` string: the string is what destroyed a source with a `:`.
+        let bind = |src: &str, dst: &str, ro: bool| MountSpec::Bind {
+            source: src.into(),
+            target: dst.into(),
+            read_only: ro,
         };
         assert_eq!(
             parse_mount_spec("TYPE=BIND,SRC=/A,DST=/b").unwrap(),
-            bind("/A:/b", "/A"),
+            bind("/A", "/b", false),
             "the key folds, the path does not"
         );
         assert_eq!(
             parse_mount_spec("Type=Bind,Source=/A,Target=/b,ReadOnly=TRUE").unwrap(),
-            bind("/A:/b:ro", "/A")
+            bind("/A", "/b", true)
         );
         // An empty field is a typo, in either position.
         assert!(parse_mount_spec("type=bind,,src=/a,dst=/b").is_err());
@@ -7359,23 +7409,25 @@ mod tests {
     // so a path with a comma could not be mounted through this flag at all.
     #[test]
     fn mount_spec_parses_quoted_fields() {
-        let bind = |spec: &str, src: &str| MountSpec::Bind {
-            spec: spec.into(),
-            src: src.into(),
+        // THE FIELDS, not a `src:dst` string: the string is what destroyed a source with a `:`.
+        let bind = |src: &str, dst: &str, ro: bool| MountSpec::Bind {
+            source: src.into(),
+            target: dst.into(),
+            read_only: ro,
         };
         assert_eq!(
             parse_mount_spec(r#"type=bind,"src=/tmp/a,b",dst=/x"#).unwrap(),
-            bind("/tmp/a,b:/x", "/tmp/a,b")
+            bind("/tmp/a,b", "/x", false)
         );
         // The quote wraps the whole `key=value`, so it is stripped before the `=` split.
         assert_eq!(
             parse_mount_spec(r#""type=bind","source=/a","target=/b""#).unwrap(),
-            bind("/a:/b", "/a")
+            bind("/a", "/b", false)
         );
         // An unquoted comma still separates: the quoting must not swallow ordinary specs.
         assert_eq!(
             parse_mount_spec("type=bind,src=/a,dst=/b,ro").unwrap(),
-            bind("/a:/b:ro", "/a")
+            bind("/a", "/b", true)
         );
         // And the NEGATIVE: a comma inside quotes is NOT a separator, so this is one field with a
         // bad key rather than two fields, and it is refused instead of half-parsed.
@@ -7390,8 +7442,9 @@ mod tests {
         let ro = |v: &str| {
             parse_mount_spec(&format!("type=bind,src=/a,dst=/b,{v}")).map(|m| {
                 m == MountSpec::Bind {
-                    spec: "/a:/b:ro".into(),
-                    src: "/a".into(),
+                    source: "/a".into(),
+                    target: "/b".into(),
+                    read_only: true,
                 }
             })
         };

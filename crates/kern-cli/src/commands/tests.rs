@@ -7090,3 +7090,58 @@ fn the_opaque_probe_refuses_to_fork_from_a_threaded_process() {
         "the probe forked from a threaded process, where its child's first allocation can deadlock"
     );
 }
+
+/// `--mount` carries a source path that `-v` cannot express, and says so when `-v` is asked to.
+///
+/// THE TWO FORMS ARE NOT INTERCHANGEABLE AND THE CODE PRETENDED THEY WERE. `parse_mount_spec` read
+/// `src=`, `dst=` and `ro` out of a `key=value` list and then built a `src:dst:ro` STRING for the
+/// `-v` parser to split again, so a source containing a `:` was destroyed by the very form that
+/// exists to carry it: `--mount type=bind,src=/tmp/a:b,dst=/data` came back as
+/// `bad -v '/tmp/a:b:/data'`. Same shape as the overlay layer chain - fields joined into one string
+/// and cut apart by the next reader.
+///
+/// The `-v` GRAMMAR IS UNCHANGED, because it is Docker's and a source with a `:` is inexpressible
+/// there on the reference too. What changed is the refusal: it named `/data`, the TARGET the caller
+/// had asked for, as an unknown mount option.
+#[test]
+fn a_mount_carries_a_source_a_dash_v_cannot_express_and_the_refusal_says_which() {
+    use crate::commands::split_volume_spec;
+
+    // `-v` still splits exactly as before for everything it can express.
+    assert_eq!(
+        split_volume_spec("/srv/app:/app").expect("two fields"),
+        ("/srv/app".to_string(), "/app".to_string(), false)
+    );
+    assert_eq!(
+        split_volume_spec("/srv/app:/app:ro").expect("three fields"),
+        ("/srv/app".to_string(), "/app".to_string(), true)
+    );
+    assert_eq!(
+        split_volume_spec("data:/data:rw,z").expect("an option LIST is one field"),
+        ("data".to_string(), "/data".to_string(), false)
+    );
+
+    // A `:` in the source: refused, and the message names the cause and the way out. The old text
+    // called the target an unknown option, which sent the reader to check their spelling of `ro`.
+    let said = match split_volume_spec("/tmp/a:b:/data") {
+        Err(e) => format!("{e}"),
+        Ok(v) => panic!("a source with a ':' must not parse as `-v`, got {v:?}"),
+    };
+    assert!(
+        said.contains("--mount") && said.contains("source"),
+        "the refusal must name the cause and the form that carries it: {said}"
+    );
+    assert!(
+        !said.contains("unknown mount option"),
+        "still blaming the target for being an option: {said}"
+    );
+    // A genuinely misspelled option is still reported as one.
+    let opt = match split_volume_spec("/tmp:/data:rn") {
+        Err(e) => format!("{e}"),
+        Ok(v) => panic!("an unknown option must not parse, got {v:?}"),
+    };
+    assert!(
+        opt.contains("unknown mount option"),
+        "a real typo must still read as a typo: {opt}"
+    );
+}

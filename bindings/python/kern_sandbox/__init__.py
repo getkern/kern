@@ -171,6 +171,10 @@ _PYC_BUILDS: "dict[str, threading.Thread]" = {}
 # True once this process has swept, so adopting a cache in a hundred sessions costs one scan. Under
 # `_PYC_LOCK`, because two sessions opened from two threads would otherwise both start one.
 _PYC_SWEPT = False
+#: Images already reported as having no cache, so the warning is printed once each.
+_PYC_REPORTED: "set[str]" = set()
+#: Named in the warning so the two limits a build can hit are both visible to the reader.
+_PYC_BUILD_TIMEOUT_HINT = "the session timeout"
 _PYC_LOCK = threading.Lock()
 
 
@@ -409,6 +413,61 @@ def _pyc_sweep(root: str, keep: int = _PYC_KEEP) -> None:
         _pyc_discard(path)
 
 
+def _pyc_report_failure(image: str, code: int, stderr: "bytes | None") -> None:
+    """Say, once per image, that this image got no bytecode cache and why.
+
+    NOT RAISED. A missing cache is slower, never wrong, and a caller who asked to run code must not
+    have their call fail because an optimisation could not be built. But silence was its own defect:
+    the build runs on a background thread with its output discarded, so an image that never got a
+    cache looked identical to one that did, and the only symptom was milliseconds.
+
+    ONCE PER IMAGE, because the build is started once per destination per process and a server that
+    opens many sessions would otherwise repeat one line forever.
+    """
+    with _PYC_LOCK:
+        if image in _PYC_REPORTED:
+            return
+        _PYC_REPORTED.add(image)
+    detail = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
+    tail = detail[-1] if detail else f"exit {code}"
+    print(
+        f"kern-sandbox: no bytecode cache for {image!r} ({tail}). Calls still run and are correct, "
+        f"just without precompiled imports. A large image can exceed the build box's 512 MiB or "
+        f"{_PYC_BUILD_TIMEOUT_HINT}; `pyc_cache=False` silences this.",
+        file=sys.stderr,
+    )
+
+
+def _mount_args(source: str, target: str, read_only: bool) -> "list[str]":
+    """The argv that mounts `source` at `target`, in the form that can CARRY that source.
+
+    `-v src:dst[:ro]` separates its fields with `:`, so a source path containing one cannot be
+    written in it at all: kern splits `-v /tmp/a:b:/data` into three and reports the TARGET as an
+    unknown mount option. A cache home such as `/tmp/colon:cache` is enough to hit it, and the mount
+    that broke was this package's own bytecode cache - silently, because the failure landed in a
+    background build whose output is discarded.
+
+    `--mount type=bind,src=…,dst=…[,ro]` carries each field separately and takes a `:`; a field
+    holding a `,` is quoted, doubling any `"` inside it, which is the CSV grammar kern parses.
+
+    WHY NOT `--mount` FOR EVERYTHING. The two forms differ in a rule this package relies on: `-v`
+    CREATES a source that is not there and `--mount` refuses it. The eviction sweep can discard a
+    cache under a live session, and `-v` turning that into an empty directory is what makes the box
+    fall back to compiling from source instead of failing the caller's call. So the form is chosen by
+    what the path needs, and the choice is never silent about which one it took.
+    """
+    if ":" not in source and "," not in source and ":" not in target and "," not in target:
+        return ["-v", f"{source}:{target}:ro" if read_only else f"{source}:{target}"]
+
+    def field(text: str) -> str:
+        if "," in text or '"' in text:
+            return '"' + text.replace('"', '""') + '"'
+        return text
+
+    spec = f"type=bind,{field(f'src={source}')},{field(f'dst={target}')}"
+    return ["--mount", spec + ",ro" if read_only else spec]
+
+
 def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
     """Compile `image`'s standard library into `dest`, atomically. Never raises: the caller is a thread.
 
@@ -430,7 +489,7 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
         argv = [
             kern_bin, "box", f"kern-pyc-{uuid.uuid4().hex[:8]}",
             "--image", image, "--ro",
-            "-v", f"{tmp}:{_PYC_MOUNT}",
+            *_mount_args(tmp, _PYC_MOUNT, False),
             "--env", f"PYTHONPYCACHEPREFIX={_PYC_MOUNT}",
             "--cap-drop", "ALL",
             # CAPPED LIKE ANY OTHER BOX, and not because compiling is dangerous: the command is ours,
@@ -443,10 +502,16 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
             "--timeout", str(int(timeout_s)),
             "--", "python3", "-c", _PYC_BUILD_CODE,
         ]
-        r = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        # STDERR IS KEPT, NOT DISCARDED. A build that fails leaves no cache, and the session runs
+        # exactly as it did before this feature existed - which is correct and was also SILENT, so a
+        # caller whose image never got a cache had nothing to look at. The likeliest cause is this
+        # box's own caps: `compileall` walks every import root, and an image with large packages
+        # (torch, pandas) can exceed 512 MiB where a slim one never comes close. The message says
+        # which image, what the box answered, and that the cap is the first thing to suspect.
+        r = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                            timeout=timeout_s + 10)
-        # An image without python3, or one whose stdlib will not compile, leaves no cache and no trace.
-        # The next session finds nothing and runs exactly as it did before this feature existed.
+        if r.returncode != 0:
+            _pyc_report_failure(image, r.returncode, r.stderr)
         if r.returncode == 0 and any(os.scandir(tmp)) and _pyc_tree_is_publishable(tmp):
             os.rename(tmp, dest)
             return
@@ -2345,7 +2410,7 @@ class Sandbox:
                 else:
                     target, ro = spec, False
                 real, tgt = _validate_mount(source, target)
-                self._mount_args += ["-v", f"{real}:{tgt}:ro" if ro else f"{real}:{tgt}"]
+                self._mount_args += _mount_args(real, tgt, ro)
                 bound_targets.add("/" + "/".join(c for c in tgt.split("/") if c and c != "."))
         # A caller who binds their own directory at /tmp gets it: the default tmpfs would be mounted
         # over their bind, so the files they passed would be invisible to the code they are running.
@@ -2597,7 +2662,8 @@ class Sandbox:
             # so 0.25%. A file that HAS changed pays one `--version` (0.44 ms) and is refused by name if
             # it is no longer kern.
             self._kern_version = _verify_is_kern(self._kern)
-        argv = [self._kern, "box", name, "--image", self.image, "--ro", "-v", f"{self._ws}:{_WORKSPACE}",
+        argv = [self._kern, "box", name, "--image", self.image, "--ro",
+                *_mount_args(self._ws, _WORKSPACE, False),
                 "--workdir", _WORKSPACE]
         # deps_readonly: mount <workspace>/.deps read-only OVER the writable workspace for run_code boxes
         # (not the setup box, which must populate it). Closes the cross-run dep-poisoning window within a
@@ -2605,12 +2671,17 @@ class Sandbox:
         if self.deps_readonly and not is_setup:
             deps = os.path.join(self._ws, _DEPS_DIR)
             if os.path.isdir(deps):
-                argv += ["-v", f"{deps}:{_WORKSPACE}/{_DEPS_DIR}:ro"]
+                argv += _mount_args(deps, f"{_WORKSPACE}/{_DEPS_DIR}", True)
         # The image's precompiled stdlib, read-only. Not on the setup box: that one installs deps and
         # then compiles them into `.deps/__pycache__`, which the prefix would redirect into a mount it
         # cannot write. `__enter__` already excluded a session that has deps at all.
         if self._pyc_dir and not is_setup:
-            argv += ["-v", f"{self._pyc_dir}:{_PYC_MOUNT}:ro"]
+            # CHECKED AGAIN HERE, not only at adoption: the sweep in another process can discard
+            # this tree between the two, and `--mount` refuses a source that is not there. Dropping
+            # the mount for this one call degrades to compiling from source, which is what the
+            # missing directory produced before, instead of failing the caller.
+            if _pyc_has_content(self._pyc_dir):
+                argv += _mount_args(self._pyc_dir, _PYC_MOUNT, True)
         # kern's own --timeout is a tight BACKSTOP just beyond our deadline: it is the RELIABLE killer of
         # the in-PID-namespace box (a CPU-bound box survives a SIGKILL of kern's parent process, but not
         # kern's own timeout teardown). OUR proc.wait deadline is the authority that LABELS a `timeout`

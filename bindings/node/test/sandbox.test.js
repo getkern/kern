@@ -2937,3 +2937,46 @@ test("the uid range is skipped exactly when capDrop ALL makes it useless", async
     else process.env.KERN_BIN = prev;
   }
 });
+
+test("the pyc cache survives a cache home the -v form cannot express", async () => {
+  // `-v src:dst[:ro]` separates its fields with `:`, so a cache directory holding one cannot be
+  // written in that form: kern split the spec into four and reported the TARGET as an unknown mount
+  // option. Both ends of that were invisible - the build's output was discarded and the mount is
+  // built for a box the caller never sees - so under a `colon:cache` home the feature was simply
+  // absent, at full price, with nothing to read. This asserts the ARGV, because the choice of form
+  // IS the fix: a test that only checked "it works here" would pass on a silent fall back to no
+  // cache at all.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-colon-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  try {
+    for (const [label, infix, quoted] of [["colon", "colon:cache", false], ["comma", "comma,cache", true]]) {
+      process.env.XDG_CACHE_HOME = path.join(home, infix);
+      const dir = publishCache(kern._pycDirFor("python:3.12-slim"));
+      const s = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+      await s.open();
+      try {
+        assert.strictEqual(s._pycDir, dir, `${label}: the cache was not adopted`);
+        const argv = s._baseArgv("b", { network: false, timeoutS: 30, dry: true });
+        const specs = argv.filter((a, i) => i > 0 && argv[i - 1] === "--mount");
+        assert.ok(
+          specs.some((m) => m.includes(`src=${dir}`) && m.includes(`dst=${kern._PYC_MOUNT}`) && m.endsWith(",ro")),
+          `${label}: no read-only --mount for the cache: ${JSON.stringify(specs)}`,
+        );
+        if (quoted) {
+          // `,` is what separates --mount's OWN fields, so an unquoted one splits the spec exactly
+          // as the `:` split the `-v`.
+          assert.ok(
+            specs.some((m) => m.includes(`"src=${dir}"`)),
+            `${label}: the comma was not quoted: ${JSON.stringify(specs)}`,
+          );
+        }
+      } finally {
+        await s.close();
+      }
+    }
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -226,6 +226,11 @@ pub struct BoxRunArgs<'a> {
     pub detached: bool,
     pub read_only: bool,
     pub volumes: &'a [String],
+    /// `--mount` mounts, ALREADY split into (source, target, read_only).
+    ///
+    /// Separate from `volumes` because that one holds `-v` STRINGS. Re-joining a mount into that form
+    /// is what destroyed a source containing a `:`, which is the one thing `--mount` exists to carry.
+    pub mounts: &'a [(String, String, bool)],
     pub env: &'a [String],
     /// `--egress-allow d1,d2`: outbound network restricted to these domains (+ subdomains) via a
     /// kern-run filtering proxy; empty = the default (no outbound unless `--net`/`--pod`).
@@ -1606,45 +1611,104 @@ enum VolumeOpt {
 fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
     let mut out = Vec::with_capacity(specs.len());
     for s in specs {
-        let parts: Vec<&str> = s.split(':').collect();
-        let (source, target, read_only) = match parts.as_slice() {
-            [src, dst] => (*src, *dst, false),
-            // THE OPTION FIELD IS A COMMA-SEPARATED LIST, which is what Docker accepts: `:ro,z` is
-            // one field with two options, and splitting on `:` alone made it a fourth part and an
-            // error. The last of `ro`/`rw` wins, as it does for a mount option list.
-            [src, dst, opts] => {
-                let mut ro = false;
-                for opt in opts.split(',').filter(|o| !o.is_empty()) {
-                    match volume_option(opt) {
-                        Some(VolumeOpt::ReadOnly) => ro = true,
-                        Some(VolumeOpt::ReadWrite) => ro = false,
-                        Some(VolumeOpt::NoCopy | VolumeOpt::Inert) => {}
-                        None => {
+        let (source, target, read_only) = split_volume_spec(s)?;
+        out.push(resolve_volume(
+            &source,
+            &target,
+            read_only,
+            &format!("-v '{s}'"),
+        )?);
+    }
+    Ok(out)
+}
+
+/// Split one `-v src:dst[:opt,opt…]` spec into its three fields.
+///
+/// DOCKER'S GRAMMAR, INCLUDING ITS LIMIT: the fields are separated by `:`, so a SOURCE containing a
+/// `:` cannot be written in this form at all, here or on the reference. What changed is the refusal:
+/// a spec with four fields was reported as `unknown mount option '/data'`, which names the TARGET the
+/// caller asked for and says nothing about the real cause. `--mount type=bind,src=…,dst=…` carries
+/// each field separately and takes a source with a `:` (and, quoted, one with a `,`), so the message
+/// points there.
+pub(crate) fn split_volume_spec(s: &str) -> Result<(String, String, bool), Error> {
+    let parts: Vec<&str> = s.split(':').collect();
+    let (source, target, read_only) = match parts.as_slice() {
+        [src, dst] => (*src, *dst, false),
+        // THE OPTION FIELD IS A COMMA-SEPARATED LIST, which is what Docker accepts: `:ro,z` is
+        // one field with two options, and splitting on `:` alone made it a fourth part and an
+        // error. The last of `ro`/`rw` wins, as it does for a mount option list.
+        [src, dst, opts] => {
+            let mut ro = false;
+            for opt in opts.split(',').filter(|o| !o.is_empty()) {
+                match volume_option(opt) {
+                    Some(VolumeOpt::ReadOnly) => ro = true,
+                    Some(VolumeOpt::ReadWrite) => ro = false,
+                    Some(VolumeOpt::NoCopy | VolumeOpt::Inert) => {}
+                    None => {
+                        // AN ABSOLUTE PATH IN THE OPTION FIELD IS ALMOST ALWAYS A `:` IN THE
+                        // SOURCE, not a typo in an option name. `-v /tmp/a:b:/data` split into
+                        // three, so kern reported `/data` - the TARGET the caller asked for - as
+                        // an unknown mount option, and said nothing about the real cause. The
+                        // option field is never a path, so this is safe to name.
+                        if opt.starts_with('/') {
                             return Err(Error::Sandbox(format!(
-                                "bad -v '{s}': unknown mount option '{opt}' (kern reads ro, rw and \
-                                 nocopy, and accepts z, Z, cached, delegated and consistent)"
-                            )))
+                                    "bad -v '{s}': '{opt}' is where the mount OPTIONS go, and it \
+                                     looks like a path, so the source almost certainly contains a \
+                                     `:`. This form separates its fields with `:` and cannot carry \
+                                     one - use `--mount type=bind,src=<source>,dst={opt}` instead, \
+                                     which carries each field separately (quote a source containing \
+                                     a comma: src=\"/a,b\")"
+                                )));
                         }
+                        return Err(Error::Sandbox(format!(
+                            "bad -v '{s}': unknown mount option '{opt}' (kern reads ro, rw and \
+                                 nocopy, and accepts z, Z, cached, delegated and consistent)"
+                        )));
                     }
                 }
-                (*src, *dst, ro)
             }
-            _ => {
-                return Err(Error::Sandbox(format!(
-                    "bad -v '{s}' (expected src:dst[:ro])"
-                )))
-            }
-        };
+            (*src, *dst, ro)
+        }
+        _ => {
+            return Err(Error::Sandbox(format!(
+                "bad -v '{s}': it has {} `:`-separated fields and this form takes two or three \
+                     (src:dst[:opts]). A source path containing a `:` cannot be written as `-v` - \
+                     use `--mount type=bind,src=<source>,dst=<target>[,ro]`, which carries each \
+                     field separately (quote a source containing a comma: src=\"/a,b\")",
+                parts.len()
+            )))
+        }
+    };
+    Ok((source.to_string(), target.to_string(), read_only))
+}
+
+/// Turn one mount's FIELDS into a [`Volume`]: validate the target, resolve a named volume or a host
+/// path, and refuse the registry. `shown` names the spec in every error, so `-v` and `--mount` each
+/// report themselves.
+///
+/// SPLIT FROM THE PARSING SO `--mount` NEED NOT RE-JOIN. `parse_mount_spec` read its fields out of a
+/// `key=value` list and then built a `src:dst:ro` string for this function to split again, so a
+/// source with a `:` was destroyed by the very form that exists to carry it: `--mount
+/// type=bind,src=/tmp/a:b,dst=/data` failed with `bad -v '/tmp/a:b:/data'`. The fields now travel as
+/// fields, which is the same lesson as the overlay layer chain.
+pub(crate) fn resolve_volume(
+    source: &str,
+    target: &str,
+    read_only: bool,
+    shown: &str,
+) -> Result<Volume, Error> {
+    {
+        let s = shown;
         // The target is always an absolute, `.`/`..`-free, NUL-free path inside the box.
         if !target.starts_with('/') {
-            return Err(Error::Sandbox(format!("-v '{s}': target must be absolute")));
+            return Err(Error::Sandbox(format!("{s}: target must be absolute")));
         }
         if target.contains('\0') {
-            return Err(Error::Sandbox(format!("-v '{s}': target has a NUL byte")));
+            return Err(Error::Sandbox(format!("{s}: target has a NUL byte")));
         }
         if target.split('/').any(|c| c == "." || c == "..") {
             return Err(Error::Sandbox(format!(
-                "-v '{s}': target must not contain '.' or '..'"
+                "{s}: target must not contain '.' or '..'"
             )));
         }
         // Refuse to shadow the box's own essential mounts: a `-v` exactly over `/`, `/proc`, `/sys` or
@@ -1655,13 +1719,13 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
         // resolves to `/dev` at mount time - can't slip past this guard.
         let comps: Vec<&str> = target.split('/').filter(|c| !c.is_empty()).collect();
         if comps.is_empty() || matches!(comps.as_slice(), ["proc"] | ["sys"] | ["dev"]) {
-            let shown = if comps.is_empty() {
+            let over = if comps.is_empty() {
                 "/".to_string()
             } else {
                 format!("/{}", comps.join("/"))
             };
             return Err(Error::Sandbox(format!(
-                "-v '{s}': cannot mount over {shown} (a box essential mount)"
+                "{s}: cannot mount over {over} (a box essential mount)"
             )));
         }
         // A NAMED volume resolves to its data dir (auto-created on first use); a PATH is
@@ -1702,13 +1766,13 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
                 let canon = std::fs::canonicalize(source).map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
                         Error::Sandbox(format!(
-                            "-v '{s}': source {source} does not exist and kern could not create it. \
+                            "{s}: source {source} does not exist and kern could not create it. \
                              Docker's daemon creates a missing bind source as root; kern is \
                              rootless, so it can only create one where you could yourself. Create \
                              it first, or point the mount at a path you own"
                         ))
                     } else {
-                        Error::Sandbox(format!("-v '{s}': source {source}: {e}"))
+                        Error::Sandbox(format!("{s}: source {source}: {e}"))
                     }
                 })?;
                 // A box that can WRITE the kern registry can forge a PEER box's recorded capability/
@@ -1717,7 +1781,7 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
                 // any box. Named volumes resolve in the SIBLING branch above and are unaffected.
                 if crate::registry::path_overlaps_trusted_state(&canon) {
                     return Err(Error::Sandbox(format!(
-                        "-v '{s}': refusing to mount the kern registry ({}) into a box - a box able \
+                        "{s}: refusing to mount the kern registry ({}) into a box - a box able \
                          to write it could forge another box's recorded capability/seccomp posture \
                          and elevate its own `kern exec`",
                         canon.display()
@@ -1727,17 +1791,16 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
             }
             crate::volume::SourceKind::Neither => {
                 return Err(Error::Sandbox(format!(
-                    "-v '{s}': source must be a volume name or a path (absolute, or ./ or ../)"
+                    "{s}: source must be a volume name or a path (absolute, or ./ or ../)"
                 )))
             }
         };
-        out.push(Volume {
+        Ok(Volume {
             source,
             target: target.to_string(),
             read_only,
-        });
+        })
     }
-    Ok(out)
 }
 
 /// The command a box/exec runs when none is given.

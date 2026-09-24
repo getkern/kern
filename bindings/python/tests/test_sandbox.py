@@ -43,11 +43,16 @@ _KERN_OOM_LINE = (
 
 
 class _FakeCompleted:
-    """The two fields `_pyc_build` reads off `subprocess.run`, so the argv can be inspected without
-    starting anything."""
+    """The fields `_pyc_build` reads off `subprocess.run`, so the argv can be inspected without
+    starting anything.
 
-    def __init__(self, returncode: int) -> None:
+    `stderr` is here because the build stopped discarding it: a failed build now says so, once per
+    image, and reads the box's last line to say what it answered.
+    """
+
+    def __init__(self, returncode: int, stderr: bytes = b"") -> None:
         self.returncode = returncode
+        self.stderr = stderr
 
 
 def _publish_cache(d):
@@ -4453,3 +4458,72 @@ def test_the_two_bindings_agree_on_when_to_skip_the_uid_range():
     assert 'replace(/^CAP_/, "")' in js and '=== "ALL"' in js, (
         "the Node binding no longer decides that posture from `ALL` being dropped"
     )
+
+def test_pyc_cache_survives_a_cache_home_that_the_dash_v_form_cannot_express(tmp_path, monkeypatch):
+    """A `:` in `$XDG_CACHE_HOME` must not silently kill the cache.
+
+    `-v src:dst[:ro]` separates its fields with `:`, so a cache directory holding one cannot be
+    written in that form: kern split the spec into four and reported the TARGET as an unknown mount
+    option. Both ends of that were invisible - the build's output is discarded and the mount is built
+    for a box the caller never sees - so under `XDG_CACHE_HOME=/x/colon:cache` the feature was simply
+    absent, at full price, with nothing to read.
+
+    `--mount type=bind,src=...,dst=...` carries each field separately. This asserts the ARGV, because
+    the choice of form is the fix: a test that only checked "the cache works here" would pass on a
+    build that quietly fell back to no cache at all.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "colon:cache"))
+    cache = pathlib.Path(kern._pyc_dir_for("python:3.12-slim"))
+    _publish_cache(cache)
+    assert ":" in str(cache), "this test needs a cache path with a ':' to mean anything"
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_dir == str(cache), "the cache was not adopted at all"
+        argv = s._base_argv("b", network=False, timeout_s=30, dry=True)
+        assert "-v" not in argv or not any(
+            str(cache) in a and ":" in a.replace(str(cache), "") for a in argv
+        ), f"the cache went through `-v`, which cannot carry its path: {argv}"
+        spec = [argv[i + 1] for i, a in enumerate(argv) if a == "--mount"]
+        assert any(f"src={cache}" in m and f"dst={kern._PYC_MOUNT}" in m and m.endswith(",ro")
+                   for m in spec), f"no read-only --mount for the cache: {spec}"
+
+    # A path with a COMMA is carried too, by quoting the field: `,` is what separates `--mount`'s own
+    # fields, so an unquoted one would split the spec exactly as the `:` split the `-v`.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "comma,cache"))
+    cache2 = pathlib.Path(kern._pyc_dir_for("python:3.12-slim"))
+    _publish_cache(cache2)
+    with _cfg(image="python:3.12-slim") as s:
+        argv = s._base_argv("b", network=False, timeout_s=30, dry=True)
+        spec = [argv[i + 1] for i, a in enumerate(argv) if a == "--mount"]
+        assert any(f'"src={cache2}"' in m for m in spec), f"the comma was not quoted: {spec}"
+
+
+def test_pyc_build_failure_is_reported_once_per_image_and_never_raises(tmp_path, monkeypatch, capsys):
+    """A build that fails must say so, and must not fail the caller's call.
+
+    The build ran with its stderr on DEVNULL, so an image that never got a cache was
+    indistinguishable from one that did and the only symptom was milliseconds. The likeliest cause is
+    the build box's own caps: `compileall` walks EVERY import root, and an image with large packages
+    can exceed 512 MiB where a slim one never comes close.
+
+    ONCE PER IMAGE, because a long-lived server opening many sessions would otherwise repeat one line
+    forever.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(kern, "_PYC_REPORTED", set())
+    monkeypatch.setattr(
+        kern.subprocess,
+        "run",
+        lambda argv, **kw: _FakeCompleted(137, b"kern: the workload was killed by the OOM killer\n"),
+    )
+    dest = kern._pyc_dir_for("python:3.12-slim")
+    kern._pyc_build("/nonexistent/kern", "python:3.12-slim", dest, 30.0)
+    said = capsys.readouterr().err
+    assert "no bytecode cache" in said and "python:3.12-slim" in said, said
+    assert "OOM killer" in said, "the box's own last line must be quoted, or the cause is guesswork"
+    assert "512 MiB" in said, "the cap is the first thing to suspect and must be named"
+    assert not pathlib.Path(dest).exists(), "a failed build must publish nothing"
+
+    # SECOND FAILURE, SAME IMAGE: silent.
+    kern._pyc_build("/nonexistent/kern", "python:3.12-slim", dest, 30.0)
+    assert capsys.readouterr().err == "", "the warning repeated for one image"
+

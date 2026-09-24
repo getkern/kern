@@ -938,6 +938,17 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             crate::volume::is_named(src) && crate::volume::size_limit(src).is_some()
         });
     let mut volumes = parse_volumes(&plain_specs)?;
+    // `--mount`'s mounts, resolved from their FIELDS. They never pass through a `src:dst` string, so
+    // a source containing a `:` (or, quoted, a `,`) arrives whole - which is the difference between
+    // `--mount` and `-v` now, and the reason the cache under a `colon:cache` path can be mounted.
+    for (source, target, read_only) in args.mounts {
+        volumes.push(crate::commands::resolve_volume(
+            source,
+            target,
+            *read_only,
+            &format!("--mount src={source},dst={target}"),
+        )?);
+    }
     // A box "asked for DNS" if it named ANY of the three: a `search` line alone is still a request
     // to own the file, and owning it in a pod means not sharing the pod's.
     let dns_requested =
