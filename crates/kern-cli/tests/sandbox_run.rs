@@ -14167,7 +14167,9 @@ fn the_registry_cannot_become_a_box_root_through_rootfs_or_overlay_lower() {
 #[test]
 fn a_build_under_a_cache_path_with_a_space_deletes_nothing_outside_its_tree() {
     if !a_box_can_start("cy") {
-        eprintln!("skip: no box starts on this host, so the build cannot reach the probe that deleted");
+        eprintln!(
+            "skip: no box starts on this host, so the build cannot reach the probe that deleted"
+        );
         return;
     }
     let root = std::env::temp_dir().join(format!("kern-it-canary-{}", std::process::id()));

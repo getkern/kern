@@ -105,9 +105,17 @@ if [ "$FULL" -eq 1 ]; then
     step "integration suite" cargo test -q -p getkern
 fi
 
+# WHAT CI ACTUALLY SAID, read rather than predicted. Everything above is this host answering about
+# itself, and the sentence below used to claim it spoke for the runner. It did not: CI was red on
+# `main` for four commits while this file printed green, once because a test asked whether a user
+# namespace was ALLOWED when the runner allows it and refuses its uid map, and once because a push
+# skipped this gate entirely. A prediction cannot catch either. Reading can.
+echo
+sh "$(dirname "$0")/ci-status.sh" || true
+
 echo
 if [ "$fail" -eq 0 ]; then
-    [ "$FULL" -eq 1 ] && echo "green: this is what CI will say." \
+    [ "$FULL" -eq 1 ] && echo "green HERE, and the ci-status line above is what the runner says." \
                       || echo "green on the fast set. Before pushing: sh scripts/pre-push.sh --full"
     exit 0
 fi
