@@ -105,10 +105,9 @@ shells out to the `curl` and `tar` already on the machine rather than linking a 
 ### The binary
 
 A box is made of Linux kernel features, so kern runs where there is a Linux kernel: **Linux and ARM
-boards** (Raspberry Pi · Jetson · Arduino UNO Q) directly, **Windows through WSL2** with a pre-baked
-rootfs and an installer that sets WSL2 up for you, and **a Mac inside a Linux VM** (colima, Lima,
-OrbStack, UTM), where it is the ordinary Linux kern: same binary, same CLI, same behaviour as your CI
-box.
+boards** directly, **Windows through WSL2** with a pre-baked rootfs and an installer that sets WSL2
+up for you, and **a Mac inside a Linux VM** (colima, Lima, OrbStack, UTM), where it is the ordinary
+Linux kern: same binary, same CLI, same behaviour as your CI box.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
@@ -127,7 +126,8 @@ any distribution with unprivileged user namespaces and cgroup v2. Each release r
 those, in real VMs and on the boards, before it ships.
 
 [docs/INSTALL.md](docs/INSTALL.md) has the rest: verifying the checksum by hand, `KERN_INSTALL_DIR`,
-the Windows and Mac guests step by step, and what the resource caps do on a default VM.
+the Windows and Mac guests step by step, what the resource caps do on a default VM, and the one thing
+[Ubuntu 23.10 and newer needs first](docs/INSTALL.md#requirements-and-limitations), once, with root.
 
 ### The SDK, to call kern from Python or Node
 
@@ -230,84 +230,25 @@ kern compose stack.toml ps            # what is running, and what each service p
 kern compose stack.toml port web 8080 # the host address serving that port, read from the running box
 ```
 
-`kern compose <file> watch` is the fourth one, left out of the block above because it needs a service
-with a `build:` context and the file here has none: pointed at a stack that builds, it rebuilds and
-restarts that one service when its context changes.
+Both official images start, `web` reaches `db` by service name, and the port is published. A fourth
+verb, `watch`, rebuilds and restarts one service when its `build:` context changes.
 
-Both official images start, `web` reaches `db` by service name, and the port is published. A compose
-file can also name kern's own things in the spec's extension namespace (`x-kern-vcpu`,
-`x-kern-security-profile`) and still run anywhere else unchanged, because the spec has
-every runtime ignore an `x-` field. A typo inside one is reported rather than dropped.
+**Each service gets its own network namespace, and they meet on a bridge,** the arrangement a Docker
+user already has: a service's `127.0.0.1` is its own, and peers reach each other by name. `--pod`
+puts them all in one namespace instead, which is faster. A compose file can name kern's own things in
+the spec's extension namespace (`x-kern-vcpu`, `x-kern-security-profile`) and still run anywhere else
+unchanged.
 
-**Each service gets its own network namespace, and they meet on a bridge,** which is the arrangement
-a Docker user already has: a service's `127.0.0.1` is its own, two services may listen on the same
-container port, and peers reach each other by name at their addresses. A single-service stack keeps
-one namespace, because there is nobody to separate it from. When `networks:` leave two services with
-nothing in common, kern honours that separation with a namespace per service and no bridge between
-them, announcing what it costs (a relay hop between the peers that do share a network). `--pod`
-forces one shared namespace, which is faster and refuses a file it cannot express rather than running
-it with the separation dropped; `--bridge` and `--no-pod` ask for the other two explicitly.
+This is the local dev loop, not a production orchestrator. Official images that drop to a non-root
+user want `uidmap` and an `/etc/subuid` line, and outbound pulls want `pasta`; `kern doctor` names
+either if it is missing. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 
-Official images that drop to a non-root user want `uidmap` and an `/etc/subuid` line, and outbound
-pulls want `pasta`; `kern doctor` names either if it is missing. This is the local dev loop, not a
-production orchestrator. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
-
-**On a server you reached over `ssh`, run kern inside a scope once.** An ordinary ssh session sits
-outside the systemd user manager on every distribution we measured, and a box's caps live in a cgroup
-that session cannot write into: the stack comes up and is capped correctly, but `kern compose … exec`
-refuses, because entering the box would step outside those caps. One line fixes it for the whole
-session and keeps the caps enforced:
+**Over `ssh`, run kern inside a scope once,** or `kern compose … exec` refuses: an ssh session sits
+outside the systemd user manager, and a box's caps live in a cgroup that session cannot write into.
 
 ```sh
 systemd-run --user --scope bash     # then run kern in that shell
 ```
-
-`kern doctor` reports which cap path a host takes. On Ubuntu 23.10 and newer there is one more thing
-to do first, once, with root: see [docs/INSTALL.md](docs/INSTALL.md#requirements-and-limitations).
-
-## Resource profiles
-
-A slice is declared once in `~/.config/kern/kern.toml` and attached by name, to a sandboxed box or a
-bare process, with the same token. Three kinds: `vcpu:` (CPU and memory), `vdisk:` (a size-capped
-scratch disk) and `vgpio:` (device nodes).
-
-```toml
-# ~/.config/kern/kern.toml - declared once, attached by name
-[[cpu]]                     # the host budget a slice is carved from
-id    = "cpu:0"
-cores = 8.0
-
-[[vcpu]]                    # 1.5 cores and 512 MiB  ->  attach as  vcpu:heavy
-name    = "heavy"
-backend = "cpu:0"
-cpus    = 1.5
-memory  = "512m"
-
-[[disk]]                    # the physical disk a scratch slice is carved from
-id   = "data"
-path = "/var/lib/kern/volumes"
-
-[[vdisk]]                   # 2 GiB of scratch  ->  attach as  vdisk:scratch
-name    = "scratch"
-backend = "data"
-size    = "2g"
-```
-
-```sh
-kern validate ~/.config/kern/kern.toml       # check it before anything runs
-kern box train --image alpine vcpu:heavy vdisk:scratch -- ./train.sh
-kern run vcpu:heavy -- ./train.sh            # the same slice, no sandbox
-```
-
-Profiles compose, an explicit flag beats a profile's own value, and every key is spelled like its CLI
-flag. A backend naming no declared pool is refused when the config is read, not when the box runs.
-
-Two things this says out loud rather than letting you assume. A `vdisk:` is a RAM-backed tmpfs when
-kern runs rootless, whatever its backend says, and an ext4-on-loop image with a real quota when it
-runs privileged; kern reports which one you got, and the size cap binds either way. And **`vgpio:` is
-chip-granular, not per-line**: asking for `pins` binds the whole `/dev/gpiochipN`, which exposes every
-line of that controller, so `pins = [17]` is cooperative metadata rather than a boundary. Naming a
-device node grants that node and nothing else. [docs/RESOURCES.md](docs/RESOURCES.md)
 
 ## What a container costs, and what kern does not have
 
