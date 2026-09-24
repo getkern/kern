@@ -48,7 +48,8 @@ kern doctor    # run this first inside the VM: it names anything the guest still
 
 ## What kern is
 
-A rootless container runtime in one static binary. No daemon.
+A rootless container runtime in one static binary, with no daemon. The same binary is the sandbox an
+agent's code runs in, called from Python, Node or any MCP client.
 
 ```sh
 kern box --image alpine -- sh              # full isolation
