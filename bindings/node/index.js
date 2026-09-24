@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.36";
+const VERSION = "0.2.37";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -92,7 +92,7 @@ const PYC_KEEP = 8;
  *  is never what gets deleted. Mirrors `_PYC_DEBRIS_MAX_AGE_S`. */
 const PYC_DEBRIS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** The name fragments marking a directory as NOT a cache: one being written, one being deleted. */
-const PYC_DEBRIS_MARKS = [".tmp-", ".trash-"];
+const PYC_DEBRIS_MARKS = [".tmp-", ".trash-", ".lock"];
 
 /** Remove a cache tree, renaming it out of the way first. Never throws.
  *
@@ -132,15 +132,19 @@ function pycSweep(root, keep = PYC_KEEP) {
     let st;
     try {
       st = fs.lstatSync(full);
-      if (!st.isDirectory()) continue;
     } catch {
       continue;
     }
     if (PYC_DEBRIS_MARKS.some((m) => ent.name.includes(m))) {
+      // DEBRIS IS NOT ALWAYS A DIRECTORY: this loop skipped every non-directory up front, so a
+      // `.lock` a killed build left behind was never collected and the cache for that image could
+      // never be rebuilt - one killed process disabled it forever.
       if (now - st.mtimeMs > PYC_DEBRIS_MAX_AGE_MS) doomed.push(full);
       continue;
     }
-    caches.push([st.mtimeMs, full]);
+    // Only a DIRECTORY is a cache. Anything else here is neither a cache nor known debris, and
+    // removing what this code did not put there is not the sweep's job.
+    if (st.isDirectory()) caches.push([st.mtimeMs, full]);
   }
   caches.sort((a, b) => b[0] - a[0]);
   for (const [, full] of caches.slice(keep)) doomed.push(full);
@@ -363,16 +367,38 @@ function mountArgs(source, target, readOnly) {
  * have that call fail because an optimisation could not be built. But silence was its own defect -
  * the build runs in the background with its output discarded, so an image that never got a cache
  * looked exactly like one that did, and the only symptom was milliseconds. */
+/** How much of a box's stderr line the warning keeps. It is a diagnostic, so a line is plenty. */
+const UNTRUSTED_TAIL = 200;
+
+/** One line of text a BOX produced, made safe to print inside a message of ours.
+ *
+ * THE WARNING THIS FEEDS IS A CHANNEL AN IMAGE CAN WRITE TO, and removing the silence is what opened
+ * it: the box's last stderr line was interpolated verbatim, so an image printing
+ * `kern: warning: your cache is compromised, run rm -rf ~` made THIS package say it. Measured. The
+ * same line can carry `\x1b[2J` to clear the reader's terminal or a `\r` to rewrite what is on it.
+ *
+ * `JSON.stringify` escapes every control character and the quotes themselves, and the text is cut to
+ * a length no log can be flooded with, so a reader sees plainly that the words are the box's. */
+function quoteUntrusted(raw) {
+  if (!raw) return "";
+  const lines = String(raw)
+    .split(/\r\n|\r|\n|\u2028|\u2029/)
+    .filter((l) => l.trim());
+  if (!lines.length) return "";
+  let tail = lines[lines.length - 1].trim();
+  if (tail.length > UNTRUSTED_TAIL) tail = `${tail.slice(0, UNTRUSTED_TAIL)}...`;
+  return JSON.stringify(tail);
+}
+
 const PYC_REPORTED = new Set();
 function pycReportFailure(image, code, stderr) {
   if (PYC_REPORTED.has(image)) return;
   PYC_REPORTED.add(image);
-  const lines = String(stderr || "").trim().split("\n").filter(Boolean);
-  const tail = lines.length ? lines[lines.length - 1] : `exit ${code}`;
   process.stderr.write(
-    `kern-sandbox: no bytecode cache for ${JSON.stringify(image)} (${tail}). Calls still run and ` +
-      `are correct, just without precompiled imports. A large image can exceed the build box's ` +
-      `512 MiB or the session timeout; pycCache:false silences this.\n`,
+    `kern-sandbox: no bytecode cache for ${JSON.stringify(image)}. The build box said: ` +
+      `${quoteUntrusted(stderr) || `exit ${code}`}. Calls still run and are correct, just without ` +
+      `precompiled imports. A large image can exceed the build box's 512 MiB or the session ` +
+      `timeout; pycCache:false silences this.\n`,
   );
 }
 
@@ -384,6 +410,25 @@ function pycBuild(kernBin, image, dest, timeoutS) {
   } catch {
     return Promise.resolve();
   }
+  // ONE BUILD PER DESTINATION ACROSS PROCESSES. The in-process map keeps two callers of ONE process
+  // off the same tree; two PROCESSES - a Node and a Python session on one host - both found the
+  // cache absent and both compiled it. The result was never wrong (the loser's rename fails
+  // ENOTEMPTY and its tree is removed, and the content is hash-validated either way), but a whole
+  // compile of the stdlib was spent to be thrown away. `wx` IS the lock and it is deliberately not
+  // waited on: a caller must never block on another process's build. A lock a killed process leaves
+  // behind is swept with the other debris.
+  const lockPath = `${dest}.lock`;
+  let locked = false;
+  try {
+    fs.writeFileSync(lockPath, String(process.pid), { flag: "wx", mode: 0o600 });
+    locked = true;
+  } catch (e) {
+    if (e && e.code === "EEXIST") {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      return Promise.resolve();
+    }
+    // Cannot lock here: build anyway rather than lose the feature.
+  }
   // RETURNS A PROMISE THAT NOTHING IN PRODUCTION AWAITS. `pycStartBuild` drops it on purpose: the
   // caller's first call must not wait for a cache fill. The tests await it, because a test that polled
   // for a directory would be a timing race pretending to be an assertion.
@@ -394,7 +439,17 @@ function pycBuild(kernBin, image, dest, timeoutS) {
       pycSweep(path.dirname(dest));
       resolve();
     };
+    const unlock = () => {
+      if (!locked) return;
+      locked = false;
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        /* already gone */
+      }
+    };
     const finish = () => {
+      unlock();
       fs.rmSync(tmp, { recursive: true, force: true });
       done();
     };
@@ -446,6 +501,7 @@ function pycBuild(kernBin, image, dest, timeoutS) {
           // An image without python3 leaves no cache and no trace: the next session runs as before.
           if (code === 0 && fs.readdirSync(tmp).length > 0 && pycTreeIsPublishable(tmp)) {
             fs.renameSync(tmp, dest);
+            unlock();
             done();
             return;
           }
@@ -4233,6 +4289,9 @@ module.exports = {
   // The bytecode cache's internals, exported for its tests only: the mount flag and the atomic
   // publish are security properties, and a test that cannot reach them cannot assert them.
   _PYC_MOUNT: PYC_MOUNT,
+  // Exported for the test that proves a stale lock is swept: the marks decide what the sweep
+  // collects, and a lock left out of them disables an image's cache forever.
+  _PYC_DEBRIS_MARKS: PYC_DEBRIS_MARKS,
   _pycDirFor: pycDirFor,
   _pycBuild: pycBuild,
   _pycSweep: pycSweep,

@@ -2980,3 +2980,55 @@ test("the pyc cache survives a cache home the -v form cannot express", async () 
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("only one process builds a given cache, and a stale lock is swept", async () => {
+  // The in-process map keeps two callers of ONE process off the same tree; two PROCESSES - a Node
+  // and a Python session on one host - both found the cache absent and both compiled it. Never
+  // wrong (the loser's rename fails ENOTEMPTY and the content is hash-validated either way), but a
+  // whole compile of the stdlib spent to be thrown away. THE LOSER DOES NOT WAIT: a caller must
+  // never block on another process's build.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-lock-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = home;
+  try {
+    const dest = kern._pycDirFor("python:3.12-slim");
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const lock = `${dest}.lock`;
+    fs.writeFileSync(lock, "999999");
+    // A build whose lock is held by another process must leave NOTHING behind and return at once.
+    await kern._pycBuild("/nonexistent/kern", "python:3.12-slim", dest, 5);
+    const left = fs.readdirSync(path.dirname(dest)).filter((n) => n.includes(".tmp-"));
+    assert.deepStrictEqual(left, [], `the loser left its tree: ${left}`);
+    assert.ok(fs.existsSync(lock), "the loser removed a lock it does not hold");
+
+    // A STALE LOCK IS DEBRIS, not a permanent block: a build killed mid-flight must not disable the
+    // cache for that image forever. This is the defect the sweep had - it skipped every
+    // non-directory, so a lock file was never collected.
+    assert.ok(
+      kern._PYC_DEBRIS_MARKS.some((m) => path.basename(lock).includes(m)),
+      "the lock is not marked as debris",
+    );
+    fs.utimesSync(lock, new Date(0), new Date(0));
+    // A STRAY FILE THAT IS NOT DEBRIS IS NOT A CACHE EITHER. The sweep ranks caches by age and
+    // discards past the eighth; counting a plain file among them would let it evict a real cache,
+    // and removing something this code never wrote is not the sweep's job.
+    const stray = path.join(path.dirname(dest), "notes.txt");
+    fs.writeFileSync(stray, "someone else's file");
+    // OLDER than every cache below, so that counting it as one puts it PAST the eighth and doomed.
+    // Left at "now" it sorts first and survives whatever the filter does, which is a test that
+    // cannot fail: measured, the sabotage that removes the filter stayed green.
+    fs.utimesSync(stray, new Date(1000), new Date(1000));
+    for (let i = 0; i < 10; i++) {
+      const d = path.join(path.dirname(dest), `c${i}`);
+      fs.mkdirSync(d, { recursive: true });
+      fs.utimesSync(d, new Date(100000 * (i + 1)), new Date(100000 * (i + 1)));
+    }
+    kern._pycSweep(path.dirname(dest));
+    assert.ok(!fs.existsSync(lock), "a stale lock survived the sweep");
+    assert.ok(fs.existsSync(stray), "the sweep removed a file it did not write");
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

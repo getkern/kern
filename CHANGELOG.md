@@ -7,6 +7,31 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**A cache path containing a `:` silently disabled the bytecode cache, and a mount could not carry
+one at all.** overlayfs and `-v src:dst` both separate their fields with `:`, so a host path holding
+one could not be written: `-v /tmp/a:b:/data` was reported as `unknown mount option '/data'`, naming
+the TARGET the caller had asked for. `--mount type=bind,src=…,dst=…` exists to carry each field
+separately and was building a `src:dst:ro` string for the `-v` parser to split again, so it destroyed
+the very thing it was for. It carries the fields now, and both SDKs pick the form the path needs, so
+a cache under `/x/colon:cache` works: adopted on the 5th call, imports 65.9 -> 22.5 ms, where the
+feature had simply been absent at full price.
+
+**A failing cache build said nothing, and then said too much.** Its stderr went to `/dev/null`, so an
+image that never got a cache looked exactly like one that did. It is reported once per image now,
+naming the image and quoting the box's own last line - and that line is the CALLER'S IMAGE speaking,
+so it is quoted and cut rather than pasted: an image printing `kern: warning: your cache is
+compromised, run rm -rf ~` made this package say it, in its own voice.
+
+**`--secret /path/with:a/colon` could mount the wrong file.** `SRC:NAME` peels the last `:`-segment
+off as the secret's name, so a real file called `api:key` was read as `api` named `key`, and where
+that shorter path also existed the box got a DIFFERENT file under the name asked for, with no error.
+The filesystem decides it now, and a spec where both readings name a real file is refused rather than
+guessed: `--secret NAME=- < 'path'` has no delimiter at all.
+
+**Two processes compiled the same cache.** A lock makes one of them build and the other carry on
+without waiting; a lock left by a killed build is swept like the other debris, which the sweep could
+not do before because it skipped everything that was not a directory.
+
 **The SDKs precompile an image's standard library once and mount it read-only, and imports get 2.7 to
 4.5x faster.** A box compiles the image's stdlib in the background, into a per-image directory under
 `$XDG_CACHE_HOME`, and every later box mounts that tree READ-ONLY with `PYTHONPYCACHEPREFIX`. On by

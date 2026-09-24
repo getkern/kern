@@ -106,56 +106,89 @@ pub fn parse_secrets(
     for spec in specs {
         // A `NAME=…` form (inline or stdin) takes precedence over the file form, so a value that
         // happens to contain `:` is not misread as a filename. A leading `/` is always a file.
-        let (name, bytes) =
-            if let Some((k, v)) = spec.split_once('=').filter(|_| !spec.starts_with('/')) {
-                if !valid_name(k) {
-                    return Err(name_err(k));
+        let (name, bytes) = if let Some((k, v)) =
+            spec.split_once('=').filter(|_| !spec.starts_with('/'))
+        {
+            if !valid_name(k) {
+                return Err(name_err(k));
+            }
+            if v == "-" {
+                if stdin_used {
+                    return Err(Error::Sandbox(
+                        "--secret: only one value can be read from stdin ('-')".into(),
+                    ));
                 }
-                if v == "-" {
-                    if stdin_used {
-                        return Err(Error::Sandbox(
-                            "--secret: only one value can be read from stdin ('-')".into(),
-                        ));
-                    }
-                    stdin_used = true;
-                    let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf).map_err(|e| {
-                        Error::Sandbox(format!("--secret {k}=-: reading stdin: {e}"))
-                    })?;
-                    (k.to_string(), buf)
-                } else {
-                    // Inline value: convenient, but it sits in THIS process's argv, so it is visible in
-                    // `ps` / `/proc/<pid>/cmdline` for the box's lifetime - AND, when kern re-execs under a
-                    // systemd `--user` scope for cgroup caps, the argv is recorded in the systemd unit /
-                    // journal, where it PERSISTS after the box exits (a hacker-mode audit surfaced this
-                    // beyond the ephemeral `ps` exposure). Warn honestly and steer to the argv-free forms.
-                    eprintln!(
+                stdin_used = true;
+                let mut buf = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .map_err(|e| Error::Sandbox(format!("--secret {k}=-: reading stdin: {e}")))?;
+                (k.to_string(), buf)
+            } else {
+                // Inline value: convenient, but it sits in THIS process's argv, so it is visible in
+                // `ps` / `/proc/<pid>/cmdline` for the box's lifetime - AND, when kern re-execs under a
+                // systemd `--user` scope for cgroup caps, the argv is recorded in the systemd unit /
+                // journal, where it PERSISTS after the box exits (a hacker-mode audit surfaced this
+                // beyond the ephemeral `ps` exposure). Warn honestly and steer to the argv-free forms.
+                eprintln!(
                     "kern: warning: --secret {k}=<value> is visible in `ps` and recorded in the \
                          systemd journal (persists after the box exits); \
                          prefer '{k}=-' (read from stdin) or a file ('SRC:{k}')"
                 );
-                    (k.to_string(), v.as_bytes().to_vec())
-                }
-            } else {
-                // File form `SRC[:NAME]`. `NAME` (if given) is the last `:`-segment; the rest is the path
-                // (so an absolute path keeps working - only a trailing `:name` is peeled off).
-                let (src, name) = match spec.rsplit_once(':') {
-                    Some((s, n)) if valid_name(n) && !s.is_empty() => (s, n.to_string()),
-                    _ => {
-                        let base = spec
-                            .rsplit('/')
-                            .next()
-                            .filter(|b| !b.is_empty())
-                            .unwrap_or("secret");
-                        (spec.as_str(), base.to_string())
+                (k.to_string(), v.as_bytes().to_vec())
+            }
+        } else {
+            // File form `SRC[:NAME]`. `NAME` (if given) is the last `:`-segment; the rest is the path
+            // (so an absolute path keeps working - only a trailing `:name` is peeled off).
+            // A PATH MAY CONTAIN A `:`, AND `SRC:NAME` CANNOT TELL. `/tmp/demo/api:key` was
+            // read as the file `/tmp/demo/api` under the name `key`; where that shorter path
+            // ALSO existed, the box was handed a DIFFERENT FILE under the name the caller asked
+            // for, with no error at all. Measured. The filesystem answers this for one `stat` on
+            // a path the caller typed, which is cheaper than the guess it replaces.
+            //
+            // AMBIGUITY IS REFUSED, not resolved. Where both readings name a real file the spec
+            // has said two things, and either one silently ignores half of what was written. The
+            // way out is the form that has no delimiter at all: `NAME=-` reads the value from
+            // stdin, so any path a shell can write is expressible.
+            let whole = std::path::Path::new(spec.as_str());
+            let (src, name) = match spec.rsplit_once(':') {
+                Some((s, n)) if valid_name(n) && !s.is_empty() && whole.is_file() => {
+                    let base = spec.rsplit('/').next().unwrap_or_default();
+                    if std::path::Path::new(s).is_file() {
+                        return Err(Error::Cli(format!(
+                                "--secret '{spec}': both '{spec}' and '{s}' are files, so this spec \
+                                 names two different secrets - the whole path, or the shorter one \
+                                 under the name '{n}'. Say which: delete or rename one, or read the \
+                                 value with no delimiter at all: `--secret {n}=- < '{spec}'`"
+                            )));
                     }
-                };
-                if !valid_name(&name) {
-                    return Err(name_err(&name));
+                    if !valid_name(base) {
+                        return Err(Error::Cli(format!(
+                            "--secret '{spec}': that path is a file, but its base name \
+                                 '{base}' cannot be a secret's name (letters/digits/_/./- only), \
+                                 and `SRC:NAME` cannot carry a path with a `:` either. Give the \
+                                 value a name and read it from stdin: \
+                                 `--secret <name>=- < '{spec}'`"
+                        )));
+                    }
+                    (spec.as_str(), base.to_string())
                 }
-                let bytes = read_secret_file(src)?;
-                (name, bytes)
+                Some((s, n)) if valid_name(n) && !s.is_empty() => (s, n.to_string()),
+                _ => {
+                    let base = spec
+                        .rsplit('/')
+                        .next()
+                        .filter(|b| !b.is_empty())
+                        .unwrap_or("secret");
+                    (spec.as_str(), base.to_string())
+                }
             };
+            if !valid_name(&name) {
+                return Err(name_err(&name));
+            }
+            let bytes = read_secret_file(src)?;
+            (name, bytes)
+        };
         if out.iter().any(|s| s.name == name) {
             return Err(Error::Sandbox(format!("--secret: duplicate name '{name}'")));
         }
@@ -360,5 +393,74 @@ mod tests {
             parse_secrets(&[format!("{}:k", f.to_string_lossy())], DEFAULT_SECRET_MODE).is_err()
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod colon_path_tests {
+    use super::parse_secrets;
+
+    /// A FILE PATH MAY CONTAIN A `:`, AND `SRC:NAME` CANNOT TELL WHICH IT IS.
+    ///
+    /// `--secret /tmp/demo/api:key` peels the last `:`-segment off as the secret's NAME and reads
+    /// `/tmp/demo/api`. Where that shorter path also exists, the box was handed a DIFFERENT FILE
+    /// under the name the caller asked for, with no error anywhere. Measured on a real box: the cell
+    /// read the contents of `/tmp/demo/api` at `/run/secrets/key`.
+    ///
+    /// The filesystem answers this for one `stat` on a path the caller typed. Where BOTH readings
+    /// name a real file the spec has said two things and is refused, because either reading silently
+    /// ignores half of what was written; the way out is `NAME=-`, which has no delimiter at all.
+    #[test]
+    fn a_secret_path_containing_a_colon_is_never_silently_the_wrong_file() {
+        // `temp_dir()` reads the process-global `TMPDIR`, which `main.rs` refuses to let a test touch
+        // without the shared lock: without it this races every other test in this binary.
+        let _g = crate::env_guard();
+        let dir = std::env::temp_dir().join(format!("kern-secret-colon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let whole = dir.join("api:key");
+        let short = dir.join("api");
+        std::fs::write(&whole, b"the-right-one").expect("whole");
+
+        let one = |s: &str| parse_secrets(&[s.to_string()], 0o400);
+
+        // ONLY THE WHOLE PATH EXISTS. Its base name cannot be a secret's name (it holds a `:`), so
+        // this is refused rather than guessed - and the refusal names the form that works.
+        let said = match one(whole.to_str().expect("utf8")) {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("a base name with a ':' cannot be a secret name"),
+        };
+        assert!(
+            said.contains("=-"),
+            "the refusal must name the form that works: {said}"
+        );
+
+        // BOTH EXIST: genuinely ambiguous, refused, and the message says why.
+        std::fs::write(&short, b"THE-WRONG-ONE").expect("short");
+        let said = match one(whole.to_str().expect("utf8")) {
+            Err(e) => format!("{e}"),
+            Ok(v) => panic!(
+                "an ambiguous spec must not resolve, got {} secrets",
+                v.len()
+            ),
+        };
+        assert!(
+            said.contains("two different secrets"),
+            "the refusal must name the ambiguity: {said}"
+        );
+        assert!(
+            !said.contains("THE-WRONG-ONE"),
+            "a refusal must not print a secret's contents: {said}"
+        );
+
+        // THE CLASSIC FORM IS UNTOUCHED, which is the control: `SRC:NAME` where SRC is a real file
+        // and the whole spec is not still means "that file, under that name".
+        let plain = dir.join("token");
+        std::fs::write(&plain, b"v").expect("plain");
+        let got = one(&format!("{}:mine", plain.display())).expect("the classic form must work");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "mine");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -974,10 +974,13 @@ def test_pyc_build_survives_a_timeout_and_cleans_up(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     dest = kern._pyc_dir_for("img:slow")
 
-    def _boom(argv, **kw):
+    def _boom(argv, timeout_s):
         raise kern.subprocess.TimeoutExpired(argv, 1.0)
 
-    monkeypatch.setattr(kern.subprocess, "run", _boom)
+    # THE SEAM IS `_run_capped`, not `subprocess.run`: the build reads the box's stderr by hand now,
+    # keeping a bounded prefix, because a pipe read to EOF grows the HOST process with whatever the
+    # caller's image decides to print.
+    monkeypatch.setattr(kern, "_run_capped", _boom)
     kern._pyc_build("/bin/true", "img:slow", dest, 1.0)  # must not raise
     assert not os.path.exists(dest)
     assert not [p for p in pathlib.Path(dest).parent.iterdir() if ".tmp-" in p.name], "debris"
@@ -1085,8 +1088,9 @@ def test_pyc_cache_under_a_credential_directory_is_refused_and_the_build_box_is_
         assert s._pyc_dir != "", "the positive control must still work"
 
     seen = []
-    monkeypatch.setattr(kern.subprocess, "run",
-                        lambda argv, **kw: seen.append(argv) or _FakeCompleted(1))
+    monkeypatch.setattr(
+        kern, "_run_capped", lambda argv, timeout_s: seen.append(argv) or _FakeCompleted(1)
+    )
     kern._pyc_build("/bin/true", "img:x", str(tmp_path / "d"), 30.0)
     assert seen, "the build never spawned"
     argv = seen[0]
@@ -4511,9 +4515,11 @@ def test_pyc_build_failure_is_reported_once_per_image_and_never_raises(tmp_path,
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.setattr(kern, "_PYC_REPORTED", set())
     monkeypatch.setattr(
-        kern.subprocess,
-        "run",
-        lambda argv, **kw: _FakeCompleted(137, b"kern: the workload was killed by the OOM killer\n"),
+        kern,
+        "_run_capped",
+        lambda argv, timeout_s: _FakeCompleted(
+            137, b"kern: the workload was killed by the OOM killer\n"
+        ),
     )
     dest = kern._pyc_dir_for("python:3.12-slim")
     kern._pyc_build("/nonexistent/kern", "python:3.12-slim", dest, 30.0)
@@ -4526,4 +4532,80 @@ def test_pyc_build_failure_is_reported_once_per_image_and_never_raises(tmp_path,
     # SECOND FAILURE, SAME IMAGE: silent.
     kern._pyc_build("/nonexistent/kern", "python:3.12-slim", dest, 30.0)
     assert capsys.readouterr().err == "", "the warning repeated for one image"
+
+def test_a_failing_build_cannot_put_words_in_kerns_mouth(tmp_path, monkeypatch, capsys):
+    """The build's stderr is a channel the CALLER'S IMAGE writes to, and removing the silence opened it.
+
+    The warning interpolated the box's last stderr line verbatim, so an image printing
+    `kern: warning: your cache is compromised, run rm -rf ~` made THIS package say it, in its own
+    voice, to the caller's terminal. Measured. The same line can carry `\x1b[2J` to clear the reader's
+    screen or a `\r` to rewrite what is already on it, and a line of megabytes to flood a log.
+
+    Quoting with `repr` escapes every control character and the quotes themselves, and the text is
+    cut, so a reader sees plainly that the words are the box's.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(kern, "_PYC_REPORTED", set())
+    # THE LAST LINE IS THE ONE QUOTED, so the flood has to be ON it: a first version put 50,000
+    # bytes on an EARLIER line, `splitlines` dropped them, and the length cap was never exercised -
+    # the sabotage that removed it stayed green.
+    hostile = (
+        b"\x1b[2J\x1b[H harmless first line\n"
+        b"kern: warning: your cache is compromised, run rm -rf ~ " + b"A" * 50_000 + b"\n"
+    )
+    monkeypatch.setattr(kern, "_run_capped", lambda argv, timeout_s: _FakeCompleted(1, hostile))
+    kern._pyc_build("/bin/true", "img:hostile", str(tmp_path / "d"), 30.0)
+    said = capsys.readouterr().err
+
+    assert "\x1b" not in said and "\033" not in said, "raw escape codes reached the terminal"
+    assert "\r" not in said, "a carriage return can rewrite the line already printed"
+    # THE FORGED LINE MAY APPEAR, but never as kern's own sentence: quoted, it reads as a citation.
+    # The forged text may appear, but never as kern's own sentence: quoted, it reads as a citation,
+    # and cut, it cannot be the whole log line either.
+    assert "The build box said: '" in said, said
+    assert "..." in said, "the flooding line was not cut"
+    assert "The build box said:" in said, "the words must be attributed to the box"
+    assert len(said) < 1000, f"one failing image flooded the log with {len(said)} bytes"
+    # AND IT STILL SAYS THE USEFUL THING. A sanitiser that dropped the message would be worse than
+    # the silence it replaced.
+    assert "no bytecode cache" in said and "img:hostile" in said and "512 MiB" in said, said
+
+
+def test_only_one_process_builds_a_given_cache(tmp_path, monkeypatch):
+    """Two PROCESSES that both find a cache absent must not both compile the stdlib.
+
+    `_PYC_BUILDS` keeps two threads of ONE process off the same tree; two processes - a Python and a
+    Node session on one host, or two servers - both built it. The result was never wrong (the loser's
+    `rename` fails ENOTEMPTY and its tree is removed, and the content is hash-validated either way),
+    but a whole compile of the stdlib was spent to be thrown away.
+
+    THE LOSER DOES NOT WAIT. A caller must never block on another process's build: it simply does not
+    build, and the winner's tree is there for the session after.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    dest = kern._pyc_dir_for("python:3.12-slim")
+    runs = []
+    monkeypatch.setattr(
+        kern, "_run_capped", lambda argv, timeout_s: runs.append(argv) or _FakeCompleted(1)
+    )
+    # The first build takes the lock and releases it, so the second one runs: a lock that leaked
+    # would make this one silent and the assertion below would pass for the wrong reason.
+    kern._pyc_build("/bin/true", "python:3.12-slim", dest, 30.0)
+    kern._pyc_build("/bin/true", "python:3.12-slim", dest, 30.0)
+    assert len(runs) == 2, "the lock leaked: a later build could never run"
+
+    # Now hold the lock, as another process would.
+    lock = pathlib.Path(f"{dest}.lock")
+    lock.write_text("999999")
+    runs.clear()
+    kern._pyc_build("/bin/true", "python:3.12-slim", dest, 30.0)
+    assert runs == [], "a second process compiled the same tree anyway"
+    assert not [p for p in lock.parent.iterdir() if ".tmp-" in p.name], "the loser left its tree"
+
+    # A STALE LOCK IS DEBRIS, not a permanent block: a build killed mid-flight must not disable the
+    # cache for that image forever.
+    assert any(m in lock.name for m in kern._PYC_DEBRIS_MARKS), "the lock is not swept"
+    os.utime(lock, (0, 0))
+    kern._pyc_sweep(str(lock.parent))
+    assert not lock.exists(), "a stale lock survived the sweep"
 

@@ -505,12 +505,39 @@ impl Sandbox {
             out.push(format!("{secs}"));
         }
         for v in &self.volumes {
-            out.push("-v".to_string());
-            out.push(if v.read_only {
-                format!("{}:{}:ro", v.source, v.target)
+            // THE FORM THAT CAN CARRY THE PATH. `-v src:dst[:ro]` separates its fields with `:`, so
+            // a source holding one cannot be written in it - `build()` used to refuse such a volume
+            // outright, which was fail-closed and also a real path a caller could not mount.
+            // `--mount` carries each field separately (a field holding a `,` is quoted, doubling any
+            // `"` inside, which is the CSV grammar the CLI parses).
+            let plain = |s: &str| !s.contains(':') && !s.contains(',');
+            if plain(&v.source) && plain(&v.target) {
+                out.push("-v".to_string());
+                out.push(if v.read_only {
+                    format!("{}:{}:ro", v.source, v.target)
+                } else {
+                    format!("{}:{}", v.source, v.target)
+                });
             } else {
-                format!("{}:{}", v.source, v.target)
-            });
+                let field = |text: String| {
+                    if text.contains(',') || text.contains('"') {
+                        format!("\"{}\"", text.replace('"', "\"\""))
+                    } else {
+                        text
+                    }
+                };
+                let spec = format!(
+                    "type=bind,{},{}",
+                    field(format!("src={}", v.source)),
+                    field(format!("dst={}", v.target))
+                );
+                out.push("--mount".to_string());
+                out.push(if v.read_only {
+                    format!("{spec},ro")
+                } else {
+                    spec
+                });
+            }
         }
         // Guest environment (the box starts from a clean env - pass each var in).
         for (k, val) in &self.env {
@@ -858,8 +885,16 @@ impl SandboxBuilder {
             if v.source.is_empty() || v.target.is_empty() {
                 return bad("volume source and target must both be non-empty");
             }
-            if v.source.contains(':') || v.target.contains(':') {
-                return bad("volume source/target must not contain ':' (it delimits the -v spec)");
+            // A `:` USED TO BE REFUSED HERE. It delimits the `-v` spec, so the argv builder could
+            // not express it and a silent mis-mount was the alternative; refusing was right then.
+            // It now emits `--mount` for such a volume, which carries the fields separately, so a
+            // legitimate path is mountable instead of rejected. A NUL still cannot be in an argv at
+            // all, and a newline poisons every line-oriented reader downstream.
+            if v.source.contains('\0') || v.target.contains('\0') {
+                return bad("volume source/target must not contain a NUL byte");
+            }
+            if v.source.contains('\n') || v.target.contains('\n') {
+                return bad("volume source/target must not contain a newline");
             }
         }
         // Profile tokens: each MUST be a recognized `<kind>:<name>` (vcpu/vgpio/
@@ -1175,9 +1210,14 @@ mod tests {
     #[test]
     fn build_rejects_ambiguous_volume_specs() {
         let b = || Sandbox::builder().rootfs("/r");
-        // A ':' in source/target would shift the -v src:tgt[:ro] fields.
-        assert!(b().volume("/a:b", "/mnt", false).build().is_err());
-        assert!(b().volume("/a", "/mn:t", false).build().is_err());
+        // A ':' USED TO BE REFUSED because it shifts the `-v src:tgt[:ro]` fields. The argv builder
+        // emits `--mount` for such a volume now, which carries the fields separately, so a real host
+        // path is mountable instead of rejected. See `volume_form_tests` for the argv it produces.
+        assert!(b().volume("/a:b", "/mnt", false).build().is_ok());
+        assert!(b().volume("/a", "/mn:t", false).build().is_ok());
+        // What still cannot be in an argv, or in a line a reader parses.
+        assert!(b().volume("/a\0b", "/mnt", false).build().is_err());
+        assert!(b().volume("/a\nb", "/mnt", false).build().is_err());
         // Empty source/target rejected.
         assert!(b().volume("", "/mnt", false).build().is_err());
         assert!(b().volume("/a", "", false).build().is_err());
@@ -1463,5 +1503,89 @@ mod tests {
         assert_eq!(o.stdout_str(), Some("hi"));
         assert!(o.stdout_text().truncated);
         assert_eq!(o.stdout_text().complete(), None);
+    }
+}
+
+#[cfg(test)]
+mod volume_form_tests {
+    use super::*;
+
+    /// A volume whose path holds a `:` is MOUNTED, not refused, and it never becomes a `-v` string.
+    ///
+    /// `-v src:dst[:ro]` separates its fields with `:`, so `build()` refused such a volume outright.
+    /// That was fail-closed and correct while the argv builder had no other form, and it also made a
+    /// legitimate host path unmountable through this API - the CLI could do it and the library could
+    /// not. `--mount` carries each field separately; a field holding a `,` is quoted, doubling any
+    /// `"` inside, which is the CSV grammar the CLI parses.
+    #[test]
+    fn a_volume_path_with_a_colon_is_carried_rather_than_refused() {
+        let argv = |src: &str, dst: &str, ro: bool| -> Vec<String> {
+            Sandbox::builder()
+                .rootfs("/tmp")
+                .volume(src, dst, ro)
+                .build()
+                .expect("a path with a ':' must not be refused")
+                .assemble_kern_args("true", &[])
+        };
+        // THE ORDINARY CASE IS UNTOUCHED, which is the control: if this moved, every existing caller
+        // would have its argv rewritten by a change meant for the exotic one.
+        let plain = argv("/srv/app", "/app", false);
+        assert!(
+            plain.windows(2).any(|w| w == ["-v", "/srv/app:/app"]),
+            "a plain volume must still be `-v`: {plain:?}"
+        );
+        let plain_ro = argv("/srv/app", "/app", true);
+        assert!(
+            plain_ro.windows(2).any(|w| w == ["-v", "/srv/app:/app:ro"]),
+            "{plain_ro:?}"
+        );
+
+        // A `:` in the source: `--mount`, with the fields whole.
+        let colon = argv("/tmp/a:b", "/data", true);
+        assert!(
+            !colon.iter().any(|a| a == "-v"),
+            "a path with a ':' went through `-v`, which cannot carry it: {colon:?}"
+        );
+        let spec = colon
+            .iter()
+            .zip(colon.iter().skip(1))
+            .find(|(f, _)| *f == "--mount")
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| panic!("no --mount in {colon:?}"));
+        assert_eq!(spec, "type=bind,src=/tmp/a:b,dst=/data,ro");
+
+        // A `,` is quoted, because `,` is what separates `--mount`'s OWN fields: unquoted it would
+        // split the spec exactly as the `:` split the `-v`.
+        let comma = argv("/tmp/a,b", "/data", false);
+        let spec = comma
+            .iter()
+            .zip(comma.iter().skip(1))
+            .find(|(f, _)| *f == "--mount")
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| panic!("no --mount in {comma:?}"));
+        assert_eq!(spec, "type=bind,\"src=/tmp/a,b\",dst=/data");
+    }
+
+    /// What a path may still NOT contain, and why each one is different from a `:`.
+    #[test]
+    fn a_nul_or_a_newline_in_a_volume_is_still_refused() {
+        let built = |src: &str| {
+            Sandbox::builder()
+                .rootfs("/tmp")
+                .volume(src, "/d", false)
+                .build()
+        };
+        assert!(
+            built("/tmp/a\0b").is_err(),
+            "a NUL cannot be in an argv at all"
+        );
+        assert!(
+            built("/tmp/a\nb").is_err(),
+            "a newline poisons every line-oriented reader"
+        );
+        assert!(
+            built("/tmp/a:b").is_ok(),
+            "a ':' is carryable now and must not be refused"
+        );
     }
 }

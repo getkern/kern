@@ -69,7 +69,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.36"
+__version__ = "0.2.37"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -162,7 +162,7 @@ _PYC_KEEP = 8
 # enough that a build still running is never the thing being deleted.
 _PYC_DEBRIS_MAX_AGE_S = 24 * 60 * 60
 # The two name fragments that mark a directory as NOT a cache: one being written, one being deleted.
-_PYC_DEBRIS_MARKS = (".tmp-", ".trash-")
+_PYC_DEBRIS_MARKS = (".tmp-", ".trash-", ".lock")
 # One build per (process, destination), so ten sessions opened at once on one image start one compile
 # and not ten. A MAP OF THREADS rather than a set of names: a second caller gets the thread of the
 # build already in flight, which is what lets a test `join()` the real thing instead of polling for a
@@ -372,7 +372,14 @@ def _pyc_discard(path: str) -> None:
         os.rename(path, trash)
     except OSError:
         return
+    # A FILE, NOT ONLY A TREE. The sweep also collects a stale `.lock` left by a build that was
+    # killed, and `rmtree` on a file raises NotADirectoryError, which `ignore_errors` swallows: the
+    # renamed file would sit there as `.trash-` debris, be swept again, be renamed again, forever.
     shutil.rmtree(trash, ignore_errors=True)
+    try:
+        os.unlink(trash)
+    except OSError:
+        pass  # a directory, already removed above, or gone
 
 
 def _pyc_sweep(root: str, keep: int = _PYC_KEEP) -> None:
@@ -396,21 +403,91 @@ def _pyc_sweep(root: str, keep: int = _PYC_KEEP) -> None:
         return
     for e in entries:
         try:
-            if not e.is_dir(follow_symlinks=False):
-                continue
             st = e.stat(follow_symlinks=False)
+            is_dir = e.is_dir(follow_symlinks=False)
         except OSError:
             continue
         if any(mark in e.name for mark in _PYC_DEBRIS_MARKS):
-            # A tree half-written by a build that was killed, or half-deleted by a sweep that was.
+            # A tree half-written by a build that was killed, half-deleted by a sweep that was, or a
+            # `.lock` a build never got to release. DEBRIS IS NOT ALWAYS A DIRECTORY: the loop
+            # skipped every non-directory up front, so a stale lock was never collected and the image
+            # it belonged to could never be rebuilt - the cache was disabled for that image forever
+            # by one killed process.
             if now - st.st_mtime > _PYC_DEBRIS_MAX_AGE_S:
                 doomed.append(e.path)
             continue
-        caches.append((st.st_mtime, e.path))
+        # Only a DIRECTORY is a cache. Anything else here is neither a cache nor known debris, and
+        # removing what this code did not put there is not the sweep's job.
+        if is_dir:
+            caches.append((st.st_mtime, e.path))
     caches.sort(reverse=True)
     doomed.extend(path for _, path in caches[keep:])
     for path in doomed:
         _pyc_discard(path)
+
+
+def _run_capped(argv: "list[str]", timeout_s: float) -> "subprocess.CompletedProcess":
+    """Run `argv`, keeping only the first `_UNTRUSTED_STDERR_MAX` bytes of its stderr.
+
+    The rest is read and dropped rather than left in the pipe: a child whose pipe fills BLOCKS, and a
+    build that blocks holds its box until the timeout kills it. Bounded memory and a child that can
+    always finish writing are the same requirement, and one loop satisfies both.
+    """
+    with subprocess.Popen(
+        argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    ) as proc:
+        kept = bytearray()
+        assert proc.stderr is not None
+        deadline = time.monotonic() + timeout_s
+        try:
+            while True:
+                chunk = proc.stderr.read(8192)
+                if not chunk:
+                    break
+                if len(kept) < _UNTRUSTED_STDERR_MAX:
+                    kept += chunk[: _UNTRUSTED_STDERR_MAX - len(kept)]
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    raise subprocess.TimeoutExpired(argv, timeout_s)
+            proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+        except BaseException:
+            proc.kill()
+            raise
+    return subprocess.CompletedProcess(argv, proc.returncode, None, bytes(kept))
+
+
+#: How much of a failing build box's stderr is kept for the warning. It is a diagnostic, so a line
+#: is plenty, and the box producing it is the CALLER'S IMAGE, which may not be friendly.
+_UNTRUSTED_TAIL = 200
+#: How much of that stderr is read at all. Beyond this the bytes are drained and dropped.
+_UNTRUSTED_STDERR_MAX = 64 * 1024
+
+
+def _quote_untrusted(raw: "bytes | str | None") -> str:
+    """One line of text a BOX produced, made safe to print inside a message of ours.
+
+    THE WARNING THIS FEEDS IS A CHANNEL AN IMAGE CAN WRITE TO, and it was opened by the fix that
+    removed the silence: the box's last stderr line was interpolated verbatim, so an image printing
+    `kern: warning: your cache is compromised, run rm -rf ~` made THIS package say it. Measured. The
+    same line can carry `\x1b[2J` to clear the reader's terminal or a `\r` to rewrite what is
+    already on it.
+
+    So the text is quoted with `repr`, which escapes every control character and the quotes
+    themselves, and cut to a length no log can be flooded with. A reader then sees plainly that the
+    words are the box's, not kern's.
+    """
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    # The LAST non-empty line: a build that fails says why at the end. `splitlines` also splits on
+    # the exotic separators, which is what keeps a `\r`-only "line" from hiding the real one.
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    tail = lines[-1].strip()
+    if len(tail) > _UNTRUSTED_TAIL:
+        tail = tail[:_UNTRUSTED_TAIL] + "..."
+    return repr(tail)
 
 
 def _pyc_report_failure(image: str, code: int, stderr: "bytes | None") -> None:
@@ -428,11 +505,10 @@ def _pyc_report_failure(image: str, code: int, stderr: "bytes | None") -> None:
         if image in _PYC_REPORTED:
             return
         _PYC_REPORTED.add(image)
-    detail = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
-    tail = detail[-1] if detail else f"exit {code}"
     print(
-        f"kern-sandbox: no bytecode cache for {image!r} ({tail}). Calls still run and are correct, "
-        f"just without precompiled imports. A large image can exceed the build box's 512 MiB or "
+        f"kern-sandbox: no bytecode cache for {image!r}. The build box said: "
+        f"{_quote_untrusted(stderr) or f'exit {code}'}. Calls still run and are correct, just "
+        f"without precompiled imports. A large image can exceed the build box's 512 MiB or "
         f"{_PYC_BUILD_TIMEOUT_HINT}; `pyc_cache=False` silences this.",
         file=sys.stderr,
     )
@@ -482,6 +558,25 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
         os.makedirs(tmp, mode=0o700, exist_ok=True)
     except OSError:
         return
+    # ONE BUILD PER DESTINATION ACROSS PROCESSES, not just within one. `_PYC_BUILDS` keeps two
+    # threads of one process off the same tree; two PROCESSES - a Python and a Node session on one
+    # host, or two servers - both found the cache absent and both compiled it. The result was never
+    # wrong (the loser's `rename` fails ENOTEMPTY and its tree is removed, and the content is
+    # hash-validated either way) but it is a whole compile of the stdlib spent to be thrown away.
+    #
+    # `O_EXCL` IS THE WHOLE LOCK, and it is deliberately not waited on: a caller must never block on
+    # another process's build. The loser simply does not build, and the winner's tree is there for
+    # the session after. A lock left by a killed process is swept with the other debris.
+    lock = f"{dest}.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+    except OSError:
+        lock = ""  # cannot lock here: build anyway rather than lose the feature
     try:
         # A dedicated argv rather than `_base_argv`: that one mounts the session's workspace, writes an
         # env file and would add THIS cache read-only, which is exactly what must not happen while it is
@@ -508,8 +603,11 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
         # box's own caps: `compileall` walks every import root, and an image with large packages
         # (torch, pandas) can exceed 512 MiB where a slim one never comes close. The message says
         # which image, what the box answered, and that the cap is the first thing to suspect.
-        r = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                           timeout=timeout_s + 10)
+        # THE READ IS BOUNDED. `subprocess.run` with a pipe reads until EOF, so a box that writes
+        # megabytes to stderr - which the caller's own image decides - grows the HOST process. The
+        # pipe is drained by hand, keeping only what the warning can use and discarding the rest, so
+        # the child never blocks on a full pipe either.
+        r = _run_capped(argv, timeout_s + 10)
         if r.returncode != 0:
             _pyc_report_failure(image, r.returncode, r.stderr)
         if r.returncode == 0 and any(os.scandir(tmp)) and _pyc_tree_is_publishable(tmp):
@@ -520,6 +618,11 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
         # the tree below is removed rather than left for the next process to find.
         pass
     finally:
+        if lock:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
         # AFTER the publish and after the failure path alike: a build that produced nothing is still the
         # moment to notice that eight other caches are older than this one.
         _pyc_sweep(os.path.dirname(dest))
