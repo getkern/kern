@@ -529,6 +529,9 @@ test("the pyc cache is mounted read-only, never on the setup box, and adopted by
       await kern._pycStartBuild("", "", dir, 5); // the promise of the build already in flight
     }
   } finally {
+    // ORDERED, not retried: a background build still writing into this home makes the rm
+    // below fail in `rimraf`, which looks like a product defect and is a teardown bug.
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });
@@ -564,6 +567,9 @@ test("an empty pyc cache directory is not a cache and does not block the repair"
       await kern._pycStartBuild("", "", dir, 5);
     }
   } finally {
+    // ORDERED, not retried: a background build still writing into this home makes the rm
+    // below fail in `rimraf`, which looks like a product defect and is a teardown bug.
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });
@@ -636,6 +642,9 @@ test("pyc adoption happens before the pool is asked, and re-runs every guard", a
       await kern._pycStartBuild("", "", dir, 5);
     }
   } finally {
+    // ORDERED, not retried: a background build still writing into this home makes the rm
+    // below fail in `rimraf`, which looks like a product defect and is a teardown bug.
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });
@@ -800,6 +809,9 @@ test("a cache under a credential directory is refused, and the build box is capp
     assert.ok(argv.includes("--memory") && argv.includes("--pids-limit"), argv);
     assert.ok(argv.includes("--cap-drop ALL"), argv);
   } finally {
+    // ORDERED, not retried: a background build still writing into this home makes the rm
+    // below fail in `rimraf`, which looks like a product defect and is a teardown bug.
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });
@@ -856,6 +868,9 @@ test("pycBuild publishes atomically, leaves nothing on failure, and takes no net
       "debris left behind",
     );
   } finally {
+    // ORDERED, not retried: a background build still writing into this home makes the rm
+    // below fail in `rimraf`, which looks like a product defect and is a teardown bug.
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });
@@ -2975,6 +2990,9 @@ test("the pyc cache survives a cache home the -v form cannot express", async () 
       }
     }
   } finally {
+    // ORDERED, not retried: a background build still writing into this home makes the rm
+    // below fail in `rimraf`, which looks like a product defect and is a teardown bug.
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });
@@ -3027,13 +3045,16 @@ test("only one process builds a given cache, and a stale lock is swept", async (
     assert.ok(!fs.existsSync(lock), "a stale lock survived the sweep");
     assert.ok(fs.existsSync(stray), "the sweep removed a file it did not write");
   } finally {
+    // ORDERED, not retried: a background build still writing into this home makes the rm
+    // below fail in `rimraf`, which looks like a product defect and is a teardown bug.
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
 
-test("sanitizeRef agrees with kern's own, and a moved tag discards the cache", () => {
+test("sanitizeRef agrees with kern's own, and a moved tag discards the cache", async () => {
   // THE PORT NAMES FILES KERN WROTE. Every vector was DUMPED from `sanitize_ref` in kern-cli, not
   // derived from reading it. If the two disagree the identity is read from a path that does not
   // exist, `pycSourceId` answers "" and the cache is never invalidated again - a silent regression
@@ -3063,18 +3084,19 @@ test("sanitizeRef agrees with kern's own, and a moved tag discards the cache", (
     // THE TAG MOVES: kern re-pulls and rewrites its own files for that reference.
     fs.writeFileSync(path.join(images, `${safe}.image`), "config-v2");
     assert.notStrictEqual(kern._pycSourceId(img), first);
-    return (async () => {
-      const s = new Sandbox({ image: img, timeoutS: 30 });
-      await s.open();
-      try {
-        assert.strictEqual(s._pycDir, "", "a cache built from another image was adopted");
-        assert.ok(!fs.existsSync(dest), "the stale tree was left in place and blocks its replacement");
-      } finally {
-        await s.close();
-        await kern._pycStartBuild("", "", dest, 5);
-      }
-    })();
+    // AWAITED, not returned from inside `try`: a promise returned there runs the `finally` FIRST, so
+    // the home below was removed while this was still working in it. The test passed on a quiet
+    // machine and failed in the gate, where it does not.
+    const s = new Sandbox({ image: img, timeoutS: 30 });
+    await s.open();
+    try {
+      assert.strictEqual(s._pycDir, "", "a cache built from another image was adopted");
+      assert.ok(!fs.existsSync(dest), "the stale tree was left in place and blocks its replacement");
+    } finally {
+      await s.close();
+    }
   } finally {
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });
@@ -3099,6 +3121,9 @@ test("a process that already built a cache can build it again", async () => {
     assert.notStrictEqual(second, first, "the second call got the settled promise back, so no build ran");
     await second;
   } finally {
+    // ORDERED, not retried: a background build still writing into this home makes the rm
+    // below fail in `rimraf`, which looks like a product defect and is a teardown bug.
+    await kern._pycSettle();
     if (prev === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = prev;
     fs.rmSync(home, { recursive: true, force: true });

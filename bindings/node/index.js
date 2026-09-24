@@ -36,7 +36,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.38";
+const VERSION = "0.2.39";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
@@ -285,9 +285,22 @@ function pycSourceId(image) {
     const root = path.join(cacheHome(), "kern", "images");
     const safe = sanitizeRef(image);
     const h = crypto.createHash("sha256");
-    for (const suffix of [".image", ".ok"]) {
-      h.update(fs.readFileSync(path.join(root, safe + suffix)).subarray(0, 4096));
-      h.update(Buffer.from([0]));
+    // THE CONFIG, which changes when ENTRYPOINT/ENV/WORKDIR/USER do.
+    h.update(fs.readFileSync(path.join(root, `${safe}.image`)).subarray(0, 4096));
+    // THE SENTINEL'S STAMP, NOT ITS BYTES. `.ok` holds the REFERENCE, so its contents are the tag and
+    // never move when the tag does: hashing them missed the commonest case there is, a rebuilt rootfs
+    // under an unchanged config. Its mtime and length are what kern ITSELF uses to decide an image's
+    // content changed, because a re-pull rewrites the sentinel last. Measured: a real re-pull leaves
+    // the config byte-identical and moves this.
+    const st = fs.statSync(path.join(root, `${safe}.ok`), { bigint: true });
+    h.update(`${st.mtimeNs}:${st.size}`);
+    // AND THE LAYER MANIFEST FOR A BUILT IMAGE, which names its layers by content. A pulled image has
+    // none, and that absence is part of the identity: an image that stops being layered is not the
+    // same image.
+    try {
+      h.update(fs.readFileSync(path.join(root, `${safe}.layers`)).subarray(0, 8192));
+    } catch {
+      h.update("\0no-layers");
     }
     return h.digest("hex").slice(0, 32);
   } catch {
@@ -4411,5 +4424,11 @@ module.exports = {
   _ociCanonicalRef: ociCanonicalRef,
   _PYC_BUILD_CODE: PYC_BUILD_CODE,
   _pycStartBuild: pycStartBuild,
+  /** Await every build still in flight. FOR TESTS, and it removes a real race rather than masking
+   *  one: a test that removes its temp cache home while a background build is still writing into it
+   *  fails in `rimraf` with ENOTEMPTY, which is a teardown ordering bug and reads like a product
+   *  defect. Measured under the gate, where the machine is busy enough for the build to outlive the
+   *  test. */
+  _pycSettle: () => Promise.allSettled([...PYC_BUILDS.values()]),
   version: VERSION,
 };

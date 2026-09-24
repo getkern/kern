@@ -4706,3 +4706,86 @@ def test_pyc_a_process_that_already_built_can_build_again(tmp_path, monkeypatch)
         th.join(30)
     assert len(runs) == 2, f"the second build never ran: {len(runs)} run(s)"
 
+def test_pyc_identity_moves_when_the_rootfs_does_and_not_only_the_config(tmp_path, monkeypatch):
+    """A re-pull that changes only the ROOTFS must invalidate the cache.
+
+    The first version hashed the BYTES of kern's two sidecars, and one of them holds the REFERENCE:
+    `.ok` reads `alpine:3.19` and says that whatever the tag now points at. So a tag moved to a new
+    manifest with an unchanged OCI config - a stdlib security rebuild, which is the commonest shape
+    there is - left both files byte-identical and the stale cache adopted. It was a check that fired
+    only where the answer was already easy.
+
+    kern's own stamp for "this image's content changed" is the sentinel's MTIME AND LENGTH: a re-pull
+    rewrites it last, and `dir_size_cached` keys its cached total on exactly that pair. Using the same
+    stamp means this cache is invalidated by the same event kern already treats as a new image.
+    MEASURED on a real `kern pull`: the config stayed byte-identical and the identity moved.
+
+    `.layers` is in it too, for a BUILT image whose layers are named by content, and so is its
+    ABSENCE: an image that stops being layered is not the same image.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    img = "python:3.12-slim"
+    images = tmp_path / "kern" / "images"
+    images.mkdir(parents=True)
+    safe = kern._sanitize_ref(img)
+    cfg, ok = images / f"{safe}.image", images / f"{safe}.ok"
+    cfg.write_bytes(b"cmd\t/bin/sh\n")
+    ok.write_bytes(img.encode())
+    os.utime(ok, (1000, 1000))
+    first = kern._pyc_source_id(img)
+    assert first
+
+    # A RE-PULL OF A MOVED TAG: the reference is the same, the config is the same, the sentinel is
+    # rewritten. Only the stamp can tell, and it is the one thing the first version did not read.
+    os.utime(ok, (2000, 2000))
+    assert kern._pyc_source_id(img) != first, (
+        "a rebuilt rootfs under an unchanged config did not move the identity"
+    )
+
+    # The config alone still moves it, which is the case that already worked.
+    os.utime(ok, (1000, 1000))
+    assert kern._pyc_source_id(img) == first, "the stamp is not stable for an unchanged image"
+    cfg.write_bytes(b"cmd\t/bin/bash\n")
+    assert kern._pyc_source_id(img) != first
+
+    # A BUILT image's layer manifest is part of it, and so is losing one.
+    cfg.write_bytes(b"cmd\t/bin/sh\n")
+    assert kern._pyc_source_id(img) == first
+    (images / f"{safe}.layers").write_bytes(b"base\nk1\n")
+    layered = kern._pyc_source_id(img)
+    assert layered != first, "a layer manifest must be part of the identity"
+    (images / f"{safe}.layers").write_bytes(b"base\nk2\n")
+    assert kern._pyc_source_id(img) != layered, "different layers, same identity"
+    (images / f"{safe}.layers").unlink()
+    assert kern._pyc_source_id(img) == first, "losing the manifest must be visible too"
+
+
+def test_pyc_identity_is_the_same_in_both_bindings(tmp_path, monkeypatch):
+    """Python and Node share ONE cache directory, so they must agree on its identity.
+
+    They key it the same way, so a disagreement would have one binding discard and rebuild what the
+    other had just published, forever, on any host that uses both.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    img = "python:3.12-slim"
+    images = tmp_path / "kern" / "images"
+    images.mkdir(parents=True)
+    safe = kern._sanitize_ref(img)
+    (images / f"{safe}.image").write_bytes(b"cmd\t/bin/sh\n")
+    (images / f"{safe}.ok").write_bytes(img.encode())
+    (images / f"{safe}.layers").write_bytes(b"base\nk1\n")
+
+    index = pathlib.Path(__file__).resolve().parents[2] / "node" / "index.js"
+    got = subprocess.run(
+        [node, "-e", f'const k=require({str(index)!r});process.stdout.write(k._pycSourceId({img!r}))'],
+        capture_output=True, text=True, env={**os.environ, "XDG_CACHE_HOME": str(tmp_path)},
+    )
+    assert got.returncode == 0, got.stderr
+    assert got.stdout == kern._pyc_source_id(img), (
+        f"the two bindings disagree about one cache: node {got.stdout!r} vs python "
+        f"{kern._pyc_source_id(img)!r}"
+    )
+

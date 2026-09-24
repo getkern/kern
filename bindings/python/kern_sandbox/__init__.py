@@ -69,7 +69,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.38"
+__version__ = "0.2.39"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -286,10 +286,25 @@ def _pyc_source_id(image: str) -> str:
         root = os.path.join(_cache_home(), "kern", "images")
         safe = _sanitize_ref(image)
         h = hashlib.sha256()
-        for suffix in (".image", ".ok"):
-            with open(os.path.join(root, safe + suffix), "rb") as fh:
-                h.update(fh.read(4096))
-            h.update(b"\0")
+        # THE CONFIG, which changes when ENTRYPOINT/ENV/WORKDIR/USER do.
+        with open(os.path.join(root, safe + ".image"), "rb") as fh:
+            h.update(fh.read(4096))
+        # THE SENTINEL'S STAMP, NOT ITS BYTES. `.ok` holds the REFERENCE, so its contents are the tag
+        # and never move when the tag does: hashing them missed the commonest case there is, a rebuilt
+        # rootfs under an unchanged config. Its mtime and length are what kern ITSELF uses to decide
+        # that an image's content changed (`dir_size_cached` keys its cached total on exactly this
+        # pair), because a re-pull rewrites the sentinel last. Using the same stamp means this cache is
+        # invalidated by the same event kern already treats as "this image is not what it was".
+        st = os.stat(os.path.join(root, safe + ".ok"))
+        h.update(f"{st.st_mtime_ns}:{st.st_size}".encode())
+        # AND THE LAYER MANIFEST FOR A BUILT IMAGE, which names its layers by content. A pulled image
+        # has no such file, and its absence is part of the identity too: an image that stops being
+        # layered is not the same image.
+        try:
+            with open(os.path.join(root, safe + ".layers"), "rb") as fh:
+                h.update(fh.read(8192))
+        except OSError:
+            h.update(b"\0no-layers")
         return h.hexdigest()[:32]
     except OSError:
         return ""

@@ -7,6 +7,14 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**The cache's identity read the tag's NAME, which is the one thing a moved tag does not change.**
+The check added a moment ago hashed the bytes of kern's two sidecars, and one of them holds the
+reference itself: a tag moved to a new manifest with an unchanged OCI config - a stdlib security
+rebuild, the commonest shape there is - left both byte-identical and the stale cache adopted. It now
+uses the stamp kern itself treats as "this image's content changed", the completion sentinel's mtime
+and length, which a re-pull rewrites; the layer manifest of a built image is in it too. Measured on a
+real `kern pull`: the config stayed byte-identical and the identity moved.
+
 **A moved tag left a cache that no longer helped and that nothing rebuilt.** The bytecode cache is
 keyed on the image's canonical reference, and a tag is mutable: `python:3.12-slim` can point at a new
 manifest tomorrow. Nothing wrong was ever run - the cache validates on the source's hash, so CPython

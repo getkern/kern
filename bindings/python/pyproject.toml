@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kern-sandbox"
-version = "0.2.38"
+version = "0.2.39"
 description = "Your model writes the code. This runs it where it can't touch your machine: a rootless Linux container, no daemon, no VM, no cloud, no account. A kernel boundary, not a microVM: for deliberately hostile code, use one."
 readme = "README.md"
 requires-python = ">=3.9"
