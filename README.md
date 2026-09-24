@@ -173,20 +173,14 @@ and over `ssh` run `systemd-run --user --scope bash` once or `kern compose … e
 
 ## What a container costs, and what kern does not have
 
-Properties, not timings: what each one IS, where a reader can check the answer without a stopwatch.
-The timings are in [BENCHMARKS.md](BENCHMARKS.md), measured on one host, same workload, same day.
-
 | | kern | Docker | Podman |
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
-| Rootless | **yes**, always | opt-in | yes |
-| Cold start | **milliseconds** | hundreds of ms | hundreds of ms |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
-| Footprint | **one static binary** | daemon stack | multi-binary install |
-| OCI images, pull / build / push | yes | yes | yes |
-| `docker-compose.yml` | yes, read as-is ([how the network is wired](#run-a-whole-stack-your-docker-composeyml-unchanged)) | yes | partial |
-| Overlay networks, Swarm, CRI | **no** | yes | partial |
-| GPU passed into the container | no | yes | yes |
+| Rootless | **yes**, always | opt-in | yes |
+| `docker-compose.yml` | **read as-is** | yes | partial |
+
+kern does not have overlay networks, Swarm, CRI, or a GPU passed into the container.
 
 ## Performance
 
