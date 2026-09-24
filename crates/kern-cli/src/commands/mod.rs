@@ -262,9 +262,11 @@ pub struct BoxRunArgs<'a> {
     /// `--security-profile <untrusted>`: opt-in hardening bundle applied as a base (see
     /// [`SecurityProfile`]). `None` = no profile.
     pub security_profile: Option<SecurityProfile>,
-    /// INTERNAL (build): explicit colon-joined overlay lower dir(s), used instead of `--rootfs`/
-    /// `--image` and paired with `overlay_upper` to run a build's RUN step against the base.
-    pub overlay_lower: Option<&'a str>,
+    /// INTERNAL (build): the base's overlay layers, TOP first, one path each, used instead of
+    /// `--rootfs`/`--image` and paired with `overlay_upper` to run a build's RUN step against the
+    /// base. Empty = not a build step. A list and never a `:`-joined string: a layer path may
+    /// contain a `:`.
+    pub overlay_lower: &'a [String],
     /// INTERNAL (build): a persistent overlay upper (the build layer) instead of ephemeral scratch.
     pub overlay_upper: Option<&'a str>,
     /// `--memory`/`-m`: hard memory ceiling in bytes (default cap if `None`).
@@ -1219,7 +1221,10 @@ fn io_max_line(maj: u32, min: u32, iops: Option<u64>, bandwidth: Option<u64>) ->
 /// Parsed inputs for [`build_spec`].
 struct BuildSpec<'a> {
     name: &'a BoxName,
-    lower: String,
+    /// The root's layers, TOP first, one path each: `--rootfs` and a pulled image are one entry, a
+    /// built image is several. Kept a list until the mount, where [`kern_isolation::overlay_lowerdir`]
+    /// escapes and joins it; a `:`-joined string broke on the first `:` in a host path.
+    lower: Vec<String>,
     cmd: Vec<String>,
     read_only: bool,
     landlock_rw: Vec<String>,
@@ -1343,7 +1348,25 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
     let (root, mode, overlay, eph): (String, MountMode, Option<OverlayDirs>, Option<PathBuf>) = if b
         .bind_rootfs
     {
-        (b.lower, MountMode::Bind, None, None)
+        // A BIND MOUNT IS ONE DIRECTORY, and a layered root is several: binding the joined string
+        // named a path that did not exist, and the mount failed with a bare `ENOENT`. `--rootfs` and a
+        // pulled image are one layer, which is the only case a bind can serve.
+        let one = match b.lower.as_slice() {
+            [one] => one.clone(),
+            [] => {
+                return Err(Error::Sandbox(
+                    "--bind-rootfs: the root has no directory to bind".into(),
+                ))
+            }
+            layers => {
+                return Err(Error::Sandbox(format!(
+                "--bind-rootfs binds ONE directory and this root has {} layers (a locally built \
+                     image); drop --bind-rootfs to mount it as an overlay",
+                layers.len()
+            )))
+            }
+        };
+        (one, MountMode::Bind, None, None)
     } else {
         // The writable overlay upper. Normally an ephemeral scratch (discarded on exit). For a `kern
         // build` RUN step (`overlay_upper` set) the UPPER persists in the build tree so successive RUN/
@@ -3540,9 +3563,9 @@ fn prepare_stage(
                             if let std::collections::hash_map::Entry::Vacant(slot) =
                                 chains.entry(src_idx)
                             {
-                                // The chain is `top:...:base`; split into a top-first Vec of layer dirs.
+                                // Already a top-first list of layer dirs; nothing to split.
                                 let (lower, _cfg) = resolve_image(&stage_tags[src_idx])?;
-                                slot.insert(lower.split(':').map(str::to_string).collect());
+                                slot.insert(lower);
                             }
                             (chains[&src_idx].clone(), stage_tags[src_idx].clone())
                         }
@@ -3555,7 +3578,7 @@ fn prepare_stage(
                                 // Runs synchronously on the single-threaded build main, so the confined
                                 // copy that follows keeps the fork-safety invariant.
                                 let (lower, _cfg) = resolve_image(img)?;
-                                slot.insert(lower.split(':').map(str::to_string).collect());
+                                slot.insert(lower);
                             }
                             (image_chains[img].clone(), img.clone())
                         }
@@ -3848,19 +3871,78 @@ fn verify_download_checksum(path: &std::path::Path, checksum: &str) -> Result<()
     Ok(())
 }
 
-/// Child of [`probe_opaque_honored`]: mount a RW overlay (lower has `dir/secret`), `rm -rf dir && mkdir
-/// dir` in the merged view, then re-open the merged view read-only and check `dir/secret` is GONE (the
-/// opaque was honoured). `_exit(0)` iff hidden; any other path `_exit`s non-zero. Async-signal-safe until
-/// the `system()` - acceptable here (single-threaded at fork, like `merged_view_child`).
-unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: libc::gid_t) -> ! {
-    // A path with an interior NUL cannot name a file, and this ran inside a FORKED CHILD where a
-    // panic is not a clean error: unwinding past a `-> !` in a half-set-up namespace is the worst
-    // place in this codebase to abort. The child has an exit-code protocol already, so a path it
-    // cannot express is one more code, and the parent reads it like any other refusal.
-    let cs = |p: String| match std::ffi::CString::new(p) {
-        Ok(c) => c,
-        Err(_) => libc::_exit(19),
-    };
+/// Everything [`probe_opaque_child`] touches, built BEFORE the fork.
+///
+/// After `fork()` in a process that has threads, only async-signal-safe calls are legal: an
+/// allocation whose lock another thread held at the instant of the fork deadlocks the child, and the
+/// parent then waits on a child that will never exit. The child below does only unshare / open /
+/// write / mount / umount / stat / `_exit`, with no allocation of its own.
+pub(crate) struct OpaquePlan {
+    /// `lowerdir=<lower>,upperdir=<up>,workdir=<wk>`, escaped.
+    rw_opts: std::ffi::CString,
+    /// `lowerdir=<up>:<lower>`, escaped: the re-mount that the merged view would do.
+    ro_opts: std::ffi::CString,
+    /// The merge target.
+    merged: std::ffi::CString,
+    /// `<merged>/dir`, the directory the probe deletes and recreates.
+    dir: std::path::PathBuf,
+    /// `<merged>/dir/secret`, the file that must stay hidden.
+    secret: std::path::PathBuf,
+    /// `<merged>/witness`, a file of the lower's that must still be VISIBLE after the re-mount. The
+    /// positive control: without it, an empty view answers "hidden" exactly like a real opaque.
+    witness: std::path::PathBuf,
+}
+
+impl OpaquePlan {
+    /// `None` if a path this process built holds an interior NUL, which cannot name a file.
+    pub(crate) fn build(tmp: &std::path::Path) -> Option<Self> {
+        let p = |s: &str| tmp.join(s).to_string_lossy().into_owned();
+        let (lower, up, wk, merged) = (p("lower"), p("up"), p("wk"), p("mg"));
+        // THROUGH THE SHARED JOINER, not a hand-rolled `format!`: this probe decides whether a build
+        // may be layered, so a probe that fails on a character the real mount handles would send
+        // every build on such a host down the flat path for no reason.
+        let rw = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            kern_isolation::overlay_lowerdir(std::slice::from_ref(&lower)),
+            kern_isolation::overlay_escape(&up),
+            kern_isolation::overlay_escape(&wk)
+        );
+        let ro = format!(
+            "lowerdir={}",
+            kern_isolation::overlay_lowerdir(&[&up, &lower])
+        );
+        let dir = std::path::Path::new(&merged).join("dir");
+        Some(OpaquePlan {
+            rw_opts: std::ffi::CString::new(rw).ok()?,
+            ro_opts: std::ffi::CString::new(ro).ok()?,
+            witness: std::path::Path::new(&merged).join("witness"),
+            merged: std::ffi::CString::new(merged).ok()?,
+            secret: dir.join("secret"),
+            dir,
+        })
+    }
+}
+
+/// Child of [`probe_opaque_honored`]: mount a RW overlay (lower has `dir/secret`), `rm -rf dir &&
+/// mkdir dir` in the merged view, then re-open the merged view read-only and check `dir/secret` is
+/// GONE (the opaque was honoured). `_exit(0)` iff hidden, `_exit(14)` iff it came back, any other
+/// code means the probe learned nothing - and the caller must not report those as a kernel defect.
+///
+/// Exit codes: 11 unshare, 12 id maps, 13 the first mount, 14 the secret came back, 15 the delete,
+/// 16 the mkdir, 17 the umount, 18 the read-only re-mount, 20 the lookup could not answer.
+///
+/// # No shell, and that is the fix for a DATA LOSS
+///
+/// The steps below were a `libc::system()` script with the probe directory interpolated WITHOUT
+/// QUOTES, and that directory is under `$XDG_CACHE_HOME`. A cache path with a space in it cut the
+/// script at the space: MEASURED with `XDG_CACHE_HOME="…/canary space"`, `kern build` ran
+/// `rm -rf …/canary` - a directory the build never created - deleted everything in it, recreated it
+/// empty with the script's `mkdir`, and reported `built` with exit 0. A `:` in the same path broke the
+/// mounts instead, so the probe failed, the build fell back to flat and blamed the kernel.
+///
+/// So nothing here is text for a shell any more: each step is the syscall or `std::fs` call the
+/// command was a wrapper for, and the mount options come from [`OpaquePlan`], built before the fork.
+unsafe fn probe_opaque_child(plan: &OpaquePlan, euid: libc::uid_t, egid: libc::gid_t) -> ! {
     if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
         libc::_exit(11);
     }
@@ -3877,15 +3959,12 @@ unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: lib
         libc::MS_REC | libc::MS_PRIVATE,
         std::ptr::null(),
     );
-    let d = tmp.to_string_lossy();
-    let opts = cs(format!("lowerdir={d}/lower,upperdir={d}/up,workdir={d}/wk"));
-    let mg = cs(format!("{d}/mg"));
     if libc::mount(
         c"overlay".as_ptr(),
-        mg.as_ptr(),
+        plan.merged.as_ptr(),
         c"overlay".as_ptr(),
         0,
-        opts.as_ptr() as *const libc::c_void,
+        plan.rw_opts.as_ptr() as *const libc::c_void,
     ) != 0
     {
         libc::_exit(13);
@@ -3898,22 +3977,43 @@ unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: lib
     // resurfaces. So: do the rm in the live mount, then RE-MOUNT `up:lower` read-only (as the merged
     // view would) and check the secret is STILL hidden. Only if it stays hidden across the re-mount is
     // the opaque truly persisted → layered is safe.
-    // stderr silenced ({{…}} 2>/dev/null): this is an internal PROBE - only its exit status matters
-    // (drives the layered-vs-flat decision). On a filesystem where the overlay `rm` can't fully remove
-    // the dir (WSL's 9p/overlay: "rm: can't remove …: I/O error"), the probe correctly falls back to a
-    // flat build; leaking that rm's diagnostic to the user's build output just looks alarming.
-    let script = cs(format!(
-        "{{ rm -rf {d}/mg/dir && mkdir {d}/mg/dir && \
-           umount {d}/mg && \
-           mount -t overlay overlay -o lowerdir={d}/up:{d}/lower,ro {d}/mg && \
-           test ! -e {d}/mg/dir/secret; }} 2>/dev/null"
-    ));
-    let ret = libc::system(script.as_ptr());
-    // system() returns the shell's wait-status; 0 exit == opaque persisted (secret gone after re-mount).
-    if ret == 0 {
-        libc::_exit(0);
+    //
+    // A delete the filesystem refuses (WSL's 9p/overlay answers `I/O error`) exits 15, which the
+    // caller reports as a probe that could not run rather than as a kernel missing the marker.
+    if std::fs::remove_dir_all(&plan.dir).is_err() {
+        libc::_exit(15);
     }
-    libc::_exit(14);
+    if std::fs::create_dir(&plan.dir).is_err() {
+        libc::_exit(16);
+    }
+    if libc::umount2(plan.merged.as_ptr(), 0) != 0 {
+        libc::_exit(17);
+    }
+    if libc::mount(
+        c"overlay".as_ptr(),
+        plan.merged.as_ptr(),
+        c"overlay".as_ptr(),
+        libc::MS_RDONLY,
+        plan.ro_opts.as_ptr() as *const libc::c_void,
+    ) != 0
+    {
+        libc::_exit(18);
+    }
+    // THE POSITIVE CONTROL FIRST. An absence only means "hidden" if the view can show anything at
+    // all: a re-mount that came up empty would answer `NotFound` for the secret exactly like a real
+    // opaque marker, and the build would take the layered path on a kernel that does not persist one.
+    // The witness is the lower's own file, outside the opaque directory, so it must be there.
+    if std::fs::symlink_metadata(&plan.witness).is_err() {
+        libc::_exit(26);
+    }
+    // FAIL-CLOSED ON THE LOOKUP TOO. The script's `test ! -e` answered "hidden" for ANY failure to
+    // stat, so an I/O error on the re-mounted view read as a kernel that honours opaques and chose the
+    // layered path. Only `NotFound` means hidden now; a lookup that cannot answer is not a yes.
+    match std::fs::symlink_metadata(&plan.secret) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => libc::_exit(0),
+        Ok(_) => libc::_exit(14),
+        Err(_) => libc::_exit(20),
+    }
 }
 
 /// Run one `RUN` step inside a `kern box` with host networking, so writes persist to the build layer
@@ -3924,7 +4024,7 @@ unsafe fn probe_opaque_child(tmp: &std::path::Path, euid: libc::uid_t, egid: lib
 fn run_build_step(
     self_exe: &std::path::Path,
     layered: bool,
-    base_lower: &str,
+    base_lower: &[String],
     work: &std::path::Path,
     write_dir: &std::path::Path,
     config: &kern_oci::ImageConfig,
@@ -3936,10 +4036,12 @@ fn run_build_step(
     cmd.arg("box")
         .arg(format!("_build-{}-{step}", std::process::id()));
     if layered {
-        cmd.arg("--overlay-lower")
-            .arg(base_lower)
-            .arg("--overlay-upper")
-            .arg(work);
+        // One flag per layer, TOP first. A `:`-joined value was cut apart again in the child at every
+        // `:`, including one inside a host path.
+        for layer in base_lower {
+            cmd.arg("--overlay-lower").arg(layer);
+        }
+        cmd.arg("--overlay-upper").arg(work);
     } else {
         cmd.arg("--rootfs").arg(write_dir).arg("--bind-rootfs");
     }

@@ -519,9 +519,15 @@ fn overlay_probe() -> OverlayProbe {
         // fail.
         let (Some(t), Some(o)) = (
             std::ffi::CString::new(base.join("merged").as_os_str().as_bytes()).ok(),
+            // ESCAPED, because this directory is under `$TMPDIR` and overlayfs cuts its options at
+            // `,` and its lowers at `:`: a `TMPDIR` with either made this probe fail and doctor report
+            // that the kernel cannot do an unprivileged overlay. Built here, before the fork, like
+            // every other thing the child touches.
             std::ffi::CString::new(format!(
-                "lowerdir={0}/lower,upperdir={0}/upper,workdir={0}/work",
-                base.display()
+                "lowerdir={},upperdir={},workdir={}",
+                kern_isolation::overlay_lowerdir(&[base.join("lower").to_string_lossy()]),
+                kern_isolation::overlay_escape(&base.join("upper").to_string_lossy()),
+                kern_isolation::overlay_escape(&base.join("work").to_string_lossy()),
             ))
             .ok(),
         ) else {

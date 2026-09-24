@@ -433,7 +433,7 @@ fn point_the_box_at_the_egress_proxy(
 /// through per-file whiteouts and through opaque directories that carry no `.wh.` file at all. A
 /// single-layer image cannot hold a cross-layer opaque and is copied directly, which is the same
 /// split the push path makes.
-fn seed_empty_named_volumes(lower: &str, volumes: &[Volume]) {
+fn seed_empty_named_volumes(lower: &[String], volumes: &[Volume]) {
     // NOTHING TO SEED: the common case, and it must cost nothing. Checked before the fork, because a
     // fork per box start would be a real cost on the hot path for a job that is almost always empty.
     let seedable: Vec<&Volume> = volumes.iter().filter(|v| is_seedable(v)).collect();
@@ -448,13 +448,12 @@ fn seed_empty_named_volumes(lower: &str, volumes: &[Volume]) {
     // `prom/prometheus`, whose `/prometheus` is `nobody:nobody` and whose volume came back owned by
     // in-box root, so it died with `mkdir data/: permission denied` even after the image's own
     // ownership was fixed. The contents are only half of what a volume inherits.
-    let lower = lower.to_string();
     let owned: Vec<(String, String)> = seedable
         .iter()
         .map(|v| (v.source.clone(), v.target.clone()))
         .collect();
     let seed = move |_ranged: bool| {
-        seed_now(&lower, &owned);
+        seed_now(lower, &owned);
         0
     };
     if kern_isolation::with_id_mapped_userns(seed).is_err() {
@@ -486,19 +485,26 @@ fn is_seedable_under(root: &std::path::Path, v: &Volume) -> bool {
 }
 
 /// The seeding itself, running as root of the mapped namespace (see [`seed_empty_named_volumes`]).
-fn seed_now(lower: &str, volumes: &[(String, String)]) {
-    let chain: Vec<String> = lower.split(':').map(str::to_string).collect();
+fn seed_now(lower: &[String], volumes: &[(String, String)]) {
+    // The layers as they were resolved, TOP first. This used to be the joined string cut at every
+    // `:`, so under a cache path with one the merged view was handed layers that did not exist and
+    // the `let _` below swallowed the failure. It was never SEEN on its own, because the box's own
+    // mount failed on the same `:` right after (measured); it would have been an empty volume the
+    // day that mount worked, which is today.
+    let Some(top) = lower.first() else {
+        return; // no layer, nothing to seed from
+    };
     for (source, target) in volumes {
         let src = std::path::Path::new(source);
         let rel = target.trim_start_matches('/');
-        if chain.len() >= 2 {
+        if lower.len() >= 2 {
             let _ = crate::commands::merged_view_extract(
-                &chain,
+                lower,
                 crate::commands::Extract::Contents(rel),
                 src,
             );
         } else {
-            let from = std::path::Path::new(&chain[0]).join(rel);
+            let from = std::path::Path::new(top).join(rel);
             if from.is_dir() {
                 let _ = std::process::Command::new("cp")
                     .arg("-a")
@@ -514,7 +520,7 @@ fn seed_now(lower: &str, volumes: &[(String, String)]) {
         // THE VOLUME'S OWN ROOT, which no content copy can set: `cp -a` fills the directory and
         // leaves the directory itself alone. An image whose mount point is an EMPTY directory owned
         // by a non-root user copies nothing at all, and that is exactly the Prometheus case.
-        let from = std::path::Path::new(&chain[0]).join(rel);
+        let from = std::path::Path::new(top).join(rel);
         if let Ok(m) = std::fs::metadata(&from) {
             use std::os::unix::fs::MetadataExt;
             use std::os::unix::fs::PermissionsExt;
@@ -1090,22 +1096,35 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // A user `--rootfs` becomes the box's ENTIRE root (overlay lower or `--bind-rootfs`): guard it
     // against the registry through the SAME chokepoint `--secret`/`--env-file` use, or `--rootfs
     // <runtime>/kern` would make the registry the box's filesystem - the most privileged exposure of
-    // the lot. (An INTERNAL build lower, `overlay_lower`, is kern-generated and is not user input.)
+    // the lot.
     if let Some(r) = args.rootfs {
         crate::secret::guard_host_path(r, "--rootfs")?;
     }
+    // `--overlay-lower` TOO, AND IT IS NOT INTERNAL JUST BECAUSE IT IS UNDOCUMENTED. The comment here
+    // used to say "kern-generated, not user input", but the flag is parsed from the same argv as any
+    // other: `kern box x --overlay-lower <runtime>/kern --overlay-lower <an image dir> -- /bin/sh`
+    // stacks the registry into the box's root, which is exactly what the line above refuses for
+    // `--rootfs`. Guarding every layer costs one `canonicalize` per layer on the build's RUN steps
+    // and closes the flag that was left open beside the one that was closed.
+    for layer in args.overlay_lower {
+        crate::secret::guard_host_path(layer, "--overlay-lower")?;
+    }
     // The lower/base rootfs: an explicit --rootfs, or pull --image into a local cache. An --image
     // also yields its OCI runtime config (Entrypoint/Cmd/Env/WorkingDir/User) - the defaults below.
-    let (lower, image_config) = match (args.overlay_lower, args.rootfs, args.image) {
-        // Build RUN step: an explicit (possibly colon-joined multi-) lower, no image config.
-        (Some(ol), _, _) => (ol.to_string(), kern_oci::ImageConfig::default()),
-        (None, Some(r), _) => (r.to_string(), kern_oci::ImageConfig::default()),
-        // `--image` may be a pulled (flat) OR a locally-built (layered) image - resolve both. The
-        // `--pull` policy rides all the way down to the one site that hits the network (`pull_to_cache`);
-        // `scratch` and locally-built images short-circuit before that, so `never` naturally passes them.
-        (None, None, Some(img)) => resolve_image_depth(img, 0, args.pull)?,
-        (None, None, None) => return Err(Error::Sandbox("need --rootfs or --image".to_string())),
-    };
+    // `lower` is the root's layers, TOP first, one path each - a list up to the mount, never a
+    // `:`-joined string (a host path may contain a `:`).
+    let (lower, image_config): (Vec<String>, kern_oci::ImageConfig) =
+        match (args.overlay_lower, args.rootfs, args.image) {
+            // Build RUN step: the base's layers as the build resolved them, no image config.
+            (ol, _, _) if !ol.is_empty() => (ol.to_vec(), kern_oci::ImageConfig::default()),
+            (_, Some(r), _) => (vec![r.to_string()], kern_oci::ImageConfig::default()),
+            // `--image` may be a pulled (flat) OR a locally-built (layered) image - resolve both. The
+            // `--pull` policy rides all the way down to the one site that hits the network
+            // (`pull_to_cache`); `scratch` and locally-built images short-circuit before that, so
+            // `never` naturally passes them.
+            (_, None, Some(img)) => resolve_image_depth(img, 0, args.pull)?,
+            (_, None, None) => return Err(Error::Sandbox("need --rootfs or --image".to_string())),
+        };
     // AN EMPTY NAMED VOLUME IS SEEDED FROM THE IMAGE, WHICH IS WHAT DOCKER DOES.
     //
     // Docker copies the image's content at the mount point into a named volume the first time that

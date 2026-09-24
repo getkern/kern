@@ -270,6 +270,7 @@ pub use real::{
     TmpfsMount, UidRange, Unplaceable, VdiskMount, Volume, ULIMITS,
 };
 pub use real::{iface_set_ipv4, iface_up, member_mac, pod_bridge_parts, POD_BRIDGE};
+pub use real::{overlay_escape, overlay_lowerdir};
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};
 pub use seccomp::{denied_syscall_count, SeccompFilter};

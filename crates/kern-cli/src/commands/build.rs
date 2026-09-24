@@ -617,8 +617,9 @@ fn build_multi_stage(
 /// because `COPY` was rewriting directory modes, and a second copier that did the same would have
 /// reintroduced the defect through the fix for a different one.
 fn materialize_final_image(tag: &str) -> Result<(), Error> {
-    let (lower, config) = resolve_image(tag)?;
-    let chain: Vec<String> = lower.split(':').map(str::to_string).collect();
+    // TOP first, one path each. The COUNT picks the branch below, and the merged view is what hides a
+    // file a later layer deleted: it has to be the real layer count, not the number of `:` in a path.
+    let (chain, config) = resolve_image(tag)?;
     let cache = cache_dir();
     let safe = sanitize_ref(tag);
     // A sibling of the final location, so the rename below is within one filesystem.
@@ -685,6 +686,12 @@ pub(crate) enum FlatReason {
     /// so a file deleted in one build step would come back in a `COPY --from` or a push. Measured on
     /// tegra 5.15. The flat path deletes for real, which closes the leak by construction.
     OpaqueNotHonoured,
+    /// The opaque probe could not FINISH, so it learned nothing, and a probe that learned nothing is
+    /// a flat build like the others. Separate from `OpaqueNotHonoured` because that one is a claim
+    /// about the KERNEL: on WSL's 9p the probe's own delete is refused with an I/O error, and telling
+    /// that user their kernel omits opaque markers sends them to look at the wrong thing. The code is
+    /// the child's exit status, so the cause is reportable rather than guessed.
+    OpaqueProbeFailed(i32),
 }
 
 impl FlatReason {
@@ -696,6 +703,12 @@ impl FlatReason {
             Self::OpaqueNotHonoured => {
                 "this kernel does not record overlay opaque markers, so a layered build could \
                  resurrect a deleted file"
+            }
+            // Not `const`, so this arm carries the code: `why` stays `&'static str` by keeping the
+            // number out of it, and the caller that needs it says so.
+            Self::OpaqueProbeFailed(_) => {
+                "the overlay opaque-marker probe could not run here, and an unproven marker is \
+                 treated as a missing one"
             }
         }
     }
@@ -717,7 +730,7 @@ fn build_run(
     let total = instrs.len();
 
     // FROM is always the first instruction (the parser guarantees it). Resolve the base to an overlay
-    // lower (a single dir, or a colon chain for a layered base).
+    // lower: its layers, TOP first (one entry for a pulled image, several for a built one).
     let Some(Instr::From {
         image: base_ref, ..
     }) = instrs.first()
@@ -765,18 +778,50 @@ fn build_run(
         Some(FlatReason::Forced)
     } else if !probe_overlay(&self_exe, &base_lower, work) {
         Some(FlatReason::NoUnprivilegedOverlay)
-    } else if !probe_opaque_honored() {
-        Some(FlatReason::OpaqueNotHonoured)
     } else {
-        None
+        match probe_opaque_honored() {
+            crate::commands::OpaqueProbe::Honoured => None,
+            crate::commands::OpaqueProbe::NotHonoured => Some(FlatReason::OpaqueNotHonoured),
+            crate::commands::OpaqueProbe::Inconclusive(c) => Some(FlatReason::OpaqueProbeFailed(c)),
+        }
     };
     let layered = flat_because.is_none();
-    if !layered && base_lower.contains(':') {
-        return Err(Error::Sandbox(
-            "cannot build FROM a layered image without unprivileged overlay + honoured opaque dirs on \
-             this kernel (needed to avoid a deleted-file leak); rebuild on a newer kernel"
-                .into(),
-        ));
+    // A FLAT BUILD COPIES ONE DIRECTORY, and a base built locally is several layers that only an
+    // overlay can stack. This asked `base_lower.contains(':')`, which counted the `:` in a PATH as a
+    // layer boundary: under a cache such as `colon:cache` a one-layer pulled base looked layered,
+    // `probe_overlay` had already failed on the same `:`, and the user on a 7.0 kernel was told to
+    // "rebuild on a newer kernel". It is the layer count now, and the message says which of the
+    // reasons it was, because only one of them is about the kernel.
+    if let (Some(reason), true) = (flat_because, base_lower.len() > 1) {
+        return Err(Error::Sandbox(format!(
+            "cannot build FROM '{base_ref}': it is a locally built image of {} layers, which only an \
+             overlay can stack, and this build is on the flat path ({}). {}",
+            base_lower.len(),
+            reason.why(),
+            match reason {
+                FlatReason::Forced => "Unset KERN_BUILD_FLAT to build on it.",
+                FlatReason::NoUnprivilegedOverlay => {
+                    "`kern doctor` reports whether this kernel allows an unprivileged overlay."
+                }
+                FlatReason::OpaqueNotHonoured => {
+                    "kern refuses the layered path here on purpose; rebuild the base with \
+                     KERN_BUILD_FLAT=1 so it is a single layer, or build on a kernel that records \
+                     the markers."
+                }
+                FlatReason::OpaqueProbeFailed(c) => {
+                    // The step, by code, because the remedies differ: a refused delete is the
+                    // filesystem (WSL's 9p), a refused mount is the kernel or the sandbox.
+                    match c {
+                        15 | 16 => "the probe could not delete and recreate a directory in its own \
+                                    overlay, which is the filesystem under $XDG_CACHE_HOME refusing \
+                                    it (measured on WSL's 9p); point XDG_CACHE_HOME at a local disk.",
+                        13 | 17 | 18 => "the probe could not mount its own throwaway overlay; \
+                                         `kern doctor` reports whether this kernel allows one.",
+                        _ => "rebuild the base with KERN_BUILD_FLAT=1 so it is a single layer.",
+                    }
+                }
+            }
+        )));
     }
     // Layered mode: per-unit **cached** layers (each RUN batch / COPY / WORKDIR is a content-addressed
     // overlay layer reused on an unchanged rebuild). Feedback-first: name the strategy so a silent flat
@@ -797,7 +842,16 @@ fn build_run(
     // busts the key and rebuilds - it never serves a stale image.
     let ig = crate::dockerignore::DockerIgnore::load(ctx);
     let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
-    let flat_key = flat_image_key(&base_lower, instrs, ctx, &ctx_root, ig.as_ref());
+    // The key is the ESCAPED lowerdir: byte-identical to the old `:`-joined string for every path
+    // free of `\`, `:` and `,` - exactly the paths that could mount before - so no valid cache moves,
+    // and unlike the plain join it cannot make two different layer lists into one key.
+    let flat_key = flat_image_key(
+        &kern_isolation::overlay_lowerdir(&base_lower),
+        instrs,
+        ctx,
+        &ctx_root,
+        ig.as_ref(),
+    );
     if flat_cache_hit(tag, &flat_key) {
         if !quiet {
             kern_common::progress!("  [cached · flat image unchanged]");
@@ -828,7 +882,13 @@ fn build_run(
         );
     }
     let write_dir = work.join("rootfs");
-    copy_tree(std::path::Path::new(&base_lower), &write_dir)?;
+    // Exactly one layer here: a multi-layer base returned above.
+    let Some(base_dir) = base_lower.first() else {
+        return Err(Error::Sandbox(format!(
+            "FROM '{base_ref}': the base has no layer"
+        )));
+    };
+    copy_tree(std::path::Path::new(base_dir), &write_dir)?;
     // DNS for RUN: seed the host resolv.conf into the copied rootfs so apk/apt resolve; stripped
     // before finalize (if we created it) so the host's DNS servers aren't baked into the image.
     let seeded_resolv = seed_resolv_conf(&write_dir);
@@ -1052,7 +1112,7 @@ fn build_layered_cached(
     work: &std::path::Path,
     instrs: &[crate::dockerfile::Instr],
     base_ref: &str,
-    base_lower: &str,
+    base_lower: &[String],
     mut config: kern_oci::ImageConfig,
 ) -> Result<(), Error> {
     use crate::dockerfile::Instr;
@@ -1068,10 +1128,12 @@ fn build_layered_cached(
     };
     // Overlay lower chain (base first); a layer dir is appended per fs-unit. `key` is the running
     // chained key; `layer_keys` are the produced layers in order (→ the tag's `.layers` manifest).
-    let mut chain: Vec<String> = vec![base_lower.to_string()];
+    // The base arrives TOP first, so reversing it gives this chain's base-first order, one path each.
+    let mut chain: Vec<String> = base_lower.iter().rev().cloned().collect();
     // Seed the chain key from the RESOLVED base lower (content-addressed for a locally-built base:
-    // its colon-chain of layer keys), not just the ref string - so rebuilding the base busts a child.
-    let mut key = layer_key("", base_lower);
+    // its chain of layer keys), not just the ref string - so rebuilding the base busts a child. The
+    // escaped lowerdir, for the same reason as the flat key: every key that could exist is unchanged.
+    let mut key = layer_key("", &kern_isolation::overlay_lowerdir(base_lower));
     let mut layer_keys: Vec<String> = Vec::new();
     let mut cmd_from_dockerfile = false;
     let mut unit = 0usize;
@@ -1083,7 +1145,9 @@ fn build_layered_cached(
     while i < instrs.len() {
         // The overlay `lowerdir=` string (all layers + base) must fit ~one kernel page. Stop with a
         // clear message BEFORE the chain overflows and the mount fails with a cryptic EINVAL.
-        if chain_lower(&chain).len() > MAX_LOWERDIR_BYTES {
+        // The LENGTH does not depend on the order, so this measures the chain as it is rather than
+        // cloning the whole list once per instruction just to reverse it.
+        if kern_isolation::overlay_lowerdir(&chain).len() > MAX_LOWERDIR_BYTES {
             return Err(Error::Sandbox(
                 "build has too many layers to overlay - squash consecutive RUN/COPY steps or reduce \
                  the number of instructions"
@@ -1137,7 +1201,7 @@ fn build_layered_cached(
                     run_build_step(
                         &self_exe,
                         true,
-                        &chain_lower(&chain),
+                        &chain_top_first(&chain),
                         &fresh,
                         &fresh,
                         &config,

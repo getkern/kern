@@ -13630,3 +13630,582 @@ fn a_cpuset_list_produces_exactly_those_cpu_directories() {
         "a list cpuset must yield exactly its own ids, no gaps filled and no extras"
     );
 }
+
+/// A cache path holding `:`, `,`, a space or a backslash must pull, run, build and stack layers.
+///
+/// # Why this is an integration test and not a unit one
+///
+/// The defect lived BETWEEN processes. The chain was resolved in one process, `:`-joined, handed to a
+/// child `kern box` on a flag, and cut apart there - so every piece in isolation was correct and the
+/// composition was not. Measured on the old binary under `XDG_CACHE_HOME=…/colon:cache`:
+/// `kern box --image alpine:3.19` died with `mount(overlay) failed: No such file or directory`, whose
+/// hint blamed the host, and `kern build` said "rebuild on a newer kernel" on a 7.0 kernel.
+///
+/// # The two halves, and why the offline one cannot carry the whole test
+///
+/// `FROM scratch` needs no registry and still goes through `resolve_image`, the overlay mount of a
+/// real box, the `TMPDIR` probes and the build tree - so it runs everywhere. But a scratch build is
+/// FLAT (measured: `.flatkey` and no `.layers`), so it can never exercise a chain of more than one
+/// directory, which is the case the `:` actually broke. The layered half therefore needs a pulled
+/// base, and skips when there is no registry - on the PLAIN row, so a skip is never a special
+/// character quietly failing.
+///
+/// The SPACE row is not decoration. The opaque probe interpolated this same directory into a
+/// `libc::system()` script without quoting, and with a space in it the script's `rm -rf` ran against a
+/// PREFIX of the path. The canary below is a directory named after that prefix, holding a file: if any
+/// step deletes it, a build has destroyed data outside its own tree.
+///
+/// The BACKSLASH row covers a second defect on the same paths: `sha256sum` escapes a name that holds
+/// one, so every blob of every pull was refused as a digest mismatch.
+#[test]
+fn a_cache_path_with_special_characters_still_pulls_builds_and_stacks_layers() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kern-it-specialpath-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let ctx = root.join("ctx");
+    fs::create_dir_all(&ctx).expect("ctx");
+    fs::write(ctx.join("payload"), b"hello\n").expect("payload");
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM scratch\nCOPY payload /payload\nWORKDIR /srv\nENV K=v\n",
+    )
+    .expect("dockerfile");
+    // The layered half: a pulled base, so the chain is the base plus this image's own layers.
+    let ctx2 = root.join("ctx2");
+    fs::create_dir_all(&ctx2).expect("ctx2");
+    fs::write(ctx2.join("payload"), b"layered\n").expect("payload2");
+    // TWO layers of its own, and the `RUN` SHADOWS a file the base ships. One layer would never pass
+    // more than one `--overlay-lower` across the process boundary, and a chain whose entries hold
+    // distinct files passes even stacked backwards: the shadowed file is what can tell the order.
+    // `RUN` is also what makes `run_build_step` spawn the child box that receives the repeated flag.
+    fs::write(
+        ctx2.join("Dockerfile"),
+        "FROM alpine:3.19\nCOPY payload /payload\nRUN echo shadowed > /etc/alpine-release\n",
+    )
+    .expect("dockerfile2");
+
+    // THE CAPABILITY, ASKED SEPARATELY AND ONCE. A skip decided by a build's own failure turns every
+    // regression that breaks builds into a green test.
+    let probe_home = root.join("probe");
+    fs::create_dir_all(&probe_home).expect("probe home");
+    let registry_up = kern()
+        .env("XDG_CACHE_HOME", &probe_home)
+        .env("XDG_RUNTIME_DIR", &probe_home)
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !registry_up {
+        eprintln!("skip (layered half): no registry reachable; the offline half still runs");
+    }
+    let mut plain_doctor_refused: Option<bool> = None;
+    for (label, infix) in [
+        ("plain", "post"),
+        ("colon", ":post"),
+        ("comma", ",post"),
+        ("space", " post"),
+        ("backslash", "\\post"),
+    ] {
+        let home = root.join(label);
+        // THE CANARY: the path up to the first space, which is what an unquoted shell word would
+        // become. It must be untouched at the end.
+        let canary = home.join("pre");
+        fs::create_dir_all(&canary).expect("canary");
+        fs::write(canary.join("keep.txt"), b"do not delete me\n").expect("canary file");
+        let cache = home.join(format!("pre{infix}"));
+        let xdg = home.join("run");
+        fs::create_dir_all(&cache).expect("cache");
+        fs::create_dir_all(&xdg).expect("xdg");
+
+        // Returns the EXIT CODE, not just success: "the box got far enough to try the exec" is code
+        // 126, and no combination of output strings says that as precisely.
+        let run_status = |args: &[&str]| -> (String, Option<i32>) {
+            let o = kern()
+                .env("XDG_CACHE_HOME", &cache)
+                .env("XDG_RUNTIME_DIR", &xdg)
+                // TMPDIR too: `doctor`'s overlay probe and the build tree both live under it, and both
+                // built mount options from it.
+                .env("TMPDIR", &cache)
+                .args(args)
+                .output()
+                .expect("run kern");
+            (
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                o.status.code(),
+            )
+        };
+        let run = |args: &[&str]| -> (String, bool) {
+            let (out, code) = run_status(args);
+            (out, code == Some(0))
+        };
+
+        // -- OFFLINE HALF: build and mount an image that needs no registry -----------------------
+        let tag = format!("kern-sp-{label}:1");
+        // WHAT THIS HALF DOES NOT COVER: a `FROM scratch` build is FLAT, because `probe_overlay`
+        // starts a box running `true` in the base and a scratch image has no executable, so it never
+        // reaches `probe_opaque_honored`. It covers `resolve_image`, the box's own overlay mount and
+        // doctor's probe; the probe that did the deleting is covered by
+        // `a_build_under_a_cache_path_with_a_space_deletes_nothing_outside_its_tree`.
+        let (said, ok) = run(&["build", "-t", &tag, ctx.to_str().expect("ctx utf8")]);
+        assert!(ok, "build failed under a {label} cache path:\n{said}");
+
+        // THE BOX: the chain is resolved, handed over and mounted - the composition a unit test
+        // cannot reach. A `scratch` image holding one data file has no executable, so the box must
+        // fail to EXEC and not to MOUNT: that distinction IS the assertion.
+        let (out, code) = run_status(&[
+            "box",
+            &format!("sp{label}"),
+            "--image",
+            &tag,
+            "--",
+            "/payload",
+        ]);
+        // 126 = the sandbox WAS built and the program could not be executed, which is what a data
+        // file as the command must give. Asserting only the absence of two strings would also pass
+        // for a box that failed earlier, for any reason at all.
+        assert_eq!(
+            code,
+            Some(126),
+            "a {label} cache path did not get as far as exec'ing inside a built box:\n{out}"
+        );
+
+        // `doctor` probes an overlay under TMPDIR, and reported the kernel as unable when that path
+        // held a `:` or a `,`.
+        let (doc, _) = run(&["doctor"]);
+        // Against the PLAIN control, not absolutely: on a host where unprivileged overlay really is
+        // unavailable (WSL2, a vendor kernel) every row should say so, and only a row that DIFFERS
+        // from the control is this defect.
+        let refused = doc.contains("UNPRIVILEGED mount is refused");
+        if label == "plain" {
+            plain_doctor_refused = Some(refused);
+        }
+        assert_eq!(
+            Some(refused),
+            plain_doctor_refused,
+            "a {label} TMPDIR changed doctor's overlay verdict against the plain control:\n{doc}"
+        );
+
+        // -- LAYERED HALF: needs a registry ------------------------------------------------------
+        if registry_up {
+            let tag2 = format!("kern-sp-{label}-l:1");
+            let (said2, ok2) = run(&["build", "-t", &tag2, ctx2.to_str().expect("ctx2 utf8")]);
+            {
+                assert!(
+                    ok2,
+                    "a layered build failed under a {label} cache path:\n{said2}"
+                );
+                let manifest = fs::read_dir(cache.join("kern/images"))
+                    .expect("images dir")
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .find(|p| {
+                        p.extension().is_some_and(|x| x == "layers")
+                            && p.file_name().is_some_and(|n| {
+                                n.to_string_lossy()
+                                    .starts_with(&format!("kern-sp-{label}-l"))
+                            })
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("a {label} cache path fell back to a FLAT build:\n{said2}")
+                    });
+                let body = fs::read_to_string(&manifest).expect("manifest");
+                let own = body
+                    .lines()
+                    .skip(1)
+                    .filter(|l| !l.trim().is_empty())
+                    .count();
+                assert!(own >= 1, "no own layer in the manifest:\n{body}");
+
+                // The stacked chain, MOUNTED: the base's files and this image's own must both be
+                // there, which is what a chain cut at a `:` could not deliver.
+                let (o2, _) = run(&[
+                    "box",
+                    &format!("spl{label}"),
+                    "--image",
+                    &tag2,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "cat /payload; cat /etc/alpine-release; ls /bin/busybox",
+                ]);
+                // `/payload` is this image's and `/bin/busybox` is the base's: both present means the
+                // stack has both ends.
+                assert!(
+                    o2.contains("layered") && o2.contains("/bin/busybox"),
+                    "a {label} cache path did not stack this image over its base:\n{o2}"
+                );
+                // `/etc/alpine-release` exists in BOTH layers, so it is the only file that can tell
+                // the ORDER. Stacked backwards the base's version wins, and this is the assertion
+                // that notices.
+                assert!(
+                    o2.contains("shadowed") && !o2.contains("3.19"),
+                    "the base's file won over this image's: the chain is stacked BOTTOM first:\n{o2}"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `COPY f /etc` onto a LOCALLY BUILT base puts `f` INSIDE `/etc`, it does not replace it.
+///
+/// # A defect the layer-list change fixed without meaning to, so it needs its own test
+///
+/// `chain_has_dir` answers "is this destination a directory in the image?", and COPY uses it to pick
+/// "into a dir" over "as a file". The build seeded its chain with the base as ONE string, so for a
+/// layered base that string was `L/k2:L/k1:alpine`, and `chain_has_dir` looked for a directory
+/// literally named `L/k2:L/k1:alpine/etc`, which cannot exist. Every destination therefore read as
+/// "not a directory".
+///
+/// MEASURED on the old binary: the image came out with `/etc` as a FILE containing the copied
+/// payload, so `/etc/passwd`, `/etc/group` and the rest of the directory were gone from the image,
+/// and the build reported success. The same reading loses directory MODES for the same reason.
+///
+/// Only a LOCALLY BUILT base shows it: a pulled base is one directory, so its string was a real path.
+#[test]
+fn copy_into_a_directory_of_a_locally_built_base_does_not_replace_the_directory() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kern-it-copydir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let base_ctx = root.join("base");
+    let top_ctx = root.join("top");
+    let cache = root.join("cache");
+    // SEPARATE from the cache, deliberately. Pointing both at one directory puts the build tree
+    // under the registry root, and `--rootfs`'s guard then refuses the build's own flat bind - a
+    // failure of the test's setup that looks exactly like a failure of the subject.
+    let xdg = root.join("run");
+    for d in [&base_ctx, &top_ctx, &cache, &xdg] {
+        fs::create_dir_all(d).expect("dir");
+    }
+    fs::write(
+        base_ctx.join("Dockerfile"),
+        "FROM alpine:3.19\nRUN echo b > /marker\n",
+    )
+    .expect("base dockerfile");
+    fs::write(top_ctx.join("payload"), b"copied\n").expect("payload");
+    // NO trailing slash, which is what makes the answer depend on `chain_has_dir`.
+    fs::write(
+        top_ctx.join("Dockerfile"),
+        "FROM kern-copydir-base:1\nCOPY payload /etc\n",
+    )
+    .expect("top dockerfile");
+
+    let run = |args: &[&str]| -> (String, bool) {
+        let o = kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            o.status.success(),
+        )
+    };
+
+    let (pulled, have_registry) = run(&["pull", "alpine:3.19"]);
+    if !have_registry {
+        eprintln!("skip: no registry, and only a locally built base shows this: {pulled}");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let (b, bok) = run(&[
+        "build",
+        "-t",
+        "kern-copydir-base:1",
+        base_ctx.to_str().expect("utf8"),
+    ]);
+    assert!(bok, "the base build failed:\n{b}");
+    let (s, sok) = run(&[
+        "build",
+        "-t",
+        "kern-copydir-top:1",
+        top_ctx.to_str().expect("utf8"),
+    ]);
+    assert!(sok, "the build on top of it failed:\n{s}");
+
+    let (out, _) = run(&[
+        "box",
+        "copydirbox",
+        "--image",
+        "kern-copydir-top:1",
+        "--",
+        "/bin/sh",
+        "-c",
+        "if [ -d /etc ]; then echo DIR; cat /etc/payload; test -f /etc/passwd && echo PASSWD-OK; \
+         else echo FILE; fi",
+    ]);
+    assert!(
+        out.contains("DIR") && out.contains("copied") && out.contains("PASSWD-OK"),
+        "COPY replaced the base's /etc instead of copying into it, destroying the directory:\n{out}"
+    );
+    let _ = run(&["rmi", "kern-copydir-top:1"]);
+    let _ = run(&["rmi", "kern-copydir-base:1"]);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The kern REGISTRY may not become a box's filesystem through `--rootfs` or `--overlay-lower`.
+///
+/// `--rootfs` has been guarded for a long time; the guard canonicalizes the path and refuses one that
+/// lands on the registry, which holds every other box's secrets, ssh host keys and posture records.
+/// Two ways around it existed and both are closed here.
+///
+/// MEASURED on the old binary, both of them: the box listed 8730 entries of the registry's `env/`.
+///
+/// 1. `--rootfs "<a real dir>:<runtime>/kern"`. The guard canonicalized the WHOLE string, which was a
+///    single innocent directory, and the mount then split it at the `:` so the registry became the
+///    second layer. Escaping closes it: the string is now one layer and the guard sees what mounts.
+/// 2. `--overlay-lower <runtime>/kern`. The flag is undocumented but parsed from the same argv as any
+///    other, and it had no guard at all - a comment claimed it was "kern-generated, not user input".
+#[test]
+fn the_registry_cannot_become_a_box_root_through_rootfs_or_overlay_lower() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    let rootfs = build_rootfs(&busybox, "regguard");
+    let run_dir = std::env::temp_dir().join(format!("kern-it-regguard-{}", std::process::id()));
+    let registry = run_dir.join("kern");
+    // The registry as kern lays it out, with a secret in it: a guard that refuses an EMPTY directory
+    // would pass this test while leaving a real registry exposed.
+    fs::create_dir_all(registry.join("env")).expect("registry");
+    fs::write(registry.join("env/other-box"), b"SECRET=hunter2\n").expect("secret");
+
+    // THE ATTACK NEEDS A DIRECTORY THAT REALLY IS NAMED `<rootfs>:<registry>`, and building the
+    // string from two separate paths does NOT make one: as a single path it does not exist, the
+    // guard's `canonicalize` fails, and the refusal that follows says "No such file or directory"
+    // rather than anything about the registry - a pass for the wrong reason. So create it: a
+    // directory whose first component ends in `:`, holding the rest of the registry's path.
+    let trap_root = std::env::temp_dir().join(format!("kern-it-regtrap-{}", std::process::id()));
+    let joined_dir = std::path::PathBuf::from(format!(
+        "{}:{}",
+        trap_root.join("rootfs").display(),
+        registry.display()
+    ));
+    let made_trap = fs::create_dir_all(&joined_dir).is_ok();
+    // Give the trap a rootfs of its own so a refusal cannot be "there is nothing to run here".
+    if made_trap {
+        let _ = fs::create_dir_all(trap_root.join("rootfs/bin"));
+        let _ = fs::copy(&busybox, trap_root.join("rootfs/bin/busybox"));
+    }
+
+    let run = |args: &[&str]| -> (String, bool) {
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &run_dir)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            o.status.success(),
+        )
+    };
+
+    // THE POSITIVE CONTROL FIRST: an ordinary rootfs still works under this same runtime dir, so a
+    // build where every box fails cannot make the refusals below look like a working guard.
+    let (ok_out, ok_ran) = run(&[
+        "box",
+        "regok",
+        "--rootfs",
+        rootfs.to_str().expect("utf8"),
+        "--",
+        "/bin/busybox",
+        "true",
+    ]);
+    if !ok_ran {
+        eprintln!("skip: no box starts on this host: {ok_out}");
+        let _ = fs::remove_dir_all(&run_dir);
+        let _ = fs::remove_dir_all(&rootfs);
+        return;
+    }
+
+    let joined = joined_dir.to_string_lossy().into_owned();
+    let mut cases: Vec<(&str, Vec<&str>)> = vec![(
+        "--overlay-lower",
+        vec![
+            "box",
+            "regbad2",
+            "--overlay-lower",
+            registry.to_str().expect("utf8"),
+            "--overlay-lower",
+            rootfs.to_str().expect("utf8"),
+            "--overlay-upper",
+            run_dir.to_str().expect("utf8"),
+            "--",
+            "/bin/busybox",
+            "sh",
+        ],
+    )];
+    if made_trap {
+        cases.push((
+            "--rootfs naming a directory whose name contains the registry's path",
+            vec![
+                "box",
+                "regbad1",
+                "--rootfs",
+                joined.as_str(),
+                "--",
+                "/bin/busybox",
+                "sh",
+            ],
+        ));
+    } else {
+        eprintln!("note: this filesystem would not take a directory named with a ':' - that row is skipped");
+    }
+    // THE PROPERTY IS THAT THE SECRET IS NOT READABLE, not that a particular message appears. The two
+    // routes are stopped in two different ways and both are correct: `--overlay-lower` is REFUSED by
+    // the guard, while the `--rootfs` trap is no longer an attack at all - the path is taken
+    // literally now, so the box gets that one (empty) directory instead of a stack ending in the
+    // registry. Asserting the refusal TEXT would have called the second one a failure.
+    for (what, mut args) in cases {
+        args.extend_from_slice(&["-c", "cat /env/other-box 2>&1 || true"]);
+        let (out, _ran) = run(&args);
+        assert!(
+            !out.contains("hunter2"),
+            "{what} let a box read another box's secret out of the kern registry:\n{out}"
+        );
+    }
+    // AND THE GUARD IS WHAT STOPS THE ONE IT IS FOR. Without this, the loop above would stay green if
+    // `--overlay-lower` started failing for some unrelated reason and the guard were removed.
+    let (guarded, ran) = run(&[
+        "box",
+        "regbad3",
+        "--overlay-lower",
+        registry.to_str().expect("utf8"),
+        "--overlay-lower",
+        rootfs.to_str().expect("utf8"),
+        "--overlay-upper",
+        run_dir.to_str().expect("utf8"),
+        "--",
+        "/bin/busybox",
+        "true",
+    ]);
+    assert!(!ran, "--overlay-lower accepted the registry:\n{guarded}");
+    assert!(
+        guarded.contains("registry"),
+        "--overlay-lower was refused, but NOT for being the registry - so the guard is not what \
+         stopped it, and the refusal could go away without anyone noticing:\n{guarded}"
+    );
+    let _ = fs::remove_dir_all(&run_dir);
+    let _ = fs::remove_dir_all(&trap_root);
+    let _ = fs::remove_dir_all(&rootfs);
+}
+
+/// A build must not delete anything OUTSIDE its own tree, whatever the cache path contains.
+///
+/// # This is its own test because it could not be an assertion in the one above
+///
+/// The data loss and the build failure are DIFFERENT outcomes of the same defect, and the failure
+/// fires first: with the old probe under a space path, the script's `rm -rf` deleted the canary, its
+/// `mkdir` then failed on the relative half of the path, the probe returned false and the build fell
+/// back to flat and SUCCEEDED. Any assertion placed after the build therefore fires on the flat
+/// fallback, and a canary check at the end of that test was unreachable - measured by reading the
+/// order, then fixed by moving the check here where nothing can run before it.
+///
+/// # It has to reach the opaque probe, and only one kind of build does
+///
+/// `probe_opaque_honored` runs only after `probe_overlay` succeeds, and `probe_overlay` starts a real
+/// box running `true` in the base - which a `FROM scratch` image has no executable for. So a scratch
+/// build never reaches the probe that did the deleting, and a test built on one would pass on the
+/// defect. This needs a base with a `/bin/true`, so it needs a registry, and it SKIPS without one
+/// rather than passing.
+#[test]
+fn a_build_under_a_cache_path_with_a_space_deletes_nothing_outside_its_tree() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kern-it-canary-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let ctx = root.join("ctx");
+    fs::create_dir_all(&ctx).expect("ctx");
+    // A `RUN` that deletes and recreates a directory from the base: the exact shape whose opaque
+    // marker the probe exists to check, so the build really does take that path.
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM alpine:3.19
+RUN rm -rf /etc/apk && mkdir /etc/apk
+",
+    )
+    .expect("dockerfile");
+
+    // THE CANARY IS THE PATH UP TO THE FIRST SPACE, which is what an unquoted shell word becomes.
+    let canary = root.join("pre");
+    fs::create_dir_all(&canary).expect("canary");
+    fs::write(canary.join("keep.txt"), b"do not delete me\n").expect("canary file");
+    let cache = root.join("pre post");
+    let xdg = root.join("run");
+    fs::create_dir_all(&cache).expect("cache");
+    fs::create_dir_all(&xdg).expect("xdg");
+
+    let run = |args: &[&str]| -> (String, bool) {
+        let o = kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env("TMPDIR", &cache)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            o.status.success(),
+        )
+    };
+
+    // THE CAPABILITY, ASKED SEPARATELY. A skip decided by the build's own failure would turn every
+    // regression that breaks builds into a green test.
+    let (pulled, have_registry) = run(&["pull", "alpine:3.19"]);
+    if !have_registry {
+        eprintln!(
+            "skip: no registry reachable, and a scratch base never reaches the probe: {pulled}"
+        );
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+
+    let (said, ok) = run(&[
+        "build",
+        "-t",
+        "kern-canary:1",
+        ctx.to_str().expect("ctx utf8"),
+    ]);
+    // THE CANARY FIRST, before anything about the build's outcome. The old defect deleted it and then
+    // reported success, so an assertion on `ok` would have said the build was fine.
+    assert!(
+        canary.join("keep.txt").is_file(),
+        "a build under a cache path with a space DELETED data outside its tree ({} is gone). \
+         Build said ok={ok}:\n{said}",
+        canary.display()
+    );
+    assert!(
+        ok,
+        "the build itself failed under a space cache path:\n{said}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

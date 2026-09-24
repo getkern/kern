@@ -427,7 +427,15 @@ fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
     // "Already cached" must mean RUNNABLE, not "a sentinel file exists". Asked with the same predicate
     // the pull itself uses, so the message cannot claim a hit the resolver treated as a miss.
     let had = cache_entry_complete(&cache_dir(), &key);
-    let (path, _cfg) = resolve_image_depth(image, 0, PullPolicy::Missing)?;
+    let (layers, _cfg) = resolve_image_depth(image, 0, PullPolicy::Missing)?;
+    // Where the image lives: its own directory, which is the TOP layer. A locally built image rests
+    // on base layers too, and this used to print them all joined by `:`, the same text that could
+    // not be told apart from a `:` inside a path.
+    let path = match layers.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [top, rest @ ..] => format!("{top} (+{} base layers)", rest.len()),
+    };
     // `-q` PRINTS THE REFERENCE AND NOTHING ELSE, which is the shape the flag means everywhere.
     //
     // MEASURED on Docker 29.1.3: `docker pull --quiet alpine:3.18` prints exactly one line,

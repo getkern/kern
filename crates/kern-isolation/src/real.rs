@@ -378,9 +378,74 @@ pub struct VdiskMount {
 
 /// overlayfs directories. `lower` is the read-only image; `upper`/`work` are the writable layer.
 pub struct OverlayDirs {
-    pub lower: String,
+    /// The image's layers, TOP first (overlayfs shadows left to right), one path per entry.
+    ///
+    /// A LIST, NOT A `:`-JOINED STRING, because a host path may contain a `:`. It was a joined
+    /// string, and a cache under `colon:cache` reached the kernel as two layers that did not exist.
+    /// Four call sites build a `lowerdir=` (this mount, the build's merged view, the opaque probe and
+    /// doctor's probe) and every one of them goes through [`overlay_lowerdir`], so the escaping rule
+    /// lives in one function and a later change to it cannot reach some of them and miss others.
+    pub lower: Vec<String>,
     pub upper: String,
     pub work: String,
+}
+
+/// One path as overlayfs reads it inside a mount option.
+///
+/// OVERLAYFS CUTS ITS OPTIONS ON TWO CHARACTERS, and a host path may contain either. The option
+/// string is split at every `,` (one option from the next) and `lowerdir=` again at every `:` (one
+/// layer from the next), so a cache under `colon:cache` reached the kernel as a layer named
+/// `.../colon` plus a RELATIVE path `cache/kern/images/...`, and the box failed with a bare
+/// `ENOENT` that its hint then blamed on the host. A backslash is what the kernel honours in front
+/// of either, so a backslash has to be escaped too.
+///
+/// MEASURED, not recalled from the kernel source, on 6.8 and on 7.0, with identical results: raw, a
+/// `:` in the lower and a `,` or `\` anywhere fail with `ENOENT`; escaped this way, all seven shapes
+/// probed mount AND show the lower's files, including two read-only layers of which one has a `:` in
+/// its name. A `:` in `upperdir=`/`workdir=` passes even raw, since those are not split on it, and is
+/// escaped anyway: one rule for every path is a rule a later edit cannot apply to the wrong option.
+///
+/// ⚠️ BOTH KERNELS PROBED SHARE ONE PARSER. overlayfs moved to the `fs_context` parser before either,
+/// so agreeing tells us the two agree and not that the behaviour is stable across the split. The
+/// parser a 5.15 vendor kernel uses (the Jetson board) is NOT covered by that measurement. Escaping is
+/// the older of the two conventions and is what every other runtime emits, so this is the safe side of
+/// the uncertainty, but a board run is what would close it.
+pub fn overlay_escape(path: &str) -> String {
+    // THE COMMON PATH IS A PATH WITH NOTHING TO ESCAPE, and it is on every box start. Answering it
+    // with one scan and a plain copy keeps this at memcpy cost instead of a per-char push loop.
+    if !path.contains(['\\', ':', ',']) {
+        return path.to_string();
+    }
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        if matches!(c, '\\' | ':' | ',') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The `lowerdir=` value for `layers`, TOP first: the one place a layer list becomes text.
+///
+/// Also what a length check has to measure rather than an unescaped join, because escaping adds
+/// bytes and the whole option string has to fit in one page.
+pub fn overlay_lowerdir<S: AsRef<str>>(layers: &[S]) -> String {
+    // One pre-sized String rather than a Vec of Strings plus a join: this runs in the child between
+    // fork and exec, where every allocation is on the box's start latency.
+    let mut out = String::with_capacity(layers.iter().map(|l| l.as_ref().len() + 1).sum());
+    for (i, l) in layers.iter().enumerate() {
+        if i > 0 {
+            out.push(':');
+        }
+        let s = l.as_ref();
+        if s.contains(['\\', ':', ',']) {
+            out.push_str(&overlay_escape(s));
+        } else {
+            out.push_str(s);
+        }
+    }
+    out
 }
 
 /// A host directory or file bind-mounted into the box.
@@ -531,10 +596,25 @@ fn make_private() -> Result<(), Error> {
 /// Mount an overlayfs at `merged` (read-only `lower` image + writable `upper`/`work`). The
 /// kernel holds references to the dirs, so the box's root stays writable; changes land in
 /// `upper` and the image is untouched.
-fn mount_overlay(lower: &str, upper: &str, work: &str, merged: &str) -> Result<(), Error> {
+fn mount_overlay(lower: &[String], upper: &str, work: &str, merged: &str) -> Result<(), Error> {
+    // An overlay needs a lower, and an empty `lowerdir=` is a kernel `EINVAL` naming nothing. No
+    // caller can produce one today; the message says what is missing if a later one does.
+    if lower.is_empty() {
+        // `Spec`, not `Unsupported`: the child's hint for `Unsupported` says the box could not be
+        // BUILT because of a host capability, and sends the reader to `kern doctor`. A root with no
+        // layer is a caller mistake, and naming the host would send them to look at the wrong thing.
+        return Err(Error::Spec(
+            "mount(overlay): the root has no image layer to mount".into(),
+        ));
+    }
     let ty = cstr("overlay")?;
     let merged_c = cstr(merged)?;
-    let opts = cstr(&format!("lowerdir={lower},upperdir={upper},workdir={work}"))?;
+    let opts = cstr(&format!(
+        "lowerdir={},upperdir={},workdir={}",
+        overlay_lowerdir(lower),
+        overlay_escape(upper),
+        overlay_escape(work)
+    ))?;
     // `NODEV|NOSUID` on the box root: a device node on the rootfs is inert and a setuid binary can't
     // elevate. Both are already assured (userns superblocks are `SB_I_NODEV`; the workload runs under
     // `NO_NEW_PRIVS` + the bounding-set cap drop), so this is defense-in-depth that doesn't rely on
@@ -8664,5 +8744,145 @@ mod cpu_dir_name_tests {
             assert!(len > 0 && len < buf.len(), "id {id} produced len {len}");
             assert_eq!(buf[len], 0, "id {id} must be NUL-terminated for mkdirat");
         }
+    }
+}
+
+#[cfg(test)]
+mod overlay_option_tests {
+    use super::{overlay_escape, overlay_lowerdir};
+
+    /// overlayfs's reading of a mount option string, as MEASURED on 6.8 and 7.0: the string is cut at
+    /// every unescaped `,`, and `lowerdir=` again at every unescaped `:`, then each `\x` becomes `x`.
+    /// A model, so a round trip can be checked on inputs no fixed table would think of; the kernel
+    /// agreed with it on all seven shapes the escape probe mounted.
+    fn kernel_split(s: &str, sep: char) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            let last = out.last_mut().expect("never empty");
+            if c == '\\' {
+                if let Some(n) = it.next() {
+                    last.push('\\');
+                    last.push(n);
+                }
+            } else if c == sep {
+                out.push(String::new());
+            } else {
+                last.push(c);
+            }
+        }
+        out
+    }
+
+    fn kernel_unescape(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                if let Some(n) = it.next() {
+                    out.push(n);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// What the kernel ends up with for `lowerdir=<lower>,upperdir=<up>,workdir=<wk>`.
+    fn kernel_reads(opts: &str) -> (Vec<String>, String, String) {
+        let (mut lower, mut up, mut wk) = (Vec::new(), String::new(), String::new());
+        for opt in kernel_split(opts, ',') {
+            if let Some(v) = opt.strip_prefix("lowerdir=") {
+                lower = kernel_split(v, ':')
+                    .iter()
+                    .map(|l| kernel_unescape(l))
+                    .collect();
+            } else if let Some(v) = opt.strip_prefix("upperdir=") {
+                up = kernel_unescape(v);
+            } else if let Some(v) = opt.strip_prefix("workdir=") {
+                wk = kernel_unescape(v);
+            }
+        }
+        (lower, up, wk)
+    }
+
+    #[test]
+    fn exactly_the_three_characters_the_kernel_cuts_on_are_escaped() {
+        assert_eq!(
+            overlay_escape("/home/alex/.cache/kern"),
+            "/home/alex/.cache/kern"
+        );
+        assert_eq!(overlay_escape("/with space/and é"), "/with space/and é");
+        assert_eq!(overlay_escape("/colon:cache"), "/colon\\:cache");
+        assert_eq!(overlay_escape("/a,b"), "/a\\,b");
+        assert_eq!(overlay_escape("/back\\slash"), "/back\\\\slash");
+    }
+
+    /// The CACHE-KEY property, and the reason this test exists separately. Built-layer keys are
+    /// derived from this string, and for every path free of `\`, `:` and `,` it must equal the plain
+    /// `:`-join the keys were derived from before - those are exactly the paths that could mount -
+    /// or every user's layered build cache is invalidated by the upgrade. Measured on a real cache: the
+    /// new binary reused the old binary's layers and created none.
+    #[test]
+    fn a_plain_layer_list_is_byte_identical_to_the_old_join() {
+        let layers = [
+            "/home/u/.cache/kern/images/L/0123",
+            "/home/u/.cache/kern/images/alpine_3_19-44",
+        ];
+        assert_eq!(overlay_lowerdir(&layers), layers.join(":"));
+        assert_eq!(overlay_lowerdir(&["/only"]), "/only");
+    }
+
+    /// The plain join is not injective: `["a:b"]` and `["a", "b"]` were one key and one mount string.
+    #[test]
+    fn two_different_layer_lists_never_produce_one_string() {
+        assert_ne!(overlay_lowerdir(&["/a:b"]), overlay_lowerdir(&["/a", "b"]));
+        assert_ne!(
+            overlay_lowerdir(&["/a\\", "b"]),
+            overlay_lowerdir(&["/a\\:b"])
+        );
+    }
+
+    /// Every layer list survives the kernel's reading, whatever it contains, in order.
+    #[test]
+    fn every_layer_list_round_trips_through_the_kernels_parser() {
+        let hard: &[&[&str]] = &[
+            &["/colon:cache/kern/images/alpine"],
+            &["/x/L/k2", "/x/L/k1", "/colon:cache/base"],
+            &["/a,b/c", "/d:e,f"],
+            &["/trailing\\", "/next"],
+            &["/::", "/,,", "/\\\\:"],
+            &["/with space", "/é:ü"],
+        ];
+        for layers in hard {
+            let up = "/run/user/1000/kern/scratch/box:1,x/upper";
+            let wk = "/run/user/1000/kern/scratch/box:1,x/work";
+            let opts = format!(
+                "lowerdir={},upperdir={},workdir={}",
+                overlay_lowerdir(layers),
+                overlay_escape(up),
+                overlay_escape(wk)
+            );
+            let (lower, got_up, got_wk) = kernel_reads(&opts);
+            let want: Vec<String> = layers.iter().map(|s| s.to_string()).collect();
+            assert_eq!(lower, want, "lowerdir did not survive: {opts}");
+            assert_eq!(got_up, up, "upperdir did not survive: {opts}");
+            assert_eq!(got_wk, wk, "workdir did not survive: {opts}");
+        }
+    }
+
+    /// The model has to be able to fail, or the round trip above proves nothing: the RAW strings the
+    /// old code built are exactly what it must reject.
+    #[test]
+    fn the_kernel_model_rejects_what_the_old_code_built() {
+        let (lower, _, _) =
+            kernel_reads("lowerdir=/colon:cache/kern/images/alpine,upperdir=/u,workdir=/w");
+        assert_eq!(
+            lower,
+            vec!["/colon".to_string(), "cache/kern/images/alpine".to_string()]
+        );
+        let (lower, up, _) = kernel_reads("lowerdir=/l,upperdir=/a,b/upper,workdir=/w");
+        assert_eq!((lower, up), (vec!["/l".to_string()], "/a".to_string()));
     }
 }

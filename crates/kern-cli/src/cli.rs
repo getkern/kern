@@ -107,9 +107,12 @@ pub enum Command {
         /// `--security-profile <untrusted>`: a bundle of opt-in hardening (seccomp allowlist +
         /// cap-drop ALL + read-only) applied as a base that explicit flags override.
         security_profile: Option<commands::SecurityProfile>,
-        /// INTERNAL (used by `kern build`): explicit overlay lower dir(s), colon-joined, used as the
-        /// read-only base instead of `--rootfs`/`--image`. Paired with `--overlay-upper`.
-        overlay_lower: Option<String>,
+        /// INTERNAL (used by `kern build`): the read-only base's layers, ONE PER `--overlay-lower`,
+        /// top first, used instead of `--rootfs`/`--image`. Paired with `--overlay-upper`.
+        ///
+        /// Repeated rather than `:`-joined because a layer path may contain a `:`: joined, a cache
+        /// under `colon:cache` split into two layers that did not exist. argv is already a list.
+        overlay_lower: Vec<String>,
         /// INTERNAL (used by `kern build`): a PERSISTENT overlay upper dir (the build layer) instead
         /// of the ephemeral scratch upper - so a build's writes accumulate across RUN steps.
         overlay_upper: Option<String>,
@@ -2898,7 +2901,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut require_limits = false;
     let mut allow_uncapped = false;
     let mut security_profile: Option<commands::SecurityProfile> = None;
-    let mut overlay_lower: Option<String> = None;
+    let mut overlay_lower: Vec<String> = Vec::new();
     let mut overlay_upper: Option<String> = None;
     let mut tty = false;
     let mut restart = commands::RestartPolicy::No;
@@ -3277,7 +3280,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // Internal build-layer flags (see the Command::BoxRun docs) - take a value.
                 "--overlay-lower" => {
                     i += 1;
-                    overlay_lower = Some(
+                    // One layer per occurrence, kept whole: see the field's docs for why no split.
+                    overlay_lower.push(
                         rest.get(i)
                             .ok_or(Error::Usage("--overlay-lower <dir>"))?
                             .to_string(),
@@ -5028,7 +5032,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             require_limits,
             allow_uncapped,
             security_profile,
-            overlay_lower: overlay_lower.as_deref(),
+            overlay_lower: &overlay_lower,
             overlay_upper: overlay_upper.as_deref(),
             memory,
             memory_swap_max,
@@ -6473,6 +6477,41 @@ mod tests {
         assert_eq!(parse_size_z(" 0 "), Some(0));
         assert_eq!(parse_size_z("512m"), Some(512 * 1024 * 1024));
         assert_eq!(parse_size_z("bad"), None);
+    }
+
+    /// `--overlay-lower` is ONE LAYER PER OCCURRENCE, kept whole, in the order given.
+    ///
+    /// It was one `:`-joined value that the child cut apart again, so a layer under a cache path with
+    /// a `:` (`colon:cache`) became two layers that did not exist. The value with a `:` below is the
+    /// discriminating row: this covers the PARSER only, which is the first of the hops that value
+    /// makes; the mount end is covered by `overlay_option_tests` in kern-isolation and the whole
+    /// journey by the integration test that runs a build under such a path.
+    #[test]
+    fn overlay_lower_is_one_whole_layer_per_occurrence_in_order() {
+        let got = |args: &[&str]| -> Vec<String> {
+            let mut v = vec!["box", "b"];
+            v.extend_from_slice(args);
+            v.extend_from_slice(&["--", "true"]);
+            match parse_box(&v) {
+                Ok(Command::BoxRun { overlay_lower, .. }) => overlay_lower,
+                other => panic!("must parse as a box: {other:?}"),
+            }
+        };
+        assert_eq!(
+            got(&[]),
+            Vec::<String>::new(),
+            "absent means not a build step"
+        );
+        assert_eq!(
+            got(&[
+                "--overlay-lower",
+                "/c/colon:cache/top",
+                "--overlay-lower",
+                "/c/a,b/base"
+            ]),
+            vec!["/c/colon:cache/top".to_string(), "/c/a,b/base".to_string()],
+            "each occurrence is one layer, top first, never split"
+        );
     }
 
     /// `--entrypoint` PARSES INTO THE THREE STATES IT HAS, and refuses the fourth.

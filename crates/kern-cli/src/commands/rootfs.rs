@@ -311,7 +311,7 @@ pub(crate) fn merged_view_extract(
     src_rel: Extract<'_>,
     out_dir: &std::path::Path,
 ) -> Result<(), Error> {
-    // `chain` is ALREADY top-first (the caller split `resolve_image`'s `top:…:base` on ':'), and
+    // `chain` is ALREADY top-first (the caller passed `resolve_image`'s layer list), and
     // overlayfs `lowerdir=` shadows left-to-right (leftmost wins) - so we join it AS-IS (no reverse).
     // Getting this order wrong silently defeats the opaque (base would shadow top), re-leaking the
     // deleted file. The RO mount needs only lowerdir. The opts CString outlives the fork.
@@ -362,10 +362,11 @@ pub(crate) fn merged_view_extract(
         std::os::unix::fs::symlink(layer, farm.join(i.to_string()))
             .map_err(|e| Error::Oci(format!("merged-view: link layer {i}: {e}")))?;
     }
-    let lower = (0..chain.len())
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(":"); // top:…:base, order-preserving
+    // Through the shared joiner even though these names are digits with nothing to escape: ONE
+    // function builds every `lowerdir=` in this codebase, so a later change to the escaping rule
+    // cannot reach some of them and miss others.
+    let names: Vec<String> = (0..chain.len()).map(|i| i.to_string()).collect();
+    let lower = kern_isolation::overlay_lowerdir(&names); // top:…:base, order-preserving
     let opts = cstring(&format!("lowerdir={lower}"))?;
     // The child resolves those names, and its mountpoint, relative to this directory.
     let farm_c = cstring(&farm.to_string_lossy())?;
@@ -1139,7 +1140,34 @@ pub(crate) fn remove_build_tree(path: &std::path::Path) {
 /// silently omits the opaque (measured: tegra 5.15) - where the caller must NOT build layered, or a
 /// deleted file would leak into a `COPY --from`/push. Best-effort: if the probe itself can't run
 /// (no unpriv userns at all - but then `probe_overlay` already said no), we return `false` (fail-closed).
-pub(crate) fn probe_opaque_honored() -> bool {
+pub(crate) enum OpaqueProbe {
+    /// The opaque marker survived a re-mount: a layered build cannot resurrect a deleted file.
+    Honoured,
+    /// The probe ran to the end and the secret CAME BACK. This is the kernel defect the flat
+    /// fallback exists for, and the only outcome that may be reported as one.
+    NotHonoured,
+    /// The probe could not finish, so it learned nothing. Fail-closed like `NotHonoured`, but it must
+    /// not be REPORTED as a kernel that omits opaque markers: on WSL's 9p the delete itself is
+    /// refused with an I/O error, and telling that user their kernel does not record markers sends
+    /// them to look at the wrong thing.
+    Inconclusive(i32),
+}
+
+/// Whether this kernel HONOURS an overlay opaque directory in a rootless (single-uid userns) mount -
+/// i.e. after `rm -rf dir && mkdir dir` on a dir that lives in a lower layer, the lower's files stay
+/// hidden across a RE-MOUNT. Tested once, in-process (fork + `unshare(CLONE_NEWUSER|NEWNS)` +
+/// single-uid self-map + a throwaway 2-dir overlay), so it needs no `newuidmap` and mirrors exactly
+/// what a build layer does. `Honoured` on a modern kernel (a sub-ms check); `NotHonoured` on a kernel
+/// that silently omits the opaque (measured: tegra 5.15) - where the caller must NOT build layered, or
+/// a deleted file would leak into a `COPY --from`/push.
+///
+/// EVERYTHING THE CHILD TOUCHES IS BUILT HERE, before the fork, and the child gets `CString`s: after
+/// `fork()` in a process with threads only async-signal-safe calls are legal, and an allocation whose
+/// lock another thread held at the instant of the fork deadlocks the child forever. `kern build` is
+/// single-threaded where this runs (verified with `strace`: no `CLONE_THREAD` in the build process,
+/// with a cached base and with a live pull), and the guard below keeps that true if it ever stops
+/// being: a probe that cannot prove it is alone declines instead of forking.
+pub(crate) fn probe_opaque_honored() -> OpaqueProbe {
     let tmp = cache_dir().join(format!(".opaque-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     // lower/dir/secret + empty upper/work + a merge target. If mkdir fails we can't probe → fail-closed.
@@ -1150,42 +1178,69 @@ pub(crate) fn probe_opaque_honored() -> bool {
         && mk(&tmp.join("mg")))
     {
         remove_build_tree(&tmp);
-        return false;
+        return OpaqueProbe::Inconclusive(21);
     }
-    if std::fs::write(tmp.join("lower/dir/secret"), b"x").is_err() {
+    // THE SECRET, and a WITNESS beside it that nothing hides. `NotFound` on the secret is read as
+    // "the opaque was honoured", so a re-mounted view that is empty for an unrelated reason would
+    // answer the same and send the build down the layered path - the exact leak this probe exists to
+    // prevent. The witness lives OUTSIDE the opaque directory and must be VISIBLE after the re-mount,
+    // which is what makes the secret's absence mean something.
+    if std::fs::write(tmp.join("lower/dir/secret"), b"x").is_err()
+        || std::fs::write(tmp.join("lower/witness"), b"w").is_err()
+    {
         remove_build_tree(&tmp);
-        return false;
+        return OpaqueProbe::Inconclusive(22);
+    }
+    let Some(plan) = crate::commands::OpaquePlan::build(&tmp) else {
+        remove_build_tree(&tmp);
+        return OpaqueProbe::Inconclusive(19); // a path this process built holds an interior NUL
+    };
+    if !kern_isolation::single_threaded() {
+        remove_build_tree(&tmp);
+        return OpaqueProbe::Inconclusive(23);
     }
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
-    // The child does the ns/mount/rm and _exits 0 iff the opaque IS honoured (secret hidden). Any failure
-    // (mount error, opaque not honoured, secret still visible) → non-zero → fail-closed.
+    // The child does the ns/mount/rm and `_exit`s 0 iff the opaque IS honoured (secret hidden). Any
+    // other code is fail-closed; only 14 means the secret came back.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         remove_build_tree(&tmp);
-        return false;
+        return OpaqueProbe::Inconclusive(24);
     }
     if pid == 0 {
-        unsafe { probe_opaque_child(&tmp, euid, egid) };
+        unsafe { probe_opaque_child(&plan, euid, egid) };
     }
     let mut status = 0i32;
     let waited = crate::eintr::waitpid(pid, &mut status, 0);
     remove_build_tree(&tmp);
-    waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    if waited != pid || !libc::WIFEXITED(status) {
+        return OpaqueProbe::Inconclusive(25);
+    }
+    match libc::WEXITSTATUS(status) {
+        0 => OpaqueProbe::Honoured,
+        14 => OpaqueProbe::NotHonoured,
+        other => OpaqueProbe::Inconclusive(other),
+    }
 }
 
 pub(crate) fn probe_overlay(
     self_exe: &std::path::Path,
-    base_lower: &str,
+    base_lower: &[String],
     work: &std::path::Path,
 ) -> bool {
     let probe = work.join(".probe");
-    let ok = std::process::Command::new(self_exe)
-        .env("KERN_BUILD_STEP", "1") // no transient scope for the throwaway probe box
+    let mut cmd = std::process::Command::new(self_exe);
+    cmd.env("KERN_BUILD_STEP", "1") // no transient scope for the throwaway probe box
         .arg("box")
-        .arg(format!("_probe-{}", std::process::id()))
-        .arg("--overlay-lower")
-        .arg(base_lower)
+        .arg(format!("_probe-{}", std::process::id()));
+    // One flag per layer, TOP first: the child must see the same layers the build will use, and a
+    // `:`-joined value split on a `:` inside a path - which made this probe fail and the build blame
+    // the kernel.
+    for layer in base_lower {
+        cmd.arg("--overlay-lower").arg(layer);
+    }
+    let ok = cmd
         .arg("--overlay-upper")
         .arg(&probe)
         .arg("--quiet")

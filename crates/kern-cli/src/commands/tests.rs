@@ -296,7 +296,7 @@ mod image_user_resolution_tests {
             "root:x:0:\nstaff:x:50:\nmemcache:x:11211:\n",
         )
         .unwrap();
-        let lower = root.to_string_lossy();
+        let lower = vec![root.to_string_lossy().into_owned()];
 
         // bare NAME -> uid AND its passwd primary gid (Docker's rule).
         assert_eq!(resolve_image_user("memcache", &lower), Some((11211, 11211)));
@@ -316,7 +316,7 @@ mod image_user_resolution_tests {
         let empty = std::env::temp_dir().join(format!("kern-usr-empty-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(
-            resolve_image_user("memcache", &empty.to_string_lossy()),
+            resolve_image_user("memcache", &[empty.to_string_lossy().into_owned()]),
             None
         );
 
@@ -342,7 +342,7 @@ mod image_user_resolution_tests {
             "root:x:0:0:root:/root:/bin/sh\nairflow:x:50000:0:First Last,,,:/home/airflow:/bin/bash\nweird:x:7:7::relative/path:/bin/sh\n",
         )
         .unwrap();
-        let lower = root.to_string_lossy();
+        let lower = vec![root.to_string_lossy().into_owned()];
 
         assert_eq!(image_user_home(50000, &lower), "/home/airflow");
         assert_eq!(image_user_home(0, &lower), "/root");
@@ -353,7 +353,10 @@ mod image_user_resolution_tests {
         // No account file at all (a scratch image) is the same answer.
         let empty = std::env::temp_dir().join(format!("kern-home-empty-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
-        assert_eq!(image_user_home(50000, &empty.to_string_lossy()), "/");
+        assert_eq!(
+            image_user_home(50000, &[empty.to_string_lossy().into_owned()]),
+            "/"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&empty);
@@ -385,7 +388,7 @@ mod image_user_resolution_tests {
             "root:x:0:kibana\nwheel:x:10:kibana,someone\nkibana:x:1000:\nother:x:77:someone\n",
         )
         .unwrap();
-        let lower = root.to_string_lossy();
+        let lower = vec![root.to_string_lossy().into_owned()];
 
         // A NUMERIC user is resolved to its NAME first, because a member list holds names.
         assert_eq!(image_supplementary_gids("1000", &lower), vec![0, 10]);
@@ -402,7 +405,9 @@ mod image_user_resolution_tests {
         // A scratch image with no account files answers with nothing, never with a guess.
         let empty = std::env::temp_dir().join(format!("kern-sgid-empty-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(image_supplementary_gids("1000", &empty.to_string_lossy()).is_empty());
+        assert!(
+            image_supplementary_gids("1000", &[empty.to_string_lossy().into_owned()]).is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&empty);
@@ -435,7 +440,7 @@ mod image_user_resolution_tests {
 ",
         )
         .expect("passwd");
-        let lower = root.to_string_lossy();
+        let lower = vec![root.to_string_lossy().into_owned()];
 
         // THE ROWS BELOW ARE CHOSEN TO DISCRIMINATE, which is not the same as being realistic.
         //
@@ -483,7 +488,7 @@ mod image_user_resolution_tests {
         let bare = std::env::temp_dir().join(format!("kern-usrnum-bare-{}", std::process::id()));
         std::fs::create_dir_all(&bare).expect("the empty rootfs");
         assert_eq!(
-            resolve_image_user("1000", &bare.to_string_lossy()),
+            resolve_image_user("1000", &[bare.to_string_lossy().into_owned()]),
             Some((1000, 0))
         );
 
@@ -501,8 +506,11 @@ mod image_user_resolution_tests {
         std::fs::create_dir_all(top.join("etc")).unwrap();
         std::fs::write(base.join("etc/passwd"), "app:x:1000:1000::/:/bin/sh\n").unwrap();
         std::fs::write(top.join("etc/passwd"), "app:x:2000:2000::/:/bin/sh\n").unwrap();
-        // chain is "top:base"; top's entry (2000) is authoritative.
-        let chain = format!("{}:{}", top.to_string_lossy(), base.to_string_lossy());
+        // The layers TOP first, as `resolve_image` returns them; top's entry (2000) is authoritative.
+        let chain = vec![
+            top.to_string_lossy().into_owned(),
+            base.to_string_lossy().into_owned(),
+        ];
         assert_eq!(resolve_image_user("app", &chain), Some((2000, 2000)));
 
         let _ = std::fs::remove_dir_all(&base);
@@ -523,14 +531,17 @@ mod image_user_resolution_tests {
         std::fs::write(&outside, "victim:x:1234:1234::/:/bin/sh\n").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("etc/passwd")).unwrap();
         // Unconfined this would return Some((1234, 1234)); confined it must be None.
-        assert_eq!(resolve_image_user("victim", &root.to_string_lossy()), None);
+        assert_eq!(
+            resolve_image_user("victim", &[root.to_string_lossy().into_owned()]),
+            None
+        );
 
         // An IN-rootfs symlink (a real distro layout) still resolves - its target stays under the layer.
         std::fs::remove_file(root.join("etc/passwd")).unwrap();
         std::fs::write(root.join("etc/passwd.real"), "app:x:777:777::/:/bin/sh\n").unwrap();
         std::os::unix::fs::symlink("passwd.real", root.join("etc/passwd")).unwrap();
         assert_eq!(
-            resolve_image_user("app", &root.to_string_lossy()),
+            resolve_image_user("app", &[root.to_string_lossy().into_owned()]),
             Some((777, 777))
         );
 
@@ -2080,10 +2091,10 @@ mod net_resource_tests {
         assert_ne!(k0, layer_key("base", "RUN b")); // repr changed
         assert_ne!(k0, layer_key("other", "RUN a")); // parent key changed
         assert_eq!(k0.len(), 32); // 128-bit hex
-                                  // chain_lower stacks top (last) first, base (first) last - overlayfs shadow order.
+                                  // chain_top_first stacks top (last) first, base (first) last - overlayfs shadow order.
         assert_eq!(
-            chain_lower(&["base".into(), "l1".into(), "l2".into()]),
-            "l2:l1:base"
+            chain_top_first(&["base".into(), "l1".into(), "l2".into()]),
+            vec!["l2".to_string(), "l1".into(), "base".into()]
         );
     }
 
@@ -2157,7 +2168,7 @@ mod net_resource_tests {
             "root:x:0:0:root:/root:/bin/sh\nsvc:x:1000:0:svc:/:/bin/sh\n",
         )
         .expect("passwd");
-        let lower = root.to_string_lossy();
+        let lower = vec![root.to_string_lossy().into_owned()];
 
         let img = kern_oci::ImageConfig {
             entrypoint: vec!["/entry.sh".into()],
@@ -7022,4 +7033,60 @@ fn an_env_file_is_read_with_dockers_rules_not_a_second_parser() {
     assert!(format!("{err}").contains("bad line 2"), "{err}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The opaque probe DECLINES TO FORK when this process has more than one thread.
+///
+/// After `fork()` in a threaded process only async-signal-safe calls are legal: an allocation whose
+/// lock another thread happened to hold at the instant of the fork deadlocks the child forever, and
+/// the parent then waits on a child that will never exit - a `kern build` that hangs with no output.
+/// The probe's child allocates (it joins paths and walks a directory), so it must not run there.
+///
+/// `merged_view_extract` and `with_id_mapped_userns` both enforce this already; the probe did not,
+/// and the invariant held only because `kern build` happens to be single-threaded where it runs
+/// (verified with `strace`: no `CLONE_THREAD` in the build process, with a cached base and a live
+/// pull). "Happens to" is not a guarantee, and a later thread anywhere in the build path would have
+/// turned it into a hang rather than an error.
+///
+/// The thread is parked on a channel rather than sleeping: a timing-based test would decide whether
+/// the guard is under test by how fast the machine is.
+#[test]
+fn the_opaque_probe_refuses_to_fork_from_a_threaded_process() {
+    use crate::commands::OpaqueProbe;
+    // The probe builds its tree under `$XDG_CACHE_HOME`, which is process-global: without the lock
+    // this races every other test in this binary, and `main.rs` refuses to let it.
+    let _g = crate::env_guard();
+
+    // WHERE THE POSITIVE CONTROL LIVES, since it cannot live here: libtest runs every test on a
+    // spawned thread, so this process is NEVER single-threaded and the "the probe does run when it
+    // is alone" direction is unreachable from inside the harness. It is covered where it is real -
+    // a `kern build` that comes out LAYERED has had this probe return `Honoured`, because the
+    // layered path is the one `Inconclusive` and `NotHonoured` both refuse. The integration test
+    // `a_cache_path_with_special_characters_still_pulls_builds_and_stacks_layers` asserts exactly
+    // that, by reading the `.layers` manifest a flat build never writes.
+    //
+    // So this test asserts the DIRECTION the harness can reach, and starts by proving its premise
+    // rather than assuming it.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let helper = std::thread::spawn(move || {
+        let _ = done_tx.send(()); // "I am alive"
+        let _ = rx.recv(); // park until the assertion below has run
+    });
+    done_rx.recv().expect("the helper thread must start");
+    // THE PREMISE, CHECKED: if `/proc/self/status` did not see the extra thread, the assertion below
+    // would be testing nothing and would pass on a removed guard.
+    assert!(
+        !kern_isolation::single_threaded(),
+        "the helper thread did not register in /proc/self/status, so this test cannot see threads"
+    );
+
+    let verdict = crate::commands::probe_opaque_honored();
+    let _ = tx.send(());
+    helper.join().expect("helper thread");
+
+    assert!(
+        matches!(verdict, OpaqueProbe::Inconclusive(23)),
+        "the probe forked from a threaded process, where its child's first allocation can deadlock"
+    );
 }

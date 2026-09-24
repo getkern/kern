@@ -342,8 +342,8 @@ fn refresh_image_config(
 }
 
 /// Look up `name` in a colon-line account file (`passwd`/`group`) inside the image rootfs and return the
-/// matched line's colon-separated FIELDS, read and scanned ONCE. `lower` is the box's lower spec - a
-/// single dir for a flat image, or an overlay chain `top:…:base`; the file is read from the FIRST layer
+/// matched line's colon-separated FIELDS, read and scanned ONCE. `lower` is the box's layers, TOP
+/// first - one entry for a flat image, several for a built one; the file is read from the FIRST layer
 /// that has it (top-most wins, as the merged view would). `None` if no layer has the file or it has no
 /// matching entry - the caller then keeps box-root behaviour. Returning the whole entry lets
 /// `resolve_image_user` take uid (field 2) AND primary gid (field 3) from ONE passwd read, not two.
@@ -360,13 +360,15 @@ fn refresh_image_config(
 /// lookup) and `2` for the numeric id, which is what a NUMERIC `USER` needs - see
 /// [`resolve_image_user`].
 pub(crate) fn image_account_entry(
-    lower: &str,
+    lower: &[String],
     file: &str,
     key: &str,
     key_field: usize,
 ) -> Option<Vec<String>> {
     use std::path::Path;
-    for layer in lower.split(':') {
+    // TOP FIRST, as resolved. The `:` splitting below is the account file's own format and correct;
+    // the one that is gone is a split of the LAYER list, which cut a host path at its first `:`.
+    for layer in lower {
         let (Ok(target), Ok(base)) = (
             std::fs::canonicalize(Path::new(layer).join(file)),
             std::fs::canonicalize(layer),
@@ -394,9 +396,9 @@ pub(crate) fn image_account_entry(
 /// Same confinement and same top-most-layer rule as [`image_account_entry`], which looks up ONE
 /// entry; this returns the text, because a group membership scan has to read every line rather than
 /// stop at the first match.
-fn image_account_file(lower: &str, file: &str) -> Option<String> {
+fn image_account_file(lower: &[String], file: &str) -> Option<String> {
     use std::path::Path;
-    for layer in lower.split(':') {
+    for layer in lower {
         let (Ok(target), Ok(base)) = (
             std::fs::canonicalize(Path::new(layer).join(file)),
             std::fs::canonicalize(layer),
@@ -426,7 +428,7 @@ fn image_account_file(lower: &str, file: &str) -> Option<String> {
 /// group 0, where `root:x:0:kibana` puts it.
 ///
 /// The PRIMARY gid is not repeated here: `setgid` already sets it.
-pub(crate) fn image_supplementary_gids(spec: &str, lower: &str) -> Vec<u32> {
+pub(crate) fn image_supplementary_gids(spec: &str, lower: &[String]) -> Vec<u32> {
     if spec.contains(':') {
         return Vec::new();
     }
@@ -480,7 +482,7 @@ pub(crate) fn image_supplementary_gids(spec: &str, lower: &str) -> Vec<u32> {
 /// WorkingDir for the same input (`HOME=/opt/airflow` for `--user 1000` on the airflow image). This
 /// is the one rule here taken from Docker over podman, and both halves are now measured rather than
 /// argued: a known uid gives its passwd home under all three.
-pub(crate) fn image_user_home(uid: u32, lower: &str) -> String {
+pub(crate) fn image_user_home(uid: u32, lower: &[String]) -> String {
     image_account_entry(lower, "etc/passwd", &uid.to_string(), 2)
         .and_then(|e| e.get(5).cloned())
         .filter(|h| h.starts_with('/'))
@@ -493,7 +495,7 @@ pub(crate) fn image_user_home(uid: u32, lower: &str) -> String {
 /// to that account's uid/gid. Docker's rule - a bare user takes its primary group from the passwd entry;
 /// an explicit `:group` overrides it. Returns `None` (caller keeps box-root, with a note) if the account
 /// isn't in the image, so an image referencing a host-provided name still degrades honestly.
-pub(crate) fn resolve_image_user(spec: &str, lower: &str) -> Option<(u32, u32)> {
+pub(crate) fn resolve_image_user(spec: &str, lower: &[String]) -> Option<(u32, u32)> {
     let (user, group) = match spec.split_once(':') {
         Some((u, g)) => (u, Some(g)),
         None => (spec, None),
@@ -1063,10 +1065,12 @@ pub(crate) fn materialize_image(
     // `overlay.opaque` xattr, NOT a `.wh.` file). A secret `rm`'d in a build step then resurfaces in the
     // pushed image. So we DON'T hand-roll the merge: we copy from the KERNEL-MERGED overlay view (see
     // [`merged_view_extract`]), where the kernel has already applied opaque + whiteout + redirect_dir +
-    // metacopy - the only correct reader. The chain is `top:…:base`; a single-layer image can't have a
+    // metacopy - the only correct reader. The chain is TOP first; a single-layer image can't have a
     // cross-layer opaque, so it's copied directly (below); a ≥2-layer chain goes through the merged view.
-    let (lower, config) = resolve_image(image)?;
-    let chain: Vec<String> = lower.split(':').map(str::to_string).collect();
+    // The layer COUNT picks that branch. The old split could only OVER-count (a `:` in a path looked
+    // like a boundary), so it sent a one-layer image through the merged view rather than the reverse:
+    // that was an availability failure, never a leak.
+    let (chain, config) = resolve_image(image)?;
     let tmp = cache.join(format!(".push-squash-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| Error::Oci(format!("squash dir: {e}")))?;
@@ -1101,9 +1105,13 @@ pub(crate) fn materialize_image(
 /// Resolve `--image <ref>` to an overlay `(lowerdir, config)`. A pulled (flat) image is a single
 /// cache dir. A locally-built (**layered**) image - marked by a `<ref>.base` sidecar - is its
 /// `<ref>.diff` layer stacked over its base, resolved RECURSIVELY (the base may itself be layered)
-/// and re-pulled if the base was pruned, so layered images are prune-safe. The returned `lowerdir`
-/// may be a colon-joined chain (top layer first, exactly overlayfs's ordering).
-pub(crate) fn resolve_image(image: &str) -> Result<(String, kern_oci::ImageConfig), Error> {
+/// and re-pulled if the base was pruned, so layered images are prune-safe.
+///
+/// The layers come back as a LIST, TOP first (overlayfs's shadowing order), one path per entry. It
+/// used to be one `:`-joined string, and every reader cut it back apart at every `:` - including the
+/// `:` in a cache path such as `colon:cache`, which turned one real directory into two that did not
+/// exist. A list is joined exactly once, escaped, by [`kern_isolation::overlay_lowerdir`] at the mount.
+pub(crate) fn resolve_image(image: &str) -> Result<(Vec<String>, kern_oci::ImageConfig), Error> {
     resolve_image_depth(image, 0, PullPolicy::Missing)
 }
 
@@ -1111,7 +1119,7 @@ pub(crate) fn resolve_image_depth(
     image: &str,
     depth: u32,
     policy: PullPolicy,
-) -> Result<(String, kern_oci::ImageConfig), Error> {
+) -> Result<(Vec<String>, kern_oci::ImageConfig), Error> {
     // Bound the chain so a self-referential build (`FROM` its own tag) can't recurse forever.
     if depth > 128 {
         return Err(Error::Oci(
@@ -1126,7 +1134,7 @@ pub(crate) fn resolve_image_depth(
         let empty = cache.join(".scratch-empty");
         own_only_dir(&empty).map_err(|e| Error::Oci(format!("scratch base: {e}")))?;
         return Ok((
-            empty.to_string_lossy().into_owned(),
+            vec![empty.to_string_lossy().into_owned()],
             kern_oci::ImageConfig::default(),
         ));
     }
@@ -1141,7 +1149,8 @@ pub(crate) fn resolve_image_depth(
         // Base layers of a built image are used as-is; `--pull always` never force-repulls them.
         let (base_lower, _) = resolve_image_depth(base_ref, depth + 1, PullPolicy::Missing)?;
         let lc = layer_cache_dir();
-        let mut chain = vec![base_lower];
+        // This image's own layers, in manifest order: oldest first.
+        let mut own: Vec<String> = Vec::new();
         for k in lines.map(str::trim).filter(|k| !k.is_empty()) {
             // A layer key MUST be 32 lowercase hex (what we write). Reject anything else so a corrupt
             // or (once layered images are shippable) hostile manifest can't turn a key into a `/etc`,
@@ -1149,10 +1158,12 @@ pub(crate) fn resolve_image_depth(
             if k.len() != 32 || !k.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(Error::Oci(format!("corrupt layer manifest for '{image}'")));
             }
-            chain.push(lc.join(k).to_string_lossy().into_owned());
+            own.push(lc.join(k).to_string_lossy().into_owned());
         }
-        let lower = chain_lower(&chain);
-        if lower.len() > MAX_LOWERDIR_BYTES {
+        // TOP FIRST: this image's layers newest first, then the base's, which is already top first.
+        let lower: Vec<String> = own.into_iter().rev().chain(base_lower).collect();
+        // Measured on the string the kernel will receive, escaping included: that is what has to fit.
+        if kern_isolation::overlay_lowerdir(&lower).len() > MAX_LOWERDIR_BYTES {
             return Err(Error::Oci(format!(
                 "image '{image}' has too many layers to overlay (rebuild with fewer steps)"
             )));
@@ -1171,9 +1182,12 @@ pub(crate) fn resolve_image_depth(
         let diff = cache.join(format!("{safe}.diff"));
         let config = read_image_config(&cache.join(format!("{safe}.image")));
         // Top (this image's diff) first, then the base chain - overlayfs shadows left-to-right.
-        return Ok((format!("{}:{base_lower}", diff.to_string_lossy()), config));
+        let mut lower = vec![diff.to_string_lossy().into_owned()];
+        lower.extend(base_lower);
+        return Ok((lower, config));
     }
-    pull_to_cache(image, policy)
+    // A pulled image is ONE directory.
+    pull_to_cache(image, policy).map(|(dir, config)| (vec![dir], config))
 }
 
 /// Is the FLAT cache entry for `safe` complete, i.e. actually runnable?
@@ -1808,7 +1822,10 @@ pub(crate) fn flat_image_key(
     format!("{:016x}", fnv1a(&acc))
 }
 
-/// Join an overlay lower `chain` (base first) into a `lowerdir=` string (TOP layer first, base last).
-pub(crate) fn chain_lower(chain: &[String]) -> String {
-    chain.iter().rev().cloned().collect::<Vec<_>>().join(":")
+/// An overlay `chain` (base first) in the order a mount takes it: TOP layer first, base last.
+///
+/// A list, not the `:`-joined string this used to return: a layer path may contain a `:`, and the
+/// one place a list becomes `lowerdir=` text is [`kern_isolation::overlay_lowerdir`], which escapes.
+pub(crate) fn chain_top_first(chain: &[String]) -> Vec<String> {
+    chain.iter().rev().cloned().collect()
 }

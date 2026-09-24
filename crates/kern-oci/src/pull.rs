@@ -1757,8 +1757,16 @@ fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
             "unsupported digest algorithm (only sha256 is verified): {digest}"
         )));
     };
+    // ON STDIN, NOT AS AN ARGUMENT. `sha256sum` prints the file's NAME after the hash, and when that
+    // name holds a backslash or a newline it starts the line with a `\` - its documented escape - so
+    // the first field became `\<hex>`. MEASURED: under a cache path with a backslash every blob of
+    // every pull was refused as `digest mismatch (expected 17a3…, got \17a3…)`. It failed closed, so
+    // nothing unverified got through, but nothing could be pulled either. On stdin the name is `-`,
+    // which has nothing to escape and cannot be read as an option.
+    let input = std::fs::File::open(file)
+        .map_err(|e| OciError::Tool("sha256sum", format!("open {}: {e}", file.display())))?;
     let out = Command::new("sha256sum")
-        .arg(file)
+        .stdin(input)
         .output()
         .map_err(|e| OciError::Tool("sha256sum", e.to_string()))?;
     if !out.status.success() {
@@ -3386,6 +3394,36 @@ mod token_error_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A blob under a path with a BACKSLASH verifies like any other.
+    ///
+    /// `sha256sum` prints the file's name after the hash, and when the name holds a backslash it
+    /// starts the line with a `\` (its documented escape), so the first field was `\<hex>`. MEASURED
+    /// before the fix: every blob of every pull under such a cache was refused as a digest mismatch.
+    /// The plain directory is the control, so a verifier that rejects everything cannot pass.
+    #[test]
+    fn a_blob_under_a_path_with_a_backslash_verifies_and_a_wrong_digest_still_fails() {
+        // `printf 'x\n' | sha256sum`, measured.
+        const X_NL: &str =
+            "sha256:73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac";
+        let root = std::env::temp_dir().join(format!("kern-digest-bs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["plain", "back\\slash", "colon:comma,dir"] {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).expect("dir");
+            let f = d.join("blob");
+            std::fs::write(&f, b"x\n").expect("blob");
+            assert!(
+                super::verify_digest(&f, X_NL).is_ok(),
+                "a correct blob under {dir:?} was refused"
+            );
+            assert!(
+                super::verify_digest(&f, &X_NL.replace("73cb", "73cc")).is_err(),
+                "a wrong digest under {dir:?} was accepted"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// `take_data` MUST NOT RETURN MORE THAN `keep`, whatever the layer says.
     ///

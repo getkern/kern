@@ -214,9 +214,12 @@ fn pack_layer(
 
 /// `sha256:<hex>` of a file, via `sha256sum` (coreutils). Errs if the tool is missing or fails.
 pub(crate) fn sha256_file(path: &Path) -> Result<String, OciError> {
+    // On stdin for the reason `verify_digest` gives: with the file as an argument, a backslash in its
+    // path makes `sha256sum` start the line with `\` and the parse below reject a correct hash.
+    let input = std::fs::File::open(path)
+        .map_err(|e| OciError::Extract(format!("sha256sum: open {}: {e}", path.display())))?;
     let out = Command::new("sha256sum")
-        .arg("--")
-        .arg(path)
+        .stdin(input)
         .output()
         .map_err(|e| OciError::Extract(format!("sha256sum: {e}")))?;
     if !out.status.success() {
@@ -437,6 +440,23 @@ fn short(digest: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// `sha256_file` under a path with a backslash returns the hash, not `\<hash>` refused as
+    /// malformed. The reason is the one `verify_digest` documents; this is the push side of it.
+    #[test]
+    fn sha256_file_under_a_path_with_a_backslash_is_the_real_hash() {
+        let d = std::env::temp_dir().join(format!("kern-push-bs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.join("back\\slash");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let f = dir.join("layer.tar");
+        std::fs::write(&f, b"x\n").expect("file");
+        assert_eq!(
+            super::sha256_file(&f).expect("hashes"),
+            "sha256:73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
     use super::*;
 
     #[test]
