@@ -2967,29 +2967,76 @@ mod tests {
         for a in AUTHORITATIVE_DIRS {
             assert!(!BOX_DATA_DIRS.contains(&a), "{a:?} is in BOTH classes");
         }
+        // A PRIVATE ROOT, NOT THE HOST'S. This used to scan the live `$XDG_RUNTIME_DIR/kern`, so any kern
+        // binary on the machine could redden it: on 2026-09-24 a KVolt build from another worktree had
+        // created an empty `vm/`, a child this tree does not know because it does not have that
+        // feature, and all three test steps of the gate failed on a defect that was not here. The same
+        // repointing was already on the KVolt branch, where `networks/` from another build had done
+        // the same on 2026-09-12; it had never reached this tree.
+        //
+        // WHAT THE TEST CLAIMS IS UNCHANGED: "every registry child THIS CODE creates is classified",
+        // and `materialize_authoritative_dirs_for_test` creates exactly that set. The real guard stays
+        // `assert_registry_child`, the chokepoint every `<runtime>/kern/<name>` path goes through, so
+        // an unclassified child cannot be CREATED. The memo in `runtime_subdir` is keyed on
+        // `XDG_RUNTIME_DIR`, which is what makes the repointing take effect.
+        let private = std::env::temp_dir().join(format!(
+            "kern-registry-classify-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&private);
+        if fs::create_dir_all(&private).is_err() {
+            eprintln!("skip: no writable temp dir for a private registry root");
+            return;
+        }
+        let saved = crate::global_env("XDG_RUNTIME_DIR");
+        crate::set_global_env("XDG_RUNTIME_DIR", &private);
+
         // Materialize every authoritative child so the scan is meaningful and `trusted_state_dirs` can
         // canonicalize all of them (`runtime_subdir` creates `<root>/kern/<leaf>`, the same path
         // `pods_root` resolves to for `pods`).
         materialize_authoritative_dirs_for_test();
-        let Ok(instances) = dir() else { return };
-        let Some(root) = instances.parent() else {
-            return;
-        };
-        let Ok(rd) = fs::read_dir(root) else { return };
-        for e in rd.flatten() {
-            if !e.path().is_dir() {
-                continue; // registry children are directories; a stray file is not this test's concern
+        let mut unclassified: Vec<String> = Vec::new();
+        if let Ok(instances) = dir() {
+            if let Some(root) = instances.parent() {
+                if let Ok(rd) = fs::read_dir(root) {
+                    for e in rd.flatten() {
+                        if !e.path().is_dir() {
+                            // registry children are directories; a stray file is not this test's concern
+                            continue;
+                        }
+                        let raw = e.file_name();
+                        let name = raw.to_string_lossy();
+                        if !AUTHORITATIVE_DIRS.contains(&name.as_ref())
+                            && !BOX_DATA_DIRS.contains(&name.as_ref())
+                        {
+                            unclassified.push(name.into_owned());
+                        }
+                    }
+                }
             }
-            let raw = e.file_name();
-            let name = raw.to_string_lossy();
-            assert!(
-                AUTHORITATIVE_DIRS.contains(&name.as_ref()) || BOX_DATA_DIRS.contains(&name.as_ref()),
-                "unclassified registry child {name:?}: add it to AUTHORITATIVE_DIRS (kern reads and \
-                 acts on it, or it holds a cross-box secret) or BOX_DATA_DIRS (opaque box data)"
-            );
         }
+        // MEASURED INSIDE THE WINDOW, ASSERTED OUTSIDE IT: `trusted_state_dirs` canonicalizes every
+        // authoritative path, so read after the restore it would count against the real root, where
+        // nothing was materialized, and drop the leaves that are not there.
+        let trusted_len = trusted_state_dirs().len();
+
+        // RESTORE BEFORE ASSERTING. A panic between the repointing and the restore would leave every
+        // later test in this process resolving a temp directory this one then deleted.
+        match saved {
+            Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+            None => crate::unset_global_env("XDG_RUNTIME_DIR"),
+        }
+        let _ = fs::remove_dir_all(&private);
+
+        assert!(
+            unclassified.is_empty(),
+            "unclassified registry child {:?}: add it to AUTHORITATIVE_DIRS (kern reads and \
+             acts on it, or it holds a cross-box secret) or BOX_DATA_DIRS (opaque box data)",
+            unclassified.join(", ")
+        );
         // `trusted_state_dirs` is DERIVED from `AUTHORITATIVE_DIRS` - one per entry, no parallel list.
-        assert_eq!(trusted_state_dirs().len(), AUTHORITATIVE_DIRS.len());
+        assert_eq!(trusted_len, AUTHORITATIVE_DIRS.len());
     }
 
     #[test]
