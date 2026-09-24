@@ -49,6 +49,9 @@ caps and a deadline applied from outside, and threw the container away before re
   an i7-14700KF, and nothing is left behind.
 - **State when you want it**: a `Sandbox()` you keep open shares `/workspace`, and `kernel()` keeps
   one warm interpreter where variables carry too.
+- **Imports are precompiled once**: the image's standard library is compiled in the background the
+  first time you use that image and mounted READ-ONLY into every box after it, so `import json, re`
+  in a fresh container costs 17 ms instead of 46 on this machine. `pyc_cache=False` turns it off.
 - **Two parts**: the `kern` binary is the isolation, this package is the API in front of it.
 
 ## When you would use this

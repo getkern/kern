@@ -221,6 +221,8 @@ new Sandbox({
   requireLimits,   // default false; true = FAIL-CLOSED (refuse to start unless caps enforced). NOT
                    // enforceLimits (that picks the cap PATH); mutually exclusive with KERN_ALLOW_UNCAPPED env.
   depsReadonly,    // default TRUE: runCode cannot modify what setup= installed
+  pycCache,        // default TRUE: precompile the image's stdlib ONCE into a per-image cache and
+                   // mount it READ-ONLY in every box. Imports 2.7-4.5x faster; false turns it off.
   trackFiles,      // default true: diff the workspace each call for result.files (O(files)); false = [], O(1)
   onStdout,        // (chunk: Buffer) => void, live stdout streaming (result.stdout still captured)
   onStderr,        // (chunk: Buffer) => void, live stderr streaming

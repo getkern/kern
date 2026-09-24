@@ -7,6 +7,26 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## Unreleased
 
+**The SDKs precompile an image's standard library once and mount it read-only, and imports get 2.7 to
+4.5x faster.** A box compiles the image's stdlib in the background, into a per-image directory under
+`$XDG_CACHE_HOME`, and every later box mounts that tree READ-ONLY with `PYTHONPYCACHEPREFIX`. On by
+default in both bindings, one cache shared by them, `pyc_cache=False` / `pycCache: false` to turn it
+off. Measured with the arms alternated and a null control first: `import json,re` in a fresh box goes
+from 182.6 to 67.4 ms on a small VPS and from 46.1 to 17.1 on a desktop; three heavier imports go
+from 572.8 to 196.1 ms. `print(1)` is unchanged, which is the honest half - the gain is in imports,
+which is what code written by a model actually does. READ-ONLY is the design: a shared WRITABLE
+bytecode cache is code execution between calls, since a `.pyc` is validated on its source's timestamp
+and size. The cache validates on the source's HASH instead of its timestamp, so an image rebuilt with
+fixed timestamps (BuildKit's `rewrite-timestamp`, apko, Nix, distroless) cannot make a box run stale
+code. The first session pays for the build and uses it from the call after it lands; a cache another
+process swept away is rebuilt rather than adopted empty.
+
+**A box on Ubuntu 23.10+ now reads the remedy under the error instead of being sent to another
+command.** `kernel.apparmor_restrict_unprivileged_userns=1` refuses the sandbox, the message was
+already exact about what happened, and the `hint:` line was the generic one. It now prints
+`kern doctor`'s own text, so the exact command to run appears under the error with the real path of
+the binary.
+
 **`kern top` drew its first frame in 74.9 ms and showed no real CPU% for a full second.** Both were
 work nobody had asked for. The tab bar prints a count per tab, so every list has to be ENUMERATED on
 every frame, but only the tab on screen needs its CONTENTS read, and the two costs are nothing alike:
