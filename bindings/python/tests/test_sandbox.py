@@ -4673,7 +4673,17 @@ def test_pyc_a_cache_built_from_a_different_image_is_discarded_not_kept(tmp_path
     with _cfg(image=img) as s:
         assert s._pyc_dir == "", "a cache built from another image was adopted"
         assert s._pyc_pending == str(cache), "nothing was scheduled to replace it"
-    assert not cache.exists(), "the stale tree was left in place and would block its replacement"
+    # THE REBUILD IS ALLOWED TO WIN. `_pyc_source_matches` discards the stale tree on this thread,
+    # and `__enter__` starts the replacement on another, so a moment later the name may resolve to
+    # nothing OR to the NEW tree. Asserting "nothing" asserted on which thread got there first: it
+    # was green here and red on a loaded CI runner, on a documentation-only commit. What the user
+    # needs is that the STALE BYTES are gone, so wait for the build and ask whose identity is there.
+    for th in list(kern._PYC_BUILDS.values()):
+        th.join(30)
+    assert cache.exists(), "the replacement never published"
+    assert (cache / kern._PYC_SOURCE_ID).read_text() == kern._pyc_source_id(img), (
+        "the stale tree was left in place and would block its replacement"
+    )
 
     # UNKNOWN COUNTS AS UNCHANGED, both ways: a cache written before this check existed has no
     # identity file, and a host whose image kern has pruned cannot produce one. Neither may cause a
