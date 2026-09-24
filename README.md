@@ -229,16 +229,10 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) | the threat model (structured, then per-mechanism), and why a userspace VRAM cap is not a boundary |
 | [docs/CVE-POSTURE.md](docs/CVE-POSTURE.md) | the published container-runtime escapes, each reproduced against this tree, and the class kern does not defend against |
 | [ROADMAP.md](ROADMAP.md) | what is missing or unmeasured today, and what may come |
+| [CHANGELOG.md](CHANGELOG.md) | what changed in each release, and the CLI stability rule the build enforces |
 | [BENCHMARKS.md](BENCHMARKS.md) | measurements, including the ARM boards |
 | [examples/](examples/) · [blog/](blog/) | 94 runnable scripts in eight folders, and longer write-ups |
 | [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the Kern Sandbox SDK: embed kern in Python or Node |
-
-## Status
-
-**The core is done and the CLI is frozen.** Tested on every push, clippy-clean and
-`cargo-deny`-clean, on Linux, WSL2, Raspberry Pi 5, Jetson Orin Nano and Arduino UNO Q. No verb, flag
-or `--json` field changes meaning inside a patch release; what changed is in the
-[changelog](CHANGELOG.md).
 
 ## What kern is not
 
