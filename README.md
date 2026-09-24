@@ -49,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh  
 kern doctor    # run this first inside the VM: it names anything the guest still needs
 ```
 
-<sub>Runs on Linux and ARM boards directly, on Windows through WSL2 and on a Mac through colima, Lima or OrbStack: the same binary and the same CLI under a Linux kernel. [Install](#install).</sub>
+<sub>Runs on Linux and ARM boards directly, on Windows through WSL2 and on a Mac through colima, Lima or OrbStack: the same binary and the same CLI under a Linux kernel, on any distribution with unprivileged user namespaces and cgroup v2. The script installs one static file to `~/.local/bin` and refuses a download whose SHA256 does not match; from source instead, `cargo install --git https://github.com/getkern/kern getkern --locked`. [docs/INSTALL.md](docs/INSTALL.md) has the rest, including the one thing [Ubuntu 23.10 and newer needs first](docs/INSTALL.md#requirements-and-limitations).</sub>
 
 ---
 
@@ -91,33 +91,6 @@ shells out to the `curl` and `tar` already on the machine rather than linking a 
 <p align="center">
   <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms; 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one static binary, no daemon.">
 </p>
-
-## Install
-
-A box is made of Linux kernel features, so kern runs where there is a Linux kernel: **Linux and ARM
-boards** directly, **Windows through WSL2** with a pre-baked rootfs and an installer that sets WSL2
-up for you, and **a Mac inside a Linux VM** (colima, Lima, OrbStack, UTM), where it is the ordinary
-Linux kern: same binary, same CLI, same behaviour as your CI box.
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-```
-
-One static file, no toolchain. The script picks `x86_64` or `aarch64`, installs to `~/.local/bin`,
-and refuses a download whose SHA256 does not match. From source instead, the whole dependency tree is
-one crate:
-
-```sh
-cargo install --git https://github.com/getkern/kern getkern --locked
-```
-
-Debian and Ubuntu, Fedora, the RHEL family (Rocky, CentOS Stream), openSUSE, WSL2, and ARM boards:
-any distribution with unprivileged user namespaces and cgroup v2. Each release runs the full suite on
-those, in real VMs and on the boards, before it ships.
-
-[docs/INSTALL.md](docs/INSTALL.md) has the rest: verifying the checksum by hand, `KERN_INSTALL_DIR`,
-the Windows and Mac guests step by step, what the resource caps do on a default VM, and the one thing
-[Ubuntu 23.10 and newer needs first](docs/INSTALL.md#requirements-and-limitations), once, with root.
 
 ## Quickstart
 
