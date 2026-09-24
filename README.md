@@ -66,14 +66,11 @@ kern compose up -d
 - **A real container.** Real OCI images: `pull`, `build` from a `Containerfile` or `Dockerfile`,
   `commit`, `push`, `save`/`load`. A box from an image starts in single-digit milliseconds.
 - **Run LLM-generated code in a sandbox.** The snippet a model just wrote, the command an agent just
-  decided to run, a notebook cell, a CI step: kern starts a box, runs it, deletes it, with nothing
-  left behind. Network off unless you ask, memory and PID caps the kernel enforces where your host
-  delegates them, capabilities dropped, seccomp deny-by-default, timeout from the outside.
-  <br>**Typed faults, not stack archaeology.** Timeout, OOM-kill, blocked syscall, missing command:
-  each returned next to stdout and the exit code. Branch on it and keep going.
-  <br>**One binary, no daemon.** Wire it from Python, Node, LangChain, or any MCP client
-  [below](#run-an-agents-code-python-node-langchain-mcp-pi). And
-  [what it is not](#what-kern-is-not), because the boundary is the Linux kernel.
+  decided to run: kern starts a box, runs it, deletes it. Network off unless you ask, memory and PID
+  caps where your host delegates them, capabilities dropped, seccomp deny-by-default, a timeout from
+  the outside. A timeout, an OOM-kill or a blocked syscall comes back as a **typed fault** next to
+  the exit code instead of a stack trace. Wire it from Python, Node, LangChain or any MCP client
+  [below](#run-an-agents-code-python-node-langchain-mcp-pi), and [what it is not](#what-kern-is-not).
 - **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
   `--security-profile untrusted`, is the whole hardened bundle.
@@ -158,37 +155,25 @@ something the [changelog](CHANGELOG.md) says it should not.
 
 ## Run an agent's code: Python, Node, LangChain, MCP, pi
 
-The bindings are how **your program** calls kern. The code **inside** the box can be in any language,
-because the box is an OCI image: Python, Node, Go and Rust all run with the same command and a
-different `--image`, and so does anything else that ships one.
-
-
-An agent needs somewhere to run what the model just wrote. **`kern-sandbox`** is that place: a thin,
-dependency-free wrapper over the `kern` binary, called from your own program and
-[installed in the Quickstart](#quickstart). The API is in
-[bindings/python/](bindings/python/README.md) and [bindings/node/](bindings/node/README.md).
-
-Every call is a fresh isolated box: network off, memory and pid caps, capabilities dropped, output
-bounded, and a timeout the binding enforces itself. A timeout, an OOM-kill or a blocked syscall comes
-back as a typed `fault` on the result rather than as an exception. `code_stderr` is that result's
-stderr without kern's own notes, which is what belongs in a context window.
+The bindings are how **your program** calls kern; the code **inside** the box can be in any language,
+because the box is an OCI image. **`kern-sandbox`** is
+[installed in the Quickstart](#quickstart): every call is a fresh isolated box, and a timeout, an
+OOM-kill or a blocked syscall comes back as a typed `fault` on the result rather than as an
+exception.
 
 It also ships **`kern-mcp`**, a dependency-free stdio server that gives Claude Desktop or Cursor a
-local code interpreter, and the server is stdio, so the same one line points a client at a box on
-another machine.
+local code interpreter:
 
 ```json
 { "mcpServers": { "kern": { "command": "kern-mcp" } } }
 ```
 
-The rest is on the pages that own it, none of it repeated here: the full API, the rich-result capture,
-prewarming and the LangChain integration in
-[bindings/python/README.md](bindings/python/README.md) and
-[bindings/node/README.md](bindings/node/README.md); every `KERN_MCP_*` variable and the remote form in
-[docs/MCP.md](docs/MCP.md); and, for the [pi](https://github.com/earendil-works/pi) coding agent,
-[`kern-pi`](https://www.npmjs.com/package/kern-pi) routing its `bash`, `read`, `write`, `edit`, `ls`,
-`grep` and `find` into a box, with a README that states which half is the kernel's boundary and which
-is a path check, in [integrations/pi/](integrations/pi/).
+The rest is on the pages that own it: the full API, prewarming and LangChain in
+[bindings/python/](bindings/python/README.md) and [bindings/node/](bindings/node/README.md); every
+`KERN_MCP_*` variable and the remote form in [docs/MCP.md](docs/MCP.md); and
+[`kern-pi`](https://www.npmjs.com/package/kern-pi), which routes the
+[pi](https://github.com/earendil-works/pi) coding agent's tools into a box, in
+[integrations/pi/](integrations/pi/).
 
 ## Run a whole stack: your `docker-compose.yml`, unchanged
 
@@ -212,26 +197,14 @@ kern compose stack.toml ps          # what is running, and what each service pub
 kern compose stack.toml port web 80 # the host address serving that port, read from the running box
 ```
 
-Both official images start, `http://localhost:8080` serves the nginx page, and `web` reaches the
-cache by name. A fourth verb, `watch`, rebuilds and restarts one service when its `build:` context
-changes.
+Both official images start and `http://localhost:8080` serves the nginx page. **Each service gets its
+own network namespace and they meet on a bridge,** the arrangement a Docker user already has: a
+service's `127.0.0.1` is its own, peers reach each other by name, and `--pod` puts them all in one
+instead, which is faster.
 
-**Each service gets its own network namespace, and they meet on a bridge,** the arrangement a Docker
-user already has: a service's `127.0.0.1` is its own, and peers reach each other by name. `--pod`
-puts them all in one namespace instead, which is faster. A compose file can name kern's own things in
-the spec's extension namespace (`x-kern-vcpu`, `x-kern-security-profile`) and still run anywhere else
-unchanged.
-
-This is the local dev loop, not a production orchestrator. Official images that drop to a non-root
-user want `uidmap` and an `/etc/subuid` line, and outbound pulls want `pasta`; `kern doctor` names
-either if it is missing. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
-
-**Over `ssh`, run kern inside a scope once,** or `kern compose … exec` refuses: an ssh session sits
-outside the systemd user manager, and a box's caps live in a cgroup that session cannot write into.
-
-```sh
-systemd-run --user --scope bash     # then run kern in that shell
-```
+The local dev loop, not a production orchestrator: `kern doctor` names a missing `uidmap` or `pasta`,
+and over `ssh` run `systemd-run --user --scope bash` once or `kern compose … exec` refuses.
+[docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 
 ## What a container costs, and what kern does not have
 
