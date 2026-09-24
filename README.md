@@ -65,15 +65,10 @@ kern compose up -d
 
 - **A real container.** Real OCI images: `pull`, `build` from a `Containerfile` or `Dockerfile`,
   `commit`, `push`, `save`/`load`. A box from an image starts in single-digit milliseconds.
-- **Run LLM-generated code in a sandbox, one per call.** The snippet a model just wrote, the command an
-  agent just decided to run, a notebook cell, a CI step. kern starts a box, runs it, deletes it: a
-  hundred calls are a hundred boxes and **1.4 s in total**, with nothing left behind, so per-call
-  isolation is the default rather than something you ration ([measured](BENCHMARKS.md), and when
-  state has to carry, a session shares its workspace and a warm interpreter is one argument away).
-  Network off unless you ask, memory and PID
-  caps the kernel enforces where your host delegates them (`kern doctor` says whether yours does, and
-  `--require-limits` refuses to start rather than give you an uncapped box), capabilities dropped,
-  seccomp deny-by-default, timeout applied from the outside.
+- **Run LLM-generated code in a sandbox.** The snippet a model just wrote, the command an agent just
+  decided to run, a notebook cell, a CI step: kern starts a box, runs it, deletes it, with nothing
+  left behind. Network off unless you ask, memory and PID caps the kernel enforces where your host
+  delegates them, capabilities dropped, seccomp deny-by-default, timeout from the outside.
   <br>**Typed faults, not stack archaeology.** Timeout, OOM-kill, blocked syscall, missing command:
   each returned next to stdout and the exit code. Branch on it and keep going.
   <br>**One binary, no daemon.** Wire it from Python, Node, LangChain, or any MCP client
@@ -214,24 +209,24 @@ have, unchanged.
 
 ```toml
 # stack.toml - one table per service, keys spelled like the `kern box` flags
-[box.db]
-image = "postgres:alpine"
-env   = ["POSTGRES_PASSWORD=secret", "POSTGRES_DB=app"]
+[box.cache]
+image = "redis:7-alpine"
 
 [box.web]
-image      = "adminer"
-ports      = ["8080:8080"]
-depends_on = ["db"]
+image      = "nginx:alpine"
+ports      = ["8080:80"]
+depends_on = ["cache"]
 ```
 
 ```sh
-kern compose stack.toml up            # or point it at your compose.yaml instead
-kern compose stack.toml ps            # what is running, and what each service publishes
-kern compose stack.toml port web 8080 # the host address serving that port, read from the running box
+kern compose stack.toml up          # or point it at your compose.yaml instead
+kern compose stack.toml ps          # what is running, and what each service publishes
+kern compose stack.toml port web 80 # the host address serving that port, read from the running box
 ```
 
-Both official images start, `web` reaches `db` by service name, and the port is published. A fourth
-verb, `watch`, rebuilds and restarts one service when its `build:` context changes.
+Both official images start, `http://localhost:8080` serves the nginx page, and `web` reaches the
+cache by name. A fourth verb, `watch`, rebuilds and restarts one service when its `build:` context
+changes.
 
 **Each service gets its own network namespace, and they meet on a bridge,** the arrangement a Docker
 user already has: a service's `127.0.0.1` is its own, and peers reach each other by name. `--pod`
