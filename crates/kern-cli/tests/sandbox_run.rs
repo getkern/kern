@@ -13631,6 +13631,39 @@ fn a_cpuset_list_produces_exactly_those_cpu_directories() {
     );
 }
 
+/// Can a box actually START on this host? Asked by starting one, not inferred from a sysctl.
+///
+/// `userns_plausible` reads whether the namespace may be created, and that is NOT the same question.
+/// The GitHub runner ships `kernel.apparmor_restrict_unprivileged_userns=1`, which ALLOWS the
+/// namespace and refuses its rootless uid map - kern's own error says exactly that - so every test
+/// that needed a box ran there and failed with exit 125 instead of skipping. Three did, for four
+/// commits, while the local gate said green: the gate's whole promise is to say what CI will say, and
+/// the shape it does not reproduce is this one.
+///
+/// A PROBE, NOT A SKIP DERIVED FROM THE OUTCOME. The capability is asked separately and once, so a
+/// regression that breaks every box still turns the tests red rather than green.
+fn a_box_can_start(tag: &str) -> bool {
+    let Some(busybox) = static_busybox() else {
+        return false;
+    };
+    let root = build_rootfs(&busybox, &format!("canprobe-{tag}"));
+    let ok = kern()
+        .args([
+            "box",
+            &format!("canprobe{}{}", tag, std::process::id()),
+            "--rootfs",
+            root.to_str().unwrap_or("."),
+            "--",
+            "/bin/busybox",
+            "true",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let _ = fs::remove_dir_all(&root);
+    ok
+}
+
 /// A cache path holding `:`, `,`, a space or a backslash must pull, run, build and stack layers.
 ///
 /// # Why this is an integration test and not a unit one
@@ -13659,8 +13692,8 @@ fn a_cpuset_list_produces_exactly_those_cpu_directories() {
 /// one, so every blob of every pull was refused as a digest mismatch.
 #[test]
 fn a_cache_path_with_special_characters_still_pulls_builds_and_stacks_layers() {
-    if !userns_plausible() {
-        eprintln!("skip: unprivileged user namespaces disabled");
+    if !a_box_can_start("sp") {
+        eprintln!("skip: no box starts on this host, so no cache path can be measured through one");
         return;
     }
     let root = std::env::temp_dir().join(format!("kern-it-specialpath-{}", std::process::id()));
@@ -13871,8 +13904,8 @@ fn a_cache_path_with_special_characters_still_pulls_builds_and_stacks_layers() {
 /// Only a LOCALLY BUILT base shows it: a pulled base is one directory, so its string was a real path.
 #[test]
 fn copy_into_a_directory_of_a_locally_built_base_does_not_replace_the_directory() {
-    if !userns_plausible() {
-        eprintln!("skip: unprivileged user namespaces disabled");
+    if !a_box_can_start("cp") {
+        eprintln!("skip: no box starts on this host, so no build can run");
         return;
     }
     let root = std::env::temp_dir().join(format!("kern-it-copydir-{}", std::process::id()));
@@ -14133,8 +14166,8 @@ fn the_registry_cannot_become_a_box_root_through_rootfs_or_overlay_lower() {
 /// rather than passing.
 #[test]
 fn a_build_under_a_cache_path_with_a_space_deletes_nothing_outside_its_tree() {
-    if !userns_plausible() {
-        eprintln!("skip: unprivileged user namespaces disabled");
+    if !a_box_can_start("cy") {
+        eprintln!("skip: no box starts on this host, so the build cannot reach the probe that deleted");
         return;
     }
     let root = std::env::temp_dir().join(format!("kern-it-canary-{}", std::process::id()));
