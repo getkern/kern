@@ -466,6 +466,402 @@ test("per-call timeoutS is validated", () => {
   assert.strictEqual(s._effTimeout(2), 2);
 });
 
+/** Create a pyc cache directory that LOOKS like one a build published.
+ *
+ * A bare mkdir stopped being enough the day an EMPTY directory stopped counting as a cache, which is
+ * the husk kern recreates under a mount another process swept away. The tests have to build the thing
+ * under test, not a directory with its name. */
+function publishCache(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "stdlib.pyc"), Buffer.alloc(4));
+  return dir;
+}
+
+test("the pyc cache is mounted read-only, never on the setup box, and adopted by a call", async () => {
+  // A WRITABLE shared bytecode cache is code execution across calls: those .pyc are timestamp-validated,
+  // so a cell could rewrite json/__init__.pyc with a payload and the next cell would import it. The `:ro`
+  // is asserted on the argv that actually starts the box, not read off the source.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-t-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = home;
+  try {
+    const dir = kern._pycDirFor("python:3.12-slim");
+    publishCache(dir);
+    const s = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+    await s.open();
+    try {
+      assert.strictEqual(s._pycDir, dir, "a cache that exists at open must be adopted");
+      const run = s._baseArgv("b", { network: false, timeoutS: 30, dry: true });
+      assert.ok(run.includes(`${dir}:${kern._PYC_MOUNT}:ro`), run.join(" "));
+      assert.ok(!run.includes(`${dir}:${kern._PYC_MOUNT}`), "mounted writable: a cell could poison it");
+      const setup = s._baseArgv("b", { network: true, timeoutS: 30, isSetup: true, dry: true });
+      assert.ok(!setup.some((a) => String(a).includes(kern._PYC_MOUNT)), setup.join(" "));
+    } finally {
+      await s.close();
+    }
+    // ADOPTED BY A CALL, not at open() and not the instant the directory appears. Freezing it at open()
+    // made the session that PAID for the build the one session that never used it - measured on a
+    // held-open Sandbox, _pycDir stayed empty for its whole life seconds after the tree landed. The
+    // freeze was protecting the prewarm pool from an argv that moves mid-session, which the pool already
+    // absorbs: claim retires the boxes whose key moved and the refill rebuilds it. Measured with
+    // prewarm=4, ONE call falls back to the cold path (33 ms against 1.4) and the pool is full again.
+    fs.rmSync(dir, { recursive: true, force: true });
+    const s2 = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+    await s2.open();
+    try {
+      assert.strictEqual(s2._pycDir, "", "no cache existed at open");
+      assert.strictEqual(s2._pycPending, dir, "a build was started, so its tree must be awaited");
+      publishCache(dir);
+      const argv = s2._baseArgv("b", { network: false, timeoutS: 30, dry: true });
+      assert.ok(!argv.some((a) => String(a).includes(kern._PYC_MOUNT)), "adoption is not a file event");
+      // THE CALL PATH, not the hook: a test that drove _pycAdoptIfReady directly would stay green with
+      // the call in _spawn deleted, which is the sabotage that matters. The double exits 0 without
+      // being a box, so the RESULT means nothing here and the adoption is what is asserted.
+      await s2.run(["true"]).catch(() => {});
+      assert.strictEqual(s2._pycDir, dir, "a call must adopt: the hook is not on the call path");
+      assert.strictEqual(s2._pycPending, "", "nothing left to await, so the check costs one read");
+      const after = s2._baseArgv("b", { network: false, timeoutS: 30, dry: true });
+      assert.ok(after.includes(`${dir}:${kern._PYC_MOUNT}:ro`), after.join(" "));
+    } finally {
+      await s2.close();
+      // The open() above started a background build into this tree. Let it settle before the teardown
+      // deletes the tree under it, or the rm races the build and fails ENOTEMPTY - which it did.
+      await kern._pycStartBuild("", "", dir, 5); // the promise of the build already in flight
+    }
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("an empty pyc cache directory is not a cache and does not block the repair", async () => {
+  // MEASURED ON KERN: a sweep in another process discards a tree this session has mounted, kern then
+  // RECREATES the missing -v source as an empty directory, and from then on every session adopted that
+  // husk, mounted it, found no bytecode and compiled from source. Permanently and silently, because a
+  // cache "existed" so nothing rebuilt it. Refusing it repairs the state: a build starts, and a rename
+  // onto an EMPTY directory SUCCEEDS (verified; onto a non-empty one it is ENOTEMPTY). An empty tree is
+  // NOT READY rather than refused, so the pending destination has to survive it.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-husk-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = home;
+  try {
+    const dir = kern._pycDirFor("python:3.12-slim");
+    fs.mkdirSync(dir, { recursive: true }); // the husk
+    const s = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+    await s.open();
+    try {
+      assert.strictEqual(s._pycDir, "", "an empty directory was adopted as a cache");
+      assert.strictEqual(s._pycPending, dir, "and no build was started to put a real tree back");
+      await s.run(["true"]).catch(() => {});
+      assert.strictEqual(s._pycDir, "", "still empty, still not a cache");
+      assert.strictEqual(s._pycPending, dir, "empty is NOT READY, not a refusal");
+      fs.writeFileSync(path.join(dir, "stdlib.pyc"), Buffer.alloc(4)); // a build publishes
+      await s.run(["true"]).catch(() => {});
+      assert.strictEqual(s._pycDir, dir, "content appeared and the session was still waiting");
+    } finally {
+      await s.close();
+      await kern._pycStartBuild("", "", dir, 5);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("pyc adoption happens before the pool is asked, and re-runs every guard", async () => {
+  // BEFORE THE POOL: _WarmPool's key is built from the live _baseArgv, so adopting AFTER the claim would
+  // hand the call a box warmed without the mount and leave the pool refilling against the old key for as
+  // long as the claims kept hitting. Adopting first is what makes the stale boxes stale.
+  // EVERY GUARD AGAIN: open() asked its questions before this tree existed. The symlink case is not an
+  // own goal - a CELL with a writable volume containing the cache root can plant a link where the build
+  // was going to publish, and pycMountAllowed reads the STRING and cannot see it.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-ad2-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = home;
+  try {
+    const dir = kern._pycDirFor("python:3.12-slim");
+
+    const s = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+    await s.open();
+    try {
+      publishCache(dir);
+      let seen = null;
+      s._pool = { claim: () => { seen = s._pycDir; return null; } };
+      await s.runCode("print(1)").catch(() => {});
+      s._pool = null; // the stub has no teardown and close() would call one
+      assert.strictEqual(seen, dir, "the pool was asked with the cache still unadopted");
+    } finally {
+      s._pool = null;
+      await s.close();
+    }
+
+    // A symlink planted where the build was going to publish.
+    fs.rmSync(dir, { recursive: true, force: true });
+    // WITH CONTENT: an empty target is "not ready" and returns before the symlink walk, so the
+    // refusal under test would never be reached and the green would mean nothing.
+    const planted = publishCache(path.join(home, "planted"));
+    const s2 = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+    await s2.open();
+    try {
+      assert.strictEqual(s2._pycPending, dir);
+      fs.mkdirSync(path.dirname(dir), { recursive: true });
+      fs.symlinkSync(planted, dir, "dir");
+      assert.ok(fs.existsSync(dir), "the link resolves, so only an lstat walk refuses it");
+      s2._pycAdoptIfReady();
+      assert.strictEqual(s2._pycDir, "", "a symlinked cache path was adopted");
+      assert.strictEqual(s2._pycPending, "", "a refusal must not be re-walked on every later call");
+    } finally {
+      await s2.close();
+      await kern._pycStartBuild("", "", dir, 5); // let the in-flight build settle before the teardown
+      fs.rmSync(dir, { force: true });
+    }
+
+    // And the deps guard, which open() answered before any setup of THIS session could have run: the
+    // prefix redirects every lookup, .deps included, stranding the precompile the setup box does on
+    // purpose (+40 ms per call without it).
+    fs.rmSync(dir, { recursive: true, force: true });
+    const s3 = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+    await s3.open();
+    try {
+      assert.strictEqual(s3._pycPending, dir);
+      publishCache(dir);
+      fs.mkdirSync(path.join(s3._ws, ".deps"), { recursive: true });
+      s3._pycAdoptIfReady();
+      assert.strictEqual(s3._pycDir, "", "deps appeared: the prefix would strand their precompile");
+      assert.strictEqual(s3._pycPending, "");
+    } finally {
+      await s3.close();
+      await kern._pycStartBuild("", "", dir, 5);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("one cache directory per image, not per spelling", () => {
+  // Every pair was DUMPED FROM parse_ref in kern-oci/src/pull.rs by a temporary test, not derived from
+  // reading it: the two implementations must agree about what "the same image" is. Twelve of twelve
+  // matched, and the Python binding holds the same table.
+  const refs = [
+    ["python:3.12-slim", "registry-1.docker.io/library/python:3.12-slim"],
+    ["docker.io/library/python:3.12-slim", "registry-1.docker.io/library/python:3.12-slim"],
+    ["index.docker.io/python:3.12-slim", "registry-1.docker.io/library/python:3.12-slim"],
+    ["docker.io/python:3.12-slim", "registry-1.docker.io/library/python:3.12-slim"],
+    ["alpine", "registry-1.docker.io/library/alpine:latest"],
+    ["library/alpine:latest", "registry-1.docker.io/library/alpine:latest"],
+    ["localhost:5000/x", "localhost:5000/x:latest"],
+    ["localhost:5000/x:latest", "localhost:5000/x:latest"],
+    ["ghcr.io/a/b:1", "ghcr.io/a/b:1"],
+    ["ghcr.io/alpine", "ghcr.io/alpine:latest"],
+    ["python@sha256:abc", "registry-1.docker.io/library/python:sha256:abc"],
+    ["python:3.12@sha256:abc", "registry-1.docker.io/library/python:sha256:abc"],
+    ["", ""],
+  ];
+  for (const [raw, want] of refs) assert.strictEqual(kern._ociCanonicalRef(raw), want, raw);
+  const hub = new Set(
+    [
+      "python:3.12-slim",
+      "docker.io/library/python:3.12-slim",
+      "index.docker.io/python:3.12-slim",
+      "docker.io/python:3.12-slim",
+    ].map((r) => kern._pycDirFor(r)),
+  );
+  assert.strictEqual(hub.size, 1, `one image, ${hub.size} cache directories`);
+  // A digest pin and a tag are DIFFERENT images and must not share a cache.
+  assert.notStrictEqual(kern._pycDirFor("python:3.12-slim"), kern._pycDirFor("python@sha256:abc"));
+});
+
+test("the sweep runs once per process even when nothing is built", async () => {
+  // The sweep used to run only at the end of a build, so a long-lived server that always found its
+  // cache already there never aged the others: the ceiling existed only for callers who compiled.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-ad-"));
+  // An earlier test in this process may already have adopted a cache and consumed the single sweep.
+  kern._pycResetSweptForTests();
+  try {
+    for (let i = 0; i < 12; i++) {
+      const d = path.join(root, `c${String(i).padStart(2, "0")}`);
+      fs.mkdirSync(d);
+      fs.utimesSync(d, new Date((2000 + i) * 1000), new Date((2000 + i) * 1000));
+    }
+    const adopted = path.join(root, "adopted");
+    fs.mkdirSync(adopted);
+    fs.utimesSync(adopted, new Date(), new Date());
+    await kern._pycStartSweep(root);
+    const left = fs.readdirSync(root).sort();
+    assert.ok(left.includes("adopted"), "evicted the newest cache");
+    assert.strictEqual(left.length, 8, `${left.length} caches left, expected 8`);
+    // AND ONLY ONCE: a second call must not scan again. Asserted by deleting the ceiling's worth of
+    // evidence - a second sweep would take the count down again, and it must not.
+    fs.mkdirSync(path.join(root, "extra"));
+    await kern._pycStartSweep(root);
+    assert.ok(fs.existsSync(path.join(root, "extra")), "swept twice in one process");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pycSweep keeps the recently adopted and removes only old debris", () => {
+  // LEAST RECENTLY ADOPTED, not least recently built: an image built once and used daily must outlive
+  // one built yesterday and never used. open() records the adoption with utimes, so the directory's
+  // own mtime is the order and there is no marker file to exclude from the .pyc-only tree check.
+  // DEBRIS IS AGED, not swept on sight: a fresh .tmp- tree belongs to a build that may still be
+  // running, and deleting it would race the build that owns it.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-sw-"));
+  try {
+    for (let i = 0; i < 12; i++) {
+      const d = path.join(root, `cache${String(i).padStart(2, "0")}`);
+      fs.mkdirSync(d);
+      fs.utimesSync(d, new Date((1000 + i) * 1000), new Date((1000 + i) * 1000));
+    }
+    fs.mkdirSync(path.join(root, "cache99.tmp-running"));
+    const oldMs = Date.now() - 25 * 60 * 60 * 1000;
+    for (const name of ["cache98.tmp-killed", "cache97.trash-abandoned"]) {
+      const d = path.join(root, name);
+      fs.mkdirSync(d);
+      fs.utimesSync(d, new Date(oldMs), new Date(oldMs));
+    }
+    kern._pycSweep(root, 8);
+    assert.deepStrictEqual(fs.readdirSync(root).sort(), [
+      "cache04", "cache05", "cache06", "cache07",
+      "cache08", "cache09", "cache10", "cache11",
+      "cache99.tmp-running",
+    ]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the pyc build asks for hash validation and every import root", () => {
+  // CHECKED_HASH, because the default timestamp validation accepts bytecode whose source has a
+  // matching mtime and size: measured with two images, same CPython 3.12, one stdlib file edited to a
+  // different value of the SAME LENGTH with the mtime preserved - with timestamps the box ran the OLD
+  // code. Reproducible builds pin mtimes by construction, so that image is not exotic.
+  //
+  // EVERY IMPORT ROOT, because PYTHONPYCACHEPREFIX REPLACES the in-tree __pycache__ rather than adding
+  // to it: a root left out has its shipped bytecode made invisible and recompiled in every box.
+  const code = kern._PYC_BUILD_CODE;
+  assert.ok(code.includes("CHECKED_HASH"), code);
+  assert.ok(!code.includes("UNCHECKED_HASH"), "never invalidating is the opposite error");
+  assert.ok(code.includes("sys.path") && code.includes("purelib"), "compiles only the stdlib");
+  // Kept character-for-character in step with the Python binding: two spellings of one rule drift.
+  assert.ok(code.includes("workers=1"), "multiprocessing needs a temp dir a box does not have");
+  // force=True, measured on the VPS: without it 39 of 1097 files kept TIMESTAMP validation - the
+  // modules this command itself imports, whose bytecode the import machinery writes to the prefix in
+  // the default mode before compile_dir runs, which then skips them as up to date.
+  assert.ok(code.includes("force=True"), "the modules this command imports keep timestamp validation");
+});
+
+test("a cache under a credential directory is refused, and the build box is capped", async () => {
+  // The cache path comes from $XDG_CACHE_HOME, so a cache home under a credential directory would have
+  // kern mount a subdirectory of it into every box, and into the build box WRITABLE. The caps matter
+  // for the same reason they do anywhere else here: the command is ours, the interpreter is the
+  // caller's image, and no image gets an uncapped process.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-s-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  try {
+    const bad = path.join(home, ".ssh");
+    fs.mkdirSync(bad);
+    process.env.XDG_CACHE_HOME = bad;
+    // THE CACHE MUST EXIST, or this asserts nothing: without it the session takes the "build one"
+    // branch and leaves _pycDir empty for an unrelated reason. Caught by sabotage.
+    fs.mkdirSync(kern._pycDirFor("python:3.12-slim"), { recursive: true });
+    const s = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+    await s.open();
+    try {
+      assert.strictEqual(s._pycDir, "", "mounted a cache from under .ssh");
+      const argv = s._baseArgv("b", { network: false, timeoutS: 30, dry: true });
+      assert.ok(!argv.some((a) => String(a).includes(kern._PYC_MOUNT)), argv.join(" "));
+    } finally {
+      await s.close();
+    }
+    // POSITIVE CONTROL: an ordinary cache home is still adopted, or the assertion above would pass on
+    // a build where the cache never works at all.
+    const good = path.join(home, "cache");
+    process.env.XDG_CACHE_HOME = good;
+    publishCache(kern._pycDirFor("python:3.12-slim"));
+    const s2 = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
+    await s2.open();
+    try {
+      assert.notStrictEqual(s2._pycDir, "", "the positive control must still work");
+    } finally {
+      await s2.close();
+    }
+    // The caps, read off the argv the build actually passes to kern.
+    const marker = path.join(home, "argv");
+    const fake = path.join(home, "kern-fake");
+    fs.writeFileSync(fake, `#!/bin/sh\necho "$@" > ${marker}\nexit 1\n`);
+    fs.chmodSync(fake, 0o755);
+    await kern._pycBuild(fake, "img:caps", path.join(good, "d"), 30);
+    const argv = fs.readFileSync(marker, "utf8");
+    assert.ok(argv.includes("--memory") && argv.includes("--pids-limit"), argv);
+    assert.ok(argv.includes("--cap-drop ALL"), argv);
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("pycBuild publishes atomically, leaves nothing on failure, and takes no network", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-b-"));
+  const prev = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = home;
+  try {
+    const failed = kern._pycDirFor("img:fails");
+    await kern._pycBuild("/bin/false", "img:fails", failed, 10);
+    assert.ok(!fs.existsSync(failed), "published a cache from a failed build");
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(failed)), [], "left debris behind");
+
+    const marker = path.join(home, "argv");
+    const fake = path.join(home, "kern-fake");
+    fs.writeFileSync(
+      fake,
+      "#!/bin/sh\n" +
+        `echo "$@" > ${marker}\n` +
+        'for a in "$@"; do case "$a" in *:/kern-pyc) mkdir -p "${a%%:*}" && : > "${a%%:*}/x.pyc";; esac; done\n' +
+        "exit 0\n",
+    );
+    fs.chmodSync(fake, 0o755);
+    const ok = kern._pycDirFor("img:ok");
+    await kern._pycBuild(fake, "img:ok", ok, 10);
+    assert.ok(fs.existsSync(path.join(ok, "x.pyc")), "did not publish a successful build");
+    assert.ok(
+      !fs.readdirSync(path.dirname(ok)).some((n) => n.includes(".tmp-")),
+      "temp sibling survived",
+    );
+    const argv = fs.readFileSync(marker, "utf8");
+    assert.ok(argv.includes("--ro") && argv.includes(`PYTHONPYCACHEPREFIX=${kern._PYC_MOUNT}`), argv);
+    assert.ok(!argv.includes("--net"), "the build box must not get the network");
+
+    // AND THE TREE IS INSPECTED BEFORE IT IS PUBLISHED, asserted through pycBuild and not on the
+    // helper alone: sabotage showed that testing the predicate while the build ignored it left this
+    // file green. A box that writes something other than a .pyc must publish nothing.
+    const junk = path.join(home, "kern-junk");
+    fs.writeFileSync(
+      junk,
+      "#!/bin/sh\n" +
+        'for a in "$@"; do case "$a" in *:/kern-pyc) mkdir -p "${a%%:*}" && : > "${a%%:*}/evil.sh";; esac; done\n' +
+        "exit 0\n",
+    );
+    fs.chmodSync(junk, 0o755);
+    const dirty = kern._pycDirFor("img:junk");
+    await kern._pycBuild(junk, "img:junk", dirty, 10);
+    assert.ok(!fs.existsSync(dirty), "published a tree holding a file that is not .pyc");
+    assert.ok(
+      !fs.readdirSync(path.dirname(dirty)).some((n) => n.includes(".tmp-")),
+      "debris left behind",
+    );
+  } finally {
+    if (prev === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("pull network failure classifies as startup_failed (curl marker)", () => {
   // A box that never started because the PULL failed (network/DNS down) prints kern's
   // "error: curl failed:" prefix -> a startup failure, not the user's code failing.

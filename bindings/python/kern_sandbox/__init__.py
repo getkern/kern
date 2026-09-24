@@ -37,6 +37,7 @@ from __future__ import annotations
 import atexit
 import base64
 import errno
+import hashlib
 import json
 import os
 import queue
@@ -77,6 +78,429 @@ _DEFAULT_IMAGE = "python:3.12-slim"
 
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
 _DEPS_DIR = ".deps"  # pip --target dir inside the workspace (added to PYTHONPATH for run_code)
+
+# -- the standard library's bytecode, compiled once per image and mounted READ-ONLY ------------------
+#
+# WHY THIS EXISTS, measured. `python:3.12-slim` ships its standard library as 567 `.py` files and no
+# `.pyc`, and a box mounts its root read-only, so EVERY box recompiles from source what it imports and
+# throws the result away. `import json,re` costs 45.5 ms on an i7-14700KF and 172.0 ms on a 4-vCPU
+# Contabo VPS, against 13.1 ms for a box that runs `/bin/true` there: most of a call is a compiler
+# running, not a sandbox starting. `encodings.aliases`, which every interpreter imports before it runs
+# anything, is 9.9 ms of that on the VPS by itself.
+#
+# One box compiles the stdlib once per image into a host directory, and every later box mounts that
+# directory READ-ONLY with `PYTHONPYCACHEPREFIX` pointing at it. Measured over 7 alternated pairs:
+# `import json,re` goes 45.50 -> 19.68 ms on the desktop.
+#
+# READ-ONLY IS NOT A PRECAUTION, IT IS THE WHOLE DESIGN. A writable shared bytecode cache is remote
+# code execution across calls: `python:3.12-slim`'s `.pyc` are timestamp-validated, so a cell can
+# rewrite `json/__init__.pyc` with a payload, re-paste the legitimate header (magic, mtime, size), and
+# the NEXT cell that imports json executes it. That attack was demonstrated on this project before this
+# cache existed. Here the mount is `:ro`, verified: a cell's `write_bytes` on a cached `.pyc` comes back
+# `OSError` 30, EROFS.
+#
+# A CACHE FROM THE WRONG IMAGE IS SAFE, and this is the property the key rests on rather than a hope.
+# CPython validates every `.pyc` against the source's mtime and size before using it, so bytecode that
+# does not belong to the interpreter reading it is IGNORED, not executed. Verified by building the cache
+# from `python:3.12-slim` and mounting it into `python:3.11-slim`: the box reported 3.11.16 and computed
+# correct answers. The failure mode of a stale or mismatched cache is therefore "as slow as before",
+# never "runs the wrong code".
+_PYC_MOUNT = "/kern-pyc"  # where the cache is mounted inside a box, read-only
+# `workers=1` because `compileall` with more than one worker uses multiprocessing, which needs a
+# temporary directory, and a box with a read-only root and no tmpfs has none: MEASURED, it dies with
+# `FileNotFoundError: No usable temporary directory found`. Serial costs 1.2 s on the desktop, and it
+# runs in a background thread where nothing waits for it. `quiet=2` keeps a file that will not compile
+# from writing to stderr: bytecode is an optimisation and a failure here is not the caller's problem.
+#
+# EVERY IMPORT ROOT, NOT JUST THE STDLIB, and the first version compiled only
+# `sysconfig.get_paths()['stdlib']`. That is enough on `python:3.12-slim`, where `purelib` happens to
+# be a SUBDIRECTORY of stdlib and `compile_dir` recurses into it, and wrong everywhere else: MEASURED
+# on `debian:13-slim` with python3 from apt, stdlib is `/usr/lib/python3.13` while purelib is
+# `/usr/local/lib/python3.13/dist-packages`, and `sys.path` holds five separate roots. Since
+# `PYTHONPYCACHEPREFIX` REPLACES the in-tree `__pycache__` rather than adding to it, a root left out of
+# the cache has its shipped bytecode made invisible and is recompiled in every box - the feature would
+# slow down exactly the images that carry preinstalled packages. Nested roots are dropped so a
+# directory is not walked twice.
+#
+# CHECKED_HASH, NOT THE DEFAULT TIMESTAMP, and this is a correctness property rather than a taste.
+# A timestamp-validated `.pyc` is accepted when the source's mtime and size match what the header
+# records, and images built reproducibly (BuildKit `rewrite-timestamp`, apko, Nix, distroless) pin
+# mtimes by construction. MEASURED: two images, same CPython 3.12, one stdlib file edited to a
+# different value of the SAME LENGTH with the mtime preserved - with timestamp validation the box ran
+# the OLD code, with CHECKED_HASH it ran the new one. The failure mode was a security patch that was
+# installed and then not executed. Hashing the source on every import costs nothing measurable here
+# (15.26 ms against 15.30 for `import json,re`, 7 alternated pairs), and it is what makes the cache key
+# a performance hint rather than a correctness dependency. UNCHECKED_HASH would be the opposite error:
+# bytecode that never invalidates at all.
+#
+# `force=True`, and it is NOT belt and braces. MEASURED on the VPS: 39 of 1097 cached files came out
+# with TIMESTAMP validation anyway, and they are exactly the modules this very command imports -
+# `compileall`, `encodings`, `importlib`, `functools`, `collections`. Importing them writes their
+# bytecode to the prefix through the ordinary import machinery, which uses the default mode, BEFORE
+# `compile_dir` runs; `compile_dir` then finds them up to date and skips them. So the one guarantee
+# this cache rests on was missing from `encodings/aliases`, which is 9.9 ms of interpreter startup on
+# that host. Recompiling everything costs a fraction of a second on a tree that is fresh anyway.
+_PYC_BUILD_CODE = (
+    "import compileall,os,py_compile,sys,sysconfig;"
+    "r={p for p in sys.path if p and os.path.isdir(p)};"
+    "r|={v for v in (sysconfig.get_paths().get(k) for k in "
+    "('stdlib','platstdlib','purelib','platlib')) if v and os.path.isdir(v)};"
+    "r={p for p in r if not any(p!=q and p.startswith(q.rstrip('/')+'/') for q in r)};"
+    "sys.exit(0 if all([compileall.compile_dir(p,quiet=2,workers=1,force=True,"
+    "invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH) for p in sorted(r)]) else 1)"
+)
+# A ceiling on what one image may publish. The stdlib is ~20 MiB and an image with large packages is
+# more, so this is not a tight bound - it exists so a hostile image cannot fill the host's disk from
+# the one box that exists to make things faster.
+_PYC_MAX_BYTES = 512 * 1024 * 1024
+# How many image caches to keep, least-recently-ADOPTED evicted first. Eight is not a measurement: it
+# is "more images than a session mixes, fewer than a disk notices" at ~20 MiB each. A cache is
+# reproducible from its image, so evicting one costs time and nothing else.
+_PYC_KEEP = 8
+# A build killed by a SIGKILL leaves its private `.tmp-` tree behind forever: nothing in the happy path
+# removes it, because the happy path is the one that did not run. Swept after a day, which is long
+# enough that a build still running is never the thing being deleted.
+_PYC_DEBRIS_MAX_AGE_S = 24 * 60 * 60
+# The two name fragments that mark a directory as NOT a cache: one being written, one being deleted.
+_PYC_DEBRIS_MARKS = (".tmp-", ".trash-")
+# One build per (process, destination), so ten sessions opened at once on one image start one compile
+# and not ten. A MAP OF THREADS rather than a set of names: a second caller gets the thread of the
+# build already in flight, which is what lets a test `join()` the real thing instead of polling for a
+# directory. A poll would race the build, and in the Node binding it raced the test's own teardown.
+_PYC_BUILDS: "dict[str, threading.Thread]" = {}
+# True once this process has swept, so adopting a cache in a hundred sessions costs one scan. Under
+# `_PYC_LOCK`, because two sessions opened from two threads would otherwise both start one.
+_PYC_SWEPT = False
+_PYC_LOCK = threading.Lock()
+
+
+def _pyc_root() -> str:
+    """The host directory holding one bytecode cache per image.
+
+    `$XDG_CACHE_HOME` when set, else `~/.cache`, which is where a cache belongs on a Linux host: it is
+    reproducible from the image, so a user clearing it loses time and nothing else.
+    """
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "kern-sandbox", "pyc")
+
+
+# kern's own defaults, from `kern-oci/src/pull.rs`. Copied rather than derived because they cross a
+# process boundary: if kern ever changes them, two references that kern considers one image would get
+# two cache directories here, which costs disk and never correctness.
+_OCI_DEFAULT_REGISTRY = "registry-1.docker.io"
+_OCI_DEFAULT_TAG = "latest"
+
+
+def _oci_split_tag(image: str) -> "tuple[str, str] | None":
+    """`(name, tag)` iff the reference ends in an explicit tag. Mirrors `split_tag` in kern-oci.
+
+    A trailing `:x` is a tag only when `x` has no `/`, or `localhost:5000/img` would read its PORT as a
+    tag. A digest (`img@sha256:<hex>`) splits at that same colon and so counts as explicit, which is
+    what a caller wants: a digest pins harder than a tag and must never have `:latest` bolted on.
+    """
+    name, sep, tag = image.rpartition(":")
+    if sep and "/" not in tag and name:
+        return name, tag
+    return None
+
+
+def _oci_canonical_ref(image: str) -> str:
+    """One canonical string per image, so one cache directory per image.
+
+    WHY THIS EXISTS. `python:3.12-slim`, `docker.io/library/python:3.12-slim` and
+    `index.docker.io/python:3.12-slim` are the same image to kern and were three cache directories
+    here, because the key was the raw string the caller typed. Three compiles and three copies of the
+    same 16 MiB.
+
+    A FAITHFUL PORT OF `parse_ref` in `kern-oci/src/pull.rs`, rule for rule, because the two must agree
+    about what "the same image" means:
+
+    * a digest pin splits at `@` FIRST, since `rpartition(':')` would otherwise tear `sha256:<hex>` in
+      half; the digest wins over any tag, so a trailing `:tag` on the name is dropped;
+    * the first path segment is a REGISTRY only if it looks like a host (contains a dot or a colon, or
+      is exactly `localhost`), otherwise `user/img` is a Docker Hub repository, not a host;
+    * `docker.io` and `index.docker.io` are aliases for `registry-1.docker.io`, which is where Docker
+      Hub's API actually is;
+    * on Docker Hub a single-segment repository gets `library/`, and ONLY there: `ghcr.io/alpine`
+      means what it says.
+
+    Worst case for a reference this function cannot parse is that it returns the input unchanged and
+    two spellings get two directories: disk, never correctness, because the bytecode itself is
+    validated against its source by hash.
+    """
+    if not image:
+        return image
+    name, sep, digest = image.partition("@")
+    if sep and name and digest:
+        base = _oci_split_tag(name)
+        name, reference = (base[0] if base else name), digest
+    else:
+        split = _oci_split_tag(image)
+        name, reference = split if split else (image, _OCI_DEFAULT_TAG)
+    host, sep, rest = name.partition("/")
+    if sep and ("." in host or ":" in host or host == "localhost"):
+        registry, repo = host, rest
+    else:
+        registry, repo = _OCI_DEFAULT_REGISTRY, name
+    if registry in ("docker.io", "index.docker.io"):
+        registry = _OCI_DEFAULT_REGISTRY
+    if registry == _OCI_DEFAULT_REGISTRY and "/" not in repo:
+        repo = f"library/{repo}"
+    return f"{registry}/{repo}:{reference}"
+
+
+def _pyc_dir_for(image: str) -> str:
+    """Where this image's cache lives. Keyed on the image REFERENCE, hashed for a filesystem-safe name.
+
+    The reference, not a content digest, and the honest reason is that kern exposes no digest a caller
+    can read cheaply: `kern inspect` prints for a human, and resolving one would cost a box start on
+    every session. The key therefore identifies a NAME, and a moved tag yields a cache whose bytecode
+    no longer validates - which CPython handles by recompiling, as verified above. The cost of the
+    imperfect key is a slow call, not a wrong one.
+    """
+    # THE FULL DIGEST, not a truncation. 64 bits is almost certainly enough against an accident and the
+    # key is no longer load-bearing for correctness (see CHECKED_HASH above), but the saving was 48
+    # characters of path and the cost of being wrong is two images sharing a cache directory.
+    key = hashlib.sha256(
+        _oci_canonical_ref(image).encode("utf-8", "surrogateescape")
+    ).hexdigest()
+    return os.path.join(_pyc_root(), key)
+
+
+def _pyc_has_content(dest: str) -> bool:
+    """Is there a cache at `dest`, as opposed to a directory named like one?
+
+    AN EMPTY DIRECTORY IS NOT AN ABSENT ONE, and the difference was a hole that silences the whole
+    feature. Measured: a sweep in another process discards a tree this session has mounted, kern then
+    RECREATES the missing `-v` source as an empty directory, and from then on every session adopts that
+    empty directory, mounts it, finds no bytecode and compiles from source - permanently, silently, with
+    nothing to rebuild it because a cache "exists". The `.pyc` count in the box went to zero and stayed
+    there.
+
+    Treating empty as absent repairs it instead: the adoption is refused, a build starts, and
+    `os.rename` onto an EMPTY directory SUCCEEDS (verified; onto a non-empty one it is `ENOTEMPTY`,
+    which is the check `_pyc_build` relies on when two processes race). So the next session that opens
+    puts a real tree back.
+
+    One `scandir` that stops at the first entry, not a walk: the question is whether anything is there.
+    """
+    try:
+        with os.scandir(dest) as it:
+            return any(True for _ in it)
+    except OSError:
+        return False
+
+
+def _pyc_path_has_no_symlink(dest: str) -> bool:
+    """True iff no component of the cache path is a symlink.
+
+    THE VALIDATOR ABOVE IS LEXICAL AND A BIND MOUNT IS NOT: `_validate_mount_lexical` inspects the
+    STRING, while kern's `-v` follows links. So a symlink at `<cache>/kern-sandbox/pyc/<key>` pointing
+    at `~/.ssh` passes the name check and mounts the real directory into every box of every later
+    session, read-only - and reading is what exfiltration needs.
+
+    WHO CAN PLANT IT is the part that makes this a boundary and not a foot-gun. Not only the user: a
+    CELL given a writable volume that contains the cache root (`-v ~:/host`, a workspace under
+    `$XDG_CACHE_HOME`) can create it, and then every future session of every future process is
+    affected. That is the `.deps` poisoning vector escaping the session that produced it, which is the
+    one class of bug this package treats as fatal. The same write also lets a cell replace the `.pyc`
+    themselves, so the check has to be on the PATH, before anything is mounted.
+
+    Walked with `lstat` from the leaf to the root: a component that does not exist yet is not a link,
+    and a component that is one disqualifies the whole path.
+    """
+    seen: "set[str]" = set()
+    cur = os.path.abspath(dest)
+    while cur not in seen:
+        seen.add(cur)
+        try:
+            if stat.S_ISLNK(os.lstat(cur).st_mode):
+                return False
+        except OSError:
+            pass  # does not exist: nothing to follow
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return True
+        cur = parent
+    return True
+
+
+def _pyc_tree_is_publishable(root: str) -> bool:
+    """True iff the built tree is only directories and `.pyc` files, and fits under the size ceiling.
+
+    The build box runs the CALLER'S image with this directory writable, so what lands in it is chosen
+    by that image, not by the command. Inside a later box a symlink resolves in that box's own
+    namespace and is harmless, but this tree also lives on the HOST, where a backup, an indexer or the
+    cache's own future eviction will walk it: a symlink out of it is a way to have those follow a link
+    the user never made, and a FIFO blocks whoever opens it, forever. Everything that is not a regular
+    `.pyc` or a directory is refused, and the tree is discarded rather than repaired.
+    """
+    total = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            for name in dirnames:
+                if stat.S_ISLNK(os.lstat(os.path.join(dirpath, name)).st_mode):
+                    return False
+            for name in filenames:
+                st = os.lstat(os.path.join(dirpath, name))
+                if not stat.S_ISREG(st.st_mode) or not name.endswith(".pyc"):
+                    return False
+                total += st.st_size
+                if total > _PYC_MAX_BYTES:
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def _pyc_discard(path: str) -> None:
+    """Remove a cache tree, renaming it out of the way first. Never raises.
+
+    THE RENAME IS THE POINT, not tidiness. `rmtree` walks and unlinks, so a tree being deleted is for a
+    while a tree with half its files: a session that mounts it in that window gets a partial stdlib.
+    A rename is atomic, so the name either resolves to a whole tree or to nothing, and `kern` CREATES a
+    `-v` source that does not exist (measured), which is why nothing breaks when it resolves to nothing:
+    the box gets an empty directory, finds no bytecode and compiles from source, exactly as it did
+    before this cache existed.
+    """
+    trash = f"{path}.trash-{uuid.uuid4().hex[:8]}"
+    try:
+        os.rename(path, trash)
+    except OSError:
+        return
+    shutil.rmtree(trash, ignore_errors=True)
+
+
+def _pyc_sweep(root: str, keep: int = _PYC_KEEP) -> None:
+    """Bound the cache: keep the `keep` most recently adopted, and remove stale debris. Never raises.
+
+    LEAST RECENTLY ADOPTED, and adoption is what `__enter__` records with a `utime` on the directory.
+    Not least recently BUILT: an image built once and used daily would be evicted ahead of one built
+    yesterday and never used again, which is backwards. The directory's own mtime carries it, so there
+    is no marker file - one would be visible inside every box that mounts the cache, and would have to
+    be excluded from the tree check that refuses everything which is not a `.pyc`.
+
+    Called at the end of a build, in the background thread: it is the only moment this module runs when
+    nobody is waiting, and the only moment a new directory has just appeared.
+    """
+    now = time.time()
+    caches: "list[tuple[float, str]]" = []
+    doomed: "list[str]" = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for e in entries:
+        try:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            st = e.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if any(mark in e.name for mark in _PYC_DEBRIS_MARKS):
+            # A tree half-written by a build that was killed, or half-deleted by a sweep that was.
+            if now - st.st_mtime > _PYC_DEBRIS_MAX_AGE_S:
+                doomed.append(e.path)
+            continue
+        caches.append((st.st_mtime, e.path))
+    caches.sort(reverse=True)
+    doomed.extend(path for _, path in caches[keep:])
+    for path in doomed:
+        _pyc_discard(path)
+
+
+def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
+    """Compile `image`'s standard library into `dest`, atomically. Never raises: the caller is a thread.
+
+    Built into a private sibling and `rename`d into place, so a reader either sees no cache or a
+    complete one - there is no window where a box mounts a half-written tree. Two processes racing
+    both build, and the loser's tree is removed: `rename` onto an existing directory fails with
+    ENOTEMPTY, which is the check, not an error to report.
+    """
+    tmp = f"{dest}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+        os.makedirs(tmp, mode=0o700, exist_ok=True)
+    except OSError:
+        return
+    try:
+        # A dedicated argv rather than `_base_argv`: that one mounts the session's workspace, writes an
+        # env file and would add THIS cache read-only, which is exactly what must not happen while it is
+        # being written. Nothing of the caller's session is in this box.
+        argv = [
+            kern_bin, "box", f"kern-pyc-{uuid.uuid4().hex[:8]}",
+            "--image", image, "--ro",
+            "-v", f"{tmp}:{_PYC_MOUNT}",
+            "--env", f"PYTHONPYCACHEPREFIX={_PYC_MOUNT}",
+            "--cap-drop", "ALL",
+            # CAPPED LIKE ANY OTHER BOX, and not because compiling is dangerous: the command is ours,
+            # but the INTERPRETER running it is the caller's image, and this package's whole claim is
+            # that an image gets no uncapped process. Without these a hostile image's `python3` could
+            # fork-bomb or exhaust the host from the one box that exists to make things faster. 512 MiB
+            # and 256 tasks are the Sandbox defaults; `compileall` with `workers=1` needs neither.
+            "--memory", "512m",
+            "--pids-limit", "256",
+            "--timeout", str(int(timeout_s)),
+            "--", "python3", "-c", _PYC_BUILD_CODE,
+        ]
+        r = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=timeout_s + 10)
+        # An image without python3, or one whose stdlib will not compile, leaves no cache and no trace.
+        # The next session finds nothing and runs exactly as it did before this feature existed.
+        if r.returncode == 0 and any(os.scandir(tmp)) and _pyc_tree_is_publishable(tmp):
+            os.rename(tmp, dest)
+            return
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # `subprocess.TimeoutExpired` is a `SubprocessError`, so a build that overruns lands here and
+        # the tree below is removed rather than left for the next process to find.
+        pass
+    finally:
+        # AFTER the publish and after the failure path alike: a build that produced nothing is still the
+        # moment to notice that eight other caches are older than this one.
+        _pyc_sweep(os.path.dirname(dest))
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _pyc_start_sweep(root: str) -> "threading.Thread | None":
+    """Sweep the cache once per process, in the background. Returns the thread, or None if already done.
+
+    WHY THIS EXISTS SEPARATELY FROM THE BUILD. The sweep used to run only at the end of a build, so a
+    process that always found its cache already there never evicted anything: the bound existed only
+    for callers who happened to compile something. A long-lived server that adopts one cache for weeks
+    is exactly the process that should be aging the seven others.
+
+    IN A THREAD, because it is a `scandir` plus one `stat` per entry and a caller's first call must pay
+    nothing for it. Once per process, because the answer cannot change often enough to be worth
+    scanning twice.
+    """
+    global _PYC_SWEPT
+    with _PYC_LOCK:
+        if _PYC_SWEPT:
+            return None
+        _PYC_SWEPT = True
+    th = threading.Thread(target=_pyc_sweep, args=(root,), daemon=True, name="kern-pyc-sweep")
+    th.start()
+    return th
+
+
+def _pyc_start_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> "threading.Thread":
+    """Start one background build for this destination, or hand back the one already running.
+
+    The thread is returned for the tests and dropped by `__enter__`: a caller's first call must never
+    wait on a cache fill. `daemon=True` so a build cannot hold up interpreter exit; a half-built tree is
+    a `.tmp-` sibling that no box can mount and that the next build ignores.
+    """
+    with _PYC_LOCK:
+        running = _PYC_BUILDS.get(dest)
+        if running is not None:
+            return running
+        th = threading.Thread(
+            target=_pyc_build, args=(kern_bin, image, dest, timeout_s), daemon=True,
+            name="kern-pyc-build",
+        )
+        _PYC_BUILDS[dest] = th
+    th.start()
+    return th
 _ENV_FILE = ".kern-env"  # host-side 0600 env file (kept out of argv so values don't show in `ps`)
 # One file per CALL, `.kern-env.<box-name>`: a single fixed name made two concurrent calls on the
 # same Sandbox race for one path. The plain `.kern-env` is still recognised so a workspace written
@@ -1824,6 +2248,11 @@ class Sandbox:
     # narrower set, e.g. `cap_drop=("SYS_ADMIN", "NET_RAW")`.
     cap_drop: Sequence[str] = ("ALL",)
     deps_readonly: bool = True  # mount setup= deps read-only for run_code (block cross-run poisoning)
+    # pyc_cache=True compiles this image's standard library ONCE, in a background box, and mounts the
+    # result READ-ONLY into every later box (see `_PYC_MOUNT`). It changes no observable behaviour: the
+    # bytecode is the image's own stdlib compiled by the image's own interpreter, and CPython validates
+    # each file against its source before using it. Set False to keep boxes compiling from source.
+    pyc_cache: bool = True
     # track_files=True populates result.files by walking the workspace before AND after each call, which
     # is O(workspace file count): a long session that accumulates thousands of files makes every run_code
     # slower. Set False (result.files always []) when you don't need the per-call file diff - O(1) then.
@@ -1853,6 +2282,13 @@ class Sandbox:
     _single_uid: bool = field(default=False, init=False, repr=False)
     _ws: str = field(default="", init=False, repr=False)
     _own_ws: bool = field(default=False, init=False, repr=False)  # we created it → we delete it
+    # The cache directory to mount: "" means this session compiles from source. Set at `__enter__` when
+    # a cache is already there, and by `_pyc_adopt_if_ready` on the first call after this session's own
+    # build publishes one.
+    _pyc_dir: str = field(default="", init=False, repr=False)
+    # The destination a build was started for at `__enter__`, until it is adopted or refused. Empty
+    # whenever there is nothing to wait for, which is what keeps the check on the call path free.
+    _pyc_pending: str = field(default="", init=False, repr=False)
     _entered: bool = field(default=False, init=False, repr=False)
     _pool: object = field(default=None, init=False, repr=False)
     # The workspace files this binding put there itself, by exact name. See `_claim`.
@@ -2060,6 +2496,54 @@ class Sandbox:
             except BaseException:
                 self.__exit__()
                 raise
+        # THE BYTECODE CACHE IS DECIDED HERE, once, before the pool is filled and after the setup ran.
+        # Present -> every box this session starts mounts it; absent -> this session compiles from
+        # source and a background box builds the cache for the NEXT one. It is never adopted mid-session
+        # for the reason the paragraph below gives about `.deps`.
+        #
+        # SKIPPED WHEN A SETUP INSTALLED DEPS, and this is a regression that was reasoned about rather
+        # than discovered in the field: `PYTHONPYCACHEPREFIX` redirects EVERY bytecode lookup, including
+        # `<workspace>/.deps`, whose `__pycache__` the setup box fills on purpose (see `_run_setup`,
+        # which measures +40 ms per call without it). Pointing the prefix at a read-only mount would
+        # make that precompile unreachable and hand back the 40 ms on every call of the session. The
+        # stdlib win is not worth a deps loss, and the two cannot share one prefix: deps are per
+        # session, the cache is per image, and mixing them would leak one session's bytecode into
+        # another's.
+        if self.pyc_cache and not os.path.isdir(os.path.join(self._ws, _DEPS_DIR)):
+            dest = _pyc_dir_for(self.image)
+            # THROUGH THE SAME VALIDATOR AS EVERY OTHER MOUNT. This path is derived from
+            # `$XDG_CACHE_HOME`, so a caller whose cache home sits under a credential directory would
+            # otherwise have kern mount a subdirectory of it into every box, and into the build box
+            # WRITABLE - the one class of mount this package refuses with no opt-out. It only ever
+            # exposes a directory we created, so the exposure is narrow; the rule is not. A refusal
+            # disables the cache for the session rather than raising: bytecode is an optimisation, and
+            # a caller cannot be made to fail over where their cache lives.
+            try:
+                _validate_mount_lexical(dest, _PYC_MOUNT)
+            except MountRefused:
+                dest = ""  # refused: no mount, and no build to produce one either
+            if dest and not _pyc_path_has_no_symlink(dest):
+                dest = ""  # a link anywhere on the path: the lexical check cannot see through it
+            # `_pyc_has_content`, not `isdir`: an empty directory here is a cache that was swept
+            # out from under a mount and recreated by kern, and adopting it silences the feature
+            # for good. Refusing it sends this session down the `elif` and rebuilds the tree.
+            if dest and _pyc_has_content(dest):
+                self._pyc_dir = dest
+                # Records the ADOPTION for the sweep's least-recently-used order. Best effort: a cache
+                # on a read-only filesystem is still perfectly usable, it just cannot be aged.
+                try:
+                    os.utime(dest, None)
+                except OSError:
+                    pass
+                # The bound has to hold for processes that never build, which is most of them once the
+                # cache is warm. One scan per process, off the critical path, AFTER the `utime` above so
+                # the cache being adopted is the newest thing the sweep can see.
+                _pyc_start_sweep(os.path.dirname(dest))
+            elif dest:
+                _pyc_start_build(self._kern, self.image, dest, float(max(self.timeout_s, 300)))
+                # Remembered so the first call AFTER the build publishes can adopt it. Without this the
+                # session that paid for the build was the one session that never used it.
+                self._pyc_pending = dest
         # AFTER the setup, deliberately. `_base_argv` adds the `.deps` read-only remount only once that
         # directory exists, so a pool filled before the setup ran would hold boxes whose argv no longer
         # matches the one `run_code` builds - every claim would miss, and the prewarming would be pure
@@ -2122,6 +2606,11 @@ class Sandbox:
             deps = os.path.join(self._ws, _DEPS_DIR)
             if os.path.isdir(deps):
                 argv += ["-v", f"{deps}:{_WORKSPACE}/{_DEPS_DIR}:ro"]
+        # The image's precompiled stdlib, read-only. Not on the setup box: that one installs deps and
+        # then compiles them into `.deps/__pycache__`, which the prefix would redirect into a mount it
+        # cannot write. `__enter__` already excluded a session that has deps at all.
+        if self._pyc_dir and not is_setup:
+            argv += ["-v", f"{self._pyc_dir}:{_PYC_MOUNT}:ro"]
         # kern's own --timeout is a tight BACKSTOP just beyond our deadline: it is the RELIABLE killer of
         # the in-PID-namespace box (a CPU-bound box survives a SIGKILL of kern's parent process, but not
         # kern's own timeout teardown). OUR proc.wait deadline is the authority that LABELS a `timeout`
@@ -2165,6 +2654,11 @@ class Sandbox:
         merged_env = dict(self.env or {})
         # Deps installed by `setup` live in <workspace>/.deps - put them on PYTHONPATH for run_code.
         merged_env.setdefault("PYTHONPATH", f"{_WORKSPACE}/{_DEPS_DIR}")
+        # `setdefault`, so a caller who sets `PYTHONPYCACHEPREFIX` in `env=` keeps their own: this is an
+        # optimisation and must never overrule an explicit choice. Set only when the mount above exists,
+        # or the interpreter would look for bytecode in a directory that is not there.
+        if self._pyc_dir and not is_setup:
+            merged_env.setdefault("PYTHONPYCACHEPREFIX", _PYC_MOUNT)
         # Pass the workload env via a private --env-file, NOT `--env K=V` on argv: an argv value is
         # visible in `ps` / /proc/<pid>/cmdline to any local user for the box's lifetime, and this
         # component's whole point is running untrusted code beside sensitive data (a credential in
@@ -2242,6 +2736,58 @@ class Sandbox:
             "half the HOST's RAM) and which no option here can bound. Check both before the workload"
         )
 
+    def _pyc_adopt_if_ready(self) -> None:
+        """Adopt the bytecode cache THIS session's own build produced, on the first call after it lands.
+
+        WHY THIS EXISTS. Adoption used to happen only in `__enter__`, which made the session that paid
+        for the build the one session that never used it. Measured on a held-open Sandbox: `_pyc_dir`
+        stayed empty for the whole life of the session, seconds after the tree was published with 1097
+        files, and every call kept compiling from source. A one-shot `run_code` was unaffected because
+        each call is its own session (measured: the 5th call, 2.3 s in, was the first to drop from 70 ms
+        to 21). A held-open Sandbox is the agent loop, which is the shape this package is for.
+
+        WHY THE FREEZE WAS NOT WORTH ITS PRICE. It was defending the prewarm pool: `_base_argv` is what
+        `_WarmPool._key` compares postures with, so an argv that changes mid-session invalidates every
+        box already warm. That cost is real and it is ALREADY absorbed - `claim` kills the boxes whose
+        key no longer matches and `_start_one` rebuilds the key from the live argv, which is the very
+        machinery `_key` documents for a `.deps` remount appearing mid-session. So the price is one
+        claim that misses, once, not a session that never gets the cache.
+
+        BOTH GUARDS RUN AGAIN. The directory did not exist at `__enter__`, so the state the symlink walk
+        reads is new. The lexical check is re-run with it rather than trusted from then, so the refusal
+        does not depend on reasoning about which of the two could have changed in between.
+
+        Called on the CALLER's thread, before the pool is asked for a box, so the claim that follows
+        already compares against the new posture. `kernel()` is deliberately not covered: its box is
+        started once and lives on, and a warm interpreter compiles the stdlib once anyway.
+        """
+        dest = self._pyc_pending
+        # Empty means NOT READY, so the pending destination is kept: either the build has not
+        # published yet, or what is there is the husk kern recreates under a swept mount, and the
+        # next session's `__enter__` is what rebuilds that.
+        if not dest or not _pyc_has_content(dest):
+            return
+        # Cleared FIRST and unconditionally: a refusal below must not leave this session re-checking a
+        # path it has already rejected on every call it makes.
+        self._pyc_pending = ""
+        # The deps guard again, for the same reason as the two below: `__enter__` asked this question
+        # before the build existed, and a prefix pointed at a read-only mount would make the setup box's
+        # own precompile unreachable and hand back the 40 ms per call it exists to remove.
+        if os.path.isdir(os.path.join(self._ws, _DEPS_DIR)):
+            return
+        try:
+            _validate_mount_lexical(dest, _PYC_MOUNT)
+        except MountRefused:
+            return
+        if not _pyc_path_has_no_symlink(dest):
+            return
+        self._pyc_dir = dest
+        try:
+            os.utime(dest, None)  # best effort, as at `__enter__`: it only orders the sweep
+        except OSError:
+            pass
+        _pyc_start_sweep(os.path.dirname(dest))
+
     def _spawn(
         self,
         command: Sequence[str],
@@ -2252,6 +2798,7 @@ class Sandbox:
         on_stdout: object = _UNSET,
         on_stderr: object = _UNSET,
     ) -> ExecutionResult:
+        self._pyc_adopt_if_ready()  # one attribute read once there is nothing left to wait for
         cb_out = self.on_stdout if on_stdout is _UNSET else on_stdout
         cb_err = self.on_stderr if on_stderr is _UNSET else on_stderr
         for part in command:
@@ -3101,6 +3648,9 @@ class Sandbox:
         # arrives. Calling it once at the end would look like streaming without being it, so a streaming
         # call takes the cold path and streams for real. A NUL in the code is refused by `_spawn` below,
         # and refusing it there keeps ONE place that decides what a rejected cell looks like.
+        # BEFORE the claim, not after: the claim compares the posture the next box would have, so a cache
+        # adopted here is already in the key and the boxes warmed without it are retired as stale.
+        self._pyc_adopt_if_ready()
         pool = self._pool
         streaming = (self.on_stdout if on_stdout is _UNSET else on_stdout) is not None or (
             self.on_stderr if on_stderr is _UNSET else on_stderr

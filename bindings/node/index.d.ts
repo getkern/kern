@@ -154,6 +154,8 @@ export interface SandboxOptions {
   enforceLimits?: boolean;
   /** Mount setup= deps read-only for runCode (blocks cross-run dependency poisoning). Default false. */
   depsReadonly?: boolean;
+  /** Compile this image's stdlib once and mount it read-only in every box (default true). */
+  pycCache?: boolean;
   /** true (default) populates result.files by walking the workspace before AND after each call (O(N) in
    * file count; a long session that accretes files slows every runCode). false = result.files [], O(1). */
   trackFiles?: boolean;

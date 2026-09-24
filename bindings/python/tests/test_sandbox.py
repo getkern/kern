@@ -14,6 +14,7 @@ import signal
 import threading
 from pathlib import Path
 import os
+import pathlib
 import shutil
 import subprocess
 import uuid
@@ -39,6 +40,26 @@ _KERN_OOM_LINE = (
     'Raise it with `--memory <size>` (or `memory = "<size>"` in a vcpu: profile) if the workload '
     "needs more.\n"
 )
+
+
+class _FakeCompleted:
+    """The two fields `_pyc_build` reads off `subprocess.run`, so the argv can be inspected without
+    starting anything."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+
+def _publish_cache(d):
+    """Create a pyc cache directory that LOOKS like one a build published.
+
+    A bare `mkdir` stopped being enough the day an EMPTY directory stopped counting as a cache, which is
+    the husk kern recreates under a mount another process swept away. The tests have to build the thing
+    under test, not a directory with its name.
+    """
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "stdlib.pyc").write_bytes(b"\x00\x00\x00\x00")
+    return d
 
 
 def _cfg(**kw):
@@ -619,6 +640,499 @@ def test_result_success_semantics():
     assert ExecutionResult("", "", 0, 1).success is True
     assert ExecutionResult("", "", 1, 1).success is False
     assert ExecutionResult("", "", 0, 1, fault=SandboxFault("timeout", "x")).success is False
+
+
+def test_pyc_cache_is_mounted_read_only_and_never_on_the_setup_box(tmp_path, monkeypatch):
+    """The shared stdlib cache is mounted `:ro`, and that is the whole security argument.
+
+    A WRITABLE shared bytecode cache is remote code execution across calls: `python:3.12-slim` ships
+    timestamp-validated `.pyc`, so a cell could rewrite `json/__init__.pyc` with a payload, re-paste the
+    legitimate header, and the next cell importing json would run it. The mount flag is therefore not a
+    detail to be checked by reading - it is asserted, character for character, on the argv that actually
+    starts the box.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    s = _cfg(image="python:3.12-slim")
+    cache = pathlib.Path(kern._pyc_dir_for("python:3.12-slim"))
+    _publish_cache(cache)
+    with s:
+        assert s._pyc_dir == str(cache), "a cache that exists at enter must be adopted"
+        run = s._base_argv("b", network=False, timeout_s=30, dry=True)
+        assert f"{cache}:{kern._PYC_MOUNT}:ro" in run, run
+        assert f"{cache}:{kern._PYC_MOUNT}" not in run, "mounted writable: a cell could poison it"
+        # The setup box installs deps and then compiles them into `.deps/__pycache__`; the prefix would
+        # redirect that write into a mount it cannot make, silently undoing the precompile.
+        setup = s._base_argv("b", network=True, timeout_s=30, is_setup=True, dry=True)
+        assert not any(kern._PYC_MOUNT in a for a in setup), setup
+
+
+def test_pyc_cache_this_session_built_is_adopted_by_a_call_and_skipped_when_a_setup_left_deps(
+    tmp_path, monkeypatch
+):
+    """The session that PAYS for the build has to be a session that uses it.
+
+    It used to be frozen at `__enter__`, which made that session the one session that never did:
+    measured on a held-open Sandbox, `_pyc_dir` stayed empty for its whole life, seconds after 1097
+    files landed, and every call went on compiling from source. A one-shot call never showed it because
+    each call is its own session.
+
+    The freeze was protecting the prewarm pool from an argv that moves mid-session, and the pool already
+    absorbs that: `claim` retires the boxes whose key no longer matches and the refill rebuilds the key
+    from the live argv. Measured with prewarm=4: ONE call falls back to the cold path, 33 ms against
+    1.4, and the pool is full again by the next one.
+
+    ADOPTION IS A CALL, not a filesystem event, because the check belongs on the caller's thread ahead
+    of the claim that compares the new posture. SKIPPED WITH DEPS: `PYTHONPYCACHEPREFIX` redirects every
+    lookup, `.deps` included, which would cost the +40 ms per call that `_run_setup`'s own precompile
+    exists to remove.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    cache = pathlib.Path(kern._pyc_dir_for("python:3.12-slim"))
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_dir == "", "no cache existed at enter"
+        assert s._pyc_pending == str(cache), "a build was started, so its tree must be awaited"
+        assert not any(kern._PYC_MOUNT in a for a in s._base_argv("b", network=False, timeout_s=30, dry=True))
+        _publish_cache(cache)  # published by the background build, mid-session
+        assert s._pyc_dir == "", "adoption is a call, not a filesystem event"
+        # THE CALL PATH, not the hook: a test that only drove `_pyc_adopt_if_ready` would stay green
+        # with the call in `_spawn` deleted, which is the sabotage that matters. The fake kern exits 0
+        # without being a box, so the RESULT is meaningless here and the adoption is what is asserted.
+        try:
+            s.run(["true"])  # an argv LIST: a string is refused before `_spawn` is ever entered
+        except Exception:
+            pass
+        assert s._pyc_dir == str(cache), "a call must adopt: the hook is not on the call path"
+        assert s._pyc_pending == "", "nothing left to await, so the check costs one attribute read"
+        run = s._base_argv("b", network=False, timeout_s=30, dry=True)
+        assert f"{cache}:{kern._PYC_MOUNT}:ro" in run, run
+        assert f"{cache}:{kern._PYC_MOUNT}" not in run, "mounted writable: a cell could poison it"
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_dir == str(cache), "the next session must pick it up at enter"
+        assert s._pyc_pending == "", "there was nothing to build"
+    with _cfg(image="python:3.12-slim") as s2:
+        pathlib.Path(s2._ws, ".deps").mkdir(exist_ok=True)
+        s3 = _cfg(image="python:3.12-slim", workspace=s2._ws)
+        with s3:
+            assert s3._pyc_dir == "", "a session with deps must compile from source"
+
+
+def test_pyc_an_empty_cache_directory_is_not_a_cache_and_does_not_block_the_repair(tmp_path, monkeypatch):
+    """A directory named like a cache, with nothing in it, must not be adopted.
+
+    MEASURED ON KERN, not imagined: a sweep in another process discards a tree this session has mounted,
+    kern then RECREATES the missing `-v` source as an empty directory, and from then on every session
+    adopted that husk, mounted it, found no bytecode and compiled from source. Permanently, and silently,
+    because a cache "existed" so nothing ever rebuilt it.
+
+    Refusing it repairs the state instead of freezing it: the session starts a build, and `os.rename`
+    onto an EMPTY directory SUCCEEDS (verified; onto a non-empty one it is `ENOTEMPTY`, which is the
+    check `_pyc_build` relies on when two processes race). An empty tree is NOT READY rather than
+    refused, so the pending destination has to survive it.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    cache = pathlib.Path(kern._pyc_dir_for("python:3.12-slim"))
+    cache.mkdir(parents=True)  # the husk kern leaves under a swept mount
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_dir == "", "an empty directory was adopted as a cache"
+        assert s._pyc_pending == str(cache), "and no build was started to put a real tree back"
+        assert not any(kern._PYC_MOUNT in a for a in s._base_argv("b", network=False, timeout_s=30, dry=True))
+        try:
+            s.run(["true"])
+        except Exception:
+            pass
+        assert s._pyc_dir == "", "still empty, still not a cache"
+        assert s._pyc_pending == str(cache), "empty is NOT READY, not a refusal: the wait must continue"
+        (cache / "stdlib.pyc").write_bytes(b"\x00\x00\x00\x00")  # a build publishes
+        try:
+            s.run(["true"])
+        except Exception:
+            pass
+        assert s._pyc_dir == str(cache), "content appeared and the session was still waiting for it"
+
+
+def test_pyc_adoption_happens_before_the_pool_is_asked_for_a_box(tmp_path, monkeypatch):
+    """The claim has to compare the posture the cache is already in.
+
+    `_WarmPool._key` is built from the live `_base_argv`, so adopting AFTER the claim would hand the
+    call a box warmed without the mount and leave the pool refilling against the old key for as long as
+    the claims kept hitting. Adopting first is what makes the stale boxes stale.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    cache = pathlib.Path(kern._pyc_dir_for("python:3.12-slim"))
+    seen = {}
+
+    class _SpyPool:
+        """Answers `claim` with nothing, and records what the cache was at that instant."""
+
+        def claim(self, **_kw):
+            seen["pyc_dir"] = s._pyc_dir
+            return None
+
+    with _cfg(image="python:3.12-slim") as s:
+        _publish_cache(cache)
+        s._pool = _SpyPool()
+        try:
+            s.run_code("print(1)")
+        except Exception:
+            pass
+        finally:
+            s._pool = None  # the stub has no teardown, and `__exit__` would call one
+    assert seen.get("pyc_dir") == str(cache), (
+        f"the pool was asked with the cache still unadopted: {seen}"
+    )
+
+
+def test_pyc_adoption_re_runs_every_guard_on_the_tree_that_appeared(tmp_path, monkeypatch):
+    """`__enter__` asked its questions before this tree existed, so the answers are asked again.
+
+    The symlink case is not an own goal: a CELL holding a writable volume that contains the cache root
+    can plant a link where the build was going to publish, and that link would then be bind-mounted into
+    every box of this session. `_validate_mount_lexical` reads the STRING and cannot see it; only the
+    `lstat` walk can. A refusal also has to CLEAR the pending destination, or the session re-walks a
+    path it has already rejected on every call it makes.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    cache = pathlib.Path(kern._pyc_dir_for("python:3.12-slim"))
+    # WITH CONTENT: an empty target is "not ready" and returns before the symlink walk, so the
+    # refusal under test would never be reached and the green would mean nothing.
+    elsewhere = _publish_cache(tmp_path / "planted")
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_pending == str(cache)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.symlink_to(elsewhere, target_is_directory=True)
+        assert os.path.isdir(str(cache)), "the link resolves, so only an lstat walk refuses it"
+        s._pyc_adopt_if_ready()
+        assert s._pyc_dir == "", "a symlinked cache path was adopted"
+        assert s._pyc_pending == "", "a refusal must not be re-walked on every later call"
+    cache.unlink()
+
+    # And the deps guard, which `__enter__` answered before any setup of THIS session could have run.
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_pending == str(cache)
+        _publish_cache(cache)
+        pathlib.Path(s._ws, ".deps").mkdir(exist_ok=True)
+        s._pyc_adopt_if_ready()
+        assert s._pyc_dir == "", "deps appeared: the prefix would strand their precompile"
+        assert s._pyc_pending == ""
+
+
+def test_pyc_cache_off_and_caller_env_win(tmp_path, monkeypatch):
+    """`pyc_cache=False` mounts nothing, and an explicit `PYTHONPYCACHEPREFIX` is never overruled."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    _publish_cache(pathlib.Path(kern._pyc_dir_for("python:3.12-slim")))
+    with _cfg(image="python:3.12-slim", pyc_cache=False) as s:
+        assert s._pyc_dir == ""
+        assert not any(kern._PYC_MOUNT in a for a in s._base_argv("b", network=False, timeout_s=30, dry=True))
+    with _cfg(image="python:3.12-slim", env={"PYTHONPYCACHEPREFIX": "/tmp/mine"}) as s:
+        # `dry=True` folds the env INTO the argv (the real path writes a per-box file, whose name is
+        # deliberately excluded from posture comparisons), so the value is read straight off it.
+        argv = s._base_argv("b", network=False, timeout_s=30, dry=True)
+        env = argv[argv.index("--env-file") + 1].split("\0")
+        assert "PYTHONPYCACHEPREFIX=/tmp/mine" in env, env
+        assert f"PYTHONPYCACHEPREFIX={kern._PYC_MOUNT}" not in env, env
+
+
+# Every vector below was DUMPED FROM `parse_ref` in `kern-oci/src/pull.rs` by a temporary test, not
+# derived from reading it: the two implementations must agree about what "the same image" is, and
+# twelve out of twelve matched. Kept as a table so a future edit to either side fails here.
+_OCI_REFS = [
+    ("python:3.12-slim", "registry-1.docker.io/library/python:3.12-slim"),
+    ("docker.io/library/python:3.12-slim", "registry-1.docker.io/library/python:3.12-slim"),
+    ("index.docker.io/python:3.12-slim", "registry-1.docker.io/library/python:3.12-slim"),
+    ("docker.io/python:3.12-slim", "registry-1.docker.io/library/python:3.12-slim"),
+    ("alpine", "registry-1.docker.io/library/alpine:latest"),
+    ("library/alpine:latest", "registry-1.docker.io/library/alpine:latest"),
+    ("localhost:5000/x", "localhost:5000/x:latest"),
+    ("localhost:5000/x:latest", "localhost:5000/x:latest"),
+    ("ghcr.io/a/b:1", "ghcr.io/a/b:1"),
+    ("ghcr.io/alpine", "ghcr.io/alpine:latest"),
+    ("python@sha256:abc", "registry-1.docker.io/library/python:sha256:abc"),
+    ("python:3.12@sha256:abc", "registry-1.docker.io/library/python:sha256:abc"),
+    ("", ""),
+]
+
+
+def test_pyc_cache_is_one_directory_per_image_not_per_spelling():
+    """Four spellings of one Docker Hub image must key one cache, and a host must stay a host.
+
+    Keyed on the raw string, `python:3.12-slim` and `docker.io/library/python:3.12-slim` were two
+    directories, two compiles and two copies of the same 16 MiB. The port must also not over-normalise:
+    `localhost:5000/x` keeps its port, and `ghcr.io/alpine` does NOT get `library/` - that prefix is a
+    Docker Hub rule and nothing else.
+    """
+    for raw, want in _OCI_REFS:
+        assert kern._oci_canonical_ref(raw) == want, raw
+    hub = {kern._pyc_dir_for(r) for r in (
+        "python:3.12-slim", "docker.io/library/python:3.12-slim",
+        "index.docker.io/python:3.12-slim", "docker.io/python:3.12-slim",
+    )}
+    assert len(hub) == 1, f"one image, {len(hub)} cache directories"
+    # A digest pin and a tag are DIFFERENT images and must not share a cache.
+    assert kern._pyc_dir_for("python:3.12-slim") != kern._pyc_dir_for("python@sha256:abc")
+
+
+def test_pyc_sweep_runs_once_per_process_even_when_nothing_is_built(tmp_path, monkeypatch):
+    """The bound has to hold for a process that always finds its cache already there.
+
+    The sweep used to run only at the end of a build, so a long-lived server that adopts one cache for
+    weeks never aged the others: the ceiling existed only for callers who happened to compile
+    something. Adoption starts it now, once, in a thread.
+    """
+    monkeypatch.setattr(kern, "_PYC_SWEPT", False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    root = pathlib.Path(kern._pyc_root())
+    root.mkdir(parents=True)
+    for i in range(12):
+        d = root / f"c{i:02d}"
+        d.mkdir()
+        os.utime(d, (2000 + i, 2000 + i))
+    adopted = _publish_cache(pathlib.Path(kern._pyc_dir_for("python:3.12-slim")))
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_dir == str(adopted)
+    for th in list(kern._PYC_BUILDS.values()):
+        th.join(30)
+    for th in threading.enumerate():
+        if th.name == "kern-pyc-sweep":
+            th.join(30)
+    left = sorted(p.name for p in root.iterdir())
+    assert adopted.name in left, "evicted the cache it had just adopted"
+    assert len(left) == kern._PYC_KEEP, f"{len(left)} caches left, expected {kern._PYC_KEEP}"
+    # And only once: a second session must not start a second scan.
+    assert kern._PYC_SWEPT is True
+
+
+def test_pyc_sweep_keeps_the_recently_adopted_and_removes_only_old_debris(tmp_path):
+    """The cache is bounded by USE, and debris from a killed build does not live forever.
+
+    LEAST RECENTLY ADOPTED, not least recently built: an image built once and used daily must outlive
+    one built yesterday and never used again. `__enter__` records the adoption with a `utime`, so the
+    directory's own mtime is the order, and there is no marker file to exclude from the check that
+    refuses everything which is not a `.pyc`.
+
+    DEBRIS IS AGED, not swept on sight: a `.tmp-` tree younger than the cutoff belongs to a build that
+    may still be running, and deleting it would race the build that owns it.
+    """
+    import time as _time
+
+    root = tmp_path / "pyc"
+    root.mkdir()
+    for i in range(12):
+        d = root / f"cache{i:02d}"
+        d.mkdir()
+        os.utime(d, (1000 + i, 1000 + i))  # cache11 newest, cache00 oldest
+    fresh = root / "cache99.tmp-running"
+    fresh.mkdir()
+    old = root / "cache98.tmp-killed"
+    old.mkdir()
+    os.utime(old, (_time.time() - kern._PYC_DEBRIS_MAX_AGE_S - 60,) * 2)
+    stale_trash = root / "cache97.trash-abandoned"
+    stale_trash.mkdir()
+    os.utime(stale_trash, (_time.time() - kern._PYC_DEBRIS_MAX_AGE_S - 60,) * 2)
+
+    kern._pyc_sweep(str(root), keep=8)
+    left = sorted(p.name for p in root.iterdir())
+    assert left == [
+        "cache04", "cache05", "cache06", "cache07",
+        "cache08", "cache09", "cache10", "cache11",
+        "cache99.tmp-running",
+    ], left
+
+
+def test_pyc_discard_unpublishes_atomically_even_if_the_delete_fails(tmp_path, monkeypatch):
+    """The cache name stops resolving to a tree in one step, whether or not the deletion then works.
+
+    `rmtree` walks and unlinks, so a tree being deleted is for a while a tree with half its files, and
+    a session that mounts it in that window gets a partial stdlib. The rename is what makes the name
+    resolve to a whole tree or to nothing - and nothing is safe, because kern CREATES a `-v` source
+    that is missing (measured), so the box just compiles from source.
+
+    Tested by making the deletion fail, which is the only way to see the difference: with the rename
+    the original name is gone regardless, without it the tree is still sitting there.
+    """
+    d = tmp_path / "cache"
+    (d / "sub").mkdir(parents=True)
+    (d / "sub" / "a.pyc").write_bytes(b"x")
+    monkeypatch.setattr(kern.shutil, "rmtree", lambda *a, **k: None)
+    kern._pyc_discard(str(d))
+    assert not d.exists(), "the cache name still resolves to a tree a session could mount"
+    moved = [p for p in tmp_path.iterdir() if ".trash-" in p.name]
+    assert moved and (moved[0] / "sub" / "a.pyc").exists(), "the tree was not moved aside intact"
+
+
+def test_pyc_build_survives_a_timeout_and_cleans_up(tmp_path, monkeypatch):
+    """A build that overruns removes its tree instead of leaving it for the next process.
+
+    `subprocess.TimeoutExpired` is a `SubprocessError`, which the handler names; asserted rather than
+    read, because the thread that runs this has no caller to report to and an escaping exception would
+    print a traceback into the caller's process from a cache fill.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    dest = kern._pyc_dir_for("img:slow")
+
+    def _boom(argv, **kw):
+        raise kern.subprocess.TimeoutExpired(argv, 1.0)
+
+    monkeypatch.setattr(kern.subprocess, "run", _boom)
+    kern._pyc_build("/bin/true", "img:slow", dest, 1.0)  # must not raise
+    assert not os.path.exists(dest)
+    assert not [p for p in pathlib.Path(dest).parent.iterdir() if ".tmp-" in p.name], "debris"
+
+
+def test_pyc_build_asks_for_hash_validation_and_every_import_root():
+    """The compile command carries the two properties the cache's correctness rests on.
+
+    CHECKED_HASH, because the default timestamp validation accepts bytecode whose source has a matching
+    mtime and size. MEASURED with two images, same CPython 3.12, one stdlib file edited to a different
+    value of the SAME LENGTH with `touch -t` preserving the mtime: with timestamps the box ran the OLD
+    code, with CHECKED_HASH the new one. Reproducible builds (BuildKit rewrite-timestamp, apko, Nix,
+    distroless) pin mtimes by construction, so that is not an exotic image. The failure mode was a
+    security patch installed and then not executed.
+
+    EVERY IMPORT ROOT, because `PYTHONPYCACHEPREFIX` REPLACES the in-tree `__pycache__` rather than
+    adding to it: a root left out of the cache has its shipped bytecode made invisible and is
+    recompiled in every box. `python:3.12-slim` hides this (purelib sits under stdlib); `debian:13-slim`
+    with python3 from apt does not, and `sys.path` there holds five separate roots.
+
+    Asserted on the command, not on a description of it, because it crosses into a box as a string.
+    """
+    code = kern._PYC_BUILD_CODE
+    assert "CHECKED_HASH" in code, code
+    assert "UNCHECKED_HASH" not in code, "never invalidating is the opposite error"
+    assert "sys.path" in code and "purelib" in code, "compiles only the stdlib: shadows site-packages"
+    # `force=True`, MEASURED on the VPS: without it 39 of 1097 files came out timestamp-validated
+    # anyway - exactly the modules this command imports (`compileall`, `encodings`, `importlib`,
+    # `functools`), whose bytecode the ordinary import machinery writes to the prefix in the DEFAULT
+    # mode before `compile_dir` runs, after which `compile_dir` finds them up to date and skips them.
+    # `encodings/aliases` was among them, and it is 9.9 ms of interpreter startup on that host.
+    assert "force=True" in code, "without it the modules this command imports keep timestamp validation"
+    # It has to be a single expression a `python3 -c` accepts, and a syntax error here would show up as
+    # "no cache, no reason" in the field.
+    compile(code, "<pyc-build>", "exec")
+
+
+def test_pyc_refuses_a_symlinked_cache_path_and_an_unpublishable_tree(tmp_path, monkeypatch):
+    """A symlink anywhere on the cache path, and anything but `.pyc` files in the built tree.
+
+    THE PATH: `_validate_mount_lexical` inspects the string while a bind mount follows links, so a
+    symlink at the cache directory pointing at `~/.ssh` would pass the name check and mount the real
+    directory into every box of every later session, read-only. A CELL holding a writable volume that
+    contains the cache root can plant it, which makes this the `.deps` poisoning vector escaping the
+    session that produced it rather than a foot-gun the user aims at themselves.
+
+    THE TREE: the build box runs the caller's image with that directory writable, and the result also
+    lives on the HOST, where a backup, an indexer or a future eviction walks it. A FIFO blocks whoever
+    opens it.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    dest = pathlib.Path(kern._pyc_dir_for("python:3.12-slim"))
+    real = tmp_path / "real"
+    real.mkdir()
+    dest.parent.mkdir(parents=True)
+    dest.symlink_to(real)
+    assert not kern._pyc_path_has_no_symlink(str(dest)), "a symlinked cache dir was accepted"
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_dir == "", "mounted a symlinked cache"
+    # A link on an ANCESTOR is the same hole one level up.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "viacache"))
+    (tmp_path / "viacache").symlink_to(tmp_path / "real")
+    assert not kern._pyc_path_has_no_symlink(kern._pyc_dir_for("python:3.12-slim"))
+
+    tree = tmp_path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "a.pyc").write_bytes(b"x")
+    assert kern._pyc_tree_is_publishable(str(tree)), "a plain tree of .pyc must publish"
+    (tree / "sub" / "link.pyc").symlink_to("/etc/passwd")
+    assert not kern._pyc_tree_is_publishable(str(tree)), "published a tree containing a symlink"
+    (tree / "sub" / "link.pyc").unlink()
+    (tree / "sub" / "notes.txt").write_bytes(b"x")
+    assert not kern._pyc_tree_is_publishable(str(tree)), "published a tree with a non-.pyc file"
+    (tree / "sub" / "notes.txt").unlink()
+    monkeypatch.setattr(kern, "_PYC_MAX_BYTES", 0)  # the file is 1 byte: the ceiling must be below it
+    assert not kern._pyc_tree_is_publishable(str(tree)), "published a tree over the size ceiling"
+
+
+def test_pyc_cache_under_a_credential_directory_is_refused_and_the_build_box_is_capped(tmp_path, monkeypatch):
+    """Two holes this cache opened, both closed where the rest of the package closes them.
+
+    THE MOUNT: the cache path comes from `$XDG_CACHE_HOME`, so a cache home under a credential
+    directory would have kern mount a subdirectory of it into every box, and into the build box
+    WRITABLE - the one class of mount this package refuses with no opt-out. It only ever exposes a
+    directory we created, so the exposure is narrow and the rule is not.
+
+    THE CAPS: the command in the build box is ours, the interpreter running it is the CALLER'S image,
+    and nothing else in this package hands an image an uncapped process.
+    """
+    home = tmp_path / ".ssh"
+    home.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home))
+    # THE CACHE MUST EXIST, or this asserts nothing: without it the session takes the "build one" branch
+    # and leaves `_pyc_dir` empty for a reason that has nothing to do with the refusal. Caught by
+    # sabotage - deleting the validator left this test green.
+    _publish_cache(pathlib.Path(kern._pyc_dir_for("python:3.12-slim")))
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_dir == "", "mounted a cache from under .ssh"
+        assert not any(kern._PYC_MOUNT in a for a in s._base_argv("b", network=False, timeout_s=30, dry=True))
+    # and it is a REFUSAL, not a silent skip of everything: an ordinary cache home is still adopted.
+    ok = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(ok))
+    _publish_cache(pathlib.Path(kern._pyc_dir_for("python:3.12-slim")))
+    with _cfg(image="python:3.12-slim") as s:
+        assert s._pyc_dir != "", "the positive control must still work"
+
+    seen = []
+    monkeypatch.setattr(kern.subprocess, "run",
+                        lambda argv, **kw: seen.append(argv) or _FakeCompleted(1))
+    kern._pyc_build("/bin/true", "img:x", str(tmp_path / "d"), 30.0)
+    assert seen, "the build never spawned"
+    argv = seen[0]
+    assert "--memory" in argv and "--pids-limit" in argv, argv
+    assert "--cap-drop" in argv and argv[argv.index("--cap-drop") + 1] == "ALL", argv
+    assert "--net" not in argv, "the build box must not get the network"
+
+
+def test_pyc_build_publishes_atomically_and_leaves_nothing_on_failure(tmp_path, monkeypatch):
+    """A box that fails publishes no cache and no debris; a box that succeeds publishes in one rename.
+
+    The half-written tree matters: a box mounting a partial stdlib would import a truncated module. The
+    build writes to a private sibling and renames, so a reader sees all of it or none of it.
+    """
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    dest = kern._pyc_dir_for("img:fails")
+    kern._pyc_build("/bin/false", "img:fails", dest, 10.0)
+    assert not os.path.exists(dest)
+    assert os.listdir(os.path.dirname(dest)) == [], "left debris behind"
+
+    marker = tmp_path / "ran"
+    fake = tmp_path / "kern-fake"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f"echo \"$@\" > {marker}\n"
+        'for a in "$@"; do case "$a" in *:/kern-pyc) mkdir -p "${a%%:*}" && : > "${a%%:*}/x.pyc";; esac; done\n'
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    kern._pyc_build(str(fake), "img:ok", kern._pyc_dir_for("img:ok"), 10.0)
+    published = pathlib.Path(kern._pyc_dir_for("img:ok"))
+    assert published.is_dir() and (published / "x.pyc").exists()
+    assert not [p for p in published.parent.iterdir() if ".tmp-" in p.name], "temp sibling survived"
+    argv = marker.read_text()
+    assert "--ro" in argv and f"PYTHONPYCACHEPREFIX={kern._PYC_MOUNT}" in argv, argv
+    assert "--net" not in argv, "the build box must not get the network"
+
+    # AND THE TREE IS INSPECTED BEFORE IT IS PUBLISHED, asserted through `_pyc_build` rather than on
+    # the helper alone: sabotage showed that testing the predicate while the build ignored it left this
+    # file green. A build whose box writes something other than `.pyc` must publish nothing.
+    junk = tmp_path / "junk"
+    junk.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do case "$a" in *:/kern-pyc) mkdir -p "${a%%:*}" && : > "${a%%:*}/evil.sh";; esac; done\n'
+        "exit 0\n"
+    )
+    junk.chmod(0o755)
+    dirty = kern._pyc_dir_for("img:junk")
+    kern._pyc_build(str(junk), "img:junk", dirty, 10.0)
+    assert not os.path.exists(dirty), "published a tree holding a file that is not .pyc"
+    assert not [p for p in pathlib.Path(dirty).parent.iterdir() if ".tmp-" in p.name], "debris"
 
 
 def test_classify_order_escape_not_masked_by_stderr_marker():

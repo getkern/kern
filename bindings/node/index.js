@@ -41,6 +41,400 @@ const VERSION = "0.2.35";
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
 const DEPS_DIR = ".deps"; // pip --target dir inside the workspace (added to PYTHONPATH for python)
+
+/** Where the shared stdlib bytecode cache is mounted inside a box, READ-ONLY.
+ *
+ * WHY, measured. `python:3.12-slim` ships its standard library as `.py` with no `.pyc`, and a box
+ * mounts its root read-only, so every box recompiles what it imports and throws the result away:
+ * `import json,re` costs 45.5 ms on an i7-14700KF and 172.0 ms on a 4-vCPU VPS, against 13.1 ms there
+ * for a box running `/bin/true`. One box compiles the stdlib once per image into a host directory and
+ * every later box mounts it read-only with `PYTHONPYCACHEPREFIX`: 45.50 -> 19.68 ms, 7 alternated pairs.
+ *
+ * READ-ONLY IS THE DESIGN, not a precaution. A writable shared cache is code execution across calls:
+ * those `.pyc` are timestamp-validated, so a cell could rewrite `json/__init__.pyc` with a payload,
+ * re-paste the legitimate header and have the next cell import it. Verified here: a cell's write comes
+ * back EROFS. And a cache from the WRONG image is safe rather than wrong - CPython validates each file
+ * against its source's mtime and size, so mismatched bytecode is ignored and recompiled (verified by
+ * mounting a 3.12 cache into 3.11: correct answers, reported 3.11.16). Mirrors `_PYC_MOUNT` in Python.
+ */
+const PYC_MOUNT = "/kern-pyc";
+/** `workers=1`: more than one worker uses multiprocessing, which needs a temp dir, and a box with a
+ *  read-only root and no tmpfs has none (measured: it dies with FileNotFoundError). `quiet=2` keeps a
+ *  file that will not compile off stderr - bytecode is an optimisation.
+ *
+ *  EVERY IMPORT ROOT, not just the stdlib: `PYTHONPYCACHEPREFIX` REPLACES the in-tree `__pycache__`
+ *  rather than adding to it, so a root left out has its shipped bytecode made invisible and is
+ *  recompiled in every box. On `python:3.12-slim` purelib happens to sit under stdlib; on
+ *  `debian:13-slim` with python3 from apt it does not, and `sys.path` holds five separate roots.
+ *
+ *  CHECKED_HASH rather than the default timestamp validation. Measured: two images, same CPython 3.12,
+ *  one stdlib file edited to a different value of the SAME LENGTH with the mtime preserved - with
+ *  timestamps the box ran the OLD code, with CHECKED_HASH the new one. Reproducible builds (BuildKit
+ *  rewrite-timestamp, apko, Nix, distroless) pin mtimes by construction, so this is not exotic. It
+ *  costs nothing measurable and makes the cache key a performance hint, not a correctness dependency.
+ *  Mirrors `_PYC_BUILD_CODE`. */
+const PYC_BUILD_CODE =
+  "import compileall,os,py_compile,sys,sysconfig;" +
+  "r={p for p in sys.path if p and os.path.isdir(p)};" +
+  "r|={v for v in (sysconfig.get_paths().get(k) for k in " +
+  "('stdlib','platstdlib','purelib','platlib')) if v and os.path.isdir(v)};" +
+  "r={p for p in r if not any(p!=q and p.startswith(q.rstrip('/')+'/') for q in r)};" +
+  "sys.exit(0 if all([compileall.compile_dir(p,quiet=2,workers=1,force=True," +
+  "invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH) for p in sorted(r)]) else 1)";
+/** A ceiling on what one image may publish: the stdlib is ~20 MiB, so this is not tight. It exists so
+ *  a hostile image cannot fill the host's disk from the box that exists to make things faster. */
+const PYC_MAX_BYTES = 512 * 1024 * 1024;
+/** How many image caches to keep, least-recently-ADOPTED evicted first. Not a measurement: "more
+ *  images than a session mixes, fewer than a disk notices" at ~20 MiB each. Mirrors `_PYC_KEEP`. */
+const PYC_KEEP = 8;
+/** A build killed by a SIGKILL leaves its `.tmp-` tree forever: nothing in the happy path removes it,
+ *  because the happy path is the one that did not run. A day is long enough that a build still running
+ *  is never what gets deleted. Mirrors `_PYC_DEBRIS_MAX_AGE_S`. */
+const PYC_DEBRIS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** The name fragments marking a directory as NOT a cache: one being written, one being deleted. */
+const PYC_DEBRIS_MARKS = [".tmp-", ".trash-"];
+
+/** Remove a cache tree, renaming it out of the way first. Never throws.
+ *
+ * THE RENAME IS THE POINT: `rm -r` walks and unlinks, so a tree being deleted is for a while a tree
+ * with half its files, and a session mounting it in that window gets a partial stdlib. A rename is
+ * atomic, and kern CREATES a `-v` source that does not exist (measured), so a name resolving to
+ * nothing just means the box compiles from source. Mirrors `_pyc_discard`. */
+function pycDiscard(target) {
+  const trash = `${target}.trash-${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    fs.renameSync(target, trash);
+  } catch {
+    return;
+  }
+  fs.rmSync(trash, { recursive: true, force: true });
+}
+
+/** Keep the `keep` most recently adopted caches, remove stale debris. Never throws.
+ *
+ * LEAST RECENTLY ADOPTED, which `open()` records with a `utimes` on the directory - not least recently
+ * BUILT, or an image built once and used daily would go before one built yesterday and never used.
+ * The directory's own mtime carries it, so there is no marker file: one would be visible inside every
+ * box and would have to be excluded from the check that refuses everything which is not a `.pyc`.
+ * Mirrors `_pyc_sweep`. */
+function pycSweep(root, keep = PYC_KEEP) {
+  const now = Date.now();
+  const caches = [];
+  const doomed = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of entries) {
+    const full = path.join(root, ent.name);
+    let st;
+    try {
+      st = fs.lstatSync(full);
+      if (!st.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    if (PYC_DEBRIS_MARKS.some((m) => ent.name.includes(m))) {
+      if (now - st.mtimeMs > PYC_DEBRIS_MAX_AGE_MS) doomed.push(full);
+      continue;
+    }
+    caches.push([st.mtimeMs, full]);
+  }
+  caches.sort((a, b) => b[0] - a[0]);
+  for (const [, full] of caches.slice(keep)) doomed.push(full);
+  for (const full of doomed) pycDiscard(full);
+}
+/** One build per (process, destination), keyed so ten sessions opened at once on one image start one
+ *  compile and not ten. A MAP OF PROMISES rather than a set of names: a second caller gets the promise
+ *  of the build already in flight, which is what lets a test await the real thing instead of polling
+ *  for a directory - a poll would race the build, and it raced the test's own teardown first. */
+const PYC_BUILDS = new Map();
+/** Set once this process has swept: adopting a cache in a hundred sessions costs one scan. */
+let PYC_SWEPT = false;
+
+/** The host directory holding one bytecode cache per image: $XDG_CACHE_HOME, else ~/.cache. */
+function pycRoot() {
+  const base = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+  return path.join(base, "kern-sandbox", "pyc");
+}
+
+/** kern's own defaults, from `kern-oci/src/pull.rs`. Copied because they cross a process boundary. */
+const OCI_DEFAULT_REGISTRY = "registry-1.docker.io";
+const OCI_DEFAULT_TAG = "latest";
+
+/** `[name, tag]` iff the reference ends in an explicit tag. Mirrors `split_tag` in kern-oci: a
+ *  trailing `:x` is a tag only when `x` has no `/`, or `localhost:5000/img` reads its PORT as one. */
+function ociSplitTag(image) {
+  const i = image.lastIndexOf(":");
+  if (i <= 0) return null;
+  const name = image.slice(0, i);
+  const tag = image.slice(i + 1);
+  return !tag.includes("/") && name ? [name, tag] : null;
+}
+
+/** One canonical string per image, so one cache directory per image.
+ *
+ * `python:3.12-slim`, `docker.io/library/python:3.12-slim` and `index.docker.io/python:3.12-slim` are
+ * one image to kern and were three cache directories here, because the key was the raw string the
+ * caller typed. A faithful port of `parse_ref` in `kern-oci/src/pull.rs`, verified against its actual
+ * output on twelve references including digest pins. Mirrors `_oci_canonical_ref`. */
+function ociCanonicalRef(image) {
+  if (!image) return image;
+  let name;
+  let reference;
+  const at = image.indexOf("@");
+  if (at > 0 && at < image.length - 1) {
+    // A digest pin splits at `@` FIRST: splitting on the last `:` would tear `sha256:<hex>` in half.
+    // The digest wins over any tag, so a trailing `:tag` on the name is dropped.
+    const head = image.slice(0, at);
+    const split = ociSplitTag(head);
+    name = split ? split[0] : head;
+    reference = image.slice(at + 1);
+  } else {
+    const split = ociSplitTag(image);
+    if (split) [name, reference] = split;
+    else [name, reference] = [image, OCI_DEFAULT_TAG];
+  }
+  let registry;
+  let repo;
+  const slash = name.indexOf("/");
+  const host = slash > 0 ? name.slice(0, slash) : "";
+  // The first segment is a REGISTRY only if it looks like a host; otherwise `user/img` is a Docker Hub
+  // repository, not a hostname.
+  if (slash > 0 && (host.includes(".") || host.includes(":") || host === "localhost")) {
+    registry = host;
+    repo = name.slice(slash + 1);
+  } else {
+    registry = OCI_DEFAULT_REGISTRY;
+    repo = name;
+  }
+  if (registry === "docker.io" || registry === "index.docker.io") registry = OCI_DEFAULT_REGISTRY;
+  // `library/` only on Docker Hub: `ghcr.io/alpine` means what it says.
+  if (registry === OCI_DEFAULT_REGISTRY && !repo.includes("/")) repo = `library/${repo}`;
+  return `${registry}/${repo}:${reference}`;
+}
+
+/** Where this image's cache lives, keyed on the image REFERENCE hashed for a safe filename.
+ *
+ * The reference and not a content digest, honestly because kern exposes no digest a caller can read
+ * cheaply. A moved tag therefore yields bytecode that no longer validates, which CPython handles by
+ * recompiling: the cost of the imperfect key is a slow call, never a wrong one. Mirrors `_pyc_dir_for`.
+ */
+function pycDirFor(image) {
+  // The full digest: the key is no longer load-bearing for correctness, and a truncation saved 48
+  // characters of path against two images sharing a cache directory.
+  const key = crypto.createHash("sha256").update(ociCanonicalRef(image), "utf8").digest("hex");
+  return path.join(pycRoot(), key);
+}
+
+/** True iff mounting this cache directory is allowed by the same policy as every other mount.
+ *
+ * WHY AN ANCESTOR: `validateMount` resolves the source with `realpathSync` and therefore needs it to
+ * EXIST, and on the first session the cache does not yet. So the nearest existing ancestor is checked
+ * instead, which asks the same question: the components this module appends below it ("kern-sandbox",
+ * "pyc", a hex digest) are fixed and are in no refused set, so a subtree is allowed exactly when its
+ * ancestor is. Python checks the full path because its validator has a purely lexical half; the
+ * mechanism differs, the policy asked is the same. Mirrors the `_validate_mount_lexical` call there.
+ */
+function pycMountAllowed(dest) {
+  let probe = path.resolve(dest);
+  while (!fs.existsSync(probe)) {
+    const up = path.dirname(probe);
+    if (up === probe) return false; // walked past the root without finding anything that exists
+    probe = up;
+  }
+  try {
+    validateMount(probe, PYC_MOUNT);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True iff no component of the cache path is a symlink.
+ *
+ * `validateMount` resolves the SOURCE with realpath, but it is called on the nearest existing ancestor
+ * and a bind mount follows links: a symlink planted at `<cache>/kern-sandbox/pyc/<key>` pointing at
+ * `~/.ssh` would mount the real directory into every box of every later session, read-only, and
+ * reading is what exfiltration needs. It is not only the user who can plant it: a CELL holding a
+ * writable volume that contains the cache root can, and then every future process is affected - the
+ * `.deps` poisoning vector escaping the session that produced it. Mirrors `_pyc_path_has_no_symlink`.
+ */
+function pycHasContent(dest) {
+  // AN EMPTY DIRECTORY IS NOT AN ABSENT ONE, and the difference silences the whole feature. Measured: a
+  // sweep in another process discards a tree this session has mounted, kern then RECREATES the missing
+  // -v source as an empty directory, and from then on every session adopts that husk, mounts it, finds
+  // no bytecode and compiles from source - permanently, with nothing to rebuild it because a cache
+  // "exists". Treating empty as absent repairs it: the adoption is refused, a build starts, and a
+  // rename onto an EMPTY directory SUCCEEDS (verified; onto a non-empty one it is ENOTEMPTY, which is
+  // the check pycBuild relies on when two processes race).
+  try {
+    const it = fs.opendirSync(dest);
+    try {
+      return it.readSync() !== null;
+    } finally {
+      it.closeSync();
+    }
+  } catch {
+    return false;
+  }
+}
+
+function pycPathHasNoSymlink(dest) {
+  let cur = path.resolve(dest);
+  for (;;) {
+    try {
+      if (fs.lstatSync(cur).isSymbolicLink()) return false;
+    } catch {
+      /* does not exist: nothing to follow */
+    }
+    const up = path.dirname(cur);
+    if (up === cur) return true;
+    cur = up;
+  }
+}
+
+/** True iff the built tree is only directories and `.pyc` files and fits under the size ceiling.
+ *
+ * The build box runs the CALLER'S image with this directory writable, so its contents are chosen by
+ * that image. Inside a later box a symlink is harmless, but this tree also lives on the HOST, where a
+ * backup, an indexer or the cache's own eviction will walk it. Mirrors `_pyc_tree_is_publishable`. */
+function pycTreeIsPublishable(root) {
+  let total = 0;
+  const walk = (dir) => {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, ent.name);
+      const st = fs.lstatSync(full);
+      if (st.isSymbolicLink()) return false;
+      if (st.isDirectory()) {
+        if (!walk(full)) return false;
+      } else if (!st.isFile() || !ent.name.endsWith(".pyc")) {
+        return false;
+      } else {
+        total += st.size;
+        if (total > PYC_MAX_BYTES) return false;
+      }
+    }
+    return true;
+  };
+  try {
+    return walk(root);
+  } catch {
+    return false;
+  }
+}
+
+/** Compile `image`'s stdlib into `dest`, atomically. Never throws: nothing waits for this.
+ *
+ * Built into a private sibling and renamed into place, so a box mounts a complete tree or none: a
+ * partial stdlib would have a box importing a truncated module. Two processes racing both build and
+ * the loser's tree is removed. Mirrors `_pyc_build`. */
+function pycBuild(kernBin, image, dest, timeoutS) {
+  const tmp = `${dest}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(tmp, { recursive: true, mode: 0o700 });
+  } catch {
+    return Promise.resolve();
+  }
+  // RETURNS A PROMISE THAT NOTHING IN PRODUCTION AWAITS. `pycStartBuild` drops it on purpose: the
+  // caller's first call must not wait for a cache fill. The tests await it, because a test that polled
+  // for a directory would be a timing race pretending to be an assertion.
+  return new Promise((resolve) => {
+    // AFTER the publish and after the failure alike: a build that produced nothing is still the moment
+    // to notice that eight other caches are older than this one.
+    const done = () => {
+      pycSweep(path.dirname(dest));
+      resolve();
+    };
+    const finish = () => {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      done();
+    };
+    try {
+    // A dedicated argv, not `_baseArgv`: that one mounts the session's workspace, writes an env file
+    // and would add THIS cache read-only, which is what must not happen while it is being written.
+    const argv = [
+      "box", `kern-pyc-${crypto.randomBytes(4).toString("hex")}`,
+      "--image", image, "--ro",
+      "-v", `${tmp}:${PYC_MOUNT}`,
+      "--env", `PYTHONPYCACHEPREFIX=${PYC_MOUNT}`,
+      "--cap-drop", "ALL",
+      // CAPPED LIKE ANY OTHER BOX: the command is ours, the interpreter running it is the caller's
+      // image, and this package's claim is that an image gets no uncapped process. Mirrors Python.
+      "--memory", "512m",
+      "--pids-limit", "256",
+      "--timeout", String(Math.trunc(timeoutS)),
+      "--", "python3", "-c", PYC_BUILD_CODE,
+    ];
+    // ASYNCHRONOUS, and `spawnSync` was the first version. It blocks the event loop for the whole
+    // build - 1.2 s on a desktop, 5 s on the VPS - which in a server process is not a stall but an
+    // outage: every request in flight waits for a cache fill. Nothing waits for this result, so there
+    // is no reason for it to hold the loop at all.
+      const child = spawn(kernBin, argv, { stdio: "ignore", detached: false });
+      const killer = setTimeout(() => child.kill("SIGKILL"), (timeoutS + 10) * 1000);
+      if (typeof killer.unref === "function") killer.unref();
+      child.on("error", () => {
+        clearTimeout(killer);
+        finish();
+      });
+      child.on("close", (code) => {
+        clearTimeout(killer);
+        try {
+          // An image without python3 leaves no cache and no trace: the next session runs as before.
+          if (code === 0 && fs.readdirSync(tmp).length > 0 && pycTreeIsPublishable(tmp)) {
+            fs.renameSync(tmp, dest);
+            done();
+            return;
+          }
+        } catch {
+          /* fall through to the cleanup below */
+        }
+        finish();
+      });
+    } catch {
+      /* a cache fill has no failure the caller can act on */
+      finish();
+    }
+  });
+}
+
+/** Start one background build per image, at most once per process. Returns immediately.
+ *
+ * `setImmediate` rather than a worker thread: `spawnSync` would block the event loop, and this must
+ * never delay the caller's first call. Mirrors `_pyc_start_build`. */
+/** Sweep the cache once per process, off the critical path. Returns a promise for the tests.
+ *
+ * The sweep used to run only at the end of a build, so a process that always found its cache already
+ * there never evicted anything: the bound existed only for callers who happened to compile. A
+ * long-lived server adopting one cache for weeks is exactly the process that should age the others.
+ * `setImmediate` because it is a readdir plus a stat per entry and a caller's first call pays nothing.
+ * Mirrors `_pyc_start_sweep`. */
+function pycStartSweep(root) {
+  if (PYC_SWEPT) return Promise.resolve();
+  PYC_SWEPT = true;
+  return new Promise((resolve) => {
+    const t = setImmediate(() => {
+      pycSweep(root);
+      resolve();
+    });
+    if (typeof t.unref === "function") t.unref();
+  });
+}
+
+function pycStartBuild(kernBin, image, dest, timeoutS) {
+  const inFlight = PYC_BUILDS.get(dest);
+  if (inFlight) return inFlight;
+  // `pycBuild` is already asynchronous (it spawns and returns), so there is nothing to defer. The
+  // promise is returned for the tests and dropped by `open()`: a caller's first call must not wait on
+  // a cache fill. A test that polled for the directory instead would be a timing race pretending to be
+  // an assertion, and it would also race the test's own teardown - which is how this was found.
+  const started = pycBuild(kernBin, image, dest, timeoutS);
+  PYC_BUILDS.set(dest, started);
+  return started;
+}
 const ENV_FILE = ".kern-env"; // host-side 0600 env file (kept out of argv so values don't show in `ps`)
 // One file per CALL, `.kern-env.<box-name>`. A single fixed name made concurrent calls on the same
 // Sandbox fight over one path: one call `unlink`ed the file while kern was still starting for
@@ -1355,6 +1749,7 @@ class Sandbox {
    * @param {number} [opts.maxOutputBytes]   cap on captured stdout/stderr EACH. Default 64 MiB.
    * @param {boolean} [opts.enforceLimits]   true (default) hard-enforces caps via a systemd scope.
    * @param {boolean} [opts.depsReadonly]    mount setup= deps read-only for runCode (default true).
+   * @param {boolean} [opts.pycCache]        compile this image's stdlib once and mount it read-only (default true).
    */
   constructor(opts = {}) {
     this.image = opts.image ?? DEFAULT_IMAGE;
@@ -1413,6 +1808,13 @@ class Sandbox {
     // must be loaded on the host; kern fails the box CLOSED if it is not. null (default) applies none.
     this.apparmor = opts.apparmor ?? null;
     this.depsReadonly = opts.depsReadonly ?? true;
+    this.pycCache = opts.pycCache ?? true;
+    /** The cache to mount: "" means this session compiles from source. Set at open() when one is already
+     * there, and by `_pycAdoptIfReady` on the first call after this session's own build publishes one. */
+    this._pycDir = "";
+    /** The destination a build was started for at open(), until it is adopted or refused. Empty whenever
+     * there is nothing to wait for, which is what keeps the check on the call path free. */
+    this._pycPending = "";
     // Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
     // The default drops the lot: kern already drops 14 dangerous capabilities unconditionally, but the
     // rest were still held over the box's own user namespace, on the one code path whose purpose is
@@ -1587,6 +1989,44 @@ class Sandbox {
     }
     this._entered = true;
     if (this.setup) await this._runSetup(this.setup);
+    // THE BYTECODE CACHE IS DECIDED HERE, once, and frozen: `_baseArgv` is what the prewarm pool
+    // compares postures with, so a cache appearing mid-session would change the argv runCode builds and
+    // every claim would miss. SKIPPED WHEN A SETUP LEFT DEPS: `PYTHONPYCACHEPREFIX` redirects every
+    // lookup, `.deps` included, whose `__pycache__` the setup box fills on purpose (+40 ms per call
+    // without it, measured in `_runSetup`). The two cannot share one prefix - deps are per session, the
+    // cache is per image - and the stdlib win is not worth handing that back.
+    if (this.pycCache && !fs.existsSync(path.join(this._ws, DEPS_DIR))) {
+      const dest = pycDirFor(this.image);
+      // THROUGH THE SAME VALIDATOR AS EVERY OTHER MOUNT: this path comes from $XDG_CACHE_HOME, so a
+      // cache home under a credential directory would otherwise be mounted into every box, and into the
+      // build box writable. A refusal disables the cache rather than throwing - bytecode is an
+      // optimisation and cannot be a reason to fail a session. Mirrors Python.
+      // A refusal means no mount AND no build: there is nothing to produce a cache we may not use.
+      if (pycMountAllowed(dest) && pycPathHasNoSymlink(dest)) {
+        // pycHasContent, not existsSync: an empty directory here is a cache that was swept out
+        // from under a mount and recreated by kern, and adopting it silences the feature for good.
+        if (pycHasContent(dest)) {
+          this._pycDir = dest;
+          // Records the ADOPTION for the sweep's least-recently-used order. Best effort: a cache on a
+          // read-only filesystem is still usable, it just cannot be aged.
+          try {
+            const now = new Date();
+            fs.utimesSync(dest, now, now);
+          } catch {
+            /* not ageable, still usable */
+          }
+          // The bound must hold for processes that never build, which is most of them once the cache
+          // is warm. After the utimes above, so the cache being adopted is the newest thing seen.
+          pycStartSweep(path.dirname(dest));
+        }
+        else {
+          pycStartBuild(this._kern, this.image, dest, Math.max(this.timeoutS, 300));
+          // Remembered so the first call AFTER the build publishes can adopt it. Without this the
+          // session that paid for the build was the one session that never used it.
+          this._pycPending = dest;
+        }
+      }
+    }
     // AFTER the setup, deliberately. _baseArgv adds the .deps read-only remount only once that
     // directory exists, so a pool filled before the setup ran would hold boxes whose argv no longer
     // matches the one runCode builds: every claim would miss and the prewarming would be pure cost.
@@ -1688,6 +2128,9 @@ class Sandbox {
       this._kern, "box", name, "--image", this.image, "--ro",
       "-v", `${this._ws}:${WORKSPACE}`, "--workdir", WORKSPACE,
     ];
+    // The image's precompiled stdlib, read-only. Never on the setup box: that one compiles `.deps`
+    // into `__pycache__`, which the prefix would redirect into a mount it cannot write.
+    if (this._pycDir && !isSetup) argv.push("-v", `${this._pycDir}:${PYC_MOUNT}:ro`);
     if (this.depsReadonly && !isSetup) {
       const deps = path.join(this._ws, DEPS_DIR);
       try {
@@ -1725,6 +2168,10 @@ class Sandbox {
 
     const mergedEnv = { ...(this.env || {}) };
     if (mergedEnv.PYTHONPATH === undefined) mergedEnv.PYTHONPATH = `${WORKSPACE}/${DEPS_DIR}`;
+    // Only when the mount exists, and never over a caller's own value: this is an optimisation and
+    // must not overrule an explicit choice.
+    if (this._pycDir && !isSetup && mergedEnv.PYTHONPYCACHEPREFIX === undefined)
+      mergedEnv.PYTHONPYCACHEPREFIX = PYC_MOUNT;
     // Pass env via a private 0600 --env-file, NOT `--env K=V` on argv (an argv value is visible in
     // `ps` to any local user for the box's lifetime; a credential in env= would leak).
     // `_ws` is set by open(); before that it is "". The public API is gated, but the unit tests call
@@ -1778,7 +2225,48 @@ class Sandbox {
     return argv;
   }
 
+  /**
+   * Adopt the bytecode cache THIS session's own build produced, on the first call after it lands.
+   *
+   * WHY THIS EXISTS. Adoption used to happen only in open(), which made the session that paid for the
+   * build the one session that never used it: measured on a held-open Sandbox, `_pycDir` stayed empty
+   * for its whole life, seconds after the tree was published, and every call kept compiling from
+   * source. A one-shot call was unaffected because each is its own session. A held-open Sandbox is the
+   * agent loop, which is the shape this package is for.
+   *
+   * WHY THE FREEZE WAS NOT WORTH ITS PRICE. It was defending the prewarm pool: `_baseArgv` is what the
+   * pool compares postures with, so an argv that changes mid-session invalidates every warm box. That
+   * cost is already absorbed - `claim` retires boxes whose key no longer matches and the refill rebuilds
+   * the key from the live argv, the same machinery that handles a `.deps` remount appearing
+   * mid-session. Measured with prewarm=4: ONE call pays the cold path (33 ms against 1.4) and the pool
+   * is full again by the next one, against a whole session that never got the cache.
+   *
+   * ALL THREE GUARDS RUN AGAIN, because open() asked its questions before this tree existed.
+   *
+   * Called before the pool is asked for a box, so the claim that follows compares the new posture.
+   */
+  _pycAdoptIfReady() {
+    const dest = this._pycPending;
+    // Empty means NOT READY, so the pending destination is kept: either the build has not
+    // published yet, or what is there is the husk kern recreates under a swept mount.
+    if (!dest || !pycHasContent(dest)) return;
+    // Cleared FIRST and unconditionally: a refusal below must not leave this session re-checking a path
+    // it has already rejected on every call it makes.
+    this._pycPending = "";
+    if (fs.existsSync(path.join(this._ws, DEPS_DIR))) return;
+    if (!pycMountAllowed(dest) || !pycPathHasNoSymlink(dest)) return;
+    this._pycDir = dest;
+    try {
+      const now = new Date();
+      fs.utimesSync(dest, now, now); // best effort, as at open(): it only orders the sweep
+    } catch {
+      /* not ageable, still usable */
+    }
+    pycStartSweep(path.dirname(dest));
+  }
+
   _spawn(command, { network, timeoutS, isSetup = false, onStdout = UNSET, onStderr = UNSET }) {
+    this._pycAdoptIfReady(); // one property read once there is nothing left to wait for
     const cbOut = onStdout === UNSET ? this.onStdout : onStdout;
     const cbErr = onStderr === UNSET ? this.onStderr : onStderr;
     for (const part of command)
@@ -2571,6 +3059,9 @@ class Sandbox {
     const streaming =
       (onStdout === UNSET ? this.onStdout : onStdout) !== null ||
       (onStderr === UNSET ? this.onStderr : onStderr) !== null;
+    // BEFORE the claim, not after: the claim compares the posture the next box would have, so a cache
+    // adopted here is already in the key and the boxes warmed without it are retired as stale.
+    this._pycAdoptIfReady();
     if (this._pool && !streaming && !code.includes("\0")) {
       const warm = this._pool.claim({ network: this.network, deadlineS: eff });
       if (warm) {
@@ -3673,5 +4164,22 @@ module.exports = {
   Result,
   SandboxError,
   MountRefused,
+  // The bytecode cache's internals, exported for its tests only: the mount flag and the atomic
+  // publish are security properties, and a test that cannot reach them cannot assert them.
+  _PYC_MOUNT: PYC_MOUNT,
+  _pycDirFor: pycDirFor,
+  _pycBuild: pycBuild,
+  _pycSweep: pycSweep,
+  _pycStartSweep: pycStartSweep,
+  // TEST-ONLY. `PYC_SWEPT` is process state by design (one scan per process), which makes any test
+  // of it order-dependent: an earlier test that adopts a cache consumes the single sweep. Python
+  // reaches the same global with monkeypatch; Node needs a setter because a `let` cannot be
+  // reassigned through the exports object.
+  _pycResetSweptForTests: () => {
+    PYC_SWEPT = false;
+  },
+  _ociCanonicalRef: ociCanonicalRef,
+  _PYC_BUILD_CODE: PYC_BUILD_CODE,
+  _pycStartBuild: pycStartBuild,
   version: VERSION,
 };
