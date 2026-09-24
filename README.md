@@ -118,6 +118,9 @@ It finds `kern` on your PATH, or wherever `$KERN_BIN` points.
 Quickstart](#quickstart): every call is a fresh isolated box, and the code **inside** it can be in
 any language, because the box is an OCI image.
 
+**The page to read next: [the Python SDK](bindings/python/README.md)** for the full API, the fault
+types, sessions, prewarming and LangChain, or [the same for Node](bindings/node/README.md).
+
 <p align="center">
   <img src="assets/kern-sandbox-demo.gif" width="780" alt="A scrolling Python session, seven calls. run_code returns ('4950', None); an infinite loop under timeout_s=3 returns fault.type 'timeout' and exit 137; a 400 MiB allocation under memory_mb=128 returns 'oom' and 137; a urlopen with the network off returns fault None and exit 1, so the code raised and the sandbox stopped nothing; os.remove('/root/.bashrc') comes back OSError [Errno 30] Read-only file system; print(1) on alpine:3.19 returns 'exec_failed' and 127 because alpine ships no python3; and print(1) on an image that does not exist returns 'startup_failed' and 1. Exit 137 does not say which of those it was; the fault field does.">
 </p>
@@ -133,10 +136,8 @@ local code interpreter:
 { "mcpServers": { "kern": { "command": "kern-mcp" } } }
 ```
 
-The rest is on the pages that own it: the full API, prewarming and LangChain in
-[bindings/python/](bindings/python/README.md) and [bindings/node/](bindings/node/README.md); every
-`KERN_MCP_*` variable and the remote form in [docs/MCP.md](docs/MCP.md); and
-[`kern-pi`](https://www.npmjs.com/package/kern-pi), which routes the
+Every `KERN_MCP_*` variable and the remote form are in [docs/MCP.md](docs/MCP.md), and
+[`kern-pi`](https://www.npmjs.com/package/kern-pi) routes the
 [pi](https://github.com/earendil-works/pi) coding agent's tools into a box, in
 [integrations/pi/](integrations/pi/).
 
