@@ -5,10 +5,13 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## Unreleased
+## v0.25.0 - 2026-09-24
+
+The SDK halves of this shipped as kern-sandbox 0.2.36 through 0.2.39 while the runtime waited for
+this tag; every entry below that names the bytecode cache is in those packages already.
 
 **The cache's identity read the tag's NAME, which is the one thing a moved tag does not change.**
-The check added a moment ago hashed the bytes of kern's two sidecars, and one of them holds the
+The check hashed the bytes of kern's two sidecars, and one of them holds the
 reference itself: a tag moved to a new manifest with an unchanged OCI config - a stdlib security
 rebuild, the commonest shape there is - left both byte-identical and the stale cache adopted. It now
 uses the stamp kern itself treats as "this image's content changed", the completion sentinel's mtime
@@ -68,6 +71,11 @@ command.** `kernel.apparmor_restrict_unprivileged_userns=1` refuses the sandbox,
 already exact about what happened, and the `hint:` line was the generic one. It now prints
 `kern doctor`'s own text, so the exact command to run appears under the error with the real path of
 the binary.
+
+## v0.20.0 - 2026-09-22
+
+Cut without an entry of its own at the time; these are its changes, written down here rather than
+left only in the git history.
 
 **`kern top` drew its first frame in 74.9 ms and showed no real CPU% for a full second.** Both were
 work nobody had asked for. The tab bar prints a count per tab, so every list has to be ENUMERATED on
