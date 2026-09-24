@@ -102,7 +102,7 @@ one flag. `kern ps` and `kern top` show what is running; every verb that lists o
 `--json`, so nothing has to parse a table. One runnable example per thing kern does:
 [examples/](examples/).
 
-To call all of that from a program, `kern-sandbox`
+To call all of that from a program, **Kern Sandbox**
 ([PyPI](https://pypi.org/project/kern-sandbox/), [npm](https://www.npmjs.com/package/kern-sandbox))
 is a dependency-free wrapper over the binary you just installed:
 
@@ -122,9 +122,9 @@ It finds `kern` on your PATH, or wherever `$KERN_BIN` points. Binary and wrapper
 clocks, so `kern --version` and `kern_sandbox.__version__` are the pair to quote when a call does
 something the [changelog](CHANGELOG.md) says it should not.
 
-## kern-sandbox: run an agent's code from Python or Node
+## Kern Sandbox: run an agent's code from Python or Node
 
-**`kern-sandbox`** is how **your program** calls kern, [installed in the
+**Kern Sandbox** is how **your program** calls kern, [installed in the
 Quickstart](#quickstart): every call is a fresh isolated box, and the code **inside** it can be in
 any language, because the box is an OCI image.
 
@@ -251,7 +251,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | [ROADMAP.md](ROADMAP.md) | what is missing or unmeasured today, and what may come |
 | [BENCHMARKS.md](BENCHMARKS.md) | measurements, including the ARM boards |
 | [examples/](examples/) · [blog/](blog/) | 94 runnable scripts in eight folders, and longer write-ups |
-| [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the `kern-sandbox` SDK: embed kern in Python or Node |
+| [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the Kern Sandbox SDK: embed kern in Python or Node |
 
 ## Status
 
