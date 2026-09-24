@@ -70,7 +70,7 @@ kern compose up -d
   caps where your host delegates them, capabilities dropped, seccomp deny-by-default, a timeout from
   the outside. A timeout, an OOM-kill or a blocked syscall comes back as a **typed fault** next to
   the exit code instead of a stack trace. Wire it from Python, Node, LangChain or any MCP client
-  [below](#run-an-agents-code-python-node-langchain-mcp-pi), and [what it is not](#what-kern-is-not).
+  [below](#kern-sandbox-run-an-agents-code-from-python-or-node), and [what it is not](#what-kern-is-not).
 - **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
   read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
   `--security-profile untrusted`, is the whole hardened bundle.
@@ -87,10 +87,6 @@ kern compose up -d
 
 Its entire Rust dependency tree is `libc`: JSON and OCI manifests are parsed by hand, and `pull`
 shells out to the `curl` and `tar` already on the machine rather than linking a TLS stack.
-
-<p align="center">
-  <img src="assets/demo.svg" width="780" alt="Terminal demo: a kern.toml defines reusable vcpu/vdisk/vgpio (device) profiles; 'kern box train --image alpine vcpu:heavy vdisk:scratch' attaches a 4-vCPU, 8 GB, 2 GB-scratch rootless isolated slice in a few ms; 'kern run vcpu:heavy -- ffmpeg' caps a heavy transcode with no sandbox; 'kern box iot --image alpine vgpio:sensor' exposes only /dev/i2c-1 and nothing else; piping a request into 'kern box fn --image python' runs it in a fresh isolated box per request (serverless style); 'kern compose stack.toml up' brings up a multi-box stack; 'kern top' is the live TUI for boxes, profiles and volumes: CPU, memory, disk and devices, sliced per box, in one static binary, no daemon.">
-</p>
 
 ## Quickstart
 
@@ -126,13 +122,19 @@ It finds `kern` on your PATH, or wherever `$KERN_BIN` points. Binary and wrapper
 clocks, so `kern --version` and `kern_sandbox.__version__` are the pair to quote when a call does
 something the [changelog](CHANGELOG.md) says it should not.
 
-## Run an agent's code: Python, Node, LangChain, MCP, pi
+## kern-sandbox: run an agent's code from Python or Node
 
-The bindings are how **your program** calls kern; the code **inside** the box can be in any language,
-because the box is an OCI image. **`kern-sandbox`** is
-[installed in the Quickstart](#quickstart): every call is a fresh isolated box, and a timeout, an
-OOM-kill or a blocked syscall comes back as a typed `fault` on the result rather than as an
-exception.
+**`kern-sandbox`** is how **your program** calls kern, [installed in the
+Quickstart](#quickstart): every call is a fresh isolated box, and the code **inside** it can be in
+any language, because the box is an OCI image.
+
+<p align="center">
+  <img src="assets/kern-sandbox-demo.gif" width="780" alt="A scrolling Python session, seven calls. run_code returns ('4950', None); an infinite loop under timeout_s=3 returns fault.type 'timeout' and exit 137; a 400 MiB allocation under memory_mb=128 returns 'oom' and 137; a urlopen with the network off returns fault None and exit 1, so the code raised and the sandbox stopped nothing; os.remove('/root/.bashrc') comes back OSError [Errno 30] Read-only file system; print(1) on alpine:3.19 returns 'exec_failed' and 127 because alpine ships no python3; and print(1) on an image that does not exist returns 'startup_failed' and 1. Exit 137 does not say which of those it was; the fault field does.">
+</p>
+
+`docker run` hands you exit 137 and leaves you to guess whether that was your timeout or the OOM
+killer. A timeout, an OOM-kill or a blocked syscall comes back as a typed `fault` on the result
+instead, so a program can branch on it.
 
 It also ships **`kern-mcp`**, a dependency-free stdio server that gives Claude Desktop or Cursor a
 local code interpreter:
