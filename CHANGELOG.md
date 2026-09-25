@@ -5,6 +5,32 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## Unreleased
+
+**`kern images` listed a size per image and never said what they came to.** On this machine the
+cache had reached **107 GB over 1680 images**, and what surfaced it was `df` reporting the disk at
+99%, not kern. Every row carried its own number and nothing added them up, so the only way to learn
+the total was to sum the column by hand or walk the directory with `du`.
+
+The listing now ends with one line: `40 images, 2.9G (a layer shared by several is counted once)`.
+Under a filter it says both sides, `5 of 40 images`, because the count describes the rows on screen
+and the bytes describe every image.
+
+**It is not the column added up, and that distinction is the whole feature.** `L/` is shared, so an
+image that references a base twelve others also reference is rightly charged for it in its own row:
+that is what the image costs you. Adding those rows together charges the base thirteen times and
+prints a cache larger than the directory could possibly hold. The total counts each layer once, from
+the map the listing already builds, so it costs no extra reads. A layer a manifest names and the
+disk no longer has adds nothing, which is also why that image reads `dangling`.
+
+Checked against `du` rather than asserted: the directory held 3379.7 MB, decomposed as 2954.2 in the
+images' own directories, 417.5 in `V/` and 8.0 in `L/`, which add back to the byte. The line reports
+the first plus the referenced part of the third, and says nothing about the directory, which holds
+things `kern images` does not list.
+
+`--json` is unchanged, still an array with the same four keys, and `--format` still prints one line
+per image and nothing else: a script reading either sees exactly what it saw before.
+
 ## v0.25.0 - 2026-09-24
 
 The SDK halves of this shipped as kern-sandbox 0.2.36 through 0.2.39 while the runtime waited for

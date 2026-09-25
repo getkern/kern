@@ -3120,12 +3120,6 @@ pub(crate) struct ImageEntry {
     pub dangling: bool,
 }
 
-/// The cached OCI images, sorted by name - the SINGLE source for both `kern images` and the `kern top`
-/// Images tab, so the CLI and TUI can never drift on which images exist, their sizes, or their health.
-pub(crate) fn image_entries() -> Vec<ImageEntry> {
-    image_entries_with(crate::listing::Detail::Read).records
-}
-
 /// [`image_entries`], with the per-image work under the caller's control.
 ///
 /// MEASURED COST: on a host with 316 cached images this reads one `.ok` sentinel per image for the
@@ -3137,9 +3131,46 @@ pub(crate) fn image_entries() -> Vec<ImageEntry> {
 pub(crate) fn image_entries_with(
     detail: crate::listing::Detail,
 ) -> crate::listing::Listing<ImageEntry> {
-    let cache = cache_dir();
+    image_entries_sized(detail).0
+}
+
+/// [`image_entries_with`], plus what the cache holds for those images with a SHARED LAYER COUNTED
+/// ONCE.
+///
+/// WHY THIS IS NOT THE SUM OF THE ROWS. `image_stat` charges a layered image for every layer it
+/// references, which is the right number for one row: it is what that image costs you. Adding the
+/// rows up is not, because `L/` is shared - on this machine 316 images resolved through 364 distinct
+/// layers over 889 references, so the column summed to far more than the cache could possibly hold.
+/// A total a reader can compare against `df` has to see each layer once, and the sweep's memo is
+/// already exactly that: one entry per distinct layer, sized.
+///
+/// WHAT IT DOES NOT COUNT, decomposed against `du` rather than assumed. On a 40-image cache the
+/// directory held 3379.7 MB: **2954.2** in the images' own dirs, **417.5** in `V/` and **8.0** in
+/// `L/`, which add back to the byte. This number is the first plus the referenced part of the third,
+/// so two things sit outside it: an `L/` layer no image names any more, which is what `kern gc`
+/// reclaims, and all of `V/`, which held 35 sparse `.ext4` files with `.fast`/`.lock`/`.ok`
+/// siblings. No image names those and `kern images` does not list them, which is why they are out;
+/// WHAT writes them was not established, and this comment says so rather than guessing.
+pub(crate) fn image_entries_sized(
+    detail: crate::listing::Detail,
+) -> (crate::listing::Listing<ImageEntry>, u64) {
+    image_entries_in(&cache_dir(), detail)
+}
+
+/// [`image_entries_sized`] against an explicit cache root.
+///
+/// The path is a parameter so a test can build a cache with two images over one shared layer and
+/// assert the total counts it once. Reading `cache_dir()` inside would have made that test set
+/// `XDG_CACHE_HOME`, which is process-global while the test binary runs its cases on threads: the
+/// assertion would then depend on which other test was running beside it.
+pub(crate) fn image_entries_in(
+    cache: &std::path::Path,
+    detail: crate::listing::Detail,
+) -> (crate::listing::Listing<ImageEntry>, u64) {
+    let cache = cache.to_path_buf();
     let mut rows: Vec<ImageEntry> = Vec::new();
     let mut total = 0usize;
+    let mut own_bytes = 0u64;
     // One layer size per PROCESS-CALL, not per referring image. `image_stat` memoises each layer on
     // disk already, but that memo is keyed by the layer, so an image that shares a base with 12
     // others re-reads the same sidecar 13 times in one sweep. This map is the in-process half: it
@@ -3171,6 +3202,13 @@ pub(crate) fn image_entries_with(
                 .map(|s| kern_oci::normalize_ref(&s))
                 .unwrap_or_else(|| stem.clone());
             let (size, dangling) = image_stat_memo(&cache, &stem, &mut layers);
+            // OWN BYTES ONLY. `image_stat_memo` returns early for a flat or single-diff image and
+            // touches no layer, so that size belongs to this image alone and is added here. A
+            // layered image contributes nothing at this point: its bytes are in `layers`, where a
+            // base shared with twelve others is one entry, not thirteen.
+            if cache.join(&stem).is_dir() || cache.join(format!("{stem}.diff")).is_dir() {
+                own_bytes = own_bytes.saturating_add(size);
+            }
             let pulled = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok()
@@ -3185,10 +3223,17 @@ pub(crate) fn image_entries_with(
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    crate::listing::Listing {
-        records: rows,
-        total,
-    }
+    // `flatten()` drops the `None`s, which are the layers a manifest names and the disk no longer
+    // has. They are why an image reads `dangling`, and charging the cache for bytes that are not
+    // there would make the total unfalsifiable against `du`.
+    let layer_bytes: u64 = layers.values().flatten().copied().sum();
+    (
+        crate::listing::Listing {
+            records: rows,
+            total,
+        },
+        own_bytes.saturating_add(layer_bytes),
+    )
 }
 
 /// Reclaim orphaned build layers (`L/` dirs referenced by no image). Safe and non-destructive: every

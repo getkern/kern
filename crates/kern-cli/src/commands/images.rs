@@ -156,7 +156,8 @@ fn glob_match(pattern: &str, subject: &str) -> bool {
 pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) -> Result<(), Error> {
     // FILTERED ONCE, BEFORE EITHER RENDERER, so the human table and `--json` describe the same set
     // by construction - the property a script comparing the two would otherwise take on trust.
-    let all = image_entries();
+    let (listing, cache_bytes) = image_entries_sized(crate::listing::Detail::Read);
+    let all = listing.records;
     let cache_empty = all.is_empty();
     // FILTERED AGAINST THE WHOLE LISTING, because `before=`/`since=` name another image and have to
     // find it: filtering a list with a predicate that reads the same list means the pivot is
@@ -255,6 +256,32 @@ pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) ->
                 c = p.c
             );
         }
+        // THE LINE THAT WAS MISSING. Every row carried a size and nothing said what they came to,
+        // so a cache reaching 107 GB over 1680 images was discovered by `df` at 99% rather than by
+        // kern. It is NOT the column added up: `L/` is shared, so the sum of the rows exceeds what
+        // the cache can hold. This is each layer once, which is the number that can be checked.
+        //
+        // The count is of the ROWS ON SCREEN and the bytes are of EVERY image, so a filtered
+        // listing says both rather than implying the filter's own total, which cannot be computed
+        // here without re-reading every manifest a filter excluded.
+        //
+        // It says nothing about the cache DIRECTORY, deliberately: that also holds `V/`, sparse
+        // `.ext4` files no image references, 417 MB of the 3379 measured here.
+        let shown = if rows.len() == all.len() {
+            format!(
+                "{} image{}",
+                all.len(),
+                if all.len() == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("{} of {} images", rows.len(), all.len())
+        };
+        println!(
+            "{d}{shown}, {} (a layer shared by several is counted once){z}",
+            human_bytes(cache_bytes),
+            d = p.d,
+            z = p.z
+        );
     }
     Ok(())
 }

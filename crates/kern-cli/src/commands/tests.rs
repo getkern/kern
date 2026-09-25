@@ -3192,6 +3192,82 @@ mod save_tag_tests {
 }
 
 #[cfg(test)]
+mod image_cache_total_tests {
+    use crate::commands::*;
+
+    /// A cache holding `stems`, each a layered image whose manifest names `layers` in `L/`. Every
+    /// layer dir is written once with `bytes` bytes, so a layer named by two images is ONE dir on
+    /// disk, which is the situation the total exists to get right.
+    fn layered(cache: &std::path::Path, stem: &str, refname: &str, layers: &[(&str, usize)]) {
+        std::fs::write(cache.join(format!("{stem}.ok")), refname).unwrap();
+        let mut manifest = String::from("base-ref\n"); // line 0 is the base ref, not a key
+        for (key, bytes) in layers {
+            manifest.push_str(key);
+            manifest.push('\n');
+            let d = cache.join("L").join(key);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("blob"), vec![0u8; *bytes]).unwrap();
+        }
+        std::fs::write(cache.join(format!("{stem}.layers")), manifest).unwrap();
+    }
+
+    /// THE CLAIM THE LINE MAKES. Two images over one shared base: the rows charge the base to both,
+    /// because that is what each image costs you, and the total must charge it once, because that
+    /// is what the disk holds. Adding the column up would have printed a cache larger than the
+    /// directory it describes, which is the failure this test exists to prevent.
+    #[test]
+    fn a_layer_two_images_share_is_counted_once_in_the_total() {
+        let cache = std::env::temp_dir().join(format!("kern-total-shared-{}", std::process::id()));
+        let _ = force_remove_dir_all(&cache);
+        std::fs::create_dir_all(cache.join("L")).unwrap();
+        // 4 KiB of shared base, 1 KiB private to each: on disk that is 4 + 1 + 1 = 6 KiB.
+        layered(&cache, "a-0000", "a:1", &[("base", 4096), ("onlya", 1024)]);
+        layered(&cache, "b-0000", "b:1", &[("base", 4096), ("onlyb", 1024)]);
+
+        let (listing, total) = image_entries_in(&cache, crate::listing::Detail::Read);
+        assert_eq!(listing.records.len(), 2, "both images must be listed");
+        let rows: u64 = listing.records.iter().map(|e| e.size).sum();
+
+        // The rows are right to double-count: each image really does need the base to run.
+        assert!(
+            rows >= 10240,
+            "each row must carry its whole cost, got {rows} over the two rows"
+        );
+        // And the total is right not to. The dirs also cost their own inodes, so this is a window
+        // around 6 KiB rather than an equality: what matters is that it is nowhere near the 10 KiB
+        // the column adds up to.
+        assert!(
+            (6144..8192).contains(&total),
+            "the shared base was counted twice: total {total}, rows {rows}"
+        );
+        assert!(
+            total < rows,
+            "a total that is not below the column sum has not deduplicated anything"
+        );
+        let _ = force_remove_dir_all(&cache);
+    }
+
+    /// A layer a manifest names and the disk does not have is not bytes. It makes the image
+    /// `dangling`, and charging the cache for it would put a number in front of a reader that no
+    /// `du` could ever agree with.
+    #[test]
+    fn a_missing_layer_adds_nothing_to_the_total() {
+        let cache = std::env::temp_dir().join(format!("kern-total-missing-{}", std::process::id()));
+        let _ = force_remove_dir_all(&cache);
+        std::fs::create_dir_all(cache.join("L")).unwrap();
+        layered(&cache, "c-0000", "c:1", &[("gone", 2048)]);
+        let _ = force_remove_dir_all(&cache.join("L").join("gone"));
+
+        let (listing, total) = image_entries_in(&cache, crate::listing::Detail::Read);
+        assert!(
+            listing.records.iter().all(|e| e.dangling),
+            "an image whose only layer is gone must read dangling"
+        );
+        assert_eq!(total, 0, "bytes that are not on disk were counted");
+        let _ = force_remove_dir_all(&cache);
+    }
+}
+
 mod image_rm_tests {
     use crate::commands::*;
 
