@@ -5,6 +5,24 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## kern-sandbox 0.2.40 - 2026-09-26
+
+**The page says what it works with, by name.** Claude Code, Cursor, Claude Desktop and LM Studio,
+instead of "MCP clients", which a reader has to already know they are one of.
+
+**Credentials get their own paragraph, because filesystem and network do not cover them.** A
+compromised dependency is stopped by the box; a prompt-injected agent is not, because it runs the
+code you asked for. Mounts over 17 credential directories are refused with no opt-out, and they are
+now named.
+
+**The tool-call chart is in multiples of one call, not milliseconds**, and carries the range in its
+own footer: `print(1)` is the workload that flatters it most and a heavier call is 7x rather than
+20x. No millisecond and no CPU model is left on either page.
+
+**The Node page had the opening the Python page replaced in September** and never got the same fix:
+the rejected title, and a note about measurement method above the first example. Both pages now open
+the same way.
+
 ## Unreleased
 **`kern images` listed a size per image and never said what they came to.** Every row carried its
 own number and nothing added them up, so the only way to learn the total was to sum the column by

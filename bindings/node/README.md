@@ -1,17 +1,31 @@
-# kern-sandbox (Node.js / TypeScript)
+<div align="center">
 
-**Run LLM-generated code in a fast, real sandbox, one fresh box per call.**
+<img src="https://raw.githubusercontent.com/getkern/kern/main/assets/brand/kern-logo.png" width="220" alt="kern">
 
-Fast means milliseconds, and it is two numbers rather than one: the box is the cheap part, and an
-interpreter starting inside it costs more than the box does. Both depend on your machine, so they are
-measured under [Prewarming](https://github.com/getkern/kern/blob/main/bindings/node/README.md#prewarming-a-box-ready-before-the-call-arrives) with the machine and the method beside them, and the
-runtime's own are in [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
+# Kern Sandbox
 
-`kern-sandbox` is the Node and TypeScript binding for **[kern](https://getkern.dev)**: a rootless,
-kernel-enforced sandbox out of one static binary, with no daemon, no VM and no cloud. An agent's
-tool-call, a model's generated snippet, a CI step: code that runs before anyone reads it gets its own
-box, and the box is thrown away after. A hundred calls are a hundred boxes and 1.4 s in total, with
-nothing left behind, and when state has to carry across them there is
+**Your model writes the code. This runs it where it can't touch your machine.**
+
+<sub>**Works with** Claude Code · Cursor · Claude Desktop · LM Studio · LangChain · pi</sub>
+
+[![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm&color=0b7285)](https://www.npmjs.com/package/kern-sandbox)
+[![PyPI](https://img.shields.io/pypi/v/kern-sandbox?label=PyPI&color=0b7285)](https://pypi.org/project/kern-sandbox/)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/getkern/kern/blob/main/LICENSE)
+
+<sub>rootless · no daemon · no socket · no VM · no cloud · no account</sub>
+
+**[The runtime](https://github.com/getkern/kern)** ·
+**[MCP server](https://github.com/getkern/kern/blob/main/docs/MCP.md)** ·
+**[Security model](https://github.com/getkern/kern/blob/main/SECURITY.md)** ·
+**[Benchmarks](https://github.com/getkern/kern/blob/main/BENCHMARKS.md)**
+
+</div>
+
+An agent's tool-call, a generated snippet, a notebook cell, a CI step: it arrives, you run it, and
+nobody has read it first.
+
+`kern-sandbox` is the Node and TypeScript binding for **[kern](https://getkern.dev)**. Every call
+gets its own box, thrown away after; when state has to carry across calls there is
 [a session](#a-session-files-persist-processes-are-ephemeral) and a warm interpreter.
 
 Network off, memory and PID caps the kernel enforces **where your host delegates them**,
@@ -288,7 +302,7 @@ RUN python3 -m compileall -q -j 0 /usr/local/lib/python3.12
 
 Build it once and pass it: `run_code(..., image="my-python")`. The default stays the stock tag,
 because an SDK that silently required a custom image would be worse than one that costs 29 ms and
-says so. Measured on an Intel i7-14700KF, Linux 7.0.0, idle; [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md) has the method.
+says so. Measured rootless on an idle machine; [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md) has the method.
 
 ## Prewarming: a box ready before the call arrives
 
