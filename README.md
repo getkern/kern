@@ -37,6 +37,8 @@ kern run --memory 256m --cpus 0.5 -- ./job # limits only, host still visible
 kern compose up -d
 ```
 
+<sub>kern calls that container a **box**, and so does the rest of this page.</sub>
+
 - **A real container.** Real OCI images: `pull`, `build`, `commit`, `push`, `save`/`load`. A box
   starts in single-digit milliseconds.
 - **A sandbox for code your model wrote.** It runs where it can't touch your machine. No network
