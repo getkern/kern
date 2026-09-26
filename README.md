@@ -38,10 +38,10 @@ kern compose up -d
 
 - **A real container.** Real OCI images: `pull`, `build`, `commit`, `push`, `save`/`load`. A box
   starts in single-digit milliseconds.
-- **A sandbox for code your model wrote.** It runs where it cannot touch your machine: no network
-  unless you ask, and a timeout or an OOM-kill comes back as a **typed fault**, not a stack trace.
+- **A sandbox for code your model wrote.** It runs where it can't touch your machine, with no
+  network unless you ask. If it hangs or runs out of memory, the result tells you which.
 - **Rootless, always.** Six namespaces, an overlay or read-only root, a seccomp allowlist and cgroup
-  v2 limits. `--security-profile untrusted` is the whole hardened bundle, in one flag.
+  v2 limits.
 - **Your `docker-compose.yml`, unchanged.** Or kern's own `stack.toml`. One stack to one pod,
   services reaching each other by name.
 - **Caps without a sandbox too.** `kern run` applies the same memory and CPU limits to a process on
