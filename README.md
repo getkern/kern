@@ -38,18 +38,16 @@ kern compose up -d
 
 - **A real container.** Real OCI images: `pull`, `build`, `commit`, `push`, `save`/`load`. A box
   starts in single-digit milliseconds.
-- **A sandbox for code your model wrote.** It runs where it can't touch your machine, with no
-  network unless you ask. If it hangs or runs out of memory, the result tells you which.
+- **A sandbox for code your model wrote.** It runs where it can't touch your machine. No network
+  unless you ask.
 - **Rootless, always.** Six namespaces, an overlay or read-only root, a seccomp allowlist and cgroup
   v2 limits.
 - **Your `docker-compose.yml`, unchanged.** Or kern's own `stack.toml`. One stack to one pod,
   services reaching each other by name.
-- **Caps without a sandbox too.** `kern run` applies the same memory and CPU limits to a process on
-  the host, plus `--landlock-rw <path>` to confine its writes with the kernel's own LSM.
-  [docs/RESOURCES.md](docs/RESOURCES.md)
+- **Caps without a sandbox too.** `kern run` puts the same limits on a process on the host, plus
+  `--landlock-rw` to confine its writes. [docs/RESOURCES.md](docs/RESOURCES.md)
 - **The tools you expect.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
-  `doctor`. The Python binding plugs into LangChain twice: as a code tool, and as an execution policy
-  for its shell middleware.
+  `doctor`.
 
 <sub>One Rust dependency, `libc`: JSON and OCI manifests are parsed by hand, and `pull` shells out to
 the `curl` and `tar` already on the machine rather than linking a TLS stack.</sub>
