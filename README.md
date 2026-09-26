@@ -88,9 +88,9 @@ kern ps                                          # what is running (--json, like
 `--security-profile untrusted` is the seccomp allowlist, `--cap-drop ALL` and `--read-only` in one
 flag. [examples/](examples/) holds 94 runnable scripts, one per thing kern does.
 
-From a program, **Kern Sandbox**
+From Python or Node, **Kern Sandbox**
 ([PyPI](https://pypi.org/project/kern-sandbox/), [npm](https://www.npmjs.com/package/kern-sandbox))
-wraps that same binary:
+wraps the same binary:
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate    # PEP 668: most distributions refuse a system-wide pip
@@ -108,9 +108,9 @@ It finds `kern` on your PATH, or wherever `$KERN_BIN` points.
 
 ## Kern Sandbox: run an agent's code from Python or Node
 
-**Kern Sandbox** is how **your program** calls kern, [installed in the
-Quickstart](#quickstart): every call is a fresh isolated box, and the code **inside** it can be in
-any language, because the box is an OCI image.
+**Kern Sandbox** is the Python and Node wrapper over that binary,
+[installed in the Quickstart](#quickstart). Every call is a fresh box, and the code **inside** it
+can be in any language.
 
 **The page to read next: [the Python SDK](bindings/python/README.md)** for the full API, the fault
 types, sessions, prewarming and LangChain, or [the same for Node](bindings/node/README.md).
@@ -120,11 +120,10 @@ types, sessions, prewarming and LangChain, or [the same for Node](bindings/node/
 </p>
 
 `docker run` hands you exit 137 and leaves you to guess whether that was your timeout or the OOM
-killer. A timeout, an OOM-kill or a blocked syscall comes back as a typed `fault` on the result
-instead, so a program can branch on it.
+killer. Here it comes back as a typed `fault` you can branch on.
 
-It also ships **`kern-mcp`**, a dependency-free stdio server that gives Claude Desktop or Cursor a
-local code interpreter:
+It also ships **`kern-mcp`**, a stdio server that gives Claude Desktop or Cursor a local code
+interpreter:
 
 ```json
 { "mcpServers": { "kern": { "command": "kern-mcp" } } }
