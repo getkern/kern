@@ -65,7 +65,10 @@ privilege-escalation bug is an escape.
 
 - **Always-on seccomp, allowlist by default**: the shipped default is moby's own default filter
   minus kern's 35 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
-  opt-out via `KERN_SECCOMP=denylist`.
+  opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **35 escape syscalls**: 24
+  that hard-kill plus the 11 that return `ENOSYS`; a rootless `--privileged` box denies 5 fewer. Do
+  not take the number from this file, ask the binary: `kern box <name> --image <ref> --show-config`
+  prints `seccomp_denied_syscalls` from the live lists.
 
 - **`clone(2)` is filtered on its ARGUMENTS**, and it is the only rule of that shape.
 
@@ -96,7 +99,10 @@ Verified on this desktop, the string arrives outside.
 
 ### What a denied syscall returns
 The filter has two verdicts. Real escape vectors (kexec, module load/unload, the mount API, `bpf`,
-`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`.
+`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Eleven, in seven
+families (io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's three, `syslog`,
+`clone3` and `open_by_handle_at`), return **`ENOSYS`** instead: equally denied, and the difference
+is Redis falling back to its epoll path rather than Redis dying.
 
 The obvious objection is that a survivable denial is easier to enumerate than a fatal one. Measured
 inside a box on x86_64, kernel 7.0:
