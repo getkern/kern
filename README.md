@@ -70,9 +70,8 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
 Then `kern doctor` says what this host can enforce, and names the one command to fix anything
-missing. Any distribution with unprivileged user namespaces and cgroup v2 works. From source:
-`cargo install --git https://github.com/getkern/kern getkern --locked`.
-[docs/INSTALL.md](docs/INSTALL.md) has the rest, including the one thing
+missing. Any distribution with unprivileged user namespaces and cgroup v2 works.
+[docs/INSTALL.md](docs/INSTALL.md) has the rest: building from source, and the one thing
 [Ubuntu 23.10 and newer needs first](docs/INSTALL.md#requirements-and-limitations).
 
 ## Quickstart
