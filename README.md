@@ -51,17 +51,22 @@ kern compose up -d
 
 ## Install
 
-```sh
-# Linux and ARM boards: one static file in ~/.local/bin, SHA256 checked by the script
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+**Linux and ARM boards** · one static file in `~/.local/bin`, SHA256 checked by the script
 
-# macOS: a Linux VM first, then the line above inside it
-brew install colima && colima start && colima ssh
+```sh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
+**Windows** · the same binary under WSL2, and the script sets WSL2 up for you
+
 ```powershell
-# Windows: the same binary under WSL2, and the script sets WSL2 up for you
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+```
+
+**macOS** · a Linux VM first, then the Linux line inside it
+
+```sh
+brew install colima && colima start && colima ssh
 ```
 
 Then `kern doctor` says what this host can enforce, and names the one command to fix anything
