@@ -49,9 +49,6 @@ kern compose up -d
 - **The tools you expect.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
   `doctor`.
 
-<sub>One Rust dependency, `libc`: JSON and OCI manifests are parsed by hand, and `pull` shells out to
-the `curl` and `tar` already on the machine rather than linking a TLS stack.</sub>
-
 ## Install
 
 ```sh

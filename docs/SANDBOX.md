@@ -4,6 +4,8 @@ Your model writes the code. This runs it where it can't touch your machine: a re
 per call, and a hundred of them cost 1.4 s in total. How much survives between calls is
 [your choice](#choose-how-much-survives-between-calls).
 
+**Works with** Claude Code, Cursor, Claude Desktop, LM Studio, LangChain and pi.
+
 `kern-sandbox` is the SDK in front of the `kern` binary. Two things, not one: the isolation is the
 binary's, the package is the API. The same API ships for Python and for Node.
 
@@ -62,12 +64,19 @@ prints `[exit 0]` can't fake it. The other values are `killed`, `escape_blocked`
 
 ## Safe by default
 
+**Two threats, and the second is not covered by the first.** A compromised dependency is stopped by
+the filesystem and the network: no network unless you ask, a read-only root, and only the paths you
+name. A prompt-injected agent is not, because it runs the code you asked for. The defence there is
+that the credentials were never in the box at all, which is why mounts over them are refused rather
+than discouraged.
+
 A bare `Sandbox()` has no network, no host mounts, seccomp on, capabilities dropped and a
 **mandatory** timeout. Every relaxation is a named argument. Two that have surprised people, both
 measured:
 
-- **Mounts over sensitive sources are refused even if you ask**: the host's own directories,
-  anything with `.ssh`, `.aws` or `.kube` in its path, and kern's own state. No opt-out. Mount a
+- **Mounts over sensitive sources are refused even if you ask**: the host's own directories, kern's
+  own state, and 17 credential directories by name (`.ssh`, `.aws`, `.kube`, `.gnupg`, `.netrc`,
+  `.npmrc`, `.git-credentials` and the rest), plus `~/.config/gh` and `~/.config/gcloud`. Mount a
   copy of what the code needs.
 - **`network=True` includes the host's loopback**, where unauthenticated services live. A test read
   the host's SSH banner off `127.0.0.1:22`. [`egress_allow`](EGRESS.md) is the middle setting and
@@ -99,7 +108,7 @@ with kern.Sandbox(image="python:3.12-slim") as s:
         k.run_code("print(x)")                           # 41
 ```
 
-Measured on an Intel i7-14700KF with a
+Measured with a
 [precompiled image](https://github.com/getkern/kern/tree/main/examples/precompiled-image), 40 calls
 each. On the stock `python:3.12-slim` the first two rows cost about three times as much and the
 third does not change, because there the interpreter starts once.
