@@ -182,8 +182,9 @@ kern does not have overlay networks, Swarm, CRI, or a GPU passed into the contai
 | one container, against rootless `runc` | **3.6x faster** |
 
 <sub>Same machine, same workload, same day, rounded down. On ARM boards the docker gap is nearer
-30x. Every runtime, the numbers and the method: [BENCHMARKS.md](BENCHMARKS.md). Yours:
-`python3 examples/benchmark.py --runs 200 --conc 200`.</sub>
+30x. Against bubblewrap there is no gap on a single start, and kern is applying a memory and a PID
+cap there that bubblewrap does not. Every runtime, the numbers and the method:
+[BENCHMARKS.md](BENCHMARKS.md). Yours: `python3 examples/benchmark.py --runs 200 --conc 200`.</sub>
 
 ## Security
 
@@ -193,8 +194,13 @@ outside the vetted set returns `ENOSYS`), cgroup v2 limits that
 `--require-limits` refuses to start without, and a deny-by-default `/dev`. Where a boundary is
 cooperative rather than kernel-enforced, [SECURITY.md](SECURITY.md) says so and names the bypass.
 
-You do not have to take it on trust. [pentest/](pentest/) holds five adversarial suites that assert
-those boundaries against the kernel rather than against kern's own reporting, with no registry
+**Every published container-runtime escape, run against this tree.**
+[docs/CVE-POSTURE.md](docs/CVE-POSTURE.md) takes 25 CVEs one at a time and reports what each does to
+kern, with the command and its output rather than a description of the design, and it ends by naming
+the class kern does not defend against instead of softening it.
+
+You do not have to take that on trust either. [pentest/](pentest/) holds five adversarial suites that
+assert those boundaries against the kernel rather than against kern's own reporting, with no registry
 account and no network:
 
 ```sh
@@ -225,6 +231,9 @@ Each section above links the page it belongs to. These are the ones it does not:
   `--net host` and `--privileged` are opt-outs by name.
 - **Not a Docker Engine reimplementation.** The *formats*, not the API: no overlay networks, no
   plugins, no Swarm. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
+- **Not a bubblewrap competitor.** bwrap is a sandbox building block, and on a single start the two
+  are inside each other's run-to-run noise. kern sits above that line: OCI images, compose, and the
+  memory and PID caps bwrap leaves to you.
 - **Not a Kubernetes runtime.** No CRI. Use containerd or CRI-O.
 - **Not shipping GPU slices.** On the [roadmap](ROADMAP.md). Nothing intercepts a driver call and
   nothing caps a GPU; on consumer hardware a VRAM cap would be a cooperative quota,
