@@ -3194,6 +3194,32 @@ mod save_tag_tests {
 #[cfg(test)]
 mod image_cache_total_tests {
     use crate::commands::*;
+    /// A FILE NAMED `...ok` HAS THE FILE STEM `..`, so `cache.join(stem)` is the cache's PARENT.
+    /// `remove_image` has refused such a stem as a delete target for a long time; the listing did
+    /// not, so `kern images` showed it as a row and charged the total with whatever sits beside the
+    /// cache. Measured before the guard: a 3 MB file in the parent directory was counted.
+    #[test]
+    fn a_sentinel_whose_stem_escapes_the_cache_is_not_listed_or_sized() {
+        let base = std::env::temp_dir().join(format!("kern-esc-{}", std::process::id()));
+        let _ = force_remove_dir_all(&base);
+        let cache = base.join("cache");
+        std::fs::create_dir_all(cache.join("L")).unwrap();
+        std::fs::create_dir_all(base.join("neighbour")).unwrap();
+        std::fs::write(base.join("neighbour").join("big"), vec![0u8; 3_000_000]).unwrap();
+        std::fs::write(cache.join("...ok"), b"harmless").unwrap();
+
+        let (listing, total) = image_entries_in(&cache, crate::listing::Detail::Read);
+        assert!(
+            listing.records.is_empty(),
+            "a stem that leaves the cache was listed as an image: {:?}",
+            listing.records.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            total, 0,
+            "the parent directory was walked into the total: {total} bytes"
+        );
+        let _ = force_remove_dir_all(&base);
+    }
 
     /// A cache holding `stems`, each a layered image whose manifest names `layers` in `L/`. Every
     /// layer dir is written once with `bytes` bytes, so a layer named by two images is ONE dir on

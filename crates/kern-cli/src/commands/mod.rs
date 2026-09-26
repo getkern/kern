@@ -3131,11 +3131,11 @@ pub(crate) struct ImageEntry {
 pub(crate) fn image_entries_with(
     detail: crate::listing::Detail,
 ) -> crate::listing::Listing<ImageEntry> {
-    image_entries_sized(detail).0
+    image_entries_in(&cache_dir(), detail).0
 }
 
-/// [`image_entries_with`], plus what the cache holds for those images with a SHARED LAYER COUNTED
-/// ONCE.
+/// [`image_entries_with`], against an explicit cache root and reporting what those images hold
+/// with a SHARED LAYER COUNTED ONCE.
 ///
 /// WHY THIS IS NOT THE SUM OF THE ROWS. `image_stat` charges a layered image for every layer it
 /// references, which is the right number for one row: it is what that image costs you. Adding the
@@ -3151,13 +3151,6 @@ pub(crate) fn image_entries_with(
 /// reclaims, and all of `V/`, which held 35 sparse `.ext4` files with `.fast`/`.lock`/`.ok`
 /// siblings. No image names those and `kern images` does not list them, which is why they are out;
 /// WHAT writes them was not established, and this comment says so rather than guessing.
-pub(crate) fn image_entries_sized(
-    detail: crate::listing::Detail,
-) -> (crate::listing::Listing<ImageEntry>, u64) {
-    image_entries_in(&cache_dir(), detail)
-}
-
-/// [`image_entries_sized`] against an explicit cache root.
 ///
 /// The path is a parameter so a test can build a cache with two images over one shared layer and
 /// assert the total counts it once. Reading `cache_dir()` inside would have made that test set
@@ -3187,6 +3180,14 @@ pub(crate) fn image_entries_in(
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
                 continue;
             };
+            // THE SAME GUARD `remove_image` APPLIES, and for the same reason: a file named `...ok`
+            // has the file stem `..`, so `cache.join(stem)` resolves to the cache's PARENT. The
+            // remover refused such a stem as a delete target; this path did not, so the listing
+            // showed it as an image and `dir_size` walked the parent tree into the total. Measured:
+            // a 3 MB file beside the cache was counted.
+            if !crate::commands::imagecache::is_safe_stem(&stem) {
+                continue;
+            }
             total += 1;
             if detail == crate::listing::Detail::Skip {
                 continue;

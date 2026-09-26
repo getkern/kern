@@ -121,8 +121,8 @@ that you are avoiding a cost.
 ## From an MCP client
 
 The package ships `kern-mcp`, a dependency-free stdio server, so the model writes code, kern runs it
-on your machine, and charts come back as images it can see. It works in any MCP client: Cursor,
-Claude Code, Claude Desktop, LM Studio, Zed, Windsurf.
+on your machine, and charts come back as images it can see. It works in any MCP client: Claude
+Code, Cursor, Claude Desktop, LM Studio, Zed.
 
 ```json
 { "mcpServers": { "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] } } }

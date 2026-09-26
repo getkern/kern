@@ -124,9 +124,9 @@ name. A prompt-injected agent is not, because it runs the code you asked for. Th
 that the credentials were never in the box at all, which is why mounts over them are refused rather
 than discouraged.
 
-A bare `Sandbox()` has no network, no host mounts, seccomp on, capabilities dropped and a
-**mandatory** timeout. Every relaxation is a named argument. Two have surprised people, both
-measured:
+A bare `Sandbox()` runs `python:3.12-slim` with a 30 second deadline, no network, no host mounts,
+seccomp on and capabilities dropped. The timeout is **mandatory**: there is no value that disables
+it. Every relaxation is a named argument, and two have surprised people, both measured:
 
 - **Mounts over sensitive sources are refused even if you ask**: the host's own directories, kern's
   own state, and 17 credential directories by name (`.ssh`, `.aws`, `.kube`, `.gnupg`, `.netrc`,

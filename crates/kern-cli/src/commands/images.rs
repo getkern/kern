@@ -156,7 +156,7 @@ fn glob_match(pattern: &str, subject: &str) -> bool {
 pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) -> Result<(), Error> {
     // FILTERED ONCE, BEFORE EITHER RENDERER, so the human table and `--json` describe the same set
     // by construction - the property a script comparing the two would otherwise take on trust.
-    let (listing, cache_bytes) = image_entries_sized(crate::listing::Detail::Read);
+    let (listing, cache_bytes) = image_entries_in(&cache_dir(), crate::listing::Detail::Read);
     let all = listing.records;
     let cache_empty = all.is_empty();
     // FILTERED AGAINST THE WHOLE LISTING, because `before=`/`since=` name another image and have to
