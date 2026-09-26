@@ -1352,9 +1352,19 @@ fn scope_probe_read(unit: &str, what: &std::path::Path) -> Option<String> {
 /// for the same reason `config::load_impl` is - a unit test can drive it against a synthetic tree
 /// without reading (or mutating) the real `/proc/self/cgroup`.
 fn memory_cap_state_at(cur: &std::path::Path) -> MemoryCapState {
-    let child = cur.join(format!("{CAPPROBE_LEAF_PREFIX}{}", unsafe {
-        libc::getpid()
-    }));
+    // ONE NAME PER CALL, NOT PER PROCESS, AND THE PID LAST. The leaf used to be
+    // `kern-capprobe-<pid>`, so two threads of one process raced for a single directory: the second
+    // took the `AlreadyExists` branch below and REMOVED the first one's directory to retry, and the
+    // first then probed (or removed) a directory that was no longer its own. Measured before this
+    // line changed: six threads calling this function, 33 of 40 rounds returned states that
+    // disagreed with each other on one unchanged host.
+    //
+    // The counter goes BEFORE the pid because the leftover sweep reads the LAST dash-separated
+    // component as the owner's pid (`leaf_owner_is_dead`). With the counter last it would parse
+    // that instead, find no process with that id, and reclaim a LIVE probe's directory.
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let child = cur.join(capprobe_leaf(seq, unsafe { libc::getpid() } as u32));
     // Create the throwaway child. `AlreadyExists` is a leftover from a crashed probe: remove and
     // retry once. Any other creation error means child cgroups cannot be created here at all, which
     // is the not-delegated signal, refined below by whether the controller is even present.
@@ -1743,9 +1753,19 @@ fn exe_stem_is_kern(name: &str) -> bool {
     name == "kern" || name == "kern (deleted)"
 }
 
-/// Is the process that OWNS a capped leaf dead? `rest` is the leaf name with its family PREFIX already
-/// stripped, so this reads the trailing `-<pid>` that `kern-box-<tag>-<pid>` and `kern-run-<pid>` both
-/// end in. The tag may itself contain '-', so the pid is the LAST field and never the second.
+/// The name of one probe's throwaway cgroup: a per-call counter, then the owner's pid.
+///
+/// THE ORDER IS THE POINT, and [`leaf_owner_pid`] is why: it reads the LAST dash-separated component
+/// as the pid. Put the counter there instead and the sweep parses it, finds no process with that id,
+/// and reclaims a directory a probe is still using.
+fn capprobe_leaf(seq: u64, pid: u32) -> String {
+    format!("{CAPPROBE_LEAF_PREFIX}{seq}-{pid}")
+}
+
+/// The pid a leaf name carries, `None` when it does not end in one. `rest` is the leaf name with its
+/// family PREFIX already stripped, so this reads the trailing `-<pid>` that `kern-box-<tag>-<pid>`,
+/// `kern-run-<pid>` and `kern-capprobe-<seq>-<pid>` all end in. The tag and the counter may
+/// themselves contain '-', so the pid is the LAST field and never the second.
 ///
 /// `-sup` is stripped first, because the supervisor's sibling leaf is `kern-box-<tag>-<pid>-sup` and
 /// its last field is the literal `sup`, which parses as no pid at all: without this the leaf is
@@ -1753,20 +1773,27 @@ fn exe_stem_is_kern(name: &str) -> bool {
 /// session, one per box. They are empty and harmless on their own, and not harmless in aggregate - the
 /// sweep examines at most `limit` entries per box start, so a pile of unreapable directories crowds out
 /// the orphans it exists to find. The `a_box_start_still_reaps_an_orphan_cgroup` test failed exactly
-/// that way, and passed again the moment the pile was cleared. The pid is the SUPERVISOR's in both
+/// that way, and passed again the moment the pile was cleared. The pid is the SUPERVISOR's in both box
 /// names, so one liveness check covers a leaf and the box it belongs to.
+///
+/// One spelling for two readers: [`leaf_owner_is_dead`] asks whether that process is gone, and the
+/// leak tests ask whether a leaf is this process's.
+fn leaf_owner_pid(rest: &str) -> Option<u32> {
+    rest.strip_suffix("-sup")
+        .unwrap_or(rest)
+        .rsplit('-')
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+}
+
+/// Is the process that OWNS a capped leaf dead?
 ///
 /// ASKED OF `/proc` AND NOT OF THE DIRECTORY'S CONTENTS, deliberately: a box is momentarily EMPTY
 /// between its `mkdir` and its `cgroup.procs` write, so a rmdir-if-empty rule would reap a box that is
 /// starting. It also puts the pid-reuse hazard on the safe side - a reused pid reads as ALIVE, so the
 /// leaf is skipped and never killed.
 fn leaf_owner_is_dead(rest: &str) -> bool {
-    rest.strip_suffix("-sup")
-        .unwrap_or(rest)
-        .rsplit('-')
-        .next()
-        .and_then(|p| p.parse::<u32>().ok())
-        .is_some_and(|pid| !proc_entry_exists(pid))
+    leaf_owner_pid(rest).is_some_and(|pid| !proc_entry_exists(pid))
 }
 
 /// Does `/proc/<pid>` exist, asked WITHOUT allocating?
@@ -4379,6 +4406,7 @@ mod tests {
         // cannot have that property. This asserts the invariant that survives either answer: the
         // verdict must not be worse than what the caller's own cgroup alone would give, which is the
         // directory the test's boxes actually used and the one `or_else` skipped.
+        let _probe = real_host_probe_lock();
         let combined = memory_cap_state();
         let own = current_v2_cgroup();
         if combined == MemoryCapState::Unknown {
@@ -4404,23 +4432,14 @@ mod tests {
         // and not this test's subject. What that red DID find is real and is fixed elsewhere: nothing
         // reaped that family, so the orphan sweep and `kern gc` now know it. The invariant here is
         // narrower and is the one this function owns.
-        let count = || -> usize {
-            [ensure_kern_slice(), current_v2_cgroup()]
-                .into_iter()
-                .flatten()
-                .filter_map(|d| fs::read_dir(d).ok())
-                .flat_map(|rd| rd.flatten())
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with(CAPPROBE_LEAF_PREFIX)
-                })
-                .count()
-        };
-        let before = count();
+        // ...AND OWNED BY THIS PROCESS, which the first version also got wrong in the other direction:
+        // counting every `kern-capprobe-*` in the directory reads a peer test binary's in-flight leaf
+        // as this call's leak. `own_capprobe_leaves` says why that happens.
+        let dirs = real_probe_dirs();
+        let before = own_capprobe_leaves(&dirs);
         let _ = memory_cap_state();
         assert_eq!(
-            count(),
+            own_capprobe_leaves(&dirs),
             before,
             "a completed cap probe must leave no child cgroup behind"
         );
@@ -4806,44 +4825,129 @@ mod tests {
         assert_eq!(scope_parent_from_proc_cgroup("0::/some.scope\n"), None);
     }
 
+    /// The directories a probe of the REAL host can create a leaf in, both of them.
+    fn real_probe_dirs() -> Vec<PathBuf> {
+        [ensure_kern_slice(), current_v2_cgroup()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// How many `kern-capprobe-*` leaves under `dirs` does THIS PROCESS own?
+    ///
+    /// A directory-wide count is the wrong question, and the two reasons were both measured here.
+    /// Cargo runs the test BINARIES of several crates at once and they all sit in the shell's cgroup,
+    /// so another crate's probe leaves its own in-flight directory in the very dir this counts; and a
+    /// run killed hours ago leaves a stale one that is nobody's current doing. The pid is the last
+    /// component of the name, so this asks [`leaf_owner_pid`] rather than spelling the layout again.
+    ///
+    /// ⚠️ This does NOT make the count thread-safe: the threads of one test binary share a pid, so
+    /// a peer test's leaf counts as ours. That is what `real_host_probe_lock` is for.
+    fn own_capprobe_leaves(dirs: &[PathBuf]) -> usize {
+        let mine = unsafe { libc::getpid() } as u32;
+        dirs.iter()
+            .filter_map(|d| fs::read_dir(d).ok())
+            .flat_map(|rd| rd.flatten())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .strip_prefix(CAPPROBE_LEAF_PREFIX)
+                    .and_then(leaf_owner_pid)
+                    .is_some_and(|pid| pid == mine)
+            })
+            .count()
+    }
+
+    /// Serialises the three tests that probe the process's REAL cgroup and assert the probe left
+    /// nothing behind.
+    ///
+    /// MEASURED: `concurrent_probes_agree_and_leave_nothing_behind` passed alone and went red beside
+    /// its two peers. Cargo runs tests as threads in ONE process, so one test's before/after window
+    /// observes a peer's in-flight `kern-capprobe-*` leaf and the delta assertion fails on the peer
+    /// behaving correctly. Per-call leaf NAMES fixed the production race; the leak COUNT is still
+    /// directory-wide, and within one process the owning pid cannot tell the peers apart.
+    fn real_host_probe_lock() -> std::sync::MutexGuard<'static, ()> {
+        static REAL_HOST_PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A panic in one of these tests must not turn its peers' report into `PoisonError`.
+        REAL_HOST_PROBE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// THE LEAF NAME CARRIES THE OWNER'S PID LAST, and the sweep depends on it: it reads the last
+    /// dash-separated component as a pid and reclaims the directory when no such process exists.
+    /// The per-call counter was put BEFORE the pid for this reason. With it last, the sweep would
+    /// parse the counter, find no process with that id, and delete a probe that is still running.
+    #[test]
+    fn the_sweep_still_reads_the_owner_pid_from_a_probe_leaf() {
+        let mine = unsafe { libc::getpid() } as u32;
+        // The name THE CODE BUILDS, not one written out here: a test that spells the leaf itself
+        // passes while the production order is wrong, which is what the first version of this did.
+        let leaf = capprobe_leaf(7, mine);
+        let rest = leaf
+            .strip_prefix(CAPPROBE_LEAF_PREFIX)
+            .expect("the leaf must carry the prefix the sweep matches on");
+        assert!(
+            !leaf_owner_is_dead(rest),
+            "a live owner was read as dead from {leaf:?}: the sweep would remove a running probe"
+        );
+        // A pid that cannot be running: the sweep must be willing to reclaim it.
+        let stale = capprobe_leaf(7, 2_147_483_646);
+        assert!(leaf_owner_is_dead(
+            stale.strip_prefix(CAPPROBE_LEAF_PREFIX).unwrap()
+        ));
+    }
+
+    /// Six threads probing at once returned states that disagreed in 33 of 40 rounds, because the
+    /// leaf was named per PROCESS: the second caller took the `AlreadyExists` path and removed the
+    /// first caller's directory to retry. `kern doctor` calls this twice in one process and never
+    /// noticed; a library caller with two threads would.
+    #[test]
+    fn concurrent_probes_agree_and_leave_nothing_behind() {
+        let _probe = real_host_probe_lock();
+        if current_v2_cgroup().is_none() {
+            eprintln!("skip: no cgroup v2 to probe");
+            return;
+        }
+        let dirs = real_probe_dirs();
+        let before = own_capprobe_leaves(&dirs);
+        for round in 0..20 {
+            let hs: Vec<_> = (0..6)
+                .map(|_| std::thread::spawn(memory_cap_state))
+                .collect();
+            let rs: Vec<_> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(
+                rs.iter().all(|r| *r == rs[0]),
+                "round {round}: six threads read one unchanged host differently: {rs:?}"
+            );
+        }
+        assert_eq!(
+            before,
+            own_capprobe_leaves(&dirs),
+            "a concurrent probe leaked a cgroup"
+        );
+    }
+
     #[test]
     fn capprobe_on_the_real_host_is_deterministic_and_leaks_nothing() {
         // The full probe against the process's real cgroup. Host-agnostic assertions: it must not
         // leave a `kern-capprobe-*` cgroup behind, and two back-to-back calls must agree (the host's
         // delegation does not change between them). SKIP-graceful: if the current cgroup dir cannot
         // be listed (a locked-down CI sandbox), there is nothing to check, so return rather than fail.
+        let _probe = real_host_probe_lock();
         let Some(cur) = current_v2_cgroup() else {
             eprintln!("skip: no cgroup v2 to probe");
             return;
         };
-        let Ok(rd) = std::fs::read_dir(&cur) else {
+        if fs::read_dir(&cur).is_err() {
             eprintln!("skip: current cgroup dir not listable here");
             return;
-        };
-        let before = rd
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("kern-capprobe-")
-            })
-            .count();
+        }
+        let dirs = real_probe_dirs();
+        let before = own_capprobe_leaves(&dirs);
         let a = memory_cap_state();
         let b = memory_cap_state();
-        let after = std::fs::read_dir(&cur)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .starts_with("kern-capprobe-")
-                    })
-                    .count()
-            })
-            .unwrap_or(before);
         assert_eq!(
             before,
-            after,
+            own_capprobe_leaves(&dirs),
             "the probe leaked a kern-capprobe cgroup under {}",
             cur.display()
         );
