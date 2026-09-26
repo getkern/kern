@@ -68,7 +68,7 @@ The signing key ships next to this file, and [SECURITY.md](../SECURITY.md) carri
 to compare it against:
 
 ```sh
-gpg --import provenance/getkerndev-signing-key.asc
+gpg --import provenance/signing-key.asc
 ```
 
 ## Producing the record

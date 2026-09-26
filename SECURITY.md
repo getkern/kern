@@ -15,7 +15,7 @@ Release tags are GPG-signed and independently timestamped (see [provenance/](pro
 checks need the public key, so it ships in the repository:
 
 ```sh
-gpg --import provenance/getkerndev-signing-key.asc
+gpg --import provenance/signing-key.asc
 gpg --fingerprint 9737460E1260B27B     # CFBC 8C13 C150 EBBA FBF2  F25C 9737 460E 1260 B27B
 git verify-tag "$(git describe --tags --abbrev=0)"   # or name the tag you are checking
 ```
@@ -24,6 +24,10 @@ The fingerprint above is what to compare against; the file is a convenience, not
 key shipped next to the thing it signs proves authorship of the release, not the identity of the
 author. The OpenTimestamps anchor in `provenance/` is what makes the DATE independent of this
 repository, of GitHub, and of the key holder.
+
+`gpg` will print the user id `getkerndev` when it checks a signature. That is the GitHub account the
+project was first published from, and it no longer exists; the user id is baked into the key and
+cannot be edited without re-issuing it. Compare the fingerprint, not the name.
 
 Released binaries carry a `.sha256` next to the `.tar.gz`:
 

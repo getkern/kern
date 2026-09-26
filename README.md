@@ -241,8 +241,7 @@ gates; contributions are covered by the [CLA](CLA.md).
 
 ## Maintainer
 
-Alessandro Polito, [@realexhub](https://github.com/realexhub), Italy. Earlier commits carry the
-name getkerndev, the account the project was first published from.
+Alessandro Polito, [@realexhub](https://github.com/realexhub).
 
 ## License
 
