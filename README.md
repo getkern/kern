@@ -20,6 +20,7 @@
 </div>
 
 ```sh
+# Linux. Windows and macOS below.
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
@@ -63,10 +64,11 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
-**macOS** · a Linux VM first, then the Linux line inside it
+**macOS** · a Linux VM first, then kern inside it
 
 ```sh
 brew install colima && colima start && colima ssh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # inside the VM
 ```
 
 Then `kern doctor` says what this host can enforce, and names the one command to fix anything

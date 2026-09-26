@@ -106,6 +106,9 @@ code{font-family:var(--mono);font-size:.88em;background:var(--panel);padding:.15
 border-radius:4px}
 pre{background:var(--panel);padding:1rem;border-radius:6px;overflow-x:auto;border:1px solid var(--line)}
 pre code{background:none;padding:0}
+.codewrap{position:relative}
+.codewrap>button{position:absolute;top:.45rem;right:.45rem;font:inherit;font-size:.78rem;padding:.1rem .5rem;border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--dim);cursor:pointer}
+.codewrap>button:hover{color:var(--ink);border-color:var(--dim)}
 table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.92rem;display:block;overflow-x:auto}
 th,td{border:1px solid var(--line);padding:.5rem .7rem;text-align:left;vertical-align:top}
 th{background:var(--panel)}
@@ -267,6 +270,28 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "", page: s
 <a href="{REPO}/blob/main/{src_rel}">this page on GitHub</a> &middot;
 <a href="{REPO}">source</a>
 </footer>
+<script>
+// THE COMMAND IS THE FIRST THING A READER DOES WITH THIS PAGE, and until 2026-09-26 the only way to
+// take it was to select it by hand: the home page had a copy button and the guide did not. The
+// site's CSP is `script-src 'self' 'unsafe-inline'`, so this needs no exception, and it is the same
+// handler the home page uses, bound to every block rather than to four hand-written ones.
+document.querySelectorAll('main pre').forEach(function (pre) {{
+  var w = document.createElement('div');
+  w.className = 'codewrap';
+  pre.parentNode.insertBefore(w, pre);
+  w.appendChild(pre);
+  var b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = 'copy';
+  b.addEventListener('click', function () {{
+    navigator.clipboard.writeText(pre.textContent).then(function () {{
+      b.textContent = 'copied';
+      setTimeout(function () {{ b.textContent = 'copy'; }}, 1500);
+    }});
+  }});
+  w.appendChild(b);
+}});
+</script>
 {beacon(token)}</body>
 </html>
 """
