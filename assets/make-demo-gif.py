@@ -45,9 +45,22 @@ from PIL import Image, ImageDraw, ImageFont
 # The README deliberately publishes NO figure (a front page has no machine, method or date beside
 # it). This frame does, and can, because the footer names the host and tells the reader to measure
 # their own. The full numbers with their method live in BENCHMARKS.md.
-KERN_MS = "3.6 ms"
-DOCKER_MS = "294 ms"
-HOST = "Intel i7-14700KF, Linux 7.0"
+# 2026-09-26: THE FRAME SHOWS THE RATIO, NOT THE TWO COSTS. A millisecond means nothing to a reader
+# without the other side, and the pair plus a CPU model was four pieces of information to hold to
+# reach one conclusion. 294 / 3.6 = 81.7, published as 80: rounded DOWN, so the frame claims less
+# than was measured. The two costs it came from are in BENCHMARKS.md, with the replicas and the
+# spread.
+#
+# ⚠️ A RATIO IS LESS STABLE THAN A COST, and that is why the footer carries a range. The fleet run on
+# 2026-09-22 read the docker gap at 84x on x86 and 30x on ARM boards, so a reader on a Pi who
+# measures 30 against a frame claiming 80 would be right to call it inflated. "x86, ARM boards nearer
+# 30x" is there for them.
+#
+# The CPU model is gone and the DATE is not: a figure with no date is a figure nobody can check
+# against a later one. What was measured, on which command, with how many replicas, is in
+# BENCHMARKS.md.
+KERN_VS_DOCKER = "80x faster than docker run"
+HOST = "x86, ARM boards nearer 30x . 2026-09-20 . measure your own"
 
 COMMAND = 'kern box app --image alpine -- echo "hello from a real container"'
 OUTPUT = "hello from a real container"
@@ -116,14 +129,7 @@ def render(font: ImageFont.FreeTypeFont) -> list[Image.Image]:
         if show_output:
             d.text((X0 + int(cw * 2), ROWS["out"]), OUTPUT, font=font, fill=TEXT)
         if show_stats:
-            left = f"kern started in {KERN_MS}"
-            d.text((X0, ROWS["stat"]), left, font=font, fill=ACCENT)
-            d.text(
-                (X0 + int(cw * (len(left) + 6)), ROWS["stat"]),
-                f"docker run: {DOCKER_MS}",
-                font=font,
-                fill=TEXT,
-            )
+            d.text((X0, ROWS["stat"]), KERN_VS_DOCKER, font=font, fill=ACCENT)
             d.text(
                 (X0, ROWS["meta"]),
                 "real OCI image  .  rootless  .  static binary  .  no daemon",
@@ -132,7 +138,7 @@ def render(font: ImageFont.FreeTypeFont) -> list[Image.Image]:
             )
             d.text(
                 (X0, ROWS["note"]),
-                f"* {HOST} . your hardware differs . measure your own",
+                f"* {HOST}",
                 font=load_font(FONT_SIZE - 3),
                 fill=NOTE,
             )
