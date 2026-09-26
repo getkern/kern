@@ -6,14 +6,14 @@
 
 **Your model writes the code. This runs it where it can't touch your machine.**
 
+<sub>**Works with** Claude Code · Cursor · Claude Desktop · LM Studio · LangChain · pi</sub>
+
 [![PyPI](https://img.shields.io/pypi/v/kern-sandbox?label=PyPI&color=0b7285)](https://pypi.org/project/kern-sandbox/)
 [![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm&color=0b7285)](https://www.npmjs.com/package/kern-sandbox)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-0b7285.svg)](https://pypi.org/project/kern-sandbox/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/getkern/kern/blob/main/LICENSE)
 
 <sub>rootless · no daemon · no socket · no VM · no cloud · no account</sub>
-
-<sub>**Works with** Claude Code · Cursor · Claude Desktop · LM Studio · LangChain · pi</sub>
 
 **[The runtime](https://github.com/getkern/kern)** ·
 **[MCP server](https://github.com/getkern/kern/blob/main/docs/MCP.md)** ·
