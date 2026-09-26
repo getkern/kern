@@ -65,15 +65,21 @@ BARS = [
     ("Docker Sandboxes (sbx), already running", 421.0, False),
 ]
 
-FOOT = ("one tool-call: print(1) in python:3.12-slim, p50, wall clock around the whole call. "
-        "Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21.\n"
+# THE BARS ARE MULTIPLES OF kern-sandbox, NOT MILLISECONDS. A millisecond means nothing to a reader
+# without the other side, and every bar here has the other side on the same axis. The one thing a
+# multiple loses is that it moves with the workload, so the footer carries the range: this chart's
+# call is `print(1)`, which is the workload that flatters it most, and a heavier call is 7x.
+BASELINE = 14.5   # kern-sandbox, one call, p50: every bar is drawn relative to this
+
+FOOT = ("one tool-call: print(1) in python:3.12-slim, p50, wall clock around the whole call, "
+        "rootless, 2026-09-21.\n"
         "docker and podman are ENGINES, not sandbox products: one run per call is the "
         "do-it-yourself baseline. llm-sandbox drives docker underneath.\n"
         "The two session-based arms keep their session alive, which is the arm most favourable to "
-        "them: sbx create is paid once and cost 5067 ms here.\n"
-        "n=15 unless stated. Spread: kern 11.4 to 23.5, prewarm 0.64 to 1.46, docker 273 to 305, "
-        "sbx 393 to 506.\n"
-        "A heavier call narrows the distance: import json,re is 45.4 ms here against 329.7.")
+        "them: sbx create is paid once, and cost 34x one call here.\n"
+        "THE MULTIPLE MOVES WITH THE WORKLOAD: print(1) is the call that flatters this chart most. "
+        "A heavier one, import json,re, is 7x rather than 20x.\n"
+        "n=15 unless stated.")
 
 
 def main() -> int:
@@ -85,17 +91,22 @@ def main() -> int:
     fig, ax = plt.subplots(figsize=(9.2, 4.2), dpi=150)
     fig.patch.set_facecolor(BG)
     ax.set_facecolor(BG)
-    ax.barh(labels, values, color=colours, height=0.62)
+    ax.barh(labels, [v / BASELINE for v in values], color=colours, height=0.62)
     ax.set_xscale("log")
-    ax.set_xlim(0.3, 1400)
-    ax.set_xlabel("milliseconds per call, log scale", color=DIM, fontsize=9)
+    ax.set_xlim(0.02, 95)
+    ax.set_xlabel("times the cost of one kern-sandbox call, log scale", color=DIM, fontsize=9)
     ax.tick_params(colors=DIM, labelsize=9)
     for s in ax.spines.values():
         s.set_color("#1d2731")
     ax.grid(axis="x", color="#141c25", zorder=0)
     ax.set_axisbelow(True)
     for y, (v, c) in enumerate(zip(values, colours)):
-        ax.text(v * 1.15, y, f"{v:g} ms", va="center", color=TEXT if c == OURS else DIM,
+        x = v / BASELINE
+        # Rounded DOWN above 1, so a bar never claims more distance than was measured.
+        # A bar below the baseline is spelled out. "0.05x" on an axis of COST is correct and reads
+        # as "0.05 times faster" to someone scanning, which is the opposite of what it says.
+        txt = "1x" if abs(x - 1) < 0.01 else (f"{1/x:.0f}x faster" if x < 1 else f"{int(x)}x")
+        ax.text(x * 1.15, y, txt, va="center", color=TEXT if c == OURS else DIM,
                 fontsize=10, fontweight="bold" if c == OURS else "normal")
     for lbl in ax.get_yticklabels():
         lbl.set_color(TEXT if lbl.get_text().startswith("kern-sandbox") else DIM)

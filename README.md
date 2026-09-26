@@ -218,7 +218,6 @@ Each section above links the page it belongs to. These are the ones it does not:
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [docs/CVE-POSTURE.md](docs/CVE-POSTURE.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) | the threat model, every published container-runtime escape reproduced against this tree, and why a userspace VRAM cap is not a boundary |
 | [docs/CONFIG.md](docs/CONFIG.md) · [docs/EGRESS.md](docs/EGRESS.md) | the `kern.toml` schema, and egress |
 | [CHANGELOG.md](CHANGELOG.md) | what changed in each release, and the CLI stability rule the build enforces |
-| [blog/](blog/) | longer write-ups on how pieces of this were built and measured |
 
 ## What kern is not
 

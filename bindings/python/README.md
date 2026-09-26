@@ -45,13 +45,13 @@ print(r.stdout, r.fault)   # 4950  None
 That call ran the code in a fresh container from an OCI image, with **no network**, memory and PID
 caps and a deadline applied from outside, and threw the container away before returning.
 
-- **Cheap enough for every call**: a hundred calls are a hundred containers, **1.4 s** in total on
-  an i7-14700KF, and nothing is left behind.
+- **Cheap enough for every call**: a hundred calls are a hundred containers, and nothing is left
+  behind.
 - **State when you want it**: a `Sandbox()` you keep open shares `/workspace`, and `kernel()` keeps
   one warm interpreter where variables carry too.
 - **Imports are precompiled once**: the image's standard library is compiled in the background the
   first time you use that image and mounted READ-ONLY into every box after it, so `import json, re`
-  in a fresh container costs 17 ms instead of 46 on this machine. `pyc_cache=False` turns it off.
+  in a fresh container is about 3x cheaper. `pyc_cache=False` turns it off.
 - **Two parts**: the `kern` binary is the isolation, this package is the API in front of it.
 
 ## When you would use this
@@ -118,34 +118,43 @@ nothing, `pipx install kern-sandbox` is the other way. From macOS or Windows swa
 
 ## Safe by default
 
+**Two threats, and the second is not covered by the first.** A compromised dependency is stopped by
+the filesystem and the network: no network unless you ask, a read-only root, and only the paths you
+name. A prompt-injected agent is not, because it runs the code you asked for. The defence there is
+that the credentials were never in the box at all, which is why mounts over them are refused rather
+than discouraged.
+
 A bare `Sandbox()` has no network, no host mounts, seccomp on, capabilities dropped and a
 **mandatory** timeout. Every relaxation is a named argument. Two have surprised people, both
 measured:
 
-- **Mounts over sensitive sources are refused even if you ask**: the host's own directories, anything
-  with `.ssh`/`.aws`/`.kube` in its path, and kern's own state. No opt-out. Mount a copy.
+- **Mounts over sensitive sources are refused even if you ask**: the host's own directories, kern's
+  own state, and 17 credential directories by name (`.ssh`, `.aws`, `.kube`, `.gnupg`, `.netrc`,
+  `.npmrc`, `.git-credentials` and the rest), plus `~/.config/gh` and `~/.config/gcloud`. No opt-out.
+  Mount a copy.
 - **`network=True` includes the host's loopback**, where unauthenticated services live. A test read
   the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the middle setting and is route-level.
 
 ## How fast
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-vs.png" width="880" alt="Horizontal bar chart on a log scale, milliseconds per call: kern-sandbox with a prewarm pool 0.7 ms, kern-sandbox 14.5 ms, llm-sandbox with its session kept alive 77 ms, podman run --rm 286 ms, docker run --rm 292.8 ms, and Docker Sandboxes (sbx) into an already running sandbox 421 ms. Measured on an Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-21.">
+  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-vs.png" width="880" alt="Horizontal bar chart on a log scale, times the cost of one kern-sandbox call: kern-sandbox with a prewarm pool 21x faster, kern-sandbox 1x, llm-sandbox with its session kept alive 5x, podman run --rm 19x, docker run --rm 20x, and Docker Sandboxes (sbx) into an already running sandbox 29x. One tool-call, print(1), rootless, 2026-09-21; a heavier call is 7x rather than 20x.">
 </p>
 
-<sub>**14.5 ms is the number to quote**, one tool-call on an i7-14700KF: 4.9 ms of it is the box,
-the rest CPython starting. The 0.7 ms bar is a prewarm burst that falls back to 14.5 when the pool
-cannot keep up. `print(1)` flatters everyone: `import json,re` reads 45.4 ms against docker's 329.7,
-7x rather than 20x, and that 45 is the stock image compiling its standard library, not the box, against
-17.7 ms on a [precompiled one](https://github.com/getkern/kern/tree/main/examples/precompiled-image)
-([BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md)). Measure your own, p50.</sub>
+<sub>**A tool-call costs a twentieth of `docker run`.** Most of what is left is CPython starting
+inside the box, not the box, so a heavier call narrows it: `import json,re` is 7x rather than 20x,
+and 3x of that is the stock image compiling its standard library, which a
+[precompiled one](https://github.com/getkern/kern/tree/main/examples/precompiled-image) removes. The
+prewarm bar is what a call gets while the pool keeps up.
+([BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md) has the method. Measure
+your own.)</sub>
 
 ## Compared to what you are probably doing
 
 - **a venv** isolates imports, not the process: the code still has your files, your keys and your
   network.
-- **`docker run` per call** is the same idea with a daemon and a socket in front of it, at 292.8 ms
-  against 14.5 ms on the same machine. That socket is root-equivalent.
+- **`docker run` per call** is the same idea with a daemon and a socket in front of it, and costs
+  20x as much per call. That socket is root-equivalent.
 - **[nono](https://github.com/nolabs-ai/nono)** fences the environment you already have with
   Landlock, so your own tools are there and state carries between commands. This builds a new
   one from an image instead. Measured both ways in
