@@ -13,7 +13,7 @@
 
 <sub>rootless · no daemon · no socket · no VM · no cloud · no account</sub>
 
-<sub>**Works with** MCP clients · LangChain · pi · Python and Node</sub>
+<sub>**Works with** Claude Code · Cursor · Claude Desktop · Windsurf · LM Studio · LangChain · pi</sub>
 
 **[The runtime](https://github.com/getkern/kern)** ·
 **[MCP server](https://github.com/getkern/kern/blob/main/docs/MCP.md)** ·
