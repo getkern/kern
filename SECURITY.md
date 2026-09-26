@@ -1,59 +1,13 @@
 # Security Policy
-
 kern runs untrusted images inside a sandbox. It *will* receive security reports; here is the model
 and how to report.
 
 ## Reporting a vulnerability
-
 **Please do not open a public issue for security bugs.** Report privately via GitHub Security
 Advisories ("Report a vulnerability" on the repo) or email hello@getkern.dev. You will get an
 acknowledgement and a coordinated-disclosure timeline.
 
-## Verifying a release
-
-Release tags are GPG-signed and independently timestamped (see [provenance/](provenance/)). Both
-checks need the public key, so it ships in the repository:
-
-```sh
-gpg --import provenance/signing-key.asc
-gpg --fingerprint 9737460E1260B27B     # CFBC 8C13 C150 EBBA FBF2  F25C 9737 460E 1260 B27B
-git verify-tag "$(git describe --tags --abbrev=0)"   # or name the tag you are checking
-```
-
-The fingerprint above is what to compare against; the file is a convenience, not the authority, and a
-key shipped next to the thing it signs proves authorship of the release, not the identity of the
-author. The OpenTimestamps anchor in `provenance/` is what makes the DATE independent of this
-repository, of GitHub, and of the key holder.
-
-`gpg` will print the user id `getkerndev` when it checks a signature. That is the GitHub account the
-project was first published from, and it no longer exists; the user id is baked into the key and
-cannot be edited without re-issuing it. Compare the fingerprint, not the name.
-
-Released binaries carry a `.sha256` next to the `.tar.gz`:
-
-```sh
-sha256sum -c kern-x86_64-unknown-linux-musl.tar.gz.sha256
-```
-
-### Verifying what the SDK will run
-
-`pip install kern-sandbox` (or `npm i kern-sandbox`) installs the BINDING, not kern: the binding is
-pure source and ships no binary, and it executes the `kern` already on your `PATH` (or the one named by
-`KERN_BIN`). So the thing to verify is that binary, not the wheel:
-
-```sh
-python3 -c "import kern_sandbox, shutil, os; print(os.environ.get('KERN_BIN') or shutil.which('kern'))"
-sha256sum "$(command -v kern)"      # compare against the .sha256 of the asset you installed
-kern --version                      # the version is the TAG, so it names the release to compare with
-```
-
-The wheel and the npm tarball are served over TLS by registries that publish their own digests; that
-bounds tampering in transit and says nothing about the binary the binding will call, which is where
-the isolation actually lives. A binding from the registry paired with a `kern` of unknown provenance
-is the case to avoid, and the first command above is how you see which one you have.
-
 ## Threat model
-
 The structured view - assets, entry points, and the two trust levels (a kernel-enforced boundary
 versus a cooperative governor) as tables - is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md). This
 section is the summary; the rest of this file is the per-mechanism detail behind it.
@@ -62,24 +16,26 @@ section is the summary; the rest of this file is the per-mechanism detail behind
 
 - A malicious OCI image or `--rootfs` must not read or write host files outside the rootfs (path
   traversal, cross-layer symlink escape, whiteout-through-symlink, tar traversal).
+
 - A box must not see or affect host processes, mounts, or other boxes.
+
 - A box must not read or write kern's own runtime registry (a peer box's ssh host keys, secrets, and
   recorded capability/seccomp posture) through any host-path input: `-v`, `--secret`, `--env-file`,
   `--rootfs`, the `kern build` context/`-f` Dockerfile, or `kern cp`/`kern save -o`.
+
 - Resource limits must hold: fork bombs and OOM must be contained.
+
 - seccomp must block the dangerous syscall set unconditionally.
 
 **Out of scope, by design: the GPU.** No GPU limit ships, so there is no cap here to attack. What
 ships is the verdict about one, and the verdict is that a VRAM cap in userspace is a quota and not a
-boundary. The bypasses are named below rather than promised for later, and
-[`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) runs them.
+boundary.
 
 **An unprivileged user namespace is itself kernel attack surface.** kern's isolation is *built on*
 one, and userns has historically been a fertile source of kernel privilege-escalation CVEs. Running
 untrusted code in a box hands that code the in-kernel namespace surface to probe.
 
 ## kern or a microVM
-
 kern isolates with namespaces, seccomp and a pivoted root: millisecond start, one small binary, no
 VM, no daemon. That boundary is real and its attack surface is the host **kernel**, so a kernel
 privilege-escalation bug is an escape.
@@ -87,150 +43,60 @@ privilege-escalation bug is an escape.
 - **Reach for kern** when the code is yours or semi-trusted and you want speed, density and
   simplicity: CI jobs, build steps, dev sandboxes, your own agent's tool-calls under your
   supervision.
+
 - **Reach for a microVM** (Firecracker, Kata) or gVisor when you run actively hostile, multi-tenant
   code from strangers sharing one host, and a hardware-virtualization boundary is worth the startup
-  cost. That is not where kern competes.
+  cost.
 
 ## What is enforced now
-
 - **Namespaces**: user, PID, network (loopback-only), UTS, IPC and mount.
-- **`pivot_root`** into the rootfs. The default root is a writable overlay whose scratch is discarded
-  on exit; `--read-only` remounts it read-only, and the ordering (read-only only *after* the pivot)
-  is compile-enforced by a typestate. The overlay `lowerdir` is the content-addressed image cache,
-  **shared read-only** across boxes; every write lands in a **per-box ephemeral upper**. Asserted on a
-  real overlay by `overlay_lower_is_shared_ro_across_boxes` in CI: what one box writes is invisible to
-  a fresh box from the same image. After the pivot neither box can reach the lower's host path either (`/proc/kcore` and
-  `open_by_handle_at` are the two ways to escape a pivoted root to a host inode; the first is masked,
-  the second `ENOSYS`, so a leaked file handle cannot be opened). **What masked looks like from inside**, because an independent test had to work it out: the path is still THERE, bound over with `/dev/null`, so it reads as a character device of size 0 rather than as a missing file. A check that expects the path to be absent will report a hole that is not there.
-- **Least-privilege capabilities**: 16 never-needed dangerous caps (module load, raw I/O, `SYS_TIME`,
-  `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, `SYS_PTRACE`, `NET_ADMIN` and
-  `SYS_ADMIN`, the same default set Docker and Podman drop) are dropped from the effective, permitted,
-  inheritable, **ambient and bounding** sets just before exec, so no setuid or file-capability binary
-  in the image can wield them. The bounding drop is read back with `PR_CAPBSET_READ`, and under
-  `--cap-drop ALL` every set (`CapEff`/`CapPrm`/`CapInh`/`CapAmb`/`CapBnd`) is asserted all-zero from
-  the box's own `/proc/self/status`; ambient matters because it survives `execve` and `NO_NEW_PRIVS`
-  does not clear it. Dropping `SYS_PTRACE` closes the **cross-UID** `/proc/<pid>/mem` read in a
-  multi-uid box (its syscall is seccomp-killed anyway); a **same-uid** sibling read inside one box
-  stays possible and is not a boundary, a box being one trust domain, and host or peer-box memory is
-  unreachable regardless because those pids are not in the box's pid namespace. `--cap-drop
-  CAP` / `--cap-drop ALL` drops more;
-  `--cap-add CAP` keeps one that would otherwise go (add wins), and an unknown cap name is a hard
-  error so a typo cannot silently leave a cap in place. `NET_ADMIN` and `SYS_ADMIN` are in the dropped
-  set but CONDITIONALLY re-kept: `NET_ADMIN` for `--tun` (the box brings its own tunnel interface up;
-  kern brings `lo` up before the drop, so loopback never needed it) and `SYS_ADMIN` for `--privileged`
-  (in-namespace `mount`). Even a re-kept `CAP_SYS_ADMIN` is held only over the box's own user
-  namespace, and the always-on filter still blocks the escape syscalls it would unlock, so re-keeping
-  it cannot breach the host.
+
+- **`pivot_root`** into the rootfs. The default root is a writable overlay whose scratch is discarded on exit; `--read-only` remounts it read-only. The overlay `lowerdir` is the image cache, shared read-only across boxes, and every write lands in a per-box ephemeral upper.
+
+- **Least-privilege capabilities**: 16 never-needed dangerous caps (module load, raw I/O,
+  `SYS_TIME`, `SYSLOG`, `BPF`, `PERFMON`, MAC and audit admin, `SYS_BOOT`, `SYS_PTRACE`, `NET_ADMIN`
+  and `SYS_ADMIN`, the same default set Docker and Podman drop) are dropped from the effective,
+  permitted, inheritable, **ambient and bounding** sets just before exec, so no setuid or file-
+  capability binary in the image can wield them. Dropping `SYS_PTRACE` closes the **cross-UID**
+  `/proc/<pid>/mem` read in a multi-uid box (its syscall is seccomp-killed anyway); a **same-uid**
+  sibling read inside one box stays possible and is not a boundary, a box being one trust domain,
+  and host or peer-box memory is unreachable regardless because those pids are not in the box's pid
+  namespace.
+
 - **Always-on seccomp, allowlist by default**: the shipped default is moby's own default filter
   minus kern's 35 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
-  opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **35 escape syscalls** below:
-  24 that hard-kill plus the 11 that return `ENOSYS`; a rootless `--privileged` box denies 5 fewer. Do not take the number from
-  this file, ask the binary: `kern box <name> --image <ref> --show-config` prints
-  `seccomp_denied_syscalls` from the live lists. The set: kexec (+`_file_load`), module
-  load/unload, `ptrace` + `process_vm_readv`/`writev`, reboot, swap, the classic **and** new mount
-  API including the whole reconfiguration family (`mount_setattr`, `fspick`,
-  `fsopen`/`fsconfig`/`fsmount`, `open_tree`/`move_mount`), so a box cannot re-mount its own root
-  writable, plus `pivot_root`, `setns`, `unshare`, `bpf`, `clone3`, io_uring's three, `userfaultfd`,
-  `perf_event_open`, the keyring's three, `syslog`, and `open_by_handle_at` (the file-handle escape
-  primitive Docker gates on the dropped `CAP_DAC_READ_SEARCH`). Wrong-arch syscalls are killed, and on x86_64
-  so is every **x32-ABI** syscall, closing the bypass where the x32 alias of a denied number slips
-  past a number-only filter. This is verified end to end: an i386 `int 0x80` with `eax=21` (i386
-  `mount`, whose number is `access` on x86_64, which the allowlist permits) is `SIGSYS`-killed by the
-  arch guard, not silently reinterpreted against the x86_64 table.
-- **`clone(2)` is filtered on its ARGUMENTS**, and it is the only rule of that shape. Denying
-  `unshare` and `setns` does not stop a workload making a namespace, because `clone` takes the same
-  `CLONE_NEW*` flags, and a process that creates a nested user namespace is handed a full capability
-  set by the kernel, bounding set included. `clone` cannot simply be denied by number, since `fork`,
-  `vfork`, `posix_spawn` and `pthread_create` are all `clone` with no namespace bit, so the filter
-  reads the flags out of the register they arrive in and kills only the seven `CLONE_NEW*` bits.
-  `clone3` puts the same flags in a struct behind a pointer, which BPF **cannot dereference**, so it
-  is refused wholesale with `ENOSYS` rather than `SIGSYS`: the errno makes glibc fall back to plain
-  `clone` (which IS flag-filtered), where a kill would take down a benign `fork`. Verified on six
-  platforms. The filter inspects call ARGUMENTS in exactly two places - the
-  `clone` flags above and the `socket` domain (below) - and matches every other syscall by number
-  alone. So `ioctl` is allowed as a whole, not per-command (moby's default does the same), and
-  `personality` is left to the number-level allow: its risky flags weaken the box against ITSELF
-  (`ADDR_NO_RANDOMIZE` drops the box's own ASLR), never the host.
+  opt-out via `KERN_SECCOMP=denylist`.
+
+- **`clone(2)` is filtered on its ARGUMENTS**, and it is the only rule of that shape.
+
 - **`socket(AF_VSOCK, …)` is refused** with `EAFNOSUPPORT`, in BOTH the denylist and the allowlist.
-  The network namespace does
-  **not** contain vsock (it is not an IP address family), so on a host with a `vsock` transport loaded -
-  **WSL2**, where `VMADDR_CID_HOST` reaches Windows-side services that never touch the box's loopback
-  netns - a box could otherwise reach the host past its netns. It is a **reachability gap, not a
-  privilege escalation** (it grants no capability the box lacks), and `EAFNOSUPPORT` is the exact errno a
-  host with no `vhost_vsock` returns, so a workload that probes vsock falls back cleanly instead of
-  dying. The rule keys on the low 32 bits of `args[0]` (the domain) and is unaffected by `--privileged`.
-  Verified with a discriminant: on a host where vsock works, the same `socket(AF_VSOCK)` SUCCEEDS
-  outside a box and returns `EAFNOSUPPORT` inside one.
+
 - **Device access is deny-by-default**: the box's `/dev` is a fresh box-owned tmpfs shadowing the
-  image's, with only `null`, `zero`, `full`, `random` and `urandom` bound in. Any other node is
-  **absent**, and one the box fabricates is **inert**: a filesystem mounted in an unprivileged user
-  namespace is flagged `SB_I_NODEV`, so a `mknod`'d node cannot be opened to reach a host device. The
-  root, `/dev` and every extra mount also carry `MS_NODEV`, so this does not rely on that implicit
-  userns behaviour. Verified in a default box: `/dev/mem` and `/dev/kmem` are absent (no host RAM
-  window), `/sys/kernel/uevent_helper` is absent (no host `call_usermodehelper` as root),
-  `/proc/sysrq-trigger` and `/proc/sys/kernel/core_pattern` are read-only, and `/proc/kallsyms`
-  exposes no non-zero symbol address (KASLR-defeat guard).
+  image's, with only `null`, `zero`, `full`, `random` and `urandom` bound in.
+
 - **Landlock write-allowlist** (`--landlock-rw <path>`, opt-in, needs Linux 5.13+): a kernel LSM
   confines the box's writes to the named paths while the root stays read+exec, with symlinks opened
-  `O_NOFOLLOW`. **A real boundary**, verified: a box with `--landlock-rw /tmp` writes `/tmp` and is
-  denied `/etc` and `/root`. **Fail-closed**: where the kernel lacks Landlock, a box that passes the
-  flag is refused rather than run unconfined (verified on a Raspberry Pi 5, whose only LSM is
-  `capability`), so the flag cannot silently mean less on one host than on another. A box that does
-  not pass it is unaffected and keeps the namespace, seccomp and cgroup boundary.
-  The same flag works on **`kern run`**, which has no namespaces at all: Landlock restricts the calling
-  process, so it is the one real boundary the governor verb can offer. There it grants only the named
-  paths (plus the character devices a program opens for writing, `/dev/null` and friends), never the
-  host's `/tmp`, `/run` or `/proc`, and it refuses on the same fail-closed rule. Verified on this
-  desktop (ABI 8): writes land in the granted directory, `/tmp` and `/etc` are denied, a symlink
-  planted inside the grant does not reach outside it, and cross-directory `rename`/`link` out of the
-  grant are denied with `REFER` ungranted.
+  `O_NOFOLLOW`.
 
-  **Measured on four hosts**, each with a positive control, so a host that cannot run the command at
-  all is never read as a pass: enforced on this desktop (Linux 7.0, ABI 8, unprivileged) and on an
-  Ubuntu 24.04 VPS as root (kernel 6.8, ABI 4, where a write outside the grant is denied at uid 0
-  exactly as for a normal user); **refused**, on both `box` and `run`, on a Raspberry Pi 5 whose only
-  LSM is `capability` and on a Jetson Orin Nano (5.15-tegra, systemd 249). On the two that refuse, the
-  same command runs without the flag, so the refusal is the flag's and not the host's.
+**Measured on four hosts**, each with a positive control, so a host that cannot run the command at
+all is never read as a pass: enforced on this desktop (Linux 7.0, ABI 8, unprivileged) and on an
+Ubuntu 24.04 VPS as root (kernel 6.8, ABI 4, where a write outside the grant is denied at uid 0
+exactly as for a normal user); **refused**, on both `box` and `run`, on a Raspberry Pi 5 whose only
+LSM is `capability` and on a Jetson Orin Nano (5.15-tegra, systemd 249). On the two that refuse, the
+same command runs without the flag, so the refusal is the flag's and not the host's.
 
-  **Two limits of a write allowlist, measured rather than assumed**, because "writes stay in the
-  folder" is true of bytes and not of everything:
-  - **A FIFO inside the grant is a channel out.** A named pipe in the granted directory, with a reader
-    running outside the confinement, carries data past the boundary: the write is inside the grant and
-    Landlock permits it exactly as documented. Verified on this desktop, the string arrives outside.
-    The boundary bounds *where bytes land*, not *who reads them*; for that you need the workload to have
-    no shared filesystem with the reader at all, which is what a box's mount namespace gives.
-  - **`/dev/tty` is in the `run` auto-grant set**, so `TIOCSTI` is worth naming, but the vector does
-    not come from the grant: Landlock mediates filesystem access and not `ioctl`, and the workload
-    already holds the terminal through the inherited descriptors 0/1/2. It is closed by
-    `dev.tty.legacy_tiocsti`, `0` by default on current kernels and measured `0` here.
-  - **Metadata is not confined, only content.** Landlock has no access right for `chmod`, `chown` or
-    `utimes`, so those are not mediated at all: measured on this desktop, a command confined to one
-    directory changed the mode, owner and timestamps of a file outside it, while a write to that same
-    file's contents and a `rename` were both denied. The gap is in the LSM, not in kern, and it cannot
-    be closed here. What differs between the two verbs is the reach: in a box the workload only sees
-    the box's own filesystem, so the blast radius is whatever was mounted into it; under `run` there is
-    no mount namespace, so it is every file the invoking user owns. A confined agent cannot alter your
-    files, and can still make them world-readable.
-  - **A device node inside the grant is granted as a device.** A block device under a `--landlock-rw`
-    path is writable raw, and `IOCTL_DEV` applies to it. Creating one needs privileges the confined
-    process does not have, so this is reachable only if the operator put a device node in the directory
-    they granted. Named because the flag says "confine writes to this path", and a device node is not a
-    file of bytes.
+**Two limits of a write allowlist, measured rather than assumed**, because "writes stay in the
+folder" is true of bytes and not of everything: - **A FIFO inside the grant is a channel out.** A
+named pipe in the granted directory, with a reader running outside the confinement, carries data
+past the boundary: the write is inside the grant and Landlock permits it exactly as documented.
+Verified on this desktop, the string arrives outside.
+
 - **Egress allowlist** (`--egress-allow`, opt-in, foreground): the box reaches the internet only
-  through a kern-run filtering proxy. **SSRF-guarded**: a domain resolving to any non-public address
-  is refused at connect time even if allow-listed. Honest residual: a domain sharing a CDN IP and SNI
-  with an allowed one can be reached, so this is an application-layer allowlist for a semi-trusted
-  workload, **not a hard exfiltration boundary**. Full model in [docs/EGRESS.md](docs/EGRESS.md).
+  through a kern-run filtering proxy.
 
 ### What a denied syscall returns
-
 The filter has two verdicts. Real escape vectors (kexec, module load/unload, the mount API, `bpf`,
-`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Eleven, in seven
-families - the ten software probes for an optional fast path, plus the file-handle escape primitive -
-(io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's three, `syslog`, `clone3`, and
-`open_by_handle_at`), return **`ENOSYS`**. They are
-equally denied; the difference is only what the caller sees, and it is the difference between Redis
-falling back to its epoll path and Redis dying. The two sets are asserted disjoint by a test.
+`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`.
 
 The obvious objection is that a survivable denial is easier to enumerate than a fatal one. Measured
 inside a box on x86_64, kernel 7.0:
@@ -241,431 +107,268 @@ inside a box on x86_64, kernel 7.0:
 | syscall number 998 (exists on no kernel) | `-1 ENOSYS`, process survives |
 | `kexec_load`, `bpf` (denied, kill set) | killed by `SIGSYS` |
 | the same calls with no kern filter (control) | a *different* errno, never `ENOSYS` |
-
 So the errno discloses nothing: a filtered call is byte-identical to one this kernel does not
 implement. What is cheap to enumerate is the **permitted** set, and always was, since a permitted
-syscall runs and returns its own errno. Whether mapping a filter helps an attacker who already has
-code execution in the box is a separate and open question, recorded as unresolved in
-[ROADMAP.md](ROADMAP.md#known-gaps-and-what-would-settle-them) rather than argued either way here.
+syscall runs and returns its own errno.
 
 ### Read-only and cgroup-mask integrity
-
-Two independent layers, and neither is the default cap drop - which does **not** remove `CAP_SYS_ADMIN`
-(that cap is kept, held only over the box's own user namespace). First, the always-on filter **kills**
-the mount API - `mount`, `umount2`, `pivot_root`, `setns` and the whole reconfiguration family - so a
-box cannot re-mount its root writable OR `umount` the cgroup masks to reach the host hierarchy,
-whatever caps it holds. Second, a child user namespace's capabilities are not effective over the
-namespace that owns them, so even a kept or `--cap-add`ed `CAP_SYS_ADMIN` cannot act on the
-host-owned cgroupfs and mounts. There is no flag that waives the first layer: a seccomp filter is
-always installed, and BOTH postures block the mount API, the shipped allowlist by not allowing it and
-the wider `KERN_SECCOMP=denylist` opt-out by naming it. The one thing that relaxes it is
-`--privileged`, which drops the CLASSIC `mount`/`umount2`/`pivot_root` denial so a nested `kern box`
-can set itself up, keeps the NEW mount API (`fsopen`, `fsconfig`, `fsmount`, `move_mount`,
-`open_tree`) blocked regardless so the denial cannot be walked around, and is honoured only when the
-box root maps to an unprivileged host uid. The second layer stands under all of them. A third
-hardening, locking the mounts with `MNT_LOCKED` so the first layer holds even under `--privileged`,
-is deferred rather than shipped untested: it reorders capability-sensitive setup that must be
-verified on real namespaces.
+Two independent layers, and neither is the default cap drop - which does **not** remove
+`CAP_SYS_ADMIN` (that cap is kept, held only over the box's own user namespace). First, the always-
+on filter **kills** the mount API - `mount`, `umount2`, `pivot_root`, `setns` and the whole
+reconfiguration family - so a box cannot re-mount its root writable OR `umount` the cgroup masks to
+reach the host hierarchy, whatever caps it holds.
 
 ### Nested boxes (`--privileged`)
-
 By default a full `kern box` cannot run inside another; it gets `SIGSYS`. `--privileged` relaxes
 **exactly five** syscalls, `unshare`, `setns`, `mount`, `umount2` and `pivot_root`, so a nested box
-can create its own namespaces and rootfs. Everything else stays blocked, so a `--privileged` kern box
-is materially stronger than a Docker `--privileged` container, which drops the filter wholesale. It
-also skips `/proc` masking, because the kernel refuses a nested `/proc` mount under the locked masks.
+can create its own namespaces and rootfs.
 
 **Rootless-only, and gated on the effective mapping rather than the caller's euid:** it is honoured
 only when the box's root maps to an unprivileged host uid, decided by reading `/proc/self/uid_map`
-after the namespace is set up, and refused outright as real root, where a relaxed `mount` could reach
-the host-global `/proc/sys` knobs. Rootless, those knobs stay unwritable regardless: a `--privileged`
-box can read `/proc/sys` but not write it, verified against `core_pattern`.
+after the namespace is set up, and refused outright as real root, where a relaxed `mount` could
+reach the host-global `/proc/sys` knobs. Rootless, those knobs stay unwritable regardless: a
+`--privileged` box can read `/proc/sys` but not write it, verified against `core_pattern`.
 
 ### Pods share three namespaces, and one of them is the identity domain
-
 A pod exists so its members can reach each other by name, and that is a boundary decision, not a
-networking convenience. Read from `/proc/self/ns` in four boxes that are alive AT THE SAME TIME, the shared set is:
+networking convenience. Read from `/proc/self/ns` in four boxes that are alive AT THE SAME TIME, the
+shared set is:
 
 | namespace | in a pod | standalone |
 |---|---|---|
 | **user** | **shared** | private |
 | **network** | **shared** | private |
 | mount, PID, IPC, uts, cgroup | private | private |
-
 Four boxes at once, rather than four in a row, because a namespace inode is freed when its last
-member exits and the kernel reuses the number. An earlier version of this table said `uts` was shared
-too, read off boxes that had run one after another: with all four alive it is private, and the runs
-that said otherwise were comparing an inode a dead box had handed back. `pentest/pentest-pod-boundary.sh`
-asserts the whole set with that constraint built in.
+member exits and the kernel reuses the number. An earlier version of this table said `uts` was
+shared too, read off boxes that had run one after another: with all four alive it is private, and
+the runs that said otherwise were comparing an inode a dead box had handed back.
 
 The user namespace is the one to weigh. Members are one identity and capability domain rather than
 separate ones: root in one member and root in another are the same mapped authority, and a
-capability held over that namespace is held over it by all of them. Their mount, PID, IPC and cgroup
-namespaces stay private, so no member can see another's processes or mounts by looking, and the
-private PID namespace is what removes the obvious handle, since `/proc` inside a box does not list a
-sibling and there is no descriptor to pass to `setns`. That is a reachability property rather than a
-refusal by the kernel: a descriptor that arrives by another route is usable, because the capability
-check that would stop it is evaluated in a namespace they share.
+capability held over that namespace is held over it by all of them.
 
 The shared network namespace is a route. Members share `127.0.0.1` and the abstract socket
 namespace, which is exactly what makes a pod useful and also means a listener on loopback in one
-member is reachable from another. Measured, not argued:
+member is reachable from another.
 
 ```sh
 kern pod create p
 kern box srv --image alpine --pod p -d -- sh -c 'echo secret | nc -l -p 9999 -s 127.0.0.1'
 kern box cli --image alpine --pod p    -- nc -w 2 127.0.0.1 9999    # prints: secret
 ```
-
 The same command from a box outside the pod reaches nothing.
 
 **So: put workloads in one pod when you would have put them in one trust boundary anyway**, which is
 what a compose stack is. Do not reach for a pod to make a box start faster, even though it does
-([BENCHMARKS.md](BENCHMARKS.md) measures 2.59 ms against 3.89): the millisecond is real and so is the
-shared identity domain that buys it. For two workloads that must not reach each other, use two boxes
-and no pod.
+([BENCHMARKS.md](BENCHMARKS.md) measures 2.59 ms against 3.89): the millisecond is real and so is
+the shared identity domain that buys it.
 
 A pod maps a sub-uid range into its shared user namespace by default, the same default a standalone
-`--image` box has, because the mapping costs nothing per member once the holder has done it.
-`--no-uid-range` asks for the single-uid map instead: tighter, and the same trade the flag makes on a
-standalone box. Neither flag changes how much is shared, only what the shared namespace maps.
+`--image` box has, because the mapping costs nothing per member once the holder has done it. `--no-
+uid-range` asks for the single-uid map instead: tighter, and the same trade the flag makes on a
+standalone box.
 
 ## Resource caps
-
 Inside the systemd **user** manager's tree, `kern box` caps directly in its delegated `kern.slice`;
 where that is out of reach it falls back to a transient `systemd-run --user --scope` with
 `MemoryMax`/`TasksMax`. Either way fork bombs and OOM are cgroup-enforced, verified by read-back.
-Without a user manager a best-effort cgroup v2 path applies where the hierarchy is delegated, else it
-is skipped gracefully: on a host with **neither**, containment is not guaranteed. `--pids-limit N`
-sets `pids.max`, default 512, on the same terms.
 
 **`--require-limits` makes the uncapped fallback fatal.** With it (or `KERN_REQUIRE_LIMITS`) a box
 refuses to start, non-zero, unless the memory and pids caps are actually in force, **read back from
-the cgroup** rather than merely written: the OOM / fork-bomb backstop, never a box that runs believing
-it is capped when it is not. cpu/cpuset stay best-effort, as they carry no containment role.
-`--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) is the explicit inverse, for a host with no cgroup
-delegation (nested CI): accept uncapped operation silently instead of the once-per-host warning. The
-two are mutually exclusive; the default is unchanged (warn once, run uncapped).
+the cgroup** rather than merely written: the OOM / fork-bomb backstop, never a box that runs
+believing it is capped when it is not. cpu/cpuset stay best-effort, as they carry no containment
+role.
 
 **`kern exec` and the box's caps.** An exec'd command inherits them **only where the box sits in a
-delegated cgroup kern can write**. On the rootless per-box-scope path (an SSH login on an edge board,
-whose shell is a sibling scope) the kernel will not let it migrate into the box's transient scope, so
-the exec'd command runs **outside** the box's caps; kern warns rather than leak that silently. The
-box's own workload is always capped, and namespaces plus seccomp isolate the exec'd command
-regardless. Each exec does not get its own capped scope on purpose: that would grant every exec the
-box's full limit, so N execs could use N times the box's memory.
+delegated cgroup kern can write**. On the rootless per-box-scope path (an SSH login on an edge
+board, whose shell is a sibling scope) the kernel will not let it migrate into the box's transient
+scope, so the exec'd command runs **outside** the box's caps; kern warns rather than leak that
+silently.
 
 ## Delivering an environment, and who can read it
+`--env-file` exists so a secret does not have to travel in `argv`, where the process table shows it
+to every local user for as long as the box lives. That is the whole of what it buys, and the
+boundary is worth stating exactly, because a caller who reads more into it will be wrong in the
+direction that costs them.
 
-`--env-file` exists so a secret does not have to travel in `argv`, where the process table shows it to
-every local user for as long as the box lives. That is the whole of what it buys, and the boundary is
-worth stating exactly, because a caller who reads more into it will be wrong in the direction that costs
-them.
+**Against another user on the host**, the file's mode is the guard, and the Python binding's
+LangChain policy goes further: it puts the environment in an anonymous `memfd` and passes the
+descriptor, so there is no name on any filesystem to open, and a `kill -9` of the caller leaves
+nothing behind (a named temp file cleaned by a finalizer does, since finalizers do not run on a
+kill).
 
-**Against another user on the host**, the file's mode is the guard, and the Python binding's LangChain
-policy goes further: it puts the environment in an anonymous `memfd` and passes the descriptor, so there
-is no name on any filesystem to open, and a `kill -9` of the caller leaves nothing behind (a named temp
-file cleaned by a finalizer does, since finalizers do not run on a kill).
+**Against another process of the SAME user, it is not a boundary.** kern does not close descriptors
+it did not open, so an inherited one stays in its table for the life of the box: `/proc/<kern-
+pid>/fd/N` is readable by anything running as you. Measured with a sampler over a whole session
+rather than a single look at a running one, which is how a first and sloppier probe of ours reported
+the opposite.
 
-**Against another process of the SAME user, it is not a boundary.** kern does not close descriptors it
-did not open, so an inherited one stays in its table for the life of the box: `/proc/<kern-pid>/fd/N` is
-readable by anything running as you. Measured with a sampler over a whole session rather than a single
-look at a running one, which is how a first and sloppier probe of ours reported the opposite. The window
-is the session, not the milliseconds of startup.
-
-So: better than `argv` in every case, better than a named file after the process dies, and the same as
-either while it lives. Closing an inherited descriptor once the environment is parsed would shrink that
-window to the parse itself; until that lands, this is a documented limit and not a defence, and a host
-where other local processes are hostile is not one to hand a secret to through any of these paths.
+So: better than `argv` in every case, better than a named file after the process dies, and the same
+as either while it lives. Closing an inherited descriptor once the environment is parsed would
+shrink that window to the parse itself; until that lands, this is a documented limit and not a
+defence, and a host where other local processes are hostile is not one to hand a secret to through
+any of these paths.
 
 ## Flags that change the posture
-
 - **`--security-profile untrusted`** is an opt-in bundle for code nobody has read: the seccomp
   **allowlist** (deny-by-default, the same posture the default now installs), **`--cap-drop ALL`**,
-  and **`--read-only`** root, applied as a BASE that explicit
-  flags still override. `--cap-add ALL` and `--privileged` are **refused** under it (each would negate a
-  constituent, leaving a box labelled untrusted that is not), and a SET-but-unrecognised `KERN_SECCOMP`
-  is a usage error rather than a silent downgrade. It prints its resolved constituents (the real seccomp
-  mode and any surviving `--cap-add`), so the label cannot lie. It does **not** touch Landlock (which
-  needs the workload's real write paths) or set `--require-limits` (which would break a cgroup-less
-  host). A CLI/SDK flag, not a compose key: a compose service reaches the same posture through its
-  individual keys and `KERN_SECCOMP`.
-- **`--apparmor <profile>`** enters a pre-loaded AppArmor (LSM) profile on the box's `exec`, layering
-  kernel-enforced file/capability confinement over namespaces + seccomp - Docker's `--security-opt
-  apparmor=`. The profile must be loaded on the host (root, once, `apparmor_parser -r`); a missing or
-  unloadable profile **fails the box closed** rather than running it unconfined. `kern exec` re-enters
-  the box's own profile, so an exec is no less confined than the workload (parity with the caps + seccomp
-  it already reapplies) - and a box whose posture predates this recording is refused rather than exec'd
-  unconfined. The periodic `--health-cmd` probe is a deliberate exception: it is kern's OWN command, not
-  the workload, and runs OUTSIDE the profile (it reproduces the box's seccomp mode but not its AppArmor
-  profile) so a restrictive profile cannot make a box permanently unhealthy by denying its own check.
-  kern applies **no** default profile: without the flag the box keeps kern's own
-  (usually unconfined) and its boundary is namespaces + seccomp + cgroups, as documented above.
-- **`--user UID[:GID]` (or a name)** drops the workload after all privileged setup and the capability
-  drop. A name (`--user memcache`, compose `user:`, or the image's own `USER`) is resolved against the
-  image's `/etc/passwd`/`/etc/group`. Only ids mapped into the box's user namespace work, so a non-root
-  `--user` implies the uid/gid-range mapping. It **fails closed**: if the id cannot be mapped the box refuses to start rather than
-  silently running as in-box root. Note it **sheds all capabilities**, including any `--cap-add`.
-- **`--tmpfs PATH[:size]`** mounts a fresh `NOSUID,NODEV` tmpfs. Mounting one over the sandbox's own
-  hardened `/proc`, `/sys` or `/dev` is **refused**. The size is a real cap but counts against RAM.
+  and **`--read-only`** root, applied as a BASE that explicit flags still override.
+
+- **`--apparmor <profile>`** enters a pre-loaded AppArmor (LSM) profile on the box's `exec`,
+  layering kernel-enforced file/capability confinement over namespaces + seccomp - Docker's
+  `--security-opt apparmor=`.
+
+- **`--user UID[:GID]` (or a name)** drops the workload after all privileged setup and the
+  capability drop.
+
+- **`--tmpfs PATH[:size]`** mounts a fresh `NOSUID,NODEV` tmpfs.
+
 - **`--net`** (`--network host`) shares the host network namespace: there is then **no network
-  isolation**. The box can reach host `localhost` services, the host's networks, and **every
-  abstract-namespace UNIX socket** (X11, some D-Bus sockets), and can bind host-visible addresses.
-  It **cannot** sniff or spoof that network, though: the box keeps `CAP_NET_RAW` (`NET_ADMIN` is now
-  dropped by default) but only over its OWN user namespace, and a child namespace's capabilities are
-  not effective over a namespace the initial one owns, so an `AF_PACKET`/raw socket on the host netns
-  is `EPERM` (a CI
-  regression test opens both `AF_PACKET` and `AF_INET`/`SOCK_RAW` under `--net host` and asserts the
-  refusal, with the box's own private netns as the positive control) - the same scoping that stops
-  `--tun`+`--net host` from reconfiguring host interfaces.
-- **`--tun`** binds `/dev/net/tun` in. The box holds `CAP_NET_ADMIN`, but a child user namespace's
-  capabilities are not effective over a namespace owned by the initial one, so even with
-  `--network host` it **cannot reconfigure the host's interfaces** (`EPERM`).
-- **`-v src:dst`** binds a host path in. A writable volume is a hole through the sandbox by design;
-  use `:ro`. The two ends are resolved differently, on purpose. The **source** (host side) is the
-  operator's own path: kern rejects a non-existent source and `canonicalize`s it to an absolute,
-  symlink-free path at parse time. The **target** (`dst`, inside the box root) is walked one component
-  at a time with `O_NOFOLLOW`, refusing `..` and confined to the new root, so a hostile **image** that
-  ships a symlink at the mount point cannot redirect the bind onto a host path. The bind is
-  **non-recursive**, because a recursive one would clone host submounts that a `:ro` volume could then
-  leave writable; the flip side is that a filesystem already mounted *under* the source keeps its own
-  flags, so a pre-existing read-write submount there is not remounted read-only. A submount beneath the
-  source that a process other than the operator can create is thus outside the `:ro` guarantee - the
-  source path is trusted as the operator's own. kern additionally **refuses to expose its own runtime
-  registry** (`$XDG_RUNTIME_DIR/kern`) to a box. The rule is an **inverted default**: everything under
-  the registry root is refused except an explicit box-data allowlist (`logs/`, `scratch/`), so a
-  directory added later (as `waitexit/` was) is non-mountable by omission rather than mountable by
-  omission. A `mount --bind` alias whose path is elsewhere is caught by **device+inode identity**, not
-  path alone. This closes the class at **every** host-path entry point, not only `-v`: `--secret`,
-  `--env-file`, `--rootfs`, and the `kern build` context / `-f` Dockerfile route through the same check.
-  The registry holds a peer box's `ssh/` host keys, `secret`s, and `instances/` capability/seccomp
-  posture records: a box able to READ them steals a peer's secrets, and one able to WRITE them forges a
-  peer's recorded posture to elevate that peer's `kern exec`.
+  isolation**.
+
+- **`--tun`** binds `/dev/net/tun` in. The box holds `CAP_NET_ADMIN`, but a child user namespace's capabilities are not effective over a namespace owned by the initial one, so even with `--network host` it **cannot reconfigure the host's interfaces** (`EPERM`).
+
+- **`-v src:dst`** binds a host path in. A writable volume is a hole through the sandbox by design; use `:ro`.
+
 - **`-p [ip:]host:box`** binds **`0.0.0.0` by default**, which is every interface, which is the LAN.
-  That is Docker's default and kern matches it, and this file said the opposite for as long as it has
-  existed: it claimed `127.0.0.1`, the safer-sounding answer, while `kern box --help` and
-  [docs/CONFIG.md](docs/CONFIG.md) both said `0.0.0.0`. MEASURED, because a sentence in a security
-  document is worth exactly what a command says: `-p 18081:80` listens on `0.0.0.0:18081`,
-  `-p 127.0.0.1:18082:80` listens on `127.0.0.1:18082`. A reader who trusted this paragraph published a
-  service to their network believing it was loopback-only.
-  **For loopback only, one of two things**: write the address in the spec (`-p 127.0.0.1:H:B`), or set
-  `publish_bind = "127.0.0.1"` under `[kern]` in `kern.toml`, which is a CEILING rather than a default:
-  it NARROWS even a spec that explicitly writes `0.0.0.0`, and says how many it narrowed, because a
-  policy a downloaded compose file could defeat by writing an address would not be a policy. Measured:
-  with that key set, `-p 0.0.0.0:18093:80` listens on `127.0.0.1:18093` and kern prints the override.
-  It is read from the DEFAULT config only, never from a `--config` a compose file chose. The forwarder runs in the host network namespace,
-  the box stays in its own.
-- **`kern exec`** is restricted to the user who started the box. The exec'd process gets the same
-  always-on seccomp filter, **fail-closed**, and the same dropped-cap baseline. A box's custom
-  `--cap-drop`/`--user` are not reapplied, since they are not recorded per box, so an exec runs at the
-  baseline rather than the tightened profile. The host boundary still holds.
+
+- **`kern exec`** is restricted to the user who started the box.
+
 - **`kern cp`** resolves the in-box path with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`, so
-  every symlink and `..` is reinterpreted as if the box root were `/`: a hostile image cannot plant a
-  link that makes the copy touch a host file (the CVE-2019-14271 class). Nothing is executed inside
-  the box to do it. Regular files only, opened `O_NONBLOCK` so a planted FIFO cannot hang the copy,
-  with a 4 GiB cap. The **host side** runs the same registry guard as `-v`, in both directions: a copy
-  INTO a box refuses a source that resolves onto the registry (it cannot read a peer's key or posture
-  record into the box), and a copy OUT of a box refuses a destination that lands on the registry. The
-  destination check follows a symlink final component to where the write would **actually land**, so a
-  symlink planted in a writable directory cannot redirect the write onto a peer's posture record.
-  **`kern save -o <file>`** applies the same destination guard.
+  every symlink and `..` is reinterpreted as if the box root were `/`: a hostile image cannot plant
+  a link that makes the copy touch a host file (the CVE-2019-14271 class).
+
 - **`kern pause`/`unpause`** write only the box's own cgroup and refuse when it has none.
-  **`kern attach`** is read-only.
-- **What kern RENDERS is sanitised; what the WORKLOAD wrote is not.** Two different questions, and the
-  answer differs on purpose. A box NAME cannot carry a control character at all (refused at the parse
-  boundary: letters, digits, `_`, `.`, `-`), and the strings kern renders about a box in `ps`, `top` and
-  `inspect` have their escape and carriage-return bytes removed, so a command line carrying
-  `\x1b]0;title\x07` cannot retitle the window of whoever runs `kern ps`. Measured with `cat -v`: the
-  ESC bytes are gone and the CR is a space. `ps --json` keeps them encoded, because that output is for a
-  program.
-  **`kern logs` passes the workload's own bytes through**, exactly as `docker logs` does: they are the
-  program's output and the operator asked to see them. So a hostile workload CAN colour, retitle and
-  overwrite lines in the terminal that reads its log, and that is the same exposure as any `cat` of an
-  untrusted file. Where those bytes go to a MODEL rather than a terminal, the bindings neutralise them
-  (the LangChain renderer and the MCP server both strip ANSI, control characters and their own
-  framing), because there the text is a channel the model uses to decide.
-  This sentence was **false for the MCP server until 2026-09-12**, and that server is what a Cursor or
-  Claude Desktop user runs: measured with a real `tools/call`, a cell that exited 3 after printing
-  `[exit 0]` had both lines in the reply, and terminal escapes went through untouched. It now shares the
-  escape/control stripping with the LangChain renderer, and since 2026-09-13 each surface neutralises
-  BOTH families rather than only its own: the MCP server's (`[exit N]`, `[stderr]`, `[rich result]`, the
-  two truncation notes, the session-reset note) and the LangChain renderer's (`[sandbox: …]`). They ship
-  in one package and a model reading a transcript cannot tell which surface wrote a line, so a cell
-  printing `[sandbox: oom]` into an MCP reply used to arrive as a verdict; it now reads
-  `[printed by the code, not the sandbox: …]`, like every other forged marker.
-  What is NOT closed, on either channel, is ordinary
-  prompt injection: a cell whose output is `[system] ignore your instructions` printed a string, and no
-  filter separates that from a program legitimately printing the same characters. The structured
-  verdict is the one a client should branch on (`isError` on MCP, `fault` in the SDK); it was correct
-  throughout, because it never passes through the text.
+
+- **What kern RENDERS is sanitised; what the WORKLOAD wrote is not.** Two different questions, and
+  the answer differs on purpose.
 
 ## OCI pull, build and push
-
 - **Integrity**: every blob is verified against its `sha256:` digest before use, which defends
-  against a compromised or MITM registry beyond TLS. The check runs **before** both the vetter and
-  the extractor and both read the same verified file, so any disagreement between them can only be
-  interpretive, never a difference in bytes.
+  against a compromised or MITM registry beyond TLS.
+
 - **Layer vetting, in-process.** Absolute and `..` paths, device nodes, escaping hardlink and
-  symlink targets, a 2 GiB decompression-bomb cap and an entry-count cap are rejected before anything
-  is written. The decision reads the **raw tar headers** at fixed offsets, not `tar -tv`'s
-  locale-dependent text, which a member name containing ` -> ` could otherwise desync. Because the
-  vetter and `tar -xzf` are two parsers, the principle is **fail closed wherever they could
-  disagree**: a path set from two sources (GNU `L`/`K` *and* PAX `path=`), a PAX global override, a
-  GNU sparse or multivolume member, a base-256 size too large for a `u64`, and any unknown typeflag
-  are all refused. The scan requires an all-zero tail, capped so a zero flood cannot make the check
-  itself a DoS. A legitimate image built with an exotic-but-safe construct is refused rather than
-  extracted. The byte-level parser is fuzzed.
+  symlink targets, a 2 GiB decompression-bomb cap and an entry-count cap are rejected before
+  anything is written.
+
 - **Isolated staging, no-follow merge**: each layer extracts into a fresh staging dir, then merges
   into the rootfs refusing to traverse any symlink, so the cross-layer escape class is closed
-  structurally rather than by trusting tar. Whiteouts, including opaque dirs, are applied under the
-  same guard, and the cache and scratch dirs are mode 0700 and user-owned.
-- **Image file modes are preserved as-is**, so an image's `/tmp` keeps its sticky `1777`. Stated
-  plainly: an image shipping a world-writable system dir leaves it world-writable **inside the box**.
-  It is contained, being the box's own rootfs on a 0700 host scratch, never the host, and a setuid
-  bit there is inert because the box root is `MS_NOSUID`.
-- **`push`** packs the rootfs with ownership normalized to uid/gid 0 and setuid/setgid bits stripped,
-  so an untrusted base cannot smuggle a privilege bit into what you publish.
+  structurally rather than by trusting tar.
+
+- **Image file modes are preserved as-is**, so an image's `/tmp` keeps its sticky `1777`.
+
+- **`push`** packs the rootfs with ownership normalized to uid/gid 0 and setuid/setgid bits
+  stripped, so an untrusted base cannot smuggle a privilege bit into what you publish.
 
 ## Registry authentication
-
 - Auth follows the standard registry-v2 challenge, so any compliant registry works, anonymously or
   with `kern login`.
+
 - **Every request is TLS-pinned**: `--proto =https`, `--proto-redir =https` where redirects are
   followed, a bounded `--max-redirs` and a `--` URL terminator, so a hostile registry cannot
   downgrade a fetch to `http://` or `file://` or smuggle a `-`-leading URL into a flag.
+
 - **Credentials never touch argv.** They are stored `0600` in a `0700` dir, base64-encoded for
   obfuscation only (the mode is the protection), read from the terminal with echo off, and fed to
   `curl` through a `-K -` **stdin config**, so no same-uid process can read them from
-  `/proc/<pid>/cmdline`. Control characters are stripped so a crafted credential cannot inject a curl
-  directive.
+  `/proc/<pid>/cmdline`.
+
 - **Realm pinning (CVE-2020-15157 class).** For a Bearer challenge the stored password goes to the
   advertised token realm **only if that host is the registry host or a subdomain of its parent
-  domain**; otherwise the token is fetched anonymously, with a warning. The realm host is parsed
-  exactly as curl dials it, userinfo and port stripped, so `realm="https://trusted:0@evil.com/"`
-  cannot masquerade as trusted, and a multi-label public suffix (`co.uk`) is never a trustable
-  parent. A cross-host redirect during upload is refused.
+  domain**; otherwise the token is fetched anonymously, with a warning.
 
 ## vGPIO device passthrough (opt-in)
-
 A `vgpio:` profile **deliberately widens** the box's device surface: it binds the listed peripherals
 (`/dev/i2c-*`, `/dev/spi*`, `/dev/gpiochip*`, camera and audio, and `/sys` dirs for pwm, adc, 1-wire
 and leds) into the box. Only the listed devices are exposed, deny-by-default still holds for
-everything else, and the source paths are canonicalized and re-checked to stay under `/dev/`. Two
-honest limitations:
+everything else, and the source paths are canonicalized and re-checked to stay under `/dev/`.
 
 - **GPIO is chip-granular, not per-line.** Requesting any `pins` binds every `/dev/gpiochipN`, and
-  that character device exposes *all* of the controller's lines via ioctl. `pins = [17]` does **not**
-  restrict the box to line 17; the kernel has no per-line mount boundary. The pin list is cooperative
-  metadata, not a security boundary.
-- **`--read-only` keeps a vGPIO box's `/sys` writable**, because LED and PWM control are writes. The
-  root filesystem is still read-only.
+  that character device exposes *all* of the controller's lines via ioctl. The pin list is
+  cooperative metadata, not a security boundary.
+
+- **`--read-only` keeps a vGPIO box's `/sys` writable**, because LED and PWM control are writes.
 
 Grant a `vgpio:` profile only to workloads you would trust with that hardware.
 
 ## GPU: no cap ships, and why one in userspace would not be a boundary
-
-**No GPU limit ships, so there is no cap here to attack.** What ships is a read-only verdict:
-`kern doctor` reads sysfs and reports what a VRAM cap on each device would be worth. `TIER-HW` where
-a MIG or SR-IOV partition is present, which the device enforces rather than the tenant, though kern
-reads its presence and **has not measured the VRAM split**; `TIER-SOFT` for everything else, which on
-consumer hardware is a cooperative quota, NOT a boundary against malicious code. Nothing intercepts a
-driver call and nothing caps a GPU.
+**No GPU limit ships, so there is no cap here to attack.** What ships is a read-only verdict: `kern
+doctor` reads sysfs and reports what a VRAM cap on each device would be worth. `TIER-HW` where a MIG
+or SR-IOV partition is present, which the device enforces rather than the tenant, though kern reads
+its presence and **has not measured the VRAM split**; `TIER-SOFT` for everything else, which on
+consumer hardware is a cooperative quota, NOT a boundary against malicious code.
 
 The reason a userspace cap cannot be a boundary is that the workload does not have to go through it:
 measured on an RTX 5060 Ti, a process linking only libc reached the driver with a raw ioctl and was
-answered, on two distinct driver ABIs. The full argument, the four other measured bypasses, the scope
-it does and does not cover, and **two named blind spots** in kern's own detection are in
-[docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md), and
-[`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-claims.sh) runs them.
+answered, on two distinct driver ABIs. The full argument, the four other measured bypasses, the
+scope it does and does not cover, and **two named blind spots** in kern's own detection are in
+[docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md), and [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-
+claims.sh) runs them.
 
 **What to do with a hostile GPU tenant.** Give it a MIG instance or an SR-IOV virtual function, or
 give it the whole device. A cooperative quota is the right tool for packing several of your own
 models onto one card, and the wrong tool for containing someone else's.
 
 ## vDisk
-
 A `vdisk:` profile mounts a size-capped volume at `/vdisk/<name>`. Rootless it is a RAM-backed
 tmpfs: the size is a real quota (`ENOSPC` past it) but it counts against RAM, so pair a large vdisk
-with `--memory`; kern warns at 1 GiB and above. The mount is created inside a fresh box-owned
-`/vdisk` tmpfs with symlinks neutralized, so a hostile image shipping `/vdisk` as a symlink cannot
-redirect it. A disk-backed ext4-on-loop backend is used instead when kern runs privileged, configured
-`LO_FLAGS_AUTOCLEAR` and unwound immediately on any setup failure so a half-built vdisk cannot leak a
-loop device or a stray mount. `iops` and `bandwidth` limits are recognised but not yet applied, and
-are reported rather than silently dropped.
+with `--memory`; kern warns at 1 GiB and above.
 
 ## Secrets (`--secret`)
-
 `--secret` delivers a value as `/run/secrets/<name>`, mode **0400**, without it landing in the image
 or the environment. Three forms: `NAME=value` (inline, and **visible in the host's `ps`**, so prefer
-a file or stdin for real secrets), `NAME=-` (read from kern's stdin, never in argv), and `SRC[:NAME]`
-(a host file; a world-writable source is refused and a group-readable one warned). The name is
-validated to a single path component and duplicates are rejected.
+a file or stdin for real secrets), `NAME=-` (read from kern's stdin, never in argv), and
+`SRC[:NAME]` (a host file; a world-writable source is refused and a group-readable one warned).
 
 The bytes are read on the host **before the fork**; inside the box they are written to a RAM-backed
 tmpfs, so a secret never touches the persisted overlay upper and is gone when the box exits. A
-hostile image shipping `/run/secrets` as a symlink is neutralised, and each file is created
-`O_EXCL | O_NOFOLLOW` inside the box-owned tmpfs so the write cannot be redirected out.
+hostile image shipping `/run/secrets` as a symlink is neutralised, and each file is created `O_EXCL
+| O_NOFOLLOW` inside the box-owned tmpfs so the write cannot be redirected out.
 
 ## SSH (`--ssh`)
-
 `--ssh PORT` runs a throwaway `sshd` **inside** the box and publishes it via the ordinary rootless
 forwarder. It is for interactive box access, not a hardened bastion.
 
-- **Keys never touch the image.** Without `--ssh-key`, kern generates a throwaway ed25519 keypair
-  in the owner-only runtime dir. The host key, `authorized_keys` and config live on the box's `/run`
-  tmpfs, remounted read-only after setup. sshd is **pubkey-only** and dies with the box's PID 1.
-- **Needs a group mapping**, because sshd's privilege separation calls `setgroups`, which a
-  single-uid user namespace forbids. So `--ssh` implies the uid/gid-range mapping via `newgidmap`;
-  without `newuidmap` login will not complete and kern says so. The image must ship `openssh-server`.
-- **Honest scope: the forked sshd, and the shells it spawns, run WITHOUT the box's seccomp filter and
-  with the pre-drop capability set**, because they are forked before both steps. Those caps are
-  namespaced and largely inert against the host, but the SSH subtree is strictly more privileged than
-  the box's main workload. Standing sshd up also **runs the image's own binaries** pre-seccomp, so a
-  hostile image could ship a malicious one: that is the interactive-trust surface you opted into.
-- **It logs in as (namespaced) root even with `--user`**, since sshd is forked before the drop. That
-  root is your own uid mapped to 0 in the box with no host privilege, but a `--user`-restricted box
-  is still reachable as root over SSH. With `--net` the sshd binds the **host** loopback directly.
+- **Keys never touch the image.** Without `--ssh-key`, kern generates a throwaway ed25519 keypair in
+  the owner-only runtime dir.
+
+- **Needs a group mapping**, because sshd's privilege separation calls `setgroups`, which a single-
+  uid user namespace forbids.
+
+- **Honest scope: the forked sshd, and the shells it spawns, run WITHOUT the box's seccomp filter
+  and with the pre-drop capability set**, because they are forked before both steps.
+
+- **It logs in as (namespaced) root even with `--user`**, since sshd is forked before the drop.
 
 ## Volumes
+- **Named volumes** live under `~/.local/share/kern/volumes`.
 
-- **Named volumes** live under `~/.local/share/kern/volumes`. The name is charset-validated to a
-  single component and the resolved path is canonicalized and confined under the volumes dir, so a
-  planted symlink cannot redirect the bind.
 - **Per-volume quota** is real only when the box runs privileged (ext4-on-loop); otherwise it falls
-  back to a plain directory and kern **says the quota is not enforced**, never silently drops it. The
-  size is clamped to 64 TiB at create time and again when read back, so a hand-edited `meta.json`
-  cannot drive a multi-exabyte `mkfs`. The first privileged mount seeds the fresh image from the
-  unenforced backend, so upgrading does not hide files already written.
-- **Network volumes** (`nfs://`, `smb://`, `sshfs://`) mount rootless via FUSE. Host and path are
-  strictly validated (no shell metacharacters, control characters, or a leading `-` a tool would read
-  as an option) and everything is spawned via argv, never a shell. A mount that cannot reach its
-  server is killed after 25 s and unmounted when the box exits. `sshfs` uses
-  `StrictHostKeyChecking=accept-new`, so an active MITM at *first* contact could impersonate the
-  server: pin the host key beforehand on untrusted networks.
+  back to a plain directory and kern **says the quota is not enforced**, never silently drops it.
+
+- **Network volumes** (`nfs://`, `smb://`, `sshfs://`) mount rootless via FUSE.
 
 ## Supervision (`--timeout`, `--health-action`)
-
 The watchdogs run **host-side**, forked **before** the box's `unshare(CLONE_NEWPID)`, the only
 position from which they can reliably signal the box's ns-init. An in-box process cannot reach them:
 the foreground `--timeout` pipe is `FD_CLOEXEC`, severed at the workload's exec, and the target pid
 comes from the trusted `fork()` return or the host-only registry, never from anything the box can
-write. So an untrusted workload **cannot forge a pid to make the host signal an arbitrary process**.
-The foreground watchdog pins its target with a **pidfd** taken while the box is alive, so a delayed
-signal cannot land on a reused pid.
+write.
 
 Known, bounded limitation: `--health-action restart` re-reads PID 1 from the registry and `SIGKILL`s
 it, and during a restart gap that pid could in principle be reused by another process **of the same
 user** before the kill lands. The window is sub-quantum and not attacker-targetable, since an
-unprivileged kill only reaches same-uid processes and an in-box workload cannot create host-namespace
-processes to steer the reuse. It is not a cross-tenant boundary.
+unprivileged kill only reaches same-uid processes and an in-box workload cannot create host-
+namespace processes to steer the reuse. It is not a cross-tenant boundary.
 
 ## Check it yourself
-
 The claims above are asserted by five adversarial suites in [pentest/](pentest/), which ask the
 kernel what is true rather than asking kern to report on itself: that a published port cannot tunnel
 into a host service, that `--ssh` does not hand out the host's shell, that `kern exec` does not
-escape the box, that a box cannot raise its own `memory.max` and sees no cgroup above its own, that a
-device not granted does not cross, and that a SIGKILLed supervisor does not leave a host port held.
+escape the box, that a box cannot raise its own `memory.max` and sees no cgroup above its own, that
+a device not granted does not cross, and that a SIGKILLed supervisor does not leave a host port
+held.
 
 The fifth is the GPU claim suite, and it is the one that attacks a claim rather than a mechanism: it
 reads what `kern doctor` says about each card, then runs T1 to T9 against the host's own driver and
@@ -674,17 +377,13 @@ fails if the two disagree.
 ```sh
 sh pentest/pentest-gpu-claims.sh ./target/release/kern
 ```
-
 ```sh
 cargo build --release
 sh pentest/run-with-local-registry.sh ./target/release/kern pentest/pentest-ports.sh
 ```
-
 That wrapper serves the test image from your own loopback, so nothing here needs a registry account
 or a network. Exit status is 0 only if every asserted property held; a host that cannot answer a
-question reports `SKIP` with the reason and never counts it as a pass. Measured results, and what is
-deliberately not wired into CI, are in [pentest/README.md](pentest/README.md).
+question reports `SKIP` with the reason and never counts it as a pass.
 
 ## What's supported
-
 The code on `main` is what's supported; security fixes land there.
