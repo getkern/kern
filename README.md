@@ -20,29 +20,8 @@
 </div>
 
 ```sh
-# install the release binary (static, checksum-verified by the script)
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-
-# what THIS host can enforce, and the one command to fix it if something is missing
-kern doctor
-
-# a throwaway shell in a real OCI image: rootless, kernel-enforced, a few ms
-kern box dev --image alpine -it -- sh
 ```
-
-```powershell
-# Windows: the same binary under WSL2, and the script sets WSL2 up for you
-irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
-```
-
-```sh
-# macOS, two steps: a Linux VM, then kern inside it
-brew install colima && colima start && colima ssh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # inside the VM
-kern doctor    # run this first inside the VM: it names anything the guest still needs
-```
-
-<sub>Runs on Linux and ARM boards directly, on Windows through WSL2 and on a Mac through colima, Lima or OrbStack: the same binary and the same CLI under a Linux kernel, on any distribution with unprivileged user namespaces and cgroup v2. The script installs one static file to `~/.local/bin` and refuses a download whose SHA256 does not match; from source instead, `cargo install --git https://github.com/getkern/kern getkern --locked`. [docs/INSTALL.md](docs/INSTALL.md) has the rest, including the one thing [Ubuntu 23.10 and newer needs first](docs/INSTALL.md#requirements-and-limitations).</sub>
 
 ---
 
@@ -57,30 +36,46 @@ kern run --memory 256m --cpus 0.5 -- ./job # limits only, host still visible
 kern compose up -d
 ```
 
-- **A real container.** Real OCI images: `pull`, `build` from a `Containerfile` or `Dockerfile`,
-  `commit`, `push`, `save`/`load`. A box from an image starts in single-digit milliseconds.
-- **Run LLM-generated code in a sandbox.** The snippet a model just wrote, the command an agent just
-  decided to run: kern starts a box, runs it, deletes it. Network off unless you ask, memory and PID
-  caps where your host delegates them, capabilities dropped, seccomp deny-by-default, a timeout from
-  the outside. A timeout, an OOM-kill or a blocked syscall comes back as a **typed fault** next to
-  the exit code instead of a stack trace. Wire it from Python, Node, LangChain or any MCP client
-  [below](#kern-sandbox-run-an-agents-code-from-python-or-node), and [what it is not](#what-kern-is-not).
-- **Rootless, always.** User, PID, mount, network, UTS and IPC namespaces, an overlay or
-  read-only root pivoted in, a deny-by-default seccomp allowlist and cgroup v2 limits. One flag,
-  `--security-profile untrusted`, is the whole hardened bundle.
-- **Resource profiles, not just isolation.** CPU (`vcpu:`), memory, disk (`vdisk:`) and devices
-  (`vgpio:`), declared once in a `kern.toml` and attached by name. `kern run` applies the same caps
-  to a process on the host, with no sandbox at all, plus `--landlock-rw <path>` to confine that
-  process's writes with the kernel's own LSM. [docs/RESOURCES.md](docs/RESOURCES.md)
-- **Stacks, in kern's own format or in the one you already have.** `kern compose <file> up` takes a
-  `stack.toml` (`[box.NAME]` tables, with the resource profiles above) or a `docker-compose.yml`, with
-  no conversion step. One stack to one pod, services reaching each other by name.
-- **The tools around them.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
-  `doctor`. The Python binding also plugs into LangChain twice: as a code tool, and as an execution
-  policy for its shell middleware.
+- **A real container.** Real OCI images: `pull`, `build`, `commit`, `push`, `save`/`load`. A box
+  starts in single-digit milliseconds.
+- **A sandbox for code your model wrote.** kern starts a box, runs it, deletes it. Network off
+  unless you ask, memory and PID caps, capabilities dropped, seccomp deny-by-default, a timeout from
+  outside. A timeout, an OOM-kill or a blocked syscall comes back as a **typed fault** next to the
+  exit code, not a stack trace.
+- **Rootless, always.** Six namespaces, an overlay or read-only root, a seccomp allowlist and cgroup
+  v2 limits. `--security-profile untrusted` is the whole hardened bundle, in one flag.
+- **Your `docker-compose.yml`, unchanged.** Or kern's own `stack.toml`. One stack to one pod,
+  services reaching each other by name.
+- **Caps without a sandbox too.** `kern run` applies the same memory and CPU limits to a process on
+  the host, plus `--landlock-rw <path>` to confine its writes with the kernel's own LSM.
+  [docs/RESOURCES.md](docs/RESOURCES.md)
+- **The tools you expect.** `ps`, `logs`, `exec`, `stats`, `inspect`, `wait`, `top` (a live TUI),
+  `doctor`. The Python binding plugs into LangChain twice: as a code tool, and as an execution policy
+  for its shell middleware.
 
-Its entire Rust dependency tree is `libc`: JSON and OCI manifests are parsed by hand, and `pull`
-shells out to the `curl` and `tar` already on the machine rather than linking a TLS stack.
+<sub>One Rust dependency, `libc`: JSON and OCI manifests are parsed by hand, and `pull` shells out to
+the `curl` and `tar` already on the machine rather than linking a TLS stack.</sub>
+
+## Install
+
+```sh
+# Linux and ARM boards: one static file in ~/.local/bin, SHA256 checked by the script
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
+
+# macOS: a Linux VM first, then the line above inside it
+brew install colima && colima start && colima ssh
+```
+
+```powershell
+# Windows: the same binary under WSL2, and the script sets WSL2 up for you
+irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
+```
+
+Then `kern doctor` says what this host can enforce, and names the one command to fix anything
+missing. Any distribution with unprivileged user namespaces and cgroup v2 works. From source:
+`cargo install --git https://github.com/getkern/kern getkern --locked`.
+[docs/INSTALL.md](docs/INSTALL.md) has the rest, including the one thing
+[Ubuntu 23.10 and newer needs first](docs/INSTALL.md#requirements-and-limitations).
 
 ## Quickstart
 
@@ -186,20 +181,14 @@ kern does not have overlay networks, Swarm, CRI, or a GPU passed into the contai
 
 ## Performance
 
-One isolated `/bin/true`, same machine, same day.
+| one isolated `/bin/true` | kern is |
+|---|---:|
+| one container, against `docker run --rm` | **80x faster** |
+| 200 at once, against `docker run --rm` | **130x faster** |
+| one container, against rootless `runc` | **3.6x faster** |
 
-| runtime | one container | 200 at once | what it does per start |
-|---|---:|---:|---|
-| **kern** `box --rootfs` | **2.7 ms** | **0.10 s** | namespaces, overlay, `pivot_root`, seccomp allowlist, memory and PID cap |
-| **kern** `box --image` | **3.6 ms** | **0.12 s** | the same, plus unpacking an OCI image |
-| bubblewrap | 2.7 ms | 0.15 s | namespaces and a bind mount, no seccomp and no cgroup cap |
-| runc, rootless | 13.2 ms | 0.32 s | OCI runtime, normally driven by an engine above it |
-| podman `run --rm` | 288 ms | 43.6 s | forks `conmon` and the full OCI stack every run |
-| docker `run --rm` | 294 ms | 16.6 s | client, daemon round trip, containerd, runc |
-
-<sub>Intel i7-14700KF, Linux 7.0.0, rootless, 2026-09-20. The single start is the best replica on an
-idle machine, so expect ~4 ms on a working one; the parallel figure is the median of three. Method,
-dates and the drift: [BENCHMARKS.md](BENCHMARKS.md). Your hardware:
+<sub>Same machine, same workload, same day, rounded down. On ARM boards the docker gap is nearer
+30x. Every runtime, the numbers and the method: [BENCHMARKS.md](BENCHMARKS.md). Yours:
 `python3 examples/benchmark.py --runs 200 --conc 200`.</sub>
 
 ## Security
