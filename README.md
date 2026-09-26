@@ -71,10 +71,10 @@ brew install colima && colima start && colima ssh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # inside the VM
 ```
 
-Then `kern doctor` says what this host can enforce, and names the one command to fix anything
-missing. Any distribution with unprivileged user namespaces and cgroup v2 works.
-[docs/INSTALL.md](docs/INSTALL.md) has the rest: building from source, and the one thing
-[Ubuntu 23.10 and newer needs first](docs/INSTALL.md#requirements-and-limitations).
+Then run `kern doctor`: it checks the host and prints what to fix. kern needs unprivileged user
+namespaces and cgroup v2. Building from source, and the extra step on
+[Ubuntu 23.10 and newer](docs/INSTALL.md#requirements-and-limitations), are in
+[docs/INSTALL.md](docs/INSTALL.md).
 
 ## Quickstart
 
@@ -83,7 +83,7 @@ kern box dev --image alpine -it -- sh            # a shell in a real OCI image
 kern box svc --image nginx:alpine -d -p 8080:80  # a service, published on the host
 kern box job --image python:3.12-slim --security-profile untrusted -- python3 /w/x.py
 kern compose stack.toml up                       # a whole stack, one command
-kern ps                                          # what is running (--json, like every verb that lists)
+kern ps                                          # what is running (--json too)
 ```
 
 `--security-profile untrusted` is the seccomp allowlist, `--cap-drop ALL` and `--read-only` in one
@@ -94,7 +94,7 @@ From Python or Node, **Kern Sandbox**
 wraps the same binary:
 
 ```sh
-python3 -m venv .venv && . .venv/bin/activate    # PEP 668: most distributions refuse a system-wide pip
+python3 -m venv .venv && . .venv/bin/activate    # PEP 668: no system-wide pip
 pip install kern-sandbox                         # Node: npm install kern-sandbox
 ```
 
@@ -102,7 +102,7 @@ pip install kern-sandbox                         # Node: npm install kern-sandbo
 from kern_sandbox import run_code
 
 r = run_code("import platform; print(platform.python_version())")
-print(r.stdout)          # ran in a fresh box; a timeout / OOM / blocked escape is data on r.fault
+print(r.stdout)          # a fresh box; r.fault says if it was stopped
 ```
 
 It finds `kern` on your PATH, or wherever `$KERN_BIN` points.
