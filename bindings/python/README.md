@@ -13,7 +13,7 @@
 
 <sub>rootless · no daemon · no socket · no VM · no cloud · no account</sub>
 
-<sub>**Works with** Claude Code · Cursor · Claude Desktop · Windsurf · LM Studio · LangChain · pi</sub>
+<sub>**Works with** Claude Code · Cursor · Claude Desktop · LM Studio · LangChain · pi</sub>
 
 **[The runtime](https://github.com/getkern/kern)** ·
 **[MCP server](https://github.com/getkern/kern/blob/main/docs/MCP.md)** ·
@@ -92,7 +92,7 @@ prints `[exit 0]` can't fake it. Also `killed` and `escape_blocked`.
 
 ## Works with
 
-- **Any MCP client**: Cursor, Claude Code, Claude Desktop, LM Studio, Zed, Windsurf. The package
+- **Any MCP client**: Claude Code, Cursor, Claude Desktop, LM Studio, Zed. The package
   ships `kern-mcp`, a stdio server, and charts come back as images the model can see. One session
   backs the connection, so files carry between tool calls and variables do not, unless
   `KERN_MCP_KERNEL=1`: [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).

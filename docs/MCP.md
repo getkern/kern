@@ -1,8 +1,9 @@
 # `kern-mcp`: a local code interpreter for any MCP client
 
-Claude Desktop, Cursor, LM Studio, Windsurf, Goose: the config below is the same in all of them,
+Claude Code, Cursor, Claude Desktop, LM Studio: the config below is the same in all of them,
 because LM Studio follows Cursor's `mcp.json` notation and the others share its shape. What differs
-is where the file lives, not what goes in it.
+is where the file lives, not what goes in it. The list is the table below, so a client named here is
+one this page tells you where to put the block for.
 
 | client | where the block goes |
 |---|---|

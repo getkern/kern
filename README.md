@@ -122,8 +122,8 @@ types, sessions, prewarming and LangChain, or [the same for Node](bindings/node/
 `docker run` hands you exit 137 and leaves you to guess whether that was your timeout or the OOM
 killer. Here it comes back as a typed `fault` you can branch on.
 
-It also ships **`kern-mcp`**, a stdio server that gives Claude Code, Cursor, Claude Desktop,
-Windsurf or LM Studio a local code interpreter:
+It also ships **`kern-mcp`**, a stdio server that gives Claude Code, Cursor, Claude Desktop or
+LM Studio a local code interpreter:
 
 ```json
 { "mcpServers": { "kern": { "command": "kern-mcp" } } }
