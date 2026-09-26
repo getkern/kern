@@ -88,7 +88,7 @@ kern ps                                          # what is running (--json, like
 ```
 
 `--security-profile untrusted` is the seccomp allowlist, `--cap-drop ALL` and `--read-only` in one
-flag. One runnable example per thing kern does: [examples/](examples/).
+flag. [examples/](examples/) holds 94 runnable scripts, one per thing kern does.
 
 From a program, **Kern Sandbox**
 ([PyPI](https://pypi.org/project/kern-sandbox/), [npm](https://www.npmjs.com/package/kern-sandbox))
@@ -211,19 +211,14 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Documentation
 
+Each section above links the page it belongs to. These are the ones it does not:
+
 | Document | What is in it |
 |---|---|
-| [docs/INSTALL.md](docs/INSTALL.md) | install on Linux, WSL2 and ARM boards, from source |
-| [docs/MCP.md](docs/MCP.md) | the MCP server: tools, every `KERN_MCP_*` variable, and running it over ssh or WSL so the sandbox sits on another machine |
-| [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md) | what of Docker works, what does not, and where it differs |
-| [docs/RESOURCES.md](docs/RESOURCES.md) · [docs/CONFIG.md](docs/CONFIG.md) · [docs/EGRESS.md](docs/EGRESS.md) | the two-verb model with volumes and vdisks, the `kern.toml` schema, and egress |
-| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [SECURITY.md](SECURITY.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) | the threat model (structured, then per-mechanism), and why a userspace VRAM cap is not a boundary |
-| [docs/CVE-POSTURE.md](docs/CVE-POSTURE.md) | the published container-runtime escapes, each reproduced against this tree, and the class kern does not defend against |
-| [ROADMAP.md](ROADMAP.md) | what is missing or unmeasured today, and what may come |
+| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) · [docs/CVE-POSTURE.md](docs/CVE-POSTURE.md) · [docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md) | the threat model, every published container-runtime escape reproduced against this tree, and why a userspace VRAM cap is not a boundary |
+| [docs/CONFIG.md](docs/CONFIG.md) · [docs/EGRESS.md](docs/EGRESS.md) | the `kern.toml` schema, and egress |
 | [CHANGELOG.md](CHANGELOG.md) | what changed in each release, and the CLI stability rule the build enforces |
-| [BENCHMARKS.md](BENCHMARKS.md) | measurements, including the ARM boards |
-| [examples/](examples/) · [blog/](blog/) | 94 runnable scripts in eight folders, and longer write-ups |
-| [bindings/python/README.md](bindings/python/README.md) · [bindings/node/README.md](bindings/node/README.md) | the Kern Sandbox SDK: embed kern in Python or Node |
+| [blog/](blog/) | longer write-ups on how pieces of this were built and measured |
 
 ## What kern is not
 
