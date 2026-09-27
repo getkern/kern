@@ -15,9 +15,8 @@ by one.
 Three questions, three numbers. Quoting one under another's definition is a mistake this project
 made once and corrected, so each carries its definition and its denominator.
 
-**Corpus: 259 real compose files**, one per repository, sampled across 733, listed with the
-repository, the path and the sha256 of the bytes measured in `docs/compose-corpus-neutral.tsv`. The
-binary is proven to be the working tree; the script refuses to measure otherwise.
+**Corpus: 259 real compose files**, one per repository, sampled across 733. The binary is proven to
+be the working tree; the script refuses to measure otherwise.
 
 | Question | Answer | What it means |
 |---|---|---|
