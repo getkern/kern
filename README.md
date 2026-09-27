@@ -140,11 +140,11 @@ ports      = ["8080:80"]
 depends_on = ["cache"]
 ```
 
-| What it does | Command |
-|---|---|
-| Start it (or point it at your `compose.yaml`) | `kern compose stack.toml up` |
-| What is running, and what each service publishes | `kern compose stack.toml ps` |
-| The host address serving a port | `kern compose stack.toml port web 80` |
+```sh
+kern compose stack.toml up            # start it (or point it at your compose.yaml)
+kern compose stack.toml ps            # what is running, and what each service publishes
+kern compose stack.toml port web 80   # the host address serving a port
+```
 
 Each service gets its own network namespace and they reach each other by name. It is the local dev
 loop, not a production orchestrator. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
