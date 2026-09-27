@@ -108,8 +108,6 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -U kern-sandbox
 ```
 
-On Node: `npm install kern-sandbox`.
-
 ```python
 import kern_sandbox as kern
 
@@ -117,57 +115,14 @@ r = kern.run_code("print(sum(range(100)))")
 print(r.stdout, r.fault)   # 4950  None
 ```
 
-Every call is a fresh box. A timeout or an out-of-memory comes back as a typed `fault` you can branch
-on, not as a bare exit 137. It finds `kern` on your PATH, or wherever `$KERN_BIN` points.
-
-**The basics, one call each:**
+Every call is a fresh box, and a timeout or an out-of-memory comes back as a typed `fault`.
+Node: `npm install kern-sandbox`.
 
 <img src="assets/readme-basics.svg" width="880" alt="Three windows. files.py: a Sandbox writes in.csv, runs a job, reads out.txt back. state.py: a kernel keeps x = 40 between calls and prints x + 2. package.py: a Sandbox with setup pip install numpy imports numpy.">
 
-**Give it a file, get a file back.**
-
-```python
-job = """
-import csv
-rows = list(csv.DictReader(open("in.csv")))
-hottest = max(rows, key=lambda row: int(row["temp"]))
-open("out.txt", "w").write(hottest["city"])
-"""
-with kern.Sandbox() as sb:
-    sb.write_file("in.csv", "city,temp\nRome,24\nOslo,9\n")
-    sb.run_code(job)
-    print(sb.read_file("out.txt"))   # b'Rome'
-```
-
-**Keep variables between steps.**
-
-```python
-with kern.Sandbox() as sb, sb.kernel() as k:
-    k.run_code("x = 40")
-    r = k.run_code("print(x + 2)")
-    print(r.stdout)   # 42
-```
-
-**Install a package first.**
-
-```python
-with kern.Sandbox(setup="pip install numpy") as sb:
-    r = sb.run_code("import numpy as np; print(np.pi)")
-    print(r.stdout)   # 3.141592653589793
-```
-
-A host on the network, a shell command and a chart back: [the Python SDK](bindings/python/README.md#the-basics-one-call-each).
-
-**Read next: [the Python SDK](bindings/python/README.md)**, for sessions, prewarming and LangChain,
-or [the same for Node](bindings/node/README.md).
-
-**`kern-mcp`** gives Claude Code, Cursor, Claude Desktop or LM Studio a local code interpreter:
-
-```json
-{ "mcpServers": { "kern": { "command": "kern-mcp" } } }
-```
-
-Every option is in [docs/MCP.md](docs/MCP.md).
+These three and three more, ready to copy: [the Python SDK](bindings/python/README.md#the-basics-one-call-each),
+[the same for Node](bindings/node/README.md). For Claude Code, Cursor, Claude Desktop or LM Studio,
+`kern-mcp` is a local code interpreter: [docs/MCP.md](docs/MCP.md).
 
 ## Run a whole stack: your `docker-compose.yml`, unchanged
 
