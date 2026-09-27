@@ -115,7 +115,131 @@ th{background:var(--panel)}
 blockquote{margin:1rem 0;padding:.4rem 1rem;border-left:3px solid var(--line);color:var(--dim)}
 footer{max-width:52rem;margin:3rem auto 0;padding-top:1rem;border-top:1px solid var(--line);
 color:var(--dim);font-size:.85rem}
+.win{margin:1rem 0;border-radius:10px;overflow:hidden;background:#080c13;border:1px solid #1f2933;
+box-shadow:0 8px 24px rgba(1,4,9,.16)}
+.win-bar{display:flex;align-items:center;gap:.8rem;height:2.25rem;padding:0 .8rem;background:#141a21;
+border-bottom:1px solid #1f2933}
+.win-dots{display:inline-flex;gap:.42rem}
+.win-dots i{display:block;width:.7rem;height:.7rem;border-radius:50%}
+.win-dots i:nth-child(1){background:#c58038}
+.win-dots i:nth-child(2){background:#e2b241}
+.win-dots i:nth-child(3){background:#3ab593}
+.win-title{display:inline-flex;align-items:center;gap:.45rem;font-family:var(--mono);font-size:.8rem;
+color:#6e8c91}
+.win-title svg{width:15px;height:15px;color:#3ab593}
+.win[data-lang=python] .win-title svg{color:#e2b241}
+.win[data-lang=json] .win-title svg,.win[data-lang=toml] .win-title svg,
+.win[data-lang=yaml] .win-title svg{color:#c58038}
+.win-bar>button{margin-left:auto;font:inherit;font-family:var(--mono);font-size:.75rem;
+padding:.05rem .55rem;border:1px solid #2a3642;border-radius:5px;background:transparent;color:#6e8c91;
+cursor:pointer}
+.win-bar>button:hover{color:#e6edf3;border-color:#6e8c91}
+.win pre{margin:0;border:0;border-radius:0;background:transparent;color:#d4d4d4;padding:1rem 1.15rem;
+line-height:1.55;scrollbar-color:#2a3642 #080c13}
+.win pre::-webkit-scrollbar{height:8px}
+.win pre::-webkit-scrollbar-track{background:#080c13}
+.win pre::-webkit-scrollbar-thumb{background:#2a3642;border-radius:4px}
+.win pre code{color:inherit}
+.win .k,.win .kd,.win .kr,.win .kt,.win .kc{color:#569cd6}
+.win .kn,.win .ow{color:#c586c0}
+.win .s,.win .s1,.win .s2,.win .sa,.win .sb,.win .sd,.win .se,.win .sh,.win .si,.win .sx{color:#ce9178}
+.win .c,.win .c1,.win .cm,.win .ch,.win .cs,.win .cp{color:#6a9955}
+.win .m,.win .mi,.win .mf,.win .mh,.win .mo,.win .il{color:#b5cea8}
+.win .nf,.win .fm,.win .nb,.win .bp{color:#dcdcaa}
+.win .nc,.win .nn{color:#4ec9b0}
+.win .nv,.win .na,.win .nt{color:#9cdcfe}
+.win-tabs{display:flex;align-self:stretch;overflow-x:auto;scrollbar-width:none;min-width:0}
+.win-tabs::-webkit-scrollbar{display:none}
+.win-tab{font:inherit;font-family:var(--mono);font-size:.78rem;color:#6e8c91;background:transparent;
+border:0;border-right:1px solid #1f2933;padding:0 .75rem;cursor:pointer;white-space:nowrap}
+.win-tab:first-child{border-left:1px solid #1f2933}
+.win-tab:hover{color:#e6edf3}
+.win-tab[aria-selected=true]{background:#080c13;color:#e6edf3;box-shadow:inset 0 2px 0 #3ab593}
+.win-tabbed.js .win-title{display:none}
+.win-panel{padding-top:.9rem}
+.win-panel+.win-panel{border-top:1px solid #1f2933}
+.win-tabbed.js .win-panel+.win-panel{border-top:0}
+.win-panel[hidden]{display:none}
+.win-panel p{margin:0 1.15rem;color:#9aa7b0;font-size:.93rem;line-height:1.55}
+.win-panel p strong{color:#e6edf3}
+.win-panel p code{background:#141a21;color:#d4d4d4}
+.win-panel pre{padding-top:.75rem}
 """
+
+# Code blocks are drawn as windows, the way the demo GIF on the Sandbox page draws its terminal: a bar
+# with three dots, an icon and the language, and colours from Pygments at BUILD time, so the page
+# needs no highlighter script. Only a block that declares its language gets the frame: an undeclared
+# one is a diagram or a transcript, and a label on it would be a guess. Without Pygments the frame
+# still draws and the code stays plain.
+try:
+    from pygments import highlight as _highlight
+    from pygments.formatters import HtmlFormatter as _HtmlFormatter
+    from pygments.lexers import get_lexer_by_name as _get_lexer
+    from pygments.util import ClassNotFound as _ClassNotFound
+except ImportError:
+    _highlight = None
+
+_SVG = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="{}" fill="none" stroke="currentColor" ' \
+    'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+ICON_TERMINAL = _SVG.format("M3 4.5 6.5 8 3 11.5M8.5 12H13")
+ICON_CODE = _SVG.format("M5.5 4.5 2 8l3.5 3.5M10.5 4.5 14 8l-3.5 3.5")
+ICON_DATA = _SVG.format("M6 2.5C4.5 2.5 4 3.2 4 4.5V6c0 1-.6 1.5-1.5 2 .9.5 1.5 1 1.5 2v1.5c0 1.3.5 2 2 2"
+                        "M10 2.5c1.5 0 2 .7 2 2V6c0 1 .6 1.5 1.5 2-.9.5-1.5 1-1.5 2v1.5c0 1.3-.5 2-2 2")
+WINDOW_LANGS = {
+    "bash": ("Terminal", ICON_TERMINAL), "sh": ("Terminal", ICON_TERMINAL),
+    "shell": ("Terminal", ICON_TERMINAL), "console": ("Terminal", ICON_TERMINAL),
+    "python": ("Python", ICON_CODE), "py": ("Python", ICON_CODE),
+    "javascript": ("JavaScript", ICON_CODE), "js": ("JavaScript", ICON_CODE),
+    "typescript": ("TypeScript", ICON_CODE), "ts": ("TypeScript", ICON_CODE),
+    "rust": ("Rust", ICON_CODE), "go": ("Go", ICON_CODE),
+    "json": ("JSON", ICON_DATA), "toml": ("TOML", ICON_DATA), "yaml": ("YAML", ICON_DATA),
+    "yml": ("YAML", ICON_DATA),
+}
+
+
+def code_windows(body: str) -> str:
+    def frame(m: "re.Match[str]") -> str:
+        lang, code = m.group(1).lower(), m.group(2)
+        known = WINDOW_LANGS.get(lang)
+        if known is None:
+            return m.group(0)
+        if _highlight is not None:
+            try:
+                code = _highlight(html.unescape(code), _get_lexer(lang), _HtmlFormatter(nowrap=True))
+            except _ClassNotFound:
+                pass
+        name, icon = known
+        return (
+            f'<div class="win" data-lang="{lang}"><div class="win-bar"><span class="win-dots">'
+            f'<i></i><i></i><i></i></span><span class="win-title">{icon}{name}</span></div>'
+            f'<pre><code class="language-{lang}">{code}</code></pre></div>'
+        )
+
+    return re.sub(r'<pre><code class="language-([\w+-]+)">(.*?)</code></pre>', frame, body, flags=re.S)
+
+
+# A run of short examples reads as ONE window with a tab per example, the way an editor holds
+# several files. The source marks it with HTML comments (`<!-- tabs -->`, `<!-- tab: name -->`,
+# `<!-- /tabs -->`), which GitHub and PyPI do not render, so the README reads as a plain list there.
+# Each tab keeps its paragraph and loses its own window frame. The page script turns the panels into
+# tabs; without it every panel stays visible, one under the other, inside the one window.
+def code_tabs(body: str) -> str:
+    def group(m: "re.Match[str]") -> str:
+        parts = re.split(r"<!-- tab: ([\w.-]+) -->", m.group(1))[1:]
+        panels = []
+        for name, content in zip(parts[0::2], parts[1::2]):
+            content = re.sub(
+                r'<div class="win" data-lang="[^"]+"><div class="win-bar">.*?</div>(<pre>.*?</pre>)</div>',
+                r"\1", content.strip(), flags=re.S,
+            )
+            panels.append(f'<div class="win-panel" data-tab="{name}">{content}</div>')
+        return (
+            '<div class="win win-tabbed" data-lang="python"><div class="win-bar"><span class="win-dots">'
+            f'<i></i><i></i><i></i></span><span class="win-title">{ICON_CODE}Python</span></div>'
+            + "".join(panels) + "</div>"
+        )
+
+    return re.sub(r"<!-- tabs -->(.*?)<!-- /tabs -->", group, body, flags=re.S)
 
 
 def out_name(md: str) -> str:
@@ -215,7 +339,7 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "", page: s
     body = markdown.markdown(
         text, extensions=["tables", "fenced_code", "toc", "attr_list", "md_in_html"]
     )
-    body = rewrite_links(body)
+    body = code_tabs(code_windows(rewrite_links(body)))
     # The description is the first paragraph WITH TEXT, flattened. Better than a constant: it is what
     # the document itself opens with, so it cannot drift from the page. With text, because the
     # README's first paragraph is its logo, which flattens to nothing.
@@ -274,22 +398,57 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "", page: s
 // THE COMMAND IS THE FIRST THING A READER DOES WITH THIS PAGE, and until 2026-09-26 the only way to
 // take it was to select it by hand: the home page had a copy button and the guide did not. The
 // site's CSP is `script-src 'self' 'unsafe-inline'`, so this needs no exception, and it is the same
-// handler the home page uses, bound to every block rather than to four hand-written ones.
-document.querySelectorAll('main pre').forEach(function (pre) {{
-  var w = document.createElement('div');
-  w.className = 'codewrap';
-  pre.parentNode.insertBefore(w, pre);
-  w.appendChild(pre);
+// handler the home page uses, bound to every block rather than to four hand-written ones. A block
+// drawn as a window already has a bar, and the button goes in it. A tabbed window has ONE button,
+// and it copies the tab that is open.
+function copyButton(bar, source) {{
   var b = document.createElement('button');
   b.type = 'button';
   b.textContent = 'copy';
   b.addEventListener('click', function () {{
-    navigator.clipboard.writeText(pre.textContent).then(function () {{
+    navigator.clipboard.writeText(source().textContent).then(function () {{
       b.textContent = 'copied';
       setTimeout(function () {{ b.textContent = 'copy'; }}, 1500);
     }});
   }});
-  w.appendChild(b);
+  bar.appendChild(b);
+}}
+document.querySelectorAll('main .win-tabbed').forEach(function (win) {{
+  var bar = win.querySelector('.win-bar'), panels = win.querySelectorAll('.win-panel');
+  var strip = document.createElement('div'), current = panels[0];
+  strip.className = 'win-tabs';
+  strip.setAttribute('role', 'tablist');
+  panels.forEach(function (panel, i) {{
+    var t = document.createElement('button');
+    t.type = 'button';
+    t.className = 'win-tab';
+    t.setAttribute('role', 'tab');
+    t.textContent = panel.dataset.tab;
+    t.setAttribute('aria-selected', i === 0 ? 'true' : 'false');
+    panel.setAttribute('role', 'tabpanel');
+    panel.hidden = i !== 0;
+    t.addEventListener('click', function () {{
+      strip.querySelectorAll('.win-tab').forEach(function (o) {{ o.setAttribute('aria-selected', 'false'); }});
+      t.setAttribute('aria-selected', 'true');
+      panels.forEach(function (p) {{ p.hidden = p !== panel; }});
+      current = panel;
+    }});
+    strip.appendChild(t);
+  }});
+  bar.appendChild(strip);
+  win.classList.add('js');
+  copyButton(bar, function () {{ return current.querySelector('pre'); }});
+}});
+document.querySelectorAll('main pre').forEach(function (pre) {{
+  if (pre.closest('.win-tabbed')) return;
+  var w = pre.parentNode.classList.contains('win') ? pre.parentNode.querySelector('.win-bar') : null;
+  if (!w) {{
+    w = document.createElement('div');
+    w.className = 'codewrap';
+    pre.parentNode.insertBefore(w, pre);
+    w.appendChild(pre);
+  }}
+  copyButton(w, function () {{ return pre; }});
 }});
 </script>
 {beacon(token)}</body>

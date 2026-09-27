@@ -68,6 +68,92 @@ back as a value your loop can branch on.
 **Analysis you did not write.** A chart comes back as an image the model can see, and a failure
 comes back labelled, so you can tell a bug in the code from the sandbox stopping it.
 
+## The basics, one call each
+
+Each block starts from `import kern_sandbox as kern`, as above, and prints what the comment says.
+
+<!-- tabs -->
+
+<!-- tab: files.py -->
+
+**Give it a file, get a file back.** A `Sandbox()` you keep open has a `/workspace` that you and the
+code both see.
+
+```python
+job = """
+import csv
+rows = list(csv.DictReader(open("temps.csv")))
+hottest = max(rows, key=lambda row: int(row["temp"]))
+open("hottest.txt", "w").write(hottest["city"])
+"""
+with kern.Sandbox() as sb:
+    sb.write_file("temps.csv", "city,temp\nRome,24\nOslo,9\n")
+    sb.run_code(job)
+    print(sb.read_file("hottest.txt"))   # b'Rome'
+```
+
+<!-- tab: state.py -->
+
+**Keep variables between steps.** `kernel()` is one warm interpreter, the way a notebook is.
+
+```python
+with kern.Sandbox() as sb, sb.kernel() as k:
+    k.run_code("total = 40")
+    r = k.run_code("total += 2; print(total)")
+    print(r.stdout)   # 42
+```
+
+<!-- tab: package.py -->
+
+**Install a package first.** `setup=` runs once, with network, before any of your code. The code
+itself still runs without network.
+
+```python
+with kern.Sandbox(setup="pip install humanize") as sb:
+    r = sb.run_code("import humanize as h; print(h.naturalsize(3_000_000))")
+    print(r.stdout)   # 3.0 MB
+```
+
+<!-- tab: network.py -->
+
+**Let it reach one host.** There is no network by default. `egress_allow` opens the hosts you name
+and nothing else; `network=True` opens everything, your own loopback included.
+
+```python
+code = ("import urllib.request as u; "
+        "print(u.urlopen('https://pypi.org').status)")
+r = kern.run_code(code)
+print(r.exit_code)   # 1: no network
+r = kern.run_code(code, egress_allow=["pypi.org"])
+print(r.stdout)      # 200
+```
+
+<!-- tab: shell.py -->
+
+**Run a shell command.**
+
+```python
+r = kern.run_code("uname -s && python3 --version", language="bash")
+print(r.stdout)   # Linux, then the image's Python 3.12
+```
+
+<!-- tab: chart.py -->
+
+**Get a chart back.** An open matplotlib figure comes back as a PNG on `r.results`.
+
+```python
+plot = """
+import matplotlib.pyplot as plt
+plt.plot([1, 4, 9, 16])
+plt.show()
+"""
+with kern.Sandbox(setup="pip install matplotlib") as sb:
+    r = sb.run_code(plot)
+    open("chart.png", "wb").write(r.results[0].png)
+```
+
+<!-- /tabs -->
+
 ## The result says who stopped the run
 
 <p align="center">
