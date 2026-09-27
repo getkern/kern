@@ -294,7 +294,11 @@ def localize_images(page: str, out: pathlib.Path) -> str:
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes((ROOT / rel).read_bytes())
             return tag.replace(raw, f"{BASE}/assets/{dst.name}")
-        if src.startswith("https://img.shields.io/"):
+        # the CI badge comes from github.com rather than shields.io, and the policy blocks it the same
+        # way: MEASURED 2026-09-27, the only badge left pointing off-site when the README gained one
+        if src.startswith("https://img.shields.io/") or (
+            src.startswith("https://github.com/") and src.endswith("/badge.svg")
+        ):
             name = "badge-" + hashlib.sha1(src.encode()).hexdigest()[:10] + ".svg"
             try:
                 req = urllib.request.Request(src, headers={"User-Agent": "curl/8"})

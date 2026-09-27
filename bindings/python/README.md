@@ -8,10 +8,12 @@
 
 <sub>**Works with** Claude Code · Cursor · Claude Desktop · LM Studio · LangChain · pi</sub>
 
-[![PyPI](https://img.shields.io/pypi/v/kern-sandbox?label=PyPI&color=0b7285)](https://pypi.org/project/kern-sandbox/)
-[![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm&color=0b7285)](https://www.npmjs.com/package/kern-sandbox)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-0b7285.svg)](https://pypi.org/project/kern-sandbox/)
+[![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/getkern/kern/blob/main/LICENSE)
+[![Release](https://img.shields.io/github/v/release/getkern/kern?color=blue)](https://github.com/getkern/kern/releases/latest)
+[![PyPI](https://img.shields.io/pypi/v/kern-sandbox?label=pypi%20kern-sandbox&color=blue)](https://pypi.org/project/kern-sandbox/)
+[![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm%20kern-sandbox&color=blue)](https://www.npmjs.com/package/kern-sandbox)
+[![Runs on](https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20Windows%20via%20WSL2%20%C2%B7%20macOS%20via%20a%20Linux%20VM-informational.svg)](https://github.com/getkern/kern/blob/main/docs/INSTALL.md)
 
 <sub>rootless · no daemon · no socket · no VM · no cloud · no account</sub>
 
