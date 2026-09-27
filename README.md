@@ -11,6 +11,8 @@
 
 **A real, kernel-enforced container in a few milliseconds, out of one static binary with no daemon.**
 
+With an MCP server, so Claude Code, Cursor, Claude Desktop and LM Studio can run their code in it.
+
 <img src="assets/readme-windows.svg" width="880" alt="Two windows. Container: kern box dev --image alpine -it -- sh; kern compose up -d, for your compose.yaml; kern ps. Sandbox: import kern_sandbox as kern; r = kern.run_code(&quot;print(6 * 7)&quot;); print(r.stdout) prints 42.">
 
 <sub>**0 RAM at rest** · no daemon, no socket, nothing to start · one static binary, `libc` its only Rust dependency</sub>
@@ -42,22 +44,30 @@ agent's code runs in, called from Python, Node or any MCP client. kern calls a c
 
 ## Install
 
-**Linux** (`x86_64` or `aarch64`)
+<img src="assets/os/linux.svg" width="16" height="16" alt=""> **Linux** (`x86_64` or `aarch64`)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-**Windows**, under WSL2, which the script sets up
+<img src="assets/os/windows.svg" width="16" height="16" alt=""> **Windows**, under WSL2, which the script sets up
 
 ```powershell
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
-**macOS**, inside a Linux VM. On the Mac:
+<img src="assets/os/apple.svg" width="16" height="16" alt=""> **macOS**, inside a Linux VM. On the Mac:
 
 ```sh
-brew install colima && colima start && colima ssh
+brew install colima
+```
+
+```sh
+colima start
+```
+
+```sh
+colima ssh
 ```
 
 Then, inside the VM:
@@ -121,8 +131,21 @@ Node: `npm install kern-sandbox`.
 <img src="assets/readme-basics.svg" width="880" alt="Three windows. files.py: a Sandbox writes in.csv, runs a job, reads out.txt back. state.py: a kernel keeps x = 40 between calls and prints x + 2. package.py: a Sandbox with setup pip install numpy imports numpy.">
 
 These three and three more, ready to copy: [the Python SDK](bindings/python/README.md#the-basics-one-call-each),
-[the same for Node](bindings/node/README.md). For Claude Code, Cursor, Claude Desktop or LM Studio,
-`kern-mcp` is a local code interpreter: [docs/MCP.md](docs/MCP.md).
+[the same for Node](bindings/node/README.md).
+
+**MCP server** for Claude Code, Cursor, Claude Desktop and LM Studio. The same block goes in
+`claude_desktop_config.json`, in Cursor's or LM Studio's `mcp.json`, or in `.mcp.json` at your
+project root for Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] }
+  }
+}
+```
+
+Every option: [docs/MCP.md](docs/MCP.md).
 
 ## Run a whole stack: your `docker-compose.yml`, unchanged
 
@@ -164,13 +187,13 @@ loop, not a production orchestrator. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.
   <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern is 80x faster than docker run. A real OCI image, rootless, a static binary, no daemon, measured on x86 on 2026-09-20, and you should measure your own.">
 </p>
 
-| one isolated `/bin/true` | kern is |
+| one isolated `/bin/true`&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp; | kern is |
 |---|---:|
 | one container, against `docker run --rm` | **80x faster** |
 | 200 at once, against `docker run --rm` | **130x faster** |
 | one container, against rootless `runc` | **3.6x faster** |
 
-| | kern | Docker | Podman |
+| | kern | Docker | Podman&emsp;&emsp;&emsp;&emsp;&emsp; |
 |---|---|---|---|
 | Daemon | **no** | yes (`dockerd` + `containerd`) | no |
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
