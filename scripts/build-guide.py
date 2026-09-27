@@ -59,7 +59,7 @@ SITE_LOGOS = (
 # The documents worth a page of their own, in the order a reader meets them. `title` is what goes in
 # `<title>` and in the nav; the file's own H1 stays as the page heading.
 PAGES = [
-    ("INSTALL.md", "Install kern on Linux, WSL2, macOS and ARM boards"),
+    ("INSTALL.md", "Install kern on Linux, Windows and macOS"),
     ("SANDBOX.md", "Kern Sandbox: run a model's code from Python or Node"),
     ("RESOURCES.md", "Virtual resources: CPU, memory, disk and device profiles"),
     ("EGRESS.md", "Egress control: what a box can reach"),
@@ -188,6 +188,7 @@ ICON_DATA = _SVG.format("M6 2.5C4.5 2.5 4 3.2 4 4.5V6c0 1-.6 1.5-1.5 2 .9.5 1.5 
 WINDOW_LANGS = {
     "bash": ("Terminal", ICON_TERMINAL), "sh": ("Terminal", ICON_TERMINAL),
     "shell": ("Terminal", ICON_TERMINAL), "console": ("Terminal", ICON_TERMINAL),
+    "powershell": ("PowerShell", ICON_TERMINAL), "ps1": ("PowerShell", ICON_TERMINAL),
     "python": ("Python", ICON_CODE), "py": ("Python", ICON_CODE),
     "javascript": ("JavaScript", ICON_CODE), "js": ("JavaScript", ICON_CODE),
     "typescript": ("TypeScript", ICON_CODE), "ts": ("TypeScript", ICON_CODE),
