@@ -44,19 +44,19 @@ agent's code runs in, called from Python, Node or any MCP client. kern calls a c
 
 ## Install
 
-<img src="assets/os/linux.svg" width="16" height="16" alt=""> **Linux** (`x86_64` or `aarch64`)
+<img src="assets/os/linux.svg" alt="Linux, x86_64 or aarch64">
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
-<img src="assets/os/windows.svg" width="16" height="16" alt=""> **Windows**, under WSL2, which the script sets up
+<img src="assets/os/windows.svg" alt="Windows, through WSL2">
 
 ```powershell
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
-<img src="assets/os/apple.svg" width="16" height="16" alt=""> **macOS**, inside a Linux VM. On the Mac:
+<img src="assets/os/macos.svg" alt="macOS, in a Linux VM">
 
 ```sh
 brew install colima
