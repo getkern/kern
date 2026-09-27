@@ -34,7 +34,7 @@ a deny-by-default seccomp allowlist that a stock low-level runtime does not.
 ## kern vs E2B / Modal / Daytona?
 
 Those are hosted clouds: they need an account, a network round-trip and per-execution cost, and they do
-not run offline, air-gapped, in your CI, or on an ARM board. kern runs on your own machine with nothing
+not run offline, air-gapped, in your CI, or on your own hardware. kern runs on your own machine with nothing
 to call. For **actively hostile, multi-tenant** code from strangers on shared hardware they use a
 hardware boundary (a microVM); kern's ground is your own or semi-trusted code run locally. Same job,
 different substrate.
@@ -42,7 +42,7 @@ different substrate.
 ## Does it run on Windows?
 
 Not natively. kern's isolation is Linux kernel machinery (user namespaces, cgroup v2, seccomp), so it
-runs on **Linux, WSL2 and ARM boards** (Raspberry Pi, Jetson, Arduino UNO Q). On Windows, use WSL2: the
+runs on **Linux** (x86_64 and ARM) and **WSL2**. On Windows, use WSL2: the
 release ships a pre-baked WSL rootfs and a small `kern.exe` shim.
 
 ## Does it run on macOS?
@@ -107,13 +107,7 @@ By design. The source is version-free (no stale number lives in git); the versio
 and the release. A published release binary reports the release version; a from-source `cargo install`
 reports `0.0.0`, which is expected and harmless.
 
-## Where is the GPU support?
+## Does kern support GPUs?
 
-Slices are not in this edition, they are on the [roadmap](../ROADMAP.md). What is here is the
-verdict: `kern doctor` reads sysfs and reports, per GPU, what a VRAM cap would be worth. `TIER-HW`
-means a MIG or SR-IOV partition is present, enforced by the device and not by the tenant. kern
-reads that the partition is there and has not measured the VRAM split, and says so on the line. `TIER-SOFT`, which is what consumer
-hardware gets, means a cooperative quota: useful for density, fairness and accidental overcommit, and
-not a boundary against code that is trying to get around it. Detection is read-only and caps nothing,
-so there is still nothing to attack. kern today virtualizes CPU (`vcpu:`), memory, disk (`vdisk:`)
-and devices (`vgpio:`).
+Yes, as a device. A box can be given the host's GPU as a device, the whole card: the render node as `display` in [`kern.toml`](CONFIG.md), or `devices:` plus `--allow-device-grants` in a compose file. kern does not split a GPU between boxes or cap it per box.
+kern today virtualizes CPU (`vcpu:`), memory, disk (`vdisk:`) and devices (`vgpio:`).

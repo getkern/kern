@@ -1,527 +1,113 @@
-# kern config & profile schema
+# kern.toml
 
-kern reads TOML from `~/.config/kern/kern.toml` and from compose files. Two kinds of definition live
-there, sharing **one schema philosophy** (every key mirrors a CLI flag):
+kern reads TOML from `~/.config/kern/kern.toml` and from compose files. Every key is spelled like its
+CLI flag: if you know the flag, you know the key.
 
-- **Resource profiles**: reusable `[[vcpu]]` / `[[vgpio]]` / `[[vdisk]]` tables, attached to any
-  `kern box` or `kern run` by **prefix**: `kern run vcpu:heavy vgpio:sensors vdisk:data -- ./job`.
-  Managed with `kern config`, and edited live (guided, validated) in `kern top`.
-- **Compose stacks**: `[box.NAME]` tables in a compose file, brought up by `kern compose` in
-  `depends_on` order.
+`KERN_CONFIG=<path>` picks another file for every command, `--config <path>` for one. `kern info` prints
+the file in effect, `kern config setup` writes a starter for this host, and `kern validate <file>` checks
+one.
 
-The parser is hand-rolled (no `serde`/`toml`) and **tolerant**: an unrecognized section or key is
-**ignored, not rejected**, so a `kern.toml` shared with another kern edition still loads. A malformed
-value of a key it DOES implement is always an error, with its line.
-
-## Which file is in effect
-
-| source | applies to |
-|---|---|
-| `--config <path>` | that one `kern box` / `kern run` invocation, for its `vcpu:`/`vgpio:`/`vdisk:` tokens |
-| **`KERN_CONFIG=<path>`** | **everything**: reads *and* writes. `config list`/`add`/`rm`/`setup`/`edit`, `validate`, `info`, and every profile token |
-| `$XDG_CONFIG_HOME/kern/kern.toml`, else `~/.config/kern/kern.toml` | the default when neither is set |
-
-`KERN_CONFIG` is how you keep a per-project config: export it and every kern command, including the
-ones that *edit* the file, uses it. `kern info` prints the path in effect. An exported-but-empty
-`KERN_CONFIG` counts as unset, since it would otherwise resolve to a relative path and drop a
-`kern.toml` in the current directory.
-
----
-
-## Resource profiles
-
-Profiles are **resource-centric**: you declare a named slice once, then attach it to as many boxes as
-you like by its prefix (declare-then-carve, attach-by-prefix). The CPU field names are spelled to match
-the CLI flags, see the divergence note at the end. A GPU family is on the
-[Roadmap](../ROADMAP.md), not in this schema.
-
-> **Editing by hand? Three rules cover everything:**
->
-> 1. **Attach by prefix.** `[[vcpu]] name = "heavy"` is used as `vcpu:heavy` on the command line
->    (`kern run vcpu:heavy -- ./job`); same for `vgpio:` and `vdisk:`.
-> 2. **Every profile MUST name a `backend`** (the host resource it slices): a declared
->    `[[cpu]]`/`[[gpio]]`/`[[disk]]` id, or a reserved keyword: **`host`** (the whole host CPU, or the
->    host's own device nodes) or **`ram`** (a RAM-backed vdisk).
-> 3. **Key == flag.** Every key is spelled exactly like its CLI flag (`cpus` = `--cpus`, `memory` =
->    `--memory`, `cpuset` = `--cpuset-cpus`), so if you know the flag you know the field.
->
-> Copy-paste this starter, then edit. It shows the **declare-then-carve** shape: a physical
-> `[[cpu]]`/`[[disk]]`/`[[gpio]]` block, then a profile that references it by `backend`. **One key per
-> line** (the parser wants the multi-line form, not `[[vcpu]] name = "x" cpus = 2` on one line):
->
-> ```toml
-> [[cpu]]                 # physical: the host CPU budget
-> id    = "cpu:0"
-> cores = 8.0
-> [[vcpu]]                # a slice of it  ->  attach with  vcpu:cpu
-> name    = "cpu"
-> backend = "cpu:0"       # or "host" for the whole host CPU, with no [[cpu]] block
-> cpus    = 2
->
-> [[disk]]                # physical: a disk pool for volumes
-> id = "pool"
-> path = "/var/lib/kern/disks"
-> [[vdisk]]               # a size-capped scratch on it  ->  vdisk:scratch
-> name    = "scratch"
-> backend = "disk:pool"   # or "ram" for a RAM tmpfs, with no [[disk]] block
-> size    = "8g"
->
-> [[gpio]]                # physical: a controller anchor (kern config setup writes one per host)
-> id = "gpio:0"
-> [[vgpio]]               # the device grant  ->  vgpio:sensor
-> name    = "sensor"
-> backend = "gpio:0"      # or "host"; pins/pwm/adc/onewire NEED a [[gpio]] id here
-> i2c     = ["/dev/i2c-1"]
-> ```
->
-> Prefer not to hand-edit? `kern config setup` writes a starter tuned to this host, `kern top` edits
-> profiles live (validated, with device pickers), `kern validate <file>` checks one, and
-> `kern examples` prints a full annotated reference.
-
-### `[[vcpu]]`, a CPU + memory slice · attach with `vcpu:<name>`
+## Profiles: declare once, attach by name
 
 ```toml
-[[vcpu]]
-name     = "heavy"
-cpus     = 4.0         # core QUOTA (cgroup cpu.max), like --cpus: 4.0 = four cores, 0.5 = half a core
-memory   = "2 GB"      # RAM limit (cgroup memory.max), like --memory
-cpuset   = "0-7"       # optional CPU PINNING (cpulist), like --cpuset-cpus; exclusive with `numa`
-numa     = 0           # optional: pin to this NUMA node's CPUs
-nice     = -5          # optional: scheduling priority, like --nice (-20 high … 19 low)
-backend  = "cpu:0"     # REQUIRED: a [[cpu]] id to carve from, or "host" for the whole host CPU
-extends  = "base"      # optional: inherit another [[vcpu]] by name
-```
+[[vcpu]]                 # CPU + memory  ->  vcpu:heavy
+name    = "heavy"
+backend = "host"         # the whole host CPU, or a [[cpu]] id
+cpus    = 4.0            # like --cpus
+memory  = "2 GB"         # like --memory
 
-> Profile fields match the CLI flags **1:1**: `cpus` = `--cpus` (quota), `cpuset` = `--cpuset-cpus`
-> (pinning), `memory` = `--memory`, `nice` = `--nice`. Know the flag, know the field.
+[[vdisk]]                # a size-capped disk  ->  vdisk:scratch
+name    = "scratch"
+backend = "ram"          # a RAM tmpfs, or a [[disk]] id
+size    = "8g"
 
-### `[[vgpio]]`, device passthrough · attach with `vgpio:<name>`
-
-Deny-by-default: **only** the peripherals you list cross into the box; every other `/dev` node is
-refused. Each device is fd-pinned at bind time to close a check→mount race.
-
-```toml
-[[vgpio]]
+[[vgpio]]                # devices  ->  vgpio:sensors
 name    = "sensors"
-backend = "gpio:0"     # references a [[gpio]] controller (required)
-pins    = [17, 27]     # GPIO lines
-pwm     = [18]         # PWM channels
-i2c     = ["1"]        # /dev/i2c-1
-spi     = ["0.0"]      # /dev/spidev0.0
-adc     = [0]
-onewire = [4]
-# also available: uart, can, camera, audio, leds, bluetooth, usb, input, midi, display, net, extra
-# `extra` takes explicit /dev paths (validated); everything is refused unless a capability-based
-# deny-list (raw memory, disks, VFIO/DMA, kvm, HID injection, the console, …) rejects it first.
+backend = "host"
+i2c     = ["1"]                     # /dev/i2c-1
+display = ["/dev/dri/renderD128"]   # the GPU, as a device
 ```
-
-**Every supported device field** (list what you want, nothing else crosses in). Hand-edit the TOML, or
-let `kern top` / `kern config setup` pre-fill it from what it detects on the host:
-
-| field | grants | host path | needs a `[[gpio]]`? |
-|---|---|---|---|
-| `pins` | GPIO lines (chip-granular) | `/dev/gpiochip*` | yes |
-| `pwm` | PWM channels | sysfs pwm | yes |
-| `adc` | ADC channels | sysfs | yes |
-| `onewire` | 1-Wire | sysfs | yes |
-| `i2c` | I2C buses | `/dev/i2c-*` | no |
-| `spi` | SPI buses | `/dev/spidev*` | no |
-| `uart` | serial | `/dev/ttyS*` `ttyUSB*` `ttyACM*` | no |
-| `can` | CAN bus | `/dev/can*` | no |
-| `camera` | cameras | `/dev/video*` | no |
-| `audio` | ALSA audio | `/dev/snd/pcm*` `controlC*` | no |
-| `midi` | ALSA MIDI | `/dev/snd/midi*` | no |
-| `input` | keyboards / mice / sensors | `/dev/input/event*` | no |
-| `leds` | on-board LEDs | `/sys/class/leds/*` | no |
-| `bluetooth` | BT controllers | `/sys/class/bluetooth/hci*` | no |
-| `net` | network interfaces | `/sys/class/net/*` (eth0, wlan0) | no |
-| `display` | GPU render node | `/dev/dri/renderD*` (never `card*`) | no |
-| `usb` | USB devices | by bus / port | no |
-| `extra` | explicit `/dev/*` paths | any (validated) | no |
-
-**How to write an entry.** `i2c` takes a bus number (`"1"`, `"i2c-1"`) or a full path; `spi` takes
-`BUS.CS` (`"0.0"`, `"spidev0.0"`) or a full path. **Every other field takes the full `/dev/…` path**
-(`uart = ["/dev/ttyUSB0"]`, not `["ttyUSB0"]`). An entry kern cannot resolve is skipped with a line on
-stderr naming the field and the entry, because a device grant that vanishes quietly is
-indistinguishable from one that was honoured until the workload fails.
-
-`pins`/`pwm`/`adc`/`onewire` are lines of a controller, so they need a `backend` naming a `[[gpio]]`
-id. The rest are standalone host device nodes: use `backend = "host"`, or any declared `[[gpio]]` id as
-the anchor. Whatever you list, kern binds only the paths that **exist** on this host (absent ones are
-skipped) and **refuses** any node that grants host control (disk, raw memory, kvm, tun, fuse, the
-console, ...) by device **identity**, even via `extra`. A `[[gpio]]` block is a bare named anchor
-(`id = "..."`); it holds no device list of its own, the grant lives on the `[[vgpio]]`.
-
-### `[[vdisk]]`, a size-capped disk · attach with `vdisk:<name>`
-
-```toml
-[[vdisk]]
-name       = "data"
-size       = "2g"          # quota
-backend    = "disk:pool"   # REQUIRED: a declared [[disk]] pool, or "ram" for a RAM-backed tmpfs
-iops       = 1000          # optional I/O-ops limit
-bandwidth  = "50m"         # optional throughput limit
-persistent = true          # survive box removal AND be shared by name across boxes
-                           # (default: false → a private scratch disk per box, discarded)
-```
-
-A `vdisk:` appears in the box at `/vdisk/<name>`: a RAM tmpfs when rootless, or an ext4-on-loop image
-with a real quota when privileged **and the box runs in the foreground**. The ext4 backend's teardown
-is bounded to the box's run, so `-d` and `-it` take the tmpfs path even as root; kern says so when a
-`backend = "disk:…"` profile ends up RAM-backed, and the size cap is enforced either way. `iops`,
-`bandwidth` and `persistent` need the ext4 backend and are reported as unapplied without it.
-
-### Physical declarations, what a profile's `backend` points at
-
-Declaring these is optional (a profile can use the reserved `host`/`ram` backend), but every profile
-**must name a `backend`**: a block below, or `host` (vcpu/vgpio) / `ram` (vdisk). Field shapes:
-
-```toml
-[[cpu]]   # a physical CPU budget a [[vcpu]] splits
-id = "0"; cores = 16.0; memory = "32 GB"; cpuset = "0-15"; numa = 0
-
-[[gpio]]  # a physical GPIO / peripheral controller a [[vgpio]] draws from
-id = "0"; total_pins = 40; pins = [2, 3, 4, 17, 27]; i2c = ["1"]; leds = ["led0"]
-# a specific USB port can be reserved on a controller:
-[[gpio.usb_ports]]
-bus = 1; port = 2; name = "sensor-hub"
-
-[[disk]]  # a physical disk pool a [[vdisk]] places volumes on
-id = "pool"; path = "/var/lib/kern/disks"; default = true; size = "100g"; iops = 5000
-```
-
----
-
-## Compose, `[box.NAME]` tables
-
-`kern compose <file>` brings up a stack of `[box.NAME]` tables in `depends_on` order (it also reads a
-`docker-compose.yml`). `compose` shells out to `kern box`, so a value can never mean something
-different from its flag. **Every service is started detached**, so there is no `detach` key: `up`
-adds `-d` itself and returns once the stack is up. Use `kern logs` and `kern ps` to follow it. Every key maps to one, except `port` and `expose`, which are pod-scoped and
-described below.
-
-```toml
-[box.api]
-# source (one required)
-image      = "alpine:3.19"        # --image
-rootfs     = "/var/lib/rootfs"    # --rootfs   (mutually: image OR rootfs)
-
-# named resource profiles, the ones declared above as [[vcpu]] / [[vdisk]] / [[vgpio]]
-config     = "kern.toml"          # --config: the file those profiles are DECLARED in
-vcpu       = "slim"               # -> the positional token `vcpu:slim`
-vdisk      = ["scratch", "logs"]  # -> `vdisk:scratch vdisk:logs`, one mount each
-vgpio      = "leds"               # -> `vgpio:leds`
-
-# command & ordering
-command    = ["/bin/sh", "-c", "exec app"]   # -- <command...>
-depends_on = ["db"]               # start after these boxes
-# conditional dependencies, `up` WAITS for the condition before starting this box:
-depends_healthy   = ["db"]        # wait until each named box's health_cmd reports healthy
-depends_completed = ["migrate"]   # wait until each named box exits 0 (init-container / migration job)
-# Docker long-syntax is accepted verbatim too, so a docker-compose.yml block pastes in as-is:
-#   depends_on = { db = { condition = "service_healthy" }, migrate = { condition = "service_completed_successfully" } }
-# Constraints (rejected at bring-up, not left to time out): a `depends_healthy` target must declare
-# `health_cmd`; a `depends_completed` target must NOT set `restart = true` (it would never complete).
-# `up` waits up to 120s per condition, and aborts early if a dependency dies or fails.
-
-# filesystem / runtime
-workdir    = "/srv"               # --workdir / -w
-read_only  = true                 # --read-only
-bind_rootfs = false               # --bind-rootfs   (rootfs only; mutually excl. read_only)
-uid_range  = false                # --uid-range
-hostname   = "api"                # --hostname
-user       = "1000:1000"          # --user  (UID[:GID], or a name from the image's /etc/passwd)
-tmpfs      = ["/tmp:64m"]         # --tmpfs  (repeatable; PATH[:size])
-
-# resources
-memory     = "512m"               # --memory / -m
-cpus       = "1.5"                # --cpus                (quota)
-cpuset     = "0-3"                # --cpuset-cpus         (pinning, via sched_setaffinity, rootless)
-swap_max   = "1g"                 # --memory-swap-max
-pids_limit = "512"                # --pids-limit
-io_weight  = "200"                # --io-weight (cgroup v2 io.weight, 1-10000)
-nice       = "5"                  # --nice (-20..19)
-# (Resource profiles attach on the CLI, `kern run vcpu:heavy vgpio:sensors -- cmd`, not via a box
-#  key yet. Docker's `profiles: [...]` service-gating key IS honored: a service with a non-empty
-#  profile list stays inactive unless enabled via COMPOSE_PROFILES, exactly like Docker.)
-
-# networking
-net        = false                # --net   (share host net; no isolation)
-tun        = false                # --tun   (expose /dev/net/tun)
-ports      = ["127.0.0.1:8080:80"]  # --publish / -p  (repeatable)
-ssh        = "2222"               # --ssh PORT  (in-box sshd on host PORT)
-ssh_key    = "/keys/id.pub"       # --ssh-key   (authorize this pubkey instead of a throwaway)
-add_host   = ["db:10.0.0.5"]      # --add-host N:IP (IP may be `host-gateway`; repeatable)
-dns        = ["1.1.1.1"]          # --dns  (nameserver lines; without it the image's file is kept)
-dns_search = ["example.com"]      # --dns-search  (the resolver's `search` line)
-dns_opt    = ["ndots:2"]          # --dns-option  (resolv.conf options; `dns_options` also accepted)
-networks   = ["front", "back"]    # the networks this service joins. INERT in a pod (one shared
-                                  #   namespace); under --no-pod it is ENFORCED: only services with
-                                  #   a network in common get a peer relay and resolve each other.
-                                  #   No key = the implicit `default` network (Compose Spec rule)
-links      = ["db:database"]      # Docker's `links`: an /etc/hosts ALIAS for a peer, plus the
-                                  #   start-ordering edge. No CLI flag: the alias becomes an
-                                  #   --add-host whose address kern resolves per stack mode
-# Pod-scoped, and the only two keys with no CLI flag: a pod shares one network namespace, so kern
-# needs to know what each service LISTENS on to refuse a collision before it starts anything.
-port       = 3000                 # the port this service listens on inside the pod
-expose     = ["8080", "9000/udp"] # the same, for several; documented, not published
-
-# process & metadata
-init       = true                 # --init     (reaping PID 1: no zombies, forwards SIGTERM)
-labels     = ["team=api"]         # --label / -l  (repeatable; selectable with `ps --filter label=`)
-sysctls    = ["net.core.somaxconn=1024"]  # --sysctl (namespaced knobs only; repeatable)
-ulimits    = ["nofile=1024:2048"] # --ulimit  (rootless can only LOWER; repeatable)
-
-# environment / secrets
-env        = ["LOG=debug", "PORT=8080"]   # --env / -e  (repeatable)
-env_file   = ["/etc/app.env"]     # --env-file  (repeatable; K=V lines)
-secrets    = ["/host/db-pw:db"]   # --secret  (repeatable; src:name → /run/secrets/name)
-
-# least privilege
-cap_add    = ["NET_ADMIN"]        # --cap-add  (repeatable)
-cap_drop   = ["ALL"]              # --cap-drop (repeatable)
-
-# supervision (detached boxes)
-restart              = true       # --restart
-restart_max          = 10         # --restart-max (retries before giving up; default 10)
-stop_signal          = "SIGTERM"  # --stop-signal  (name or number)
-stop_grace_period    = "30s"      # --stop-timeout (seconds before the SIGKILL; default 10)
-timeout              = "300"      # --timeout  (SIGTERM at N, SIGKILL 2s later: N+2 worst case)
-health_cmd           = "wget -qO- localhost/health"   # --health-cmd
-health_interval      = 30         # --health-interval (integer seconds)
-health_retries       = "3"        # --health-retries
-health_start_period  = "10"       # --health-start-period
-health_start_interval = "5"       # --health-start-interval (probe cadence INSIDE the start period,
-                                  #   Docker 25+'s start_interval; default: the steady interval)
-health_timeout       = "2"        # --health-timeout
-health_action        = "restart"  # --health-action <restart|stop|none>
-
-# devices
-devices    = ["/dev/net/tun", "/dev/kvm:/dev/kvm:r"]  # HOST[:BOX[:PERMS]] - bound in, not created.
-                                  #   /dev/net/tun maps to --tun (the node alone is useless without
-                                  #   CAP_NET_ADMIN); a spec with no `w` becomes a read-only bind
-
-# logs (kern's own capture, read with `kern logs`)
-mem_reservation = "64m"           # --memory-reservation (cgroup memory.low: a SOFT floor,
-                                  #   protected under pressure, never a cap and never an OOM kill)
-cpu_weight = "100"                # --cpu-weight (cgroup cpu.weight, 1-10000, 100 = normal). A
-                                  #   compose `cpu_shares:` is CONVERTED onto this scale
-pull       = "missing"            # --pull (compose spells it `pull_policy:`)
-shm_size   = "1g"                 # --shm-size (/dev/shm cap; the memory cgroup still bounds the
-                                  #   total, so a size above the memory cap is not more memory)
-volumes_from = ["data"]           # copy another service's mounts (`data:ro` narrows the copy).
-                                  #   Resolved after the whole file; ONE level, never a chain
-log_max_size = "10m"              # --log-max-size (rotate at this size; default 16m)
-log_max_file = "3"                # --log-max-file (files kept, active one included; default 2)
-
-# host paths
-volumes    = ["/data:/data:ro", "/etc/app:/app"]  # --volume / -v  (repeatable)
-```
-
-### Key → flag map (the non-obvious ones)
-
-| TOML key            | CLI flag            |
-|---------------------|---------------------|
-| `cpuset`            | `--cpuset-cpus`     |
-| `swap_max`          | `--memory-swap-max` |
-| `volumes`           | `--volume` / `-v`   |
-| `env`               | `--env` / `-e`      |
-| `secrets`           | `--secret`          |
-| `ports`             | `--publish` / `-p`  |
-| `labels`            | `--label` / `-l`    |
-| `sysctls`           | `--sysctl`          |
-| `ulimits`           | `--ulimit`          |
-| `stop_grace_period` | `--stop-timeout`    |
-| `dns_opt`           | `--dns-option`      |
-| `devices`           | `--volume` / `-v` (a device is bound, not created; `/dev/net/tun` → `--tun`) |
-| `links`             | `--add-host` (the alias; the ordering edge folds into `depends_on`) |
-| `networks`          | no flag: it shapes the `--no-pod` relay graph and each box's `--add-host` set |
-| `log_max_size`      | `--log-max-size`    |
-| `log_max_file`      | `--log-max-file`    |
-| `shm_size`          | `--shm-size`        |
-| `network_mode: host` | `--net` (the service leaves the stack's network, as under Docker) |
-| `network_mode: none` | no pod and no NAT: loopback only |
-| `mem_reservation`   | `--memory-reservation` |
-| `cpu_weight`        | `--cpu-weight` (compose's `cpu_shares:` is converted onto this scale) |
-| `pull`              | `--pull` (compose spells it `pull_policy:`) |
-| `volumes_from`      | no flag: it appends the named service's entries to `--volume` |
-| `vcpu`/`vdisk`/`vgpio` | positional `vcpu:<name>` … |
-| `security_profile`  | `--security-profile` |
-
-### `[kern] publish_bind`
-
-```toml
-[kern]
-publish_bind = "127.0.0.1"   # or "0.0.0.0" (the default: Docker's, every interface)
-```
-
-A `-p`/`ports:` spec that names no address binds **`0.0.0.0`**, which is what Docker does and what a
-compose file written for Docker means. This key changes that for the whole host.
-
-It is a **CEILING, not a default**: with `publish_bind = "127.0.0.1"` even a spec that explicitly
-writes `0.0.0.0:8080:80` is bound to loopback, because a policy any downloaded compose file could
-defeat by writing an address would not be a policy. It is never silent: the box reports how many
-specs it narrowed.
-
-Read from the DEFAULT config only, never from a `--config` path a compose file chose, for the same
-reason as `allow_device_grants` below: a stack obtained from anywhere must not decide where the host
-listens. Only the two values above are accepted; a different bind address belongs in the spec, next
-to the port it applies to (`10.0.0.5:8080:80`).
-
-If `kern.toml` cannot be parsed, publishing falls back to **loopback** and says so. The two wrong
-answers are not symmetric: guessing "every interface" would publish ports an operator may have
-written a config file to prevent.
-
-### `[kern] compose_memory_max`
-
-```toml
-[kern]
-compose_memory_max = "512m"   # absent: the host's own RAM, which is Docker's bound
-```
-
-A `kern compose` **service** whose file names no `mem_limit:` gets the **host's RAM** as its
-`memory.max`. That is the bound a `docker compose` service has, because Docker imposes no memory
-limit on a container at all and the machine is the only limit. kern used to hand such a service
-`kern box`'s 512 MiB default, so a service that runs fine under Docker was OOM-killed at a number
-written **nowhere in the file**, with exit 137 and nothing to grep for. Measured on a neutral corpus
-of 259 compose files, one per repository: **243** have at least one service in that position, which
-made it the largest remaining difference from Docker after the publish default.
-
-It is **not uncapped**, and the difference matters: the box still carries a `memory.max` and still
-has `memory.oom.group = 1`, so a service that really does exhaust the machine is killed against
-**its own cgroup** with kern's message naming the cap, rather than leaving the host OOM killer to
-choose a victim elsewhere. `kern build`'s `RUN` steps already took exactly this decision, for exactly
-this measured reason; this makes the two agree.
-
-This key restores a strict ceiling, and like `publish_bind` it is a **CEILING, not a default**: a
-service asking for more through `mem_limit:` is held at this value, because a limit a downloaded
-compose file can raise by writing a bigger number limits nothing. A service asking for **less** is
-left alone. It is never silent when it binds: kern names the services it moved, and says nothing on a
-stack where the ceiling changed nothing.
-
-`kern box` and `kern run` are **not affected**. Their 512 MiB default is a sensible bound for a
-one-off sandbox typed at a prompt; a compose service is a declared long-running workload whose file
-has a way to say what it needs.
-
-If `kern.toml` cannot be parsed, compose services fall back to the historic **512 MiB** and kern says
-so. The two wrong answers are not symmetric: reading a broken config as "no ceiling" would hand every
-stack on the machine the whole of its RAM because of a typo.
-
-### `[kern] allow_device_grants`
-
-A compose stack that names a `vgpio` profile is REFUSED unless the person running it says so, because
-that profile resolves to host device nodes and, unlike a cpu or disk profile, there is no sense in
-which the local grant is the smaller one: `/dev/gpiochip0` is not a smaller `/dev/gpiochip1`. The
-acknowledgement is `--allow-device-grants` on the command line, or this key:
-
-```toml
-[kern]
-allow_device_grants = true
-```
-
-It exists for the case the command line cannot reach. A service with `restart:` becomes a systemd unit
-whose `ExecStart` nobody types, so without a persistent grant such a service either never restarts
-after a reboot (and nobody finds out until the machine reboots) or the generated unit has to carry the
-permission itself, which is a self-perpetuating hardware grant on a machine nobody is watching.
-
-**This key is read from YOUR config only.** A stack file can name its own config (`config =
-"other.toml"`), so honouring the key from there would let a downloaded bundle ship its own permission.
-Only the default config (or `KERN_CONFIG`, which is equally yours) is consulted, and a config that
-cannot be read is not a grant. Run `kern compose <file> config` first: it prints the exact device paths
-each profile name reaches on this host.
-
-Everything else shares the flag's long name. **Two keys have no flag**, `port` and `expose`: they
-declare what a service listens on so `compose` can refuse a port collision inside the shared pod
-namespace before starting anything, which is a property of the stack rather than of one box.
-
-**The three v-profile keys are named after the tables that declare them**, not after a flag, because
-`kern box` takes them POSITIONALLY (`kern box api --image alpine vcpu:slim vdisk:scratch -- app`).
-Each takes one name or a list, and the prefix is optional inside the value: `vcpu = "slim"` and
-`vcpu = "vcpu:slim"` are the same profile. They could not be called `profiles`: that key already
-exists here with Docker's meaning (which services a plain `up` starts), and one word with two
-meanings in one file is how a stack quietly does something else.
-
-`config` names the file those profiles resolve against. Without it kern falls back to its usual
-discovery order, which depends on the caller's `$HOME` and environment: fine on a laptop, wrong for a
-stack that ships its own `kern.toml` beside it. `kern compose <file> config` prints the tokens each
-service will receive and the file they resolve against, so a name that is not in it is visible before
-anything starts.
-
----
-
-## The one rule: TOML mirrors the CLI
-
-Every key maps to a flag, nothing to learn twice. If you know the flag, you know the key. The two
-exceptions are named above and exist because a pod is not a box.
-
-- **Scalar** → a **quoted string** carrying the exact CLI argument: `memory = "512m"`, `cpus = "1.5"`,
-  `cpuset = "0-3"`. (Numeric profile fields like `cpus = 4.0` / `iops = 1000` / `nice = -5` are
-  bare numbers, as shown above.)
-- **Switch** → a **TOML bool**: `read_only = true`. A `false` (or absent) key emits no flag.
-- **Repeatable flag** → an **array**: `volumes = ["src:dst:ro"]`, `pins = [17, 27]`.
-
-## Types & tolerance
-
-- Strings are double-quoted. An unquoted scalar (`memory = 512m`) for a key kern **implements** is a
-  parse error, quote it. A *malformed value* of a recognized key is always caught, with its line.
-- Bools are bare `true` / `false`. Integers/floats are bare (`health_interval = 30`, `cpus = 4.0`).
-- Arrays are `["a", "b"]` / `[17, 27]`; a comma inside a quoted element does not split it.
-- `#` starts a comment outside a string.
-- **Unknown keys and sections are ignored, not rejected**, so a `kern.toml` written for another kern
-  edition still loads. The trade is deliberate and has a cost: a typo in a key name is silently
-  skipped, so lean on `kern config` / `kern top`, which validate live.
-
-## Deliberate choices in this schema
-
-- **Two surfaces, one philosophy.** Profiles are resource-centric (`[[vcpu]]`/`[[vgpio]]`/`[[vdisk]]`,
-  attached by prefix) and compose is box-centric (`[box.NAME]`). They read differently because they
-  answer different questions: "what slice" and "what stack".
-- **CPU field names match the CLI everywhere**: `cpus` = quota, `cpuset` = pinning, in the flat compose
-  keys AND the `[[vcpu]]` profile. One spelling per concept, and it is the flag's. Know the flag, know
-  the field, in both files.
-- **No `seccomp = "off"` / `no_seccomp` / `no_cgroup` key**: the seccomp filter and the cgroup caps
-  are always on and cannot be disabled from config (hardening over blind parity, by design).
-- **Keys this edition does not model** (a `[[vgpu]]` / `[[gpu]]` family among them) are **ignored,
-  not rejected**, so a `kern.toml` shared with another kern edition still loads here. What is on the
-  roadmap is listed in the [roadmap](../ROADMAP.md); what is in the schema is this document.
-
-## Fleet limits (environment)
-
-Per-box caps (`--memory`, `--cpus`, `--pids-limit`) bound each box on its own. For a HOST that runs many
-boxes (a serverless `box fn` pattern, an agent platform), three environment variables bound the fleet as
-a whole. They are deployment-level, so they live in the environment kern runs under, not in a `kern.toml`
-profile:
-
-| Variable | Effect | Kind |
-|---|---|---|
-| `KERN_MAX_CONCURRENT=N` | Refuse to start a new box when `N` boxes are already running. | **Cooperative.** First-party governor, NOT a security boundary (a caller can unset it). The count is crash-safe (a dead box's slot frees automatically). The count-and-claim runs under a `flock` (the ceiling is read while the lock is held), so a **concurrent burst** (`kern compose up`, `xargs -P kern box`) serializes on the claim and cannot overshoot `N`. |
-| `KERN_FLEET_MEMORY_MAX` | A `memory.max` on kern's shared `kern.slice`, bounding the SUM of all boxes' memory. Accepts `512m`, `4g`, or bare bytes. | **Kernel-enforced ONLY when boxes share `kern.slice`** (see below). |
-| `KERN_FLEET_PIDS_MAX` | A `pids.max` on `kern.slice`, bounding total tasks across all boxes. | Same condition as above. |
-
-**Important scope of the fleet caps.** The fleet SUM caps write `memory.max` / `pids.max` on kern's
-`kern.slice` and only bound boxes that actually run INSIDE that slice, which happens on the **direct-cap
-path** (kern as root, or a host where a delegated `kern.slice` is ensured). In the common ROOTLESS setup
-kern puts each box in its OWN per-box systemd scope (under `app.slice`, NOT `kern.slice`), so the fleet
-SUM is currently **not** enforced there. kern does not stay silent about it: when a fleet cap is set but
-the direct-cap path is not taken, it prints a one-line warning at box start. The **per-box `--memory` /
-`--pids-limit` caps are the reliable knob and enforce everywhere the controller is delegated** (verified on
-x86, the ARM boards, and the VPS: a box over its `--memory` is OOM-killed). For a guaranteed fleet bound
-today, run kern as root, or cap each box with `--memory` / `--pids-limit`; add `--require-limits` to make a box
-refuse to start rather than run uncapped where the per-box cap cannot be enforced. A rootless
-shared-slice fleet cap is tracked as a post-launch improvement. Example:
 
 ```sh
-export KERN_MAX_CONCURRENT=200        # at most 200 boxes at once
-export KERN_FLEET_MEMORY_MAX=16g      # SUM cap, enforced only when boxes share kern.slice (see above)
-export KERN_FLEET_PIDS_MAX=20000
+kern run vcpu:heavy vdisk:scratch -- ./job
+kern box app --image alpine vgpio:sensors -- sh
 ```
 
-**Cross-box OOM semantics.** `KERN_FLEET_MEMORY_MAX` caps the SUM of all boxes on the shared
-`kern.slice`. When that shared ceiling is hit, the kernel's cgroup OOM killer acts at the slice level: it
-picks a victim task by the usual heuristic (roughly the largest RSS) across ALL boxes, so one box's
-memory spike can cause a task in a DIFFERENT box to be killed. This is the intended pooled-budget
-behavior (the fleet shares one hard limit), but it means a fleet cap is not a per-box guarantee. For a
-workload that must not be collateral, ALSO give it a per-box `--memory`: a box with its own `memory.max`
-is OOM-scoped to itself first (its own cgroup limit is hit before it can push the slice over), so the
-fleet cap becomes a backstop for the aggregate rather than the thing that kills your critical box.
+- **One key per line**, and every profile names a `backend`.
+- `[[vcpu]]` also takes `cpuset`, `numa`, `nice` and `extends`. `[[vdisk]]` also takes `iops`,
+  `bandwidth` and `persistent`.
+- `[[vgpio]]` grants only what you list: `pins`, `pwm`, `adc` and `onewire` (these need a `[[gpio]]`
+  controller as `backend`), `i2c`, `spi`, `uart`, `can`, `camera`, `audio`, `midi`, `input`, `leds`,
+  `bluetooth`, `net`, `display` (the GPU render node, the whole card), `usb` and `extra` (explicit
+  `/dev` paths). Nodes that give control of the host (disks, raw memory, `kvm`, the console) are
+  refused even when listed.
+- `[[cpu]]`, `[[disk]]` and `[[gpio]]` declare the physical resource a profile's `backend` names. They
+  are optional: `host` and `ram` need none.
+
+## Compose stacks: `[box.NAME]`
+
+`kern compose stack.toml up` starts the boxes in `depends_on` order; a `docker-compose.yml` works too.
+Every service runs detached.
+
+```toml
+[box.db]
+image = "redis:7-alpine"
+
+[box.api]
+image      = "alpine:3.19"
+command    = ["/bin/sh", "-c", "exec sleep 60"]
+depends_on = ["db"]
+ports      = ["127.0.0.1:8080:80"]
+env        = ["LOG=debug"]
+memory     = "512m"
+restart    = true
+health_cmd = "wget -qO- localhost/health"
+```
+
+Every key is its flag's long name, with `_` for `-`. Where the flag differs, it is in brackets:
+
+| | keys |
+|---|---|
+| source | `image`, `rootfs`, `bind_rootfs` |
+| command and order | `command`, `depends_on`, `depends_healthy`, `depends_completed` |
+| filesystem | `workdir`, `read_only`, `tmpfs`, `volumes` (`-v`), `volumes_from`, `user`, `uid_range`, `hostname` |
+| resources | `memory`, `cpus`, `cpuset` (`--cpuset-cpus`), `swap_max` (`--memory-swap-max`), `pids_limit`, `cpu_weight`, `io_weight`, `nice`, `mem_reservation` or `memory_reservation`, `shm_size` |
+| profiles | `config` (the file they are declared in), `vcpu`, `vdisk`, `vgpio` (become `vcpu:<name>` and so on) |
+| network | `net`, `tun`, `ports` (`-p`), `networks`, `links`, `add_host`, `dns`, `dns_search`, `dns_opt` or `dns_options`, `ssh`, `ssh_key`, `port`, `expose` |
+| security | `security_profile`, `cap_add`, `cap_drop`, `devices`, `init`, `labels`, `sysctls`, `ulimits` |
+| environment | `env`, `env_file`, `secrets` |
+| supervision | `restart`, `restart_max`, `stop_signal`, `stop_grace_period` (`--stop-timeout`), `timeout`, `health_cmd`, `health_interval`, `health_retries`, `health_timeout`, `health_start_period`, `health_start_interval`, `health_action` |
+| images and logs | `pull` or `pull_policy`, `log_max_size`, `log_max_file` |
+
+`port` and `expose` have no flag: they say what a service listens on inside the shared pod, so a port
+collision is refused before anything starts. `kern compose stack.toml config` prints what each service
+will get, without starting it.
+
+## `[kern]` settings
+
+```toml
+[kern]
+publish_bind        = "127.0.0.1"  # a port with no address binds here
+compose_memory_max  = "512m"       # memory ceiling per compose service
+allow_device_grants = true         # compose stacks may use device profiles
+```
+
+Without them, a port binds every interface, a compose service with no `mem_limit` gets the host's
+RAM, and a stack that names a device profile is refused. They are read only from your own config,
+never from a file a stack names, so a downloaded stack cannot grant itself anything. The first two are
+ceilings: a stack cannot ask for more.
+
+## Values
+
+- A value that is a flag's argument is a quoted string: `memory = "512m"`. A switch is `true` or
+  `false`. A repeatable flag is an array: `volumes = ["/data:/data:ro"]`.
+- Numeric profile fields are bare numbers: `cpus = 4.0`, `nice = -5`.
+- Unknown keys are ignored, so a typo is skipped too: check the file with `kern validate`.
+- Seccomp and the cgroup caps cannot be turned off from a config file.
+
+## Limits for many boxes
+
+`KERN_MAX_CONCURRENT=N` refuses a new box while `N` are running. `KERN_FLEET_MEMORY_MAX` and
+`KERN_FLEET_PIDS_MAX` cap all boxes together, but only where boxes share `kern.slice` (as root, or on a
+delegated slice); kern warns when they do not apply. Per-box `--memory` and `--pids-limit` are the
+caps that hold everywhere.

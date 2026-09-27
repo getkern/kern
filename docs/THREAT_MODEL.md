@@ -74,7 +74,7 @@ box's network.
 | vGPIO pin list | GPIO is chip-granular: the character device exposes every line via ioctl, the kernel has no per-line mount boundary | `pins = [...]` is cooperative metadata; grant a `vgpio:` profile only to a workload you trust with that hardware |
 | The `--ssh` subtree | sshd and its shells are forked before seccomp and the cap drop, and run the image's own binaries pre-filter | for interactive access, not a hardened bastion; the interactive-trust surface you opted into |
 | `--net host` | shares the host netns | there is then no network isolation, by request |
-| GPU limits | not shipped in this tree | when they land, expect a cooperative governor for honest workloads, with the bypasses named here |
+| The GPU | a device grant gives the box the whole card, through the host's driver | kern does not split or cap a GPU; grant it only to workloads you would trust with that hardware |
 
 ## Attack surface, mitigation, residual
 
@@ -111,7 +111,7 @@ The claims are checked by asking the kernel what is true, not by asking kern to 
   registry, so no account or network is needed; a host that cannot answer a question reports `SKIP`,
   never a false pass.
 - The tar byte-parser is fuzzed. Production code is panic-free (no `unwrap`/`expect`/`panic!` on any
-  reachable path). The boundaries have been exercised on x86_64, three ARM boards, WSL2, and a VPS.
+  reachable path). The boundaries have been exercised on x86_64, ARM (aarch64), WSL2 and a VPS.
 - Three sequence/coverage properties are asserted by a test, not assumed: (1) the WHOLE mount API,
   classic and the fd-based family (`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/`fspick`/
   `mount_setattr`), hard-kills with `SIGSYS` - not merely `ENOSYS`-by-allowlist - checked by

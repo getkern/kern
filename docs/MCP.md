@@ -31,7 +31,7 @@ stdio transport spawns `kern-mcp` where the CLIENT runs, and `kern-mcp` needs a 
 it: kern is Linux-only, because it is namespaces and cgroups. A client running on macOS or on Windows
 therefore cannot use the line above as written - it would spawn a command that is not there - and
 needs a transport into a Linux machine instead. Both are one line and both are below: `wsl` from
-Windows, `ssh` to a VM or a board from anywhere. The SDK says the same thing at the point it bites:
+Windows, `ssh` to a VM or another Linux machine from anywhere. The SDK says the same thing at the point it bites:
 on macOS its missing-binary error names the VM rather than an installer.
 
 **A `pip install` into a virtual environment is invisible to the client**, which spawns `kern-mcp`
@@ -110,7 +110,7 @@ config is one line either way.
 **A box on another machine, over ssh:**
 
 ```json
-{ "mcpServers": { "kern": { "command": "ssh", "args": ["pi@raspberrypi", "kern-mcp"] } } }
+{ "mcpServers": { "kern": { "command": "ssh", "args": ["you@linux-host", "kern-mcp"] } } }
 ```
 
 **A Linux box from a Windows host, over WSL:**
@@ -119,9 +119,9 @@ config is one line either way.
 { "mcpServers": { "kern": { "command": "wsl", "args": ["-d", "Ubuntu", "--", "kern-mcp"] } } }
 ```
 
-The agent runs where you are; the sandbox runs where the box is. For an ARM board that is the whole
-integration: `pip install kern-sandbox` and a `kern` binary on the board, a key you already have, and
-one line in a config file.
+The agent runs where you are; the sandbox runs where the box is. For another machine that is the whole
+integration: `pip install kern-sandbox` and a `kern` binary there, a key you already have, and one
+line in a config file.
 
 ### What it costs
 

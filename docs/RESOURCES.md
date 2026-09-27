@@ -14,7 +14,7 @@ control, and devices are deny-by-default. The exact `kern.toml` schema is in [CO
 | **Devices** | `vgpio:` | *Only* the named GPIO/I²C/SPI/LED nodes | fresh `/dev` + fd-pinned bind + capability deny-list |
 | **PIDs** | `--pids-limit` | Fork-bomb ceiling | cgroup `pids.max`, hard |
 | **Block I/O** | `--io-weight` | I/O bandwidth weight | cgroup `io` |
-| **GPU** | *(roadmap)* | Not shipped | see [Roadmap](../ROADMAP.md) |
+| **GPU** | `display` device grant · compose `devices:` | The whole card, as a device | no per-box cap |
 
 ¹ Where the `memory` controller is not delegated to a non-root user's scope, kern warns and shows the
 one-line `.wslconfig` fix; enforced natively on Linux.
@@ -41,8 +41,7 @@ That holds on both cap paths. Where a rootless box takes the `systemd-run --scop
 the direct `kern.slice` one, kern builds its own cgroup inside the scope: the workload capped at
 exactly what you asked for, kern's supervisor outside the blast radius so the group-kill takes the
 workload and not the process that has to report it. Re-checked in both layouts on four hosts and four
-systemd versions (**249, 252, 255, 257**). On the UNO Q, Android's `lmkd` is not running, so it is the
-cgroup doing the killing and not a host-level low-memory killer.
+systemd versions (**249, 252, 255, 257**).
 
 **Enforce, or refuse to start.** Where the controllers are not delegated, the default is to warn once
 and run uncapped. `--require-limits` (or `KERN_REQUIRE_LIMITS`) makes that fatal: the box refuses to

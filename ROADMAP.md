@@ -7,7 +7,6 @@ What kern does not do. Nothing here is a commitment or a date. Shipped work is i
 
 | | where it stands |
 |---|---|
-| **GPU slices** | Nothing caps a GPU. `kern doctor` prints the tier a cap would have: `TIER-HW` where a MIG or SR-IOV partition exists, `TIER-SOFT` everywhere else, where a quota is bypassed by skipping the vendor library |
 | **A VM tier** | A shared kernel is the wrong boundary for genuinely hostile, multi-tenant code, and [SECURITY.md](SECURITY.md) says so rather than arguing. A microVM tier is the honest answer to that case. Nothing ships, and it would be its own thing rather than a flag on a box |
 | **Running kern in a Kubernetes pod** | It runs inside a container today, and CI holds it there on `main`, on the listed branches and on every pull request: `kern box --memory 64m` inside a privileged `docker run`, red if the cap does not bite, and red if `doctor` and the box disagree where the controller cannot be delegated. What is not measured is how much LESS privilege it needs, and that is the whole question: nobody signs off a `privileged: true` pod, so the lowest rung that still runs is the spec you would hand a security team. The rungs, in order: drop `--privileged`, then the default seccomp, then the default AppArmor, then a read-only cgroup, then without `SYS_ADMIN` |
 | **More governed resources** | I/O bandwidth and IOPS ship and bind where the host delegates `io`. Widening that, plus network shaping |

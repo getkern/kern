@@ -505,6 +505,12 @@ def gpu_claims_agree() -> list[str]:
             # SECURITY.md is the page that owns both, so only it is held to the hardware caveat.
             if marker == "has not measured the VRAM split" and path == "README.md":
                 continue
+            # Since 2026-09-27 the pages describe a GPU only as a device grant (the whole card, no
+            # split, no cap), by the owner's decision, and name no tier. A page that makes no tier
+            # claim has no admission to carry. The moment either page names a tier or a VRAM cap
+            # again, the admission is required again, which is the part of this rule that matters.
+            if "tier-" not in text.lower() and "vram" not in text.lower():
+                continue
             if marker.lower() not in text.lower():
                 bad.append(
                     f"{path} carries the GPU claim to a reader and no longer states "

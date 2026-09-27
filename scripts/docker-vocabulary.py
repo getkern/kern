@@ -40,8 +40,8 @@ VOCABULARY = {
     "someone evaluating kern before installing cannot look",
     "docker.sock": "the first thing an integrator asks for, and a declared non-goal: it is a second "
     "product, not a flag",
-    "--gpus": "no GPU cap ships, and the reasoning is in GPU-CLAIMS.md. The word is how a reader "
-    "reaches that answer instead of assuming one",
+    "--gpus": "a GPU is a device grant here, the whole card, and nothing splits it. The word is how "
+    "a reader reaches that answer instead of assuming one",
     "swarm": "a declared non-goal (it needs a daemon), and the word a reader arrives with",
     "overlay network": "the multi-host network they may be looking for, refused with a reason: a "
     "rootless L2 bridge is not possible",

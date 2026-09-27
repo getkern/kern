@@ -27,9 +27,8 @@ section is the summary; the rest of this file is the per-mechanism detail behind
 
 - seccomp must block the dangerous syscall set unconditionally.
 
-**Out of scope, by design: the GPU.** No GPU limit ships, so there is no cap here to attack. What
-ships is the verdict about one, and the verdict is that a VRAM cap in userspace is a quota and not a
-boundary.
+**Out of scope, by design: the GPU.** A box can be given the host's GPU as a device, the whole card,
+and kern does not split or cap it, so there is no GPU limit here to attack.
 
 **An unprivileged user namespace is itself kernel attack surface.** kern's isolation is *built on*
 one, and userns has historically been a fertile source of kernel privilege-escalation CVEs. Running
@@ -298,23 +297,10 @@ everything else, and the source paths are canonicalized and re-checked to stay u
 
 Grant a `vgpio:` profile only to workloads you would trust with that hardware.
 
-## GPU: no cap ships, and why one in userspace would not be a boundary
-**No GPU limit ships, so there is no cap here to attack.** What ships is a read-only verdict: `kern
-doctor` reads sysfs and reports what a VRAM cap on each device would be worth. `TIER-HW` where a MIG
-or SR-IOV partition is present, which the device enforces rather than the tenant, though kern reads
-its presence and **has not measured the VRAM split**; `TIER-SOFT` for everything else, which on
-consumer hardware is a cooperative quota, NOT a boundary against malicious code.
-
-The reason a userspace cap cannot be a boundary is that the workload does not have to go through it:
-measured on an RTX 5060 Ti, a process linking only libc reached the driver with a raw ioctl and was
-answered, on two distinct driver ABIs. The full argument, the four other measured bypasses, the
-scope it does and does not cover, and **two named blind spots** in kern's own detection are in
-[docs/GPU-CLAIMS.md](docs/GPU-CLAIMS.md), and [`pentest/pentest-gpu-claims.sh`](pentest/pentest-gpu-
-claims.sh) runs them.
-
-**What to do with a hostile GPU tenant.** Give it a MIG instance or an SR-IOV virtual function, or
-give it the whole device. A cooperative quota is the right tool for packing several of your own
-models onto one card, and the wrong tool for containing someone else's.
+## GPU: a device grant, not a slice
+A box can be given the host's GPU as a device grant: the whole card, through the host's driver. kern
+does not split a GPU or cap it per box, so a workload holding the GPU has the driver's attack surface.
+Grant it only to workloads you would trust with that hardware, as with any other device.
 
 ## vDisk
 A `vdisk:` profile mounts a size-capped volume at `/vdisk/<name>`. Rootless it is a RAM-backed
@@ -376,8 +362,7 @@ escape the box, that a box cannot raise its own `memory.max` and sees no cgroup 
 a device not granted does not cross, and that a SIGKILLed supervisor does not leave a host port
 held.
 
-The fifth is the GPU claim suite, and it is the one that attacks a claim rather than a mechanism: it
-reads what `kern doctor` says about each card, then runs T1 to T9 against the host's own driver and
+The fifth checks what `kern doctor` reports about the host's GPUs against the host's own driver, and
 fails if the two disagree.
 
 ```sh

@@ -5,8 +5,7 @@ Docker Engine API. This page is the reference: what is supported, what is not, a
 differences bite.
 
 Every FIGURE on this page is measured, and the measurement is named where it matters. Statements
-about what Docker does are measured against **Docker 29.6.2** on a real daemon (a Jetson Orin Nano,
-aarch64) and against **podman 4.9.3** rootless on the development host; where a question was not put
+about what Docker does are measured against **Docker 29.6.2** on a real daemon (aarch64) and against **podman 4.9.3** rootless on the development host; where a question was not put
 to a daemon, the line says so. [RUNTIME-PARITY.md](RUNTIME-PARITY.md) carries those measurements one
 by one.
 
@@ -355,9 +354,8 @@ Peers resolve each other by service name, by `networks.<net>.aliases` and by the
 announces. `external: true` joins a network shared between projects.
 
 What needs a daemon does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything
-that attaches to it. Nor does `--gpus`: kern ships no GPU cap and says why in
-[GPU-CLAIMS.md](GPU-CLAIMS.md), so a workload that needs the whole card gets the whole card and there
-is no quota to ask for.
+that attaches to it. Nor does `--gpus`: a GPU is a device grant here (`devices:` plus `--allow-device-grants`), so a
+workload that needs the card gets the whole card and there is no quota to ask for.
 
 ### Reaching the host from inside a box: `host.docker.internal`
 
