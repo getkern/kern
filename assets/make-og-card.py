@@ -70,6 +70,15 @@ LEFT = 71
 Y_LINE1, Y_LINE2, Y_SUB = 215, 299, 380
 BAND = (0, 200, 1200, 425)  # cleared before repainting: below the wordmark, above the platform line
 
+# THE PLATFORM LINE is repainted too, so the card lists what the README's badge lists and nothing it
+# dropped. Recovered from the v5 card the same way as the rest: Lato Semibold at 28 px matched four
+# words to within 2 px of ink width in total, ink starts at x=74, the letters sit on y=459, and a dot
+# sits 16 px after a word and 18 px before the next.
+PLATFORMS = ("Linux", "macOS (VM)", "Windows (WSL2)")
+PLATFORM_INK = (11, 114, 133)  # sampled from the original line
+PLATFORM_BAND = (0, 430, 1200, 474)  # cleared: below the sub-line, above the install box
+PLATFORM_X, PLATFORM_BASE, GAP_BEFORE_DOT, GAP_AFTER_DOT = 74, 459, 16, 18
+
 
 def _ink_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
     return img.convert("L").point(lambda v: 255 if v < 200 else 0).getbbox()
@@ -100,10 +109,35 @@ def _repaint_pill(card: Image.Image) -> None:
     d.text(((x0 + x1 - w) / 2, (y0 + y1) / 2 - 21), PILL, font=font, fill=PILL_INK)
 
 
+def _repaint_platforms(card: Image.Image) -> None:
+    """Clear the platform line and write PLATFORMS on the original's baseline and spacing."""
+    d = ImageDraw.Draw(card)
+    d.rectangle(PLATFORM_BAND, fill="white")
+    font = ImageFont.truetype(f"{FONTS}/Lato-Semibold.ttf", 28)
+    pieces = []
+    for i, word in enumerate(PLATFORMS):
+        if i:
+            pieces.append(("\u00b7", GAP_BEFORE_DOT))
+            pieces.append((word, GAP_AFTER_DOT))
+        else:
+            pieces.append((word, 0))
+    x = PLATFORM_X
+    for text, gap in pieces:
+        # measure the INK on a scratch canvas, relative to the baseline, and paste it: the font's
+        # advance and side bearings are not where the ink is, and the original was laid out by ink
+        scratch = Image.new("RGB", (600, 120), "white")
+        ImageDraw.Draw(scratch).text((20, 90), text, font=font, fill=PLATFORM_INK, anchor="ls")
+        box = _ink_bbox(scratch)
+        x += gap
+        card.paste(scratch.crop(box), (x, PLATFORM_BASE + 1 - (90 - box[1])))
+        x += box[2] - box[0]
+
+
 def build(base_path: str, out_path: str) -> None:
     card = Image.open(base_path).convert("RGB")
     ImageDraw.Draw(card).rectangle(BAND, fill="white")
     _repaint_pill(card)
+    _repaint_platforms(card)
 
     head = ImageFont.truetype(f"{FONTS}/Lato-Black.ttf", 74)
     sub = ImageFont.truetype(f"{FONTS}/Lato-Semibold.ttf", 31)

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="129" viewBox="0 0 880 129" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13.5" role="img">
+<title>kern box dev --image alpine -it -- sh kern compose up -d      # your compose.yaml kern ps import kern_sandbox as kern r = kern.run_code(&quot;print(6 * 7)&quot;) print(r.stdout)   # 42</title>
+<g transform="translate(0 0)">
+<rect x="0.5" y="0.5" width="431" height="128" rx="10" fill="#080c13" stroke="#1f2933"/>
+<path d="M0.5 34V10.5a10 10 0 0 1 10-10H421.5a10 10 0 0 1 10 10V34Z" fill="#141a21"/>
+<line x1="0.5" y1="34" x2="431.5" y2="34" stroke="#1f2933"/>
+<circle cx="20" cy="17.0" r="5.6" fill="#c58038"/>
+<circle cx="38" cy="17.0" r="5.6" fill="#e2b241"/>
+<circle cx="56" cy="17.0" r="5.6" fill="#3ab593"/>
+<path transform="translate(80 9.5) scale(0.94)" d="M3 4.5 6.5 8 3 11.5M8.5 12H13" fill="none" stroke="#3ab593" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="101" y="21.5" fill="#c9d1d9" font-size="13.5" font-weight="600">Container</text>
+<text x="20" y="65" xml:space="preserve"><tspan fill="#d4d4d4">kern</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">box</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">dev</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">--image</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">alpine</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">-it</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">--</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">sh</tspan></text>
+<text x="20" y="86" xml:space="preserve"><tspan fill="#d4d4d4">kern</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">compose</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">up</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">-d</tspan><tspan fill="#d4d4d4">      </tspan><tspan fill="#6a9955"># your compose.yaml</tspan></text>
+<text x="20" y="107" xml:space="preserve"><tspan fill="#d4d4d4">kern</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">ps</tspan></text>
+</g>
+<g transform="translate(448 0)">
+<rect x="0.5" y="0.5" width="431" height="128" rx="10" fill="#080c13" stroke="#1f2933"/>
+<path d="M0.5 34V10.5a10 10 0 0 1 10-10H421.5a10 10 0 0 1 10 10V34Z" fill="#141a21"/>
+<line x1="0.5" y1="34" x2="431.5" y2="34" stroke="#1f2933"/>
+<circle cx="20" cy="17.0" r="5.6" fill="#c58038"/>
+<circle cx="38" cy="17.0" r="5.6" fill="#e2b241"/>
+<circle cx="56" cy="17.0" r="5.6" fill="#3ab593"/>
+<path transform="translate(80 9.5) scale(0.94)" d="M5.5 4.5 2 8l3.5 3.5M10.5 4.5 14 8l-3.5 3.5" fill="none" stroke="#e2b241" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="101" y="21.5" fill="#c9d1d9" font-size="13.5" font-weight="600">Sandbox</text>
+<text x="20" y="65" xml:space="preserve"><tspan fill="#c586c0">import</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#4ec9b0">kern_sandbox</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#569cd6">as</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#4ec9b0">kern</tspan></text>
+<text x="20" y="86" xml:space="preserve"><tspan fill="#d4d4d4">r</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">=</tspan><tspan fill="#d4d4d4"> </tspan><tspan fill="#d4d4d4">kern</tspan><tspan fill="#d4d4d4">.</tspan><tspan fill="#d4d4d4">run_code</tspan><tspan fill="#d4d4d4">(</tspan><tspan fill="#ce9178">&quot;</tspan><tspan fill="#ce9178">print(6 * 7)</tspan><tspan fill="#ce9178">&quot;</tspan><tspan fill="#d4d4d4">)</tspan></text>
+<text x="20" y="107" xml:space="preserve"><tspan fill="#dcdcaa">print</tspan><tspan fill="#d4d4d4">(</tspan><tspan fill="#d4d4d4">r</tspan><tspan fill="#d4d4d4">.</tspan><tspan fill="#d4d4d4">stdout</tspan><tspan fill="#d4d4d4">)</tspan><tspan fill="#d4d4d4">   </tspan><tspan fill="#6a9955"># 42</tspan></text>
+</g>
+</svg>
