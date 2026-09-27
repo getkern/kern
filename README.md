@@ -54,11 +54,16 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 ```
 
-**macOS**, inside a Linux VM
+**macOS**, inside a Linux VM. On the Mac:
 
 ```sh
 brew install colima && colima start && colima ssh
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh   # inside the VM
+```
+
+Then, inside the VM:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
 Then `kern doctor` checks the host and says what to fix. Ubuntu 23.10 and newer need one root step
@@ -66,12 +71,28 @@ first: [docs/INSTALL.md](docs/INSTALL.md#linux).
 
 ## Quickstart
 
+**A shell in a real OCI image**
+
 ```sh
-kern box dev --image alpine -it -- sh            # a shell in a real OCI image
-kern box svc --image nginx:alpine -d -p 8080:80  # a service, published on the host
-kern box job --image python:3.12-slim --security-profile untrusted -- python3 /w/x.py
-kern compose stack.toml up                       # a whole stack, one command
-kern ps                                          # what is running (--json too)
+kern box dev --image alpine -it -- sh
+```
+
+**A service, published on the host**
+
+```sh
+kern box svc --image nginx:alpine -d -p 8080:80
+```
+
+**Untrusted code, with the strict profile**
+
+```sh
+kern box job --image python:3.12-slim --security-profile untrusted -- python3 -c "print('hi')"
+```
+
+**What is running** (`--json` too)
+
+```sh
+kern ps
 ```
 
 `--security-profile untrusted` is the seccomp allowlist, `--cap-drop ALL` and `--read-only` in one
@@ -81,8 +102,13 @@ flag. [examples/](examples/) holds 94 runnable scripts, one per thing kern does.
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
-pip install -U kern-sandbox                      # Node: npm install kern-sandbox
 ```
+
+```sh
+pip install -U kern-sandbox
+```
+
+On Node: `npm install kern-sandbox`.
 
 ```python
 import kern_sandbox as kern
@@ -94,77 +120,43 @@ print(r.stdout, r.fault)   # 4950  None
 Every call is a fresh box. A timeout or an out-of-memory comes back as a typed `fault` you can branch
 on, not as a bare exit 137. It finds `kern` on your PATH, or wherever `$KERN_BIN` points.
 
-**The basics, one call each** (click one to open it):
+**The basics, one call each:**
 
-<details><summary><code>files.py</code> · Give it a file, get a file back</summary>
+<img src="assets/readme-basics.svg" width="880" alt="Three windows. files.py: a Sandbox writes in.csv, runs a job, reads out.txt back. state.py: a kernel keeps x = 40 between calls and prints x + 2. package.py: a Sandbox with setup pip install numpy imports numpy.">
+
+**Give it a file, get a file back.**
 
 ```python
 job = """
 import csv
-rows = list(csv.DictReader(open("temps.csv")))
+rows = list(csv.DictReader(open("in.csv")))
 hottest = max(rows, key=lambda row: int(row["temp"]))
-open("hottest.txt", "w").write(hottest["city"])
+open("out.txt", "w").write(hottest["city"])
 """
 with kern.Sandbox() as sb:
-    sb.write_file("temps.csv", "city,temp\nRome,24\nOslo,9\n")
+    sb.write_file("in.csv", "city,temp\nRome,24\nOslo,9\n")
     sb.run_code(job)
-    print(sb.read_file("hottest.txt"))   # b'Rome'
+    print(sb.read_file("out.txt"))   # b'Rome'
 ```
 
-</details>
-<details><summary><code>state.py</code> · Keep variables between steps</summary>
+**Keep variables between steps.**
 
 ```python
 with kern.Sandbox() as sb, sb.kernel() as k:
-    k.run_code("total = 40")
-    r = k.run_code("total += 2; print(total)")
+    k.run_code("x = 40")
+    r = k.run_code("print(x + 2)")
     print(r.stdout)   # 42
 ```
 
-</details>
-<details><summary><code>package.py</code> · Install a package first</summary>
+**Install a package first.**
 
 ```python
-with kern.Sandbox(setup="pip install humanize") as sb:
-    r = sb.run_code("import humanize as h; print(h.naturalsize(3_000_000))")
-    print(r.stdout)   # 3.0 MB
+with kern.Sandbox(setup="pip install numpy") as sb:
+    r = sb.run_code("import numpy as np; print(np.pi)")
+    print(r.stdout)   # 3.141592653589793
 ```
 
-</details>
-<details><summary><code>network.py</code> · Let it reach one host</summary>
-
-```python
-code = ("import urllib.request as u; "
-        "print(u.urlopen('https://pypi.org').status)")
-r = kern.run_code(code)
-print(r.exit_code)   # 1: no network
-r = kern.run_code(code, egress_allow=["pypi.org"])
-print(r.stdout)      # 200
-```
-
-</details>
-<details><summary><code>shell.py</code> · Run a shell command</summary>
-
-```python
-r = kern.run_code("uname -s && python3 --version", language="bash")
-print(r.stdout)   # Linux, then the image's Python 3.12
-```
-
-</details>
-<details><summary><code>chart.py</code> · Get a chart back</summary>
-
-```python
-plot = """
-import matplotlib.pyplot as plt
-plt.plot([1, 4, 9, 16])
-plt.show()
-"""
-with kern.Sandbox(setup="pip install matplotlib") as sb:
-    r = sb.run_code(plot)
-    open("chart.png", "wb").write(r.results[0].png)
-```
-
-</details>
+A host on the network, a shell command and a chart back: [the Python SDK](bindings/python/README.md#the-basics-one-call-each).
 
 **Read next: [the Python SDK](bindings/python/README.md)**, for sessions, prewarming and LangChain,
 or [the same for Node](bindings/node/README.md).
@@ -190,10 +182,22 @@ ports      = ["8080:80"]
 depends_on = ["cache"]
 ```
 
+**Start it** (or point it at your `compose.yaml` instead)
+
 ```sh
-kern compose stack.toml up          # or point it at your compose.yaml instead
-kern compose stack.toml ps          # what is running, and what each service publishes
-kern compose stack.toml port web 80 # the host address serving that port, read from the running box
+kern compose stack.toml up
+```
+
+**What is running, and what each service publishes**
+
+```sh
+kern compose stack.toml ps
+```
+
+**The host address serving a port**, read from the running box
+
+```sh
+kern compose stack.toml port web 80
 ```
 
 Each service gets its own network namespace and they reach each other by name. It is the local dev

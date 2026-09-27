@@ -82,14 +82,14 @@ code both see.
 ```python
 job = """
 import csv
-rows = list(csv.DictReader(open("temps.csv")))
+rows = list(csv.DictReader(open("in.csv")))
 hottest = max(rows, key=lambda row: int(row["temp"]))
-open("hottest.txt", "w").write(hottest["city"])
+open("out.txt", "w").write(hottest["city"])
 """
 with kern.Sandbox() as sb:
-    sb.write_file("temps.csv", "city,temp\nRome,24\nOslo,9\n")
+    sb.write_file("in.csv", "city,temp\nRome,24\nOslo,9\n")
     sb.run_code(job)
-    print(sb.read_file("hottest.txt"))   # b'Rome'
+    print(sb.read_file("out.txt"))   # b'Rome'
 ```
 
 <!-- tab: state.py -->
@@ -98,8 +98,8 @@ with kern.Sandbox() as sb:
 
 ```python
 with kern.Sandbox() as sb, sb.kernel() as k:
-    k.run_code("total = 40")
-    r = k.run_code("total += 2; print(total)")
+    k.run_code("x = 40")
+    r = k.run_code("print(x + 2)")
     print(r.stdout)   # 42
 ```
 
@@ -109,9 +109,9 @@ with kern.Sandbox() as sb, sb.kernel() as k:
 itself still runs without network.
 
 ```python
-with kern.Sandbox(setup="pip install humanize") as sb:
-    r = sb.run_code("import humanize as h; print(h.naturalsize(3_000_000))")
-    print(r.stdout)   # 3.0 MB
+with kern.Sandbox(setup="pip install numpy") as sb:
+    r = sb.run_code("import numpy as np; print(np.pi)")
+    print(r.stdout)   # 3.141592653589793
 ```
 
 <!-- tab: network.py -->
