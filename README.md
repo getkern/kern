@@ -60,13 +60,7 @@ irm https://raw.githubusercontent.com/getkern/kern/main/install.ps1 | iex
 
 ```sh
 brew install colima
-```
-
-```sh
 colima start
-```
-
-```sh
 colima ssh
 ```
 
@@ -81,29 +75,12 @@ first: [docs/INSTALL.md](docs/INSTALL.md#linux).
 
 ## Quickstart
 
-**A shell in a real OCI image**
-
-```sh
-kern box dev --image alpine -it -- sh
-```
-
-**A service, published on the host**
-
-```sh
-kern box svc --image nginx:alpine -d -p 8080:80
-```
-
-**Untrusted code, with the strict profile**
-
-```sh
-kern box job --image python:3.12-slim --security-profile untrusted -- python3 -c "print('hi')"
-```
-
-**What is running** (`--json` too)
-
-```sh
-kern ps
-```
+| What it does | Command |
+|---|---|
+| A shell in a real OCI image | `kern box dev --image alpine -it -- sh` |
+| A service, published on the host | `kern box svc --image nginx:alpine -d -p 8080:80` |
+| Untrusted code, with the strict profile | `kern box job --image python:3.12-slim --security-profile untrusted -- python3 -c "print('hi')"` |
+| What is running (`--json` too) | `kern ps` |
 
 `--security-profile untrusted` is the seccomp allowlist, `--cap-drop ALL` and `--read-only` in one
 flag. [examples/](examples/) holds 94 runnable scripts, one per thing kern does.
@@ -160,23 +137,11 @@ ports      = ["8080:80"]
 depends_on = ["cache"]
 ```
 
-**Start it** (or point it at your `compose.yaml` instead)
-
-```sh
-kern compose stack.toml up
-```
-
-**What is running, and what each service publishes**
-
-```sh
-kern compose stack.toml ps
-```
-
-**The host address serving a port**, read from the running box
-
-```sh
-kern compose stack.toml port web 80
-```
+| What it does | Command |
+|---|---|
+| Start it (or point it at your `compose.yaml`) | `kern compose stack.toml up` |
+| What is running, and what each service publishes | `kern compose stack.toml ps` |
+| The host address serving a port | `kern compose stack.toml port web 80` |
 
 Each service gets its own network namespace and they reach each other by name. It is the local dev
 loop, not a production orchestrator. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
