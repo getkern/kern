@@ -166,8 +166,8 @@ with kern.Sandbox(setup="pip install matplotlib") as sb:
 
 </details>
 
-**Read next: [the Python SDK](bindings/python/README.md)**, with the basics one call each, sessions,
-prewarming and LangChain, or [the same for Node](bindings/node/README.md).
+**Read next: [the Python SDK](bindings/python/README.md)**, for sessions, prewarming and LangChain,
+or [the same for Node](bindings/node/README.md).
 
 **`kern-mcp`** gives Claude Code, Cursor, Claude Desktop or LM Studio a local code interpreter:
 
@@ -223,7 +223,8 @@ loop, not a production orchestrator. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.
 ## Security
 
 Namespaces, a `pivot_root`, dangerous capabilities dropped before exec, an always-on seccomp
-**allowlist**, cgroup v2 limits and a deny-by-default `/dev`. Where a boundary is cooperative rather
+**allowlist** that keeps kern's 35 escape syscalls denied, cgroup v2 limits and a deny-by-default
+`/dev`. Where a boundary is cooperative rather
 than kernel-enforced, [SECURITY.md](SECURITY.md) says so and names the bypass.
 [docs/CVE-POSTURE.md](docs/CVE-POSTURE.md) runs 25 published container-runtime escapes against this
 tree, one at a time, and [pentest/](pentest/) asserts the boundaries against the kernel.
