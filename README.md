@@ -14,7 +14,7 @@
 
 **A real, kernel-enforced container in a few milliseconds, out of one static binary with no daemon.**
 
-With an MCP server, so Claude Code, Cursor, Claude Desktop and LM Studio can run their code in it.
+**MCP support** for Claude Code, Cursor, Claude Desktop and LM Studio, through Kern Sandbox.
 
 <img src="assets/readme-windows.svg" width="880" alt="Two windows. Container: kern box dev --image alpine -it -- sh; kern compose up -d, for your compose.yaml; kern ps. Sandbox: import kern_sandbox as kern; r = kern.run_code(&quot;print(6 * 7)&quot;); print(r.stdout) prints 42.">
 
