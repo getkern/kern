@@ -105,7 +105,8 @@ r = kern.run_code("print(sum(range(100)))")
 print(r.stdout, r.fault)   # 4950  None
 ```
 
-Every call is a fresh box, and a timeout or an out-of-memory comes back as a typed `fault`.
+Your code runs in a container of its own, for one call or for a whole session, and a timeout or an
+out-of-memory comes back as a typed `fault`.
 Node: `npm install kern-sandbox`.
 
 <img src="assets/readme-basics.svg" width="880" alt="Three windows. files.py: a Sandbox writes in.csv, runs a job, reads out.txt back. state.py: a kernel keeps x = 40 between calls and prints x + 2. package.py: a Sandbox with setup pip install numpy imports numpy.">
