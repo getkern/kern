@@ -674,6 +674,12 @@ enum Userns {
     /// setgroups for the rootless map, so a probe that stops at `unshare` reports success on a
     /// host where no box can start.
     NoMap,
+    /// The namespace and the uid map both work, and mounting a fresh `/proc` is refused. THE
+    /// CONTAINER CASE, Google Colab among them: an outer container masks part of its own `/proc`,
+    /// and the kernel grants a fresh procfs only where an unmasked instance already exists. Every
+    /// step before this one succeeds, which is exactly why a probe that stopped at the map called
+    /// the host ready.
+    NoProcMount,
 }
 
 /// Can a rootless box start here?
@@ -709,7 +715,61 @@ fn probe_userns() -> Userns {
             if !write_bytes(c"/proc/self/uid_map".as_ptr(), uid_map.as_bytes()) {
                 libc::_exit(2);
             }
-            libc::_exit(0);
+            // AND THE MOUNT, because the map is not the last step a box takes either. MEASURED on
+            // Google Colab, kernel 6.6.122: unshare, setgroups and the map all succeed, doctor
+            // printed "ready - `kern box` will run here" and offered the `kern box hello` line,
+            // and that command died on `mount(proc) failed: Permission denied`. A container that
+            // masks part of its own `/proc` leaves no unmasked instance, and the kernel allows a
+            // fresh procfs only where one exists, so the refusal is invisible to every step above.
+            //
+            // The target is `/proc` itself: inside this child's own mount namespace it is the
+            // mount a box performs, it needs no directory created for it, and nothing outside sees
+            // it. `MS_PRIVATE` first, for the same reason the real sequence does it - without it
+            // the mount can propagate back to the host's namespace.
+            // THE PID NAMESPACE IS PART OF THE ANSWER AND NOT A DETAIL, and leaving it out made
+            // this probe fail on an ordinary desktop where boxes run. MEASURED here: with
+            // `CLONE_NEWUSER | CLONE_NEWNS` the mount is EPERM, and adding `CLONE_NEWPID` it
+            // succeeds. The reason is the same visibility rule: `/proc/sys/fs/binfmt_misc` is a
+            // mount on top of procfs, so this host's `/proc` is not fully visible either, and the
+            // kernel waives the check only for a procfs belonging to a DIFFERENT pid namespace.
+            // A box makes one, so a probe without it asks a harder question than a box asks.
+            if libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID) != 0 {
+                libc::_exit(3);
+            }
+            // `CLONE_NEWPID` takes effect for CHILDREN, not for the caller, so the mount has to
+            // happen one fork further down or it is still made from the old pid namespace.
+            let inner = libc::fork();
+            if inner == 0 {
+                if libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    libc::_exit(3);
+                }
+                if libc::mount(
+                    c"proc".as_ptr(),
+                    c"/proc".as_ptr(),
+                    c"proc".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    libc::_exit(3);
+                }
+                libc::_exit(0);
+            }
+            if inner < 0 {
+                libc::_exit(3);
+            }
+            let mut ist = 0i32;
+            if libc::waitpid(inner, &mut ist, 0) != inner || !libc::WIFEXITED(ist) {
+                libc::_exit(3);
+            }
+            libc::_exit(libc::WEXITSTATUS(ist));
         }
     }
     if pid < 0 {
@@ -738,6 +798,7 @@ fn probe_userns() -> Userns {
     match libc::WEXITSTATUS(st) {
         0 => Userns::Works,
         2 => Userns::NoMap,
+        3 => Userns::NoProcMount,
         _ => Userns::NoNamespace,
     }
 }
@@ -786,6 +847,14 @@ fn userns_verdict(probe: Userns) -> R {
             "unprivileged user namespaces: the namespace is allowed and its uid map is REFUSED - no box can start"
                 .into(),
             no_map_hint(),
+        ),
+        // A FAILURE for the same reason as the two above: the summary must not read "ready" on a
+        // host where the command it then suggests dies. The hint names the CAUSE rather than a
+        // remedy on this host, because there is none to give: the restriction belongs to the
+        // container around kern, not to kern's own configuration.
+        Userns::NoProcMount => R::Fail(
+            "unprivileged user namespaces: a fresh /proc mount is REFUSED - no box can start".into(),
+            "the namespace and its uid map both work here, so the AppArmor profile and the sysctl are not the fix. A container that masks part of its own /proc leaves no unmasked instance, and the kernel grants a fresh procfs only where one exists. Measured on Google Colab: run the outer container with --privileged, or run kern on the host".into(),
         ),
     }
 }
@@ -2195,6 +2264,29 @@ mod tests {
         // It must not read as the namespace being unavailable, which is a different host and a
         // different fix.
         assert!(!msg(&no_map).contains("DISABLED"), "{}", msg(&no_map));
+
+        // THE CONTAINER CASE, and the same defect one step further along. MEASURED on Google Colab,
+        // kernel 6.6.122: the namespace, the setgroups deny and the uid map all succeed, so the
+        // probe that stopped at the map returned `Works` and the summary printed "ready - `kern box`
+        // will run here" with a `kern box hello` line under it. That line died on
+        // `mount(proc) failed: Permission denied`. A host where no box can start must not pass here
+        // either, whichever step does the refusing.
+        let no_proc = userns_verdict(Userns::NoProcMount);
+        assert!(
+            matches!(no_proc, R::Fail(..)),
+            "a host that cannot mount a fresh /proc must not pass: {}",
+            msg(&no_proc)
+        );
+        // It must not be confused with the two above: the namespace and the map WORK here, and a
+        // reader sent to the AppArmor profile or the sysctl would change a setting that is already
+        // correct and still have no box.
+        assert!(msg(&no_proc).contains("/proc"), "{}", msg(&no_proc));
+        assert!(!msg(&no_proc).contains("DISABLED"), "{}", msg(&no_proc));
+        assert!(
+            !msg(&no_proc).contains("uid map is REFUSED"),
+            "{}",
+            msg(&no_proc)
+        );
         // THE PROFILE IS OFFERED BEFORE THE SYSCTL. Turning the sysctl off lifts the restriction
         // for every program on the machine and does not survive a reboot; the profile is scoped to
         // this binary and persists. A hint that leads with the global switch teaches the wrong fix
