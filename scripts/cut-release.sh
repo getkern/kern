@@ -179,4 +179,11 @@ cat <<EOF
         git commit -m 'chore(provenance): anchor $VERSION' && git push origin main
       It is born PENDING. Hours later, once a BTC block confirms:
         sh provenance/upgrade-when-ready.sh $VERSION
+
+   6. THE PYTHON WHEELS CARRY THE BINARY, so until they are rebuilt \`pip install kern-sandbox\` keeps
+      installing the PREVIOUS kern on Linux, and nothing about that looks wrong either. After step 4:
+        python3 bindings/python/build-wheels.py --kern-version $VERSION
+      then bump bindings/python to a patch version, publish it (PyPI only with the owner's go), and
+      check the registry, not the upload: \`pip install kern-sandbox\` in a clean venv, then
+      \`.venv/bin/kern --version\` must print $VERSION.
 EOF
