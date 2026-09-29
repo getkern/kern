@@ -1,7 +1,8 @@
 "use strict";
 
-const { test } = require("node:test");
+const { before, test } = require("node:test");
 const assert = require("node:assert");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -28,6 +29,7 @@ const { Sandbox, withSandbox, runCode, SandboxError, MountRefused } = kern;
 
 // Execution tests need a real `kern`; findKern() throws if absent. Detect once and skip if missing.
 let KERN_OK = false;
+let KERN_PATH = "";
 try {
   const findKern = () => {
     if (process.env.KERN_BIN) return process.env.KERN_BIN;
@@ -41,12 +43,50 @@ try {
     }
     throw new Error("no kern");
   };
-  findKern();
+  KERN_PATH = findKern();
   KERN_OK = true;
 } catch {
   KERN_OK = false;
 }
 const exec = { skip: !KERN_OK && "kern binary not found (set KERN_BIN)" };
+
+// THE IMAGE STORE THE TESTS FOUND, read before any test moves $XDG_CACHE_HOME. The bytecode-cache tests
+// move it to isolate the cache, and kern keeps its IMAGES under the same variable, so every one of
+// them used to pull `python:3.12-slim` again from the registry. MEASURED on 29/09: that made the suite
+// depend on the network test by test, and a CDN transfer that stalled with the connection still open
+// held one test for 310 s of a 360 s run, and hung others until an outer timeout killed the run, at a
+// different test each time. The tests are about the cache, not about pulling.
+const REAL_IMAGES = path.join(
+  process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "kern", "images",
+);
+const TEST_IMAGE = "python:3.12-slim";
+
+// Pulled ONCE into the real store if this host does not have it, so the suite touches the network at
+// most once instead of once per test that moves the cache home.
+before(() => {
+  if (!KERN_OK || fs.existsSync(path.join(REAL_IMAGES, `${kern._sanitizeRef(TEST_IMAGE)}.ok`))) return;
+  spawnSync(KERN_PATH, ["pull", TEST_IMAGE], { stdio: "inherit", timeout: 600_000 });
+});
+
+/** Point $XDG_CACHE_HOME at `home` with the test image already in kern's store there.
+ *
+ * The rootfs is a SYMLINK into the real store and the three small files are COPIES. Not hard links:
+ * the image carries directories owned by the box's own users that this uid cannot read, so a linked
+ * copy stops half way. Not a link for the small files either: a test rewrites them to move the tag,
+ * and through a link that write would land in the real store. Removing `home` removes the link and
+ * never follows it. MEASURED: a box started in a home seeded this way in 26 ms with no download. */
+function moveCacheHome(home) {
+  process.env.XDG_CACHE_HOME = home;
+  const safe = kern._sanitizeRef(TEST_IMAGE);
+  const src = path.join(REAL_IMAGES, safe);
+  if (!fs.existsSync(`${src}.ok`)) return; // not on this host: kern pulls it, as before
+  const dst = path.join(home, "kern", "images");
+  fs.mkdirSync(dst, { recursive: true });
+  fs.symlinkSync(src, path.join(dst, safe));
+  for (const ext of [".image", ".ok", ".size", ".layers"]) {
+    if (fs.existsSync(src + ext)) fs.copyFileSync(src + ext, path.join(dst, safe + ext));
+  }
+}
 
 // snapshot/restore is opt-in in the Node binding (KERN_SANDBOX_SNAPSHOT=1); enable it for the suite.
 // The dedicated gate test below temporarily unsets it to prove it fails closed.
@@ -483,7 +523,7 @@ test("the pyc cache is mounted read-only, never on the setup box, and adopted by
   // is asserted on the argv that actually starts the box, not read off the source.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-t-"));
   const prev = process.env.XDG_CACHE_HOME;
-  process.env.XDG_CACHE_HOME = home;
+  moveCacheHome(home);
   try {
     const dir = kern._pycDirFor("python:3.12-slim");
     publishCache(dir);
@@ -547,7 +587,7 @@ test("an empty pyc cache directory is not a cache and does not block the repair"
   // NOT READY rather than refused, so the pending destination has to survive it.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-husk-"));
   const prev = process.env.XDG_CACHE_HOME;
-  process.env.XDG_CACHE_HOME = home;
+  moveCacheHome(home);
   try {
     const dir = kern._pycDirFor("python:3.12-slim");
     fs.mkdirSync(dir, { recursive: true }); // the husk
@@ -585,7 +625,7 @@ test("pyc adoption happens before the pool is asked, and re-runs every guard", a
   // was going to publish, and pycMountAllowed reads the STRING and cannot see it.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-ad2-"));
   const prev = process.env.XDG_CACHE_HOME;
-  process.env.XDG_CACHE_HOME = home;
+  moveCacheHome(home);
   try {
     const dir = kern._pycDirFor("python:3.12-slim");
 
@@ -774,7 +814,7 @@ test("a cache under a credential directory is refused, and the build box is capp
   try {
     const bad = path.join(home, ".ssh");
     fs.mkdirSync(bad);
-    process.env.XDG_CACHE_HOME = bad;
+    moveCacheHome(bad);
     // THE CACHE MUST EXIST, or this asserts nothing: without it the session takes the "build one"
     // branch and leaves _pycDir empty for an unrelated reason. Caught by sabotage.
     fs.mkdirSync(kern._pycDirFor("python:3.12-slim"), { recursive: true });
@@ -790,7 +830,7 @@ test("a cache under a credential directory is refused, and the build box is capp
     // POSITIVE CONTROL: an ordinary cache home is still adopted, or the assertion above would pass on
     // a build where the cache never works at all.
     const good = path.join(home, "cache");
-    process.env.XDG_CACHE_HOME = good;
+    moveCacheHome(good);
     publishCache(kern._pycDirFor("python:3.12-slim"));
     const s2 = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
     await s2.open();
@@ -2965,7 +3005,7 @@ test("the pyc cache survives a cache home the -v form cannot express", async () 
   const prev = process.env.XDG_CACHE_HOME;
   try {
     for (const [label, infix, quoted] of [["colon", "colon:cache", false], ["comma", "comma,cache", true]]) {
-      process.env.XDG_CACHE_HOME = path.join(home, infix);
+      moveCacheHome(path.join(home, infix));
       const dir = publishCache(kern._pycDirFor("python:3.12-slim"));
       const s = new Sandbox({ image: "python:3.12-slim", timeoutS: 30 });
       await s.open();
@@ -3066,14 +3106,20 @@ test("sanitizeRef agrees with kern's own, and a moved tag discards the cache", a
 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "kern-pyc-id-"));
   const prev = process.env.XDG_CACHE_HOME;
-  process.env.XDG_CACHE_HOME = home;
+  moveCacheHome(home);
   try {
-    const img = "python:3.12-slim";
+    const img = TEST_IMAGE;
     const images = path.join(home, "kern", "images");
     fs.mkdirSync(images, { recursive: true });
     const safe = kern._sanitizeRef(img);
-    fs.writeFileSync(path.join(images, `${safe}.image`), "config-v1");
-    fs.writeFileSync(path.join(images, `${safe}.ok`), "ok");
+    const config = path.join(images, `${safe}.image`);
+    const ok = path.join(images, `${safe}.ok`);
+    // kern's own files as a pull leaves them: seeded from the real store, or, on a host that has never
+    // pulled the image, written here, in which case the open() below pulls it as it always did.
+    if (!fs.existsSync(ok)) {
+      fs.writeFileSync(config, "config-v1");
+      fs.writeFileSync(ok, "ok");
+    }
     const first = kern._pycSourceId(img);
     assert.ok(first, "the identity must be readable when kern's own files are there");
 
@@ -3081,8 +3127,18 @@ test("sanitizeRef agrees with kern's own, and a moved tag discards the cache", a
     fs.writeFileSync(path.join(dest, kern._PYC_SOURCE_ID), first);
     assert.ok(kern._pycSourceMatches ? true : true); // the check runs through open() below
 
-    // THE TAG MOVES: kern re-pulls and rewrites its own files for that reference.
-    fs.writeFileSync(path.join(images, `${safe}.image`), "config-v2");
+    // A NEW CONFIG IS A NEW IDENTITY. Checked on the function and PUT BACK: a config kern cannot parse
+    // sends the open() below to the registry, which is how this test came to depend on the network.
+    const original = fs.readFileSync(config);
+    fs.writeFileSync(config, Buffer.concat([original, Buffer.from(" ")]));
+    assert.notStrictEqual(kern._pycSourceId(img), first, "a changed config kept the identity");
+    fs.writeFileSync(config, original);
+    assert.strictEqual(kern._pycSourceId(img), first, "restoring the config did not restore the identity");
+
+    // THE TAG MOVES: a re-pull rewrites the sentinel last, so its stamp moves even when the config
+    // stays byte-identical. That stamp is what the identity keys on, as kern itself does.
+    const later = new Date(Date.now() + 60_000);
+    fs.utimesSync(ok, later, later);
     assert.notStrictEqual(kern._pycSourceId(img), first);
     // AWAITED, not returned from inside `try`: a promise returned there runs the `finally` FIRST, so
     // the home below was removed while this was still working in it. The test passed on a quiet
