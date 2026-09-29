@@ -92,6 +92,8 @@ flag. [examples/](examples/) holds 94 runnable scripts, one per thing kern does.
 
 ## Kern Sandbox: run an agent's code from Python or Node
 
+In a terminal:
+
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
 ```
@@ -99,6 +101,8 @@ python3 -m venv .venv && . .venv/bin/activate
 ```sh
 pip install -U kern-sandbox
 ```
+
+Then in a Python file:
 
 ```python
 import kern_sandbox as kern
