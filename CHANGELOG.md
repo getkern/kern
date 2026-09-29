@@ -40,7 +40,15 @@ own footer: `print(1)` is the workload that flatters it most and a heavier call 
 the rejected title, and a note about measurement method above the first example. Both pages now open
 the same way.
 
-## Unreleased
+## v0.25.1 - 2026-09-29
+
+**Two threads asking whether memory caps work could get two different answers.** The probe named
+its throwaway cgroup once per process, so a second thread removed the first one's directory to
+retry, and the first then probed a directory that was no longer its own. Measured with six threads
+on one unchanged host: 33 of 40 rounds disagreed; after the fix, 0 of 40. `kern doctor` never saw it
+because it asks twice in sequence; a library caller with two threads decides from that answer
+whether a box starts with caps or is refused.
+
 **A registry transfer that stalls is ended and retried, instead of holding the pull for ten
 minutes.** Measured on 29/09: a CDN connection delivered 32 MB of a layer and then nothing for 142 s
 with the socket still open, and with only `--max-time 600` curl waited out the whole window while the
