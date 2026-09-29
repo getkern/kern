@@ -5,6 +5,12 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## kern-sandbox 0.2.42 (Python) - 2026-09-29
+
+**The Linux wheels carry kern v0.25.1**, so `pip install kern-sandbox` brings the pull that ends a
+stalled image download after 30 s and retries it, instead of waiting ten minutes. Nothing else in the
+package changes; the Node package is unchanged.
+
 ## kern-sandbox 0.2.41 (Python) - 2026-09-29
 
 **`pip install kern-sandbox` is the whole install on Linux.** The wheels for `x86_64` and `aarch64`
