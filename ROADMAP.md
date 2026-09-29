@@ -29,10 +29,10 @@ posture becomes runc's, without the user namespace, with the caller's seccomp an
 
 | gap | what it costs you | what would settle it |
 |---|---|---|
-| The progress gate classifies by module, not by meaning | Three image-cache diagnostics were silenced under an SDK: a damaged entry was re-fetched without saying so. A suite caught it, the gate did not | A rule that reads what a line says |
-| `--egress-allow` cannot be validated on most hosts | Where policy routing is present, the defective version passes exactly as the fix does, so `acceptance-matrix.sh` reports that it validated nothing | A board without policy routing |
+| The progress gate classifies by module, not by meaning | Three image-cache diagnostics were silenced under an SDK: a damaged entry was re-fetched without saying so, and a suite caught it rather than the gate | A rule that reads what a line says |
+| `--egress-allow` cannot be validated on most hosts | Under policy routing the defective version passes exactly as the fix does, so `acceptance-matrix.sh` reports that it validated nothing | A board without policy routing |
 | Landlock is absent on every ARM board tested | `--landlock-rw` REFUSES rather than running unconfined. Measured absent on Raspberry Pi OS 6.6, Jetson 5.15-tegra and Arduino UNO Q 6.16 | The kernel shipping the LSM |
 | A host delegating `memory` but not `pids` | Would take the default `TasksMax=512` silently. Not observed anywhere tested | A predicate that stays quiet on healthy hosts |
 | `kern ps` prints the mapping recorded at start | A forwarder killed while its box runs would still show. It dies with the supervisor, so the window is narrow | A live probe |
-| Three legacy fallbacks in the pod store reason about a forgeable pid | Reachable only from a pod dir written by an older kern; which they are, and how the forgery was verified, is in `pod.rs` | One condition against the STORE FORMAT: when such a dir can no longer be produced, all three go together |
+| Three legacy fallbacks in the pod store reason about a forgeable pid | Reachable only from a pod dir written by an older kern; how the forgery was verified is in `pod.rs` | One condition against the STORE FORMAT: when such a dir can no longer be produced, all three go together |
 | Whether a survivable denial helps an attacker | Eleven denied syscalls return `ENOSYS` so probing software falls back. The errno leaks nothing; whether a cheaper map of the filter helps code already executing is not measured | `SECCOMP_RET_USER_NOTIF` hides the structure, but the listener must be the box's parent and fail closed |
