@@ -33,7 +33,7 @@ In a terminal:
 # if the venv line fails, your distribution ships it separately:
 #     sudo apt install python3-venv
 python3 -m venv .venv && . .venv/bin/activate
-pip install kern-sandbox   # on Linux x86_64 and aarch64, this brings kern with it
+pip install -U kern-sandbox   # on Linux x86_64 and aarch64, this brings kern with it
 ```
 
 On a Mac, run these inside a Linux VM, with your code:

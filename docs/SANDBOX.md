@@ -10,13 +10,17 @@ per call, and a hundred of them cost 1.4 s in total. How much survives between c
 is the API. On Linux `x86_64` and `aarch64` the Python package brings the binary with it. The same
 API ships for Node, which needs the [install script](INSTALL.md) for the binary.
 
+In a terminal:
+
 ```sh
 # if the venv line fails, your distribution ships it separately: sudo apt install python3-venv
 python3 -m venv .venv && . .venv/bin/activate
-pip install kern-sandbox
+pip install -U kern-sandbox
 ```
 
 On a Mac, all of it goes inside a Linux VM: [macOS](INSTALL.md#macos).
+
+Then in a Python file:
 
 ```python
 import kern_sandbox as kern
