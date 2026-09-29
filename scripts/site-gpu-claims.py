@@ -25,8 +25,14 @@ without asking whether the sentence found was affirmative. Usage:
 
 Run bare it checks itself, because `gates-selftest.py` runs every script in `scripts/` with no
 arguments and because a gate whose own reading of the page was wrong twice has not earned being
-trusted unexercised. Exit 0 when the page makes no GPU-cap claim AND still carries the
-cooperative-quota disclaimer.
+trusted unexercised. Exit 0 when the page makes no GPU-cap claim AND still says, in so many words,
+that kern does not split or cap a GPU.
+
+THE POSITIVE CONTROL MOVED ON 29/09. It used to require the cooperative-quota disclaimer ("NOT a
+boundary against malicious code"). The owner decided on 27/09 that the GPU is a device grant and
+nothing else, the page lost its quota section with that decision, and this workflow went red three
+nights running for a page that was saying the right thing. The control now requires the sentence the
+README and the page share: kern gives a box the whole card and does not split or cap it.
 """
 
 import re
@@ -45,8 +51,8 @@ CLAIM = re.compile(
 NEGATION = re.compile(r"\b(?:no|not|never|nothing|without|neither|nor)\b[^.;:]{0,40}$", re.I)
 
 # The page must still carry this. Without it, a page that simply deleted the whole GPU section would
-# pass the check above by saying nothing at all.
-DISCLAIMER = "NOT a boundary against malicious code"
+# pass the check above by saying nothing at all. The README says the same words.
+DISCLAIMER = "does not split a GPU or cap it per box"
 
 
 def flatten(html: str) -> str:
@@ -76,16 +82,21 @@ def carries_disclaimer(html: str) -> bool:
 # directions, which is why they are the fixtures.
 SELFTEST = [
     (
-        "the page's own denial is not a claim",
-        "<li><b>Not shipping GPU slices.</b> <span>No GPU limit ships, so there is\n"
-        "  nothing here to attack. a cooperative quota, NOT a boundary against\n"
-        "  malicious code.</span></li>",
+        "the page's own statement is not a claim",
+        "<li><b>GPU: the whole card, as a device.</b> A box can be given the host's GPU;\n"
+        "  kern does not split a GPU or cap it per box.</li>",
+        False,
+    ),
+    (
+        "a denial is not a claim either",
+        "<li>No GPU limit ships, so there is nothing here to attack. kern does not split\n"
+        "  a GPU or cap it per box.</li>",
         False,
     ),
     (
         "the sentence the site really shipped IS a claim",
         "<p>a <code>vgpu:</code> profile caps VRAM well enough that PyTorch and\n"
-        "  ollama size themselves to it. NOT a boundary against malicious code.</p>",
+        "  ollama size themselves to it. kern does not split a GPU or cap it per box.</p>",
         True,
     ),
     (
@@ -94,8 +105,8 @@ SELFTEST = [
         True,
     ),
     (
-        "the disclaimer counts even when the markup wraps it",
-        "<span>a cooperative quota, NOT a boundary\n   against\n   malicious code.</span>",
+        "the statement counts even when the markup wraps it",
+        "<span>kern does not split a GPU\n   or cap it\n   per box.</span>",
         False,
     ),
 ]
@@ -130,12 +141,12 @@ def main() -> int:
         return 1
     if not carries_disclaimer(html):
         print(
-            "::error::the live page no longer carries the cooperative-quota disclaimer, so the",
+            f"::error::the live page no longer says '{DISCLAIMER}', so the",
             file=sys.stderr,
         )
         print("  check above would pass on a page that simply dropped the GPU section", file=sys.stderr)
         return 1
-    print("the live page makes no GPU-cap claim, and still carries the disclaimer")
+    print(f"the live page makes no GPU-cap claim, and still says '{DISCLAIMER}'")
     return 0
 
 
