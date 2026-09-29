@@ -28,14 +28,14 @@ An agent's tool-call, a generated snippet, a notebook cell, a CI step: it arrive
 nobody has read it first.
 
 ```bash
-# the runtime: one static binary, checksum-verified by the script
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-
 # if the venv line fails, your distribution ships it separately:
 #     sudo apt install python3-venv
 python3 -m venv .venv && . .venv/bin/activate
-pip install kern-sandbox
+pip install kern-sandbox   # on Linux x86_64 and aarch64, this brings kern with it
 ```
+
+On a Mac, run these inside a Linux VM, with your code:
+[macOS](https://github.com/getkern/kern/blob/main/docs/INSTALL.md#macos).
 
 ```python
 import kern_sandbox as kern
@@ -54,7 +54,8 @@ caps and a deadline applied from outside, and threw the container away before re
 - **Imports are precompiled once**: the image's standard library is compiled in the background the
   first time you use that image and mounted READ-ONLY into every box after it, so `import json, re`
   in a fresh container is about 3x cheaper. `pyc_cache=False` turns it off.
-- **Two parts**: the `kern` binary is the isolation, this package is the API in front of it.
+- **Two parts, one install**: the `kern` binary is the isolation, this package is the API in front
+  of it. The Linux wheels carry the binary, so the venv has `kern doctor` and `kern ps` too.
 
 ## When you would use this
 
@@ -200,9 +201,9 @@ prints `[exit 0]` can't fake it. Also `killed` and `escape_blocked`.
 }
 ```
 
-A client spawns the server from **its own** PATH, so a venv is invisible to it: `uvx` installs
-nothing, `pipx install kern-sandbox` is the other way. From macOS or Windows swap the command for
-`wsl` or `ssh`.
+A client spawns the server from **its own** PATH, so a venv is invisible to it: `uvx` fetches the
+package, kern included on Linux, and `pipx install kern-sandbox` is the other way. From macOS or
+Windows swap the command for `wsl` or `ssh`.
 
 ## Safe by default
 
@@ -265,8 +266,10 @@ your own.)</sub>
 - **No `--user`**, so an image that refuses to run as root has no answer here yet.
 - **Not inside a container without `--privileged`, and not on Google Colab.** Measured:
   [install notes](https://github.com/getkern/kern/blob/main/docs/INSTALL.md#macos).
-- **`pip install kern-sandbox` does not install the sandbox.** It drives a `kern` binary on `PATH`
-  or in `$KERN_BIN`, a second thing to keep current.
+- **The binary comes with the package only on Linux x86_64 and aarch64.** Anywhere else pip picks
+  the wheel without it, and the package drives a `kern` on `PATH` or in `$KERN_BIN`, installed with
+  the [install script](https://github.com/getkern/kern/blob/main/docs/INSTALL.md). `$KERN_BIN`
+  always wins over the bundled one.
 
 ## More
 
@@ -275,5 +278,5 @@ sharp edges:
 [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
 
 Runs on Linux, with unprivileged user namespaces and cgroup v2, and Python 3.9+. Windows through
-WSL2; on a Mac it installs but runs only inside a Linux VM.
+WSL2; on a Mac, inside a Linux VM, where the same `pip install` is the whole install.
 [install notes](https://github.com/getkern/kern/blob/main/docs/INSTALL.md). Apache-2.0.

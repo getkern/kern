@@ -51,7 +51,7 @@ import shutil
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import (_FORGED_CUT_NOTICE, _FORGED_LINE_FRAME, _FRAME_LC_CUT, _FRAME_LC_FAULT,
-               _WORKSPACE, ExecutionResult, Sandbox, _neutralise_terminal,
+               _WORKSPACE, ExecutionResult, Sandbox, _bundled_kern, _neutralise_terminal,
                _validate_mount_lexical)
 
 if TYPE_CHECKING:  # typing only; this import never runs
@@ -657,7 +657,8 @@ def _build_policy_class():
             return not workspace.name.startswith(prefix)
 
         def _resolve_binary(self) -> str:
-            """`$KERN_BIN` first, matching the rest of this binding, then `PATH`."""
+            """`$KERN_BIN` first, matching the rest of this binding, then the kern this package's Linux
+            wheel installed (only for the default name), then `PATH`."""
             override = os.environ.get("KERN_BIN")
             if override:
                 if not os.path.isfile(override) or not os.access(override, os.X_OK):
@@ -665,7 +666,7 @@ def _build_policy_class():
                         f"$KERN_BIN={override!r} is not an executable file."
                     )
                 return override
-            path = shutil.which(self.binary)
+            path = (_bundled_kern() if self.binary == "kern" else None) or shutil.which(self.binary)
             if path is None:
                 raise RuntimeError(
                     f"kern execution policy requires the {self.binary!r} binary on PATH "

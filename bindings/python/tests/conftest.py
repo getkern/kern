@@ -29,8 +29,15 @@ def pytest_report_header(config):
     """One line in pytest's header: the kern these tests will drive, and where it came from."""
     del config  # the header does not depend on the invocation, only on the environment
     env = os.environ.get("KERN_BIN")
+    bundled = None
+    if not env:
+        from kern_sandbox import _bundled_kern
+
+        bundled = _bundled_kern()
     if env:
         path, how = env, "$KERN_BIN"
+    elif bundled:
+        path, how = bundled, "the installed wheel"
     else:
         found = shutil.which("kern")
         if not found:

@@ -5,6 +5,23 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## kern-sandbox 0.2.41 (Python) - 2026-09-29
+
+**`pip install kern-sandbox` is the whole install on Linux.** The wheels for `x86_64` and `aarch64`
+carry kern's static release binary, v0.25.0, the same file `install.sh` serves and checked against
+its published sha256. pip installs it as `kern` next to `python`, the way ruff and uv ship theirs,
+so the venv has `kern doctor` too. The universal wheel stays, unchanged, for every other platform.
+Measured in a fresh venv with no `kern` on PATH: `run_code` ran on x86_64 and on a Raspberry Pi 5,
+and `uvx --from kern-sandbox kern-mcp` answered a `run_code` call over stdio.
+
+**The SDK takes the kern its own wheel installed, and finds it through the package's RECORD.** The
+order is `$KERN_BIN`, then that binary, then PATH. Not by looking next to the interpreter: a
+user-scheme install shares `~/.local/bin` with `install.sh`, and a kern found there by position can
+be a copy installed by hand months earlier.
+
+**On a Mac, the error and the pages say where the code goes**: inside the Linux VM, where the same
+`pip install` brings kern. The Node package is unchanged and still needs the install script.
+
 ## kern-sandbox 0.2.40 - 2026-09-26
 
 **The page says what it works with, by name.** Claude Code, Cursor, Claude Desktop and LM Studio,

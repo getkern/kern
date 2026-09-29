@@ -37,6 +37,7 @@ from __future__ import annotations
 import atexit
 import base64
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -69,7 +70,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.40"
+__version__ = "0.2.41"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -1967,37 +1968,75 @@ def _verify_is_kern(path: str) -> str:
     return first
 
 
+@functools.lru_cache(maxsize=1)
+def _bundled_kern() -> "str | None":
+    """The ``kern`` that the Linux wheel of THIS package installed, or None.
+
+    The Linux wheels (x86_64 and aarch64) carry kern's static release binary as a script, so pip puts
+    it in the environment's `bin` next to `python`, the way ruff and uv ship theirs. `pip install
+    kern-sandbox` is then the whole install, and the SDK drives the binary it was published with.
+
+    FOUND THROUGH THE PACKAGE'S OWN RECORD, NOT BY LOOKING NEAR THE INTERPRETER. A user-scheme install
+    puts scripts in `~/.local/bin`, which is where `install.sh` puts kern too, and a `kern` found there
+    by position could be a copy installed by hand months ago, preferred over the one the user runs on
+    PATH. The tests' own header documents that exact trap (a forgotten 0.9.2 in `~/.local/bin`). The
+    RECORD lists what pip installed for this distribution and nothing else, so only a kern this wheel
+    brought is taken, and only when the RECORD is the one this module was loaded from: a source tree
+    on `sys.path` must not borrow the binary of some installed copy.
+    """
+    try:
+        from importlib import metadata
+
+        dist = metadata.distribution("kern-sandbox")
+        files = dist.files or []
+    except Exception:  # noqa: BLE001 - no metadata (source tree, zipapp, vendored): nothing bundled
+        return None
+    here = os.path.realpath(__file__)
+    binary = None
+    ours = False
+    for entry in files:
+        parts = entry.parts
+        if len(parts) >= 2 and parts[-2] == "bin" and parts[-1] == "kern":
+            binary = entry
+        elif entry.as_posix().endswith("kern_sandbox/__init__.py"):
+            ours = os.path.realpath(str(dist.locate_file(entry))) == here
+    if binary is None or not ours:
+        return None
+    path = os.path.normpath(str(dist.locate_file(binary)))
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
 def _find_kern() -> str:
-    """Locate ``kern``: ``$KERN_BIN`` if set, else the first ``kern`` on ``$PATH``. The result is also
-    IDENTIFIED as kern (see :func:`_verify_is_kern`), because being executable and being named `kern` are
-    not the same as being kern."""
+    """Locate ``kern``: ``$KERN_BIN`` if set, else the kern this package's Linux wheel installed (see
+    :func:`_bundled_kern`), else the first ``kern`` on ``$PATH``. The result is also IDENTIFIED as kern
+    (see :func:`_verify_is_kern`), because being executable and being named `kern` are not the same as
+    being kern."""
     env = os.environ.get("KERN_BIN")
     if env:
         if not (Path(env).is_file() and os.access(env, os.X_OK)):
             raise SandboxError(f"$KERN_BIN='{env}' is not an executable file")
         _verify_is_kern(env)
         return env
-    found = shutil.which("kern")
+    found = _bundled_kern() or shutil.which("kern")
     if not found:
         # On macOS the generic "install it" is a dead end: there is no macOS build to install, and a
         # user who pip-installed this package here would otherwise keep looking for one. kern needs a
-        # Linux kernel, so the answer is a VM, and saying so costs one branch.
+        # Linux kernel, so the answer is a VM, and inside one the same `pip install` brings kern.
         if sys.platform == "darwin":
             raise SandboxError(
-                "the `kern` binary was not found on PATH, and this is macOS: kern is Linux-only "
-                "(no namespaces, no cgroups on a Mac), so there is no macOS build to find. "
-                "Run inside a Linux VM (colima, Lima, OrbStack, UTM) and install it there with:\n"
-                "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n"
-                "or set $KERN_BIN to a kern reachable from here."
+                "kern was not found, and this is macOS: kern is Linux-only (no namespaces, no "
+                "cgroups on a Mac), so there is no macOS build. Run your code inside a Linux VM "
+                "(colima, Lima, OrbStack, UTM) and install this package there:\n"
+                "    pip install kern-sandbox\n"
+                "On Linux x86_64 and aarch64 that brings kern with it. Or set $KERN_BIN to a kern "
+                "reachable from here."
             )
-        # THE COMMAND, NOT A LINK. `pip install kern-sandbox` does NOT bring the binary: this
-        # package is a wrapper around a process it does not ship, and the moment a user meets that
-        # fact is this exception. It used to answer with a repository URL, which asks someone who is
-        # one paste away from working to go and read a page first. The installer is the same line
-        # the project's README leads with, so the two cannot drift apart in what they recommend.
+        # THE COMMAND, NOT A LINK. Reached on Linux only when the wheel pip chose carries no binary:
+        # an architecture with no Linux wheel, or a pip too old to pick one. The installer is the
+        # same line the project's README gives for the runtime, so the two cannot drift apart.
         raise SandboxError(
-            "the `kern` binary was not found on PATH. `pip install kern-sandbox` installs this "
-            "wrapper, not the runtime it drives - install kern with:\n"
+            "kern was not found: the package pip installed here carries no kern binary (its Linux "
+            "wheels do, for x86_64 and aarch64) and there is none on PATH. Install kern with:\n"
             "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n"
             "or point $KERN_BIN at a kern you already have."
         )
