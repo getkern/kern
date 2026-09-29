@@ -268,8 +268,10 @@ your own.)</sub>
   `require_limits=True` refuses to start rather than run uncapped.
 - **Nothing bounds the workspace.** It is a host directory, so a job can fill your disk.
 - **No `--user`**, so an image that refuses to run as root has no answer here yet.
-- **Not inside a container without `--privileged`, and not on Google Colab.** Measured:
-  [install notes](https://github.com/getkern/kern/blob/main/docs/INSTALL.md#macos).
+- **Not inside a container without `--privileged`, and not on Google Colab.** A box mounts a fresh
+  `/proc`, and the kernel allows that only where an unmasked `/proc` already exists. A container
+  that masks parts of its own `/proc`, which is the default and is why it is safe, leaves none, so
+  the box stops at `mount(proc) failed: Permission denied`. Measured on Colab, kernel 6.6.122.
 - **The binary comes with the package only on Linux x86_64 and aarch64.** Anywhere else pip picks
   the wheel without it, and the package drives a `kern` on `PATH` or in `$KERN_BIN`, installed with
   the [install script](https://github.com/getkern/kern/blob/main/docs/INSTALL.md). `$KERN_BIN`
