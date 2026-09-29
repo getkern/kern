@@ -482,6 +482,7 @@ fn download_blob_quiet(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError
         "-o",
         tmp,
     ]);
+    args.extend_from_slice(&STALL_GUARD);
     curl_authed(&args, url, auth)?;
     Ok(())
 }
@@ -941,9 +942,20 @@ impl Platform {
 /// every hop on TLS - a hostile registry can't redirect a blob to `http://`/`file://`. Bearer creds
 /// go in a header; Basic creds go via `-K` STDIN (off-argv).
 fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
+    curl_download_guarded(url, tmp, auth, &STALL_GUARD)
+}
+
+/// [`curl_download`] with the stall guard as a parameter, so a test can shrink its thirty seconds.
+fn curl_download_guarded(
+    url: &str,
+    tmp: &str,
+    auth: &Auth,
+    stall_guard: &[&str],
+) -> Result<(), OciError> {
     let mut cmd = Command::new("curl");
     cmd.args(["--no-progress-meter", "-S", "-L"])
         .args(pin_for_url(url))
+        .args(stall_guard)
         .args([
             "--max-redirs",
             "10",
@@ -1059,6 +1071,7 @@ fn download_blobs_oneconn(
         args.push("10");
         args.push("--max-time");
         args.push("600");
+        args.extend_from_slice(&STALL_GUARD);
         args.push("--max-filesize");
         args.push(MAX_LAYER_DOWNLOAD_BYTES);
         args.push("-o");
@@ -1853,6 +1866,25 @@ const MAX_LAYER_ENTRIES: u64 = 2_000_000;
 /// Max COMPRESSED bytes for a single layer download (curl `--max-filesize`), as a string for the argv.
 /// Bounds a disk-fill DoS from a hostile registry; generous enough for any realistic layer (8 GB).
 const MAX_LAYER_DOWNLOAD_BYTES: &str = "8000000000";
+
+/// A blob transfer that STOPS is ended and started again, instead of holding the pull for the whole
+/// `--max-time`. MEASURED on 29/09/2026: a registry CDN connection delivered 32 MB of a layer and then
+/// nothing for 142 s with the socket still ESTABLISHED, and with only `--max-time 600` curl waits out
+/// the ten minutes while the `kern box` that asked for the image prints nothing. Under 1 KiB/s for 30 s
+/// is a stall on any link a pull can finish on; curl ends it with exit 28, which `--retry` treats as
+/// transient, and a retry rewrites `-o` from the start (measured: the file held one attempt's bytes,
+/// not three). Two retries, a second apart: a registry that keeps stalling still fails, in about a
+/// minute and a half, with curl's own message on stderr.
+const STALL_GUARD: [&str; 8] = [
+    "--speed-limit",
+    "1024",
+    "--speed-time",
+    "30",
+    "--retry",
+    "2",
+    "--retry-delay",
+    "1",
+];
 
 /// The TLS-pinning flags EVERY registry fetch must carry: HTTPS-only on the initial request AND on
 /// every redirect hop (registries hand blobs to a CDN), with a bounded redirect count. Single-sourced
@@ -3474,6 +3506,75 @@ mod tests {
     }
 
     use super::*;
+
+    /// A blob transfer that STALLS with the connection open is ended by the guard and started again,
+    /// not waited out for the whole `--max-time`. The server reproduces 29/09: part of a body, then
+    /// nothing, the socket still open. Without the guard curl sits there until the server gives up
+    /// (60 s here, 600 s against a real CDN), which is what the time bound below catches.
+    #[test]
+    fn a_stalled_blob_transfer_is_ended_and_retried_not_waited_out() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                seen.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut req = [0u8; 4096];
+                    let _ = s.read(&mut req);
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10000000\r\n\r\n");
+                    let _ = s.write_all(&[b'x'; 200_000]);
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                });
+            }
+        });
+        let tmp = std::env::temp_dir().join(format!("kern-stall-{}.blob", std::process::id()));
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/sha256:00");
+        // The production guard with its thirty seconds shrunk to two, and one retry instead of two.
+        let guard = [
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "2",
+            "--retry",
+            "1",
+            "--retry-delay",
+            "1",
+        ];
+        let t0 = std::time::Instant::now();
+        let r = curl_download_guarded(&url, tmp.to_str().unwrap(), &Auth::None, &guard);
+        let took = t0.elapsed();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(r.is_err(), "a stalled transfer was reported as a download");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the stalled transfer was not retried"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(40),
+            "held for {took:?}: the stall was waited out"
+        );
+        // And the guard the blob downloads carry is that one, at its production values.
+        assert_eq!(
+            STALL_GUARD,
+            [
+                "--speed-limit",
+                "1024",
+                "--speed-time",
+                "30",
+                "--retry",
+                "2",
+                "--retry-delay",
+                "1"
+            ]
+        );
+    }
 
     #[test]
     fn loopback_match_is_exact_not_prefix() {

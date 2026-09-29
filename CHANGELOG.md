@@ -41,6 +41,14 @@ the rejected title, and a note about measurement method above the first example.
 the same way.
 
 ## Unreleased
+**A registry transfer that stalls is ended and retried, instead of holding the pull for ten
+minutes.** Measured on 29/09: a CDN connection delivered 32 MB of a layer and then nothing for 142 s
+with the socket still open, and with only `--max-time 600` curl waited out the whole window while the
+`kern box` that needed the image printed nothing. Every blob download now gives up below 1 KiB/s for
+30 s and tries again, twice, a second apart; a registry that keeps stalling fails in about a minute
+and a half with curl's own message. A test reproduces the stall on a loopback server, and fails in
+60 s without the guard.
+
 **`kern images` listed a size per image and never said what they came to.** Every row carried its
 own number and nothing added them up, so the only way to learn the total was to sum the column by
 hand or walk the directory with `du`.
