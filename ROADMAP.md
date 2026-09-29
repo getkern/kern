@@ -18,6 +18,9 @@ What kern does not do. Nothing here is a commitment or a date. Shipped work is i
 collision, and a per-box seccomp profile from a file. A stack is one pod, and an arbitrary OCI
 profile is a parser whose bugs permit rather than crash.
 
+**GPU:** a box is given the host's GPU whole, as a device, and kern does not split a GPU or cap it
+per box. Both halves are the shipped behaviour, not a plan ([docs/CONFIG.md](docs/CONFIG.md)).
+
 ## Known gaps, and what would settle them
 
 | gap | what it costs you | what would settle it |
