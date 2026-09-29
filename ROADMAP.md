@@ -13,17 +13,11 @@ What kern does not do. Nothing here is a commitment or a date. Shipped work is i
 | **Snapshot and warm start** | Rootless CRIU needs a capability and seccomp suspended, so it would be opt-in and same-host |
 | **A `kern` command on the macOS side** | A Mac already runs the ordinary Linux kern inside a Linux VM, verified by hand on colima and the same shape on Lima, OrbStack and UTM ([platforms](docs/INSTALL.md#platforms)). What is under consideration is a shim, so `kern` can be typed in the Mac's own shell without entering the VM first. A NATIVE port is not: macOS has no namespaces and no cgroups, so there is nothing to port it to |
 
-**Out by design:** network segmentation between services, `deploy.replicas`, `docker.sock`, the
-compose `privileged:` key, an automatic fallback on a port collision, and a per-box seccomp profile
-from a file. A stack is one pod, and an arbitrary OCI profile is a parser whose bugs permit rather
-than crash.
-
-**And the OCI RUNTIME spec, deliberately.** Reading OCI images is a format and is done; being the
-`--runtime` under podman, or a CRI implementation under a kubelet, is a position, and the answer is
-no. The user would type `podman`, the UX would be podman's, and none of what makes kern a product
-(its CLI, compose, pods, prewarming, the SDK) would be reached. On the kubelet path it is worse: the
-posture becomes runc's, without the user namespace, with the caller's seccomp and
-`noNewPrivileges` off, which hands over a kern missing the four reasons to choose kern.
+**Out by design:** the OCI runtime spec (reading OCI images is a format and is done; being podman's
+`--runtime` or a CRI under a kubelet is not), network segmentation between services,
+`deploy.replicas`, `docker.sock`, the compose `privileged:` key, an automatic fallback on a port
+collision, and a per-box seccomp profile from a file. A stack is one pod, and an arbitrary OCI
+profile is a parser whose bugs permit rather than crash.
 
 ## Known gaps, and what would settle them
 
