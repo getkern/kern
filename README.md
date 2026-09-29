@@ -73,6 +73,8 @@ Then, inside the VM:
 curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 ```
 
+Kern Sandbox goes in the VM too, with the code that calls it: `pip install kern-sandbox` there.
+
 Then `kern doctor` checks the host and says what to fix. Ubuntu 23.10 and newer need one root step
 first: [docs/INSTALL.md](docs/INSTALL.md#linux).
 
@@ -106,8 +108,8 @@ print(r.stdout, r.fault)   # 4950  None
 ```
 
 Your code runs in a container of its own, for one call or for a whole session, and a timeout or an
-out-of-memory comes back as a typed `fault`.
-Node: `npm install kern-sandbox`.
+out-of-memory comes back as a typed `fault`. On Linux, pip brings kern with it.
+Node: `npm install kern-sandbox`, with kern from the install line above.
 
 <img src="assets/readme-basics.svg" width="880" alt="Three windows. files.py: a Sandbox writes in.csv, runs a job, reads out.txt back. state.py: a kernel keeps x = 40 between calls and prints x + 2. package.py: a Sandbox with setup pip install numpy imports numpy.">
 

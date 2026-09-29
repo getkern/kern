@@ -14,6 +14,9 @@ kern box dev --image alpine -it -- sh
 The script picks your architecture (`x86_64` or `aarch64`), checks the SHA256 and puts `kern` in
 `~/.local/bin`. `kern doctor` tells you what your machine can and cannot do.
 
+For Kern Sandbox from Python, `pip install kern-sandbox` is enough: on `x86_64` and `aarch64` it
+brings the same binary, into the venv.
+
 **Ubuntu 23.10 and newer need one root step before the first box:**
 
 ```sh
@@ -64,6 +67,11 @@ curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
 colima's default guest is Ubuntu, so run the Ubuntu step above once. In that guest, memory and
 process limits are not enforced, and kern says so when a box starts. More in the
 [FAQ](FAQ.md#does-it-run-on-macos).
+
+**Kern Sandbox runs where kern runs, so your code goes in the VM too.** `pip install kern-sandbox`
+on the Mac itself installs, and its first call stops with an error that says so. Inside the VM, in a
+venv, it brings kern with it. An MCP client on the Mac needs the `ssh` line in
+[docs/MCP.md](MCP.md).
 
 ## Uninstall
 

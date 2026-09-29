@@ -6,17 +6,17 @@ per call, and a hundred of them cost 1.4 s in total. How much survives between c
 
 **Works with** Claude Code, Cursor, Claude Desktop, LM Studio, LangChain and pi.
 
-`kern-sandbox` is the SDK in front of the `kern` binary. Two things, not one: the isolation is the
-binary's, the package is the API. The same API ships for Python and for Node.
+`kern-sandbox` is the SDK in front of the `kern` binary: the isolation is the binary's, the package
+is the API. On Linux `x86_64` and `aarch64` the Python package brings the binary with it. The same
+API ships for Node, which needs the [install script](INSTALL.md) for the binary.
 
 ```sh
-# the runtime: one static binary, checksum-verified by the script
-curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh
-
 # if the venv line fails, your distribution ships it separately: sudo apt install python3-venv
 python3 -m venv .venv && . .venv/bin/activate
 pip install kern-sandbox
 ```
+
+On a Mac, all of it goes inside a Linux VM: [macOS](INSTALL.md#macos).
 
 ```python
 import kern_sandbox as kern
@@ -145,8 +145,8 @@ If the code is actively hostile, or belongs to someone else, use a microVM (Fire
 gVisor. That is a different job and costs what a machine costs: about half a second per command
 there against about 14 ms here. The full statement is the [threat model](THREAT_MODEL.md).
 
-And `pip install kern-sandbox` does not install the sandbox: it drives a `kern` binary on `PATH` or
-in `$KERN_BIN`, which is a second thing to keep current.
+The binary comes with the Python package only on Linux `x86_64` and `aarch64`. Anywhere else, and
+for Node, the package drives a `kern` on `PATH` or in `$KERN_BIN`, a second thing to keep current.
 
 ## The rest
 

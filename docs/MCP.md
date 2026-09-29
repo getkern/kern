@@ -37,7 +37,8 @@ on macOS its missing-binary error names the VM rather than an installer.
 **A `pip install` into a virtual environment is invisible to the client**, which spawns `kern-mcp`
 from its own PATH. `pipx install kern-sandbox` puts it somewhere the client can see. Or install
 nothing at all, and name the package rather than the command: `uvx kern-mcp` fails, because the two
-have different names and there is no `kern-mcp` on PyPI.
+have different names and there is no `kern-mcp` on PyPI. On Linux `x86_64` and `aarch64` the package
+brings the `kern` binary with it, so this line is the whole install.
 
 ```json
 { "mcpServers": { "kern": { "command": "uvx", "args": ["--from", "kern-sandbox", "kern-mcp"] } } }
@@ -120,8 +121,8 @@ config is one line either way.
 ```
 
 The agent runs where you are; the sandbox runs where the box is. For another machine that is the whole
-integration: `pip install kern-sandbox` and a `kern` binary there, a key you already have, and one
-line in a config file.
+integration: `pip install kern-sandbox` there, which on Linux brings kern with it, a key you already
+have, and one line in a config file.
 
 ### What it costs
 
