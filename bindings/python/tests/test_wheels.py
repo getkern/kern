@@ -20,7 +20,6 @@ import io
 import os
 import subprocess
 import sys
-import venv
 import zipfile
 from pathlib import Path
 
@@ -114,18 +113,25 @@ def test_a_binary_the_wheel_cannot_honour_is_refused(data, machine, reason):
     build_wheels.check_elf(_elf(machine), machine, "kern under test")  # and the right one passes
 
 
+def _make_venv(env_dir: Path) -> Path:
+    """A venv with pip, made from the REAL interpreter. Inside a venv, Python 3.9 reports the venv's
+    own `python` as `sys._base_executable`, so `venv.EnvBuilder` there links a symlink to a symlink,
+    and a relocatable build (uv's) then cannot find its standard library: measured, `No module named
+    'encodings'`. The resolved path is the interpreter itself on every version."""
+    base = os.path.realpath(getattr(sys, "_base_executable", "") or sys.executable)
+    subprocess.run([base, "-m", "venv", str(env_dir)], check=True)
+    return env_dir / "bin" / "python"
+
+
 @pytest.fixture(scope="module")
 def installed(tmp_path_factory):
     """A venv with this package's platform wheel installed by pip, offline, and its python and bin."""
     root = tmp_path_factory.mktemp("wheel-install")
     wheel = build_wheels.platform_wheel(_universal_wheel(root), ARCH, FAKE_KERN)
     env_dir = root / "venv"
-    venv.EnvBuilder(with_pip=True).create(env_dir)
-    subprocess.run(
-        [env_dir / "bin" / "python", "-m", "pip", "install", "-q", "--no-index", str(wheel)],
-        check=True,
-    )
-    return env_dir / "bin" / "python", env_dir / "bin"
+    python = _make_venv(env_dir)
+    subprocess.run([python, "-m", "pip", "install", "-q", "--no-index", str(wheel)], check=True)
+    return python, env_dir / "bin"
 
 
 def _ask(python: Path, code: str, **env: str) -> str:
@@ -163,8 +169,7 @@ def test_a_kern_dropped_next_to_python_by_hand_is_not_taken_for_the_bundled_one(
     is not "the bundled kern": the SDK falls through to PATH, where the user decides what runs."""
     wheel = _universal_wheel(tmp_path)
     env_dir = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=True).create(env_dir)
-    python = env_dir / "bin" / "python"
+    python = _make_venv(env_dir)
     subprocess.run([python, "-m", "pip", "install", "-q", "--no-index", str(wheel)], check=True)
     stray = env_dir / "bin" / "kern"
     stray.write_bytes(FAKE_KERN)
