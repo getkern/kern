@@ -27,6 +27,8 @@
 An agent's tool-call, a generated snippet, a notebook cell, a CI step: it arrives, you run it, and
 nobody has read it first.
 
+In a terminal:
+
 ```bash
 # if the venv line fails, your distribution ships it separately:
 #     sudo apt install python3-venv
@@ -36,6 +38,8 @@ pip install kern-sandbox   # on Linux x86_64 and aarch64, this brings kern with 
 
 On a Mac, run these inside a Linux VM, with your code:
 [macOS](https://github.com/getkern/kern/blob/main/docs/INSTALL.md#macos).
+
+Then in a Python file:
 
 ```python
 import kern_sandbox as kern
