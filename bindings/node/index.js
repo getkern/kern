@@ -3,9 +3,15 @@
  *
  *   const kern = require('kern-sandbox');
  *
- *   // one-shot (a throwaway session under the hood)
- *   const r = await kern.runCode("console.log(1 + 1)", { language: "node" });
+ *   // one-shot (a throwaway session under the hood). The CODE is Python, because the default image
+ *   // is python:3.12-slim: this example used to pass `language: "node"`, which that image cannot
+ *   // run, so the first thing a reader copied was the one call that fails.
+ *   const r = await kern.runCode("print(1 + 1)");
  *   console.log(r.stdout, r.success);
+ *
+ *   // JavaScript needs an image that carries node; kern refuses it on the default one rather than
+ *   // starting a box to discover that.
+ *   const js = await kern.runCode("console.log(1 + 1)", { language: "node", image: "node:22-slim" });
  *
  *   // a session: FILE state persists across steps; processes are ephemeral
  *   await kern.withSandbox({ setup: "pip install pandas" }, async (sbx) => {
@@ -2631,7 +2637,14 @@ class Sandbox {
               `interpreter line names something the image lacks.` +
               // The one case where the remedy is not "a different image": every image has a POSIX
               // shell, so a caller who asked for bash and does not need bash has a one-word fix.
-              (what === "bash" ? " This image has no bash; use language:'sh' if the script is POSIX." : "");
+              (what === "bash" ? " This image has no bash; use language:'sh' if the script is POSIX." : "") +
+              // NODE HAS NO IN-IMAGE FALLBACK, so the remedy is the image, and it is NAMED. Kept
+              // word-for-word in step with the Python binding: the two are one API with two
+              // spellings, and a message that differs between them is a product that differs.
+              (what === "node"
+                ? ` No image kern defaults to carries node; name one that does, e.g.` +
+                  ` new Sandbox({ image: "node:22-slim" }).`
+                : "");
           } else if (reason.includes("Permission denied")) {
             detail = "Permission denied: it is present in the box but not executable there.";
           } else {
@@ -3267,6 +3280,25 @@ class Sandbox {
         `unsupported language ${JSON.stringify(language)} (v1: 'python' | 'bash' | 'sh' | 'node')`,
       );
     const [runner, evalFlag, ext] = spec;
+    // REFUSED HERE, BECAUSE THE ANSWER IS ALREADY KNOWN, and this binding advertised it hardest:
+    // the example at the top of this file was `runCode("console.log(1 + 1)", { language: "node" })`,
+    // which cannot work as written because the default image has no node. MEASURED on
+    // python:3.12-slim: python, sh and bash 5.2 all run there, node does not. So a caller who leaves
+    // the image alone is told at the moment of the choice, with the remedy, rather than paying a box
+    // start to be told the same thing by an `exec_failed` fault.
+    //
+    // ⛔ ONLY for the default image. For an image the caller NAMED, kern does not know what is inside
+    // it, and refusing on a guess would be inventing a measurement; that case still reaches the box.
+    // Kept identical to the Python binding, which has the same check for the same reason: the two
+    // are one API with two spellings, and a divergence here is a divergence in the product.
+    if (language === "node" && this.image === DEFAULT_IMAGE) {
+      throw new SandboxError(
+        `language='node' needs an image that provides node, and this Sandbox is on the default ` +
+          `${JSON.stringify(DEFAULT_IMAGE)}, which does not (it provides python, sh and bash). ` +
+          `Name one that does, e.g. new Sandbox({ image: "node:22-slim" }), or run the code with ` +
+          `language='python'.`,
+      );
+    }
     const eff = this._effTimeout(timeoutS);
     if (language === "python")
       return this._runPythonCell(code, { timeoutS: eff, onStdout, onStderr });

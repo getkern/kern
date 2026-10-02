@@ -1965,14 +1965,47 @@ test("a missing interpreter is a typed fault naming the binary and the image", {
   // + a kern: marker" is its signal that a workload forged the marker. kern signals started BEFORE it
   // execs, so an ENOENT on `execve` lands in exactly that hole and arrived as a bare exit 127 with
   // `fault === null`: indistinguishable from the user's own code failing.
-  const r = await runCode("console.log(1)", { language: "node", image: "python:3.12-slim" });
+  // ON AN IMAGE THE CALLER NAMED, which is the only shape that still reaches the box: the DEFAULT
+  // image is refused before a box starts (the test below owns that), because there kern already
+  // knows the answer. `alpine:3.19` has no node and is not the default, so this still exercises the
+  // classifier the comment above is about.
+  const r = await runCode("console.log(1)", { language: "node", image: "alpine:3.19" });
   assert.strictEqual(r.exitCode, 127);
   assert.ok(r.fault, "a missing interpreter must not arrive as an ordinary non-zero exit");
   assert.strictEqual(r.fault.type, "exec_failed");
   assert.match(r.fault.message, /node/);
-  assert.match(r.fault.message, /python:3\.12-slim/);
+  assert.match(r.fault.message, /alpine:3\.19/);
   assert.match(r.fault.message, /No such file or directory/);
+  // THE REMEDY TRAVELS WITH THE FACT. Naming the binary and the image says what happened; a caller
+  // who has just been told their image lacks node still has to guess which one does not.
+  assert.match(r.fault.message, /node:22-slim/);
   assert.strictEqual(r.success, false);
+});
+
+test("node on the DEFAULT image is refused before a box is started", { skip: !KERN_OK && "kern not installed" }, async () => {
+  // MEASURED on python:3.12-slim: three of the four languages the enum advertises run there
+  // (python, sh, bash 5.2) and node does not. That is a fact kern holds about its OWN default, so
+  // paying a box start to rediscover it - and answering with a fault, as if the outcome had been
+  // uncertain - is the wrong shape. A field report listed `language: "node"` as offered-but-absent,
+  // and this file's own header example used to be that exact call.
+  await assert.rejects(
+    () => runCode("console.log(1)", { language: "node" }),
+    (e) => {
+      assert.strictEqual(e.name, "SandboxError");
+      assert.match(e.message, /python:3\.12-slim/);
+      assert.match(e.message, /node:22-slim/, "the refusal must name a remedy, not only the problem");
+      return true;
+    },
+  );
+});
+
+test("node on an image that HAS node is untouched", { skip: !KERN_OK && "kern not installed" }, async () => {
+  // The positive control for both tests above: the refusal must be about the DEFAULT image and not
+  // about the language, or it would have removed a working feature instead of a dead end.
+  const r = await runCode("console.log(40 + 2)", { language: "node", image: "node:20-slim" });
+  assert.strictEqual(r.fault, null);
+  assert.strictEqual(r.exitCode, 0);
+  assert.strictEqual(r.stdout.trim(), "42");
 });
 
 test("command-not-found inside the user's own script is not a fault", { skip: !KERN_OK && "kern not installed" }, async () => {

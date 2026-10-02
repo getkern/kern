@@ -78,6 +78,52 @@ __version__ = "0.2.42"
 _DEFAULT_IMAGE = "python:3.12-slim"
 
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
+
+
+def _workspace_usage(root: str) -> int:
+    """Bytes the workspace occupies ON DISK, or 0 when it cannot be read.
+
+    `st_blocks * 512` and NOT `st_size`, because the question is "how much of the disk is gone" and
+    the two disagree in both directions: a sparse file reports a size it does not occupy, and a
+    1-byte file occupies a whole block. `st_blocks` is what `du` reports and what the disk filling up
+    actually tracks.
+
+    HARD LINKS AND REPEATED INODES ARE COUNTED ONCE. A box that hard-links one large file a thousand
+    times occupies one file's worth of disk, and charging it a thousand times would refuse a session
+    that is costing nothing.
+
+    SYMLINKS ARE NOT FOLLOWED. The workspace is box-controlled: a symlink to `/usr` would otherwise
+    make this walk the host's filesystem - unbounded work driven by untrusted input, which is a
+    denial of service dressed as a measurement. `os.scandir` with `follow_symlinks=False` keeps the
+    walk inside the directory tree, and the link itself is charged its own (tiny) blocks.
+
+    BEST EFFORT, never raising: a file deleted between `scandir` and `stat` is ordinary in a live
+    workspace, and a measurement that can abort a call is worse than one that is slightly stale.
+    """
+    total = 0
+    seen: set = set()
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    # One charge per inode, on every file type, so a hard-linked tree is not
+                    # multiplied and a directory's own blocks are still counted.
+                    key = (st.st_dev, st.st_ino)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    total += getattr(st, "st_blocks", 0) * 512
+        except OSError:
+            continue
+    return total
 _DEPS_DIR = ".deps"  # pip --target dir inside the workspace (added to PYTHONPATH for run_code)
 
 # -- the standard library's bytecode, compiled once per image and mounted READ-ONLY ------------------
@@ -1689,6 +1735,18 @@ class ExecutionResult:
 
     stdout: str
     stderr: str
+    #: The box process's exit status, or ``-1`` when NO PROCESS EXIT APPLIES. The sentinel is not an
+    #: error code and must not be compared against one. It is what a resident kernel returns, because
+    #: a cell that times out there does not end a process: the deadline belongs to the CELL, the
+    #: interpreter survives it, and the next cell runs in the same box with its state intact. The
+    #: one-shot path reports ``137`` for the same fault because there the binding does SIGKILL the box,
+    #: so ``128 + 9`` is a true statement about a process that really died. MEASURED, both on
+    #: python:3.10-alpine with ``timeout_s=3``: kernel ``fault=timeout, exit_code=-1``; one-shot
+    #: ``fault=timeout, exit_code=137``. The numbers differ because the events differ, and forging
+    #: ``137`` for the kernel would report a kill that never happened.
+    #: ⛔ Branch on :attr:`fault`, never on this field: ``fault`` carries the same verdict in both modes.
+    #: A caller that tested ``exit_code == 137`` has already been caught missing a timeout once (see the
+    #: note on the Node binding's 137 in ``_spawn``).
     exit_code: int
     duration_ms: int
     fault: SandboxFault | None = None
@@ -2557,6 +2615,55 @@ class Sandbox:
     image: str = _DEFAULT_IMAGE
     setup: str | None = None
     workspace: str | None = None
+    #: Refuse to start a call once the workspace holds more than this many bytes. ``None`` (default)
+    #: is off and costs nothing: the walk below only runs when a cap is set.
+    #:
+    #: ⛔ A COOPERATIVE CAP, NOT A BOUNDARY, and the difference is the whole contract. The workspace
+    #: is a host directory bind-mounted at ``/workspace``, so the box writes to the real filesystem
+    #: and nothing in the kernel is holding it back. kern's other limits ARE boundaries, measured to
+    #: the byte: memory to the megabyte, pids at 251 of 256, ``/tmp`` full at exactly 64 MiB. This one
+    #: cannot be, from here: a kernel-enforced quota needs a disk-backed ``vdisk`` (``mkfs.ext4``,
+    #: which needs root) and the SDK is rootless by construction, while a size-capped ``tmpfs`` would
+    #: be enforced and would NOT survive between calls, which is the one thing a workspace must do.
+    #:
+    #: So what it bounds is DAMAGE ACROSS CALLS, not within one: a single call can blow past it and
+    #: the next one is refused. Said plainly because a cap that sounds like a boundary and is not is
+    #: worse than no cap at all - it is the same honesty kern applies to its vGPU VRAM governor.
+    workspace_max_bytes: int | None = None
+    #: A STABLE IDENTITY for this sandbox, used only with ``persist=True``. Two processes that name
+    #: the same sandbox meet the same resident box.
+    name: str | None = None
+    #: Keep ONE resident box alive and run every call inside it with ``kern exec``, instead of
+    #: starting a throwaway box per call. Survives ``__exit__``: that is the point, and it is why
+    #: :meth:`destroy` exists. Requires ``name``.
+    #:
+    #: ⭐ WHAT IT BUYS, measured on this tree: ``kern exec`` into a resident box is **2 ms** against
+    #: **6 ms** for a fresh box, and whatever the previous call left in the box (``/tmp``, an
+    #: installed package, a background process) is still there for the next one - across PROCESSES,
+    #: not just across calls. ``workspace=`` already carried FILES between sessions; this carries the
+    #: box.
+    #:
+    #: ⛔ WHAT IT COSTS, stated because it is the opposite of what the one-shot path promises, and
+    #: MEASURED rather than assumed - the first version of this comment claimed more than was true.
+    #: A resident box is NOT a fresh box:
+    #:
+    #: * ``/tmp`` ACCUMULATES instead of starting empty. Verified: a file written by one call is
+    #:   still there for the next.
+    #: * The network posture is whatever the box was CREATED with, not what this call asks for. That
+    #:   is why it is part of the adoption fingerprint.
+    #: * The PID namespace is SHARED across calls (pids increment, 2 then 3 then 4, and PID 1 is the
+    #:   box's own init), so a call can see that earlier calls happened.
+    #:
+    #: What does NOT leak, measured and contrary to what this comment first said: a process a previous
+    #: call left running. ``kern exec`` reaps its descendants when it returns, including one detached
+    #: with ``start_new_session=True``, so each call still gets a clean process table. That is why the
+    #: resident box runs ``--init``: without a reaping PID 1 those corpses stayed as zombies.
+    persist: bool = False
+    #: How long the resident box lives with nothing asking for it. It is kern's own ``--timeout`` on
+    #: that box, so the box ends by itself if the owning process dies: a resident sandbox cannot leak
+    #: for longer than this, which is the property that makes `persist` safe to default to on in an
+    #: agent loop. The next call after expiry recreates it.
+    persist_ttl_s: int = 3600
     memory_mb: int | None = 512
     cpus: float | None = None
     pids: int | None = 256
@@ -2805,9 +2912,139 @@ class Sandbox:
                 "domain allowlist for run_code, network=True gives the full host network"
             )
         self._kern = _find_kern()
+        self._resident: str | None = None  # nome del box residente adottato (`persist=True`)
         self._kern_version = _verify_is_kern(self._kern)
 
     # -- lifecycle -----------------------------------------------------------------------------------
+
+    # ---- resident box (`persist=True`) -------------------------------------------------------
+    #
+    # THE WHOLE FEATURE IS THREE DECISIONS, and each of them is a place this could lie to the caller.
+
+    #: Prefix for the resident box's name. Namespaced so a resident sandbox cannot be confused with,
+    #: or collide with, a box the user started by hand. kern is rootless and its registry lives in the
+    #: caller's own runtime directory, so the name space is already per-user: this prefix separates
+    #: KINDS of box, not users.
+    _RESIDENT_PREFIX = "kern-sbx-"
+    #: The label the configuration fingerprint is stamped into.
+    _CFG_LABEL = "kern.sbx.cfg"
+
+    def _resident_name(self) -> str:
+        return f"{self._RESIDENT_PREFIX}{self.name}"
+
+    def _resident_fingerprint(self) -> str:
+        """The posture a resident box BAKES IN, taken from the argv that would create it.
+
+        ADOPTION IS THE DANGEROUS HALF OF THIS FEATURE. A caller who asks for `memory_mb=256` and is
+        silently handed a box someone else created with 512 has been told a limit is in force that is
+        not. So the posture is hashed at creation, stamped into a label, and compared on adoption; a
+        mismatch is refused with both values named rather than resolved by guessing.
+
+        ⭐ TAKEN FROM `_base_argv` AND NOT RE-LISTED HERE. A hand-written list of the fields that
+        matter is a second spelling of the posture, and the two drift the first time a flag is added:
+        the new flag changes what the box IS and does not change the fingerprint, so a box built
+        before it is adopted by a Sandbox that asks for it. Hashing the argv itself cannot drift,
+        because the argv is what creates the box.
+
+        The box NAME is stripped before hashing - it is the identity, not the posture, and leaving it
+        in would make every fingerprint unique and every adoption a mismatch.
+        """
+        argv = self._base_argv(
+            "", network=self.network, timeout_s=int(self.persist_ttl_s), dry=True
+        )
+        return hashlib.sha256("\x00".join(argv).encode()).hexdigest()[:16]
+
+    def _resident_lookup(self) -> "dict | None":
+        """The running resident box for this name, or None. Never raises: a registry that cannot be
+        read is the same answer as no box, and both lead to creating one."""
+        try:
+            out = subprocess.run(  # noqa: S603 - argv list, no shell
+                [self._kern, "ps", "--filter", f"name={self._resident_name()}", "--json"],
+                capture_output=True, text=True, timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        try:
+            data = json.loads(out.stdout)
+        except ValueError:
+            return None
+        rows = data if isinstance(data, list) else [data]
+        for row in rows:
+            if isinstance(row, dict) and row.get("name") == self._resident_name():
+                return row if row.get("status") == "running" else None
+        return None
+
+    def _resident_ensure(self) -> str:
+        """Adopt the resident box or create it, and return its name.
+
+        THE RACE IS REAL AND IS HANDLED BY LOSING GRACEFULLY. Two processes naming the same sandbox
+        can reach the create at the same moment; kern refuses a duplicate name, so the loser does not
+        retry-and-hope - it looks the box up again and adopts what the winner made, verified by the
+        same fingerprint, so losing the race cannot smuggle in a different posture.
+        """
+        want = self._resident_fingerprint()
+        found = self._resident_lookup()
+        if found is not None:
+            have = (found.get("labels") or {}).get(self._CFG_LABEL)
+            if have != want:
+                raise SandboxError(
+                    f"a resident sandbox named {self.name!r} is already running with a DIFFERENT "
+                    f"posture (its fingerprint is {have!r}, this Sandbox asks for {want!r}), so "
+                    f"adopting it would report limits that are not the ones in force. Use another "
+                    f"name, or stop it: kern stop {self._resident_name()}"
+                )
+            return self._resident_name()
+        # THE SAME ARGV THE ONE-SHOT PATH USES, so the resident box carries the identical mounts,
+        # caps, tmpfs and environment - plus `-d` to detach, the fingerprint label, and a PID 1 that
+        # does nothing. `sleep` for exactly the TTL: the box must OUTLIVE the command that created it
+        # and every workload arrives later through `exec`, so a PID 1 that did anything else would be
+        # a second thing to reason about.
+        argv = self._base_argv(
+            self._resident_name(), network=self.network, timeout_s=int(self.persist_ttl_s)
+        )
+        # `--init` AND NOT A BARE `sleep` AS PID 1, and the difference is measured. A resident box
+        # outlives many calls, and a call that detaches a process (`start_new_session=True`) leaves it
+        # to be reparented to PID 1 when the exec returns. `sleep` never calls `wait()`, so every one
+        # of those became a ZOMBIE: observed as `3 [sleep]` in the box's own `ps`, accumulating one
+        # entry per detached process until `pids.max` refused the next fork. kern ships a reaping init
+        # for exactly this, and a resident box is the first thing in this binding that needs one.
+        argv += [
+            "-d", "--init", "--label", f"{self._CFG_LABEL}={want}",
+            "--", "sleep", str(int(self.persist_ttl_s)),
+        ]
+        try:
+            made = subprocess.run(argv, capture_output=True, text=True, timeout=180)  # noqa: S603
+        except (OSError, subprocess.SubprocessError) as e:
+            raise SandboxError(f"could not start the resident sandbox {self.name!r}: {e}") from e
+        if made.returncode != 0:
+            again = self._resident_lookup()
+            if again is not None and (again.get("labels") or {}).get(self._CFG_LABEL) == want:
+                return self._resident_name()
+            raise SandboxError(
+                f"could not start the resident sandbox {self.name!r}: "
+                f"{(made.stderr or made.stdout or '').strip()[:400]}"
+            )
+        return self._resident_name()
+
+    def destroy(self) -> None:
+        """Stop the resident box. The ONLY way a `persist=True` sandbox goes away before its TTL.
+
+        Deliberately not `__exit__`: a sandbox that disappeared when the `with` block ended would be
+        the one-shot behaviour under a different name, and nothing would be resumable. Idempotent and
+        quiet: stopping a box that is already gone is the state the caller asked for.
+        """
+        if not self.name:
+            return
+        try:
+            subprocess.run(  # noqa: S603 - argv list, no shell
+                [self._kern, "stop", self._resident_name()],
+                capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        self._resident = None
 
     def __enter__(self) -> "Sandbox":
         if self.workspace is None:
@@ -2838,6 +3075,26 @@ class Sandbox:
             self._ws = os.path.realpath(self.workspace)
             self._own_ws = False
         self._entered = True
+        # THE RESIDENT BOX, adopted or created, BEFORE `setup` runs: a `setup=` on a persistent
+        # sandbox has to install into the box every later call will use, not into a throwaway one.
+        if self.persist:
+            if not self.name:
+                raise SandboxError(
+                    "persist=True needs a name: it is the identity two processes meet on. "
+                    "Sandbox(name='my-agent', persist=True)"
+                )
+            if self.workspace is None:
+                # A TEMPORARY WORKSPACE WOULD MAKE THIS HALF-PERSISTENT, and silently so: the box
+                # would be adopted while its FILES started empty in a fresh directory every process,
+                # and the fingerprint (which contains the workspace path, because the mount is part
+                # of the posture) would never match twice, so no adoption could ever succeed. Refuse
+                # the combination instead of shipping a feature that only looks like it works.
+                raise SandboxError(
+                    "persist=True needs an explicit workspace=: the resident box is adopted by "
+                    "posture, and a temporary workspace is a different path in every process, so "
+                    "nothing would ever be resumed. Sandbox(name=..., persist=True, workspace='...')"
+                )
+            self._resident = self._resident_ensure()
         if self.setup:
             # A setup that fails raises out of `__enter__`, so the `with` body is never entered and
             # `__exit__` never runs: the workspace this method just created would outlive the session
@@ -3163,6 +3420,27 @@ class Sandbox:
         for part in command:
             if "\0" in part:
                 raise SandboxError("command/code must not contain a NUL byte")
+        # THE WORKSPACE CAP, CHECKED BEFORE THE WORK AND NOT AFTER IT. A call that has already run
+        # cannot be un-run, and its output is what the caller needs most when something went wrong, so
+        # refusing afterwards would destroy the evidence to enforce a limit the write had already
+        # passed. Checking first bounds the damage ACROSS calls, which is the only thing a cooperative
+        # cap can bound, and it is the shape the field report asked for: "a job can fill your disk".
+        #
+        # COSTS NOTHING WHEN UNSET, which is the default: the walk is inside the `is not None`. With a
+        # cap it is one `scandir` pass per call, the same order as the `track_files` snapshot the line
+        # below already pays when tracking is on - and the MCP server, the one caller that runs this
+        # hottest, turns tracking off and sets no cap.
+        if self.workspace_max_bytes is not None and self._ws:
+            used = _workspace_usage(self._ws)
+            if used > self.workspace_max_bytes:
+                raise SandboxError(
+                    f"workspace holds {used} bytes, over the {self.workspace_max_bytes}-byte "
+                    f"workspace_max_bytes, so this call was refused before running. The box writes "
+                    f"to a host directory ({self._ws}), so this is a cooperative cap and not a "
+                    f"kernel boundary: it bounds what accumulates ACROSS calls, and one call can "
+                    f"still exceed it. Delete what the session no longer needs, raise the cap, or "
+                    f"give the Sandbox a workspace on a filesystem you are willing to fill"
+                )
         before = self._snapshot() if self.track_files else None  # skip the O(N) walk when not tracked
         name = _unique_name()
         # The env file is named after THIS box, and removed in the `finally` below. It used to be one
@@ -3173,7 +3451,19 @@ class Sandbox:
         # the box may have planted) and is kept exactly as it was; only the NAME becomes per-call, so
         # two calls no longer contend for one path. It is also cleaned up now: with a persistent
         # `workspace=`, the old fixed file was left behind after every session.
-        argv = self._base_argv(name, network=network, timeout_s=timeout_s, is_setup=is_setup) + ["--"] + list(command)
+        if self._resident is not None:
+            # INTO THE RESIDENT BOX, which is the whole point of `persist=True`. `exec` and not `box`:
+            # measured on this tree, 2 ms against 6 ms, and the box's own state (its `/tmp`, an
+            # installed package, a process a previous call left running) is still there.
+            #
+            # `-w` puts the call in the same working directory a fresh box starts in, so code that
+            # writes a relative path lands in the workspace exactly as it does on the one-shot path.
+            # `timeout_s` is NOT passed to kern here: the resident box carries its own TTL, and the
+            # binding's deadline (the one that produces the `timeout` fault) is enforced around this
+            # process, as it already is for every other call.
+            argv = [self._kern, "exec", self._resident, "-w", _WORKSPACE, "--"] + list(command)
+        else:
+            argv = self._base_argv(name, network=network, timeout_s=timeout_s, is_setup=is_setup) + ["--"] + list(command)
         child_env = dict(os.environ)
         if not self.enforce_limits:
             child_env["KERN_NO_SCOPE"] = "1"
@@ -3207,7 +3497,20 @@ class Sandbox:
             try:
                 # start_new_session so the box + kern share a process group we can signal as a unit.
                 proc = subprocess.Popen(  # noqa: S603 - argv list, no shell
-                    argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env,
+                    # `stdin=DEVNULL`, and leaving it out was worse than the hang it caused. Without
+                    # it the box INHERITS this process's stdin, so a cell calling `input()` reads from
+                    # whatever the caller's stdin happens to be. Under `kern-mcp` that descriptor is
+                    # the JSON-RPC transport itself: the cell would take bytes off the stream the
+                    # server is framing, so an untrusted box could desynchronise the session and read
+                    # client-sent content meant for another tool call. The reported symptom was only
+                    # the benign half - no data available, so the read blocks until the deadline
+                    # (measured: 15 s to the timeout), while the kernel path has always been correct
+                    # because its driver rebinds user stdin to an empty stream (`io.StringIO("")`).
+                    # DEVNULL rather than a PIPE we close: one descriptor, EOF on the first read, and
+                    # no pipe left for a later refactor to forget. Nothing is lost - no public entry
+                    # point (`run_code`, `_spawn`) takes stdin, so no caller can feed a box today.
+                    argv, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env,
                     start_new_session=True, pass_fds=(started_w, alive_w),
                 )
             except FileNotFoundError as e:
@@ -3339,6 +3642,14 @@ class Sandbox:
                     # shell, so a caller who asked for bash and does not need bash has a one-word fix.
                     + (" This image has no bash; use language='sh' if the script is POSIX."
                        if what == "bash" else "")
+                    # NODE HAS NO IN-IMAGE FALLBACK, so the remedy is the image, and it is NAMED. The
+                    # message used to stop at "the image does not provide it", which states the fact
+                    # and leaves the reader to guess the fix: a field report listed `language='node'`
+                    # as offered-but-unusable for exactly that reason. `language` is the caller's
+                    # declared intent, so the suggestion can be specific without inventing anything.
+                    + (f" No image kern defaults to carries node; name one that does, e.g."
+                       f" Sandbox(image='node:22-slim')."
+                       if what == "node" else "")
                 )
             elif "Permission denied" in reason:
                 detail = "Permission denied: it is present in the box but not executable there."
@@ -3962,6 +4273,28 @@ class Sandbox:
                 f"unsupported language {language!r} (v1: 'python' | 'bash' | 'sh' | 'node')"
             )
         runner, inline_flag, ext = spec
+        # REFUSED HERE, BECAUSE THE ANSWER IS ALREADY KNOWN. `_DEFAULT_IMAGE` is a fact this file
+        # holds, not a guess about someone's image: MEASURED on python:3.12-slim, three of the four
+        # languages this API advertises run there (python, sh, and bash 5.2) and node does not. So a
+        # caller who leaves the image alone and asks for node is told at the moment of the choice,
+        # with the remedy, instead of paying a box start (16 ms, measured) to be told the same thing
+        # by a fault. A field report listed this as "offered but absent", and being offered was the
+        # whole complaint: the API names four languages and the default image runs three.
+        #
+        # ⛔ ONLY for the default image. For an image the caller NAMED, kern does not know what is in
+        # it, and refusing on a guess would be the invented measurement this codebase refuses
+        # everywhere else - that case still goes to the box and comes back as `exec_failed`, which
+        # now names the remedy too.
+        #
+        # An ERROR and not a fault: nothing ran, so there is no run to report on, and this is the
+        # same shape as the unsupported-language raise a few lines above.
+        if language == "node" and self.image == _DEFAULT_IMAGE:
+            raise SandboxError(
+                f"language='node' needs an image that provides node, and this Sandbox is on the "
+                f"default {_DEFAULT_IMAGE!r}, which does not (it provides python, sh and bash). "
+                f"Name one that does, e.g. Sandbox(image='node:22-slim'), or run the code with "
+                f"language='python'."
+            )
         eff = self._eff_timeout(timeout_s)
         if language == "python":
             return self._run_python_cell(code, timeout_s=eff, on_stdout=on_stdout, on_stderr=on_stderr)
@@ -4031,7 +4364,17 @@ class Sandbox:
         self.write_file(runf, shim)
         try:
             result = self._spawn(
-                ["python3", f"{_WORKSPACE}/{runf}"],
+                # `-u`: UNBUFFERED, and it is the difference between knowing where a killed cell got
+                # to and not knowing. CPython block-buffers stdout when it is a pipe, which it always
+                # is here, so a cell that prints and is then SIGKILLed (OOM, timeout) loses whatever
+                # sits in that buffer: the caller gets `(no output)` and cannot tell "printed nothing"
+                # from "printed, and the kill discarded it". MEASURED on this tree before the flag,
+                # python:3.10-alpine, memory_mb=128: `print('X'); bytearray(400<<20)` returned
+                # fault=oom, exit=137 and an EMPTY stdout, while the same cell with an explicit
+                # flush=True returned 'X'. Making the interpreter unbuffered removes the failure
+                # instead of reporting it, and costs one write syscall per print on a path whose
+                # floor is already a box start.
+                ["python3", "-u", f"{_WORKSPACE}/{runf}"],
                 network=self.network,
                 timeout_s=eff,
                 on_stdout=on_stdout,
@@ -4383,6 +4726,23 @@ class Kernel:
                 "delegation), so no memory limit was in force to attribute it to",
                 rc,
             )
+        # NOBODY KILLED IT, AND THAT IS A FACT, SO IT IS DECIDED BEFORE THE INFERENCES BELOW. This test
+        # used to sit AFTER the `memory_mb` block, which made it unreachable for every caller that sets a
+        # memory cap - including `kern-mcp`, which always does. MEASURED through that server: a cell
+        # calling `os._exit(0)`, a deliberate and clean termination, was reported as
+        # `killed: an external kill (kern stop, a signal, or the host running out of memory)`, so an
+        # agent was told the host had run out of memory when its own code had asked to exit. The
+        # ordering was the whole defect: `workload_signal == 0` is kern's fourth byte saying NO SIGNAL
+        # ENDED THIS BOX, which is exact, while the branch that preempted it is an inference from the
+        # presence of a cap. Same discipline the SIGSYS test above already follows, and for the same
+        # stated reason: name the cause that can be named before reaching for the vague ones.
+        if workload_signal == 0:
+            return (
+                "killed",
+                "the kernel box exited on its own (no signal killed it), so its interpreter is gone: a "
+                "crash inside the box, or something in the box ending PID 1",
+                rc,
+            )
         if self._sbx.memory_mb is not None:
             # A BINARY THAT DOES NOT REPORT THE SIGNAL CANNOT HAVE THIS SENTENCE PUT IN ITS MOUTH.
             # MEASURED on the released 0.9.32, which is what `install.sh` serves today: it writes two of
@@ -4408,18 +4768,9 @@ class Kernel:
                 "exceeding its own memory",
                 rc,
             )
-        # NOBODY KILLED IT, and kern's fourth byte is what allows saying so. A resident kernel whose
-        # driver exits on its own (it crashed, or something inside the box killed it) is not an external
-        # kill, and a message that says "killed" with no cause is the vague answer this file keeps
-        # replacing with named ones. `None` means this kern does not report it, and then the old wording
-        # stands rather than a claim the byte did not support.
-        if workload_signal == 0:
-            return (
-                "killed",
-                "the kernel box exited on its own (no signal killed it), so its interpreter is gone: a "
-                "crash inside the box, or something in the box ending PID 1",
-                rc,
-            )
+        # `workload_signal is None` only: this kern does not report the byte, so the old vague wording
+        # stands rather than a claim it cannot support. The `== 0` case is decided above, before the
+        # memory-cap inference that used to shadow it.
         return "killed", "the kernel box exited", rc
 
     def _result_from_reply(self, reply: bytes, started: float) -> ExecutionResult:

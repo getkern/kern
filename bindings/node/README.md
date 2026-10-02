@@ -168,7 +168,7 @@ A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it i
 | `escape_blocked` | a syscall was blocked by the seccomp filter (SIGSYS) |
 | `oom` | the kernel's OOM killer took the box against its own memory cap. Read from a descriptor the code in the box cannot write, so it is an observation and not a guess from the exit code |
 | `killed` | SIGKILL with **no** OOM reported: an external kill (`kern stop`, a signal, the host out of memory), or a cap that did not bind here, which the message names |
-| `exec_failed` | the box started, the command did not exist inside it. `{language:"node"}` on an image with no `node` is the ordinary way there; the message names the binary AND the image |
+| `exec_failed` | the box started, the command did not exist inside it. `{language:"node"}` on an image YOU named that has no `node` is the ordinary way there; the message names the binary AND the image, and the remedy. On the DEFAULT image kern refuses before starting a box, because there it already knows the answer |
 | `startup_failed` | the box never ran, and kern said why in `stderr`. Two shapes: your `timeoutS` fired while kern was still BUILDING the box (run it again: if the second call is fast it was a cold image read, and if it is not, look for a bind source on a dead NFS export), or kern refused to build it at all (an image that cannot be pulled, a mount it will not make). The cold read is the FIRST call on a new machine and it is not small: 38 s for an arm64 image on a Raspberry Pi 5 here, against 0.1 s warm |
 
 ```js

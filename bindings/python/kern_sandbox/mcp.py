@@ -70,6 +70,11 @@ _MAX_FILE_TEXT = _MAX_TOTAL_TEXT
 # because guessing interpreters from a tag would be inventing a measurement.
 _DEFAULT_MCP_IMAGE = "python:3.12-slim"
 _MAX_NAME = 200                   # chars of a client-supplied method/tool name echoed back in an error
+# What the BINDING reads into host RAM per stream, as opposed to what the reply carries. Kept here
+# next to the reply budgets it is sized against, not left at the `Sandbox` default of 64 MiB: that
+# default exists to stop a hostile cell OOM-ing the host, and on this channel it is 4000x what any
+# reply can surface. See the comment at the `Sandbox(...)` call for the measurement.
+_INGEST_CAP = 1024 * 1024         # 1 MiB per stream: ~64x the aggregate reply budget, 2 MiB worst case
 
 
 # THE FRAMING BELOW IS OURS, and a box that prints it forges a verdict about itself in the one channel
@@ -361,6 +366,19 @@ class _Server:
                 # the MCP layer never surfaces result.files (it has a dedicated list_files tool), so skip
                 # the per-call O(N) workspace diff: run_code stays O(1) even as a session accretes files.
                 track_files=False,
+                # AN LLM-SIZED INGEST CAP, because the host one is four thousand times what this
+                # channel can ever say. `Sandbox` defaults `max_output_bytes` to 64 MiB per stream,
+                # sized to stop a hostile cell from OOM-ing the HOST; this server then clips the reply
+                # to `_MAX_TEXT` (16k chars per stream, `_MAX_TOTAL_TEXT` aggregate). So a cell that
+                # prints 100 MB made the binding read 64 MiB of stdout AND 64 MiB of stderr into host
+                # RAM, decode both, and throw away all but 16k - 128 MiB and the time it takes, spent
+                # to produce nothing. An independent test wired this server into a client and the
+                # client stalled on exactly that cell while the server stayed alive, which is the
+                # shape this produces: the reply was small, the wait was not.
+                # 1 MiB per stream is ~64x the most a reply can carry, so nothing surfaceable is lost,
+                # and it bounds the worst case at 2 MiB. `_CappedReader.truncated` already records the
+                # cut, so the clip stays honest rather than silent.
+                max_output_bytes=_INGEST_CAP,
                 # A warm KERNEL and a warm POOL solve the same cost twice and would fight over it: the
                 # kernel path never reaches `run_code`, so a pool behind it would hold boxes nothing
                 # claims. The kernel wins when it is asked for, because it is the stronger promise (state

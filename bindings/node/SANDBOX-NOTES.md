@@ -97,9 +97,12 @@ exited cleanly. Code that does not catch it dies naming "Resource temporarily un
 itself is enforced: on WSL2, `pids: 32` blocked at 29 forks while `pids: 256` let 120 through, same code
 and same image.
 
-**The `language` enum is a convenience, not a promise about the image.** The default
-`python:3.12-slim` carries `python` and `bash`; `{language:"node"}` there is `exec_failed`, and the
-message names the binary and the image because the remedy is one or the other. A shell's own
+**The `language` enum is a convenience, not a promise about the image.** MEASURED on the default
+`python:3.12-slim`: three of the four run there (`python`, `sh`, and `bash` 5.2) and `node` does not.
+`{language:"node"}` on the DEFAULT image is REFUSED before a box is started, with the remedy, because
+that is a fact kern holds rather than a guess. On an image YOU named kern cannot know what is inside
+it, so that case still reaches the box and comes back `exec_failed`, naming the binary, the image and
+the remedy. A shell's own
 `command not found` inside your script stays an ordinary non-zero exit.
 
 **Which box-not-started failures THROW, and which come back as a fault.** kern exits **125**, its
