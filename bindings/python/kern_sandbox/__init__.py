@@ -78,6 +78,10 @@ __version__ = "0.2.42"
 _DEFAULT_IMAGE = "python:3.12-slim"
 
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
+#: What `kern exec` says when the box it was asked for is not running. Matched rather than inferred
+#: from an exit code, because `exec` reports a MISSING BOX and a workload that exited non-zero through
+#: the same status, and only the first of the two is something the binding can repair.
+_RESIDENT_GONE = "no running box named"
 
 
 def _workspace_usage(root: str) -> int:
@@ -2654,6 +2658,13 @@ class Sandbox:
     #: * The PID namespace is SHARED across calls (pids increment, 2 then 3 then 4, and PID 1 is the
     #:   box's own init), so a call can see that earlier calls happened.
     #:
+    #: ⛔ AND THE VERDICT IS COARSER HERE. `oom` is read from the teardown bytes kern writes for the
+    #: box IT started; `kern exec` does not carry them, and the registry keeps only `exit_code=137`,
+    #: which an external kill produces too. So a cell that overruns its memory cap comes back
+    #: ``killed`` on this path where the one-shot path says ``oom``. Measured, not assumed. It is not
+    #: papered over with a guess: claiming ``oom`` from "137 and a cap was set" would be an inference
+    #: presented as a measurement, which is the defect this taxonomy exists to avoid.
+    #:
     #: What does NOT leak, measured and contrary to what this comment first said: a process a previous
     #: call left running. ``kern exec`` reaps its descendants when it returns, including one detached
     #: with ``start_new_session=True``, so each call still gets a clean process table. That is why the
@@ -2913,6 +2924,7 @@ class Sandbox:
             )
         self._kern = _find_kern()
         self._resident: str | None = None  # nome del box residente adottato (`persist=True`)
+        self._resident_calls = 0  # chiamate servite dal box residente corrente
         self._kern_version = _verify_is_kern(self._kern)
 
     # -- lifecycle -----------------------------------------------------------------------------------
@@ -3413,6 +3425,7 @@ class Sandbox:
         is_setup: bool = False,
         on_stdout: object = _UNSET,
         on_stderr: object = _UNSET,
+        _resident_retry: bool = True,
     ) -> ExecutionResult:
         self._pyc_adopt_if_ready()  # one attribute read once there is nothing left to wait for
         cb_out = self.on_stdout if on_stdout is _UNSET else on_stdout
@@ -3461,6 +3474,19 @@ class Sandbox:
             # `timeout_s` is NOT passed to kern here: the resident box carries its own TTL, and the
             # binding's deadline (the one that produces the `timeout` fault) is enforced around this
             # process, as it already is for every other call.
+            # THE BOX CAN BE GONE, AND IT IS NOT AN EXOTIC CASE. `memory.oom.group=1` means an OOM
+            # takes the WHOLE cgroup, so a cell that overruns its memory cap destroys the resident box
+            # rather than just its own process - MEASURED: `bytearray(400<<20)` under `memory_mb=128`
+            # left `kern ps` empty and the NEXT call came back `startup_failed`, with the sandbox
+            # silently unusable from then on. The TTL expiring does the same thing on a longer clock.
+            # An earlier version of this comment claimed the TTL case was "covered by the recreate
+            # path"; there was no recreate path, which is why there is one now.
+            #
+            # CHECKED BY TRYING, NOT BY ASKING. A `kern ps` before every call would cost a second
+            # process spawn on the hot path and buy nothing in the common case, where the box is
+            # there: it would trade the 2 ms this feature exists for. So the exec runs, and only a
+            # failure that says the box is missing triggers one recreate and one retry.
+            self._resident_calls += 1
             argv = [self._kern, "exec", self._resident, "-w", _WORKSPACE, "--"] + list(command)
         else:
             argv = self._base_argv(name, network=network, timeout_s=timeout_s, is_setup=is_setup) + ["--"] + list(command)
@@ -3680,6 +3706,42 @@ class Sandbox:
         # run (timeout, OOM-kill, blocked escape) stay as DATA on `.fault`, unchanged.
         if rc == 125 and fault is not None and fault.type == "startup_failed":
             raise SandboxError(fault.message or "the box failed to start")
+        # THE RESIDENT BOX IS GONE: recreate it once and run the call again, so a sandbox does not
+        # become permanently unusable because one cell overran its memory cap. `oom.group=1` makes an
+        # OOM take the whole box, and the TTL ends it on a longer clock; both land here identically.
+        # ONE retry, never a loop: if the box dies again immediately the cause is not transient, and
+        # retrying forever would hide it behind a hang instead of reporting it.
+        if (
+            _resident_retry
+            and self._resident is not None
+            and not is_setup
+            and _RESIDENT_GONE in stderr
+        ):
+            lost = self._resident_calls
+            self._resident = self._resident_ensure()
+            self._resident_calls = 0
+            # SAID OUT LOUD, because the repair is not free and the caller cannot see it. The box is
+            # new: its `/tmp` is empty again and anything a previous call installed into it is gone.
+            # Only the WORKSPACE survived, because that is a host directory. Repairing this silently
+            # would hand back a sandbox that looks continuous and is not, which is a worse failure
+            # than the one being repaired - the caller would debug missing state instead of a dead box.
+            warnings.warn(
+                f"the resident sandbox {self.name!r} had died (an OOM takes the whole box, and the "
+                f"TTL ends it) after serving {lost} call(s); it was recreated and this call re-run. "
+                f"Its in-box state is gone - /tmp is empty and anything installed into the box is "
+                f"not there. Files under the workspace are unaffected.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return self._spawn(
+                command,
+                network=network,
+                timeout_s=timeout_s,
+                is_setup=is_setup,
+                on_stdout=on_stdout,
+                on_stderr=on_stderr,
+                _resident_retry=False,
+            )
         files = self._diff(before) if before is not None else []
         return ExecutionResult(
             stdout=stdout,
