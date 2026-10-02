@@ -233,6 +233,27 @@ named as not applied.
 
 ## What is refused rather than dropped
 
+**A path that leaves the compose file's own directory.** Docker accepts `build: /somewhere/else`, a
+bind source above the project, and a secret file outside it; kern refuses all four with
+`escapes the compose directory (refused)`, naming the service and the path. The directory holding the
+compose file is the project, and a stack that reads from outside it cannot be moved, copied or
+reviewed as one thing. Each path is CANONICALISED first, so `../` and a symlink pointing out are the
+same case and neither is a way around it. The guards, and what each refuses:
+
+| in the file | refused when |
+|---|---|
+| `build: <ctx>` | the context resolves outside the compose directory |
+| `dockerfile: <f>` | it resolves outside the **context** (Docker resolves it relative to the context too) |
+| `volumes: - <src>:<dst>` | the bind SOURCE resolves outside the compose directory |
+| `secrets: file: <f>` | the file resolves outside the compose directory |
+
+There is **no opt-out**: no flag and no environment variable relaxes it. Move what the stack needs
+inside the project directory, or run the build from the directory that contains both.
+
+⚠️ The build context is resolved when the build runs, so `compose config` renders such a file without
+complaint and `compose build` and `compose up` are where it is refused. Measured: `build: ..` renders
+clean under `config` and fails under both of the others with the message above.
+
 **`${VAR:?message}`** with no value. That form exists to stop a file being rendered without it, and it
 is what a compose file writes for a password. Every variable with no value is named, not just the
 first. `${VAR}` and `${VAR:-default}` are unchanged.

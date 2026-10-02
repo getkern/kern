@@ -12,7 +12,25 @@
 # The shim targets the `kern` distro by default, so `kern ...` just works. Steps 2-4 need no admin.
 # Local test: drop kern.exe + kern-wsl-rootfs.tar.gz next to this script (the dist/ bundle does).
 
+# THIS RUNS IN THE READER'S OWN SESSION, so the preference has to be GIVEN BACK. The documented
+# invocation is `irm ... | iex`, which executes this text in the caller's scope - the same fact the
+# note further down records about `exit`. A bare assignment here therefore does not configure "the
+# script", it reconfigures the SHELL, and it stays reconfigured after the installer is done: from
+# that point every command in that window which writes a single line to stderr becomes a terminating
+# error. MEASURED, in a field report: the first `wsl ... kern compose config` run after installing
+# died on an INFORMATIONAL line, and the reader had to set `Continue` by hand to get the session back.
+#
+# `Stop` is kept for the installer itself, where it is load-bearing: a failed step must abort rather
+# than carry a broken install forward. It is the LEAK that is the defect, not the setting.
+#
+# `try`/`finally` and not a `trap`: `try` does NOT create a new scope in PowerShell, so the body
+# below keeps script scope exactly as before - every function it defines stays visible to the run
+# block at the end, and not one line of it had to be re-indented. Both of this script's exits are
+# covered: normal completion, and `throw`, which is the only way it ever fails (it never calls
+# `exit`, deliberately, because under `iex` that would close the reader's window).
+$KernPrevEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
+try {
 
 # By default pull from the LATEST GitHub release (its Windows assets are CI-built + sha256-signed);
 # pin an exact release with KERN_VERSION=v0.6.5. GitHub's /releases/latest/download/<asset> redirects
@@ -572,4 +590,11 @@ if (Ensure-WslEngine) {
     if (-not (Verify-Install)) {
         Warn "install NOT verified - nothing above was silently accepted."
     }
+}
+} finally {
+    # GIVEN BACK ON EVERY PATH, including the `throw`s above. `Remove-Variable` because the saved
+    # value would otherwise be left behind in the reader's session too: this script's scope IS their
+    # scope, so every variable it creates is one they did not ask for.
+    $ErrorActionPreference = $KernPrevEAP
+    Remove-Variable -Name KernPrevEAP -ErrorAction SilentlyContinue
 }

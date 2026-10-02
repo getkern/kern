@@ -1118,7 +1118,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // NOW THAT IMAGES CAN BE READ, the health gates the parser deferred are decided. Before the
     // wiring note below, so a reader sees the gate's fate next to the rest of the stack's plan.
     crate::commands::settle_deferred_health_gates(&mut boxes);
-    let collides = crate::commands::pod_would_collide(&boxes)
+    let declared_collision = crate::commands::pod_would_collide(&boxes);
+    let collides = declared_collision.is_some()
         // THE SAME KNOWLEDGE THE WARNING HAS. A collision between two IMAGES' exposed ports is a
         // collision: kern named it and then ran the stack in one namespace anyway, where the second
         // service died of the EADDRINUSE the warning had just predicted. Measured on Sentry
@@ -1265,13 +1266,33 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             boxes.len()
         );
     }
-    if auto_no_pod || (auto_bridge && !default_bridge) {
+    // GATED ON THE SAME PREDICATE AS THE NOTE ABOVE, and it was not. This explains the WIRING kern
+    // chose for a bring-up, and it was printed by every verb that loads the file - `ps`, `restart`,
+    // `logs`, `port` - where no wiring is being decided and the reader cannot act on it. A field
+    // report named it: the note "came out on every command". A standing note on a correct stack is
+    // what teaches a reader to skim past kern's output, which costs more than the line buys.
+    if wiring_is_the_subject && (auto_no_pod || (auto_bridge && !default_bridge)) {
+        // NAMED, because an unactionable note is a note nobody acts on. The collision is identified
+        // by service and by port when it comes from the FILE; when it comes from two images' EXPOSE
+        // the names live in `image_expose_collisions`, so the generic wording stands for that case
+        // rather than a claim this branch cannot support.
+        let collision_detail = declared_collision.as_ref().map(|c| {
+            format!(
+                "puts '{}' and '{}' both on container port {}/{}",
+                c.first,
+                c.second,
+                c.port,
+                if c.udp { "udp" } else { "tcp" }
+            )
+        });
         let why = if segregates {
-            "separates services with `networks:`"
+            "separates services with `networks:`".to_string()
+        } else if let Some(detail) = collision_detail {
+            detail
         } else if collides {
-            "puts two services on the same internal port"
+            "puts two services on the same internal port (from the images' own EXPOSE)".to_string()
         } else {
-            "gives a service's own name a fixed address with `extra_hosts:`"
+            "gives a service's own name a fixed address with `extra_hosts:`".to_string()
         };
         // THE 30 ms IS MEASURED AND BROKEN DOWN, because the breakdown is what decides whether the
         // bridge can ever become the default wiring. Alternated runs of this same binary, whole
@@ -2498,6 +2519,36 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // reconciliation the levels may already have been filtered down to the changed ones, and a
     // header promising more boxes than it starts is the kind of small untruth this codebase avoids.
     let total: usize = levels.iter().map(Vec::len).sum();
+    // WHAT THIS INVOCATION WILL ACTUALLY START, by box name, taken from the plan AFTER every filter
+    // that narrows it (service selection, `--no-deps`, `start`'s already-running skip, drift
+    // reconciliation). It answers one question for `wait_for_conditions`: is a `service_completed_
+    // successfully` dependency going to be re-run by THIS command, or did it complete under an
+    // earlier one?
+    //
+    // THE EPOCH GUARD IS RIGHT AND ITS CONDITION WAS WRONG. Every `depends_completed` target's exit
+    // sidecar carries `up_token`, and the wait requires a match so a sidecar left by a PREVIOUS `up`
+    // cannot satisfy this run: correct, because an `up` is about to re-run that target and accepting
+    // the old record would call a migration done before it ran. The guard was gated on `--no-deps`,
+    // which is only ONE of the ways a dependency ends up outside the plan.
+    //
+    // MEASURED, from a field report on a 10-service stack: `kern compose -p kernfull compose.yml
+    // restart hatchet-worker api-server`, where `hatchet-worker` declares
+    // `depends_on: {hatchet-setup: {condition: service_completed_successfully}}` and `hatchet-setup`
+    // had already exited 0 during the `up`. `restart` does NOT expand to dependencies (the `wanted`
+    // set above expands only for `Up` without `--no-deps`), so `hatchet-setup` was not in the plan,
+    // nothing was going to write a sidecar under the new token, and the wait burned the full
+    // COMPOSE_CONDITION_TIMEOUT_SECS and exited 1. The worker was left dead and silent; `api-server`,
+    // which depends only on `service_healthy`, restarted normally. `docker compose restart` does not
+    // re-evaluate dependencies at all, so the divergence was ours.
+    //
+    // Membership, not the flag, is therefore the condition: a dependency inside the plan is started
+    // here and must satisfy THIS token; one outside it never will, and the question becomes whether
+    // it ever completed, answered from the cross-token `waitexit` breadcrumb.
+    let will_start: std::collections::HashSet<String> = levels.iter().flatten().cloned().collect();
+    // A reference for the per-level `move` closures below. The set itself outlives the scope, and a
+    // `&HashSet` is `Copy`, so every spawned worker captures the same read-only plan without cloning
+    // it per box - a `move` of the set would not compile for more than one closure anyway.
+    let will_start_plan: &std::collections::HashSet<String> = &will_start;
     kern_common::progress!(
         "→ bringing up {total} box(es) in {} dependency {}: {}",
         levels.len(),
@@ -2616,7 +2667,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // is performed in the release loop, in dependency order, which is where
                             // "start only after the dependency is healthy" actually means something.
                             if !gate_active {
-                                wait_for_conditions(b, pod, up_token, wait_timeout, no_deps)?;
+                                wait_for_conditions(
+                                    b,
+                                    pod,
+                                    up_token,
+                                    wait_timeout,
+                                    no_deps,
+                                    will_start_plan,
+                                )?;
                             }
                             let n = started.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             let dep = if b.depends_on.is_empty() {
@@ -3150,7 +3208,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 // reads EOF and refuses to exec. The stack does not come up half-released.
                 // Every NAT was attached above, before this loop, and the ordering argument that
                 // used to live here is made there instead.
-                wait_for_conditions(b, &pod, &up_token, wait_timeout, no_deps)?;
+                wait_for_conditions(b, &pod, &up_token, wait_timeout, no_deps, &will_start)?;
                 if !gate_release(fd) {
                     return Err(Error::Compose(format!(
                         "service '{}': the box was prepared but could not be released (it is no \

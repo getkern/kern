@@ -280,6 +280,7 @@ fn rows() -> Vec<R> {
     ];
     results.extend(check_gpu());
     results.extend(check_tools());
+    results.push(check_duplicate_installs());
     results.push(check_kernel());
     results
 }
@@ -1458,6 +1459,250 @@ fn check_uid_range() -> R {
     )
 }
 
+/// Is there MORE THAN ONE kern on this machine, and do they agree on a version?
+///
+/// A field report on a Windows host found three: `0.6.32` inside the WSL distro named `kern`,
+/// `0.20.0` in `~/.local/bin` and `0.9.2` in `/usr/local/bin`, with nothing anywhere saying so. The
+/// one that answers is whichever `PATH` reaches first, so a user who upgraded one of them kept
+/// hitting a defect that had been fixed months earlier, and the upgrade appeared not to work. kern
+/// already refuses to be silent about far smaller surprises, and this one costs hours.
+///
+/// SCOPE AND ITS LIMITS, stated rather than implied. This walks `PATH` and the two directories the
+/// installer writes, and it CANNOT see across a WSL boundary: a `kern.exe` on the Windows side talks
+/// only to its own distro, and from inside a distro that other binary is not on any path this
+/// process can read. So a clean row here does not mean "one kern on this computer", it means "one
+/// kern reachable from this shell", and the row says exactly that rather than the stronger claim.
+///
+/// FAILURE MODES considered, in order:
+///   * A file named `kern` that is NOT kern (a script, a different project). Its `--version` will not
+///     start with `kern `, and it is reported as present-but-foreign instead of being counted as a
+///     second install, because calling it a kern would be the same invented measurement this file
+///     refuses elsewhere.
+///   * The SAME binary reached twice (a symlink from `~/.local/bin` to `/usr/local/bin`, or a `PATH`
+///     that lists a directory twice). Deduped by CANONICAL path, so a symlink farm is one install.
+///   * A binary that hangs. Bounded: the child is spawned with a pipe and reaped, and a version that
+///     does not arrive leaves the entry unversioned rather than blocking `doctor` forever.
+///   * A directory on `PATH` that cannot be read. Skipped silently: an unreadable `PATH` entry is the
+///     user's business and says nothing about kern.
+///
+/// 🔐 WHAT THIS WIDENS, stated rather than left to be discovered. Running `kern` executes whichever
+/// binary `PATH` reaches FIRST; this check executes EVERY candidate on it, including ones in later
+/// directories that an ordinary invocation would never reach. So a hostile file named `kern` in a
+/// late `PATH` entry, which previously sat there unexecuted, is run by `kern doctor`. The attacker
+/// must already be able to write to a directory the user has put on their own `PATH`, and from there
+/// the usual move is to be FIRST rather than last, so the widening is real but narrow. It is paid for
+/// deliberately: the check found a 19-minor-version skew on the first machine it ran on, which is the
+/// class of defect that costs hours and leaves no trace.
+///
+/// What bounds the hostile case: no shell and a fixed argv, `stdin` closed, `stderr` discarded, a
+/// hard deadline after which the child is killed AND reaped, at most `READ_MAX` bytes read and only
+/// the first line of them used, and every control character stripped from what reaches the message.
+///
+/// Read-only and allocation-light: at most one `exec` per distinct candidate, and the common case
+/// (one kern) does one.
+fn check_duplicate_installs() -> R {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    /// `<dir>/kern` if it exists and is executable by this user, canonicalised.
+    ///
+    /// Canonicalisation is the dedupe key and not a cosmetic: `~/.local/bin/kern` is very often a
+    /// symlink to the real file, and counting both would invent a conflict that does not exist.
+    fn candidate(dir: &std::path::Path) -> Option<PathBuf> {
+        let p = dir.join("kern");
+        let meta = std::fs::metadata(&p).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        // Executable by SOMEBODY is the cheap, portable test here. A file on `PATH` that is not
+        // executable is not what the shell would run, so it is not a competing install.
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+        std::fs::canonicalize(&p).ok()
+    }
+
+    /// The `--version` line of a candidate, or `None` when it does not answer or is not kern.
+    ///
+    /// NOT A SHELL, and the argv is fixed: nothing from `PATH` reaches a shell here. The binary is
+    /// one the user's own shell would already run by typing `kern`, so executing it is not a new
+    /// exposure; what would be new is letting it block `doctor`, which the wait below prevents.
+    fn version_of(p: &std::path::Path) -> Option<String> {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+        /// A `--version` that has not answered in this long is not going to, and `doctor` is not
+        /// going to wait for it. Generous for a cold page-in of a static binary off a slow disk,
+        /// and still imperceptible on the common path where there is nothing to wait for.
+        const BUDGET: Duration = Duration::from_millis(1500);
+        /// Enough for a version line many times over, and a hard bound on what a hostile binary can
+        /// make `doctor` hold. Only the FIRST line is used, so nothing beyond this can matter.
+        const READ_MAX: usize = 4096;
+
+        let mut child = std::process::Command::new(p)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+
+        // ACTUALLY BOUNDED, and the first version of this only CLAIMED to be. It used `output()`,
+        // which blocks until the child closes its pipes: a binary on `PATH` that never exits hung
+        // `kern doctor` with no way out but Ctrl-C, on the one command a user runs precisely when
+        // something is already wrong. Polling `try_wait` is the std-only way to put a deadline on a
+        // child without a thread or a dependency; the sleep is short enough that a normal
+        // `--version` (sub-millisecond) is not measurably delayed by it.
+        let deadline = Instant::now() + BUDGET;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break None,
+            }
+        };
+        let Some(status) = status else {
+            // KILLED AND REAPED, both. A kill without the wait leaves a zombie for the rest of the
+            // process's life, which on a long-lived embedder is a leak `doctor` would be creating
+            // while reporting on hygiene.
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        if !status.success() {
+            return None;
+        }
+        // Read AFTER the exit, so the pipe is closed and this cannot block. Bounded regardless: a
+        // child that exited having written more than `READ_MAX` is truncated rather than trusted.
+        let mut buf = Vec::new();
+        if let Some(mut out) = child.stdout.take() {
+            let _ = out.by_ref().take(READ_MAX as u64).read_to_end(&mut buf);
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let line = text.lines().next().unwrap_or_default().trim();
+        // A FOREIGN `kern` IS NOT A SECOND INSTALL. Only a binary that identifies itself as kern is
+        // counted, for the same reason the MCP server verifies its binary before quoting its version.
+        //
+        // The version is used in a message, so it is bounded and stripped of anything that could
+        // forge kern's own output. A service name cannot reach this (compose validates its alphabet
+        // at parse time), but THIS string comes from an arbitrary executable on `PATH`, which is the
+        // one input here that nothing upstream constrains.
+        let v = line.strip_prefix("kern ")?.trim();
+        let clean: String = v
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        (!clean.is_empty()).then_some(clean)
+    }
+
+    // `PATH` first, in order, then the two directories the installer writes even when they are not
+    // on `PATH` - an install that is not reachable today becomes reachable the moment a shell adds
+    // the directory, and it is exactly the one a user forgets.
+    let mut dirs: Vec<PathBuf> = crate::global_env("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(home) = crate::global_env("HOME") {
+        dirs.push(PathBuf::from(&home).join(".local").join("bin"));
+    }
+    dirs.push(PathBuf::from("/usr/local/bin"));
+
+    // Canonical path -> version. `BTreeMap` for a deterministic row: a verdict that reorders itself
+    // between runs is one a reader cannot diff.
+    let mut found: BTreeMap<PathBuf, Option<String>> = BTreeMap::new();
+    for d in &dirs {
+        if let Some(real) = candidate(d) {
+            found.entry(real).or_insert_with_key(|p| version_of(p));
+        }
+    }
+
+    duplicate_install_verdict(&found)
+}
+
+/// The verdict, as a PURE function of what was found, so it can be driven over its whole input space.
+///
+/// Split out from the probe deliberately: a verdict built inline inside an IO probe can only ever be
+/// exercised on the state the test machine happens to be in, which is the shape this codebase has
+/// already been bitten by (a row that walked THIS host's answer instead of enumerating the answers).
+/// Four inputs decide everything here - no entries, one kern, several kerns agreeing, several
+/// disagreeing - times the presence of a foreign binary, and every one of them is asserted below.
+fn duplicate_install_verdict(
+    found: &std::collections::BTreeMap<std::path::PathBuf, Option<String>>,
+) -> R {
+    use std::path::PathBuf;
+    // TWO DIFFERENT HAZARDS, AND THEY ARE NOT THE SAME ROW. A second kern is a version question; a
+    // file named `kern` that is not kern SHADOWS kern and answers nothing it was asked. Counting the
+    // second as "a kern binary disagreeing on version" would be a false statement about what it is,
+    // so they are separated here and the row names whichever is present.
+    let (kerns, foreign): (Vec<_>, Vec<_>) = found.iter().partition(|(_, v)| v.as_ref().is_some());
+    let list = |entries: &[(&PathBuf, &Option<String>)]| -> String {
+        entries
+            .iter()
+            .map(|(p, v)| match v.as_deref() {
+                Some(ver) => format!("{} ({ver})", p.display()),
+                None => format!("{}", p.display()),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let foreign_note = if foreign.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " A file named `kern` that does not identify itself as kern is on the path too ({}): \
+             whichever comes first is what your shell runs, so it can shadow kern entirely",
+            list(&foreign)
+        )
+    };
+
+    let mut versions: Vec<&str> = kerns.iter().filter_map(|(_, v)| v.as_deref()).collect();
+    versions.sort_unstable();
+    versions.dedup();
+
+    if kerns.len() <= 1 {
+        if foreign.is_empty() {
+            return R::ok("one kern reachable from this shell".into());
+        }
+        // The foreign file is the whole finding here: there is one kern, and something is sitting
+        // next to it under the same name.
+        return R::Warn(
+            "a file named `kern` that is not kern is reachable".into(),
+            foreign_note.trim_start().to_string(),
+        );
+    }
+    // ONE VERSION IN TWO PLACES IS NOT A DEFECT, so it is not a warning. It is worth printing because
+    // an upgrade has to reach both, but nothing is behaving unexpectedly today.
+    if versions.len() <= 1 {
+        return R::Ok(
+            format!("{} kern binaries reachable, same version", kerns.len()),
+            format!(
+                "{} - an upgrade has to reach every one of them.{foreign_note}",
+                list(&kerns)
+            ),
+        );
+    }
+    R::Warn(
+        format!(
+            "{} kern binaries reachable and they DISAGREE on version",
+            kerns.len()
+        ),
+        format!(
+            "{} - `PATH` order decides which one answers, so a fix you installed in one is \
+             invisible from the other. Remove the stale ones, or put the one you want first. A \
+             `kern.exe` on the Windows side of WSL is NOT visible from here and is counted by \
+             neither number.{foreign_note}",
+            list(&kerns)
+        ),
+    )
+}
+
 fn check_tools() -> Vec<R> {
     vec![
         // Required for the OCI pull path.
@@ -2446,5 +2691,98 @@ mod tests {
         let unopenable = selinux_verdict(true, None);
         assert!(matches!(unopenable, R::Warn(..)));
         assert!(msg(&unopenable).contains("could not be opened"));
+    }
+}
+
+#[cfg(test)]
+mod duplicate_install_tests {
+    use super::{duplicate_install_verdict, R};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    /// Build the map the probe produces, without touching the filesystem.
+    fn m(entries: &[(&str, Option<&str>)]) -> BTreeMap<PathBuf, Option<String>> {
+        entries
+            .iter()
+            .map(|(p, v)| (PathBuf::from(p), v.map(str::to_string)))
+            .collect()
+    }
+
+    fn text(r: &R) -> String {
+        match r {
+            R::Ok(m, n) | R::Warn(m, n) | R::Fail(m, n) => format!("{m} | {n}"),
+        }
+    }
+
+    /// ENUMERATED, not walked: every combination of (how many kerns) x (a foreign file or not).
+    /// The probe reads the real `PATH`, so a test that called it could only ever assert whatever
+    /// this machine happens to hold - which is one point of an eight-point space.
+    #[test]
+    fn every_shape_of_install_set_gets_the_verdict_that_matches_it() {
+        // Nothing found at all: `PATH` had no kern. Not a warning - `doctor` is being run somehow.
+        assert!(matches!(duplicate_install_verdict(&m(&[])), R::Ok(..)));
+
+        // One kern: the ordinary machine, and it must stay a plain pass with no note.
+        let one = duplicate_install_verdict(&m(&[("/usr/local/bin/kern", Some("0.25.1"))]));
+        assert!(matches!(one, R::Ok(..)), "{}", text(&one));
+        assert!(text(&one).contains("one kern reachable"), "{}", text(&one));
+
+        // Two kerns, SAME version. Worth saying (an upgrade has to reach both) and not a defect, so
+        // it must not be a warning: a standing warning on a correct machine teaches the reader to
+        // skim past `doctor`.
+        let same = duplicate_install_verdict(&m(&[
+            ("/usr/local/bin/kern", Some("0.25.1")),
+            ("/home/u/.local/bin/kern", Some("0.25.1")),
+        ]));
+        assert!(matches!(same, R::Ok(..)), "{}", text(&same));
+        assert!(text(&same).contains("same version"), "{}", text(&same));
+
+        // Two kerns that DISAGREE: the field report's machine. A warning, and it must name both
+        // paths and both versions, because the whole defect is not knowing which one answers.
+        let diff = duplicate_install_verdict(&m(&[
+            ("/home/u/.cargo/bin/kern", Some("0.6.1")),
+            ("/home/u/.local/bin/kern", Some("0.25.0")),
+        ]));
+        assert!(matches!(diff, R::Warn(..)), "{}", text(&diff));
+        let t = text(&diff);
+        for needle in [
+            "DISAGREE",
+            "/home/u/.cargo/bin/kern",
+            "0.6.1",
+            "/home/u/.local/bin/kern",
+            "0.25.0",
+        ] {
+            assert!(t.contains(needle), "missing {needle:?} in {t}");
+        }
+
+        // A FOREIGN FILE IS NOT A KERN. One real kern plus something else called `kern`: the count of
+        // kerns stays one, and the row is about the shadowing, not about versions.
+        let foreign = duplicate_install_verdict(&m(&[
+            ("/usr/local/bin/kern", Some("0.25.1")),
+            ("/tmp/evil/kern", None),
+        ]));
+        assert!(matches!(foreign, R::Warn(..)), "{}", text(&foreign));
+        let t = text(&foreign);
+        assert!(t.contains("is not kern"), "{t}");
+        assert!(t.contains("/tmp/evil/kern"), "{t}");
+        assert!(
+            !t.contains("DISAGREE"),
+            "a foreign file is not a version disagreement: {t}"
+        );
+
+        // Two disagreeing kerns AND a foreign file: the version warning leads (it is the actionable
+        // one) and the foreign note still arrives, so neither hazard is dropped for the other.
+        let both = duplicate_install_verdict(&m(&[
+            ("/a/kern", Some("0.1.0")),
+            ("/b/kern", Some("0.2.0")),
+            ("/c/kern", None),
+        ]));
+        assert!(matches!(both, R::Warn(..)), "{}", text(&both));
+        let t = text(&both);
+        assert!(t.contains("DISAGREE"), "{t}");
+        assert!(
+            t.contains("/c/kern"),
+            "the foreign file must still be named: {t}"
+        );
     }
 }

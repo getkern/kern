@@ -4795,6 +4795,10 @@ fn wait_for_conditions(
     token: &str,
     wait_timeout: Option<u64>,
     no_deps: bool,
+    // Box names this invocation will start, after every filter that narrows the plan. A dependency
+    // OUTSIDE it is never going to satisfy this run's token, whatever flag put it outside, so the
+    // question becomes whether it completed earlier. `no_deps` survives only to word the message.
+    will_start: &std::collections::HashSet<String>,
 ) -> Result<(), Error> {
     use std::time::{Duration, Instant};
     if b.depends_healthy.is_empty() && b.depends_completed.is_empty() {
@@ -4830,6 +4834,16 @@ fn wait_for_conditions(
     let deadline = Instant::now() + Duration::from_secs(limit);
     let key_of = |dep: &str| exit_key(pod, token, dep);
 
+    // WHY A DEPENDENCY IS OUTSIDE THE PLAN, in the caller's terms. Written once: both gates below
+    // (`service_healthy` and `service_completed_successfully`) refuse for the same structural reason
+    // and differ only in which condition can never be met, so two copies of this sentence were two
+    // places to keep in step.
+    let why_not_started = if no_deps {
+        "--no-deps was given, so it will not be started"
+    } else {
+        "this command does not start it (it was not named, and only `up` expands to dependencies)"
+    };
+
     // `depends_healthy`: poll each dep's health sidecar until healthy. Abort on unhealthy, on the dep
     // dying, or on timeout.
     for dep in &b.depends_healthy {
@@ -4840,9 +4854,12 @@ fn wait_for_conditions(
         // Under `--no-deps` a dependency that is not even running will never become healthy here:
         // nothing is going to start it. Refuse now, naming the flag, instead of spending the whole
         // timeout to say the same thing less clearly.
-        if no_deps && !is_box_alive(dep) {
+        // Same condition as the completion gate below, for the same reason: a dependency that is not
+        // in this invocation's plan and is not already running will never become healthy, because
+        // nothing here is going to start it. The flag only chooses the wording.
+        if !will_start.contains(dep) && !is_box_alive(dep) {
             return Err(Error::Compose(format!(
-                "box '{}': --no-deps was given, so '{dep}' will not be started, and it is not running - its `service_healthy` condition can never be met. Bring it up first, or drop --no-deps",
+                "box '{}': '{dep}' is a `service_healthy` dependency, {why_not_started}, and it is not running - the condition can never be met here. Bring it up first, or name it in this command",
                 b.name
             )));
         }
@@ -4903,18 +4920,28 @@ fn wait_for_conditions(
         // successfully is satisfied at once and one that did not is refused at once. A non-zero
         // earlier exit is a failure, not a reason to keep waiting: it is the same record `kern ps -a`
         // shows, and the service is not going to run again in this invocation.
-        if no_deps && registry::exit_of(&key_of(dep)).is_none() {
+        // MEMBERSHIP IN THE PLAN IS THE CONDITION, NOT THE FLAG, and testing the flag was the defect.
+        // `--no-deps` is only one way a dependency ends up outside what this command will start; a
+        // `restart` (or `start`, or a drift-reconciled `up`) naming a SUBSET is another, because none
+        // of those expand to dependencies. In every one of those cases nothing is going to write a
+        // sidecar under this run's token, so requiring one asks for something that cannot happen and
+        // the wait is guaranteed to burn the whole timeout before failing. MEASURED on a 10-service
+        // stack: `restart hatchet-worker api-server` against a `hatchet-setup` that had already
+        // exited 0 waited out COMPOSE_CONDITION_TIMEOUT_SECS and exited 1, leaving the worker dead.
+        if !will_start.contains(dep) && registry::exit_of(&key_of(dep)).is_none() {
+            // Named for the caller: the remedy differs, and "--no-deps was given" is false for a
+            // `restart` that simply did not name the service.
             match completed_earlier(dep) {
                 Some(0) => continue,
                 Some(code) => {
                     return Err(Error::Compose(format!(
-                        "box '{}': dependency '{dep}' completed with exit {code} (in an earlier run - --no-deps means this one will not re-run it) - run `kern logs {dep}` for the reason",
+                        "box '{}': dependency '{dep}' completed with exit {code} in an earlier run, and {why_not_started} - run `kern logs {dep}` for the reason",
                         b.name
                     )))
                 }
                 None => {
                     return Err(Error::Compose(format!(
-                        "box '{}': --no-deps was given, so '{dep}' will not be started, and kern holds no record of it having completed - its `service_completed_successfully` condition can never be met. Bring it up first, or drop --no-deps",
+                        "box '{}': '{dep}' is a `service_completed_successfully` dependency, {why_not_started}, and kern holds no record of it having completed - the condition can never be met here. Bring it up first, or name it in this command",
                         b.name
                     )))
                 }
@@ -6088,21 +6115,46 @@ fn device_grant_refusal(service: &str, vgpio: &[crate::config::ResolvedVgpio]) -
 /// is the difference this project exists to remove - and the per-service wiring expresses it
 /// exactly, so the answer is to choose that wiring rather than to refuse.
 #[must_use]
-pub(crate) fn pod_would_collide(boxes: &[crate::compose::ComposeBox]) -> bool {
+/// THE FIRST COLLIDING CLAIM, NAMED, or `None`. It used to answer `bool`, and the caller then told
+/// the reader only that the file "puts two services on the same internal port" - without the port and
+/// without either service, in a stack where a reader has no way to find them but to re-derive
+/// `declared_container_ports` by hand across every service. A field report on a 10-service file
+/// raised exactly that: the note was repeated on every command and named nothing. The information
+/// was already here: `seen` holds the first claimant of each slot and the loop has the second in
+/// hand at the moment it decides. Returning it costs one `String` on a path that runs once per
+/// command, and only when a collision exists.
+pub(crate) struct PortCollision {
+    /// The container port both services claim.
+    pub port: u16,
+    /// `true` for UDP, `false` for TCP: the slot key is the pair, so 53/tcp and 53/udp do not clash.
+    pub udp: bool,
+    /// The service that claimed the slot first, in file order.
+    pub first: String,
+    /// The service whose claim collided with it.
+    pub second: String,
+}
+
+pub(crate) fn pod_would_collide(boxes: &[crate::compose::ComposeBox]) -> Option<PortCollision> {
     if boxes.len() < 2 {
-        return false;
+        return None;
     }
     let mut seen: std::collections::HashMap<(u16, bool), &str> = std::collections::HashMap::new();
     for b in boxes {
         for slot in declared_container_ports(b) {
             if let Some(other) = seen.insert(slot, b.service_name()) {
                 if other != b.service_name() {
-                    return true;
+                    let (port, udp) = slot;
+                    return Some(PortCollision {
+                        port,
+                        udp,
+                        first: other.to_string(),
+                        second: b.service_name().to_string(),
+                    });
                 }
             }
         }
     }
-    false
+    None
 }
 
 /// The image tag kern gives a service that has `build:` and no `image:`.
