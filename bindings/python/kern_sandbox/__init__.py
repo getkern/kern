@@ -2570,6 +2570,22 @@ class Sandbox:
             an explicit ``--memory`` flag, and kern's "explicit flag wins over profile" rule means the
             default **overrides** a ``vcpu:`` profile's own ``memory=``. To let a profile's memory apply,
             pass ``memory_mb=None`` (which also means uncapped if the profile carries no memory).
+
+            ⚠️ HOW LONG THE OOM TAKES IS THE HOST'S, NOT OURS, and on one real host it is minutes.
+            The cap is enforced (the box's own ``memory.max`` carries it, and ``memory.swap.max`` is
+            0, so swap cannot defeat it), but the kernel decides WHEN to declare the OOM. Measured
+            with the same cell - a 400 MiB allocation under a 128 MiB cap - on three hosts:
+            **127 ms** on a WSL2 kernel 6.18, **645 ms** on a kernel 6.8 server, and **317 s** on a
+            Jetson Orin (kernel 5.15-tegra, 6 zram devices), where a one-shot box took **552 s**.
+
+            THE CONSEQUENCE IS NOT THEORETICAL. ``timeout_s`` defaults to 30, so on a host like that
+            the CELL deadline always fires first: the result you get back is a ``timeout`` fault, not
+            an ``oom`` one, and with ``persist=True`` the box is still being reclaimed afterwards -
+            it dies later, so a LATER call is the one that finds it gone and triggers the recreation
+            (with its warning). Verified on that host with ``timeout_s=900``: the same cell then
+            returns exit 137 at 317 s, the in-box state is gone, and exactly one recreation warning
+            is emitted. If you need the OOM itself to be the reported fault on a slow-reclaim host,
+            give the call a deadline longer than that host's OOM latency.
         cpus: CPU cap in cores; ``None`` = uncapped and lets a ``vcpu:`` profile's ``cpus=`` apply (kern
             ``--cpus``). A set value overrides the profile, like ``memory_mb``.
         pids: task/fork-bomb ceiling (kern ``--pids-limit``). Default 256.

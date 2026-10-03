@@ -2087,6 +2087,15 @@ class Sandbox {
    * @param {string} [opts.workspace]        host dir to persist as the workspace. null -> a temp dir,
    *                                          created on open() and DELETED on close().
    * @param {number|null} [opts.memoryMb]    RAM cap (kern --memory). Default 512.
+   *   ⚠️ HOW LONG THE OOM TAKES IS THE HOST'S, NOT OURS, and on one real host it is minutes. The cap
+   *   is enforced (the box's own `memory.max` carries it and `memory.swap.max` is 0, so swap cannot
+   *   defeat it), but the kernel decides WHEN to declare the OOM. Measured with one cell, a 400 MiB
+   *   allocation under a 128 MiB cap: 127 ms on a WSL2 kernel 6.18, 645 ms on a kernel 6.8 server,
+   *   and 317 s on a Jetson Orin (kernel 5.15-tegra), where a one-shot box took 552 s. Since
+   *   `timeoutS` defaults to 30, on such a host the CELL deadline fires first: you get a `timeout`
+   *   fault rather than an `oom` one, and with `persist: true` the box dies LATER, so a subsequent
+   *   call is the one that finds it gone and recreates it. Same wording and same numbers as the
+   *   Python binding's `memory_mb`.
    * @param {number|null} [opts.cpus]        CPU cap in cores; null = uncapped.
    * @param {number|null} [opts.pids]        task/fork-bomb ceiling. Default 256.
    * @param {number} [opts.timeoutS]         MANDATORY per-call wall-clock limit (binding-owned). Default 30.
