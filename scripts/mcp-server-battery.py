@@ -180,11 +180,25 @@ check("KERN_MCP_KERNEL: lo stato persiste fra celle", not is_err and "42" in txt
       f"isError={is_err} {txt.strip()[:60]!r}")
 
 # 11. Un OOM: deve tornare un errore LEGGIBILE, non un silenzio.
+# ⛔ IL PREDICATO DEVE FORZARE IL SIGNIFICATO DEL NOME, e la prima versione non lo faceva.
+# Era `is_err or "oom" in txt or "kill" in txt`, cioe' soddisfatto da QUALUNQUE `isError: true`.
+# PROVATO: sostituendo la cella con un errore di SINTASSI il caso diceva ancora `ok`, perche' un
+# SyntaxError e' pure lui un isError. Un caso verde su una classe di fallimento sbagliata e' peggio
+# di nessun caso: dice che la storia dell'OOM e' provata quando non lo e'. Ora pretende la riga che
+# SOLO un OOM produce - il messaggio del killer del kernel scritto da kern - e in piu' che la cella
+# non sia semplicemente andata in errore di programmazione.
 res, err = session("oom", [call("x = bytearray(400*1024*1024); print(len(x))")],
                    env={"KERN_MCP_MEMORY_MB": "128"}, timeout=600)
 txt, is_err = text_of(res[-1])
-check("un OOM torna un errore leggibile", is_err or "oom" in txt.lower() or "kill" in txt.lower(),
+check("un OOM e riferito COME un OOM", is_err and "oom killer" in txt.lower(),
       f"isError={is_err} {txt.strip()[:90]!r}")
+# E il controllo che rende il caso sopra una misura: un errore di PROGRAMMAZIONE non deve
+# somigliargli. Senza questo, "pretende la riga del killer" resterebbe un'asserzione su una stringa.
+res, err = session("oom controllo", [call("this is not python at all ((((")])
+txt2, is_err2 = text_of(res[-1])
+check("un errore di sintassi NON somiglia a un OOM",
+      is_err2 and "oom killer" not in txt2.lower(),
+      f"isError={is_err2} {txt2.strip()[:60]!r}")
 
 # 12. Il tetto sull'uscita: una cella che stampa molto non deve far gonfiare la risposta.
 res, err = session("tetto uscita", [call("print('x' * 5_000_000)")], timeout=600)
@@ -192,11 +206,52 @@ txt, is_err = text_of(res[-1])
 check("il tetto sull'uscita tiene", len(txt) < 200_000, f"risposta di {len(txt)} caratteri")
 
 # 13. Una cella che esce non-zero.
+# Lo stesso difetto, piu' mite: era `"3" in txt or is_err`, e qualunque isError lo soddisfaceva
+# senza provare che il codice 3 fosse riportato. Ora pretende la forma documentata, `[exit 3`.
 res, err = session("exit", [call("import sys; sys.exit(3)")])
 txt, is_err = text_of(res[-1])
-check("un exit non-zero e' riferito", "3" in txt or is_err, f"isError={is_err} {txt.strip()[:70]!r}")
+check("un exit non-zero riporta IL CODICE", is_err and "[exit 3" in txt,
+      f"isError={is_err} {txt.strip()[:70]!r}")
 
-# 14. Uno strumento che non esiste: errore JSON-RPC, non un crash.
+# 14. ⭐ L'INTERPRETE CALDO CHE MUORE: lo stato va perso e il modello DEVE essere avvisato.
+#     Senza questo caso la batteria provava solo che `KERN_MCP_KERNEL=1` conserva lo stato (caso 10),
+#     cioe' la metta' facile. Un interprete caldo che muore e viene rimpiazzato in silenzio
+#     restituirebbe al modello una sessione che SEMBRA continua e non lo e'.
+res, err = session("kernel oom", [
+    call("marcatore = 'vivo'"),
+    call("x = bytearray(400*1024*1024)"),
+    call("print('marcatore' in dir())"),
+], env={"KERN_MCP_KERNEL": "1", "KERN_MCP_MEMORY_MB": "128"}, timeout=900)
+replies = [text_of(m) for m in res if "result" in m and "content" in (m.get("result") or {})]
+after_txt, after_err = replies[-1] if replies else ("", False)
+died_txt, died_err = replies[-2] if len(replies) > 1 else ("", False)
+check("un Kernel caldo che va in OOM lo dichiara", died_err,
+      f"la cella che sfora: isError={died_err} {died_txt.strip()[:70]!r}")
+check("e lo stato in memoria e' PERSO, non finto continuo",
+      "False" in after_txt or after_err,
+      f"dopo: isError={after_err} {after_txt.strip()[:70]!r}")
+
+# 15. ⭐ UN PROFILO CON IL PREWARM: la forma in cui il difetto della chiave del pool arriva a un
+#     utente dell'MCP. `KERN_MCP_PREWARM` vale 1 per difetto, quindi questa e' la configurazione
+#     normale di chi usa `KERN_MCP_PROFILES`.
+with tempfile.TemporaryDirectory() as home:
+    os.makedirs(os.path.join(home, "kern"))
+    toml = os.path.join(home, "kern", "kern.toml")
+    with open(toml, "w") as fh:
+        fh.write('[[vcpu]]\nname = "agente"\nbackend = "host"\ncpus = 1.0\nmemory = "256M"\n')
+    res, err = session("profilo+prewarm", [call(
+        "import os\n"
+        "print('cap', open('/sys/fs/cgroup/memory.max').read().strip())\n")],
+        env={"XDG_CONFIG_HOME": home, "KERN_MCP_PROFILES": "vcpu:agente",
+             "KERN_MCP_MEMORY_MB": "0"}, timeout=600)
+    txt, is_err = text_of(res[-1])
+    # 256 MiB = 268435456. Letto dal cgroup DAL MISURATO, non dalla riga di comando: e' il canale
+    # indipendente che il progetto richiede.
+    check("un profilo col prewarm applica il SUO tetto",
+          not is_err and "268435456" in txt,
+          f"isError={is_err} {txt.strip()[:70]!r}")
+
+# 16. Uno strumento che non esiste: errore JSON-RPC, non un crash.
 res, err = session("tool ignoto", [{"method": "tools/call",
                                     "params": {"name": "nonesiste", "arguments": {}}}])
 last = res[-1]
