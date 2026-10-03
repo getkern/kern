@@ -232,6 +232,17 @@ CASES: list[Case] = [
      append("VOLUME /data\n")),
     ("dockerfiles", "an instruction kern refuses", "images/sandbox/Dockerfile",
      append("ONBUILD RUN true\n")),
+
+    # --- test-env-lock: a per-directory clippy.toml replaces the root's rules for a whole subtree ---
+    # Clippy uses the FIRST config it finds walking up, with NO merging, so a file like this switches
+    # `disallowed-methods` off for everything under it and leaves no trace in any `.rs` file - which
+    # is precisely what the attribute scan in that gate cannot see. One case per direction: an
+    # undeclared config, and a declaration whose file is gone (coverage that is not there).
+    ("test-env-lock", "the declaration removed, leaving a real config unwatched",
+     "scripts/test-env-lock.py",
+     replace_once('"windows/kern-win/clippy.toml": (', '"windows/kern-win/clippy.toml_DISARMED": (')),
+    ("test-env-lock", "a declaration for a config that no longer exists", "scripts/test-env-lock.py",
+     replace_once('DECLARED_CONFIGS = {', 'DECLARED_CONFIGS = {\n    "crates/gone/clippy.toml": "stale",')),
 ]
 
 

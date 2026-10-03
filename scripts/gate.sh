@@ -60,6 +60,21 @@ else
     printf '  %-34s %s\n' "cargo clippy (aarch64)" \
         "SKIP  target not installed: rustup target add aarch64-unknown-linux-gnu"
 fi
+# THE WINDOWS SHIM, WHICH NOTHING LINTED UNTIL NOW. `windows/kern-win` is `exclude`d from the
+# workspace, so `--all` above does not reach it and the release CI only ever ran `cargo build` on it:
+# it failed `cargo fmt --check` and carried 3 clippy errors on main, unnoticed, while shipping as
+# `kern.exe` to every Windows user. A crate that ships is a crate that is linted.
+#
+# NO `--target x86_64-pc-windows-gnu` HERE, deliberately: clippy for that target needs the mingw
+# toolchain, which a Linux dev box may not have, and the lints that matter are not target-specific -
+# the crate is `std`-only and has no `cfg(windows)` branches. The release workflow builds the real
+# Windows target; this checks the source everyone edits. Its tests run natively for the same reason.
+step "cargo fmt --check (kern-win)" \
+    cargo fmt --manifest-path windows/kern-win/Cargo.toml --check
+step "cargo clippy (kern-win)" \
+    cargo clippy --manifest-path windows/kern-win/Cargo.toml --all-targets
+step "cargo test (kern-win)" \
+    env -u KERN_BIN cargo test --manifest-path windows/kern-win/Cargo.toml
 echo "docs"
 for g in docker-vocabulary dockerfiles flat-continuation gen-seccomp-allowlist injection-declared \
          md-links no-ai-slop registry-classified stale-numbers progress-is-tty-gated gates-selftest; do

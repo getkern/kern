@@ -56,6 +56,24 @@ REQUIRED_METHODS = (
     "std::env::var_os",
 )
 
+# EVERY `clippy.toml` THAT IS NOT THE ROOT ONE, and why it is allowed to exist.
+#
+# 🪤 THE HOLE THIS CLOSES. Clippy walks up from a crate root and uses the FIRST config it finds, with
+# NO merging. So dropping a `clippy.toml` next to any crate replaces the root's `disallowed-methods`
+# wholesale for that whole subtree - the same effect as `#![allow(clippy::disallowed_methods)]`,
+# which this gate already refuses undeclared, except that it leaves no mark in any `.rs` file and so
+# the attribute scan above cannot see it. A per-directory config was the quietest remaining way to
+# switch the lint off for a subtree.
+#
+# A declaration is not approval, it is visibility: the reason has to be written here, where someone
+# reviewing the environment rule will read it.
+DECLARED_CONFIGS = {
+    "windows/kern-win/clippy.toml": (
+        "the Windows->WSL2 shim: a separate crate whose tests are pure functions in no shared "
+        "process, where the prescribed remedy `crate::global_env` does not exist"
+    ),
+}
+
 
 def main():
     problems = []
@@ -64,6 +82,28 @@ def main():
     for m in REQUIRED_METHODS:
         if f'"{m}"' not in text:
             problems.append(f"clippy.toml no longer disallows `{m}`, so nothing stops a direct call")
+
+    # A `clippy.toml` anywhere but the root REPLACES the root's rules for its whole subtree, with no
+    # merging and no trace in any `.rs` file. Same standard as the allow attributes below: declared
+    # with a reason, or it fails. And a declaration for a file that is gone is removed, because a
+    # stale entry reads as coverage that is not there.
+    configs = {
+        str(p.relative_to(ROOT))
+        for p in ROOT.rglob("clippy.toml")
+        if "target/" not in str(p) and "node_modules/" not in str(p) and p != CONFIG
+    }
+    for path in sorted(configs - set(DECLARED_CONFIGS)):
+        problems.append(
+            f"{path} replaces the root clippy.toml for its whole subtree and is not declared in "
+            f"{pathlib.Path(__file__).name}. Clippy uses the FIRST config it finds walking up, with "
+            f"no merging, so this switches `disallowed-methods` off for every crate under it and "
+            f"leaves no mark in any .rs file: add it with its reason, or delete it"
+        )
+    for path in sorted(set(DECLARED_CONFIGS) - configs):
+        problems.append(
+            f"{path} is declared as a per-directory clippy config but no longer exists. Remove it "
+            f"from the list: a stale declaration reads as coverage that is not there"
+        )
 
     found = {}
     for f in sorted(ROOT.rglob("*.rs")):
@@ -93,9 +133,12 @@ def main():
             print(f"  {p}")
         return 1
 
+    # THE GATE SAYS WHAT IT CHECKED, including the count it would be easiest to forget. A summary
+    # that omits the per-directory configs would read as full coverage of a rule it had not looked at.
     print(
         f"the environment lint is armed on {len(REQUIRED_METHODS)} methods, with "
-        f"{len(DECLARED)} declared exemptions and no undeclared ones"
+        f"{len(DECLARED)} declared file exemptions and {len(DECLARED_CONFIGS)} declared "
+        f"per-directory clippy config(s), and no undeclared ones of either kind"
     )
     return 0
 

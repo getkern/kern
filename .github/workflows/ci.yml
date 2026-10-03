@@ -36,6 +36,21 @@ jobs:
         # and it reads as decoration to anyone auditing the step. Saying it on the command makes the
         # step true on its own.
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: fmt, clippy and test the Windows shim
+        # `windows/kern-win` IS `exclude`d FROM THE WORKSPACE, so neither `--all` above reaches it.
+        # It shipped as `kern.exe` to every Windows user while failing `cargo fmt --check` and
+        # carrying three clippy errors, because the only job that ever touched it (`windows` in
+        # release.yml) runs `cargo build` and nothing else. `-D warnings` is spelled on the command
+        # for the same reason as the step above: a rule whose teeth are in a variable declared
+        # elsewhere reads as decoration.
+        #
+        # HOST TARGET, NOT `x86_64-pc-windows-gnu`: that needs mingw, the crate is `std`-only with no
+        # `cfg(windows)` branches, and its tests are pure functions. The release job still builds and
+        # ships the real Windows binary; this lints the source people edit.
+        run: |
+          cargo fmt --manifest-path windows/kern-win/Cargo.toml --check
+          cargo clippy --manifest-path windows/kern-win/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path windows/kern-win/Cargo.toml
       - name: test
         run: cargo test --all
         # HW/privilege-gated tests skip gracefully, so x86 CI stays green.
