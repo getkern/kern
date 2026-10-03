@@ -2166,6 +2166,24 @@ class Sandbox {
     // external kill produces too. So an OOM comes back `killed` on this path where the one-shot path
     // says `oom`. Not papered over: claiming `oom` from "137 and a cap was set" would be an inference
     // presented as a measurement.
+    //
+    // 📌 WHAT ADOPTION KEYS ON, AND THE TWO THINGS IT DELIBERATELY DOES NOT. A box is adopted when
+    // its fingerprint matches: the argv, the `KERN_*` environment kern builds the box from, and what
+    // a `vcpu:`/`vgpio:`/`vdisk:` token resolves to in your kern.toml. That is the ISOLATION
+    // posture, which is what a caller is promised. Two things it does not key on, both decisions
+    // rather than gaps:
+    //
+    //   * THE BYTES BEHIND A FLOATING IMAGE TAG. `image: "python:3.12-slim"` is hashed as that
+    //     string, not as the digest it currently resolves to, so a box built before an ordinary
+    //     re-pull of the same tag is still adopted. Keying on the digest would refuse resumption
+    //     after every security update of the base image, and the isolation is identical either way.
+    //     ⭐ If resume must mean the same image bytes, PIN IT: `image: "python@sha256:..."` is a
+    //     valid reference, it goes into the argv and therefore into the fingerprint (verified:
+    //     three distinct hashes for a tag and two different digests).
+    //   * THE BODY OF AN APPARMOR PROFILE. `apparmor: "name"` hashes the NAME; replacing the policy
+    //     loaded under that name on the host changes enforcement without moving the fingerprint.
+    //     That is host administration, in the same class as replacing the kernel under a running
+    //     box, and not something this binding can observe portably.
     this.persist = opts.persist ?? false;
     // How long the resident box lives. It is kern's own `--timeout` on that box, so it ends by itself
     // if the owning process dies: a resident sandbox cannot leak for longer than this.

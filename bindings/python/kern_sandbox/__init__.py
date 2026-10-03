@@ -2694,6 +2694,24 @@ class Sandbox:
     #: call left running. ``kern exec`` reaps its descendants when it returns, including one detached
     #: with ``start_new_session=True``, so each call still gets a clean process table. That is why the
     #: resident box runs ``--init``: without a reaping PID 1 those corpses stayed as zombies.
+    #:
+    #: 📌 WHAT ADOPTION KEYS ON, AND THE TWO THINGS IT DELIBERATELY DOES NOT. A box is adopted when
+    #: its fingerprint matches: the argv, the ``KERN_*`` environment kern builds the box from, and
+    #: what a ``vcpu:``/``vgpio:``/``vdisk:`` token resolves to in your ``kern.toml``. That is the
+    #: ISOLATION posture, which is what a caller is promised. Two things it does not key on, both
+    #: decisions rather than gaps:
+    #:
+    #: * **The bytes behind a floating image tag.** ``image="python:3.12-slim"`` is hashed as that
+    #:   string, not as the digest it currently resolves to, so a box built before an ordinary
+    #:   re-pull of the same tag is still adopted. Keying on the digest would refuse resumption after
+    #:   every security update of the base image, and the isolation is identical either way. ⭐ If
+    #:   resume must mean the same image bytes, PIN IT: ``image="python@sha256:..."`` is a valid
+    #:   reference, it goes into the argv, and it therefore goes into the fingerprint (verified: three
+    #:   distinct hashes for a tag and two different digests).
+    #: * **The body of an AppArmor profile.** ``apparmor="name"`` hashes the NAME; replacing the
+    #:   policy loaded under that name on the host changes enforcement without moving the
+    #:   fingerprint. That is host administration, in the same class as replacing the kernel under a
+    #:   running box, and not something this binding can observe portably.
     persist: bool = False
     #: How long the resident box lives with nothing asking for it. It is kern's own ``--timeout`` on
     #: that box, so the box ends by itself if the owning process dies: a resident sandbox cannot leak
