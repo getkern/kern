@@ -4433,6 +4433,62 @@ def test_the_resident_posture_includes_the_kern_env_that_builds_the_box():
 
 
 @integration
+def test_the_prewarm_pool_key_is_the_same_posture_as_the_resident_fingerprint():
+    """A POOL IS ADOPTION UNDER ANOTHER NAME, and it had the hole the fingerprint had just lost.
+
+    `_WarmPool._key` decides whether a box filled EARLIER matches what this call would create. It is
+    where the resident fingerprint took its `KERN_*` fix from - and when the fingerprint then learned
+    to fold in what a `vcpu:`/`vgpio:` token RESOLVES to, this copy was left behind.
+
+    MEASURED before the fix: with `profiles=["vcpu:agent"]` and the definition changed from
+    `cpus=1, memory="128M"` to `cpus=4, memory="4G"`, the pool key was the SAME `1d5657772d173be5`
+    both times while the resident fingerprint correctly differed. The pool would have handed over a
+    box built under the old definition, and `vgpio:` profiles are the only way to give a box a
+    hardware device.
+
+    Both now come from ONE function, `_posture_material`, so the two cannot drift again - which is
+    the actual fix, the two-copies being the reason this happened at all.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as ws:
+        os.makedirs(os.path.join(home, "kern"))
+        toml = Path(home, "kern", "kern.toml")
+        prev = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = home
+        try:
+            sb = Sandbox(workspace=ws, profiles=["vcpu:agent"], memory_mb=None, prewarm=1)
+            sb._ws = ws
+            pool = kern._WarmPool(sb, 1)
+
+            toml.write_text('[[vcpu]]\nname = "agent"\nbackend = "host"\n'
+                            'cpus = 1.0\nmemory = "128M"\n')
+            small = pool._key(network=False)
+            toml.write_text('[[vcpu]]\nname = "agent"\nbackend = "host"\n'
+                            'cpus = 4.0\nmemory = "4G"\n')
+            big = pool._key(network=False)
+            assert small != big, "the pool must not hand over a box built under another definition"
+            # Deterministic, or no warm box would ever be claimed even when the posture matches.
+            toml.write_text('[[vcpu]]\nname = "agent"\nbackend = "host"\n'
+                            'cpus = 1.0\nmemory = "128M"\n')
+            assert pool._key(network=False) == small, "the same definition must give the same key"
+
+            # ONE SPELLING: the pool key IS `_posture_material`, which is what the resident
+            # fingerprint hashes, so a control added to one reaches the other. Asserted on the SAME
+            # Sandbox - an earlier version of this compared a `persist=True` Sandbox with a
+            # different name against the pool's, which have different argv by construction and
+            # therefore different material. That was a badly built assertion, not a finding.
+            assert pool._key(network=False) == sb._posture_material(network=False, timeout_s=0), (
+                "the pool key must BE the shared posture material, not a second copy of it"
+            )
+        finally:
+            if prev is None:
+                os.environ.pop("XDG_CONFIG_HOME", None)
+            else:
+                os.environ["XDG_CONFIG_HOME"] = prev
+
+
+@integration
 def test_what_a_profile_token_resolves_to_is_part_of_the_resident_posture():
     """A PROFILE IS A TOKEN IN THE ARGV AND A DEFINITION IN A FILE, and only one was hashed.
 

@@ -3433,3 +3433,56 @@ test(
     }
   },
 );
+
+test(
+  "the prewarm pool key is the same posture as the resident fingerprint",
+  { skip: !KERN_OK && "kern not installed" },
+  async () => {
+    // A POOL IS ADOPTION UNDER ANOTHER NAME, and it had the hole the fingerprint had just lost.
+    // `WarmPool._key` decides whether a box filled EARLIER matches what this call would create. It
+    // is where the fingerprint took its `KERN_*` fix from, and when the fingerprint then learned to
+    // fold in what a `vcpu:`/`vgpio:` token RESOLVES to, this copy was left behind. Measured in the
+    // Python binding: the key was the SAME across two definitions of one token while the
+    // fingerprint differed, so the pool would hand over a box built under the old one - and
+    // `vgpio:` profiles are the only way to give a box a hardware device. Both now come from ONE
+    // function, `_postureMaterial`, which is the actual fix: two copies were the reason.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "npool-"));
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "npoolws-"));
+    fs.mkdirSync(path.join(home, "kern"));
+    const toml = path.join(home, "kern", "kern.toml");
+    const prev = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = home;
+    const SMALL = '[[vcpu]]\nname = "agent"\nbackend = "host"\ncpus = 1.0\nmemory = "128M"\n';
+    const BIG = '[[vcpu]]\nname = "agent"\nbackend = "host"\ncpus = 4.0\nmemory = "4G"\n';
+    try {
+      const sb = new Sandbox({
+        workspace: ws,
+        profiles: ["vcpu:agent"],
+        memoryMb: null,
+        prewarm: 1,
+      });
+      sb._ws = ws;
+      const pool = new kern._WarmPool(sb, 1);
+
+      fs.writeFileSync(toml, SMALL);
+      const small = await pool._key(false);
+      fs.writeFileSync(toml, BIG);
+      const big = await pool._key(false);
+      assert.notStrictEqual(small, big, "the pool must not hand over a box from another definition");
+      // Deterministic, or no warm box would ever be claimed even when the posture matches.
+      fs.writeFileSync(toml, SMALL);
+      assert.strictEqual(await pool._key(false), small, "same definition, same key");
+      // ONE SPELLING: the key IS the shared material, not a second copy of it.
+      assert.strictEqual(
+        await pool._key(false),
+        await sb._postureMaterial({ network: false, timeoutS: 0 }),
+        "the pool key must BE the shared posture material",
+      );
+    } finally {
+      if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prev;
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  },
+);

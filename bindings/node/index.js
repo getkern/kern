@@ -2517,11 +2517,24 @@ class Sandbox {
   // not `spawnSync`: this file's own rule, and a synchronous spawn here would stop every timer and
   // socket in the host process.
   async _residentFingerprint() {
-    const argv = this._baseArgv("", {
-      network: this.network,
-      timeoutS: Math.trunc(this.persistTtlS),
-      dry: true,
-    });
+    return crypto
+      .createHash("sha256")
+      .update(await this._postureMaterial({ network: this.network, timeoutS: Math.trunc(this.persistTtlS) }))
+      .digest("hex")
+      .slice(0, 16);
+  }
+
+  // EVERYTHING THAT DETERMINES WHAT A BOX IS, as one string, spelled ONCE.
+  //
+  // 🚨 THIS EXISTS BECAUSE THE SAME HOLE WAS FOUND TWICE. An outside review found the resident
+  // fingerprint omitted the `KERN_*` environment, then that it omitted what a `vcpu:`/`vgpio:` token
+  // RESOLVES to. Both were fixed in the fingerprint - and the prewarm pool's key, which is the same
+  // question asked by a different mechanism, kept the second hole. Measured in the Python binding:
+  // with `profiles: ["vcpu:agent"]` and the definition changed from `cpus=1, memory="128M"` to
+  // `cpus=4, memory="4G"`, the pool key was the SAME both times while the fingerprint differed. A
+  // pool is adoption under another name: it hands a call a box that was built earlier.
+  async _postureMaterial({ network, timeoutS }) {
+    const argv = this._baseArgv("", { network, timeoutS, dry: true });
     // AND THE CONTROLS THAT NEVER REACH argv ARE ADDED EXPLICITLY. Taking the posture from
     // `_baseArgv` answers the drift problem for everything that IS a flag; `enforceLimits` is not a
     // flag, it is `KERN_NO_SCOPE=1` in the spawn's ENVIRONMENT, so it changed whether the caps are
@@ -2577,7 +2590,7 @@ class Sandbox {
         );
       material += `\u0000\u0000${shown.stdout}`;
     }
-    return crypto.createHash("sha256").update(material).digest("hex").slice(0, 16);
+    return material;
   }
 
   /** The running resident box for this name, or null. Never throws: a registry that cannot be read is
@@ -3801,7 +3814,7 @@ class Sandbox {
     // adopted here is already in the key and the boxes warmed without it are retired as stale.
     this._pycAdoptIfReady();
     if (this._pool && !streaming && !code.includes("\0")) {
-      const warm = this._pool.claim({ network: this.network, deadlineS: eff });
+      const warm = await this._pool.claim({ network: this.network, deadlineS: eff });
       if (warm) {
         const before = this.trackFiles ? this._snapshot() : null;
         return warm.runCell(code, { deadlineS: eff, before });
@@ -4770,19 +4783,18 @@ class WarmPool {
    * filled would have been served a box built under the previous filter. Every `KERN_*` variable is
    * folded in, rather than the handful we can name today, because the failure mode is a variable nobody
    * thought to list. */
-  _key(network) {
-    const argv = this._sbx._baseArgv("", { network, timeoutS: 0, dry: true }).join("\0");
-    const env = Object.entries(process.env)
-      .filter(([k]) => k.startsWith("KERN_"))
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([k, v]) => `${k}=${v}`)
-      .join("\0");
-    return `${argv}\0\0${env}`;
+  // ⭐ ONE SPELLING, SHARED WITH THE RESIDENT FINGERPRINT, and async for the same reason it is:
+  // resolving a profile token means asking kern. ⛔ Computed at CLAIM time and not cached, because
+  // the question is "does this warm box match what THIS call would create" and a cached answer would
+  // say yes to a box built before a `kern.toml` edit. Measured in the Python binding: 1.33 ms per
+  // claim WITH a profile, 0.039 ms without - the spawn is only paid when a profile is asked for.
+  async _key(network) {
+    return this._sbx._postureMaterial({ network, timeoutS: 0 });
   }
 
-  claim({ network, deadlineS }) {
+  async claim({ network, deadlineS }) {
     if (this._closed || this._size <= 0) return null;
-    const key = this._key(network);
+    const key = await this._key(network);
     let picked = null;
     const keep = [];
     const stale = [];
@@ -4823,7 +4835,7 @@ class WarmPool {
     let box = null;
     let ok = false;
     try {
-      box = new WarmBox(this._sbx, this._key(network), deadlineS, (b) => this._sweep(b));
+      box = new WarmBox(this._sbx, await this._key(network), deadlineS, (b) => this._sweep(b));
       ok = (await box.start()) && (await box.waitReady());
     } catch {
       ok = false;
@@ -4902,6 +4914,11 @@ module.exports = {
   Result,
   SandboxError,
   MountRefused,
+  // The prewarm pool, exported for its tests only, and under an underscore for the same reason the
+  // bytecode cache's internals are below: a pool key is the same posture question the resident
+  // fingerprint asks, the two were allowed to drift once, and the test that stops them doing it
+  // again has to be able to ask the pool directly. The Python binding exposes it the same way.
+  _WarmPool: WarmPool,
   // The bytecode cache's internals, exported for its tests only: the mount flag and the atomic
   // publish are security properties, and a test that cannot reach them cannot assert them.
   _PYC_MOUNT: PYC_MOUNT,

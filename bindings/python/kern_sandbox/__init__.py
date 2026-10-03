@@ -3025,9 +3025,25 @@ class Sandbox:
         whether it arrives as a flag or as an environment variable is an implementation detail of
         how it is delivered.
         """
-        argv = self._base_argv(
-            "", network=self.network, timeout_s=int(self.persist_ttl_s), dry=True
-        )
+        return hashlib.sha256(
+            self._posture_material(
+                network=self.network, timeout_s=int(self.persist_ttl_s)
+            ).encode()
+        ).hexdigest()[:16]
+
+    def _posture_material(self, *, network: bool, timeout_s: int) -> str:
+        """EVERYTHING THAT DETERMINES WHAT A BOX IS, as one string, spelled ONCE.
+
+        🚨 THIS FUNCTION EXISTS BECAUSE THE SAME HOLE WAS FOUND TWICE. An outside review found that
+        the resident fingerprint omitted the `KERN_*` environment, then that it omitted what a
+        `vcpu:`/`vgpio:` token RESOLVES to. Both were fixed in `_resident_fingerprint` - and the
+        prewarm pool's key, which is the same question asked by a different mechanism, was left with
+        the second hole. MEASURED: with `profiles=["vcpu:agent"]` and the definition changed from
+        `cpus=1, memory="128M"` to `cpus=4, memory="4G"`, the pool key was the SAME
+        `1d5657772d173be5` both times while the resident fingerprint correctly differed. A pool is
+        adoption under another name: it hands a call a box that was built earlier.
+        """
+        argv = self._base_argv("", network=network, timeout_s=timeout_s, dry=True)
         # Spelled as a pseudo-flag so it reads like the rest of the material being hashed, and so a
         # future out-of-argv control is added in the same obvious way.
         argv = argv + [f"--enforce-limits={int(bool(self.enforce_limits))}"]
@@ -3114,7 +3130,7 @@ class Sandbox:
                     f"{(shown.stderr or shown.stdout or '').strip()[:300]}"
                 )
             material += "\x00\x00" + shown.stdout
-        return hashlib.sha256(material.encode()).hexdigest()[:16]
+        return material
 
     def _resident_lookup(self) -> "dict | None":
         """The running resident box for this name, or None. Never raises: a registry that cannot be
@@ -5673,9 +5689,20 @@ class _WarmPool:
         previous filter. Measured before it was closed: the key did not move and the stale box was
         handed over. Every `KERN_*` variable is folded in, rather than the handful we can name today,
         because the failure mode is a variable nobody thought to list."""
-        argv = self._sbx._base_argv("", network=network, timeout_s=0, dry=True)
-        env = sorted((k, v) for k, v in os.environ.items() if k.startswith("KERN_"))
-        return "\0".join(argv) + "\0\0" + "\0".join(f"{k}={v}" for k, v in env)
+        # ⭐ ONE SPELLING, SHARED WITH THE RESIDENT FINGERPRINT. This used to build its own string
+        # from `_base_argv` plus the `KERN_*` environment, and that is where the resident path TOOK
+        # its `KERN_*` fix from - but when the resident path then learned to fold in what a
+        # `vcpu:`/`vgpio:` token RESOLVES to, this copy was left behind. MEASURED: with
+        # `profiles=["vcpu:agent"]` and the definition changed from `cpus=1, memory="128M"` to
+        # `cpus=4, memory="4G"`, this key was the SAME `1d5657772d173be5` both times while the
+        # resident fingerprint correctly differed, so the pool would hand over a box built under the
+        # old definition. A pool is adoption under another name.
+        #
+        # ⛔ COMPUTED AT CLAIM TIME AND NOT CACHED, deliberately: the question is "does this warm box
+        # match what THIS call would create", and a cached answer would say yes to a box built before
+        # a `kern.toml` edit. The cost is one `kern box --show-config` spawn, paid ONLY when a profile
+        # is asked for - see the measurement in `_posture_material`.
+        return self._sbx._posture_material(network=network, timeout_s=0)
 
     def claim(self, *, network: bool, deadline: int) -> "_WarmBox | None":
         if self._closed or self._size <= 0:
