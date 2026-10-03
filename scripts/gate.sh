@@ -97,6 +97,16 @@ step "compose-corpus" python3 "scripts/compose-corpus-gate.py"
 # should not report a red gate for a missing artefact. Built binary first, then the debug one.
 if [ -x target/release/kern ] || [ -x target/debug/kern ]; then
     step "deployment-cli" python3 "scripts/deployment-cli-battery.py"
+    # THE MCP SERVER DRIVEN THE WAY A CLIENT DRIVES IT, over stdio with a JSON-RPC session. The 180
+    # MCP unit tests exercise the functions; this exercises the SERVER - the handshake, the shape of
+    # each reply, and the environment variables a Claude Desktop config carries, which is where this
+    # branch's `KERN_MCP_SETUP` reordering and its new `KERN_MCP_IMAGE` actually land. Measured at
+    # ~2.95 s on two consecutive runs, with the expensive cases genuinely happening (the setup box
+    # resolved DNS and connected, the OOM produced kern's own killer line, a 5 MB print came back
+    # capped to 16 kB). ⛔ An MCP server exits 0 while answering `isError: true`, so every case in it
+    # asserts on the decoded reply and never on an exit code - a harness reading `$?` would be green
+    # on every failure in there. It skips itself without a release binary.
+    step "mcp-server" python3 "scripts/mcp-server-battery.py"
 else
     printf '  %-34s %s\n' "deployment-cli" "SKIP  no binary: cargo build --release"
 fi
