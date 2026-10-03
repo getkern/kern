@@ -221,6 +221,17 @@ CASES: list[Case] = [
      prepend('#![allow(clippy::all)]')),
     ("test-env-lock", "the lint disarmed in clippy.toml", "clippy.toml",
      replace_once('"std::env::set_var"', '"std::env::set_var_DISARMED"')),
+
+    # --- dockerfiles: the repository's own image recipes, parsed and not built ---
+    # Both cases come from the gate's FIRST version failing to catch them. It counted `dropped`
+    # lines itself, and the sabotage I reached for was `HEALTHCHECK`, which kern DOES act on: the
+    # gate passed, correctly, while the branch that mattered stayed unexercised. `VOLUME` is the
+    # instruction kern really drops, and `ONBUILD` is one it refuses outright - one case per exit
+    # path, so neither can go quiet again.
+    ("dockerfiles", "an instruction kern parses and drops", "images/sandbox/Dockerfile",
+     append("VOLUME /data\n")),
+    ("dockerfiles", "an instruction kern refuses", "images/sandbox/Dockerfile",
+     append("ONBUILD RUN true\n")),
 ]
 
 

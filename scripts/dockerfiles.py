@@ -55,6 +55,14 @@ def main() -> int:
               "cargo build --release -p getkern")
         return 0
 
+    # THE COUNT COMES FROM kern's OWN SUMMARY LINE, not from counting the lines above it:
+    # "2 stages, 10 instructions kern acts on, 0 it does not". Counting `dropped` lines myself was
+    # the first version of this gate and it COULD NOT FAIL: my first sabotage used `HEALTHCHECK`,
+    # which kern does act on, so it passed correctly while the dropped branch stayed unexercised and
+    # a wrong regex would have gone unnoticed. Reading the number kern states takes my parse out of
+    # the verdict. (The instruction kern really drops, and the one that exercises this, is `VOLUME`.)
+    SUMMARY = re.compile(r"(\d+) instructions? kern acts on, (\d+) it does not")
+
     failed = []
     for f in files:
         rel = f.relative_to(ROOT)
@@ -64,13 +72,20 @@ def main() -> int:
             [str(kern), "build", "--check", "-f", str(f), str(f.parent)],
             capture_output=True, text=True,
         )
-        dropped = len(re.findall(r"^\s*dropped\s", r.stdout, re.M))
         if r.returncode != 0:
             failed.append((rel, f"exit {r.returncode}", r.stdout + r.stderr))
-        elif dropped:
-            failed.append((rel, f"{dropped} instruction(s) dropped", r.stdout))
+            continue
+        m = SUMMARY.search(r.stdout)
+        if m is None:
+            # A GATE THAT CANNOT READ THE OUTPUT MUST NOT REPORT GREEN. If `--check` changes its
+            # wording, this fails and gets fixed, instead of passing everything forever.
+            failed.append((rel, "could not find the summary line in `build --check` output",
+                           r.stdout + r.stderr))
+            continue
+        acted, dropped = int(m.group(1)), int(m.group(2))
+        if dropped:
+            failed.append((rel, f"{dropped} instruction(s) kern does not act on", r.stdout))
         else:
-            acted = len(re.findall(r"^\s*ok\s", r.stdout, re.M))
             print(f"  ok    {rel}  ({acted} instructions)")
 
     for rel, why, detail in failed:

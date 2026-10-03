@@ -88,6 +88,21 @@ Every knob is an environment variable in the client's `env` block. There is no c
 | `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes, which otherwise land in the model's output as if the cell had printed them |
 | `KERN_BIN` | `kern` on `PATH` | where the binary is |
 
+**`KERN_MCP_SETUP` is the one knob that opens the network, and there is a way not to need it.** The
+default image has python, sh and bash and nothing else, so the most ordinary request an agent makes
+("plot this") needs `pip install matplotlib` first, in a network-on box. This repository carries the
+recipe for an image that already has the plotting stack and node:
+
+```sh
+kern build -t kern-sandbox:local -f images/sandbox/Dockerfile images/sandbox
+export KERN_MCP_IMAGE=kern-sandbox:local
+```
+
+Measured in that image, through the SDK: `numpy`, `pandas` and `matplotlib` import, a figure is
+written to the workspace as a real PNG, `language='node'` runs, and a connection attempt to the
+network still fails. It is **not** the default: a default has to name a published image, and this one
+exists only where it was built.
+
 **`0` is a sentinel on three of them, and unsetting is not the same thing.**
 
 - `KERN_MCP_MEMORY_MB=0` sends **no `--memory` flag at all**, which is the only way to let a `vcpu:`
