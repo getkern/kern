@@ -18,8 +18,9 @@ DIFFERENT commit that happens to be newer than the sources. Measured while writi
 release binary said `ge479dff` while `HEAD` was `6452ea8`, one commit behind, with an mtime that
 looked perfectly fresh.
 
-The date is still consulted, but only where the hash cannot answer: a build from a dirty tree
-identifies a commit and not the edits on top of it, so there the newest MODIFIED source decides.
+The date is still consulted for what the hash cannot answer, which is the edits on top of that
+commit: a build from a dirty tree, AND a clean build in a tree that has been edited since. There
+the newest MODIFIED source decides.
 Modified is git's answer, not the filesystem's: a file whose content equals HEAD's cannot differ
 from what a build of HEAD contains, however recent its timestamp, and timestamps move for reasons
 that are not edits (`gates-selftest.py` mutates a real source to prove a gate can go red and then
@@ -56,17 +57,30 @@ def _dirty_sources(root):
     Without this, every `gates-selftest` run left the corpus gate and the rate refusing to measure
     until a rebuild that had nothing to rebuild.
     """
-    out = _run(["git", "status", "--porcelain", "--", "*.rs"], cwd=str(root))
-    if out is None:
+    # `-z`, read directly and NOT through `_run`. `_run` strips its output, and porcelain's first
+    # line for a file modified in the worktree starts with a SPACE (` M path`): stripped, `line[3:]`
+    # cut the path's first letter. MEASURED: one edited `crates/kern-cli/src/commands/mod.rs` came
+    # back as `rates/kern-cli/...`, which does not exist, so `_newer_sources` dropped it in silence
+    # and the date check never saw the first modified file - which is usually the only one. `-z`
+    # also leaves paths unquoted, and gives a rename's ORIGINAL path as a separate entry.
+    try:
+        p = subprocess.run(["git", "status", "--porcelain", "-z", "--", "*.rs"],
+                           capture_output=True, text=True, timeout=30, cwd=str(root))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
         return None
     files = []
-    for line in out.splitlines():
-        # `XY <path>`, and for a rename `XY <old> -> <new>`: the path after the arrow is the one
-        # that exists now.
-        path = line[3:].strip() if len(line) > 3 else ""
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        path = path.strip('"')
+    entries = p.stdout.split("\0")
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        if status[0] in "RC":
+            i += 1  # the next entry is where it came FROM, which no longer holds this content
         if path.endswith(".rs"):
             files.append(root / path)
     return files
@@ -121,21 +135,24 @@ def why_not_current(kern, root="."):
                 f" ({version}).\nRebuild before measuring: {rebuild}"
             )
 
-    # 2. DATE, for what the hash cannot decide: a dirty build, or a binary with no describe in it.
-    dirty_build = bool(version and version.endswith("-dirty"))
-    if built_from is None or dirty_build:
-        try:
-            built_at = exe.stat().st_mtime
-        except OSError as e:
-            return f"cannot read {exe}: {e}"
-        newer = _newer_sources(built_at, root)
-        if newer:
-            shown = ", ".join(str(p) for p in sorted(newer)[:3])
-            more = ", …" if len(newer) > 3 else ""
-            return (
-                f"{exe} is older than {len(newer)} source file(s) ({shown}{more}).\n"
-                f"Rebuild before measuring: {rebuild}"
-            )
+    # 2. DATE, for what the hash cannot decide, and that is not only a `-dirty` build. It was gated
+    # on the BINARY being dirty or carrying no describe, which missed the TREE becoming dirty after a
+    # clean build: MEASURED, a debug binary built at a clean HEAD (`-geba5878`, no `-dirty`) was
+    # still accepted after a `.rs` file was edited and not rebuilt, so a gate graded the old code.
+    # The hash names the commit; only the modified sources say what has changed on top of it. On a
+    # clean tree there are none, and this is one `git status`.
+    try:
+        built_at = exe.stat().st_mtime
+    except OSError as e:
+        return f"cannot read {exe}: {e}"
+    newer = _newer_sources(built_at, root)
+    if newer:
+        shown = ", ".join(str(p) for p in sorted(newer)[:3])
+        more = ", …" if len(newer) > 3 else ""
+        return (
+            f"{exe} is older than {len(newer)} source file(s) ({shown}{more}).\n"
+            f"Rebuild before measuring: {rebuild}"
+        )
     return None
 
 
