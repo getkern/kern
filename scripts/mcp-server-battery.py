@@ -51,7 +51,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SDK = os.path.join(ROOT, "bindings", "python")
 KERN = os.environ.get("KERN_BIN") or os.path.join(ROOT, "target", "release", "kern")
-ok = bad = 0
+ok = bad = skipped = 0
 
 
 INIT = {"jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -153,6 +153,25 @@ def check(label, cond, detail):
         bad += 1
 
 
+def skip(label, why):
+    """Un caso che NON ha misurato, detto come tale e contato a parte: un salto stampato come `ok`
+    sarebbe un verde su una cosa mai provata."""
+    global skipped
+    print(f"  SKIP  {label:54s} {why}")
+    skipped += 1
+
+
+def have_image(ref):
+    """L'immagine e' nello store di kern? Chiesto a kern, non dedotto da un percorso. Se la domanda
+    stessa fallisce si risponde SI', cosi' il caso gira e cade in vista invece di saltare in silenzio."""
+    try:
+        p = subprocess.run([KERN, "images", "--json", "--filter", f"reference={ref}"],
+                           capture_output=True, text=True, timeout=30)
+        return p.returncode != 0 or json.loads(p.stdout or "[]") != []
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return True
+
+
 def text_of(resp):
     r = resp.get("result") or {}
     return "".join(c.get("text", "") for c in r.get("content", [])), bool(r.get("isError"))
@@ -220,23 +239,35 @@ txt, is_err = text_of(res[-1])
 check("la cella NON ha rete", not is_err and "spenta" in txt, f"{txt.strip()[:60]!r}")
 
 # 7. ⭐ L'IMMAGINE NUOVA (#9): matplotlib SENZA aprire la rete, che e' il motivo per cui esiste.
-with tempfile.TemporaryDirectory() as ws:
-    res, err = session("immagine nuova", [call(
-        "import matplotlib; matplotlib.use('Agg')\n"
-        "import matplotlib.pyplot as plt, numpy as np, pandas as pd\n"
-        "fig, ax = plt.subplots(); ax.plot(np.arange(5))\n"
-        "fig.savefig('/workspace/g.png')\n"
-        "import os; print('png', os.path.getsize('/workspace/g.png') > 0, 'numpy', numpy.__version__ if False else np.__version__)\n")],
-        env={"KERN_MCP_IMAGE": "kern-sandbox:local", "KERN_MCP_WORKSPACE": ws}, timeout=600)
-    txt, is_err = text_of(res[-1])
-    check("immagine #9: matplotlib senza KERN_MCP_SETUP", not is_err and "png True" in txt,
-          f"isError={is_err} {txt.strip()[:80]!r}")
+#    ⛔ L'immagine NON e' pubblicata, quindi esiste solo dove qualcuno l'ha costruita. Senza, questi
+#    due casi cadevano per un artefatto mancante e non per un difetto, su ogni clone pulito e su ogni
+#    host di prova: la stessa ragione per cui l'intera batteria salta senza binario.
+SANDBOX_IMAGE = "kern-sandbox:local"
+BUILD_IT = "kern build -t kern-sandbox:local -f images/sandbox/Dockerfile images/sandbox"
+has_sandbox_image = have_image(SANDBOX_IMAGE)
+if not has_sandbox_image:
+    skip("immagine #9: matplotlib senza KERN_MCP_SETUP", f"{SANDBOX_IMAGE} assente: {BUILD_IT}")
+else:
+    with tempfile.TemporaryDirectory() as ws:
+        res, err = session("immagine nuova", [call(
+            "import matplotlib; matplotlib.use('Agg')\n"
+            "import matplotlib.pyplot as plt, numpy as np, pandas as pd\n"
+            "fig, ax = plt.subplots(); ax.plot(np.arange(5))\n"
+            "fig.savefig('/workspace/g.png')\n"
+            "import os; print('png', os.path.getsize('/workspace/g.png') > 0, 'numpy', numpy.__version__ if False else np.__version__)\n")],
+            env={"KERN_MCP_IMAGE": SANDBOX_IMAGE, "KERN_MCP_WORKSPACE": ws}, timeout=600)
+        txt, is_err = text_of(res[-1])
+        check("immagine #9: matplotlib senza KERN_MCP_SETUP", not is_err and "png True" in txt,
+              f"isError={is_err} {txt.strip()[:80]!r}")
 
 # 8. node nell'immagine nuova.
-res, err = session("node", [call("console.log('node', process.version)", language="node")],
-                   env={"KERN_MCP_IMAGE": "kern-sandbox:local"}, timeout=600)
-txt, is_err = text_of(res[-1])
-check("immagine #9: language=node", not is_err and "node v" in txt, f"{txt.strip()[:60]!r}")
+if not has_sandbox_image:
+    skip("immagine #9: language=node", f"{SANDBOX_IMAGE} assente: {BUILD_IT}")
+else:
+    res, err = session("node", [call("console.log('node', process.version)", language="node")],
+                       env={"KERN_MCP_IMAGE": SANDBOX_IMAGE}, timeout=600)
+    txt, is_err = text_of(res[-1])
+    check("immagine #9: language=node", not is_err and "node v" in txt, f"{txt.strip()[:60]!r}")
 
 # 9. Il rifiuto di node sull'immagine PREDEFINITA, che l'MCP deve riferire come errore leggibile.
 res, err = session("node default", [call("console.log(1)", language="node")])
@@ -454,5 +485,5 @@ check("due chiamate in fila: ognuna la sua uscita",
       and "BBB" in by_id.get(2, "") and "AAA" not in by_id.get(2, ""),
       f"{ {k: v.strip()[:12] for k, v in by_id.items()} }")
 
-print(f"\n{ok} ok, {bad} falliti")
+print(f"\n{ok} ok, {bad} falliti, {skipped} saltati")
 sys.exit(1 if bad else 0)
