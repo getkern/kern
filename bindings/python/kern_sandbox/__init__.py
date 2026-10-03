@@ -77,6 +77,15 @@ __version__ = "0.2.42"
 # building+hosting our own (independent test-ratified FLAG 4). Ship a datascience default when demand justifies.
 _DEFAULT_IMAGE = "python:3.12-slim"
 
+# WHAT THE DEFAULT IMAGE CONTAINS, as a fact ABOUT THE IMAGE and not about its name.
+#
+# This drives the node refusal below, and it lives here so that changing `_DEFAULT_IMAGE` forces a
+# decision about it in the same edit. The batteries-included image this repo builds
+# (`images/sandbox/Dockerfile`) ships node; `python:3.12-slim` does not, and a refusal that keyed on
+# "is this the default image" would, the day the default changed, go on refusing a path that had
+# started working. MEASURED on python:3.12-slim: python, sh and bash 5.2 are present, node is not.
+_DEFAULT_IMAGE_HAS_NODE = False
+
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
 #: What `kern exec` says when the box it was asked for is not running. Matched rather than inferred
 #: from an exit code, because `exec` reports a MISSING BOX and a workload that exited non-zero through
@@ -4350,7 +4359,12 @@ class Sandbox:
         #
         # An ERROR and not a fault: nothing ran, so there is no run to report on, and this is the
         # same shape as the unsupported-language raise a few lines above.
-        if language == "node" and self.image == _DEFAULT_IMAGE:
+        #
+        # The second half of the condition is `_DEFAULT_IMAGE_HAS_NODE`, not a repetition of the
+        # image name: the reason for this refusal is what the image CONTAINS. When the default
+        # becomes an image that ships node, flipping that flag retires this refusal in one place,
+        # instead of leaving it to refuse a path that has started working.
+        if language == "node" and self.image == _DEFAULT_IMAGE and not _DEFAULT_IMAGE_HAS_NODE:
             raise SandboxError(
                 f"language='node' needs an image that provides node, and this Sandbox is on the "
                 f"default {_DEFAULT_IMAGE!r}, which does not (it provides python, sh and bash). "

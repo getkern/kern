@@ -3197,20 +3197,52 @@ def test_a_failed_setup_keeps_a_workspace_the_caller_supplied(tmp_path):
 
 @integration
 def test_a_missing_interpreter_is_a_typed_fault_naming_the_binary_and_the_image():
-    """`language="node"` on the default image is the case a model hits: the enum advertises three
-    languages and `python:3.12-slim` carries two.
+    """A missing interpreter must not arrive as a bare non-zero exit.
 
     Before this, `_classify` said `startup_failed` and `_spawn` ERASED it, because "box started + a
     kern: marker" is its signal that a workload forged the marker. kern signals started BEFORE it
     execs, so an ENOENT on `execve` lands in exactly that hole and arrived as a bare exit 127 with
-    `fault=None`: indistinguishable from the user's own code failing."""
-    r = kern.run_code("console.log(1)", language="node", image="python:3.12-slim")
+    `fault=None`: indistinguishable from the user's own code failing.
+
+    ON AN IMAGE THE CALLER NAMED, which is the only shape that still reaches the box: the DEFAULT
+    image is refused before a box starts (the test below owns that case), because there the binding
+    already knows the answer. `alpine:3.19` has no node and is not the default, so this still
+    exercises the classifier this test is about."""
+    r = kern.run_code("console.log(1)", language="node", image="alpine:3.19")
     assert r.exit_code == 127
     assert r.fault is not None, "a missing interpreter must not arrive as an ordinary non-zero exit"
     assert r.fault.type == "exec_failed"
-    assert "node" in r.fault.message and "python:3.12-slim" in r.fault.message
+    assert "node" in r.fault.message and "alpine:3.19" in r.fault.message
     assert "No such file or directory" in r.fault.message
+    # THE REMEDY TRAVELS WITH THE FACT: a caller just told their image lacks node still has to guess
+    # which image has it. Same assertion as the Node binding's copy of this test.
+    assert "node:22-slim" in r.fault.message
     assert not r.success
+
+
+@integration
+def test_node_on_the_default_image_is_refused_before_a_box_is_started():
+    """MEASURED on python:3.12-slim: three of the four languages the enum advertises run there
+    (python, sh, bash 5.2) and node does not. That is a fact the binding holds about its OWN default,
+    so paying a box start to rediscover it - and answering with a fault, as if the outcome had been
+    uncertain - is the wrong shape.
+
+    ⚠️ WHY THIS TEST WAS MISSING, AND WHAT IT COST. The refusal shipped with the Node binding's two
+    tests and NEITHER of the Python pair: the test above still expected the FAULT on the default
+    image, and it was `@integration`, so the run that signed the commit off skipped it and reported
+    "433 passed / 122 skipped". ⛔ 122 skipped is not green, it is unmeasured, and the skip count was
+    the signal. `@integration` here is honest and not a workaround: `__enter__` validates the binary
+    before anything else, so this cannot be reached without one (verified: with `KERN_BIN` pointing
+    at a missing file, the context manager raises first and the refusal is never consulted)."""
+    with Sandbox() as sb:
+        with pytest.raises(SandboxError) as e:
+            sb.run_code("console.log(1)", language="node")
+    msg = str(e.value)
+    assert "python:3.12-slim" in msg, msg
+    assert "node:22-slim" in msg, msg  # the remedy, as above
+    # And an image the caller NAMED is NOT refused on a guess: that case has to reach the box, which
+    # is what the test above measures. Asserted here so the refusal cannot quietly widen.
+    assert Sandbox(image="alpine:3.19").image == "alpine:3.19"
 
 
 @integration

@@ -45,6 +45,13 @@ const { spawn, spawnSync } = require("child_process");
 const VERSION = "0.2.40";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
+// WHAT THE DEFAULT IMAGE CONTAINS, as a fact ABOUT THE IMAGE and not about its name. It drives the
+// node refusal below and sits here so that changing DEFAULT_IMAGE forces a decision about it in the
+// same edit: the batteries-included image this repo builds (`images/sandbox/Dockerfile`) ships node,
+// `python:3.12-slim` does not, and a refusal keyed on "is this the default image" would go on
+// refusing a path that had started working the day the default changed. Same spelling, same reason,
+// as `_DEFAULT_IMAGE_HAS_NODE` in the Python binding.
+const DEFAULT_IMAGE_HAS_NODE = false;
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
 // What `kern exec` says when the box it was asked for is not running. Matched rather than inferred
 // from an exit code, because `exec` reports a MISSING BOX and a workload that exited non-zero through
@@ -3634,7 +3641,7 @@ class Sandbox {
     // it, and refusing on a guess would be inventing a measurement; that case still reaches the box.
     // Kept identical to the Python binding, which has the same check for the same reason: the two
     // are one API with two spellings, and a divergence here is a divergence in the product.
-    if (language === "node" && this.image === DEFAULT_IMAGE) {
+    if (language === "node" && this.image === DEFAULT_IMAGE && !DEFAULT_IMAGE_HAS_NODE) {
       throw new SandboxError(
         `language='node' needs an image that provides node, and this Sandbox is on the default ` +
           `${JSON.stringify(DEFAULT_IMAGE)}, which does not (it provides python, sh and bash). ` +
