@@ -16,19 +16,16 @@ package that no longer exists passes this gate and fails a build. The check is t
 still a recipe kern can execute, not that the world it reaches out to is unchanged.
 """
 
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kernbin  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def kern_binary() -> Path | None:
-    """The release binary, or `None`. A gate that silently used a DEBUG build would be reporting on
-    a binary nobody ships."""
-    p = ROOT / "target" / "release" / "kern"
-    return p if p.exists() else None
 
 
 def tracked_dockerfiles() -> list[Path]:
@@ -45,15 +42,22 @@ def tracked_dockerfiles() -> list[Path]:
 
 
 def main() -> int:
-    kern = kern_binary()
+    # Release OR debug, whichever represents this tree: see `kernbin.pick` for why release-only made
+    # this gate skip on every CI runner.
+    kern, stale = kernbin.pick(ROOT)
     files = tracked_dockerfiles()
     if not files:
         print("  no tracked Dockerfile found, nothing to check")
         return 0
-    if kern is None:
-        print(f"  SKIP  target/release/kern is not built ({len(files)} file(s) unchecked): "
-              "cargo build --release -p getkern")
+    if kern is None and not stale:
+        print(f"  SKIP  no kern binary is built ({len(files)} file(s) unchecked): "
+              "cargo build -p getkern")
         return 0
+    if kern is None:
+        print("  no kern binary represents this working tree:")
+        for why in stale:
+            print(f"    {why}")
+        return 2
 
     # THE COUNT COMES FROM kern's OWN SUMMARY LINE, not from counting the lines above it:
     # "2 stages, 10 instructions kern acts on, 0 it does not". Counting `dropped` lines myself was

@@ -152,3 +152,34 @@ def require_current(kern, root="."):
         return 0
     print(why, file=sys.stderr)
     return 2
+
+
+def pick(root="."):
+    """The binary a GATE should run: the first of release and debug that exists AND represents this
+    working tree.
+
+    Returns `(binary, reasons_the_others_were_rejected)`. `(None, [])` means nobody has built, which
+    is a skip and not a failure: a checkout that has not built a binary should not report a red gate
+    for a missing artefact. `(None, [why, ...])` means a binary exists and is NOT this tree, which is
+    a failure - a green from a binary that predates the change decides nothing.
+
+    IT USED TO PREFER RELEASE, in two gates, and that is how two defects arrived. `compose-corpus`
+    kept grading a release binary from before the change, because every edit-and-check cycle here
+    builds debug: caught with the release binary a whole commit behind `HEAD` and an mtime that
+    looked fresh. `dockerfiles` took ONLY release, so on a CI runner, which builds debug for its tests,
+    it skipped and exited 0, and `gates-selftest` there reported it "stayed GREEN" on both of its
+    injected violations. Debug and release run the same parser; what matters is the tree.
+    """
+    import os
+
+    root = pathlib.Path(root)
+    stale = []
+    for rel in ("target/release/kern", "target/debug/kern"):
+        p = root / rel
+        if not (p.is_file() and os.access(p, os.X_OK)):
+            continue
+        why = why_not_current(str(p), root)
+        if why is None:
+            return p, stale
+        stale.append(why)
+    return None, stale
