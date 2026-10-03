@@ -47,6 +47,25 @@ privilege-escalation bug is an escape.
   code from strangers sharing one host, and a hardware-virtualization boundary is worth the startup
   cost.
 
+## Credentials and network in the sandbox SDK
+The SDK (`kern-sandbox`, and the MCP server built on it) runs code an agent wrote. That is two
+threats, and the defence against the first does not cover the second.
+
+- **A compromised dependency** is contained by the filesystem and the network: no network unless
+  asked, a read-only root, and only the host paths you name. A `setup=` step gets the network for
+  that step alone, in its own box, and what it installs is mounted read-only into every later call.
+- **A prompt-injected agent** runs exactly the code it was asked to run, so containment does not
+  help. The defence is that credentials are never in the box: mounts over the host's own
+  directories, kern's own state and 17 credential directories by name (`.ssh`, `.aws`, `.kube`,
+  `.gnupg`, `.netrc`, `.npmrc`, `.git-credentials` and the rest, plus `~/.config/gh` and
+  `~/.config/gcloud`) are refused, with no opt-out, and the box does not inherit the caller's
+  environment: only what `env=` passes reaches it.
+
+The network has three settings. None is the default. `egress_allow=[...]` opens the named hosts and
+nothing else, through an isolated network namespace and kern's filtering proxy. `network=True` shares
+the host network, the host's loopback and the services on it included. For code from strangers on
+shared hardware, see [kern or a microVM](#kern-or-a-microvm).
+
 ## What is enforced now
 - **Namespaces**: user, PID, network (loopback-only), UTS, IPC and mount.
 

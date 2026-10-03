@@ -101,6 +101,22 @@ gVisor. kern is honest about this in [SECURITY.md](../SECURITY.md) before it mak
 is semi-trusted or your-own code: CI, build steps, dev sandboxes, an agent's tool-calls under your
 supervision.
 
+## How do my SSH keys and cloud credentials stay out of the sandbox?
+
+They are never in it. Mounts over `~/.ssh`, `~/.aws`, `~/.kube`, `~/.gnupg` and the other credential
+directories are refused, with no opt-out; the box does not inherit your environment, only what you pass
+with `env=`; and there is no network unless you open it. The two threats this separates, a compromised
+dependency and a prompt-injected agent, are in
+[SECURITY.md](../SECURITY.md#credentials-and-network-in-the-sandbox-sdk).
+
+## Isn't a fresh container per tool-call slow?
+
+Not at this cost: one call measured at about a twentieth of `docker run --rm`, and most of what is left
+is CPython starting inside the box. The SDK hides even that two ways: a prewarm pool starts the next box
+before it is asked for, and `Sandbox.kernel()` keeps one interpreter warm across cells, so the start is
+paid once and in-memory state carries over. The method and the numbers are in
+[BENCHMARKS.md](../BENCHMARKS.md).
+
 ## Why does `kern --version` print `0.0.0` from a source build?
 
 By design. The source is version-free (no stale number lives in git); the version lives in the git tag
