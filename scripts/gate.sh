@@ -25,7 +25,17 @@ step() {
     printf '  %-34s ' "$1"
     shift
     if "$@" >/tmp/gate.$$ 2>&1; then
-        echo ok
+        # A STEP THAT SKIPPED IS NOT A STEP THAT PASSED. Several steps skip with a reason when this
+        # host lacks an input (no corpus, no release binary, an image nobody built), exit 0 as they
+        # should, and were printed here as a bare `ok`: on a fresh clone the gate read "compose-corpus
+        # ok" over a step that checked nothing. Their skip lines are shown with the count.
+        n=$(grep -cE '^[[:space:]]*SKIP\b' /tmp/gate.$$ || true)
+        if [ "$n" -gt 0 ]; then
+            echo "ok, $n SKIP"
+            grep -E '^[[:space:]]*SKIP\b' /tmp/gate.$$ | head -3 | sed 's/^[[:space:]]*/      /'
+        else
+            echo ok
+        fi
     else
         echo FAILED
         tail -12 /tmp/gate.$$ | sed 's/^/      /'
