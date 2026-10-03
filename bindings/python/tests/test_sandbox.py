@@ -206,6 +206,30 @@ def test_both_bindings_validate_an_apparmor_name_identically():
     )
 
 
+def _node_that_loads_the_binding() -> str:
+    """The `node` that can load `bindings/node/index.js`, or a skip that says why there is none.
+
+    `shutil.which("node")` answered a narrower question than these tests ask. MEASURED on a Jetson
+    (Ubuntu 22.04): the apt `node` is v12.22.9, the binding declares `engines.node >=18` and uses
+    `??`, so three parity tests FAILED on a SyntaxError inside `index.js` - a runtime older than the
+    package supports, not a divergence between the bindings. The floor is read from `package.json`
+    rather than copied here; if that file cannot be read the version is not used to skip."""
+    node = shutil.which("node")
+    src = Path(__file__).resolve().parents[2] / "node"
+    if node is None or not (src / "index.js").is_file():
+        pytest.skip("node runtime or Node source unavailable")
+    try:
+        need = json.loads((src / "package.json").read_text(encoding="utf-8"))["engines"]["node"]
+        floor = int(re.search(r"(\d+)", need).group(1))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return node
+    shown = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
+    have = re.match(r"v(\d+)", shown)
+    if not have or int(have.group(1)) < floor:
+        pytest.skip(f"node {shown or '(no version)'} is older than the binding's engines.node {need!r}")
+    return node
+
+
 def test_both_bindings_produce_THE_SAME_tmpfs_argv_for_one_corpus():
     """The tmpfs policy is now written twice: a default constant, a size gate, a target gate, a zero
     sentinel and a setup-box exclusion, in Python and again in Node. Duplicated policy drifts, and the
@@ -220,10 +244,8 @@ def test_both_bindings_produce_THE_SAME_tmpfs_argv_for_one_corpus():
     import shutil
     import subprocess
 
-    node_bin = shutil.which("node")
+    node_bin = _node_that_loads_the_binding()
     node_src = Path(__file__).resolve().parents[3] / "bindings" / "node" / "index.js"
-    if node_bin is None or not node_src.is_file():
-        pytest.skip("node runtime or Node source unavailable")
 
     here = str(Path(__file__).resolve().parent)
     null_ = None  # spelled once, so the two halves of a row read as the same value
@@ -299,10 +321,8 @@ def test_both_bindings_agree_on_every_apparmor_input_behaviourally():
     import shutil
     import subprocess
 
-    node_bin = shutil.which("node")
+    node_bin = _node_that_loads_the_binding()
     node_src = Path(__file__).resolve().parents[3] / "bindings" / "node" / "index.js"
-    if node_bin is None or not node_src.is_file():
-        pytest.skip("node runtime or Node source unavailable")
 
     vectors = [
         "kern-box", "unconfined", "docker-default", "lxc-container-default", "a.b_c-1", "A", "x" * 128,
@@ -3502,7 +3522,9 @@ def test_both_bindings_carry_A_BYTE_IDENTICAL_kernel_driver():
     # failed where node is absent: a missing toolchain is not a divergence.
     node = shutil.which("node")
     if node is None:
-        return
+        # A SKIP, NOT A RETURN: a bare `return` reported this test PASSED with the JS half never
+        # run. The source comparison above did run, and the skip says which half did not.
+        pytest.skip("node is not installed: the source drivers match, the JS evaluation did not run")
     script = (
         "const fs=require('fs');"
         "const src=fs.readFileSync(process.argv[1],'utf8');"
@@ -3641,6 +3663,27 @@ def test_every_python_path_sees_the_same_sys_path_and_the_image_packages(tmp_pat
     assert origins["cold"].get("pip"), "positive control: pip must resolve at all, or this proves nothing"
 
 
+def _host_cannot_map_a_uid_range() -> "str | None":
+    """Why this host cannot give a box a uid RANGE, or None when it can. The same requirement kern
+    states when it refuses (`newuidmap`/`newgidmap` plus an `/etc/subuid` and `/etc/subgid`
+    allocation for this user), checked here on its own."""
+    import pwd
+
+    for tool in ("newuidmap", "newgidmap"):
+        if not shutil.which(tool):
+            return f"{tool} is not installed"
+    me = {str(os.getuid()), pwd.getpwuid(os.getuid()).pw_name}
+    for table in ("/etc/subuid", "/etc/subgid"):
+        try:
+            with open(table, encoding="utf-8") as fh:
+                owners = {line.split(":", 1)[0] for line in fh if line.strip()}
+        except OSError as e:
+            return f"{table} cannot be read ({e.strerror})"
+        if not owners & me:
+            return f"{table} has no allocation for {sorted(me)}"
+    return None
+
+
 @integration
 def test_no_new_privs_is_what_makes_a_setuid_binary_inert_in_a_box(tmp_path):
     """The guard that actually holds, asserted so the reasoning elsewhere can point at it.
@@ -3673,6 +3716,14 @@ def test_no_new_privs_is_what_makes_a_setuid_binary_inert_in_a_box(tmp_path):
     # The SDK exposes neither `--user` nor `--uid-range` (both are open 0.2 decisions), so the second
     # box is driven straight through the CLI. That is the configuration where the setuid bit would
     # bite if anything let it: a uid RANGE is mapped and the workload is NOT uid 0.
+    #
+    # It needs a host that CAN map a uid range, asked of the host and not read from this box's
+    # failure: a regression that broke the mapping on a capable host must stay red. MEASURED on a VPS
+    # as root with `newuidmap` installed and no `/etc/subuid` line: kern refused with "cannot drop to
+    # the target uid - it isn't mapped into the box", and this test failed on a premise.
+    why = _host_cannot_map_a_uid_range()
+    if why:
+        pytest.skip(f"the second box needs a uid range and this host cannot map one: {why}")
     out = subprocess.run(
         [kern_bin, "box", f"nnp-{uuid.uuid4().hex[:8]}", "--image", "alpine", "--uid-range",
          "--user", "1000", "-v", f"{ws}:/w", "--quiet", "--", "sh", "-c", "id -u; /w/id -u"],
@@ -5188,9 +5239,7 @@ def test_pyc_identity_is_the_same_in_both_bindings(tmp_path, monkeypatch):
     They key it the same way, so a disagreement would have one binding discard and rebuild what the
     other had just published, forever, on any host that uses both.
     """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node is not installed")
+    node = _node_that_loads_the_binding()
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     img = "python:3.12-slim"
     images = tmp_path / "kern" / "images"

@@ -119,6 +119,13 @@ def _make_venv(env_dir: Path) -> Path:
     and a relocatable build (uv's) then cannot find its standard library: measured, `No module named
     'encodings'`. The resolved path is the interpreter itself on every version."""
     base = os.path.realpath(getattr(sys, "_base_executable", "") or sys.executable)
+    # A HOST THAT CANNOT MAKE A VENV WITH PIP is a host capability, asked of the interpreter on its
+    # own and not inferred from the venv failing. MEASURED on Ubuntu 24.04 as root without
+    # `python3-venv`: `python3 -m venv` exits 1 because `ensurepip` is absent, and these tests ERRORED
+    # there - three at setup and one failed - over a missing package and not over a wheel.
+    if subprocess.run([base, "-m", "ensurepip", "--version"], capture_output=True).returncode != 0:
+        pytest.skip(f"{base} has no ensurepip, so it cannot make a venv with pip "
+                    "(Debian/Ubuntu: the python3-venv package)")
     subprocess.run([base, "-m", "venv", str(env_dir)], check=True)
     return env_dir / "bin" / "python"
 
