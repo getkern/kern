@@ -4183,9 +4183,22 @@ mod image_defaults_tests {
         // Process-global env (`KERN_GATE_FD`) - serialize with every other env-mutating test.
         let _g = crate::env_guard();
 
+        // `pipe2(O_CLOEXEC)` AND NOT `pipe()`, because this test's verdict is POLLHUP and POLLHUP is
+        // a statement about the whole PROCESS TABLE, not about this thread.
+        //
+        // 🪤 MEASURED: with a bare `pipe()` this test failed 3 times in 20 runs of the binary under
+        // load, always at the `Some(false)` below, always `Some(true)`. `Some(true)` with no POLLIN
+        // means POLLHUP was ABSENT, which means the write end was still open somewhere - and it was:
+        // sibling tests in this same binary spawn processes (`Command::new(self_exe)` in the compose
+        // tests, `cp`, `systemctl`), so a fork between `pipe()` and `drop(wr)` hands the child an
+        // inherited copy of the write end. Dropping our own copy then leaves the pipe with a living
+        // writer, so the kernel is right and the test was wrong. `O_CLOEXEC` makes the inherited
+        // copy vanish at the child's `execvp`, which is what line 4045 of this file already does
+        // for the same reason. The production readiness pipe near line 3412 deliberately does NOT
+        // set it: there the child is MEANT to inherit the write end.
         fn pipe() -> (OwnedFd, OwnedFd) {
             let mut fds = [0 as libc::c_int; 2];
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
             unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
         }
         fn ask(rd: &OwnedFd) -> Option<bool> {

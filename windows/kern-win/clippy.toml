@@ -1,0 +1,21 @@
+# THE ROOT `clippy.toml` DOES NOT APPLY TO THIS CRATE, AND SAYING SO IS THE POINT OF THIS FILE.
+#
+# Clippy walks up from a crate root and uses the FIRST config it finds, with no merging. Without this
+# file the repository-root one applies here by directory ancestry alone, and its `disallowed-methods`
+# forbids `std::env::var` with the reason "use crate::global_env, which witnesses TEST_ENV_LOCK in a
+# test build".
+#
+# WHY THAT RULE CANNOT APPLY HERE, rather than "it is inconvenient":
+#
+#   * `crate::global_env` is a `kern-cli` item. It does not exist in this crate, so the lint's
+#     prescribed remedy is unreachable and the lint can only ever be suppressed, never satisfied.
+#   * The rule exists because `kern-cli`'s TESTS ARE THREADS IN ONE PROCESS sharing one environment
+#     table, so one test reading a variable a sibling is mid-write is a real race. This crate is a
+#     single-shot forwarder: it reads `LOCALAPPDATA` and `KERN_WSL_DISTRO` once, before any work,
+#     writes neither, and its tests are pure functions that touch no environment at all.
+#
+# ⛔ THIS FILE IS WATCHED. `scripts/test-env-lock.py` fails if a `clippy.toml` outside the repository
+# root is not declared there with its reason: a per-directory config is the quietest way to disarm a
+# lint for a whole subtree, and the gate already refuses that when it is spelled as an `allow`
+# attribute. The empty list below is deliberate and must stay auditable, not convenient.
+disallowed-methods = []
