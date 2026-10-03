@@ -378,11 +378,25 @@ def check_no_gate_writes(failures: list[str], keep: Path) -> None:
         wrote = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
         if not wrote:
             continue
+        # ⛔ WHAT IS UNDONE IS KEPT FIRST. "This gate wrote the file" is an inference, and the other
+        # explanation is a person editing while the gate ran. MEASURED: two test files edited during
+        # a `gate.sh` run were blamed on `readme-blocks` and `wiring-cost`, put back to HEAD with the
+        # `git checkout` below, and the edits were gone with no copy anywhere. The copy is named in
+        # the failure and the directory holding it is not deleted at the end.
+        aside: list[str] = []
+        for rel in wrote:
+            target = REPO / rel
+            if target.is_file():
+                dst = keep / f"undone-{len(list(keep.glob('undone-*'))):03d}-{target.name}"
+                dst.write_bytes(target.read_bytes())
+                aside.append(str(dst))
         failures.append(
             f"{gate}: run with no argument, it MODIFIED the tree instead of checking it.\n"
             f"      {', '.join(wrote)}\n"
             "      A gate reads. Put the writing behind an explicit flag, and leave the bare\n"
-            "      invocation as the check, because bare is what a sweep and a habit will use."
+            "      invocation as the check, because bare is what a sweep and a habit will use.\n"
+            "      If YOU edited these while the gates ran, your version is kept at:\n"
+            + "".join(f"        {a}\n" for a in aside)
         )
         for rel in wrote:
             # The same timestamp reasoning as the mutation loop below: a file put back the way it
@@ -486,7 +500,10 @@ def main(argv: list[str]) -> int:
         for ln in sorted(leaked):
             print(f"    {ln}")
         return 1
-    shutil.rmtree(backup, ignore_errors=True)
+    if any(backup.glob("undone-*")):
+        print(f"gates-selftest: content a write-check undid is kept in {backup}")
+    else:
+        shutil.rmtree(backup, ignore_errors=True)
 
     if failures:
         print(f"\n{len(failures)} gate case{'' if len(failures) == 1 else 's'} did not hold:\n")
