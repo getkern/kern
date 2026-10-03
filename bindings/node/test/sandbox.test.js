@@ -3411,6 +3411,44 @@ test(
       fs.writeFileSync(toml, SMALL);
       assert.strictEqual(await fp(), small, "the same definition must give the same fingerprint");
 
+      // AND A DEVICE GRANT, which the first version of this fix did not cover: kern's
+      // `--show-config` printed the cgroup numbers a `vcpu:` profile yields and nothing a `vgpio:`
+      // profile yields, so two device grants under one token gave ONE fingerprint and this test,
+      // which only exercised `vcpu:`, stayed green. `/dev/null` and `/dev/zero` because a CI runner
+      // has no serial port and a device that does not exist is dropped before it is printed.
+      //
+      // TWO BRANCHES, BOTH REAL ASSERTIONS, because the protection depends on the kern this binding
+      // is paired with and the published package has shipped an older one. A kern that prints
+      // `devices:` must give two grants two fingerprints; a kern that does not must be REFUSED, never
+      // hashed around. Neither branch passes vacuously: an old kern that is not refused lands in the
+      // first branch and collides, and a new kern that collides fails it too.
+      const fpDev = () =>
+        new Sandbox({ workspace: ws, name: "prof", persist: true, profiles: ["vgpio:dev"] })
+          ._residentFingerprint();
+      fs.writeFileSync(toml, '[[vgpio]]\nname = "dev"\nbackend = "host"\nextra = ["/dev/null"]\n');
+      const probeKern = new Sandbox({ workspace: ws, name: "prof", persist: true })._kern;
+      const shown = spawnSync(
+        probeKern,
+        ["box", "p", "--image", "x", "--show-config", "vgpio:dev", "--", "/bin/true"],
+        { encoding: "utf8", timeout: 60000 },
+      );
+      const describes = (shown.stdout || "").split("\n").some((l) => l.startsWith("devices:"));
+      if (describes) {
+        const devOne = await fpDev();
+        fs.writeFileSync(
+          toml,
+          '[[vgpio]]\nname = "dev"\nbackend = "host"\nextra = ["/dev/null", "/dev/zero"]\n',
+        );
+        const devTwo = await fpDev();
+        assert.notStrictEqual(devOne, devTwo, "a different DEVICE GRANT must be a different posture");
+      } else {
+        await assert.rejects(fpDev, (e) => {
+          assert.ok(e instanceof SandboxError, `expected a SandboxError, got ${e}`);
+          assert.match(e.message, /cannot describe what a vgpio/);
+          return true;
+        });
+      }
+
       // FAIL CLOSED: a token that does not resolve is refused, not hashed around.
       await assert.rejects(
         () =>
@@ -3433,6 +3471,41 @@ test(
     }
   },
 );
+
+test("the pool steps aside when the posture cannot be known", async () => {
+  // THE POOL IS AN OPTIMISATION, SO WHEN IT CANNOT VOUCH FOR A BOX IT GETS OUT OF THE WAY.
+  // `_key` throws when a profile's resolution cannot be asked of kern - a probe failure, or a kern
+  // too old to print what a `vgpio:` profile grants. The resident path is right to throw on that.
+  // The pool used to throw too, which turned "I cannot vouch for a warm box" into "this call
+  // fails": the wrong failure to choose. A fresh box is built from the live argv and has the right
+  // posture by construction, so null (the cold path) loses nothing but speed. Mirrors
+  // `test_the_pool_steps_aside_when_the_posture_cannot_be_known`.
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  try {
+    const sb = new Sandbox();
+    sb._ws = os.tmpdir();
+    const pool = new kern._WarmPool(sb, 1);
+    sb._postureMaterial = async () => {
+      throw new SandboxError("the posture cannot be determined");
+    };
+    assert.strictEqual(
+      await pool.claim({ network: false, deadlineS: 30 }),
+      null,
+      "the pool must step aside, not throw",
+    );
+    // The control: an error that is NOT about knowing the posture is not swallowed. Stepping aside
+    // is for "I cannot vouch", not for every exception the key path might throw.
+    sb._postureMaterial = async () => {
+      throw new TypeError("a bug, not a posture question");
+    };
+    await assert.rejects(() => pool.claim({ network: false, deadlineS: 30 }), TypeError);
+    await pool.close();
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
+});
 
 test(
   "the prewarm pool key is the same posture as the resident fingerprint",

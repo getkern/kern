@@ -4432,6 +4432,38 @@ def test_the_resident_posture_includes_the_kern_env_that_builds_the_box():
         assert with_var == base, "KERN_BIN is already represented by argv[0] and must not be hashed"
 
 
+def test_the_pool_steps_aside_when_the_posture_cannot_be_known():
+    """THE POOL IS AN OPTIMISATION, SO WHEN IT CANNOT VOUCH FOR A BOX IT GETS OUT OF THE WAY.
+
+    `_key` raises when a profile's resolution cannot be asked of kern - a probe failure, or a kern
+    too old to print what a `vgpio:` profile grants. The resident path is right to raise on that:
+    adopting a box whose posture it cannot read is the defect it exists to prevent. The pool used to
+    raise too, which turned "I cannot vouch for a warm box" into "this call fails": the wrong failure
+    to choose. A fresh box is built from the live argv and has
+    the right posture by construction, so returning None (the cold path) loses nothing but speed.
+
+    No binary needed: the posture is made to fail directly, which is the only thing under test.
+    """
+    sb = _cfg()
+    sb._ws = "/tmp"
+    pool = kern._WarmPool(sb, 1)
+
+    def cannot_know(**_kw):
+        raise SandboxError("the posture cannot be determined")
+
+    sb._posture_material = cannot_know
+    assert pool.claim(network=False, deadline=30) is None, "the pool must step aside, not raise"
+
+    # The control: an error that is NOT about knowing the posture is not swallowed. Stepping aside is
+    # for "I cannot vouch", not for every exception the key path might throw.
+    def broken(**_kw):
+        raise RuntimeError("a bug, not a posture question")
+
+    sb._posture_material = broken
+    with pytest.raises(RuntimeError):
+        pool.claim(network=False, deadline=30)
+
+
 @integration
 def test_the_prewarm_pool_key_is_the_same_posture_as_the_resident_fingerprint():
     """A POOL IS ADOPTION UNDER ANOTHER NAME, and it had the hole the fingerprint had just lost.
@@ -4533,6 +4565,36 @@ def test_what_a_profile_token_resolves_to_is_part_of_the_resident_posture():
             toml.write_text('[[vcpu]]\nname = "agent"\nbackend = "host"\n'
                             'cpus = 1.0\nmemory = "128M"\n')
             assert fingerprint() == small, "the same definition must give the same fingerprint"
+
+            # ⛔ AND A DEVICE GRANT, which the first version of this fix did NOT cover. The probe asks
+            # kern's `--show-config`, and that printed what a `vcpu:` profile yields (memory, cpus) and
+            # nothing a `vgpio:` profile yields - so two different device grants under one token gave
+            # ONE fingerprint, measured, and this test only exercised `vcpu:` and stayed green. kern
+            # prints `devices:` now. `/dev/null` and `/dev/zero` because a CI runner has no serial
+            # port, and a device that does not exist is dropped from the grant before it is printed.
+            #
+            # ⭐ TWO BRANCHES, BOTH REAL ASSERTIONS, because the protection depends on the kern this
+            # binding is paired with and the published wheel has shipped an older one. A kern that
+            # prints `devices:` must give two grants two fingerprints; a kern that does not must be
+            # REFUSED, never hashed around. Neither branch can pass vacuously: an old kern that is not
+            # refused lands in the first branch and collides; a new kern that collides fails it too.
+            toml.write_text('[[vgpio]]\nname = "dev"\nbackend = "host"\nextra = ["/dev/null"]\n')
+            probe_sb = Sandbox(workspace=ws, name="prof", persist=True, profiles=["vgpio:dev"])
+            shown = subprocess.run(
+                [probe_sb._kern, "box", "p", "--image", "x", "--show-config", "vgpio:dev",
+                 "--", "/bin/true"], capture_output=True, text=True, timeout=60,
+            )
+            describes = any(line.startswith("devices:") for line in shown.stdout.splitlines())
+            if describes:
+                fp_one = probe_sb._resident_fingerprint()
+                toml.write_text('[[vgpio]]\nname = "dev"\nbackend = "host"\n'
+                                'extra = ["/dev/null", "/dev/zero"]\n')
+                fp_two = Sandbox(workspace=ws, name="prof", persist=True,
+                                 profiles=["vgpio:dev"])._resident_fingerprint()
+                assert fp_one != fp_two, "a different DEVICE GRANT must be a different posture"
+            else:
+                with pytest.raises(SandboxError, match="cannot describe what a vgpio"):
+                    probe_sb._resident_fingerprint()
 
             # FAIL CLOSED: a token that does not resolve is refused, not hashed around. A fallback to
             # the argv-only hash here would reopen the hole this test is about.

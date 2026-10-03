@@ -2526,8 +2526,8 @@ class Sandbox {
 
   // EVERYTHING THAT DETERMINES WHAT A BOX IS, as one string, spelled ONCE.
   //
-  // 🚨 THIS EXISTS BECAUSE THE SAME HOLE WAS FOUND TWICE. An outside review found the resident
-  // fingerprint omitted the `KERN_*` environment, then that it omitted what a `vcpu:`/`vgpio:` token
+  // 🚨 THIS EXISTS BECAUSE THE SAME HOLE WAS FOUND TWICE. First the resident fingerprint was found
+  // to omit the `KERN_*` environment, then to omit what a `vcpu:`/`vgpio:` token
   // RESOLVES to. Both were fixed in the fingerprint - and the prewarm pool's key, which is the same
   // question asked by a different mechanism, kept the second hole. Measured in the Python binding:
   // with `profiles: ["vcpu:agent"]` and the definition changed from `cpus=1, memory="128M"` to
@@ -2587,6 +2587,20 @@ class Sandbox {
           `the resource profiles ${JSON.stringify(this.profiles || [])} do not resolve, so the ` +
             `resident sandbox posture cannot be compared: ` +
             `${(shown.stderr || shown.stdout || "").trim().slice(0, 300)}`,
+        );
+      // ⛔ A kern TOO OLD TO DESCRIBE A GRANT IS REFUSED, not hashed around. Before the device and
+      // disk lines existed, `--show-config` printed what a `vcpu:` profile yields and nothing a
+      // `vgpio:`/`vdisk:` profile yields, so two device grants under one token gave one fingerprint.
+      // The fix lives in kern, so this binding is only protected when paired with a kern that has
+      // it. With a `vgpio:`/`vdisk:` token and no `devices:` line the posture cannot be known.
+      // `vcpu:` alone is not refused: memory and cpus have always been printed.
+      const grants = this._profileArgs.some((t) => ["vgpio", "vdisk"].includes(t.split(":")[0]));
+      if (grants && !shown.stdout.split("\n").some((l) => l.startsWith("devices:")))
+        throw new SandboxError(
+          `the kern at ${this._kern} cannot describe what a vgpio:/vdisk: profile grants ` +
+            `(its --show-config prints no \`devices:\` line), so a box built earlier cannot be ` +
+            `matched to this posture and is not reused. Upgrade kern to a version that prints the ` +
+            `granted devices`,
         );
       material += `\u0000\u0000${shown.stdout}`;
     }
@@ -4794,7 +4808,18 @@ class WarmPool {
 
   async claim({ network, deadlineS }) {
     if (this._closed || this._size <= 0) return null;
-    const key = await this._key(network);
+    // THE POOL STEPS ASIDE WHEN THE POSTURE CANNOT BE KNOWN; it does not fail the call. `_key`
+    // throws when a profile cannot be resolved or kern is too old to print a `vgpio:` grant. The
+    // resident path is right to throw on that; the pool is an optimisation, and the call it would
+    // have served can always start a fresh box from the live argv, which has the right posture by
+    // construction. Same decision, same reason, as the Python binding.
+    let key;
+    try {
+      key = await this._key(network);
+    } catch (e) {
+      if (e instanceof SandboxError) return null;
+      throw e;
+    }
     let picked = null;
     const keep = [];
     const stale = [];

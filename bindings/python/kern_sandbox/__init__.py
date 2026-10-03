@@ -3034,8 +3034,8 @@ class Sandbox:
     def _posture_material(self, *, network: bool, timeout_s: int) -> str:
         """EVERYTHING THAT DETERMINES WHAT A BOX IS, as one string, spelled ONCE.
 
-        🚨 THIS FUNCTION EXISTS BECAUSE THE SAME HOLE WAS FOUND TWICE. An outside review found that
-        the resident fingerprint omitted the `KERN_*` environment, then that it omitted what a
+        🚨 THIS FUNCTION EXISTS BECAUSE THE SAME HOLE WAS FOUND TWICE. First the resident
+        fingerprint was found to omit the `KERN_*` environment, then to omit what a
         `vcpu:`/`vgpio:` token RESOLVES to. Both were fixed in `_resident_fingerprint` - and the
         prewarm pool's key, which is the same question asked by a different mechanism, was left with
         the second hole. MEASURED: with `profiles=["vcpu:agent"]` and the definition changed from
@@ -3128,6 +3128,27 @@ class Sandbox:
                     f"the resource profiles {list(self.profiles or [])} do not resolve, so the "
                     f"resident sandbox posture cannot be compared: "
                     f"{(shown.stderr or shown.stdout or '').strip()[:300]}"
+                )
+            # ⛔ A kern TOO OLD TO DESCRIBE A GRANT IS REFUSED, not hashed around.
+            #
+            # The device and disk lines are new in `--show-config`: before them it printed what a
+            # `vcpu:` profile yields and NOTHING a `vgpio:` or `vdisk:` profile yields, so two
+            # different device grants under one token produced one fingerprint (measured: one serial
+            # port and two gave byte-identical output). That fix lives in kern, which means this
+            # binding is only protected when paired with a kern that has it - and the published wheel
+            # of this SDK has shipped with an older one. Hashing that kern's output would compute a
+            # posture that silently omits the grant. So with a `vgpio:`/`vdisk:` token and no
+            # `devices:` line, the posture cannot be known, and this says so. `vcpu:` alone is not
+            # refused: memory and cpus have always been printed.
+            grants = any(t.split(":", 1)[0] in ("vgpio", "vdisk") for t in self._profile_args)
+            if grants and not any(
+                line.startswith("devices:") for line in shown.stdout.splitlines()
+            ):
+                raise SandboxError(
+                    f"{self._kern_version or self._kern!s} cannot describe what a vgpio:/vdisk: "
+                    f"profile grants (its --show-config prints no `devices:` line), so a box built "
+                    f"earlier cannot be matched to this posture and is not reused. Upgrade kern to a "
+                    f"version that prints the granted devices"
                 )
             material += "\x00\x00" + shown.stdout
         return material
@@ -5707,7 +5728,20 @@ class _WarmPool:
     def claim(self, *, network: bool, deadline: int) -> "_WarmBox | None":
         if self._closed or self._size <= 0:
             return None
-        key = self._key(network)
+        # 🚨 THE POOL STEPS ASIDE WHEN THE POSTURE CANNOT BE KNOWN; it does not fail the call.
+        #
+        # `_key` raises when a profile's resolution cannot be asked of kern (a probe failure, or a
+        # kern too old to print what a `vgpio:` grants). The resident path is right to raise on that
+        # - adopting a box whose posture it cannot read is the defect it exists to prevent. The pool
+        # is different: it is an OPTIMISATION, and the call it would have served can always start a
+        # fresh box, which is built from the live argv and therefore has the right posture by
+        # construction. Raising here turned "the pool cannot vouch for a warm box" into "this call
+        # fails", which is the wrong failure to choose: no wrong box either way, but only one of the
+        # two keeps working. Returning None is the cold path.
+        try:
+            key = self._key(network)
+        except SandboxError:
+            return None
         stale: "list[_WarmBox]" = []
         picked: "_WarmBox | None" = None
         with self._lock:
