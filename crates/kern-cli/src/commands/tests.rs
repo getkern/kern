@@ -3575,10 +3575,32 @@ mod image_rm_tests {
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o000),
         )
         .unwrap();
-        assert!(
-            std::fs::remove_dir_all(&hard).is_err(),
-            "the premise: a plain remove must fail here, or this test proves nothing"
-        );
+        // THE PREMISE IS GATED ON THE EUID, and as root it is not even ATTEMPTED.
+        //
+        // 🪤 Measured on the VPS, which is root-only: `remove_dir_all` on a mode-000 directory
+        // SUCCEEDS for root (`CAP_DAC_OVERRIDE` walks straight through it), while as uid 1000 it
+        // fails with `PermissionError`. So this assertion failed there and the test reported itself
+        // as proving nothing - which is correct of it, and still a red suite on a legitimate host
+        // shape, which trains people to ignore red.
+        //
+        // ⛔ AND AS ROOT THE CALL CANNOT BE MADE AT ALL: it would SUCCEED, deleting the fixture this
+        // test is about, and everything after it would be asserting against an empty directory. Gated,
+        // not merely unasserted. The gate is `permission_bits_block_unlink` for the reason written at
+        // its definition: the EUID is an independent cause, while probing `remove_dir_all` to decide
+        // whether to trust `remove_dir_all` would make the control vacuous.
+        if crate::commands::tests::permission_bits_block_unlink() {
+            assert!(
+                std::fs::remove_dir_all(&hard).is_err(),
+                "the premise: a plain remove must fail here, or this test proves nothing"
+            );
+        } else {
+            // Said out loud, like the other two root skips in this file: a run that quietly dropped
+            // half a test would be worse than the failure it replaces. What follows is still asserted.
+            eprintln!(
+                "SKIP(partial): running as root, so a 0o000 directory does not block the unlink and \
+                 the positive control cannot be armed; the removal of BOTH volumes is still asserted"
+            );
+        }
 
         let svc = |vol: &str| crate::compose::ComposeBox {
             name: format!("box-{vol}"),
