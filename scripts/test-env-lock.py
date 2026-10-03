@@ -100,9 +100,38 @@ DECLARED_CONFIGS = {
 LINT_TABLE = re.compile(
     r"\[(?:workspace\.)?lints(?:\.clippy)?\]|lints\s*=|rustflags\s*=", re.I
 )
+# THE KEYS IN A CARGO LINT TABLE ARE BARE, and the first version of this pattern missed that.
+#
+# 🪤 Reported by the same outside review that found the table class at all, and MEASURED here, one
+# form at a time, against a planted `std::env::var` with `RUSTFLAGS=-D warnings`:
+#
+#   [lints.clippy] disallowed_methods = "allow"   clippy stops flagging   gate RED    (was caught)
+#   [lints.clippy] all   = "allow"                clippy stops flagging   gate GREEN  (the hole)
+#   [lints.clippy] style = "allow"                clippy stops flagging   gate GREEN  (the hole)
+#   [lints.clippy] style = "warn"                 still flagged           -
+#   [lints.clippy] disallowed_methods = "warn"    still flagged           -
+#   [lints.clippy] correctness = "allow"          still flagged           -
+#
+# So the groups that actually contain this lint are `style` and `all`, measured rather than recalled,
+# and `warn` does not disarm it because `-D warnings` promotes it back. Inside a table the key is
+# `all`, not `clippy::all`, which is why a pattern written for the attribute spelling could not see
+# it. Both spellings are matched now: the bare key for tables, the `clippy::` one for attributes and
+# for rustflags.
+#
+# ⛔ AND ONE PART OF THAT REPORT DID NOT HOLD, measured: `rustflags = ["-A", "clippy::all"]` in a
+# `.cargo/config.toml` does NOT disarm the lint here. An env `RUSTFLAGS` REPLACES the config's
+# rustflags rather than merging with them - the repository's own `.cargo/config.toml` says so in its
+# header - and every path that runs this lint sets `RUSTFLAGS=-D warnings`. The rustflags spelling is
+# still matched below, as a belt for anyone running clippy without that variable, but it is not the
+# hole it was reported to be.
 LINT_OFF = re.compile(
-    r"disallowed_methods\s*=\s*[\"']?(?:allow|warn)|clippy::disallowed_methods|"
-    r"clippy::all\s*=\s*[\"']?allow|clippy::style\s*=\s*[\"']?allow",
+    # The lint itself, by either spelling. `warn` is kept for the bare key: it does not disarm under
+    # `-D warnings`, but a tree that ever drops that flag should not also be carrying this.
+    r"disallowed_methods\s*=\s*[\"']?(?:allow|warn)"
+    r"|clippy::disallowed_methods"
+    # The groups that contain it, bare (a Cargo lint table) or prefixed (an attribute, rustflags).
+    r"|(?<![\w:])(?:all|style)\s*=\s*[\"']?allow"
+    r"|clippy::(?:all|style)",
     re.I,
 )
 # Where a Cargo lint table or a cargo config may legitimately live, with the reason. Empty: nothing

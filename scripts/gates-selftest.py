@@ -253,6 +253,16 @@ CASES: list[Case] = [
     # `cargo clippy` had stopped flagging a planted `std::env::var`. One case per spelling.
     ("test-env-lock", "a Cargo lint table in a member crate", "crates/kern-cli/Cargo.toml",
      append('\n[lints.clippy]\ndisallowed_methods = "allow"\n')),
+    # THE KEYS IN A LINT TABLE ARE BARE, which the first pattern missed: inside `[lints.clippy]` the
+    # group is `all`, not `clippy::all`. Both of these were MEASURED to stop clippy flagging a
+    # planted `std::env::var` while this gate stayed green, and `style` is the group that actually
+    # contains the lint - measured, not recalled. The forms that do NOT disarm it
+    # (`correctness = "allow"`, and any `= "warn"` under `-D warnings`) are deliberately not cases
+    # here: a gate that went red on them would be refusing something that works.
+    ("test-env-lock", "a lint GROUP allowed by its bare key", "crates/kern-cli/Cargo.toml",
+     append('\n[lints.clippy]\nall = "allow"\n')),
+    ("test-env-lock", "the style group, which is the one containing this lint",
+     "crates/kern-cli/Cargo.toml", append('\n[lints.clippy]\nstyle = "allow"\n')),
     ("test-env-lock", "a workspace lint table in the root", "Cargo.toml",
      append('\n[workspace.lints.clippy]\ndisallowed_methods = "allow"\n')),
     # The REAL attack on this one: the flag goes INTO the rustflags array that is already there, not
