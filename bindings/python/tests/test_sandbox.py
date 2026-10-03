@@ -4335,6 +4335,143 @@ def test_a_binary_that_identifies_itself_but_runs_nothing_is_not_a_success():
             os.environ["KERN_BIN"] = prev
 
 
+def test_enforce_limits_is_part_of_the_resident_posture():
+    """A CONTROL THAT NEVER REACHES argv STILL CHANGES WHAT THE BOX IS.
+
+    `enforce_limits` is delivered as `KERN_NO_SCOPE=1` in the spawn's environment, not as a flag, so
+    hashing `_base_argv` alone could not see it. MEASURED before the fix: `memory_mb=128` with
+    enforcement and `memory_mb=128` without produced the SAME fingerprint `cf96122e2a64e200`, while
+    the control (128 against 256 MiB) correctly differed. A box created without scope enforcement
+    could therefore be adopted by a Sandbox asking for it, and the caller told that hard limits were
+    in force over a box that has them best-effort.
+
+    THE FAKE KERN, so this runs in the shape CI sees. The fingerprint is derived from the argv the
+    binding BUILDS, which is what `_cfg` exists for; nothing is executed. An earlier version of this
+    test said "no binary is needed" and constructed a plain `Sandbox`, which was wrong in a way the
+    pre-push gate caught: the CONSTRUCTOR resolves kern and raises when there is none, so the test
+    passed here and failed under `env -u KERN_BIN PATH=/usr/bin:/bin`. Marking it `@integration`
+    would have hidden the property in exactly the run where it is cheapest to check.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as ws:
+        common = dict(workspace=ws, name="posture", persist=True, memory_mb=128)
+        hard = _cfg(**common, enforce_limits=True)._resident_fingerprint()
+        soft = _cfg(**common, enforce_limits=False)._resident_fingerprint()
+        assert hard != soft, "enforcement must be part of the posture, not invisible to it"
+        # The control: a difference that was ALREADY visible must stay visible, so the added term
+        # cannot have swallowed the rest of the posture.
+        bigger = _cfg(
+            workspace=ws, name="posture", persist=True, memory_mb=256, enforce_limits=True
+        )._resident_fingerprint()
+        assert hard != bigger, "memory_mb must still change the fingerprint"
+
+
+@integration
+def test_a_setup_on_a_persistent_sandbox_gets_its_own_network_on_box():
+    """THE SETUP BOX IS SEPARATE, ITS NETWORK IS ON, AND IT DIES - under `persist=True` too.
+
+    MEASURED before the fix, with the one-shot path as the control. The resident box was created
+    BEFORE the setup ran, and `_spawn` routes every call into a resident box once one exists, so:
+
+      * the setup ran via `kern exec` inside a box created with a run_code posture, which is
+        network-OFF. `network=True` was dropped in silence and a connection from inside that box
+        failed with `gaierror`, which means `setup="pip install X"` could not work at all.
+      * `_base_argv` mounts `<workspace>/.deps` read-only for every non-setup box, but only when that
+        directory already exists. It did not yet, so the resident box was created WITHOUT the mount,
+        and `kern exec` does not re-apply mounts: `.deps` stayed writable for the box's whole life
+        while `deps_readonly` (default True) documented the opposite.
+
+    Both halves are asserted here, because fixing the order without excluding `is_setup` from the
+    routing, or the reverse, would leave one of them.
+    """
+    import contextlib
+    import tempfile
+
+    net_probe = (
+        "python3 -c \"import socket; socket.setdefaulttimeout(8); "
+        "socket.create_connection(('pypi.org',443))\" "
+        "&& mkdir -p /workspace/.deps && echo pkg > /workspace/.deps/installed.txt"
+    )
+    with tempfile.TemporaryDirectory() as ws:
+        sb = Sandbox(workspace=ws, name=f"setupnet-{os.getpid()}", persist=True,
+                     persist_ttl_s=300, setup=net_probe)
+        try:
+            with sb as s:
+                # The setup reached the network: it had to resolve and connect before writing this.
+                assert Path(ws, ".deps", "installed.txt").exists(), "the setup had no network"
+                r = s.run_code(
+                    "import os\n"
+                    "try:\n"
+                    "    open('/workspace/.deps/POISON','w').write('x'); print('WRITABLE')\n"
+                    "except OSError as e:\n"
+                    "    print('ro', e.errno)\n"
+                    "print('dep', os.path.exists('/workspace/.deps/installed.txt'))\n"
+                )
+                assert "WRITABLE" not in r.stdout, f".deps must be read-only: {r.stdout!r}"
+                assert "ro 30" in r.stdout, f"expected EROFS: {r.stdout!r}"
+                assert "dep True" in r.stdout, "the setup's deps must be visible to the cell"
+                assert not Path(ws, ".deps", "POISON").exists(), "a cell reached .deps on the host"
+                # And the CELL still has no network, which is the property the setup box exists to
+                # keep exclusive.
+                n = s.run_code(
+                    "import socket\n"
+                    "try:\n"
+                    "    socket.setdefaulttimeout(3); socket.create_connection(('pypi.org',443))\n"
+                    "    print('NET')\n"
+                    "except OSError:\n"
+                    "    print('off')\n"
+                )
+                assert n.stdout.strip() == "off", f"a run_code cell had network: {n.stdout!r}"
+        finally:
+            with contextlib.suppress(Exception):
+                sb.destroy()
+
+
+@integration
+def test_a_silent_cell_in_a_resident_box_is_a_success_not_a_failed_start():
+    """THE MOST ORDINARY CALL AN AGENT MAKES WAS REPORTED AS A SANDBOX THAT NEVER STARTED.
+
+    The guard above refuses a binary that identifies itself and runs nothing, on the invariant that
+    "a kern that ran a box WRITES the started byte". That invariant describes `kern box`, which
+    STARTS a box. A `persist=True` call is `kern exec`, which joins a box already running: it starts
+    nothing, writes no byte, and so `box_started` is False on EVERY resident call and carries no
+    information.
+
+    MEASURED, with the one-shot path as the control: under `persist=True`, `run_code("x = 1")` and
+    `run_code("pass")` came back `exit_code=0, success=False, fault=startup_failed`, while
+    `print(...)` came back clean - the fault depended on whether the cell happened to print. The same
+    silent cells on the one-shot path were `success=True, fault=None`. A cell that computes and
+    prints nothing is most of what an agent runs.
+
+    The anti-stub protection is NOT weakened: a fake binary cannot reach this path, because
+    `_resident_ensure` had to start the box and then confirm it in the registry by its posture label,
+    which a script that prints a version cannot produce. The test above still covers that, and the
+    control at the end of this one asserts the pair are not the same call.
+    """
+    import contextlib
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as ws:
+        sb = Sandbox(workspace=ws, name=f"silent-{os.getpid()}", persist=True, persist_ttl_s=300)
+        try:
+            with sb as s:
+                for code in ("x = 1", "pass", "import os"):
+                    r = s.run_code(code)
+                    assert r.exit_code == 0, f"{code!r} -> {r.exit_code}"
+                    assert r.fault is None, f"{code!r} reported {r.fault.type if r.fault else None}"
+                    assert r.success, f"a silent cell that exited 0 is a success: {code!r}"
+                    assert r.stdout.strip() == ""
+                # A cell that DOES print is unaffected, and a non-zero exit is still not a success:
+                # the narrowing must not have turned the branch into "the resident path never faults".
+                assert s.run_code("print('ciao')").stdout.strip() == "ciao"
+                bad = s.run_code("import sys; sys.exit(3)")
+                assert bad.exit_code == 3 and not bad.success
+        finally:
+            with contextlib.suppress(Exception):
+                sb.destroy()
+
+
 @integration
 def test_a_prewarmed_session_leaves_no_scratch_behind():
     """A PREWARMED SESSION MUST NOT LEAK DIRECTORIES INTO A tmpfs.

@@ -2985,10 +2985,30 @@ class Sandbox:
 
         The box NAME is stripped before hashing - it is the identity, not the posture, and leaving it
         in would make every fingerprint unique and every adoption a mismatch.
+
+        🚨 AND THE CONTROLS THAT NEVER REACH argv ARE ADDED EXPLICITLY, which is not a contradiction
+        of the paragraph above. "Take it from the argv" answers the drift problem for everything that
+        IS a flag. `enforce_limits` is not a flag: it is `KERN_NO_SCOPE=1` in the ENVIRONMENT of the
+        spawn, so it changed whether the caps are kernel-enforced while leaving the argv byte for
+        byte identical.
+
+        MEASURED before this line existed: `Sandbox(memory_mb=128, enforce_limits=True)` and
+        `Sandbox(memory_mb=128, enforce_limits=False)` produced the SAME fingerprint
+        `cf96122e2a64e200`, while the control (128 against 256 MiB) correctly differed. So a box
+        created without scope enforcement could be adopted by a Sandbox asking for enforcement, and
+        the caller would be told hard limits were in force over a box that has them best-effort -
+        exactly the failure the first paragraph is about, through the one door the argv does not see.
+
+        The rule this encodes: anything that changes what the box IS belongs in this hash, and
+        whether it arrives as a flag or as an environment variable is an implementation detail of
+        how it is delivered.
         """
         argv = self._base_argv(
             "", network=self.network, timeout_s=int(self.persist_ttl_s), dry=True
         )
+        # Spelled as a pseudo-flag so it reads like the rest of the material being hashed, and so a
+        # future out-of-argv control is added in the same obvious way.
+        argv = argv + [f"--enforce-limits={int(bool(self.enforce_limits))}"]
         return hashlib.sha256("\x00".join(argv).encode()).hexdigest()[:16]
 
     def _resident_lookup(self) -> "dict | None":
@@ -3051,8 +3071,28 @@ class Sandbox:
             "-d", "--init", "--label", f"{self._CFG_LABEL}={want}",
             "--", "sleep", str(int(self.persist_ttl_s)),
         ]
+        # 🚨 THE ENVIRONMENT IS BUILT, NOT INHERITED, because `enforce_limits` lives in it.
+        #
+        # This call used to be a plain `subprocess.run(argv, ...)` with no `env=`, so the box took
+        # whatever `KERN_NO_SCOPE` happened to be in the ambient environment of whichever process
+        # created it. Two consequences, both silent: `enforce_limits=False` did NOT reach the box
+        # (only `_spawn`'s children got it, which on the resident path are `kern exec` calls and not
+        # the box's own cgroup placement), and a process that merely HAD `KERN_NO_SCOPE=1` exported
+        # created an unenforced box for a Sandbox that had asked for enforcement.
+        #
+        # `_spawn` already builds its child environment from this same field, 100 lines below; this
+        # makes the creation agree with the calls instead of agreeing with the shell.
+        create_env = dict(os.environ)
+        if self.enforce_limits:
+            # An inherited `KERN_NO_SCOPE=1` would otherwise override an explicit request for
+            # enforcement, which is the dangerous direction: the caller asked for the stronger thing.
+            create_env.pop("KERN_NO_SCOPE", None)
+        else:
+            create_env["KERN_NO_SCOPE"] = "1"
         try:
-            made = subprocess.run(argv, capture_output=True, text=True, timeout=180)  # noqa: S603
+            made = subprocess.run(  # noqa: S603 - argv list, no shell
+                argv, capture_output=True, text=True, timeout=180, env=create_env
+            )
         except (OSError, subprocess.SubprocessError) as e:
             raise SandboxError(f"could not start the resident sandbox {self.name!r}: {e}") from e
         if made.returncode != 0:
@@ -3112,8 +3152,8 @@ class Sandbox:
             self._ws = os.path.realpath(self.workspace)
             self._own_ws = False
         self._entered = True
-        # THE RESIDENT BOX, adopted or created, BEFORE `setup` runs: a `setup=` on a persistent
-        # sandbox has to install into the box every later call will use, not into a throwaway one.
+        # THE PERSIST GUARDS FIRE BEFORE ANY WORK, so a combination that cannot be resumed is refused
+        # before a setup spends two minutes on a pip install.
         if self.persist:
             if not self.name:
                 raise SandboxError(
@@ -3131,7 +3171,6 @@ class Sandbox:
                     "posture, and a temporary workspace is a different path in every process, so "
                     "nothing would ever be resumed. Sandbox(name=..., persist=True, workspace='...')"
                 )
-            self._resident = self._resident_ensure()
         if self.setup:
             # A setup that fails raises out of `__enter__`, so the `with` body is never entered and
             # `__exit__` never runs: the workspace this method just created would outlive the session
@@ -3143,6 +3182,35 @@ class Sandbox:
             except BaseException:
                 self.__exit__()
                 raise
+        # 🚨 THE RESIDENT BOX IS CREATED AFTER THE SETUP, AND THAT ORDER IS THE FIX.
+        #
+        # It used to be created first, on the stated reasoning that "a `setup=` on a persistent
+        # sandbox has to install into the box every later call will use, not into a throwaway one".
+        # The premise was wrong and the consequence was two defects:
+        #
+        #   * `_run_setup` calls `_spawn`, which routes EVERY call into the resident box once one
+        #     exists. The setup box's defining property is that it is the ONE moment the network is
+        #     on - and a resident box is created with a run_code posture, which is network-OFF.
+        #     `kern exec` cannot add a network to a box that is already running, so `network=True`
+        #     was silently dropped. MEASURED from inside a resident box: a connection to pypi.org
+        #     fails with `gaierror`, which means `setup="pip install X"` could not work at all.
+        #   * `_base_argv` mounts `<workspace>/.deps` READ-ONLY for every non-setup box, but only
+        #     `if os.path.isdir(deps)`. At that point the setup had not run, so `.deps` did not
+        #     exist, so the resident box was created WITHOUT that mount - and `kern exec` does not
+        #     re-apply mounts, so `.deps` stayed writable for the whole life of the box.
+        #     `deps_readonly` defaults to True and is documented as the defence against cross-run
+        #     dependency poisoning: it was off while the field said it was on.
+        #
+        # ⭐ The premise was wrong because the setup does NOT install into its own box: it installs
+        # into `<workspace>/.deps`, which is a HOST directory bind-mounted into every later box. A
+        # throwaway setup box therefore leaves its deps exactly where the resident box will find
+        # them. What it cannot leave behind is state inside the box's own filesystem (an `apt-get`),
+        # and that was never promised - the one-shot path has always thrown that away too.
+        #
+        # So: setup first, in its own network-on box, then the resident box - which now sees `.deps`
+        # on disk and carries the read-only mount in the posture its fingerprint is taken from.
+        if self.persist:
+            self._resident = self._resident_ensure()
         # THE BYTECODE CACHE IS DECIDED HERE, once, before the pool is filled and after the setup ran.
         # Present -> every box this session starts mounts it; absent -> this session compiles from
         # source and a background box builds the cache for the NEXT one. It is never adopted mid-session
@@ -3249,7 +3317,10 @@ class Sandbox:
                 "--workdir", _WORKSPACE]
         # deps_readonly: mount <workspace>/.deps read-only OVER the writable workspace for run_code boxes
         # (not the setup box, which must populate it). Closes the cross-run dep-poisoning window within a
-        # session for tighter (still semi-trusted) workloads. Default off - deps writable, documented.
+        # session for tighter (still semi-trusted) workloads. Default ON (`deps_readonly: bool = True`),
+        # so this applies unless a caller asks for writable deps. This comment said "Default off -
+        # deps writable" while the field said `True`: a reader auditing the defence would have
+        # concluded it was opt-in when it is the default, which is the direction that matters.
         if self.deps_readonly and not is_setup:
             deps = os.path.join(self._ws, _DEPS_DIR)
             if os.path.isdir(deps):
@@ -3489,7 +3560,15 @@ class Sandbox:
         # the box may have planted) and is kept exactly as it was; only the NAME becomes per-call, so
         # two calls no longer contend for one path. It is also cleaned up now: with a persistent
         # `workspace=`, the old fixed file was left behind after every session.
-        if self._resident is not None:
+        # `and not is_setup`: A SETUP NEVER RUNS IN THE RESIDENT BOX, even if one already exists.
+        #
+        # `__enter__` now creates the resident box after the setup, so in the normal path there is no
+        # resident box to route into. This is the belt: the setup box is defined by three properties -
+        # it is separate, its network is ON, and it dies at the end - and `kern exec` into a running
+        # box can provide none of them. Routing a setup there dropped `network=True` in silence, and
+        # a `pip install` setup then failed with a DNS error the caller could not connect to a cause.
+        # Any future call with `is_setup=True` gets its own box, which is the only shape that works.
+        if self._resident is not None and not is_setup:
             # INTO THE RESIDENT BOX, which is the whole point of `persist=True`. `exec` and not `box`:
             # measured on this tree, 2 ms against 6 ms, and the box's own state (its `/tmp`, an
             # installed package, a process a previous call left running) is still there.
@@ -3660,9 +3739,29 @@ class Sandbox:
         # raise would break a legitimate silent command; a fault leaves the caller a result to read and
         # still refuses to call it a success. All four conditions are required for the same reason: any
         # output, any non-zero code, or the byte itself is evidence that something ran.
+        # 🚨 NOT ON THE RESIDENT PATH, because there the invariant above does not hold.
+        #
+        # The stated premise is "a kern that ran a box WRITES the started byte". That is true of
+        # `kern box`, which STARTS one. A `persist=True` call is `kern exec`, which joins a box that
+        # is already running and therefore starts nothing and writes no byte - so `box_started` is
+        # False on every resident call and carries no information at all.
+        #
+        # MEASURED, with the one-shot path as the control: on `persist=True`, `run_code("x = 1")` and
+        # `run_code("pass")` came back `exit_code=0, success=False, fault=startup_failed` while
+        # `run_code("print('ciao')")` came back clean; the same silent cells on the one-shot path are
+        # `success=True, fault=None`. So the single most ordinary call an agent makes - a cell that
+        # computes and prints nothing - was reported as a sandbox that never started. All four
+        # conditions were required and all four were met, by a call that had run perfectly.
+        #
+        # THE ANTI-STUB PROTECTION IS NOT LOST, which is why this is a narrowing and not a removal.
+        # A fake binary cannot reach here under `persist=True`: `_resident_ensure` had to start the
+        # box first and confirm it by looking it up in the registry and matching its posture label,
+        # which a stub that merely prints a version cannot produce. The guard keeps its full force on
+        # the path it was written for, where there IS a box start to account for.
         if (
             fault is None
             and rc == 0
+            and self._resident is None
             and not box_started
             and not stdout.strip()
             and not stderr.strip()

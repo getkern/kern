@@ -3218,3 +3218,101 @@ test("a process that already built a cache can build it again", async () => {
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// --- PARITY WITH THE PYTHON BINDING ON THE THREE PERSIST DEFECTS -------------------------------
+//
+// The two bindings are one API with two spellings, so a defect fixed in one and not the other is a
+// divergence in the product. These mirror `test_enforce_limits_is_part_of_the_resident_posture` and
+// `test_a_setup_on_a_persistent_sandbox_gets_its_own_network_on_box` in
+// `bindings/python/tests/test_sandbox.py`, with the same reasoning and the same measurements.
+
+test("enforceLimits is part of the resident posture", () => {
+  // A CONTROL THAT NEVER REACHES argv STILL CHANGES WHAT THE BOX IS. `enforceLimits` is delivered as
+  // `KERN_NO_SCOPE=1` in the spawn's ENVIRONMENT, not as a flag, so hashing `_baseArgv` alone could
+  // not see it. Measured in the Python binding before the fix: the two values produced ONE
+  // fingerprint, so a box created without scope enforcement could be adopted by a Sandbox asking for
+  // it, and the caller told hard limits were in force over a box that has them best-effort.
+  // No binary needed: the fingerprint is computed in-process.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "nposture-"));
+  try {
+    const common = { workspace: ws, name: "posture", persist: true, memoryMb: 128 };
+    const hard = new Sandbox({ ...common, enforceLimits: true })._residentFingerprint();
+    const soft = new Sandbox({ ...common, enforceLimits: false })._residentFingerprint();
+    assert.notStrictEqual(hard, soft, "enforcement must be part of the posture");
+    // The control: a difference that was already visible must stay visible, so the added term
+    // cannot have swallowed the rest of the posture.
+    const bigger = new Sandbox({
+      workspace: ws,
+      name: "posture",
+      persist: true,
+      memoryMb: 256,
+      enforceLimits: true,
+    })._residentFingerprint();
+    assert.notStrictEqual(hard, bigger, "memoryMb must still change the fingerprint");
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test(
+  "a setup on a persistent sandbox gets its own network-on box, and .deps ends read-only",
+  { skip: !KERN_OK && "kern not installed" },
+  async () => {
+    // THE SETUP BOX IS SEPARATE, ITS NETWORK IS ON, AND IT DIES - under `persist` too. Before the
+    // fix the resident box was created BEFORE the setup, and `_spawn` routes every call into a
+    // resident box once one exists, so the setup ran via `kern exec` inside a network-OFF box
+    // (`network: true` dropped in silence, a connection failing with a DNS error), and `_baseArgv`
+    // mounts `<workspace>/.deps` read-only only when that directory already exists - which it did
+    // not yet, so the resident box never carried the mount and `kern exec` does not re-apply them.
+    // `depsReadonly` defaults to true and documents the opposite.
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "nsetup-"));
+    const setup =
+      "python3 -c \"import socket; socket.setdefaulttimeout(8); " +
+      "socket.create_connection(('pypi.org',443))\" " +
+      "&& mkdir -p /workspace/.deps && echo pkg > /workspace/.deps/installed.txt";
+    const sb = new Sandbox({
+      workspace: ws,
+      name: `nsetup-${process.pid}`,
+      persist: true,
+      persistTtlS: 300,
+      setup,
+    });
+    try {
+      await sb.open();
+      // The setup reached the network: it had to resolve and connect before writing this file.
+      assert.ok(
+        fs.existsSync(path.join(ws, ".deps", "installed.txt")),
+        "the setup had no network",
+      );
+      const r = await sb.runCode(
+        "import os\n" +
+          "try:\n" +
+          "    open('/workspace/.deps/POISON','w').write('x'); print('WRITABLE')\n" +
+          "except OSError as e:\n" +
+          "    print('ro', e.errno)\n" +
+          "print('dep', os.path.exists('/workspace/.deps/installed.txt'))\n",
+      );
+      assert.ok(!r.stdout.includes("WRITABLE"), `.deps must be read-only: ${r.stdout}`);
+      assert.match(r.stdout, /ro 30/, `expected EROFS: ${r.stdout}`);
+      assert.match(r.stdout, /dep True/, "the setup's deps must be visible to the cell");
+      assert.ok(
+        !fs.existsSync(path.join(ws, ".deps", "POISON")),
+        "a cell reached .deps on the host",
+      );
+      // And the CELL still has no network, which is the property the setup box keeps exclusive.
+      const n = await sb.runCode(
+        "import socket\n" +
+          "try:\n" +
+          "    socket.setdefaulttimeout(3); socket.create_connection(('pypi.org',443))\n" +
+          "    print('NET')\n" +
+          "except OSError:\n" +
+          "    print('off')\n",
+      );
+      assert.strictEqual(n.stdout.trim(), "off", `a runCode cell had network: ${n.stdout}`);
+    } finally {
+      await sb.destroy().catch(() => {});
+      await sb.close().catch(() => {});
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  },
+);

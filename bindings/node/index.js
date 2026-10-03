@@ -120,11 +120,17 @@ function workspaceUsage(root) {
  * why that is wrong here (see `pycBuild`): a synchronous spawn stops every other timer and socket in
  * the host process for its whole duration, and these calls talk to `kern ps` and `kern box`.
  */
-function runCapture(argv, timeoutMs) {
+function runCapture(argv, timeoutMs, env) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(argv[0], argv.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+      // `env` IS OPTIONAL AND DEFAULTS TO INHERITING, which is right for the read-only queries that
+      // use this helper (`kern ps`, `kern stop`). It exists because ONE caller must not inherit:
+      // creating a resident box has to honour the Sandbox's `enforceLimits` rather than whatever
+      // `KERN_NO_SCOPE` happened to be exported in the shell.
+      const opts = { stdio: ["ignore", "pipe", "pipe"] };
+      if (env !== undefined) opts.env = env;
+      child = spawn(argv[0], argv.slice(1), opts);
     } catch (e) {
       resolve({ code: -1, stdout: "", stderr: String(e && e.message) });
       return;
@@ -2403,9 +2409,17 @@ class Sandbox {
             "temporary workspace is a different path in every process, so nothing would ever be " +
             "resumed. new Sandbox({ name, persist: true, workspace })",
         );
-      this._resident = await this._residentEnsure();
     }
     if (this.setup) await this._runSetup(this.setup);
+    // THE RESIDENT BOX IS CREATED AFTER THE SETUP, AND THAT ORDER IS THE FIX. It used to come first,
+    // so `_runSetup` was routed into it (network silently dropped), and `_baseArgv` mounts
+    // `<workspace>/.deps` READ-ONLY only `if` that directory exists - which it did not yet, so the
+    // resident box was created WITHOUT the mount and `kern exec` never re-applies mounts. The
+    // `depsReadonly` default is true and is documented as the defence against cross-run dependency
+    // poisoning: it was off for the whole life of every resident box. The setup does not need to run
+    // IN the resident box, because it installs into `<workspace>/.deps`, a HOST directory every
+    // later box mounts. Same reasoning, same measurements, as the Python binding.
+    if (this.persist) this._resident = await this._residentEnsure();
     // THE BYTECODE CACHE IS DECIDED HERE, once, and frozen: `_baseArgv` is what the prewarm pool
     // compares postures with, so a cache appearing mid-session would change the argv runCode builds and
     // every claim would miss. SKIPPED WHEN A SETUP LEFT DEPS: `PYTHONPYCACHEPREFIX` redirects every
@@ -2481,6 +2495,13 @@ class Sandbox {
       timeoutS: Math.trunc(this.persistTtlS),
       dry: true,
     });
+    // AND THE CONTROLS THAT NEVER REACH argv ARE ADDED EXPLICITLY. Taking the posture from
+    // `_baseArgv` answers the drift problem for everything that IS a flag; `enforceLimits` is not a
+    // flag, it is `KERN_NO_SCOPE=1` in the spawn's ENVIRONMENT, so it changed whether the caps are
+    // kernel-enforced while leaving the argv byte for byte identical. Measured in the Python binding
+    // before the same fix: `enforceLimits` true and false produced ONE fingerprint, so an unenforced
+    // box could be adopted by a Sandbox that had asked for enforcement.
+    argv.push(`--enforce-limits=${this.enforceLimits ? 1 : 0}`);
     return crypto.createHash("sha256").update(argv.join("\u0000")).digest("hex").slice(0, 16);
   }
 
@@ -2544,7 +2565,15 @@ class Sandbox {
       "sleep",
       String(Math.trunc(this.persistTtlS)),
     ];
-    const made = await runCapture(argv, 180000);
+    // THE ENVIRONMENT IS BUILT, NOT INHERITED. Without this the box took whatever `KERN_NO_SCOPE`
+    // was in the ambient environment: `enforceLimits: false` never reached the box (only `_spawn`'s
+    // children got it, which on this path are `kern exec` calls and not the box's own cgroup
+    // placement), and a shell that merely had the variable exported created an unenforced box for a
+    // Sandbox that asked for enforcement - the dangerous direction.
+    const createEnv = { ...process.env };
+    if (this.enforceLimits) delete createEnv.KERN_NO_SCOPE;
+    else createEnv.KERN_NO_SCOPE = "1";
+    const made = await runCapture(argv, 180000, createEnv);
     if (made.code !== 0) {
       const again = await this._residentLookup();
       if (again && (again.labels || {})[CFG_LABEL] === want) return this._residentName();
@@ -2865,7 +2894,14 @@ class Sandbox {
     const before = this.trackFiles ? this._snapshot() : null; // skip the O(N) walk when not tracked
     const name = uniqueName();
     let argv;
-    if (this._resident !== null) {
+    // `&& !isSetup`: A SETUP NEVER RUNS IN THE RESIDENT BOX, even if one already exists. The setup
+    // box is defined by three properties - separate, network ON, dies at the end - and `kern exec`
+    // into a running box provides none of them: the resident box is created with a runCode posture,
+    // which is network-OFF, and exec cannot add a network to a box already running. Routing a setup
+    // there dropped `network: true` in SILENCE, so `setup: "pip install X"` failed with a DNS error.
+    // Same fix and same reason as the Python binding; `_enter` also creates the resident box after
+    // the setup now, so in the normal path there is nothing to route into.
+    if (this._resident !== null && !isSetup) {
       // INTO THE RESIDENT BOX, which is the point of `persist`. `exec` and not `box`: measured, 2 ms
       // against 6 ms, and the box's own state is still there. `-w` puts the call in the same working
       // directory a fresh box starts in, so code writing a relative path lands in the workspace
