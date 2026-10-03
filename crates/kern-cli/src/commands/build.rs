@@ -1511,6 +1511,17 @@ pub fn build_check(args: BuildArgs) -> Result<(), Error> {
 
     let (mut honoured, mut dropped) = (0usize, 0usize);
     let mut stages = 0usize;
+    // EXTERNAL IMAGES A `COPY --from=` WILL PULL, collected to be NAMED in the summary.
+    //
+    // This is where a typo changes meaning silently. `resolve_from` classifies a `--from=` token as a
+    // STAGE when it matches a declared one and as an IMAGE otherwise, which is Docker's rule too - so
+    // `--from=buidler` for `builder` is not an error, it becomes a pull of an image called `buidler`.
+    // Measured: `COPY --from=inesistente` passed this check with "builds here, and every line it
+    // contains has an effect", and the build then failed with "cannot access 'library/inesistente' on
+    // registry-1.docker.io - it may be private", which talks about a registry to someone who mistyped
+    // a stage name. The check cannot resolve it (it pulls nothing, by design, and that is the
+    // direction that never refuses something that works), so it says so instead of implying it did.
+    let mut pulled_by_copy: Vec<String> = Vec::new();
     for ins in &instrs {
         let (kw, note) = match ins {
             crate::dockerfile::Instr::From { image, as_name } => {
@@ -1553,7 +1564,14 @@ pub fn build_check(args: BuildArgs) -> Result<(), Error> {
                 (
                     match from {
                         Some(crate::dockerfile::CopyFrom::Stage(s)) => format!("COPY --from={s}"),
-                        Some(crate::dockerfile::CopyFrom::Image(i)) => format!("COPY --from={i}"),
+                        Some(crate::dockerfile::CopyFrom::Image(i)) => {
+                            // Recorded once per distinct reference: a file copying three paths out
+                            // of one image has one unresolved image, not three.
+                            if !pulled_by_copy.iter().any(|seen| seen == i) {
+                                pulled_by_copy.push(i.clone());
+                            }
+                            format!("COPY --from={i}")
+                        }
                         None => "COPY".to_string(),
                     },
                     format!("{} -> {dst}", truncate(&srcs.join(" "), 46)),
@@ -1613,6 +1631,26 @@ pub fn build_check(args: BuildArgs) -> Result<(), Error> {
              on the image",
             plural(dropped),
             if dropped == 1 { "has" } else { "have" }
+        );
+    }
+    // THE ONE THING THE SENTENCE ABOVE CANNOT COVER, SAID RATHER THAN LEFT TO BE DISCOVERED.
+    //
+    // Every `--from=` token that is not a declared stage is an image, so a mistyped stage name reads
+    // as fine here and fails the build with a registry error. Naming the references is enough: the
+    // reader who meant a stage sees their typo in a list of images, and the reader who meant an
+    // image learns which pulls are still ahead of them. A base `FROM` is not listed, because its
+    // name is the first line of the file and the build's first action; a `--from` hides mid-file.
+    if !pulled_by_copy.is_empty() {
+        let one = pulled_by_copy.len() == 1;
+        println!(
+            "note: {} `COPY --from=` reference{} no stage in this file declares, so {} pulled as \
+             {} at build time and this check did not resolve {}: {}",
+            pulled_by_copy.len(),
+            if one { " that" } else { "s that" },
+            if one { "it is" } else { "they are" },
+            if one { "an image" } else { "images" },
+            if one { "it" } else { "them" },
+            pulled_by_copy.join(", ")
         );
     }
     Ok(())

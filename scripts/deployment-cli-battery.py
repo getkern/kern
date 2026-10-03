@@ -377,6 +377,21 @@ def main():
         b.check("build --check reports without building", "docker build (no dry run exists)",
                 ["build", "--check", "-f", "sub/Dockerfile", "."],
                 want_out="builds here")
+        # A `--from=` TOKEN THAT NAMES NO STAGE IS AN IMAGE, and the check has to say so.
+        #
+        # `resolve_from` classifies it as a stage when one matches and as an image otherwise, which is
+        # Docker's rule, so `--from=buidler` for `builder` is a silent change of meaning rather than
+        # an error. Measured before the note existed: this exact file passed with "builds here, and
+        # every line it contains has an effect", and the build then failed with "cannot access
+        # 'library/nosuchstage' on registry-1.docker.io - it may be private", which answers a
+        # mistyped stage name with a sentence about a registry. The check pulls nothing by design, so
+        # the fix is to NAME what it did not resolve, not to start resolving it.
+        with open(os.path.join(work, "sub", "D-typo"), "w") as f:
+            f.write("FROM alpine:3.19 AS builder\nFROM alpine:3.19\n"
+                    "COPY --from=nosuchstage /bin/true /t\n")
+        b.check("--check names a --from= that no stage declares", "docker build --check (warnings)",
+                ["build", "--check", "-f", "sub/D-typo", "."],
+                want_out="did not resolve it: nosuchstage")
         b.check("build.args reaches the build", "docker compose build --build-arg",
                 ["build", "-t", "battery/shape:1", "-f", "sub/Dockerfile",
                  "--build-arg", "MARKER=arrivato", "."],
