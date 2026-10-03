@@ -74,6 +74,41 @@ DECLARED_CONFIGS = {
     ),
 }
 
+# 🪤 THE THIRD DOOR, and it was found by an outside reviewer after the first two were shut.
+#
+# Cargo's own lint tables switch a clippy lint off for a whole package or the whole workspace:
+#
+#     [lints.clippy]            # in any member's Cargo.toml
+#     disallowed_methods = "allow"
+#
+#     [workspace.lints.clippy]  # in the root Cargo.toml
+#     disallowed_methods = "allow"
+#
+# and `rustflags = ["-A", "clippy::disallowed_methods"]` in a `.cargo/config.toml` does the same for
+# everything built under that directory. None of them leaves a mark in any `.rs` file, and none of
+# them is a `clippy.toml`, so neither of the two checks above could see any of them.
+#
+# MEASURED, not reasoned: with that three-line block added to `crates/kern-cli/Cargo.toml`, this gate
+# printed "the environment lint is armed ... and no undeclared ones of either kind" and exited 0,
+# while `cargo clippy -p getkern` stopped flagging a planted `std::env::var` entirely. A green gate
+# over a disarmed lint.
+#
+# The pattern deliberately does not try to parse TOML. It asks the only question that matters - does
+# this file mention a lint table AND this lint, or blanket-allow the group that contains it - because
+# a check that has to parse the language loses to someone who is trying, which is the rule written at
+# the top of this file.
+LINT_TABLE = re.compile(
+    r"\[(?:workspace\.)?lints(?:\.clippy)?\]|lints\s*=|rustflags\s*=", re.I
+)
+LINT_OFF = re.compile(
+    r"disallowed_methods\s*=\s*[\"']?(?:allow|warn)|clippy::disallowed_methods|"
+    r"clippy::all\s*=\s*[\"']?allow|clippy::style\s*=\s*[\"']?allow",
+    re.I,
+)
+# Where a Cargo lint table or a cargo config may legitimately live, with the reason. Empty: nothing
+# in this repository needs one, and that is the point - an entry appearing here is a decision.
+DECLARED_LINT_TABLES: dict[str, str] = {}
+
 
 def main():
     problems = []
@@ -103,6 +138,36 @@ def main():
         problems.append(
             f"{path} is declared as a per-directory clippy config but no longer exists. Remove it "
             f"from the list: a stale declaration reads as coverage that is not there"
+        )
+
+    # Cargo lint tables and cargo configs: the third way to switch the lint off for a subtree, with
+    # no `.rs` mark and no `clippy.toml`. Tracked files only, same reason as above.
+    tables = set()
+    for name in ("Cargo.toml", "config.toml"):
+        for p in ROOT.rglob(name):
+            rel = str(p.relative_to(ROOT))
+            if "target/" in rel or "node_modules/" in rel:
+                continue
+            if name == "config.toml" and ".cargo/" not in rel:
+                continue
+            try:
+                text = p.read_text()
+            except OSError:
+                continue
+            if LINT_TABLE.search(text) and LINT_OFF.search(text):
+                tables.add(rel)
+    for path in sorted(tables - set(DECLARED_LINT_TABLES)):
+        problems.append(
+            f"{path} switches `disallowed_methods` off through a Cargo lint table or rustflags, for "
+            f"its whole package or workspace, with no mark in any .rs file and no clippy.toml: "
+            f"neither check above can see it. Declare it in "
+            f"{pathlib.Path(__file__).name} with its reason, or route the calls through the "
+            f"chokepoints"
+        )
+    for path in sorted(set(DECLARED_LINT_TABLES) - tables):
+        problems.append(
+            f"{path} is declared as carrying a lint exemption and no longer does. Remove it from "
+            f"the list: a stale declaration reads as coverage that is not there"
         )
 
     found = {}
@@ -137,8 +202,9 @@ def main():
     # that omits the per-directory configs would read as full coverage of a rule it had not looked at.
     print(
         f"the environment lint is armed on {len(REQUIRED_METHODS)} methods, with "
-        f"{len(DECLARED)} declared file exemptions and {len(DECLARED_CONFIGS)} declared "
-        f"per-directory clippy config(s), and no undeclared ones of either kind"
+        f"{len(DECLARED)} declared file exemptions, {len(DECLARED_CONFIGS)} declared "
+        f"per-directory clippy config(s) and {len(DECLARED_LINT_TABLES)} declared Cargo lint "
+        f"table(s), and no undeclared ones of any kind"
     )
     return 0
 

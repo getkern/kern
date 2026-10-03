@@ -243,6 +243,23 @@ CASES: list[Case] = [
      replace_once('"windows/kern-win/clippy.toml": (', '"windows/kern-win/clippy.toml_DISARMED": (')),
     ("test-env-lock", "a declaration for a config that no longer exists", "scripts/test-env-lock.py",
      replace_once('DECLARED_CONFIGS = {', 'DECLARED_CONFIGS = {\n    "crates/gone/clippy.toml": "stale",')),
+
+    # --- test-env-lock: the THIRD door, Cargo's own lint tables ---
+    # Found by an outside reviewer after the `.rs` attribute scan and the per-directory `clippy.toml`
+    # check were both in place. A `[lints.clippy]` table in a member, a `[workspace.lints.clippy]`
+    # table in the root, or a `rustflags = ["-A", ...]` in `.cargo/config.toml` each disarm the lint
+    # for a whole subtree with no mark in any `.rs` file and no second `clippy.toml`. Measured before
+    # the check existed: the gate printed "no undeclared ones of either kind" and exited 0 while
+    # `cargo clippy` had stopped flagging a planted `std::env::var`. One case per spelling.
+    ("test-env-lock", "a Cargo lint table in a member crate", "crates/kern-cli/Cargo.toml",
+     append('\n[lints.clippy]\ndisallowed_methods = "allow"\n')),
+    ("test-env-lock", "a workspace lint table in the root", "Cargo.toml",
+     append('\n[workspace.lints.clippy]\ndisallowed_methods = "allow"\n')),
+    # The REAL attack on this one: the flag goes INTO the rustflags array that is already there, not
+    # into a comment. A comment mentioning the lint would also turn the gate red (the check does not
+    # parse TOML, deliberately), but a case that proves only that would be a case whose label lies.
+    ("test-env-lock", "rustflags disarming the lint in a cargo config", ".cargo/config.toml",
+     replace_once('rustflags = [\n', 'rustflags = [\n    "-A", "clippy::disallowed_methods",\n')),
 ]
 
 
