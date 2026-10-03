@@ -5,6 +5,36 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## v0.30.0 - 2026-10-03
+
+**`kern box --show-config` prints what a profile grants, not only its cgroup numbers.** Three lines
+follow `privileged:`: `devices:`, `sysfs:` and `vdisks:`, each sorted, `-` when empty. Two different
+device grants under one profile name used to print identical output. The lines are added; every
+existing one is unchanged.
+
+**On Windows, `kern.exe` says which WSL2 distro it runs in and lets you choose:** `kern wsl list
+[--probe] | status | use <distro> | reset`. `use` warns when `KERN_WSL_DISTRO` is set, because that
+variable wins over the stored choice.
+
+**`kern compose restart` no longer hangs on a one-shot dependency that already completed.** It
+waited 120 s, exited 1 and left the service down; `service_healthy` dependencies waited the same way.
+
+**`kern doctor` no longer says "ready" on a host where a box dies at the `/proc` mount**, and it
+reports when more than one kern is installed and the versions disagree.
+
+**The note about two services on one internal port names both services and the port**, and `ps`,
+`restart` and `logs` no longer print it.
+
+**`kern build --check` names a `COPY --from=` stage it cannot resolve** instead of saying the file
+builds here.
+
+**`install.ps1` no longer leaves `$ErrorActionPreference = 'Stop'` in the PowerShell session it was
+piped into**, where every later command writing to stderr became a terminating error.
+
+The sandbox SDK and MCP server changes on this line (resident named sandboxes, a workspace cap, an
+MCP server that answers every request id it can read) ship as kern-sandbox, with Linux wheels that
+carry this kern.
+
 ## kern-sandbox 0.2.42 (Python) - 2026-09-29
 
 **The Linux wheels carry kern v0.25.1**, so `pip install kern-sandbox` brings the pull that ends a
