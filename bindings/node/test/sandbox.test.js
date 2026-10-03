@@ -3316,3 +3316,57 @@ test(
     }
   },
 );
+
+test("the resident posture includes the KERN_ env that builds the box", () => {
+  // kern READS ITS OWN ENVIRONMENT WHEN IT BUILDS A BOX, so that environment is posture.
+  // `kern box` resolves `KERN_SECCOMP` to choose the seccomp filter, and `KERN_ALLOW_UNCAPPED`,
+  // `KERN_LANDLOCK_REQUIRED` and `KERN_DIRECT_CAPS` each change what the box is. None appears in the
+  // argv. Measured in the Python binding before the same fix: six different settings produced ONE
+  // fingerprint, so a box built under one filter could be adopted by a Sandbox asking for another -
+  // the dangerous direction being adopting the WEAKER filter while believing in the stronger.
+  // The prewarm pool in this same file already folds these into its own key; the resident path did
+  // not follow it. Mirrors `test_the_resident_posture_includes_the_kern_env_that_builds_the_box`.
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), "nkenv-"));
+  const saved = { ...process.env };
+  try {
+    const fp = () =>
+      new Sandbox({ workspace: ws, name: "kenv", persist: true, memoryMb: 128 })._residentFingerprint();
+    const base = fp();
+    const seen = new Set([base]);
+    for (const [v, val] of [
+      ["KERN_SECCOMP", "allowlist"],
+      ["KERN_SECCOMP", "denylist"],
+      ["KERN_ALLOW_UNCAPPED", "1"],
+      ["KERN_LANDLOCK_REQUIRED", "1"],
+      ["KERN_DIRECT_CAPS", "1"],
+    ]) {
+      process.env[v] = val;
+      const got = fp();
+      delete process.env[v];
+      assert.notStrictEqual(got, base, `${v}=${val} changes the box but not the fingerprint`);
+      assert.ok(!seen.has(got), `${v}=${val} collides with another posture`);
+      seen.add(got);
+    }
+    // AND `KERN_BIN` MUST NOT MOVE IT - but only for the SAME binary reached two ways, which is the
+    // property. An earlier version of this assertion compared a Sandbox resolved to the real kern
+    // against one resolved to the test double, i.e. two DIFFERENT binaries, and failed: a different
+    // binary SHOULD change the posture, and argv[0] correctly carried that. The honest comparison is
+    // one path, found through the variable and found through PATH, which is what two processes
+    // disagreeing about how they located kern looks like from here.
+    const target = process.env.KERN_BIN || FAKE_KERN;
+    process.env.KERN_BIN = target;
+    const viaVar = fp();
+    delete process.env.KERN_BIN;
+    process.env.PATH = `${path.dirname(target)}${path.delimiter}${process.env.PATH}`;
+    const viaPath = fp();
+    assert.strictEqual(
+      viaPath,
+      viaVar,
+      "KERN_BIN is represented by argv[0] and must not be hashed on top of it",
+    );
+  } finally {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    for (const [k, v] of Object.entries(saved)) process.env[k] = v;
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});

@@ -4367,6 +4367,71 @@ def test_enforce_limits_is_part_of_the_resident_posture():
         assert hard != bigger, "memory_mb must still change the fingerprint"
 
 
+def test_the_resident_posture_includes_the_kern_env_that_builds_the_box():
+    """kern READS ITS OWN ENVIRONMENT WHEN IT BUILDS A BOX, so that environment is posture.
+
+    `kern box` resolves `KERN_SECCOMP` (explicit > profile > default) to choose the seccomp filter,
+    and `KERN_ALLOW_UNCAPPED`, `KERN_LANDLOCK_REQUIRED` and `KERN_DIRECT_CAPS` each change what the
+    box is. None of them appears in the argv, so hashing the argv alone could not see any of them.
+
+    MEASURED before the fix: with `KERN_SECCOMP` unset, `=allowlist` and `=denylist`, and with each
+    of the other three set, the fingerprint was the same `93c05ae6e931af44` six times over. Process A
+    could create a box under one filter and process B, with identical Sandbox fields and a different
+    `KERN_SECCOMP`, would adopt it and be told its own posture was in force. The dangerous direction
+    is B asking for the stronger filter and receiving A's weaker one.
+
+    ⭐ The prewarm pool in this same module already folds every `KERN_*` into its own key, with the
+    reason written there and its own measurement. This is the resident path following it.
+
+    ⛔ `KERN_BIN` IS EXCLUDED, and the last assertion is why: it selects which binary to run, and
+    that binary's resolved path is already argv[0] of the hashed material. Hashing the variable too
+    would refuse adoption between two processes that found the SAME binary by different means, which
+    breaks resumption for nothing.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as ws:
+        def fp():
+            return _cfg(workspace=ws, name="kenv", persist=True, memory_mb=128)._resident_fingerprint()
+
+        base = fp()
+        seen = {base}
+        for var, val in (
+            ("KERN_SECCOMP", "allowlist"),
+            ("KERN_SECCOMP", "denylist"),
+            ("KERN_ALLOW_UNCAPPED", "1"),
+            ("KERN_LANDLOCK_REQUIRED", "1"),
+            ("KERN_DIRECT_CAPS", "1"),
+        ):
+            prev = os.environ.get(var)
+            os.environ[var] = val
+            try:
+                got = fp()
+            finally:
+                if prev is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = prev
+            assert got != base, f"{var}={val} changes the box but not the fingerprint"
+            assert got not in seen, f"{var}={val} collides with another posture"
+            seen.add(got)
+
+        # AND `KERN_BIN` MUST NOT MOVE IT: the same binary reached two ways is one posture. `_cfg`
+        # sets `KERN_BIN` to the double, so the comparison is between that and the same double named
+        # through the variable - which is what two processes disagreeing about how they found kern
+        # looks like from here.
+        prev = os.environ.get("KERN_BIN")
+        os.environ["KERN_BIN"] = _FAKE_KERN
+        try:
+            with_var = fp()
+        finally:
+            if prev is None:
+                os.environ.pop("KERN_BIN", None)
+            else:
+                os.environ["KERN_BIN"] = prev
+        assert with_var == base, "KERN_BIN is already represented by argv[0] and must not be hashed"
+
+
 @integration
 def test_a_setup_on_a_persistent_sandbox_gets_its_own_network_on_box():
     """THE SETUP BOX IS SEPARATE, ITS NETWORK IS ON, AND IT DIES - under `persist=True` too.

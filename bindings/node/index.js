@@ -2502,7 +2502,25 @@ class Sandbox {
     // before the same fix: `enforceLimits` true and false produced ONE fingerprint, so an unenforced
     // box could be adopted by a Sandbox that had asked for enforcement.
     argv.push(`--enforce-limits=${this.enforceLimits ? 1 : 0}`);
-    return crypto.createHash("sha256").update(argv.join("\u0000")).digest("hex").slice(0, 16);
+    // AND EVERY `KERN_*` IN THE ENVIRONMENT, because kern reads its OWN environment when it BUILDS
+    // the box: `KERN_SECCOMP` picks the seccomp filter, and `KERN_ALLOW_UNCAPPED`,
+    // `KERN_LANDLOCK_REQUIRED`, `KERN_DIRECT_CAPS` and `KERN_CONFIG` all change what the box is,
+    // with none of them in the argv. Measured in the Python binding: six different settings produced
+    // ONE fingerprint, so a box built under one filter could be adopted by a Sandbox asking for
+    // another - and the dangerous direction is adopting a WEAKER filter while believing in the
+    // stronger. The prewarm pool in this same file already folds these in, with its own measurement;
+    // the resident path did not follow it.
+    //
+    // ⛔ `KERN_BIN` is excluded: it selects which binary to run and that binary's resolved path is
+    // already argv[0] above, so hashing the variable too would refuse adoption between two processes
+    // that found the SAME binary by different means (one with the variable, one through PATH).
+    const kernEnv = Object.entries(process.env)
+      .filter(([k]) => k.startsWith("KERN_") && k !== "KERN_BIN")
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\u0000");
+    const material = `${argv.join("\u0000")}\u0000\u0000${kernEnv}`;
+    return crypto.createHash("sha256").update(material).digest("hex").slice(0, 16);
   }
 
   /** The running resident box for this name, or null. Never throws: a registry that cannot be read is

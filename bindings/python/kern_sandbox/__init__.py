@@ -3009,7 +3009,34 @@ class Sandbox:
         # Spelled as a pseudo-flag so it reads like the rest of the material being hashed, and so a
         # future out-of-argv control is added in the same obvious way.
         argv = argv + [f"--enforce-limits={int(bool(self.enforce_limits))}"]
-        return hashlib.sha256("\x00".join(argv).encode()).hexdigest()[:16]
+        # 🚨 AND EVERY `KERN_*` IN THE ENVIRONMENT, because kern reads its own environment when it
+        # BUILDS the box, which is the same hole `enforce_limits` was and one variable wider.
+        #
+        # `kern box` resolves `KERN_SECCOMP` (explicit > profile > default, `start.rs`) to pick the
+        # seccomp filter, and `KERN_ALLOW_UNCAPPED`, `KERN_LANDLOCK_REQUIRED`, `KERN_DIRECT_CAPS` and
+        # `KERN_CONFIG` all change what the box IS - none of them appears in the argv. MEASURED: with
+        # `KERN_SECCOMP` unset, `=allowlist` and `=denylist`, and with each of the other three set,
+        # the fingerprint was the SAME `93c05ae6e931af44` six times over. So process A could create a
+        # box under one filter and process B, same Sandbox fields and a different `KERN_SECCOMP`,
+        # would adopt it and be told its own posture was in force. The dangerous direction is B
+        # asking for the STRONGER filter and getting A's weaker one.
+        #
+        # ⭐ THE PREWARM POOL ALREADY DOES EXACTLY THIS, 2500 lines below, with the same reasoning
+        # written out and its own measurement ("the key did not move and the stale box was handed
+        # over"). The resident path simply did not follow it. Folding EVERY `KERN_*` rather than the
+        # handful nameable today is deliberate and is that comment's point: the failure mode is a
+        # variable nobody thought to list.
+        #
+        # ⛔ `KERN_BIN` IS THE ONE EXCLUSION, and it is not a hand-wave: it selects which binary to
+        # run, and that binary's resolved path is ALREADY argv[0] of the material above (verified:
+        # `_base_argv(...)[0]` is `self._kern`). Hashing the variable too would refuse adoption
+        # between two processes that found the SAME binary by different means - one with `KERN_BIN`
+        # exported, one through `PATH` - which breaks resumption for no gain in what is represented.
+        env = sorted(
+            (k, v) for k, v in os.environ.items() if k.startswith("KERN_") and k != "KERN_BIN"
+        )
+        material = "\x00".join(argv) + "\x00\x00" + "\x00".join(f"{k}={v}" for k, v in env)
+        return hashlib.sha256(material.encode()).hexdigest()[:16]
 
     def _resident_lookup(self) -> "dict | None":
         """The running resident box for this name, or None. Never raises: a registry that cannot be
