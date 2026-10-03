@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The MCP server, driven over stdio the way a client drives it, with the features of this branch.
 
-WHY THIS EXISTS AND WHY THE 180 UNIT TESTS DO NOT COVER IT. Those exercise the functions; a client
+WHY THIS EXISTS AND WHY THE 188 UNIT TESTS DO NOT COVER IT. Those exercise the functions; a client
 exercises the SERVER: the handshake, the shape of each reply, and the environment variables a user
 puts in a Claude Desktop config. Three of this branch's changes land exactly there and none of them
 is visible to a unit test:
@@ -19,12 +19,16 @@ is visible to a unit test:
 `isError: true`, so a harness reading `$?` would report green on every failure in here. Every case
 below asserts on the decoded JSON-RPC result.
 
+IT ALSO DRIVES THE TRANSPORT the way a broken or hostile client does: two frames on one line, a frame
+cut short at EOF, `NaN` where JSON has none, and the kern binary deleted between two calls. Each
+of those was measured first, and the first three got NO reply at all, so the client waited forever.
+
 WHAT IT IS NOT. It does not test the MCP protocol against a conformance suite, and it does not test
 the tools' internals - those have unit tests. It answers one question a unit test cannot: does a
 client that configures this server the documented way get what the documentation promises.
 
-IN THE GATE, because it is cheap: MEASURED at 2.95 s and 2.97 s on two consecutive runs, all 15
-cases, with the expensive ones genuinely happening - the setup box resolved DNS and connected, the
+IN THE GATE, because it is cheap: MEASURED at 3.94 s and 3.80 s on two consecutive runs, all 28
+checks, with the expensive ones genuinely happening - the setup box resolved DNS and connected, the
 OOM produced kern's own OOM-killer line, and a 5 MB print came back capped to 16 kB. The first draft
 of this docstring said it was too slow for the gate; it was written before the measurement, which is
 the habit this file is supposed to be against.
@@ -35,9 +39,12 @@ checkout that has not built one should not report a red gate for a missing artef
 
 import json
 import os
+import select
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 # RESOLVED FROM THIS FILE, not hard-coded to one machine: a battery that only runs in one checkout
 # is a battery nobody else runs.
@@ -47,11 +54,14 @@ KERN = os.environ.get("KERN_BIN") or os.path.join(ROOT, "target", "release", "ke
 ok = bad = 0
 
 
+INIT = {"jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "batteria", "version": "1"}}}
+
+
 def session(label, calls, env=None, timeout=300):
     """Una sessione: initialize, poi le chiamate. Torna la lista delle risposte ai tool call."""
-    msgs = [{"jsonrpc": "2.0", "id": 0, "method": "initialize",
-             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                        "clientInfo": {"name": "batteria", "version": "1"}}}]
+    msgs = [INIT]
     for i, c in enumerate(calls, start=1):
         msgs.append({"jsonrpc": "2.0", "id": i, **c})
     payload = "".join(json.dumps(m) + "\n" for m in msgs)
@@ -69,6 +79,68 @@ def session(label, calls, env=None, timeout=300):
         except json.JSONDecodeError:
             out.append({"_raw": line[:200]})
     return out, p.stderr
+
+
+def strict(line):
+    """Il JSON che un client RIGOROSO accetta: niente `NaN`/`Infinity`, che `json` di Python
+    accetta e `JSON.parse` no. Il decodificatore della batteria non deve essere piu' tollerante
+    del client che descrive, o una risposta illeggibile per Node qui risulterebbe leggibile."""
+    def no(name):
+        raise ValueError(f"{name} non e' JSON")
+    return json.loads(line, parse_constant=no)
+
+
+class Live:
+    """Una sessione APERTA: si scrive una riga, si aspetta la risposta, si cambia il mondo, si
+    riscrive. `session()` manda tutto e chiude stdin, quindi non puo' cancellare un binario FRA due
+    chiamate. Legge dal descrittore senza buffer: un `readline` su uno stdout bufferizzato si porta
+    via due righe e il `select` successivo non ne vede piu' nessuna, che e' come la prima sonda di
+    questi casi ha scambiato una risposta in ritardo per una mancante."""
+
+    def __init__(self, env=None):
+        e = dict(os.environ, PYTHONPATH=SDK, KERN_BIN=KERN)
+        e.update(env or {})
+        self.p = subprocess.Popen([sys.executable, "-m", "kern_sandbox.mcp"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=SDK, env=e)
+        self.buf = b""
+        self.lines = []  # ogni riga ricevuta, grezza, per il controllo di validita'
+        self.send(json.dumps(INIT))
+        self.wait({0}, 30)
+
+    def send(self, line):
+        self.p.stdin.write(line.encode() + b"\n")
+        self.p.stdin.flush()
+
+    def wait(self, ids, timeout):
+        """Le risposte agli `ids`, per id; si ferma quando ci sono tutte o allo scadere."""
+        got, end = {}, time.monotonic() + timeout
+        while set(ids) - set(got):
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([self.p.stdout], [], [], left)[0]:
+                break
+            chunk = os.read(self.p.stdout.fileno(), 1 << 16)
+            if not chunk:
+                break
+            self.buf += chunk
+            while b"\n" in self.buf:
+                raw, self.buf = self.buf.split(b"\n", 1)
+                line = raw.decode("utf-8", "replace")
+                self.lines.append(line)
+                try:
+                    m = strict(line)
+                except ValueError:
+                    continue
+                if isinstance(m, dict) and "id" in m:
+                    got[m["id"]] = m
+        return got
+
+    def close(self):
+        self.p.stdin.close()
+        try:
+            return self.p.wait(30)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            return None
 
 
 def check(label, cond, detail):
@@ -252,12 +324,135 @@ with tempfile.TemporaryDirectory() as home:
           f"isError={is_err} {txt.strip()[:70]!r}")
 
 # 16. Uno strumento che non esiste: errore JSON-RPC, non un crash.
+# Pretende il CODICE e il NOME, non "un errore qualunque": `"error" in last or isError` era la stessa
+# forma del predicato dell'OOM, soddisfatta da qualunque fallimento.
 res, err = session("tool ignoto", [{"method": "tools/call",
                                     "params": {"name": "nonesiste", "arguments": {}}}])
-last = res[-1]
-check("uno strumento ignoto da' un errore, non un crash",
-      ("error" in last) or bool((last.get("result") or {}).get("isError")),
+last = (res[-1].get("error") or {}) if res else {}
+check("uno strumento ignoto da' -32602 e lo nomina",
+      last.get("code") == -32602 and "nonesiste" in last.get("message", ""),
       f"{json.dumps(last)[:110]}")
+
+# 17. ⭐ DUE FRAME SU UNA RIGA. MISURATO prima della correzione: nessuna risposta a nessuno dei due,
+#     e il server rispondeva normalmente alla riga dopo, quindi niente segnalava la perdita e il
+#     client aspettava due id per sempre. Ora ogni id riceve -32700 e sulla riga non gira niente.
+#     ⛔ "Non e' girato niente" senza controllo positivo sarebbe vuoto: se la cella non scrivesse
+#     dove credo, il file mancherebbe comunque. Quindi la STESSA scrittura, su una riga sua, deve
+#     creare il suo file.
+def write_cell(i, name):
+    return json.dumps({"jsonrpc": "2.0", "id": i, **call(f"open('/workspace/{name}', 'w').write('x')")})
+
+
+with tempfile.TemporaryDirectory() as ws:
+    s17 = Live(env={"KERN_MCP_WORKSPACE": ws})
+    s17.send(write_cell(1, "a") + write_cell(2, "b"))
+    both = s17.wait({1, 2}, 30)
+    codes = {i: (both.get(i, {}).get("error") or {}).get("code") for i in (1, 2)}
+    s17.send(write_cell(3, "c"))
+    alone = s17.wait({3}, 120).get(3, {})
+    s17.close()
+    ran = sorted(n for n in ("a", "b", "c") if os.path.exists(os.path.join(ws, n)))
+    check("due frame su una riga: OGNI id riceve -32700", codes == {1: -32700, 2: -32700}, f"{codes}")
+    check("e sulla riga non gira niente (controllo: da sola si')",
+          ran == ["c"] and not (alone.get("result") or {}).get("isError", True),
+          f"file creati {ran}")
+
+# 18. Mezzo frame e poi EOF: il client muore a meta' scrittura. La meta' che c'e' porta l'id, quindi
+#     si risponde a quello, e il server esce pulito invece di restare appeso.
+p18 = subprocess.run([sys.executable, "-m", "kern_sandbox.mcp"],
+                     input=json.dumps(INIT) + "\n" + '{"jsonrpc":"2.0","id":5,"method":"ping"',
+                     capture_output=True, text=True, cwd=SDK, timeout=30,
+                     env=dict(os.environ, PYTHONPATH=SDK, KERN_BIN=KERN))
+half = [m for m in (strict(x) for x in p18.stdout.splitlines() if x.strip()) if m.get("id") == 5]
+check("mezzo frame poi EOF: risposta all'id ed uscita pulita",
+      p18.returncode == 0 and len(half) == 1 and (half[0].get("error") or {}).get("code") == -32700,
+      f"exit={p18.returncode} {json.dumps(half)[:80]}")
+
+# 19. `NaN` e `Infinity`: `json` di Python li accetta, RFC 8259 no. MISURATO prima: `"id": NaN`
+#     tornava come `"id": NaN`, una riga che `JSON.parse` di Node rifiuta. Ogni riga che il server
+#     scrive deve essere JSON per un client RIGOROSO.
+try:
+    strict('{"id": NaN}')
+    strict_ok = False
+except ValueError:
+    strict_ok = True
+check("controllo: il lettore rigoroso rifiuta NaN", strict_ok, "senza questo il caso sotto e' vuoto")
+s19 = Live()
+s19.send('{"jsonrpc":"2.0","id":NaN,"method":"ping"}')
+s19.send('{"jsonrpc":"2.0","id":8,"method":"ping","params":{"x":Infinity}}')
+s19.send(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"}))
+got19 = s19.wait({8, 9}, 30)
+s19.close()
+bad19 = []
+for line in s19.lines:
+    try:
+        strict(line)
+    except ValueError:
+        bad19.append(line[:60])
+check("NaN/Infinity: ogni riga scritta e' JSON, e la sessione continua",
+      not bad19 and (got19.get(8, {}).get("error") or {}).get("code") == -32700 and "result" in got19.get(9, {}),
+      f"righe non JSON {bad19}, id 8 -> {(got19.get(8, {}).get('error') or {}).get('code')}")
+
+def gone(txt):
+    """La risposta che dice che il binario non c'e' piu': il prefisso degli errori del binding, che
+    l'uscita di una cella non porta, piu' l'errore del sistema."""
+    return txt.startswith("kern error:") and "No such file or directory" in txt
+
+
+# 20. ⭐ IL BINARIO CHE SPARISCE A META' SESSIONE. Senza prewarm, cosi' la seconda chiamata ha
+#     bisogno del binario per forza: deve dirlo, non restare appesa e non riferire un successo.
+with tempfile.TemporaryDirectory() as d:
+    kb = os.path.join(d, "kern")
+    shutil.copy2(KERN, kb)
+    s20 = Live(env={"KERN_BIN": kb, "KERN_MCP_PREWARM": "0"})
+    s20.send(json.dumps({"jsonrpc": "2.0", "id": 1, **call("print(6*7)")}))
+    first = text_of(s20.wait({1}, 120).get(1, {}))
+    os.unlink(kb)
+    t20 = time.monotonic()
+    s20.send(json.dumps({"jsonrpc": "2.0", "id": 2, **call("print(6*7)")}))
+    second = s20.wait({2}, 60).get(2)
+    dt20 = time.monotonic() - t20
+    s20.close()
+    txt2, err2 = text_of(second or {})
+    check("binario sparito: la prima cella girava", not first[1] and "42" in first[0], f"{first[0].strip()[:40]!r}")
+    # Il predicato e' "un errore DEL BINDING che nomina il file mancante", non una frase: con il
+    # controllo d'identita' aggirato, misurato, lo strato sotto risponde `could not execute kern:
+    # [Errno 2] No such file or directory`, che e' una risposta altrettanto giusta.
+    check("binario sparito: la seconda lo DICE, subito",
+          second is not None and err2 and gone(txt2),
+          f"{dt20:.2f}s isError={err2} {txt2.strip()[:70]!r}")
+
+# 21. Lo stesso CON il prewarm predefinito, che e' la configurazione normale. Un box caldo avviato
+#     PRIMA della cancellazione e' un box vero, quindi usarlo e' un successo vero e non uno finto;
+#     quello che non deve succedere e' un'attesa, o un successo senza la cella. Il pool non puo'
+#     ricaricarsi senza binario, quindi l'ultima chiamata deve dirlo.
+with tempfile.TemporaryDirectory() as d:
+    kb = os.path.join(d, "kern")
+    shutil.copy2(KERN, kb)
+    s21 = Live(env={"KERN_BIN": kb})
+    s21.send(json.dumps({"jsonrpc": "2.0", "id": 1, **call("print(6*7)")}))
+    s21.wait({1}, 120)
+    os.unlink(kb)
+    for i in (2, 3, 4):
+        s21.send(json.dumps({"jsonrpc": "2.0", "id": i, **call("print(6*7)")}))
+    after = s21.wait({2, 3, 4}, 120)
+    s21.close()
+    shapes = []
+    for i in (2, 3, 4):
+        t, e = text_of(after.get(i, {}))
+        shapes.append("ok" if (not e and "42" in t and "[exit 0" in t) else "detto" if (e and gone(t)) else "ALTRO")
+    check("binario sparito col prewarm: nessuna attesa, nessun successo finto",
+          len(after) == 3 and "ALTRO" not in shapes and shapes[-1] == "detto", f"{shapes}")
+
+# 22. Due chiamate IN FILA sulla stessa sessione, la seconda servita dal pool caldo: ognuna deve
+#     tornare con la SUA uscita sotto il SUO id. Il server e' un solo processo su un solo stdio, quindi
+#     non c'e' concorrenza vera da mescolare; questo e' il controllo che lo dice invece di supporlo.
+res, err = session("in fila", [call("print('AAA')"), call("print('BBB')")])
+by_id = {m.get("id"): text_of(m)[0] for m in res if "result" in m and "content" in (m.get("result") or {})}
+check("due chiamate in fila: ognuna la sua uscita",
+      "AAA" in by_id.get(1, "") and "BBB" not in by_id.get(1, "")
+      and "BBB" in by_id.get(2, "") and "AAA" not in by_id.get(2, ""),
+      f"{ {k: v.strip()[:12] for k, v in by_id.items()} }")
 
 print(f"\n{ok} ok, {bad} falliti")
 sys.exit(1 if bad else 0)

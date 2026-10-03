@@ -1322,14 +1322,65 @@ def test_main_answers_a_last_frame_with_no_trailing_newline(monkeypatch):
     assert _lines(raw)[0]["id"] == 8
 
 
-def test_main_skips_two_json_objects_concatenated_without_a_newline(monkeypatch):
+def test_main_refuses_two_json_objects_on_one_line_and_answers_both(monkeypatch):
     """The transport is newline-delimited: two objects on one line are one malformed frame, not two
-    messages. Skipping is correct; parsing the first and silently discarding the second would be worse
-    than either."""
+    messages, so NEITHER runs - parsing the first and discarding the second would be worse than both.
+
+    But each id is ANSWERED. This test used to assert that only the next line got a reply, which is
+    the defect: MEASURED over a live session, both ids waited forever while the server answered the
+    following line normally, so nothing told the client its two requests were gone."""
     glued = json.dumps(_req("ping", mid=1)) + json.dumps(_req("ping", mid=2)) + "\n"
     stdin = glued + json.dumps(_req("ping", mid=3)) + "\n"
     replies = _lines(_run_main(stdin, monkeypatch))
-    assert [r["id"] for r in replies] == [3]
+    assert [(r["id"], (r.get("error") or {}).get("code")) for r in replies] == [
+        (1, -32700), (2, -32700), (3, None),
+    ]
+    assert "not ONE JSON-RPC message" in replies[0]["error"]["message"]
+    assert replies[2]["result"] == {}
+
+
+def test_main_answers_a_frame_cut_short_from_its_prefix(monkeypatch):
+    """A frame with no end has nothing to decode, but its `id` is in the bytes that did arrive: the
+    client is told, instead of waiting on a request the server cannot read."""
+    stdin = '{"jsonrpc": "2.0", "id": "half", "method": "ping"\n' + json.dumps(_req("ping", mid=4)) + "\n"
+    replies = _lines(_run_main(stdin, monkeypatch))
+    assert [(r["id"], (r.get("error") or {}).get("code")) for r in replies] == [
+        ("half", -32700), (4, None),
+    ]
+
+
+def test_main_answers_a_frame_followed_by_garbage(monkeypatch):
+    raw = _run_main(json.dumps(_req("ping", mid=6)) + " trailing\n", monkeypatch)
+    assert [(r["id"], r["error"]["code"]) for r in _lines(raw)] == [(6, -32700)]
+
+
+def test_main_refuses_nan_and_infinity_and_never_writes_them(monkeypatch):
+    """RFC 8259 has no `NaN` or `Infinity`, and Python's `json` accepts both. MEASURED: `"id": NaN` was
+    echoed as `"id": NaN`, a reply line Node's `JSON.parse` rejects. Every line written must parse
+    under a decoder that refuses them, and a request carrying one is a malformed frame."""
+    stdin = (
+        '{"jsonrpc": "2.0", "id": NaN, "method": "ping"}\n'
+        '{"jsonrpc": "2.0", "id": 8, "method": "ping", "params": {"x": -Infinity}}\n'
+        + json.dumps(_req("ping", mid=9)) + "\n"
+    )
+    raw = _run_main(stdin, monkeypatch)
+
+    def refuse(name):
+        raise ValueError(name)
+
+    replies = [json.loads(ln, parse_constant=refuse) for ln in raw.split("\n") if ln.strip()]
+    assert [(r["id"], (r.get("error") or {}).get("code")) for r in replies] == [(8, -32700), (9, None)]
+    assert "-Infinity is not JSON" in replies[0]["error"]["message"]
+
+
+@pytest.mark.parametrize("mid", ["true", "1.5", "null", "[1]", '{"a": 1}'])
+def test_an_id_that_is_not_a_string_or_integer_is_not_echoed(mid, monkeypatch):
+    """Recovering ids from a malformed line must not invent a reply to something that is not an id:
+    `true` is an int to Python, and a float id may be `NaN`. The well-formed frame beside it is still
+    answered, which is what makes the empty answer for the bad one a measurement."""
+    glued = '{"jsonrpc": "2.0", "id": ' + mid + ', "method": "ping"}' + json.dumps(_req("ping", mid=2))
+    replies = _lines(_run_main(glued + "\n", monkeypatch))
+    assert [(r["id"], r["error"]["code"]) for r in replies] == [(2, -32700)]
 
 
 def test_main_survives_deeply_nested_json(monkeypatch):

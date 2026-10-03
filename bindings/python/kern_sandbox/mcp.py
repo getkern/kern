@@ -118,6 +118,56 @@ def _clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + f"\n{_CLIP_HEAD}{len(s) - n}{_CLIP_TAIL}"
 
 
+_PREFIX_ID = re.compile(r'"id"\s*:\s*(?:"((?:[^"\\]|\\.)*)"|(-?\d+))')
+
+
+def _prefix_id(text: str) -> "str | int | None":
+    """The `id` of a frame that cannot be parsed, read from its first 4 kB: a JSON-RPC frame carries
+    its `id` near the start, so the one thing the client is waiting on survives a frame that does
+    not."""
+    m = _PREFIX_ID.search(text[:4096])
+    if not m:
+        return None
+    return m.group(1) if m.group(1) is not None else int(m.group(2))
+
+
+def _unparsed_ids(line: str) -> list:
+    """Every request id a line that is not ONE JSON value still carries, in order, without repeats.
+
+    Two frames on one line are two complete objects, so each is decoded where it stands and each id is
+    recovered exactly; a frame cut short has no end to decode, and its id comes from the prefix. Only
+    a string or an integer is kept, the two forms the prefix reader recognises: `true` is an int to
+    Python, and a float id may be `NaN`, which would go back out as a line that is not JSON.
+    """
+    ids: list = []
+    dec = json.JSONDecoder()
+    pos = 0
+    try:
+        while True:
+            while pos < len(line) and line[pos] in " \t\r\n":
+                pos += 1
+            if pos >= len(line):
+                break
+            obj, pos = dec.raw_decode(line, pos)
+            mid = obj.get("id") if isinstance(obj, dict) else None
+            if isinstance(mid, (str, int)) and not isinstance(mid, bool) and mid not in ids:
+                ids.append(mid)
+    except (ValueError, RecursionError):
+        if not ids:
+            mid = _prefix_id(line)
+            if mid is not None:
+                ids.append(mid)
+    return ids
+
+
+def _not_json(name: str) -> None:
+    """`parse_constant` for the inbound decoder. Python's `json` accepts `NaN`, `Infinity` and
+    `-Infinity`, which RFC 8259 does not, and an id read that way is echoed back verbatim. MEASURED:
+    `"id": NaN` came back as `{"jsonrpc": "2.0", "id": NaN, ...}`, a line Node's `JSON.parse`
+    rejects. Refused on the way in, it is a malformed frame like any other."""
+    raise ValueError(f"{name} is not JSON")
+
+
 def _env_int(name: str, default: int) -> int:
     """A positive int from the environment, else the default - so a negative/garbage operator value can't
     poison the session (every later call failing identically in the Sandbox constructor)."""
@@ -810,10 +860,7 @@ def main() -> None:
                 # JSON-RPC frame, which is inside the bytes already read, so the one thing the client
                 # needs is recoverable even though the frame is not parseable. If it is not there, the
                 # silence is unavoidable and is the only case left.
-                mid = None
-                m = re.search(r'"id"\s*:\s*(?:"((?:[^"\\]|\\.)*)"|(-?\d+))', line[:4096])
-                if m:
-                    mid = m.group(1) if m.group(1) is not None else int(m.group(2))
+                mid = _prefix_id(line)
                 while True:
                     chunk = sys.stdin.readline(_MAX_FRAME)
                     if chunk == "" or chunk.endswith("\n"):
@@ -831,14 +878,31 @@ def main() -> None:
             if not line:
                 continue
             try:
-                msg = json.loads(line)
-            except (ValueError, RecursionError):
+                msg = json.loads(line, parse_constant=_not_json)
+            except (ValueError, RecursionError) as e:
                 # JSONDecodeError (a ValueError) is the ordinary malformed frame. RecursionError is the
                 # hostile one: `[`*100000 is SYNTACTICALLY valid, so the decoder recurses past the
                 # interpreter's limit and raises something that is NOT a JSONDecodeError. Caught only as
                 # JSONDecodeError, it escaped the loop and killed the connection - one frame, no reply to
                 # anything after it.
-                continue  # malformed or abusive frame: skip, keep serving
+                #
+                # 🔴 AND EVERY ID ON THE LINE IS ANSWERED, for the reason the oversize frame above is:
+                # a dropped frame leaves its client waiting forever. MEASURED before this: two `ping`s
+                # on one line, a frame cut short, and a line that is not JSON each got NO reply, and
+                # the server answered the next well-formed line normally, so nothing marked the loss.
+                # Nothing on the line runs - it is not one message, so which part was meant cannot be
+                # known - and each id gets -32700. With no id there is no reply: MCP's error schema
+                # requires the request's id, so JSON-RPC's `"id": null` form is not available here.
+                why = _clip(str(e), _MAX_NAME)
+                for mid in _unparsed_ids(line):
+                    server._error(
+                        mid,
+                        -32700,
+                        f"this line is not ONE JSON-RPC message ({why}), so nothing on it ran. The "
+                        f"stdio transport carries exactly one message per line, each ending in a "
+                        f"newline",
+                    )
+                continue
             if not isinstance(msg, dict):
                 continue
             try:
