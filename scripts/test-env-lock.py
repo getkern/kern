@@ -74,7 +74,7 @@ DECLARED_CONFIGS = {
     ),
 }
 
-# 🪤 THE THIRD DOOR, and it was found by an outside reviewer after the first two were shut.
+# 🪤 THE THIRD DOOR, and it was still open after the first two were shut.
 #
 # Cargo's own lint tables switch a clippy lint off for a whole package or the whole workspace:
 #
@@ -102,8 +102,7 @@ LINT_TABLE = re.compile(
 )
 # THE KEYS IN A CARGO LINT TABLE ARE BARE, and the first version of this pattern missed that.
 #
-# 🪤 Reported by the same outside review that found the table class at all, and MEASURED here, one
-# form at a time, against a planted `std::env::var` with `RUSTFLAGS=-D warnings`:
+# 🪤 MEASURED one form at a time, against a planted `std::env::var` with `RUSTFLAGS=-D warnings`:
 #
 #   [lints.clippy] disallowed_methods = "allow"   clippy stops flagging   gate RED    (was caught)
 #   [lints.clippy] all   = "allow"                clippy stops flagging   gate GREEN  (the hole)

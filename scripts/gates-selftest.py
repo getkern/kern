@@ -245,8 +245,8 @@ CASES: list[Case] = [
      replace_once('DECLARED_CONFIGS = {', 'DECLARED_CONFIGS = {\n    "crates/gone/clippy.toml": "stale",')),
 
     # --- test-env-lock: the THIRD door, Cargo's own lint tables ---
-    # Found by an outside reviewer after the `.rs` attribute scan and the per-directory `clippy.toml`
-    # check were both in place. A `[lints.clippy]` table in a member, a `[workspace.lints.clippy]`
+    # Still open after the `.rs` attribute scan and the per-directory `clippy.toml` check were both
+    # in place. A `[lints.clippy]` table in a member, a `[workspace.lints.clippy]`
     # table in the root, or a `rustflags = ["-A", ...]` in `.cargo/config.toml` each disarm the lint
     # for a whole subtree with no mark in any `.rs` file and no second `clippy.toml`. Measured before
     # the check existed: the gate printed "no undeclared ones of either kind" and exited 0 while
