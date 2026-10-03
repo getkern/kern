@@ -37,7 +37,10 @@ fn read_cache() -> Option<(String, Option<String>)> {
     let s = fs::read_to_string(cache_file()?).ok()?;
     let mut lines = s.lines().map(str::trim);
     let d = lines.next().filter(|d| !d.is_empty())?.to_string();
-    let path = lines.next().filter(|p| p.starts_with('/')).map(str::to_string);
+    let path = lines
+        .next()
+        .filter(|p| p.starts_with('/'))
+        .map(str::to_string);
     Some((d, path))
 }
 
@@ -113,7 +116,16 @@ fn resolve_target() -> Result<Target, ResolveErr> {
         }
     }
     // Distros exist but none has kern - report the most likely candidate (the first tried).
-    Err(ResolveErr::KernMissing(ordered[0].clone()))
+    //
+    // `first()` AND NOT `[0]`: the index is provably in range here (`names` is non-empty above and
+    // `order_candidates` partitions it, so it returns exactly as many elements) but that invariant
+    // lives in two other functions. This binary is built with `panic = "abort"`, so a wrong index
+    // would abort with no message at all - the forwarder would simply vanish. The fallback cannot
+    // happen; if it ever does, it reports the condition instead of killing the process.
+    match ordered.first() {
+        Some(d) => Err(ResolveErr::KernMissing((*d).clone())),
+        None => Err(ResolveErr::NoDistro),
+    }
 }
 
 /// Capture the stdout of a `wsl.exe` sub-command, or `None` on spawn failure / non-zero exit. Sets
@@ -121,7 +133,11 @@ fn resolve_target() -> Result<Target, ResolveErr> {
 /// `decode_wsl`. THE one place probe spawns live - a non-success status is never parsed as output
 /// (else WSL's own error text would be mistaken for a distro name / kern path).
 fn wsl_query(args: &[&str]) -> Option<String> {
-    let out = Command::new("wsl.exe").args(args).env("WSL_UTF8", "1").output().ok()?;
+    let out = Command::new("wsl.exe")
+        .args(args)
+        .env("WSL_UTF8", "1")
+        .output()
+        .ok()?;
     out.status.success().then(|| decode_wsl(&out.stdout))
 }
 
@@ -166,9 +182,16 @@ fn decode_wsl(bytes: &[u8]) -> String {
     if !bytes.contains(&0) {
         return String::from_utf8_lossy(bytes).into_owned();
     }
+    // DESTRUCTURED, not indexed: a two-element slice pattern proves the bound to the compiler, so
+    // this carries no index that could abort (`panic = "abort"` here means an out-of-range index
+    // would kill the forwarder with no output at all). An odd trailing byte is DROPPED explicitly,
+    // which is what `chunks_exact` did silently - half a UTF-16 code unit is not a character.
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .chunks(2)
+        .filter_map(|c| match c {
+            [lo, hi] => Some(u16::from_le_bytes([*lo, *hi])),
+            _ => None,
+        })
         .collect();
     char::decode_utf16(units.into_iter().filter(|&u| u != 0xFEFF)) // strip a BOM if present
         .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
@@ -208,11 +231,32 @@ fn split_mount(s: &str) -> Option<(&str, &str)> {
 }
 
 /// `C:\Users\me\proj` → `/mnt/c/Users/me/proj`. Drive letter lowercased; backslashes → forward.
+///
+/// CARRIES ITS OWN GUARD INSTEAD OF TRUSTING ITS CALLER. The only production caller is
+/// `translate_arg`, which calls it after `is_win_path` has already proved the first three bytes
+/// exist, so the previous `b[0]` and `p[2..]` could not go out of range. But the proof lived in the
+/// OTHER function: anything that ever calls this directly (a test does) would abort the whole
+/// process, with no message, because this binary is built `panic = "abort"`. A path that is not a
+/// drive path is now returned unchanged, which is also what the forwarder does with every other
+/// argument it does not recognise.
 fn win_to_wsl(p: &str) -> String {
-    let b = p.as_bytes();
-    let drive = (b[0] as char).to_ascii_lowercase();
-    let rest = p[2..].replace('\\', "/");
-    format!("/mnt/{drive}{}", if rest.starts_with('/') { rest } else { format!("/{rest}") })
+    let mut chars = p.chars();
+    let (Some(letter), Some(':')) = (chars.next(), chars.next()) else {
+        return p.to_string();
+    };
+    if !letter.is_ascii_alphabetic() {
+        return p.to_string();
+    }
+    let drive = letter.to_ascii_lowercase();
+    let rest = chars.as_str().replace('\\', "/");
+    format!(
+        "/mnt/{drive}{}",
+        if rest.starts_with('/') {
+            rest
+        } else {
+            format!("/{rest}")
+        }
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -259,22 +303,76 @@ fn parse_wsl(args: &[String]) -> Option<WslCmd> {
     if args.first().map(String::as_str) != Some("wsl") {
         return None;
     }
-    let rest = &args[1..];
+    let rest = args.get(1..).unwrap_or(&[]);
+    let tail = rest.get(1..).unwrap_or(&[]);
     Some(match rest.first().map(String::as_str) {
         None => WslCmd::Usage(None),
-        Some("list" | "ls") => WslCmd::List {
-            probe: rest[1..].iter().any(|a| a == "--probe"),
+
+        // AN UNRECOGNISED ARGUMENT IS REFUSED, NEVER IGNORED, and every arm below says so.
+        //
+        // 🪤 MEASURED ON A REAL HOST, and this is the whole reason these arms are not one-liners:
+        //   * `kern wsl list --prob` (a typo for `--probe`) ran a plain `list`, printed
+        //     "not probed" on every row, and exited 0. The user asked to probe, was told nothing,
+        //     and read an answer that looked like the probe's.
+        //   * `kern wsl use kern rodlaw` stored `kern` and dropped `rodlaw` in silence, so a
+        //     command with two distro names in it succeeds and the second one never happened.
+        // Both are the same defect: an argument the parser does not understand, accepted. The exit
+        // code is 2 (usage), which is what `use` with no name already returned.
+        Some("list" | "ls") => match tail.iter().find(|a| *a != "--probe") {
+            Some(bad) => WslCmd::Usage(Some(format!(
+                "`kern wsl list` takes only --probe, not {}",
+                short(bad)
+            ))),
+            None => WslCmd::List {
+                probe: tail.iter().any(|a| a == "--probe"),
+            },
         },
-        Some("status") => WslCmd::Status,
-        Some("reset") => WslCmd::Reset,
-        Some("use") => match rest.get(1) {
+
+        Some("status") => no_args("status", tail, WslCmd::Status),
+        Some("reset") => no_args("reset", tail, WslCmd::Reset),
+
+        Some("use") => match (tail.first(), tail.get(1)) {
             // A name is REQUIRED and is never guessed: `use` with no argument writing the default
             // distro would persist a choice the user did not make.
-            Some(n) if !n.trim().is_empty() => WslCmd::Use(n.trim().to_string()),
-            _ => WslCmd::Usage(Some("kern wsl use needs a distro name".into())),
+            (None, _) => WslCmd::Usage(Some("kern wsl use needs a distro name".into())),
+            (Some(n), _) if n.trim().is_empty() => {
+                WslCmd::Usage(Some("kern wsl use needs a distro name".into()))
+            }
+            // ONE name, because two is ambiguous and picking the first is a guess. A WSL distro
+            // name can contain a space, so the remedy named here is quoting rather than "pick one".
+            (Some(_), Some(extra)) => WslCmd::Usage(Some(format!(
+                "`kern wsl use` takes ONE distro name, got a second: {}. \
+                 A name containing a space must be quoted",
+                short(extra)
+            ))),
+            (Some(n), None) => WslCmd::Use(n.trim().to_string()),
         },
-        Some(other) => WslCmd::Usage(Some(format!("unknown: kern wsl {other}"))),
+
+        Some(other) => WslCmd::Usage(Some(format!("unknown: kern wsl {}", short(other)))),
     })
+}
+
+/// A name from the command line or the cache file, made safe to put in a one-line message.
+///
+/// WHY EVERY ECHO OF AN UNTRUSTED NAME GOES THROUGH THIS. Measured on the test host: `kern wsl use`
+/// with a 4096-character name printed all 4096 into the refusal; a name containing a newline split
+/// the message across two lines so the second half read like a separate statement; and a cache file
+/// holding one 70,000-character line put all of it into two different messages. None of these is a
+/// privilege boundary - the cache is in the user's own `%LOCALAPPDATA%` and the argument is their own
+/// shell - but a refusal is meant to be read, and the same rule is already applied to the version
+/// strings `kern doctor` collects: strip the control characters, then cap the length.
+fn short(s: &str) -> String {
+    const MAX: usize = 48;
+    let clean: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    // `char_indices` and not a byte slice: cutting a multi-byte character in half would panic, and
+    // a distro name can be any UTF-16 the user typed.
+    match clean.char_indices().nth(MAX) {
+        Some((at, _)) => format!("'{}…' ({} characters)", &clean[..at], clean.chars().count()),
+        None => format!("'{clean}'"),
+    }
 }
 
 const WSL_USAGE: &str = "\
@@ -307,7 +405,7 @@ fn running_distros() -> Vec<String> {
 /// that is some other project would otherwise be reported as a kern install at an unknown version.
 /// `command -v` short-circuits with `&&`, so "not installed" comes back as empty output rather than
 /// as a half-filled answer.
-fn kern_in(distro: &str) -> Option<(String, String)> {
+fn kern_in(distro: &str) -> Option<KernInDistro> {
     let out = wsl_query(&[
         "-d",
         distro,
@@ -325,6 +423,14 @@ fn kern_in(distro: &str) -> Option<(String, String)> {
     Some((path.to_string(), version.to_string()))
 }
 
+/// kern's absolute path inside a distro, and the version string it reported.
+type KernInDistro = (String, String);
+
+/// One row of a `--probe` sweep: the distro name, and what was found in it. The inner `None` is
+/// "looked, no kern"; a distro ABSENT from the slice was never looked at, which is a third state and
+/// the one `render_list` must not collapse into the second.
+type ProbeRow = (String, Option<KernInDistro>);
+
 /// Render `kern wsl list`. Pure: the table and every marker are unit-tested without a Windows host.
 ///
 /// `probed` is `None` for the distros that were not probed, which is NOT the same as "kern is not
@@ -334,7 +440,7 @@ fn render_list(
     running: &[String],
     selected: Option<&str>,
     source: &Source,
-    probed: Option<&[(String, Option<(String, String)>)]>,
+    probed: Option<&[ProbeRow]>,
 ) -> String {
     if names.is_empty() {
         return "kern: no WSL2 distro is registered on this machine.\n".to_string();
@@ -342,8 +448,16 @@ fn render_list(
     let mut s = String::new();
     s.push_str("  DISTRO                STATE     KERN\n");
     for n in names {
-        let state = if running.iter().any(|r| r == n) { "running" } else { "stopped" };
-        let mark = if Some(n.as_str()) == selected { "*" } else { " " };
+        let state = if running.iter().any(|r| r == n) {
+            "running"
+        } else {
+            "stopped"
+        };
+        let mark = if Some(n.as_str()) == selected {
+            "*"
+        } else {
+            " "
+        };
         let kern = match probed.map(|p| p.iter().find(|(d, _)| d == n)) {
             // Probed and found: the version is what makes a mismatch between distros visible.
             Some(Some((_, Some((_, v))))) => v.clone(),
@@ -353,15 +467,27 @@ fn render_list(
         };
         s.push_str(&format!("{mark} {n:<21} {state:<9} {kern}\n"));
     }
+    let why = |source: &Source| match source {
+        Source::Env => "from KERN_WSL_DISTRO",
+        Source::Cache => "stored by `kern wsl use`",
+        Source::Unresolved => "auto-detected",
+    };
     match selected {
-        Some(d) => s.push_str(&format!(
-            "\n* = in use: '{d}' ({}).\n",
-            match source {
-                Source::Env => "from KERN_WSL_DISTRO",
-                Source::Cache => "stored by `kern wsl use`",
-                Source::Unresolved => "auto-detected",
-            }
+        // THE SELECTED DISTRO MAY NOT BE IN THE LIST, and the legend must not pretend otherwise.
+        //
+        // 🪤 MEASURED: with a stored choice naming a distro that has since been unregistered, this
+        // printed a table where NO row carried a `*` and then a footer reading "* = in use:
+        // '<name>'". A legend for a marker that is not on the page, under a list the name is absent
+        // from. The forwarder recovers from this on its own (a stale cache is cleared and re-probed
+        // on the next command), so the honest line is that the stored name is gone, not an error.
+        Some(d) if !names.iter().any(|n| n == d) => s.push_str(&format!(
+            "\nThe selected distro {} ({}) is NOT in the list above: it is no longer registered, \
+             so no row is marked. The next kern command detects one again, or pick one with \
+             `kern wsl use <distro>`.\n",
+            short(d),
+            why(source)
         )),
+        Some(d) => s.push_str(&format!("\n* = in use: {} ({}).\n", short(d), why(source))),
         None => s.push_str(
             "\nNo distro is selected yet; the next kern command detects one. \
              Pick one with `kern wsl use <distro>`.\n",
@@ -376,7 +502,11 @@ fn render_list(
 #[derive(Debug, PartialEq)]
 enum UseVerdict {
     /// Store it. `warn_env` carries the name that will WIN over what we are about to store.
-    Store { path: String, version: String, warn_env: Option<String> },
+    Store {
+        path: String,
+        version: String,
+        warn_env: Option<String>,
+    },
     /// Refuse: the distro is not registered. Carries the names we did see.
     NoSuchDistro(Vec<String>),
     /// Refuse: it exists, but kern is not inside it.
@@ -386,7 +516,7 @@ enum UseVerdict {
 fn use_verdict(
     want: &str,
     names: &[String],
-    found: Option<(String, String)>,
+    found: Option<KernInDistro>,
     env_override: Option<&str>,
 ) -> UseVerdict {
     // Case-insensitively, because WSL itself treats distro names that way and `wsl -d UBUNTU`
@@ -411,9 +541,41 @@ fn use_verdict(
     }
 }
 
+/// Which distro is in use, and where that choice came from.
+///
+/// ONE SPELLING OF THE PRECEDENCE RULE, because `list` and `status` must agree about it and a second
+/// copy drifts the first time the order changes. The order is `KERN_WSL_DISTRO`, then the stored
+/// choice, then detection - the same order `resolve_target` forwards with, which is what makes
+/// `status` able to say what the NEXT command will do rather than what this one looked up.
+fn selection(
+    env_distro: Option<&String>,
+    cached: Option<&(String, Option<String>)>,
+) -> (Option<String>, Source) {
+    match (env_distro, cached) {
+        (Some(d), _) => (Some(d.clone()), Source::Env),
+        (None, Some((d, _))) => (Some(d.clone()), Source::Cache),
+        (None, None) => (None, Source::Unresolved),
+    }
+}
+
+/// A sub-command that takes no arguments: either the command, or a usage refusal naming the first
+/// extra argument. Spelled once because `status` and `reset` had the same four lines, and a message
+/// that exists twice is a message that will disagree with itself.
+fn no_args(verb: &str, tail: &[String], cmd: WslCmd) -> WslCmd {
+    match tail.first() {
+        Some(bad) => WslCmd::Usage(Some(format!(
+            "`kern wsl {verb}` takes no arguments, got {}",
+            short(bad)
+        ))),
+        None => cmd,
+    }
+}
+
 /// Run a `kern wsl` command. Returns the process exit code.
 fn run_wsl_cmd(cmd: WslCmd) -> i32 {
-    let env_distro = env::var("KERN_WSL_DISTRO").ok().filter(|s| !s.trim().is_empty());
+    let env_distro = env::var("KERN_WSL_DISTRO")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     match cmd {
         WslCmd::Usage(err) => {
             if let Some(e) = err {
@@ -429,11 +591,7 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
             let names = list_distros();
             let running = running_distros();
             let cached = read_cache();
-            let (selected, source) = match (&env_distro, &cached) {
-                (Some(d), _) => (Some(d.clone()), Source::Env),
-                (None, Some((d, _))) => (Some(d.clone()), Source::Cache),
-                (None, None) => (None, Source::Unresolved),
-            };
+            let (selected, source) = selection(env_distro.as_ref(), cached.as_ref());
             let probed = if probe && !names.is_empty() {
                 // ANNOUNCED BEFORE IT HAPPENS: asking a stopped distro for a version boots it, which
                 // takes seconds and leaves it running. A diagnostic must not do that silently.
@@ -443,13 +601,24 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
                         "kern: probing starts {stopped} stopped distro(s) and can take a few seconds each..."
                     );
                 }
-                Some(names.iter().map(|n| (n.clone(), kern_in(n))).collect::<Vec<_>>())
+                Some(
+                    names
+                        .iter()
+                        .map(|n| (n.clone(), kern_in(n)))
+                        .collect::<Vec<_>>(),
+                )
             } else {
                 None
             };
             print!(
                 "{}",
-                render_list(&names, &running, selected.as_deref(), &source, probed.as_deref())
+                render_list(
+                    &names,
+                    &running,
+                    selected.as_deref(),
+                    &source,
+                    probed.as_deref()
+                )
             );
             if !probe && !names.is_empty() {
                 println!("Run `kern wsl list --probe` to see kern's version inside each distro.");
@@ -459,10 +628,12 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
 
         WslCmd::Status => {
             let cached = read_cache();
-            let (distro, source) = match (&env_distro, &cached) {
-                (Some(d), _) => (d.clone(), Source::Env),
-                (None, Some((d, _))) => (d.clone(), Source::Cache),
-                (None, None) => {
+            // THE SAME `selection` AS `list`, so the two cannot disagree about which distro is in
+            // use. Only the "nothing selected yet" case differs, because `status` has a sentence to
+            // print for it and `list` has a table to put it under.
+            let (distro, source) = match selection(env_distro.as_ref(), cached.as_ref()) {
+                (Some(d), src) => (d, src),
+                (None, _) => {
                     println!(
                         "kern: no distro selected yet - the next kern command will detect one.\n\
                          Run `kern wsl list` to see what is available."
@@ -470,7 +641,7 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
                     return 0;
                 }
             };
-            println!("distro:  {distro}");
+            println!("distro:  {}", short(&distro));
             println!(
                 "chosen:  {}",
                 match source {
@@ -482,7 +653,10 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
             if source == Source::Env {
                 if let Some((d, _)) = &cached {
                     if !d.eq_ignore_ascii_case(&distro) {
-                        println!("stored:  {d}  (NOT in use - the environment variable wins)");
+                        println!(
+                            "stored:  {}  (NOT in use - the environment variable wins)",
+                            short(d)
+                        );
                     }
                 }
             }
@@ -493,11 +667,12 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
                     0
                 }
                 None => {
-                    println!("kern:    NOT FOUND inside '{distro}'");
+                    println!("kern:    NOT FOUND inside {}", short(&distro));
                     eprintln!(
-                        "\nkern: '{distro}' is selected but has no kern. Pick another with\n\
+                        "\nkern: {} is selected but has no kern. Pick another with\n\
                          `kern wsl use <distro>`, or install kern inside it:\n\n\
-                         {INSTALL_HINT}"
+                         {INSTALL_HINT}",
+                        short(&distro)
                     );
                     1
                 }
@@ -514,7 +689,7 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
                 .and_then(|actual| kern_in(actual));
             match use_verdict(&want, &names, found, env_distro.as_deref()) {
                 UseVerdict::NoSuchDistro(seen) => {
-                    eprintln!("kern: no WSL2 distro named '{want}'.");
+                    eprintln!("kern: no WSL2 distro named {}.", short(&want));
                     if seen.is_empty() {
                         eprintln!("No distro is registered. Install one:\n\n{INSTALL_HINT}");
                     } else {
@@ -523,16 +698,29 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
                     1
                 }
                 UseVerdict::NoKernInside => {
+                    // THE `wsl -d {want}` IN THE SUGGESTION IS DELIBERATELY NOT PUT THROUGH
+                    // `short()`, unlike every other echo in this file: it is a command to paste,
+                    // and a truncated name would make it a command that does not work. It is safe
+                    // to print whole because this arm is only reachable when `want` matched a
+                    // REGISTERED distro (see `use_verdict`), so its length is whatever WSL itself
+                    // accepted - not, as in the cache and the argument list, whatever anything
+                    // happened to write. The leading sentence still uses `short()`, so an absurd
+                    // name is visible as absurd on the first line.
                     eprintln!(
-                        "kern: '{want}' exists but kern is not installed inside it, so it is NOT stored:\n\
+                        "kern: {} exists but kern is not installed inside it, so it is NOT stored:\n\
                          a stored choice that cannot answer would break every later command.\n\n\
                          Install kern in it:  wsl -d {want} -- sh -lc 'curl -fsSL \
                          https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh'\n\
-                         or re-run the Windows installer:\n\n{INSTALL_HINT}"
+                         or re-run the Windows installer:\n\n{INSTALL_HINT}",
+                        short(&want)
                     );
                     1
                 }
-                UseVerdict::Store { path, version, warn_env } => {
+                UseVerdict::Store {
+                    path,
+                    version,
+                    warn_env,
+                } => {
                     // The distro is stored under WSL's spelling, not the user's, so the cache never
                     // holds a name that only works by case-insensitive luck.
                     let actual = names
@@ -545,7 +733,7 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
                         // VERIFIED, not assumed: the cache file collided with a directory once and
                         // every write failed silently, so every command re-ran the first-run probe.
                         Some((d, _)) if d == actual => {
-                            println!("kern: now using '{actual}' ({version}).");
+                            println!("kern: now using {} ({version}).", short(&actual));
                         }
                         _ => {
                             eprintln!(
@@ -557,9 +745,11 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
                     }
                     if let Some(e) = warn_env {
                         eprintln!(
-                            "\nkern: WARNING - KERN_WSL_DISTRO is set to '{e}' and OVERRIDES what was just\n\
-                             stored, so commands will still go to '{e}'. Clear it to use '{actual}':\n\
-                             \n    set KERN_WSL_DISTRO=\n"
+                            "\nkern: WARNING - KERN_WSL_DISTRO is set to {env} and OVERRIDES what was\n\
+                             just stored, so commands will still go there. Clear it to use {chosen}:\n\
+                             \n    set KERN_WSL_DISTRO=\n",
+                            env = short(&e),
+                            chosen = short(&actual)
                         );
                     }
                     0
@@ -571,13 +761,17 @@ fn run_wsl_cmd(cmd: WslCmd) -> i32 {
             let had = read_cache().map(|(d, _)| d);
             clear_cache();
             match had {
-                Some(d) => println!("kern: forgot '{d}'. The next command detects a distro again."),
+                Some(d) => println!(
+                    "kern: forgot {}. The next command detects a distro again.",
+                    short(&d)
+                ),
                 None => println!("kern: no stored choice to forget."),
             }
             if let Some(e) = env_distro {
                 eprintln!(
-                    "\nkern: note - KERN_WSL_DISTRO is set to '{e}', so detection is still bypassed.\n\
-                     Clear it with:  set KERN_WSL_DISTRO="
+                    "\nkern: note - KERN_WSL_DISTRO is set to {}, so detection is still bypassed.\n\
+                     Clear it with:  set KERN_WSL_DISTRO=",
+                    short(&e)
                 );
             }
             0
@@ -674,7 +868,11 @@ fn main() {
         let translated: Vec<String> = args.iter().map(|a| translate_arg(a)).collect();
 
         // Best-effort perf hint: a `-v` source under /mnt/<drive> crosses WSL2's 9p bridge (~10x slower).
-        if args.iter().zip(&translated).any(|(o, t)| o != t && t.starts_with("/mnt/")) {
+        if args
+            .iter()
+            .zip(&translated)
+            .any(|(o, t)| o != t && t.starts_with("/mnt/"))
+        {
             hint_9p_once();
         }
 
@@ -684,8 +882,8 @@ fn main() {
             Ok(s) if s.code() == Some(-1) && target.from_cache && attempt == 0 => {
                 clear_cache();
                 eprintln!(
-                    "kern: WSL distro '{}' didn't start (removed or renamed?) - re-detecting...",
-                    target.distro
+                    "kern: WSL distro {} didn't start (removed or renamed?) - re-detecting...",
+                    short(&target.distro)
                 );
                 continue;
             }
@@ -697,7 +895,15 @@ fn main() {
             }
         }
     }
-    unreachable!("second attempt always exits");
+    // NOT `unreachable!`. The loop cannot fall through - every arm of the match either exits or, at
+    // attempt 0 only, continues - but `unreachable!` is a panic, and with `panic = "abort"` in this
+    // profile that is the forwarder dying silently on a condition it could have reported. The exit
+    // code is the generic failure, with a line saying which invariant broke, so if the loop is ever
+    // restructured the symptom is a message and not a vanished process.
+    eprintln!(
+        "kern: internal error - the WSL retry loop ended without forwarding. Please report this."
+    );
+    exit(1);
 }
 
 #[cfg(test)]
@@ -739,13 +945,22 @@ mod tests {
         // WSL_UTF8=1 path: plain UTF-8, no NULs.
         assert_eq!(decode_wsl(b"Ubuntu\nkern\n"), "Ubuntu\nkern\n");
         // Old-WSL path: UTF-16LE. Latin-1 name…
-        let utf16: Vec<u8> = "kern\r\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let utf16: Vec<u8> = "kern\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert_eq!(decode_wsl(&utf16), "kern\r\n");
         // …and a non-Latin-1 name, which the old byte-skipping heuristic would have mangled.
-        let cjk: Vec<u8> = "开发-Ubuntu\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let cjk: Vec<u8> = "开发-Ubuntu\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert_eq!(decode_wsl(&cjk), "开发-Ubuntu\n");
         // A BOM is stripped, not leaked into the first name.
-        let bom: Vec<u8> = "\u{FEFF}kern\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let bom: Vec<u8> = "\u{FEFF}kern\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert_eq!(decode_wsl(&bom), "kern\n");
         // Empty output → empty string (no distros).
         assert_eq!(decode_wsl(b""), "");
@@ -755,14 +970,20 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // kern lives one line below the default (docker-desktop) → must be tried FIRST.
         let names = s(&["docker-desktop", "Ubuntu", "kern"]);
-        let ord: Vec<&str> = order_candidates(&names).iter().map(|s| s.as_str()).collect();
+        let ord: Vec<&str> = order_candidates(&names)
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         assert_eq!(ord, ["kern", "docker-desktop", "Ubuntu"]);
         // Case-insensitive match on the kern distro.
         let names = s(&["Ubuntu", "KERN"]);
         assert_eq!(order_candidates(&names)[0], "KERN");
         // No kern distro → original order, all still tried.
         let names = s(&["Ubuntu", "Debian"]);
-        let ord: Vec<&str> = order_candidates(&names).iter().map(|s| s.as_str()).collect();
+        let ord: Vec<&str> = order_candidates(&names)
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         assert_eq!(ord, ["Ubuntu", "Debian"]);
     }
     #[test]
@@ -780,7 +1001,10 @@ mod tests {
     fn split_mount_finds_the_linux_dest_colon() {
         // Source Windows path, Linux dest, optional opts after a SECOND colon stay in `rest`.
         assert_eq!(split_mount(r"C:\proj:/src"), Some((r"C:\proj", "/src")));
-        assert_eq!(split_mount(r"C:\proj:/src:ro"), Some((r"C:\proj", "/src:ro")));
+        assert_eq!(
+            split_mount(r"C:\proj:/src:ro"),
+            Some((r"C:\proj", "/src:ro"))
+        );
         // A Windows path with no Linux dest (bare mount source alone) → no split.
         assert_eq!(split_mount(r"C:\proj"), None);
         // The drive colon at index 1 is never mistaken for the dest separator.
@@ -805,14 +1029,56 @@ mod tests {
         let args = vec!["box".into(), "--env".into(), "X=1;rm -rf /".into()];
         assert_eq!(
             forward_argv(&t, &args),
-            ["-d", "kern", "--exec", "/root/.local/bin/kern", "box", "--env", "X=1;rm -rf /"]
+            [
+                "-d",
+                "kern",
+                "--exec",
+                "/root/.local/bin/kern",
+                "box",
+                "--env",
+                "X=1;rm -rf /"
+            ]
         );
         // Env-override distro (no cached path) → fixed login-shell trampoline, user args positional.
-        let t = Target { distro: "Ubuntu".into(), kern_path: None, from_cache: false };
+        let t = Target {
+            distro: "Ubuntu".into(),
+            kern_path: None,
+            from_cache: false,
+        };
         assert_eq!(
             forward_argv(&t, &["ps".into()]),
-            ["-d", "Ubuntu", "--exec", "sh", "-lc", r#"exec kern "$@""#, "sh", "ps"]
+            [
+                "-d",
+                "Ubuntu",
+                "--exec",
+                "sh",
+                "-lc",
+                r#"exec kern "$@""#,
+                "sh",
+                "ps"
+            ]
         );
+    }
+
+    #[test]
+    fn win_to_wsl_does_not_abort_on_a_string_that_is_not_a_drive_path() {
+        // BEFORE THE GUARD THESE FOUR ABORTED THE PROCESS. `win_to_wsl` indexed `b[0]` and `p[2..]`
+        // and relied on `is_win_path` having been called first, by a different function. With
+        // `panic = "abort"` in this profile that is not an exception a caller can see, it is the
+        // forwarder disappearing with no output. The production path is unchanged, which the
+        // `translate_arg` tests above still prove; this one covers calling in directly.
+        for odd in ["", "C", "C:", ":/x", "7:/x", "/mnt/c"] {
+            let out = win_to_wsl(odd);
+            if odd.len() < 2 || !odd.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                assert_eq!(
+                    out, odd,
+                    "a non-drive path must come back untouched: {odd:?}"
+                );
+            }
+        }
+        // And the real conversion is untouched by the guard.
+        assert_eq!(win_to_wsl(r"C:\Users\me"), "/mnt/c/Users/me");
+        assert_eq!(win_to_wsl("D:/data"), "/mnt/d/data");
     }
 
     // --- `kern wsl …`: the parse, the table and the refusals ----------------------------------
@@ -834,14 +1100,132 @@ mod tests {
 
     #[test]
     fn wsl_subcommands_parse() {
-        assert_eq!(parse_wsl(&s(&["wsl", "list"])), Some(WslCmd::List { probe: false }));
-        assert_eq!(parse_wsl(&s(&["wsl", "ls"])), Some(WslCmd::List { probe: false }));
-        assert_eq!(parse_wsl(&s(&["wsl", "list", "--probe"])), Some(WslCmd::List { probe: true }));
+        assert_eq!(
+            parse_wsl(&s(&["wsl", "list"])),
+            Some(WslCmd::List { probe: false })
+        );
+        assert_eq!(
+            parse_wsl(&s(&["wsl", "ls"])),
+            Some(WslCmd::List { probe: false })
+        );
+        assert_eq!(
+            parse_wsl(&s(&["wsl", "list", "--probe"])),
+            Some(WslCmd::List { probe: true })
+        );
         assert_eq!(parse_wsl(&s(&["wsl", "status"])), Some(WslCmd::Status));
         assert_eq!(parse_wsl(&s(&["wsl", "reset"])), Some(WslCmd::Reset));
-        assert_eq!(parse_wsl(&s(&["wsl", "use", "Ubuntu"])), Some(WslCmd::Use("Ubuntu".into())));
+        assert_eq!(
+            parse_wsl(&s(&["wsl", "use", "Ubuntu"])),
+            Some(WslCmd::Use("Ubuntu".into()))
+        );
         // Surrounding whitespace is trimmed, because a name pasted from `wsl -l -v` carries it.
-        assert_eq!(parse_wsl(&s(&["wsl", "use", "  kern "])), Some(WslCmd::Use("kern".into())));
+        assert_eq!(
+            parse_wsl(&s(&["wsl", "use", "  kern "])),
+            Some(WslCmd::Use("kern".into()))
+        );
+    }
+
+    #[test]
+    fn the_precedence_rule_has_one_spelling_and_the_environment_wins() {
+        // THE ORDER IS THE CORRECTNESS PROPERTY, not a preference: `resolve_target` forwards with
+        // the environment variable beating the stored choice, so if `selection` disagreed, `status`
+        // and `list` would report a distro that commands do not go to. It used to be written twice,
+        // once in each arm, which is how that disagreement would have arrived.
+        let env = "rodlaw".to_string();
+        let cache = ("kern".to_string(), Some("/usr/local/bin/kern".to_string()));
+
+        assert_eq!(
+            selection(Some(&env), Some(&cache)),
+            (Some("rodlaw".to_string()), Source::Env),
+            "the environment variable must beat the stored choice"
+        );
+        assert_eq!(
+            selection(None, Some(&cache)),
+            (Some("kern".to_string()), Source::Cache)
+        );
+        assert_eq!(selection(None, None), (None, Source::Unresolved));
+        // An env value with no cache is still an override, not a detection.
+        assert_eq!(
+            selection(Some(&env), None),
+            (Some("rodlaw".to_string()), Source::Env)
+        );
+    }
+
+    #[test]
+    fn an_argument_the_parser_does_not_understand_is_refused_not_ignored() {
+        // ALL FOUR OF THESE WERE MEASURED SUCCEEDING ON A REAL HOST before this existed, which is
+        // the only reason they are worth four assertions: `list --prob` ran a plain list and printed
+        // "not probed" on every row, so the user who asked to probe got an answer shaped like the
+        // probe's; `use kern rodlaw` stored the first and dropped the second in silence.
+        for argv in [
+            vec!["wsl", "list", "--prob"],
+            vec!["wsl", "list", "--nonesiste"],
+            vec!["wsl", "list", "extra"],
+            vec!["wsl", "use", "kern", "rodlaw"],
+            vec!["wsl", "status", "kern"],
+            vec!["wsl", "reset", "--force"],
+        ] {
+            let got = parse_wsl(&s(&argv));
+            assert!(
+                matches!(got, Some(WslCmd::Usage(Some(_)))),
+                "{argv:?} must be refused, got {got:?}"
+            );
+        }
+        // And the forms that ARE understood still are, so the refusal did not widen.
+        assert_eq!(
+            parse_wsl(&s(&["wsl", "list", "--probe"])),
+            Some(WslCmd::List { probe: true })
+        );
+        assert_eq!(
+            parse_wsl(&s(&["wsl", "list"])),
+            Some(WslCmd::List { probe: false })
+        );
+        assert_eq!(parse_wsl(&s(&["wsl", "status"])), Some(WslCmd::Status));
+        assert_eq!(parse_wsl(&s(&["wsl", "reset"])), Some(WslCmd::Reset));
+        assert_eq!(
+            parse_wsl(&s(&["wsl", "use", "kern"])),
+            Some(WslCmd::Use("kern".into()))
+        );
+    }
+
+    #[test]
+    fn an_echoed_name_is_bounded_and_carries_no_control_characters() {
+        // MEASURED on the test host: a 4096-character name was printed in full into a refusal, a
+        // name containing a newline split the message in two so the tail read as a separate
+        // statement, and a cache file with one 70,000-character line put all of it into two
+        // messages. A refusal is meant to be read.
+        let long = "x".repeat(4096);
+        let out = short(&long);
+        assert!(
+            out.len() < 120,
+            "a 4096-char name must not be echoed whole: {} bytes",
+            out.len()
+        );
+        assert!(out.contains("4096 characters"), "{out}");
+        assert_eq!(short("a\nb"), "'a b'", "a newline must not break the line");
+        assert_eq!(short("a\tb\r\n"), "'a b  '");
+        // A short, ordinary name is untouched apart from the quotes.
+        assert_eq!(short("kern"), "'kern'");
+        // MULTI-BYTE SAFE: cutting at a byte offset inside a character would panic, and `panic =
+        // "abort"` in this profile makes that a silent death rather than an error.
+        let cjk = "距".repeat(100);
+        let out = short(&cjk);
+        assert!(out.contains("100 characters"), "{out}");
+        assert!(out.starts_with('\''), "{out}");
+    }
+
+    #[test]
+    fn list_does_not_print_a_legend_for_a_marker_that_is_not_there() {
+        // MEASURED: a stored choice naming an unregistered distro printed a table with NO `*` on any
+        // row and then "* = in use: '<name>'" underneath it.
+        let names = s(&["kern", "rodlaw"]);
+        let out = render_list(&names, &[], Some("gone-distro"), &Source::Cache, None);
+        assert!(!out.contains('*'), "no row is marked, so no legend: {out}");
+        assert!(out.contains("NOT in the list above"), "{out}");
+        assert!(out.contains("no longer registered"), "{out}");
+        // The normal case is unaffected.
+        let out = render_list(&names, &[], Some("kern"), &Source::Cache, None);
+        assert!(out.contains("* = in use: 'kern'"), "{out}");
     }
 
     #[test]
@@ -853,7 +1237,10 @@ mod tests {
         assert!(matches!(r, Some(WslCmd::Usage(Some(_)))));
         // An unknown sub-command says so instead of being forwarded to the Linux side, where the
         // error would name a command the user never typed.
-        assert!(matches!(parse_wsl(&s(&["wsl", "frobnicate"])), Some(WslCmd::Usage(Some(_)))));
+        assert!(matches!(
+            parse_wsl(&s(&["wsl", "frobnicate"])),
+            Some(WslCmd::Usage(Some(_)))
+        ));
     }
 
     #[test]
@@ -881,7 +1268,13 @@ mod tests {
         assert!(!out.contains("not installed"), "{out}");
 
         let probed = vec![
-            ("kern".to_string(), Some(("/usr/local/bin/kern".to_string(), "kern v0.25.1".to_string()))),
+            (
+                "kern".to_string(),
+                Some((
+                    "/usr/local/bin/kern".to_string(),
+                    "kern v0.25.1".to_string(),
+                )),
+            ),
             ("rodlaw".to_string(), None),
         ];
         let out = render_list(&names, &[], Some("kern"), &Source::Cache, Some(&probed));
@@ -911,7 +1304,10 @@ mod tests {
         // Storing it would make EVERY later command fail, and the failure would look like a kern
         // bug rather than the consequence of this command.
         let names = s(&["kern", "rodlaw"]);
-        assert_eq!(use_verdict("rodlaw", &names, None, None), UseVerdict::NoKernInside);
+        assert_eq!(
+            use_verdict("rodlaw", &names, None, None),
+            UseVerdict::NoKernInside
+        );
     }
 
     #[test]
@@ -919,7 +1315,10 @@ mod tests {
         // `wsl -d KERN` reaches `kern`, so refusing the user's spelling would refuse a name that
         // WSL itself accepts.
         let names = s(&["kern"]);
-        let found = Some(("/usr/local/bin/kern".to_string(), "kern v0.25.1".to_string()));
+        let found = Some((
+            "/usr/local/bin/kern".to_string(),
+            "kern v0.25.1".to_string(),
+        ));
         assert!(matches!(
             use_verdict("KERN", &names, found, None),
             UseVerdict::Store { .. }
@@ -931,7 +1330,10 @@ mod tests {
         // KERN_WSL_DISTRO beats the stored choice in `resolve_target`, so a silent success here
         // leaves the user with a choice that does nothing.
         let names = s(&["kern", "rodlaw"]);
-        let found = Some(("/usr/local/bin/kern".to_string(), "kern v0.25.1".to_string()));
+        let found = Some((
+            "/usr/local/bin/kern".to_string(),
+            "kern v0.25.1".to_string(),
+        ));
         let v = use_verdict("kern", &names, found.clone(), Some("rodlaw"));
         assert_eq!(
             v,
