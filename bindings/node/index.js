@@ -46,6 +46,113 @@ const VERSION = "0.2.40";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
+// What `kern exec` says when the box it was asked for is not running. Matched rather than inferred
+// from an exit code, because `exec` reports a MISSING BOX and a workload that exited non-zero through
+// the same status, and only the first of the two is something the binding can repair.
+const RESIDENT_GONE = "no running box named";
+// Prefix for a resident box's name, so one cannot be confused with a box the user started by hand.
+const RESIDENT_PREFIX = "kern-sbx-";
+// The label a resident box's posture fingerprint is stamped into.
+const CFG_LABEL = "kern.sbx.cfg";
+
+/**
+ * Bytes a directory tree occupies ON DISK, or 0 when it cannot be read.
+ *
+ * `blocks * 512` and NOT `size`, because the question is how much of the disk is gone and the two
+ * disagree in both directions: a sparse file reports a size it does not occupy, and a 1-byte file
+ * occupies a whole block.
+ *
+ * HARD LINKS ARE COUNTED ONCE, keyed by `(dev, ino)`: a box that hard-links one large file a thousand
+ * times occupies one file's worth of disk, and charging it a thousand times would refuse a session
+ * that is costing nothing.
+ *
+ * SYMLINKS ARE NOT FOLLOWED. The workspace is box-controlled, and a symlink to `/usr` would otherwise
+ * make untrusted input drive an unbounded walk - a denial of service dressed as a measurement.
+ * `lstatSync` keeps the walk inside the tree and charges the link its own (tiny) blocks.
+ *
+ * Iterative with an explicit stack, not recursion: a deep tree is something the box chooses, and a
+ * 2000-level one is enough to end a recursive walk in a stack overflow.
+ *
+ * Best effort, never throwing: a file deleted mid-walk is ordinary in a live workspace, and a
+ * measurement that can abort a call is worse than one that is slightly stale.
+ */
+function workspaceUsage(root) {
+  let total = 0;
+  const seen = new Set();
+  const stack = [root];
+  while (stack.length) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      let st;
+      try {
+        st = fs.lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (entry.isDirectory()) stack.push(full);
+      const key = `${st.dev}:${st.ino}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      total += (st.blocks || 0) * 512;
+    }
+  }
+  return total;
+}
+
+/**
+ * Run a command and capture it, WITHOUT blocking the event loop.
+ *
+ * `spawnSync` would be shorter and is what the first version of this used; this file already records
+ * why that is wrong here (see `pycBuild`): a synchronous spawn stops every other timer and socket in
+ * the host process for its whole duration, and these calls talk to `kern ps` and `kern box`.
+ */
+function runCapture(argv, timeoutMs) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(argv[0], argv.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      resolve({ code: -1, stdout: "", stderr: String(e && e.message) });
+      return;
+    }
+    let out = "";
+    let err = "";
+    let settled = false;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, stdout: out, stderr: err });
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      finish(-1);
+    }, timeoutMs);
+    child.stdout.on("data", (d) => {
+      out += d.toString();
+    });
+    child.stderr.on("data", (d) => {
+      err += d.toString();
+    });
+    child.on("error", (e) => {
+      err += String(e && e.message);
+      finish(-1);
+    });
+    child.on("close", (code) => finish(code === null ? -1 : code));
+  });
+}
+
 const DEPS_DIR = ".deps"; // pip --target dir inside the workspace (added to PYTHONPATH for python)
 
 /** Where the shared stdlib bytecode cache is mounted inside a box, READ-ONLY.
@@ -2000,6 +2107,44 @@ class Sandbox {
           "should run (it runs once, with the network on)",
       );
     this.workspace = opts.workspace ?? null;
+    // Refuse to start a call once the workspace holds more than this many bytes. `null` is off and
+    // costs nothing: the walk only runs when a cap is set.
+    //
+    // ⛔ A COOPERATIVE CAP, NOT A BOUNDARY. The workspace is a host directory bind-mounted at
+    // /workspace, so the box writes to the real filesystem and nothing in the kernel holds it back.
+    // kern's other limits ARE boundaries, measured to the byte. This one cannot be from here: a
+    // kernel-enforced quota needs a disk-backed vdisk (mkfs.ext4, root) and this binding is rootless,
+    // while a size-capped tmpfs would be enforced and would NOT survive between calls, which is the
+    // one thing a workspace must do. So it bounds damage ACROSS calls, not within one: the call that
+    // exceeds it still runs, the next is refused. Said plainly, because a cap that sounds like a
+    // boundary and is not is worse than no cap at all.
+    this.workspaceMaxBytes = opts.workspaceMaxBytes ?? null;
+    // A STABLE IDENTITY, used only with `persist`. Two processes that name the same sandbox meet the
+    // same resident box.
+    this.name = opts.name ?? null;
+    // Keep ONE resident box alive and run every call inside it with `kern exec`, instead of starting
+    // a throwaway box per call. Survives `close()`: that is the point, and why `destroy()` exists.
+    //
+    // ⭐ MEASURED: `kern exec` into a resident box is 2 ms against 6 ms for a fresh box, and whatever
+    // a previous call left in the box is still there for the next - across PROCESSES, not just calls.
+    //
+    // ⛔ A resident box is NOT a fresh box. /tmp ACCUMULATES instead of starting empty; the network
+    // posture is whatever the box was CREATED with, which is why it is part of the fingerprint; the
+    // PID namespace is SHARED across calls. What does NOT leak, measured: a process a previous call
+    // left running - `kern exec` reaps its descendants when it returns, including one detached with
+    // setsid, which is why the resident box runs `--init`.
+    //
+    // ⛔ AND THE VERDICT IS COARSER. `oom` is read from the teardown bytes kern writes for the box IT
+    // started; `kern exec` does not carry them and the registry keeps only exitCode 137, which an
+    // external kill produces too. So an OOM comes back `killed` on this path where the one-shot path
+    // says `oom`. Not papered over: claiming `oom` from "137 and a cap was set" would be an inference
+    // presented as a measurement.
+    this.persist = opts.persist ?? false;
+    // How long the resident box lives. It is kern's own `--timeout` on that box, so it ends by itself
+    // if the owning process dies: a resident sandbox cannot leak for longer than this.
+    this.persistTtlS = opts.persistTtlS ?? 3600;
+    this._resident = null;
+    this._residentCalls = 0;
     this.memoryMb = opts.memoryMb === undefined ? 512 : opts.memoryMb;
     this.cpus = opts.cpus ?? null;
     this.pids = opts.pids === undefined ? 256 : opts.pids;
@@ -2224,6 +2369,26 @@ class Sandbox {
       this._ownWs = false;
     }
     this._entered = true;
+    // THE RESIDENT BOX, adopted or created, BEFORE `setup` runs: a setup on a persistent sandbox has
+    // to install into the box every later call will use, not into a throwaway one.
+    if (this.persist) {
+      if (!this.name)
+        throw new SandboxError(
+          "persist needs a name: it is the identity two processes meet on. " +
+            'new Sandbox({ name: "my-agent", persist: true, workspace: "..." })',
+        );
+      if (this.workspace === null)
+        // A TEMPORARY WORKSPACE WOULD MAKE THIS HALF-PERSISTENT, and silently: the box would be
+        // adopted while its FILES started empty in a fresh directory every process, and the
+        // fingerprint (which contains the workspace path, because the mount is part of the posture)
+        // would never match twice, so no adoption could ever succeed.
+        throw new SandboxError(
+          "persist needs an explicit workspace: the resident box is adopted by posture, and a " +
+            "temporary workspace is a different path in every process, so nothing would ever be " +
+            "resumed. new Sandbox({ name, persist: true, workspace })",
+        );
+      this._resident = await this._residentEnsure();
+    }
     if (this.setup) await this._runSetup(this.setup);
     // THE BYTECODE CACHE IS DECIDED HERE, once, and frozen: `_baseArgv` is what the prewarm pool
     // compares postures with, so a cache appearing mid-session would change the argv runCode builds and
@@ -2275,6 +2440,119 @@ class Sandbox {
 
   /** Close the session: tear down any prewarmed boxes, then delete the workspace iff we created it.
    * Idempotent. */
+  // ---- resident box (`persist: true`) ---------------------------------------------------------
+
+  _residentName() {
+    return `${RESIDENT_PREFIX}${this.name}`;
+  }
+
+  /**
+   * The posture a resident box BAKES IN, taken from the argv that would create it.
+   *
+   * ADOPTION IS THE DANGEROUS HALF OF THIS FEATURE: a caller who asks for memoryMb 256 and is handed
+   * a box someone else created with 512 has been told a limit is in force that is not. So the posture
+   * is hashed at creation, stamped into a label, and compared on adoption; a mismatch is refused with
+   * both values named rather than resolved by guessing.
+   *
+   * ⭐ TAKEN FROM `_baseArgv` AND NOT RE-LISTED. A hand-written list of the fields that matter is a
+   * second spelling of the posture, and the two drift the first time a flag is added: the new flag
+   * changes what the box IS without changing the fingerprint, so a box built before it gets adopted
+   * by a Sandbox that asks for it. The NAME is stripped before hashing - it is identity, not posture.
+   */
+  _residentFingerprint() {
+    const argv = this._baseArgv("", {
+      network: this.network,
+      timeoutS: Math.trunc(this.persistTtlS),
+      dry: true,
+    });
+    return crypto.createHash("sha256").update(argv.join("\u0000")).digest("hex").slice(0, 16);
+  }
+
+  /** The running resident box for this name, or null. Never throws: a registry that cannot be read is
+   * the same answer as no box, and both lead to creating one. */
+  async _residentLookup() {
+    const r = await runCapture(
+      [this._kern, "ps", "--filter", `name=${this._residentName()}`, "--json"],
+      20000,
+    );
+    if (r.code !== 0 || !r.stdout.trim()) return null;
+    let data;
+    try {
+      data = JSON.parse(r.stdout);
+    } catch {
+      return null;
+    }
+    const rows = Array.isArray(data) ? data : [data];
+    for (const row of rows)
+      if (row && row.name === this._residentName())
+        return row.status === "running" ? row : null;
+    return null;
+  }
+
+  /**
+   * Adopt the resident box or create it, and return its name.
+   *
+   * THE RACE IS REAL AND IS HANDLED BY LOSING GRACEFULLY. Two processes naming the same sandbox can
+   * reach the create at the same moment; kern refuses a duplicate name, so the loser looks the box up
+   * again and adopts what the winner made, verified by the same fingerprint - so losing the race
+   * cannot smuggle in a different posture.
+   */
+  async _residentEnsure() {
+    const want = this._residentFingerprint();
+    const found = await this._residentLookup();
+    if (found) {
+      const have = (found.labels || {})[CFG_LABEL];
+      if (have !== want)
+        throw new SandboxError(
+          `a resident sandbox named ${JSON.stringify(this.name)} is already running with a ` +
+            `DIFFERENT posture (its fingerprint is ${JSON.stringify(have)}, this Sandbox asks for ` +
+            `${JSON.stringify(want)}), so adopting it would report limits that are not the ones in ` +
+            `force. Use another name, or stop it: kern stop ${this._residentName()}`,
+        );
+      return this._residentName();
+    }
+    // THE SAME ARGV THE ONE-SHOT PATH USES, so the resident box carries identical mounts, caps, tmpfs
+    // and environment - plus `-d` to detach, `--init` so PID 1 REAPS, the fingerprint label, and a
+    // PID 1 that does nothing else. `--init` and not a bare `sleep`: `sleep` never calls wait(), so a
+    // process a call detached became a zombie and they accumulated until pids.max refused a fork.
+    const argv = [
+      ...this._baseArgv(this._residentName(), {
+        network: this.network,
+        timeoutS: Math.trunc(this.persistTtlS),
+      }),
+      "-d",
+      "--init",
+      "--label",
+      `${CFG_LABEL}=${want}`,
+      "--",
+      "sleep",
+      String(Math.trunc(this.persistTtlS)),
+    ];
+    const made = await runCapture(argv, 180000);
+    if (made.code !== 0) {
+      const again = await this._residentLookup();
+      if (again && (again.labels || {})[CFG_LABEL] === want) return this._residentName();
+      throw new SandboxError(
+        `could not start the resident sandbox ${JSON.stringify(this.name)}: ` +
+          `${(made.stderr || made.stdout || "").trim().slice(0, 400)}`,
+      );
+    }
+    return this._residentName();
+  }
+
+  /**
+   * Stop the resident box. The ONLY way a `persist` sandbox goes away before its TTL.
+   *
+   * Deliberately not `close()`: a sandbox that disappeared when the session ended would be the
+   * one-shot behaviour under another name, and nothing would be resumable. Idempotent and quiet:
+   * stopping a box that is already gone is the state the caller asked for.
+   */
+  async destroy() {
+    if (!this.name) return;
+    await runCapture([this._kern, "stop", this._residentName()], 60000);
+    this._resident = null;
+  }
+
   async close() {
     // Boxes first: they are live processes holding the workspace we are about to delete, and a box
     // still writing into a directory being removed is how a teardown turns into a stale mount.
@@ -2507,16 +2785,81 @@ class Sandbox {
     pycStartSweep(path.dirname(dest));
   }
 
-  _spawn(command, { network, timeoutS, isSetup = false, onStdout = UNSET, onStderr = UNSET }) {
+  /**
+   * One call, with ONE repair of a resident box that has died.
+   *
+   * THE BOX CAN BE GONE, AND IT IS NOT AN EXOTIC CASE. `memory.oom.group=1` means an OOM takes the
+   * WHOLE cgroup, so a cell that overruns its memory cap destroys the resident box rather than just
+   * its own process - MEASURED in the Python binding: the next call came back `startup_failed` and
+   * the sandbox was silently unusable from then on. The TTL expiring does the same on a longer clock.
+   *
+   * CHECKED BY TRYING, NOT BY ASKING: a `kern ps` before every call would spend a second process
+   * spawn on the hot path and buy nothing in the common case, which is the 2 ms this feature exists
+   * for. ONE retry and never a loop: a box that dies again immediately has a cause that is not
+   * transient, and retrying would hide it behind a hang.
+   */
+  async _spawn(command, opts) {
+    const r = await this._spawnOnce(command, opts);
+    if (
+      this._resident === null ||
+      (opts && opts.isSetup) ||
+      !String(r.stderr || "").includes(RESIDENT_GONE)
+    )
+      return r;
+    const lost = this._residentCalls;
+    this._resident = await this._residentEnsure();
+    this._residentCalls = 0;
+    // SAID OUT LOUD, because the repair is not free and the caller cannot see it. The box is new: its
+    // /tmp is empty again and anything a previous call installed into it is gone. Only the WORKSPACE
+    // survived, because that is a host directory. Repairing this silently would hand back a sandbox
+    // that looks continuous and is not - the caller would debug missing state instead of a dead box.
+    process.emitWarning(
+      `the resident sandbox ${JSON.stringify(this.name)} had died (an OOM takes the whole box, and ` +
+        `the TTL ends it) after serving ${lost} call(s); it was recreated and this call re-run. Its ` +
+        `in-box state is gone - /tmp is empty and anything installed into the box is not there. ` +
+        `Files under the workspace are unaffected.`,
+      "KernResidentRecreated",
+    );
+    return this._spawnOnce(command, opts);
+  }
+
+  _spawnOnce(command, { network, timeoutS, isSetup = false, onStdout = UNSET, onStderr = UNSET }) {
     this._pycAdoptIfReady(); // one property read once there is nothing left to wait for
     const cbOut = onStdout === UNSET ? this.onStdout : onStdout;
     const cbErr = onStderr === UNSET ? this.onStderr : onStderr;
     for (const part of command)
       if (typeof part !== "string" || part.includes("\0"))
         throw new SandboxError("command/code must be strings with no NUL byte");
+    // THE WORKSPACE CAP, CHECKED BEFORE THE WORK AND NOT AFTER IT. A call that has already run cannot
+    // be un-run, and its output is what the caller needs most when something went wrong, so refusing
+    // afterwards would destroy the evidence to enforce a limit the write had already passed. Costs
+    // nothing when unset, which is the default.
+    if (this.workspaceMaxBytes !== null && this._ws) {
+      const used = workspaceUsage(this._ws);
+      if (used > this.workspaceMaxBytes)
+        throw new SandboxError(
+          `workspace holds ${used} bytes, over the ${this.workspaceMaxBytes}-byte ` +
+            `workspaceMaxBytes, so this call was refused before running. The box writes to a host ` +
+            `directory (${this._ws}), so this is a cooperative cap and not a kernel boundary: it ` +
+            `bounds what accumulates ACROSS calls, and one call can still exceed it. Delete what the ` +
+            `session no longer needs, raise the cap, or give the Sandbox a workspace on a filesystem ` +
+            `you are willing to fill`,
+        );
+    }
     const before = this.trackFiles ? this._snapshot() : null; // skip the O(N) walk when not tracked
     const name = uniqueName();
-    const argv = [...this._baseArgv(name, { network, timeoutS, isSetup }), "--", ...command];
+    let argv;
+    if (this._resident !== null) {
+      // INTO THE RESIDENT BOX, which is the point of `persist`. `exec` and not `box`: measured, 2 ms
+      // against 6 ms, and the box's own state is still there. `-w` puts the call in the same working
+      // directory a fresh box starts in, so code writing a relative path lands in the workspace
+      // exactly as it does on the one-shot path. `timeoutS` is NOT passed to kern here: the resident
+      // box carries its own TTL, and the binding's deadline is enforced around this process.
+      this._residentCalls += 1;
+      argv = [this._kern, "exec", this._resident, "-w", WORKSPACE, "--", ...command];
+    } else {
+      argv = [...this._baseArgv(name, { network, timeoutS, isSetup }), "--", ...command];
+    }
     const childEnv = { ...process.env };
     if (!this.enforceLimits) childEnv.KERN_NO_SCOPE = "1";
     // Unforgeable "box started" channel: kern writes one byte to fd 3 iff its sandbox setup SUCCEEDED
