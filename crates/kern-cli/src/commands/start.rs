@@ -999,7 +999,19 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--show-config`: a dry run - print the resolved box configuration and exit BEFORE any host-side
     // mount or the systemd-scope re-exec, so nothing is created or torn down.
     if args.show_config {
-        print_resolved_config(&args, name.as_str(), memory, cpus, cpuset.as_deref(), nice);
+        print_resolved_config(
+            &args,
+            name.as_str(),
+            memory,
+            cpus,
+            cpuset.as_deref(),
+            nice,
+            &crate::commands::ResolvedGrants {
+                devs: &vgpio_devs,
+                sysfs: &vgpio_sysfs,
+                vdisk: &vdisk,
+            },
+        );
         std::process::exit(0);
     }
     let Supervision {

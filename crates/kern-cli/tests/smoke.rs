@@ -319,6 +319,106 @@ fn box_plan_rejects_a_traversing_name() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("invalid box name"));
 }
 
+/// `--show-config` PRINTS WHAT A PROFILE GRANTS, not only the cgroup numbers it produces.
+///
+/// The SDKs fingerprint a reusable box from this output: a resident sandbox and a prewarmed box are
+/// both handed to a later call only when the fingerprint matches. It used to print what a `vcpu:`
+/// profile yields (memory, cpus) and NOTHING a `vgpio:` or `vdisk:` profile yields - the device list
+/// was resolved a few lines before the call and dropped. MEASURED: `uart = ["/dev/ttyS0"]` and
+/// `uart = ["/dev/ttyS0", "/dev/ttyS1"]` under one profile name printed byte-identical output, so a
+/// box built with one device grant was reused for a caller whose config granted another. `vgpio:` is
+/// the only way to give a box a hardware device.
+///
+/// `/dev/null` and `/dev/zero` and not a serial port, because a CI runner has no `ttyS*` and a
+/// device that does not exist is (correctly) dropped from the grant before it is printed.
+#[test]
+fn show_config_prints_the_devices_and_disks_a_profile_grants() {
+    let home = std::env::temp_dir().join(format!("kern-showgrants-{}", std::process::id()));
+    let cfg_dir = home.join("kern");
+    std::fs::create_dir_all(&cfg_dir).expect("config dir");
+    let toml = cfg_dir.join("kern.toml");
+    let show = |token: &str| -> String {
+        let out = kern()
+            .env("XDG_CONFIG_HOME", &home)
+            .env_remove("KERN_CONFIG")
+            .args([
+                "box",
+                "t",
+                "--rootfs",
+                "/tmp",
+                "--show-config",
+                token,
+                "--",
+                "/bin/true",
+            ])
+            .output()
+            .expect("run kern");
+        assert!(
+            out.status.success(),
+            "--show-config should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let line = |out: &str, key: &str| -> String {
+        out.lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+            .unwrap_or_else(|| panic!("no `{key}` line in:\n{out}"))
+            .trim()
+            .to_string()
+    };
+
+    std::fs::write(
+        &toml,
+        "[[vgpio]]\nname = \"t\"\nbackend = \"host\"\nextra = [\"/dev/null\"]\n",
+    )
+    .expect("write");
+    let one = show("vgpio:t");
+    std::fs::write(
+        &toml,
+        "[[vgpio]]\nname = \"t\"\nbackend = \"host\"\nextra = [\"/dev/null\", \"/dev/zero\"]\n",
+    )
+    .expect("write");
+    let two = show("vgpio:t");
+    assert_eq!(line(&one, "devices"), "/dev/null");
+    assert_eq!(line(&two, "devices"), "/dev/null,/dev/zero");
+    assert_ne!(
+        one, two,
+        "a different device grant must be a different resolved configuration"
+    );
+
+    // THE SAME SET IN ANOTHER ORDER IS THE SAME GRANT, so the line is canonical. Without this a
+    // reordered list in kern.toml would read as a different box and every reuse would be refused.
+    std::fs::write(
+        &toml,
+        "[[vgpio]]\nname = \"t\"\nbackend = \"host\"\nextra = [\"/dev/zero\", \"/dev/null\"]\n",
+    )
+    .expect("write");
+    assert_eq!(
+        show("vgpio:t"),
+        two,
+        "reordering a grant list must not change the output"
+    );
+
+    // A disk's size is part of what the box is given.
+    std::fs::write(
+        &toml,
+        "[[vdisk]]\nname = \"s\"\nbackend = \"ram\"\nsize = \"64m\"\n",
+    )
+    .expect("w");
+    let small = show("vdisk:s");
+    std::fs::write(
+        &toml,
+        "[[vdisk]]\nname = \"s\"\nbackend = \"ram\"\nsize = \"8g\"\n",
+    )
+    .expect("w");
+    let big = show("vdisk:s");
+    assert!(line(&small, "vdisks").contains("size=67108864"), "{small}");
+    assert!(line(&big, "vdisks").contains("size=8589934592"), "{big}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// `--show-config` is a DRY RUN of the real decision, so it must not disagree with the box it
 /// describes. It reported `uid_range: false` for every `--image` box while the box itself mapped a
 /// range, because the per-image rule was written once in the run path and not at all in the dry run.

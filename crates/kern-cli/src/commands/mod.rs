@@ -836,6 +836,29 @@ fn display_source_cmd<'a>(args: &'a BoxRunArgs) -> (&'a str, String) {
     (source, cmd)
 }
 
+/// What a box's resource profiles GRANT beyond cgroup numbers: the device nodes and sysfs trees a
+/// `vgpio:` profile binds in, and the disks a `vdisk:` profile attaches. Carried into
+/// `--show-config` as one value rather than three more arguments.
+pub(crate) struct ResolvedGrants<'a> {
+    pub devs: &'a [String],
+    pub sysfs: &'a [String],
+    pub vdisk: &'a [crate::config::ResolvedVdisk],
+}
+
+/// A grant list in a canonical form: sorted, deduplicated, `-` when empty. SORTED because the line
+/// describes the SET of things the box is given, and `uart = ["/dev/ttyS1", "/dev/ttyS0"]` grants
+/// exactly what the reverse order does - a reordering in kern.toml must not read as a different box.
+fn grant_list(items: &[String]) -> String {
+    let mut v: Vec<&str> = items.iter().map(String::as_str).collect();
+    v.sort_unstable();
+    v.dedup();
+    if v.is_empty() {
+        "-".to_string()
+    } else {
+        v.join(",")
+    }
+}
+
 /// `--show-config`: print the resolved box configuration (after profiles, clamps and flag merges) to
 /// stdout as plain `key: value` lines, then the caller exits. A dry run - unlike the status panel it
 /// always prints (it's the whole point of the command) and goes to stdout so it can be captured.
@@ -846,6 +869,7 @@ fn print_resolved_config(
     cpus: Option<f64>,
     cpuset: Option<&str>,
     nice: Option<i32>,
+    grants: &ResolvedGrants<'_>,
 ) {
     let (source, cmd) = display_source_cmd(args);
     println!("name: {name}");
@@ -903,6 +927,46 @@ fn print_resolved_config(
         kern_isolation::denied_syscall_count(nesting_active(args.privileged))
     );
     println!("privileged: {}", nesting_active(args.privileged));
+    // 🚨 WHAT THE PROFILES GRANT, which this dry run used to resolve and then not print.
+    //
+    // `--show-config` is "the resolved box configuration", and the SDKs fingerprint a box from it
+    // when deciding whether one built earlier may be reused. It printed the cgroup numbers a `vcpu:`
+    // profile produces and nothing a `vgpio:` or `vdisk:` profile produces - the device list was
+    // computed a few lines before the call and dropped. MEASURED: one `[[vgpio]]` with
+    // `uart = ["/dev/ttyS0"]` and the same profile with `uart = ["/dev/ttyS0", "/dev/ttyS1"]` printed
+    // byte-identical output, so a resident sandbox or a prewarmed box created under the first was
+    // adopted under the second. `vgpio:` is the only way to give a box a hardware device, so that
+    // was a silent change of DEVICE GRANT, the case the fingerprint work was meant to cover first.
+    //
+    // Only what the BOX is given. `pins` are deliberately absent: they are exported as
+    // `KERN_VGPIO_PINS` on the no-sandbox `run` path only and never reach a box, where they select
+    // devices and nothing else - and those devices are already on the `devices` line.
+    println!("devices: {}", grant_list(grants.devs));
+    println!("sysfs: {}", grant_list(grants.sysfs));
+    let mut disks: Vec<String> = grants
+        .vdisk
+        .iter()
+        .map(|d| {
+            format!(
+                "{}(size={},iops={},bandwidth={},persistent={},backend={})",
+                d.name,
+                or_dash(d.size),
+                or_dash(d.iops),
+                or_dash(d.bandwidth),
+                d.persistent,
+                d.backend_dir.as_deref().unwrap_or("-"),
+            )
+        })
+        .collect();
+    disks.sort_unstable();
+    println!(
+        "vdisks: {}",
+        if disks.is_empty() {
+            "-".to_string()
+        } else {
+            disks.join(";")
+        }
+    );
 }
 
 /// Whether a `--privileged` request will ACTUALLY relax seccomp for nesting: only rootless (as real
