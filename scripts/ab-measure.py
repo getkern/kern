@@ -20,6 +20,10 @@ perche' la coda alta di un avvio di processo e' rumore del sistema e non del pro
 alla differenza fra mediane un intervallo per ricampionamento, che non assume nessuna distribuzione.
 """
 
+# Le annotazioni restano stringhe, cosi' `float | None` non alza il pavimento di versione a 3.10 per
+# uno strumento che tutti lanciano: il binding dichiara `requires-python = ">=3.9"`.
+from __future__ import annotations
+
 import argparse
 import random
 import statistics
@@ -31,9 +35,11 @@ import time
 # terza cifra su campioni di questa dimensione, ed e' meno di un secondo di calcolo.
 RESAMPLES = 10000
 
-# Il carico medio oltre il quale una misura su questa macchina non e' interpretabile. Uno per core
-# significa che la macchina e' gia' piena e i due comandi si contendono la CPU con altro.
-LOAD_CEILING_PER_CORE = 0.5
+# La percentuale di CPU occupata oltre la quale una misura su questa macchina non e' interpretabile.
+# E' la stessa soglia di `scripts/bench-idle.sh`, deliberatamente: due strumenti dello stesso
+# progetto che rispondono diversamente a "la macchina e' ferma" rendono il verdetto una questione di
+# quale si e' lanciato.
+BUSY_CEILING_PERCENT = 12.0
 
 
 def _same_file(a: str, b: str) -> bool:
@@ -77,21 +83,66 @@ def bootstrap_ci(deltas: list[float], confidence: float = 0.95) -> tuple[float, 
     return lo, hi
 
 
+def _busy_percent(window_s: float = 2.0) -> float | None:
+    """Quanta CPU e' occupata ADESSO, in percentuale, letta su una finestra di `window_s`."""
+    def snapshot() -> tuple[int, int] | None:
+        try:
+            with open("/proc/stat", encoding="utf-8") as fh:
+                fields = [int(x) for x in fh.readline().split()[1:]]
+        except (OSError, ValueError, IndexError):
+            return None
+        # `idle` e `iowait` non sono tempo occupato; tutto il resto lo e'. Le voci oltre la ottava
+        # (guest, guest_nice) sono gia' contate dentro user e nice dal kernel, quindi fermarsi a
+        # otto non perde niente e non conta due volte.
+        total = sum(fields[:8])
+        idle = fields[3] + fields[4]
+        return total, idle
+
+    first = snapshot()
+    if first is None:
+        return None
+    time.sleep(window_s)
+    second = snapshot()
+    if second is None:
+        return None
+    elapsed = second[0] - first[0]
+    if elapsed <= 0:
+        return None
+    return 100.0 * (1.0 - (second[1] - first[1]) / elapsed)
+
+
 def check_load(cores: int) -> None:
-    """Rifiuta di concludere se la macchina e' gia' occupata."""
+    """Rifiuta di concludere se la macchina e' occupata ADESSO.
+
+    IL CARICO MEDIO MENTE, in entrambe le direzioni, e questa funzione lo leggeva. Dopo una
+    compilazione il load dice 2,53 su una macchina la cui CPU e' all'8%: la misura veniva rifiutata
+    a vuoto. Il verso pericoloso e' l'altro: il load porta un minuto di memoria, quindi all'inizio
+    di un carico nuovo e' ancora basso e questo controllo dichiarava ferma una macchina che aveva
+    appena iniziato a lavorare. Un controllo che sbaglia verso l'ACCETTARE e' un controllo spento.
+
+    `scripts/bench-idle.sh` legge gia' il segnale giusto e con la stessa soglia, e la ragione e'
+    scritta li': "What matters here is whether the CPU is busy NOW". Due strumenti dello stesso
+    progetto non possono dare due giudizi diversi su "la macchina e' ferma", quindi la soglia e' la
+    stessa costante e non una scelta nuova.
+    """
+    busy = _busy_percent()
+    if busy is None:
+        print("nota: /proc/stat non leggibile, il carico non e' stato controllato")
+        return
+    lagging = "?"
     try:
         with open("/proc/loadavg", encoding="utf-8") as fh:
-            load = float(fh.read().split()[0])
+            lagging = f"{float(fh.read().split()[0]):.2f}"
     except (OSError, ValueError, IndexError):
-        print("nota: /proc/loadavg non leggibile, il carico non e' stato controllato")
-        return
-    ceiling = LOAD_CEILING_PER_CORE * cores
-    print(f"carico: {load:.2f} su {cores} core (soglia {ceiling:.2f})")
-    if load > ceiling:
+        pass
+    print(f"CPU occupata ora: {busy:.1f}% su {cores} core (soglia {BUSY_CEILING_PERCENT}%)"
+          f"   [carico medio, che ritarda di un minuto: {lagging}]")
+    if busy > BUSY_CEILING_PERCENT:
         raise SystemExit(
-            f"errore: carico {load:.2f} sopra la soglia {ceiling:.2f}.\n"
+            f"errore: CPU occupata al {busy:.1f}%, sopra la soglia {BUSY_CEILING_PERCENT}%.\n"
             "  Una misura presa sotto carico proprio e' gia' costata un numero sbagliato in questo\n"
-            "  progetto (1879 us contro 931 veri). Aspetta che la macchina sia ferma."
+            "  progetto (1879 us contro 931 veri). Chiudi cio' che gira, o la misura descrive la\n"
+            "  macchina invece dei due comandi."
         )
 
 
@@ -101,9 +152,22 @@ def main() -> int:
     ap.add_argument("-w", "--warmup", type=int, default=3, help="campioni scartati all'inizio")
     ap.add_argument("--allow-zero", action="store_true",
                     help="accetta una differenza identicamente nulla (usalo SOLO per il controllo nullo)")
+    # LA TOLLERANZA SI SCRIVE, non ha un valore implicito. Con `nargs="?"` argparse si mangiava il
+    # primo comando come se fosse il numero ("invalid float value: '/bin/true'"), e a parte questo
+    # una soglia predefinita e' una soglia che nessuno ha scelto.
+    ap.add_argument("--assert-not-slower", type=float, default=None, metavar="US",
+                    help="esce 1 se l'intervallo sta INTERAMENTE sopra questa tolleranza in us. "
+                         "A e' il riferimento, B il candidato. Scrivi 0 per tolleranza nulla")
+    # IL CONTROLLO NULLO COME ASSERZIONE. Due copie dello stesso binario nelle due colonne: se la
+    # misura le dichiara distinguibili, lo strumento e' rotto e ogni verdetto preso con lui nella
+    # stessa sessione e' inaffidabile. Una volta questo script ha dichiarato un binario diverso da
+    # se stesso di 645 us, e lo si e' scoperto a mano; un cancello lo deve scoprire da solo.
+    ap.add_argument("--assert-indistinguishable", action="store_true",
+                    help="esce 1 se l'intervallo NON contiene lo zero: per il controllo nullo A/A")
     ap.add_argument("a", help="comando A, fra virgolette")
     ap.add_argument("b", help="comando B, fra virgolette")
     args = ap.parse_args()
+    assert_not_slower = args.assert_not_slower
 
     cmd_a, cmd_b = args.a.split(), args.b.split()
     # DUE PERCORSI ALLO STESSO FILE SONO LA STESSA COLONNA, e il confronto fra le stringhe non lo
@@ -126,10 +190,30 @@ def main() -> int:
 
     samples_a: list[float] = []
     samples_b: list[float] = []
-    # ALTERNATE, non a blocchi: vedi il docstring.
+    # ALTERNATE, non a blocchi: vedi il docstring. E DENTRO LA COPPIA SI RUOTA L'ORDINE.
+    #
+    # 🚨 LA ROTAZIONE E' UN DIFETTO CORRETTO, NON UN ABBELLIMENTO. Questo ciclo eseguiva sempre A e
+    # poi B. Su `kern box --vm`, con due COPIE DELLO STESSO BINARIO nelle due colonne, dava:
+    #
+    #     n=120   B - A  -645,6 us   [-1112,5, -287,9]   "differenza distinguibile"
+    #     n=300   B - A  +374,5 us   [  +81,4,  +584,4]  "differenza distinguibile"
+    #
+    # Un binario dichiarato diverso da se stesso, due volte, con il SEGNO CHE SI RIBALTA fra le due
+    # esecuzioni. Chi sta in seconda posizione paga o incassa qualcosa di sistematico (cache di
+    # pagina, frequenza, collocazione sulla CPU), l'intervallo per ricampionamento si stringe attorno
+    # a quel bias invece che attorno allo zero, e piu' campioni lo rendono PIU' sicuro di una cosa
+    # falsa. A n=30 conteneva lo zero per fortuna, non per correttezza.
+    #
+    # Ruotare mette ogni colonna in prima posizione la meta' delle volte, quindi il bias di posizione
+    # entra in entrambe e si cancella nella differenza appaiata. Il campione va nella colonna del
+    # comando, mai nella colonna della posizione.
     for i in range(args.samples + args.warmup):
-        ta = run_once(cmd_a)
-        tb = run_once(cmd_b)
+        if i % 2 == 0:
+            ta = run_once(cmd_a)
+            tb = run_once(cmd_b)
+        else:
+            tb = run_once(cmd_b)
+            ta = run_once(cmd_a)
         if i >= args.warmup:
             samples_a.append(ta)
             samples_b.append(tb)
@@ -177,6 +261,37 @@ def main() -> int:
               "colonne. Non scrivere la mediana come se fosse una differenza.")
     else:
         print(f"\nverdetto: differenza distinguibile, {med_d:+.1f} us")
+
+    # IL PAVIMENTO DI RILEVAZIONE, sempre, anche quando il verdetto e' "non distinguibile".
+    #
+    # "Non distinguibile" da solo si legge come "non costa niente", e sono due cose diverse: la
+    # seconda e' vera solo se questa misura sarebbe stata capace di vedere un costo. La meta'
+    # larghezza dell'intervallo e' cio' che questa misura poteva vedere, quindi si stampa accanto al
+    # verdetto invece di lasciarla dedurre.
+    floor = (hi - lo) / 2.0
+    print(f"pavimento di rilevazione: +-{floor:.1f} us "
+          f"(n={len(deltas)}; un costo sotto questa soglia questa misura NON lo vedrebbe)")
+
+    # IL CANCELLO, per chi misura una REGRESSIONE e non una differenza.
+    #
+    # Chi chiama qui ha gia' deciso quale colonna e' il riferimento: A e' il prima, B e' il dopo.
+    # Bocciare quando l'intervallo sta INTERAMENTE sopra la tolleranza, e non quando la mediana e'
+    # positiva: una mediana positiva dentro un intervallo che contiene lo zero e' rumore, e un
+    # cancello che la boccia diventa un cancello che si spegne.
+    #
+    # ⛔ E il contrario vale uguale: un intervallo interamente sotto lo zero NON e' un successo da
+    # rivendicare qui. Questo cancello dice solo "non e' peggiorato".
+    if args.assert_indistinguishable and not (lo <= 0 <= hi):
+        print(f"\nSTRUMENTO ROTTO: due colonne che dovrebbero essere identiche escono distinguibili,\n"
+              f"intervallo [{lo:+.1f}, {hi:+.1f}]. Nessun verdetto preso in questa sessione vale.")
+        return 1
+    if assert_not_slower is not None:
+        if lo > assert_not_slower:
+            print(f"\nREGRESSIONE: l'intervallo [{lo:+.1f}, {hi:+.1f}] sta interamente sopra la\n"
+                  f"tolleranza di {assert_not_slower:+.1f} us. B e' piu' lento di A, e non e' rumore.")
+            return 1
+        print(f"\nnessuna regressione oltre {assert_not_slower:+.1f} us: l'intervallo "
+              f"[{lo:+.1f}, {hi:+.1f}] non sta interamente sopra la tolleranza.")
     return 0
 
 
