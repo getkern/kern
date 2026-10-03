@@ -53,6 +53,26 @@ much faster:
 wsl -d kern
 ```
 
+### Which WSL2 distro kern uses
+
+`kern.exe` is a forwarder: it runs the real kern inside one WSL2 distro. If you have more than one,
+`kern wsl` says which, and lets you change it.
+
+```powershell
+kern wsl list            # the distros, and which one is in use
+kern wsl list --probe    # also kern's version inside each (this STARTS every stopped distro)
+kern wsl status          # the distro in use, why it was chosen, and kern's version there
+kern wsl use Ubuntu      # use this one from now on (refused if kern is not installed in it)
+kern wsl reset           # forget the choice and detect again
+```
+
+The first command detects a distro and remembers it, preferring kern's own `kern` distro. Precedence
+is: the `KERN_WSL_DISTRO` environment variable, then what `kern wsl use` stored, then detection.
+
+`--probe` is the one that answers "why does my fix not show up": it prints the version in each distro,
+so two installs disagreeing become visible. `kern doctor`, which runs inside a distro, cannot see
+across the WSL boundary and says so.
+
 ## macOS
 
 macOS has no containers of its own, so kern runs inside a Linux VM. With colima:

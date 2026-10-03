@@ -1697,7 +1697,8 @@ fn duplicate_install_verdict(
             "{} - `PATH` order decides which one answers, so a fix you installed in one is \
              invisible from the other. Remove the stale ones, or put the one you want first. A \
              `kern.exe` on the Windows side of WSL is NOT visible from here and is counted by \
-             neither number.{foreign_note}",
+             neither number; run `kern wsl list --probe` from Windows to compare the distros.\
+             {foreign_note}",
             list(&kerns)
         ),
     )
@@ -2751,6 +2752,10 @@ mod duplicate_install_tests {
             "0.6.1",
             "/home/u/.local/bin/kern",
             "0.25.0",
+            // This row states a limit of its own scope (it cannot see across a WSL boundary), so it
+            // has to name the command that CAN. Asserted because a pointer that rots is worse than
+            // no pointer: it sends a reader to a verb that does not exist.
+            "kern wsl list --probe",
         ] {
             assert!(t.contains(needle), "missing {needle:?} in {t}");
         }
