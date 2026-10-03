@@ -2086,6 +2086,11 @@ function tarParse(gz) {
 }
 
 class Sandbox {
+  // The box name the `--show-config` probe uses. A FIXED placeholder: kern refuses an empty name
+  // ("invalid box name: box name is empty", measured) and a per-call name would put itself in the
+  // output and make every fingerprint unique.
+  static FINGERPRINT_PROBE = "kern-fingerprint-probe";
+
   /**
    * @param {object} [opts]
    * @param {string} [opts.image]            OCI image the box runs from. Default a small Python image.
@@ -2489,7 +2494,11 @@ class Sandbox {
    * changes what the box IS without changing the fingerprint, so a box built before it gets adopted
    * by a Sandbox that asks for it. The NAME is stripped before hashing - it is identity, not posture.
    */
-  _residentFingerprint() {
+  // ASYNC, because resolving a `vcpu:`/`vgpio:`/`vdisk:` token means asking kern. Only one
+  // production caller (`_residentEnsure`, already async) and the tests await it. `runCapture` and
+  // not `spawnSync`: this file's own rule, and a synchronous spawn here would stop every timer and
+  // socket in the host process.
+  async _residentFingerprint() {
     const argv = this._baseArgv("", {
       network: this.network,
       timeoutS: Math.trunc(this.persistTtlS),
@@ -2519,7 +2528,37 @@ class Sandbox {
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([k, v]) => `${k}=${v}`)
       .join("\u0000");
-    const material = `${argv.join("\u0000")}\u0000\u0000${kernEnv}`;
+    let material = `${argv.join("\u0000")}\u0000\u0000${kernEnv}`;
+    // AND WHAT A `vcpu:`/`vgpio:`/`vdisk:` TOKEN RESOLVES TO. A profile is a positional token that
+    // `kern box` resolves against the user's kern.toml: the TOKEN is in the argv above, the
+    // DEFINITION is not. Measured in the Python binding: the same `vcpu:agent` with `cpus = 1,
+    // memory = "128M"` and then `cpus = 4, memory = "4G"` produced ONE fingerprint, so a box created
+    // under one definition is adopted under another and the caller is told its own limits are in
+    // force. `vgpio:` profiles are the only way to give a box a hardware device, so the collision
+    // spans a DEVICE GRANT and not just a number.
+    //
+    // ASKED OF kern, not re-derived: re-reading kern.toml here would be a second opinion about
+    // kern's own resolution (KERN_CONFIG > --config > XDG > ~/.config, plus `extends`) and two
+    // opinions drift. A MINIMAL argv - the image, the tokens, nothing else - because everything else
+    // about the posture is already in the material above. Measured: 2 ms, no pull, and it does not
+    // require the image to exist. The spawn is only paid when a profile is asked for.
+    //
+    // FAIL CLOSED: if the probe cannot answer this throws rather than falling back to the
+    // argv-only hash, which would reopen exactly this hole.
+    if (this._profileArgs.length > 0) {
+      const probe = [
+        this._kern, "box", Sandbox.FINGERPRINT_PROBE, "--image", this.image, "--show-config",
+        ...this._profileArgs, "--", "/bin/true",
+      ];
+      const shown = await runCapture(probe, 60000);
+      if (shown.code !== 0)
+        throw new SandboxError(
+          `the resource profiles ${JSON.stringify(this.profiles || [])} do not resolve, so the ` +
+            `resident sandbox posture cannot be compared: ` +
+            `${(shown.stderr || shown.stdout || "").trim().slice(0, 300)}`,
+        );
+      material += `\u0000\u0000${shown.stdout}`;
+    }
     return crypto.createHash("sha256").update(material).digest("hex").slice(0, 16);
   }
 
@@ -2553,7 +2592,7 @@ class Sandbox {
    * cannot smuggle in a different posture.
    */
   async _residentEnsure() {
-    const want = this._residentFingerprint();
+    const want = await this._residentFingerprint();
     const found = await this._residentLookup();
     if (found) {
       const have = (found.labels || {})[CFG_LABEL];

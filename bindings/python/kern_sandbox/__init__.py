@@ -2965,6 +2965,10 @@ class Sandbox:
     _RESIDENT_PREFIX = "kern-sbx-"
     #: The label the configuration fingerprint is stamped into.
     _CFG_LABEL = "kern.sbx.cfg"
+    # The box name the `--show-config` probe uses. A FIXED placeholder, because kern refuses an
+    # empty name ("invalid box name: box name is empty", measured) and a per-call name would put
+    # itself in the output and make every fingerprint unique.
+    _FINGERPRINT_PROBE = "kern-fingerprint-probe"
 
     def _resident_name(self) -> str:
         return f"{self._RESIDENT_PREFIX}{self.name}"
@@ -3036,6 +3040,62 @@ class Sandbox:
             (k, v) for k, v in os.environ.items() if k.startswith("KERN_") and k != "KERN_BIN"
         )
         material = "\x00".join(argv) + "\x00\x00" + "\x00".join(f"{k}={v}" for k, v in env)
+        # 🚨 AND WHAT A `vcpu:`/`vgpio:`/`vdisk:` TOKEN RESOLVES TO, which is the fourth link in this
+        # same chain and the one with the most at stake.
+        #
+        # A profile is a positional token (`vcpu:agent`) that `kern box` resolves against the user's
+        # `kern.toml`. The TOKEN is in the argv above and therefore in this hash; the DEFINITION is
+        # not. MEASURED: with one `kern.toml` saying `cpus = 1, memory = "128M"` and then
+        # `cpus = 4, memory = "4G"` for the same `vcpu:agent`, the fingerprint was the same
+        # `f673cbb7d56739f9` both times. So a box created when the profile meant 128 MiB is adopted
+        # by a Sandbox whose config now says 4 GiB, and the caller is told its own limits are in
+        # force. ⛔ `vgpio:` profiles are the only way to give a box a hardware device, so the same
+        # collision spans a DEVICE GRANT, not just a number.
+        #
+        # ⭐ ASKED OF kern, NOT RE-DERIVED. Re-reading `kern.toml` here would be a second opinion
+        # about kern's own config resolution (`KERN_CONFIG` > `--config` > `$XDG_CONFIG_HOME` >
+        # `~/.config`, plus `extends`), and two opinions drift. `--show-config` is kern printing the
+        # RESOLVED box configuration and exiting, which is the same material the box would be built
+        # from. Verified: deterministic across three runs, it moves when the definition moves, it
+        # creates NO box, and it exits non-zero on a token that does not resolve.
+        #
+        # THE SPAWN IS ONLY PAID WHEN A PROFILE IS ASKED FOR. With no profiles the argv and the
+        # `KERN_*` environment already determine the posture, so the default path keeps costing one
+        # file read and no process.
+        #
+        # ⛔ FAIL CLOSED. If the probe cannot answer, this raises instead of falling back to the
+        # argv-only hash: a silent fallback would reopen exactly this hole, and a profile that does
+        # not resolve here is a profile `kern box` would refuse too.
+        if self._profile_args:
+            # A MINIMAL ARGV, NOT THE BOX'S OWN. The dry argv exists to be HASHED and is not
+            # executable - it carries an empty mount source (`-v ':/workspace'`), which kern
+            # correctly refuses. And the full real argv is not wanted either: the only thing this
+            # probe has to answer is what the profile TOKENS resolve to, and everything else about
+            # the posture is already in the material above. So: the image, the tokens, nothing else.
+            # Measured: 2 ms, no pull, and it does not even require the image to exist.
+            probe = (
+                [self._kern, "box", self._FINGERPRINT_PROBE, "--image", self.image, "--show-config"]
+                + self._profile_args
+                + ["--", "/bin/true"]
+            )
+            try:
+                shown = subprocess.run(  # noqa: S603 - argv list, no shell
+                    probe, capture_output=True, text=True, timeout=60
+                )
+            except (OSError, subprocess.SubprocessError) as e:
+                raise SandboxError(
+                    f"could not resolve the resource profiles {list(self.profiles or [])} to compare "
+                    f"the resident sandbox posture: {e}. A profile's definition is part of what the "
+                    f"box IS, so adopting one without knowing it would report limits that may not be "
+                    f"the ones in force"
+                ) from e
+            if shown.returncode != 0:
+                raise SandboxError(
+                    f"the resource profiles {list(self.profiles or [])} do not resolve, so the "
+                    f"resident sandbox posture cannot be compared: "
+                    f"{(shown.stderr or shown.stdout or '').strip()[:300]}"
+                )
+            material += "\x00\x00" + shown.stdout
         return hashlib.sha256(material.encode()).hexdigest()[:16]
 
     def _resident_lookup(self) -> "dict | None":

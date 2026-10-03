@@ -3226,7 +3226,7 @@ test("a process that already built a cache can build it again", async () => {
 // `test_a_setup_on_a_persistent_sandbox_gets_its_own_network_on_box` in
 // `bindings/python/tests/test_sandbox.py`, with the same reasoning and the same measurements.
 
-test("enforceLimits is part of the resident posture", () => {
+test("enforceLimits is part of the resident posture", async () => {
   // A CONTROL THAT NEVER REACHES argv STILL CHANGES WHAT THE BOX IS. `enforceLimits` is delivered as
   // `KERN_NO_SCOPE=1` in the spawn's ENVIRONMENT, not as a flag, so hashing `_baseArgv` alone could
   // not see it. Measured in the Python binding before the fix: the two values produced ONE
@@ -3236,12 +3236,12 @@ test("enforceLimits is part of the resident posture", () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "nposture-"));
   try {
     const common = { workspace: ws, name: "posture", persist: true, memoryMb: 128 };
-    const hard = new Sandbox({ ...common, enforceLimits: true })._residentFingerprint();
-    const soft = new Sandbox({ ...common, enforceLimits: false })._residentFingerprint();
+    const hard = await new Sandbox({ ...common, enforceLimits: true })._residentFingerprint();
+    const soft = await new Sandbox({ ...common, enforceLimits: false })._residentFingerprint();
     assert.notStrictEqual(hard, soft, "enforcement must be part of the posture");
     // The control: a difference that was already visible must stay visible, so the added term
     // cannot have swallowed the rest of the posture.
-    const bigger = new Sandbox({
+    const bigger = await new Sandbox({
       workspace: ws,
       name: "posture",
       persist: true,
@@ -3317,7 +3317,7 @@ test(
   },
 );
 
-test("the resident posture includes the KERN_ env that builds the box", () => {
+test("the resident posture includes the KERN_ env that builds the box", async () => {
   // kern READS ITS OWN ENVIRONMENT WHEN IT BUILDS A BOX, so that environment is posture.
   // `kern box` resolves `KERN_SECCOMP` to choose the seccomp filter, and `KERN_ALLOW_UNCAPPED`,
   // `KERN_LANDLOCK_REQUIRED` and `KERN_DIRECT_CAPS` each change what the box is. None appears in the
@@ -3329,9 +3329,9 @@ test("the resident posture includes the KERN_ env that builds the box", () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "nkenv-"));
   const saved = { ...process.env };
   try {
-    const fp = () =>
+    const fp = async () =>
       new Sandbox({ workspace: ws, name: "kenv", persist: true, memoryMb: 128 })._residentFingerprint();
-    const base = fp();
+    const base = await fp();
     const seen = new Set([base]);
     for (const [v, val] of [
       ["KERN_SECCOMP", "allowlist"],
@@ -3341,7 +3341,7 @@ test("the resident posture includes the KERN_ env that builds the box", () => {
       ["KERN_DIRECT_CAPS", "1"],
     ]) {
       process.env[v] = val;
-      const got = fp();
+      const got = await fp();
       delete process.env[v];
       assert.notStrictEqual(got, base, `${v}=${val} changes the box but not the fingerprint`);
       assert.ok(!seen.has(got), `${v}=${val} collides with another posture`);
@@ -3355,10 +3355,10 @@ test("the resident posture includes the KERN_ env that builds the box", () => {
     // disagreeing about how they located kern looks like from here.
     const target = process.env.KERN_BIN || FAKE_KERN;
     process.env.KERN_BIN = target;
-    const viaVar = fp();
+    const viaVar = await fp();
     delete process.env.KERN_BIN;
     process.env.PATH = `${path.dirname(target)}${path.delimiter}${process.env.PATH}`;
-    const viaPath = fp();
+    const viaPath = await fp();
     assert.strictEqual(
       viaPath,
       viaVar,
@@ -3370,3 +3370,66 @@ test("the resident posture includes the KERN_ env that builds the box", () => {
     fs.rmSync(ws, { recursive: true, force: true });
   }
 });
+
+test(
+  "what a profile token resolves to is part of the resident posture",
+  { skip: !KERN_OK && "kern not installed" },
+  async () => {
+    // A PROFILE IS A TOKEN IN THE ARGV AND A DEFINITION IN A FILE, and only one was hashed.
+    // `vcpu:`/`vgpio:`/`vdisk:` tokens are positional arguments `kern box` resolves against the
+    // user's kern.toml. Measured in the Python binding before the fix: the same `vcpu:agent` with
+    // `cpus = 1, memory = "128M"` and then `cpus = 4, memory = "4G"` produced ONE fingerprint, so a
+    // box created under one definition is adopted under another while the caller is told its own
+    // limits are in force. `vgpio:` profiles are the only way to give a box a hardware device, so
+    // the collision spans a DEVICE GRANT. Mirrors
+    // `test_what_a_profile_token_resolves_to_is_part_of_the_resident_posture`.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nprof-"));
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "nprofws-"));
+    const toml = path.join(home, "kern", "kern.toml");
+    fs.mkdirSync(path.join(home, "kern"));
+    const prev = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = home;
+    const SMALL = '[[vcpu]]\nname = "agent"\nbackend = "host"\ncpus = 1.0\nmemory = "128M"\n';
+    const BIG = '[[vcpu]]\nname = "agent"\nbackend = "host"\ncpus = 4.0\nmemory = "4G"\n';
+    try {
+      const fp = () =>
+        new Sandbox({
+          workspace: ws,
+          name: "prof",
+          persist: true,
+          memoryMb: null,
+          profiles: ["vcpu:agent"],
+        })._residentFingerprint();
+
+      fs.writeFileSync(toml, SMALL);
+      const small = await fp();
+      fs.writeFileSync(toml, BIG);
+      const big = await fp();
+      assert.notStrictEqual(small, big, "a profile's definition is posture and must move the hash");
+      // Deterministic: the same definition twice is the same hash, or adoption could never succeed
+      // even when the posture genuinely matches.
+      fs.writeFileSync(toml, SMALL);
+      assert.strictEqual(await fp(), small, "the same definition must give the same fingerprint");
+
+      // FAIL CLOSED: a token that does not resolve is refused, not hashed around.
+      await assert.rejects(
+        () =>
+          new Sandbox({
+            workspace: ws,
+            name: "prof",
+            persist: true,
+            profiles: ["vcpu:nosuchprofile"],
+          })._residentFingerprint(),
+        (e) => {
+          assert.match(e.message, /do not resolve/);
+          return true;
+        },
+      );
+    } finally {
+      if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prev;
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  },
+);

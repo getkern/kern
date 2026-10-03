@@ -4433,6 +4433,66 @@ def test_the_resident_posture_includes_the_kern_env_that_builds_the_box():
 
 
 @integration
+def test_what_a_profile_token_resolves_to_is_part_of_the_resident_posture():
+    """A PROFILE IS A TOKEN IN THE ARGV AND A DEFINITION IN A FILE, and only one was hashed.
+
+    `vcpu:`/`vgpio:`/`vdisk:` tokens are positional arguments `kern box` resolves against the user's
+    `kern.toml`. The token is in `_base_argv` and therefore in the fingerprint; what it MEANS is not.
+
+    MEASURED before the fix: the same `vcpu:agent` with `cpus = 1, memory = "128M"` and then
+    `cpus = 4, memory = "4G"` produced the same fingerprint `f673cbb7d56739f9` both times. So a box
+    created when the profile meant 128 MiB is adopted by a Sandbox whose config now says 4 GiB, and
+    the caller is told its own limits are in force. ⛔ `vgpio:` profiles are the only way to give a
+    box a hardware device, so the same collision spans a DEVICE GRANT and not just a number.
+
+    The fix asks kern (`--show-config`) rather than re-reading `kern.toml`, because re-deriving
+    kern's own config resolution here would be a second opinion that drifts. Integration-marked
+    because that probe spawns the binary - measured at 2 ms, with no pull, and only when a profile is
+    actually requested (0.13 ms per fingerprint without one).
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as ws:
+        cfg = Path(home, "kern")
+        cfg.mkdir()
+        toml = cfg / "kern.toml"
+        prev = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = home
+        try:
+            def fingerprint():
+                return Sandbox(
+                    workspace=ws, name="prof", persist=True, memory_mb=None,
+                    profiles=["vcpu:agent"],
+                )._resident_fingerprint()
+
+            toml.write_text('[[vcpu]]\nname = "agent"\nbackend = "host"\n'
+                            'cpus = 1.0\nmemory = "128M"\n')
+            small = fingerprint()
+            toml.write_text('[[vcpu]]\nname = "agent"\nbackend = "host"\n'
+                            'cpus = 4.0\nmemory = "4G"\n')
+            big = fingerprint()
+            assert small != big, "a profile's definition is posture and must move the fingerprint"
+            # Deterministic: the same definition twice is the same hash, or adoption could never
+            # succeed even when the posture genuinely matches.
+            toml.write_text('[[vcpu]]\nname = "agent"\nbackend = "host"\n'
+                            'cpus = 1.0\nmemory = "128M"\n')
+            assert fingerprint() == small, "the same definition must give the same fingerprint"
+
+            # FAIL CLOSED: a token that does not resolve is refused, not hashed around. A fallback to
+            # the argv-only hash here would reopen the hole this test is about.
+            with pytest.raises(SandboxError) as e:
+                Sandbox(
+                    workspace=ws, name="prof", persist=True, profiles=["vcpu:nosuchprofile"],
+                )._resident_fingerprint()
+            assert "do not resolve" in str(e.value), str(e.value)
+        finally:
+            if prev is None:
+                os.environ.pop("XDG_CONFIG_HOME", None)
+            else:
+                os.environ["XDG_CONFIG_HOME"] = prev
+
+
+@integration
 def test_a_setup_on_a_persistent_sandbox_gets_its_own_network_on_box():
     """THE SETUP BOX IS SEPARATE, ITS NETWORK IS ON, AND IT DIES - under `persist=True` too.
 
