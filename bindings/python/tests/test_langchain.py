@@ -930,8 +930,19 @@ def test_a_session_accumulates_but_the_session_is_the_boundary():
             collected.append(out.rstrip())
         return "TIMEOUT", collected
 
+    # THE SENTINEL'S DURATION IS UNIQUE PER RUN, and that is the whole reason it is not `600`.
+    #
+    # The survivor check below is a `pgrep -f` across the WHOLE HOST, because the pid this test can
+    # see is the one INSIDE the box's pid namespace and means nothing outside it. With a round `600`
+    # that pattern matches any unrelated `sleep 600` on the machine: measured here, an unrelated
+    # background job from another project (a `bash -c` whose script contained `sleep 600`, plus its
+    # child) failed this test and, because the failure lands AFTER the `finally`, left `proc` alive
+    # with its pipes open and failed the descriptor-count test that runs next. Two red tests, neither
+    # about kern. Identifying a process by its command line is the same unreliable instrument this
+    # project already bans for KILLING; here it is narrowed instead, to a duration nothing else uses.
+    sentinel = f"600.{uuid.uuid4().int % 10000:04d}"
     try:
-        _, printed = run("sleep 600 & echo PID=$!")
+        _, printed = run(f"sleep {sentinel} & echo PID=$!")
         assert printed and printed[0].startswith("PID="), printed
         pid = printed[0].split("=", 1)[1].strip()
         alive = f"if [ -d /proc/{pid} ]; then echo ALIVE; else echo gone; fi"
@@ -946,7 +957,9 @@ def test_a_session_accumulates_but_the_session_is_the_boundary():
         shutil.rmtree(workspace, ignore_errors=True)
 
     time.sleep(2)
-    survivors = subprocess.run(["pgrep", "-fa", "sleep 600"], capture_output=True, text=True)
+    survivors = subprocess.run(
+        ["pgrep", "-fa", f"sleep {sentinel}"], capture_output=True, text=True
+    )
     left = [line for line in survivors.stdout.splitlines() if "pgrep" not in line]
     assert left == [], f"the session died but something outlived it on the host: {left}"
 
