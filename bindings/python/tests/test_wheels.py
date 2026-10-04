@@ -184,6 +184,41 @@ def test_a_kern_dropped_next_to_python_by_hand_is_not_taken_for_the_bundled_one(
     assert _ask(python, "import kern_sandbox as k; print(k._bundled_kern())") == "None"
 
 
+def test_pip_target_takes_the_wheels_own_kern_and_not_the_one_its_record_points_at(tmp_path):
+    """`pip install --target DIR` writes the RECORD from the temporary prefix it installs into: the
+    script's entry reads `../../bin/kern`, two levels ABOVE `DIR`, while the file lands in
+    `DIR/bin/kern`. A different kern sitting where the RECORD points must not be taken for the
+    wheel's own, and the wheel's own must still be found."""
+    wheel = build_wheels.platform_wheel(_universal_wheel(tmp_path), ARCH, FAKE_KERN)
+    python = _make_venv(tmp_path / "venv")
+    site = tmp_path / "a" / "b" / "site"
+    subprocess.run(
+        [python, "-m", "pip", "install", "-q", "--no-index", "--target", str(site), str(wheel)], check=True
+    )
+    record = (site / f"{STEM}.dist-info" / "RECORD").read_text()
+    listed = next(row[0] for row in csv.reader(io.StringIO(record)) if row[0].endswith("bin/kern"))
+    decoy = Path(os.path.normpath(site / listed))
+    if decoy != site / "bin" / "kern":  # this pip writes the misleading entry: plant a kern there,
+        decoy.parent.mkdir(parents=True, exist_ok=True)  # the same size, so only the hash tells them apart
+        decoy.write_bytes(FAKE_KERN.replace(b"9.9.9", b"0.9.2"))
+        decoy.chmod(0o755)
+    code = "import kern_sandbox as k; print(k._bundled_kern()); print(k._find_kern())"
+    assert _ask(python, code, PYTHONPATH=str(site)).splitlines() == [str(site / "bin" / "kern")] * 2
+
+
+def test_a_bundled_kern_whose_bytes_are_not_the_records_is_not_taken(tmp_path):
+    """Being where the RECORD says is not being what the RECORD says: a kern replaced in place (by
+    hand, by `install.sh` writing into a shared `bin`) is passed over, and PATH decides."""
+    wheel = build_wheels.platform_wheel(_universal_wheel(tmp_path), ARCH, FAKE_KERN)
+    env_dir = tmp_path / "venv"
+    python = _make_venv(env_dir)
+    subprocess.run([python, "-m", "pip", "install", "-q", "--no-index", str(wheel)], check=True)
+    # POSITIVE CONTROL: the untouched copy is taken, so the None below is the replacement's doing.
+    assert _ask(python, "import kern_sandbox as k; print(k._bundled_kern())") == str(env_dir / "bin" / "kern")
+    (env_dir / "bin" / "kern").write_bytes(FAKE_KERN.replace(b"9.9.9", b"9.9.8"))  # same size
+    assert _ask(python, "import kern_sandbox as k; print(k._bundled_kern())") == "None"
+
+
 def test_a_source_tree_on_sys_path_never_borrows_an_installed_copys_binary(installed):
     """`_bundled_kern` answers for the module that is running. Importing this source tree with an
     installed platform wheel in the same environment must not hand the tree that wheel's binary."""

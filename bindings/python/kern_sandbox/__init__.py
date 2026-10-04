@@ -2054,6 +2054,14 @@ def _bundled_kern() -> "str | None":
     RECORD lists what pip installed for this distribution and nothing else, so only a kern this wheel
     brought is taken, and only when the RECORD is the one this module was loaded from: a source tree
     on `sys.path` must not borrow the binary of some installed copy.
+
+    THE RECORD'S PATH IS NOT ENOUGH, ITS HASH IS THE IDENTITY. `pip install --target DIR` writes the
+    RECORD from the temporary prefix it installs into, so the script's entry reads `../../bin/kern`
+    and resolves two levels ABOVE `DIR`, while the file itself lands in `DIR/bin/kern`. MEASURED with
+    pip 22.0 and 24.0: a 0.9.2 planted at `DIR/../../bin/kern` was taken over the wheel's own kern
+    (uv writes `bin/kern` and was right). So a candidate is taken only when its bytes are the ones the
+    RECORD lists, and the place `--target` really puts scripts is a second candidate under the same
+    test, which position alone could not justify. Hashed once per process, by the cache above.
     """
     try:
         from importlib import metadata
@@ -2071,10 +2079,22 @@ def _bundled_kern() -> "str | None":
             binary = entry
         elif entry.as_posix().endswith("kern_sandbox/__init__.py"):
             ours = os.path.realpath(str(dist.locate_file(entry))) == here
-    if binary is None or not ours:
+    if binary is None or not ours or binary.hash is None or binary.hash.mode != "sha256":
         return None
-    path = os.path.normpath(str(dist.locate_file(binary)))
-    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+    candidates = (
+        os.path.normpath(str(dist.locate_file(binary))),
+        os.path.join(os.path.dirname(os.path.dirname(here)), "bin", "kern"),  # `--target DIR`
+    )
+    for path in candidates:
+        if not (os.path.isfile(path) and os.access(path, os.X_OK)) or os.path.getsize(path) != binary.size:
+            continue
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        if base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode() == binary.hash.value:
+            return path
+    return None
 
 
 def _find_kern() -> str:
