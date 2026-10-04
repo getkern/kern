@@ -6642,6 +6642,12 @@ fn save_reads_a_directory_owned_by_a_subordinate_uid() {
     )
     .unwrap();
     let built = run(&["build", "-t", "subimg-layered:1", ctx.to_str().unwrap()]);
+    if !built.status.success() && String::from_utf8_lossy(&built.stderr).contains("user namespaces")
+    {
+        eprintln!("skip (layered half): no box can start here, so a RUN cannot build");
+        cleanup();
+        return;
+    }
     assert!(
         built.status.success(),
         "build: {}",
@@ -6742,6 +6748,12 @@ fn a_base_without_true_still_builds_layered() {
     let inspected = run(&["inspect", "notrue-built:1", "--json"]);
     let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
     let _ = fs::remove_dir_all(&base);
+    // A RUN needs a box, and a host that cannot start one (the CI runner: AppArmor refuses the
+    // rootless uid map) fails the build for that reason and no other.
+    if !built.status.success() && err.contains("user namespaces") {
+        eprintln!("skip: no box can start here, so a RUN cannot build: {err}");
+        return;
+    }
     assert!(built.status.success(), "build: {err}");
     assert!(
         !err.contains("overlay unavailable"),
