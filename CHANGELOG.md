@@ -5,6 +5,45 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## kern-sandbox 0.2.43 - 2026-10-04
+
+**`npm install kern-sandbox` brings kern with it, and both packages carry kern v0.30.0.** On Linux
+x64 and arm64 the npm package carries kern's static release binary, the same file `install.sh`
+serves, and the Node binding takes it after `$KERN_BIN` and before `PATH`, as the Python wheels do.
+Python and Node are at one version again.
+
+**A one-shot cell no longer inherits the caller's stdin.** Under `kern-mcp` that descriptor is the
+JSON-RPC transport, so a cell could read bytes meant for another tool call. `input()` now gets EOF.
+
+**A warm or resident box built under another posture is no longer handed over.** The prewarm pool's
+key and the `persist` fingerprint now come from one function: the argv, every `KERN_*` variable kern
+reads when it builds a box, and what a `vcpu:`/`vgpio:`/`vdisk:` profile resolves to. A changed
+`kern.toml` definition or `KERN_SECCOMP` used to leave the key unchanged. A kern too old to print a
+profile's device grant is refused for `vgpio:` and `vdisk:` profiles, and the pool steps aside.
+
+**The wheel's kern is identified by the hash its RECORD lists, not by the path.** `pip install
+--target DIR` writes a RECORD entry that points two levels above `DIR`, and a kern there was taken
+over the wheel's own. Now a candidate is taken only when its bytes match, and `DIR/bin/kern` is found.
+
+- **`persist=True`** (Node: `persist: true`) keeps one resident box per `name` and runs every call in
+  it with `kern exec`: 2 ms a call against 6 ms for a fresh box, and another process adopts it. It
+  needs `name` and an explicit `workspace`. A box under another posture is refused naming both
+  fingerprints. One destroyed by an OOM or by its TTL is recreated once, with a warning that says
+  what was lost. `setup=` runs in its own network-on box before the resident one starts.
+- **`workspace_max_bytes`** (Node: `workspaceMaxBytes`) caps what a workspace accumulates across
+  calls. It is cooperative: the call that exceeds it runs, and the next is refused.
+- Output survives an OOM or a timeout: the interpreter runs unbuffered.
+- `os._exit(0)` under a memory cap is reported as a clean exit, not as an external kill.
+- `language="node"` is refused on the default image, which has no node, and the refusal names the
+  remedy.
+- The MCP server caps each stream at its reply budget. A cell printing 100 MB used to cost 129 MiB of
+  server memory to show 16k characters; it now costs 3 MiB.
+- The MCP server answers `-32700` for every id on a line that is not one message (two frames, a frame
+  cut short), and refuses `NaN` and `Infinity`.
+- `index.d.ts` declares the eight constructor options it lacked, among them `persist` and
+  `requireLimits`, plus `destroy()`. It also stops saying `depsReadonly` defaults to false: the
+  default is true.
+
 ## v0.30.0 - 2026-10-04
 
 **kern says when a limit above a box will stall it instead of letting it be killed.** Past a

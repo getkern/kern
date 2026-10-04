@@ -42,7 +42,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.40";
+const VERSION = "0.2.43";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 // WHAT THE DEFAULT IMAGE CONTAINS, as a fact ABOUT THE IMAGE and not about its name. It drives the
