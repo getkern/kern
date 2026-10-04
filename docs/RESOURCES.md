@@ -140,6 +140,22 @@ read back from the box's own cgroup. `null` means nothing is enforcing it, and t
 SIGKILL, which the system OOM killer delivers identically. A kill by the box's own cap always carries
 kern's own OOM message on stderr.
 
+**A fourth case: a limit above the box that throttles instead of killing.** A `memory.high` on a
+cgroup above the box (a slice or scope, typically set with `systemctl set-property ... MemoryHigh=`) is
+not a kill limit: past it the kernel slows the box's allocations to a halt, so a box that should be
+OOM-killed at its cap stalls until its timeout. Measured on a Jetson Orin with `MemoryHigh=80M` on
+`kern.slice`: an OOM that takes 0.06 s took 317 s. kern does not change that limit. It reports it: a
+`kern: note:` when a box starts under one, naming the cgroup and the command that lifts it, a row in
+`kern doctor`, and in `kern inspect`:
+
+```console
+$ kern inspect web | grep mem-cap
+mem-cap  512M; throttled above 80M by /user.slice/user-1000.slice/user@1000.service/kern.slice (memory.high)
+```
+
+`--json` carries the same as `memory_high_outer` (bytes) and `memory_high_outer_cgroup`, `null` when
+there is none, and `--require-limits` refuses to start such a box.
+
 **One boundary crosses the split.** `--landlock-rw <path>` works on `run` as well as on `box`, because
 Landlock restricts the calling process rather than needing a mount namespace. So
 `kern run --landlock-rw ~/project -- ./agent` runs a host binary with its writes confined by the

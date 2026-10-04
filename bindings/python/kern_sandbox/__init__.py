@@ -2571,8 +2571,8 @@ class Sandbox:
             default **overrides** a ``vcpu:`` profile's own ``memory=``. To let a profile's memory apply,
             pass ``memory_mb=None`` (which also means uncapped if the profile carries no memory).
 
-            ⚠️ A ``memory.high`` ABOVE THE BOX TURNS AN OOM INTO A STALL, and kern does not detect
-            it. The cap is enforced (the box's own ``memory.max`` carries it, and
+            ⚠️ A ``memory.high`` ABOVE THE BOX TURNS AN OOM INTO A STALL, and kern reports it. The
+            cap is enforced (the box's own ``memory.max`` carries it, and
             ``memory.swap.max`` is 0, so swap cannot defeat it), and the kernel declares the OOM
             fast: one cell, a 400 MiB allocation under a 128 MiB cap, was killed in **127 ms** on a
             WSL2 kernel 6.18, **645 ms** on a kernel 6.8 server and **0.06 s** on a Jetson Orin
@@ -2587,9 +2587,10 @@ class Sandbox:
             fires first and you get a ``timeout`` fault, not an ``oom`` one; with ``persist=True``
             the box dies later, so a LATER call is the one that finds it gone and triggers the
             recreation (with its warning). Verified under that limit with ``timeout_s=900``: exit
-            137 at 317 s, the in-box state gone, exactly one recreation warning. When a box that
-            should OOM times out instead, look at the cgroups above it
-            (``systemctl --user show kern.slice -p MemoryHigh``).
+            137 at 317 s, the in-box state gone, exactly one recreation warning. kern reports such a
+            limit when it starts a box under one: a ``kern: note:`` line in ``result.stderr`` (kept
+            out of ``code_stderr``, like every kern diagnostic) naming the cgroup and the command that
+            lifts it; ``kern doctor`` and ``kern inspect`` show it too. kern does not change it.
         cpus: CPU cap in cores; ``None`` = uncapped and lets a ``vcpu:`` profile's ``cpus=`` apply (kern
             ``--cpus``). A set value overrides the profile, like ``memory_mb``.
         pids: task/fork-bomb ceiling (kern ``--pids-limit``). Default 256.

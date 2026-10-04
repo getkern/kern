@@ -2098,7 +2098,7 @@ class Sandbox {
    * @param {string} [opts.workspace]        host dir to persist as the workspace. null -> a temp dir,
    *                                          created on open() and DELETED on close().
    * @param {number|null} [opts.memoryMb]    RAM cap (kern --memory). Default 512.
-   *   ⚠️ A `memory.high` ABOVE THE BOX TURNS AN OOM INTO A STALL, and kern does not detect it. The
+   *   ⚠️ A `memory.high` ABOVE THE BOX TURNS AN OOM INTO A STALL, and kern reports it. The
    *   cap is enforced (the box's own `memory.max` carries it and `memory.swap.max` is 0, so swap
    *   cannot defeat it), and the kernel declares the OOM fast: one cell, a 400 MiB allocation under
    *   a 128 MiB cap, was killed in 127 ms on a WSL2 kernel 6.18, 645 ms on a kernel 6.8 server and
@@ -2108,8 +2108,9 @@ class Sandbox {
    *   past 80 MiB in total, whatever its own cap. Since `timeoutS` defaults to 30, under such a
    *   limit the CELL deadline fires first: you get a `timeout` fault rather than an `oom` one, and
    *   with `persist: true` the box dies LATER, so a subsequent call is the one that finds it gone and
-   *   recreates it. When a box that should OOM times out instead, look at the cgroups above it
-   *   (`systemctl --user show kern.slice -p MemoryHigh`). Same facts as the Python binding's
+   *   recreates it. kern reports such a limit when it starts a box under one: a `kern: note:` line
+   *   in `result.stderr` naming the cgroup and the command that lifts it; `kern doctor` and
+   *   `kern inspect` show it too. kern does not change it. Same facts as the Python binding's
    *   `memory_mb`.
    * @param {number|null} [opts.cpus]        CPU cap in cores; null = uncapped.
    * @param {number|null} [opts.pids]        task/fork-bomb ceiling. Default 256.

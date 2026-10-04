@@ -7,6 +7,14 @@ the build on any undocumented change. Full detail for any entry is in the git hi
 
 ## v0.30.0 - 2026-10-03
 
+**kern says when a limit above a box will stall it instead of letting it be killed.** Past a
+`memory.high` on a cgroup above the box the kernel throttles allocations rather than OOM-killing, so a
+box that should die at its cap hangs until its timeout: with `MemoryHigh=80M` on `kern.slice`, an OOM
+that takes 0.06 s took 317 s. kern now prints a `kern: note:` naming the cgroup and the command that
+lifts it, `kern doctor` and `kern inspect` report it (`memory_high_outer` and
+`memory_high_outer_cgroup` in `--json`), and `--require-limits` refuses to start such a box. Drop the
+flag to start it anyway; `KERN_QUIET=1` silences the note. kern never changes the limit.
+
 **`kern box --show-config` prints what a profile grants, not only its cgroup numbers.** Three lines
 follow `privileged:`: `devices:`, `sysfs:` and `vdisks:`, each sorted, `-` when empty. Two different
 device grants under one profile name used to print identical output. The lines are added; every

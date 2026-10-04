@@ -202,7 +202,9 @@ where that is out of reach it falls back to a transient `systemd-run --user --sc
 refuses to start, non-zero, unless the memory and pids caps are actually in force, **read back from
 the cgroup** rather than merely written: the OOM / fork-bomb backstop, never a box that runs
 believing it is capped when it is not. cpu/cpuset stay best-effort, as they carry no containment
-role.
+role. It also refuses when a `memory.high` on a cgroup above the box is below the box's cap: past it
+the kernel throttles instead of OOM-killing, so the cap would not be the limit that holds. Without the
+flag kern prints a note naming that cgroup, and never changes it.
 
 **`kern exec` and the box's caps.** An exec'd command inherits them **only where the box sits in a
 delegated cgroup kern can write**. On the rootless per-box-scope path (an SSH login on an edge
