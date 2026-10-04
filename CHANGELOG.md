@@ -5,6 +5,31 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## v0.30.1 - 2026-10-04
+
+**A compose `devices:` entry needs `--allow-device-grants`, as the pages already said.** kern 0.30.0
+gave a box `/dev/kvm` or a GPU's modeset node from a compose file run with no flag. Such a file now
+stops with a message naming the service and every node; pass `--allow-device-grants` to run it.
+`/dev/net/tun` is unaffected.
+
+**`kern save` and `kern push` work on Debian- and Ubuntu-based images on a host with a subuid
+range.** Both failed there, on `python:3.12-slim` and on anything built on it, because the image's
+`/var/cache/apt/archives/partial` belongs to a subordinate uid; Alpine was unaffected. `kern gc` also
+removes the copies `--pull always` retires, which it left behind on the same hosts.
+
+**A command run with `kern exec` and killed with its box by the OOM killer is reported as an OOM to an
+SDK**, so a resident sandbox (`persist=True`) now returns `fault.type == "oom"` where it returned
+`killed`.
+
+**A `-v` aimed under `/sys/devices` reaches the box.** The CPU topology kern writes there covered it.
+
+**A base image without `/bin/true` builds layered**, instead of building flat and blaming the kernel
+("unprivileged overlay unavailable").
+
+**Three messages name the right thing:** compose `gpus:` is described as Docker's GPU request rather
+than a typo for `cpus:`; `kern pull` names `kern box … --pull always` to refresh an image; and a failure
+reading a cached image no longer says to check the image's name.
+
 ## kern-sandbox 0.2.43 - 2026-10-04
 
 **`npm install kern-sandbox` brings kern with it, and both packages carry kern v0.30.0.** On Linux
