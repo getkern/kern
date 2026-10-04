@@ -6128,6 +6128,61 @@ fn read_only_dev_is_not_writable() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A `-v` aimed under `/sys/devices` reaches the box, and the CPU topology kern writes there stays.
+///
+/// The topology is a tmpfs over `sys/devices`, and it used to be mounted AFTER the volumes, so it
+/// covered such a bind with no error and no note. MEASURED on a Jetson: the chip-id file CUDA reads,
+/// bound at `/sys/devices/soc0/soc_id`, was absent inside the box. Both halves are asserted, because
+/// moving the mount the other way round would trade this defect for an empty topology.
+#[test]
+fn a_volume_under_sys_devices_is_not_covered_by_the_cpu_topology() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "sysdevvol");
+    let host = std::env::temp_dir().join(format!("kern-it-socid-{}", std::process::id()));
+    fs::write(&host, b"35\n").unwrap();
+    let vol = format!("{}:/sys/devices/soc0/soc_id:ro", host.display());
+    let out = kern_out(&[
+        "box",
+        "sysdevvol",
+        "--rootfs",
+        root.to_str().unwrap(),
+        "-v",
+        &vol,
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "cat /sys/devices/soc0/soc_id; cat /sys/devices/system/cpu/online",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_file(&host);
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("35"),
+        "the bound file must be visible under /sys/devices: {stdout} / {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        lines.get(1).is_some_and(|l| !l.is_empty()
+            && l.bytes()
+                .all(|b| b.is_ascii_digit() || b == b'-' || b == b',')),
+        "and the CPU topology must still be there: {stdout}"
+    );
+}
+
 /// When `newuidmap` + an `/etc/subuid` allocation are present, the box gets a RANGED uid map
 /// (box uid 0 → caller, box uids 1..N → subordinate ids) so other uids are usable. Verified via
 /// the box's own `/proc/self/uid_map` having the second (range) row. Skips where unavailable

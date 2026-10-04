@@ -1322,6 +1322,14 @@ fn child_setup_and_exec(
     }
     setup_vgpio(&spec.root, &spec.vgpio_devs, &spec.vgpio_sysfs)?;
     t.mark("dev");
+    // BEFORE THE VOLUMES, AFTER `setup_vgpio`. The topology is a tmpfs over `sys/devices`, and it was
+    // mounted after `setup_volumes`, so it covered every `-v` aimed under `/sys/devices` with no
+    // error and no note: MEASURED on a Jetson, `-v /sys/devices/soc0/soc_id:/sys/devices/soc0/soc_id`
+    // left the box with no such file, which is where CUDA reads the chip id. A bind made after it
+    // lands on top of the tmpfs, which is writable, so its mountpoint can be created there. `vgpio`'s
+    // sysfs grants mount a tmpfs over the whole of `/sys` and must stay underneath, which is why this
+    // follows them.
+    setup_cpu_topology(&spec.root, spec.cpuset.as_deref());
     setup_volumes(&spec.root, &spec.volumes)?;
     setup_vdisk(&spec.root, &spec.vdisks)?;
     setup_tmpfs(&spec.root, &spec.tmpfs)?;
@@ -1334,7 +1342,6 @@ fn child_setup_and_exec(
         make_box_tmpfs(&spec.root, "run")?;
     }
     setup_secrets(&spec.root, &spec.secrets, run_tmpfs)?;
-    setup_cpu_topology(&spec.root, spec.cpuset.as_deref());
     setup_etc_identity(&spec.root, &spec.hostname);
     setup_extra_hosts(&spec.root, &spec.extra_hosts);
     // AFTER the hosts files, because the two are independent and this one only fires when asked.
