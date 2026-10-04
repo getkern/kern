@@ -5,7 +5,7 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
-## v0.30.0 - 2026-10-03
+## v0.30.0 - 2026-10-04
 
 **kern says when a limit above a box will stall it instead of letting it be killed.** Past a
 `memory.high` on a cgroup above the box the kernel throttles allocations rather than OOM-killing, so a
