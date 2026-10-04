@@ -6479,8 +6479,10 @@ fn tiny_image_archive(dir: &Path, repo_tag: &str, busybox: Option<&Path>) -> Pat
     }
     let layout = dir.join("layout");
     fs::create_dir_all(layout.join("l1")).unwrap();
+    // Root-owned in the archive, as a registry image is: `kern load` keeps an archive's ownership, so
+    // files recorded as this user's uid would land as a SUBORDINATE id on a ranged host.
     assert!(Command::new("tar")
-        .args(["-C"])
+        .args(["--owner=0", "--group=0", "--numeric-owner", "-C"])
         .arg(&layer_root)
         .args(["-cf"])
         .arg(layout.join("l1/layer.tar"))
@@ -6677,6 +6679,75 @@ fn save_reads_a_directory_owned_by_a_subordinate_uid() {
     assert!(has(&layered_tar, "./extra.txt"), "and the layers on top");
     assert!(has(&layered_tar, "./ran"), "including the RUN's");
     cleanup();
+}
+
+/// A base with no `true` still builds LAYERED. The layered-build probe runs `true` inside the base,
+/// and treated a missing command as a refused overlay: MEASURED, a busybox-only base built flat and
+/// the reason given was "unprivileged overlay unavailable". The probe asks whether the overlay mounts.
+#[test]
+fn a_base_without_true_still_builds_layered() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("kern-it-notrue-{}", std::process::id()));
+    let cache = base.join("cache");
+    let data = base.join("data");
+    fs::create_dir_all(&cache).unwrap();
+    let archive = tiny_image_archive(&base, "notrue:1", Some(&busybox));
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    assert!(run(&["load", "-i", archive.to_str().unwrap()])
+        .status
+        .success());
+    let images = cache.join("kern/images");
+    let img_dir = fs::read_dir(&images)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("notrue"))
+        })
+        .expect("the loaded image's cache dir");
+    // THE PREMISE: the base has busybox and no `true`.
+    let _ = fs::remove_file(img_dir.join("bin/true"));
+    assert!(!img_dir.join("bin/true").exists() && img_dir.join("bin/busybox").exists());
+    let ctx = base.join("ctx");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM notrue:1\nRUN [\"/bin/busybox\", \"touch\", \"/ran\"]\n",
+    )
+    .unwrap();
+    let built = run(&["build", "-t", "notrue-built:1", ctx.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&built.stderr).to_string();
+    let layered = fs::read_dir(&images).unwrap().flatten().any(|e| {
+        e.file_name().to_string_lossy().starts_with("notrue-built")
+            && e.file_name().to_string_lossy().ends_with(".layers")
+    });
+    let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+    let _ = fs::remove_dir_all(&base);
+    assert!(built.status.success(), "build: {err}");
+    assert!(
+        !err.contains("overlay unavailable"),
+        "a missing `true` is not a kernel limitation: {err}"
+    );
+    assert!(
+        layered,
+        "the build must take the layered path on a base without `true`"
+    );
 }
 
 #[test]

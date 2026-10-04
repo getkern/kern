@@ -1269,7 +1269,12 @@ pub(crate) fn probe_overlay(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
+        // 127 IS A PASS: the box was built over the overlay and only the command was missing. The
+        // question is whether the overlay mounts, and `true` is just something to run in it. MEASURED:
+        // a base with no `/bin/true` (busybox without the applet link, distroless) exits 127 here,
+        // and the build went flat saying "unprivileged overlay unavailable", blaming the kernel for
+        // a file the image does not have. A refused mount exits 1, the same as before.
+        .map(|s| s.success() || s.code() == Some(127))
         .unwrap_or(false);
     remove_build_tree(&probe); // the probe leaves a mode-000 overlay workdir too
     ok
