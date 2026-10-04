@@ -259,8 +259,13 @@ pub(crate) fn build_config_json(cfg: &ImageConfigOut, diff_id: &str) -> String {
     if let Some(u) = &cfg.user {
         config_fields.push(format!("\"User\":{}", json_str(u)));
     }
+    // ONE HISTORY ENTRY FOR THE ONE LAYER. `history` is optional in the OCI spec, and buildah counts its
+    // non-empty entries against the layers anyway: MEASURED, `podman build` of `FROM <an image kern
+    // saved>` failed with "history lists 0 non-empty layers, but we have 1 layers on disk", so an
+    // image kern published could not be the base of a podman or buildah build. No `created` time,
+    // which keeps the config, and so the image digest, the same for the same rootfs.
     format!(
-        "{{\"architecture\":{},\"os\":\"linux\",\"config\":{{{}}},\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[{}]}}}}",
+        "{{\"architecture\":{},\"os\":\"linux\",\"config\":{{{}}},\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[{}]}},\"history\":[{{\"created_by\":\"kern: the image's filesystem as one layer\"}}]}}",
         json_str(crate::Platform::host().as_oci_arch()),
         config_fields.join(","),
         json_str(diff_id)
@@ -489,6 +494,10 @@ mod tests {
         assert!(j.contains("\"Entrypoint\":[\"/bin/app\"]"));
         assert!(j.contains("\"WorkingDir\":\"/srv\""));
         assert!(!j.contains("\"User\"")); // None → omitted
+
+        // One non-empty history entry per layer, or buildah refuses the image as a base.
+        assert_eq!(j.matches("\"created_by\"").count(), 1, "{j}");
+        assert!(!j.contains("empty_layer"), "{j}");
     }
 
     #[test]
