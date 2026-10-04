@@ -1,0 +1,4 @@
+# `build-package.py` writes the npm tarball here, and stages `bin/` in a temporary directory, never in
+# this checkout. A `bin/` here is a copy made by hand, and is not committed.
+dist/
+/bin/

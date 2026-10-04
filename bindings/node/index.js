@@ -1466,9 +1466,34 @@ function verifyIsKern(bin) {
   VERIFIED_KERN.add(key);
 }
 
-/** Locate `kern`: $KERN_BIN if set, else the first `kern` on $PATH. The result is also IDENTIFIED as
- * kern (see `verifyIsKern`): being executable and being named `kern` are not the same as being kern. */
-function findKern() {
+/** The `kern` this package's npm tarball carries for this machine, or null.
+ *
+ * The published package carries kern's static release binary for Linux x64 and arm64 under
+ * `bin/linux-<arch>/kern`, the same file `install.sh` serves for the same tag, so `npm install
+ * kern-sandbox` is the whole install there and the binding drives the kern it was published with.
+ * Mirrors `_bundled_kern`, which finds the Linux wheel's copy.
+ *
+ * FOUND NEXT TO THIS FILE AND NOWHERE ELSE. A kern taken by position from some other directory can be
+ * a copy installed by hand months earlier; `root` is the package's own directory, so only a binary
+ * this package brought is taken. A source checkout has no `bin/` and falls through to PATH. A file
+ * that is there but cannot be executed (a `noexec` mount, an archive-backed install) falls through
+ * too, rather than failing a call that a `kern` on PATH could serve. `root` is a parameter for the
+ * tests only. */
+function bundledKern(root = __dirname) {
+  if (process.platform !== "linux") return null;
+  const cand = path.join(root, "bin", `linux-${process.arch}`, "kern");
+  try {
+    fs.accessSync(cand, fs.constants.X_OK);
+    return fs.statSync(cand).isFile() ? cand : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Locate `kern`: $KERN_BIN if set, else the kern this package carries (see `bundledKern`), else the
+ * first `kern` on $PATH. The result is also IDENTIFIED as kern (see `verifyIsKern`): being executable
+ * and being named `kern` are not the same as being kern. `root` is for the tests only. */
+function findKern(root = __dirname) {
   const env = process.env.KERN_BIN;
   if (env) {
     try {
@@ -1479,6 +1504,11 @@ function findKern() {
     }
     verifyIsKern(env);
     return env;
+  }
+  const bundled = bundledKern(root);
+  if (bundled) {
+    verifyIsKern(bundled);
+    return bundled;
   }
   const exts = [""];
   const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
@@ -1497,25 +1527,21 @@ function findKern() {
     }
   }
   // On macOS the generic "install it" is a dead end: there is no macOS build to install. kern needs
-  // a Linux kernel, so the answer is a VM, and the error says which one rather than leaving the
-  // reader hunting for a download that does not exist.
+  // a Linux kernel, so the answer is a VM, and inside one the same `npm install` brings kern.
   if (process.platform === "darwin")
     throw new SandboxError(
-      "the `kern` binary was not found on PATH, and this is macOS: kern is Linux-only " +
-        "(no namespaces, no cgroups on a Mac), so there is no macOS build to find. " +
-        "Run inside a Linux VM (colima, Lima, OrbStack, UTM) and install it there with:\n" +
-        "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n" +
-        "or set $KERN_BIN to a kern reachable from here.",
+      "kern was not found, and this is macOS: kern is Linux-only (no namespaces, no cgroups on a " +
+        "Mac), so there is no macOS build. Run your code inside a Linux VM (colima, Lima, OrbStack, " +
+        "UTM) and install this package there:\n" +
+        "    npm install kern-sandbox\n" +
+        "On Linux x64 and arm64 that brings kern with it. Or set $KERN_BIN to a kern reachable from here.",
     );
-  // THE COMMAND, NOT A LINK. `npm install kern-sandbox` does NOT bring the binary: this package is a
-  // wrapper around a process it does not ship, and the moment a user meets that fact is this error.
-  // It used to answer with a repository URL, which asks someone one paste away from working to go
-  // and read a page first. The same sentence the Python binding gives, deliberately: two wrappers
-  // around one runtime must not disagree about how to get it, and the installer line is the one the
-  // project's README leads with.
+  // THE COMMAND, NOT A LINK. Reached on Linux only when this copy carries no binary for the machine:
+  // an architecture the package has no kern for, or a source checkout. The installer is the same
+  // line the Python binding and the project's README give, so the three cannot drift apart.
   throw new SandboxError(
-    "the `kern` binary was not found on PATH. `npm install kern-sandbox` installs this wrapper, " +
-      "not the runtime it drives - install kern with:\n" +
+    `kern was not found: this copy of kern-sandbox carries no kern binary for linux-${process.arch} ` +
+      "(the npm package carries one for x64 and arm64) and there is none on PATH. Install kern with:\n" +
       "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh\n" +
       "or point $KERN_BIN at a kern you already have.",
   );
@@ -4949,6 +4975,11 @@ module.exports = {
   // fingerprint asks, the two were allowed to drift once, and the test that stops them doing it
   // again has to be able to ask the pool directly. The Python binding exposes it the same way.
   _WarmPool: WarmPool,
+  // Where the binding finds kern, exported for its tests only: the order ($KERN_BIN, the package's
+  // own copy, PATH) decides which binary runs every box, and only a test that can hand these a
+  // package root can assert it without writing a `bin/` into this checkout.
+  _bundledKern: bundledKern,
+  _findKern: findKern,
   // The bytecode cache's internals, exported for its tests only: the mount flag and the atomic
   // publish are security properties, and a test that cannot reach them cannot assert them.
   _PYC_MOUNT: PYC_MOUNT,

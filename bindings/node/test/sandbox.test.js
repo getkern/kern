@@ -1750,6 +1750,61 @@ test("a binary that is not kern is refused before any code runs", async () => {
   }
 });
 
+test(
+  "the kern the package carries is taken from the package, after $KERN_BIN and before PATH",
+  { skip: process.platform !== "linux" && "the package carries kern for Linux only" },
+  () => {
+    // A package root laid out as the published tarball is, a PATH directory holding a different
+    // kern, and a binding that must pick by ORDER, not by whichever it happens to meet first.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kern-bundled-"));
+    const write = (p, version) => {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, `#!/bin/sh\n[ "$1" = --version ] && echo "${version}" && exit 0\nexit 0\n`);
+      fs.chmodSync(p, 0o755);
+      return p;
+    };
+    const root = path.join(tmp, "pkg");
+    const bundled = write(path.join(root, "bin", `linux-${process.arch}`, "kern"), "kern 9.9.9-bundled");
+    const onPath = write(path.join(tmp, "path", "kern"), "kern 9.9.9-path");
+    const empty = path.join(tmp, "empty");
+    fs.mkdirSync(empty);
+    const prevBin = process.env.KERN_BIN;
+    const prevPath = process.env.PATH;
+    try {
+      delete process.env.KERN_BIN;
+      process.env.PATH = path.dirname(onPath);
+      assert.strictEqual(kern._bundledKern(root), bundled);
+      assert.strictEqual(kern._findKern(root), bundled, "the package's kern must win over PATH");
+      // POSITIVE CONTROL: with no `bin/` in the root, the same call reaches PATH. Without it, the
+      // assertion above would also pass on a binding that never looks at PATH at all.
+      assert.strictEqual(kern._bundledKern(empty), null);
+      assert.strictEqual(kern._findKern(empty), onPath);
+      // $KERN_BIN is the caller's explicit choice and beats the package's copy.
+      process.env.KERN_BIN = FAKE_KERN;
+      assert.strictEqual(kern._findKern(root), FAKE_KERN);
+      delete process.env.KERN_BIN;
+      // A copy that cannot be executed is passed over, not run: the call goes to PATH instead.
+      fs.chmodSync(bundled, 0o644);
+      assert.strictEqual(kern._bundledKern(root), null);
+      assert.strictEqual(kern._findKern(root), onPath);
+      // The package's copy is IDENTIFIED like any other: being in the right place is not being kern.
+      fs.writeFileSync(bundled, '#!/bin/sh\necho "not kern"\nexit 0\n');
+      fs.chmodSync(bundled, 0o755);
+      assert.throws(() => kern._findKern(root), (e) => e instanceof SandboxError && /is not kern/.test(e.message));
+      // Another architecture's copy is never taken.
+      const other = process.arch === "x64" ? "arm64" : "x64";
+      const foreign = path.join(tmp, "foreign");
+      write(path.join(foreign, "bin", `linux-${other}`, "kern"), "kern 9.9.9-foreign");
+      assert.strictEqual(kern._bundledKern(foreign), null);
+    } finally {
+      if (prevBin === undefined) delete process.env.KERN_BIN;
+      else process.env.KERN_BIN = prevBin;
+      process.env.PATH = prevPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  },
+);
+
 test("a chosen exit code is not a signal", () => {
   // The OOM inversion one level down: kern propagates the workload's status as `128 + N`, so a cell doing
   // `sys.exit(137)` and a cell the kernel killed are the same number downstream. MEASURED through the

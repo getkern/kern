@@ -30,13 +30,15 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "README.md"
+    "README.md",
+    "bin/"
   ],
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepublishOnly": "node -e \"for (const a of ['x64', 'arm64']) if (!require('fs').existsSync('bin/linux-' + a + '/kern')) { console.error('kern-sandbox: bin/linux-' + a + '/kern is missing. Publish the tarball build-package.py writes, not this directory.'); process.exit(1) }\""
   },
   "os": [
     "linux"
