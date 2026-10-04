@@ -2798,33 +2798,37 @@ pub fn exec(
     }
     match result {
         Ok(code) => {
-            if code == 128 + libc::SIGKILL && kern_isolation::exec_was_oom_killed() {
-                signal_exec_oom();
-            }
+            signal_exec_outcome();
             std::process::exit(code)
         }
         Err(e) => Err(Error::Sandbox(e.to_string())),
     }
 }
 
-/// Hand an exec'd command's OOM verdict to the caller's `KERN_STARTED_FD`, in the byte order `kern box`
-/// writes at its teardown: the command ran (1), cap enforcement not known on this path (0), killed by
-/// the OOM killer (1), and the signal.
+/// Hand an exec'd command's outcome to the caller's `KERN_STARTED_FD`, in the byte order `kern box`
+/// writes at its teardown: the command ran (1), cap enforcement is not known on this path (0), whether
+/// the OOM killer took it with its box, and the signal that ended it (0 for an exit of its own).
 ///
-/// THE VERDICT EXISTED AND ONLY A READER OF STDERR COULD HAVE IT. `memory.oom.group=1` makes an OOM
-/// take the whole box, so a command run with `kern exec` dies with it; the exec path attributes that
-/// from the ancestor's `oom_group_kill` and printed a sentence, while writing nothing to this
-/// descriptor. MEASURED through the SDK: `bytearray(400 << 20)` under `memory_mb=128` in a resident
-/// sandbox came back `killed` where the same cell in a fresh box says `oom`, and an agent told `killed`
-/// does not try more memory. Stderr is no substitute: the workload writes to it too.
+/// THE OUTCOME EXISTED AND ONLY A READER OF STDERR COULD HAVE IT. `memory.oom.group=1` makes an OOM
+/// take the whole box, so a command run with `kern exec` dies with it; the exec path attributed that
+/// and printed a sentence, and wrote nothing here. MEASURED through the SDK, resident sandbox,
+/// `memory_mb=128`: `bytearray(400 << 20)` came back `killed` where a fresh box says `oom`, so an agent
+/// does not try more memory, and a cell's own `sys.exit(137)` ALSO came back `killed`, a kill that never
+/// happened, which `kern box`'s fourth byte had already ruled out for the one-shot path. Stderr is no
+/// substitute: the workload writes to it too.
 ///
 /// The workload cannot reach this descriptor: `kern exec` sheds inherited fds before the command runs
 /// (measured: a caller's fd 7 is absent from the box's `/proc/self/fd`).
-fn signal_exec_oom() {
+fn signal_exec_outcome() {
     let Some(fd) = started_signal_fd() else {
         return;
     };
-    let buf = [1u8, 0, 1, libc::SIGKILL as u8];
+    let buf = [
+        1u8,
+        0,
+        u8::from(kern_isolation::exec_was_oom_killed()),
+        kern_isolation::exec_workload_signal(),
+    ];
     loop {
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
         if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {

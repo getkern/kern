@@ -133,6 +133,20 @@ pub fn exec_was_oom_killed() -> bool {
     EXEC_WAS_OOM_KILLED.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The signal that ended the command this process ran with `kern exec`, or 0 when it exited on its
+/// own. The 137 a caller sees is the same for `exit(137)` and for a SIGKILL, so this is the half that
+/// tells a chosen exit from a kill, exactly as `box_workload_signal` does for `kern box`.
+static EXEC_WORKLOAD_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn latch_exec_signal(sig: u8) {
+    EXEC_WORKLOAD_SIGNAL.store(sig, std::sync::atomic::Ordering::Release);
+}
+
+#[must_use]
+pub fn exec_workload_signal() -> u8 {
+    EXEC_WORKLOAD_SIGNAL.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The capped cgroup THIS process created for its box, recorded by [`apply_limits`] and read by the
 /// supervisor after the box exits.
 ///

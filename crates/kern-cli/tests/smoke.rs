@@ -1058,7 +1058,7 @@ fn the_started_signal_carries_the_oom_verdict_and_the_workload_signal() {
 /// `bytearray(400 << 20)` under a 128 MiB cap as `killed`, where a fresh box says `oom`.
 ///
 /// The control comes FIRST, because the OOM takes the box with it: an exec that CHOOSES exit 137 must
-/// write nothing, or the bytes would claim an OOM for every 137.
+/// read as an exit with no signal and no OOM, or every 137 would be a kill.
 #[test]
 fn an_exec_killed_with_its_box_by_the_oom_killer_says_so_on_the_started_signal() {
     let name = format!("execoom-{}", std::process::id());
@@ -1091,9 +1091,10 @@ fn an_exec_killed_with_its_box_by_the_oom_killer_says_so_on_the_started_signal()
         Some(137),
         "the exec did not propagate the chosen code"
     );
-    assert!(
-        sig.is_empty(),
-        "an exec that chose exit 137 was reported on the started signal: {sig:?}"
+    assert_eq!(
+        sig,
+        vec![1, 0, 0, 0],
+        "an exec that CHOSE exit 137 must read as ran, no OOM, no signal"
     );
     let (code, sig) = started_bytes(&[
         "exec",

@@ -6624,6 +6624,18 @@ fn reap_retry_eintr(pid: i32, status: &mut i32) -> i32 {
 }
 
 /// Decode a `waitpid` status into a shell-style exit code (128+signal if killed).
+/// The run state and start time (fields 3 and 22) of `/proc/<pid>/stat`, or `None` when the process is
+/// gone. Parsed after the LAST `)`, because field 2 is the command name and may hold spaces and a `)`.
+fn stat_state_and_start(pid: i32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // `rest` starts at field 3, so field 22 is the 19th after the state.
+    let start = fields.nth(18)?.parse().ok()?;
+    Some((state, start))
+}
+
 fn wait_code(status: i32) -> i32 {
     if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
@@ -6934,6 +6946,10 @@ pub fn exec_in_box(
     let oom_events_fd = crate::cgroup::oom_kill_dir_for_pid(pid1)
         .and_then(|d| crate::cgroup::open_oom_events_fd(&d));
     let oom_baseline = oom_events_fd.and_then(crate::cgroup::oom_group_kill_from_fd);
+    // THE BOX'S PID 1, PINNED BY ITS START TIME, for the second half of the attribution below: the
+    // ancestor's counter is SHARED by every box under it, so a rise says an OOM happened somewhere,
+    // and only the death of THIS box's PID 1 says it happened here.
+    let pid1_start = stat_state_and_start(pid1).map(|(_, st)| st);
 
     // IS THERE A CAP TO ESCAPE AT ALL? Computed HERE, before the `setns` below, and this is the
     // input the refusal was missing.
@@ -7231,6 +7247,9 @@ pub fn exec_in_box(
                 return Err(Error::last("waitpid"));
             }
             let code = wait_code(status);
+            if libc::WIFSIGNALED(status) {
+                crate::cgroup::latch_exec_signal(u8::try_from(libc::WTERMSIG(status)).unwrap_or(0));
+            }
             // SIGKILL E IL CONTATORE SALITO: il comando e' stato ucciso col box. Da solo `128 + SIGKILL`
             // non dice niente, perche' SIGKILL ha molti mittenti; l'incremento di `oom_group_kill` sul
             // cgroup ANTENATO e' cio' che lo attribuisce.
@@ -7239,13 +7258,23 @@ pub fn exec_in_box(
             // morto. Misurato, un solo campione preso all'istante della morte riportava l'OOM in 3 corse
             // su 10. A passi di 2 ms fino a 400: sono 200x il massimo osservato (2 ms), e questo tempo lo
             // paga solo un comando GIA' ucciso, mai uno sano.
-            if code == 128 + libc::SIGKILL {
-                if let (Some(fd), Some(base)) = (oom_events_fd, oom_baseline) {
+            // A SIGNAL, NOT THE NUMBER 137, and the box's own PID 1 gone with it. MEASURED under the full
+            // gate, with other tests OOM-killing their own boxes alongside: an exec that CHOSE `exit 137`
+            // was attributed to the OOM killer, because the check read only the code, and the counter it
+            // reads is the ancestor's, which every box under it raises. A chosen exit is not a kill, and
+            // `memory.oom.group=1` takes PID 1 with the command, which an OOM in a neighbour does not.
+            if libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL {
+                if let (Some(fd), Some(base), Some(start)) =
+                    (oom_events_fd, oom_baseline, pid1_start)
+                {
                     let mut fired = false;
                     let mut waited = 0;
                     while !fired && waited <= 400 {
-                        fired =
-                            crate::cgroup::oom_group_kill_from_fd(fd).is_some_and(|now| now > base);
+                        let pid1_gone = stat_state_and_start(pid1)
+                            .is_none_or(|(state, st)| state == 'Z' || st != start);
+                        fired = pid1_gone
+                            && crate::cgroup::oom_group_kill_from_fd(fd)
+                                .is_some_and(|now| now > base);
                         if fired {
                             break;
                         }
