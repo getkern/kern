@@ -2041,12 +2041,27 @@ fn current_mount_flags(fd: libc::c_int) -> libc::c_ulong {
         libc::MS_MANDLOCK,
         libc::MS_NOATIME,
         libc::MS_NODIRATIME,
-        libc::MS_RELATIME,
     ] {
         let b = bit as libc::c_ulong;
         if f & b != 0 {
             ms |= b;
         }
+    }
+    // THE ATIME POLICY IS WHERE "THE SAME NUMERIC VALUES" STOPS BEING TRUE. `ST_NOATIME` (0x400) and
+    // `ST_NODIRATIME` (0x800) are `MS_NOATIME`/`MS_NODIRATIME`, but `ST_RELATIME` is 0x1000 while
+    // `MS_RELATIME` is 1 << 21, and `strictatime` has no `ST_*` bit at all: it is the absence of both
+    // the other two. MEASURED against `/proc/self/mountinfo`: `/proc` here is `relatime` there and this
+    // reader returned no relatime bit, because the list above used to carry `MS_RELATIME` and that bit
+    // can never appear in `f_flags`. The kernel (3.17+) preserves the atime policy on a remount that
+    // names NO atime flag, which hid it for `relatime` mounts; but `MS_NODIRATIME` alone names one,
+    // and then an unnamed policy falls back to `relatime`, which a user namespace refuses to change on
+    // a `strictatime` mount it inherited. So the policy is named explicitly, always.
+    const ST_NOATIME: libc::c_ulong = 0x0400;
+    const ST_RELATIME: libc::c_ulong = 0x1000;
+    if f & ST_RELATIME != 0 {
+        ms |= libc::MS_RELATIME as libc::c_ulong;
+    } else if f & ST_NOATIME == 0 {
+        ms |= libc::MS_STRICTATIME as libc::c_ulong;
     }
     ms
 }
@@ -8218,28 +8233,91 @@ mod shm_and_mount_flag_gates {
 
     #[test]
     fn current_mount_flags_reads_the_kernel_and_discriminates() {
-        // A positive control for the reader itself: `/proc` is `nosuid,nodev,noexec` on every Linux
-        // this runs on, and `/` is not, so a reader that returned a constant would fail one of the two.
+        // A positive control for the reader itself, against a SECOND channel: the per-mount options
+        // the kernel prints in `/proc/self/mountinfo`, which `fstatfs64` does not read. Each probed
+        // mount must agree bit for bit, and a reader that returned a constant fails as soon as two
+        // probed mounts differ.
+        //
+        // IT USED TO ASSUME `/proc` IS `nosuid` "on every Linux this runs on", and that is false.
+        // MEASURED on a Jetson Orin (L4T, kernel 5.15-tegra): `/proc` is `rw,relatime`, the same
+        // options as `/`, so the reader correctly returned no `nosuid` and the test failed on its
+        // premise. There `/run` and `/dev/shm` are `nosuid,nodev`, which is what the discrimination
+        // half now rests on, read from the host instead of assumed.
+        //
+        // `ro` is NOT compared: `statfs` sets it for a read-only SUPERBLOCK as well, which the
+        // per-mount field does not show. The bits compared are the per-mount ones.
+        const PER_MOUNT: [libc::c_ulong; 7] = [
+            libc::MS_NOSUID as libc::c_ulong,
+            libc::MS_NODEV as libc::c_ulong,
+            libc::MS_NOEXEC as libc::c_ulong,
+            libc::MS_NOATIME as libc::c_ulong,
+            libc::MS_NODIRATIME as libc::c_ulong,
+            libc::MS_RELATIME as libc::c_ulong,
+            libc::MS_STRICTATIME as libc::c_ulong,
+        ];
+        let mask = PER_MOUNT.iter().fold(0, |a, b| a | b);
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return; // no procfs (a stripped container): there is no second channel to compare with
+        };
+        // The options of the TOPMOST mount at `mp`: the last line naming it as its mount point.
+        let from_mountinfo = |mp: &str| -> Option<libc::c_ulong> {
+            let opts = mountinfo
+                .lines()
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split(' ').collect();
+                    (f.get(4) == Some(&mp)).then(|| f.get(5).copied())?
+                })
+                .next_back()?;
+            let mut bits: libc::c_ulong = 0;
+            for o in opts.split(',') {
+                bits |= match o {
+                    "nosuid" => libc::MS_NOSUID as libc::c_ulong,
+                    "nodev" => libc::MS_NODEV as libc::c_ulong,
+                    "noexec" => libc::MS_NOEXEC as libc::c_ulong,
+                    "noatime" => libc::MS_NOATIME as libc::c_ulong,
+                    "nodiratime" => libc::MS_NODIRATIME as libc::c_ulong,
+                    "relatime" => libc::MS_RELATIME as libc::c_ulong,
+                    _ => 0,
+                };
+            }
+            // `mountinfo` prints no word for strictatime: it is neither `noatime` nor `relatime`.
+            let atime = (libc::MS_NOATIME | libc::MS_RELATIME) as libc::c_ulong;
+            if bits & atime == 0 {
+                bits |= libc::MS_STRICTATIME as libc::c_ulong;
+            }
+            Some(bits)
+        };
         let open = |p: &str| -> libc::c_int {
             let c = cstr(p).expect("a literal path has no NUL");
             unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) }
         };
-        let proc_fd = open("/proc");
-        if proc_fd < 0 {
-            return; // no /proc (a stripped container): the check has nothing to read, so it says nothing
+        let mut seen: Vec<(&str, libc::c_ulong)> = Vec::new();
+        for mp in ["/proc", "/", "/sys", "/dev", "/run", "/tmp", "/dev/shm"] {
+            let Some(want) = from_mountinfo(mp) else {
+                continue; // not a mount point on this host
+            };
+            let fd = open(mp);
+            if fd < 0 {
+                continue;
+            }
+            let got = current_mount_flags(fd) & mask;
+            unsafe { libc::close(fd) };
+            assert_eq!(
+                got, want,
+                "{mp}: the reader says {got:#x}, mountinfo says {want:#x}; a remount built from the \
+                 reader would clear or invent a locked flag"
+            );
+            seen.push((mp, want));
         }
-        let f = current_mount_flags(proc_fd);
-        unsafe { libc::close(proc_fd) };
-        assert_ne!(
-            f & libc::MS_NOSUID as libc::c_ulong,
-            0,
-            "/proc is mounted nosuid; a reader that missed it would let a remount CLEAR the flag"
+        assert!(
+            seen.len() >= 2,
+            "fewer than two probed mount points exist ({seen:?}): the check compared nothing"
         );
-        let root_fd = open("/");
-        if root_fd >= 0 {
-            let rf = current_mount_flags(root_fd);
-            unsafe { libc::close(root_fd) };
-            assert_ne!(f, rf, "the reader must discriminate: / and /proc differ");
+        let differ = seen.iter().any(|(_, f)| *f != seen[0].1);
+        if !differ {
+            // Every probed mount carries the same options on this host, so a constant reader would
+            // also have agreed: the equality above held, the discrimination is not testable here.
+            eprintln!("current_mount_flags: all probed mounts share one option set: {seen:?}");
         }
     }
 }
