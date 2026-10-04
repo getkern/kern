@@ -4124,6 +4124,19 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     ));
                 }
             }
+            // Docker's GPU request, which compose spells `gpus:` since docker compose v2.30. It is a
+            // real key, so the near-miss path below must not reach it: MEASURED, it answered "did you
+            // mean `cpus:`? ... the key as written does nothing here or under Docker", which is false
+            // twice.
+            "gpus" => {
+                warn(&format!(
+                    "service '{name}': `gpus:` is NOT applied - kern does not read Docker's GPU \
+                     request. The GPU is a DEVICE GRANT here: name the nodes the service needs \
+                     under `devices:` and pass `--allow-device-grants` to `kern compose`. WHAT YOU \
+                     WILL SEE without them: the service starts without the GPU and fails inside \
+                     with a CUDA or driver error"
+                ));
+            }
             "configs" | "extends" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
@@ -4359,7 +4372,8 @@ fn deploy_reservation_note(service: &str, key: &str) -> String {
         return format!(
             "service '{service}': deploy.resources.reservations.devices ignored - kern grants NO device \
              from a compose file, so this service runs WITHOUT the device (a GPU included) it asks for. \
-             A device comes from an operator: an `x-kern-vgpio:` profile plus `--allow-device-grants`"
+             A device comes from an operator: the nodes under `devices:` (or an `x-kern-vgpio:` \
+             profile) plus `--allow-device-grants`"
         );
     }
     format!(
@@ -6044,7 +6058,7 @@ fn edit_distance_at_most_one(a: &str, b: &str) -> bool {
 
 /// The service keys a near miss is measured against: every key this parser acts on, plus the ones it
 /// deliberately ignores, because a typo for an ignored key is still a typo worth naming.
-const KNOWN_SERVICE_KEYS: [&str; 46] = [
+const KNOWN_SERVICE_KEYS: [&str; 47] = [
     "image",
     "build",
     "command",
@@ -6090,6 +6104,7 @@ const KNOWN_SERVICE_KEYS: [&str; 46] = [
     "mem_limit",
     "memswap_limit",
     "cpus",
+    "gpus",
     "runtime",
 ];
 
@@ -10250,6 +10265,36 @@ services:
     /// is an EMPTY STRING and legal, so "nothing follows the tag" cannot be the test; only the next
     /// content line separates the empty scalar from the block collection. A guard that refused on the
     /// bare tag alone would reject the last case here, which is why it is asserted.
+    /// `gpus:` IS A COMPOSE KEY, AND THE NOTE MUST SAY WHAT KERN DOES INSTEAD.
+    ///
+    /// MEASURED with kern 0.30.0: `gpus: all` reached the unknown-key path, which answered "did you
+    /// mean `cpus:`? ... the key as written does nothing here or under Docker". Under Docker it is the
+    /// GPU request (docker compose v2.30+), so the suggestion pointed at the wrong key and the
+    /// explanation was false. Both forms docker compose accepts are asserted.
+    #[test]
+    fn gpus_is_named_as_a_gpu_request_and_not_as_a_typo_for_cpus() {
+        for value in ["all", "\n      - driver: nvidia\n        count: 1"] {
+            let _ = take_warnings();
+            let src = format!("services:\n  a:\n    image: alpine\n    gpus: {value}\n");
+            parse(&src).expect("parses");
+            let warned = take_warnings();
+            let w = warned
+                .iter()
+                .find(|w| w.contains("gpus:"))
+                .unwrap_or_else(|| panic!("no note for gpus:, got {warned:?}"));
+            assert!(!w.contains("did you mean"), "not a typo: {w}");
+            assert!(
+                !w.contains("does nothing here or under Docker"),
+                "false under Docker: {w}"
+            );
+            assert!(w.contains("NOT applied") && w.contains("GPU"), "{w}");
+            assert!(
+                w.contains("devices:") && w.contains("--allow-device-grants"),
+                "it names what does work here: {w}"
+            );
+        }
+    }
+
     #[test]
     fn a_reservation_is_named_and_a_device_request_says_it_gets_nothing() {
         // MEASURED with a release checklist: a service asking for a GPU through
@@ -10260,7 +10305,9 @@ services:
         assert!(dev.contains("runs WITHOUT the device"), "{dev}");
         assert!(dev.contains("GPU"), "the word a reader searches for: {dev}");
         assert!(
-            dev.contains("x-kern-vgpio") && dev.contains("--allow-device-grants"),
+            dev.contains("devices:")
+                && dev.contains("x-kern-vgpio")
+                && dev.contains("--allow-device-grants"),
             "a warning without a remedy is read once and skipped after that: {dev}"
         );
         // The scheduling half says something DIFFERENT, because the remedy is a cap and not a grant.
