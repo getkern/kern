@@ -15,5 +15,4 @@ By submitting a contribution to this project, you agree to the following:
    `Signed-off-by:` line to your commits (`git commit -s`).
 
 This agreement keeps the project able to relicense or steward the code as a whole; it does not
-take away your own rights to your contribution. A CLA-assistant bot records acceptance on your
-first pull request.
+take away your own rights to your contribution. Acceptance is recorded on your first pull request.
