@@ -93,6 +93,20 @@ export interface SandboxOptions {
   setup?: string;
   /** Host dir to persist as the workspace. Omit -> a temp dir, created on open() and deleted on close(). */
   workspace?: string;
+  /** Cap on what the workspace ACCUMULATES across calls, in bytes. Cooperative, not a boundary: the
+   * call that exceeds it still runs, the next is refused. Default null (no cap). */
+  workspaceMaxBytes?: number | null;
+  /** A stable identity, used only with `persist`: two processes that name the same sandbox meet the
+   * same resident box. */
+  name?: string | null;
+  /** Keep ONE resident box and run every call in it with `kern exec`, 2 ms against 6 ms for a fresh
+   * box. Requires `name` and `workspace`. Survives close(); destroy() stops it. A resident box is not
+   * a fresh one: /tmp accumulates, the PID namespace is shared, and an OOM comes back `killed` rather
+   * than `oom`. A box built under another posture with the same name is refused. Default false. */
+  persist?: boolean;
+  /** How long the resident box lives, in seconds. It is kern's own `--timeout` on that box, so it ends
+   * by itself if the owning process dies. Default 3600. */
+  persistTtlS?: number;
   /** RAM cap in MiB (kern --memory). Default 512. Passed as an explicit --memory, so by kern's
    * "explicit flag wins over profile" rule the default OVERRIDES a `vcpu:` profile's own `memory=`;
    * pass `null` to let the profile's memory apply (uncapped if the profile carries none). */
@@ -152,7 +166,19 @@ export interface SandboxOptions {
   maxOutputBytes?: number;
   /** true (default) hard-enforces caps via a systemd scope (~6 ms start); false = best-effort (~3 ms). */
   enforceLimits?: boolean;
-  /** Mount setup= deps read-only for runCode (blocks cross-run dependency poisoning). Default false. */
+  /** Refuse to start unless the memory and pids caps are ACTUALLY enforced, read back from the cgroup,
+   * instead of running best-effort uncapped (kern --require-limits). Default false. */
+  requireLimits?: boolean;
+  /** "untrusted" is an opt-in hardening bundle: seccomp allowlist, cap-drop ALL and a read-only root.
+   * A bound `mounts` path stays writable. null (default) leaves kern's normal posture. */
+  securityProfile?: string | null;
+  /** Enter this pre-loaded AppArmor profile on the box's exec. kern fails the box CLOSED if it is not
+   * loaded on the host. null (default) applies none. */
+  apparmor?: string | null;
+  /** Capabilities dropped from every box (kern --cap-drop). Default ["ALL"]. NOT behaviour-free: a
+   * workload binding a port below 1024 inside the box needs NET_BIND_SERVICE. [] drops none. */
+  capDrop?: string[];
+  /** Mount setup= deps read-only for runCode (blocks cross-run dependency poisoning). Default true. */
   depsReadonly?: boolean;
   /** Compile this image's stdlib once and mount it read-only in every box (default true). */
   pycCache?: boolean;
@@ -202,6 +228,9 @@ export class Sandbox {
   open(): Promise<this>;
   /** Delete the workspace iff we created it. Idempotent. */
   close(): Promise<void>;
+  /** Stop the resident box of a `persist` sandbox: the only way it goes away before its TTL.
+   * Idempotent. */
+  destroy(): Promise<void>;
   /** Run a snippet on the workspace in a fresh, network-off box. File state persists; memory does not.
    * `timeoutS`/`onStdout`/`onStderr` override the session defaults for this call only. */
   runCode(code: string, opts?: { language?: Language } & PerCallOptions): Promise<ExecutionResult>;

@@ -2925,16 +2925,23 @@ test("a NUL byte in a workspace path is refused by name, in both directions", as
 //
 // The comparison is on the OBJECT, not on a list typed here: own enumerable keys plus the getters on
 // the prototype, which is where `success`, `codeStderr` and `runtimeNotes` live.
-test("index.d.ts declares exactly the fields an ExecutionResult exposes", async () => {
-  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "index.d.ts"), "utf8");
-  const body = src.split("export class ExecutionResult {")[1].split("\n}")[0];
-  const declared = new Set(
+// The names `index.d.ts` declares at the top level of one block (`export class X {`, `export
+// interface X {`): fields as `name:` / `name?:`, methods as `name(`.
+function declaredIn(header) {
+  const src = fs.readFileSync(path.join(__dirname, "..", "index.d.ts"), "utf8");
+  const body = src.split(`${header} {`)[1].split("\n}")[0];
+  return new Set(
     body
       .split("\n")
       .map((l) => l.trim())
-      .filter((l) => /^(readonly )?[a-zA-Z]+[?]?:/.test(l))
-      .map((l) => l.replace(/^readonly /, "").split(/[?:]/)[0]),
+      .filter((l) => /^(readonly )?[a-zA-Z]+[?]?[:(]/.test(l))
+      .map((l) => l.replace(/^readonly /, "").split(/[?:(]/)[0])
+      .filter((k) => k !== "constructor"),
   );
+}
+
+test("index.d.ts declares exactly the fields an ExecutionResult exposes", async () => {
+  const declared = declaredIn("export class ExecutionResult");
 
   const r = await runCode("print(1)");
   const real = new Set([
@@ -2950,6 +2957,38 @@ test("index.d.ts declares exactly the fields an ExecutionResult exposes", async 
   const extra = [...declared].filter((k) => !real.has(k)).sort();
   assert.deepStrictEqual(missing, [], `fields on the object that the .d.ts does not declare: ${missing}`);
   assert.deepStrictEqual(extra, [], `fields the .d.ts declares that the object does not have: ${extra}`);
+});
+
+// THE SAME DRIFT ONE CLASS OVER, and it was worse. FOUND BY RUNNING `tsc` 7.0.2 on a file using
+// `persist`: `'name' does not exist in type 'SandboxOptions'` and `'destroy' does not exist on type
+// 'Sandbox'`. Eight options the constructor reads were undeclared (`name`, `persist`, `persistTtlS`,
+// `workspaceMaxBytes`, `requireLimits`, `securityProfile`, `apparmor`, `capDrop`), so a TypeScript
+// caller could not ask for the fail-closed caps the README tells them to, and `depsReadonly` was
+// declared "Default false" when it is true.
+//
+// Compared on the OBJECT: every option the constructor stores is a public field of the instance, and
+// every public method is on the prototype. `_`-prefixed members are private by this file's convention.
+test("index.d.ts declares every option a Sandbox takes and every method it has", () => {
+  const prev = process.env.KERN_BIN;
+  process.env.KERN_BIN = FAKE_KERN;
+  try {
+    const fields = Object.keys(new Sandbox()).filter((k) => !k.startsWith("_"));
+    const methods = Object.getOwnPropertyNames(Sandbox.prototype).filter(
+      (k) => k !== "constructor" && !k.startsWith("_"),
+    );
+    for (const [what, real, declared] of [
+      ["options", fields, declaredIn("export interface SandboxOptions")],
+      ["methods", methods, declaredIn("export class Sandbox")],
+    ]) {
+      const missing = real.filter((k) => !declared.has(k)).sort();
+      const extra = [...declared].filter((k) => !real.includes(k)).sort();
+      assert.deepStrictEqual(missing, [], `${what} the Sandbox has that the .d.ts does not declare: ${missing}`);
+      assert.deepStrictEqual(extra, [], `${what} the .d.ts declares that the Sandbox does not have: ${extra}`);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.KERN_BIN;
+    else process.env.KERN_BIN = prev;
+  }
 });
 
 test("the credential list covers the third cloud and does not fire on a lookalike", async () => {
