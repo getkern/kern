@@ -26,6 +26,9 @@ SDK**, so a resident sandbox (`persist=True`) now returns `fault.type == "oom"` 
 **A base image without `/bin/true` builds layered**, instead of building flat and blaming the kernel
 ("unprivileged overlay unavailable").
 
+**`kern inspect` answers for a built image.** It said "nothing named" for every image `kern build`
+made, while `kern images` listed it.
+
 **Three messages name the right thing:** compose `gpus:` is described as Docker's GPU request rather
 than a typo for `cpus:`; `kern pull` names `kern box … --pull always` to refresh an image; and a failure
 reading a cached image no longer says to check the image's name.
