@@ -871,14 +871,31 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 ///   the request would name a ceiling the box does not actually have.
 /// - asked and NOT held: say so in the row. Silence here is what let a box report `mem-cap 64M`
 ///   on a host holding no such limit, which is the defect this whole field exists to close.
-fn mem_cap_row(asked: Option<u64>, enforced: Option<u64>) -> String {
-    match (asked, enforced) {
+///
+/// AND A `memory.high` ABOVE THE BOX, appended whatever the arm, because it is the one limit the
+/// arms above cannot express: the cap can be asked, held and equal, and the box still stalls before
+/// reaching it. MEASURED on a Jetson Orin, 2026-10-03: `mem-cap 512M` over a box that `kern.slice`'s
+/// `MemoryHigh=80M` held in state D at ~90 MiB. The row names the limit and the cgroup carrying it.
+fn mem_cap_row(
+    asked: Option<u64>,
+    enforced: Option<u64>,
+    throttle: Option<&kern_isolation::OuterMemoryHigh>,
+) -> String {
+    let base = match (asked, enforced) {
         (None, _) => "-".into(),
         (Some(asked), Some(live)) if live == asked => human_bytes(asked),
         (Some(asked), Some(live)) => {
             format!("{} (in force: {})", human_bytes(asked), human_bytes(live))
         }
         (Some(asked), None) => format!("{} (requested, NOT enforced here)", human_bytes(asked)),
+    };
+    match throttle {
+        Some(t) => format!(
+            "{base}; throttled above {} by {} (memory.high)",
+            t.high_human(),
+            t.cgroup_path()
+        ),
+        None => base,
     }
 }
 
@@ -1195,9 +1212,16 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     // field is empty for a box with no dedicated cgroup, which is precisely the case being reported
     // on, and `box_cgroup_dir` refuses anything that is not one of kern's own leaves, so the ROOT
     // cgroup answers `None` instead of being read as though it were the box's.
-    let enforced_mem = kern_isolation::box_cgroup_dir(b.pid1_recorded)
+    let box_dir = kern_isolation::box_cgroup_dir(b.pid1_recorded);
+    let enforced_mem = box_dir
+        .as_deref()
         .and_then(|d| std::fs::read_to_string(d.join("memory.max")).ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
+    // The limit the two numbers above cannot show: a `memory.high` on or above the box's cgroup that
+    // the kernel applies before the cap. Same directory, so the three readings are about one box.
+    let outer_mem_high = box_dir
+        .as_deref()
+        .and_then(kern_isolation::outer_memory_high);
     if json {
         // ⚠️ ONE OBJECT, WHERE `docker inspect` EMITS AN ARRAY of one. Measured: Docker's document
         // opens with `[`. kern's opens with `{`, deliberately and from before this, because
@@ -1214,7 +1238,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         // agree word for word: `running`, `paused`, `exited`.
         let status = box_lifecycle_status(&b);
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"pids_max\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1234,6 +1258,10 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&b.landlock_rw),
             num(b.memory_max),
             num(enforced_mem),
+            num(outer_mem_high.as_ref().map(|o| o.high)),
+            outer_mem_high
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |o| json_str(&o.cgroup_path())),
             num(b.pids_max),
         );
     } else {
@@ -1273,7 +1301,10 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         row("tasks", &tasks.map_or("-".into(), |t| t.to_string()));
         // Configured caps (the REQUESTED limits, distinct from the live usage above, which reads `-`
         // when the box has no dedicated cgroup) and the 0.6.7 isolation policies, shown when set.
-        row("mem-cap", &mem_cap_row(b.memory_max, enforced_mem));
+        row(
+            "mem-cap",
+            &mem_cap_row(b.memory_max, enforced_mem, outer_mem_high.as_ref()),
+        );
         row(
             "pids-cap",
             &b.pids_max.map_or("-".into(), |v| v.to_string()),
@@ -2099,7 +2130,7 @@ mod tests {
     #[test]
     fn an_asked_for_cap_that_nothing_enforces_says_so_in_the_row() {
         assert_eq!(
-            mem_cap_row(Some(64 * 1024 * 1024), None),
+            mem_cap_row(Some(64 * 1024 * 1024), None, None),
             "64M (requested, NOT enforced here)"
         );
     }
@@ -2109,7 +2140,7 @@ mod tests {
     /// warning above would stop standing out - which is the only thing that makes it useful.
     #[test]
     fn a_cap_held_exactly_as_asked_prints_the_number_alone() {
-        let row = mem_cap_row(Some(64 * 1024 * 1024), Some(64 * 1024 * 1024));
+        let row = mem_cap_row(Some(64 * 1024 * 1024), Some(64 * 1024 * 1024), None);
         assert_eq!(row, "64M");
         assert!(
             !row.contains("force") && !row.contains("NOT"),
@@ -2124,7 +2155,7 @@ mod tests {
     #[test]
     fn a_ceiling_that_differs_from_the_request_names_both() {
         assert_eq!(
-            mem_cap_row(Some(64 * 1024 * 1024), Some(32 * 1024 * 1024)),
+            mem_cap_row(Some(64 * 1024 * 1024), Some(32 * 1024 * 1024), None),
             "64M (in force: 32M)"
         );
     }
@@ -2134,7 +2165,38 @@ mod tests {
     /// has one would otherwise report a limit the operator never asked for as though it were theirs.
     #[test]
     fn no_requested_cap_is_a_dash_whatever_the_kernel_holds() {
-        assert_eq!(mem_cap_row(None, None), "-");
-        assert_eq!(mem_cap_row(None, Some(64 * 1024 * 1024)), "-");
+        assert_eq!(mem_cap_row(None, None, None), "-");
+        assert_eq!(mem_cap_row(None, Some(64 * 1024 * 1024), None), "-");
+    }
+
+    /// A `memory.high` above the box is appended to EVERY arm, and the plain arms are unchanged
+    /// without one: the common case must stay exactly as quiet as before.
+    #[test]
+    fn mem_cap_row_names_a_memory_high_above_the_box_in_every_arm() {
+        let jetson = kern_isolation::OuterMemoryHigh {
+            dir: std::path::PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/kern.slice",
+            ),
+            high: 80 * 1024 * 1024,
+            ceiling: Some(512 * 1024 * 1024),
+        };
+        let tail =
+            "; throttled above 80M by /user.slice/user-1000.slice/user@1000.service/kern.slice \
+                    (memory.high)";
+        let mib = 1024 * 1024;
+        for (asked, enforced) in [
+            (Some(512 * mib), Some(512 * mib)),
+            (Some(512 * mib), Some(256 * mib)),
+            (Some(512 * mib), None),
+            (None, None),
+        ] {
+            let plain = mem_cap_row(asked, enforced, None);
+            let with = mem_cap_row(asked, enforced, Some(&jetson));
+            assert_eq!(with, format!("{plain}{tail}"), "arm {asked:?}/{enforced:?}");
+            assert!(
+                !plain.contains("throttled"),
+                "a plain row mentions a throttle: {plain}"
+            );
+        }
     }
 }

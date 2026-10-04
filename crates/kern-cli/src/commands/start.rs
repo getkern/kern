@@ -2487,6 +2487,21 @@ pub fn run(
             );
         }
     }
+    // A `memory.high` ABOVE THE WORKLOAD, the same check `kern box` makes at its start and for the same
+    // measured reason: past that limit the kernel throttles instead of OOM-killing, so a command that
+    // should die at its cap stalls instead (Jetson Orin, 2026-10-03: 317 s against 0.06 s). The
+    // workload's cgroup is the one the default-cap branch above reads, for the reason it gives: where
+    // this process forks, it sits OUTSIDE the capped leaf. A warning and never a refusal here,
+    // because `kern run` treats its caps as a cooperative governor (see the top of this block).
+    if !kern_common::env_flag("KERN_QUIET") {
+        if let Some(outer) = kern_isolation::outer_memory_high_for_box(
+            cg.as_ref()
+                .filter(|_| forking)
+                .map(kern_isolation::CgroupGuard::box_dir),
+        ) {
+            eprintln!("{}", outer.note_for("command"));
+        }
+    }
     // THE FORK - and past this line, on every path, this process is the workload's.
     //
     // Where it forks, this call returns ONLY in the child, which is inside the capped leaf; the

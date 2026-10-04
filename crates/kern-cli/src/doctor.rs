@@ -273,11 +273,14 @@ fn rows() -> Vec<R> {
         check_cgroup(),
         check_scope_toll(),
         check_linger(),
-        // Root filesystem strategy.
-        check_overlay(),
-        // Optional feature: multi-uid mapping.
-        check_uid_range(),
     ];
+    // Next to the cgroup rows because it qualifies them: the cap can be enforced AND a limit above it
+    // can make the box stall before the cap is reached. A row only when there is something to say.
+    results.extend(check_outer_memory_high());
+    // Root filesystem strategy.
+    results.push(check_overlay());
+    // Optional feature: multi-uid mapping.
+    results.push(check_uid_range());
     results.extend(check_gpu());
     results.extend(check_tools());
     results.push(check_duplicate_installs());
@@ -1142,6 +1145,38 @@ fn no_user_manager_verdict(state: kern_isolation::MemoryCapState, sites: &str) -
     }
 }
 
+/// The verdict on a `memory.high` above kern's boxes, as a pure function of what the walk found.
+///
+/// Split out for the reason [`no_user_manager_verdict`] is: the host this was written on has no such
+/// limit, so the only way to render the row is to construct it. The cgroup path is EVIDENCE and goes
+/// on the second line with the remedy, never in the verdict: a GitHub runner's paths are long enough
+/// to take a verdict line past the 100-character `ROW_MAX` the row test holds every verdict to.
+///
+/// MEASURED on a Jetson Orin, 2026-10-03: with `MemoryHigh=80M` on `kern.slice`, this doctor said
+/// "caps enforced" (true) and nothing else, while every box over 80 MiB stalled in state D and an
+/// OOM that takes 0.06 s took 317 s.
+fn outer_memory_high_verdict(found: Option<&kern_isolation::OuterMemoryHigh>) -> Option<R> {
+    let o = found?;
+    Some(R::Warn(
+        format!(
+            "a `memory.high` above kern's boxes: past {} they are throttled, not OOM-killed",
+            o.high_human()
+        ),
+        format!(
+            "{} carries it. A box that should be killed at its cap stalls and times out instead. \
+             kern does not change it; if it is not meant for kern's boxes: {}",
+            o.cgroup_path(),
+            o.remedy()
+        ),
+    ))
+}
+
+/// Read-only, like every check here: it reads `memory.high` and `memory.max` up the chain kern's
+/// boxes are created in, and writes nothing.
+fn check_outer_memory_high() -> Option<R> {
+    outer_memory_high_verdict(kern_isolation::outer_memory_high_above_boxes().as_ref())
+}
+
 fn check_cgroup() -> R {
     use kern_isolation::MemoryCapState;
     if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
@@ -1910,6 +1945,38 @@ mod tests {
     ///
     /// The path may be on either line of the row. It is on the second one for the two arms that
     /// carried it in the verdict, where it cost 255 characters on one line.
+    /// THE `memory.high` ROW: present only when there is something to say, and then it says what
+    /// bites first, which cgroup carries it, and the command that lifts it. Rendered by construction
+    /// because the host this was written on has no such limit (the Jetson that had one is where the
+    /// defect was measured).
+    #[test]
+    fn the_memory_high_row_names_what_bites_where_and_how_to_lift_it() {
+        assert!(
+            outer_memory_high_verdict(None).is_none(),
+            "a host with no memory.high above its boxes got a row: healthy hosts must stay quiet"
+        );
+        let o = kern_isolation::OuterMemoryHigh {
+            dir: std::path::PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/kern.slice",
+            ),
+            high: 80 * 1024 * 1024,
+            ceiling: Some(512 * 1024 * 1024),
+        };
+        let row = outer_memory_high_verdict(Some(&o)).expect("a row when a limit is found");
+        assert!(
+            matches!(row, R::Warn(..)),
+            "a limit that stalls boxes is a warning"
+        );
+        let text = row.text();
+        for must in [
+            "past 80M they are throttled, not OOM-killed",
+            "/user.slice/user-1000.slice/user@1000.service/kern.slice",
+            "systemctl --user set-property kern.slice MemoryHigh=infinity",
+        ] {
+            assert!(text.contains(must), "the row lacks {must:?}: {text}");
+        }
+    }
+
     #[test]
     fn a_row_that_denies_a_memory_cap_names_the_cgroup_it_probed() {
         use kern_isolation::MemoryCapState;
@@ -2295,6 +2362,17 @@ mod tests {
                 "probed a child of: /sys/fs/cgroup/system.slice/hosted-compute-agent.service",
             ));
         }
+        // The `memory.high` row, with the longest path a real host gives it (a runner's), since the
+        // path is interpolated into the second line and must never push the verdict past ROW_MAX.
+        all.extend(outer_memory_high_verdict(Some(
+            &kern_isolation::OuterMemoryHigh {
+                dir: std::path::PathBuf::from(
+                    "/sys/fs/cgroup/system.slice/hosted-compute-agent.service/kern.slice",
+                ),
+                high: 80 * 1024 * 1024,
+                ceiling: Some(512 * 1024 * 1024),
+            },
+        )));
         // Both branches of a tool row, for every tool as it is actually spelled in `check_tools`.
         // `which` decides which branch a real call takes, so a host with the tool never renders the
         // other one. The names are deliberately absent ones so the not-found branch is the one built.

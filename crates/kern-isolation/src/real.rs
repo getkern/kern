@@ -4628,6 +4628,30 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     // the self-read, which is the same answer as before.
     crate::cgroup::record_memory_cap_signal(spec.memory_max, box_cg);
 
+    // A `memory.high` ABOVE THE BOX turns its OOM into a stall, and nothing here said so. MEASURED on
+    // a Jetson Orin, 2026-10-03: `kern.slice` carried `MemoryHigh=80M`, a box under `--memory 512M`
+    // sat in state D on `mem_cgroup_handle_over_high` at ~90 MiB, its OOM took 317 s instead of
+    // 0.06 s, and `doctor`, `inspect` and this start path all reported the 512M cap as the one in
+    // force. Same directory as the two readers above, for the same reason: the box's own cgroup.
+    //
+    // kern REPORTS it and does not change it. The limit may be deliberate, and lifting another
+    // party's limit from inside a box start would be kern deciding something that is not its to
+    // decide. `--require-limits` is the caller saying the cap must be the one that holds, so there
+    // this is a refusal, with the note printed first because the error type carries a fixed message.
+    if let Some(outer) = crate::cgroup::outer_memory_high_for_box(box_cg) {
+        if spec.require_limits {
+            eprintln!("{}", outer.note());
+            return Err(Error::Unsupported(
+                "--require-limits (KERN_REQUIRE_LIMITS) is set and a `memory.high` above this box would \
+                 throttle it below its memory cap instead of letting it be OOM-killed (the note above \
+                 names the cgroup and the command that lifts it): refusing to start",
+            ));
+        }
+        if !crate::cgroup::env_flag("KERN_QUIET") {
+            eprintln!("{}", outer.note());
+        }
+    }
+
     // FAIL-CLOSED on the direct fast path. When we DELIBERATELY skipped the per-box systemd scope
     // (`took_direct_cap_path()` - the SAME canonical predicate `reexec` used, so they can't diverge), the
     // box's OWN cgroup is the sole enforcer. `apply_limits` returns `None` iff a MANDATORY cap didn't bite

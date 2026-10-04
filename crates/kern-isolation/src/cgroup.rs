@@ -3717,6 +3717,514 @@ pub fn memory_cap_signal() -> u8 {
     MEMORY_CAP_SIGNAL.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// A `memory.high` above (or on) a box's cgroup that the kernel will apply BEFORE the box's own
+/// ceiling can OOM-kill it.
+///
+/// WHY THIS IS REPORTED. `memory.high` is not a kill limit: past it the kernel reclaims and then
+/// THROTTLES the allocating task (`mem_cgroup_handle_over_high`), so a box that should be OOM-killed
+/// slows to a halt instead and the caller sees a timeout. MEASURED on a Jetson Orin, 2026-10-03:
+/// `kern.slice` carried `MemoryHigh=80M` from an old `systemctl --user set-property`, a box under
+/// `--memory 512M` sat in state D at ~90 MiB, an OOM that takes 0.06 s took 317 s, and every surface
+/// of kern reported the 512M cap as the one in force. kern never writes `memory.high` itself, so any
+/// finite value found on this chain was put there by someone else.
+///
+/// Only a limit that bites FIRST is reported: the tightest finite `memory.high` on the chain, when it
+/// is below the tightest `memory.max` on the same chain, or when nothing caps the box at all. A
+/// `memory.high` at or above the box's ceiling is reached only after the box is already OOM-killed,
+/// so it changes nothing this box can observe on its own. (A `memory.high` on an ancestor is shared by
+/// every cgroup under it, so siblings can push the shared usage past it sooner; that is the same limit
+/// biting earlier, and the report names the cgroup so a reader can see what shares it.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OuterMemoryHigh {
+    /// The cgroup directory carrying the limit, absolute, under the cgroup mount.
+    pub dir: PathBuf,
+    /// Its `memory.high`, in bytes.
+    pub high: u64,
+    /// The tightest `memory.max` on the same chain, in bytes; `None` when nothing caps the box.
+    pub ceiling: Option<u64>,
+}
+
+impl OuterMemoryHigh {
+    /// The systemd unit the limit belongs to, when the directory is one (`*.slice`, `*.scope`,
+    /// `*.service`): the name `systemctl set-property` takes. `None` for a plain cgroup directory.
+    pub fn unit(&self) -> Option<&str> {
+        let name = self.dir.file_name()?.to_str()?;
+        [".slice", ".scope", ".service"]
+            .iter()
+            .any(|ext| name.ends_with(ext))
+            .then_some(name)
+    }
+
+    /// Whether the unit is a USER manager's (its path runs through `user@<uid>.service`), which is the
+    /// difference between `systemctl --user` and `systemctl` in the remedy.
+    pub fn under_user_manager(&self) -> bool {
+        self.dir.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| s.starts_with("user@") && s.ends_with(".service"))
+        })
+    }
+
+    /// The directory as `systemd` and `/proc/<pid>/cgroup` name it: relative to the cgroup mount.
+    pub fn cgroup_path(&self) -> String {
+        let rel = self
+            .dir
+            .strip_prefix(CGROUP_V2_MOUNT)
+            .unwrap_or(self.dir.as_path());
+        format!("/{}", rel.display()).replace("//", "/")
+    }
+
+    /// The command that lifts the limit, for the note. kern prints it and does NOT run it: the limit
+    /// may be deliberate, and whoever set it is the one to decide.
+    pub fn remedy(&self) -> String {
+        match self.unit() {
+            Some(unit) => format!(
+                "systemctl{} set-property {unit} MemoryHigh=infinity",
+                if self.under_user_manager() {
+                    " --user"
+                } else {
+                    ""
+                }
+            ),
+            None => format!("echo max > {}", self.dir.join("memory.high").display()),
+        }
+    }
+
+    /// The limit as the note prints it (`80M`, `2G`, or exact bytes).
+    pub fn high_human(&self) -> String {
+        human_limit(self.high)
+    }
+
+    /// The one-paragraph note printed at box start (and before a `--require-limits` refusal).
+    pub fn note(&self) -> String {
+        self.note_for("box")
+    }
+
+    /// The note with the verb's own noun: `kern run` starts a COMMAND, not a box, and a note that
+    /// called it a box would describe something the reader did not ask for.
+    pub fn note_for(&self, subject: &str) -> String {
+        let where_ = self.cgroup_path();
+        let high = human_limit(self.high);
+        let against = match self.ceiling {
+            Some(c) => format!("below this {subject}'s {} memory cap", human_limit(c)),
+            None => format!("and this {subject} has no memory cap of its own"),
+        };
+        format!(
+            "kern: note: {where_} has memory.high={high}, {against}. Past {high} the kernel throttles \
+             the {subject} instead of OOM-killing it: allocations stall, and a {subject} that should \
+             be killed runs into its timeout instead. kern does not change it; if it is not meant for \
+             what kern runs, lift it with `{}`",
+            self.remedy()
+        )
+    }
+}
+
+/// Where the cgroup v2 hierarchy is mounted, the root every walk in this file stops at.
+const CGROUP_V2_MOUNT: &str = "/sys/fs/cgroup";
+
+/// Bytes as the note prints them: whole GiB as `G`, whole MiB as `M`, otherwise exact bytes. Exact
+/// rather than rounded, because the reader compares it against a value they typed (`80M`,
+/// `MemoryHigh=83886080`) and a rounded figure would not match either.
+fn human_limit(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB && bytes % GIB == 0 {
+        format!("{}G", bytes / GIB)
+    } else if bytes >= MIB && bytes % MIB == 0 {
+        format!("{}M", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// A cgroup limit file (`memory.high`, `memory.max`) as bytes, read into a stack buffer.
+///
+/// `None` for `max` (no limit), an absent or unreadable file, and anything that is not a single
+/// decimal number: every one of those is "no limit known here", which is what the walk needs, and
+/// none of them may stop it. The buffer is 32 bytes because the longest valid content is
+/// `18446744073709551615\n` (21); a file longer than the buffer is not a limit this code models and
+/// reads as `None` rather than as a truncated number.
+fn read_limit_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 32];
+    let mut len = 0usize;
+    loop {
+        let rest = buf.get_mut(len..)?;
+        if rest.is_empty() {
+            return None; // filled the buffer without reaching EOF: not a value we model
+        }
+        match file.read(rest) {
+            Ok(0) => break,
+            Ok(n) => len = len.saturating_add(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    std::str::from_utf8(buf.get(..len)?)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// The [`OuterMemoryHigh`] that applies to the box whose cgroup is `box_dir`, if any.
+///
+/// The walk visits `box_dir` and every ancestor up to (not including) the cgroup mount, reading
+/// `memory.high` per level, and `memory.max` only once a limit has been found. ONE `PathBuf` is
+/// reused for every read (`push` the file name, read, `pop`), so the walk allocates nothing per level
+/// beyond the copy of the starting path and, only when a limit is found, the copy of the directory
+/// that carries it. A path outside the mount answers `None`.
+///
+/// MEASURED on box start with `scripts/ab-measure.py` (n=300, both column orders, new minus old):
+/// indistinguishable from the binary without it, +11.3 us [-0.3, +27.5] and -2.3 us [-24.3, +24.8],
+/// against an A/A floor of +-14 to +-27 us, on a ~3.9 ms start.
+pub fn outer_memory_high(box_dir: &std::path::Path) -> Option<OuterMemoryHigh> {
+    outer_memory_high_under(std::path::Path::new(CGROUP_V2_MOUNT), box_dir)
+}
+
+/// [`outer_memory_high`] with the mount as a parameter, so a test can build a synthetic tree several
+/// levels deep: [`in_tree`] is anchored at the real mount and evaluates only the leaf of a tree that
+/// lives anywhere else, which cannot exercise an ANCESTOR's limit at all.
+fn outer_memory_high_under(
+    root: &std::path::Path,
+    box_dir: &std::path::Path,
+) -> Option<OuterMemoryHigh> {
+    if !box_dir.starts_with(root) || box_dir == root {
+        return None;
+    }
+    // PASS 1 READS `memory.high` ALONE, and it is the only pass a healthy host pays. MEASURED with
+    // `scripts/ab-measure.py` on box start (n=300, A/A floor +-26.7 us): reading `memory.high` AND
+    // `memory.max` at every level cost +26.1 us [+9.8, +50.5] over the previous binary, ten opens on
+    // five levels, and on a host with no `memory.high` anywhere the `memory.max` half answered a
+    // question nobody had asked. The ceiling is only needed once a limit has been found.
+    //
+    // Capacity for the longest file name pushed (`memory.high`, 11 bytes, plus a separator), so the
+    // walk's one buffer is allocated once and never grown.
+    let mut cur = PathBuf::with_capacity(box_dir.as_os_str().len().saturating_add(16));
+    cur.push(box_dir);
+    let mut tightest_high: Option<(u64, PathBuf)> = None;
+    loop {
+        cur.push("memory.high");
+        let high = read_limit_bytes(&cur);
+        cur.pop();
+        if let Some(h) = high {
+            if tightest_high.as_ref().is_none_or(|(t, _)| h < *t) {
+                tightest_high = Some((h, cur.clone()));
+            }
+        }
+        if !cur.pop() || cur.as_path() == root || !cur.starts_with(root) {
+            break;
+        }
+    }
+    let (high, dir) = tightest_high?;
+    // PASS 2, only when a limit exists: the tightest `memory.max` on the same chain decides whether the
+    // OOM comes first (a ceiling at or below the limit), in which case there is nothing to report.
+    let ceiling = tightest_memory_max_under(root, box_dir);
+    match ceiling {
+        Some(c) if high >= c => None,
+        _ => Some(OuterMemoryHigh { dir, high, ceiling }),
+    }
+}
+
+/// The tightest finite `memory.max` from `box_dir` up to (not including) `root`, or `None` when no
+/// level caps it. Called only after [`outer_memory_high_under`] has found a `memory.high`.
+fn tightest_memory_max_under(root: &std::path::Path, box_dir: &std::path::Path) -> Option<u64> {
+    let mut cur = PathBuf::with_capacity(box_dir.as_os_str().len().saturating_add(16));
+    cur.push(box_dir);
+    let mut ceiling: Option<u64> = None;
+    loop {
+        cur.push("memory.max");
+        if let Some(m) = read_limit_bytes(&cur) {
+            ceiling = Some(ceiling.map_or(m, |c| c.min(m)));
+        }
+        cur.pop();
+        if !cur.pop() || cur.as_path() == root || !cur.starts_with(root) {
+            break;
+        }
+    }
+    ceiling
+}
+
+/// The [`OuterMemoryHigh`] for a box being started, resolved the way [`warn_unenforced_caps`] resolves
+/// its directory: the BOX's cgroup when the supervisor sits outside it (the sibling-leaf layout), else
+/// this process's own cgroup, which is the box's on the paths where the supervisor stays inside.
+pub fn outer_memory_high_for_box(dir: Option<&std::path::Path>) -> Option<OuterMemoryHigh> {
+    match dir {
+        Some(d) => outer_memory_high(d),
+        None => own_cgroup_dir().and_then(|d| outer_memory_high(&d)),
+    }
+}
+
+/// The [`OuterMemoryHigh`] that every box kern starts here would run under: walked from `kern.slice`
+/// when that slice exists (both cap paths put boxes beneath it), else from this process's own cgroup
+/// (the no-user-manager hosts, where the box's leaf is created under the caller's cgroup). For
+/// `kern doctor`, which has no box to ask about.
+pub fn outer_memory_high_above_boxes() -> Option<OuterMemoryHigh> {
+    let start = kern_slice_path()
+        .filter(|p| p.is_dir())
+        .or_else(current_v2_cgroup)?;
+    outer_memory_high(&start)
+}
+
+#[cfg(test)]
+mod outer_memory_high_tests {
+    use super::{human_limit, outer_memory_high_under, read_limit_bytes, OuterMemoryHigh};
+    use std::path::{Path, PathBuf};
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A synthetic cgroup tree: `<tmp>/root` stands for the mount, `a.slice/b.slice/box` hangs off it.
+    /// Per-test directory names, because the tests run as threads of one process.
+    struct Tree {
+        root: PathBuf,
+    }
+
+    impl Tree {
+        fn new(name: &str) -> Tree {
+            let root = std::env::temp_dir()
+                .join(format!("kern-omh-{}-{name}", std::process::id()))
+                .join("root");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("a.slice/b.slice/box")).expect("synthetic tree");
+            Tree { root }
+        }
+        fn dir(&self, rel: &str) -> PathBuf {
+            if rel.is_empty() {
+                self.root.clone()
+            } else {
+                self.root.join(rel)
+            }
+        }
+        fn set(&self, rel: &str, file: &str, value: &str) {
+            std::fs::write(self.dir(rel).join(file), value).expect("write limit");
+        }
+        fn found(&self) -> Option<OuterMemoryHigh> {
+            outer_memory_high_under(&self.root, &self.dir("a.slice/b.slice/box"))
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            if let Some(parent) = self.root.parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+
+    /// The Jetson, as measured: `MemoryHigh=80M` two levels up, a 512 MiB cap on the box.
+    #[test]
+    fn a_memory_high_below_the_cap_is_found_on_the_ancestor_that_carries_it() {
+        let t = Tree::new("below");
+        t.set("a.slice", "memory.high", "83886080\n");
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        let got = t.found().expect("a limit below the cap must be reported");
+        assert_eq!(got.dir, t.dir("a.slice"), "named the wrong cgroup");
+        assert_eq!(got.high, 80 * MIB);
+        assert_eq!(got.ceiling, Some(512 * MIB));
+    }
+
+    /// The negative control for the test above: the same tree with the limit lifted reports nothing.
+    #[test]
+    fn the_same_tree_with_the_limit_lifted_reports_nothing() {
+        let t = Tree::new("lifted");
+        t.set("a.slice", "memory.high", "max\n");
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        assert_eq!(t.found(), None);
+    }
+
+    /// At or above the box's ceiling the kernel OOM-kills the box first, so there is nothing to report.
+    #[test]
+    fn a_memory_high_at_or_above_the_cap_is_not_reported() {
+        let t = Tree::new("above");
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        t.set("a.slice", "memory.high", "1073741824\n");
+        assert_eq!(
+            t.found(),
+            None,
+            "1G above a 512M cap is never reached by this box alone"
+        );
+        t.set("a.slice", "memory.high", "536870912\n");
+        assert_eq!(
+            t.found(),
+            None,
+            "equal to the cap: the OOM and the limit coincide"
+        );
+        t.set("a.slice", "memory.high", "536870911\n");
+        assert!(t.found().is_some(), "one byte below the cap bites first");
+    }
+
+    #[test]
+    fn the_tightest_of_two_limits_is_the_one_named() {
+        let t = Tree::new("tightest");
+        t.set("a.slice/b.slice/box", "memory.max", "2147483648\n");
+        t.set("a.slice", "memory.high", "1073741824\n");
+        t.set("a.slice/b.slice", "memory.high", "83886080\n");
+        let got = t.found().expect("two limits below the cap");
+        assert_eq!(got.dir, t.dir("a.slice/b.slice"));
+        assert_eq!(got.high, 80 * MIB);
+    }
+
+    /// A box with no cap of its own under a finite `memory.high`: the throttle is the only limit.
+    #[test]
+    fn an_uncapped_box_under_a_memory_high_is_reported_with_no_ceiling() {
+        let t = Tree::new("uncapped");
+        t.set("a.slice/b.slice/box", "memory.max", "max\n");
+        t.set("a.slice", "memory.high", "83886080\n");
+        let got = t.found().expect("an uncapped box is throttled too");
+        assert_eq!(got.ceiling, None);
+    }
+
+    /// A tighter `memory.max` above the box (a fleet cap on `kern.slice`) OOM-kills before the high.
+    #[test]
+    fn an_ancestor_memory_max_below_the_high_means_the_oom_comes_first() {
+        let t = Tree::new("fleet");
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        t.set("a.slice", "memory.max", "67108864\n");
+        t.set("a.slice/b.slice", "memory.high", "83886080\n");
+        assert_eq!(t.found(), None, "the 64M ceiling binds before the 80M high");
+    }
+
+    /// kern never writes `memory.high`, so one on the box's own cgroup is someone else's too.
+    #[test]
+    fn a_memory_high_on_the_box_itself_counts() {
+        let t = Tree::new("own");
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        t.set("a.slice/b.slice/box", "memory.high", "83886080\n");
+        let got = t.found().expect("the box's own memory.high");
+        assert_eq!(got.dir, t.dir("a.slice/b.slice/box"));
+    }
+
+    #[test]
+    fn the_mount_itself_is_never_read_and_a_path_outside_it_answers_nothing() {
+        let t = Tree::new("mount");
+        t.set("", "memory.high", "1\n");
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        assert_eq!(t.found(), None, "the mount carried a value and was read");
+        assert_eq!(outer_memory_high_under(&t.root, &t.root), None);
+        assert_eq!(
+            outer_memory_high_under(&t.root, Path::new("/elsewhere/box")),
+            None
+        );
+    }
+
+    /// Every content that is not one decimal number is "no limit here", and none of them stops the walk.
+    #[test]
+    fn unreadable_and_malformed_limits_are_skipped_not_fatal() {
+        let t = Tree::new("malformed");
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        t.set("a.slice/b.slice", "memory.high", "garbage\n");
+        t.set("a.slice", "memory.high", "83886080\n");
+        let got = t
+            .found()
+            .expect("a malformed level must not hide the real limit above it");
+        assert_eq!(got.dir, t.dir("a.slice"));
+        for bad in ["", "max", "-1", "12 34", "0x50000"] {
+            t.set("a.slice", "memory.high", bad);
+            assert_eq!(t.found(), None, "{bad:?} read as a limit");
+        }
+    }
+
+    #[test]
+    fn a_limit_file_is_read_whole_or_not_at_all() {
+        let t = Tree::new("read");
+        let f = t.dir("a.slice").join("memory.high");
+        std::fs::write(&f, "18446744073709551615\n").expect("write");
+        assert_eq!(
+            read_limit_bytes(&f),
+            Some(u64::MAX),
+            "the longest valid value"
+        );
+        std::fs::write(&f, "1".repeat(32)).expect("write");
+        assert_eq!(
+            read_limit_bytes(&f),
+            None,
+            "a buffer-filling value is not truncated"
+        );
+        assert_eq!(read_limit_bytes(&t.dir("a.slice").join("absent")), None);
+    }
+
+    fn jetson() -> OuterMemoryHigh {
+        OuterMemoryHigh {
+            dir: PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/kern.slice",
+            ),
+            high: 80 * MIB,
+            ceiling: Some(512 * MIB),
+        }
+    }
+
+    #[test]
+    fn the_note_names_the_limit_the_cgroup_and_the_command_that_lifts_it() {
+        let o = jetson();
+        assert_eq!(o.unit(), Some("kern.slice"));
+        assert!(o.under_user_manager());
+        assert_eq!(
+            o.cgroup_path(),
+            "/user.slice/user-1000.slice/user@1000.service/kern.slice"
+        );
+        assert_eq!(
+            o.remedy(),
+            "systemctl --user set-property kern.slice MemoryHigh=infinity"
+        );
+        let note = o.note();
+        for must in [
+            "memory.high=80M",
+            "below this box's 512M memory cap",
+            "throttles the box instead of OOM-killing it",
+            "kern does not change it",
+            "systemctl --user set-property kern.slice MemoryHigh=infinity",
+        ] {
+            assert!(note.contains(must), "the note lacks {must:?}: {note}");
+        }
+        let run = o.note_for("command");
+        assert!(
+            run.contains("below this command's 512M memory cap"),
+            "{run}"
+        );
+        assert!(
+            !run.contains("box"),
+            "the `kern run` note called it a box: {run}"
+        );
+    }
+
+    #[test]
+    fn the_remedy_matches_who_owns_the_cgroup() {
+        let system = OuterMemoryHigh {
+            dir: PathBuf::from("/sys/fs/cgroup/kern.slice"),
+            high: 80 * MIB,
+            ceiling: None,
+        };
+        assert!(!system.under_user_manager());
+        assert_eq!(
+            system.remedy(),
+            "systemctl set-property kern.slice MemoryHigh=infinity"
+        );
+        assert!(system
+            .note()
+            .contains("and this box has no memory cap of its own"));
+        let plain = OuterMemoryHigh {
+            dir: PathBuf::from("/sys/fs/cgroup/custom"),
+            high: 80 * MIB,
+            ceiling: None,
+        };
+        assert_eq!(plain.unit(), None);
+        assert_eq!(
+            plain.remedy(),
+            "echo max > /sys/fs/cgroup/custom/memory.high"
+        );
+    }
+
+    #[test]
+    fn limits_print_exactly_as_typed() {
+        assert_eq!(human_limit(80 * MIB), "80M");
+        assert_eq!(human_limit(2 * 1024 * MIB), "2G");
+        assert_eq!(human_limit(1536 * MIB), "1536M");
+        assert_eq!(human_limit(1000), "1000 bytes");
+        assert_eq!(human_limit(80 * MIB + 1), "83886081 bytes");
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

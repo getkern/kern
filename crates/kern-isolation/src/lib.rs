@@ -122,6 +122,11 @@ pub use cgroup::box_workload_signal;
 pub use cgroup::Leaf as CgroupLeaf;
 pub use cgroup::DEFAULT_COMPOSE_PIDS_MAX;
 pub use cgroup::DEFAULT_MEMORY_MAX;
+/// A `memory.high` above a box that the kernel applies before the box's own ceiling can OOM-kill it,
+/// for the surfaces that report it (`kern doctor`, `kern inspect`). See [`cgroup::OuterMemoryHigh`].
+pub use cgroup::{
+    outer_memory_high, outer_memory_high_above_boxes, outer_memory_high_for_box, OuterMemoryHigh,
+};
 pub use real::bring_loopback_up;
 pub use real::id_range_available;
 pub use real::single_threaded;
