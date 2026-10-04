@@ -246,8 +246,8 @@ your own.)</sub>
 
 - **a venv** isolates imports, not the process: the code still has your files, your keys and your
   network.
-- **`docker run` per call** is the same idea with a daemon and a socket in front of it, and costs
-  20x as much per call. That socket is root-equivalent.
+- **`docker run` per call** is the same idea with a daemon in front of it, and costs 20x as much
+  per call.
 - **[nono](https://github.com/nolabs-ai/nono)** fences the environment you already have with
   Landlock, so your own tools are there and state carries between commands. This builds a new
   one from an image instead. Measured both ways in

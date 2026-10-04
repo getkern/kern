@@ -197,20 +197,6 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 | [docs/CONFIG.md](docs/CONFIG.md) · [docs/EGRESS.md](docs/EGRESS.md) | the `kern.toml` schema, and egress |
 | [CHANGELOG.md](CHANGELOG.md) | what changed in each release |
 
-## What kern is not
-
-- **Not a hypervisor.** The boundary is the Linux kernel, built on an unprivileged user namespace, so
-  a kernel privilege-escalation bug is an escape. It is for code you chose to run, not for hostile
-  code from strangers on a kernel you share. [SECURITY.md](SECURITY.md)
-- **Not a wall around what you mount in.** `-v $HOME:/host` gives the box your home directory;
-  `--net host` and `--privileged` are opt-outs by name.
-- **Not a Docker Engine.** The *formats*, not the API: no overlay networks, no plugins, no Swarm.
-- **Not a Kubernetes runtime.** No CRI. Use containerd or CRI-O.
-- **GPU: the whole card, as a device.** A box can be given the host's GPU; kern does not split a GPU
-  or cap it per box. [docs/CONFIG.md](docs/CONFIG.md)
-
-Known gaps: [ROADMAP.md](ROADMAP.md#known-gaps-and-what-would-settle-them).
-
 ## Contributing
 
 Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) has the workflow and the

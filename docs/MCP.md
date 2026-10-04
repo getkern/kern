@@ -224,7 +224,7 @@ server at all.
 a box is the workspace. If you want the agent to work on a repository, point `KERN_MCP_WORKSPACE` at it
 and know what that means: the agent can then write anything in that tree, including a `.cursor/mcp.json`
 or `.mcp.json` that configures this server on the next restart. The SDK refuses `$HOME`, `/etc`, `/root`,
-the docker socket, any path with a credential directory in it (`.ssh`, `.aws`, `.kube`, `.config/gcloud`,
+any path with a credential directory in it (`.ssh`, `.aws`, `.kube`, `.config/gcloud`,
 `.config/gh`, ...) and kern's
 own state (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, the data dir that holds every
 named volume), but a workspace you chose is a

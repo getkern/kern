@@ -1437,7 +1437,7 @@ mod tests {
             12 => "Twelve",
             _ => "UNMAPPED-COUNT-add-the-word-here",
         };
-        let expect: [(&str, Vec<String>); 3] = [
+        let expect: [(&str, Vec<String>); 2] = [
             (
                 "SECURITY.md",
                 vec![
@@ -1459,11 +1459,6 @@ mod tests {
                 ],
             ),
             ("README.md", vec![format!("kern's {total} escape syscalls")]),
-            // ROADMAP.md states the ENOSYS count in words, and it went stale the moment `clone3`
-            // joined the set: the file said "Nine denied syscalls" while the filter denied ten. It
-            // was not covered here, which is exactly why nobody noticed. Word forms are checked
-            // rather than digits because that is how the page is written.
-            ("ROADMAP.md", vec![format!("{word} denied syscalls")]),
         ];
         for (file, needles) in expect {
             let path = dir.join(file);

@@ -197,7 +197,7 @@ Every relaxing option says so in its name or docs:
 - **env off argv**: workload env is written to a private `0600` file, never `--env K=V` on the command
   line, so a credential in `env` does not leak into `ps`.
 - **mounts refused**: the host's own sources (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`,
-  `$HOME`, the docker socket), any path with a **credential directory** in it (`.ssh`, `.aws`, `.gnupg`,
+  `$HOME`), any path with a **credential directory** in it (`.ssh`, `.aws`, `.gnupg`,
   `.kube`, `.docker`, `.azure`, `.oci`, `.terraform.d`, `.password-store`, `.netrc`, `.git-credentials`,
   `.pypirc`, `.npmrc`, `.databrickscfg`, `.boto`, `.s3cfg`, `.rclone.conf`, and under `.config`:
   `gcloud`, `gh`, `doctl`, `rclone`),
