@@ -6737,6 +6737,9 @@ fn a_base_without_true_still_builds_layered() {
         e.file_name().to_string_lossy().starts_with("notrue-built")
             && e.file_name().to_string_lossy().ends_with(".layers")
     });
+    // And a layered image is something `inspect` can answer for: kern 0.30.0 said "nothing named" for
+    // every built image while `kern images` listed it.
+    let inspected = run(&["inspect", "notrue-built:1", "--json"]);
     let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
     let _ = fs::remove_dir_all(&base);
     assert!(built.status.success(), "build: {err}");
@@ -6747,6 +6750,11 @@ fn a_base_without_true_still_builds_layered() {
     assert!(
         layered,
         "the build must take the layered path on a base without `true`"
+    );
+    assert!(
+        inspected.status.success(),
+        "a layered image must be inspectable: {}",
+        String::from_utf8_lossy(&inspected.stderr)
     );
 }
 

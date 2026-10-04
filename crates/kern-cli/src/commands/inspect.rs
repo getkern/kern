@@ -919,7 +919,22 @@ fn mem_cap_row(
 fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
     let cache = crate::commands::imagecache::cache_dir();
     let safe = crate::commands::imagecache::sanitize_ref(name);
-    if !crate::commands::imagecache::cache_entry_complete(&cache, &safe) {
+    // A BUILT IMAGE HAS NO `<ref>/` DIRECTORY. `cache_entry_complete` describes a PULLED image, whose
+    // rootfs is that directory; a layered build is a `.layers` manifest over `L/` (and a legacy one a
+    // `.diff`), so it always read as absent. MEASURED with kern 0.30.0: `kern inspect` of a built
+    // image answered "nothing named ... `kern pull` fetches one" while `kern images` listed it on the
+    // line above. Present here means what `kern images` already means: the sentinel and the config
+    // sidecar exist and no layer it references is missing.
+    let built = cache.join(format!("{safe}.layers")).exists()
+        || cache.join(format!("{safe}.diff")).is_dir();
+    let present = if built {
+        cache.join(format!("{safe}.ok")).exists()
+            && cache.join(format!("{safe}.image")).exists()
+            && !crate::commands::imagecache::image_stat(&cache, &safe).1
+    } else {
+        crate::commands::imagecache::cache_entry_complete(&cache, &safe)
+    };
+    if !present {
         // THREE SUBJECTS, NOT TWO. A reader who reaches here has usually just watched a box run,
         // and the third case is the one they are in: the box EXITED. `kern ps -a` lists it with its
         // code and `kern ps -a --json` carries the same as a field, so answering "nothing named
