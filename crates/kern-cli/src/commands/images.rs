@@ -494,7 +494,7 @@ fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
             z = p.z
         );
         println!(
-            "{d}  cached at {path}  ·  `kern images` lists it  ·  refresh with `--pull always`{z}",
+            "{d}  cached at {path}  ·  `kern images` lists it  ·  `kern box <name> --image {image} --pull always` re-fetches it{z}",
             d = p.d,
             z = p.z
         );
@@ -507,6 +507,53 @@ fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
 /// private repo needs `kern login`. The rootfs is materialized (flat cache dir, or the overlay chain
 /// squashed) and packed into one layer.
 pub fn push(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
+    // A push that failed half way has uploaded nothing a retry would corrupt: blobs are addressed by
+    // digest, so sending one twice is a no-op at the registry.
+    as_user_then_mapped("push", |_| true, || push_once(local_ref, remote_ref))
+}
+
+/// Run one materialize-and-pack (`save` or `push`) as this user, and once more as root of the
+/// id-mapped namespace when that fails and this host has a subordinate uid range.
+///
+/// A rootless pull on such a host extracts an image with its own ownership, so a Debian base keeps
+/// `/var/cache/apt/archives/partial` as `drwx------ _apt`, which on disk is uid `100041`. This
+/// process cannot open that directory: the squash child exited 114 (`merged_view_child` maps one uid,
+/// and root of a one-uid namespace has no rights over an id it does not map), and the flat path's
+/// `find` stopped on EACCES. MEASURED on an Ubuntu host with a subuid allocation: `kern save
+/// python:3.12-slim` failed, `alpine:3.19` saved, and a built image on the Python base could be
+/// neither saved nor pushed. Inside the mapped namespace those ids are ours, which is the retry
+/// `copy_base_rootfs` already makes for the same class.
+///
+/// THE WHOLE ATTEMPT RUNS AGAIN, not just the step that failed. The squash copier keeps ownership, so
+/// in the mapped namespace its copy is again owned by subordinate ids and only a packer running in the
+/// same namespace can read it back; the cleanup of that copy needs the namespace too.
+///
+/// `retryable` says whether a failure left nothing behind that a second attempt would duplicate.
+fn as_user_then_mapped(
+    what: &str,
+    retryable: impl Fn(&Error) -> bool,
+    attempt: impl Fn() -> Result<(), Error>,
+) -> Result<(), Error> {
+    let first = match attempt() {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !retryable(&first) || !kern_isolation::id_range_available() {
+        return Err(first);
+    }
+    match kern_isolation::with_id_mapped_userns(|_| match attempt() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("kern: {what} failed again as root of your subordinate uid range: {e}");
+            1
+        }
+    }) {
+        Ok(0) => Ok(()),
+        _ => Err(first),
+    }
+}
+
+fn push_once(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
     let remote = remote_ref.unwrap_or(local_ref);
     // Materialize the image to a single rootfs directory. A flat pulled image IS a cache dir; a
     // layered/built image is squashed into a temp dir via its overlay chain so we push one layer.
@@ -539,6 +586,22 @@ pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
     if let Some(o) = out {
         crate::secret::guard_host_write_path(o, "save -o")?;
     }
+    // NOT RETRIED WHEN THE ARCHIVE WAS ALREADY STREAMING TO STDOUT. `kern_oci::save` writes stdout only
+    // in its last step, after the layer is packed, so every ownership failure happens before a byte
+    // is out; a failure IN that last step may have sent part of a tar, and a second attempt would
+    // append a whole one after it.
+    let retryable =
+        |e: &Error| out.is_some() || !e.to_string().contains("tar of the archive failed");
+    as_user_then_mapped("save", retryable, || save_once(image, out))?;
+    // On stderr so a `kern save img > img.tar` (stdout) stream stays clean.
+    kern_common::progress!(
+        "✓ saved '{image}'{}",
+        out.map(|o| format!(" → {o}")).unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn save_once(image: &str, out: Option<&str>) -> Result<(), Error> {
     let (rootfs, config, cleanup) = materialize_image(image)?;
     let cfg = kern_oci::ImageConfigOut {
         entrypoint: config.entrypoint,
@@ -565,13 +628,6 @@ pub fn save(image: &str, out: Option<&str>) -> Result<(), Error> {
     let _ = std::fs::remove_dir_all(&work);
     if let Some(tmp) = cleanup {
         remove_build_tree(&tmp);
-    }
-    if result.is_ok() {
-        // On stderr so a `kern save img > img.tar` (stdout) stream stays clean.
-        kern_common::progress!(
-            "✓ saved '{image}'{}",
-            out.map(|o| format!(" → {o}")).unwrap_or_default()
-        );
     }
     result
 }

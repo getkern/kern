@@ -584,7 +584,11 @@ pub(crate) fn sweep_retired_images() -> usize {
                     continue;
                 }
             }
-            if e.path().is_dir() && std::fs::remove_dir_all(e.path()).is_ok() {
+            // `force_remove_dir_all`, not `remove_dir_all`: a retired image keeps its own ownership,
+            // and on a host with a subordinate range a Debian base carries `drwx------ _apt`, which
+            // this user cannot empty. MEASURED: two `.old-<pid>` copies (357 MB) survived every
+            // sweep, reported by nothing.
+            if e.path().is_dir() && force_remove_dir_all(&e.path()).is_ok() {
                 n += 1;
             }
         }
@@ -1299,19 +1303,19 @@ pub(crate) fn pull_to_cache(
         // yank files overlayfs opens lazily). Fail-safe: on any error `dir` is left untouched/restored.
         let pid = std::process::id();
         let staging = cache.join(format!("{safe}.pull-{pid}"));
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = force_remove_dir_all(&staging);
         std::fs::create_dir_all(&staging).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
         kern_common::progress!("→ re-pulling image '{image}' (--pull always)");
         let config = match kern_oci::pull(image, &staging, None) {
             Ok(c) => c,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&staging);
+                let _ = force_remove_dir_all(&staging);
                 return Err(Error::Oci(e.to_string()));
             }
         };
         if dir.exists() {
             let retired = cache.join(format!("{safe}.old-{pid}"));
-            let _ = std::fs::remove_dir_all(&retired);
+            let _ = force_remove_dir_all(&retired);
             // Atomic swap: exchange `dir` <-> `staging` in ONE syscall so `dir` is NEVER momentarily
             // absent for a concurrent reader. A two-step rename leaves a window in which a fast-path
             // box (which resolves `dir` WITHOUT the pull lock) could mount an absent `dir` -> ENOENT.

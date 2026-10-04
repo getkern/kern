@@ -129,6 +129,7 @@ pub use cgroup::{
 };
 pub use real::bring_loopback_up;
 pub use real::id_range_available;
+pub use real::is_root_of_ranged_userns;
 pub use real::single_threaded;
 pub use real::with_id_mapped_userns;
 pub use real::Secret;

@@ -138,18 +138,31 @@ fn tar_is_gnu() -> bool {
 /// real uid for a rootless BusyBox save (functional, just not renumbered). The setuid strip runs on
 /// BOTH paths FIRST, so normalizing owner to 0 can never forge a setuid-root binary.
 pub(crate) fn tar_rootfs_root_owned(rootfs: &Path, out: &Path) -> Result<(), OciError> {
+    // stderr CAPTURED, not inherited: the caller retries an ownership failure as root of the
+    // subordinate range, and an inherited stderr printed "find: ... Permission denied" above a save
+    // that then succeeded. The lines go into the error instead, where they belong when it is final.
     let stripped = Command::new("find")
         .arg(rootfs)
         .args([
             "-type", "f", "-perm", "/6000", "-exec", "chmod", "a-s", "{}", "+",
         ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !stripped {
-        return Err(OciError::Extract(
-            "stripping setuid before archiving failed".into(),
-        ));
+        .stderr(Stdio::piped())
+        .output();
+    match stripped {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let said = String::from_utf8_lossy(&o.stderr);
+            let said: Vec<&str> = said.lines().take(3).collect();
+            return Err(OciError::Extract(format!(
+                "stripping setuid before archiving failed: {}",
+                said.join("; ")
+            )));
+        }
+        Err(e) => {
+            return Err(OciError::Extract(format!(
+                "stripping setuid before archiving failed: {e}"
+            )))
+        }
     }
     let mut cmd = Command::new("tar");
     cmd.arg("-C").arg(rootfs).arg("--numeric-owner");

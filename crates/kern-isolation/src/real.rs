@@ -4401,6 +4401,19 @@ fn uid_map_is_ranged() -> bool {
     std::fs::read_to_string("/proc/self/uid_map").is_ok_and(|s| map_text_is_ranged(&s))
 }
 
+/// Is this process uid 0 of a namespace that maps more than one id - root of the id-mapped namespace
+/// [`with_id_mapped_userns`] builds, or root of the initial namespace?
+///
+/// A caller that would otherwise make its own one-uid namespace must not do so here: root of a one-uid
+/// namespace has rights over that one id only, so nesting one inside the mapped namespace throws away
+/// the access to subordinate-owned files the mapped namespace exists to give. MEASURED: `podman
+/// unshare kern save` failed exactly like plain `kern save`, because the merged-view child nested its
+/// own namespace.
+pub fn is_root_of_ranged_userns() -> bool {
+    let euid = unsafe { libc::geteuid() };
+    euid == 0 && uid_map_is_ranged()
+}
+
 /// The parse half of [`uid_map_is_ranged`], split from the read so it can be asserted.
 ///
 /// A `uid_map` row is `<in-ns start> <host start> <count>`, and the question is whether any row maps

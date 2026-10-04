@@ -6383,6 +6383,247 @@ fn images_lists_cached_pulls_by_original_ref() {
     let _ = fs::remove_dir_all(&cache);
 }
 
+/// Run `cmd` as root of a namespace that maps this user's subordinate range, the way kern's own
+/// id-mapped namespace does. `None` when the host cannot (no `newuidmap`, no allocation, an
+/// `unshare` without `--map-auto`), which is the case the caller skips on.
+fn as_mapped_root(cmd: &str) -> Option<bool> {
+    let out = Command::new("unshare")
+        .args(["--map-root-user", "--map-auto", "sh", "-c", cmd])
+        .output()
+        .ok()?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success()
+        && (err.contains("map-auto") || err.contains("newuidmap") || err.contains("subuid"))
+    {
+        return None;
+    }
+    Some(out.status.success())
+}
+
+/// A docker-archive tar of a one-layer image holding `secret/f`, `etc/os-release` and, when given, a
+/// static busybox at `/bin/busybox` so a `RUN` can execute in it.
+fn tiny_image_archive(dir: &Path, repo_tag: &str, busybox: Option<&Path>) -> PathBuf {
+    let layer_root = dir.join("rootfs");
+    fs::create_dir_all(layer_root.join("secret")).unwrap();
+    fs::create_dir_all(layer_root.join("etc")).unwrap();
+    fs::create_dir_all(layer_root.join("bin")).unwrap();
+    fs::write(layer_root.join("secret/f"), b"inside").unwrap();
+    fs::write(layer_root.join("etc/os-release"), b"ID=tiny\n").unwrap();
+    if let Some(bb) = busybox {
+        use std::os::unix::fs::PermissionsExt;
+        fs::copy(bb, layer_root.join("bin/busybox")).unwrap();
+        fs::set_permissions(
+            layer_root.join("bin/busybox"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        // `true` is what the layered-build probe runs inside the base; without it the build goes flat.
+        for applet in ["true", "sh"] {
+            std::os::unix::fs::symlink("busybox", layer_root.join("bin").join(applet)).unwrap();
+        }
+    }
+    let layout = dir.join("layout");
+    fs::create_dir_all(layout.join("l1")).unwrap();
+    assert!(Command::new("tar")
+        .args(["-C"])
+        .arg(&layer_root)
+        .args(["-cf"])
+        .arg(layout.join("l1/layer.tar"))
+        .arg(".")
+        .status()
+        .unwrap()
+        .success());
+    fs::write(
+        layout.join("c.json"),
+        br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["/bin/true"]},"rootfs":{"type":"layers","diff_ids":[]}}"#,
+    )
+    .unwrap();
+    fs::write(
+        layout.join("manifest.json"),
+        format!(r#"[{{"Config":"c.json","RepoTags":["{repo_tag}"],"Layers":["l1/layer.tar"]}}]"#),
+    )
+    .unwrap();
+    let archive = dir.join("image.tar");
+    assert!(Command::new("tar")
+        .args(["-C"])
+        .arg(&layout)
+        .args(["-cf"])
+        .arg(&archive)
+        .arg(".")
+        .status()
+        .unwrap()
+        .success());
+    archive
+}
+
+/// `kern save` of an image holding a directory owned by a SUBORDINATE uid, flat and layered.
+///
+/// A rootless pull on a host with a subuid range keeps an image's ownership, so a Debian base carries
+/// `drwx------ _apt` as uid `100041` on disk, a directory this user cannot open. MEASURED on Ubuntu:
+/// `kern save python:3.12-slim` stopped at `find: Permission denied`, and a built image on that base
+/// exited the squash child with 114 ("reading the image's merged overlay view failed"), followed by
+/// a hint to check the image's name. Both now retry as root of the mapped range.
+#[test]
+fn save_reads_a_directory_owned_by_a_subordinate_uid() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("kern-it-subuid-save-{}", std::process::id()));
+    let cache = base.join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    let busybox = static_busybox();
+    let archive = tiny_image_archive(&base, "subimg:1", busybox.as_deref());
+    // Build records live under XDG_DATA_HOME, not the cache: without this the test's builds land in the
+    // user's own `kern builds` history.
+    let data = base.join("data");
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        // The tree holds subordinate-owned entries this user cannot unlink: remove it where it can.
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+    };
+    let loaded = run(&["load", "-i", archive.to_str().unwrap()]);
+    assert!(
+        loaded.status.success(),
+        "load: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let images = cache.join("kern/images");
+    let img_dir = fs::read_dir(&images)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("subimg"))
+        })
+        .expect("the loaded image's cache dir");
+    let secret = img_dir.join("secret");
+    match as_mapped_root(&format!(
+        "chown -R 42:42 '{0}' && chmod 0700 '{0}'",
+        secret.display()
+    )) {
+        Some(true) => {}
+        Some(false) | None => {
+            eprintln!("skip: no subordinate uid range to own a file with (newuidmap/subuid/unshare --map-auto)");
+            cleanup();
+            return;
+        }
+    }
+    // THE PREMISE, measured rather than assumed: this user really cannot open the directory.
+    assert!(
+        fs::read_dir(&secret).is_err(),
+        "premise: {} should be unreadable to this user once a subordinate uid owns it",
+        secret.display()
+    );
+
+    let has = |tar_path: &Path, member: &str| -> bool {
+        let outer = Command::new("tar")
+            .arg("-xOf")
+            .arg(tar_path)
+            .arg("./manifest.json")
+            .output()
+            .unwrap();
+        let manifest = String::from_utf8_lossy(&outer.stdout).to_string();
+        let layer = manifest
+            .split("\"Layers\":[\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        let list = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "tar -xOf '{}' './{}' | tar -t",
+                tar_path.display(),
+                layer.trim_start_matches("./")
+            ))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .any(|l| l.trim_end_matches('/') == member)
+    };
+
+    // FLAT: the cache dir is the rootfs, packed in place.
+    let flat_tar = base.join("flat.tar");
+    let saved = run(&["save", "subimg:1", "-o", flat_tar.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&saved.stderr);
+    assert!(saved.status.success(), "flat save must succeed: {err}");
+    assert!(
+        !err.contains("Permission denied") && !err.contains("Permesso negato"),
+        "a save that succeeded printed a failure: {err}"
+    );
+    assert!(
+        has(&flat_tar, "./secret/f"),
+        "the flat save must carry the subordinate-owned directory's file"
+    );
+
+    // LAYERED: a RUN on top makes a layered image, read back through the kernel-merged view. A
+    // COPY-only build is FLAT (the base copied, the file added), which is how an earlier version of
+    // this test passed with the merged-view half of the fix removed: it never reached that path.
+    let Some(_) = busybox else {
+        eprintln!("skip (layered half): no static busybox for a RUN step");
+        cleanup();
+        return;
+    };
+    let ctx = base.join("ctx");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(ctx.join("extra.txt"), b"x").unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM subimg:1\nRUN [\"/bin/busybox\", \"touch\", \"/ran\"]\nCOPY extra.txt /extra.txt\n",
+    )
+    .unwrap();
+    let built = run(&["build", "-t", "subimg-layered:1", ctx.to_str().unwrap()]);
+    assert!(
+        built.status.success(),
+        "build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    // THE PREMISE OF THIS HALF: the image really is layered, or the save below exercises the flat
+    // path a second time and proves nothing about the merged view.
+    let layered = fs::read_dir(&images).unwrap().flatten().any(|e| {
+        e.file_name()
+            .to_string_lossy()
+            .starts_with("subimg-layered")
+            && e.file_name().to_string_lossy().ends_with(".layers")
+    });
+    assert!(
+        layered,
+        "premise: a RUN step must produce a layered image (a `.layers` manifest)"
+    );
+    let layered_tar = base.join("layered.tar");
+    let saved = run(&[
+        "save",
+        "subimg-layered:1",
+        "-o",
+        layered_tar.to_str().unwrap(),
+    ]);
+    let err = String::from_utf8_lossy(&saved.stderr);
+    assert!(saved.status.success(), "layered save must succeed: {err}");
+    assert!(
+        !err.contains("check the image name"),
+        "a local read failure must not be hinted as a naming problem: {err}"
+    );
+    assert!(
+        has(&layered_tar, "./secret/f"),
+        "the layered save must carry the base's subordinate-owned file"
+    );
+    assert!(has(&layered_tar, "./extra.txt"), "and the layers on top");
+    assert!(has(&layered_tar, "./ran"), "including the RUN's");
+    cleanup();
+}
+
 #[test]
 fn images_strips_terminal_escapes_from_untrusted_ref() {
     // SECURITY regression: a crafted `.ok` sentinel (the image ref) must NOT inject ANSI/control

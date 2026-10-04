@@ -390,6 +390,10 @@ pub(crate) fn merged_view_extract(
     };
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
+    // Already root of a namespace that maps the image's ids (the retry `save`/`push` make, or a real
+    // root): a one-uid namespace of our own would map only uid 0 and lose the rest. See
+    // `kern_isolation::is_root_of_ranged_userns`.
+    let nest_userns = !kern_isolation::is_root_of_ranged_userns();
 
     // FORK SAFETY: the child allocates (the copier uses `format!`/`CString`), which is only safe after
     // `fork()` when no OTHER thread could hold the allocator lock - i.e. the process is single-threaded.
@@ -411,7 +415,7 @@ pub(crate) fn merged_view_extract(
     }
     if pid == 0 {
         // ---- CHILD: sets up the ns/mount and copies; never returns (always `_exit`). ----
-        merged_view_child(&opts, &farm_c, out_fd, src_rel, euid, egid);
+        merged_view_child(&opts, &farm_c, out_fd, src_rel, euid, egid, nest_userns);
     }
     // ---- PARENT: close our copy of the out fd, reap the child, map its exit code to a precise error. ----
     unsafe { libc::close(out_fd) };
@@ -456,6 +460,14 @@ pub(crate) fn merged_view_extract(
         106 => Err(Error::Oci(
             "merged-view: could not enter the layer-link directory".into(),
         )),
+        // The copier could not open a directory of the image (113: its copy, 114: the source, 115:
+        // reading it). MEASURED as 114 for `drwx------ _apt` in a Debian base, owned on disk by a
+        // subordinate uid this user has no rights over.
+        113..=115 => Err(Error::Oci(format!(
+            "a directory in the image could not be opened while reading its layers (extract stage \
+             {code}). A directory owned by one of your subordinate uids is readable only as root of \
+             that range, which needs newuidmap/newgidmap and an allocation in /etc/subuid"
+        ))),
         _ => Err(Error::Oci(format!(
             "reading the image's merged overlay view failed (extract stage {code})"
         ))),
@@ -478,6 +490,7 @@ pub(crate) fn merged_view_child(
     src_rel: Extract<'_>,
     euid: libc::uid_t,
     egid: libc::gid_t,
+    nest_userns: bool,
 ) -> ! {
     unsafe {
         // 0. Into the layer-link directory: `lowerdir=` names and the mountpoint below are BOTH
@@ -486,15 +499,22 @@ pub(crate) fn merged_view_child(
         if libc::chdir(farm.as_ptr()) != 0 {
             libc::_exit(106);
         }
-        // 1. New user + mount namespace.
-        if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+        // 1. New mount namespace, and a user namespace of our own unless this process is already root
+        // of one that maps the image's ids (then the existing one already grants the mount).
+        let flags = if nest_userns {
+            libc::CLONE_NEWUSER | libc::CLONE_NEWNS
+        } else {
+            libc::CLONE_NEWNS
+        };
+        if libc::unshare(flags) != 0 {
             libc::_exit(101);
         }
         // Single-uid self map: `deny` setgroups (required before writing gid_map unprivileged), then
         // `0 <euid> 1` / `0 <egid> 1`. Grants CAP_SYS_ADMIN in the new userns with no `newuidmap` helper.
-        if !write_proc_self(b"/proc/self/setgroups\0", b"deny")
-            || !write_proc_self_map(b"/proc/self/uid_map\0", euid)
-            || !write_proc_self_map(b"/proc/self/gid_map\0", egid)
+        if nest_userns
+            && (!write_proc_self(b"/proc/self/setgroups\0", b"deny")
+                || !write_proc_self_map(b"/proc/self/uid_map\0", euid)
+                || !write_proc_self_map(b"/proc/self/gid_map\0", egid))
         {
             libc::_exit(102);
         }

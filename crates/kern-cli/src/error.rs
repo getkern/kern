@@ -274,6 +274,18 @@ fn oci_hint(msg: &str) -> String {
         // is worse than no hint: the reader has to guess which half to believe.
         "an authenticated pull has a much higher quota; `kern login <registry>` once and it persists"
             .into()
+    } else if msg.contains("could not be opened while reading its layers")
+        || msg.contains("merged overlay view")
+        || msg.contains("of the archive failed")
+        || msg.contains("of rootfs failed")
+        || msg.contains("stripping setuid")
+    {
+        // A LOCAL read of an image already in the cache. The name/tag hint below sent a reader to
+        // check a reference that had resolved: MEASURED on `kern save` of a cached image whose base
+        // carries a subordinate-owned directory.
+        "the image is in the cache, so its name is not the problem: reading it from disk failed. \
+         `kern doctor` says whether this host has the subordinate uid range such images need"
+            .into()
     } else {
         // Registry / manifest / not-found: the name or tag is the likely culprit.
         "check the image name and tag exist; private images need `kern login` first".into()
@@ -646,6 +658,20 @@ mod tests {
             rl.contains("quota"),
             "the hint must name the actual remedy: {rl}"
         );
+        // A failure READING a cached image is not a naming problem either: the reference resolved,
+        // which is how the cache entry was found. Each local-read message the packers and the
+        // merged-view copier produce, so a new one cannot fall back to the name/tag hint unnoticed.
+        for local in [
+            "a directory in the image could not be opened while reading its layers (extract stage 114)",
+            "reading the image's merged overlay view failed (extract stage 116)",
+            "tar of rootfs failed",
+            "tar of the archive failed",
+            "stripping setuid before archiving failed",
+        ] {
+            let h = oci_hint(local);
+            assert!(!h.contains("check the image name"), "{local} -> {h}");
+            assert!(h.contains("in the cache"), "{local} -> {h}");
+        }
     }
 }
 
