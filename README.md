@@ -153,8 +153,8 @@ kern compose stack.toml ps            # what is running, and what each service p
 kern compose stack.toml port web 80   # the host address serving a port
 ```
 
-Each service gets its own network namespace and they reach each other by name. It is the local dev
-loop, not a production orchestrator. [docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
+Each service gets its own network namespace and they reach each other by name.
+[docs/DOCKER-COMPAT.md](docs/DOCKER-COMPAT.md)
 
 ## Speed and footprint
 
