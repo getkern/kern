@@ -17,9 +17,9 @@ range.** Both failed there, on `python:3.12-slim` and on anything built on it, b
 `/var/cache/apt/archives/partial` belongs to a subordinate uid; Alpine was unaffected. `kern gc` also
 removes the copies `--pull always` retires, which it left behind on the same hosts.
 
-**A command run with `kern exec` and killed with its box by the OOM killer is reported as an OOM to an
-SDK**, so a resident sandbox (`persist=True`) now returns `fault.type == "oom"` where it returned
-`killed`.
+**`kern exec` tells an SDK how the command ended.** A resident sandbox (`persist=True`) now returns
+`fault.type == "oom"` for an OOM where it returned `killed`, and a cell's own `exit(137)` reads as an
+exit instead of an external kill.
 
 **A `-v` aimed under `/sys/devices` reaches the box.** The CPU topology kern writes there covered it.
 
