@@ -2659,7 +2659,7 @@ class Sandbox:
         enforce_limits: ``True`` (default) hard-enforces caps via a systemd scope (~6 ms start);
             ``False`` skips it for a ~3 ms start (best-effort caps).
         cap_drop: Linux capabilities dropped from every box, as kern's ``--cap-drop`` takes them.
-            Default ``("ALL",)``. kern already drops 14 dangerous capabilities unconditionally; this
+            Default ``("ALL",)``. kern already drops 16 dangerous capabilities unconditionally; this
             drops the remainder, which were otherwise held over the box's own user namespace. It is
             defence in depth, not the boundary itself, and it changes one behaviour: a workload that
             binds a port below 1024 INSIDE the box needs ``CAP_NET_BIND_SERVICE``. Pass
@@ -2774,7 +2774,7 @@ class Sandbox:
     # not loaded. `None` (default) applies no profile. Validated at construction so it can't smuggle a flag.
     apparmor: str | None = None
     # Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
-    # The default drops the lot: kern already drops 14 dangerous capabilities unconditionally, but the
+    # The default drops the lot: kern already drops 16 dangerous capabilities unconditionally, but the
     # rest were still held over the box's own user namespace, and this is the one code path whose whole
     # purpose is running code nobody has read. It is defence in depth rather than the boundary itself
     # (those capabilities are namespaced, and the always-on seccomp filter refuses the escape syscalls

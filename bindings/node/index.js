@@ -2247,7 +2247,7 @@ class Sandbox {
      * there is nothing to wait for, which is what keeps the check on the call path free. */
     this._pycPending = "";
     // Capabilities dropped from every box this sandbox starts, as kern's own `--cap-drop` takes them.
-    // The default drops the lot: kern already drops 14 dangerous capabilities unconditionally, but the
+    // The default drops the lot: kern already drops 16 dangerous capabilities unconditionally, but the
     // rest were still held over the box's own user namespace, on the one code path whose purpose is
     // running code nobody has read. Defence in depth rather than the boundary itself, and measured to
     // cost nothing. It is NOT behaviour-free: a workload binding a port below 1024 INSIDE the box
