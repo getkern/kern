@@ -6108,6 +6108,9 @@ fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Op
         return None;
     }
     for b in boxes {
+        if let Some(msg) = compose_devices_refusal(b.service_name(), &b.devices) {
+            return Some(msg);
+        }
         let toks = b.profile_tokens();
         if toks.is_empty() {
             continue;
@@ -6123,6 +6126,34 @@ fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Op
         }
     }
     None
+}
+
+/// The refusal text for a service whose `devices:` binds host nodes, or `None` when it binds none.
+///
+/// THE GATE THE PAGES ALREADY DESCRIBED. FAQ, DOCKER-COMPAT and RUNTIME-PARITY said `devices:` needs
+/// `--allow-device-grants`, and the `runtime: nvidia` note told people to use exactly that pair; the
+/// gate only ever looked at `vgpio` profiles. MEASURED with kern 0.30.0: a compose file with no flag
+/// gave its box `/dev/kvm` (10:232) and `/dev/dri/card1`, the modeset node, both of which the `vgpio`
+/// path refuses as dangerous. A file someone downloaded reached this host's hardware with nothing
+/// asked, while the operator was told it could not.
+///
+/// The host sources ARE the grant here: there is no profile to resolve, so nothing differs between
+/// what this shows and what the box gets. `/dev/net/tun` is not in the list, because the normaliser
+/// turns it into kern's own `--tun` before it reaches `devices`.
+fn compose_devices_refusal(service: &str, devices: &[String]) -> Option<String> {
+    let sources: Vec<&str> = devices
+        .iter()
+        .map(|d| d.split(':').next().unwrap_or(d.as_str()))
+        .collect();
+    if sources.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "service '{service}' binds host device(s) {} through `devices:`. Which hardware a compose \
+         file may reach is the operator's decision, not the file's: check the list with `kern \
+         compose <file> config`, then pass --allow-device-grants to run it.",
+        sources.join(" ")
+    ))
 }
 
 /// The refusal text for a resolved set of `vgpio` profiles, or `None` when they grant no hardware.

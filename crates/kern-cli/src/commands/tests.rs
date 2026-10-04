@@ -4913,6 +4913,54 @@ mod port_collision_tests {
         assert!(device_grant_refusal("app", &[]).is_none());
     }
 
+    /// A COMPOSE `devices:` ENTRY IS A DEVICE GRANT, AND THE FILE CANNOT GRANT IT ON ITS OWN.
+    ///
+    /// The pages said so and the gate did not look: kern 0.30.0 gave a box `/dev/kvm` and the modeset
+    /// node from a compose file run with no flag. Asserted through the gate itself
+    /// (`device_grant_problem`), with the acknowledgement on and off, so the wiring is covered and
+    /// not only the message.
+    #[test]
+    fn a_compose_devices_entry_needs_the_operators_grant() {
+        // `device_grant_problem` reads the operator's config, located through process-global env.
+        let _g = crate::env_guard();
+        let mut b = crate::compose::ComposeBox {
+            name: "emu".into(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        };
+        b.devices = vec![
+            "/dev/kvm:/dev/kvm".into(),
+            "/dev/dri/card1:/dev/dri/card1:ro".into(),
+        ];
+        let boxes = vec![b];
+        let msg = device_grant_problem(&boxes, false)
+            .expect("devices: without the grant must be refused");
+        assert!(
+            msg.contains("/dev/kvm") && msg.contains("/dev/dri/card1"),
+            "the refusal names every host node, without the in-box side or the mode: {msg}"
+        );
+        assert!(
+            !msg.contains(":ro"),
+            "the mode is not part of what is granted: {msg}"
+        );
+        assert!(
+            msg.contains("--allow-device-grants") && msg.contains("emu"),
+            "{msg}"
+        );
+        assert!(
+            device_grant_problem(&boxes, true).is_none(),
+            "the operator's flag lifts it, as it does for a vgpio profile"
+        );
+        // POSITIVE CONTROL: a service that binds no device is never gated, or every stack would need
+        // the flag.
+        let plain = vec![crate::compose::ComposeBox {
+            name: "web".into(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        }];
+        assert!(device_grant_problem(&plain, false).is_none());
+    }
+
     /// A PROFILE NAME IS RESOLVED LOCALLY, SO `config` HAS TO SAY WHAT IT RESOLVED TO.
     ///
     /// The case this exists for: someone downloads a `docker-compose.yml` that says
