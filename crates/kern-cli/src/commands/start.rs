@@ -2797,9 +2797,42 @@ pub fn exec(
         unsafe { libc::close(p.master) };
     }
     match result {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => {
+            if code == 128 + libc::SIGKILL && kern_isolation::exec_was_oom_killed() {
+                signal_exec_oom();
+            }
+            std::process::exit(code)
+        }
         Err(e) => Err(Error::Sandbox(e.to_string())),
     }
+}
+
+/// Hand an exec'd command's OOM verdict to the caller's `KERN_STARTED_FD`, in the byte order `kern box`
+/// writes at its teardown: the command ran (1), cap enforcement not known on this path (0), killed by
+/// the OOM killer (1), and the signal.
+///
+/// THE VERDICT EXISTED AND ONLY A READER OF STDERR COULD HAVE IT. `memory.oom.group=1` makes an OOM
+/// take the whole box, so a command run with `kern exec` dies with it; the exec path attributes that
+/// from the ancestor's `oom_group_kill` and printed a sentence, while writing nothing to this
+/// descriptor. MEASURED through the SDK: `bytearray(400 << 20)` under `memory_mb=128` in a resident
+/// sandbox came back `killed` where the same cell in a fresh box says `oom`, and an agent told `killed`
+/// does not try more memory. Stderr is no substitute: the workload writes to it too.
+///
+/// The workload cannot reach this descriptor: `kern exec` sheds inherited fds before the command runs
+/// (measured: a caller's fd 7 is absent from the box's `/proc/self/fd`).
+fn signal_exec_oom() {
+    let Some(fd) = started_signal_fd() else {
+        return;
+    };
+    let buf = [1u8, 0, 1, libc::SIGKILL as u8];
+    loop {
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    let _ = unsafe { libc::close(fd) };
 }
 
 /// Foreground-launcher side of a detached start: block on the readiness pipe until the box `exec`s

@@ -117,6 +117,8 @@ pub use cgroup::box_was_oom_killed;
 /// [`cgroup::box_workload_signal`]: kern's own exit code cannot carry this, because propagating
 /// `128 + N` makes a killed workload and one that called `exit(137)` indistinguishable.
 pub use cgroup::box_workload_signal;
+/// Was a `kern exec`'d command OOM-killed with its box? See [`cgroup::exec_was_oom_killed`].
+pub use cgroup::exec_was_oom_killed;
 /// Which family of capped cgroup leaf an [`apply_cgroup_limits`] call creates, and why the two must
 /// not share a directory name. See [`cgroup::Leaf`].
 pub use cgroup::Leaf as CgroupLeaf;

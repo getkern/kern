@@ -115,6 +115,24 @@ pub fn box_was_oom_killed() -> bool {
     BOX_WAS_OOM_KILLED.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Set when a `kern exec`'d command was killed WITH ITS BOX by the kernel's OOM killer, read by the
+/// CLI after `exec_in_box` returns. The exec path already attributed the kill (the ancestor's
+/// `oom_group_kill` counter, read from a descriptor held across the command) and printed a sentence
+/// about it; this is the same verdict where an SDK can read it without parsing a stream the workload
+/// also writes. See [`exec_was_oom_killed`].
+static EXEC_WAS_OOM_KILLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn latch_exec_oom() {
+    EXEC_WAS_OOM_KILLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Was the command this process ran with `kern exec` killed by the OOM killer along with its box?
+#[must_use]
+pub fn exec_was_oom_killed() -> bool {
+    EXEC_WAS_OOM_KILLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The capped cgroup THIS process created for its box, recorded by [`apply_limits`] and read by the
 /// supervisor after the box exits.
 ///

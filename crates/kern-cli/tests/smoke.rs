@@ -1050,6 +1050,71 @@ fn the_started_signal_carries_the_oom_verdict_and_the_workload_signal() {
     );
 }
 
+/// `kern exec` puts the OOM verdict on `KERN_STARTED_FD` too, for a command killed WITH ITS BOX.
+///
+/// `memory.oom.group=1` makes an OOM take the whole box, so a command run with `kern exec` dies with
+/// it. The exec path attributed that kill and printed a sentence, but wrote nothing to the caller's
+/// descriptor, so an SDK could only read the 137: MEASURED, a resident sandbox reported
+/// `bytearray(400 << 20)` under a 128 MiB cap as `killed`, where a fresh box says `oom`.
+///
+/// The control comes FIRST, because the OOM takes the box with it: an exec that CHOOSES exit 137 must
+/// write nothing, or the bytes would claim an OOM for every 137.
+#[test]
+fn an_exec_killed_with_its_box_by_the_oom_killer_says_so_on_the_started_signal() {
+    let name = format!("execoom-{}", std::process::id());
+    let up = kern()
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--init",
+            "--memory",
+            "128m",
+            "--image",
+            "python:3.12-slim",
+            "--",
+            "sleep",
+            "120",
+        ])
+        .output()
+        .expect("run kern");
+    if !up.status.success() {
+        eprintln!(
+            "SKIP: no detached box here: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    let (code, sig) = started_bytes(&["exec", &name, "--", "sh", "-c", "exit 137"]);
+    assert_eq!(
+        code,
+        Some(137),
+        "the exec did not propagate the chosen code"
+    );
+    assert!(
+        sig.is_empty(),
+        "an exec that chose exit 137 was reported on the started signal: {sig:?}"
+    );
+    let (code, sig) = started_bytes(&[
+        "exec",
+        &name,
+        "--",
+        "python3",
+        "-c",
+        "bytearray(400*1024*1024)",
+    ]);
+    let _ = kern().args(["stop", &name]).output();
+    if code != Some(137) {
+        eprintln!("SKIP: the exec was not SIGKILLed here (exit {code:?}): the cap is not enforced");
+        return;
+    }
+    assert_eq!(
+        sig,
+        vec![1, 0, 1, 9],
+        "an exec killed with its box by the OOM killer must say so, in `kern box`'s byte order"
+    );
+}
+
 /// **A fork failure must never be answered with the user-namespace and rootfs hint, whatever the
 /// errno.**
 ///

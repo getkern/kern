@@ -7257,6 +7257,7 @@ pub fn exec_in_box(
                         waited += 2;
                     }
                     if fired {
+                        crate::cgroup::latch_exec_oom();
                         eprintln!(
                             "kern: exec: this command was killed with its box by the kernel's OOM \
                              killer, against the box's memory cap (memory.oom.group kills the whole \
