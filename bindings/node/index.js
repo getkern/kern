@@ -42,7 +42,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.43";
+const VERSION = "0.2.44";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 // WHAT THE DEFAULT IMAGE CONTAINS, as a fact ABOUT THE IMAGE and not about its name. It drives the
@@ -2192,11 +2192,12 @@ class Sandbox {
     // left running - `kern exec` reaps its descendants when it returns, including one detached with
     // setsid, which is why the resident box runs `--init`.
     //
-    // ⛔ AND THE VERDICT IS COARSER. `oom` is read from the teardown bytes kern writes for the box IT
-    // started; `kern exec` does not carry them and the registry keeps only exitCode 137, which an
-    // external kill produces too. So an OOM comes back `killed` on this path where the one-shot path
-    // says `oom`. Not papered over: claiming `oom` from "137 and a cap was set" would be an inference
-    // presented as a measurement.
+    // ⛔ THE VERDICT NEEDS kern 0.30.1 OR NEWER. `oom` is read from the bytes kern writes where the
+    // workload cannot reach them, and `kern exec` writes them since 0.30.1: the command ran, whether
+    // the OOM killer took it with its box, and the signal that ended it. Measured with 0.30.1: an OOM
+    // comes back `oom` and the cell's own `exit(137)` an exit with no fault. Against an older kern on
+    // PATH only the 137 arrives and both read `killed`, never guessed into `oom`. The npm package
+    // carries 0.30.1.
     //
     // 📌 WHAT ADOPTION KEYS ON, AND THE TWO THINGS IT DELIBERATELY DOES NOT. A box is adopted when
     // its fingerprint matches: the argv, the `KERN_*` environment kern builds the box from, and what

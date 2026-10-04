@@ -70,7 +70,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.43"
+__version__ = "0.2.44"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -2708,12 +2708,14 @@ class Sandbox:
     #: * The PID namespace is SHARED across calls (pids increment, 2 then 3 then 4, and PID 1 is the
     #:   box's own init), so a call can see that earlier calls happened.
     #:
-    #: ⛔ AND THE VERDICT IS COARSER HERE. `oom` is read from the teardown bytes kern writes for the
-    #: box IT started; `kern exec` does not carry them, and the registry keeps only `exit_code=137`,
-    #: which an external kill produces too. So a cell that overruns its memory cap comes back
-    #: ``killed`` on this path where the one-shot path says ``oom``. Measured, not assumed. It is not
-    #: papered over with a guess: claiming ``oom`` from "137 and a cap was set" would be an inference
-    #: presented as a measurement, which is the defect this taxonomy exists to avoid.
+    #: ⛔ THE VERDICT NEEDS kern 0.30.1 OR NEWER. ``oom`` is read from the bytes kern writes where the
+    #: workload cannot reach them, and ``kern exec`` writes them since 0.30.1: the command ran, whether
+    #: the OOM killer took it with its box, and the signal that ended it. Measured with 0.30.1, a cell
+    #: that overruns its cap comes back ``oom``, a ``kern stop`` during a cell ``killed``, and the cell's
+    #: own ``sys.exit(137)`` an exit with no fault. Against an older kern on PATH only the 137 arrives,
+    #: so the first and the last both read ``killed``; it is not guessed into ``oom`` from "137 and a
+    #: cap was set", which would be an inference presented as a measurement. The Linux wheels carry
+    #: 0.30.1.
     #:
     #: What does NOT leak, measured and contrary to what this comment first said: a process a previous
     #: call left running. ``kern exec`` reaps its descendants when it returns, including one detached

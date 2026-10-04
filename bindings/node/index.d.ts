@@ -101,8 +101,8 @@ export interface SandboxOptions {
   name?: string | null;
   /** Keep ONE resident box and run every call in it with `kern exec`, 2 ms against 6 ms for a fresh
    * box. Requires `name` and `workspace`. Survives close(); destroy() stops it. A resident box is not
-   * a fresh one: /tmp accumulates, the PID namespace is shared, and an OOM comes back `killed` rather
-   * than `oom`. A box built under another posture with the same name is refused. Default false. */
+   * a fresh one: /tmp accumulates and the PID namespace is shared. A box built under another posture
+   * with the same name is refused. Default false. */
   persist?: boolean;
   /** How long the resident box lives, in seconds. It is kern's own `--timeout` on that box, so it ends
    * by itself if the owning process dies. Default 3600. */

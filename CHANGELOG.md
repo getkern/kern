@@ -5,6 +5,13 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## kern-sandbox 0.2.44 - 2026-10-04
+
+**Both packages carry kern v0.30.1**, so a resident sandbox (`persist=True`, Node `persist: true`)
+reports an OOM as `oom` where it reported `killed`, and a cell's own `exit(137)` as an exit with no
+fault where it reported an external kill. Measured in both bindings; with an older kern on `PATH`
+both still read `killed`.
+
 ## v0.30.1 - 2026-10-04
 
 **A compose `devices:` entry needs `--allow-device-grants`, as the pages already said.** kern 0.30.0
