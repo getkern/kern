@@ -112,8 +112,8 @@ print(r.stdout, r.fault)   # 4950  None
 ```
 
 Your code runs in a container of its own, for one call or for a whole session, and a timeout or an
-out-of-memory comes back as a typed `fault`. On Linux, pip brings kern with it.
-Node: `npm install kern-sandbox`, with kern from the install line above.
+out-of-memory comes back as a typed `fault`. On Linux, pip brings kern with it, and so does
+`npm install kern-sandbox` for Node.
 
 <img src="assets/readme-basics.svg" width="880" alt="Three windows. files.py: a Sandbox writes in.csv, runs a job, reads out.txt back. state.py: a kernel keeps x = 40 between calls and prints x + 2. package.py: a Sandbox with setup pip install numpy imports numpy.">
 

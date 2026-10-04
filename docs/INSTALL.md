@@ -14,8 +14,8 @@ kern box dev --image alpine -it -- sh
 The script picks your architecture (`x86_64` or `aarch64`), checks the SHA256 and puts `kern` in
 `~/.local/bin`. `kern doctor` tells you what your machine can and cannot do.
 
-For Kern Sandbox from Python, `pip install kern-sandbox` is enough: on `x86_64` and `aarch64` it
-brings the same binary, into the venv.
+For Kern Sandbox, `pip install kern-sandbox` or `npm install kern-sandbox` is enough: on `x86_64`
+and `aarch64` each brings the same binary, into the venv or into `node_modules`.
 
 **Ubuntu 23.10 and newer need one root step before the first box:**
 

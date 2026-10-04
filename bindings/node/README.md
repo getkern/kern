@@ -73,7 +73,9 @@ import { runCode, withSandbox, Sandbox } from "kern-sandbox";
 npm install kern-sandbox
 ```
 
-You also need the `kern` binary on `PATH` (or point `$KERN_BIN` at it). The quickest route is the
+On Linux x64 and arm64 that brings kern with it: the package carries kern's static release binary,
+the same file the install script serves, and the binding drives that copy. `$KERN_BIN` always wins
+over it. Anywhere else the binding drives a `kern` on `PATH`, and the quickest route to one is the
 released static binary, whose checksum the script verifies:
 
 ```sh
@@ -214,6 +216,12 @@ new Sandbox({
   image,           // default "python:3.12-slim"
   setup,           // one-time, network-on, e.g. "pip install pandas"
   workspace,       // host dir to persist; omit for a temp dir deleted on close()
+  workspaceMaxBytes, // default null; caps what the workspace ACCUMULATES across calls. Cooperative:
+                   // the call that exceeds it runs, the next is refused
+  persist,         // default false; true = ONE resident box per name, every call `kern exec`s into it
+                   // (2 ms against 6 ms). Needs name + workspace; survives close(), destroy() stops it
+  name,            // the stable identity two processes share a persist box by
+  persistTtlS,     // default 3600: the resident box ends by itself after this
   memoryMb,        // default 512
   cpus,            // default null (uncapped)
   pids,            // default 256
@@ -398,11 +406,11 @@ gives kern a delegated cgroup: on one that does not (a root shell with no user m
 runners) kern warns and the box runs UNCAPPED. `kern doctor` says which path a host takes, and
 `requireLimits: true` refuses to start rather than run a box whose caps are decoration.
 
-**`npm install kern-sandbox` does not install the sandbox.** The binding drives a `kern` binary it
-finds on `PATH` or in `$KERN_BIN`, and that is a SECOND thing to install and to keep current: a
-binary that is not kern is refused by name, but an OLDER kern runs fine and answers fewer questions,
-because the fault taxonomy reads bytes only newer builds write. If a verdict looks wrong, print
-`kern --version` before anything else.
+**The binary comes with the package only on Linux x64 and arm64.** Anywhere else, and whenever
+`$KERN_BIN` is set, the binding drives a `kern` it did not bring, and that is a SECOND thing to keep
+current: a binary that is not kern is refused by name, but an OLDER kern runs fine and answers fewer
+questions, because the fault taxonomy reads bytes only newer builds write. If a verdict looks wrong,
+print that kern's `--version` before anything else.
 
 ## License
 

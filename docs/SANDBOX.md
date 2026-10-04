@@ -7,8 +7,8 @@ per call, and a hundred of them cost 1.4 s in total. How much survives between c
 **Works with** Claude Code, Cursor, Claude Desktop, LM Studio, LangChain and pi.
 
 `kern-sandbox` is the SDK in front of the `kern` binary: the isolation is the binary's, the package
-is the API. On Linux `x86_64` and `aarch64` the Python package brings the binary with it. The same
-API ships for Node, which needs the [install script](INSTALL.md) for the binary.
+is the API. On Linux `x86_64` and `aarch64` the package brings the binary with it, from PyPI and
+from npm alike.
 
 In a terminal:
 
@@ -121,6 +121,13 @@ Pick the top row unless you need the others. A hundred one-shot calls are a hund
 **1.36 s in total** on the stock image, after which `kern ps -a` lists nothing and the state
 directory is the same size it was: the reason to move down the table is that you want the state, not
 that you are avoiding a cost.
+
+`Sandbox(name="agent-1", workspace=..., persist=True)` keeps one box alive across calls and across
+processes: every call runs in it with `kern exec`, 2 ms against 6 ms for a fresh box, and a second
+process naming the same sandbox finds what the first left in `/tmp`. It is not a fresh box: `/tmp`
+accumulates, the PID namespace is shared, an OOM comes back `killed` rather than `oom`, and a box
+built under another posture is refused instead of adopted. It ends after `persist_ttl_s` (an hour by
+default) or at `destroy()`. Node spells it `persist: true`.
 
 ## From an MCP client
 
