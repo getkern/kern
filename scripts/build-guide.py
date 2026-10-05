@@ -20,6 +20,7 @@ Usage:
 import hashlib
 import html
 import pathlib
+import posixpath
 import re
 import sys
 import urllib.request
@@ -247,26 +248,32 @@ def out_name(md: str) -> str:
     return md.replace(".md", "").lower().replace("_", "-") + ".html"
 
 
-def rewrite_links(body: str) -> str:
+def rewrite_links(body: str, src_dir: str = "docs") -> str:
     """Point relative markdown links at the rendered page, or at the repo when there is none.
 
     A doc links to its siblings (`RESOURCES.md`), to repo files (`../SECURITY.md`) and to
-    directories (`../pentest/`). Only the first has an HTML page here; the rest must reach GitHub,
-    or the reader gets a 404 on a link that worked before.
+    directories (`../pentest/`). Only a page of this guide has an HTML page here; the rest must reach
+    GitHub, or the reader gets a 404 on a link that worked before.
+
+    RESOLVED FROM THE FILE'S OWN DIRECTORY (`src_dir`, repo-relative). The first version stripped
+    `./` and `../` and joined what was left to the repo root, which is right for `../SECURITY.md`
+    from `docs/` by coincidence and wrong for a sibling that is not a guide page: MEASURED on the
+    served docker-compat page, `RUNTIME-PARITY.md` (a file in `docs/`) became
+    `blob/main/RUNTIME-PARITY.md`, a 404 on GitHub.
     """
     have = {md for md, _ in PAGES}
 
     def fix(m):
         href = m.group(1)
-        if href.startswith(("http", "#", "mailto:")):
+        if href.startswith(("http", "#", "mailto:", "/")):
             return m.group(0)
         target, _, frag = href.partition("#")
-        base = target.split("/")[-1]
-        if base in have and "/" not in target.strip("./"):
-            return f'href="{out_name(base)}{"#" + frag if frag else ""}"'
-        clean = target.lstrip("./")
+        tail = "#" + frag if frag else ""
+        resolved = posixpath.normpath(posixpath.join(src_dir, target))
+        if resolved.startswith("docs/") and resolved[len("docs/"):] in have:
+            return f'href="{out_name(resolved[len("docs/"):])}{tail}"'
         kind = "tree" if target.endswith("/") else "blob"
-        return f'href="{REPO}/{kind}/main/{clean}{"#" + frag if frag else ""}"'
+        return f'href="{REPO}/{kind}/main/{resolved}{tail}"'
 
     return re.sub(r'href="([^"]+)"', fix, body)
 
@@ -334,7 +341,19 @@ def beacon(token: str) -> str:
     )
 
 
-def render(md_path: pathlib.Path, title: str, nav: str, token: str = "", page: str = "") -> str:
+def render(
+    md_path: pathlib.Path, title: str, nav: str, token: str = "", page: str = "", source: str = ""
+) -> str:
+    """One guide page. `page` is its file name under /guide/ and `source` the repo-relative path its
+    "this page on GitHub" link names; both default to what `md_path` says, which is wrong only for a
+    page generated from a temporary file (the index)."""
+    page = page or out_name(md_path.name)
+    # Where the page's source lives, for "this page on GitHub" and for resolving its relative links:
+    # the README for the Sandbox page, `docs/` for the rest, and `docs/` itself for the index.
+    src = md_path.resolve()
+    src_rel = source or (
+        src.relative_to(ROOT).as_posix() if src.is_relative_to(ROOT) else f"docs/{md_path.name}"
+    )
     text = md_path.read_text(encoding="utf-8")
     # The package README centres its header in a raw `<div align="center">`, which Markdown passes
     # through untouched, so its title, slogan and badges would print as literal `#` and `**`.
@@ -344,7 +363,9 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "", page: s
     body = markdown.markdown(
         text, extensions=["tables", "fenced_code", "toc", "attr_list", "md_in_html"]
     )
-    body = code_tabs(code_windows(rewrite_links(body)))
+    # A DIRECTORY source (the index's `docs/`) is where its links start; a file's links start beside it.
+    src_dir = src_rel.rstrip("/") if src_rel.endswith("/") else (posixpath.dirname(src_rel) or ".")
+    body = code_tabs(code_windows(rewrite_links(body, src_dir)))
     # The description is the first paragraph WITH TEXT, flattened. Better than a constant: it is what
     # the document itself opens with, so it cannot drift from the page. With text, because the
     # README's first paragraph is its logo, which flattens to nothing.
@@ -357,11 +378,7 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "", page: s
     if len(desc) > 157:
         desc = desc[:157].rsplit(" ", 1)[0].rstrip(",;:") + "…"
     desc = html.escape(desc, quote=True)
-    page = page or out_name(md_path.name)
-    # Where the page's source lives, for "this page on GitHub": the README for the Sandbox page,
-    # `docs/` for the rest. The guide index is built from a temporary file, which keeps the old form.
-    src = md_path.resolve()
-    src_rel = src.relative_to(ROOT).as_posix() if src.is_relative_to(ROOT) else f"docs/{md_path.name}"
+    src_kind = "tree" if src_rel.endswith("/") else "blob"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -396,7 +413,7 @@ def render(md_path: pathlib.Path, title: str, nav: str, token: str = "", page: s
 </main>
 <footer>
 <a href="{SITE}/">getkern.dev</a> &middot;
-<a href="{REPO}/blob/main/{src_rel}">this page on GitHub</a> &middot;
+<a href="{REPO}/{src_kind}/main/{src_rel.rstrip("/")}">this page on GitHub</a> &middot;
 <a href="{REPO}">source</a>
 </footer>
 <script>
@@ -548,8 +565,12 @@ def main(argv: list[str]) -> int:
     )
     tmp = out / "_index.md"
     tmp.write_text(body, encoding="utf-8")
+    # The page name and its source are GIVEN, not derived from the temporary file: derived, the index
+    # named itself `-index.html` in its canonical link and sent "this page on GitHub" to a
+    # `docs/_index.md` that does not exist, two 404s measured on the served page.
     (out / "index.html").write_text(
-        render(tmp, "kern guide: installing and configuring kern", build_nav(), token),
+        render(tmp, "kern guide: installing and configuring kern", build_nav(), token,
+               page="index.html", source="docs/"),
         encoding="utf-8",
     )
     tmp.unlink()
