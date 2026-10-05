@@ -12,13 +12,13 @@ Claude Desktop / Cursor config (``claude_desktop_config.json`` / MCP settings):
     {
       "mcpServers": {
         "kern": {
-          "command": "kern-mcp",
-          "env": { "KERN_MCP_SETUP": "pip install numpy pandas matplotlib" }
+          "command": "kern-mcp"
         }
       }
     }
 
-Environment knobs (all optional): ``KERN_MCP_IMAGE`` (default python:3.12-slim), ``KERN_MCP_SETUP``
+Environment knobs (all optional): ``KERN_MCP_IMAGE`` (default ``ghcr.io/getkern/kern-sandbox:0.2.44``,
+pinned by digest: python 3.12 with numpy, pandas and matplotlib, and node 22), ``KERN_MCP_SETUP``
 (a one-time ``pip install ...``), ``KERN_MCP_MEMORY_MB`` (default 1024; set it to ``0`` to pass no
 ``--memory`` at all, which is the only way to let a ``vcpu:`` profile's own ``memory=`` apply - simply
 unsetting it still sends the 1024 default and shadows the profile), ``KERN_MCP_TIMEOUT`` (default
@@ -38,12 +38,13 @@ import json
 import os
 import re
 import sys
+import threading
 import traceback
 
 from . import (Kernel, Sandbox, SandboxError, __version__, _FORGED_CUT_NOTICE,
                _FORGED_LINE_FRAME, _FRAME_MCP_CLIP, _FRAME_MCP_EXIT, _FRAME_MCP_IMG_TAIL,
                _FRAME_MCP_RESET, _FRAME_MCP_RICH, _FRAME_MCP_STDERR, _FRAME_MCP_TRUNC,
-               _INVIS, _neutralise_terminal)
+               _INVIS, _fetch_image, _find_kern, _neutralise_terminal)
 
 # The single MCP protocol revision we implement; initialize always answers with THIS (we negotiate to
 # our version, we never echo a client-chosen string back).
@@ -65,10 +66,24 @@ _MAX_FAULT_REASON = 300           # chars of the fault MESSAGE carried in the ta
 # tools/call - 250x the budget every other tool respects, enough to blow a model's context and stall the
 # client's stdio transport. The host cap stays large so a legitimate big file still reads and reports.
 _MAX_FILE_TEXT = _MAX_TOTAL_TEXT
-# The image this server runs unless the operator names another. Its CONTENTS are a fact we hold and
-# state in the tool schema (python, bash and sh; no node); for any other image we can only name it,
-# because guessing interpreters from a tag would be inventing a measurement.
-_DEFAULT_MCP_IMAGE = "python:3.12-slim"
+# The image this server runs unless the operator names another, PINNED BY DIGEST: a default runs on
+# every server that does not name an image, so a tag anyone with push access could move would decide
+# what all of them execute. kern verifies the digest it is given (`pull.rs`), so the pin is enforced and
+# not only written. Built from `images/sandbox/Dockerfile`, for amd64 and arm64.
+_DEFAULT_MCP_IMAGE = (
+    "ghcr.io/getkern/kern-sandbox:0.2.44"
+    "@sha256:8c4faa6169fb74cfa6a956ffbdb59c5605faea63c5a1060e77c6fff3d8118620"
+)
+# The images whose CONTENTS are a fact we hold, measured through the SDK on amd64 and arm64: what the
+# tool description adds about each, and the interpreters it provides. For any other image we can only
+# name it, because guessing interpreters from a tag would be inventing a measurement.
+_KNOWN_IMAGES = {
+    _DEFAULT_MCP_IMAGE: (
+        " numpy, pandas and matplotlib are installed: import them, there is nothing to pip install.",
+        "python (3.12, with numpy, pandas and matplotlib), bash, sh and node (22)",
+    ),
+    "python:3.12-slim": ("", "python, bash and sh but NOT node: do not offer node here"),
+}
 _MAX_NAME = 200                   # chars of a client-supplied method/tool name echoed back in an error
 # What the BINDING reads into host RAM per stream, as opposed to what the reply carries. Kept here
 # next to the reply budgets it is sized against, not left at the `Sandbox` default of 64 MiB: that
@@ -472,6 +487,26 @@ class _Server:
             except Exception:
                 pass
 
+    def start_image_fetch(self) -> threading.Thread:
+        """Start downloading this server's image now, in the background, and return the thread.
+
+        The session is created by the FIRST tool call, so without this the download started there and
+        the model's first call waited for it. A client starts its servers before the model calls
+        anything, which is time this download can use. The session's own fetch takes the same per-image
+        lock, so it waits for this one instead of starting a second. Nothing here writes to stdout, which
+        is the protocol."""
+        image = self._image
+
+        def _go() -> None:
+            try:
+                _fetch_image(_find_kern(), image)
+            except Exception:
+                pass  # no kern, or not one: the first tool call reports it in its own words
+
+        th = threading.Thread(target=_go, daemon=True, name="kern-mcp-image-fetch")
+        th.start()
+        return th
+
     def close(self) -> None:
         self._drop_kernel()
         if self._sbx is not None:
@@ -561,14 +596,13 @@ class _Server:
             t["description"] = t["description"].format(
                 state=_STATE_RESIDENT if self._use_kernel else _STATE_FRESH
             ) + f" This server's boxes run the OCI image `{image}`."
+            known = _KNOWN_IMAGES.get(image)
             lang = t["inputSchema"]["properties"]["language"]
-            # Only the DEFAULT image's contents are a fact we hold. For any other image, say which one
-            # it is and stop: guessing its interpreters from the tag would be inventing a measurement.
-            if image == _DEFAULT_MCP_IMAGE:
-                lang["description"] += (
-                    f" This server runs {_DEFAULT_MCP_IMAGE}, which provides python, bash and sh but"
-                    " NOT node: do not offer node here."
-                )
+            # Only a KNOWN image's contents are a fact we hold. For any other image, say which one it
+            # is and stop: guessing its interpreters from the tag would be inventing a measurement.
+            if known is not None:
+                t["description"] += known[0]
+                lang["description"] += f" This server runs {image}, which provides {known[1]}."
             else:
                 lang["description"] += (
                     f" This server runs {image!r}; use a language you know that image provides."
@@ -711,10 +745,12 @@ class _Server:
                 # prove the interpreter died), and nothing else would ever reap it.
                 self._drop_kernel()
                 r = self._get_kernel().run_code(code, **kw)
-            if r.fault is not None:
-                # this cell tore the kernel down (timeout/kill); drop it so the NEXT call respawns warm.
+            if r.fault is not None or (self._kernel is not None and self._kernel.ended):
+                # this cell tore the kernel down (timeout/kill), or ENDED it with no fault at all
+                # (`os._exit(0)` is an exit, not a kill): drop it so the NEXT call respawns warm, and say
+                # the session was replaced, which a clean exit makes no less true.
                 self._drop_kernel()
-                reset_note = _reset_note_for(r.fault.type)
+                reset_note = _reset_note_for(r.fault.type if r.fault is not None else f"exit {r.exit_code}")
         else:
             r = self._session().run_code(code, language=language, **kw)
         content: list = []
@@ -835,6 +871,7 @@ def main() -> None:
     if os.environ.get("KERN_MCP_QUIET", "1").strip().lower() not in ("0", "false", "no", ""):
         os.environ["KERN_QUIET"] = "1"
     server = _Server()
+    server.start_image_fetch()
     # Deterministic stdio encoding regardless of the operator's locale: UTF-8 out (so ensure_ascii=False
     # is safe and never raises), and tolerant in, so a bad byte can't crash the transport.
     for stream, kw in ((sys.stdout, {"errors": "replace"}), (sys.stdin, {"errors": "replace"})):

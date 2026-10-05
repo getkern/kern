@@ -17,6 +17,7 @@ Run: `pytest tests/test_mcp.py`  (integration auto-skips without a real kern; se
 
 import io
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -277,17 +278,56 @@ def test_the_language_enum_says_which_image_it_is_talking_about(monkeypatch):
     # bash and sh are DIFFERENT shells and the schema has to say so: a model that reads "bash" and
     # gets dash writes `[[ ]]` and is told `[[: not found`, which names neither cause nor remedy.
     assert "'bash' runs bash" in lang["description"] and "POSIX shell" in lang["description"]
-    assert "python:3.12-slim" in lang["description"] and "NOT node" in lang["description"]
-    # The top-level description must not advertise node either: that sentence is what got copied into
-    # a "Node.js supported" table in a real report.
+    # The DEFAULT image's contents are measured, so they are stated: node is there, and so are the
+    # three packages a model would otherwise try to pip install with the network off.
+    assert M._DEFAULT_MCP_IMAGE in lang["description"] and "node (22)" in lang["description"]
     desc = next(t for t in default if t["name"] == "run_code")["description"]
+    assert "numpy, pandas and matplotlib are installed" in desc
+    # The top-level description must not advertise node in its first sentence: that sentence is what
+    # got copied into a "Node.js supported" table in a real report.
     assert "node" not in desc.split(".")[0]
+
+    # The previous default is still a known image when an operator names it, and it has no node.
+    slim = _one(_server(KERN_MCP_IMAGE="python:3.12-slim"), _req("tools/list"), monkeypatch)["result"]["tools"]
+    lang_slim = next(t for t in slim if t["name"] == "run_code")["inputSchema"]["properties"]["language"]
+    assert "python:3.12-slim" in lang_slim["description"] and "NOT node" in lang_slim["description"]
+    slim_desc = next(t for t in slim if t["name"] == "run_code")["description"]
+    assert "numpy" not in slim_desc, "the slim image was described with packages it does not have"
 
     # For any OTHER image we do not know the contents, so we name the image and stop. Guessing the
     # interpreters from a tag would be inventing a measurement.
     other = _one(_server(KERN_MCP_IMAGE="node:20-slim"), _req("tools/list"), monkeypatch)["result"]["tools"]
     lang2 = next(t for t in other if t["name"] == "run_code")["inputSchema"]["properties"]["language"]
     assert "node:20-slim" in lang2["description"] and "NOT node" not in lang2["description"]
+
+
+def test_the_default_image_is_pinned_by_digest():
+    """A default runs on every server that names no image, so a movable tag would let whoever can push
+    to it decide what all of them execute. kern verifies a pinned digest, so the pin is the guarantee."""
+    assert re.fullmatch(r"ghcr\.io/getkern/kern-sandbox:[0-9.]+@sha256:[0-9a-f]{64}", M._DEFAULT_MCP_IMAGE)
+    assert M._DEFAULT_MCP_IMAGE in M._KNOWN_IMAGES, "the default's contents are not stated anywhere"
+
+
+def test_the_start_up_fetch_pulls_the_image_and_writes_nothing_to_stdout(tmp_path, monkeypatch, capfd):
+    """`main()` starts the download before the first tool call. On this channel stdout IS the protocol,
+    so the fetch must not put a byte there, and it must ask kern for THIS server's image."""
+    log = tmp_path / "kern.log"
+    fake = tmp_path / "kern-rec"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in --version) echo "kern v0.0.0-test-double"; exit 0 ;; esac\n'
+        f'echo "$1 $2" >> "{log}"\n'
+        "echo 'a line kern prints on stdout'\n"
+        "echo 'and one on stderr' >&2\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("KERN_BIN", str(fake))
+    img = "fetch-at-start:1"
+    _server(KERN_MCP_IMAGE=img).start_image_fetch().join(10)
+    assert log.read_text().splitlines() == [f"pull {img}"]
+    assert capfd.readouterr().out == "", "the start-up fetch wrote to the protocol channel"
 
 
 def test_the_language_note_does_not_mutate_the_module_table(monkeypatch):
@@ -1110,10 +1150,11 @@ def test_server_keeps_serving_after_a_tool_raises(monkeypatch):
 
 
 class _FakeKernel:
-    def __init__(self, *, raises=None, result=None):
+    def __init__(self, *, raises=None, result=None, ended=False):
         self.exited = False
         self._raises = raises
         self._result = result if result is not None else _res()
+        self.ended = ended  # Kernel.ended: the interpreter is gone, with or without a fault
 
     def run_code(self, code, **kw):
         if self._raises:
@@ -1186,6 +1227,21 @@ def test_faulted_kernel_is_reaped(monkeypatch):
     _one(s, _call("run_code", code="x"), monkeypatch)
     assert k.exited is True
     assert s._kernel is None
+
+
+def test_a_cell_that_ends_the_kernel_with_no_fault_still_resets_the_session(monkeypatch):
+    """`os._exit(0)` in kernel mode is an exit, not a kill, so it no longer carries a fault. The session
+    is replaced all the same, and the model has to be told: the note used to key on the fault alone, so
+    a clean exit would have answered a successful reply in which every earlier name was gone."""
+    k = _FakeKernel(result=_res(stdout="bye\n", exit_code=0), ended=True)
+    s = _server(_FakeSession(), KERN_MCP_KERNEL="1")
+    s._kernel = k
+    s._get_kernel = lambda: k  # type: ignore[method-assign]
+    r = _one(s, _call("run_code", code="import os; os._exit(0)"), monkeypatch)
+    text = _text_of(r)
+    assert "bye" in text and "(exit 0)" in text and "FRESH" in text, text
+    assert r["result"].get("isError") is not True, "a clean exit is not an error"
+    assert k.exited is True and s._kernel is None
 
 
 def test_close_clears_the_session_even_when_its_exit_raises():

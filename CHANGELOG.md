@@ -5,6 +5,40 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## kern-sandbox 0.2.45 - 2026-10-05
+
+**Both packages carry kern v0.30.2**, so a `persist=True` call that `kern exec` refused (an ssh session
+outside the delegated cgroup tree is the common case) is `startup_failed` with kern's own message, where
+it read as the code's own exit 126 with no fault. With an older kern it still reads as 126.
+
+**Output printed before an OOM, a timeout or `os._exit` now reaches the caller on every path.** 0.2.43
+made this true for a cold box only. The prewarmed box, which serves most `kern-mcp` calls, and the
+resident kernel run a driver that sent a cell's output in the reply that ends the cell, and a killed
+cell never sends one. The Node binding's cold box also lacked the unbuffered flag. The driver now
+streams output while the cell runs, and a SIGKILL loses at most the last millisecond of it. Measured,
+driver alone: 10 000 prints in one cell cost 14.3 ms where they cost 1.6 ms when the driver only
+collected them (9.8 ms on a cold box); a cell with one print costs 0.013 ms more.
+
+**One cell, one outcome, whichever box runs it.** On the prewarmed box and in the kernel, `os._exit(N)`
+returns `exit_code=N` with no fault, where it returned `killed`. A kernel timeout returns 137, where it
+returned -1: the timeout tears the kernel down, as it does a one-shot box. Kernel output over
+`max_output_bytes` is cut and the session goes on, where it ended the interpreter and its state. When a
+cell ends the interpreter with no fault, `kern-mcp` still says the session was replaced.
+
+**`kern-mcp` runs `ghcr.io/getkern/kern-sandbox:0.2.44` by default**, pinned by digest: python 3.12
+with numpy, pandas and matplotlib, and node 22, for amd64 and arm64. A model that plots or asks for
+`language="node"` no longer needs `KERN_MCP_SETUP` or another image, and the tool description says
+what the image has. The image is 145 MB against 46 for `python:3.12-slim`; the server starts the
+download when it starts. `KERN_MCP_IMAGE=python:3.12-slim` restores the previous default.
+
+**Opening a sandbox pulls a missing image first, on its own budget.** The first box used to pull it
+inside its call's deadline: on a Jetson with an empty cache the first cell answered `startup_failed`
+at the 30 s default. A pull that fails changes nothing, and the box reports it as before.
+
+The `persist` docs said a call costs 2 ms; that was `kern exec` alone. A resident call still starts a
+fresh `python3` and costs about what a fresh box does (11.4 against 13.9 ms on one host);
+`sbx.kernel()` is the fast path.
+
 ## v0.30.2 - 2026-10-05
 
 **`kern exec` no longer reports a command it refused as one that started.** When it cannot put the

@@ -1654,13 +1654,23 @@ test("kernel: survives raw fork and multiprocessing", exec, async () => {
   });
 });
 
-test("kernel: oversize reply is capped, not host-OOM", exec, async () => {
+test("kernel: output over the cap is cut, and a frame declaring too much is refused", exec, async () => {
+  // Two different things, which this test used to conflate. Output over `maxOutputBytes` is the CELL's
+  // doing and is cut, as the one-shot path cuts it: it used to tear the kernel down and every name in it.
+  // A frame that DECLARES more than the host accepts is the guard against a box streaming gigabytes into
+  // host RAM, and it still refuses before reading a byte of it. Mirrors the Python test.
   await withSandbox({ maxOutputBytes: 4 * 1024 * 1024, timeoutS: 20 }, async (s) => {
     const k = await s.kernel();
-    const r = await k.runCode("print('A' * 20_000_000)"); // 20 MB reply vs a 4 MB cap
-    assert.ok(r.fault && r.fault.type === "killed" && r.fault.message.includes("cap"));
-    await assert.rejects(() => k.runCode("1 + 1"), SandboxError); // torn down
-    await k.close();
+    try {
+      let r = await k.runCode("print('A' * 20_000_000)"); // 20 MB of output vs a 4 MB cap
+      assert.ok(r.fault === null && r.truncated === true && r.stdout.length === 4 * 1024 * 1024);
+      assert.strictEqual((await k.runCode("x = 1")).exitCode, 0, "the kernel did not survive its own output");
+      r = await k.runCode("import os, __main__\nos.write(__main__._ctrl_out, b'99999999999\\n')\nimport time\ntime.sleep(10)");
+      assert.ok(r.fault && r.fault.type === "killed" && r.fault.message.includes("cap"), JSON.stringify(r.fault));
+      await assert.rejects(() => k.runCode("1 + 1"), SandboxError); // torn down
+    } finally {
+      await k.close();
+    }
   });
 });
 
@@ -3653,3 +3663,411 @@ test(
     }
   },
 );
+
+// ---- THE IMAGE IS FETCHED BEFORE THE FIRST BOX (0.2.45) ---------------------------------------------
+// The same five tests as the Python binding's, in the same order.
+
+/** A kern double that logs `<verb> <arg>` per call and, on `pull`, can be slow, fail, or store the image
+ * the way kern does: by writing its `.ok` sentinel last. */
+function recordingKern(dir, { okFile = null, pullExit = 0, pullSleep = 0 } = {}) {
+  const log = path.join(dir, "kern.log");
+  const fake = path.join(dir, "kern-rec");
+  const store = okFile ? `mkdir -p "${path.dirname(okFile)}" && : > "${okFile}"` : ":";
+  fs.writeFileSync(
+    fake,
+    "#!/bin/sh\n" +
+      'case "$1" in --version) echo "kern v0.0.0-test-double"; exit 0 ;; esac\n' +
+      `echo "$1 $2" >> "${log}"\n` +
+      'if [ "$1" = pull ]; then\n' +
+      `  sleep ${pullSleep}\n` +
+      `  [ ${pullExit} -eq 0 ] || exit ${pullExit}\n` +
+      `  ${store}\n` +
+      "fi\n" +
+      "exit 0\n",
+  );
+  fs.chmodSync(fake, 0o755);
+  return { fake, log, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean) : []) };
+}
+
+/** Run `fn` with KERN_BIN and XDG_CACHE_HOME pointed into `dir`, restoring both after. */
+async function withFetchEnv(dir, fake, fn) {
+  const prev = { KERN_BIN: process.env.KERN_BIN, XDG_CACHE_HOME: process.env.XDG_CACHE_HOME };
+  process.env.KERN_BIN = fake;
+  process.env.XDG_CACHE_HOME = path.join(dir, "cache");
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+const okFileFor = (dir, image) =>
+  path.join(dir, "cache", "kern", "images", `${kern._sanitizeRef(image)}.ok`);
+const fetchImg = () => `fetch-${Math.random().toString(16).slice(2, 10)}:1`;
+
+test("an image kern does not have is pulled on open, before the first box", async () => {
+  // The first box of a session used to pull the image inside its own deadline: on a Jetson the first
+  // cell of a fresh cache answered `startup_failed` at 30 s while the download was still running.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-fetch-"));
+  try {
+    const img = fetchImg();
+    const k = recordingKern(dir, { okFile: okFileFor(dir, img) });
+    await withFetchEnv(dir, k.fake, async () => {
+      // What matters is that the setup box RAN, after the pull. (The double never signals a started box;
+      // the Python binding reports that setup as failed and this one does not, which is not this test.)
+      try {
+        await (await new Sandbox({ image: img, setup: "true" }).open()).close();
+      } catch (e) {
+        if (!/setup failed/.test(String(e && e.message))) throw e;
+      }
+      const calls = k.calls();
+      assert.strictEqual(calls[0], `pull ${img}`, calls.join(" | "));
+      assert.strictEqual(calls.filter((c) => c === `pull ${img}`).length, 1);
+      assert.ok(calls.length > 1, "the setup box never ran, so 'before the first box' proved nothing");
+
+      fs.writeFileSync(k.log, "");
+      const sb = await new Sandbox({ image: img }).open();
+      await sb.close();
+      assert.ok(!k.calls().includes(`pull ${img}`), "a cached image was pulled again");
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a pull that fails leaves the session as it was", async () => {
+  // Offline, a private image without a login, a typo: the session goes on to the box exactly as before,
+  // which pulls again and reports the failure in kern's own words.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-fetch-"));
+  try {
+    const img = fetchImg();
+    const k = recordingKern(dir, { pullExit: 1 });
+    await withFetchEnv(dir, k.fake, async () => {
+      const sb = await new Sandbox({ image: img }).open();
+      try {
+        await sb.runCode("print(1)");
+      } finally {
+        await sb.close();
+      }
+      const calls = k.calls();
+      assert.strictEqual(calls[0], `pull ${img}`, calls.join(" | "));
+      assert.ok(calls.slice(1).some((c) => !c.startsWith("pull ")), `no box after the failed pull: ${calls}`);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("two callers in one process wait for one download", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-fetch-"));
+  try {
+    const img = fetchImg();
+    const k = recordingKern(dir, { okFile: okFileFor(dir, img), pullSleep: 0.5 });
+    await withFetchEnv(dir, k.fake, async () => {
+      await Promise.all([1, 2, 3].map(() => kern._fetchImage(k.fake, img)));
+      assert.deepStrictEqual(k.calls(), [`pull ${img}`]);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a pull that outlives its budget is killed", async () => {
+  // A stuck download is bounded by the fetch budget even while kern prints nothing.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-fetch-"));
+  try {
+    const stuck = path.join(dir, "kern-stuck");
+    fs.writeFileSync(stuck, "#!/bin/sh\nexec sleep 30\n");
+    fs.chmodSync(stuck, 0o755);
+    await withFetchEnv(dir, stuck, async () => {
+      const t0 = Date.now();
+      await kern._fetchImage(stuck, fetchImg(), 0.5);
+      assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0} ms`);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the cache check finds every image kern lists", exec, (t) => {
+  // `imageIsCached` reads kern's `.ok` sentinel by a name this package computes, so it is checked
+  // against kern itself. A rule that missed EVERY image would add a process to every session unseen.
+  const r = spawnSync(KERN_PATH, ["images", "--json"], { encoding: "utf8", timeout: 60000 });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const refs = JSON.parse(r.stdout || "[]").map((x) => x.image);
+  if (refs.length === 0) return t.skip("kern's cache is empty here, so there is nothing to compare against");
+  const missed = refs.filter((ref) => !kern._imageIsCached(ref));
+  assert.deepStrictEqual(missed, [], `${missed.length} of ${refs.length} cached images not found`);
+});
+
+// ---- THE DRIVER STREAMS OUTPUT, SO A KILLED CELL KEEPS WHAT IT PRINTED (0.2.45) ---------------------
+// The same tests as the Python binding's, in the same order. The first ones run the real driver under
+// the host's python3 and read it with the real frame parser, with no box, so they hold on CI too.
+
+/** The driver in a plain python3, read by WarmBox's own parser (what is under test is the pair). */
+function driverChannel(outCap = 1 << 20) {
+  const child = spawn("python3", ["-c", kern._kernelDriver(outCap, 1 << 20, false)], {
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  const ch = Object.create(kern._WarmBox.prototype);
+  Object.assign(ch, {
+    _chunks: [], _total: 0, _need: -1, _headerBytes: -1, _waiters: [], _dead: false,
+    _cap: kern._replyFrameCap(outCap),
+  });
+  child.stdout.on("data", (d) => ch._onData(d));
+  child.on("close", () => ch._flush(null));
+  const exited = new Promise((res) => child.on("exit", (code) => res(code)));
+  return {
+    child, ch, exited,
+    send(code) {
+      const b = Buffer.from(code, "utf8");
+      child.stdin.write(`${b.length}\n`);
+      child.stdin.write(b);
+    },
+    async reply(outCapForHost, ms) {
+      const out = new kern._CellOutput(outCapForHost);
+      const r = await kern._nextReply(ch, Date.now() + ms, out);
+      return { r, out };
+    },
+  };
+}
+const { spawn } = require("node:child_process");
+
+test("the driver streams a cell's output before the cell ends", async () => {
+  const d = driverChannel();
+  try {
+    d.send("print('BEFORE')\nimport time\ntime.sleep(30)");
+    const { r, out } = await d.reply(1 << 20, 3000);
+    assert.strictEqual(typeof r, "symbol", "the deadline should pass first");
+    assert.strictEqual(out.stdout, "BEFORE\n");
+  } finally {
+    d.child.kill("SIGKILL");
+  }
+});
+
+test("a cell that ends the interpreter keeps its output and its exit status", async () => {
+  const d = driverChannel();
+  try {
+    d.send("print('bye')\nimport os\nos._exit(3)");
+    const { r, out } = await d.reply(1 << 20, 10000);
+    assert.strictEqual(r, null, "the channel closed: no reply");
+    assert.strictEqual(out.stdout, "bye\n");
+    assert.strictEqual(await d.exited, 3);
+  } finally {
+    d.child.kill("SIGKILL");
+  }
+  // The same, with nobody waiting while the output AND the close arrive: both are queued, and the output
+  // must come out before the end of the channel does.
+  const d2 = driverChannel();
+  try {
+    d2.send("print('bye')\nimport os\nos._exit(3)");
+    await d2.exited;
+    await new Promise((r) => setTimeout(r, 200));
+    const { r, out } = await d2.reply(1 << 20, 10000);
+    assert.strictEqual(r, null);
+    assert.strictEqual(out.stdout, "bye\n", "the end of the channel overtook the output queued before it");
+  } finally {
+    d2.child.kill("SIGKILL");
+  }
+});
+
+test("the driver cuts each stream at its budget in small frames", async () => {
+  const d = driverChannel(50000);
+  try {
+    d.send("print('x' * 10_000_000)\nprint('done', file=__import__('sys').stderr)");
+    const { r, out } = await d.reply(50000, 30000);
+    const obj = JSON.parse(r);
+    assert.ok(obj.rc === 0 && obj.trunc === true && obj.stdout === "" && obj.stderr === "");
+    assert.strictEqual(out.stdout, "x".repeat(50000));
+    assert.strictEqual(out.stderr, "done\n", "the cut on stdout must not starve stderr");
+  } finally {
+    d.child.kill("SIGKILL");
+  }
+});
+
+test("fd-level output streams too, in order, and the barrier never leaks", async () => {
+  const d = driverChannel();
+  try {
+    d.send("import os\nos.write(1, b'A' * 70000)\nprint('end')");
+    let { r, out } = await d.reply(1 << 20, 10000);
+    assert.strictEqual(JSON.parse(r).rc, 0);
+    assert.strictEqual(out.stdout, "A".repeat(70000) + "end\n");
+    for (let i = 0; i < 5; i++) {
+      d.send("import os\nos.write(1, b'fd-first ')\nprint('then-print')");
+      ({ r, out } = await d.reply(1 << 20, 10000));
+      assert.strictEqual(out.stdout, "fd-first then-print\n");
+    }
+  } finally {
+    d.child.kill("SIGKILL");
+  }
+});
+
+test("a forked child prints through the fd and the protocol holds", async () => {
+  const d = driverChannel();
+  try {
+    d.send("import os\npid = os.fork()\nif pid == 0:\n    print('child')\n    os._exit(0)\nos.waitpid(pid, 0)\nprint('parent')");
+    let { r, out } = await d.reply(1 << 20, 10000);
+    assert.strictEqual(JSON.parse(r).rc, 0);
+    assert.ok(out.stdout.includes("child\n") && out.stdout.includes("parent\n"), out.stdout);
+    d.send("print('next')");
+    ({ r, out } = await d.reply(1 << 20, 10000));
+    assert.strictEqual(out.stdout, "next\n", "the protocol did not survive the fork");
+  } finally {
+    d.child.kill("SIGKILL");
+  }
+});
+
+test("the host keeps at most its budget of streamed output", () => {
+  const out = new kern._CellOutput(10);
+  out.add({ o: "12345" });
+  out.add({ o: "6789012345" });
+  out.add({ e: "err" });
+  out.add({ o: "more" });
+  assert.strictEqual(out.stdout, "1234567890");
+  assert.strictEqual(out.truncated, true);
+  assert.strictEqual(out.stderr, "err");
+});
+
+test("output printed before an OOM or a timeout survives on every path", exec, async () => {
+  const cells = {
+    oom: "print('BEFORE')\na = []\nwhile True: a.append(bytearray(64 * 2**20))",
+    timeout: "print('BEFORE')\nimport time\ntime.sleep(30)",
+  };
+  const got = [];
+  for (const prewarm of [0, 1]) {
+    const sb = await new Sandbox({ prewarm, memoryMb: 256, timeoutS: 3 }).open();
+    try {
+      for (const [label, code] of Object.entries(cells)) {
+        if (prewarm) await new Promise((r) => setTimeout(r, 2500));
+        const r = await sb.runCode(code);
+        got.push([prewarm ? "warm" : "cold", label, r.stdout, r.fault && r.fault.type, r.exitCode]);
+      }
+    } finally {
+      await sb.close();
+    }
+  }
+  const sb = await new Sandbox({ memoryMb: 256 }).open();
+  try {
+    for (const [label, code] of Object.entries(cells)) {
+      const k = await sb.kernel();
+      const r = await k.runCode(code, { timeoutS: 3 });
+      got.push(["kernel", label, r.stdout, r.fault && r.fault.type, r.exitCode]);
+      await k.close();
+    }
+  } finally {
+    await sb.close();
+  }
+  for (const [path, label, stdout, fault, rc] of got) {
+    assert.strictEqual(stdout, "BEFORE\n", `${path} ${label}: the output was lost`);
+    assert.ok(fault === label && rc === 137, `${path} ${label}: ${fault} / ${rc}`);
+  }
+});
+
+test("os._exit is an exit and not a kill on every path", exec, async () => {
+  const code = "print('bye')\nimport os\nos._exit(3)";
+  const got = [];
+  for (const prewarm of [0, 1]) {
+    const sb = await new Sandbox({ prewarm, timeoutS: 30 }).open();
+    try {
+      if (prewarm) await new Promise((r) => setTimeout(r, 2500));
+      const r = await sb.runCode(code);
+      got.push([r.stdout, r.exitCode, r.fault]);
+    } finally {
+      await sb.close();
+    }
+  }
+  const sb = await new Sandbox({}).open();
+  try {
+    const k = await sb.kernel();
+    const r = await k.runCode(code);
+    got.push([r.stdout, r.exitCode, r.fault]);
+    assert.ok(k.ended, "the interpreter is gone and the kernel must say so");
+    await k.close();
+  } finally {
+    await sb.close();
+  }
+  for (const g of got) assert.deepStrictEqual(g, ["bye\n", 3, null]);
+});
+
+test("a kernel cuts output over its budget and keeps its state", exec, async () => {
+  const sb = await new Sandbox({ maxOutputBytes: 1 << 16 }).open();
+  try {
+    const k = await sb.kernel();
+    assert.strictEqual((await k.runCode("y = 41")).exitCode, 0);
+    const r = await k.runCode("print('x' * 10_000_000)");
+    assert.ok(r.fault === null && r.truncated === true && r.stdout.length === 1 << 16);
+    assert.strictEqual((await k.runCode("print(y + 1)")).stdout, "42\n");
+    // The reply that ends a cell carries its RESULTS, which the output budget does not bound: a figure,
+    // or a long last expression, larger than the budget must not read as a reply over the frame cap.
+    const big = await k.runCode("'z' * 200000");
+    assert.ok(big.fault === null && big.results.length === 1, JSON.stringify(big.fault));
+    assert.strictEqual((await k.runCode("print(y)")).stdout, "41\n");
+    await k.close();
+  } finally {
+    await sb.close();
+  }
+});
+
+/** A kern double whose `kern exec` refuses the way kern does. Mirrors `_refusing_kern`. */
+function refusingKern(dir, version, { startedBytes = false, message = true } = {}) {
+  const fake = path.join(dir, "kern-refuses");
+  fs.writeFileSync(
+    fake,
+    "#!/bin/sh\n" +
+      `case "$1" in --version) echo "kern ${version}"; exit 0 ;; esac\n` +
+      'if [ "$1" = exec ]; then\n' +
+      (message ? "  echo \"kern: exec: refusing: the command could not be placed in the box's cgroup\" >&2\n" : "") +
+      // fd 3 here is a socket, which /proc/self/fd cannot reopen; a one-digit fd is a plain redirection.
+      (startedBytes ? "  printf '\\001\\000\\000\\000' >&\"$KERN_STARTED_FD\"\n" : "") +
+      "  exit 126\nfi\nexit 0\n",
+  );
+  fs.chmodSync(fake, 0o755);
+  return fake;
+}
+
+async function residentCall(dir, kernBin) {
+  const prev = { KERN_BIN: process.env.KERN_BIN, XDG_CACHE_HOME: process.env.XDG_CACHE_HOME };
+  process.env.KERN_BIN = kernBin;
+  process.env.XDG_CACHE_HOME = path.join(dir, "cache");
+  try {
+    const sb = await new Sandbox({ workspace: path.join(dir, "ws") }).open();
+    try {
+      sb._resident = "fake-resident";
+      return await sb.runCode("print(1)");
+    } finally {
+      sb._resident = null;
+      await sb.close();
+    }
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test("a resident call kern refused is startup_failed from kern 0.30.2", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-refuse-"));
+  try {
+    let r = await residentCall(dir, refusingKern(dir, "0.30.2"));
+    assert.ok(r.fault && r.fault.type === "startup_failed" && r.fault.message.includes("cgroup"), JSON.stringify(r.fault));
+    r = await residentCall(dir, refusingKern(dir, "0.30.2", { message: false }));
+    assert.ok(r.fault && r.fault.type === "startup_failed", JSON.stringify(r.fault));
+    assert.ok(r.fault.message.includes("refused to enter the resident box") && r.fault.message.includes("exit 126"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("with kern 0.30.1 a refused resident call cannot be told from an exit 126", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-refuse-"));
+  try {
+    const r = await residentCall(dir, refusingKern(dir, "0.30.1", { startedBytes: true }));
+    assert.ok(r.fault === null && r.exitCode === 126, JSON.stringify(r));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

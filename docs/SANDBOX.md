@@ -123,8 +123,10 @@ directory is the same size it was: the reason to move down the table is that you
 that you are avoiding a cost.
 
 `Sandbox(name="agent-1", workspace=..., persist=True)` keeps one box alive across calls and across
-processes: every call runs in it with `kern exec`, 2 ms against 6 ms for a fresh box, and a second
-process naming the same sandbox finds what the first left in `/tmp`. It is not a fresh box: `/tmp`
+processes: every call runs in it with `kern exec`, and a second process naming the same sandbox
+finds what the first left in `/tmp`. It keeps the BOX, not the interpreter: a call still starts a
+fresh `python3`, so measured on one host it costs 11.4 ms against 13.9 for a fresh box, and
+`sbx.kernel()` is the fast path (0.22 ms a cell, state in memory). It is not a fresh box: `/tmp`
 accumulates, the PID namespace is shared, and a box built under another posture is refused instead
 of adopted. It ends after `persist_ttl_s` (an hour by
 default) or at `destroy()`. Node spells it `persist: true`.

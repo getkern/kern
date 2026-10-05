@@ -76,7 +76,7 @@ Every knob is an environment variable in the client's `env` block. There is no c
 
 | variable | default | what it does |
 |---|---|---|
-| `KERN_MCP_IMAGE` | `python:3.12-slim` | the OCI image every box runs |
+| `KERN_MCP_IMAGE` | `ghcr.io/getkern/kern-sandbox:0.2.44`, pinned by digest | the OCI image every box runs |
 | `KERN_MCP_SETUP` | none | a one-time `pip install ...` in a **network-on** box that dies afterwards. The only moment the network is on |
 | `KERN_MCP_MEMORY_MB` | `1024` | hard RAM cap per box |
 | `KERN_MCP_TIMEOUT` | `60` | per-call wall-clock deadline |
@@ -88,20 +88,26 @@ Every knob is an environment variable in the client's `env` block. There is no c
 | `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes, which otherwise land in the model's output as if the cell had printed them |
 | `KERN_BIN` | `kern` on `PATH` | where the binary is |
 
-**`KERN_MCP_SETUP` is the one knob that opens the network, and there is a way not to need it.** The
-default image has python, sh and bash and nothing else, so the most ordinary request an agent makes
-("plot this") needs `pip install matplotlib` first, in a network-on box. This repository carries the
-recipe for an image that already has the plotting stack and node:
+**`KERN_MCP_SETUP` is the one knob that opens the network, and the default image is why it is rarely
+needed.** The most ordinary request an agent makes ("plot this") needs matplotlib, and the default
+image already has it: python 3.12 with numpy, pandas and matplotlib, and node 22, for `x86_64` and
+`aarch64`. Measured through the SDK on both architectures: the three packages import, a figure is
+written to the workspace as a real PNG, `language='node'` runs, and a connection attempt to the
+network still fails. The tool description tells the model what the image has.
+
+The name is pinned to a digest, and kern verifies it, so moving the tag does not change what a server
+runs. The image is 145 MB against 46 for `python:3.12-slim`, and the server starts downloading it when
+the client starts the server, before any tool call. A call that arrives first waits for the download
+and then gets its whole deadline for the code. Measured from an empty cache, with the first call sent
+right after `initialize`: 23.7 s on `x86_64` and 45.1 s on a Jetson for that first call, and node
+answered in under 0.1 s after it. `KERN_MCP_IMAGE=python:3.12-slim` restores the previous default.
+
+It is built from this repository's recipe, which also builds it locally:
 
 ```sh
 kern build -t kern-sandbox:local -f images/sandbox/Dockerfile images/sandbox
 export KERN_MCP_IMAGE=kern-sandbox:local
 ```
-
-Measured in that image, through the SDK: `numpy`, `pandas` and `matplotlib` import, a figure is
-written to the workspace as a real PNG, `language='node'` runs, and a connection attempt to the
-network still fails. It is **not** the default: a default has to name a published image, and this one
-exists only where it was built.
 
 **`0` is a sentinel on three of them, and unsetting is not the same thing.**
 

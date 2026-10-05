@@ -99,8 +99,9 @@ export interface SandboxOptions {
   /** A stable identity, used only with `persist`: two processes that name the same sandbox meet the
    * same resident box. */
   name?: string | null;
-  /** Keep ONE resident box and run every call in it with `kern exec`, 2 ms against 6 ms for a fresh
-   * box. Requires `name` and `workspace`. Survives close(); destroy() stops it. A resident box is not
+  /** Keep ONE resident box and run every call in it with `kern exec`. It keeps the box, not the
+   * interpreter: each call still starts a fresh `python3`, so a call costs about as much as a fresh box
+   * (measured on one host: 11.4 ms against 13.9). Requires `name` and `workspace`. Survives close(); destroy() stops it. A resident box is not
    * a fresh one: /tmp accumulates and the PID namespace is shared. A box built under another posture
    * with the same name is refused. Default false. */
   persist?: boolean;

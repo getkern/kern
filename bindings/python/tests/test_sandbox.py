@@ -2681,12 +2681,21 @@ def test_kernel_survives_raw_fork_and_multiprocessing():
 
 
 @integration
-def test_kernel_oversize_reply_is_capped_not_host_oom():
-    # The box controls the reply length; a reply past max_output_bytes must be refused (host-OOM guard),
-    # tearing the kernel down with a clear fault rather than buffering gigabytes into host RAM.
+def test_kernel_output_over_the_cap_is_cut_and_a_frame_declaring_too_much_is_refused():
+    """Two different things, and this test used to conflate them. Output over `max_output_bytes` is
+    the CELL's doing and is cut, the way the one-shot path cuts it: it used to tear the kernel down,
+    which under kern-mcp (1 MiB) lost every name a session had built for printing too much. A frame
+    that DECLARES more than the host accepts is the guard against a box streaming gigabytes into host
+    RAM, and it still refuses before reading a byte of it, whoever wrote the frame."""
     with Sandbox(timeout_s=20, max_output_bytes=4 * 1024 * 1024) as s:
         with s.kernel() as k:
-            r = k.run_code("print('A' * 20_000_000)")  # 20 MB reply vs a 4 MB cap
+            r = k.run_code("print('A' * 20_000_000)")  # 20 MB of output vs a 4 MB cap
+            assert r.fault is None and r.truncated is True and len(r.stdout) == 4 * 1024 * 1024
+            assert k.run_code("x = 1").exit_code == 0, "the kernel did not survive its own output"
+            r = k.run_code(
+                "import os, __main__\nos.write(__main__._ctrl_out, b'99999999999\\n')\n"
+                "import time\ntime.sleep(10)"
+            )
             assert r.fault is not None and r.fault.type == "killed" and "cap" in r.fault.message
             with pytest.raises(SandboxError):
                 k.run_code("1 + 1")  # torn down
@@ -3760,8 +3769,10 @@ def test_the_warm_interpreter_differs_from_the_cold_one_by_exactly_the_known_set
                 assert _warm(s)
             seen["cold" if not prewarm else "warm"] = json.loads(s.run_code(probe).stdout)
     extra_threads = [t for t in seen["warm"]["threads"] if t not in seen["cold"]["threads"]]
-    assert sorted(extra_threads) == ["Thread-1 (_drain)", "Thread-2 (_drain)"], (
-        f"the warm interpreter's extra threads are not the two known drains: {extra_threads}"
+    # The two drains and, since output is streamed, the thread that sends queued print() text within a
+    # millisecond (see `_FLUSH_S` in the driver).
+    assert sorted(extra_threads) == ["Thread-1 (_flusher)", "Thread-2 (_drain)", "Thread-3 (_drain)"], (
+        f"the warm interpreter's extra threads are not the known three: {extra_threads}"
     )
     assert seen["cold"]["threads"] == ["MainThread"], (
         f"the cold path grew a thread of its own: {seen['cold']['threads']}"
@@ -3771,7 +3782,8 @@ def test_the_warm_interpreter_differs_from_the_cold_one_by_exactly_the_known_set
     # The driver imports these; the one-shot runner hand-rolls what it needs instead. `site` and
     # `_sitebuiltins` are NOT in the other direction any more: dropping `-S` is what fixed the
     # site-packages hole, so a name appearing on the cold side only would mean it came back.
-    assert only_warm == ["_ast", "_struct", "ast", "base64", "binascii", "contextlib", "struct"], (
+    # `select`: the driver polls the fd pipes so print() and fd output keep their order (see `_pull`).
+    assert only_warm == ["_ast", "_struct", "ast", "base64", "binascii", "contextlib", "select", "struct"], (
         f"the warm interpreter's extra modules changed: {only_warm}"
     )
     only_cold = sorted(cold_mods - warm_mods)
@@ -5260,3 +5272,368 @@ def test_pyc_identity_is_the_same_in_both_bindings(tmp_path, monkeypatch):
         f"{kern._pyc_source_id(img)!r}"
     )
 
+
+
+# ---------------------------------------------------------------------------
+# THE IMAGE IS FETCHED BEFORE THE FIRST BOX (0.2.45)
+# ---------------------------------------------------------------------------
+
+
+def _recording_kern(tmp_path, ok_file=None, pull_exit=0, pull_sleep=0.0):
+    """A kern double that logs `<verb> <arg>` per call and, on `pull`, can be slow, fail, or store the
+    image the way kern does: by writing its `.ok` sentinel last."""
+    log = tmp_path / "kern.log"
+    fake = tmp_path / "kern-rec"
+    store = f'mkdir -p "{os.path.dirname(ok_file)}" && : > "{ok_file}"' if ok_file else ":"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in --version) echo "kern v0.0.0-test-double"; exit 0 ;; esac\n'
+        f'echo "$1 $2" >> "{log}"\n'
+        'if [ "$1" = pull ]; then\n'
+        f"  sleep {pull_sleep}\n"
+        f"  [ {pull_exit} -eq 0 ] || exit {pull_exit}\n"
+        f"  {store}\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    return str(fake), log
+
+
+def _ok_file(tmp_path, image):
+    return str(tmp_path / "cache" / "kern" / "images" / (kern._sanitize_ref(image) + ".ok"))
+
+
+def test_an_image_kern_does_not_have_is_pulled_on_enter_before_the_first_box(tmp_path, monkeypatch):
+    """The first box of a session used to pull the image inside its own deadline: on a Jetson the first
+    cell of a fresh cache answered `startup_failed` at 30 s while the download was still running. The
+    pull now happens in `__enter__`, before the setup box (the earliest box there is), and a session
+    that finds the image in kern's cache does not ask again."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    img = f"fetch-{uuid.uuid4().hex[:8]}:1"
+    fake, log = _recording_kern(tmp_path, ok_file=_ok_file(tmp_path, img))
+    monkeypatch.setenv("KERN_BIN", fake)
+    # The double never signals a started box, so the setup "fails": what matters is that it RAN, after.
+    with pytest.raises(SandboxError, match="setup failed"):
+        with Sandbox(image=img, setup="true"):
+            pass
+    calls = log.read_text().splitlines()
+    assert calls[0] == f"pull {img}", calls
+    assert calls.count(f"pull {img}") == 1, calls
+    assert len(calls) > 1, "the setup box never ran, so 'before the first box' proved nothing"
+
+    log.write_text("")
+    with Sandbox(image=img):
+        pass
+    assert f"pull {img}" not in log.read_text().splitlines(), "a cached image was pulled again"
+
+
+def test_a_pull_that_fails_leaves_the_session_as_it_was(tmp_path, monkeypatch):
+    """Offline, a private image without a login, a typo: the pull fails, and the session goes on to the
+    box exactly as before, which pulls again and reports the failure in kern's own words."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    img = f"fetch-{uuid.uuid4().hex[:8]}:1"
+    fake, log = _recording_kern(tmp_path, pull_exit=1)
+    monkeypatch.setenv("KERN_BIN", fake)
+    with Sandbox(image=img) as sb:
+        sb.run_code("print(1)")
+    calls = log.read_text().splitlines()
+    assert calls[0] == f"pull {img}", calls
+    assert any(not c.startswith("pull ") for c in calls[1:]), f"no box after the failed pull: {calls}"
+
+
+def test_two_callers_in_one_process_wait_for_one_download(tmp_path, monkeypatch):
+    """An MCP server starts the download at start-up and its first session asks for the same image:
+    they must share one download, not run two."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    img = f"fetch-{uuid.uuid4().hex[:8]}:1"
+    fake, log = _recording_kern(tmp_path, ok_file=_ok_file(tmp_path, img), pull_sleep=0.5)
+    ths = [threading.Thread(target=kern._fetch_image, args=(fake, img)) for _ in range(3)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(10)
+    assert log.read_text().splitlines() == [f"pull {img}"]
+
+
+def test_a_pull_that_outlives_its_budget_is_killed(tmp_path, monkeypatch):
+    """A stuck download is bounded by the fetch budget, and that bound has to hold while kern prints
+    NOTHING: the first version read stderr and checked the clock only when a chunk arrived."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(kern, "_IMAGE_FETCH_BUDGET_S", 0.5)
+    fake = tmp_path / "kern-stuck"
+    fake.write_text("#!/bin/sh\nexec sleep 30\n")
+    fake.chmod(0o755)
+    t0 = time.monotonic()
+    kern._fetch_image(str(fake), f"fetch-{uuid.uuid4().hex[:8]}:1")
+    assert time.monotonic() - t0 < 5
+
+
+@integration
+def test_the_cache_check_finds_every_image_kern_lists():
+    """`_image_is_cached` reads kern's `.ok` sentinel by a name this package computes, so it is checked
+    against kern itself: every image kern lists must be found. A miss costs a 2 ms `kern pull`, but a
+    rule that misses EVERY image would add a process to every session and nobody would see it."""
+    out = subprocess.run(
+        [kern._find_kern(), "images", "--json"], capture_output=True, text=True, timeout=60
+    )
+    assert out.returncode == 0, out.stderr
+    refs = [x["image"] for x in json.loads(out.stdout or "[]")]
+    if not refs:
+        pytest.skip("kern's cache is empty here, so there is nothing to compare against")
+    missed = [r for r in refs if not kern._image_is_cached(r)]
+    assert not missed, f"{len(missed)} of {len(refs)} cached images not found: {missed[:5]}"
+
+
+# ---------------------------------------------------------------------------
+# THE DRIVER STREAMS OUTPUT, SO A KILLED CELL KEEPS WHAT IT PRINTED (0.2.45)
+# ---------------------------------------------------------------------------
+# The prewarmed box and the resident kernel run the same driver, which used to send a cell's output only
+# in the reply that ends the cell: a cell the sandbox killed (OOM, timeout) took its output with it, and
+# `os._exit` did the same. The first tests run the driver straight under this interpreter, with no box,
+# so they hold on any machine, CI included.
+
+
+def _driver(out_cap=1 << 20):
+    """The real driver in a plain subprocess, read by the real host reader: what is under test is the
+    pair, driver plus `_FrameReader`/`_next_reply`, not a box."""
+    import queue as _queue
+    import sys as _sys
+
+    src = kern._kernel_driver(out_cap, 1 << 20, hello=False)
+    p = subprocess.Popen(
+        [_sys.executable, "-c", src], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    q = _queue.Queue()
+    kern._FrameReader(p.stdout, q, kern._reply_frame_cap(out_cap)).start()
+    return p, q
+
+
+def _send(p, code):
+    b = code.encode()
+    p.stdin.write(str(len(b)).encode() + b"\n" + b)
+    p.stdin.flush()
+
+
+def test_the_driver_streams_a_cells_output_before_the_cell_ends():
+    """A cell still running has already delivered what it printed: the deadline passes, and the
+    output is there. That is what lets a timeout or an OOM report where the code got to."""
+    p, q = _driver()
+    try:
+        _send(p, "print('BEFORE')\nimport time\ntime.sleep(30)")
+        out = kern._CellOutput(1 << 20)
+        assert kern._next_reply(q, time.monotonic() + 3, out) is kern._CELL_TIMEOUT
+        assert out.stdout == "BEFORE\n"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_a_cell_that_ends_the_interpreter_keeps_its_output_and_its_exit_status():
+    p, q = _driver()
+    try:
+        _send(p, "print('bye')\nimport os\nos._exit(3)")
+        out = kern._CellOutput(1 << 20)
+        assert kern._next_reply(q, time.monotonic() + 10, out) is None  # the channel closed: no reply
+        assert out.stdout == "bye\n"
+        assert p.wait(10) == 3
+    finally:
+        p.kill()
+
+
+def test_the_driver_cuts_each_stream_at_its_budget_in_small_frames():
+    """100 MB through `print` used to be built into ONE reply, which the host refused, killing the
+    kernel. Now it is cut at the budget, sent in frames no larger than the driver's chunk, and the
+    reply says it was cut."""
+    p, q = _driver(out_cap=50_000)
+    try:
+        _send(p, "print('x' * 10_000_000)\nprint('done', file=__import__('sys').stderr)")
+        out = kern._CellOutput(50_000)
+        reply = kern._next_reply(q, time.monotonic() + 30, out)
+        obj = json.loads(reply)
+        assert obj["rc"] == 0 and obj["trunc"] is True and obj["stdout"] == "" and obj["stderr"] == ""
+        assert out.stdout == "x" * 50_000
+        assert out.stderr == "done\n", "the cut on stdout must not starve stderr"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_fd_level_output_streams_too_and_the_barrier_never_leaks():
+    """Output written to fd 1 directly (a subprocess, a C extension) goes through the drain threads, and
+    more of it than one 64 KiB read holds. The cell-end barrier must be found and none of its bytes may
+    reach the caller. And print() after it comes AFTER it: the first version sent print() ahead of fd
+    bytes still in the pipe, 1 run in 10."""
+    p, q = _driver()
+    try:
+        _send(p, "import os\nos.write(1, b'A' * 70000)\nprint('end')")
+        out = kern._CellOutput(1 << 20)
+        obj = json.loads(kern._next_reply(q, time.monotonic() + 10, out))
+        assert obj["rc"] == 0
+        assert out.stdout == "A" * 70000 + "end\n"
+        assert "KRNCELLDONE" not in out.stdout and "\x00" not in out.stdout
+        # A SMALL write is the discriminating case: it sits in the pipe while this thread holds the GIL,
+        # so only reading the pipe before queueing print() puts it first, every time.
+        for _ in range(5):
+            _send(p, "import os\nos.write(1, b'fd-first ')\nprint('then-print')")
+            out = kern._CellOutput(1 << 20)
+            assert json.loads(kern._next_reply(q, time.monotonic() + 10, out))["rc"] == 0
+            assert out.stdout == "fd-first then-print\n", out.stdout
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_a_forked_child_prints_through_the_fd_and_the_protocol_holds():
+    """A child of `os.fork` inherits the cell's `sys.stdout`. If it wrote frames they would interleave
+    with the parent's and break the protocol; it writes to the fd instead, which the parent drains."""
+    p, q = _driver()
+    try:
+        _send(p, "import os\npid = os.fork()\nif pid == 0:\n    print('child')\n    os._exit(0)\n"
+                 "os.waitpid(pid, 0)\nprint('parent')")
+        out = kern._CellOutput(1 << 20)
+        obj = json.loads(kern._next_reply(q, time.monotonic() + 10, out))
+        assert obj["rc"] == 0
+        assert "child\n" in out.stdout and "parent\n" in out.stdout
+        _send(p, "print('next')")
+        out2 = kern._CellOutput(1 << 20)
+        assert json.loads(kern._next_reply(q, time.monotonic() + 10, out2))["rc"] == 0
+        assert out2.stdout == "next\n", "the protocol did not survive the fork"
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_the_host_keeps_at_most_its_budget_of_streamed_output():
+    """The frames come from inside the box, so the host bounds them itself whatever the driver says."""
+    out = kern._CellOutput(10)
+    out.add({"o": "12345"})
+    out.add({"o": "6789012345"})
+    out.add({"e": "err"})
+    out.add({"o": "more"})
+    assert out.stdout == "1234567890" and out.truncated is True
+    assert out.stderr == "err"
+
+
+@integration
+def test_output_printed_before_an_oom_or_a_timeout_survives_on_every_path(tmp_path):
+    """The 0.2.43 promise, held on the paths agents use: the prewarmed box (kern-mcp's default) and the
+    resident kernel, not only the cold box it was measured on."""
+    cells = {
+        "oom": "print('BEFORE')\na = []\nwhile True: a.append(bytearray(64 * 2**20))",
+        "timeout": "print('BEFORE')\nimport time\ntime.sleep(30)",
+    }
+    got = {}
+    for pw in (0, 1):
+        with Sandbox(prewarm=pw, workspace=str(tmp_path / f"w{pw}"), memory_mb=256, timeout_s=3) as s:
+            for label, code in cells.items():
+                if pw:
+                    assert _warm(s), "the pool never became ready"
+                r = s.run_code(code)
+                got[(pw, label)] = (r.stdout, r.fault.type if r.fault else None, r.exit_code)
+        with Sandbox(workspace=str(tmp_path / "k"), memory_mb=256) as s:
+            for label, code in cells.items():
+                with s.kernel() as k:
+                    r = k.run_code(code, timeout_s=3)
+                    got[("kernel", label)] = (r.stdout, r.fault.type if r.fault else None, r.exit_code)
+    for (path, label), (stdout, fault, rc) in got.items():
+        assert stdout == "BEFORE\n", f"{path} {label}: the output was lost ({stdout!r})"
+        assert fault == label and rc == 137, f"{path} {label}: {fault} / {rc}"
+
+
+@integration
+def test_os_exit_is_an_exit_and_not_a_kill_on_every_path(tmp_path):
+    got = {}
+    for pw in (0, 1):
+        with Sandbox(prewarm=pw, workspace=str(tmp_path / f"w{pw}"), timeout_s=30) as s:
+            if pw:
+                assert _warm(s)
+            r = s.run_code("print('bye')\nimport os\nos._exit(3)")
+            got[pw] = (r.stdout, r.exit_code, r.fault)
+    with Sandbox(workspace=str(tmp_path / "k")) as s:
+        with s.kernel() as k:
+            r = k.run_code("print('bye')\nimport os\nos._exit(3)")
+            got["kernel"] = (r.stdout, r.exit_code, r.fault)
+            assert k.ended, "the interpreter is gone and the kernel must say so"
+    assert set(got.values()) == {("bye\n", 3, None)}, got
+
+
+@integration
+def test_a_kernel_cuts_output_over_its_budget_and_keeps_its_state(tmp_path):
+    """Under kern-mcp the budget is 1 MiB, and a cell printing 100 MB KILLED the kernel and every name
+    defined in it. It is cut now, like the one-shot path cuts it, and the session goes on."""
+    with Sandbox(workspace=str(tmp_path), max_output_bytes=1 << 16) as s:
+        with s.kernel() as k:
+            assert k.run_code("y = 41").exit_code == 0
+            r = k.run_code("print('x' * 10_000_000)")
+            assert r.fault is None and r.truncated is True and len(r.stdout) == 1 << 16
+            assert k.run_code("print(y + 1)").stdout == "42\n"
+            # The reply that ends a cell carries its RESULTS, which the output budget does not bound.
+            big = k.run_code("'z' * 200000")
+            assert big.fault is None and len(big.results) == 1, big.fault
+            assert k.run_code("print(y)").stdout == "41\n"
+
+
+def _refusing_kern(tmp_path, version, *, started_bytes=False, message=True):
+    """A kern double whose `kern exec` refuses the way kern does, before the command runs: exit 126 and,
+    by default, kern's sentence on stderr. `started_bytes` writes `[1, 0, 0, 0]` on KERN_STARTED_FD,
+    which is what v0.30.1's `kern exec` MEASURABLY writes for a refusal."""
+    fake = tmp_path / "kern-refuses"
+    say = "  echo \"kern: exec: refusing: the command could not be placed in the box's cgroup\" >&2\n"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in --version) echo "kern {version}"; exit 0 ;; esac\n'
+        'if [ "$1" = exec ]; then\n'
+        + (say if message else "")
+        + ("  printf '\\001\\000\\000\\000' > \"/proc/self/fd/$KERN_STARTED_FD\"\n" if started_bytes else "")
+        + "  exit 126\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    return str(fake)
+
+
+def _resident_call(tmp_path, monkeypatch, kern_bin):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("KERN_BIN", kern_bin)
+    with Sandbox(workspace=str(tmp_path / "ws")) as sb:
+        sb._resident = "fake-resident"
+        return sb.run_code("print(1)")
+
+
+def test_a_resident_call_kern_refused_is_startup_failed_from_kern_0_30_2(tmp_path, monkeypatch):
+    """MEASURED from an ssh session: every `persist=True` call came back `exit_code=126, fault=None`, so
+    an agent read "your code exited 126" where the sandbox had refused to run it. A kern whose
+    `kern exec` writes the started bytes only for a command that ran makes their absence the proof,
+    with kern's sentence on stderr or without it."""
+    r = _resident_call(tmp_path, monkeypatch, _refusing_kern(tmp_path, "0.30.2"))
+    assert r.fault is not None and r.fault.type == "startup_failed" and "cgroup" in r.fault.message, r
+    r = _resident_call(tmp_path, monkeypatch, _refusing_kern(tmp_path, "0.30.2", message=False))
+    assert r.fault is not None and r.fault.type == "startup_failed", r
+    assert "refused to enter the resident box" in r.fault.message and "exit 126" in r.fault.message
+
+
+def test_with_kern_0_30_1_a_refused_resident_call_cannot_be_told_from_an_exit_126(tmp_path, monkeypatch):
+    """The other half, pinned so nobody "fixes" it by reading stderr: v0.30.1's `kern exec` writes
+    `[1, 0, 0, 0]` for a refusal too, and stderr is the code's to write, so with that kern the binding
+    must NOT call it startup_failed. A cell that prints kern's sentence and exits 126 would otherwise
+    manufacture a sandbox fault."""
+    r = _resident_call(tmp_path, monkeypatch, _refusing_kern(tmp_path, "0.30.1", started_bytes=True))
+    assert r.fault is None and r.exit_code == 126, r
+
+
+def test_a_barrier_split_across_two_reads_is_held_back_not_streamed():
+    """A 64 KiB pipe read whole by a 64 KiB read never splits the barrier, so the pipe cannot show this
+    case; the helper that handles it is run on its own, from the driver's own source."""
+    import re as _re
+    src = kern._kernel_driver(1 << 20, 1 << 20)
+    fn = _re.search(r"\ndef _mark_prefix_len\(data\):\n(?:    .*\n)+", src).group(0)
+    ns = {"_MARK": b"\x00\x01KRNCELLDONE\x01\x00"}
+    exec(fn, ns)
+    held = ns["_mark_prefix_len"]
+    assert held(b"output\x00\x01KRN") == 5, "a barrier's first 5 bytes must be held back"
+    assert held(b"output\x00") == 1
+    assert held(b"output") == 0 and held(b"") == 0
+    assert held(b"out\x00x") == 0, "a NUL that cannot start the barrier is output"

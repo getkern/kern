@@ -70,7 +70,7 @@ __all__ = [
     "run_code",
 ]
 
-__version__ = "0.2.44"
+__version__ = "0.2.45"
 
 # DECISION: default image is a small Python base. Criterion "import pandas with no setup" needs a
 # batteries-included image; for v1 we start from a PUBLIC image and let `setup=` bake deps, rather than
@@ -416,6 +416,54 @@ def _sanitize_ref(image: str) -> str:
     ref = image if _oci_split_tag(image) else f"{image}:latest"
     out = "".join(c if (c.isascii() and (c.isalnum() or c in "_-")) else "_" for c in ref)
     return f"{out}-{_fnv1a(ref):016x}"
+
+
+# THE IMAGE IS FETCHED BEFORE THE FIRST BOX, ON ITS OWN BUDGET. Without this the first box of a session
+# pulled it, inside that call's deadline: measured on a Jetson with the 145 MB MCP image, the first
+# `run_code` of a fresh cache answered `startup_failed` at the 30 s default ("kern was still setting it
+# up"), the second finished the download in 18 s and only the third ran the cell (5.6 s). A deadline is
+# for the CODE. 900 s is the most a download may take (145 MB at 160 KB/s); a refused connection fails
+# in 10 ms, measured.
+_IMAGE_FETCH_BUDGET_S = 900.0
+# One lock per image, so two callers in one process (an MCP server's start-up fetch and its first
+# session) wait for ONE download instead of starting two.
+_IMAGE_FETCH_LOCKS: "dict[str, threading.Lock]" = {}
+_IMAGE_FETCH_GUARD = threading.Lock()
+
+
+def _image_is_cached(image: str) -> bool:
+    """True when kern has finished storing `image`: its `.ok` sentinel, which kern writes LAST.
+
+    A local stat, no box and no network. "Cannot tell" (a moved cache, a kern that names its files
+    differently) reads as NOT cached, which costs one `kern pull` that finds the image and returns: 2 ms,
+    measured, with or without a network."""
+    try:
+        return os.path.exists(os.path.join(_cache_home(), "kern", "images", _sanitize_ref(image) + ".ok"))
+    except Exception:  # noqa: BLE001 - "never raises" is the contract `_fetch_image` states
+        return False
+
+
+def _fetch_image(kern_bin: str, image: str) -> None:
+    """Make sure kern has `image` before any box needs it. Best effort, never raises.
+
+    A pull that FAILS changes nothing: the box that follows pulls again and reports the failure in its
+    own words, exactly as before this existed, so an offline host, a private image without a login or a
+    typo in the name gets the message it always got."""
+    with _IMAGE_FETCH_GUARD:
+        lock = _IMAGE_FETCH_LOCKS.setdefault(image, threading.Lock())
+    with lock:
+        if _image_is_cached(image):
+            return
+        try:
+            # ALL THREE STREAMS CLOSED: on an MCP server stdin and stdout ARE the protocol, and a failure
+            # here is reported by the box that follows. `run(timeout=)` kills the pull at the budget,
+            # which `_run_capped` would not: it checks its deadline only when the child writes.
+            subprocess.run(
+                [kern_bin, "pull", image], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=_IMAGE_FETCH_BUDGET_S, check=False,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
 
 
 def _pyc_dir_for(image: str) -> str:
@@ -1032,7 +1080,7 @@ sys.exit(_rc)
 # the cold `run_code` it replaces: the cold path TRUNCATES oversized output and reports `truncated=True`,
 # and a fast path that instead faulted on the same cell would be a silent semantic change.
 _PY_KERNEL_DRIVER = r'''
-import sys, io, json, base64, builtins, ast, os, threading
+import sys, io, json, base64, builtins, ast, os, threading, codecs, select, time
 _g = {"__name__": "__main__"}
 _out = []
 def _bundle(o):
@@ -1103,31 +1151,10 @@ _CAP = __KERN_OUTCAP__
 _RESCAP = __KERN_RESCAP__
 _MARK = b"\x00\x01KRNCELLDONE\x01\x00"  # per-cell barrier sentinel written to user fd 1/2 after exec
 _ulock = threading.Lock()
-_ubuf = {1: bytearray(), 2: bytearray()}
 _mevt = {1: threading.Event(), 2: threading.Event()}
-# Set by the drain threads when they cut a buffer at _CAP, read+reset by the cell loop under _ulock. A
-# list (not a bare name) because the drainers rebind nothing: they mutate this one shared cell.
+# Set when this cell's output is cut at _CAP, read+reset by the cell loop under _ulock. A list (not a
+# bare name) because the writers rebind nothing: they mutate this one shared cell.
 _tcut = [False]
-def _drain(fd, key):
-    while True:
-        try:
-            chunk = os.read(fd, 65536)
-        except OSError:
-            break
-        if not chunk:
-            break
-        with _ulock:
-            _b = _ubuf[key]
-            _b += chunk
-            _i = _b.find(_MARK)
-            if _i >= 0:
-                del _b[_i:_i + len(_MARK)]  # strip the barrier sentinel; signal the cell it is drained
-                _mevt[key].set()
-            if len(_b) > _CAP:
-                del _b[_CAP:]
-                _tcut[0] = True
-threading.Thread(target=_drain, args=(_u1r, 1), daemon=True).start()
-threading.Thread(target=_drain, args=(_u2r, 2), daemon=True).start()
 _MAIN_PID = os.getpid()  # a cell that raw os.fork()s copies this whole process; the child must NOT re-enter
 _rin = os.fdopen(_ctrl_in, "rb")
 def _read():
@@ -1142,11 +1169,167 @@ def _read():
             return None
         buf += chunk
     return buf.decode("utf-8")
+_wlock = threading.Lock()
 def _write(obj):
     b = json.dumps(obj).encode("utf-8")
     _data = memoryview(str(len(b)).encode() + b"\n" + b)
-    while _data:
-        _data = _data[os.write(_ctrl_out, _data):]
+    with _wlock:
+        while _data:
+            _data = _data[os.write(_ctrl_out, _data):]
+# OUTPUT IS STREAMED, one frame per write, while the cell runs. It used to be collected here and sent in
+# the cell's reply, so a cell the sandbox KILLED (an OOM, a timeout) took everything it had printed with
+# it: no reply, so no output, and the caller could not tell "printed nothing" from "printed, then died".
+# {"o": text} is stdout and {"e": text} stderr; the reply that ends the cell carries the rest. A
+# frame holds at most _CHUNK characters, so no single frame nears the host's cap however much is printed.
+_KEY = {1: "o", 2: "e"}
+_CHUNK = 8192
+_sent = {1: 0, 2: 0}  # characters streamed in the current cell, per stream, bounded by _CAP
+_live = [False]  # True while a cell runs: output between cells belongs to no cell and is dropped
+def _emit(key, text):
+    # Called with _ulock held.
+    if not text or not _live[0]:
+        return
+    room = _CAP - _sent[key]
+    if len(text) > room:
+        text = text[:max(room, 0)]
+        _tcut[0] = True
+    if not text:
+        return
+    _sent[key] += len(text)
+    for _p in range(0, len(text), _CHUNK):
+        _write({_KEY[key]: text[_p:_p + _CHUNK]})
+# A print() is queued and sent within _FLUSH_S by one thread, woken once per burst; flush(), os._exit()
+# and the end of the cell send what is queued at once. So what a SIGKILLed cell loses is at most its last
+# millisecond of output, where it used to lose all of it. One frame per write made 10 000 prints cost
+# 58 ms against 1.8 ms when they were only collected (and 9.8 ms on the one-shot path).
+_FLUSH_S = 0.001
+_armed = [False]  # the flusher is already due: a burst wakes it once, not once per write
+_pend = {1: [], 2: []}
+_pend_n = {1: 0, 2: 0}
+_flush_cv = threading.Condition(_ulock)
+def _flush_py(key):
+    # Called with _ulock held.
+    if _pend[key]:
+        _t = "".join(_pend[key])
+        _pend[key].clear()
+        _pend_n[key] = 0
+        _emit(key, _t)
+class _Stream(io.TextIOBase):
+    # The cell's sys.stdout / sys.stderr. ORDER with fd output (a subprocess, C code) is kept by reading,
+    # under the same lock, whatever already sits in the fd pipe before this text is queued: what was
+    # written first goes out first. A forked child writes to the fd instead, which the parent drains: a
+    # frame from the child would interleave with the parent's.
+    def __init__(self, key):
+        self._key = key
+    def writable(self):
+        return True
+    @property
+    def encoding(self):
+        return "utf-8"
+    def write(self, s):
+        if not isinstance(s, str):
+            raise TypeError("write() argument must be str, not " + type(s).__name__)
+        if os.getpid() != _MAIN_PID:
+            _b = memoryview(s.encode("utf-8", "replace"))
+            while _b:
+                _b = _b[os.write(self._key, _b):]
+            return len(s)
+        with _ulock:
+            _pull(self._key)
+            _pend[self._key].append(s)
+            _pend_n[self._key] += len(s)
+            if _pend_n[self._key] >= _CHUNK:
+                _flush_py(self._key)
+            elif not _armed[0]:
+                _armed[0] = True
+                _flush_cv.notify()
+        return len(s)
+    def flush(self):
+        if os.getpid() == _MAIN_PID:
+            with _ulock:
+                _pull(self._key)
+                _flush_py(self._key)
+def _flusher():
+    while True:
+        with _ulock:
+            while not _armed[0]:
+                _flush_cv.wait()
+        time.sleep(_FLUSH_S)
+        with _ulock:
+            _armed[0] = False
+            _flush_py(1)
+            _flush_py(2)
+threading.Thread(target=_flusher, daemon=True).start()
+_real_os_exit = os._exit
+def _os_exit_sending(n):
+    # os._exit ends the process without any of Python's cleanup, so what is queued goes out first. A
+    # forked child has nothing queued here (it writes to the fd), and a lock held elsewhere is waited for
+    # briefly, never forever: an exit must not hang.
+    if os.getpid() == _MAIN_PID and _ulock.acquire(timeout=0.5):
+        try:
+            _pull(1)
+            _pull(2)
+            _flush_py(1)
+            _flush_py(2)
+        finally:
+            _ulock.release()
+    _real_os_exit(n)
+os._exit = _os_exit_sending
+def _mark_prefix_len(data):
+    # How many bytes at the END of the data could be the START of the barrier: held back until the next
+    # read says whether they are, so a barrier split across two reads is still found and never streamed.
+    for _n in range(min(len(_MARK) - 1, len(data)), 0, -1):
+        if _MARK.startswith(data[-_n:]):
+            return _n
+    return 0
+_UFD = {1: _u1r, 2: _u2r}
+os.set_blocking(_u1r, False)
+os.set_blocking(_u2r, False)
+# poll(0) answers "is there anything to read" without the BlockingIOError an empty non-blocking read
+# raises: 0.19 us against 0.5, measured, and every print() asks it once.
+_POLL = {1: select.poll(), 2: select.poll()}
+_POLL[1].register(_u1r, select.POLLIN)
+_POLL[2].register(_u2r, select.POLLIN)
+_dec = {1: codecs.getincrementaldecoder("utf-8")("replace"), 2: codecs.getincrementaldecoder("utf-8")("replace")}
+_held = {1: b"", 2: b""}
+def _pull(key):
+    # Called with _ulock held: read everything the fd pipe holds right now and stream it. Every read of the
+    # pipe happens under the lock and is sent before the lock is released, which is what keeps fd output
+    # and print() in the order they were written. Returns False at EOF. At most 64 reads (4 MiB) a call:
+    # a child writing without pause (yes(1)) would otherwise hold the lock, and with it every print().
+    if not _POLL[key].poll(0):
+        return True
+    for _r in range(64):
+        try:
+            chunk = os.read(_UFD[key], 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        _flush_py(key)  # print() text queued before these bytes arrived was written before them
+        data = _held[key] + chunk
+        _i = data.find(_MARK)
+        if _i >= 0:
+            _emit(key, _dec[key].decode(data[:_i], final=True))  # all of the cell's bytes, THEN the barrier
+            data = data[_i + len(_MARK):]
+            _mevt[key].set()
+        _n = _mark_prefix_len(data)
+        _held[key] = data[len(data) - _n:] if _n else b""
+        _emit(key, _dec[key].decode(data[:len(data) - _n]))
+    return True
+def _drain(fd, key):
+    while True:
+        try:
+            select.select([fd], [], [])
+        except (OSError, ValueError):
+            break
+        with _ulock:
+            if not _pull(key):
+                break
+threading.Thread(target=_drain, args=(_u1r, 1), daemon=True).start()
+threading.Thread(target=_drain, args=(_u2r, 2), daemon=True).start()
 # Readiness. Popen returns when the FORK happens, not when kern has built the box and CPython has
 # booted inside it, so a pool that published a box on Popen alone would hand out boxes that are still
 # starting - and the caller would pay the remainder of that start on its own clock, which is the exact
@@ -1161,9 +1344,10 @@ while True:
         break
     _out.clear()
     with _ulock:
-        _m1, _m2 = len(_ubuf[1]), len(_ubuf[2])
         _tcut[0] = False  # a cut belongs to the cell it happens in, so clear it at the cell boundary
-    _so, _se = io.StringIO(), io.StringIO()
+        _sent[1] = _sent[2] = 0
+        _live[0] = True
+    _so, _se = _Stream(1), _Stream(2)
     _rc = 0
     _oo, _oe, _oi = sys.stdout, sys.stderr, sys.stdin
     sys.stdout, sys.stderr = _so, _se
@@ -1205,9 +1389,13 @@ while True:
                 _out.append({"image/png": base64.b64encode(_b.getvalue()).decode()})
     except Exception:
         pass
-    # Barrier: write the sentinel to fd 1/2 and wait until the drainers have consumed up to it, so this
-    # cell's raw/subprocess output is FULLY captured (not racily missed) before we snapshot. The captured
-    # raw bytes are appended AFTER the precise in-order print() capture from the redirected sys.stdout.
+    # Barrier: write the sentinel to fd 1/2 and read up to it, so this cell's raw/subprocess output is
+    # FULLY captured (not racily missed) before the reply. It is read HERE, by this thread, right after
+    # it is written: waiting for a drain thread to wake from select() for it doubled the cost of an empty
+    # cell (0.04 -> 0.16 ms, measured).
+    with _ulock:
+        _flush_py(1)
+        _flush_py(2)
     _mevt[1].clear()
     _mevt[2].clear()
     try:
@@ -1215,23 +1403,17 @@ while True:
         os.write(2, _MARK)
     except OSError:
         pass
+    with _ulock:
+        _pull(1)
+        _pull(2)
     _mevt[1].wait(2.0)
     _mevt[2].wait(2.0)
     with _ulock:
-        _r1 = bytes(_ubuf[1][_m1:])
-        _r2 = bytes(_ubuf[2][_m2:])
+        _live[0] = False
         _tr = _tcut[0]
-    # sys.stdout is a StringIO, so _CAP (which bounds only the raw-fd drain) never bounded a cell that
-    # printed through it: printing a gigabyte built the whole string into the reply. Cut BOTH streams at
-    # the same cap and say so, which is what the cold path's capped reader does.
-    _o1 = _so.getvalue() + _r1.decode("utf-8", "replace")
-    _o2 = _se.getvalue() + _r2.decode("utf-8", "replace")
-    if len(_o1) > _CAP:
-        _o1 = _o1[:_CAP]
-        _tr = True
-    if len(_o2) > _CAP:
-        _o2 = _o2[:_CAP]
-        _tr = True
+    # Both streams went out as frames while the cell ran, each cut at _CAP by _emit, so a cell that
+    # prints a gigabyte through sys.stdout streams _CAP characters and says so.
+    _o1 = _o2 = ""
     # Results are bounded bundle by bundle rather than by serializing the whole list and measuring it: a
     # single json.dumps of an oversized list would build the entire payload in the box before anything
     # could reject it. A bundle that alone exceeds the budget is dropped, not truncated mid-JSON.
@@ -1748,15 +1930,13 @@ class ExecutionResult:
 
     stdout: str
     stderr: str
-    #: The box process's exit status, or ``-1`` when NO PROCESS EXIT APPLIES. The sentinel is not an
-    #: error code and must not be compared against one. It is what a resident kernel returns, because
-    #: a cell that times out there does not end a process: the deadline belongs to the CELL, the
-    #: interpreter survives it, and the next cell runs in the same box with its state intact. The
-    #: one-shot path reports ``137`` for the same fault because there the binding does SIGKILL the box,
-    #: so ``128 + 9`` is a true statement about a process that really died. MEASURED, both on
-    #: python:3.10-alpine with ``timeout_s=3``: kernel ``fault=timeout, exit_code=-1``; one-shot
-    #: ``fault=timeout, exit_code=137``. The numbers differ because the events differ, and forging
-    #: ``137`` for the kernel would report a kill that never happened.
+    #: The box process's exit status, or ``-1`` when no exit status is known (a resident kernel that died
+    #: under a kern too old to say which signal ended it). The sentinel is not an error code and must
+    #: not be compared against one. A box the BINDING kills reports ``137`` on every path, one-shot,
+    #: prewarmed and resident kernel alike, because ``128 + 9`` is what happened to it. The kernel used to
+    #: report ``-1`` for a timeout, on the stated ground that its interpreter survives the deadline:
+    #: MEASURED, it does not. The timeout tears the kernel down and the next call answers "kernel is
+    #: dead: a prior cell ended it (timeout)", so the -1 described an event that never took place.
     #: ⛔ Branch on :attr:`fault`, never on this field: ``fault`` carries the same verdict in both modes.
     #: A caller that tested ``exit_code == 137`` has already been caught missing a timeout once (see the
     #: note on the Node binding's 137 in ``_spawn``).
@@ -1975,6 +2155,25 @@ class _CappedReader(threading.Thread):
 # program and a handful in the test suite.
 _VERIFIED_KERN: "dict[tuple, str]" = {}  # identity -> the version line it answered with
 _VERIFIED_KERN_LOCK = threading.Lock()
+
+
+def _kern_release(version: str) -> "tuple[int, int, int] | None":
+    """The ``X.Y.Z`` in what ``kern --version`` printed (``kern 0.30.1``, ``v0.30.1-23-g52496f0``), or
+    ``None`` when there is none to read."""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", version or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _kern_exec_reports_its_start(version: str) -> bool:
+    """Whether this kern's `kern exec` writes the KERN_STARTED_FD bytes ONLY for a command that ran.
+
+    v0.30.1 began writing them on every exit, refusals included: MEASURED from an ssh session, a
+    `kern exec` that refused to enter the box (exit 126, nothing ran) wrote `[1, 0, 0, 0]`, the bytes of
+    a command that started and exited. The refusal happens in the forked child, and the parent cannot
+    tell it from a command that exited 126. v0.30.2 tells the parent and writes nothing, and only from
+    there does a missing byte prove that the call never started."""
+    rel = _kern_release(version)
+    return rel is not None and rel >= (0, 30, 2)
 
 
 def _verify_is_kern(path: str) -> str:
@@ -3340,6 +3539,10 @@ class Sandbox:
                     "posture, and a temporary workspace is a different path in every process, so "
                     "nothing would ever be resumed. Sandbox(name=..., persist=True, workspace='...')"
                 )
+        # THE IMAGE BEFORE ANY BOX: the setup box, the resident box, the bytecode build and the warm pool
+        # all start one, and each used to pull inside its own deadline. After the refusals above, so a
+        # wrong configuration is not reported only after a download.
+        _fetch_image(self._kern, self.image)
         if self.setup:
             # A setup that fails raises out of `__enter__`, so the `with` body is never entered and
             # `__exit__` never runs: the workspace this method just created would outlive the session
@@ -3997,6 +4200,27 @@ class Sandbox:
         # 125 (that has no kern marker -> fault is None -> a normal result). An older kern that exits 127
         # keeps the old behavior (returned as a data fault, not raised). Runtime events where the code DID
         # run (timeout, OOM-kill, blocked escape) stay as DATA on `.fault`, unchanged.
+        # A RESIDENT CALL THAT NEVER RAN. `kern exec` refuses BEFORE entering the box when it cannot put
+        # the command under the box's caps - MEASURED from an ssh session, whose `session-N.scope` belongs
+        # to root: exit 126, kern's explanation on stderr, and this came back `fault=None`, so an agent
+        # read "your code exited 126" instead of "the sandbox refused". From v0.30.2 `kern exec` writes the
+        # started bytes only for a command that ran (see `_kern_exec_reports_its_start`), so no bytes and
+        # a non-zero exit is a call that never started. With an older kern this cannot be told from the
+        # code's own exit 126 without trusting stderr, which the code writes too, so it is left alone.
+        # A box that is GONE is excluded: it has its own repair just below.
+        if (
+            self._resident is not None
+            and fault is None
+            and not box_started
+            and rc != 0
+            and _RESIDENT_GONE not in stderr
+            and _kern_exec_reports_its_start(self._kern_version)
+        ):
+            fault = SandboxFault(
+                "startup_failed",
+                "the call never ran: `kern exec` refused to enter the resident box, so the code did not "
+                f"start. kern said: {stderr.strip()[:1200] or f'exit {rc}, nothing on stderr'}",
+            )
         if rc == 125 and fault is not None and fault.type == "startup_failed":
             raise SandboxError(fault.message or "the box failed to start")
         # THE RESIDENT BOX IS GONE: recreate it once and run the call again, so a sandbox does not
@@ -4811,6 +5035,87 @@ class Sandbox:
 # the HOST (the box's own memory cap bounds what it BUILDS, not what the host ACCEPTS). run_code maps this
 # to a fault and tears the kernel down. Mirrors the one-shot path's _RESULTS_MAX guard.
 _KERNEL_OVERSIZE: object = object()
+# Sentinel: the cell's deadline passed before the frame that ends it arrived.
+_CELL_TIMEOUT: object = object()
+# What a box that the BINDING kills reports as its exit status: SIGKILL, in the shell's 128 + signal
+# convention the one-shot path already speaks. A resident kernel used to report -1 for a timeout, on the
+# stated ground that its interpreter survives the deadline. MEASURED, it does not: the timeout tears the
+# box down and the next call answers "kernel is dead: a prior cell ended it (timeout)". The box died the
+# way a one-shot box does, so it says what a one-shot box says.
+_KILLED_BY_BINDING_RC = 128 + 9
+
+
+def _reply_frame_cap(out_cap: int) -> int:
+    """The largest frame the host accepts from a driver: both streams, the results, and room for JSON.
+    Streamed output frames are far smaller; this bounds the reply that ends a cell."""
+    return 2 * int(out_cap) + _RESULTS_MAX + 65536
+
+
+class _CellOutput:
+    """The output a driver streamed for ONE cell, kept up to ``cap`` characters per stream.
+
+    The frames are written inside the box, so their count and size are the workload's choice: past the cap
+    nothing more is stored, the cut is recorded, and the frames are still read so the pipe never fills."""
+
+    __slots__ = ("_cap", "_parts", "_n", "truncated")
+
+    def __init__(self, cap: int) -> None:
+        self._cap = max(0, int(cap))
+        self._parts: "dict[str, list[str]]" = {"o": [], "e": []}
+        self._n = {"o": 0, "e": 0}
+        self.truncated = False
+
+    def add(self, obj: dict) -> None:
+        for key in ("o", "e"):
+            if key not in obj:
+                continue
+            text = obj[key] if isinstance(obj[key], str) else str(obj[key])
+            room = self._cap - self._n[key]
+            if len(text) > room:
+                text = text[: max(room, 0)]
+                self.truncated = True
+            if text:
+                self._parts[key].append(text)
+                self._n[key] += len(text)
+
+    @property
+    def stdout(self) -> str:
+        return "".join(self._parts["o"])
+
+    @property
+    def stderr(self) -> str:
+        return "".join(self._parts["e"])
+
+
+# How a driver writes an output frame: `json.dumps({"o": ...})`. Matched on the prefix so the frame that
+# ENDS a cell, which can carry a large figure, is decoded once and not twice.
+_STREAM_FRAME_PREFIXES = (b'{"o": ', b'{"e": ')
+
+
+def _next_reply(q: "queue.Queue", deadline_at: float, out: _CellOutput) -> object:
+    """Wait for the frame that ends a cell, folding every output frame before it into ``out``.
+
+    Returns the reply's bytes, ``None`` (the box died), ``_KERNEL_OVERSIZE`` or ``_CELL_TIMEOUT``. Output
+    that arrived before a death or a timeout stays in ``out``: that is the point of streaming it."""
+    while True:
+        left = deadline_at - time.monotonic()
+        if left <= 0:
+            return _CELL_TIMEOUT
+        try:
+            frame = q.get(timeout=left)
+        except queue.Empty:
+            return _CELL_TIMEOUT
+        if not isinstance(frame, bytes):
+            return frame
+        if frame.startswith(_STREAM_FRAME_PREFIXES):
+            try:
+                obj = json.loads(frame.decode("utf-8", "replace"))
+            except Exception:
+                return frame
+            if isinstance(obj, dict) and len(obj) == 1:
+                out.add(obj)
+                continue
+        return frame
 
 
 class _FrameReader(threading.Thread):
@@ -4904,10 +5209,12 @@ class Kernel:
         sbx._require_entered()
         uid = uuid.uuid4().hex[:8]
         self._driver = sbx._claim(f".kernel-{uid}.py")
-        # The historical constants, restated at the one call site that must not change: 64 MiB of raw
-        # drain and no results budget (the host's frame cap stays the only bound). A persistent Kernel
-        # is a REPL, not a replacement for `run_code`, so it keeps the contract it shipped with.
-        sbx.write_file(self._driver, _kernel_driver(_KERNEL_DRAIN_CAP, 0))
+        # The caller's output budget, the one the prewarmed box gets, and no results budget (the frame
+        # cap bounds a reply). The output budget used to be a fixed 64 MiB while the host refused any
+        # reply over `max_output_bytes`, so under kern-mcp (1 MiB) a cell printing 100 MB was not cut:
+        # it KILLED the kernel and its in-memory state with it. Output is streamed now and cut at the
+        # same budget on both sides.
+        sbx.write_file(self._driver, _kernel_driver(sbx.max_output_bytes, 0))
         self._name = _unique_name()
         argv = sbx._base_argv(self._name, network=sbx.network, timeout_s=self._BACKSTOP_S) + [
             "--",
@@ -4934,7 +5241,7 @@ class Kernel:
         finally:
             os.close(started_w)  # the parent never writes; the box holds the only write end now
         self._started_r = started_r
-        _FrameReader(self._proc.stdout, self._q, sbx.max_output_bytes).start()
+        _FrameReader(self._proc.stdout, self._q, _reply_frame_cap(sbx.max_output_bytes)).start()
         # Drain stderr so the box never blocks on a full stderr pipe; the control protocol is on stdout,
         # so stderr only carries kern setup errors / stray driver noise.
         self._err = _CappedReader(self._proc.stderr, sbx.max_output_bytes)
@@ -4959,29 +5266,60 @@ class Kernel:
         eff = self._sbx._eff_timeout(timeout_s) if timeout_s is not None else self._timeout
         started = time.monotonic()
         payload = code.encode("utf-8")
+        out = _CellOutput(self._sbx.max_output_bytes)
         try:
             self._proc.stdin.write(str(len(payload)).encode() + b"\n")
             self._proc.stdin.write(payload)
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
-            err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            wrote, cap_sig, oom_sig, wl_sig = self._read_cap_signal()
-            fault, default, rc = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig, wrote)
-            return self._teardown_result(fault, err.strip() or default, started, rc)
-        try:
-            reply = self._q.get(timeout=eff)
-        except queue.Empty:
-            return self._teardown_result("timeout", f"cell exceeded {eff}s", started)
+            return self._death_result(started, out)
+        reply = _next_reply(self._q, started + eff, out)
+        if reply is _CELL_TIMEOUT:
+            return self._teardown_result(
+                "timeout", f"cell exceeded {eff}s", started, _KILLED_BY_BINDING_RC, out
+            )
         if reply is _KERNEL_OVERSIZE:
             return self._teardown_result(
-                "killed", f"the kernel reply exceeded the {self._sbx.max_output_bytes}-byte cap", started
+                "killed",
+                f"the kernel sent a frame larger than the {_reply_frame_cap(self._sbx.max_output_bytes)}"
+                "-byte cap",
+                started, _KILLED_BY_BINDING_RC, out,
             )
         if reply is None:
-            err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
-            wrote, cap_sig, oom_sig, wl_sig = self._read_cap_signal()
-            fault, default, rc = self._kernel_death_fault(err, cap_sig, oom_sig, wl_sig, wrote)
-            return self._teardown_result(fault, err.strip() or default, started, rc)
-        return self._result_from_reply(reply, started)
+            return self._death_result(started, out)
+        return self._result_from_reply(reply, started, out)
+
+    def _death_result(self, started: float, out: "_CellOutput") -> ExecutionResult:
+        """The box went away mid-cell: classify why from what kern wrote, keeping what the cell printed."""
+        err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
+        wrote, cap_sig, oom_sig, wl_sig = self._read_cap_signal()
+        fault, default, rc = self._kernel_death_fault(
+            err, cap_sig, oom_sig, wl_sig, wrote, exit_status=self._exit_status()
+        )
+        if fault is None and wl_sig == 0:
+            # The cell ended the interpreter itself (`os._exit(N)`): its exit code, its own output, and
+            # no sentence from us in its stderr.
+            return self._teardown_result(
+                None, "", started, rc, out, death=f"the cell ended the interpreter with exit status {rc}"
+            )
+        return self._teardown_result(fault, err.strip() or default, started, rc, out)
+
+    def _exit_status(self) -> "int | None":
+        """The box process's own exit code once it has gone, or ``None`` while it is still there."""
+        p = self._proc
+        if p is None:
+            return None
+        try:
+            rc = p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            return None
+        return rc if isinstance(rc, int) and rc >= 0 else None
+
+    @property
+    def ended(self) -> bool:
+        """True once this kernel's interpreter is gone, whatever ended it: a fault, a cell that exited
+        the interpreter, or ``__exit__``. Its in-memory state went with it."""
+        return self._dead
 
     def _read_cap_signal(self) -> "tuple[bool, int, int | None, int | None]":
         """kern's teardown bytes for the resident box, read ONCE on kernel death. See
@@ -4993,6 +5331,7 @@ class Kernel:
     def _kernel_death_fault(
         self, err: str, cap_signal: int = 0, oom_signal: "int | None" = None,
         workload_signal: "int | None" = None, kern_wrote_payload: bool = False,
+        exit_status: "int | None" = None,
     ) -> "tuple[str | None, str, int]":
         """Why the resident kernel box died mid-cell, as ``(fault type or None, message, exit code)``.
 
@@ -5097,6 +5436,12 @@ class Kernel:
         # presence of a cap. Same discipline the SIGSYS test above already follows, and for the same
         # stated reason: name the cause that can be named before reaching for the vague ones.
         if workload_signal == 0:
+            if exit_status is not None:
+                # NO SIGNAL AND A REAL EXIT STATUS: the cell ended the interpreter itself, `os._exit(N)`
+                # being the ordinary way (a `sys.exit` is caught by the driver and never gets here). That is
+                # the code's own exit, which the one-shot path reports as `exit_code=N` and no fault; this
+                # path called it `killed`, so the same cell was an exit cold and a kill here.
+                return None, "", exit_status
             return (
                 "killed",
                 "the kernel box exited on its own (no signal killed it), so its interpreter is gone: a "
@@ -5133,7 +5478,9 @@ class Kernel:
         # memory-cap inference that used to shadow it.
         return "killed", "the kernel box exited", rc
 
-    def _result_from_reply(self, reply: bytes, started: float) -> ExecutionResult:
+    def _result_from_reply(
+        self, reply: bytes, started: float, out: "_CellOutput | None" = None
+    ) -> ExecutionResult:
         """Turn one kernel reply into an :class:`ExecutionResult`.
 
         Extracted so the UNTRUSTED-INPUT boundary is one named place that can be driven directly by a
@@ -5145,9 +5492,9 @@ class Kernel:
         try:
             obj = json.loads(reply.decode("utf-8", "replace"))
         except Exception:
-            return self._teardown_result("killed", "the kernel sent a malformed reply", started)
+            return self._teardown_result("killed", "the kernel sent a malformed reply", started, _KILLED_BY_BINDING_RC, out)
         if not isinstance(obj, dict):
-            return self._teardown_result("killed", "the kernel sent a non-object reply", started)
+            return self._teardown_result("killed", "the kernel sent a non-object reply", started, _KILLED_BY_BINDING_RC, out)
         # `rc` is the ONE field whose absence cannot be defaulted. `success` is
         # `exit_code == 0 and fault is None`, so coercing a missing or non-integer `rc` to 0 - which is
         # what this did - reported a SUCCESSFUL run. Since the JSON comes from the box, a cell could
@@ -5160,28 +5507,35 @@ class Kernel:
         rc = obj.get("rc")
         if isinstance(rc, bool) or not isinstance(rc, int):
             return self._teardown_result(
-                "killed", "the kernel reply carried no usable exit code", started
+                "killed", "the kernel reply carried no usable exit code", started, _KILLED_BY_BINDING_RC, out
             )
         # The REMAINING fields are informational, so a wrong type degrades to an empty value rather
         # than failing the call: coerced so a caller doing `r.stdout.strip()` cannot be crashed by a
         # box that sent a number.
         results = [Result(data=d) for d in obj.get("results", []) if isinstance(d, dict)]
+        streamed_o = out.stdout if out is not None else ""
+        streamed_e = out.stderr if out is not None else ""
         return ExecutionResult(
-            stdout=str(obj.get("stdout", "")),
-            stderr=str(obj.get("stderr", "")),
+            stdout=streamed_o + str(obj.get("stdout", "")),
+            stderr=streamed_e + str(obj.get("stderr", "")),
             exit_code=rc,
             duration_ms=dur,
             fault=None,
             files=[],
-            truncated=False,
+            # The driver's own cut and the host's: a cell over its budget is told so, as on the cold path.
+            truncated=bool(obj.get("trunc") is True) or (out is not None and out.truncated),
             results=results,
         )
 
     def _teardown_result(
-        self, kind: "str | None", msg: str, started: float, exit_code: int = -1
+        self, kind: "str | None", msg: str, started: float, exit_code: int = -1,
+        out: "_CellOutput | None" = None, death: "str | None" = None,
     ) -> ExecutionResult:
-        self._death = kind if kind is not None else "the code crashed"
+        self._death = death or (kind if kind is not None else "the code crashed")
         self._kill()
+        streamed_o = out.stdout if out is not None else ""
+        streamed_e = out.stderr if out is not None else ""
+        cut = out is not None and out.truncated
         # Same rule as the one-shot path: a box that never STARTED (the kernel failed to boot) raises,
         # it does not return a hollow result. timeout/killed stay as data.
         if kind == "startup_failed":
@@ -5191,24 +5545,28 @@ class Kernel:
         # on stderr, because "your cell segfaulted and took the kernel with it" is worth saying even
         # though it is not a fault.
         if kind is None:
+            sep = "\n" if streamed_e and msg and not streamed_e.endswith("\n") else ""
             return ExecutionResult(
-                stdout="",
-                stderr=msg,
+                stdout=streamed_o,
+                stderr=streamed_e + sep + msg,
                 exit_code=exit_code,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 fault=None,
                 files=[],
-                truncated=False,
+                truncated=cut,
                 results=[],
             )
+        # WHAT THE CELL PRINTED BEFORE IT DIED, which is the one thing a caller needs to know where it got
+        # to. It used to be "" on every fault here, because the output travelled in the reply that a
+        # killed cell never sends.
         return ExecutionResult(
-            stdout="",
-            stderr="",
+            stdout=streamed_o,
+            stderr=streamed_e,
             exit_code=exit_code,
             duration_ms=int((time.monotonic() - started) * 1000),
             fault=SandboxFault(type=kind, message=msg),  # type: ignore[arg-type]
             files=[],
-            truncated=False,
+            truncated=cut,
             results=[],
         )
 
@@ -5450,21 +5808,23 @@ class _WarmBox:
             raise SandboxError("prewarmed box was never started")
         started = time.monotonic()
         payload = code.encode("utf-8")
+        out = _CellOutput(self._sbx.max_output_bytes)
         try:
             proc.stdin.write(str(len(payload)).encode() + b"\n")
             proc.stdin.write(payload)
             proc.stdin.flush()
-            reply: object = self._q.get(timeout=deadline)
         except (BrokenPipeError, OSError):
-            return self._fault_result("died", started, before)
-        except queue.Empty:
-            return self._fault_result("timeout", started, before, f"code exceeded {deadline}s")
+            return self._fault_result("died", started, before, out=out)
+        reply = _next_reply(self._q, started + deadline, out)
+        if reply is _CELL_TIMEOUT:
+            return self._fault_result("timeout", started, before, f"code exceeded {deadline}s", out=out)
         # Every branch below that rejects the reply produces the same shape, so it is written once. The
         # repetition was five copies of an eight-line call differing only in a string, which is the
         # form where one copy quietly drifts from the others.
         def rejected(message: str, *, truncated: bool = False) -> ExecutionResult:
             return self._result(
-                "", "", self._exit_code(), started, before, truncated=truncated,
+                out.stdout, out.stderr, self._exit_code(), started, before,
+                truncated=truncated or out.truncated,
                 fault=SandboxFault(type="killed", message=message),
             )
 
@@ -5476,7 +5836,7 @@ class _WarmBox:
                 truncated=True,
             )
         if reply is None:
-            return self._fault_result("died", started, before)
+            return self._fault_result("died", started, before, out=out)
         self.retire()
         try:
             obj = json.loads(bytes(reply).decode("utf-8", "replace"))  # type: ignore[arg-type]
@@ -5491,12 +5851,12 @@ class _WarmBox:
             return rejected("the box reply carried no usable exit code")
         results = [Result(data=d) for d in obj.get("results", []) if isinstance(d, dict)]
         return self._result(
-            str(obj.get("stdout", "")),
-            str(obj.get("stderr", "")),
+            out.stdout + str(obj.get("stdout", "")),
+            out.stderr + str(obj.get("stderr", "")),
             rc,
             started,
             before,
-            truncated=bool(obj.get("trunc", False)),
+            truncated=bool(obj.get("trunc", False)) or out.truncated,
             results=results,
         )
 
@@ -5506,18 +5866,22 @@ class _WarmBox:
         started: float,
         before: "dict[str, tuple[int, int]] | None",
         msg: str = "",
+        *,
+        out: "_CellOutput | None" = None,
     ) -> ExecutionResult:
         """A box that died or overran. The stderr text and kern's unforgeable cap byte are read BEFORE the
         kill, then classified exactly as the persistent kernel's death path does, so a prewarmed OOM is
-        reported as ``oom`` and not as a bare ``killed``."""
+        reported as ``oom`` and not as a bare ``killed``. What the cell streamed before it went is kept:
+        the cold path returns it too, and a fast path that dropped it would be a different contract."""
+        out = out if out is not None else _CellOutput(0)
         err = bytes(self._err.buf).decode("utf-8", "replace") if self._err else ""
         if kind == "timeout":
             self.retire()
             return self._result(
-                "", "", self._exit_code(), started, before,
+                out.stdout, out.stderr, self._exit_code(), started, before, truncated=out.truncated,
                 fault=SandboxFault(type="timeout", message=msg or "the code exceeded its deadline"),
             )
-        kern_wrote, cap_signal, oom_signal = self._read_cap_signal()
+        kern_wrote, cap_signal, oom_signal, workload_signal = self._read_cap_signal()
         self.retire()
         # Same order, and for the same measured reason, as `_kernel_death_fault`: kern's OOM sentence
         # carries the `kern:` prefix that `_looks_like_startup_failure` matches on, so asking about the
@@ -5530,6 +5894,14 @@ class _WarmBox:
             # box that existed, so with it set this RAISE would be a cell's own line deciding that the
             # box never came up.
             raise SandboxError(err.strip() or "the box failed to start")
+        elif kern_wrote and workload_signal == 0:
+            # NO SIGNAL: the cell ended the interpreter itself (`os._exit(N)`). The cold path reports that
+            # as `exit_code=N` and no fault, and this path said `killed`, so one cell was two outcomes
+            # depending on which box served it. MEASURED both ways before this branch: exit 0 cold,
+            # `killed` warm.
+            return self._result(
+                out.stdout, out.stderr, self._exit_code(), started, before, truncated=out.truncated
+            )
         elif cap_signal == 2:
             fault, default = (
                 "killed",
@@ -5546,16 +5918,15 @@ class _WarmBox:
         else:
             fault, default = "killed", "the box exited before the code finished"
         return self._result(
-            "", "", self._exit_code(), started, before,
+            out.stdout, out.stderr, self._exit_code(), started, before, truncated=out.truncated,
             fault=SandboxFault(type=fault, message=err.strip() or default),  # type: ignore[arg-type]
         )
 
-    def _read_cap_signal(self) -> "tuple[bool, int, int | None]":
-        """kern's cap-enforcement and OOM-outcome bytes, read once on death. The pool has no use for the
-        workload's signal (it classifies from the box's own exit code through `_classify`), but the read
-        itself is shared: see :func:`_read_teardown_bytes` for why there is exactly one."""
-        wrote, cap, oom, _ = _read_teardown_bytes(self._started_r)
-        return wrote, cap, oom
+    def _read_cap_signal(self) -> "tuple[bool, int, int | None, int | None]":
+        """kern's teardown bytes, read once on death: whether it wrote them, cap enforcement, the OOM
+        outcome and the workload's signal (0 = it exited on its own). The read is shared: see
+        :func:`_read_teardown_bytes` for why there is exactly one."""
+        return _read_teardown_bytes(self._started_r)
 
     def _result(
         self,

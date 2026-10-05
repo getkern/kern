@@ -42,7 +42,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.2.44";
+const VERSION = "0.2.45";
 
 const DEFAULT_IMAGE = "python:3.12-slim";
 // WHAT THE DEFAULT IMAGE CONTAINS, as a fact ABOUT THE IMAGE and not about its name. It drives the
@@ -391,6 +391,55 @@ function sanitizeRef(image) {
   const ref = ociSplitTag(image) ? image : `${image}:latest`;
   const out = [...ref].map((c) => (/[A-Za-z0-9_-]/.test(c) ? c : "_")).join("");
   return `${out}-${fnv1a(ref)}`;
+}
+
+/** THE IMAGE IS FETCHED BEFORE THE FIRST BOX, ON ITS OWN BUDGET. Without this the first box of a
+ * session pulled it inside that call's deadline: measured on a Jetson with the 145 MB MCP image, the
+ * first cell of a fresh cache answered `startup_failed` at the 30 s default, the second finished the
+ * download in 18 s and only the third ran the cell. A deadline is for the CODE. 900 s is the most a
+ * download may take (145 MB at 160 KB/s); a refused connection fails in 10 ms, measured. Mirrors
+ * `_IMAGE_FETCH_BUDGET_S`. */
+const IMAGE_FETCH_BUDGET_S = 900;
+/** One download per image at a time in this process; a second caller waits for it, then looks again. */
+const IMAGE_FETCHES = new Map();
+
+/** True when kern has finished storing `image`: its `.ok` sentinel, which kern writes LAST. A local
+ * stat; "cannot tell" reads as not cached, which costs one `kern pull` that finds the image (2 ms). */
+function imageIsCached(image) {
+  try {
+    return fs.existsSync(path.join(cacheHome(), "kern", "images", `${sanitizeRef(image)}.ok`));
+  } catch {
+    return false;
+  }
+}
+
+/** Make sure kern has `image` before any box needs it. Best effort, never rejects: a pull that FAILS
+ * changes nothing, because the box that follows pulls again and reports the failure in its own words.
+ * Asynchronous, so a download does not hold the event loop. Mirrors `_fetch_image`. */
+function fetchImage(kernBin, image, budgetS = IMAGE_FETCH_BUDGET_S) {
+  if (imageIsCached(image)) return Promise.resolve();
+  const running = IMAGE_FETCHES.get(image);
+  if (running) return running.then(() => fetchImage(kernBin, image, budgetS));
+  const p = new Promise((resolve) => {
+    let child;
+    try {
+      // All three streams closed: a failure here is reported by the box that follows.
+      child = spawn(kernBin, ["pull", image], { stdio: "ignore" });
+    } catch {
+      resolve();
+      return;
+    }
+    const killer = setTimeout(() => child.kill("SIGKILL"), budgetS * 1000);
+    if (typeof killer.unref === "function") killer.unref();
+    const done = () => {
+      clearTimeout(killer);
+      resolve();
+    };
+    child.on("error", done);
+    child.on("close", done);
+  }).finally(() => IMAGE_FETCHES.delete(image));
+  IMAGE_FETCHES.set(image, p);
+  return p;
 }
 
 /** The file, inside a published cache, naming the image kern had when the cache was built. */
@@ -938,7 +987,7 @@ sys.exit(_rc)
 // {stdout, stderr, rc, results}. User prints go to a buffer, so the control channel stays clean. String.raw
 // keeps the single `\n` byte-literal intact (the driver has no backtick or ${...}). Byte-identical to the
 // Python binding's _PY_KERNEL_DRIVER so both bindings behave the same.
-const PY_KERNEL_DRIVER = String.raw`import sys, io, json, base64, builtins, ast, os, threading
+const PY_KERNEL_DRIVER = String.raw`import sys, io, json, base64, builtins, ast, os, threading, codecs, select, time
 _g = {"__name__": "__main__"}
 _out = []
 def _bundle(o):
@@ -1009,31 +1058,10 @@ _CAP = __KERN_OUTCAP__
 _RESCAP = __KERN_RESCAP__
 _MARK = b"\x00\x01KRNCELLDONE\x01\x00"  # per-cell barrier sentinel written to user fd 1/2 after exec
 _ulock = threading.Lock()
-_ubuf = {1: bytearray(), 2: bytearray()}
 _mevt = {1: threading.Event(), 2: threading.Event()}
-# Set by the drain threads when they cut a buffer at _CAP, read+reset by the cell loop under _ulock. A
-# list (not a bare name) because the drainers rebind nothing: they mutate this one shared cell.
+# Set when this cell's output is cut at _CAP, read+reset by the cell loop under _ulock. A list (not a
+# bare name) because the writers rebind nothing: they mutate this one shared cell.
 _tcut = [False]
-def _drain(fd, key):
-    while True:
-        try:
-            chunk = os.read(fd, 65536)
-        except OSError:
-            break
-        if not chunk:
-            break
-        with _ulock:
-            _b = _ubuf[key]
-            _b += chunk
-            _i = _b.find(_MARK)
-            if _i >= 0:
-                del _b[_i:_i + len(_MARK)]  # strip the barrier sentinel; signal the cell it is drained
-                _mevt[key].set()
-            if len(_b) > _CAP:
-                del _b[_CAP:]
-                _tcut[0] = True
-threading.Thread(target=_drain, args=(_u1r, 1), daemon=True).start()
-threading.Thread(target=_drain, args=(_u2r, 2), daemon=True).start()
 _MAIN_PID = os.getpid()  # a cell that raw os.fork()s copies this whole process; the child must NOT re-enter
 _rin = os.fdopen(_ctrl_in, "rb")
 def _read():
@@ -1048,11 +1076,167 @@ def _read():
             return None
         buf += chunk
     return buf.decode("utf-8")
+_wlock = threading.Lock()
 def _write(obj):
     b = json.dumps(obj).encode("utf-8")
     _data = memoryview(str(len(b)).encode() + b"\n" + b)
-    while _data:
-        _data = _data[os.write(_ctrl_out, _data):]
+    with _wlock:
+        while _data:
+            _data = _data[os.write(_ctrl_out, _data):]
+# OUTPUT IS STREAMED, one frame per write, while the cell runs. It used to be collected here and sent in
+# the cell's reply, so a cell the sandbox KILLED (an OOM, a timeout) took everything it had printed with
+# it: no reply, so no output, and the caller could not tell "printed nothing" from "printed, then died".
+# {"o": text} is stdout and {"e": text} stderr; the reply that ends the cell carries the rest. A
+# frame holds at most _CHUNK characters, so no single frame nears the host's cap however much is printed.
+_KEY = {1: "o", 2: "e"}
+_CHUNK = 8192
+_sent = {1: 0, 2: 0}  # characters streamed in the current cell, per stream, bounded by _CAP
+_live = [False]  # True while a cell runs: output between cells belongs to no cell and is dropped
+def _emit(key, text):
+    # Called with _ulock held.
+    if not text or not _live[0]:
+        return
+    room = _CAP - _sent[key]
+    if len(text) > room:
+        text = text[:max(room, 0)]
+        _tcut[0] = True
+    if not text:
+        return
+    _sent[key] += len(text)
+    for _p in range(0, len(text), _CHUNK):
+        _write({_KEY[key]: text[_p:_p + _CHUNK]})
+# A print() is queued and sent within _FLUSH_S by one thread, woken once per burst; flush(), os._exit()
+# and the end of the cell send what is queued at once. So what a SIGKILLed cell loses is at most its last
+# millisecond of output, where it used to lose all of it. One frame per write made 10 000 prints cost
+# 58 ms against 1.8 ms when they were only collected (and 9.8 ms on the one-shot path).
+_FLUSH_S = 0.001
+_armed = [False]  # the flusher is already due: a burst wakes it once, not once per write
+_pend = {1: [], 2: []}
+_pend_n = {1: 0, 2: 0}
+_flush_cv = threading.Condition(_ulock)
+def _flush_py(key):
+    # Called with _ulock held.
+    if _pend[key]:
+        _t = "".join(_pend[key])
+        _pend[key].clear()
+        _pend_n[key] = 0
+        _emit(key, _t)
+class _Stream(io.TextIOBase):
+    # The cell's sys.stdout / sys.stderr. ORDER with fd output (a subprocess, C code) is kept by reading,
+    # under the same lock, whatever already sits in the fd pipe before this text is queued: what was
+    # written first goes out first. A forked child writes to the fd instead, which the parent drains: a
+    # frame from the child would interleave with the parent's.
+    def __init__(self, key):
+        self._key = key
+    def writable(self):
+        return True
+    @property
+    def encoding(self):
+        return "utf-8"
+    def write(self, s):
+        if not isinstance(s, str):
+            raise TypeError("write() argument must be str, not " + type(s).__name__)
+        if os.getpid() != _MAIN_PID:
+            _b = memoryview(s.encode("utf-8", "replace"))
+            while _b:
+                _b = _b[os.write(self._key, _b):]
+            return len(s)
+        with _ulock:
+            _pull(self._key)
+            _pend[self._key].append(s)
+            _pend_n[self._key] += len(s)
+            if _pend_n[self._key] >= _CHUNK:
+                _flush_py(self._key)
+            elif not _armed[0]:
+                _armed[0] = True
+                _flush_cv.notify()
+        return len(s)
+    def flush(self):
+        if os.getpid() == _MAIN_PID:
+            with _ulock:
+                _pull(self._key)
+                _flush_py(self._key)
+def _flusher():
+    while True:
+        with _ulock:
+            while not _armed[0]:
+                _flush_cv.wait()
+        time.sleep(_FLUSH_S)
+        with _ulock:
+            _armed[0] = False
+            _flush_py(1)
+            _flush_py(2)
+threading.Thread(target=_flusher, daemon=True).start()
+_real_os_exit = os._exit
+def _os_exit_sending(n):
+    # os._exit ends the process without any of Python's cleanup, so what is queued goes out first. A
+    # forked child has nothing queued here (it writes to the fd), and a lock held elsewhere is waited for
+    # briefly, never forever: an exit must not hang.
+    if os.getpid() == _MAIN_PID and _ulock.acquire(timeout=0.5):
+        try:
+            _pull(1)
+            _pull(2)
+            _flush_py(1)
+            _flush_py(2)
+        finally:
+            _ulock.release()
+    _real_os_exit(n)
+os._exit = _os_exit_sending
+def _mark_prefix_len(data):
+    # How many bytes at the END of the data could be the START of the barrier: held back until the next
+    # read says whether they are, so a barrier split across two reads is still found and never streamed.
+    for _n in range(min(len(_MARK) - 1, len(data)), 0, -1):
+        if _MARK.startswith(data[-_n:]):
+            return _n
+    return 0
+_UFD = {1: _u1r, 2: _u2r}
+os.set_blocking(_u1r, False)
+os.set_blocking(_u2r, False)
+# poll(0) answers "is there anything to read" without the BlockingIOError an empty non-blocking read
+# raises: 0.19 us against 0.5, measured, and every print() asks it once.
+_POLL = {1: select.poll(), 2: select.poll()}
+_POLL[1].register(_u1r, select.POLLIN)
+_POLL[2].register(_u2r, select.POLLIN)
+_dec = {1: codecs.getincrementaldecoder("utf-8")("replace"), 2: codecs.getincrementaldecoder("utf-8")("replace")}
+_held = {1: b"", 2: b""}
+def _pull(key):
+    # Called with _ulock held: read everything the fd pipe holds right now and stream it. Every read of the
+    # pipe happens under the lock and is sent before the lock is released, which is what keeps fd output
+    # and print() in the order they were written. Returns False at EOF. At most 64 reads (4 MiB) a call:
+    # a child writing without pause (yes(1)) would otherwise hold the lock, and with it every print().
+    if not _POLL[key].poll(0):
+        return True
+    for _r in range(64):
+        try:
+            chunk = os.read(_UFD[key], 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        _flush_py(key)  # print() text queued before these bytes arrived was written before them
+        data = _held[key] + chunk
+        _i = data.find(_MARK)
+        if _i >= 0:
+            _emit(key, _dec[key].decode(data[:_i], final=True))  # all of the cell's bytes, THEN the barrier
+            data = data[_i + len(_MARK):]
+            _mevt[key].set()
+        _n = _mark_prefix_len(data)
+        _held[key] = data[len(data) - _n:] if _n else b""
+        _emit(key, _dec[key].decode(data[:len(data) - _n]))
+    return True
+def _drain(fd, key):
+    while True:
+        try:
+            select.select([fd], [], [])
+        except (OSError, ValueError):
+            break
+        with _ulock:
+            if not _pull(key):
+                break
+threading.Thread(target=_drain, args=(_u1r, 1), daemon=True).start()
+threading.Thread(target=_drain, args=(_u2r, 2), daemon=True).start()
 # Readiness. Popen returns when the FORK happens, not when kern has built the box and CPython has
 # booted inside it, so a pool that published a box on Popen alone would hand out boxes that are still
 # starting - and the caller would pay the remainder of that start on its own clock, which is the exact
@@ -1067,9 +1251,10 @@ while True:
         break
     _out.clear()
     with _ulock:
-        _m1, _m2 = len(_ubuf[1]), len(_ubuf[2])
         _tcut[0] = False  # a cut belongs to the cell it happens in, so clear it at the cell boundary
-    _so, _se = io.StringIO(), io.StringIO()
+        _sent[1] = _sent[2] = 0
+        _live[0] = True
+    _so, _se = _Stream(1), _Stream(2)
     _rc = 0
     _oo, _oe, _oi = sys.stdout, sys.stderr, sys.stdin
     sys.stdout, sys.stderr = _so, _se
@@ -1111,9 +1296,13 @@ while True:
                 _out.append({"image/png": base64.b64encode(_b.getvalue()).decode()})
     except Exception:
         pass
-    # Barrier: write the sentinel to fd 1/2 and wait until the drainers have consumed up to it, so this
-    # cell's raw/subprocess output is FULLY captured (not racily missed) before we snapshot. The captured
-    # raw bytes are appended AFTER the precise in-order print() capture from the redirected sys.stdout.
+    # Barrier: write the sentinel to fd 1/2 and read up to it, so this cell's raw/subprocess output is
+    # FULLY captured (not racily missed) before the reply. It is read HERE, by this thread, right after
+    # it is written: waiting for a drain thread to wake from select() for it doubled the cost of an empty
+    # cell (0.04 -> 0.16 ms, measured).
+    with _ulock:
+        _flush_py(1)
+        _flush_py(2)
     _mevt[1].clear()
     _mevt[2].clear()
     try:
@@ -1121,23 +1310,17 @@ while True:
         os.write(2, _MARK)
     except OSError:
         pass
+    with _ulock:
+        _pull(1)
+        _pull(2)
     _mevt[1].wait(2.0)
     _mevt[2].wait(2.0)
     with _ulock:
-        _r1 = bytes(_ubuf[1][_m1:])
-        _r2 = bytes(_ubuf[2][_m2:])
+        _live[0] = False
         _tr = _tcut[0]
-    # sys.stdout is a StringIO, so _CAP (which bounds only the raw-fd drain) never bounded a cell that
-    # printed through it: printing a gigabyte built the whole string into the reply. Cut BOTH streams at
-    # the same cap and say so, which is what the cold path's capped reader does.
-    _o1 = _so.getvalue() + _r1.decode("utf-8", "replace")
-    _o2 = _se.getvalue() + _r2.decode("utf-8", "replace")
-    if len(_o1) > _CAP:
-        _o1 = _o1[:_CAP]
-        _tr = True
-    if len(_o2) > _CAP:
-        _o2 = _o2[:_CAP]
-        _tr = True
+    # Both streams went out as frames while the cell ran, each cut at _CAP by _emit, so a cell that
+    # prints a gigabyte through sys.stdout streams _CAP characters and says so.
+    _o1 = _o2 = ""
     # Results are bounded bundle by bundle rather than by serializing the whole list and measuring it: a
     # single json.dumps of an oversized list would build the entire payload in the box before anything
     # could reject it. A bundle that alone exceeds the budget is dropped, not truncated mid-JSON.
@@ -1418,6 +1601,25 @@ function sandboxFault(type, message) {
 /** Binaries already identified as kern, keyed by identity and not by path: a `kern` REPLACED between two
  * calls is a different program and gets checked again. */
 const VERIFIED_KERN = new Set();
+/** The `--version` line of each verified binary, by the same key: what the resident path needs to know
+ * whether a missing started byte means anything (see `kernExecReportsItsStart`). */
+const KERN_VERSION_LINE = new Map();
+
+/** The X.Y.Z in what `kern --version` printed, or null. Mirrors `_kern_release`. */
+function kernRelease(version) {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(version || "");
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/** Whether this kern's `kern exec` writes the KERN_STARTED_FD bytes ONLY for a command that ran. v0.30.1
+ * wrote them on refusals too (MEASURED: `[1, 0, 0, 0]` for an exec that refused, exit 126), so only from
+ * v0.30.2 does a missing byte prove the call never started. Mirrors `_kern_exec_reports_its_start`. */
+function kernExecReportsItsStart(version) {
+  const r = kernRelease(version);
+  if (!r) return false;
+  for (let i = 0; i < 3; i++) if (r[i] !== [0, 30, 2][i]) return r[i] > [0, 30, 2][i];
+  return true;
+}
 
 /** Refuse a binary that does not IDENTIFY ITSELF as kern. Throws `SandboxError` if it does not.
  *
@@ -1442,7 +1644,7 @@ function verifyIsKern(bin) {
   } catch (e) {
     throw new SandboxError(`could not stat the kern binary at '${bin}': ${e.message}`);
   }
-  if (VERIFIED_KERN.has(key)) return;
+  if (VERIFIED_KERN.has(key)) return KERN_VERSION_LINE.get(key) || "";
   const hint =
     "If this is not the kern you meant, set $KERN_BIN to the right path. To install kern:\n" +
     "    curl -fsSL https://raw.githubusercontent.com/getkern/kern/main/install.sh | sh";
@@ -1464,6 +1666,8 @@ function verifyIsKern(bin) {
     );
   }
   VERIFIED_KERN.add(key);
+  KERN_VERSION_LINE.set(key, first);
+  return first;
 }
 
 /** The `kern` this package's npm tarball carries for this machine, or null.
@@ -2465,6 +2669,10 @@ class Sandbox {
             "resumed. new Sandbox({ name, persist: true, workspace })",
         );
     }
+    // THE IMAGE BEFORE ANY BOX: the setup box, the resident box, the bytecode build and the warm pool
+    // all start one, and each used to pull inside its own deadline. After the refusals above, so a
+    // wrong configuration is not reported only after a download.
+    await fetchImage(this._kern, this.image);
     if (this.setup) await this._runSetup(this.setup);
     // THE RESIDENT BOX IS CREATED AFTER THE SETUP, AND THAT ORDER IS THE FIX. It used to come first,
     // so `_runSetup` was routed into it (network silently dropped), and `_baseArgv` mounts
@@ -3035,7 +3243,8 @@ class Sandbox {
     // there dropped `network: true` in SILENCE, so `setup: "pip install X"` failed with a DNS error.
     // Same fix and same reason as the Python binding; `_enter` also creates the resident box after
     // the setup now, so in the normal path there is nothing to route into.
-    if (this._resident !== null && !isSetup) {
+    const residentCall = this._resident !== null && !isSetup;
+    if (residentCall) {
       // INTO THE RESIDENT BOX, which is the point of `persist`. `exec` and not `box`: measured, 2 ms
       // against 6 ms, and the box's own state is still there. `-w` puts the call in the same working
       // directory a fresh box starts in, so code writing a relative path lands in the workspace
@@ -3199,6 +3408,24 @@ class Sandbox {
         // that tells a genuine box-not-started apart from a workload that itself exited 125 (no marker ->
         // fault null -> a normal result). An older kern (127) is returned as a data fault, not thrown.
         // Runtime events where the code DID run (timeout, OOM, escape) stay as data on `.fault`.
+        // A RESIDENT CALL THAT NEVER RAN: `kern exec` refused to enter the box (it could not put the
+        // command under the box's caps; an ordinary ssh session is the common case). MEASURED: exit 126,
+        // kern's explanation on stderr, and `fault: null`, so an agent read "your code exited 126".
+        // Decided on kern's started byte, never on stderr, which the code writes too; that byte proves
+        // it only from v0.30.2 (see `kernExecReportsItsStart`). A GONE box has its own repair. Mirrors
+        // the Python binding.
+        if (
+          residentCall && !fault && !boxStarted && rc !== 0 &&
+          !String(stderr || "").includes(RESIDENT_GONE) &&
+          kernExecReportsItsStart(verifyIsKern(this._kern))
+        ) {
+          const said = String(stderr || "").trim().slice(0, 1200) || `exit ${rc}, nothing on stderr`;
+          fault = sandboxFault(
+            "startup_failed",
+            "the call never ran: `kern exec` refused to enter the resident box, so the code did not " +
+              `start. kern said: ${said}`,
+          );
+        }
         if (rc === 125 && fault && fault.type === "startup_failed") {
           return reject(new SandboxError(fault.message || "the box failed to start"));
         }
@@ -3876,7 +4103,11 @@ class Sandbox {
       `${WORKSPACE}/${resf}`,
     );
     await this.writeFile(runf, shim);
-    const result = await this._spawn(["python3", `${WORKSPACE}/${runf}`], {
+    // `-u`: UNBUFFERED. CPython block-buffers stdout when it is a pipe, which it always is here, so a cell
+    // that prints and is then SIGKILLed (OOM, timeout) or ends with `os._exit` lost whatever sat in that
+    // buffer. The Python binding has passed it since 0.2.43 and this one did not: MEASURED, cold,
+    // `print('BEFORE')` then a timeout returned "" here and "BEFORE" there. Mirrors the Python call.
+    const result = await this._spawn(["python3", "-u", `${WORKSPACE}/${runf}`], {
       network: this.network,
       timeoutS: eff,
       onStdout,
@@ -3942,6 +4173,113 @@ const KERNEL_OVERSIZE = Symbol("kernel-oversize");
 // The raw-fd drain cap a PERSISTENT kernel has always used. Named rather than repeated so the one place
 // that must not drift from the shipped behaviour says which number it is and why.
 const KERNEL_DRAIN_CAP = 64 * 1024 * 1024;
+
+/** What a box the BINDING kills reports as its exit status: SIGKILL, in the shell's 128 + signal
+ * convention the one-shot path already speaks. A resident kernel used to report -1 for a timeout, on the
+ * stated ground that its interpreter survives the deadline; MEASURED, the timeout tears the box down.
+ * Mirrors `_KILLED_BY_BINDING_RC`. */
+const KILLED_BY_BINDING_RC = 128 + 9;
+
+/** The largest frame the host accepts from a driver: both streams, the results, and room for JSON.
+ * Mirrors `_reply_frame_cap`. */
+function replyFrameCap(outCap) {
+  return 2 * Math.trunc(outCap) + RESULTS_MAX + 65536;
+}
+
+/** The output a driver streamed for ONE cell, kept up to `cap` characters per stream. The frames are
+ * written inside the box, so past the cap nothing more is stored and the cut is recorded. Mirrors
+ * `_CellOutput`. */
+class CellOutput {
+  constructor(cap) {
+    this._cap = Math.max(0, Math.trunc(cap));
+    this._parts = { o: [], e: [] };
+    this._n = { o: 0, e: 0 };
+    this.truncated = false;
+  }
+
+  add(obj) {
+    for (const key of ["o", "e"]) {
+      if (!(key in obj)) continue;
+      let text = typeof obj[key] === "string" ? obj[key] : String(obj[key]);
+      const room = this._cap - this._n[key];
+      if (text.length > room) {
+        text = text.slice(0, Math.max(room, 0));
+        this.truncated = true;
+      }
+      if (text) {
+        this._parts[key].push(text);
+        this._n[key] += text.length;
+      }
+    }
+  }
+
+  get stdout() {
+    return this._parts.o.join("");
+  }
+
+  get stderr() {
+    return this._parts.e.join("");
+  }
+}
+
+/** How the (Python) driver writes an output frame: `json.dumps({"o": ...})`. Matched on the prefix so
+ * the reply that ends a cell, which can carry a large figure, is parsed once. Mirrors
+ * `_STREAM_FRAME_PREFIXES`. */
+const STREAM_FRAME_PREFIXES = ['{"o": ', '{"e": '];
+
+/** Hand a parsed frame to whoever waits for one, or queue it. A frame used to be DROPPED when nobody was
+ * waiting, which never happened while a cell sent exactly one; a streaming cell sends many, several to
+ * one read. Shared by `Kernel` and `WarmBox`, which parse frames the same way. */
+function deliverFrame(self, body) {
+  const w = self._waiters.shift();
+  if (w) {
+    clearTimeout(w.timer);
+    w.resolve(body);
+  } else {
+    (self._frames ??= []).push(body);
+  }
+}
+
+/** The next frame, or how the channel ended (`null` / `KERNEL_OVERSIZE`) once every queued frame was
+ * read, or `KERNEL_TIMEOUT`. Output queued before a death comes out before the death does. */
+function nextFrame(self, ms) {
+  if (self._frames && self._frames.length) return Promise.resolve(self._frames.shift());
+  if (self._end !== undefined || self._dead) return Promise.resolve(self._end === undefined ? null : self._end);
+  return new Promise((resolve) => {
+    const w = { resolve, timer: null };
+    w.timer = setTimeout(() => {
+      const i = self._waiters.indexOf(w);
+      if (i >= 0) self._waiters.splice(i, 1);
+      resolve(KERNEL_TIMEOUT);
+    }, Math.max(0, ms));
+    if (w.timer.unref) w.timer.unref();
+    self._waiters.push(w);
+  });
+}
+
+/** Wait for the frame that ENDS a cell, folding every output frame before it into `out`. Mirrors
+ * `_next_reply`: what arrived before a death or a timeout stays in `out`, which is the point. */
+async function nextReply(self, deadlineAtMs, out) {
+  for (;;) {
+    const left = deadlineAtMs - Date.now();
+    if (left <= 0) return KERNEL_TIMEOUT;
+    const frame = await nextFrame(self, left);
+    if (typeof frame !== "string") return frame;
+    if (STREAM_FRAME_PREFIXES.some((p) => frame.startsWith(p))) {
+      let obj;
+      try {
+        obj = JSON.parse(frame);
+      } catch {
+        return frame;
+      }
+      if (obj && typeof obj === "object" && !Array.isArray(obj) && Object.keys(obj).length === 1) {
+        out.add(obj);
+        continue;
+      }
+    }
+    return frame;
+  }
+}
 
 /** Materialize PY_KERNEL_DRIVER for one caller's output budget and handshake.
  *
@@ -4018,13 +4356,15 @@ class Kernel {
 
   async _open() {
     const sbx = this._sbx;
-    this._cap = sbx.maxOutputBytes;
+    // The caller's output budget, the one the prewarmed box gets, and no results budget: the frame cap
+    // bounds a reply. The budget used to be a fixed 64 MiB while the host refused any reply over
+    // `maxOutputBytes`, so a cell printing more than that KILLED the kernel and its state. Output is
+    // streamed now and cut on both sides. No readiness frame, which a persistent Kernel does not read.
+    this._outCap = sbx.maxOutputBytes;
+    this._cap = replyFrameCap(sbx.maxOutputBytes);
     const uid = crypto.randomBytes(4).toString("hex");
     this._driver = `.kernel-${uid}.py`;
-    // The historical constants, restated at the one call site that must not change: 64 MiB of raw drain
-    // and no results budget (the host's frame cap stays the only bound), and no readiness frame, which a
-    // persistent Kernel does not read and would consume as its first cell's reply.
-    await sbx.writeFile(this._driver, kernelDriver(KERNEL_DRAIN_CAP, 0, false));
+    await sbx.writeFile(this._driver, kernelDriver(sbx.maxOutputBytes, 0, false));
     this._name = uniqueName();
     this._childEnv = { ...process.env };
     if (!sbx.enforceLimits) this._childEnv.KERN_NO_SCOPE = "1";
@@ -4093,17 +4433,14 @@ class Kernel {
       this._total = rest.length;
       this._need = -1;
       this._headerBytes = -1;
-      const w = this._waiters.shift();
-      if (w) {
-        clearTimeout(w.timer);
-        w.resolve(body);
-      }
+      deliverFrame(this, body);
     }
   }
 
   _flush(val) {
     // A protocol error (oversize/malformed) marks the kernel dead: the stream is desynced, do not keep it.
     if (val === KERNEL_OVERSIZE || val === null) this._dead = true;
+    if (this._end === undefined) this._end = val;
     while (this._waiters.length) {
       const w = this._waiters.shift();
       clearTimeout(w.timer);
@@ -4125,32 +4462,49 @@ class Kernel {
     const eff = timeoutS != null ? this._sbx._effTimeout(timeoutS) : this._timeout;
     const started = Date.now();
     const payload = Buffer.from(code, "utf8");
-    const reply = await new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        const i = this._waiters.findIndex((w) => w.timer === timer);
-        if (i >= 0) this._waiters.splice(i, 1);
-        resolve(KERNEL_TIMEOUT);
-      }, eff * 1000);
-      this._waiters.push({ resolve, timer });
-      try {
-        this._child.stdin.write(`${payload.length}\n`);
-        this._child.stdin.write(payload);
-      } catch {
-        const i = this._waiters.findIndex((w) => w.timer === timer);
-        if (i >= 0) this._waiters.splice(i, 1);
-        clearTimeout(timer);
-        resolve(null);
-      }
-    });
-    if (reply === KERNEL_TIMEOUT) return this._teardownResult("timeout", `cell exceeded ${eff}s`, started);
-    if (reply === KERNEL_OVERSIZE)
-      return this._teardownResult("killed", `the kernel reply exceeded the ${this._cap}-byte cap`, started);
-    if (reply === null) {
-      const err = this._stderr.toString("utf8");
-      const [kind, dflt, rc] = this._kernelDeathFault(err, ...(await this._readCapSignal()));
-      return this._teardownResult(kind, err.trim() || dflt, started, rc);
+    const out = new CellOutput(this._outCap);
+    try {
+      this._child.stdin.write(`${payload.length}\n`);
+      this._child.stdin.write(payload);
+    } catch {
+      return this._deathResult(started, out);
     }
-    return this._resultFromReply(reply, started);
+    const reply = await nextReply(this, started + eff * 1000, out);
+    if (reply === KERNEL_TIMEOUT)
+      return this._teardownResult("timeout", `cell exceeded ${eff}s`, started, KILLED_BY_BINDING_RC, out);
+    if (reply === KERNEL_OVERSIZE)
+      return this._teardownResult(
+        "killed", `the kernel sent a frame larger than the ${this._cap}-byte cap`, started, KILLED_BY_BINDING_RC, out,
+      );
+    if (reply === null) return this._deathResult(started, out);
+    return this._resultFromReply(reply, started, out);
+  }
+
+  /** The box went away mid-cell: classify why from what kern wrote, keeping what the cell printed.
+   * Mirrors `_death_result`. */
+  async _deathResult(started, out) {
+    const err = this._stderr.toString("utf8");
+    const [capSignal, oomSignal, wrote, workloadSignal] = await this._readCapSignal();
+    const [kind, dflt, rc] = this._kernelDeathFault(
+      err, capSignal, oomSignal, wrote, workloadSignal, this._exitStatus(),
+    );
+    if (kind === null && workloadSignal === 0)
+      // The cell ended the interpreter itself (`os._exit(N)`): its exit code, its own output, and no
+      // sentence from us in its stderr.
+      return this._teardownResult(null, "", started, rc, out, `the cell ended the interpreter with exit status ${rc}`);
+    return this._teardownResult(kind, err.trim() || dflt, started, rc, out);
+  }
+
+  /** The box process's own exit code once it has gone, or null while it is still there. */
+  _exitStatus() {
+    const c = this._child;
+    return c && typeof c.exitCode === "number" && c.exitCode >= 0 ? c.exitCode : null;
+  }
+
+  /** True once this kernel's interpreter is gone, whatever ended it: a fault, a cell that exited the
+   * interpreter, or `close()`. Its in-memory state went with it. Mirrors `Kernel.ended`. */
+  get ended() {
+    return this._dead;
   }
 
   /** Turn one kernel reply into an `ExecutionResult`.
@@ -4158,15 +4512,15 @@ class Kernel {
    * Extracted so the UNTRUSTED-INPUT boundary is one named place a test can drive directly: `reply`
    * is JSON written INSIDE the box, by the same code the sandbox exists to contain. Every field is
    * attacker-chosen, and the question for each is what a missing or wrong-typed value must mean. */
-  _resultFromReply(reply, started) {
+  _resultFromReply(reply, started, out = null) {
     let obj;
     try {
       obj = JSON.parse(reply);
     } catch {
-      return this._teardownResult("killed", "the kernel sent a malformed reply", started);
+      return this._teardownResult("killed", "the kernel sent a malformed reply", started, KILLED_BY_BINDING_RC, out);
     }
     if (!obj || typeof obj !== "object")
-      return this._teardownResult("killed", "the kernel sent a non-object reply", started);
+      return this._teardownResult("killed", "the kernel sent a non-object reply", started, KILLED_BY_BINDING_RC, out);
     // `rc` is the ONE field whose absence cannot be defaulted. `success` is
     // `exitCode === 0 && fault === null`, so coercing a missing or non-integer `rc` to 0 - which is
     // what this did - reported a SUCCESSFUL run. Since the JSON comes from the box, a cell could
@@ -4175,7 +4529,7 @@ class Kernel {
     // `"rc"`, and it is handled like the malformed replies above. `Number.isInteger` also rejects a
     // boolean, a float and a numeric string, which is what it is here for.
     if (!Number.isInteger(obj.rc))
-      return this._teardownResult("killed", "the kernel reply carried no usable exit code", started);
+      return this._teardownResult("killed", "the kernel reply carried no usable exit code", started, KILLED_BY_BINDING_RC, out);
     // The REMAINING fields are informational, so a wrong type degrades to an empty value rather than
     // failing the call: coerced so a caller doing `r.stdout.trim()` cannot be crashed by a box that
     // sent a number.
@@ -4183,13 +4537,14 @@ class Kernel {
       ? obj.results.filter((r) => r && typeof r === "object").map((r) => new Result(r))
       : [];
     return new ExecutionResult({
-      stdout: typeof obj.stdout === "string" ? obj.stdout : "",
-      stderr: typeof obj.stderr === "string" ? obj.stderr : "",
+      stdout: (out ? out.stdout : "") + (typeof obj.stdout === "string" ? obj.stdout : ""),
+      stderr: (out ? out.stderr : "") + (typeof obj.stderr === "string" ? obj.stderr : ""),
       exitCode: obj.rc,
       durationMs: Date.now() - started,
       fault: null,
       files: [],
-      truncated: false,
+      // The driver's own cut and the host's: a cell over its budget is told so, as on the cold path.
+      truncated: obj.trunc === true || !!(out && out.truncated),
       results,
     });
   }
@@ -4207,7 +4562,7 @@ class Kernel {
    * `capSignal` is kern's unforgeable enforcement byte (0 = old kern / undetermined, 1 = cap enforced, 2 =
    * requested but NOT enforced). It no longer decides the TYPE, and a 2 still earns a sentence, because
    * "your cap was not in force here" is the one thing the caller cannot find out for itself. */
-  _kernelDeathFault(err, capSignal = 0, oomSignal = null, kernWrotePayload = false, workloadSignal = null) {
+  _kernelDeathFault(err, capSignal = 0, oomSignal = null, kernWrotePayload = false, workloadSignal = null, exitStatus = null) {
     // THE EXIT CODE COMES FROM THE FOURTH BYTE, so both paths report one event the same way: this used to
     // be a flat -1 while the one-shot path said 137 for a kill, 159 for a blocked escape, 139 for a
     // segfault. -1 stays for the cases where no signal is known. Mirrors `_kernel_death_fault`.
@@ -4248,6 +4603,10 @@ class Kernel {
     // byte is set; this path had no such guard, so the widened predicate gets it here.
     if (!kernWrotePayload && looksLikeStartupFailure(err))
       return ["startup_failed", "the kernel box failed to start", rc];
+    // NO SIGNAL AND A REAL EXIT STATUS: the cell ended the interpreter itself, `os._exit(N)` being the
+    // ordinary way. The one-shot path reports that as exitCode N and no fault; this one said `killed`.
+    // Mirrors the Python branch, which is placed after the cap branch there and reaches the same answer.
+    if (workloadSignal === 0 && exitStatus !== null) return [null, "", exitStatus];
     if (capSignal === 2)
       return [
         "killed",
@@ -4299,33 +4658,40 @@ class Kernel {
     return [capSignal, oomSignal, boxStarted, workloadSignal];
   }
 
-  _teardownResult(type, message, started, exitCode = -1) {
-    this._death = type === null ? "the code crashed" : type;
+  _teardownResult(type, message, started, exitCode = -1, out = null, death = null) {
+    this._death = death || (type === null ? "the code crashed" : type);
     this._kill();
+    const so = out ? out.stdout : "";
+    const se = out ? out.stderr : "";
+    const cut = !!(out && out.truncated);
     // Same rule as the one-shot path: a box that never STARTED (the kernel failed to boot) throws, it
     // does not return a hollow result. timeout/killed stay as data on the returned result.
     if (type === "startup_failed") throw new SandboxError(message || "the box failed to start");
     // `type === null` is a real answer, not a missing one: the code CRASHED and the sandbox did not act,
     // which is what the one-shot path reports for the same event. The message still travels on stderr.
-    if (type === null)
+    if (type === null) {
+      const sep = se && message && !se.endsWith("\n") ? "\n" : "";
       return new ExecutionResult({
-        stdout: "",
-        stderr: message,
+        stdout: so,
+        stderr: se + sep + message,
         exitCode,
         durationMs: Date.now() - started,
         fault: null,
         files: [],
-        truncated: false,
+        truncated: cut,
         results: [],
       });
+    }
+    // WHAT THE CELL PRINTED BEFORE IT DIED: it used to be "" on every fault, because the output travelled
+    // in the reply a killed cell never sends.
     return new ExecutionResult({
-      stdout: "",
-      stderr: "",
+      stdout: so,
+      stderr: se,
       exitCode,
       durationMs: Date.now() - started,
       fault: sandboxFault(type, message),
       files: [],
-      truncated: false,
+      truncated: cut,
       results: [],
     });
   }
@@ -4575,16 +4941,13 @@ class WarmBox {
       this._total = rest.length;
       this._need = -1;
       this._headerBytes = -1;
-      const w = this._waiters.shift();
-      if (w) {
-        clearTimeout(w.timer);
-        w.resolve(body);
-      }
+      deliverFrame(this, body);
     }
   }
 
   _flush(val) {
     if (val === KERNEL_OVERSIZE || val === null) this._dead = true;
+    if (this._end === undefined) this._end = val;
     while (this._waiters.length) {
       const w = this._waiters.shift();
       clearTimeout(w.timer);
@@ -4593,17 +4956,7 @@ class WarmBox {
   }
 
   _await(ms) {
-    if (this._dead) return Promise.resolve(null);
-    return new Promise((resolve) => {
-      const w = { resolve, timer: null };
-      w.timer = setTimeout(() => {
-        const i = this._waiters.indexOf(w);
-        if (i >= 0) this._waiters.splice(i, 1);
-        resolve(KERNEL_TIMEOUT);
-      }, ms);
-      if (w.timer.unref) w.timer.unref();
-      this._waiters.push(w);
-    });
+    return nextFrame(this, ms);
   }
 
   // -- the one cell ----------------------------------------------------------------------------------
@@ -4616,22 +4969,23 @@ class WarmBox {
     if (this._child === null) throw new SandboxError("prewarmed box was never started");
     const started = Date.now();
     const payload = Buffer.from(code, "utf8");
+    const out = new CellOutput(this._sbx.maxOutputBytes);
     let body;
     try {
       this._child.stdin.write(`${payload.length}\n`);
       this._child.stdin.write(payload);
-      body = await this._await(deadlineS * 1000);
+      body = await nextReply(this, started + deadlineS * 1000, out);
     } catch {
-      return this._faultResult("died", started, before);
+      return this._faultResult("died", started, before, undefined, out);
     }
     if (body === KERNEL_TIMEOUT)
-      return this._faultResult("timeout", started, before, `code exceeded ${deadlineS}s`);
+      return this._faultResult("timeout", started, before, `code exceeded ${deadlineS}s`, out);
     // Every branch below that rejects the reply produces the same shape, so it is written once. The
     // repetition was three copies of the same call differing only in a string, which is the form where
     // one copy quietly drifts from the others.
     const rejected = (message, truncated = false) =>
-      this._result("", "", this._exitCode(), started, before, {
-        truncated,
+      this._result(out.stdout, out.stderr, this._exitCode(), started, before, {
+        truncated: truncated || out.truncated,
         fault: { type: "killed", message },
       });
     if (body === KERNEL_OVERSIZE) {
@@ -4642,7 +4996,7 @@ class WarmBox {
         true,
       );
     }
-    if (body === null) return this._faultResult("died", started, before);
+    if (body === null) return this._faultResult("died", started, before, undefined, out);
     this.retire();
     let obj = null;
     try {
@@ -4659,21 +5013,22 @@ class WarmBox {
     const results = Array.isArray(obj.results)
       ? obj.results.filter((r) => r && typeof r === "object").map((r) => new Result(r))
       : [];
-    return this._result(String(obj.stdout ?? ""), String(obj.stderr ?? ""), obj.rc, started, before, {
-      truncated: !!obj.trunc,
+    return this._result(out.stdout + String(obj.stdout ?? ""), out.stderr + String(obj.stderr ?? ""), obj.rc, started, before, {
+      truncated: !!obj.trunc || out.truncated,
       results,
     });
   }
 
-  _faultResult(kind, started, before, msg) {
+  _faultResult(kind, started, before, msg, out = new CellOutput(0)) {
     const err = this._stderr.toString("utf8");
     if (kind === "timeout") {
       this.retire();
-      return this._result("", "", this._exitCode(), started, before, {
+      return this._result(out.stdout, out.stderr, this._exitCode(), started, before, {
+        truncated: out.truncated,
         fault: { type: "timeout", message: msg || "the code exceeded its deadline" },
       });
     }
-    const { boxStarted, capSignal, oomSignal } = parseStartedBytes(this._startedSig);
+    const { boxStarted, capSignal, oomSignal, workloadSignal } = parseStartedBytes(this._startedSig);
     this.retire();
     let type = "killed";
     let dflt = "the box exited before the code finished";
@@ -4688,6 +5043,10 @@ class WarmBox {
       // for a box that existed, so with the byte set this THROW would be a cell's own column-0 line
       // deciding that the box never came up.
       throw new SandboxError(err.trim() || "the box failed to start");
+    } else if (boxStarted && workloadSignal === 0) {
+      // NO SIGNAL: the cell ended the interpreter itself (`os._exit(N)`). The cold path reports that as
+      // exitCode N and no fault; this path said `killed`. Mirrors the Python warm path.
+      return this._result(out.stdout, out.stderr, this._exitCode(), started, before, { truncated: out.truncated });
     } else if (capSignal === 2) {
       dflt =
         "the box was killed, and its memory cap was not enforced here (no cgroup delegation), " +
@@ -4697,7 +5056,8 @@ class WarmBox {
         "the box was killed and the kernel reported no OOM against its memory cap: an external kill " +
         "(`kern stop`, a signal, or the host running out of memory), not the box exceeding its own memory";
     }
-    return this._result("", "", this._exitCode(), started, before, {
+    return this._result(out.stdout, out.stderr, this._exitCode(), started, before, {
+      truncated: out.truncated,
       fault: { type, message: err.trim() || dflt },
     });
   }
@@ -4986,6 +5346,15 @@ module.exports = {
   _PYC_MOUNT: PYC_MOUNT,
   _PYC_SOURCE_ID: PYC_SOURCE_ID,
   _sanitizeRef: sanitizeRef,
+  _imageIsCached: imageIsCached,
+  _fetchImage: fetchImage,
+  // The streaming protocol's pieces, for tests that drive the real driver without a box.
+  _kernelDriver: kernelDriver,
+  _WarmBox: WarmBox,
+  _CellOutput: CellOutput,
+  _nextReply: nextReply,
+  _replyFrameCap: replyFrameCap,
+  _kernExecReportsItsStart: kernExecReportsItsStart,
   _SANITIZE_VECTORS: SANITIZE_VECTORS,
   _pycSourceId: pycSourceId,
   // Exported for the test that proves a stale lock is swept: the marks decide what the sweep
