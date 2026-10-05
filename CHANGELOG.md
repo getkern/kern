@@ -5,6 +5,14 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## Unreleased
+
+- `kern doctor` names the Windows side of WSL only inside WSL. On a native Linux host the row about
+  two kern binaries that disagree on version also said that a `kern.exe` on the Windows side was not
+  visible and to run `kern wsl list --probe` from Windows.
+- kern-sandbox: the error for `language="node"` on an image without node no longer says that no image
+  kern defaults to carries node, which stopped being true when kern-mcp's default image carried it.
+
 ## kern-sandbox 0.2.45 - 2026-10-05
 
 **Both packages carry kern v0.30.2**, so a `persist=True` call that `kern exec` refused (an ssh session

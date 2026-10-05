@@ -3443,10 +3443,11 @@ fn disk_usage(p: &std::path::Path, seen: &mut std::collections::HashSet<(u64, u6
 /// Are we the kern inside a WSL2 distro? `WSL_DISTRO_NAME` is set by WSL for every process it starts;
 /// the osrelease check catches a process that inherited a stripped environment.
 ///
-/// It matters to `uninstall` alone: on Windows the pieces a user sees (`kern.exe`, the PATH entry) live
+/// It matters to `uninstall`: on Windows the pieces a user sees (`kern.exe`, the PATH entry) live
 /// OUTSIDE this filesystem, so removing the Linux binary from in here leaves a shim pointing at a distro
-/// with no kern. Recoverable - the shim says how - but not something to discover afterwards.
-fn in_wsl() -> bool {
+/// with no kern. Recoverable - the shim says how - but not something to discover afterwards. And to
+/// `doctor`, whose sentence about a `kern.exe` on the Windows side only exists inside WSL.
+pub(crate) fn in_wsl() -> bool {
     if crate::global_env("WSL_DISTRO_NAME").is_some() {
         return true;
     }

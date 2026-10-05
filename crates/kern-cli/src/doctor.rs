@@ -1658,7 +1658,7 @@ fn check_duplicate_installs() -> R {
         }
     }
 
-    duplicate_install_verdict(&found)
+    duplicate_install_verdict(&found, crate::commands::in_wsl())
 }
 
 /// The verdict, as a PURE function of what was found, so it can be driven over its whole input space.
@@ -1670,6 +1670,7 @@ fn check_duplicate_installs() -> R {
 /// disagreeing - times the presence of a foreign binary, and every one of them is asserted below.
 fn duplicate_install_verdict(
     found: &std::collections::BTreeMap<std::path::PathBuf, Option<String>>,
+    in_wsl: bool,
 ) -> R {
     use std::path::PathBuf;
     // TWO DIFFERENT HAZARDS, AND THEY ARE NOT THE SAME ROW. A second kern is a version question; a
@@ -1723,6 +1724,16 @@ fn duplicate_install_verdict(
             ),
         );
     }
+    // THE WINDOWS SIDE EXISTS ONLY INSIDE WSL. The sentence about a `kern.exe` this row cannot see was
+    // printed on every host, so a native Linux machine was told to run a Windows command (`kern wsl
+    // list --probe`) about distros it does not have. `in_wsl` is passed in rather than read here so
+    // the test can ask both answers on whatever machine it runs on.
+    let wsl_note = if in_wsl {
+        " A `kern.exe` on the Windows side of WSL is NOT visible from here and is counted by neither \
+         number; run `kern wsl list --probe` from Windows to compare the distros."
+    } else {
+        ""
+    };
     R::Warn(
         format!(
             "{} kern binaries reachable and they DISAGREE on version",
@@ -1730,10 +1741,8 @@ fn duplicate_install_verdict(
         ),
         format!(
             "{} - `PATH` order decides which one answers, so a fix you installed in one is \
-             invisible from the other. Remove the stale ones, or put the one you want first. A \
-             `kern.exe` on the Windows side of WSL is NOT visible from here and is counted by \
-             neither number; run `kern wsl list --probe` from Windows to compare the distros.\
-             {foreign_note}",
+             invisible from the other. Remove the stale ones, or put the one you want first.\
+             {wsl_note}{foreign_note}",
             list(&kerns)
         ),
     )
@@ -2798,18 +2807,23 @@ mod duplicate_install_tests {
     /// this machine happens to hold - which is one point of an eight-point space.
     #[test]
     fn every_shape_of_install_set_gets_the_verdict_that_matches_it() {
+        // Every shape below is asked OUTSIDE WSL; the WSL half of the one row that differs is asked
+        // separately, in both directions.
+        let verdict = |found: &std::collections::BTreeMap<std::path::PathBuf, Option<String>>| {
+            duplicate_install_verdict(found, false)
+        };
         // Nothing found at all: `PATH` had no kern. Not a warning - `doctor` is being run somehow.
-        assert!(matches!(duplicate_install_verdict(&m(&[])), R::Ok(..)));
+        assert!(matches!(verdict(&m(&[])), R::Ok(..)));
 
         // One kern: the ordinary machine, and it must stay a plain pass with no note.
-        let one = duplicate_install_verdict(&m(&[("/usr/local/bin/kern", Some("0.25.1"))]));
+        let one = verdict(&m(&[("/usr/local/bin/kern", Some("0.25.1"))]));
         assert!(matches!(one, R::Ok(..)), "{}", text(&one));
         assert!(text(&one).contains("one kern reachable"), "{}", text(&one));
 
         // Two kerns, SAME version. Worth saying (an upgrade has to reach both) and not a defect, so
         // it must not be a warning: a standing warning on a correct machine teaches the reader to
         // skim past `doctor`.
-        let same = duplicate_install_verdict(&m(&[
+        let same = verdict(&m(&[
             ("/usr/local/bin/kern", Some("0.25.1")),
             ("/home/u/.local/bin/kern", Some("0.25.1")),
         ]));
@@ -2818,7 +2832,7 @@ mod duplicate_install_tests {
 
         // Two kerns that DISAGREE: the field report's machine. A warning, and it must name both
         // paths and both versions, because the whole defect is not knowing which one answers.
-        let diff = duplicate_install_verdict(&m(&[
+        let diff = verdict(&m(&[
             ("/home/u/.cargo/bin/kern", Some("0.6.1")),
             ("/home/u/.local/bin/kern", Some("0.25.0")),
         ]));
@@ -2830,17 +2844,33 @@ mod duplicate_install_tests {
             "0.6.1",
             "/home/u/.local/bin/kern",
             "0.25.0",
-            // This row states a limit of its own scope (it cannot see across a WSL boundary), so it
-            // has to name the command that CAN. Asserted because a pointer that rots is worse than
-            // no pointer: it sends a reader to a verb that does not exist.
-            "kern wsl list --probe",
         ] {
             assert!(t.contains(needle), "missing {needle:?} in {t}");
+        }
+        // OUTSIDE WSL THERE IS NO WINDOWS SIDE to talk about. MEASURED on a native Linux host: this
+        // row told the reader that "a `kern.exe` on the Windows side of WSL is NOT visible from here"
+        // and to run `kern wsl list --probe` from Windows.
+        for absent in ["WSL", "kern.exe", "Windows", "kern wsl"] {
+            assert!(!t.contains(absent), "{absent:?} named outside WSL: {t}");
+        }
+        // INSIDE WSL the row states a limit of its own scope (it cannot see across the WSL boundary),
+        // so it names the command that CAN. Asserted because a pointer that rots is worse than no
+        // pointer: it sends a reader to a verb that does not exist.
+        let two = m(&[
+            ("/home/u/.cargo/bin/kern", Some("0.6.1")),
+            ("/home/u/.local/bin/kern", Some("0.25.0")),
+        ]);
+        let inside = text(&duplicate_install_verdict(&two, true));
+        for needle in ["DISAGREE", "kern.exe", "kern wsl list --probe"] {
+            assert!(
+                inside.contains(needle),
+                "missing {needle:?} inside WSL: {inside}"
+            );
         }
 
         // A FOREIGN FILE IS NOT A KERN. One real kern plus something else called `kern`: the count of
         // kerns stays one, and the row is about the shadowing, not about versions.
-        let foreign = duplicate_install_verdict(&m(&[
+        let foreign = verdict(&m(&[
             ("/usr/local/bin/kern", Some("0.25.1")),
             ("/tmp/evil/kern", None),
         ]));
@@ -2855,7 +2885,7 @@ mod duplicate_install_tests {
 
         // Two disagreeing kerns AND a foreign file: the version warning leads (it is the actionable
         // one) and the foreign note still arrives, so neither hazard is dropped for the other.
-        let both = duplicate_install_verdict(&m(&[
+        let both = verdict(&m(&[
             ("/a/kern", Some("0.1.0")),
             ("/b/kern", Some("0.2.0")),
             ("/c/kern", None),
