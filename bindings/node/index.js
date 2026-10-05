@@ -3380,7 +3380,7 @@ class Sandbox {
               // word-for-word in step with the Python binding: the two are one API with two
               // spellings, and a message that differs between them is a product that differs.
               (what === "node"
-                ? ` No image kern defaults to carries node; name one that does, e.g.` +
+                ? ` Name an image that carries node, e.g.` +
                   ` new Sandbox({ image: "node:22-slim" }).`
                 : "");
           } else if (reason.includes("Permission denied")) {

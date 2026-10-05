@@ -4169,7 +4169,9 @@ class Sandbox:
                     # and leaves the reader to guess the fix: a field report listed `language='node'`
                     # as offered-but-unusable for exactly that reason. `language` is the caller's
                     # declared intent, so the suggestion can be specific without inventing anything.
-                    + (f" No image kern defaults to carries node; name one that does, e.g."
+                    # "No image kern defaults to carries node" was true until kern-mcp's default image
+                    # carried node (0.2.45), so the remedy is stated without the claim.
+                    + (f" Name an image that carries node, e.g."
                        f" Sandbox(image='node:22-slim')."
                        if what == "node" else "")
                 )
