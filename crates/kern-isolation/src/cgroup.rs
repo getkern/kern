@@ -147,6 +147,22 @@ pub fn exec_workload_signal() -> u8 {
     EXEC_WORKLOAD_SIGNAL.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Set when the `kern exec` child REFUSED to run the command (it could not reapply the box's posture,
+/// or could not be placed under the box's caps) and exited 126 having run nothing. The parent sees only
+/// that exit code, which a command that ran and exited 126 also produces, so the child says it on a
+/// pipe of its own. Read by the CLI, which then does NOT tell an SDK that the command started.
+static EXEC_WAS_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn latch_exec_refused() {
+    EXEC_WAS_REFUSED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Did `kern exec` refuse the command before running it? See [`EXEC_WAS_REFUSED`].
+#[must_use]
+pub fn exec_was_refused() -> bool {
+    EXEC_WAS_REFUSED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The capped cgroup THIS process created for its box, recorded by [`apply_limits`] and read by the
 /// supervisor after the box exits.
 ///

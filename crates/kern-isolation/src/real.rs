@@ -6653,7 +6653,44 @@ fn wait_code(status: i32) -> i32 {
 /// it into an unprotected exec. (A `--workdir`/exec failure exits 127 "not runnable", a different case.)
 fn exec_fail_closed(reason: &str) -> ! {
     eprintln!("kern: exec: {reason} - refusing to run");
+    exec_child_says_refused();
     unsafe { libc::_exit(126) }
+}
+
+/// The write end of the pipe on which the `exec_in_box` child says "I refused" before its `_exit(126)`,
+/// or -1. Set by the parent just before the fork, so the child's copy holds it; `O_CLOEXEC` closes it in
+/// a child that reaches `execve`, so a command that RAN never writes it, whatever it exits with.
+static EXEC_REFUSAL_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// In the `exec_in_box` child, between fork and exec: one byte on the refusal pipe. An atomic load and a
+/// `write(2)`, both async-signal-safe.
+fn exec_child_says_refused() {
+    let fd = EXEC_REFUSAL_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let b = [1u8];
+        unsafe { libc::write(fd, b.as_ptr().cast(), 1) };
+    }
+}
+
+/// The parent's end of the refusal pipe, read when `exec_in_box` returns by ANY path (the tty pump, the
+/// probe timeout, the plain wait). Non-blocking, so an early return with the child still alive reads
+/// nothing instead of hanging. WHY: a refusal is `_exit(126)` in the child, and a command that ran and
+/// exited 126 is the same wait status. MEASURED from an ssh session: `kern exec` refused, and the CLI
+/// wrote `[1, 0, 0, 0]` on KERN_STARTED_FD, the bytes of a command that started, so an SDK reported the
+/// sandbox's refusal as the code's own exit 126 with no fault.
+struct RefusalWatch(libc::c_int);
+
+impl Drop for RefusalWatch {
+    fn drop(&mut self) {
+        if self.0 < 0 {
+            return;
+        }
+        let mut b = [0u8; 1];
+        if unsafe { libc::read(self.0, b.as_mut_ptr().cast(), 1) } == 1 {
+            crate::cgroup::latch_exec_refused();
+        }
+        unsafe { libc::close(self.0) };
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // each arg is a distinct exec knob; grouping would only hide it
@@ -7007,8 +7044,24 @@ pub fn exec_in_box(
     // the cgroup this process was migrated into above. NOTHING IS PLACED HERE - a second placement
     // after the `setns` is not a safety net, it is a copy of the same decision that always fails, and
     // reading its failure is what produced the silent uncapped exec.
+    let mut refusal = [-1i32; 2];
+    if unsafe { libc::pipe2(refusal.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        refusal = [-1, -1];
+    }
+    EXEC_REFUSAL_FD.store(refusal[1], std::sync::atomic::Ordering::Relaxed);
     let (pid, born) = crate::cgroup::fork_into_cgroup(box_cg.as_ref());
+    if pid != 0 {
+        // The parent (or a failed fork): the child has its own copy of the write end, or there is no
+        // child. Ours goes, so the read below sees only what the child wrote.
+        EXEC_REFUSAL_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
+        if refusal[1] >= 0 {
+            unsafe { libc::close(refusal[1]) };
+        }
+    }
     if pid < 0 {
+        if refusal[0] >= 0 {
+            unsafe { libc::close(refusal[0]) };
+        }
         return Err(Error::last("fork"));
     }
     if pid == 0 {
@@ -7054,6 +7107,7 @@ pub fn exec_in_box(
                     // where the refusal is read.
                     const MSG: &[u8] = b"kern: exec: refusing: the command could not be placed in the box's cgroup, so it would run outside its --memory/--pids caps. Either the box is at its --pids-limit, or this host runs kern outside the cgroup tree it delegates and no exec can join a box here - an ordinary ssh session is outside it on most distributions. Re-enter once with `systemd-run --user --scope bash` and run kern in that shell: caps stay enforced and exec works. `kern doctor` reports which cap path this host takes, and KERN_ALLOW_UNCAPPED=1 runs the command uncapped instead.\n";
                     unsafe { libc::write(2, MSG.as_ptr().cast(), MSG.len()) };
+                    exec_child_says_refused();
                     unsafe { libc::_exit(126) };
                 }
                 Unplaceable::ProceedWithWarning => {
@@ -7180,6 +7234,8 @@ pub fn exec_in_box(
         eprintln!("kern: exec failed: {err}");
         unsafe { libc::_exit(if eacces { 126 } else { 127 }) };
     }
+    // Read on every return below, after the child is reaped: see `RefusalWatch`.
+    let _refusal = RefusalWatch(refusal[0]);
     // `-it` parent: drop our copy of the slave so the master sees EOF when the exec'd process exits,
     // then pump host stdio <-> master until then (single-threaded, like the box path).
     if let Some(master) = tty_master {

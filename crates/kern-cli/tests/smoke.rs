@@ -1116,6 +1116,51 @@ fn an_exec_killed_with_its_box_by_the_oom_killer_says_so_on_the_started_signal()
     );
 }
 
+/// A `kern exec` that REFUSES writes nothing on the started signal, because nothing started.
+///
+/// The refusal is the child's `_exit(126)` before it runs the command (here: a box already at its
+/// `--pids-limit`, where the exec could only run outside the box's caps). To the parent that is the same
+/// wait status as a command that ran and exited 126, and the CLI wrote `[1, 0, 0, 0]` for it. MEASURED
+/// from an ssh session, where every exec refuses: an SDK reported the sandbox's refusal as the code's
+/// own exit 126 with no fault. The control, an exec that runs, is the chosen-137 case above.
+#[test]
+fn an_exec_that_refuses_writes_nothing_on_the_started_signal() {
+    let name = format!("execrefuse-{}", std::process::id());
+    let up = kern()
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--pids-limit",
+            "2",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sh",
+            "-c",
+            "sleep 120 & wait",
+        ])
+        .output()
+        .expect("run kern");
+    if !up.status.success() {
+        eprintln!(
+            "SKIP: no detached box here: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    let (code, sig) = started_bytes(&["exec", &name, "--", "true"]);
+    let _ = kern().args(["stop", &name]).output();
+    if code != Some(126) {
+        eprintln!("SKIP: this host did not refuse the exec at the pids limit (exit {code:?})");
+        return;
+    }
+    assert!(
+        sig.is_empty(),
+        "a refused exec wrote {sig:?} on KERN_STARTED_FD: an SDK reads that as a command that ran"
+    );
+}
+
 /// **A fork failure must never be answered with the user-namespace and rootfs hint, whatever the
 /// errno.**
 ///

@@ -5,6 +5,18 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+## v0.30.2 - 2026-10-05
+
+**`kern exec` no longer reports a command it refused as one that started.** When it cannot put the
+command under the box's caps (a box at its `--pids-limit`, or a shell outside the cgroup tree kern
+delegates, which an ordinary ssh session is) it refuses with exit 126, and it also wrote the "started"
+bytes on `KERN_STARTED_FD`, so an SDK read the refusal as the code's own exit 126. It writes nothing
+now, as `kern box` does for a box that never started.
+
+- An image `kern save` or `kern push` wrote can be the base of a `podman build`: the config carries the
+  `history` entry buildah requires for each layer.
+- `kern box --help` says `--user` also takes a name from the image's `/etc/passwd`, which it always did.
+
 ## kern-sandbox 0.2.44 - 2026-10-04
 
 **Both packages carry kern v0.30.1**, so a resident sandbox (`persist=True`, Node `persist: true`)

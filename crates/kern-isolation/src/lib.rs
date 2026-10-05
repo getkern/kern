@@ -119,6 +119,8 @@ pub use cgroup::box_was_oom_killed;
 pub use cgroup::box_workload_signal;
 /// Was a `kern exec`'d command OOM-killed with its box? See [`cgroup::exec_was_oom_killed`].
 pub use cgroup::exec_was_oom_killed;
+/// Did `kern exec` refuse the command before running it? See [`cgroup::exec_was_refused`].
+pub use cgroup::exec_was_refused;
 /// The signal that ended a `kern exec`'d command, 0 for an exit. See [`cgroup::exec_workload_signal`].
 pub use cgroup::exec_workload_signal;
 /// Which family of capped cgroup leaf an [`apply_cgroup_limits`] call creates, and why the two must

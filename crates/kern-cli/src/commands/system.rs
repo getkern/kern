@@ -325,7 +325,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --tmpfs <path[:sz]> Mount a fresh tmpfs at path in the box (e.g. /tmp:64m; repeatable)
     --shm-size <size>   Cap /dev/shm (e.g. 64m; default: the --memory cap, so what the box is
                         told matches what its cgroup enforces)
-    -u, --user <u[:g]>  Run the box command as this uid[:gid] (numeric; needs the id mapped)
+    -u, --user <u[:g]>  Run the box command as this user[:group], numeric or named in the image's /etc/passwd
     --cap-add <CAP>     Keep a capability kern would otherwise drop (e.g. NET_ADMIN, or ALL); repeatable
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
     --no-uid-range      Use the single-uid map (an --image box maps a uid RANGE by default)

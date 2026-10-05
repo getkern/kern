@@ -2798,7 +2798,13 @@ pub fn exec(
     }
     match result {
         Ok(code) => {
-            signal_exec_outcome();
+            // A REFUSAL IS NOT A START. The child refused before running anything and exited 126, and
+            // the parent's wait status for that is the one a command exiting 126 leaves: telling an SDK
+            // "it started" here made the sandbox's refusal read as the code's own exit. Nothing is written
+            // instead, which is what `kern box` writes for a box that never started.
+            if !kern_isolation::exec_was_refused() {
+                signal_exec_outcome();
+            }
             std::process::exit(code)
         }
         Err(e) => Err(Error::Sandbox(e.to_string())),
