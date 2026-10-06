@@ -4137,6 +4137,12 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                      with a CUDA or driver error"
                 ));
             }
+            // `extends` IS IMPLEMENTED, and is here as a backstop only: `resolve_extends` folds the
+            // base in and removes the key before this match runs, and an `extends` it cannot resolve
+            // is a parse error about the name. So this arm is reached only if a future change leaves
+            // the key behind, where "ignored" is the true answer and the unknown-key voice below
+            // ("did you mean?") would be a false one. `surface_tests` has `extends` in the frozen
+            // list of keys kern READS, which is where it belongs.
             "configs" | "extends" | "domainname" => {
                 warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
             }
@@ -10529,5 +10535,428 @@ mod services_shape_tests {
             "an empty block is not a list, and saying so would be the same wrong noun in reverse: \
              {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::{parse, take_warnings};
+
+    /// THE COMPOSE SURFACE, FROZEN: every key a file can rely on kern READING, with a document that
+    /// uses it.
+    ///
+    /// This is the compose half of `cli_surface_is_frozen`, and it holds the policy CHANGELOG.md
+    /// states: a key kern honours keeps its meaning, so DROPPING one is a breaking change that has
+    /// to be deliberate. Delete an arm from the service-key match, or rename the key it matches, and
+    /// that key falls through to the unknown-key voice - which is what this reads.
+    ///
+    /// The entries are whole documents rather than key fragments because several keys are only valid
+    /// in context: `depends_on`, `links` and `volumes_from` need a second service, `secrets` needs a
+    /// top-level block, and `bind_rootfs` needs a `rootfs`. A table of fragments would report those
+    /// as broken keys.
+    const HONOURED: &[(&str, &str)] = &[
+        ("image", "services:\n  s:\n    image: alpine\n"),
+        ("rootfs", "services:\n  s:\n    rootfs: /tmp\n"),
+        (
+            "bind_rootfs",
+            "services:\n  s:\n    rootfs: /tmp\n    bind_rootfs: true\n",
+        ),
+        (
+            "container_name",
+            "services:\n  s:\n    image: alpine\n    container_name: named\n",
+        ),
+        (
+            "command",
+            "services:\n  s:\n    image: alpine\n    command: true\n",
+        ),
+        (
+            "entrypoint",
+            "services:\n  s:\n    image: alpine\n    entrypoint: /bin/sh\n",
+        ),
+        (
+            "environment",
+            "services:\n  s:\n    image: alpine\n    environment:\n      - A=1\n",
+        ),
+        (
+            "ports",
+            "services:\n  s:\n    image: alpine\n    ports:\n      - 18080:80\n",
+        ),
+        (
+            "expose",
+            "services:\n  s:\n    image: alpine\n    expose:\n      - 8080\n",
+        ),
+        ("port", "services:\n  s:\n    image: alpine\n    port: 8080\n"),
+        (
+            "volumes",
+            "services:\n  s:\n    image: alpine\n    volumes:\n      - /tmp:/data\n",
+        ),
+        (
+            "devices",
+            "services:\n  s:\n    image: alpine\n    devices:\n      - /dev/null:/dev/null\n",
+        ),
+        (
+            "links",
+            "services:\n  s:\n    image: alpine\n    links:\n      - other\n  other:\n    image: alpine\n",
+        ),
+        (
+            "dns",
+            "services:\n  s:\n    image: alpine\n    dns: 1.1.1.1\n",
+        ),
+        (
+            "dns_search",
+            "services:\n  s:\n    image: alpine\n    dns_search: example.com\n",
+        ),
+        (
+            "dns_opt",
+            "services:\n  s:\n    image: alpine\n    dns_opt:\n      - ndots:2\n",
+        ),
+        (
+            "dns_options",
+            "services:\n  s:\n    image: alpine\n    dns_options:\n      - ndots:2\n",
+        ),
+        (
+            "depends_on",
+            "services:\n  s:\n    image: alpine\n    depends_on:\n      - other\n  other:\n    image: alpine\n",
+        ),
+        (
+            "healthcheck",
+            "services:\n  s:\n    image: alpine\n    healthcheck:\n      test: true\n",
+        ),
+        (
+            "restart",
+            "services:\n  s:\n    image: alpine\n    restart: always\n",
+        ),
+        ("user", "services:\n  s:\n    image: alpine\n    user: \"1000\"\n"),
+        (
+            "working_dir",
+            "services:\n  s:\n    image: alpine\n    working_dir: /tmp\n",
+        ),
+        (
+            "workdir",
+            "services:\n  s:\n    image: alpine\n    workdir: /tmp\n",
+        ),
+        (
+            "build",
+            "services:\n  s:\n    build: .\n",
+        ),
+        (
+            "mem_limit",
+            "services:\n  s:\n    image: alpine\n    mem_limit: 128m\n",
+        ),
+        (
+            "memory",
+            "services:\n  s:\n    image: alpine\n    memory: 128m\n",
+        ),
+        (
+            "memswap_limit",
+            "services:\n  s:\n    image: alpine\n    mem_limit: 128m\n    memswap_limit: 128m\n",
+        ),
+        (
+            "mem_swap_limit",
+            "services:\n  s:\n    image: alpine\n    mem_limit: 128m\n    mem_swap_limit: 128m\n",
+        ),
+        ("cpus", "services:\n  s:\n    image: alpine\n    cpus: \"1.0\"\n"),
+        ("cpuset", "services:\n  s:\n    image: alpine\n    cpuset: \"0\"\n"),
+        (
+            "pids_limit",
+            "services:\n  s:\n    image: alpine\n    pids_limit: 100\n",
+        ),
+        (
+            "mem_reservation",
+            "services:\n  s:\n    image: alpine\n    mem_reservation: 64m\n",
+        ),
+        (
+            "memory_reservation",
+            "services:\n  s:\n    image: alpine\n    memory_reservation: 64m\n",
+        ),
+        (
+            "cpu_shares",
+            "services:\n  s:\n    image: alpine\n    cpu_shares: 1024\n",
+        ),
+        (
+            "cpu_quota",
+            "services:\n  s:\n    image: alpine\n    cpu_quota: 50000\n",
+        ),
+        (
+            "cpu_period",
+            "services:\n  s:\n    image: alpine\n    cpu_quota: 50000\n    cpu_period: 100000\n",
+        ),
+        (
+            "platform",
+            "services:\n  s:\n    image: alpine\n    platform: linux/amd64\n",
+        ),
+        (
+            "volumes_from",
+            "services:\n  s:\n    image: alpine\n    volumes_from:\n      - other\n  other:\n    image: alpine\n",
+        ),
+        (
+            "pull_policy",
+            "services:\n  s:\n    image: alpine\n    pull_policy: always\n",
+        ),
+        (
+            "hostname",
+            "services:\n  s:\n    image: alpine\n    hostname: h\n",
+        ),
+        (
+            "cap_add",
+            "services:\n  s:\n    image: alpine\n    cap_add:\n      - NET_ADMIN\n",
+        ),
+        (
+            "cap_drop",
+            "services:\n  s:\n    image: alpine\n    cap_drop:\n      - ALL\n",
+        ),
+        ("tmpfs", "services:\n  s:\n    image: alpine\n    tmpfs: /run\n"),
+        (
+            "read_only",
+            "services:\n  s:\n    image: alpine\n    read_only: true\n",
+        ),
+        (
+            "privileged",
+            "services:\n  s:\n    image: alpine\n    privileged: true\n",
+        ),
+        (
+            "profiles",
+            "services:\n  s:\n    image: alpine\n    profiles:\n      - dev\n  other:\n    image: alpine\n",
+        ),
+        (
+            "deploy",
+            "services:\n  s:\n    image: alpine\n    deploy:\n      replicas: 1\n",
+        ),
+        (
+            "networks",
+            "services:\n  s:\n    image: alpine\n    networks:\n      - default\n",
+        ),
+        ("init", "services:\n  s:\n    image: alpine\n    init: true\n"),
+        (
+            "extra_hosts",
+            "services:\n  s:\n    image: alpine\n    extra_hosts:\n      - h:1.2.3.4\n",
+        ),
+        (
+            "labels",
+            "services:\n  s:\n    image: alpine\n    labels:\n      - a=b\n",
+        ),
+        (
+            "stop_signal",
+            "services:\n  s:\n    image: alpine\n    stop_signal: SIGTERM\n",
+        ),
+        (
+            "stop_grace_period",
+            "services:\n  s:\n    image: alpine\n    stop_grace_period: 10s\n",
+        ),
+        (
+            "ulimits",
+            "services:\n  s:\n    image: alpine\n    ulimits:\n      nofile: 1024\n",
+        ),
+        (
+            "sysctls",
+            "services:\n  s:\n    image: alpine\n    sysctls:\n      - net.ipv4.ip_forward=1\n",
+        ),
+        (
+            "shm_size",
+            "services:\n  s:\n    image: alpine\n    shm_size: 64m\n",
+        ),
+        (
+            "security_opt",
+            "services:\n  s:\n    image: alpine\n    security_opt:\n      - no-new-privileges:true\n",
+        ),
+        (
+            "network_mode",
+            "services:\n  s:\n    image: alpine\n    network_mode: bridge\n",
+        ),
+        (
+            "logging",
+            "services:\n  s:\n    image: alpine\n    logging:\n      driver: json-file\n",
+        ),
+        (
+            "stdin_open",
+            "services:\n  s:\n    image: alpine\n    stdin_open: true\n",
+        ),
+        (
+            // ITS OWN POSITIVE CONTROL: `s` declares no image, so this file parses only if the base
+            // was folded into it. `resolve_extends` does that before the service-key match runs,
+            // which is why the arm listing `extends` as unsupported is unreachable - and why this
+            // key was in the "says so" table below until the test showed the file coming out
+            // silent and correct.
+            "extends",
+            "services:\n  base:\n    image: alpine\n  s:\n    extends: base\n",
+        ),
+        (
+            "x-kern-security-profile",
+            "services:\n  s:\n    image: alpine\n    x-kern-security-profile: strict\n",
+        ),
+    ];
+
+    /// The voices that say "kern did not read this key". A key in [`HONOURED`] must never be spoken
+    /// of in one of them, and a key kern does NOT apply must always be.
+    fn is_unread_voice(w: &str) -> bool {
+        // `"is NOT read"` WAS IN THIS LIST AND MATCHED NOTHING kern emits - dead the day it was
+        // written, found by a review of this branch. The four that remain are each grepped for in
+        // the parser, and a fifth voice added later would make this test pass while the surface it
+        // freezes has broken; the honest bound on that is the `assert` at the end of
+        // `every_key_kern_does_not_apply_says_so`, which proves each of these voices is REACHABLE.
+        w.contains("ignored (unsupported)")
+            || w.contains("did you mean")
+            || w.contains("is NOT applied")
+            || w.contains("does not read")
+            // "is kern's TOML spelling": the voice for `health_cmd:` and `depends_healthy:`, which
+            // kern reads in its own TOML and NOT in a docker-compose.yml. It was missing, and the
+            // assertion below is what found it: without it, a key reported only in this voice would
+            // have passed the frozen-surface test as if kern read it.
+            || w.contains("is kern's TOML spelling")
+    }
+
+    /// Does `w` speak about `key` ITSELF, rather than mentioning it inside another key's name?
+    ///
+    /// The warnings name a key quoted (`'gpus:'`) or in backticks (`` `runtime: nvidia` ``), and a
+    /// bare `w.contains(key)` made `key = "pid"` match a warning about `pids_limit:` - so a test
+    /// could pass on the wrong warning entirely.
+    fn names_key(w: &str, key: &str) -> bool {
+        w.contains(&format!("'{key}:'"))
+            || w.contains(&format!("`{key}:"))
+            || w.contains(&format!("'{key}: "))
+    }
+
+    #[test]
+    fn every_honoured_compose_key_is_still_read() {
+        for (key, doc) in HONOURED {
+            let _ = take_warnings();
+            let parsed = parse(doc);
+            assert!(
+                parsed.is_ok(),
+                "the frozen surface document for '{key}:' no longer parses: {:?}\n{doc}",
+                parsed.err()
+            );
+            for w in take_warnings() {
+                assert!(
+                    !(is_unread_voice(&w) && names_key(&w, key)),
+                    "'{key}:' is in the frozen compose surface and kern now says it does not read \
+                     it: {w}"
+                );
+            }
+        }
+    }
+
+    /// NO KEY IS SILENT UNLESS ITS SILENCE IS THE DELIBERATE ANSWER.
+    ///
+    /// The other half of the policy: a key kern does not apply says so, with what to do instead. A
+    /// future change that drops one of these warnings would leave a file asking for something and
+    /// getting nothing, which is the defect class this parser's whole compat layer exists to avoid.
+    #[test]
+    fn every_key_kern_does_not_apply_says_so() {
+        // (key, the document, the word the warning must carry beyond the key itself)
+        let cases: &[(&str, &str)] = &[
+            ("configs", "services:\n  s:\n    image: alpine\n    configs:\n      - c\n"),
+            ("domainname", "services:\n  s:\n    image: alpine\n    domainname: d\n"),
+            ("gpus", "services:\n  s:\n    image: alpine\n    gpus: all\n"),
+            ("runtime", "services:\n  s:\n    image: alpine\n    runtime: nvidia\n"),
+            ("ipc", "services:\n  s:\n    image: alpine\n    ipc: host\n"),
+            ("pid", "services:\n  s:\n    image: alpine\n    pid: host\n"),
+            ("health_cmd", "services:\n  s:\n    image: alpine\n    health_cmd: true\n"),
+            ("depends_healthy", "services:\n  s:\n    image: alpine\n    depends_healthy:\n      - other\n  other:\n    image: alpine\n"),
+            ("depends_completed", "services:\n  s:\n    image: alpine\n    depends_completed:\n      - other\n  other:\n    image: alpine\n"),
+        ];
+        for (key, doc) in cases {
+            let _ = take_warnings();
+            let parsed = parse(doc);
+            assert!(
+                parsed.is_ok(),
+                "'{key}:' must not break the file, only be reported: {:?}",
+                parsed.err()
+            );
+            let said = take_warnings();
+            assert!(
+                said.iter().any(|w| names_key(w, key)),
+                "'{key}:' is not applied and kern said nothing about it. Said: {said:?}"
+            );
+            // AND IT SAID IT IN ONE OF THE VOICES `is_unread_voice` KNOWS, which is what keeps that
+            // predicate honest: a warning reworded out of all four would fail here instead of
+            // silently passing the frozen-surface test above.
+            assert!(
+                said.iter().any(|w| names_key(w, key) && is_unread_voice(w)),
+                "'{key}:' is reported in a voice `is_unread_voice` does not know, so the frozen \
+                 surface test can no longer tell read from unread. Said: {said:?}"
+            );
+        }
+    }
+
+    /// A key nobody has heard of is named, at both levels, and the extension mechanism is not.
+    #[test]
+    fn an_unknown_key_is_named_and_an_extension_field_is_not() {
+        for (doc, needle) in [
+            (
+                "services:\n  s:\n    image: alpine\n    frobnicate: 1\n",
+                "frobnicate",
+            ),
+            (
+                "frobnicate: 1\nservices:\n  s:\n    image: alpine\n",
+                "frobnicate",
+            ),
+        ] {
+            let _ = take_warnings();
+            parse(doc).expect("an unknown key is a warning, not a parse error");
+            let said = take_warnings();
+            assert!(
+                said.iter().any(|w| w.contains(needle)),
+                "an unknown key must be named: {said:?}"
+            );
+        }
+        // `x-…` is the Compose Specification's extension mechanism: the `x-common:` + anchors idiom
+        // is the commonest pattern in the ecosystem, so warning about it is a false alarm on every
+        // file that uses it.
+        for doc in [
+            "services:\n  s:\n    image: alpine\n    x-vendor: 1\n",
+            "x-common: 1\nservices:\n  s:\n    image: alpine\n",
+        ] {
+            let _ = take_warnings();
+            parse(doc).expect("an extension field parses");
+            let said = take_warnings();
+            assert!(
+                !said.iter().any(|w| w.contains("x-")),
+                "an `x-` extension field must be silent: {said:?}"
+            );
+        }
+        // The keys Docker itself does not act on, on Linux: kern ignoring them is not a difference
+        // from Docker, so reporting one would be a false alarm.
+        for key in [
+            "cpu_count",
+            "cpu_percent",
+            "cpus_shares",
+            "isolation",
+            "tty",
+        ] {
+            let doc = format!("services:\n  s:\n    image: alpine\n    {key}: 1\n");
+            let _ = take_warnings();
+            parse(&doc).expect("a Docker-on-Linux no-op key parses");
+            let said = take_warnings();
+            assert!(
+                !said.iter().any(|w| w.contains(key)),
+                "'{key}:' is a no-op under Docker on Linux too, so kern must not report a \
+                 difference: {said:?}"
+            );
+        }
+    }
+
+    /// The top level of the file has the same two halves.
+    #[test]
+    fn every_honoured_top_level_key_is_still_read() {
+        for key in [
+            "volumes", "networks", "version", "name", "configs", "secrets",
+        ] {
+            let doc = format!("{key}:\nservices:\n  s:\n    image: alpine\n");
+            let _ = take_warnings();
+            let parsed = parse(&doc);
+            assert!(
+                parsed.is_ok(),
+                "top-level '{key}:' no longer parses: {:?}",
+                parsed.err()
+            );
+            for w in take_warnings() {
+                assert!(
+                    !(is_unread_voice(&w) && w.contains(key)),
+                    "top-level '{key}:' is in the frozen surface and kern now says it does not \
+                     read it: {w}"
+                );
+            }
+        }
     }
 }
