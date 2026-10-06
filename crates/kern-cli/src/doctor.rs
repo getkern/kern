@@ -514,7 +514,7 @@ fn overlay_probe() -> OverlayProbe {
     let uid_map = format!("0 {uid} 1\n");
     let gid_map = format!("0 {gid} 1\n");
     let mut targets: Vec<std::ffi::CString> = Vec::with_capacity(N);
-    let mut optses: Vec<std::ffi::CString> = Vec::with_capacity(N);
+    let mut optses: Vec<kern_isolation::OverlayOpts> = Vec::with_capacity(N);
     for k in 0..N {
         let base = dir.join(k.to_string());
         // An interior NUL cannot appear in a path this function built, so the `else` is unreachable
@@ -527,12 +527,15 @@ fn overlay_probe() -> OverlayProbe {
             // `,` and its lowers at `:`: a `TMPDIR` with either made this probe fail and doctor report
             // that the kernel cannot do an unprivileged overlay. Built here, before the fork, like
             // every other thing the child touches.
-            std::ffi::CString::new(format!(
-                "lowerdir={},upperdir={},workdir={}",
-                kern_isolation::overlay_lowerdir(&[base.join("lower").to_string_lossy()]),
-                kern_isolation::overlay_escape(&base.join("upper").to_string_lossy()),
-                kern_isolation::overlay_escape(&base.join("work").to_string_lossy()),
-            ))
+            kern_isolation::OverlayOpts::new(
+                &format!(
+                    "lowerdir={},upperdir={},workdir={}",
+                    kern_isolation::overlay_lowerdir(&[base.join("lower").to_string_lossy()]),
+                    kern_isolation::overlay_escape(&base.join("upper").to_string_lossy()),
+                    kern_isolation::overlay_escape(&base.join("work").to_string_lossy()),
+                ),
+                Some(&base.join("upper")),
+            )
             .ok(),
         ) else {
             let _ = crate::commands::remove_tree_forced(&dir);
@@ -573,18 +576,19 @@ fn overlay_probe() -> OverlayProbe {
         }
         // A fixed-size array, not a Vec: no allocation, and the parent does the sorting.
         let mut us = [0u64; N];
+        // ONE WARM-UP MOUNT, BEFORE ANY TIMER: on a host where the kernel refuses the option set this
+        // upper's filesystem can take, `mount_overlay_c` tries twice, and a failed mount plus a retry
+        // would be reported as this host's per-mount cost.
+        let warm = unsafe { kern_isolation::mount_overlay_c(targets[0].as_ptr(), 0, &optses[0]) };
+        if !warm.ok() {
+            unsafe { libc::_exit(3) };
+        }
+        unsafe { libc::umount2(targets[0].as_ptr(), 0) };
         for k in 0..N {
             let t0 = std::time::Instant::now();
-            let rc = unsafe {
-                libc::mount(
-                    c"overlay".as_ptr(),
-                    targets[k].as_ptr(),
-                    c"overlay".as_ptr(),
-                    0,
-                    optses[k].as_ptr() as *const libc::c_void,
-                )
-            };
-            if rc != 0 {
+            let how =
+                unsafe { kern_isolation::mount_overlay_c(targets[k].as_ptr(), 0, &optses[k]) };
+            if !how.ok() {
                 unsafe { libc::_exit(3) };
             }
             us[k] = t0.elapsed().as_micros() as u64;

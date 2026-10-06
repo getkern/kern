@@ -41,7 +41,15 @@ CHOKEPOINT_CONSTRUCTORS = ["pods_root", "scratch_dir"]
 #   * COSMETIC FILES are single kern-internal FILES under the runtime root that kern READS but never
 #     ACTS ON (display only), so forging one skews a number, not a decision - not the identity/content
 #     forgery that makes an authoritative dir dangerous, and a file is not dir-guardable anyway.
-SIBLING_TREES = {"images", "volumes", "builds", "uncapped-notice"}  # under $XDG_DATA_HOME/$XDG_CACHE_HOME
+# `boxes` is `kern box --keep`'s store ($XDG_DATA_HOME/kern/boxes, 0700): the writable layer of each
+# kept box and the `kern box` command line `kern start` replays. A SIBLING TREE for the same reason
+# `volumes` and `images` are - it is not under the runtime registry root, so the `-v` guard on
+# registry dirs does not reach it, and like them it is state the operator can hand to a box on
+# purpose (measured: main allows `-v $XDG_DATA_HOME/kern:/x`, and `-v ~` has always exposed the image
+# cache and the profiles the same way). What `kern start` replays is checked on READ instead: the
+# record is size-bounded and must be a `kern box <name> ...` command line, or it is reported rather
+# than run.
+SIBLING_TREES = {"images", "volumes", "builds", "boxes", "uncapped-notice"}  # under $XDG_DATA_HOME/$XDG_CACHE_HOME
 COSMETIC_FILES = {"runstats", ".greeted"}  # runtime FILES kern only DISPLAYS: run counter, greet marker
 NON_DIR_CHILDREN = SIBLING_TREES | COSMETIC_FILES
 

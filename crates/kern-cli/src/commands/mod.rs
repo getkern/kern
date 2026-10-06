@@ -274,6 +274,11 @@ pub struct BoxRunArgs<'a> {
     pub overlay_lower: &'a [String],
     /// INTERNAL (build): a persistent overlay upper (the build layer) instead of ephemeral scratch.
     pub overlay_upper: Option<&'a str>,
+    /// `--keep`: this box's writable layer is the kept one for its name, and its command line is
+    /// recorded so `kern start` can run it again. See [`crate::keepbox`]. The layer's path is not a
+    /// field: it is `keepbox::dir_of(name)`, so nothing can point two boxes of one name at two
+    /// directories or leave a record beside a layer that is not its own.
+    pub keep: bool,
     /// `--memory`/`-m`: hard memory ceiling in bytes (default cap if `None`).
     pub memory: Option<u64>,
     /// `--memory-swap-max`: swap allowance in bytes → `memory.swap.max` (`None` → `0`, swap off).
@@ -1336,7 +1341,7 @@ struct BuildSpec<'a> {
     tmpfs: Vec<kern_isolation::TmpfsMount>,
     run_as: Option<(u32, u32)>,
     /// The supplementary groups the image puts that user in. See
-    /// [`crate::commands::image_supplementary_gids`] for why they are resolved and when they are not.
+    /// [`crate::commands::supplementary_gids`] for why they are resolved and when they are not.
     extra_gids: Vec<u32>,
     pids_max: Option<u64>,
     caps: kern_isolation::CapSpec,
@@ -1437,11 +1442,13 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         };
         (one, MountMode::Bind, None, None)
     } else {
-        // The writable overlay upper. Normally an ephemeral scratch (discarded on exit). For a `kern
-        // build` RUN step (`overlay_upper` set) the UPPER persists in the build tree so successive RUN/
-        // COPY steps accumulate into it (the "diff" layer). overlayfs requires upperdir and workdir to be
-        // on the SAME filesystem, so in build mode BOTH live under the build tree (work is cleared each
-        // step - overlay wants a fresh workdir); only `merged` (a bare mountpoint) stays ephemeral.
+        // The writable overlay upper. Normally an ephemeral scratch (discarded on exit). Where
+        // `overlay_upper` is set the UPPER persists there instead, and two callers set it: a `kern
+        // build` RUN step, so successive RUN/COPY steps accumulate into the build layer, and a
+        // `--keep` box, whose layer is its own directory under `$XDG_DATA_HOME` (see
+        // [`crate::keepbox`]) so `kern start` finds it again by name. overlayfs requires upperdir and
+        // workdir on the SAME filesystem, so both live under that root (work is cleared at every
+        // start - overlay wants a fresh workdir); only `merged`, a bare mountpoint, stays ephemeral.
         let eph = scratch_dir().join(format!("{}-{}", b.name.as_str(), std::process::id()));
         // Create the ephemeral parent once (0700) so the per-leaf creates below (`upper`/`work`/`merged`,
         // all under `eph` in the common case) are a single bare mkdir each instead of each re-walking
@@ -1458,15 +1465,67 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
             Some(dir) => {
                 let root = PathBuf::from(dir);
                 let w = root.join("work");
+                // A SYMLINK OR A FILE AT `upper`/`work` IS REFUSED, NEVER FOLLOWED, and this comes
+                // before the clearing below because the clearing would otherwise empty whatever the
+                // link points at. `own_only_dir` creates the directory and accepts one that is
+                // already there, so a symlink at that name sends the box's whole writable layer
+                // wherever it points: MEASURED, with a kept box's `upper` replaced by a link to a
+                // host directory, the box's `etc`, `root` and `sys` deltas were written into that
+                // directory. Both names live in a 0700 directory of the user's own, so this is
+                // defence in depth and not a boundary - but the kept-box store is a sibling tree an
+                // operator may hand to a box on purpose, and a box that was given it could plant one
+                // for a LATER `kern start` to write through.
+                for (what, path) in [("upper", build_upper_dir(&root)), ("work", w.clone())] {
+                    if let Ok(m) = std::fs::symlink_metadata(&path) {
+                        if !m.is_dir() {
+                            return Err(Error::Sandbox(format!(
+                                "overlay {what} {}: it is {}, not a directory, so kern will not \
+                                 write a box's layer through it. Remove it, or `kern rm <name>` \
+                                 and create the box again",
+                                path.display(),
+                                if m.file_type().is_symlink() {
+                                    "a symlink"
+                                } else {
+                                    "a file"
+                                }
+                            )));
+                        }
+                    }
+                }
                 // overlayfs REQUIRES an empty workdir, so this is a precondition, not tidying. Left
                 // discarded, a refused removal surfaced later as a bare `mount: invalid argument` with
                 // no way to connect it to the leftover directory that caused it.
-                match std::fs::remove_dir_all(&w) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                //
+                // THROUGH THE FORCE REMOVER, because the thing to remove is one overlayfs made. A
+                // used workdir holds `work/work` at mode 000, which `remove_dir_all` cannot even
+                // traverse: MEASURED, a box started twice on the same `--overlay-upper` failed the
+                // second time with "cannot clear it ... Permission denied (os error 13)", so a
+                // persistent writable layer could be written once and never reused. `remove_build_tree`
+                // chmods the directories it walks and falls back to a removal inside an id-mapped user
+                // namespace for anything owned by a subordinate uid, which is what a `--uid-range`
+                // box leaves. It is best effort, so the emptiness is checked afterwards and the
+                // refusal, when it comes, still names the directory.
+                remove_build_tree(&w);
+                // Afterwards, because the removal is best effort: either it is gone, or it is there
+                // and empty (which overlayfs accepts), or the refusal names it.
+                let cleared = match std::fs::read_dir(&w) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                    Ok(mut entries) => Ok(entries.next().is_none()),
+                    Err(e) => Err(e),
+                };
+                match cleared {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(Error::Sandbox(format!(
+                            "overlay work dir {}: it is not empty and could not be cleared, and \
+                             overlayfs requires it empty",
+                            w.display()
+                        )))
+                    }
                     Err(e) => {
                         return Err(Error::Sandbox(format!(
-                            "overlay work dir {}: cannot clear it, and overlayfs requires it empty: {e}",
+                            "overlay work dir {}: cannot read it to check it is empty, which \
+                             overlayfs requires: {e}",
                             w.display()
                         )))
                     }
@@ -2776,7 +2835,10 @@ fn push_unescaped(out: &mut String, s: &str) {
 /// rootfs/ports left to report; those render empty rather than as a stale value.
 trait PsRow {
     fn ps_name(&self) -> &str;
-    fn ps_pid(&self) -> i32;
+    /// `None` FOR A ROW THAT IS NOT A PROCESS. A kept box (`kern box --keep`) is a layer on disk
+    /// and a recorded command, so `{{.ID}}` renders `-` there, which is what the table prints in
+    /// the same column. `0` would read as a pid.
+    fn ps_pid(&self) -> Option<i32>;
     fn ps_image(&self) -> String;
     fn ps_command(&self) -> String;
     fn ps_ports(&self) -> &str;
@@ -2799,8 +2861,8 @@ impl PsRow for registry::Instance {
     fn ps_labels(&self) -> &str {
         &self.labels
     }
-    fn ps_pid(&self) -> i32 {
-        self.pid
+    fn ps_pid(&self) -> Option<i32> {
+        Some(self.pid)
     }
     fn ps_image(&self) -> String {
         crate::ui::scrub(&self.rootfs)
@@ -2829,8 +2891,8 @@ impl PsRow for registry::ExitedBox {
     fn ps_labels(&self) -> &str {
         ""
     }
-    fn ps_pid(&self) -> i32 {
-        self.pid
+    fn ps_pid(&self) -> Option<i32> {
+        Some(self.pid)
     }
     fn ps_image(&self) -> String {
         String::new()
@@ -2852,6 +2914,50 @@ impl PsRow for registry::ExitedBox {
     }
 }
 
+/// A KEPT BOX RENDERS THROUGH THE SAME TEMPLATE, so `ps -a --format` cannot forget the row kind the
+/// way a hand-written arm would. It is the one row with no pid and no ports; its image is the one
+/// recorded when it was created, and its "running for" is its age, because a kept box's only clock
+/// is when it was made.
+///
+/// `--json` DOES NOT COME THROUGH HERE, and neither does the table: each has its own register, the
+/// same way an exited row does. `--json` says the token (`exited`, `kept`) with the code in its own
+/// `exit_code` field, `--format` says the human string (`exited (0)`, `kept (exit 0)`), and the
+/// table says `exit 0` under a section header that already carries the row kind. Three registers of
+/// one fact is not the drift the note in `ps` is about: that one was `--json` saying NOTHING while
+/// the table said `paused`.
+impl PsRow for crate::keepbox::KeptBox {
+    fn ps_name(&self) -> &str {
+        &self.name
+    }
+    fn ps_labels(&self) -> &str {
+        ""
+    }
+    fn ps_pid(&self) -> Option<i32> {
+        None
+    }
+    fn ps_image(&self) -> String {
+        crate::ui::scrub(&self.meta.image)
+    }
+    fn ps_command(&self) -> String {
+        crate::ui::scrub(&self.command)
+    }
+    fn ps_ports(&self) -> &str {
+        ""
+    }
+    fn ps_pod(&self) -> &str {
+        ""
+    }
+    fn ps_running_for(&self, now: u64) -> String {
+        format!("{} ago", fmt_uptime(now.saturating_sub(self.meta.created)))
+    }
+    fn ps_status(&self) -> String {
+        match self.meta.last_exit {
+            Some(c) => format!("kept (exit {c})"),
+            None => "kept".to_string(),
+        }
+    }
+}
+
 /// Render one box through a `ps --format` template: the `{{.Field}}` placeholders below, plus `\t`/`\n`
 /// in literal text. A Go-template with logic (ranges/conditionals/functions) is NOT supported: an
 /// unterminated `{{` or an unknown token is a hard error (use `--json` for arbitrary shaping). Validated
@@ -2869,7 +2975,10 @@ fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Err
             .ok_or(Error::Usage("ps --format: unterminated `{{`"))?;
         match after[..close].trim() {
             ".Names" | ".Name" => out.push_str(b.ps_name()),
-            ".ID" | ".Pid" => out.push_str(&b.ps_pid().to_string()),
+            ".ID" | ".Pid" => match b.ps_pid() {
+                Some(pid) => out.push_str(&pid.to_string()),
+                None => out.push('-'),
+            },
             ".Image" | ".Rootfs" => out.push_str(&b.ps_image()),
             ".Command" => out.push_str(&b.ps_command()),
             ".Ports" => out.push_str(b.ps_ports()),
@@ -4053,9 +4162,9 @@ fn verify_download_checksum(path: &std::path::Path, checksum: &str) -> Result<()
 /// write / mount / umount / stat / `_exit`, with no allocation of its own.
 pub(crate) struct OpaquePlan {
     /// `lowerdir=<lower>,upperdir=<up>,workdir=<wk>`, escaped.
-    rw_opts: std::ffi::CString,
+    rw_opts: kern_isolation::OverlayOpts,
     /// `lowerdir=<up>:<lower>`, escaped: the re-mount that the merged view would do.
-    ro_opts: std::ffi::CString,
+    ro_opts: kern_isolation::OverlayOpts,
     /// The merge target.
     merged: std::ffi::CString,
     /// `<merged>/dir`, the directory the probe deletes and recreates.
@@ -4087,8 +4196,10 @@ impl OpaquePlan {
         );
         let dir = std::path::Path::new(&merged).join("dir");
         Some(OpaquePlan {
-            rw_opts: std::ffi::CString::new(rw).ok()?,
-            ro_opts: std::ffi::CString::new(ro).ok()?,
+            // In the form every kern overlay mount takes (`kern_isolation::mount_overlay_c`): this
+            // probe decides whether a build may be layered, so it must measure the mount builds make.
+            rw_opts: kern_isolation::OverlayOpts::new(&rw, Some(std::path::Path::new(&up))).ok()?,
+            ro_opts: kern_isolation::OverlayOpts::new(&ro, None).ok()?,
             witness: std::path::Path::new(&merged).join("witness"),
             merged: std::ffi::CString::new(merged).ok()?,
             secret: dir.join("secret"),
@@ -4133,14 +4244,7 @@ unsafe fn probe_opaque_child(plan: &OpaquePlan, euid: libc::uid_t, egid: libc::g
         libc::MS_REC | libc::MS_PRIVATE,
         std::ptr::null(),
     );
-    if libc::mount(
-        c"overlay".as_ptr(),
-        plan.merged.as_ptr(),
-        c"overlay".as_ptr(),
-        0,
-        plan.rw_opts.as_ptr() as *const libc::c_void,
-    ) != 0
-    {
+    if !kern_isolation::mount_overlay_c(plan.merged.as_ptr(), 0, &plan.rw_opts).ok() {
         libc::_exit(13);
     }
     // Reproduce EXACTLY what a build does - and the leak that only shows on RE-MOUNT. A build RUN does
@@ -4163,14 +4267,7 @@ unsafe fn probe_opaque_child(plan: &OpaquePlan, euid: libc::uid_t, egid: libc::g
     if libc::umount2(plan.merged.as_ptr(), 0) != 0 {
         libc::_exit(17);
     }
-    if libc::mount(
-        c"overlay".as_ptr(),
-        plan.merged.as_ptr(),
-        c"overlay".as_ptr(),
-        libc::MS_RDONLY,
-        plan.ro_opts.as_ptr() as *const libc::c_void,
-    ) != 0
-    {
+    if !kern_isolation::mount_overlay_c(plan.merged.as_ptr(), libc::MS_RDONLY, &plan.ro_opts).ok() {
         libc::_exit(18);
     }
     // THE POSITIVE CONTROL FIRST. An absence only means "hidden" if the view can show anything at

@@ -150,6 +150,19 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
                 .as_ref()
                 .map(|b| b.extra_gids.clone())
                 .unwrap_or_default();
+            // The box's write allowlist, from the SAME entry and re-read every round for the same
+            // reason: a box recreated under this name confines its writes to ITS paths, not its
+            // predecessor's. Stored comma-joined; empty means the box passed no `--landlock-rw`.
+            let ll: Vec<String> = entry
+                .as_ref()
+                .map(|b| {
+                    b.landlock_rw
+                        .split(',')
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             let ok = run_probe(
                 pid1,
                 &probe,
@@ -160,6 +173,7 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
                     workdir: wd,
                     run_as: who,
                     extra_gids: &sgids,
+                    landlock_rw: &ll,
                 },
             );
             if ok {
@@ -1054,11 +1068,14 @@ pub(crate) struct ProbeAs<'a> {
     /// with more access than the service it watches reports healthy for a service that cannot run.
     pub run_as: Option<(u32, u32)>,
     pub extra_gids: &'a [u32],
+    /// The box's `--landlock-rw` write allowlist, re-applied to the probe: see the call below.
+    pub landlock_rw: &'a [String],
 }
 
 pub(crate) fn run_probe(pid1: i32, probe: &[String], b: &ProbeAs<'_>) -> bool {
     let (env, timeout, seccomp_mode) = (b.env, b.timeout, b.seccomp_mode);
     let (workdir, run_as, extra_gids) = (b.workdir, b.run_as, b.extra_gids);
+    let landlock_rw = b.landlock_rw;
     let to = (timeout > 0).then_some(timeout);
     let probe_pid = unsafe { libc::fork() };
     if probe_pid == 0 {
@@ -1129,6 +1146,15 @@ pub(crate) fn run_probe(pid1: i32, probe: &[String], b: &ProbeAs<'_>) -> bool {
             // cannot run.
             run_as,
             extra_gids,
+            // THE BOX'S WRITE ALLOWLIST APPLIES TO THE PROBE TOO, which is the opposite of the choice
+            // made for its capabilities and its AppArmor profile two paragraphs up, and for a reason
+            // the other two do not have: the box's own scratch set (`/dev`, `/tmp`, `/run`, `/proc`)
+            // is granted by the same code, so a check that writes anywhere a check normally writes is
+            // unaffected, while the binary it names lives in the workload-writable rootfs. Leaving it
+            // ungranted would hand a workload that overwrote that binary one unconfined-write run per
+            // interval, in a box whose entire point was that its writes are confined. The empty list
+            // is every box that did not pass `--landlock-rw`, where this is a no-op.
+            landlock_rw,
         )
         .unwrap_or(1);
         unsafe { libc::_exit(code) };

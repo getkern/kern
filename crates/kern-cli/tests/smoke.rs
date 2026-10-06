@@ -898,6 +898,12 @@ fn a_box_that_exits_137_without_an_oom_is_not_blamed_on_the_cap() {
 /// its number intact, so no `pre_exec` is needed. The parent closes the write end before reading, or the
 /// read would never see EOF and this test would hang instead of failing.
 fn started_bytes(args: &[&str]) -> (Option<i32>, Vec<u8>) {
+    let (code, sig, _) = started_bytes_and_stderr(args);
+    (code, sig)
+}
+
+/// [`started_bytes`], and what kern said on stderr, from ONE run.
+fn started_bytes_and_stderr(args: &[&str]) -> (Option<i32>, Vec<u8>, String) {
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (r, w) = (fds[0], fds[1]);
@@ -920,7 +926,11 @@ fn started_bytes(args: &[&str]) -> (Option<i32>, Vec<u8>) {
     }
     unsafe { libc::close(r) };
     let out = child.wait_with_output().expect("wait for kern");
-    (out.status.code(), got)
+    (
+        out.status.code(),
+        got,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// The `KERN_STARTED_FD` signal is FOUR bytes: the OOM verdict is the third, the workload's SIGNAL the
@@ -1159,6 +1169,370 @@ fn an_exec_that_refuses_writes_nothing_on_the_started_signal() {
         sig.is_empty(),
         "a refused exec wrote {sig:?} on KERN_STARTED_FD: an SDK reads that as a command that ran"
     );
+}
+
+/// **`kern exec -u <user>` runs as that account of the BOX, resolved from the box's CURRENT files, and
+/// never from the host's.**
+///
+/// Five things, on one box with a uid range:
+///
+/// - an account created INSIDE the box after it started (`adduser`) is found, with its uid, its
+///   passwd group and its passwd home, because `docker exec --user` resolves against the
+///   container's files as they are now;
+/// - without `-u` the command is still box root, so the flag added a way out and changed no default;
+/// - an unknown name is refused before anything runs: nothing on `KERN_STARTED_FD`, which an SDK
+///   would read as a command that ran;
+/// - a box that points its `/etc/passwd` at an absolute HOST path, where the host has a file
+///   defining the name, gets a refusal: the link resolves inside the box, where nothing is there;
+/// - a FIFO at `/etc/passwd` answers at once instead of waiting for a writer the box controls.
+#[test]
+fn exec_user_resolves_the_box_account_and_never_a_host_file() {
+    let name = format!("execuser-{}", std::process::id());
+    let up = kern()
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sleep",
+            "120",
+        ])
+        .output()
+        .expect("run kern");
+    if !up.status.success() {
+        eprintln!(
+            "SKIP: no detached box here: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    let exec = |args: &[&str]| {
+        let mut argv = vec!["exec", name.as_str()];
+        argv.extend_from_slice(args);
+        kern().args(&argv).output().expect("run kern exec")
+    };
+    let text = |o: &std::process::Output| String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let map = exec(&["--", "cat", "/proc/self/uid_map"]);
+    if text(&map).lines().count() < 2 {
+        let _ = kern().args(["stop", &name]).output();
+        eprintln!("SKIP: this host gives a box no uid range: {}", text(&map));
+        return;
+    }
+    let made = exec(&[
+        "--",
+        "adduser",
+        "-D",
+        "-u",
+        "4321",
+        "-h",
+        "/home/late",
+        "late",
+    ]);
+    assert!(made.status.success(), "adduser in the box: {made:?}");
+    // A group OUTSIDE the range (gid 70000 past a 65536-id map) and one inside it. `setgroups`
+    // refuses a whole list for one unmapped gid, so `-u late` must get the mapped one and no warning.
+    let grouped = exec(&[
+        "--",
+        "sh",
+        "-c",
+        "addgroup -g 70000 far && addgroup -g 4400 near && addgroup late far && addgroup late near",
+    ]);
+    assert!(grouped.status.success(), "addgroup in the box: {grouped:?}");
+    let groups = exec(&["-u", "late", "--", "id", "-G"]);
+
+    let late = exec(&[
+        "-u",
+        "late",
+        "--",
+        "sh",
+        "-c",
+        "echo $(id -u) $(id -g) $HOME",
+    ]);
+    let root = exec(&["--", "id", "-u"]);
+    let (code, sig, ghost_said) =
+        started_bytes_and_stderr(&["exec", &name, "-u", "ghost", "--", "true"]);
+
+    // A HOST file that defines `victim`, at a path the box does not have.
+    let host_file = std::env::temp_dir().join(format!("kern-hostonly-{}", std::process::id()));
+    std::fs::write(&host_file, "victim:x:4242:4242::/:/bin/sh\n").expect("write the host file");
+    let host_path = host_file.to_string_lossy().into_owned();
+    let linked = exec(&["--", "sh", "-c", &format!("ln -sf {host_path} /etc/passwd")]);
+    let victim = exec(&["-u", "victim", "--", "id", "-u"]);
+    let fifo = exec(&["--", "sh", "-c", "rm -f /etc/passwd && mkfifo /etc/passwd"]);
+    // WITH A DEADLINE, so a read that blocks turns this red instead of hanging the suite. MEASURED with
+    // the non-blocking open taken out: the exec waited on the FIFO until the run was killed.
+    let mut held = kern()
+        .args(["exec", &name, "-u", "late", "--", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn kern exec");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let blocked = loop {
+        match held.try_wait().expect("wait for kern exec") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = held.kill();
+                let _ = held.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let _ = kern().args(["stop", &name]).output();
+    let _ = std::fs::remove_file(&host_file);
+
+    assert!(late.status.success(), "exec -u late: {late:?}");
+    assert_eq!(text(&late), "4321 4321 /home/late", "exec -u late");
+    let ids: Vec<&str> = std::str::from_utf8(&groups.stdout)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    assert!(
+        ids.contains(&"4400") && !ids.contains(&"70000"),
+        "exec -u late groups: {ids:?}"
+    );
+    let said = String::from_utf8_lossy(&groups.stderr);
+    assert!(
+        !said.contains("could not give the workload the group"),
+        "one unmapped gid cost the mapped ones: {said}"
+    );
+    assert_eq!(text(&root), "0", "exec without -u must stay box root");
+    assert_eq!(
+        code,
+        Some(1),
+        "an unknown user is kern's refusal, not the command's exit"
+    );
+    assert!(
+        sig.is_empty(),
+        "a refused -u wrote {sig:?} on KERN_STARTED_FD: an SDK reads that as a command that ran"
+    );
+    assert!(
+        ghost_said.contains("no user 'ghost'"),
+        "the refusal names the user: {ghost_said}"
+    );
+    assert!(linked.status.success(), "ln in the box: {linked:?}");
+    assert!(
+        !victim.status.success(),
+        "exec -u victim resolved through a HOST file: {}",
+        text(&victim)
+    );
+    let said = String::from_utf8_lossy(&victim.stderr);
+    assert!(said.contains("no user 'victim'"), "{said}");
+    assert!(fifo.status.success(), "mkfifo in the box: {fifo:?}");
+    let Some(status) = blocked else {
+        panic!("a FIFO at /etc/passwd held exec -u past 10 s: the read waits for a writer");
+    };
+    assert!(
+        !status.success(),
+        "a FIFO is no passwd, so `late` cannot resolve: {status:?}"
+    );
+}
+
+/// **`kern exec -u` works in a box that dropped every capability, and the command keeps none.**
+///
+/// The exec child used to reapply the box's capability drop in one step BEFORE switching identity.
+/// Under `--cap-drop ALL` that took `CAP_SETUID` and `CAP_SETGID` with it, and the switch failed
+/// closed: MEASURED, `kern exec -u nobody` into a `--cap-drop ALL --user nobody` box answered "could
+/// not drop to the box's own user", exit 126. That is the SDK's own posture for a non-root `user=`
+/// with `persist=True`, and `kern compose exec` of a `cap_drop: [ALL]` service with a `user:`.
+/// The other half is the boundary: after the switch, every capability set is empty.
+#[test]
+fn exec_user_works_under_cap_drop_all_and_keeps_no_capability() {
+    let name = format!("execcapall-{}", std::process::id());
+    let up = kern()
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--image",
+            "alpine:latest",
+            "--cap-drop",
+            "ALL",
+            "--user",
+            "nobody",
+            "--",
+            "sleep",
+            "120",
+        ])
+        .output()
+        .expect("run kern");
+    if !up.status.success() {
+        eprintln!(
+            "SKIP: no detached box here: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    let out = kern()
+        .args([
+            "exec",
+            &name,
+            "-u",
+            "nobody",
+            "--",
+            "sh",
+            "-c",
+            "id -u; grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb)' /proc/self/status",
+        ])
+        .output()
+        .expect("run kern exec");
+    let _ = kern().args(["stop", &name]).output();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exec -u under --cap-drop ALL: {:?} {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("65534"), "{text}");
+    let sets: Vec<&str> = lines.collect();
+    assert_eq!(sets.len(), 5, "{text}");
+    for line in sets {
+        assert!(
+            line.ends_with("0000000000000000"),
+            "a capability survived: {line}"
+        );
+    }
+}
+
+/// **On the single-uid map `kern exec -u` refuses an id the box does not have, by name, and box root
+/// gets no warning about groups it could never hold.**
+///
+/// The map is the kernel's rule (an id outside every range cannot be set), read before the fork: the
+/// child used to fail closed as "could not drop to the box's own user", exit 126, naming neither the
+/// uid nor the map. A group the box's `/etc/group` does not have is refused by name too. And root on
+/// that map: `setgroups` is denied there, root owns every mapped file, and both `kern box --user root`
+/// and `kern exec -u root` used to print, on every run, that it "could not give the workload the
+/// group(s) its image puts it in".
+#[test]
+fn exec_user_on_the_single_uid_map_refuses_by_name_and_root_hears_no_group_warning() {
+    let name = format!("execsingle-{}", std::process::id());
+    let up = kern()
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--image",
+            "alpine:latest",
+            "--no-uid-range",
+            "--",
+            "sleep",
+            "120",
+        ])
+        .output()
+        .expect("run kern");
+    if !up.status.success() {
+        eprintln!(
+            "SKIP: no detached box here: {}",
+            String::from_utf8_lossy(&up.stderr)
+        );
+        return;
+    }
+    let exec = |args: &[&str]| {
+        let mut argv = vec!["exec", name.as_str()];
+        argv.extend_from_slice(args);
+        kern().args(&argv).output().expect("run kern exec")
+    };
+    let unmapped = exec(&["-u", "nobody", "--", "true"]);
+    let no_group = exec(&["-u", "root:ghostgroup", "--", "true"]);
+    let root = exec(&["-u", "root", "--", "id", "-u"]);
+    let _ = kern().args(["stop", &name]).output();
+    let boxed = kern()
+        .args([
+            "box",
+            &format!("{name}-b"),
+            "--image",
+            "alpine:latest",
+            "--no-uid-range",
+            "--user",
+            "root",
+            "--",
+            "true",
+        ])
+        .output()
+        .expect("run kern box");
+
+    let said = String::from_utf8_lossy(&unmapped.stderr);
+    assert_eq!(unmapped.status.code(), Some(1), "{said}");
+    assert!(said.contains("uid 65534 does not exist in box"), "{said}");
+    assert!(said.contains("uid 0 alone"), "{said}");
+    let said = String::from_utf8_lossy(&no_group.stderr);
+    assert!(said.contains("no group 'ghostgroup'"), "{said}");
+    assert!(root.status.success(), "{root:?}");
+    assert_eq!(String::from_utf8_lossy(&root.stdout).trim(), "0");
+    for (what, out) in [("exec -u root", &root), ("box --user root", &boxed)] {
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !said.contains("could not give the workload the group"),
+            "{what} warned about groups root on the single-uid map can never hold: {said}"
+        );
+    }
+}
+
+/// **A workload whose image group list is refused keeps NONE of kern's own groups.**
+///
+/// `setgroups` refuses a whole list for one gid outside the box's map, and the process then kept the
+/// groups it inherited, which are the host user's as the box sees them. MEASURED on an image whose
+/// user is in group 70000 (past a 65536-id range): `kern box --user late` ran as
+/// `groups=65534(nobody) x13,0(root)`, the box's root group among them. The list is cleared now, and
+/// the warning says the gid is outside the map instead of suggesting the `--uid-range` already in use.
+#[test]
+fn a_refused_group_list_leaves_the_workload_with_none_of_the_callers_groups() {
+    let dir = std::env::temp_dir().join(format!("kern-grp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("context dir");
+    std::fs::write(
+        dir.join("Dockerfile"),
+        "FROM alpine:latest\nRUN addgroup -g 70000 far && adduser -D -u 4321 late && addgroup late far\n",
+    )
+    .expect("Dockerfile");
+    let tag = format!("kern-smoke-grp:{}", std::process::id());
+    let built = kern()
+        .args(["build", "-q", "-t", &tag, &dir.to_string_lossy()])
+        .output()
+        .expect("run kern build");
+    let _ = std::fs::remove_dir_all(&dir);
+    if !built.status.success() {
+        eprintln!(
+            "SKIP: no build here: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        return;
+    }
+    let out = kern()
+        .args([
+            "box",
+            &format!("grp-{}", std::process::id()),
+            "--image",
+            &tag,
+            "--user",
+            "late",
+            "--",
+            "id",
+            "-G",
+        ])
+        .output()
+        .expect("run kern box");
+    let _ = kern().args(["image", "rm", &tag]).output();
+    let said = String::from_utf8_lossy(&out.stderr);
+    if said.contains("cannot drop to the target") {
+        eprintln!("SKIP: no uid range for this user: {said}");
+        return;
+    }
+    assert!(out.status.success(), "{out:?}");
+    let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["4321".to_string()],
+        "the workload kept groups that are not its own: {said}"
+    );
+    assert!(said.contains("outside this box's gid map"), "{said}");
 }
 
 /// **A fork failure must never be answered with the user-namespace and rootfs hint, whatever the
@@ -2250,4 +2624,69 @@ fn no_list_verb_carries_a_terminal_escape_off_disk() {
         "no verb listed the planted name, so this swept nothing; the fixture stopped being live"
     );
     eprintln!("reached and neutralised by: {reached:?}");
+}
+
+/// `kern recover` LEAVES A BOX THAT IS STILL BEING BUILT ALONE.
+///
+/// A box creates its overlay scratch (`<runtime>/kern/scratch/<name>-<pid>/{upper,work,merged}`)
+/// before it mounts the overlay and before it writes its registry entry, so during that window it is
+/// a directory no live entry names. `recover` removed every such directory, and the other `kern` then
+/// mounted over directories that had just been deleted: `mount(overlay) failed: No such file or
+/// directory`. MEASURED on 0.30.2: 0 failures in 160 boxes from four workers, 42 in 160 with a
+/// `recover` loop beside them. The Python SDK runs `recover` when a prewarmed session closes, which is
+/// how several MCP servers on one machine came to break each other's calls.
+///
+/// Built here without the race, so the verdict does not depend on timing: one scratch directory
+/// named for a creator that is ALIVE (this test process) and one for a creator that has EXITED (a
+/// child reaped before `recover` runs). The control is the second one - a `recover` that removed
+/// nothing would pass the first assertion by doing no work at all.
+#[test]
+fn recover_keeps_scratch_whose_creator_is_alive_and_removes_the_dead() {
+    let runtime = std::env::temp_dir().join(format!("kern-recover-live-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runtime);
+    let scratch = runtime.join("kern/scratch");
+    std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    // A pid that existed and does not any more: a child, run to completion and reaped.
+    let dead = {
+        let mut c = Command::new("true").spawn().expect("spawn true");
+        let pid = c.id();
+        c.wait().expect("reap true");
+        pid
+    };
+    let alive = std::process::id();
+    let in_build = scratch.join(format!("box-in-build-{alive}"));
+    let orphan = scratch.join(format!("box-crashed-{dead}"));
+    for d in [&in_build, &orphan] {
+        for sub in ["upper", "work", "merged"] {
+            std::fs::create_dir_all(d.join(sub)).expect("mkdir scratch leaf");
+        }
+    }
+
+    let out = kern()
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .arg("recover")
+        .output()
+        .expect("run kern recover");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        in_build.join("upper").is_dir() && in_build.join("work").is_dir(),
+        "recover removed the scratch of a box whose creator is still running, which is a box \
+         mid-build: its overlay mount would now fail with ENOENT\n{said}"
+    );
+    assert!(
+        !orphan.exists(),
+        "the CONTROL: recover must still reclaim the scratch of a creator that has exited, or the \
+         assertion above passes by doing nothing\n{said}"
+    );
+    let _ = std::fs::remove_dir_all(&runtime);
 }

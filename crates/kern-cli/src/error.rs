@@ -184,7 +184,7 @@ impl Error {
             Error::Setup(msg) if msg.contains(kern_isolation::USERNS_RESTRICTED) => {
                 Some(crate::doctor::no_map_hint())
             }
-            Error::Setup(_) => Some(kern_isolation::SETUP_FAILURE_HINT.into()),
+            Error::Setup(msg) => Some(kern_isolation::setup_failure_hint(msg).into()),
             // SUPPRESSED WHEN THE MESSAGE ALREADY CARRIES ITS REPAIR, the rule `Volume` and `Compose`
             // above follow: `inspect` now answers for an image too, and its refusal names `kern ps`,
             // `kern images` and `kern pull` itself. A generic pointer under that reads as a fourth
@@ -600,6 +600,50 @@ mod tests {
             .hint()
             .unwrap_or_default();
         assert_eq!(other, kern_isolation::SETUP_FAILURE_HINT, "got: {other}");
+    }
+
+    /// AN OVERLAY MOUNT THAT ANSWERS ENOENT IS NOT BLAMED ON THE HOST.
+    ///
+    /// Every directory in its options existed when they were written, so the errno says one was
+    /// removed in between. MEASURED: `kern recover` beside other `kern box` calls produced exactly
+    /// this, and the generic line under it sent the reader to `kern doctor`, which found nothing,
+    /// because there was nothing wrong with the host.
+    ///
+    /// The subject is rendered from a real `io::Error`, as the sandbox renders it, and the routing is
+    /// checked against the CONSTANTS, so editing the prose cannot fail a test about which one is
+    /// chosen. The neighbours are asserted too: another overlay errno, and ENOENT from a different
+    /// mount, keep the general hint, since the key is the pair and not either half.
+    #[test]
+    fn an_overlay_mount_that_lost_a_directory_is_not_called_a_host_capability() {
+        let render = |op: &str, errno: i32| {
+            format!("{op} failed: {}", std::io::Error::from_raw_os_error(errno))
+        };
+        let hint = |m: String| Error::Setup(m).hint().unwrap_or_default();
+
+        let vanished = hint(render("mount(overlay)", libc::ENOENT));
+        assert_eq!(vanished, kern_isolation::OVERLAY_VANISHED_HINT);
+        // The misdirection was the pointer, not a word: the generic line sends the reader to
+        // `kern doctor`, which cannot see a directory that some other process removed.
+        assert!(
+            !vanished.contains("kern doctor") && !vanished.contains("rather than a wrong command"),
+            "the specific hint must not send the reader to the host: {vanished}"
+        );
+        // The isolation crate's child prints through the same function.
+        assert_eq!(
+            kern_isolation::setup_failure_hint(&render("mount(overlay)", libc::ENOENT)),
+            kern_isolation::OVERLAY_VANISHED_HINT
+        );
+
+        assert_eq!(
+            hint(render("mount(overlay)", libc::EINVAL)),
+            kern_isolation::SETUP_FAILURE_HINT,
+            "an overlay EINVAL is still the general class"
+        );
+        assert_eq!(
+            hint(render("mount(proc)", libc::ENOENT)),
+            kern_isolation::SETUP_FAILURE_HINT,
+            "ENOENT from another mount is not this case"
+        );
     }
 
     /// A volume bind that explained itself gets no generic hint under it, and every other setup

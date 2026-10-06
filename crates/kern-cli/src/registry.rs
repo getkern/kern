@@ -68,8 +68,8 @@ pub struct Instance {
     /// running as box root reads files the workload cannot: this stack's own certificates are 640
     /// `root:root`, so a `test -r` probe would report healthy while the service dies of EACCES, and
     /// `depends_on: service_healthy` would then release a dependent onto a service that is about to
-    /// exit. `kern exec` deliberately does NOT use this and stays box-root: it is the operator's
-    /// door into the box, and the CLI has no `--user` on it to get root back with.
+    /// exit. `kern compose exec` uses it too, as Docker's does; plain `kern exec` stays box root (the
+    /// operator's door into the box) and names any other account with `-u`.
     pub run_as: Option<(u32, u32)>,
     /// See [`Instance::run_as`]. Empty when the workload got none.
     pub extra_gids: Vec<u32>,
@@ -581,6 +581,30 @@ fn guarded_identities() -> Vec<(u64, u64)> {
 ///    non-box-data child (identity, which the path check alone would wave through).
 pub fn path_overlaps_trusted_state(src: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
+    // THE KEPT-BOX STORE IS THE SECOND ROOT, and it is refused by the same three shapes. It holds
+    // the `kern box` command line `kern start` replays, which makes it the one piece of state under
+    // `$XDG_DATA_HOME` that kern READS AND ACTS ON for a later box - the definition of an
+    // authoritative dir, and the reason the runtime registry is refused here at all.
+    //
+    // WHY A SECOND ROOT AND NOT A CLASSIFICATION ENTRY: it does not live under the runtime registry
+    // (a kept layer has to survive a reboot, which `$XDG_RUNTIME_DIR` does not).
+    //
+    // MEASURED, with the record as the only thing written: a record that passes the replay's checks
+    // still carries every flag `kern box` parses, so a box handed this tree could leave
+    // `-v $HOME:/host --privileged` behind for the operator's next `kern start` to run as them.
+    // That is a different class from the image cache, which a box could already poison to have a
+    // later box run its rootfs - inside a box. This one chooses the box's own mounts.
+    //
+    // The ancestors go with it, for the reason the registry's do: mounting `~/.local/share` exposes
+    // what is under it by traversal, so refusing only the exact path would be a rule a reader could
+    // step around without knowing it.
+    if let Some(store) = crate::keepbox::boxes_dir().parent() {
+        if let Some(verdict) = mount_refused_by_path(src, store) {
+            if verdict {
+                return true;
+            }
+        }
+    }
     let Some(root) = registry_root() else {
         return false;
     };
@@ -600,6 +624,44 @@ pub fn path_overlaps_trusted_state(src: &Path) -> bool {
         return false;
     }
     guarded_identities().contains(&(sm.dev(), sm.ino()))
+}
+
+/// Whether a FILE written at `parent/name` lands on trust-bearing registry state: the WRITE-side
+/// question, which is not the mount-side one.
+///
+/// [`path_overlaps_trusted_state`] refuses an ANCESTOR of the registry root, and for a mount that is
+/// the point: mounting `/run/user/1000` exposes `/run/user/1000/kern` with everything under it. A
+/// single file written INTO that ancestor is a different act: it creates one new entry next to `kern/`,
+/// and nothing under `kern/` is reached. Asking the mount question here refused `kern save -o
+/// /run/user/1000/img.tar`, and every write beside a non-default `XDG_RUNTIME_DIR` - measured, a
+/// `kern save -o <dir>/img.tar` with the runtime dir at `<dir>/xdg` was refused as "writing into the kern
+/// registry".
+///
+/// So the landing path is judged whole: refused when it is under the root (box-data children excepted,
+/// as for a mount), when it IS the root or an ancestor of it (a file named `kern` in the runtime dir
+/// would stand where the registry lives), or when `parent` is a registry directory under another name
+/// (a bind alias, matched by device and inode as the mount side matches it).
+pub fn write_lands_on_trusted_state(parent: &Path, name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(root) = registry_root() else {
+        return false;
+    };
+    let landing = parent.join(name);
+    // A FILE DIRECTLY IN THE ROOT, whatever its name. The box-data children are writable as
+    // DIRECTORIES to write INTO; a file named `logs` or `scratch` written before kern made the
+    // directory would stand where kern expects it, and break that state for this user.
+    if landing.parent() == Some(root.as_path()) {
+        return true;
+    }
+    if let Some(verdict) = mount_refused_by_path(&landing, &root) {
+        // Under the root, or the root or one of its ancestors: the mount rule is the write rule there.
+        return verdict;
+    }
+    // Not on the root's path. The parent may still BE a registry directory through a bind alias.
+    let (Ok(pm), Ok(rm)) = (fs::metadata(parent), fs::metadata(&root)) else {
+        return false;
+    };
+    pm.dev() == rm.dev() && guarded_identities().contains(&(pm.dev(), pm.ino()))
 }
 
 /// The PATH half of [`path_overlaps_trusted_state`], PURE so the inversion is unit-tested without a
@@ -2736,6 +2798,7 @@ impl Instance {
             kern_isolation::CapSpec,
             kern_isolation::SeccompFilter,
             Option<String>,
+            Vec<String>,
         ),
         crate::error::Error,
     > {
@@ -2780,6 +2843,19 @@ impl Instance {
             // matches a box that ran unconfined. A recorded profile is re-entered so the exec is no less
             // confined than the box's workload - the reason this is a RECORD field, not read from /proc.
             (!self.apparmor.is_empty()).then(|| self.apparmor.clone()),
+            // THE `--landlock-rw` ALLOWLIST, FOR THE SAME REASON AS THE THREE ABOVE. A Landlock
+            // restriction is only inherited from the process that was restricted, and an exec child's
+            // parent is the host CLI, not the box's PID 1 - so without re-applying it here a
+            // `kern exec` into a box started `--landlock-rw /data` could write anywhere the file
+            // permissions allowed, in a box whose own workload cannot. Same record, same gates (the
+            // `*_recorded` checks above refuse a box that predates posture recording at all), and the
+            // empty list means the box named no allowlist, which is every box that did not use the
+            // flag.
+            self.landlock_rw
+                .split(',')
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect(),
         ))
     }
 }
@@ -3073,7 +3149,7 @@ mod tests {
             parse("name=b\npid=1\npid1=2\ncapdropall=1\ncapdrops=\ncapadds=\nseccompmode=denylist\napparmor=kern-box\n")
                 .expect("parse a record carrying an apparmor line");
         assert_eq!(inst.apparmor, "kern-box");
-        let (_caps, _sec, aa) = inst.exec_posture().expect("posture reproduces");
+        let (_caps, _sec, aa, _ll) = inst.exec_posture().expect("posture reproduces");
         assert_eq!(
             aa.as_deref(),
             Some("kern-box"),
@@ -3093,7 +3169,7 @@ mod tests {
             none.aa_recorded,
             "an `apparmor=` line, even empty, marks the posture recorded"
         );
-        let (_c, _s, aa2) = none
+        let (_c, _s, aa2, _l) = none
             .exec_posture()
             .expect("posture for a recorded no-profile box");
         assert_eq!(aa2, None, "recorded-but-no-profile → no exec transition");

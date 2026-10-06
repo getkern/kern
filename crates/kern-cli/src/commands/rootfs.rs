@@ -117,6 +117,22 @@ pub(crate) fn remove_dir_all_ranged(dir: &std::path::Path) {
 /// Returns `(dirs_removed, bytes_freed)`. Shared by `recover` (its whole job) and `gc` (folded in so
 /// `gc` is the ONE full local cleanup - previously only `recover` reclaimed scratch, and it was easy
 /// to miss, so crashed-box overlay dirs quietly piled up).
+///
+/// A BOX BEING BUILT IS NOT AN ORPHAN, and the registry cannot say so. A box creates its scratch
+/// (`upper`, `work`, `merged`) before it mounts the overlay and well before it writes its registry
+/// entry, so for that whole window it is a directory no live entry names - which is exactly what this
+/// sweep used to remove. The other `kern` then mounted an overlay over directories that had just been
+/// deleted and died with `mount(overlay) failed: No such file or directory`. MEASURED on 0.30.2 with
+/// four workers starting boxes back to back: 0 of 160 failed alone, 42 of 160 with a `kern recover`
+/// loop beside them, every one of them that message. It reached users through the Python SDK, which
+/// runs `recover` when a prewarmed session closes: N MCP servers on one machine, each closing
+/// sessions, swept each other's boxes mid-build (reported at about 0.2% of calls with 4 to 16
+/// servers, and twice at the same instant, which is one sweep catching two builds).
+///
+/// So a directory is kept while the process that CREATED it is alive. Its pid is the name's last
+/// `-` field, written by the creator itself (`std::process::id()`); the registry check still covers a
+/// detached box whose creator has exited. A recycled pid keeps an orphan until that process exits,
+/// which is a bounded leak and the safe direction - the alternative is deleting a live box's root.
 pub(crate) fn sweep_orphan_scratch() -> (u32, u64) {
     // `registry::list()` already prunes entries whose process is dead on read; call it to get the
     // set of *live* boxes and to trigger that cleanup.
@@ -130,6 +146,9 @@ pub(crate) fn sweep_orphan_scratch() -> (u32, u64) {
         for e in entries.flatten() {
             let path = e.path();
             let merged = path.join("merged");
+            if creator_is_alive(&e.file_name()) {
+                continue; // still being built, or still owned by the process that built it
+            }
             // A live box's `rootfs` is its `.../merged` dir; if none matches, this scratch is orphaned.
             if !live_scratch.contains(&merged.to_string_lossy().into_owned()) && path.is_dir() {
                 freed += dir_size(&path);
@@ -144,6 +163,17 @@ pub(crate) fn sweep_orphan_scratch() -> (u32, u64) {
         }
     }
     (recovered, freed)
+}
+
+/// Whether the process that created a scratch directory named `<name>-<pid>` still exists. A name
+/// with no numeric last field (written by something else) answers `false`, which leaves the decision
+/// to the registry check exactly as before.
+fn creator_is_alive(dir_name: &std::ffi::OsStr) -> bool {
+    dir_name
+        .to_str()
+        .and_then(|n| n.rsplit_once('-'))
+        .and_then(|(_, pid)| pid.parse::<i32>().ok())
+        .is_some_and(|pid| crate::registry::pid_is_still(pid, 0))
 }
 
 /// The mount points inside a box's mount namespace, box-root-relative (e.g. `/proc`, `/dev`, `/dev/shm`,
@@ -191,56 +221,136 @@ pub(crate) fn unescape_mountinfo(s: &str) -> String {
     out
 }
 
-/// Recursively copy a box's merged rootfs at `src_root` into `dst_root`, skipping the box-root-relative
-/// paths in `skip` (its nested mounts: pseudo-fs, bind volumes, secrets). The overlay is read through
-/// `/proc/<pid1>/root`, so the kernel has already resolved whiteouts/opaque dirs; a plain recursive copy
-/// captures the merged view. Symlinks are copied verbatim (NEVER followed), directories are recreated
-/// with their mode, regular files are copied with their permission bits; devices / fifos / sockets are
-/// skipped (not image content). Descent is via `read_dir`, so a symlinked directory is copied as a link
-/// and never traversed into: a box-planted symlink cannot steer the copy outside the box root.
+/// Copy a running box's merged rootfs, the directory `root` holds open (`/proc/<pid1>/root`), into
+/// `dst_root`, skipping the box-root-relative paths in `skip` (its nested mounts: pseudo-fs, bind
+/// volumes, secrets). The kernel has already resolved whiteouts and opaque dirs in that view, so a
+/// plain recursive copy captures the merged tree. Symlinks are copied verbatim, directories are
+/// recreated with their mode, regular files are copied with their permission bits; devices, FIFOs and
+/// sockets are skipped (not image content).
+///
+/// BY DESCRIPTOR, BECAUSE THE BOX IS RUNNING WHILE THIS READS IT. Every entry is opened relative to
+/// its parent directory's descriptor with `O_NOFOLLOW`, so a directory or file the box swaps for a
+/// symlink after it was listed is refused rather than followed. By path, `/proc/<pid1>/root/a/b`
+/// resolves a symlink at `a` against THIS process's root, which put host files within reach of a
+/// box that won the race; the freeze that closes it is a no-op on a host without cgroup delegation.
+///
+/// ONE DESCRIPTOR PER DEPTH LEVEL. A directory is opened when it is taken off the stack, not when it
+/// is listed, and a pending entry holds only its parent; a wide tree costs no more descriptors than a
+/// narrow one. An entry that vanished meanwhile, or that this user may not read, is skipped as it
+/// always was; any other error stops the commit, because an image missing files without a word is
+/// worse than no image.
 pub(crate) fn copy_rootfs_snapshot(
-    src_root: &std::path::Path,
+    root: std::os::fd::BorrowedFd<'_>,
     dst_root: &std::path::Path,
     skip: &std::collections::HashSet<String>,
 ) -> Result<(), Error> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-    std::fs::create_dir_all(dst_root).map_err(|e| Error::Sandbox(format!("commit mkdir: {e}")))?;
-    // Each frame: (source dir, destination dir, box-root-relative path of the source dir).
-    let mut stack = vec![(
-        src_root.to_path_buf(),
-        dst_root.to_path_buf(),
-        "/".to_string(),
-    )];
-    while let Some((sdir, ddir, rel)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&sdir) else {
-            continue;
+    use std::rc::Rc;
+    let fail = |what: &str, rel: &str, e: std::io::Error| {
+        Error::Sandbox(format!("commit: {what} {rel}: {e}"))
+    };
+    let skippable = |e: &std::io::Error| {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::ENOENT | libc::EACCES | libc::EPERM | libc::ELOOP | libc::ENOTDIR)
+        )
+    };
+    let openat = |dir: &OwnedFd, name: &std::ffi::OsStr, flags: i32| -> std::io::Result<OwnedFd> {
+        let c = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
         };
-        for ent in entries.flatten() {
-            let name = ent.file_name();
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: `fd` was just returned by `openat` and nothing else holds it.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    };
+    std::fs::create_dir_all(dst_root).map_err(|e| Error::Sandbox(format!("commit mkdir: {e}")))?;
+    let top = root
+        .try_clone_to_owned()
+        .map_err(|e| fail("open", "/", e))?;
+    // A frame: (parent dir, entry name in it, destination dir, box-root-relative path). The root
+    // frame has no name: it is the directory `top` itself.
+    let mut stack: Vec<(
+        Rc<OwnedFd>,
+        Option<std::ffi::OsString>,
+        std::path::PathBuf,
+        String,
+    )> = vec![(Rc::new(top), None, dst_root.to_path_buf(), "/".to_string())];
+    while let Some((parent, name, ddir, rel)) = stack.pop() {
+        let dir = match &name {
+            None => parent,
+            Some(n) => match openat(&parent, n, libc::O_RDONLY | libc::O_DIRECTORY) {
+                Ok(fd) => Rc::new(fd),
+                Err(e) if skippable(&e) => continue,
+                Err(e) => return Err(fail("open", &rel, e)),
+            },
+        };
+        let listing = match std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())) {
+            Ok(it) => it,
+            Err(e) if skippable(&e) => continue,
+            Err(e) => return Err(fail("list", &rel, e)),
+        };
+        for ent in listing {
+            let ent = ent.map_err(|e| fail("list", &rel, e))?;
+            let child = ent.file_name();
             let child_rel = if rel == "/" {
-                format!("/{}", name.to_string_lossy())
+                format!("/{}", child.to_string_lossy())
             } else {
-                format!("{rel}/{}", name.to_string_lossy())
+                format!("{rel}/{}", child.to_string_lossy())
             };
             if skip.contains(&child_rel) {
                 continue; // a nested mount: proc/sys/dev/shm, a -v volume, workspace, or a secret
             }
-            let sp = ent.path();
-            let dp = ddir.join(&name);
-            let Ok(md) = std::fs::symlink_metadata(&sp) else {
-                continue;
+            let dp = ddir.join(&child);
+            // The listing came through `/proc/self/fd/<n>`, which names the directory `dir` holds,
+            // so this lstat is of the entry in that directory, never through a swapped parent.
+            let md = match std::fs::symlink_metadata(ent.path()) {
+                Ok(m) => m,
+                Err(e) if skippable(&e) => continue,
+                Err(e) => return Err(fail("stat", &child_rel, e)),
             };
             let ft = md.file_type();
             let mode = md.mode() & 0o7777;
             if ft.is_symlink() {
-                if let Ok(target) = std::fs::read_link(&sp) {
+                if let Ok(target) = std::fs::read_link(ent.path()) {
                     let _ = symlink(&target, &dp);
                 }
             } else if ft.is_dir() {
                 let _ = std::fs::create_dir(&dp);
                 let _ = std::fs::set_permissions(&dp, std::fs::Permissions::from_mode(mode));
-                stack.push((sp, dp, child_rel));
-            } else if ft.is_file() && std::fs::copy(&sp, &dp).is_ok() {
+                stack.push((Rc::clone(&dir), Some(child), dp, child_rel));
+            } else if ft.is_file() {
+                let src = match openat(
+                    &dir,
+                    &child,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+                ) {
+                    Ok(fd) => std::fs::File::from(fd),
+                    Err(e) if skippable(&e) || e.raw_os_error() == Some(libc::ENXIO) => continue,
+                    Err(e) => return Err(fail("open", &child_rel, e)),
+                };
+                // Swapped for something else between the lstat and the open: not this entry.
+                if !src
+                    .metadata()
+                    .map_err(|e| fail("stat", &child_rel, e))?
+                    .file_type()
+                    .is_file()
+                {
+                    continue;
+                }
+                let mut out =
+                    std::fs::File::create(&dp).map_err(|e| fail("create", &child_rel, e))?;
+                std::io::copy(&mut &src, &mut out).map_err(|e| fail("copy", &child_rel, e))?;
                 let _ = std::fs::set_permissions(&dp, std::fs::Permissions::from_mode(mode));
             }
         }
@@ -367,7 +477,9 @@ pub(crate) fn merged_view_extract(
     // cannot reach some of them and miss others.
     let names: Vec<String> = (0..chain.len()).map(|i| i.to_string()).collect();
     let lower = kern_isolation::overlay_lowerdir(&names); // top:…:base, order-preserving
-    let opts = cstring(&format!("lowerdir={lower}"))?;
+                                                          // Read-only: no upper, so nothing is written and the option only decides which markers are READ.
+    let opts = kern_isolation::OverlayOpts::new(&format!("lowerdir={lower}"), None)
+        .map_err(|e| Error::Oci(format!("merged-view: overlay options: {e}")))?;
     // The child resolves those names, and its mountpoint, relative to this directory.
     let farm_c = cstring(&farm.to_string_lossy())?;
     // Defence-in-depth (the kernel `openat2(RESOLVE_IN_ROOT)` already confines every component): reject a
@@ -484,7 +596,7 @@ pub(crate) fn merged_view_extract(
 /// the copier may allocate; the map-writing that precedes it stays allocation-free out of habit and to
 /// keep it robust if that ever changes.
 pub(crate) fn merged_view_child(
-    opts: &std::ffi::CStr,
+    opts: &kern_isolation::OverlayOpts,
     farm: &std::ffi::CStr,
     out_fd: libc::c_int,
     src_rel: Extract<'_>,
@@ -532,13 +644,12 @@ pub(crate) fn merged_view_child(
         // 2. Mount the merged view RO on a private mountpoint (relative to CWD at fork time).
         let mnt = c".kern-merged";
         libc::mkdir(mnt.as_ptr(), 0o700);
-        if libc::mount(
-            c"overlay".as_ptr(),
+        if !kern_isolation::mount_overlay_c(
             mnt.as_ptr(),
-            c"overlay".as_ptr(),
             (libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong,
-            opts.as_ptr() as *const libc::c_void,
-        ) != 0
+            opts,
+        )
+        .ok()
         {
             libc::_exit(104);
         }
@@ -1343,6 +1454,14 @@ pub(crate) fn supports_reflink(dir: &std::path::Path) -> Option<bool> {
 /// to create them, and the same one `remove_dir_all_ranged` uses to delete them.
 pub(crate) fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), Error> {
     std::fs::create_dir_all(dst).map_err(|e| Error::Sandbox(format!("build rootfs: {e}")))?;
+    // `cp -a` CARRIES `user.*` ATTRIBUTES, and overlayfs's own markers live there (see
+    // `kern_isolation::mount_overlay_c`): a directory in a build context carrying
+    // `user.overlay.opaque` becomes a live marker in the layer this copies into, hiding the lower
+    // layer's version of it. The attributes are kept deliberately (application metadata, the same
+    // choice the merged-view copier makes), and the shape is the author's own context hiding files
+    // from their own image, not a boundary crossing; `security.capability` IS stripped, because that
+    // one is a privilege channel. Stated here because the markers are read on every host since kern
+    // began asking for `userxattr`, where before they were ignored on a kernel that did not imply it.
     let run = || {
         std::process::Command::new("cp")
             .arg("-a")
@@ -2352,5 +2471,272 @@ mod reflink_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod commit_snapshot_tests {
+    use super::copy_rootfs_snapshot;
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+
+    /// A directory, as the box root is held: `O_PATH` on `/proc/<pid1>/root`.
+    fn dirfd(dir: &std::path::Path) -> OwnedFd {
+        let c = std::ffi::CString::new(dir.to_string_lossy().as_bytes()).unwrap();
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "open {dir:?}");
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// `kern commit` READS A RUNNING BOX, so every name in it may be something else by the time the
+    /// copier gets there.
+    ///
+    /// The copy walks by DESCRIPTOR: a directory is opened relative to its parent's descriptor with
+    /// `O_NOFOLLOW`, so a directory the box replaced with a symlink is refused rather than followed.
+    /// By path - `/proc/<pid1>/root/a/b` handed to `open(2)` - the symlink at `a` resolves against the
+    /// HOST's root, and the committed image would hold host files; the cgroup freeze that narrows that
+    /// window is a no-op on a host without cgroup delegation, which is an ordinary ssh session on most
+    /// distributions.
+    ///
+    /// Three shapes in one tree, since the walk has one branch per file type: a symlinked directory
+    /// (copied as a link, never descended), a symlinked file (same), and a real directory under it
+    /// whose contents must still arrive. A symlink that was ALREADY there when the walk listed it was
+    /// handled by the by-path walk too (it classified with `symlink_metadata` and never descended);
+    /// the case that needs the descriptor is the one in
+    /// [`a_directory_swapped_mid_walk_cannot_steer_the_commit_onto_host_files`].
+    #[test]
+    fn the_commit_copy_does_not_follow_a_directory_swapped_for_a_symlink() {
+        let base = std::env::temp_dir().join(format!("kern-commitw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, outside, out) = (base.join("root"), base.join("outside"), base.join("out"));
+        std::fs::create_dir_all(root.join("real/deep")).unwrap();
+        std::fs::create_dir_all(outside.join("secrets")).unwrap();
+        std::fs::write(outside.join("secrets/key"), "HOST SECRET").unwrap();
+        std::fs::write(outside.join("file"), "HOST FILE").unwrap();
+        std::fs::write(root.join("real/deep/own"), "mine").unwrap();
+        // What the box plants: a directory name and a file name that are links out of the tree.
+        std::os::unix::fs::symlink(outside.join("secrets"), root.join("etc")).unwrap();
+        std::os::unix::fs::symlink(outside.join("file"), root.join("hosts")).unwrap();
+
+        let fd = dirfd(&root);
+        copy_rootfs_snapshot(fd.as_fd(), &out, &std::collections::HashSet::new())
+            .expect("the copy runs");
+
+        assert_eq!(
+            std::fs::read_to_string(out.join("real/deep/own")).unwrap(),
+            "mine",
+            "the box's own files must still be committed"
+        );
+        // The links are recreated AS LINKS, and nothing was read through them.
+        for name in ["etc", "hosts"] {
+            let md = std::fs::symlink_metadata(out.join(name)).unwrap();
+            assert!(
+                md.file_type().is_symlink(),
+                "{name} came out as a {:?}, so the copier followed it",
+                md.file_type()
+            );
+        }
+        // The target is kept VERBATIM, as `cp -a` keeps it: the link is image content, what it
+        // points at is not. (`out.join("etc").exists()` would resolve THROUGH this link and say
+        // yes about the host's directory, which is why the assertion below walks instead.)
+        assert_eq!(
+            std::fs::read_link(out.join("etc")).unwrap(),
+            outside.join("secrets"),
+            "the link target was rewritten"
+        );
+        // And the copy holds no host content under any name.
+        let mut found = Vec::new();
+        let mut stack = vec![out.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let md = std::fs::symlink_metadata(e.path()).unwrap();
+                if md.file_type().is_dir() {
+                    stack.push(e.path());
+                } else if md.file_type().is_file() {
+                    let body = std::fs::read_to_string(e.path()).unwrap_or_default();
+                    if body.starts_with("HOST") {
+                        found.push(e.path());
+                    }
+                }
+            }
+        }
+        assert!(found.is_empty(), "host content in the image: {found:?}");
+
+        // A SKIP IS STILL A SKIP: the nested-mount set is box-root-relative and must be honoured.
+        let out2 = base.join("out2");
+        let skip: std::collections::HashSet<String> = ["/real".to_string()].into_iter().collect();
+        copy_rootfs_snapshot(fd.as_fd(), &out2, &skip).expect("the copy runs");
+        assert!(!out2.join("real").exists(), "a skipped path was copied");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A DIRECTORY THE BOX REPLACES WHILE THE COMMIT IS WALKING IT.
+    ///
+    /// This is the race the descriptors are for, and the only shape where the two walks differ. The
+    /// by-path walk classified a REAL directory with `symlink_metadata`, pushed its PATH, and later
+    /// handed that path back to `read_dir`: a box that turned the directory into a symlink in between
+    /// made the second resolution follow it, and an absolute target resolves against the HOST's root,
+    /// so host files were read with the committing user's own credentials and baked into the image.
+    /// The cgroup freeze that narrows the window is a no-op wherever the box has no delegated cgroup,
+    /// which is an ordinary ssh session on most distributions.
+    ///
+    /// THE WINDOW IS MADE WIDE ON PURPOSE, and this is what the first version of this test got wrong:
+    /// with ONE candidate directory the gap between its stat and its own listing is a few
+    /// microseconds and the by-path walk passed 3 runs out of 3, which would have recorded a defect
+    /// as fixed without ever having reproduced it. A directory's children are all classified while
+    /// its own listing runs and then visited one at a time, so with many siblings the ones seen first
+    /// are visited LAST: the gap for those is the whole walk. That is not a contrivance, it is what a
+    /// commit of a real `/usr/lib` does.
+    ///
+    /// WHAT WAS AND WAS NOT REPRODUCED, because the difference decides what this test is for. With
+    /// the detector below PROVEN to fire (a walker changed to follow the link leaks at a measurable
+    /// rate in this same harness, 1 host file in 12 commits), the by-path walk itself leaked NOTHING
+    /// across 3600 candidate visits: its window is the few instructions between the stat and the
+    /// listing, and the swapper holds the symlink for about a microsecond per cycle. So this is not a
+    /// reproduced escape being closed - it is a race removed BY CONSTRUCTION, and the test's job is
+    /// to keep it removed.
+    ///
+    /// The verdict is a RATE over several commits, with a swapper thread running throughout.
+    #[test]
+    fn a_directory_swapped_mid_walk_cannot_steer_the_commit_onto_host_files() {
+        let base = std::env::temp_dir().join(format!("kern-commitrace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, outside) = (base.join("root"), base.join("outside"));
+        std::fs::create_dir_all(outside.join("secrets")).unwrap();
+        std::fs::write(outside.join("secrets/key"), "HOST SECRET").unwrap();
+        const CANDIDATES: usize = 300;
+        for i in 0..CANDIDATES {
+            let d = root.join(format!("d{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            // Contents, so a round that copies the real directory has work to do.
+            for f in 0..4 {
+                std::fs::write(d.join(format!("own{f}")), "mine").unwrap();
+            }
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let (stop, root, link_to) = (
+                std::sync::Arc::clone(&stop),
+                root.clone(),
+                outside.join("secrets"),
+            );
+            std::thread::spawn(move || {
+                let mut i = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let target = root.join(format!("d{}", i % CANDIDATES));
+                    let real = root.join(format!("d{}.real", i % CANDIDATES));
+                    // directory -> symlink -> directory, as fast as the kernel will take it
+                    if std::fs::rename(&target, &real).is_ok() {
+                        let _ = std::os::unix::fs::symlink(&link_to, &target);
+                        let _ = std::fs::remove_file(&target);
+                        let _ = std::fs::rename(&real, &target);
+                    }
+                    i += 1;
+                }
+            })
+        };
+
+        let fd = dirfd(&root);
+        let mut leaked = 0usize;
+        let rounds = 12;
+        for i in 0..rounds {
+            let out = base.join(format!("out{i}"));
+            // A failed round is not a leak: the point is what the copy CONTAINS when it runs.
+            let _ = copy_rootfs_snapshot(fd.as_fd(), &out, &std::collections::HashSet::new());
+            let mut stack = vec![out.clone()];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                    let md = match std::fs::symlink_metadata(e.path()) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if md.file_type().is_dir() {
+                        stack.push(e.path());
+                    } else if md.file_type().is_file()
+                        && std::fs::read_to_string(e.path())
+                            .unwrap_or_default()
+                            .starts_with("HOST")
+                    {
+                        leaked += 1;
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&out);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = swapper.join();
+        assert_eq!(
+            leaked, 0,
+            "{leaked} host file(s) reached the image across {rounds} commits of a box that was \
+             swapping directories for symlinks"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// WIDTH COSTS ONE DESCRIPTOR, NOT ONE PER ENTRY. The walk used to open every subdirectory of a
+    /// directory as it listed it and hold them all until each was visited, so a wide tree ran the
+    /// process out of descriptors - and the old copier's own error handling dropped those subtrees
+    /// silently, which is an image missing files without a word. A directory is opened when it is
+    /// taken off the stack instead, so only the ancestors of the current one are held.
+    ///
+    /// The bound is measured against this process's own limit, lowered for the test so a pass does
+    /// not depend on the host's being generous.
+    #[test]
+    fn a_wide_tree_is_committed_whole_under_a_low_descriptor_limit() {
+        let base = std::env::temp_dir().join(format!("kern-commitwide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, out) = (base.join("root"), base.join("out"));
+        const WIDTH: usize = 600;
+        for i in 0..WIDTH {
+            let d = root.join(format!("d{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("f"), format!("{i}")).unwrap();
+        }
+        let fd = dirfd(&root);
+
+        // Lower this process's own soft limit to well under the width, and put it back afterwards.
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) },
+            0,
+            "getrlimit"
+        );
+        let restore = lim;
+        let tight = libc::rlimit {
+            rlim_cur: 256.min(lim.rlim_max),
+            rlim_max: lim.rlim_max,
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &tight) },
+            0,
+            "setrlimit"
+        );
+        let copied = copy_rootfs_snapshot(fd.as_fd(), &out, &std::collections::HashSet::new());
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &restore) };
+        copied.expect("the copy runs under a low descriptor limit");
+
+        let mut missing = Vec::new();
+        for i in 0..WIDTH {
+            let f = out.join(format!("d{i}/f"));
+            if std::fs::read_to_string(&f).ok().as_deref() != Some(&i.to_string()) {
+                missing.push(f);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {WIDTH} subtrees are missing from the image, first: {:?}",
+            missing.len(),
+            missing.first()
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

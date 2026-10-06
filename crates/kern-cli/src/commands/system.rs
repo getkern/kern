@@ -129,13 +129,17 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}box{z} <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     {c}run{z} [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     {c}run{z} --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
-    {c}exec{z} <name> [-i|-t|-it] [--env K=V] [-w <dir>] [--] [CMD...]   Run CMD in a running box
+    {c}exec{z} <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
                                                                      -t allocates a PTY; -i only keeps stdin attached, so
                                                                      `exec -i <box> psql … < file.sql` reaches EOF instead of hanging
+                                                                     -u <user>[:<group>] runs CMD as that account of the box (a name or a
+                                                                     number, from the box's own /etc/passwd) instead of box root
     {c}ps{z} [-a] [--json] [-q] [--filter name=|status=|id=|label=|pod=|health=] [--format T] [--no-trunc] [--last N|-n N]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
                                                                      health= is healthy|unhealthy|starting|none; --last N keeps the N newest across live and exited (implies -a), newest first
                                                                      a row is an INSTANCE, not a name: a name reused after a box exited appears once per instance, identified by PID
                                                                      the exited rows are DETACHED boxes: the exit note is written by the supervisor, which a foreground box has none of
+                                                                     -a also lists `box --keep` boxes, which are state on disk and NOT transient: status=kept selects exactly those, and `kern start` runs one
+                                                                     --last N is about boxes that RAN, so it does not list the kept ones (they outlive the boot and share no clock with a run)
     {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
                                                                      --since/--until take 10m, 1h30m, unix seconds, or RFC3339 UTC; a line the index cannot place in time is kept
                                                                      -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
@@ -174,6 +178,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}pause{z} <name>... | --all                                        Freeze box(es) (cgroup freezer)
     {c}unpause{z} <name>... | --all                                      Thaw frozen box(es)
     {c}kill{z} <name>... | killall                                       Stop box(es) (alias of stop)
+    {c}start{z} <name>...                                                Run a `box --keep` box again, on the layer it left behind (its recorded command line)
+    {c}rm{z} <name>...                                                   Remove a stopped `box --keep` box: its layer and its record (refuses a running one)
     {c}rename{z} <old> <new>                                             Give a running box a new name
     {c}update{z} <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
     {c}wait{z} <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
@@ -252,6 +258,15 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --rm                Leave no exit record: `kern ps -a` will not list it and `kern wait` has
                         nothing to read. A box is already thrown away at teardown; this drops the
                         hour-long breadcrumb too
+    --keep              Keep this box's writable layer after it exits, under
+                        $XDG_DATA_HOME/kern/boxes/<name>, and record its command line: `kern start
+                        <name>` runs it again on the same files, `kern rm <name>` removes it, and
+                        `kern ps -a` lists it. Without this a box leaves nothing behind, which is
+                        the default; the layer is yours to delete and `gc` will not touch it.
+                        `--rm` does NOT undo it: that flag drops the hour-long exit breadcrumb, and
+                        the layer is the thing `--keep` asked to survive. One image per layer: the
+                        same name with another `--image` is refused, because a layer is a delta of
+                        the image it was written against
     -e, --env K=V       Set an environment variable (repeatable)
     -w, --workdir <dir> Working directory inside the box
         --entrypoint <a> Replace the image's ENTRYPOINT (repeat for an exec-form list;
@@ -1046,6 +1061,16 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
         .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).count())
         .unwrap_or(0);
     push(vols, "named volumes (YOUR DATA)", true);
+    // THE KEPT BOXES ARE DATA TOO, and this verb's contract is "remove everything kern created,
+    // lists it first". MEASURED before this line existed: a kept box holding 21 MB was absent from
+    // the inventory, and the summary said "0 B is data you made" - about a directory kern made, in
+    // the user's own data home, holding the layer of a box they can still start. `kern gc` says
+    // "nothing to prune" for it and `kern recover` "nothing to recover", so nothing reported it.
+    let kept_dir = crate::keepbox::boxes_dir();
+    let kept_count = std::fs::read_dir(&kept_dir)
+        .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).count())
+        .unwrap_or(0);
+    push(kept_dir, "`box --keep` layers (YOUR DATA)", true);
     // The config, and the backup `config setup --force` leaves next to it - but ONLY the one at kern's
     // OWN default location.
     //
@@ -1151,6 +1176,14 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
     if vol_count > 0 {
         println!(
             "  {y}{vol_count} named volume(s) will be destroyed - `kern volume ls` lists them{z}",
+            y = p.y,
+            z = p.z
+        );
+    }
+    if kept_count > 0 {
+        println!(
+            "  {y}{kept_count} `box --keep` layer(s) will be destroyed - `kern ps -a --filter \
+             status=kept` lists them{z}",
             y = p.y,
             z = p.z
         );

@@ -965,7 +965,7 @@ fn list() -> Result<(), Error> {
     // and QUOTA out of line for every row of the table. `entries()` is scanned once and reused, since
     // the width has to be known before the header prints.
     let vols: Vec<_> = entries();
-    let nw = crate::ui::name_col_width(vols.iter().map(|v| v.name.as_str()), 28);
+    let nw = crate::ui::name_col_width(vols.iter().map(|v| v.name.as_str()), 28, 22);
     println!(
         "{d}{:<nw$} {:>10} {:>10}{z}",
         "NAME",

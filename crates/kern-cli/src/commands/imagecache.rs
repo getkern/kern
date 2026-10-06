@@ -341,76 +341,113 @@ fn refresh_image_config(
     }
 }
 
-/// Look up `name` in a colon-line account file (`passwd`/`group`) inside the image rootfs and return the
-/// matched line's colon-separated FIELDS, read and scanned ONCE. `lower` is the box's layers, TOP
-/// first - one entry for a flat image, several for a built one; the file is read from the FIRST layer
-/// that has it (top-most wins, as the merged view would). `None` if no layer has the file or it has no
-/// matching entry - the caller then keeps box-root behaviour. Returning the whole entry lets
-/// `resolve_image_user` take uid (field 2) AND primary gid (field 3) from ONE passwd read, not two.
+/// Where the account files (`etc/passwd`, `etc/group`) are read from.
 ///
-/// CONFINED to the rootfs: this reads PRE-PIVOT, on the host, so a hostile image whose `/etc/passwd` is a
-/// symlink to a host path (`/etc/passwd`, `../../../etc/passwd`) would otherwise make kern read a host
-/// file. That leaks nothing to the box (only a uid is extracted) and grants nothing (the image controls
-/// `USER` anyway), but kern must not follow an image symlink onto host paths - the same confinement the
-/// `-v` guard enforces. Canonicalize the target and require it stays under the canonical layer; a symlink
-/// that escapes is treated as "no file in this layer" (try the next, else fall back to box-root). An
-/// in-rootfs symlink (a real distro layout) still resolves, since its target stays under the layer.
-///
-/// `key_field` is the colon-separated column `key` is matched against: `0` for a name (the usual
-/// lookup) and `2` for the numeric id, which is what a NUMERIC `USER` needs - see
-/// [`resolve_image_user`].
-pub(crate) fn image_account_entry(
-    lower: &[String],
-    file: &str,
-    key: &str,
-    key_field: usize,
-) -> Option<Vec<String>> {
-    use std::path::Path;
-    // TOP FIRST, as resolved. The `:` splitting below is the account file's own format and correct;
-    // the one that is gone is a split of the LAYER list, which cut a host path at its first `:`.
-    for layer in lower {
-        let (Ok(target), Ok(base)) = (
-            std::fs::canonicalize(Path::new(layer).join(file)),
-            std::fs::canonicalize(layer),
-        ) else {
-            continue; // no such file in this layer (or an unresolvable path); try the next
-        };
-        if !target.starts_with(&base) {
-            continue; // the image symlinked the account file OUT of the rootfs - do not read host paths
-        }
-        let Ok(text) = std::fs::read_to_string(&target) else {
-            continue;
-        };
-        for line in text.lines() {
-            if line.split(':').nth(key_field) == Some(key) {
-                return Some(line.split(':').map(str::to_string).collect());
-            }
-        }
-        return None; // the file exists in this (top-most) layer but has no such entry - authoritative
-    }
-    None
+/// Two sources and one set of lookups, so `kern box` resolving an image's `USER` and `kern exec
+/// --user` resolving a name inside a running box cannot drift into two answers for the same spec.
+pub(crate) enum Accounts<'a> {
+    /// The image's layers on the host, TOP first: one entry for a flat image, several for a built one.
+    /// Read PRE-PIVOT at box start, where no merged root exists yet.
+    Layers(&'a [String]),
+    /// A RUNNING box's two files, read ONCE by [`Accounts::of_box_root`]: `docker exec --user`
+    /// resolves against the container's CURRENT files, so an account the box created after it
+    /// started is found, and a passwd the box rewrote is the one that answers.
+    Read {
+        passwd: Option<String>,
+        group: Option<String>,
+    },
 }
 
-/// Read a whole account file out of the image rootfs, from the first layer that has it.
-///
-/// Same confinement and same top-most-layer rule as [`image_account_entry`], which looks up ONE
-/// entry; this returns the text, because a group membership scan has to read every line rather than
-/// stop at the first match.
-fn image_account_file(lower: &[String], file: &str) -> Option<String> {
-    use std::path::Path;
-    for layer in lower {
-        let (Ok(target), Ok(base)) = (
-            std::fs::canonicalize(Path::new(layer).join(file)),
-            std::fs::canonicalize(layer),
-        ) else {
-            continue;
+/// An account file larger than this is not parsed, from either source. It matters most for a running
+/// box, whose own code writes the file kern reads; a directory-sized passwd is a few MB.
+const ACCOUNT_FILE_MAX: u64 = 8 << 20;
+
+impl Accounts<'_> {
+    /// A running box's `/etc/passwd` and `/etc/group`, through `openat2(RESOLVE_IN_ROOT)` on `root`
+    /// (an `O_PATH` dirfd on `/proc/<pid1>/root`, see [`crate::openat2::box_root_fd`]). An absolute
+    /// symlink there means the BOX's path, which is what it means to the box; `canonicalize` cannot
+    /// do that one, because `/proc/<pid>/root` of a box in its own mount namespace reads back as `/`
+    /// and a path built on it is the HOST's `/etc/passwd` (measured: a box linking its passwd to a host
+    /// file got `kern exec -u victim` running as the uid that host file gave). A missing file is
+    /// `None`; one that is there and unusable (not a regular file, past the bound, not UTF-8) or a
+    /// resolution that failed (no `openat2` before Linux 5.6) is the error, named.
+    pub(crate) fn of_box_root(
+        root: std::os::fd::BorrowedFd<'_>,
+    ) -> std::io::Result<Accounts<'static>> {
+        let read = |file: &str| {
+            crate::openat2::read_regular_in_root(root, file, ACCOUNT_FILE_MAX)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("/{file}: {e}")))
         };
-        if !target.starts_with(&base) {
-            continue; // an image symlink pointing OUT of the rootfs is not followed
-        }
-        return std::fs::read_to_string(&target).ok();
+        Ok(Accounts::Read {
+            passwd: read("etc/passwd")?,
+            group: read("etc/group")?,
+        })
     }
-    None
+
+    /// The whole text of `file`, from the FIRST layer that has a readable one (top-most wins, as the
+    /// merged view would), or from what was read off a running box. `None` when there is none.
+    ///
+    /// The layers are read on the host, CONFINED: a hostile image whose `/etc/passwd` is a symlink to
+    /// a host path (`/etc/passwd`, `../../../etc/passwd`) would otherwise make kern read a host file,
+    /// so the target is canonicalized and must stay under the canonical layer, and one that escapes
+    /// counts as "no file in this layer". An in-rootfs symlink (a real distro layout) still resolves.
+    ///
+    /// Only a REGULAR file of bounded size, without blocking: an image can put a FIFO at
+    /// `/etc/passwd`, and a plain read of one waits for a writer that never comes. MEASURED on 0.30.2
+    /// with an image built `RUN rm /etc/passwd && mkfifo /etc/passwd` / `USER nobody`: `kern box
+    /// --image` never started it (killed at 20 s). A layer whose file is not a readable regular one is
+    /// skipped, as an unreadable one always was, so the layer under it answers: that image now runs as
+    /// alpine's `nobody`, 65534, which is the image's own account either way.
+    fn text(&self, file: &str) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        match self {
+            Accounts::Layers(lower) => {
+                use std::os::unix::fs::OpenOptionsExt;
+                use std::path::Path;
+                lower.iter().find_map(|layer| {
+                    let target = std::fs::canonicalize(Path::new(layer).join(file)).ok()?;
+                    let base = std::fs::canonicalize(layer).ok()?;
+                    if !target.starts_with(&base) {
+                        return None;
+                    }
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(crate::openat2::READ_UNTRUSTED)
+                        .open(&target)
+                        .ok()?;
+                    crate::openat2::read_regular(&f, ACCOUNT_FILE_MAX)
+                        .ok()
+                        .map(Cow::Owned)
+                })
+            }
+            Accounts::Read { passwd, group } => match file {
+                "etc/passwd" => passwd.as_deref().map(Cow::Borrowed),
+                "etc/group" => group.as_deref().map(Cow::Borrowed),
+                _ => None,
+            },
+        }
+    }
+
+    /// The colon-separated FIELDS of the first line of `file` whose column `key_field` is `key`.
+    /// `key_field` is `0` for a name and `2` for the numeric id, which is what a NUMERIC spec needs.
+    /// `None` when there is no file or no such line; a file with no match is authoritative, and the
+    /// layers below it are not consulted, as the merged view would not.
+    fn entry(&self, file: &str, key: &str, key_field: usize) -> Option<Vec<String>> {
+        let text = self.text(file)?;
+        text.lines()
+            .find(|line| line.split(':').nth(key_field) == Some(key))
+            .map(|line| line.split(':').map(str::to_string).collect())
+    }
+}
+
+/// A user spec's two halves, `<user>[:<group>]`, each non-empty, or `None`. ONE RULE for `kern box
+/// --user`, an image's `USER` and `kern exec -u`: an empty half is not "the default", it is a typo.
+pub(crate) fn split_user_spec(spec: &str) -> Option<(&str, Option<&str>)> {
+    let (user, group) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    (!user.is_empty() && group.is_none_or(|g| !g.is_empty())).then_some((user, group))
 }
 
 /// The SUPPLEMENTARY groups an image's `config.User` spec puts the workload in, from the image's own
@@ -428,14 +465,14 @@ fn image_account_file(lower: &[String], file: &str) -> Option<String> {
 /// group 0, where `root:x:0:kibana` puts it.
 ///
 /// The PRIMARY gid is not repeated here: `setgid` already sets it.
-pub(crate) fn image_supplementary_gids(spec: &str, lower: &[String]) -> Vec<u32> {
+pub(crate) fn supplementary_gids(spec: &str, accounts: &Accounts) -> Vec<u32> {
     if spec.contains(':') {
         return Vec::new();
     }
     // The account NAME, which is what a group's member list holds. A numeric spec has to be turned
     // into its name first, and an uid with no passwd entry has no memberships to find.
     let name = match spec.parse::<u32>() {
-        Ok(n) => match image_account_entry(lower, "etc/passwd", &n.to_string(), 2) {
+        Ok(n) => match accounts.entry("etc/passwd", &n.to_string(), 2) {
             Some(e) => e.first().cloned().unwrap_or_default(),
             None => return Vec::new(),
         },
@@ -444,10 +481,20 @@ pub(crate) fn image_supplementary_gids(spec: &str, lower: &[String]) -> Vec<u32>
     if name.is_empty() {
         return Vec::new();
     }
-    let Some(text) = image_account_file(lower, "etc/group") else {
+    let Some(text) = accounts.text("etc/group") else {
         return Vec::new();
     };
+    // A SET FOR THE DUPLICATES AND A CEILING ON THE COUNT, both because the file is the image's and
+    // the image is untrusted. `/etc/group` is read up to `ACCOUNT_FILE_MAX`, which is room for some
+    // hundreds of thousands of lines naming the same user: a `contains` scan per line is quadratic in
+    // that, in the host CLI, before the box has started. And `setgroups` refuses a list past
+    // `NGROUPS_MAX` (65536) with `EINVAL`, which `set_user` can only report as "outside this box's gid
+    // map" - a sentence that would be wrong about its own cause. Order is kept (the file's), which is
+    // the order podman passes too.
+    const NGROUPS_MAX: usize = 65536;
     let mut out: Vec<u32> = Vec::new();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut over = false;
     for line in text.lines() {
         // `name:x:gid:member,member`
         let f: Vec<&str> = line.split(':').collect();
@@ -458,10 +505,21 @@ pub(crate) fn image_supplementary_gids(spec: &str, lower: &[String]) -> Vec<u32>
             continue;
         }
         if let Ok(g) = gid.parse::<u32>() {
-            if !out.contains(&g) {
+            if seen.insert(g) {
+                if out.len() == NGROUPS_MAX {
+                    over = true;
+                    break;
+                }
                 out.push(g);
             }
         }
+    }
+    if over {
+        eprintln!(
+            "kern: warning: this image's /etc/group puts '{name}' in more than {NGROUPS_MAX} \
+             groups, which is more than the kernel accepts: the workload gets the first \
+             {NGROUPS_MAX}. A file readable only through one of the others will fail with EACCES."
+        );
     }
     out
 }
@@ -482,8 +540,9 @@ pub(crate) fn image_supplementary_gids(spec: &str, lower: &[String]) -> Vec<u32>
 /// WorkingDir for the same input (`HOME=/opt/airflow` for `--user 1000` on the airflow image). This
 /// is the one rule here taken from Docker over podman, and both halves are now measured rather than
 /// argued: a known uid gives its passwd home under all three.
-pub(crate) fn image_user_home(uid: u32, lower: &[String]) -> String {
-    image_account_entry(lower, "etc/passwd", &uid.to_string(), 2)
+pub(crate) fn user_home(uid: u32, accounts: &Accounts) -> String {
+    accounts
+        .entry("etc/passwd", &uid.to_string(), 2)
         .and_then(|e| e.get(5).cloned())
         .filter(|h| h.starts_with('/'))
         .unwrap_or_else(|| "/".to_string())
@@ -495,11 +554,8 @@ pub(crate) fn image_user_home(uid: u32, lower: &[String]) -> String {
 /// to that account's uid/gid. Docker's rule - a bare user takes its primary group from the passwd entry;
 /// an explicit `:group` overrides it. Returns `None` (caller keeps box-root, with a note) if the account
 /// isn't in the image, so an image referencing a host-provided name still degrades honestly.
-pub(crate) fn resolve_image_user(spec: &str, lower: &[String]) -> Option<(u32, u32)> {
-    let (user, group) = match spec.split_once(':') {
-        Some((u, g)) => (u, Some(g)),
-        None => (spec, None),
-    };
+pub(crate) fn resolve_user(spec: &str, accounts: &Accounts) -> Option<(u32, u32)> {
+    let (user, group) = split_user_spec(spec)?;
     // The user half yields both a uid and (for a bare `USER name`) the default gid from its ONE passwd
     // line: fields are `name:x:uid:gid:…`, so index 2 is the uid and 3 the primary gid.
     let (uid, passwd_gid) = match user.parse::<u32>() {
@@ -525,13 +581,14 @@ pub(crate) fn resolve_image_user(spec: &str, lower: &[String]) -> Option<(u32, u
         // directories, and the report's baseline that the identical file runs healthy under Docker
         // Compose.
         Ok(n) => {
-            let gid = image_account_entry(lower, "etc/passwd", &n.to_string(), 2)
+            let gid = accounts
+                .entry("etc/passwd", &n.to_string(), 2)
                 .and_then(|e| e.get(3)?.parse().ok())
                 .unwrap_or(0);
             (n, gid)
         }
         Err(_) => {
-            let e = image_account_entry(lower, "etc/passwd", user, 0)?;
+            let e = accounts.entry("etc/passwd", user, 0)?;
             (e.get(2)?.parse().ok()?, e.get(3)?.parse().ok()?)
         }
     };
@@ -540,10 +597,7 @@ pub(crate) fn resolve_image_user(spec: &str, lower: &[String]) -> Option<(u32, u
         // `group` fields are `name:x:gid:…`, so index 2 is the gid.
         Some(g) => match g.parse::<u32>() {
             Ok(n) => n,
-            Err(_) => image_account_entry(lower, "etc/group", g, 0)?
-                .get(2)?
-                .parse()
-                .ok()?,
+            Err(_) => accounts.entry("etc/group", g, 0)?.get(2)?.parse().ok()?,
         },
     };
     Some((uid, gid))

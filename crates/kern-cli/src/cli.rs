@@ -121,6 +121,10 @@ pub enum Command {
         /// INTERNAL (used by `kern build`): a PERSISTENT overlay upper dir (the build layer) instead
         /// of the ephemeral scratch upper - so a build's writes accumulate across RUN steps.
         overlay_upper: Option<String>,
+        /// `--keep`: the box's writable layer survives its exit, and `kern start <name>` runs it
+        /// again. See [`crate::keepbox`]. Without it a box leaves nothing behind, which stays the
+        /// default.
+        keep: bool,
         /// `--memory`/`-m`: hard memory ceiling in bytes (default cap if `None`).
         memory: Option<u64>,
         /// `--memory-swap-max`: swap allowance in bytes → `memory.swap.max` (v2, separate from
@@ -265,7 +269,8 @@ pub enum Command {
         /// calling process rather than requiring a mount namespace.
         landlock_rw: Vec<String>,
     },
-    /// `kern exec <name> [-it] [--env K=V] [--workdir <dir>] [--] [cmd...]`: run a command in a box.
+    /// `kern exec <name> [-it] [-u <user>] [--env K=V] [--workdir <dir>] [--] [cmd...]`: run a
+    /// command in a box.
     Exec {
         name: String,
         command: Vec<String>,
@@ -273,6 +278,9 @@ pub enum Command {
         workdir: Option<String>,
         /// `-it`/`-t`/`-i`: allocate an interactive PTY for the exec'd command.
         tty: bool,
+        /// `-u`/`--user <user[:group]>`: run as this account of the BOX, each half a name or a number.
+        /// `None` is box root.
+        user: Option<String>,
     },
     /// `kern stop <name>... | --all`: stop running box(es) by name, or every running box.
     Stop {
@@ -547,6 +555,15 @@ pub enum Command {
     },
     /// `kern recover`: clean up stale registry entries / orphaned scratch of dead boxes.
     Recover,
+    /// `kern start <name>...`: run a `--keep` box again, on the writable layer it left behind. See
+    /// [`crate::keepbox`].
+    Start {
+        names: Vec<String>,
+    },
+    /// `kern rm <name>...`: remove a stopped `--keep` box - its layer and its record.
+    Rm {
+        names: Vec<String>,
+    },
     /// `kern rename <old> <new>`: give a running box a new name.
     Rename {
         old: String,
@@ -1622,6 +1639,40 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("recover") => {
             reject_unknown_flags("recover", &rest, &[])?;
             Command::Recover
+        }
+        // `start <name>...`: the other half of `box --keep`. No `--all`: starting every box somebody
+        // once kept is not a thing to ask for in one word, and the names are what the operator means.
+        Some("start") => {
+            reject_unknown_flags("start", &rest, &[])?;
+            let names: Vec<String> = rest
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect();
+            if names.is_empty() {
+                return Err(Error::Usage(
+                    "start <name>...  (a box created with `box --keep`)",
+                ));
+            }
+            Command::Start { names }
+        }
+        // `rm <name>...`: removes a KEPT box. Deliberately not an alias of `stop`: Docker's `rm`
+        // refuses a running container, and so does this, naming `stop` instead of killing anything.
+        Some("rm") => {
+            reject_unknown_flags("rm", &rest, &[])?;
+            let names: Vec<String> = rest
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| (*s).to_string())
+                .collect();
+            if names.is_empty() {
+                return Err(Error::Usage(
+                    "rm <name>...  (a stopped box created with `box --keep`)",
+                ));
+            }
+            Command::Rm { names }
         }
         // `update <box> [--memory M] [--cpus N] [--pids-limit P]`: change a running box's caps live.
         Some("update") => {
@@ -2926,6 +2977,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut security_profile: Option<commands::SecurityProfile> = None;
     let mut overlay_lower: Vec<String> = Vec::new();
     let mut overlay_upper: Option<String> = None;
+    let mut keep = false;
     let mut tty = false;
     let mut restart = commands::RestartPolicy::No;
     let mut health_cmd: Option<String> = None;
@@ -3099,6 +3151,11 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // tunnel inside the box's own network namespace.
                 "--tun" => tun = true,
                 "--init" => init = true,
+                // `--keep`: see `crate::keepbox`. One flag, no value: where the layer lives is kern's
+                // to choose, under `$XDG_DATA_HOME/kern/boxes/<name>`, so two boxes of the same name
+                // cannot be handed the same directory by accident and `kern rm <name>` knows where to
+                // look. A caller that wants to place the layer itself still has `--overlay-upper`.
+                "--keep" => keep = true,
                 // `--hostname NAME`: override the box's UTS hostname (default: the box name).
                 "--hostname" => {
                     i += 1;
@@ -4023,6 +4080,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             security_profile,
             overlay_lower,
             overlay_upper,
+            keep,
             memory,
             memory_swap_max,
             cpus,
@@ -4290,12 +4348,13 @@ fn is_cpu_list(s: &str) -> bool {
     crate::config::is_cpu_list(s)
 }
 
-/// Parse `exec <name> [--env K=V] [--workdir <dir>] [--] [cmd...]`. Missing name → usage error.
-/// The `--` is OPTIONAL: trailing words are the command, as `docker exec <c> ls` reads.
+/// Parse `exec <name> [-u <user>] [--env K=V] [--workdir <dir>] [--] [cmd...]`. Missing name →
+/// usage error. The `--` is OPTIONAL: trailing words are the command, as `docker exec <c> ls` reads.
 fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
     let mut name: Option<&str> = None;
     let mut env: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
+    let mut user: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
     let mut tty = false;
     let mut after_dd = false;
@@ -4316,6 +4375,18 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
                 "-w" | "--workdir" => {
                     i += 1;
                     workdir = rest.get(i).map(|v| (*v).to_string());
+                }
+                // `-u <user[:group]>`, Docker's `exec --user`. A missing or empty value is a usage
+                // error: read as "no user" it would run the command as box root, the identity the
+                // caller just asked to leave.
+                "-u" | "--user" => {
+                    i += 1;
+                    match rest.get(i).filter(|v| !v.is_empty()) {
+                        Some(v) => user = Some((*v).to_string()),
+                        None => return Err(Error::Usage(
+                            "exec -u <user[:group]> (a name or uid of the box, e.g. node or 1000)",
+                        )),
+                    }
                 }
                 // `-t` ALLOCATES A PTY. `-i` DOES NOT, and treating them as one flag was a defect
                 // with a very large blast radius, because `docker exec -i <c> psql … < file.sql` is
@@ -4365,6 +4436,7 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
             env,
             workdir,
             tty,
+            user,
         }),
         None => Err(Error::Usage("exec <name> [--] [cmd...]")),
     }
@@ -4988,6 +5060,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             security_profile,
             overlay_lower,
             overlay_upper,
+            keep,
             memory,
             memory_swap_max,
             cpus,
@@ -5072,6 +5145,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             security_profile,
             overlay_lower: &overlay_lower,
             overlay_upper: overlay_upper.as_deref(),
+            keep,
             memory,
             memory_swap_max,
             cpus,
@@ -5149,7 +5223,16 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env,
             workdir,
             tty,
-        } => commands::exec(&name, &command, &env, workdir.as_deref(), tty, false),
+            user,
+        } => commands::exec(
+            &name,
+            &command,
+            &env,
+            workdir.as_deref(),
+            tty,
+            user.as_deref()
+                .map_or(commands::ExecAs::BoxRoot, commands::ExecAs::User),
+        ),
         Command::Build {
             check,
             tag,
@@ -5311,6 +5394,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             count,
         } => commands::bench(rootfs.as_deref(), image.as_deref(), bind_rootfs, count),
         Command::Recover => commands::recover(),
+        Command::Start { names } => commands::start_kept(&names),
+        Command::Rm { names } => commands::remove_kept(&names),
         Command::Rename { old, new } => commands::rename(&old, &new),
         Command::Port {
             name,
@@ -8121,6 +8206,42 @@ mod tests {
                 }
                 other => panic!("expected Exec for {argv:?}, got {other:?}"),
             }
+        }
+    }
+
+    /// `exec -u <user>` takes the next word whatever it looks like, refuses a missing or empty one
+    /// rather than reading it as box root, and a `-u` AFTER the command belongs to the command:
+    /// `kern exec box id -u` runs `id -u` as box root, which is what the same line does under docker.
+    #[test]
+    fn exec_parses_user_and_leaves_a_later_u_to_the_command() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        for (argv, want) in [
+            (&["exec", "svc", "-u", "node", "id"][..], Some("node")),
+            (
+                &["exec", "svc", "--user", "1000:0", "--", "id"][..],
+                Some("1000:0"),
+            ),
+            (&["exec", "-u", "node:staff", "svc"][..], Some("node:staff")),
+            (&["exec", "svc", "id", "-u"][..], None),
+            (&["exec", "svc", "--", "-u", "x"][..], None),
+        ] {
+            match p(argv).unwrap().1 {
+                Command::Exec { name, user, .. } => {
+                    assert_eq!(name, "svc", "{argv:?}");
+                    assert_eq!(user.as_deref(), want, "{argv:?}");
+                }
+                other => panic!("expected Exec for {argv:?}, got {other:?}"),
+            }
+        }
+        match p(&["exec", "svc", "id", "-u"]).unwrap().1 {
+            Command::Exec { command, .. } => assert_eq!(command, vec!["id", "-u"]),
+            other => panic!("expected Exec, got {other:?}"),
+        }
+        for argv in [&["exec", "svc", "-u"][..], &["exec", "svc", "-u", ""][..]] {
+            assert!(
+                matches!(p(argv), Err(Error::Usage(_))),
+                "{argv:?} must be a usage error, not box root"
+            );
         }
     }
 

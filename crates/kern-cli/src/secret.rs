@@ -131,9 +131,11 @@ pub fn parse_secrets(
                 // journal, where it PERSISTS after the box exits (a hacker-mode audit surfaced this
                 // beyond the ephemeral `ps` exposure). Warn honestly and steer to the argv-free forms.
                 eprintln!(
-                    "kern: warning: --secret {k}=<value> is visible in `ps` and recorded in the \
-                         systemd journal (persists after the box exits); \
-                         prefer '{k}=-' (read from stdin) or a file ('SRC:{k}')"
+                    "kern: warning: --secret {k}=<value> is visible in `ps`, recorded in the \
+                         systemd journal (persists after the box exits), and - with `--keep` - \
+                         written into the box's record under $XDG_DATA_HOME/kern/boxes, where it \
+                         stays until `kern rm`; prefer '{k}=-' (read from stdin) or a file \
+                         ('SRC:{k}')"
                 );
                 (k.to_string(), v.as_bytes().to_vec())
             }
@@ -243,7 +245,14 @@ pub(crate) fn guard_host_write_path(dst: &str, what: &str) -> Result<(), Error> 
         .filter(|s| !s.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     if let Ok(cparent) = std::fs::canonicalize(parent) {
-        if crate::registry::path_overlaps_trusted_state(&cparent) {
+        // The WRITE question, on the whole landing path: a file that lands NEXT TO the registry is not
+        // a write into it (see `write_lands_on_trusted_state`). A landing with no file name (`.`, `..`)
+        // is a directory, which neither caller can write, so it keeps the stricter mount rule.
+        let refused = match landing.file_name() {
+            Some(name) => crate::registry::write_lands_on_trusted_state(&cparent, name),
+            None => crate::registry::path_overlaps_trusted_state(&cparent),
+        };
+        if refused {
             return Err(Error::Sandbox(format!(
                 "{what} '{dst}': refusing to write into the kern registry - it would forge or clobber \
                  another box's state or posture records"

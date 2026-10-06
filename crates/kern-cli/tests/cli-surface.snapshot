@@ -7,7 +7,7 @@ COMMANDS:
     box <name> [PROFILE…] --plan                                   Preview the isolation sequence + device grants
     run [--memory M] [--cpus N] [vcpu:PROFILE] [--] CMD...         Run CMD under CPU/mem caps (no sandbox)
     run --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
-    exec <name> [-i|-t|-it] [--env K=V] [-w <dir>] [--] [CMD...]   Run CMD in a running box
+    exec <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
     ps [-a] [--json] [-q] [--filter name=|status=|id=|label=|pod=|health=] [--format T] [--no-trunc] [--last N|-n N]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
     logs <name> [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
     stop <name>... | --all                                         Stop box(es), or all
@@ -39,6 +39,8 @@ COMMANDS:
     pause <name>... | --all                                        Freeze box(es) (cgroup freezer)
     unpause <name>... | --all                                      Thaw frozen box(es)
     kill <name>... | killall                                       Stop box(es) (alias of stop)
+    start <name>...                                                Run a `box --keep` box again, on the layer it left behind (its recorded command line)
+    rm <name>...                                                   Remove a stopped `box --keep` box: its layer and its record (refuses a running one)
     rename <old> <new>                                             Give a running box a new name
     update <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
     wait <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once

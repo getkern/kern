@@ -593,6 +593,180 @@ fn make_private() -> Result<(), Error> {
     Ok(())
 }
 
+/// Does the filesystem holding `dir` take `user.*` extended attributes?
+///
+/// THE QUESTION `userxattr` TURNS ON. With that option overlayfs keeps its whiteout and opaque
+/// markers in `user.overlay.*` on the UPPER layer, so a filesystem that refuses `user.*` cannot
+/// record a deletion at all - and the kernel reports that as EIO from the `rm`, not from the mount.
+/// MEASURED on tegra 5.15: lower on ext4, upper on the runtime tmpfs, `rm -rf` of a lower directory
+/// answered `Input/output error` with the option and succeeded without it, because tmpfs did not take
+/// `user.*` before Linux 6.6. The same shape on 7.0 works either way.
+///
+/// Asked of `dir` if it exists, else of its parent, which is where the upper is about to be made. A
+/// probe file is created, written to and removed; anything that cannot be done is answered `false`,
+/// which keeps the plain option and today's behaviour.
+fn fs_takes_user_xattr(dir: &std::path::Path) -> bool {
+    let at = if dir.is_dir() {
+        dir
+    } else {
+        match dir.parent() {
+            Some(p) if p.is_dir() => p,
+            _ => return false,
+        }
+    };
+    let probe = at.join(format!(".kern-xattr-probe-{}", unsafe { libc::getpid() }));
+    let Ok(path) = CString::new(probe.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // `user.overlay.*` is what overlayfs writes; the probe asks with a name of kern's own in the same
+    // namespace, because the answer is a property of the namespace and not of the attribute.
+    let ok = unsafe {
+        libc::fsetxattr(
+            fd,
+            c"user.kern-probe".as_ptr(),
+            b"1".as_ptr() as *const libc::c_void,
+            1,
+            0,
+        ) == 0
+    };
+    unsafe {
+        libc::close(fd);
+        libc::unlink(path.as_ptr());
+    }
+    ok
+}
+
+/// One overlay's mount options, in the order to try them. Built by the caller, which may allocate;
+/// [`mount_overlay_c`] runs in forked children and only reads them.
+pub struct OverlayOpts {
+    first: CString,
+    second: CString,
+}
+
+impl OverlayOpts {
+    /// `opts` is the `lowerdir=…` string kern already builds. `upper` is the upper layer's directory
+    /// for a writable mount, or `None` for a read-only one.
+    ///
+    /// WHICH FORM GOES FIRST IS THE UPPER FILESYSTEM'S ANSWER (see [`fs_takes_user_xattr`]): a mount
+    /// whose upper cannot hold `user.*` must not ask for `userxattr`, or deletions fail with EIO. A
+    /// read-only mount writes no marker, so it asks for the option unconditionally - every marker any
+    /// kern layer carries is a `user.*` one, because no kern mount has ever had a namespace root that
+    /// could write `trusted.*`.
+    pub fn new(opts: &str, upper: Option<&std::path::Path>) -> Result<Self, Error> {
+        let userxattr = cstr(&format!("{opts},userxattr"))?;
+        let plain = cstr(opts)?;
+        let prefer_userxattr = match upper {
+            Some(dir) => fs_takes_user_xattr(dir),
+            None => true,
+        };
+        Ok(if prefer_userxattr {
+            Self {
+                first: userxattr,
+                second: plain,
+            }
+        } else {
+            Self {
+                first: plain,
+                second: userxattr,
+            }
+        })
+    }
+
+    /// Whether the first attempt asks for `userxattr`: for the tests and for `kern doctor`.
+    pub fn prefers_userxattr(&self) -> bool {
+        self.first.to_bytes().ends_with(b",userxattr")
+    }
+}
+
+/// Mount an overlay at `target` with the option set [`OverlayOpts`] chose, and only if the kernel
+/// answers EINVAL - a kernel before 5.11 does not know `userxattr` - once more with the other. Every
+/// overlay kern mounts goes through here, so the probe that decides whether a build may be layered
+/// measures the mount the build and the box will make. Returns `mount(2)`'s result; on failure, errno
+/// is the last attempt's.
+///
+/// WHY `userxattr` IS ASKED FOR AT ALL. kern mounts every overlay inside a user namespace (a box's
+/// namespaces are made with `CLONE_NEWUSER` unconditionally; the build probes and the merged-view
+/// reader unshare one), and that namespace's root cannot write `trusted.*` attributes, which is where
+/// overlayfs keeps its whiteout and opaque markers unless told otherwise. Some kernels imply the
+/// option for such a mount: MEASURED on 7.0, an overlay mounted without it writes
+/// `user.overlay.opaque`, the same attribute as with it. WSL2 6.18 does not: without it the kernel
+/// could not record a deletion, so `rm -rf /etc/apk` in an ordinary `kern box` failed with "I/O
+/// error", every build there was refused the layered path (the opaque probe failed) and lost its
+/// per-instruction cache, and a layered image built elsewhere had its markers ignored.
+///
+/// AND WHY IT IS NOT ASKED FOR ALWAYS: the option moves the markers onto a filesystem that may not
+/// take them. See [`fs_takes_user_xattr`] for the measurement that decides.
+///
+/// AND THE SECOND ATTEMPT IS REPORTED, not silent. A kernel that knows `userxattr` can still refuse
+/// it together with `redirect_dir=on`/`metacopy=on`, which come from the overlay module's own
+/// defaults rather than from kern's option string, and the answer is the same EINVAL as a kernel that
+/// has never heard of it. Falling back there returns the box to the behaviour this exists to fix -
+/// on such a host a deletion is not recorded - so the caller is told which attempt carried, and the
+/// box path says so once. Without that, the one case worth knowing about looked like success.
+///
+/// # Safety
+/// `target` must be a valid NUL-terminated path for the duration of the call.
+pub unsafe fn mount_overlay_c(
+    target: *const libc::c_char,
+    flags: libc::c_ulong,
+    opts: &OverlayOpts,
+) -> OverlayMount {
+    let ty = c"overlay".as_ptr();
+    let r = libc::mount(
+        ty,
+        target,
+        ty,
+        flags,
+        opts.first.as_ptr() as *const libc::c_void,
+    );
+    if r == 0 {
+        return OverlayMount::First;
+    }
+    if *libc::__errno_location() != libc::EINVAL {
+        return OverlayMount::Failed;
+    }
+    if libc::mount(
+        ty,
+        target,
+        ty,
+        flags,
+        opts.second.as_ptr() as *const libc::c_void,
+    ) == 0
+    {
+        OverlayMount::Second
+    } else {
+        OverlayMount::Failed
+    }
+}
+
+/// Which attempt of [`mount_overlay_c`] carried, or neither.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OverlayMount {
+    /// The option set [`OverlayOpts`] chose for this host.
+    First,
+    /// The other one: the kernel refused the first with EINVAL. See [`mount_overlay_c`].
+    Second,
+    /// Neither mounted; `errno` is the last attempt's.
+    Failed,
+}
+
+impl OverlayMount {
+    /// Did the mount succeed, by either attempt?
+    pub fn ok(self) -> bool {
+        self != OverlayMount::Failed
+    }
+}
+
 /// Mount an overlayfs at `merged` (read-only `lower` image + writable `upper`/`work`). The
 /// kernel holds references to the dirs, so the box's root stays writable; changes land in
 /// `upper` and the image is untouched.
@@ -607,29 +781,36 @@ fn mount_overlay(lower: &[String], upper: &str, work: &str, merged: &str) -> Res
             "mount(overlay): the root has no image layer to mount".into(),
         ));
     }
-    let ty = cstr("overlay")?;
     let merged_c = cstr(merged)?;
-    let opts = cstr(&format!(
-        "lowerdir={},upperdir={},workdir={}",
-        overlay_lowerdir(lower),
-        overlay_escape(upper),
-        overlay_escape(work)
-    ))?;
+    let opts = OverlayOpts::new(
+        &format!(
+            "lowerdir={},upperdir={},workdir={}",
+            overlay_lowerdir(lower),
+            overlay_escape(upper),
+            overlay_escape(work)
+        ),
+        Some(std::path::Path::new(upper)),
+    )?;
     // `NODEV|NOSUID` on the box root: a device node on the rootfs is inert and a setuid binary can't
     // elevate. Both are already assured (userns superblocks are `SB_I_NODEV`; the workload runs under
     // `NO_NEW_PRIVS` + the bounding-set cap drop), so this is defense-in-depth that doesn't rely on
     // that implicit kernel behaviour. Device nodes the box legitimately uses live on the separate
     // `/dev` tmpfs, not here.
     let hardening = (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong;
-    let r = unsafe {
-        libc::mount(
-            ty.as_ptr(),
-            merged_c.as_ptr(),
-            ty.as_ptr(),
-            hardening,
-            opts.as_ptr() as *const libc::c_void,
-        )
-    };
+    let asked_userxattr = opts.prefers_userxattr();
+    let how = unsafe { mount_overlay_c(merged_c.as_ptr(), hardening, &opts) };
+    if how == OverlayMount::Second && asked_userxattr {
+        // This host's upper CAN hold `user.*`, so the refusal is the kernel's own (an overlay module
+        // built with `redirect_dir=on`/`metacopy=on` refuses `userxattr` with the same EINVAL). The
+        // box runs, and what it loses is the recording of a deletion, so this is a note and not a
+        // refusal - but it is the one case where that loss is not a property of the filesystem.
+        eprintln!(
+            "kern: note: this kernel refused the overlay's `userxattr` option, so a file this box \
+             deletes from its image may not be recorded as deleted (it stays deleted for this box). \
+             A layered build on this host falls back to a full copy for the same reason."
+        );
+    }
+    let r = i32::from(!how.ok());
     if r != 0 {
         let e = std::io::Error::last_os_error();
         // kern inside a Docker/Podman container: the scratch dir (default `/run/user/<uid>` or
@@ -1484,25 +1665,11 @@ fn child_setup_and_exec(
         apply_apparmor_onexec(profile)?;
         t.mark("apparmor");
     }
-    // Least-privilege, in three ordered steps so `--user` + `--cap-drop ALL` (the canonical hardened
-    // profile) composes correctly. All run after privileged setup (mount/pivot/loopback), so they
-    // only affect the workload.
+    // Least-privilege, in the three ordered steps of `drop_caps_around_identity`, so `--user` +
+    // `--cap-drop ALL` (the canonical hardened profile) composes correctly. All run after privileged
+    // setup (mount/pivot/loopback), so they only affect the workload.
     let cap_mask = cap_drop_mask(&spec.caps, spec.tun, spec.privileged);
-    // 1. Bounding set - needs effective `CAP_SETPCAP` (still present here); stops a file-cap binary
-    //    re-adding a dropped cap. Dropping a cap from the *bounding* set does NOT block using it from
-    //    the effective set, so the `setuid`/`setgid` below still work even under `--cap-drop ALL`.
-    drop_cap_bounding(cap_mask)?;
-    // 2. `--user UID[:GID]`: drop to the workload's uid/gid - needs `CAP_SETUID`/`CAP_SETGID` in the
-    //    *effective* set, which are still present (we haven't cleared effective yet). setgid before
-    //    setuid (once uid is non-root you can't change gid); setuid to a non-root uid then sheds the
-    //    effective caps itself. Only mapped ids succeed; a failure fails closed (refuses to exec).
-    if let Some((uid, gid)) = spec.run_as {
-        set_user(uid, gid, &spec.extra_gids)?;
-    }
-    // 3. Clear the dropped caps from effective/permitted/inheritable. For a non-root `--user` step 2
-    //    already emptied them; this covers a root box and is otherwise a harmless no-op. Fatal on a
-    //    real failure (see `clear_caps_from_sets`): the box must not run holding caps it dropped.
-    clear_caps_from_sets(cap_mask)?;
+    drop_caps_around_identity(cap_mask, spec.run_as, &spec.extra_gids, true).map_err(|(_, e)| e)?;
 
     // Landlock (LSM) write-allowlist, applied BEFORE seccomp (whose filter would otherwise block the
     // `landlock_*` syscalls). Defense-in-depth over the mount namespace: the box root is read+exec and
@@ -1783,9 +1950,10 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
         //
         // The text is [`crate::SETUP_FAILURE_HINT`] and not a copy: the CLI prints the same class of
         // failure for everything that fails BEFORE the fork, and two wordings for one condition drift.
+        let said = e.to_string();
         eprintln!(
-            "kern: sandbox setup failed: {e}\nhint: {}",
-            crate::SETUP_FAILURE_HINT
+            "kern: sandbox setup failed: {said}\nhint: {}",
+            crate::setup_failure_hint(&said)
         );
     }
 }
@@ -1798,7 +1966,7 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
 /// without `newuidmap`/`newgidmap` fell back to the single-uid map), return `Err` so the box
 /// **refuses to exec** rather than silently running the workload as in-box root. Dropping privilege
 /// must never *grant* it. `--user 0` (explicitly root) is a successful no-op.
-fn set_user(uid: u32, gid: u32, extra_gids: &[u32]) -> Result<(), Error> {
+fn set_user(uid: u32, gid: u32, extra_gids: &[u32], dumpable_after: bool) -> Result<(), Error> {
     unsafe {
         if extra_gids.is_empty() {
             // Best-effort: setgroups may be EPERM under `/proc/self/setgroups=deny` (single-uid box);
@@ -1819,21 +1987,42 @@ fn set_user(uid: u32, gid: u32, extra_gids: &[u32]) -> Result<(), Error> {
             // box's own gid map, so it can reach nothing the box could not already reach.
             let gids: Vec<libc::gid_t> = extra_gids.iter().map(|g| *g as libc::gid_t).collect();
             if libc::setgroups(gids.len(), gids.as_ptr()) != 0 {
-                // NOT FATAL, BUT NAMED. A single-uid box has `/proc/self/setgroups` set to `deny`,
-                // where this cannot succeed and the box is still perfectly usable for images that do
-                // not depend on a group. Silence would leave the reader with the EACCES above and
-                // nothing pointing at its cause.
                 let e = std::io::Error::last_os_error();
-                let list = extra_gids
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                eprintln!(
-                    "kern: warning: could not give the workload the group(s) its image puts it in \
-                     ({list}): {e}. A file readable only through one of those groups will fail with \
-                     EACCES; `--uid-range` maps a range of gids and lets this succeed."
-                );
+                // NEVER KEEP THE CALLER'S GROUPS. A refused list left the process with the ones it
+                // inherited, which are KERN's: MEASURED, an image user in one group outside the range
+                // (gid 70000 past a 65536-id map) ran as `groups=65534(nobody) x13,0(root)`, the host
+                // user's groups as the box sees them, the box's root group among them. Cleared here,
+                // best effort: the single-uid map refuses this too, and its only user is root.
+                libc::setgroups(0, std::ptr::null());
+                // NOT FATAL, BUT NAMED: the box still runs, and silence would leave a reader with an
+                // EACCES and nothing pointing at its cause.
+                //
+                // EXCEPT FOR BOX ROOT ON THE SINGLE-UID MAP, where the sentence cannot come true.
+                // `EPERM` is that map's `deny`, uid 0 is its only uid, every file with a mapped owner
+                // is root's, and no gid the image names exists to own one. MEASURED as noise on every
+                // call: an SDK session with `user="root"` over an image whose root is in eleven groups
+                // (alpine) printed it into each result's stderr. A range (`EINVAL`, a gid outside it)
+                // still warns, for root too: with `--cap-drop ALL` root reads a group-owned file
+                // through its groups there.
+                let root_in_single_uid_map = uid == 0 && e.raw_os_error() == Some(libc::EPERM);
+                if !root_in_single_uid_map {
+                    let list = extra_gids
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let why = if e.raw_os_error() == Some(libc::EINVAL) {
+                        "at least one of them is outside this box's gid map, so it got none of them"
+                    } else {
+                        "this box's single-uid map refuses supplementary groups; `--uid-range` maps a \
+                         range of gids and lets this succeed"
+                    };
+                    eprintln!(
+                        "kern: warning: could not give the workload the group(s) its image puts it \
+                         in ({list}): {e}: {why}. A file readable only through one of those groups \
+                         will fail with EACCES."
+                    );
+                }
             }
         }
         if libc::setgid(gid as libc::gid_t) != 0 && gid != 0 {
@@ -1875,7 +2064,17 @@ fn set_user(uid: u32, gid: u32, extra_gids: &[u32]) -> Result<(), Error> {
         //
         // NOT FATAL: a box that cannot be entered by a relay is still a box that runs. The relay
         // says so itself, by name, and that message is the one that used to blame a bind.
-        libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+        //
+        // NOT ON THE `kern exec` PATH, WHICH ASKS FOR `false`. There the box is already running, so
+        // a process inside it shares this child's uid the moment the switch lands and can open
+        // `/proc/<child>/fd/*` - every descriptor the CLI still holds, close-on-exec ones included,
+        // because those only close at `execve` - in the window before the AppArmor profile, the
+        // seccomp filter and the fd shed. Nothing enters a box through an exec child, so that path
+        // has no relay to serve and gives the window up instead. `execve` recomputes the flag from
+        // the new credentials either way.
+        if dumpable_after {
+            libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+        }
     }
     Ok(())
 }
@@ -5719,21 +5918,6 @@ fn clear_caps_from_sets(mask: u64) -> Result<(), Error> {
     Ok(())
 }
 
-/// Drop capabilities for the workload: always the dangerous [`DEFAULT_DROP`] set, plus `--cap-drop`
-/// (or *everything* for `--cap-drop ALL`), minus `--cap-add`. Clears the effective/permitted/
-/// inheritable sets AND the bounding set. Used where NO `--user` switch follows (e.g. `kern exec`);
-/// the box workload path splits this around `set_user` (bounding drop → setuid → effective clear) so
-/// that `--cap-drop ALL` doesn't strip `CAP_SETUID`/`SETGID` before the user switch needs them.
-/// `tun`/`privileged` are passed FALSE here on purpose: `kern exec` reproduces the box's explicit
-/// `--cap-add`/`--cap-drop` (via `spec`) but NOT the implicit `--tun`/`--privileged` keeps, staying
-/// MORE constrained than the box's PID 1 - the same deliberate "exec stays strict" axis as nesting.
-fn drop_dangerous_caps(spec: &CapSpec) -> Result<(), Error> {
-    let mask = cap_drop_mask(spec, false, false);
-    drop_cap_bounding(mask)?;
-    clear_caps_from_sets(mask)?;
-    Ok(())
-}
-
 /// The same shed, keeping SEVERAL descriptors instead of one.
 ///
 /// The egress pump needs two: the pipe it reads the box pid from, and the pipe it answers its
@@ -5750,6 +5934,44 @@ pub fn shed_inherited_fds_keeping(keep: &[i32]) {
             unsafe { libc::close(fd) };
         }
     }
+}
+
+/// Which of `drop_caps_around_identity`'s three steps failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapDropStep {
+    Bounding,
+    Identity,
+    Sets,
+}
+
+/// Drop `mask` from a process that may switch identity, in the only order that works under
+/// `--cap-drop ALL`. ONE SPELLING for the box workload and for `kern exec`: the exec path used to drop
+/// everything first, which under `--cap-drop ALL` took `CAP_SETUID` and `CAP_SETGID` with it and
+/// failed every `kern exec -u` (measured).
+///
+/// 1. The BOUNDING set, which needs effective `CAP_SETPCAP` (a non-root uid no longer has it) and
+///    stops a file-cap binary re-adding a dropped cap. It does not block using a cap from the
+///    effective set, so step 2 still works.
+/// 2. The uid/gid and groups, which need `CAP_SETUID`/`CAP_SETGID` in the EFFECTIVE set. setgid before
+///    setuid; a non-root setuid sheds the effective caps itself. Only mapped ids succeed.
+/// 3. The effective, permitted and inheritable sets: a no-op after a non-root switch, the drop itself
+///    for a root process. Every failure is the caller's to fail closed on.
+///
+/// `dumpable_after` puts back the flag the credential change clears: `true` on the box path, whose
+/// peer relay opens this process's `/proc/<pid>/ns/*` while the pre-exec gate holds it, `false` on
+/// the exec path, which has no relay and would otherwise let a box process reach the CLI's
+/// descriptors in the window before seccomp. See [`set_user`].
+fn drop_caps_around_identity(
+    mask: u64,
+    run_as: Option<(u32, u32)>,
+    extra_gids: &[u32],
+    dumpable_after: bool,
+) -> Result<(), (CapDropStep, Error)> {
+    drop_cap_bounding(mask).map_err(|e| (CapDropStep::Bounding, e))?;
+    if let Some((uid, gid)) = run_as {
+        set_user(uid, gid, extra_gids, dumpable_after).map_err(|e| (CapDropStep::Identity, e))?;
+    }
+    clear_caps_from_sets(mask).map_err(|e| (CapDropStep::Sets, e))
 }
 
 /// After `fork()`, close every inherited fd `>= 3` except `keep` (pass `-1` to keep none). Two callers
@@ -6785,17 +7007,26 @@ pub fn exec_in_box(
     pty: Option<PtyHandover>,
     // Drop to this uid/gid (with these supplementary groups) before the exec, or stay box-root.
     //
-    // ONLY THE HEALTH PROBE PASSES A USER, and the asymmetry is deliberate. Docker runs a
+    // THREE CALLERS PASS ONE: the health probe, `kern compose exec` (the service's own user) and
+    // `kern exec -u`. Plain `kern exec` stays box root: it is the operator's door into the box. The
+    // probe's reason is the sharpest. Docker runs a
     // `HEALTHCHECK` as the container's user - measured, not assumed: on Docker 29.6.2 a container
     // started `--user 1000:1000 -w /tmp` with a probe that records `id` and `pwd` reports
     // `uid=1000 gid=1000 groups=1000` and `/tmp`. A probe that runs as root is a FALSE-GREEN
     // generator: it reads files the workload cannot, reports healthy, and
     // `depends_on: service_healthy` then releases a dependent onto a service that dies of EACCES.
-    // Measured on Elastic's own stack, whose certificates are `root:root` mode 640. `kern exec`
-    // keeps box-root: it is the operator's door into the box and the frozen CLI has no `--user` on
-    // it to get root back with.
+    // Measured on Elastic's own stack, whose certificates are `root:root` mode 640.
     run_as: Option<(u32, u32)>,
     extra_gids: &[u32],
+    // The box's `--landlock-rw` write-allowlist, from the same RECORDED posture as `box_caps`,
+    // `seccomp_mode` and `apparmor`. Empty for a box that named none.
+    //
+    // RE-APPLIED HERE BECAUSE IT CANNOT BE INHERITED. A Landlock restriction passes to a process's
+    // CHILDREN, and this child's parent is the host CLI, not the box's PID 1: the `setns` calls above
+    // join the box's namespaces, which carry no LSM state. So a box started `--landlock-rw /data`,
+    // whose own workload cannot write elsewhere, was enterable by a command that could write wherever
+    // the file permissions allowed. The same gap, and the same fix, as the AppArmor profile above.
+    landlock_rw: &[String],
 ) -> Result<i32, Error> {
     if command.is_empty() {
         return Err(Error::Unsupported("no command given to exec in the box"));
@@ -7065,6 +7296,19 @@ pub fn exec_in_box(
         return Err(Error::last("fork"));
     }
     if pid == 0 {
+        // NOT DUMPABLE, FIRST THING AND BEFORE ANY OF THE SETUP BELOW. This child is already inside
+        // the box's pid namespace, and the box's `/proc` carries no `hidepid`, so a process in the box
+        // can see it. Anything it may reach through `/proc/<pid>` it reaches with THIS process's
+        // descriptors: the CLI's open files and pipes, including the close-on-exec ones, which only
+        // close at the `execve` far below. The flag the kernel consults for that is `dumpable`, and a
+        // credential change clears it anyway - this just clears it for the whole window instead of
+        // only the part after the identity switch, and covers plain `kern exec`, which switches no
+        // identity and was therefore dumpable throughout.
+        //
+        // NOTHING HERE NEEDS IT. The box path restores the flag because its peer relay opens
+        // `/proc/<pid>/ns/*` on a box held at its gate (see `set_user`); an exec child is entered by
+        // no one. `execve` recomputes it from the new credentials, so the command itself is unchanged.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
         if cgroup_ns_fd >= 0 {
             unsafe { libc::setns(cgroup_ns_fd, libc::CLONE_NEWCGROUP) };
         }
@@ -7158,28 +7402,45 @@ pub fn exec_in_box(
             adopt_controlling_tty(slave);
         }
         // Parity with a box's own workload: reapply the box's OWN capability spec, so an `exec`'d
-        // command is no MORE privileged than the box's PID 1 (which ran `drop_dangerous_caps` with the
-        // same spec + seccomp before its own exec). `box_caps` is rebuilt by the caller from the
+        // command is no MORE privileged than the box's PID 1 (which dropped the same spec, and installed
+        // seccomp, before its own exec). `box_caps` is rebuilt by the caller from the
         // registry (`--cap-drop ALL` / `--cap-drop CAP` / `--cap-add CAP`); an older box with no
         // recorded spec passes `CapSpec::default()`, the dangerous baseline this used unconditionally
         // before. A `--cap-add` the box kept is preserved so exec matches PID 1 rather than being
         // stricter (harmless if it were, but this is the faithful reconstruction).
         // Fail CLOSED if the box's cap drop cannot be reapplied: an `exec` that kept the dangerous
         // baseline while the box's PID 1 dropped it would be a silent privilege gap in the box.
-        if drop_dangerous_caps(box_caps).is_err() {
-            exec_fail_closed("could not drop capabilities");
-        }
-        // THE IDENTITY, THEN THE DIRECTORY, and both AFTER the capability drop: dropping the
-        // BOUNDING set needs `CAP_SETPCAP`, which a non-root uid no longer has. Measured by doing it
-        // the other way round first: with the drop before it, every probe on a `--user` box failed
-        // closed at "could not drop capabilities" and the box reported unhealthy. `CAP_SETUID` and
-        // `CAP_SETGID` are not in the dangerous mask, so they are still here.
         //
-        // FAIL CLOSED. Running the probe as root is exactly the false green this exists to remove.
-        if let Some((uid, gid)) = run_as {
-            if set_user(uid, gid, extra_gids).is_err() {
-                exec_fail_closed("could not drop to the box's own user");
+        // In `drop_caps_around_identity`'s three steps, the box path's, so `-u` works under
+        // `--cap-drop ALL`. `tun` and `privileged` are FALSE on purpose: exec reproduces the box's
+        // explicit `--cap-add`/`--cap-drop` but NOT the implicit `--tun`/`--privileged` keeps, staying
+        // MORE constrained than PID 1 - the same deliberate "exec stays strict" axis as nesting.
+        //
+        // FAIL CLOSED on every step. An identity that did not switch would run the command as box
+        // root where the caller (a health probe, `compose exec`, `kern exec -u`) asked for an account,
+        // and a probe running as root is exactly the false green the identity exists to remove.
+        let cap_mask = cap_drop_mask(box_caps, false, false);
+        match drop_caps_around_identity(cap_mask, run_as, extra_gids, false) {
+            Ok(()) => {}
+            Err((CapDropStep::Identity, _)) => {
+                exec_fail_closed("could not switch to the requested user")
             }
+            Err(_) => exec_fail_closed("could not drop capabilities"),
+        }
+        // The box's Landlock write-allowlist, in the box path's own position: after the capability
+        // and identity work, before AppArmor and seccomp (whose filter would block the `landlock_*`
+        // syscalls). The box's scratch set (`/dev`, `/tmp`, `/run`, `/proc`) is granted by the same
+        // code that grants it to the workload, and it is the BOX's view of those paths, because this
+        // child is already in the box's mount namespace.
+        //
+        // FAIL CLOSED ON BOTH SHAPES, and neither should be reachable: a box with a non-empty
+        // allowlist refused to start on a kernel without Landlock, so `Ok(false)` here would mean the
+        // LSM went away under a running box. An exec that could write where the workload cannot is
+        // the one outcome this must not have.
+        if !landlock_rw.is_empty()
+            && !matches!(crate::landlock::apply_rw_allowlist(landlock_rw), Ok(true))
+        {
+            exec_fail_closed("could not re-apply the box's --landlock-rw write allowlist");
         }
         // Honor `--workdir` - fatal if it can't be entered (consistent with `kern box -w`, so a
         // typo'd dir is an error, not a silent run in `/`).
@@ -8957,7 +9218,81 @@ mod cpu_dir_name_tests {
 
 #[cfg(test)]
 mod overlay_option_tests {
-    use super::{overlay_escape, overlay_lowerdir};
+    use super::{fs_takes_user_xattr, overlay_escape, overlay_lowerdir, OverlayOpts};
+
+    /// `userxattr` IS ITS OWN OPTION, whatever the paths before it hold. It is appended to a string
+    /// the escaper already made, so a `,` inside a layer or upper path must stay escaped and the
+    /// kernel must still read exactly one extra option at the end - or the mount that every box,
+    /// build and probe makes (see `mount_overlay_c`) would hand the kernel a broken path instead. The
+    /// plain form, the fallback for a kernel before 5.11, is the string as given.
+    #[test]
+    fn the_userxattr_form_adds_one_option_and_leaves_the_escaped_paths_alone() {
+        let lower = vec!["/c,a:che/l1".to_string(), "/l2".to_string()];
+        let opts = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            overlay_lowerdir(&lower),
+            overlay_escape("/run/u,p"),
+            overlay_escape("/run/w")
+        );
+        // A read-only pair (no upper): `userxattr` first, the plain string unchanged behind it.
+        let pair = OverlayOpts::new(&opts, None).expect("no NUL in these paths");
+        assert!(pair.prefers_userxattr());
+        let with = pair.first.to_str().expect("utf-8");
+        let plain = pair.second.to_str().expect("utf-8");
+        assert_eq!(plain, opts);
+        let (p_parts, w_parts) = (kernel_split(plain, ','), kernel_split(with, ','));
+        assert_eq!(w_parts.len(), p_parts.len() + 1, "{w_parts:?}");
+        assert_eq!(w_parts.last().map(String::as_str), Some("userxattr"));
+        assert_eq!(
+            &w_parts[..p_parts.len()],
+            &p_parts[..],
+            "the paths before it changed"
+        );
+        // A NUL cannot be in a path, and the error says so rather than a truncated option reaching mount.
+        assert!(
+            OverlayOpts::new("lowerdir=/bad\u{0}nul", None).is_err(),
+            "an interior NUL is refused"
+        );
+    }
+
+    /// THE UPPER FILESYSTEM DECIDES WHICH FORM IS TRIED FIRST.
+    ///
+    /// `userxattr` moves overlayfs's whiteout and opaque markers into `user.*` on the upper layer, so
+    /// a filesystem that refuses them cannot record a deletion and the kernel answers EIO from the
+    /// `rm` - not from the mount, which is why this is decided before mounting rather than retried
+    /// after. MEASURED on tegra 5.15 with the upper on the runtime tmpfs, which took no `user.*`
+    /// before Linux 6.6: `rm -rf` of a lower directory failed with the option and worked without it.
+    ///
+    /// Asserted against what this host's temp filesystem actually answers, so the test states the
+    /// RULE rather than one kernel's answer. A directory with no existing parent cannot be asked, and
+    /// an unasked question is answered conservatively.
+    #[test]
+    fn the_upper_filesystems_answer_decides_which_option_set_is_tried_first() {
+        let dir = std::env::temp_dir().join(format!("kern-xattr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let takes = fs_takes_user_xattr(&dir);
+        let pair =
+            OverlayOpts::new("lowerdir=/l,upperdir=/u,workdir=/w", Some(&dir)).expect("no NUL");
+        assert_eq!(
+            pair.prefers_userxattr(),
+            takes,
+            "the first attempt must follow the upper filesystem's answer ({takes})"
+        );
+        let nowhere = dir.join("missing").join("deeper");
+        assert!(!fs_takes_user_xattr(&nowhere));
+        assert!(!OverlayOpts::new("lowerdir=/l", Some(&nowhere))
+            .expect("no NUL")
+            .prefers_userxattr());
+        // And the probe leaves nothing behind.
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "the probe left {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// overlayfs's reading of a mount option string, as MEASURED on 6.8 and 7.0: the string is cut at
     /// every unescaped `,`, and `lowerdir=` again at every unescaped `:`, then each `\x` becomes `x`.

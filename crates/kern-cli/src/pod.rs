@@ -1911,7 +1911,7 @@ pub fn list() -> Result<(), Error> {
     // The width is measured for the same reason the other five are: a compose project pod is
     // `<project>-<hash8>`, which passes 24 as soon as the project name does.
     let shown: Vec<String> = rows.iter().map(|(n, _, _)| crate::ui::scrub(n)).collect();
-    let nw = crate::ui::name_col_width(shown.iter().map(String::as_str), 24);
+    let nw = crate::ui::name_col_width(shown.iter().map(String::as_str), 24, 16);
     println!(
         "{d}{:<nw$} {:>7}  STATUS{z}",
         "POD",

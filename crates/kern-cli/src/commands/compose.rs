@@ -1939,7 +1939,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             &[],
             b.workdir.as_deref(),
             unsafe { libc::isatty(0) } == 1,
-            true,
+            crate::commands::ExecAs::Workload,
         );
     }
     // A fresh epoch token for THIS `up`. Stamped into every `depends_completed` target's exit sidecar
@@ -3002,13 +3002,15 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     }
     if !cross.foreign_hosts.is_empty() {
         // THE OTHER PROJECT'S BOXES LEARN OUR NAMES, written into the `/etc/hosts` they are already
-        // running with. MEASURED: a write through `/proc/<pid1>/root/etc/hosts` is visible inside
-        // immediately and `getent hosts` answers the new name on the next call, so no resolver and
-        // no restart of the other stack is needed.
+        // running with. MEASURED: a write into the box's own filesystem from outside it is visible
+        // inside immediately and `getent hosts` answers the new name on the next call, so no resolver
+        // and no restart of the other stack is needed. Resolved inside that box's root and never
+        // through it as a path: see `add_foreign_host`.
         for (box_name, line) in &cross.foreign_hosts {
             if let Err(e) = crate::network::add_foreign_host(box_name, line, &pod) {
                 eprintln!(
-                    "kern: warning: compose: '{box_name}' could not be told this stack's names                      ({e}); it can be reached from here, and cannot reach back by name"
+                    "kern: warning: compose: '{box_name}' could not be told this stack's names \
+                     ({e}); it can be reached from here, and cannot reach back by name"
                 );
             }
         }

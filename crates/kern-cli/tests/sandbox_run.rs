@@ -10939,6 +10939,11 @@ fn no_new_privs_really_neutralises_a_setuid_binary() {
 ///
 /// SKIPs rather than fails when the case cannot be built: no network for the base image, or no
 /// unprivileged overlay. A skip is not a pass and says which it was.
+///
+/// THE ONLY PLACE THE MERGED VIEW'S OPAQUE HANDLING IS ASSERTED. A unit test of `merged_view_extract`
+/// existed and never ran: it needed a `trusted.*` marker no unprivileged process can set, and with the
+/// `user.*` marker kern's mounts read it reached the extractor's fork, which is refused, correctly,
+/// in the test harness's multi-threaded process. It was removed rather than kept as a permanent skip.
 #[test]
 fn from_an_earlier_stage_builds_an_image_that_runs_and_hides_deleted_files() {
     let dir = std::env::temp_dir().join(format!("kern-ms-test-{}", std::process::id()));
@@ -14630,4 +14635,742 @@ RUN rm -rf /etc/apk && mkdir /etc/apk
         "the build itself failed under a space cache path:\n{said}"
     );
     let _ = fs::remove_dir_all(&root);
+}
+
+/// A BOX MAY DELETE A FILE OF ITS OWN IMAGE, and the deletion must be recorded.
+///
+/// kern mounts every box root as an overlay INSIDE a user namespace, whose root cannot write the
+/// `trusted.*` attributes overlayfs keeps its whiteout and opaque markers in. A kernel that does not
+/// switch to the `user.*` ones by itself then has nowhere to record a deletion: MEASURED on WSL2
+/// 6.18, `rm -rf /etc/apk` in an ordinary `kern box` failed with `I/O error`, while on 7.0 the same
+/// command succeeded, because that kernel implies the option. kern asks for `userxattr` now
+/// (`kern_isolation::mount_overlay_c`), which makes the three hosts behave alike.
+///
+/// Both halves are asserted: the delete succeeds, AND the files are gone from the box's view - a
+/// delete that silently left them visible is the same defect wearing a zero exit code.
+#[test]
+fn a_box_can_delete_a_directory_of_its_image_and_it_stays_deleted() {
+    // THE SKIP IS DECIDED BEFORE THE SUBJECT RUNS, by a box of its own and a pull of its own: a skip
+    // read out of this box's OWN failure text would turn every regression that breaks boxes into a
+    // green test, which is the rule stated on `a_box_can_start`.
+    if !a_box_can_start("rmimg") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    let pull = kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull");
+    if !pull.status.success() {
+        eprintln!(
+            "skip: the base image is not available here: {}",
+            String::from_utf8_lossy(&pull.stderr).trim()
+        );
+        return;
+    }
+    let name = format!("rmimg{}", std::process::id());
+    let out = kern()
+        .args([
+            "box",
+            &name,
+            "--image",
+            "alpine:3.19",
+            "--",
+            "sh",
+            "-c",
+            "rm -rf /etc/apk && echo DELETED; ls /etc/apk 2>&1 | head -1",
+        ])
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("DELETED"),
+        "the box could not delete a directory of its own image, which is where a kernel with no \
+         place to record the deletion answers EIO:\n{said}"
+    );
+    assert!(
+        said.contains("No such file or directory"),
+        "the delete reported success and the directory is still there, so the deletion was not \
+         recorded:\n{said}"
+    );
+}
+
+/// A SOURCE FILE EDITED AFTER AN INSTALL STEP RE-RUNS ONLY WHAT FOLLOWS IT.
+///
+/// This is the per-instruction cache, and it exists only on the layered path: where the kernel gives
+/// kern no overlay that records deletions, the build is flat and its cache is whole-build, so any
+/// change starts over. MEASURED before `userxattr` was asked for: WSL2 and a Jetson both took the
+/// flat path and re-ran a 3 s install step on every source edit; with it, 61 ms and 46 ms.
+///
+/// The step is a `sleep`, so the assertion is about WHAT RE-RAN rather than about this host's speed:
+/// an unchanged install step is reused, and the rebuild cannot have run it. The flat path is a SKIP
+/// with its reason, not a failure: there the whole-build cache is the documented behaviour.
+#[test]
+fn a_layered_rebuild_reuses_the_steps_before_the_file_that_changed() {
+    if !a_box_can_start("cache") {
+        eprintln!("skip: no box starts on this host, so no build can run");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("kern-it-cache-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let ctx = root.join("ctx");
+    fs::create_dir_all(ctx.join("src")).expect("ctx");
+    fs::write(ctx.join("deps.txt"), "one\n").expect("deps");
+    fs::write(ctx.join("src/a.txt"), "a\n").expect("src");
+    // The install step is a `sleep`: long enough that re-running it is unmistakable in the timing,
+    // and its own output proves whether it ran.
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM alpine:3.19\n\
+         WORKDIR /app\n\
+         COPY deps.txt .\n\
+         RUN sleep 3 && cp deps.txt installed.txt\n\
+         COPY src/ ./src/\n\
+         RUN cat src/*.txt > bundle.txt\n",
+    )
+    .expect("dockerfile");
+    let tag = format!("kern-cache-test:{}", std::process::id());
+    // ITS OWN IMAGE CACHE. The layer cache is content-addressed and SHARED, and this suite runs its
+    // tests in parallel: measured, a neighbouring test's `kern rmi` (which frees unshared layers)
+    // removed a layer this build had just written, and the cold build failed with
+    // `cp: can't stat 'deps.txt'`. A private cache also means the layers this test reuses are its own,
+    // which is the thing under test. The base is pulled into it once, and a host that cannot pull
+    // skips rather than failing.
+    let cache = root.join("cache");
+    // ITS OWN BUILD HISTORY TOO: the records live under `XDG_DATA_HOME`, which is SHARED, and the
+    // strategy below is read from the newest record. With this suite parallel, a neighbouring test's
+    // build would be the newest, and this test would skip on someone else's choice or time its own
+    // rebuild against it.
+    let data = root.join("data");
+    fs::create_dir_all(&cache).expect("cache");
+    fs::create_dir_all(&data).expect("data");
+    let pull = kern()
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_DATA_HOME", &data)
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull");
+    if !pull.status.success() {
+        let _ = fs::remove_dir_all(&root);
+        eprintln!(
+            "skip: could not pull the base into a private cache: {}",
+            String::from_utf8_lossy(&pull.stderr).trim()
+        );
+        return;
+    }
+    let build = |label: &str| -> (String, std::time::Duration) {
+        let t0 = std::time::Instant::now();
+        let out = kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(["build", "-t", &tag, ctx.to_str().unwrap_or(".")])
+            .output()
+            .unwrap_or_else(|e| panic!("run kern build ({label}): {e}"));
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "the {label} build failed:\n{said}");
+        (said, t0.elapsed())
+    };
+
+    let (cold_said, cold) = build("cold");
+    // WHICH PATH IT TOOK, FROM THE RECORD AND NOT FROM THE OUTPUT. The `[flat · …]` line goes through
+    // the terminal gate, so under `cargo test` (a pipe) it is never printed and a test reading the
+    // output would decide every build was layered: measured, with `KERN_BUILD_FLAT=1` this test failed
+    // on the timing assertion instead of skipping. `kern build inspect --json` carries it either way.
+    let strategy = {
+        let ins = kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(["builds", "--json"])
+            .output()
+            .expect("run kern builds");
+        let body = String::from_utf8_lossy(&ins.stdout).into_owned();
+        // The newest record is first; take its `"strategy":"…"` without a JSON parser.
+        body.split("\"strategy\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("")
+            .to_string()
+    };
+    if strategy.starts_with("flat") || strategy.is_empty() {
+        let _ = fs::remove_dir_all(&root);
+        eprintln!(
+            "skip: this build was not layered ({strategy:?}), and only the layered path has a \
+             per-instruction cache: {cold_said}"
+        );
+        return;
+    }
+    assert!(
+        cold >= std::time::Duration::from_secs(3),
+        "the cold build did not run the 3 s step, so this measures nothing: {cold:?}"
+    );
+    // A source file the LAST step reads: everything before it is unchanged and must be reused.
+    fs::write(ctx.join("src/a.txt"), "a changed\n").expect("edit");
+    let (said, after) = build("rebuild");
+    assert!(
+        after < std::time::Duration::from_secs(3),
+        "the rebuild re-ran the install step after a change that comes AFTER it ({after:?}), so the \
+         cache is whole-build rather than per instruction:\n{said}"
+    );
+    // And the rebuild did produce the new content, so it was not a no-op.
+    let run = kern()
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_DATA_HOME", &data)
+        .args([
+            "box",
+            &format!("cachebox{}", std::process::id()),
+            "--image",
+            &tag,
+            "--",
+            "cat",
+            "/app/bundle.txt",
+        ])
+        .output()
+        .expect("run the built image");
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("a changed"),
+        "the rebuild reused the last step too, so the edit never reached the image: {}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // The whole private cache goes with the tree, so there is no `rmi` to race anyone.
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A `--keep` BOX IS STARTED AGAIN AND FINDS ITS FILES, and nothing else keeps anything.
+///
+/// kern's model is that a box is a process and its writable layer is scratch: both go when it ends.
+/// That stays the default, and this asserts both halves - the kept box accumulates across runs, and a
+/// box without the flag has nothing to start. The counter is in the box's own `/root`, which is the
+/// IMAGE's filesystem rather than a mount, so what is being tested is the overlay layer and not a
+/// bind the host could have kept by itself.
+///
+/// The mechanism under it was broken before: a second start on a persistent upper failed with
+/// `Permission denied`, because a used overlay workdir holds `work/work` at mode 000 and
+/// `remove_dir_all` cannot traverse it. Four runs, so the failure would show on the second.
+#[test]
+fn a_kept_box_starts_again_on_the_layer_it_left_and_an_ordinary_box_does_not() {
+    if !a_box_can_start("keep") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    let pull = kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull");
+    if !pull.status.success() {
+        eprintln!(
+            "skip: the base image is not available here: {}",
+            String::from_utf8_lossy(&pull.stderr).trim()
+        );
+        return;
+    }
+    // ITS OWN DATA HOME: kept boxes live under `$XDG_DATA_HOME/kern/boxes`, and this suite runs in
+    // parallel. A private one also means the removal at the end cannot take anyone else's box.
+    let home = std::env::temp_dir().join(format!("kern-it-keep-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).expect("data home");
+    let name = format!("itkeep{}", std::process::id());
+    let run = |args: &[&str]| -> (String, bool) {
+        let out = kern()
+            .env("XDG_DATA_HOME", &home)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.success(),
+        )
+    };
+    // The create, then three restarts: each appends a line and prints how many there are.
+    let (said, ok) = run(&[
+        "box",
+        &name,
+        "--image",
+        "alpine:3.19",
+        "--keep",
+        "--",
+        "sh",
+        "-c",
+        "echo run >> /root/log; wc -l < /root/log",
+    ]);
+    assert!(ok, "the kept box did not start:\n{said}");
+    assert!(
+        said.contains('1'),
+        "the first run should see one line: {said}"
+    );
+    for want in [2, 3, 4] {
+        // THE SWEEPERS RUN BETWEEN THE RUNS. `gc` and `recover` exist to remove what a box left
+        // behind, which is exactly what a kept box IS; the SDK runs `recover` whenever a prewarmed
+        // session closes, so on a machine using both this pair runs between two starts routinely.
+        // A kept layer is not runtime state and neither may touch it.
+        if want == 3 {
+            let (said, ok) = run(&["gc"]);
+            assert!(ok, "`kern gc` failed:\n{said}");
+            let (said, ok) = run(&["recover"]);
+            assert!(ok, "`kern recover` failed:\n{said}");
+        }
+        let (said, ok) = run(&["start", &name]);
+        assert!(ok, "`kern start` failed on run {want}:\n{said}");
+        assert!(
+            said.contains(&want.to_string()),
+            "run {want} did not see {want} lines, so the layer was not reused:\n{said}"
+        );
+    }
+    // `ps -a` lists it as something `start` can run, with its last exit.
+    let (listed, _) = run(&["ps", "-a"]);
+    assert!(
+        listed.contains(&name) && listed.contains("kept"),
+        "{listed}"
+    );
+    // EVERY CHANNEL OF `ps` AGREES, which is what this file's own `--json` note is about: the table
+    // said `paused` once while `--json` said nothing, and a row only the table can see is that
+    // defect again. A kept box is in `-a`, in `-a --json`, and selectable by `status=kept`; it is in
+    // none of the plain views, whose contract is the boxes that are UP.
+    let (plain_ps, _) = run(&["ps"]);
+    assert!(
+        !plain_ps.contains(&name),
+        "a kept box is not running, so `kern ps` must not list it:\n{plain_ps}"
+    );
+    let (plain_q, _) = run(&["ps", "-q"]);
+    assert!(!plain_q.contains(&name), "{plain_q}");
+    let (kept_q, ok) = run(&["ps", "-a", "-q", "--filter", "status=kept"]);
+    assert!(ok, "`--filter status=kept` was refused:\n{kept_q}");
+    assert!(
+        kept_q.lines().any(|l| l.trim() == name),
+        "`--filter status=kept` must select it: it is the source the shell completion for `start` \
+         and `rm` reads:\n{kept_q}"
+    );
+    let (json, _) = run(&["ps", "-a", "--json"]);
+    assert!(
+        json.contains(&format!("\"name\":\"{name}\"")) && json.contains("\"status\":\"kept\""),
+        "`ps -a --json` must carry the kept row:\n{json}"
+    );
+
+    // A RECORD THAT IS NOT A `kern box` COMMAND LINE IS REPORTED, NOT REPLAYED. `kern start` runs
+    // this binary with the recorded argv, so the record decides which verb runs; a record kern did
+    // not write names itself instead. (The store is the user's own 0700 directory, so this is not a
+    // trust boundary - it is the same contract as the size bound on the record.)
+    let rec = home.join("kern/boxes").join(&name).join("box.rec");
+    let good = fs::read(&rec).expect("the record is there");
+    fs::write(&rec, b"created=1\n\nversion\0").expect("write the record");
+    let (said, ok) = run(&["start", &name]);
+    assert!(
+        !ok,
+        "a record naming another verb must not be replayed:\n{said}"
+    );
+    assert!(
+        said.contains("does not begin `box") && said.contains(&format!("kern rm {name}")),
+        "the refusal must name what is wrong and how to clear it:\n{said}"
+    );
+    // The same for a record that is a `box` command for a DIFFERENT name.
+    fs::write(
+        &rec,
+        b"created=1\n\nbox\0someone-else\0--image\0alpine:3.19\0--\0true\0",
+    )
+    .expect("write");
+    let (said, ok) = run(&["start", &name]);
+    assert!(
+        !ok,
+        "a record for another box must not be replayed:\n{said}"
+    );
+    // A RECORD KERN CANNOT READ AT ALL IS A DIFFERENT SENTENCE FROM A BOX THAT IS NOT THERE. The
+    // layer is in the store, takes disk and is skipped by `ps -a` (which has nothing true to print
+    // for it), so "no kept box" would send the reader looking for something that is right there.
+    fs::write(&rec, b"created=1\nimage=alpine:3.19\n").expect("a record with no argv section");
+    let (said, ok) = run(&["start", &name]);
+    assert!(!ok, "an unreadable record must not be replayed:\n{said}");
+    assert!(
+        said.contains("cannot read the record") && said.contains(&format!("kern rm {name}")),
+        "the refusal must name the layer and the way out:\n{said}"
+    );
+    let (missing, ok) = run(&["start", "itnosuchbox"]);
+    assert!(!ok);
+    assert!(
+        missing.contains("no kept box"),
+        "a name that is really not there keeps its own sentence:\n{missing}"
+    );
+    fs::write(&rec, &good).expect("restore the record");
+    let (said, ok) = run(&["start", &name]);
+    assert!(ok, "the restored record must start again:\n{said}");
+
+    // AND THE DEFAULT IS UNCHANGED: the same box without `--keep` leaves nothing to start.
+    let plain = format!("itplain{}", std::process::id());
+    let (said, ok) = run(&[
+        "box",
+        &plain,
+        "--image",
+        "alpine:3.19",
+        "--",
+        "sh",
+        "-c",
+        "echo x > /root/log",
+    ]);
+    assert!(ok, "the ordinary box did not start:\n{said}");
+    let (said, ok) = run(&["start", &plain]);
+    assert!(
+        !ok,
+        "`kern start` must refuse a box that kept nothing:\n{said}"
+    );
+    assert!(said.contains("no kept box"), "{said}");
+
+    // `kern rm` takes the layer and the record, and refuses a running box.
+    let (said, ok) = run(&["rm", &name]);
+    assert!(ok, "`kern rm` failed:\n{said}");
+    assert!(
+        !home.join("kern/boxes").join(&name).exists(),
+        "the layer is still there"
+    );
+    let (said, ok) = run(&["start", &name]);
+    assert!(
+        !ok && said.contains("no kept box"),
+        "after rm, start must refuse:\n{said}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// `kern rm` DOES NOT TAKE A RUNNING BOX, and `kern start` does not restart one.
+///
+/// Both refusals are the same rule as Docker's and for the same reason: the data `rm` would take is
+/// the data the operator asked to keep, and `start` on a live box is as likely to be a typo as an
+/// intention. Each message names what to do instead.
+/// TWENTY `kern start` OF ONE KEPT BOX AT ONCE: one runs, the rest are refused, and the layer is
+/// exactly one run further on.
+///
+/// This is the test that found two defects, both measured here before they were fixed: the record
+/// was written in place (one of the twenty read it mid-rewrite and answered "no kept box"), and it
+/// was written BEFORE the name claim (the nineteen losers rewrote the winner's record and recreated
+/// its directory on their way to being refused, one of them failing with "cannot record this box:
+/// No such file or directory"). Two boxes sharing one overlay upperdir is the outcome that was
+/// never acceptable, and the name claim is what prevents it - this asserts the claim covers the
+/// kept layer too, not just the registry entry.
+#[test]
+fn twenty_concurrent_starts_of_one_kept_box_run_exactly_one() {
+    if !a_box_can_start("keeprace") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    if !kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull")
+        .status
+        .success()
+    {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("kern-it-keeprace-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).expect("data home");
+    let name = format!("itkrace{}", std::process::id());
+    // The workload counts its own runs in the kept layer, and sleeps long enough that the twenty
+    // starts genuinely overlap rather than queueing behind each other.
+    let workload = "n=$(cat /root/n 2>/dev/null || echo 0); n=$((n+1)); echo $n > /root/n; sleep 0.3; echo \"ran $n\"";
+    let out = kern()
+        .env("XDG_DATA_HOME", &home)
+        .args([
+            "box",
+            &name,
+            "--image",
+            "alpine:3.19",
+            "--keep",
+            "--",
+            "sh",
+            "-c",
+            workload,
+        ])
+        .output()
+        .expect("run kern");
+    if !out.status.success() {
+        let _ = fs::remove_dir_all(&home);
+        eprintln!(
+            "skip: the kept box does not start here: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return;
+    }
+    let kids: Vec<std::process::Child> = (0..20)
+        .map(|_| {
+            kern()
+                .env("XDG_DATA_HOME", &home)
+                .args(["start", &name])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn kern start")
+        })
+        .collect();
+    let mut ran = 0;
+    let mut refused = 0;
+    let mut other: Vec<String> = Vec::new();
+    for k in kids {
+        let o = k.wait_with_output().expect("wait");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        if o.status.success() {
+            ran += 1;
+        } else if said.contains("already starting or running") || said.contains("already running") {
+            refused += 1;
+        } else {
+            other.push(said);
+        }
+    }
+    assert!(
+        other.is_empty(),
+        "a concurrent start failed for a reason that is not the name being taken: {other:?}"
+    );
+    assert_eq!(ran, 1, "exactly one of twenty may run (refused: {refused})");
+    // THE LAYER IS ONE RUN FURTHER ON, not twenty and not zero: the create wrote 1, the one winner
+    // wrote 2, so the next start must see 3.
+    let out = kern()
+        .env("XDG_DATA_HOME", &home)
+        .args(["start", &name])
+        .output()
+        .expect("run kern");
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        said.contains("ran 3"),
+        "the layer must have advanced exactly once under the twenty: {said}"
+    );
+    let _ = kern()
+        .env("XDG_DATA_HOME", &home)
+        .args(["rm", &name])
+        .output();
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// A BOX'S WRITABLE LAYER IS NEVER WRITTEN THROUGH A SYMLINK PLANTED AT ITS NAME.
+///
+/// MEASURED before the check existed: with a kept box's `upper` replaced by a link to another
+/// directory, `kern start` succeeded and the box's `etc`, `root` and `sys` deltas were written into
+/// that directory. The `work` half is worse than it looks, because the clearing that overlayfs
+/// requires would empty whatever the link points at - so the sentinel file below is the half of this
+/// test that would have caught that, and it is checked after the refusal.
+///
+/// The store is a 0700 directory of the user's own, so this is defence in depth rather than a
+/// boundary: it matters because the kept-box store is a sibling tree an operator may hand to a box
+/// on purpose, and a box given it could plant a link for a LATER `kern start` to write through.
+#[test]
+fn a_kept_layer_is_not_written_through_a_planted_symlink() {
+    if !a_box_can_start("keepsym") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    if !kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull")
+        .status
+        .success()
+    {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("kern-it-keepsym-{}", std::process::id()));
+    let elsewhere =
+        std::env::temp_dir().join(format!("kern-it-keepsym-tgt-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&elsewhere);
+    fs::create_dir_all(&home).expect("data home");
+    fs::create_dir_all(&elsewhere).expect("the directory the link points at");
+    // The sentinel: `work` must be cleared before an overlay mount, so a refusal that comes too
+    // late would remove this file.
+    fs::write(elsewhere.join("sentinel"), b"keep me").expect("sentinel");
+    let name = format!("itksym{}", std::process::id());
+    let run = |args: &[&str]| -> (String, bool) {
+        let out = kern()
+            .env("XDG_DATA_HOME", &home)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.success(),
+        )
+    };
+    let (said, ok) = run(&[
+        "box",
+        &name,
+        "--image",
+        "alpine:3.19",
+        "--keep",
+        "--",
+        "sh",
+        "-c",
+        "echo x > /root/f",
+    ]);
+    if !ok {
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&elsewhere);
+        eprintln!("skip: the kept box does not start here:\n{said}");
+        return;
+    }
+    let dir = home.join("kern/boxes").join(&name);
+    // THE BOX IS RE-CREATED FOR EACH ROUND through `kern rm`, not by clearing the directory here: a
+    // used overlay workdir holds `work/work` at mode 000, which `remove_dir_all` cannot traverse.
+    // That is the same obstacle as the defect this feature had to fix, and it made the first version
+    // of this test fail at its own setup.
+    for half in ["upper", "work"] {
+        let (said, ok) = run(&["rm", &name]);
+        assert!(ok, "`kern rm` must clear the box between rounds:\n{said}");
+        let (said, ok) = run(&[
+            "box",
+            &name,
+            "--image",
+            "alpine:3.19",
+            "--keep",
+            "--",
+            "sh",
+            "-c",
+            "echo x > /root/f",
+        ]);
+        assert!(ok, "re-creating the kept box failed:\n{said}");
+        let (said, ok) = run(&["rm", &name]);
+        assert!(ok, "{said}");
+        // A kept directory with the pair present and sane, then one half replaced by the link.
+        for h in ["upper", "work"] {
+            fs::create_dir_all(dir.join(h)).expect("the other half");
+        }
+        fs::remove_dir(dir.join(half)).expect("the half to replace is an empty directory here");
+        std::os::unix::fs::symlink(&elsewhere, dir.join(half)).expect("plant the link");
+        // The record went with the `rm`, so write one back: the refusal under test is about the
+        // layer, and a missing record would refuse for a different reason and pass for free.
+        fs::write(
+            dir.join("box.rec"),
+            format!(
+                "created=1\nimage=alpine:3.19\ncwd={}\n\nbox\0{name}\0--image\0alpine:3.19\0--keep\0--\0true\0",
+                std::env::temp_dir().display()
+            ),
+        )
+        .expect("write the record");
+        let (said, ok) = run(&["start", &name]);
+        assert!(!ok, "`kern start` must refuse a symlinked {half}:\n{said}");
+        assert!(
+            said.contains("is a symlink, not a directory"),
+            "the refusal must say what it found:\n{said}"
+        );
+        assert!(
+            elsewhere.join("sentinel").exists(),
+            "the refusal came too late: the {half} link's target was cleared"
+        );
+        assert_eq!(
+            fs::read_dir(&elsewhere).expect("read the target").count(),
+            1,
+            "nothing may be written into the link's target"
+        );
+    }
+    // A plain FILE at the name is the same refusal, with the noun that fits.
+    let _ = fs::remove_file(dir.join("upper"));
+    let _ = fs::remove_dir(dir.join("upper"));
+    fs::write(dir.join("upper"), b"").expect("plant a file");
+    let (said, ok) = run(&["start", &name]);
+    assert!(!ok, "`kern start` must refuse a file at upper:\n{said}");
+    assert!(said.contains("is a file, not a directory"), "{said}");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&elsewhere);
+}
+
+#[test]
+fn a_running_kept_box_is_not_removed_and_not_restarted() {
+    if !a_box_can_start("keeplive") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    let pull = kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull");
+    if !pull.status.success() {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("kern-it-keeplive-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).expect("data home");
+    let name = format!("itklive{}", std::process::id());
+    let run = |args: &[&str]| -> (String, bool) {
+        let out = kern()
+            .env("XDG_DATA_HOME", &home)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.success(),
+        )
+    };
+    let (said, ok) = run(&[
+        "box",
+        &name,
+        "--image",
+        "alpine:3.19",
+        "--keep",
+        "-d",
+        "--",
+        "sleep",
+        "60",
+    ]);
+    if !ok {
+        let _ = fs::remove_dir_all(&home);
+        eprintln!("skip: a detached box does not start here:\n{said}");
+        return;
+    }
+    let (said, ok) = run(&["rm", &name]);
+    assert!(!ok, "`kern rm` must refuse a running box:\n{said}");
+    assert!(
+        said.contains("is running") && said.contains("kern stop"),
+        "{said}"
+    );
+    let (said, ok) = run(&["start", &name]);
+    assert!(!ok, "`kern start` must refuse a running box:\n{said}");
+    // `kern box <name>` refuses a held name too, with its own message, so asserting on
+    // "already running" alone passes even with the check in `start_kept` removed. These two
+    // are what only `start` says: the pid it found in the registry, and the way to use the
+    // box that is up instead of starting a second one.
+    assert!(
+        said.contains(&format!("kern exec {name} <cmd>")),
+        "`kern start` must say what to do with the box that is up, not just refuse:\n{said}"
+    );
+    let (ps, ok) = run(&["ps", "--json"]);
+    assert!(ok, "`kern ps` must answer:\n{ps}");
+    let pid = ps
+        .split(&format!("\"name\":\"{name}\","))
+        .nth(1)
+        .and_then(|rest| rest.strip_prefix("\"pid\":"))
+        .and_then(|rest| rest.split(',').next())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("the running box must be in `ps`:\n{ps}"));
+    assert!(
+        said.contains(&format!("(pid {pid})")),
+        "the refusal must name the pid it found, which is how it knows:\n{said}"
+    );
+    // The layer is still there, which is what the refusal was protecting.
+    assert!(home.join("kern/boxes").join(&name).exists());
+    let _ = run(&["stop", &name]);
+    let (said, ok) = run(&["rm", &name]);
+    assert!(ok, "after `stop`, `rm` must work:\n{said}");
+    let _ = fs::remove_dir_all(&home);
 }

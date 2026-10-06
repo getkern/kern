@@ -13,31 +13,9 @@
 //! (in), where `<box>` is a running box name. Single regular files only for now.
 
 use crate::error::Error;
-use crate::openat2::openat2_in_root;
+use crate::openat2::{box_root_fd, openat2_in_root};
+use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
-
-/// Open `/proc/<pid1>/root` as an `O_PATH` dirfd - the box's root for confined resolution.
-fn box_root_fd(pid1: i32) -> std::io::Result<RawFd> {
-    // A decimal pid can never contain a NUL, so this cannot fail - stated as an error rather than
-    // asserted, because `panic = "abort"` turns a wrong assumption here into a dead process.
-    let Ok(p) = std::ffi::CString::new(format!("/proc/{pid1}/root")) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "box root path contained a NUL",
-        ));
-    };
-    let fd = unsafe {
-        libc::open(
-            p.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(fd)
-    }
-}
 
 /// What one `kern cp` argument turned out to be.
 enum Side {
@@ -115,11 +93,14 @@ fn copy_out(pid1: i32, box_src: &str, host_dst: &str) -> Result<(), Error> {
     // BLOCKS until a writer appears, hanging the operator's `cp`. Opening non-blocking returns
     // immediately; we then `fstat` and reject anything but a regular file (below), for which the flag
     // is a no-op.
-    let fd = openat2_in_root(root, box_src, libc::O_RDONLY | libc::O_NONBLOCK, 0).map_err(|e| {
-        unsafe { libc::close(root) };
-        Error::Sandbox(format!("box:{box_src}: {e}"))
-    })?;
-    unsafe { libc::close(root) };
+    let fd = openat2_in_root(
+        root.as_raw_fd(),
+        box_src,
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    )
+    .map_err(|e| Error::Sandbox(format!("box:{box_src}: {e}")))?;
+    drop(root);
     // Regular files ONLY (also excludes a directory, FIFO, socket, device).
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let meta = file
@@ -195,22 +176,21 @@ fn copy_in(host_src: &str, pid1: i32, box_dst: &str) -> Result<(), Error> {
         std::fs::read(&canon).map_err(|e| Error::Sandbox(format!("host {host_src}: {e}")))?;
     // If the box dst names an existing directory, drop the source basename into it.
     let root = box_root_fd(pid1).map_err(|e| Error::Sandbox(format!("box root: {e}")))?;
-    let box_dst = box_dst_path(root, box_dst, host_src);
+    let box_dst = box_dst_path(root.as_raw_fd(), box_dst, host_src);
     use std::os::unix::fs::PermissionsExt;
     let mode = meta.permissions().mode() & 0o777;
     let fd = openat2_in_root(
-        root,
+        root.as_raw_fd(),
         &box_dst,
         libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
         mode,
     )
     .map_err(|e| {
-        unsafe { libc::close(root) };
         Error::Sandbox(format!(
             "box:{box_dst}: {e} (does the parent dir exist in the box?)"
         ))
     })?;
-    unsafe { libc::close(root) };
+    drop(root);
     use std::io::Write;
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     file.write_all(&data)

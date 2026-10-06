@@ -494,6 +494,53 @@ fn the_completions_and_the_reference_agree() {
     );
 }
 
+/// `kern start` AND `kern rm` COMPLETE FROM THE BOXES THEY CAN ACT ON.
+///
+/// Both take a KEPT box's name, and a kept box is by definition not running, so the running-name
+/// source the other name verbs use would offer exactly the names these two refuse. Read off the
+/// three emitted scripts rather than off the constant, because a script is what a shell runs.
+#[test]
+fn start_and_rm_complete_from_kept_boxes_not_running_ones() {
+    let script_of = |shell: &str| -> String {
+        let out = kern()
+            .args(["completions", shell])
+            .output()
+            .expect("run kern");
+        assert!(out.status.success(), "`kern completions {shell}` failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // The one query that means "what `kern start` can run". The CLI accepts it: `ps_filter_kept`
+    // in the integration suite runs it against a real kept box.
+    let src = "kern ps -a -q --filter status=kept";
+    for shell in ["bash", "zsh", "fish"] {
+        let script = script_of(shell);
+        assert!(
+            script.contains(src),
+            "{shell} completion does not list kept boxes anywhere:\n{script}"
+        );
+    }
+    // AND BOTH VERBS REACH IT, which is the half a bare substring check would miss: the source can
+    // be in the script and wired to nothing.
+    let bash = script_of("bash");
+    assert!(
+        bash.contains("        start|rm)"),
+        "bash: `start` and `rm` are not wired to the kept source:\n{bash}"
+    );
+    let zsh = script_of("zsh");
+    assert!(
+        zsh.contains("kept_verbs=(start rm)"),
+        "zsh: `start` and `rm` are not wired to the kept source:\n{zsh}"
+    );
+    let fish = script_of("fish");
+    assert!(
+        fish.lines()
+            .any(|l| l.contains("__fish_seen_subcommand_from start")
+                && l.contains("__fish_seen_subcommand_from rm")
+                && l.contains(src)),
+        "fish: `start` and `rm` are not wired to the kept source:\n{fish}"
+    );
+}
+
 /// The per-verb help must also be per-verb ON A TERMINAL, which is where everyone reads it.
 ///
 /// `every_verb_has_its_own_help` runs the binary with stdout captured, so stdout is not a tty, so

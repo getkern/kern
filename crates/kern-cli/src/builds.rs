@@ -119,6 +119,16 @@ pub struct Record {
     pub size: u64,
     /// Failure message (empty on success).
     pub error: String,
+    /// WHICH WAY THE IMAGE WAS BUILT, and why if it was not the fast one: `layered`, or
+    /// `flat: <reason>`. Empty on a record written before this field existed, and on a build that
+    /// never reached the choice.
+    ///
+    /// IT IS IN THE RECORD BECAUSE THE PROGRESS LINE IS NOT ENOUGH. The line that says it is written
+    /// through the terminal gate, so a build whose output is a pipe - CI, a script, this repo's own
+    /// integration suite - printed nothing about it, and the per-instruction cache being silently
+    /// unavailable looked exactly like a slow machine. `kern build inspect --json` answers now
+    /// without a terminal.
+    pub strategy: String,
 }
 
 /// Root directory holding all build records. Mirrors [`crate::volume::volumes_dir`] - persistent user
@@ -268,7 +278,7 @@ pub fn write(rec: &Record) -> io::Result<()> {
     // Append-only wire format: readers tolerate missing keys, so new fields never break old records.
     let _ = write!(
         body,
-        "id={}\ntag={}\ndockerfile={}\ncontext={}\nstarted={}\nduration_ms={}\nstatus={}\nwarnings={}\nsize={}\npid_starttime={}\nerror={}\n",
+        "id={}\ntag={}\ndockerfile={}\ncontext={}\nstarted={}\nduration_ms={}\nstatus={}\nwarnings={}\nsize={}\npid_starttime={}\nerror={}\nstrategy={}\n",
         rec.id,
         one_line(&rec.tag),
         one_line(&rec.dockerfile),
@@ -280,6 +290,7 @@ pub fn write(rec: &Record) -> io::Result<()> {
         rec.size,
         rec.pid_starttime,
         one_line(&rec.error),
+        one_line(&rec.strategy),
     );
     // Write a temp then rename over `meta` - the swap is atomic, so a crash mid-finalize can't leave a
     // truncated/0-byte record: the pre-written `running`/`interrupted` trace survives until the new meta
@@ -317,6 +328,7 @@ fn parse(body: &str) -> Option<Record> {
             "warnings" => r.warnings = v.parse().unwrap_or(0),
             "size" => r.size = v.parse().unwrap_or(0),
             "error" => r.error = v.to_string(),
+            "strategy" => r.strategy = v.to_string(),
             _ => {}
         }
     }
@@ -589,6 +601,14 @@ impl Capture {
         // ---- PARENT: point fd 2 at the pipe write end, drop every fd the logger now owns. Only fd 2
         // (and any child that inherits it) holds the write end, so restoring fd 2 later yields a clean
         // EOF. The logger child owns the log file now. ----
+        //
+        // First, what the user's stderr IS: after the `dup2` fd 2 is a pipe, and the progress gate
+        // would answer "not a terminal" for a build the user is watching on one. See
+        // `kern_common::set_progress_terminal`.
+        {
+            use std::io::IsTerminal;
+            kern_common::set_progress_terminal(Some(std::io::stderr().is_terminal()));
+        }
         unsafe {
             libc::close(rd);
             libc::dup2(wr, 2);
@@ -606,6 +626,8 @@ impl Drop for Capture {
     fn drop(&mut self) {
         // Restore fd 2 → the last pipe-write ref is gone → the logger child hits EOF and exits.
         unsafe { libc::dup2(self.saved_err, 2) };
+        // fd 2 is the user's stream again: the gate asks it directly.
+        kern_common::set_progress_terminal(None);
         // Reap the logger BEFORE closing `saved_err`, mirroring the old thread-join: the pipe may still
         // hold a buffer of stderr the logger must drain and tee. (It tees through its OWN inherited copy
         // of the real stderr, so closing ours can't cut it off - but reaping first also avoids a zombie.)
@@ -801,8 +823,35 @@ mod tests {
             // Zero: these fixtures describe FINISHED builds, and zero is what a record written
             // before this field existed carries, so the round-trip cases also cover that shape.
             pid_starttime: 0,
+            // Empty for the same reason as the zero above: it is what an older record carries, so the
+            // round-trip cases cover the missing-key shape too.
             error: String::new(),
+            strategy: String::new(),
         }
+    }
+
+    /// THE STRATEGY SURVIVES THE RECORD, and an older record without it reads as empty.
+    ///
+    /// It is the only way to learn whether a build had a per-instruction cache when its output was
+    /// not a terminal: the `[layered · …]`/`[flat · …]` line goes through the progress gate, so in CI,
+    /// in a script, or under this repo's own integration suite nothing is printed about it. The wire
+    /// format is append-only, which is what makes adding the key safe; this pins both halves of that.
+    #[test]
+    fn the_build_strategy_round_trips_and_an_older_record_reads_as_empty() {
+        let body = "id=1-2\ntag=t\nstatus=ok\nstrategy=flat: KERN_BUILD_FLAT=1\n";
+        let r = parse(body).expect("a record with a strategy");
+        assert_eq!(r.strategy, "flat: KERN_BUILD_FLAT=1");
+        // A record written before the field existed: absent, not malformed.
+        let older = parse("id=1-2\ntag=t\nstatus=ok\n").expect("a record without one");
+        assert_eq!(older.strategy, "");
+        // And through a real write: `one_line` keeps the value on its own line, colon and spaces
+        // included, so the reason cannot split the record.
+        with_tmp_home(|| {
+            let mut rec = rec("100-1", 100, Status::Ok);
+            rec.strategy = "flat: this kernel does not record overlay opaque markers".into();
+            write(&rec).expect("write");
+            assert_eq!(get("100-1").expect("read").strategy, rec.strategy);
+        });
     }
 
     #[test]

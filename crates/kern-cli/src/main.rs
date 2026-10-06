@@ -245,6 +245,7 @@ mod egress;
 mod eintr;
 mod error;
 mod gpu;
+mod keepbox;
 mod listing;
 /// Peer addressing and hosts files for a `--no-pod` stack.
 mod network;

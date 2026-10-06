@@ -789,8 +789,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
             ))
         })?,
     };
-    let root = std::path::PathBuf::from(format!("/proc/{pid1}/root"));
-    std::fs::metadata(&root).map_err(|e| {
+    let root = crate::openat2::box_root_fd(pid1).map_err(|e| {
         Error::Sandbox(format!(
             "box '{box_ref}' is not accessible ({e}); is it running?"
         ))
@@ -819,7 +818,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     // no dedicated cgroup simply isn't frozen (as `pause` reports), and the guard thaws on EVERY exit,
     // including the `?` early return from the copy below.
     let _freeze = FreezeGuard::freeze(inst.cgroup_pid());
-    copy_rootfs_snapshot(&root, &out, &skip)?;
+    copy_rootfs_snapshot(std::os::fd::AsFd::as_fd(&root), &out, &skip)?;
     drop(_freeze); // thaw before the (non-filesystem) config/marker writes below
 
     // A minimal runtime config: default the command to a shell so `kern box --image <image>` works with

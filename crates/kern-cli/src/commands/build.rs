@@ -10,7 +10,7 @@ use super::*;
 /// these) and `kern build inspect --json` (one of these), so the two can't drift on fields or escaping.
 fn build_json(r: &crate::builds::Record) -> String {
     format!(
-        "{{\"id\":{},\"tag\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{},\"dockerfile\":{},\"context\":{},\"error\":{}}}",
+        "{{\"id\":{},\"tag\":{},\"status\":{},\"duration_ms\":{},\"started\":{},\"size_bytes\":{},\"warnings\":{},\"dockerfile\":{},\"context\":{},\"error\":{},\"strategy\":{}}}",
         json_str(&r.id),
         json_str(&r.tag),
         json_str(r.label()),
@@ -21,6 +21,7 @@ fn build_json(r: &crate::builds::Record) -> String {
         json_str(&r.dockerfile),
         json_str(&r.context),
         json_str(&r.error),
+        json_str(&r.strategy),
     )
 }
 
@@ -138,6 +139,11 @@ pub fn build_inspect(id: &str, json: bool) -> Result<(), Error> {
         println!("  warnings   {}", r.warnings);
         println!("  dockerfile {}", s(&r.dockerfile));
         println!("  context    {}", s(&r.context));
+        if !r.strategy.is_empty() {
+            // The one line that says whether this build had a per-instruction cache, for a reader who
+            // was not watching a terminal when it ran.
+            println!("  strategy   {}", s(&r.strategy));
+        }
         if !r.error.is_empty() {
             println!("  error      {}", s(&r.error));
         }
@@ -300,6 +306,8 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
         // reader cannot mistake a recycled pid for a build still in flight.
         pid_starttime: registry::proc_starttime(std::process::id() as i32),
         error: String::new(),
+        // Filled in when the build ends: the choice is made per stage, inside `build_run`.
+        strategy: String::new(),
     };
     let _ = crate::builds::write(&rec);
     let capture = crate::builds::Capture::start(&id);
@@ -320,6 +328,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
                               // Finalize the record: outcome from `result`, size read back the way `images()` computes it. Drop
                               // the capture (restores stderr) before appending the summary so it lands after the transcript.
     rec.duration_ms = t0.elapsed().as_millis() as u64;
+    rec.strategy = taken_strategy();
     match &result {
         Ok(()) => {
             rec.status = if rec.warnings > 0 {
@@ -465,6 +474,9 @@ fn build_multi_stage(
     let ms_ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
     let ms_key = flat_image_key("multistage", instrs, ctx, &ms_ctx_root, ms_ig.as_ref());
     if flat_cache_hit(tag, &ms_key) {
+        // Nothing was built, so no stage chose a path: the record says that rather than carrying a
+        // value from a previous build in this process.
+        note_strategy("cached: multi-stage image unchanged".to_string());
         if !quiet {
             kern_common::progress!("  [cached · multi-stage image unchanged]");
         }
@@ -694,6 +706,49 @@ pub(crate) enum FlatReason {
     OpaqueProbeFailed(i32),
 }
 
+/// WHICH WAY THE LAST BUILD STRATEGY DECISION WENT, for the record `build` finalises.
+///
+/// The decision is made deep in `build_run`, once per STAGE, and the record belongs to the whole
+/// build; threading a `&mut` down every call would put the record in the signature of functions that
+/// have no other business with it. A slot the decision writes and the finaliser reads keeps that out
+/// of the API. For a multi-stage build the LAST stage's choice is the one kept: that is the stage
+/// whose layers the final image is made of. `kern build` is single-threaded, and this is only ever
+/// touched by it, so an ordinary mutex would do; the atomic-free `Mutex<String>` is the simplest thing
+/// that cannot be read half-written.
+static BUILD_STRATEGY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Record how this stage is being built. Overwrites, so the last stage wins (see [`BUILD_STRATEGY`]).
+fn note_strategy(what: String) {
+    if let Ok(mut slot) = BUILD_STRATEGY.lock() {
+        *slot = what;
+    }
+}
+
+/// Take what [`note_strategy`] left, clearing it so the next build in this process starts empty.
+fn taken_strategy() -> String {
+    BUILD_STRATEGY
+        .lock()
+        .map(|mut slot| std::mem::take(&mut *slot))
+        .unwrap_or_default()
+}
+
+/// What to do about an opaque-marker probe that could not run, by the step that failed (the child's
+/// exit code). One spelling for the refusal of a layered base and for the flat build's own line.
+pub(crate) const fn opaque_probe_remedy(code: i32) -> &'static str {
+    match code {
+        15 | 16 => {
+            "the probe could not delete and recreate a directory in its own overlay, which is \
+                    the filesystem under $XDG_CACHE_HOME refusing it (measured on WSL's 9p); point \
+                    XDG_CACHE_HOME at a local disk."
+        }
+        13 | 17 | 18 => {
+            "the probe could not mount its own throwaway overlay; `kern doctor` reports \
+                         whether this kernel allows one."
+        }
+        _ => "rebuild the base with KERN_BUILD_FLAT=1 so it is a single layer.",
+    }
+}
+
 impl FlatReason {
     /// The clause the build line prints, worded to complete `[flat · ___, copying the base]`.
     pub(crate) const fn why(self) -> &'static str {
@@ -786,6 +841,15 @@ fn build_run(
         }
     };
     let layered = flat_because.is_none();
+    // NOTED WHERE THE CHOICE IS MADE, not where it is printed. Recorded at the print site, it was
+    // missing from exactly the records a reader most wants it in: a flat build whose whole-build cache
+    // HIT returns before the print (so an unchanged rebuild said nothing about why it is slow when it
+    // misses), a refused layered base, and in a multi-stage build those returns left an earlier
+    // stage's value standing as if it were the last's.
+    note_strategy(match flat_because {
+        None => "layered".to_string(),
+        Some(reason) => format!("flat: {}", reason.why()),
+    });
     // A FLAT BUILD COPIES ONE DIRECTORY, and a base built locally is several layers that only an
     // overlay can stack. This asked `base_lower.contains(':')`, which counted the `:` in a PATH as a
     // layer boundary: under a cache such as `colon:cache` a one-layer pulled base looked layered,
@@ -808,18 +872,7 @@ fn build_run(
                      KERN_BUILD_FLAT=1 so it is a single layer, or build on a kernel that records \
                      the markers."
                 }
-                FlatReason::OpaqueProbeFailed(c) => {
-                    // The step, by code, because the remedies differ: a refused delete is the
-                    // filesystem (WSL's 9p), a refused mount is the kernel or the sandbox.
-                    match c {
-                        15 | 16 => "the probe could not delete and recreate a directory in its own \
-                                    overlay, which is the filesystem under $XDG_CACHE_HOME refusing \
-                                    it (measured on WSL's 9p); point XDG_CACHE_HOME at a local disk.",
-                        13 | 17 | 18 => "the probe could not mount its own throwaway overlay; \
-                                         `kern doctor` reports whether this kernel allows one.",
-                        _ => "rebuild the base with KERN_BUILD_FLAT=1 so it is a single layer.",
-                    }
-                }
+                FlatReason::OpaqueProbeFailed(c) => opaque_probe_remedy(c),
             }
         )));
     }
@@ -867,8 +920,16 @@ fn build_run(
         // field report measured 2m49s and 1.9 GB per build and could not tell whether that was kern
         // or their host. It is neither; it is whether this filesystem does copy-on-write.
         let cow = supports_reflink(work);
+        // THE PROBE'S STEP, when it was the probe that sent the build here: the remedies differ per
+        // step, and the line used to say only that the probe "could not run".
+        let probe_step = match flat_because {
+            Some(FlatReason::OpaqueProbeFailed(c)) => {
+                format!(" (probe step {c}: {})", opaque_probe_remedy(c))
+            }
+            _ => String::new(),
+        };
         kern_common::progress!(
-            "  [flat · {}, copying the base{}]",
+            "  [flat · {}{probe_step}, copying the base{}]",
             flat_because.map_or("no layered build", FlatReason::why),
             match cow {
                 Some(true) => " (cloned: this filesystem does copy-on-write)",

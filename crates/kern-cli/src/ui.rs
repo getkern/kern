@@ -676,9 +676,10 @@ pub fn display_box_name<'a>(name: &'a str, pod: &str) -> &'a str {
 }
 
 /// How wide a NAME column has to be to hold the names that are going in it: at least `floor` (so
-/// short output is byte-for-byte what it has always been), at most `CEIL`.
+/// short output is byte-for-byte what it has always been), and on a terminal no wider than leaves
+/// `rest` columns for the other cells and 8 for the last one, never below `CEIL`.
 ///
-/// ONE DEFINITION FOR FIVE TABLES, because it was five fixed numbers and four of them were wrong. A
+/// ONE DEFINITION FOR SIX TABLES, because it was five fixed numbers and four of them were wrong. A
 /// fixed width fails in one of two ways depending on whether the cell truncates, and BOTH were
 /// measured on this machine:
 ///
@@ -691,46 +692,93 @@ pub fn display_box_name<'a>(name: &'a str, pod: &str) -> &'a str {
 ///     `sdktest-cd95af93-wo…` for both `…-worker` and `…-workqueue`. A column whose job is to tell
 ///     rows apart told them apart not at all.
 ///
-/// THE CEILING IS NOT A TRUNCATION. Past it a row overflows exactly as it always did, which is the
-/// honest failure for a name nobody can shorten: the name is the identity `kern stop`, `kern logs`
-/// and `kern rm` take, and a table that is tidy because it hid the argument someone needs is not an
-/// improvement. `kern ps` settled that trade first; this is the same rule, spelled once.
-pub fn name_col_width<'a>(names: impl Iterator<Item = &'a str>, floor: usize) -> usize {
+/// THE CEILING IS NOT A TRUNCATION, AND IT EXISTS ONLY ON A TERMINAL. Past it a row overflows, which
+/// is the honest failure for a name nobody can shorten: the name is the identity `kern stop`, `kern
+/// logs` and `kern rm` take. What the ceiling protects is the terminal's edge: one 80-character name
+/// would otherwise widen every row and make all of them wrap. So it is as wide as the terminal allows
+/// (`CEIL` at the least, which is what it used to be everywhere), and OFF a terminal (a pipe, a file,
+/// a log) there is no edge to fall off and no ceiling: every row lines up. A fixed 48 everywhere was
+/// reported as misaligned columns.
+pub fn name_col_width<'a>(
+    names: impl Iterator<Item = &'a str>,
+    floor: usize,
+    rest: usize,
+) -> usize {
+    use std::io::IsTerminal;
+    let room = std::io::stdout()
+        .is_terminal()
+        .then(|| term_width(libc::STDOUT_FILENO).saturating_sub(rest + 8));
+    name_col_width_in(names, floor, room)
+}
+
+/// [`name_col_width`] with the room it may take spelled out: `None` off a terminal, `Some(cols)` on
+/// one. Separate so the rule can be asserted without a terminal.
+pub(crate) fn name_col_width_in<'a>(
+    names: impl Iterator<Item = &'a str>,
+    floor: usize,
+    room: Option<usize>,
+) -> usize {
     const CEIL: usize = 48;
-    names
+    let longest = names
         .map(str::chars)
         .map(Iterator::count)
         .chain(std::iter::once(floor))
         .max()
-        .unwrap_or(floor)
-        .min(CEIL.max(floor))
+        .unwrap_or(floor);
+    match room {
+        None => longest,
+        Some(room) => longest.min(CEIL.max(room).max(floor)),
+    }
 }
 
 #[cfg(test)]
 mod name_col_tests {
-    use super::name_col_width;
+    use super::name_col_width_in;
 
     #[test]
-    fn the_column_holds_the_longest_name_between_the_floor_and_the_ceiling() {
-        // Empty and all-short: exactly the floor, so existing output is unchanged.
-        assert_eq!(name_col_width(std::iter::empty(), 16), 16);
-        assert_eq!(name_col_width(["a", "bc"].into_iter(), 16), 16);
+    fn the_column_holds_the_longest_name_between_the_floor_and_the_room_a_terminal_has() {
+        let narrow = Some(30); // an 80-column terminal under `kern ps`'s other cells
+                               // Empty and all-short: exactly the floor, so existing output is unchanged.
+        assert_eq!(name_col_width_in(std::iter::empty(), 16, narrow), 16);
+        assert_eq!(name_col_width_in(["a", "bc"].into_iter(), 16, None), 16);
         // The two names that were measured overflowing their table.
-        assert_eq!(name_col_width(["pysbx-2ec9191e4825"].into_iter(), 16), 18);
         assert_eq!(
-            name_col_width(
+            name_col_width_in(["pysbx-2ec9191e4825"].into_iter(), 16, narrow),
+            18
+        );
+        assert_eq!(
+            name_col_width_in(
                 ["CEIJ-GPSDEGoTracker-49cf4a99_postgres_data"].into_iter(),
-                28
+                28,
+                narrow
             ),
             42
         );
-        // Ceilinged, not truncated: the caller overflows past 48 rather than hiding the identity.
-        assert_eq!(name_col_width([&"x".repeat(80)[..]].into_iter(), 16), 48);
+        let long = "x".repeat(80);
+        // On a narrow terminal: ceilinged at 48, not truncated - the caller overflows that one row.
+        assert_eq!(
+            name_col_width_in([long.as_str()].into_iter(), 16, narrow),
+            48
+        );
+        // On a wide one the column takes the room there is, so the long name lines up too.
+        assert_eq!(
+            name_col_width_in([long.as_str()].into_iter(), 16, Some(120)),
+            80
+        );
+        assert_eq!(
+            name_col_width_in([long.as_str()].into_iter(), 16, Some(60)),
+            60
+        );
+        // OFF a terminal there is no edge: every row lines up, however long.
+        assert_eq!(name_col_width_in([long.as_str()].into_iter(), 16, None), 80);
         // A floor ABOVE the ceiling is still honoured - no table silently narrows.
-        assert_eq!(name_col_width([&"x".repeat(80)[..]].into_iter(), 60), 60);
+        assert_eq!(
+            name_col_width_in([long.as_str()].into_iter(), 60, narrow),
+            60
+        );
         // CHARS, not bytes: a multi-byte name must not be over-counted into a wider column.
         assert_eq!(
-            name_col_width(["é".repeat(20).as_str()].into_iter(), 16),
+            name_col_width_in(["é".repeat(20).as_str()].into_iter(), 16, narrow),
             20
         );
     }

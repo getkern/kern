@@ -839,7 +839,7 @@ fn decide_supervision(args: &BoxRunArgs) -> Result<Supervision, Error> {
 /// The escape hatch is not removed, it is made explicit: `--user 0` runs as box root on purpose.
 ///
 /// `resolve` is injected rather than called directly so the decision can be asserted without an
-/// image on disk: the resolution rules themselves are `resolve_image_user`'s, and are tested there.
+/// image on disk: the resolution rules themselves are `resolve_user`'s, and are tested there.
 pub(crate) fn resolve_run_as(
     flag: Option<&str>,
     image_user: Option<&str>,
@@ -1083,6 +1083,65 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         Err(_) => None,
     };
     pt.mark("parent:claim");
+
+    // `--keep`: THE COMMAND LINE IS RECORDED HERE, AFTER THE NAME IS CLAIMED and before the box
+    // runs. Before the box, because a box that failed to start is still one the operator will want
+    // to start again after fixing what refused it. After the claim, because the record and the layer
+    // belong to the name: MEASURED with 20 `kern start` of one kept box at once, writing it earlier
+    // had the 19 LOSERS rewrite the winner's record and (re)create its directory on their way to
+    // being refused, which answered one of them "no kept box" and another "cannot record this box:
+    // No such file or directory". Past the claim, only the one process that owns the name touches
+    // either. Written every time, so a box re-created with different flags is restarted with the NEW
+    // ones; `created` is kept from the first time.
+    //
+    // `args_os`, not `args`: an argument is not required to be UTF-8, and `std::env::args` panics on
+    // one that is not. The first element is this binary's path and is dropped, since `kern start`
+    // re-runs the kern it is itself.
+    // `--keep`: the layer is TAKEN here and the record is WRITTEN further down, just before the box
+    // is launched. See the note at the write for why the two are at different points.
+    let mut keep_record: Option<(std::path::PathBuf, Vec<std::ffi::OsString>, u64)> = None;
+    if args.keep {
+        if let Some(dir) = crate::keepbox::dir_of(name.as_str()) {
+            // THE LAYER IS TAKEN BEFORE ANYTHING IS WRITTEN TO IT, because the name claim above does
+            // not cover it: the registry and the layer live in different places, and two boxes
+            // mounting one overlay upperdir is undefined behaviour by the kernel's own message. See
+            // `keepbox::hold_layer` for the two measured ways a name claim lets that happen.
+            crate::keepbox::hold_layer(&dir)?;
+            let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+            let previous = crate::keepbox::read(&dir);
+            // A DIFFERENT IMAGE ON AN EXISTING LAYER IS REFUSED, because a kept layer is a DELTA and
+            // a delta only means something on the base it was written against. MEASURED: `kern box
+            // m1 --image alpine:3.19 --keep` then `kern box m1 --image debian:12 --keep` ran the
+            // debian box with the alpine run's files live inside it, and with a real workload the
+            // delta carries that image's `/etc`, `/usr/lib` and `/var/lib` over the new base - a
+            // rootfs nobody can debug. Every other flag may change (that is what rewriting the
+            // record is for); this one cannot, and the way to change it is to say so: `kern rm`.
+            let now_runs = crate::keepbox::image_of(&argv);
+            if let Some((old_argv, _)) = previous.as_ref() {
+                let was = crate::keepbox::image_of(old_argv);
+                if !was.is_empty() && !now_runs.is_empty() && was != now_runs {
+                    return Err(Error::Sandbox(format!(
+                        "kept box '{}' has a layer written against {was}, and this command would run \
+                         {now_runs} on top of it: a kept layer is a delta, and a delta of one image \
+                         is not valid on another. `kern rm {}` throws the layer away and `kern box \
+                         {} --image {now_runs} --keep -- <cmd>` makes it again, or keep {was}",
+                        name.as_str(),
+                        name.as_str(),
+                        name.as_str()
+                    )));
+                }
+            }
+            keep_record = Some((
+                dir,
+                argv,
+                previous
+                    .as_ref()
+                    .map(|(_, m)| m.created)
+                    .filter(|c| *c > 0)
+                    .unwrap_or_else(registry::now_unix),
+            ));
+        }
+    }
 
     // `--bind-rootfs` only makes sense for a real `--rootfs` directory: an `--image` must stay an
     // immutable, shareable overlay (the cache is read-only and shared across boxes), and a bind
@@ -1426,10 +1485,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // JAR as a READ-ONLY zip filesystem. The box then restart-loops on a
     // `ReadOnlyFileSystemException` that names nothing about permissions or uids.
     //
-    // `resolve_image_user` answers for every spelling - `1000`, `1000:2000`, `keycloak`,
+    // `resolve_user` answers for every spelling - `1000`, `1000:2000`, `keycloak`,
     // `keycloak:root` - so `parse_user` is only the fallback for a spec the image cannot resolve,
     // which is where the two arms below deliberately differ.
-    let user_or_image = |u: &str| match resolve_image_user(u, &lower) {
+    let image_accounts = Accounts::Layers(&lower);
+    let user_or_image = |u: &str| match resolve_user(u, &image_accounts) {
         Some(pair) => Some(pair),
         None => parse_user(Some(u)).ok().flatten(),
     };
@@ -1440,23 +1500,23 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     )?;
     // THE GROUPS THAT USER IS IN, from the SAME spec `run_as` was resolved from and only when that
     // spec named no group. Docker and podman fill the supplementary set exactly there and nowhere
-    // else (measured; see `image_supplementary_gids`), so an operator writing `--user 1000:1000`
+    // else (measured; see `supplementary_gids`), so an operator writing `--user 1000:1000`
     // still gets that pair and nothing added to it.
     let user_spec = args
         .run_as
         .filter(|u| !u.is_empty())
         .or(image_config.user.as_deref().filter(|u| !u.is_empty()));
     let extra_gids = match user_spec {
-        Some(spec) => image_supplementary_gids(spec, &lower),
+        Some(spec) => supplementary_gids(spec, &image_accounts),
         None => Vec::new(),
     };
     // HOME FOLLOWS THE USER, as a DEFAULT under both the image's own `Env` and the caller's `-e`:
     // it is only added when neither of those named it, so an explicit `HOME=` still wins. The box
     // keeps `/root` when it runs as box root, which is that uid's home in every image that has one.
-    // See `image_user_home` for what a fixed `/root` cost a non-root workload.
+    // See `user_home` for what a fixed `/root` cost a non-root workload.
     if let Some((uid, _)) = run_as {
         if uid != 0 && !env.iter().any(|(k, _)| k == "HOME") {
-            env.insert(0, ("HOME".to_string(), image_user_home(uid, &lower)));
+            env.insert(0, ("HOME".to_string(), user_home(uid, &image_accounts)));
         }
     }
     // COMPAT HEADS-UP (not a security check; not parsing the entrypoint - only the image's own declared
@@ -1604,7 +1664,15 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         privileged: args.privileged,
         require_limits: args.require_limits,
         allow_uncapped: args.allow_uncapped,
-        overlay_upper: args.overlay_upper.map(str::to_string),
+        // `--keep` RESOLVES INTO THE PERSISTENT UPPER HERE, once, so everything downstream - the
+        // mount, the work-dir clearing, the registry record - sees one mechanism and cannot disagree
+        // about where a box's writes go. An explicit `--overlay-upper` wins: a build step passes it.
+        overlay_upper: args.overlay_upper.map(str::to_string).or_else(|| {
+            args.keep
+                .then(|| crate::keepbox::dir_of(name.as_str()))
+                .flatten()
+                .map(|d| d.to_string_lossy().into_owned())
+        }),
         memory,
         shm_size: args.shm_size,
         memory_swap_max: args.memory_swap_max,
@@ -1753,6 +1821,38 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             .unwrap_or(crate::commands::boxlog::BOX_LOG_MAX_BYTES),
         files: args.log_max_file.unwrap_or(2),
     };
+    // THE RECORD IS WRITTEN HERE: past every argument-coherence refusal and immediately before the
+    // box is launched.
+    //
+    // BEFORE THE LAUNCH, because a box that fails to START is still one the operator will want to
+    // start again after fixing what refused it (a missing mount source, a uid map, a seccomp
+    // filter): those are the runtime refusals, and they happen below this line.
+    //
+    // AFTER THE FLAG CHECKS, because a refusal about the COMMAND LINE can never be fixed by
+    // replaying that same command line. MEASURED: `kern box bad1 --image alpine --keep -it -d`
+    // failed on "-it can't combine with -d" - a refusal 600 lines after the record was written - and
+    // left a `ps -a` row and a directory for a box that had never existed and could never start.
+    if let Some((dir, argv, created)) = keep_record.as_ref() {
+        let meta = crate::keepbox::Meta {
+            created: *created,
+            last_exit: None,
+            // Not recorded: `kern ps -a` derives it from the argv (`keepbox::image_of`), so the row
+            // and the replay read one source.
+            image: String::new(),
+            cwd: std::env::current_dir()
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        // A record that cannot be written is a `kern start` that would not work, so it is the box's
+        // problem and not a note: the operator asked for a box they can start again.
+        crate::keepbox::write(dir, argv, &meta).map_err(|e| {
+            Error::Sandbox(format!(
+                "--keep: cannot record this box so `kern start {}` can run it again ({}): {e}",
+                name.as_str(),
+                dir.display()
+            ))
+        })?;
+    }
     if args.detached {
         return run_detached(
             &name,
@@ -2141,6 +2241,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     args.pod.unwrap_or(""),
                     std::slice::from_ref(&args.name.to_string()),
                 );
+            }
+            // A kept box remembers how its last run ended, which is what `kern ps -a` shows for it.
+            // Best effort: a code that could not be recorded costs a column, not the box.
+            if args.keep {
+                if let Some(dir) = crate::keepbox::dir_of(name.as_str()) {
+                    crate::keepbox::set_exit(&dir, code);
+                }
             }
             std::process::exit(code)
         }
@@ -2670,23 +2777,34 @@ fn prepare_ssh(
     Ok((Some(kern_isolation::SshSetup { authorized_key }), eff))
 }
 
-/// `kern exec <name> [--env K=V] [--workdir <dir>] [-- cmd...]` - run a command inside an
-/// already-running box, joining its namespaces. Defaults to `/bin/sh`. Propagates the exit code.
+/// WHOSE identity a `kern exec` command runs under.
 ///
-/// `as_workload` picks WHOSE identity the command runs under, and the two callers want opposite
-/// answers. `kern exec <box>` stays box-root: it is the operator's way in, and with no `--user` flag
-/// on a frozen CLI surface, defaulting it to the workload would leave no way back to root at all.
-/// `kern compose <file> exec <service>` passes `true`, because Docker's `compose exec` runs as the
-/// service's configured user and a script that reads `whoami` must not get a different answer here.
-/// The escape hatch needs no new flag and already exists: a compose service IS a box with a name, so
-/// `kern exec <that name>` is the root way in.
+/// The callers want different answers. `kern exec <box>` stays box root: it is the operator's way in,
+/// and defaulting it to the workload would leave no way back to root. `kern compose <file> exec
+/// <service>` is [`ExecAs::Workload`], because Docker's `compose exec` runs as the service's
+/// configured user and a script that reads `whoami` must not get a different answer here.
+/// `kern exec -u <spec>` names an account of the box.
+#[derive(Clone, Copy, Debug)]
+pub enum ExecAs<'a> {
+    /// Box root, with the caller's groups as they map into the box: what `kern exec` always did.
+    BoxRoot,
+    /// The workload's own uid/gid and groups, as the registry recorded them when the box started.
+    Workload,
+    /// `-u <user[:group]>`, each half a name or a number, resolved against the box's CURRENT
+    /// `/etc/passwd` and `/etc/group`, which is where `docker exec --user` looks.
+    User(&'a str),
+}
+
+/// `kern exec <name> [-u <user>] [--env K=V] [--workdir <dir>] [-- cmd...]` - run a command inside an
+/// already-running box, joining its namespaces. Defaults to `/bin/sh`. Propagates the exit code. `who`
+/// picks the identity; see [`ExecAs`].
 pub fn exec(
     name: &str,
     command: &[String],
     env: &[String],
     workdir: Option<&str>,
     tty: bool,
-    as_workload: bool,
+    who: ExecAs,
 ) -> Result<(), Error> {
     let name = BoxName::parse(name).map_err(Error::InvalidBox)?;
     let env = parse_envs(env)?;
@@ -2711,6 +2829,21 @@ pub fn exec(
         None => registry::box_init_under(inst.pid)
             .ok_or_else(|| Error::Sandbox("could not locate the box's main process".to_string()))?,
     };
+    // THE IDENTITY BEFORE THE TERMINAL: a `-u` that names nobody is refused before a raw-mode tty
+    // exists to be restored. `ExecAs::Workload` reads the SAME registry entry that gave us `pid1`, so a
+    // box recreated under this name is entered as itself rather than as whoever held the name before.
+    let recorded_env = registry::box_env(&inst.name, inst.pid);
+    let identity = match who {
+        ExecAs::BoxRoot => ExecIdentity::default(),
+        ExecAs::Workload => ExecIdentity {
+            run_as: inst.run_as,
+            extra_gids: inst.extra_gids.clone(),
+            home: None,
+        },
+        ExecAs::User(spec) => {
+            exec_user_identity(spec, name.as_str(), pid1, inst.run_as, &recorded_env, &env)?
+        }
+    };
 
     // `-it`: allocate a PTY and (when our own stdin is a terminal) put it in raw mode + forward
     // window resizes, exactly like `kern box -it`. `exec_in_box` hands the slave to the exec'd
@@ -2734,7 +2867,7 @@ pub fn exec(
     // REFUSE rather than GUESS the box's capability posture: the gate lives inside `exec_posture`, which
     // returns the box's OWN (cap spec, seccomp filter) or refuses a record that predates the posture
     // fields / is corrupt - a caller can't rebuild a usable posture without passing that gate.
-    let (box_caps, box_seccomp, box_aa) = inst.exec_posture()?;
+    let (box_caps, box_seccomp, box_aa, box_landlock) = inst.exec_posture()?;
     // With no `-w`, start where the WORKLOAD starts, not at `/`. Docker's `exec` inherits the
     // container's WorkingDir and people lean on it: a compose service with `working_dir: /app` should
     // not need `-w /app` retyped on every exec. An explicit `-w` still wins, and a box with no workdir
@@ -2749,7 +2882,11 @@ pub fn exec(
     // non-root user owns that file as a mapped uid kern cannot read. MEASURED on
     // `rabbitmq:3.12-management-alpine`: `kern exec` saw a bare `PATH` and could not find the
     // image's own binaries.
-    let mut exec_env = registry::box_env(&inst.name, inst.pid);
+    let mut exec_env = recorded_env;
+    // `-u`'S HOME, between the box's environment and the caller's `-e`: see `exec_user_home`.
+    if let Some(home) = identity.home {
+        exec_env.push(("HOME".to_string(), home));
+    }
     exec_env.extend(env.iter().cloned());
     let result = exec_in_box(
         pid1,
@@ -2782,12 +2919,9 @@ pub fn exec(
             sock_parent: parent,
             retarget: crate::pty::retarget_resize,
         }),
-        // WHOSE IDENTITY: see `as_workload` on this function. `kern exec` stays box-root; compose's
-        // `exec` re-enters as the service's own uid/gid, read from the SAME registry entry that gave
-        // us `pid1`, so a box recreated under this name is entered as itself rather than as whoever
-        // held the name before.
-        if as_workload { inst.run_as } else { None },
-        if as_workload { &inst.extra_gids } else { &[] },
+        identity.run_as,
+        &identity.extra_gids,
+        &box_landlock,
     );
 
     if let Some(prev) = saved.as_ref() {
@@ -2808,6 +2942,174 @@ pub fn exec(
             std::process::exit(code)
         }
         Err(e) => Err(Error::Sandbox(e.to_string())),
+    }
+}
+
+/// Who a `kern exec` command runs as: `None` is box root, with the caller's groups as they map in.
+#[derive(Debug, Default)]
+struct ExecIdentity {
+    run_as: Option<(u32, u32)>,
+    /// The supplementary groups, already narrowed to the ones the box can hold.
+    extra_gids: Vec<u32>,
+    /// HOME for the command, or `None` to keep the environment's: see [`exec_user_home`].
+    home: Option<String>,
+}
+
+/// Resolve `kern exec -u <spec>` in the running box whose PID 1 is `pid1`, or refuse with the reason.
+///
+/// Against the box's CURRENT `/etc/passwd` and `/etc/group`, read ONCE through
+/// `openat2(RESOLVE_IN_ROOT)` on its root (see [`Accounts::of_box_root`]), so a symlink the box planted
+/// there resolves inside the box and never onto a host file. The rules are `kern box --user`'s (one
+/// implementation, [`resolve_user`]): a bare user takes its passwd group, a numeric one not in passwd
+/// takes group 0, and the supplementary groups come from `/etc/group` only when the spec names no
+/// group.
+///
+/// THE ID MUST EXIST IN THE BOX'S USER NAMESPACE, and that is checked HERE rather than left to the
+/// `setuid` in the child. A box with the single-uid map has root alone; asked for uid 1000 there,
+/// the child failed closed with "could not drop to the box's own user", which names neither the uid
+/// nor the reason. The kernel's rule is the map itself (an id outside every range cannot be set), so
+/// reading the same map cannot disagree with it. An unreadable map is not a refusal: the child's own
+/// fail-closed still stands behind it.
+fn exec_user_identity(
+    spec: &str,
+    box_name: &str,
+    pid1: i32,
+    workload: Option<(u32, u32)>,
+    recorded_env: &[(String, String)],
+    caller_env: &[(String, String)],
+) -> Result<ExecIdentity, Error> {
+    use std::os::fd::AsFd;
+    let refuse = |why: String| Error::Sandbox(format!("exec -u '{spec}': {why}"));
+    let Some((user, group)) = split_user_spec(spec) else {
+        return Err(refuse(
+            "expected <user>[:<group>], each a name or a number".to_string(),
+        ));
+    };
+    let root = crate::openat2::box_root_fd(pid1)
+        .map_err(|e| refuse(format!("cannot open the root of box '{box_name}': {e}")))?;
+    let accounts = Accounts::of_box_root(root.as_fd()).map_err(|e| {
+        refuse(format!(
+            "cannot read the account files of box '{box_name}': {e}"
+        ))
+    })?;
+    drop(root);
+    let Some((uid, gid)) = resolve_user(spec, &accounts) else {
+        return Err(refuse(match group {
+            Some(g) if resolve_user(user, &accounts).is_some() => {
+                format!("no group '{g}' in the /etc/group of box '{box_name}'")
+            }
+            _ => format!("no user '{user}' in the /etc/passwd of box '{box_name}'"),
+        }));
+    };
+    let id_map = |file: &str| {
+        std::fs::read_to_string(format!("/proc/{pid1}/{file}"))
+            .ok()
+            .map(|t| id_map_ranges(&t))
+    };
+    let uid_ranges = id_map("uid_map");
+    let gid_ranges = id_map("gid_map");
+    for (kind, id, ranges) in [("uid", uid, &uid_ranges), ("gid", gid, &gid_ranges)] {
+        let Some(ranges) = ranges else { continue };
+        if !id_is_mapped(ranges, id) {
+            return Err(refuse(format!(
+                "{kind} {id} does not exist in box '{box_name}', {}",
+                describe_id_map(kind, ranges)
+            )));
+        }
+    }
+    // THE GROUPS THE BOX CAN HOLD. `setgroups` takes the whole list or nothing, and refuses it all for
+    // one gid outside the map, so an unmapped entry would cost the mapped ones too. (On the single-uid
+    // map only root gets this far, and `set_user` says nothing when that map refuses root's list.)
+    let extra_gids: Vec<u32> = supplementary_gids(spec, &accounts)
+        .into_iter()
+        .filter(|g| gid_ranges.as_ref().is_none_or(|r| id_is_mapped(r, *g)))
+        .collect();
+    let workload_home = workload
+        .filter(|(u, _)| *u != 0)
+        .map(|(u, _)| user_home(u, &accounts));
+    let home = exec_user_home(
+        recorded_env,
+        caller_env,
+        workload_home.as_deref(),
+        user_home(uid, &accounts),
+    );
+    Ok(ExecIdentity {
+        run_as: Some((uid, gid)),
+        extra_gids,
+        home,
+    })
+}
+
+/// The INSIDE ranges of a `/proc/<pid>/uid_map` or `gid_map`, as `(first, count)`. A line that does
+/// not parse as three numbers is skipped, and so is one with a count of 0: the kernel writes no such
+/// line, it maps nothing if it appears, and carrying it would make `describe_id_map` compute a last
+/// id of `first - 1`.
+fn id_map_ranges(text: &str) -> Vec<(u64, u64)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace().map(str::parse::<u64>);
+            match (f.next(), f.next(), f.next()) {
+                (Some(Ok(inside)), Some(Ok(_)), Some(Ok(count))) if count > 0 => {
+                    Some((inside, count))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Whether `id` falls inside one of `ranges`.
+fn id_is_mapped(ranges: &[(u64, u64)], id: u32) -> bool {
+    let id = u64::from(id);
+    ranges
+        .iter()
+        .any(|&(first, count)| id >= first && id - first < count)
+}
+
+/// The end of the sentence that refuses an unmapped id: what the box DOES map, and for the single-id
+/// map the reason it has nothing else.
+fn describe_id_map(kind: &str, ranges: &[(u64, u64)]) -> String {
+    if ranges == [(0, 1)] {
+        return format!(
+            "which maps {kind} 0 alone: it was started with the single-uid map (`--no-uid-range`, \
+             or a host with no subordinate range in /etc/subuid), and `--uid-range` gives a box the rest"
+        );
+    }
+    let spans: Vec<String> = ranges
+        .iter()
+        .map(|&(first, count)| match count {
+            1 => first.to_string(),
+            _ => format!("{first}-{}", first + count - 1),
+        })
+        .collect();
+    format!("which maps {kind}s {}", spans.join(", "))
+}
+
+/// The HOME a `kern exec -u` command gets, or `None` to keep the one its environment already has.
+///
+/// runc's rule, which `docker exec --user` inherits: HOME comes from the environment when it is set
+/// there, and from the user's passwd entry when it is not. kern's recorded box environment holds one
+/// HOME runc's would not: the one kern itself derived at start for a non-root workload
+/// (`user_home`). That one belongs to the WORKLOAD's user, so a `-u` for someone else
+/// re-derives it, and a HOME the image or the box's own `-e` set is kept, as Docker keeps
+/// `Config.Env`. An image `ENV HOME` equal to the workload user's passwd home reads as kern's and is
+/// re-derived too; for the workload's own user that changes nothing. The caller's `-e HOME=` wins
+/// over all of it, so with one there is nothing to add.
+///
+/// Without this, `kern exec -u node` into a box whose workload is root ran with `HOME=/root`, a
+/// directory node cannot write, and every tool that keeps state under `~` failed there.
+fn exec_user_home(
+    recorded: &[(String, String)],
+    caller: &[(String, String)],
+    workload_home: Option<&str>,
+    passwd_home: String,
+) -> Option<String> {
+    if caller.iter().any(|(k, _)| k == "HOME") {
+        return None;
+    }
+    match recorded.iter().rev().find(|(k, _)| k == "HOME") {
+        Some((_, set)) if Some(set.as_str()) != workload_home => None,
+        _ => Some(passwd_home),
     }
 }
 
@@ -3438,6 +3740,17 @@ fn supervise_box(
     }
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
+    }
+    // A KEPT BOX REMEMBERS HOW ITS LAST RUN ENDED WHATEVER SHAPE THAT RUN HAD. The foreground arm
+    // records it; this is the DETACHED one, and `-d` is the shape a kept box is most likely to have
+    // (it is the attach-and-detach workflow the feature exists for). Without this the kept record
+    // said "never ran" for ever, and `kern ps -a` printed the same box twice saying two different
+    // things: `exit 137` in the transient exited section and "never ran" in the kept one, measured.
+    // Best effort, like the records above: a code that could not be written costs a column.
+    if let Some(dir) = crate::keepbox::dir_of(&inst.name) {
+        if dir.is_dir() {
+            crate::keepbox::set_exit(&dir, final_code);
+        }
     }
 }
 
@@ -4165,6 +4478,107 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
             unsafe { libc::close(write_fd) };
             scope_reexec_proxy(child, read_fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod exec_user_tests {
+    use super::{describe_id_map, exec_user_home, id_is_mapped, id_map_ranges};
+
+    /// THE KERNEL'S RULE, READ FROM THE SAME MAP: an id is settable in the box when it falls inside an
+    /// INSIDE range. Both shapes kern makes, plus the edges of each range and a line that is not
+    /// three numbers.
+    #[test]
+    fn an_id_is_mapped_exactly_when_an_inside_range_holds_it() {
+        let single = id_map_ranges("         0       1000          1\n");
+        assert_eq!(single, vec![(0, 1)]);
+        assert!(id_is_mapped(&single, 0));
+        assert!(!id_is_mapped(&single, 1));
+        assert!(
+            !id_is_mapped(&single, 1000),
+            "the OUTSIDE column is not the box's id"
+        );
+
+        let range = id_map_ranges("0 1000 1\n1 100000 65536\nnot a map line\n\n");
+        assert_eq!(range, vec![(0, 1), (1, 65536)]);
+        for id in [0, 1, 1000, 65534, 65536] {
+            assert!(id_is_mapped(&range, id), "{id}");
+        }
+        assert!(!id_is_mapped(&range, 65537));
+        assert!(!id_is_mapped(&range, u32::MAX));
+        assert!(id_map_ranges("").is_empty());
+        assert!(!id_is_mapped(&[], 0), "an empty map maps nothing");
+        // A full-width range cannot overflow the check.
+        assert!(id_is_mapped(&[(0, 4_294_967_295)], u32::MAX - 1));
+    }
+
+    /// The refusal says what the box DOES map, and for root alone, why and what gives it the rest.
+    #[test]
+    fn the_refusal_names_what_the_box_maps() {
+        let single = describe_id_map("uid", &[(0, 1)]);
+        assert!(single.contains("uid 0 alone"), "{single}");
+        assert!(single.contains("--uid-range"), "{single}");
+        assert_eq!(
+            describe_id_map("gid", &[(0, 1), (1, 65536)]),
+            "which maps gids 0, 1-65536"
+        );
+    }
+
+    /// HOME follows the `-u` user unless the environment already set one that is not kern's own.
+    #[test]
+    fn exec_user_home_keeps_a_set_home_and_rederives_only_kerns() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let node = "/home/node".to_string();
+        // A root workload records no HOME: the user's passwd home.
+        assert_eq!(
+            exec_user_home(&env(&[]), &env(&[]), None, node.clone()),
+            Some(node.clone())
+        );
+        // The image's `ENV HOME`, kept as Docker keeps `Config.Env`.
+        assert_eq!(
+            exec_user_home(&env(&[("HOME", "/app")]), &env(&[]), None, node.clone()),
+            None
+        );
+        // kern's own HOME for a `--user node` workload, asked for root: re-derived.
+        assert_eq!(
+            exec_user_home(
+                &env(&[("HOME", "/home/node")]),
+                &env(&[]),
+                Some("/home/node"),
+                "/root".to_string()
+            ),
+            Some("/root".to_string())
+        );
+        // A non-root workload whose image set a HOME of its own: kept.
+        assert_eq!(
+            exec_user_home(
+                &env(&[("HOME", "/srv")]),
+                &env(&[]),
+                Some("/home/node"),
+                "/root".into()
+            ),
+            None
+        );
+        // The LAST recorded HOME is the one in force.
+        assert_eq!(
+            exec_user_home(
+                &env(&[("HOME", "/app"), ("HOME", "/home/node")]),
+                &env(&[]),
+                Some("/home/node"),
+                "/root".into()
+            ),
+            Some("/root".to_string())
+        );
+        // The caller's `-e HOME=` wins over everything, so nothing is added.
+        assert_eq!(
+            exec_user_home(&env(&[]), &env(&[("HOME", "/x")]), None, node),
+            None
+        );
     }
 }
 

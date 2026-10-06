@@ -622,17 +622,45 @@ fn foreign_marker(project: &str) -> String {
     format!("# kern-net {project}")
 }
 
+/// The most a foreign box's hosts file may hold before this refuses to rewrite it. Far above any
+/// stack's (a line is about forty bytes), and a bound because the box writes this file too.
+const FOREIGN_HOSTS_MAX: u64 = 1 << 20;
+
+/// A RUNNING box's `/etc/hosts`, open read-write, with its text.
+///
+/// RESOLVED INSIDE THE BOX'S ROOT, NEVER THROUGH IT AS A PATH. `/proc/<pid1>/root/etc/hosts` handed to
+/// `open(2)` resolves an absolute symlink inside the box against THIS process's root, and the box's
+/// PID 1 decides what its root is: MEASURED on 0.30.2 with the default seccomp filter, a PID 1 that
+/// had `chroot`ed into a directory whose `etc/hosts` was an absolute symlink made another stack's
+/// `up` append its line to a mode-600 file on the host, outside every box. Opened here with
+/// `openat2(RESOLVE_IN_ROOT)` under that root, regular files only, one descriptor for the read and
+/// the write, so the file written is the file read.
+fn open_foreign_hosts(pid1: i32) -> std::io::Result<(std::fs::File, String)> {
+    use std::os::fd::AsFd;
+    let root = crate::openat2::box_root_fd(pid1)?;
+    let file = crate::openat2::open_regular_in_root(root.as_fd(), "etc/hosts", libc::O_RDWR)?
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+    let text = crate::openat2::read_regular(&file, FOREIGN_HOSTS_MAX)?;
+    Ok((file, text))
+}
+
 /// Teach a RUNNING box of another project one of our names.
 ///
-/// WRITTEN THROUGH `/proc/<pid1>/root`, which is the box's own filesystem view from outside it.
-/// MEASURED on a live box: the write is visible inside immediately and `getent hosts` answers the
-/// new name on the next call, so a stack that joins a network late needs no resolver process and no
-/// restart of the stack that was already there. That measurement is why this feature is relays and a
-/// hosts file rather than a DNS server.
+/// WRITTEN INTO THE BOX'S OWN FILESYSTEM FROM OUTSIDE IT, through [`open_foreign_hosts`]. MEASURED on
+/// a live box: the write is visible inside immediately and `getent hosts` answers the new name on the
+/// next call, so a stack that joins a network late needs no resolver process and no restart of the
+/// stack that was already there. That measurement is why this feature is relays and a hosts file
+/// rather than a DNS server.
 ///
 /// APPEND-ONLY AND IDEMPOTENT. `up` runs again on a stack that is already up, and a line added twice
 /// would leave a duplicate behind when only one is removed. The file is read first and an identical
-/// line is not written again.
+/// line is not written again. The new bytes are written at the end and nothing before them is
+/// rewritten, so a resolver reading the file meanwhile sees the old contents or the new ones, never an
+/// empty file.
+///
+/// IN PLACE AND NOT RENAMED OVER. The file is in another box's mount namespace; a rename there would
+/// replace the file the box has open rather than update it, and `/etc/hosts` in a box is frequently a
+/// bind mount, where a rename fails outright.
 ///
 /// A FAILURE IS RETURNED, NOT SWALLOWED: the box is reachable FROM here either way, and what is lost
 /// is the other direction's name resolution, which the caller reports per box.
@@ -645,50 +673,67 @@ pub fn add_foreign_host(box_name: &str, line: &str, project: &str) -> Result<(),
             "box '{box_name}' has no recorded PID 1"
         )));
     };
-    let path = format!("/proc/{pid1}/root/etc/hosts");
-    let current = std::fs::read_to_string(&path)
+    let (file, current) = open_foreign_hosts(pid1)
         .map_err(|e| Error::Sandbox(format!("{box_name}: cannot read its hosts file: {e}")))?;
-    let want = format!("{line}	{}", foreign_marker(project));
+    append_host_line(&file, &current, line, project)
+        .map_err(|e| Error::Sandbox(format!("{box_name}: cannot write its hosts file: {e}")))
+}
+
+/// Append `line` with this project's marker to an already-read hosts file, or do nothing if it is
+/// already there. Written AT THE END of what was read, so nothing before it is rewritten and a
+/// resolver reading meanwhile sees either the old text or the new.
+fn append_host_line(
+    file: &std::fs::File,
+    current: &str,
+    line: &str,
+    project: &str,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let want = format!("{line}\t{}", foreign_marker(project));
     if current.lines().any(|l| l == want) {
         return Ok(());
     }
-    let mut next = current;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
+    let mut added = String::new();
+    if !current.is_empty() && !current.ends_with('\n') {
+        added.push('\n');
     }
-    next.push_str(&want);
-    next.push('\n');
-    // REWRITTEN IN PLACE AND NOT RENAMED OVER. The path reaches into another box's mount namespace;
-    // a rename there would replace the file the box has open rather than update it, and `/etc/hosts`
-    // in a box is frequently a bind mount, where a rename fails outright.
-    std::fs::write(&path, next)
-        .map_err(|e| Error::Sandbox(format!("{box_name}: cannot write its hosts file: {e}")))
+    added.push_str(&want);
+    added.push('\n');
+    file.write_all_at(added.as_bytes(), current.len() as u64)
 }
 
 /// Take back every line this project wrote into a foreign box's hosts file.
 ///
 /// BY MARKER AND NOT BY ADDRESS, because the address is exactly what is no longer true: by the time
 /// this runs our boxes may already be gone, and matching on their addresses would miss a line whose
-/// peer left first. The marker names the project that wrote it, so nothing else is touched.
+/// peer left first. The marker names the project that wrote it, so nothing else is touched. Opened as
+/// [`add_foreign_host`] opens it; the kept text is written over the start and the file then cut to
+/// it, so it is never empty in between.
 pub fn drop_foreign_hosts(box_name: &str, project: &str) {
     let Some(pid1) = crate::registry::find(box_name).and_then(|i| i.live_pid1()) else {
         return; // the other stack is gone too; its hosts file went with it
     };
-    let path = format!("/proc/{pid1}/root/etc/hosts");
-    let Ok(current) = std::fs::read_to_string(&path) else {
+    let Ok((file, current)) = open_foreign_hosts(pid1) else {
         return;
     };
-    let marker = foreign_marker(project);
+    let _ = drop_marked_lines(&file, &current, &foreign_marker(project));
+}
+
+/// Rewrite an already-read hosts file without the lines carrying `marker`: the kept text over the
+/// start, then the file cut to it, so it is never empty in between. Nothing to do when none match.
+fn drop_marked_lines(file: &std::fs::File, current: &str, marker: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
     let kept: Vec<&str> = current
         .lines()
-        .filter(|l| !l.trim_end().ends_with(&marker))
+        .filter(|l| !l.trim_end().ends_with(marker))
         .collect();
     if kept.len() == current.lines().count() {
-        return; // nothing of ours in there
+        return Ok(()); // nothing of ours in there
     }
     let mut next = kept.join("\n");
     next.push('\n');
-    let _ = std::fs::write(&path, next);
+    file.write_all_at(next.as_bytes(), 0)?;
+    file.set_len(next.len() as u64)
 }
 
 /// A `u32` address as dotted quad. Local because the only alternative is building an
@@ -950,7 +995,7 @@ pub fn print_list(json: bool) -> Result<(), Error> {
     // Scrubbing FIRST also keeps the column honest: measuring the raw name would reserve width for
     // characters that never print. The member cells are the same class, read from the same tree.
     let shown: Vec<String> = names.iter().map(|n| crate::ui::scrub(n)).collect();
-    let nw = crate::ui::name_col_width(shown.iter().map(String::as_str), 24);
+    let nw = crate::ui::name_col_width(shown.iter().map(String::as_str), 24, 15);
     println!("{:<nw$} {:>7}  BOXES", "NAME", "MEMBERS");
     for (n, label) in names.iter().zip(&shown) {
         let live = members(n); // the RAW name is the path; only the display is scrubbed
@@ -1134,5 +1179,80 @@ mod tests {
                 "'{bad}' must not become a member filename"
             );
         }
+    }
+
+    /// A FOREIGN BOX'S HOSTS FILE IS APPENDED TO AND CUT BACK, NEVER REPLACED.
+    ///
+    /// Both halves are written through ONE descriptor the caller already read, because the file
+    /// belongs to another project's running box: a rename there would swap the file the box has open,
+    /// and `/etc/hosts` in a box is frequently a bind mount, where a rename fails outright.
+    ///
+    /// What is asserted is the positional arithmetic, which is the part a reader cannot check by
+    /// eye: the append lands exactly at the end of what was read (no gap of NULs, nothing
+    /// overwritten), a line already present is not added twice, and the removal cuts the file to the
+    /// kept text instead of leaving the tail of the longer version behind.
+    #[test]
+    fn a_foreign_hosts_file_is_appended_at_the_end_and_truncated_to_what_is_kept() {
+        use std::io::Read;
+        let path = std::env::temp_dir().join(format!("kern-fh-{}", std::process::id()));
+        let read_back = |p: &std::path::Path| {
+            let mut t = String::new();
+            std::fs::File::open(p)
+                .unwrap()
+                .read_to_string(&mut t)
+                .unwrap();
+            t
+        };
+        let open_rw = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p)
+                .unwrap()
+        };
+
+        // A file with no trailing newline: the append adds the one it needs, at the end.
+        std::fs::write(&path, "127.0.0.1 localhost").unwrap();
+        let f = open_rw(&path);
+        append_host_line(&f, "127.0.0.1 localhost", "10.0.0.2\tapi", "front").unwrap();
+        let want = format!(
+            "127.0.0.1 localhost\n10.0.0.2\tapi\t{}\n",
+            foreign_marker("front")
+        );
+        assert_eq!(read_back(&path), want);
+
+        // IDEMPOTENT: `up` on a stack that is already up must not leave a duplicate behind, because
+        // teardown removes one line.
+        let current = read_back(&path);
+        append_host_line(&f, &current, "10.0.0.2\tapi", "front").unwrap();
+        assert_eq!(read_back(&path), want, "the same line was added twice");
+
+        // ANOTHER PROJECT'S LINE IS NOT OURS TO TAKE, and the box's own entries stay put. The removal
+        // must also SHORTEN the file: the kept text is shorter than what was there.
+        let mut text = read_back(&path);
+        text.push_str(&format!("10.0.0.9\tweb\t{}\n", foreign_marker("other")));
+        std::fs::write(&path, &text).unwrap();
+        let f = open_rw(&path);
+        drop_marked_lines(&f, &text, &foreign_marker("front")).unwrap();
+        let after = read_back(&path);
+        assert_eq!(
+            after,
+            format!(
+                "127.0.0.1 localhost\n10.0.0.9\tweb\t{}\n",
+                foreign_marker("other")
+            ),
+            "the other project's line or the box's own was touched"
+        );
+        assert!(
+            after.len() < text.len() && !after.contains("api"),
+            "the file was overwritten but not cut: {after:?}"
+        );
+
+        // NOTHING OF OURS IN THERE: the file is left exactly as it was, not rewritten.
+        let before = read_back(&path);
+        drop_marked_lines(&f, &before, &foreign_marker("front")).unwrap();
+        assert_eq!(read_back(&path), before);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

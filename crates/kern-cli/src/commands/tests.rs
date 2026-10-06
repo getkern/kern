@@ -6,6 +6,25 @@
 //! A child module still reaches its ancestors' private items, so the tests assert on exactly the
 //! internals they did before, without widening one item's visibility.
 
+/// The account lookups against an image's layers, the one source most of these tests build: the
+/// shape `kern box` calls them in, kept here so each assertion reads as one line.
+#[cfg(test)]
+pub(super) mod layered {
+    use crate::commands::{resolve_user, supplementary_gids, user_home, Accounts};
+
+    pub(crate) fn resolve_image_user(spec: &str, lower: &[String]) -> Option<(u32, u32)> {
+        resolve_user(spec, &Accounts::Layers(lower))
+    }
+
+    pub(crate) fn image_supplementary_gids(spec: &str, lower: &[String]) -> Vec<u32> {
+        supplementary_gids(spec, &Accounts::Layers(lower))
+    }
+
+    pub(crate) fn image_user_home(uid: u32, lower: &[String]) -> String {
+        user_home(uid, &Accounts::Layers(lower))
+    }
+}
+
 /// THE SWAP ALLOWANCE A SERVICE GETS, and the retraction of a decision taken on a false premise.
 ///
 /// `memory.swap.max = 0` was chosen as "stricter, and said so", believing a rootless runtime had to.
@@ -276,7 +295,146 @@ mod run_as_policy_tests {
 
 #[cfg(test)]
 mod image_user_resolution_tests {
+    use super::layered::*;
     use crate::commands::*;
+
+    /// `f` on another thread, or `None` if it has not answered within `secs`: a read that blocks turns
+    /// a test red instead of hanging the suite. The stuck thread is left behind; the test binary ends.
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+    }
+
+    /// A directory as an `O_PATH` dirfd, the shape `/proc/<pid1>/root` is opened in.
+    fn dirfd(dir: &std::path::Path) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        let c = std::ffi::CString::new(dir.to_string_lossy().as_bytes()).unwrap();
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "open {dir:?}");
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// A BOX'S ROOT RESOLVES ITS OWN SYMLINKS INSIDE ITSELF. `kern exec -u` reads the account files of a
+    /// running box through its root, and the code in the box writes them. An absolute symlink means
+    /// the BOX's path: one aimed at a host file that defines the name finds nothing, and one aimed at
+    /// a file the box does have finds that.
+    ///
+    /// MEASURED live, with the read done through the plain path instead: a box that linked its
+    /// `/etc/passwd` to a host file got `kern exec -u victim` running as the uid that HOST file gave.
+    #[test]
+    fn a_box_root_resolves_account_symlinks_inside_the_box() {
+        use std::os::fd::AsFd;
+        let root = std::env::temp_dir().join(format!("kern-acct-root-{}", std::process::id()));
+        let host = std::env::temp_dir().join(format!("kern-acct-host-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(&host, "victim:x:4242:4242::/:/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&host, root.join("etc/passwd")).unwrap();
+        let fd = dirfd(&root);
+        let accounts = Accounts::of_box_root(fd.as_fd()).unwrap();
+        assert_eq!(
+            resolve_user("victim", &accounts),
+            None,
+            "resolved through the host file"
+        );
+        // No passwd inside the box at all: a numeric uid still resolves (group 0), a name does not.
+        assert_eq!(resolve_user("4242", &accounts), Some((4242, 0)));
+
+        // The same absolute link, with the box holding a file at that path: found, inside the box.
+        let inside = root.join(host.strip_prefix("/").unwrap());
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, "app:x:777:778::/home/app:/bin/sh\n").unwrap();
+        let accounts = Accounts::of_box_root(fd.as_fd()).unwrap();
+        assert_eq!(resolve_user("app", &accounts), Some((777, 778)));
+        assert_eq!(user_home(777, &accounts), "/home/app");
+        assert_eq!(resolve_user("victim", &accounts), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&host);
+    }
+
+    /// A FIFO IS NO ACCOUNT FILE, in an image layer or in a box. Opening one for reading waits for a
+    /// writer, and the party that put it there decides whether one ever comes: `kern box` resolving
+    /// an image's `USER` and `kern exec -u` resolving a name both stopped dead on it. MEASURED in a
+    /// live box: `mkfifo /etc/passwd`, and `kern exec -u` waited until the run was killed.
+    #[test]
+    fn a_fifo_at_etc_passwd_answers_none_at_once_from_a_layer_and_from_a_box() {
+        use std::os::fd::AsFd;
+        let root = std::env::temp_dir().join(format!("kern-acct-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("etc/passwd").to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0, "mkfifo");
+        let lower = vec![root.to_string_lossy().into_owned()];
+        let layered = within(10, move || resolve_image_user("app", &lower));
+        assert_eq!(
+            layered,
+            Some(None),
+            "a layer's FIFO held the read past 10 s, or resolved"
+        );
+        // FROM A BOX IT IS AN ERROR THAT SAYS WHAT IT IS, not "no such user": `kern exec -u` names
+        // the cause rather than sending the reader to look for an account.
+        let fd = dirfd(&root);
+        let boxed = within(10, move || {
+            Accounts::of_box_root(fd.as_fd())
+                .err()
+                .map(|e| e.to_string())
+        });
+        let said = boxed.expect("a box's FIFO held the read past 10 s");
+        assert!(
+            said.as_deref()
+                .is_some_and(|m| m.contains("/etc/passwd") && m.contains("not a regular file")),
+            "{said:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// AN ACCOUNT FILE PAST THE BOUND IS NOT PARSED, and a device is not read at all: `/dev/zero` never
+    /// ends. The size is the one `fstat` reports on the open file; a sparse file costs nothing to make.
+    #[test]
+    fn an_oversized_or_non_regular_account_file_is_not_read() {
+        let root = std::env::temp_dir().join(format!("kern-acct-big-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        let big = root.join("etc/passwd");
+        std::fs::write(&big, "big:x:1:1::/:/bin/sh\n").unwrap();
+        let lower = vec![root.to_string_lossy().into_owned()];
+        assert_eq!(
+            resolve_image_user("big", &lower),
+            Some((1, 1)),
+            "the control"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_len(9 << 20)
+            .unwrap();
+        assert_eq!(resolve_image_user("big", &lower), None);
+        {
+            use std::os::fd::AsFd;
+            let fd = dirfd(&root);
+            let said = Accounts::of_box_root(fd.as_fd())
+                .err()
+                .map(|e| e.to_string());
+            assert!(
+                said.as_deref().is_some_and(|m| m.contains("larger than")),
+                "{said:?}"
+            );
+        }
+        let zero = std::fs::File::open("/dev/zero").unwrap();
+        let said = crate::openat2::read_regular(&zero, 1 << 20)
+            .err()
+            .map(|e| e.to_string());
+        assert_eq!(said.as_deref(), Some("not a regular file"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A box's `config.User` given by NAME (e.g. memcached's `USER memcache`) must resolve to the image's
     /// own uid/gid the way Docker does - reading the rootfs's `/etc/passwd`/`/etc/group` - not silently
@@ -413,6 +571,59 @@ mod image_user_resolution_tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
+    /// A GROUP FILE THE IMAGE WROTE IS NOT A LIST TO TRUST THE LENGTH OF.
+    ///
+    /// Two separate costs, both paid in the HOST CLI before the box exists, because this file is read
+    /// from the image: a membership repeated `n` times used to be re-scanned linearly for every line
+    /// (quadratic in a file that may hold hundreds of thousands of them), and a list longer than
+    /// `NGROUPS_MAX` is refused by `setgroups` with `EINVAL`, which `set_user` can only report as
+    /// "outside this box's gid map" - a sentence about a cause that is not the cause.
+    ///
+    /// The duplicate case is the one a real image produces: a user named twice in the same group
+    /// file. Both halves are asserted on their OUTPUT, since the cost of the old spelling was time
+    /// rather than a wrong answer.
+    #[test]
+    fn the_image_group_list_is_deduplicated_and_cannot_exceed_what_the_kernel_takes() {
+        let root = std::env::temp_dir().join(format!("kern-sgid-many-{}", std::process::id()));
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("passwd"), "app:x:1000:1000::/app:/bin/sh\n").unwrap();
+        // The same gid named three times, and a second gid once.
+        std::fs::write(
+            etc.join("group"),
+            "a:x:7:app\nb:x:7:app,other\nc:x:7:app\nd:x:8:app\n",
+        )
+        .unwrap();
+        let lower = vec![root.to_string_lossy().into_owned()];
+        assert_eq!(
+            image_supplementary_gids("app", &lower),
+            vec![7, 8],
+            "a gid repeated across lines is one membership, in file order"
+        );
+
+        // Past the kernel's ceiling the list is CUT, not handed on to be refused whole: a
+        // `setgroups` of 70000 gids fails with EINVAL and the workload would get NONE of them.
+        let mut big = String::from("app:x:1000:app\n");
+        for g in 2000..70000u32 {
+            big.push_str(&format!("g{g}:x:{g}:app\n"));
+        }
+        std::fs::write(etc.join("group"), &big).unwrap();
+        let got = image_supplementary_gids("app", &lower);
+        assert_eq!(
+            got.len(),
+            65536,
+            "the list stops at NGROUPS_MAX, got {} entries",
+            got.len()
+        );
+        assert_eq!(
+            got.first(),
+            Some(&1000),
+            "file order is kept from the first line"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A NUMERIC `USER` TAKES ITS GROUP FROM THE IMAGE, NOT FROM ITS OWN NUMBER.
     ///
     /// `gid = uid` for anything numeric, which is right only when the image happens to agree. It
@@ -518,7 +729,7 @@ mod image_user_resolution_tests {
     }
 
     /// A hostile image whose account file is a symlink OUT of the rootfs must NOT resolve against host
-    /// paths - `image_account_field` reads pre-pivot on the host, so an unconfined read would follow the
+    /// paths - `Accounts::Layers` reads pre-pivot on the host, so an unconfined read would follow the
     /// link. Confinement returns `None` (caller keeps box-root), even though the escape target defines the
     /// name.
     #[test]
@@ -803,8 +1014,8 @@ two"
             fn ps_name(&self) -> &str {
                 "web"
             }
-            fn ps_pid(&self) -> i32 {
-                100
+            fn ps_pid(&self) -> Option<i32> {
+                Some(100)
             }
             fn ps_image(&self) -> String {
                 String::new()
@@ -1336,6 +1547,7 @@ mod commit_tests {
 
 #[cfg(test)]
 mod net_resource_tests {
+    use super::layered::resolve_image_user;
     use crate::commands::*;
 
     fn inst(name: &str, pid: i32, pod: &str) -> registry::Instance {
@@ -1652,8 +1864,38 @@ mod net_resource_tests {
             g(&l3).is_err(),
             "a symlink chain into the registry must be refused"
         );
-        // a symlink onto a SAFE target stays writable (target in `safe/`, NOT the runtime dir root -
-        // that dir is an ANCESTOR of the registry and refused by design), and a plain safe path too
+        // A FILE WRITTEN BESIDE THE REGISTRY IS NOT WRITTEN INTO IT. The runtime dir is an ANCESTOR of
+        // the registry, which a MOUNT must never get (it exposes the whole tree under it); a single new
+        // file there is one more entry next to `kern/`. Refusing it blocked `kern save -o
+        // <runtime>/img.tar`, and every write next to a non-default `XDG_RUNTIME_DIR`. The two that stay
+        // refused are asserted beside it: the name `kern` itself, where the registry lives, and a file
+        // under a trust-bearing registry dir.
+        assert!(
+            g(&tmp.join("img.tar")).is_ok(),
+            "a file beside the registry, in the runtime dir, must be writable"
+        );
+        assert!(
+            g(&tmp.join("kern")).is_err(),
+            "a file standing where the registry root is must be refused"
+        );
+        assert!(
+            g(&instances.join("forged")).is_err(),
+            "a new file inside a posture-record dir must be refused"
+        );
+        // NOR A FILE DIRECTLY IN THE ROOT under a box-data name: before kern made `logs/`, a file of
+        // that name would stand where the directory has to be.
+        let _ = std::fs::remove_dir_all(tmp.join("kern/logs"));
+        assert!(
+            g(&tmp.join("kern/logs")).is_err(),
+            "a file named like a box-data directory, in the root itself, must be refused"
+        );
+        // A box-data child stays writable, as it is mountable.
+        std::fs::create_dir_all(tmp.join("kern/logs")).unwrap();
+        assert!(
+            g(&tmp.join("kern/logs/out.txt")).is_ok(),
+            "the box-data logs dir stays writable"
+        );
+        // a symlink onto a SAFE target stays writable, and a plain safe path too
         let good = safe.join("good");
         std::os::unix::fs::symlink(safe.join("target.txt"), &good).unwrap();
         assert!(
@@ -2765,65 +3007,6 @@ stopsignal	SIGTERM
                 joined.starts_with("/cache/kern"),
                 "{evil:?} → {joined:?} escaped the cache"
             );
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn merged_view_honours_opaque_no_secret_resurrection() {
-        // REGRESSION for the opaque-dir leak: two stacked layers where an UPPER layer made `/app` opaque
-        // (`rm -rf /app && mkdir /app`, marked by `user.overlay.opaque`) and a LOWER layer holds a secret
-        // `/app/token`. Reading the merged view (`merged_view_extract`) must NOT resurrect the secret -
-        // the kernel applies the opaque, so `/app/token` is gone and only the upper's `marker` remains.
-        // A naive raw-layer walk (the old fast-path) leaked the secret here.
-        let base = std::env::temp_dir().join(format!("kern-mvbase-{}", std::process::id()));
-        let top = std::env::temp_dir().join(format!("kern-mvtop-{}", std::process::id()));
-        let out = std::env::temp_dir().join(format!("kern-mvout-{}", std::process::id()));
-        for d in [&base, &top, &out] {
-            let _ = std::fs::remove_dir_all(d);
-        }
-        std::fs::create_dir_all(base.join("app")).unwrap();
-        std::fs::write(base.join("app/token"), b"SECRET_MUST_NOT_RESURFACE").unwrap();
-        std::fs::create_dir_all(top.join("app")).unwrap();
-        std::fs::write(top.join("app/marker"), b"public").unwrap();
-        std::fs::create_dir_all(&out).unwrap();
-        // Mark the top's `/app` opaque. In a userns-owned overlay kern mounts WITHOUT `userxattr`, so the
-        // kernel reads `trusted.overlay.opaque`; but a plain test process can only set `user.overlay.*`.
-        // We therefore skip if we can't establish the opaque (CI without the privilege) rather than pass
-        // vacuously - the real guarantee is exercised end-to-end by the build tests.
-        let set_trusted = std::process::Command::new("setfattr")
-            .args(["-n", "trusted.overlay.opaque", "-v", "y"])
-            .arg(top.join("app"))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !set_trusted {
-            let _ = std::fs::remove_dir_all(&base);
-            let _ = std::fs::remove_dir_all(&top);
-            let _ = std::fs::remove_dir_all(&out);
-            eprintln!(
-                "skip: cannot set trusted.overlay.opaque (needs privilege); covered by build e2e"
-            );
-            return;
-        }
-        // chain is top-first: [top, base].
-        let chain = vec![
-            top.to_string_lossy().into_owned(),
-            base.to_string_lossy().into_owned(),
-        ];
-        let r = merged_view_extract(&chain, Extract::Entry("/app"), &out);
-        // The copy of `/app` must succeed and contain ONLY `marker` - never the opaque-hidden `token`.
-        assert!(r.is_ok(), "merged_view_extract failed: {r:?}");
-        assert!(
-            out.join("app/marker").exists(),
-            "public marker should be copied"
-        );
-        assert!(
-            !out.join("app/token").exists(),
-            "SECRET RESURRECTED: the opaque-hidden token must not appear in the merged copy"
-        );
-        for d in [&base, &top, &out] {
-            let _ = std::fs::remove_dir_all(d);
         }
     }
 

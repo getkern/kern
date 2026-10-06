@@ -349,7 +349,36 @@ pub fn env_flag(name: &str) -> bool {
 /// behaviour for a worse one. This gates the narrator, not the messenger.
 pub fn progress_wanted() -> bool {
     use std::io::IsTerminal;
-    std::io::stderr().is_terminal()
+    match PROGRESS_TERMINAL.load(std::sync::atomic::Ordering::Acquire) {
+        PROGRESS_NOT_TERMINAL => false,
+        PROGRESS_IS_TERMINAL => true,
+        _ => std::io::stderr().is_terminal(),
+    }
+}
+
+/// What [`progress_wanted`] answers while this process's fd 2 is NOT the stream the user is reading.
+///
+/// `kern build` points fd 2 at a pipe for its whole life, teed to the real stderr and to the build's
+/// log (`kern build logs`). Asked of fd 2, "is this a terminal?" was then always no, so a build on a
+/// terminal printed none of its step lines, the one that says why it took the flat path included,
+/// and its log held none either. MEASURED on 0.30.2 under a pty: `built '<tag>'` and nothing before
+/// it. The redirecting code records what the REAL stderr was before it redirects, and clears it when
+/// it restores fd 2. One atomic, so the gate stays lock-free and cannot fail.
+static PROGRESS_TERMINAL: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(PROGRESS_ASK_FD2);
+const PROGRESS_ASK_FD2: u8 = 0;
+const PROGRESS_NOT_TERMINAL: u8 = 1;
+const PROGRESS_IS_TERMINAL: u8 = 2;
+
+/// Set ([`Some`]) or clear ([`None`]) the answer [`progress_wanted`] gives instead of asking fd 2.
+/// For the one caller that redirects fd 2 and tees it to the user: see [`PROGRESS_TERMINAL`].
+pub fn set_progress_terminal(real_stderr_is_terminal: Option<bool>) {
+    let v = match real_stderr_is_terminal {
+        None => PROGRESS_ASK_FD2,
+        Some(false) => PROGRESS_NOT_TERMINAL,
+        Some(true) => PROGRESS_IS_TERMINAL,
+    };
+    PROGRESS_TERMINAL.store(v, std::sync::atomic::Ordering::Release);
 }
 
 /// Write one line of kern's own progress to stderr, and ONLY when [`progress_wanted`].
@@ -368,6 +397,28 @@ macro_rules! progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE GATE ANSWERS FOR THE STREAM THE USER READS, once someone has said what it is.
+    ///
+    /// `kern build` points fd 2 at a pipe it tees to the terminal, so asked of fd 2 the gate said
+    /// "not a terminal" for every build and none printed a step line (measured on 0.30.2 under a
+    /// pty). The override is set by that one caller and cleared when it restores fd 2; cleared, the
+    /// gate asks fd 2 again, which under `cargo test` is not a terminal.
+    #[test]
+    fn the_progress_gate_answers_for_the_real_stderr_while_fd2_is_redirected() {
+        use std::io::IsTerminal;
+        let asked_fd2 = std::io::stderr().is_terminal();
+        set_progress_terminal(Some(true));
+        assert!(progress_wanted(), "the override says a terminal");
+        set_progress_terminal(Some(false));
+        assert!(!progress_wanted(), "the override says not a terminal");
+        set_progress_terminal(None);
+        assert_eq!(
+            progress_wanted(),
+            asked_fd2,
+            "cleared, the gate asks fd 2 again"
+        );
+    }
 
     #[test]
     fn fmt_bytes_convention() {

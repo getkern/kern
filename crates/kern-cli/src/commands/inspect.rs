@@ -251,9 +251,10 @@ pub fn ps(
                         | "created"
                         | "dead"
                         | "restarting"
+                        | "kept"
                 ) {
                     return Err(Error::Usage(
-                        "ps --filter status=: running | paused | orphaned | exited \
+                        "ps --filter status=: running | paused | orphaned | exited | kept \
                          (created/dead/restarting match nothing - kern has no such state)",
                     ));
                 }
@@ -265,7 +266,16 @@ pub fn ps(
             }
         }
     }
-    let boxes: Vec<registry::Instance> = registry::list()
+    let live = registry::list();
+    // THE LIVE NAMES, ONCE. The kept section has to exclude a box that is running (it is a row in
+    // the live section instead), and the first version asked `registry::find(name)` per kept box -
+    // one `read_dir` of the whole instances directory EACH TIME. MEASURED: 13 syscalls per kept box,
+    // and with 200 registry entries and 100 kept boxes, 3.2 ms of reading the same directory 101
+    // times, against 0.054 ms for reading it once. From the UNFILTERED list, not from `boxes`
+    // below: a running box excluded by a `--filter` would otherwise reappear as a kept row.
+    let live_names: std::collections::HashSet<String> =
+        live.iter().map(|b| b.name.clone()).collect();
+    let boxes: Vec<registry::Instance> = live
         .into_iter()
         .filter(|b| ps_matches(b, filters))
         .collect();
@@ -370,6 +380,49 @@ pub fn ps(
             "kern: note: --filter label= does not apply to exited boxes (labels are not retained past exit)"
         );
     }
+    // KEPT BOXES, the ones `kern start` can run: `-a`, or an explicit `status=kept`, exactly as the
+    // exited set above. NOT in a plain `kern ps`, whose contract is the boxes that are UP: a kept box
+    // is a layer on disk, and listing one there put a row that is not a process in the view a reader
+    // greps for processes (measured, before this gate: `kern ps` on a host with one kept box printed
+    // it under a `kept` header).
+    // THE SCAN RUNS ONLY WHEN A KEPT ROW COULD SURVIVE, because it is not free (one record read per
+    // box) and three callers used to pay for rows that were then discarded: MEASURED at 1000 kept
+    // boxes, `ps -a --last 1` paid 5.6 ms to print one row, and `--filter status=running` paid 6.1
+    // ms to print none. `--last` clears the kept rows (see the note below it), and a filter on a key
+    // no kept row can answer excludes them all in `kept_matches`.
+    let kept_possible = view.last.is_none()
+        && filters.iter().all(|(k, v)| match k.as_str() {
+            "name" => true,
+            "status" => matches!(v.as_str(), "kept" | "exited"),
+            // `pod`, `id`, `label`, `health`: a kept box has none of them, and `kept_matches`
+            // answers false for every one. Asking is the same answer for less work.
+            _ => false,
+        });
+    let want_kept =
+        kept_possible && (all || filters.iter().any(|(k, v)| k == "status" && v == "kept"));
+    // One that is RUNNING is not a kept ROW: it is in the live set, with its uptime and health, so
+    // one box is never two rows of one `ps -a`.
+    let mut kept: Vec<crate::keepbox::KeptBox> = if want_kept {
+        // `name=` IS ASKED ON THE DIRENT, before the record is opened: it is the one filter key a
+        // kept row answers from its name alone.
+        let name_want: Option<&str> = filters
+            .iter()
+            .find(|(k, _)| k == "name")
+            .map(|(_, v)| v.as_str());
+        crate::keepbox::list_matching(|n| name_want.is_none_or(|w| n.contains(w)))
+            .into_iter()
+            .filter(|k| !live_names.contains(&k.name))
+            .filter(|k| kept_matches(k, filters))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    kept.sort_by(|a, b| {
+        b.meta
+            .created
+            .cmp(&a.meta.created)
+            .then(a.name.cmp(&b.name))
+    });
     let exited: Vec<registry::ExitedBox> = if want_exited {
         // Exclude any pid that is ALSO a live box: between a box's `waitexit` write (its last act) and
         // its instance-record unregister there is a window where both artefacts exist; without this a
@@ -381,6 +434,12 @@ pub fn ps(
         registry::list_exited()
             .into_iter()
             .filter(|e| !live.contains(&(e.pid, e.starttime)) && exited_matches(e, filters))
+            // ONE BOX, ONE ROW, for a name that has a kept layer. The exit record is transient (an
+            // hour, or `kern gc`) and the kept record is durable and now carries the same code (the
+            // supervisor records it), so printing both put one box in two sections of one `ps -a`
+            // saying two different things - measured: `exit 137` in one and "never ran" in the
+            // other - and made `ps -a -q` print its name twice, which a script acts on.
+            .filter(|e| !kept.iter().any(|k| k.name == e.name))
             .collect()
     } else {
         Vec::new()
@@ -398,6 +457,17 @@ pub fn ps(
     // are comparable within a boot, which is the only span either record survives (a live box dies
     // with the machine, an exit record is reaped after an hour). `-n 0` lists nothing, as Docker's
     // does.
+    // `--last N` SELECTS AMONG THE BOXES THAT RAN, and so it drops the kept section rather than
+    // printing it whole beside a capped list. MEASURED with 1000 kept boxes: `ps -a --last 2`
+    // answered with 1002 rows, which is not what "the 2 most recent" asks for. The alternative was
+    // to order the three kinds together, and they have no comparable clock: live and exited rows are
+    // ordered on the KERNEL start-time (ticks, comparable only within a boot, and the one key that
+    // means CREATED for both - see the note below), while a kept box outlives the boot and has only
+    // a unix `created`. Mixing a tick count with a unix second is how a sort silently lies, so
+    // `--last` answers about runs and plain `ps -a` lists the kept layers.
+    if view.last.is_some() {
+        kept.clear();
+    }
     let (boxes, exited) = match view.last {
         None => (boxes, exited),
         Some(n) => {
@@ -460,6 +530,9 @@ pub fn ps(
         for e in &exited {
             println!("{}", e.name);
         }
+        for k in &kept {
+            println!("{}", k.name);
+        }
         return Ok(());
     }
     // `--format '{{.Field}}'`: render each box through the bounded template (no Go-template logic).
@@ -470,6 +543,9 @@ pub fn ps(
         }
         for e in &exited {
             println!("{}", render_ps_format(tmpl, e, now)?);
+        }
+        for k in &kept {
+            println!("{}", render_ps_format(tmpl, k, now)?);
         }
         return Ok(());
     }
@@ -525,6 +601,32 @@ pub fn ps(
                 e.exited_ago,
                 json_str("exited"),
                 json_str("exited"),
+            ));
+        }
+        for k in &kept {
+            // `status` is `kept`, which is the value `--filter status=kept` selects and the word the
+            // table's header uses. `image` is the one field a kept box has that a live row spells
+            // `rootfs`: it is what the recorded command will run, and it is the only way a consumer
+            // can tell two kept boxes apart without replaying their argv. `exit_code` is absent
+            // while the box has never finished a run, where `0` would read as a clean one.
+            //
+            // WHAT A KEPT ROW DOES NOT HAVE, because it is not a process and never was in this
+            // boot: `pid`, `pod`, `ports`, `labels`, `started`, `rootfs`. Absent, not zeroed - the
+            // same rule the exited row follows for the fields that died with the box, so a consumer
+            // reading `.pid` across `ps -a --json` must handle its absence (it already had to: an
+            // exited row has no `started`, `ports` or `rootfs`).
+            let exit = match k.meta.last_exit {
+                Some(c) => format!(",\"exit_code\":{c}"),
+                None => String::new(),
+            };
+            items.push(format!(
+                "{{\"name\":{},\"command\":{},\"image\":{},\"created\":{}{exit},\"health\":{},\"status\":{}}}",
+                json_str(&k.name),
+                json_str(&crate::ui::scrub(&k.command)),
+                json_str(&crate::ui::scrub(&k.meta.image)),
+                k.meta.created,
+                json_str("kept"),
+                json_str("kept"),
             ));
         }
         if shape == JsonShape::Lines {
@@ -650,12 +752,19 @@ pub fn ps(
         // `ui::name_col_width`, which four other tables had each got wrong in their own way.
         //
         // The LIVE rows measure their DISPLAYED name (a pod member drops the project prefix) and the
-        // exited section its full one, because that is what each prints.
+        // exited section its full one, because that is what each prints. THE KEPT SECTION TOO: it
+        // was left out, so a kept name longer than every live and exited one overflowed its cell and
+        // pushed every column after it out of line - in a pipe, where there is no ceiling and the
+        // alignment is supposed to be exact. Measured with a 71-character kept name, which is a
+        // length `kern box` accepts. This is the defect `name_col_width` exists to end, and the
+        // sixth table was passing five of its six row kinds in.
         let nw = crate::ui::name_col_width(
             rows.iter()
                 .map(|(b, _, _, _)| crate::ui::display_box_name(&b.name, &b.pod))
-                .chain(exited.iter().map(|e| e.name.as_str())),
+                .chain(exited.iter().map(|e| e.name.as_str()))
+                .chain(kept.iter().map(|k| k.name.as_str())),
             16,
+            29 + pw,
         );
         // On a TTY, truncate COMMAND to the remaining width so a long command never wraps (like
         // `docker ps`); piped/non-TTY prints it whole so scripts get the full line.
@@ -682,8 +791,10 @@ pub fn ps(
         // --format/--json also apply - raw would let `$'\e[2J'` clear the screen on every `kern ps`,
         // and an exited box's stored command would re-fire until `gc`), then TTY-truncated so it never
         // wraps.
+        // `pid` is `Option`, because one row has none: a kept box is not a process, and a literal
+        // `0` in that column reads as one.
         let emit_row = |name_cell: &str,
-                        pid: i32,
+                        pid: Option<i32>,
                         time_cell: &str,
                         status_cell: &str,
                         ports: &str,
@@ -698,7 +809,8 @@ pub fn ps(
             } else {
                 safe
             };
-            println!("{name_cell} {pid:>7} {time_cell:>7}  {status_cell} {ports:<pw$} {cmd}");
+            let pid_cell = pid.map_or_else(|| "-".to_string(), |p| p.to_string());
+            println!("{name_cell} {pid_cell:>7} {time_cell:>7}  {status_cell} {ports:<pw$} {cmd}");
         };
         // One LIVE box row. `connector` is a tree glyph ("├─ "/"└─ ") drawn INSIDE the 16-wide NAME cell
         // for a pod member, or "" for a standalone box - so every PID column still lines up.
@@ -728,7 +840,7 @@ pub fn ps(
                 let status_cell = format!("{hc}{:<9}{}", health, p.z);
                 emit_row(
                     &name,
-                    b.pid,
+                    Some(b.pid),
                     &format!("{up}s"),
                     &status_cell,
                     ports,
@@ -780,7 +892,7 @@ pub fn ps(
                 let status_cell = format!("{hc}{:<9}{}", format!("exit {}", e.code), p.z);
                 emit_row(
                     &name,
-                    e.pid,
+                    Some(e.pid),
                     &fmt_uptime(e.exited_ago),
                     &status_cell,
                     "-",
@@ -788,8 +900,69 @@ pub fn ps(
                 );
             }
         }
+        // KEPT BOXES, which are the ones `kern start` can run. A SEPARATE SECTION, because an exit
+        // record and a kept box answer different questions: the exit records are transient (reaped
+        // after an hour, gone with the machine) and say "this ran and finished", while a kept box is
+        // state on disk that is still there and can be started again. Listed even when its exit
+        // record has been reaped, which is the case the operator needs most: a box kept yesterday is
+        // invisible in every other view.
+        //
+        // One that is RUNNING is not listed here - it is in the live section above, where its uptime
+        // and health are - so one box is never two rows of one `ps -a`.
+        if !kept.is_empty() {
+            let n = kept.len();
+            let plural = if n == 1 { "box" } else { "boxes" };
+            println!(
+                "{d}kept{z} {d}({n} {plural}, `kern start <name>` runs one again){z}",
+                d = p.d,
+                z = p.z
+            );
+            let now = registry::now_unix();
+            for k in &kept {
+                let name = format!("{b}{c}{:<nw$}{z}", k.name, b = p.b, c = p.c, z = p.z);
+                // No pid: it is not running, and a stale one would read as a process. The time cell
+                // is how long ago it was created, which is the only clock a kept box has that does
+                // not expire with the machine.
+                let status = match k.meta.last_exit {
+                    Some(code) => format!("exit {code}"),
+                    None => "never ran".to_string(),
+                };
+                let hc = if k.meta.last_exit == Some(0) {
+                    p.g
+                } else {
+                    p.d
+                };
+                let status_cell = format!("{hc}{:<9}{}", status, p.z);
+                let age = now.saturating_sub(k.meta.created);
+                emit_row(&name, None, &fmt_uptime(age), &status_cell, "-", &k.command);
+            }
+        }
     }
     Ok(())
+}
+
+/// Does a kept box pass the `--filter`s `ps` was given? Only the keys a kept box can answer: it has
+/// no pid, no pod and no health, and a filter on one of those is a question about a running box, so
+/// it excludes every kept row rather than matching them all.
+fn kept_matches(k: &crate::keepbox::KeptBox, filters: &[(String, String)]) -> bool {
+    filters.iter().all(|(key, want)| match key.as_str() {
+        "name" => k.name.contains(want),
+        // `status=` is the one a script writes. A kept box is `created` when it has never finished a
+        // run and `exited` when it has, which is Docker's vocabulary for the same two states.
+        "status" => match want.as_str() {
+            // `kept` IS THE QUERY THAT MEANS "what can `kern start` run": it selects every kept box
+            // whether or not it has ever finished a run, and it selects nothing else (a running or
+            // exited registry box has no such status, so `ps_matches` excludes it).
+            "kept" => true,
+            "exited" => k.meta.last_exit.is_some(),
+            // NOT `created`: the usage message for this flag says kern has no created state, and a
+            // mapping here would have made that sentence false for one row kind only. A kept box
+            // that has never run is `status=kept` with no `exit_code` in `--json`, which answers the
+            // same question without a second vocabulary.
+            _ => false,
+        },
+        _ => false,
+    })
 }
 
 /// `kern stats [--json]` - current memory + cumulative CPU time per running box (from cgroup).
@@ -828,7 +1001,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
         // MEASURED, like `ps` above and for the same reason - this table was simply left out of that
         // fix. The FULL registry name, not the pod-stripped one: `stats` has no pod tree to supply
         // the context a bare service name would be missing.
-        let nw = crate::ui::name_col_width(boxes.iter().map(|b| b.name.as_str()), 16);
+        let nw = crate::ui::name_col_width(boxes.iter().map(|b| b.name.as_str()), 16, 29);
         println!(
             "{d}{:<nw$} {:>8} {:>9} {:>9}{z}",
             "NAME",
@@ -950,10 +1123,23 @@ fn inspect_image(name: &str, json: bool) -> Result<(), Error> {
                 exited.code
             )));
         }
+        // A KEPT BOX IS A THIRD SUBJECT WITH THAT NAME, and saying "nothing named 'x'" about a
+        // layer sitting in the store is the same defect as the one the note above records for
+        // images: `kern ps -a` listed it while `kern inspect` denied it existed.
+        if let Some(dir) = crate::keepbox::dir_of(name) {
+            if crate::keepbox::read(&dir).is_some() {
+                return Err(Error::NotRunning(format!(
+                    "'{name}' is a kept box that is not running: its layer and its command line are \
+                     in {}, and `kern start {name}` runs it. `kern inspect` reports a box while it \
+                     runs, so start it first, and `kern ps -a` shows what the last run exited with",
+                    dir.display()
+                )));
+            }
+        }
         // NEITHER EXISTS, so name both subjects: a reader told only about boxes goes looking for
         // the wrong thing.
         return Err(Error::NotRunning(format!(
-            "nothing named '{name}': no running box, no exit record for one, and no image in the local cache. `kern ps -a` lists recently-exited boxes, `kern images` lists images and `kern pull {name}` fetches one"
+            "nothing named '{name}': no running box, no exit record for one, no kept box and no image in the local cache. `kern ps -a` lists recently-exited and kept boxes, `kern images` lists images and `kern pull {name}` fetches one"
         )));
     }
     let cfg = crate::commands::imagecache::read_image_config(&cache.join(format!("{safe}.image")));
@@ -1542,7 +1728,7 @@ pub fn history(count: usize) -> Result<(), Error> {
     // different boxes as one string. A compose stack with services `worker` and `workqueue` gave two
     // rows both reading `sdktest-cd95af93-wo…`, different pids, no way to tell which log is which.
     // The column is measured now and truncates only past the shared ceiling.
-    let nw = crate::ui::name_col_width(rows.iter().map(|(n, _, _, _)| n.as_str()), 20);
+    let nw = crate::ui::name_col_width(rows.iter().map(|(n, _, _, _)| n.as_str()), 20, 30);
     println!(
         "{d}{:<nw$} {:>8} {:>12}  STATUS{z}",
         "NAME",
@@ -1969,6 +2155,16 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
             &b.pod,
             &b.command,
         );
+        // AND THE KEPT RECORD, FOR THE SAME REASON, in the same place: the sentence above says the
+        // supervisor never records its own code under a `stop`, and the kept record is the one that
+        // OUTLIVES this runtime dir. The supervisor's own call covers a box that ended by itself;
+        // this covers the one `stop` ended, which otherwise said "never ran" for ever while the
+        // transient record said `exit 137` (measured, both rows in one `ps -a`).
+        if let Some(kd) = crate::keepbox::dir_of(&b.name) {
+            if kd.is_dir() {
+                crate::keepbox::set_exit(&kd, outcome.exit_code());
+            }
+        }
         let _ = std::fs::remove_file(dir.join(format!("{}-{}", b.name, b.pid)));
         registry::clear_health(&b.name, b.pid);
         // The environment sidecar has the same lifetime as the health one: cleared together so a
@@ -2129,6 +2325,184 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+/// `kern start <name>...` - run a box created with `box --keep` again, on the writable layer it left
+/// behind.
+///
+/// IT RE-RUNS THE RECORDED COMMAND, which is the whole design (see [`crate::keepbox`]): the box comes
+/// back with the mounts, caps, filter, profile, ports and workload the operator gave it, because what
+/// is replayed is their own command line rather than a field-by-field reconstruction that could
+/// disagree with it. The kern that runs is THIS one, by path: a `kern start` must not be answered by
+/// a different binary that happens to come first on `PATH`.
+///
+/// A box of that name that is ALREADY RUNNING is refused, not restarted. Two boxes cannot hold one
+/// name, and the operator who typed `start` on a live box meant something kern cannot guess between
+/// (`stop` then `start`, or nothing at all).
+///
+/// IN THE DIRECTORY THE BOX WAS CREATED IN, because a relative `-v ./data:/data` means nothing
+/// anywhere else. A directory that is gone is a refusal that names it, rather than a box whose mounts
+/// quietly resolve against wherever the operator happens to stand.
+pub fn start_kept(names: &[String]) -> Result<(), Error> {
+    let self_exe = std::env::current_exe()
+        .map_err(|e| Error::Sandbox(format!("cannot locate the kern binary: {e}")))?;
+    let many = names.len() > 1;
+    let mut first: Option<Error> = None;
+    let mut failed = 0usize;
+    for name in names {
+        let r = start_one_kept(&self_exe, name);
+        match r {
+            Ok(code) => {
+                // THE WORKLOAD'S OWN EXIT CODE IS THE CALLER'S, like `kern box`, but only when one
+                // box was named: with several, the codes cannot all be the status of this process, so
+                // a non-zero one is reported as a failure of that box and the summary is the status.
+                if !many {
+                    std::process::exit(code);
+                }
+                if code != 0 {
+                    failed += 1;
+                    eprintln!("kern: '{name}' exited {code}");
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                if many {
+                    eprintln!("kern: '{name}': {e}");
+                } else if first.is_none() {
+                    first = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(e) = first {
+        return Err(e);
+    }
+    if failed > 0 {
+        return Err(Error::Sandbox(format!(
+            "{failed} of {} box(es) did not start or exited non-zero",
+            names.len()
+        )));
+    }
+    Ok(())
+}
+
+/// One box of [`start_kept`]: the recorded command, run to completion. Returns its exit code.
+fn start_one_kept(self_exe: &std::path::Path, name: &str) -> Result<i32, Error> {
+    let Some(dir) = crate::keepbox::dir_of(name) else {
+        return Err(Error::Sandbox(format!(
+            "'{name}' is not a box name kern would have made"
+        )));
+    };
+    // ALREADY RUNNING: refused before the record is even read, because the answer does not depend on
+    // what the record says. `find_ref` resolves a name or an id prefix, the same way `stop` does.
+    if let Some(inst) = registry::find_ref(name) {
+        return Err(Error::AlreadyRunning(format!(
+            "box '{}' is already running (pid {}) - `kern stop {}` first, or `kern exec {} <cmd>` to \
+             run something in the box that is up",
+            inst.name, inst.pid, inst.name, inst.name
+        )));
+    }
+    let Some((argv, meta)) = crate::keepbox::read(&dir) else {
+        // TWO DIFFERENT FACTS, TWO SENTENCES. "No kept box" sends the reader to look for a box that
+        // is not there; a box whose DIRECTORY is there and whose record kern cannot read is there,
+        // takes disk, and is invisible in `kern ps -a` (the listing skips what it cannot read, which
+        // is right: it would have nothing true to print). Measured with a record one byte over the
+        // size bound, which is the shape an editor or a truncated write leaves: the old message said
+        // the box did not exist while its layer sat in the store.
+        if dir.is_dir() {
+            return Err(Error::Sandbox(format!(
+                "kept box '{name}': its layer is in {} but kern cannot read the record beside it, \
+                 so it does not know what to run. `kern rm {name}` removes both and `kern box \
+                 {name} --image <ref> --keep -- <cmd>` makes it again",
+                dir.display()
+            )));
+        }
+        return Err(Error::NotRunning(format!(
+            "no kept box '{name}': `kern box {name} --image <ref> --keep -- <cmd>` creates one, and \
+             `kern ps -a` lists the ones there are. A box started without `--keep` leaves nothing to \
+             start again, which is kern's default"
+        )));
+    };
+    // THE RECORD MUST BE A `kern box` COMMAND LINE, which is the only thing `--keep` ever writes.
+    // `kern start` runs THIS binary with the recorded argv, so the record decides which verb runs;
+    // checking it keeps that decision inside what `--keep` can produce instead of inheriting
+    // whatever is on disk. The store is the user's own (`$XDG_DATA_HOME/kern/boxes`, 0700), so this
+    // is not a trust boundary - it is the same reason `read` bounds the record's size and rejects an
+    // empty argv: a record kern did not write is reported, not replayed.
+    // `box <name>` AS THE FIRST TWO ELEMENTS, not "box somewhere and the name somewhere". MEASURED
+    // on the first version, which asked for `argv[0] == "box"` and the name ANYWHERE in the line: a
+    // record of `box other-name --keep --image … -- /bin/true <name>` passed, and `kern start
+    // <name>` started a box called `other-name` with an image the `ps -a` row did not show. A
+    // replay can now only ever be this box.
+    let looks_like_box = argv.first().is_some_and(|a| a == "box")
+        && argv.get(1).is_some_and(|a| a == std::ffi::OsStr::new(name));
+    if !looks_like_box {
+        return Err(Error::Sandbox(format!(
+            "kept box '{name}': its record does not begin `box {name}`, so it is not a command \
+             line this box can be started from. `kern rm {name}` removes it, and `kern box {name} \
+             --image <ref> --keep -- <cmd>` makes it again"
+        )));
+    }
+    let cwd = std::path::PathBuf::from(&meta.cwd);
+    if !meta.cwd.is_empty() && !cwd.is_dir() {
+        return Err(Error::Sandbox(format!(
+            "kept box '{name}' was created in {} and that directory is gone, so a relative path in \
+             its command line (a `-v ./dir:/dir`, a `--env-file`) would resolve somewhere else. \
+             Re-create it with `kern box {name} ... --keep` from where you want it to run",
+            meta.cwd
+        )));
+    }
+    let mut cmd = std::process::Command::new(self_exe);
+    cmd.args(&argv);
+    if !meta.cwd.is_empty() {
+        cmd.current_dir(&cwd);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| Error::Sandbox(format!("kept box '{name}': cannot run kern again: {e}")))?;
+    // 128 + signal, the shell's convention and the one `kern wait` uses, for a kern killed by a
+    // signal while the box ran. `code()` is None exactly then.
+    Ok(status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    }))
+}
+
+/// `kern rm <name>...` - remove a stopped `--keep` box: its writable layer and its record, in one
+/// removal (they live in one directory, see [`crate::keepbox`]).
+///
+/// A RUNNING BOX IS REFUSED AND NOT KILLED. Docker's `rm` behaves this way, and the reason is the
+/// same: `rm` on a box that is up is as likely to be a typo as an intention, and the data it would
+/// take with it is the data the operator asked to keep. The message names `stop`.
+pub fn remove_kept(names: &[String]) -> Result<(), Error> {
+    let p = crate::ui::Palette::detect();
+    let mut failures: Vec<String> = Vec::new();
+    for name in names {
+        if let Some(inst) = registry::find_ref(name) {
+            failures.push(format!(
+                "'{}' is running (pid {}) - `kern stop {}` first",
+                inst.name, inst.pid, inst.name
+            ));
+            continue;
+        }
+        match crate::keepbox::remove(name) {
+            Ok(()) => println!("removed kept box '{}{name}{}'", p.c, p.z),
+            Err(e) => failures.push(format!("'{name}': {e}")),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    // One sentence per name that could not go, and a non-zero status: `kern rm a b` where `b` is
+    // running has not done what was asked, and a script reading the status must not be told it has.
+    for f in &failures {
+        eprintln!("kern: {f}");
+    }
+    Err(Error::Sandbox(format!(
+        "{} of {} kept box(es) could not be removed",
+        failures.len(),
+        names.len()
+    )))
 }
 
 #[cfg(test)]

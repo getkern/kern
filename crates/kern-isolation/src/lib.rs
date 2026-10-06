@@ -261,6 +261,31 @@ pub use outcome::{Outcome, OutputView, ResourceSource};
 /// terminal. `setup_hint_reads_as_one_sentence` asserts the rendering rather than the source.
 pub const SETUP_FAILURE_HINT: &str =
     "the box could not be BUILT, which is a host capability rather than a wrong command: the mount, the uid map, the seccomp filter or the AppArmor profile. `kern doctor` reports all four, and a `--rootfs` that does not exist or is not a directory fails the same way.";
+/// The remedy line for a setup failure, chosen by what the failure says: [`SETUP_FAILURE_HINT`] for
+/// the class, and a more specific line where the errno already rules the host out.
+///
+/// ONE FUNCTION FOR BOTH PROCESSES, for the reason [`SETUP_FAILURE_HINT`] is one constant: the forked
+/// child prints its own hint and `_exit`s, and the CLI prints one for everything that fails before
+/// the fork. Keyed on the rendered message, because by the time the CLI decides the error has
+/// crossed that process boundary as text.
+///
+/// AN OVERLAY MOUNT THAT ANSWERS ENOENT IS NOT A HOST CAPABILITY. Every directory in its options -
+/// the image's layers, and the box's own `upper`, `work` and `merged` - existed when the options were
+/// written, so ENOENT from the mount means one of them was removed in between, by something else on
+/// the same machine. MEASURED: `kern recover` running beside other `kern box` calls produced exactly
+/// this, 42 boxes in 160, and the generic line under it told the reader the host could not build a
+/// box and sent them to `kern doctor`, which reported a healthy host. (The `recover` side is fixed;
+/// the hint is for whatever else deletes those directories.)
+pub fn setup_failure_hint(msg: &str) -> &'static str {
+    if msg.contains("mount(overlay)") && msg.contains("(os error 2)") {
+        return OVERLAY_VANISHED_HINT;
+    }
+    SETUP_FAILURE_HINT
+}
+
+/// See [`setup_failure_hint`]. One physical line, for the reason given on [`SETUP_FAILURE_HINT`].
+pub const OVERLAY_VANISHED_HINT: &str =
+    "a directory this mount needs was removed while the box was being built: one of the image's layers, or the box's own scratch under the runtime directory. That is something else on this machine deleting it at the same moment (an image removal, a cleanup of $XDG_RUNTIME_DIR), not a host capability, and starting the box again normally succeeds.";
 pub use ports::{preflight as preflight_ports, PortMap};
 /// While kern waits for a box, treat a fatal signal as "end the BOX", not "end kern": forward it to
 /// the box and keep reaping, so kern exits with (and records) the box's own status. See
@@ -282,7 +307,7 @@ pub use real::{
     TmpfsMount, UidRange, Unplaceable, VdiskMount, Volume, ULIMITS,
 };
 pub use real::{iface_set_ipv4, iface_up, member_mac, pod_bridge_parts, POD_BRIDGE};
-pub use real::{overlay_escape, overlay_lowerdir};
+pub use real::{mount_overlay_c, overlay_escape, overlay_lowerdir, OverlayMount, OverlayOpts};
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};
 pub use seccomp::{denied_syscall_count, SeccompFilter};
