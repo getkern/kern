@@ -6,7 +6,14 @@ on:
     # name says something untrue about what is being built. Add the branch back, in the same push
     # that creates it, whenever work leaves `main` again. It is back for the SDK scratch work
     # (a writable /tmp and the tmpfs knob); remove it again when that lands on main.
-    branches: [main, dev]
+    #
+    # `sandbox-gaps_2026-10-06_0742` carries six sprints that are not on main yet: `box --keep` with
+    # `kern start`/`kern rm`, `kern exec -u`, the per-instruction build cache, the SDK's `user=` and
+    # one snapshot format for both bindings. It is here for the same reason `dev` is: the work is off
+    # main and the runner's host shape is the one thing a local gate cannot reproduce (no
+    # `cgroup.procs` to write, the musl and gnu lints, the arm64 cross build). Remove this line in
+    # the push that merges it.
+    branches: [main, dev, sandbox-gaps_2026-10-06_0742]
   pull_request:
   workflow_dispatch: {}
 
