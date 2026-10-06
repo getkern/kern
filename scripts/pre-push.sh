@@ -93,10 +93,12 @@ bindings_python() {
     [ -d bindings/python/tests ] || return 0
     ( cd bindings/python && env -u KERN_BIN PATH=/usr/bin:/bin python3 -m pytest -q ) || return 1
 }
+# EVERY test file, by glob: a gate that names one file leaves the next one out without a word, and CI
+# runs no Node binding suite at all, so this is the only place they run.
 bindings_node() {
-    [ -f bindings/node/test/sandbox.test.js ] || return 0
+    ls bindings/node/test/*.test.js >/dev/null 2>&1 || return 0
     command -v node >/dev/null || return 0
-    ( cd bindings/node && env -u KERN_BIN node --test test/sandbox.test.js ) || return 1
+    ( cd bindings/node && env -u KERN_BIN node --test test/*.test.js ) || return 1
 }
 step "python binding, CI shape" bindings_python
 step "node binding"            bindings_node

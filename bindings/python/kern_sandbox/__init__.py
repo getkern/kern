@@ -24,7 +24,9 @@ Design, the "middle way" (validated with review):
     not two Sandbox-like surfaces that drift apart. (# DECISION, independent test-ratified.)
   * I/O is HOST-DIRECT: the workspace is a host dir and single-uid maps box-root to the host user, so
     files the box creates are host-owned - write_file/read_file are plain host filesystem I/O, no
-    `kern cp`, no in-box shim. (`--uid-range` breaks this ownership and is OUT of v1 scope. # DECISION.)
+    `kern cp`, no in-box shim. A non-root `user=` (or image `USER`) is a uid of kern's range instead:
+    the workspace is shared with it through a POSIX ACL, and what it closes to the host on purpose is
+    reached through a helper box (see `Sandbox.user`).
 
 Threat model (honest): kern is a KERNEL-BOUNDARY sandbox for YOUR OWN or SEMI-TRUSTED code. seccomp
 is a DENYLIST - suitable for semi-trusted agent code, NOT a hard boundary against deliberately hostile
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import contextlib
 import errno
 import functools
 import hashlib
@@ -47,6 +50,7 @@ import select
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -93,7 +97,7 @@ _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside ev
 _RESIDENT_GONE = "no running box named"
 
 
-def _workspace_usage(root: str) -> int:
+def _workspace_usage(root: str, blind: "list[str] | None" = None) -> int:
     """Bytes the workspace occupies ON DISK, or 0 when it cannot be read.
 
     `st_blocks * 512` and NOT `st_size`, because the question is "how much of the disk is gone" and
@@ -110,23 +114,78 @@ def _workspace_usage(root: str) -> int:
     denial of service dressed as a measurement. `os.scandir` with `follow_symlinks=False` keeps the
     walk inside the directory tree, and the link itself is charged its own (tiny) blocks.
 
-    BEST EFFORT, never raising: a file deleted between `scandir` and `stat` is ordinary in a live
-    workspace, and a measurement that can abort a call is worse than one that is slightly stale.
+    CHURN IS BEST EFFORT, A DIRECTORY THAT IS CLOSED TO US IS NOT. A file deleted between `scandir`
+    and `stat` is ordinary in a live workspace and is skipped. A directory this process cannot read is
+    reported, because counting it as zero is how a cap is defeated for good: with the host uid owning
+    the workspace, one call writes two gigabytes into `h/` and `chmod`s it to 0, and every later call
+    then measures those bytes as nothing. Unreadable directories go into `blind` WHOLE (their entries
+    uncounted here, so nothing is counted twice) when the caller passes a list, and when it passes
+    none - a session with no box user to ask - the walk RAISES, so the caller refuses the call rather
+    than admitting it on a number it could not take.
+
+    BY DESCRIPTOR, like the file walk: each directory is opened `O_NOFOLLOW` relative to the one it
+    was listed from. By path, a directory swapped for a symlink after its parent's `lstat` sent this
+    walk onto the host's filesystem - unbounded work driven by untrusted input, which is the denial
+    of service the `follow_symlinks=False` was there to prevent and did not.
     """
     total = 0
     seen: set = set()
-    stack = [root]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(entry.path)
+    unreadable: "list[str]" = []
+    try:
+        base_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as e:
+        if blind is None and e.errno in (errno.EACCES, errno.EPERM):
+            raise
+        if e.errno in (errno.EACCES, errno.EPERM):
+            blind.append(root)
+        return total
+    # (path, parent descriptor) to open and list, or (None, fd) to close - see `_walk`, same shape.
+    stack: "list[tuple[str | None, int]]" = [(root, -1)]
+    try:
+        while stack:
+            current, parent_fd = stack.pop()
+            if current is None:
+                os.close(parent_fd)
+                continue
+            if parent_fd < 0:
+                fd = base_fd
+            else:
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                try:
+                    fd = os.open(os.path.basename(current), flags, dir_fd=parent_fd)
+                except (PermissionError, OSError) as e:
+                    if e.errno in (errno.EACCES, errno.EPERM):
+                        unreadable.append(current)
+                    elif e.errno not in _WALK_GONE:
+                        raise
+                    continue
+            keep_open = False
+            try:
+                stats = []
+                closed = False
+                try:
+                    with os.scandir(fd) as it:
+                        for entry in it:
+                            try:
+                                stats.append((entry.name, entry.stat(follow_symlinks=False)))
+                            except PermissionError:
+                                closed = True  # listable, not searchable
+                                break
+                            except OSError:
+                                continue
+                except PermissionError:
+                    closed, stats = True, []
+                except OSError as e:
+                    if e.errno not in _WALK_GONE:
+                        raise
+                    stats = []
+                if closed:
+                    unreadable.append(current)
+                    continue
+                subdirs = []
+                for name, st in stats:
+                    if stat.S_ISDIR(st.st_mode):  # from the lstat already taken: no second syscall
+                        subdirs.append(os.path.join(current, name))
                     # One charge per inode, on every file type, so a hard-linked tree is not
                     # multiplied and a directory's own blocks are still counted.
                     key = (st.st_dev, st.st_ino)
@@ -134,10 +193,431 @@ def _workspace_usage(root: str) -> int:
                         continue
                     seen.add(key)
                     total += getattr(st, "st_blocks", 0) * 512
-        except OSError:
-            continue
+                if subdirs:
+                    if fd != base_fd:
+                        stack.append((None, fd))
+                        keep_open = True
+                    stack.extend((d, fd) for d in subdirs)
+            finally:
+                if not keep_open and fd != base_fd:
+                    os.close(fd)
+    finally:
+        for current, fd in stack:
+            if current is None and fd != base_fd:
+                os.close(fd)
+        os.close(base_fd)
+    if unreadable:
+        if blind is None:
+            raise SandboxError(
+                f"the workspace cannot be measured: {len(unreadable)} directory(ies) under "
+                f"{root} cannot be read by this process, and counting them as empty would let a "
+                f"cap's worth of bytes sit where the walk does not look "
+                f"(first: {_quote_untrusted(unreadable[0])})"
+            )
+        blind.extend(unreadable)
     return total
+
+
+# -- `user=`: an account of the image, and what it takes for the workspace to stay shared -----------
+#
+# WHY THE WORKSPACE NEEDS ANYTHING AT ALL. Box root writes as this process (the single-uid map), so a
+# root box and the host agree on who owns every file. A NON-ROOT box user is a uid of kern's subordinate
+# range on disk: `node` (1000) in the box is 100999 on this host, measured. The workspace is 0700 and
+# ours, so that uid cannot enter it, and what it creates there is not ours to read or delete.
+#
+# A POSIX ACL closes both directions without moving anything: a named entry for the box user's host uid
+# on the workspace, and a DEFAULT ACL naming both uids, so each file either side creates inherits an
+# entry for the other. Measured: the box writes files and directories, `umask 077` included, and this
+# process reads and deletes them. What an ACL cannot do is outrank an explicit mode. A file created
+# 0600 or a directory created 0700 (`mkstemp`, `mkdtemp`) narrows the mask, and then only the box user
+# can reach it. For those this binding asks the box user itself, the owner, in a box of the same image
+# (see `Sandbox._helper_argv`), and it only does so after the host was refused.
+
+#: A `user=` value: `<user>[:<group>]`, each a name or a number. No leading `-`, so the value can never
+#: read as a flag on the argv it lands on, and no character an account name does not use.
+_USER_SPEC_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?")
+
+
+def _validate_user(spec: object) -> str:
+    if not isinstance(spec, str) or not _USER_SPEC_RE.fullmatch(spec):
+        raise SandboxError(
+            f"user must be '<user>' or '<user>:<group>', each a name or a number of the image's own "
+            f"accounts (e.g. user='node' or user='1000:1000'), got {spec!r}"
+        )
+    return spec
+
+
+def _is_root_user(spec: "str | None") -> bool:
+    """Whether ``spec`` runs the box as box root: no spec at all, or a user half of ``0`` or ``root``."""
+    return not spec or spec.split(":", 1)[0] in ("0", "root")
+
+
+def _image_user(image: str) -> "str | None":
+    """The ``USER`` the image declares, read from kern's config sidecar, or None when it declares none.
+
+    None also when the sidecar cannot be read, which leaves a session exactly as it was before this
+    existed. The sidecar is the file kern itself starts the box from, so the two cannot disagree about
+    the image's user."""
+    try:
+        path = _kern_image_file(image, ".image")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(1 << 20)
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, _, value = line.partition("\t")
+        if key == "user":
+            return value or None
+    return None
+
+
+# POSIX ACLs as the kernel stores them in the `system.posix_acl_*` xattrs (`posix_acl_xattr.h`): a
+# little-endian u32 version 2, then one `{u16 tag, u16 perm, u32 id}` per entry, ordered by tag and,
+# within the named tags, by id. Written here rather than through `setfacl` so the Python binding needs
+# nothing on the host but the kernel; the Node binding has no xattr call and uses `setfacl`.
+_ACL_ACCESS = "system.posix_acl_access"
+_ACL_DEFAULT = "system.posix_acl_default"
+_ACL_USER_OBJ, _ACL_USER, _ACL_GROUP_OBJ, _ACL_GROUP, _ACL_MASK, _ACL_OTHER = 1, 2, 4, 8, 16, 32
+_ACL_NO_ID = 0xFFFFFFFF
+
+
+def _acl_decode(blob: bytes) -> "list[tuple[int, int, int]] | None":
+    if len(blob) < 4 or (len(blob) - 4) % 8 or struct.unpack_from("<I", blob)[0] != 2:
+        return None
+    return [struct.unpack_from("<HHI", blob, off) for off in range(4, len(blob), 8)]
+
+
+def _acl_encode(entries: "list[tuple[int, int, int]]") -> bytes:
+    def order(e: "tuple[int, int, int]") -> "tuple[int, int]":
+        return (e[0], e[2] if e[0] in (_ACL_USER, _ACL_GROUP) else 0)
+
+    return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *e) for e in sorted(entries, key=order))
+
+
+def _acl_of_mode(mode: int) -> "list[tuple[int, int, int]]":
+    """The three entries a file with no ACL has: its mode bits."""
+    return [
+        (_ACL_USER_OBJ, (mode >> 6) & 7, _ACL_NO_ID),
+        (_ACL_GROUP_OBJ, (mode >> 3) & 7, _ACL_NO_ID),
+        (_ACL_OTHER, mode & 7, _ACL_NO_ID),
+    ]
+
+
+def _acl_with_user(entries: "list[tuple[int, int, int]]", uid: int, perm: int) -> "list[tuple[int, int, int]]":
+    """``entries`` with a named entry for ``uid`` at ``perm`` (replacing one already there) and the mask
+    recomputed as the union of the group class, which is what ``setfacl -m`` does."""
+    out = [e for e in entries if e[0] != _ACL_MASK and not (e[0] == _ACL_USER and e[2] == uid)]
+    out.append((_ACL_USER, perm, uid))
+    mask = 0
+    for tag, bits, _ in out:
+        if tag in (_ACL_USER, _ACL_GROUP_OBJ, _ACL_GROUP):
+            mask |= bits
+    out.append((_ACL_MASK, mask, _ACL_NO_ID))
+    return out
+
+
+
+
+def _acl_read(target: str, name: str) -> "list[tuple[int, int, int]] | None":
+    try:
+        return _acl_decode(os.getxattr(target, name))
+    except OSError as e:
+        if e.errno == errno.ENODATA:
+            return None
+        raise
+
+
+def _acl_grant_fd(fd: int, box_uid: int, own_uid: int) -> None:
+    """Give ``box_uid`` (the host uid the box user writes as) ``rwX`` on the inode ``fd`` holds, and for
+    a directory a default ACL naming both uids, so whatever either side creates inside stays reachable
+    by the other.
+
+    THROUGH THE DESCRIPTOR, NEVER A PATH. The workspace can be written by a box while this runs (a
+    resident box of an earlier session), and a path is resolved again at every call: a component
+    swapped for a symlink between the listing and the `setxattr` would put the entry on a HOST file
+    the link names, granting a uid of the range access to it. ``fd`` is an ``O_PATH | O_NOFOLLOW``
+    descriptor and ``/proc/self/fd/<fd>`` resolves to exactly that inode, whatever the path says now.
+
+    Only on what this process owns and is not a symlink: the box user's own files are its to reach, a
+    symlink has no ACL of its own, and an ACL can only be set by the owner. The entry is the OWNER's
+    bits, which is what box root gets on this file in a root session: a file its owner made read-only
+    stays read-only to the box user too. Existing named entries are kept, so a workspace shared by two
+    sessions with different users serves both. The default ACL's
+    owner, group and other entries are SET (rwx, none, none), as the Node binding's ``setfacl -m``
+    sets them: a default ACL makes the box's umask irrelevant, and group or other entries there would
+    publish what a ``umask 077`` workload meant to keep."""
+    st = os.fstat(fd)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != own_uid:
+        return
+    target = f"/proc/self/fd/{fd}"
+    is_dir = stat.S_ISDIR(st.st_mode)
+    perm = (st.st_mode >> 6) & 7
+    access = _acl_read(target, _ACL_ACCESS) or _acl_of_mode(st.st_mode)
+    os.setxattr(target, _ACL_ACCESS, _acl_encode(_acl_with_user(access, box_uid, perm)))
+    if is_dir:
+        named = [e for e in (_acl_read(target, _ACL_DEFAULT) or []) if e[0] in (_ACL_USER, _ACL_GROUP)]
+        default = named + [
+            (_ACL_USER_OBJ, 7, _ACL_NO_ID),
+            (_ACL_GROUP_OBJ, 0, _ACL_NO_ID),
+            (_ACL_OTHER, 0, _ACL_NO_ID),
+        ]
+        for uid in (own_uid, box_uid):
+            default = _acl_with_user(default, uid, 7)
+        os.setxattr(target, _ACL_DEFAULT, _acl_encode(default))
+
+
+def _acl_grant(path: str, box_uid: int, own_uid: int) -> None:
+    """:func:`_acl_grant_fd` on ``path``, which must be one this process controls (the workspace root):
+    only its final component is opened ``O_NOFOLLOW``."""
+    fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        _acl_grant_fd(fd, box_uid, own_uid)
+    finally:
+        os.close(fd)
+
+
+def _acl_grant_tree(root: str, box_uid: int, own_uid: int) -> "tuple[int, str]":
+    """:func:`_acl_grant_fd` on ``root`` and on everything under it this process owns, walked by
+    DESCRIPTOR (``os.fwalk``, each entry opened ``O_PATH | O_NOFOLLOW`` relative to its parent's fd),
+    so no entry is reached through a path the box could have redirected. A directory this process
+    cannot read is the box user's own, which it can already reach. ONE FILESYSTEM: a mount inside the
+    workspace is not descended into, so a broad ``workspace=`` cannot hand entries out across it.
+
+    Returns how many entries belong to a THIRD uid, neither this process nor ``box_uid``, and one of
+    them: an earlier session's different account. Neither side can give those an entry (only their
+    owner can), so the caller says so rather than let them fail in the box.
+
+    A DIRECTORY THIS PROCESS CANNOT ENTER IS SKIPPED, ON BOTH PATHS, AND THAT IS ONE DECISION RATHER
+    THAN TWO. `os.fwalk` has no `onerror`, so a subtree it could not open simply disappeared from the
+    walk, while the per-entry open of a directory this process can list but not search raised
+    `PermissionError` and failed the whole call - the same condition, silence in one place and a
+    refusal in the other. It is the box user's own either way, which is what the docstring above
+    says, so both skip it."""
+    _acl_grant(root, box_uid, own_uid)
+    device = os.stat(root, follow_symlinks=False).st_dev
+    foreign, example = 0, ""
+
+    def not_ours(e: OSError) -> None:
+        """A subtree `fwalk` could not open. EACCES/EPERM is the box user's own directory; anything
+        else is this caller's to see, because a grant silently not made shows up as a box that
+        cannot read its own workspace."""
+        if e.errno not in (errno.EACCES, errno.EPERM, errno.ENOENT):
+            raise e
+
+    for dirpath, dirnames, filenames, dirfd in os.fwalk(
+        root, follow_symlinks=False, onerror=not_ours
+    ):
+        for name in [*dirnames, *filenames]:
+            try:
+                fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirfd)
+            except FileNotFoundError:
+                continue  # removed between the listing and the grant: nothing left to grant
+            except PermissionError:
+                continue  # the box user's own, which it can already reach
+            try:
+                st = os.fstat(fd)
+                if stat.S_ISLNK(st.st_mode):
+                    continue
+                if st.st_dev != device:
+                    if name in dirnames:
+                        dirnames.remove(name)  # another filesystem: neither granted nor descended
+                    continue
+                if st.st_uid not in (own_uid, box_uid):
+                    foreign += 1
+                    example = example or os.path.relpath(os.path.join(dirpath, name), root)
+                    continue
+                _acl_grant_fd(fd, box_uid, own_uid)
+            finally:
+                os.close(fd)
+    return foreign, example
+
+
+#: The helper box's scripts (see `Sandbox._helper_argv`), run by `sh -c SCRIPT sh ARGS...` as the box
+#: user with the workspace at `/w`. Each takes PATH COMPONENTS, never a path string, and refuses a
+#: symlink in any of them: the same rule `_open_nofollow` applies on the host, so the fallback cannot
+#: reach what the direct path would refuse. Exit 40 is a symlink, 41 not a regular file, 42 a directory
+#: that could not be made, 43 not a directory.
+# `$1` is a byte limit ("" for none) and the rest are the components.
+_HELPER_READ = (
+    'l=$1; shift; p=/w; for c in "$@"; do p="$p/$c"; if [ -L "$p" ]; then exit 40; fi; done; '
+    '[ -f "$p" ] || exit 41; if [ -n "$l" ]; then exec head -c "$l" -- "$p"; fi; exec cat -- "$p"'
+)
+# The data goes into a file `mktemp` creates (O_EXCL, a name nobody can predict, so nothing can be
+# planted there first), opened up to 0664 so the host keeps its entry through the mask, and then
+# replaces the target by `mv`, which renames and never follows the old name.
+_HELPER_WRITE = (
+    'p=/w; n=$#; i=0; for c in "$@"; do i=$((i+1)); p="$p/$c"; '
+    'if [ -L "$p" ]; then exit 40; fi; '
+    'if [ "$i" -lt "$n" ]; then [ -d "$p" ] || mkdir -- "$p" || exit 42; fi; done; '
+    'if [ -e "$p" ] && [ ! -f "$p" ]; then exit 41; fi; '
+    't=$(mktemp "${p%/*}/.kern-write-XXXXXX") || exit 42; '
+    'chmod 664 "$t" && cat > "$t" && mv -f -- "$t" "$p"'
+)
+# One record per entry under the given subtrees (relative to /w): `<raw mode hex> <size> <mtime>\n<path>\0`.
+# The stat line has no newline in it and comes first, so a name with a newline still parses.
+_HELPER_LIST = (
+    'cd /w || exit 1; find "$@" -exec sh -c '
+    '\'for f; do stat -c "%f %s %Y" -- "$f" && printf "%s\\0" "$f"; done\' sh {} +'
+)
+_HELPER_DU = 'cd /w || exit 1; du -sk -- "$@"'
+_HELPER_ISDIR = 'p=/w; for c in "$@"; do p="$p/$c"; if [ -L "$p" ]; then exit 40; fi; done; [ -d "$p" ] || exit 43'
+# The account owns what it closed, so it can always open it up first; `chmod` refuses on what is not
+# its own, which is the host's and goes in the host's `rmtree`.
+_HELPER_CLEAN = (
+    'chmod -R u+rwX -- /w/* /w/.[!.]* /w/..?* 2>/dev/null; rm -rf -- /w/* /w/.[!.]* /w/..?*'
+)
+#: What the scripts need in the image, said by the refusal that cannot run them. Node says the same.
+_HELPER_TOOLS = (
+    "The image needs a POSIX shell with cat, head, find, stat, du, tar, mktemp, chmod, mv, mkdir and "
+    "rm (coreutils or busybox)"
+)
+_HELPER_TAR = 'cd /w || exit 1; exec tar -cf - "$@"'
+_HELPER_UNTAR = "exec tar -x -o -f - -C /w"
+
+
+def _helper_subtree(rel: str) -> str:
+    """A workspace-relative path as a helper script argument: under `./`, so a name can never read as
+    an option, and `.` for the workspace itself."""
+    return "./" + rel if rel and rel != "." else "."
+
+
+def _under_deps(rel: str) -> bool:
+    """Whether a workspace-relative path is inside a `.deps` directory, at any depth: the rule the host
+    walk applies by not descending there, for paths that came from the helper instead."""
+    return _DEPS_DIR in rel.split("/")[:-1]
+
+
+def _parse_helper_list(raw: bytes) -> "list[tuple[str, int, int, int]]":
+    """``(path relative to /w, st_mode, size, mtime_s)`` per record of :data:`_HELPER_LIST`."""
+    out = []
+    for rec in raw.split(b"\0"):
+        head, sep, name = rec.partition(b"\n")
+        fields = head.split()
+        if not sep or len(fields) != 3:
+            continue
+        try:
+            mode, size, mtime = int(fields[0], 16), int(fields[1]), int(fields[2])
+        except ValueError:
+            continue
+        path = os.fsdecode(name)
+        path = path[2:] if path.startswith("./") else path
+        if path and path != ".":
+            out.append((path, mode, size, mtime))
+    return out
+
+
+
+def _anonymise_member(info: "object") -> "object":
+    """Strip the OWNERSHIP of a snapshot member: uid/gid 0 and no account names.
+
+    `restore` never applies ownership - it writes as the caller, whoever that is - so the fields are
+    not read back on either side, and what they do carry is the HOST's account layout: measured, a
+    Python-written archive listed `alex/alex` on every member read from the host while the members
+    read through the helper box (which normalises them) listed `0/0`, so one archive had two
+    conventions in it. The name of an account on the machine that took the snapshot means nothing on
+    the machine that restores it, and a uid number means less: the Node binding has always written
+    `0/0`, so this is also the end of a difference between the two.
+
+    The MODE is deliberately kept - `restore` does read it, masked to the owner's bits."""
+    info.uid = info.gid = 0  # type: ignore[attr-defined]
+    info.uname = info.gname = ""  # type: ignore[attr-defined]
+    return info
+
+
+def _dir_tarinfo(tf: "object", arcname: str, st: os.stat_result) -> "object":
+    """The TarInfo ``tarfile.gettarinfo`` fills for a DIRECTORY, from an ``fstat`` already taken on its
+    open descriptor: the same fields, so a snapshot archived by descriptor has the members one archived
+    by path had. Directories are the only non-regular member a snapshot writes (see `_snapshot_add`)."""
+    import tarfile
+
+    info = tf.tarinfo()  # type: ignore[attr-defined]
+    info.name, info.mode = arcname, st.st_mode
+    info.size, info.mtime, info.type = 0, st.st_mtime, tarfile.DIRTYPE
+    return _anonymise_member(info)
+
 _DEPS_DIR = ".deps"  # pip --target dir inside the workspace (added to PYTHONPATH for run_code)
+
+# WHAT A SNAPSHOT'S `.deps` WAS BUILT FOR, as the archive's FIRST member. `setup=` installs into `.deps`
+# with the session image's own pip, so a compiled package there is bound to that image's Python, libc
+# and CPU. MEASURED: `orjson` installed by `setup=` in a python 3.12 glibc image, snapshotted, restored
+# into `python:3.10-alpine`, then `import orjson` -> `ModuleNotFoundError: No module named
+# 'orjson.orjson'`, with nothing pointing at the snapshot or at the image it came from. The record lets
+# `restore` say where the packages were built, at the moment they arrive.
+#
+# NOT A RESERVED NAME in the workspace: reserving one would let a box hide a file from snapshots and
+# listings by giving it that name, which is the invitation `_is_ours` stopped accepting. It is
+# recognised only as the FIRST member and only with its key, so a user's own file of the same name is
+# a later member and is restored like any other, and an archive with no record (an older snapshot, a
+# `tar` made by hand) restores exactly as before.
+_SNAPSHOT_RECORD = ".kern-snapshot.json"
+_SNAPSHOT_RECORD_KEY = "kern_snapshot"
+_SNAPSHOT_RECORD_MAX = 4096
+
+
+def _host_machine() -> str:
+    """The CPU architecture a box on this host runs, as `uname -m` spells it: boxes are native."""
+    return os.uname().machine
+
+
+_SNAPSHOT_FIELD = re.compile(r"[\x21-\x7e]{1,256}")
+
+
+def _snapshot_record(raw: bytes) -> "dict | None":
+    """The provenance record in ``raw``, or None when it is not one. ONE RULE, spelled the same in both
+    bindings, because an archive restored by the other one must be read the same way: strict UTF-8 JSON
+    (no BOM, no UTF-16), an object whose key is the INTEGER 1 (``true`` is not 1), and ``image`` and
+    ``machine`` as 1 to 256 printable ASCII characters. The last is what an image reference and a
+    `uname -m` are; it also keeps a crafted archive from putting escape sequences or a lone surrogate
+    into the warning `restore` prints, which made this binding's restore raise outright."""
+    import json as _json
+
+    try:
+        parsed = _json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    # The NUMBER 1, as JSON has it: `1`, `1.0` and `1e0` are one value to Node's parser, so they are one
+    # value here too. `true` is not a number, though Python would compare it equal to 1.
+    key = parsed.get(_SNAPSHOT_RECORD_KEY)
+    if isinstance(key, bool) or not isinstance(key, (int, float)) or key != 1:
+        return None
+    for field_name in ("image", "machine"):
+        value = parsed.get(field_name)
+        if not isinstance(value, str) or not _SNAPSHOT_FIELD.fullmatch(value):
+            return None
+    return parsed
+
+
+def _snapshot_origin_note(record: "dict | None", image: str, machine: str, has_deps: bool) -> "str | None":
+    """The warning `restore` gives for a snapshot whose `.deps` were built elsewhere, or None.
+
+    Compared on the image REFERENCE, normalised the way kern keys its cache (`alpine` is
+    `alpine:latest`), and on the CPU. A tag that moved between the two hosts is not seen: kern keeps no
+    content digest for a pulled image, so there is nothing local to compare, and the note does not
+    claim otherwise."""
+    if not has_deps or not isinstance(record, dict):
+        return None
+    was_image = record.get("image")
+    was_machine = record.get("machine")
+    if not isinstance(was_image, str) or not isinstance(was_machine, str):
+        return None
+    if _sanitize_ref(was_image) == _sanitize_ref(image) and was_machine == machine:
+        return None
+    return (
+        f"restore: this snapshot's .deps were installed in image {was_image!r} on {was_machine!r}, and "
+        f"this sandbox runs {image!r} on {machine!r}. A compiled package in .deps (a C or Rust "
+        f"extension) is built for one Python, libc and CPU, and fails to import on another - as "
+        f"ModuleNotFoundError or ImportError naming the package, not the snapshot. Run the install "
+        f"again in this sandbox (setup=) to rebuild them for its image."
+    )
+
+# The errors that mean "this name is not a directory any more", which is ordinary churn in a
+# workspace a box is writing to: the entry went, or it was replaced by something that is not a
+# directory (a symlink, which is refused by `O_NOFOLLOW` as ENOTDIR on current kernels, or a file).
+# EVERYTHING ELSE IS RAISED. Running out of descriptors or memory, or a failing disk, used to read as
+# churn too, and a walk that loses a subtree to that reports a workspace smaller than it is.
+_WALK_GONE = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
 
 # -- the standard library's bytecode, compiled once per image and mounted READ-ONLY ------------------
 #
@@ -343,11 +823,9 @@ def _pyc_source_id(image: str) -> str:
     try:
         # THE SAME RESOLUTION `_pyc_root` USES, through the same function, so a caller who moves
         # `$XDG_CACHE_HOME` moves both the bytecode cache and the identity it is checked against.
-        root = os.path.join(_cache_home(), "kern", "images")
-        safe = _sanitize_ref(image)
         h = hashlib.sha256()
         # THE CONFIG, which changes when ENTRYPOINT/ENV/WORKDIR/USER do.
-        with open(os.path.join(root, safe + ".image"), "rb") as fh:
+        with open(_kern_image_file(image, ".image"), "rb") as fh:
             h.update(fh.read(4096))
         # THE SENTINEL'S STAMP, NOT ITS BYTES. `.ok` holds the REFERENCE, so its contents are the tag
         # and never move when the tag does: hashing them missed the commonest case there is, a rebuilt
@@ -355,13 +833,13 @@ def _pyc_source_id(image: str) -> str:
         # that an image's content changed (`dir_size_cached` keys its cached total on exactly this
         # pair), because a re-pull rewrites the sentinel last. Using the same stamp means this cache is
         # invalidated by the same event kern already treats as "this image is not what it was".
-        st = os.stat(os.path.join(root, safe + ".ok"))
+        st = os.stat(_kern_image_file(image, ".ok"))
         h.update(f"{st.st_mtime_ns}:{st.st_size}".encode())
         # AND THE LAYER MANIFEST FOR A BUILT IMAGE, which names its layers by content. A pulled image
         # has no such file, and its absence is part of the identity too: an image that stops being
         # layered is not the same image.
         try:
-            with open(os.path.join(root, safe + ".layers"), "rb") as fh:
+            with open(_kern_image_file(image, ".layers"), "rb") as fh:
                 h.update(fh.read(8192))
         except OSError:
             h.update(b"\0no-layers")
@@ -398,6 +876,13 @@ def _fnv1a(s: str) -> int:
     for b in s.encode("utf-8"):
         h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h
+
+
+def _kern_image_file(image: str, suffix: str) -> str:
+    """One of the files kern keeps next to an image in ITS cache (`.image` config, `.ok` sentinel,
+    `.layers` manifest): the one place this package spells where they are, through `_cache_home`, so a
+    moved `$XDG_CACHE_HOME` moves every reader at once."""
+    return os.path.join(_cache_home(), "kern", "images", _sanitize_ref(image) + suffix)
 
 
 def _sanitize_ref(image: str) -> str:
@@ -438,7 +923,7 @@ def _image_is_cached(image: str) -> bool:
     differently) reads as NOT cached, which costs one `kern pull` that finds the image and returns: 2 ms,
     measured, with or without a network."""
     try:
-        return os.path.exists(os.path.join(_cache_home(), "kern", "images", _sanitize_ref(image) + ".ok"))
+        return os.path.exists(_kern_image_file(image, ".ok"))
     except Exception:  # noqa: BLE001 - "never raises" is the contract `_fetch_image` states
         return False
 
@@ -798,6 +1283,11 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
     try:
         os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
         os.makedirs(tmp, mode=0o700, exist_ok=True)
+        # THE TREE ITSELF IS 0755, its parent stays 0700. A box mounts this directory directly, so the
+        # parent is what keeps the host's other users out, and the tree has to be traversable by a
+        # NON-ROOT box user, a uid of kern's range that owns nothing here: at 0700 CPython could not
+        # enter the prefix, ignored it in silence and compiled every import from source again.
+        os.chmod(tmp, 0o755)
     except OSError:
         return
     # ONE BUILD PER DESTINATION ACROSS PROCESSES, not just within one. `_PYC_BUILDS` keeps two
@@ -924,6 +1414,58 @@ def _pyc_start_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> 
     th.start()
     return th
 _ENV_FILE = ".kern-env"  # host-side 0600 env file (kept out of argv so values don't show in `ps`)
+_ENV_DIR_PREFIX = "kern-sandbox-env-"
+# The env-file names an OLDER version wrote into the workspace: the bare legacy file, one per call box
+# named the way both bindings name them (`pysbx-`/`jssbx-` and 12 hex digits), and the resident box's
+# (`kern-sbx-` and the sandbox's name, in kern's box-name alphabet), which no version ever removed. A
+# REGULAR FILE of one of these names is kept out of SNAPSHOTS, which travel; it is NOT kept out of
+# listings, because every one of these shapes is one a cell can create and a listing the operator
+# cannot trust is worse than an archive carrying a stale file. See `_is_ours` and `_snapshot_add`.
+_LEGACY_ENV_FILE = re.compile(
+    r"\.kern-env(?:\.(?:(?:py|js)sbx-[0-9a-f]{12}|kern-sbx-[A-Za-z0-9_.-]{1,191}))?"
+)
+
+
+def _private_env_dir(avoid: str = "") -> str:
+    """A new 0700 directory for one session's env files, OUTSIDE the workspace ``avoid``.
+
+    The first candidate that is not inside the workspace: ``$XDG_RUNTIME_DIR`` when this user owns it
+    and nobody else can enter it (a tmpfs, so a file left by a process killed mid-call goes at logout),
+    the system temp directory, then the user's cache directory; ``mkdtemp`` makes the directory itself
+    0700 in each. "Not inside" is checked rather than assumed: a session given ``workspace="/tmp"`` with
+    no private runtime directory got its env directory under ``/tmp``, inside the workspace every box
+    mounts. If every candidate is inside it, the session is refused rather than given one that is."""
+    ws = os.path.realpath(avoid) if avoid else ""
+
+    def inside_workspace(path: str) -> bool:
+        real = os.path.realpath(path)
+        return bool(ws) and (real == ws or real.startswith(ws.rstrip(os.sep) + os.sep))
+
+    def closed_to_others(path: str) -> bool:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not (st.st_mode & 0o077)
+
+    candidates = []
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or ""
+    if os.path.isabs(runtime) and closed_to_others(runtime):
+        candidates.append(runtime)
+    candidates.append(tempfile.gettempdir())
+    cache = os.path.join(_cache_home(), "kern-sandbox")
+    try:
+        os.makedirs(cache, mode=0o700, exist_ok=True)
+        candidates.append(cache)
+    except OSError:
+        pass
+    for base in candidates:
+        if not inside_workspace(base):
+            return tempfile.mkdtemp(prefix=_ENV_DIR_PREFIX, dir=base)
+    raise SandboxError(
+        f"no place for this session's env files outside its workspace ({avoid}): the runtime, temp and "
+        f"cache directories are all inside it. Give the Sandbox a workspace that does not contain them."
+    )
 # One file per CALL, `.kern-env.<box-name>`: a single fixed name made two concurrent calls on the
 # same Sandbox race for one path. The plain `.kern-env` is still recognised so a workspace written
 # by an older version is filtered out of file diffs and snapshots rather than surfacing as user state.
@@ -947,6 +1489,32 @@ import sys, builtins  # C builtins: no .py to recompile in the read-only slim bo
 _CELL = "__KERN_CELL__"
 _RES = "__KERN_RES__"
 _out = []
+# Figures this cell already put in _out, id -> (figure, PNG as drawn then, or None for the cell's FINAL
+# value). The figure is kept alive, so an id freed and reused within the cell cannot make an unrelated
+# figure look already sent; the PNG lets the end of the cell skip a displayed figure only if the code did
+# not draw on it after (matplotlib renders an unchanged figure to the same bytes).
+_shown = {}
+def _figure_of(o):
+    """o if it is a matplotlib Figure, a subclass included, else None. Never raises: o is the cell's."""
+    try:
+        _mf = sys.modules.get("matplotlib.figure")
+        return o if _mf is not None and isinstance(o, _mf.Figure) else None
+    except Exception:
+        return None
+def _open_figures(plt):
+    """The figures pyplot holds open, read from the manager list matplotlib's own inline backend reads,
+    and not through plt.figure(n): that call MAKES a figure for a number closed meanwhile, and user code
+    may have replaced it. The number walk is the fallback for a matplotlib without the list."""
+    try:
+        from matplotlib._pylab_helpers import Gcf
+        # By figure NUMBER, the order the number walk gave: the manager list is in the order the
+        # figures were last made active.
+        return [m.canvas.figure for m in sorted(Gcf.get_all_fig_managers(), key=lambda m: m.num)]
+    except Exception:
+        try:
+            return [plt.figure(n) for n in plt.get_fignums()]
+        except Exception:
+            return []
 def _js(s):  # minimal JSON string encoder, so the box needs no `import json` (~80ms in a pyc-less slim box)
     r = ['"']
     for ch in s:
@@ -969,6 +1537,15 @@ def _js(s):  # minimal JSON string encoder, so the box needs no `import json` (~
     return "".join(r)
 def _bundle(o):
     d = {}
+    _fig = _figure_of(o)
+    if _fig is not None:
+        try:  # a Figure handed back as a value is DRAWN, as Jupyter's inline backend draws it
+            import base64, io  # lazy: a Figure exists, so matplotlib is already imported
+            _b = io.BytesIO()
+            _fig.savefig(_b, format="png")
+            d["image/png"] = base64.b64encode(_b.getvalue()).decode()
+        except Exception:
+            pass
     for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
                       ("_repr_svg_", "image/svg+xml"), ("_repr_latex_", "text/latex")):
         try:
@@ -1010,7 +1587,10 @@ def _bundle(o):
     return d
 def display(o=None, **kw):
     if o is not None:
-        _out.append(_bundle(o))
+        _d = _bundle(o)
+        _out.append(_d)
+        if "image/png" in _d and _figure_of(o) is not None:
+            _shown[id(o)] = (o, _d["image/png"])  # as drawn at this line; the code may draw on after it
 builtins.display = display
 sys.argv = [_CELL]
 _g = {"__name__": "__main__", "__file__": _CELL, "display": display}
@@ -1034,6 +1614,10 @@ try:
         _val = eval(compile(_tail, _CELL, "eval"), _g)
         if _val is not None:
             _out.append(_bundle(_val))
+            if _figure_of(_val) is not None:
+                # the FINAL value of the cell is the figure's final state: not sent again below. A
+                # display(fig) earlier in the cell records nothing, because the code may draw on after it.
+                _shown[id(_val)] = (_val, None)
 except SystemExit as _e:
     _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
 except BaseException as _e:
@@ -1047,10 +1631,18 @@ try:
     if "matplotlib.pyplot" in sys.modules:  # only if the cell actually used pyplot
         import base64, io  # lazy: matplotlib was already imported, so this is not the hot path
         _plt = sys.modules["matplotlib.pyplot"]
-        for _fig in _plt.get_fignums():
-            _buf = io.BytesIO()
-            _plt.figure(_fig).savefig(_buf, format="png")
-            _out.append({"image/png": base64.b64encode(_buf.getvalue()).decode()})
+        for _f in _open_figures(_plt):
+            try:  # one figure that cannot be drawn does not stop the others, as in the kernel
+                _was = _shown.get(id(_f))
+                _mine = _was is not None and _was[0] is _f
+                if not (_mine and _was[1] is None):  # the cell's final value is already in the results
+                    _buf = io.BytesIO()
+                    _f.savefig(_buf, format="png")
+                    _png = base64.b64encode(_buf.getvalue()).decode()
+                    if not (_mine and _was[1] == _png):  # displayed, and not drawn on since
+                        _out.append({"image/png": _png})
+            except Exception:
+                pass
 except Exception:
     pass
 try:
@@ -1083,8 +1675,42 @@ _PY_KERNEL_DRIVER = r'''
 import sys, io, json, base64, builtins, ast, os, threading, codecs, select, time
 _g = {"__name__": "__main__"}
 _out = []
+# Figures this cell already put in _out, id -> (figure, PNG as drawn then, or None for the cell's FINAL
+# value). The figure is kept alive, so an id freed and reused within the cell cannot make an unrelated
+# figure look already sent; the PNG lets the end of the cell skip a displayed figure only if the code did
+# not draw on it after (matplotlib renders an unchanged figure to the same bytes).
+_shown = {}
+def _figure_of(o):
+    """o if it is a matplotlib Figure, a subclass included, else None. Never raises: o is the cell's."""
+    try:
+        _mf = sys.modules.get("matplotlib.figure")
+        return o if _mf is not None and isinstance(o, _mf.Figure) else None
+    except Exception:
+        return None
+def _open_figures(plt):
+    """The figures pyplot holds open, read from the manager list matplotlib's own inline backend reads,
+    and not through plt.figure(n): that call MAKES a figure for a number closed meanwhile, and user code
+    may have replaced it. The number walk is the fallback for a matplotlib without the list."""
+    try:
+        from matplotlib._pylab_helpers import Gcf
+        # By figure NUMBER, the order the number walk gave: the manager list is in the order the
+        # figures were last made active.
+        return [m.canvas.figure for m in sorted(Gcf.get_all_fig_managers(), key=lambda m: m.num)]
+    except Exception:
+        try:
+            return [plt.figure(n) for n in plt.get_fignums()]
+        except Exception:
+            return []
 def _bundle(o):
     d = {}
+    _fig = _figure_of(o)
+    if _fig is not None:
+        try:  # a Figure handed back as a value is DRAWN, as Jupyter's inline backend draws it
+            _b = io.BytesIO()
+            _fig.savefig(_b, format="png")
+            d["image/png"] = base64.b64encode(_b.getvalue()).decode()
+        except Exception:
+            pass
     for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
                       ("_repr_svg_", "image/svg+xml"), ("_repr_latex_", "text/latex")):
         try:
@@ -1121,7 +1747,10 @@ def _bundle(o):
     return d
 def display(o=None, **kw):
     if o is not None:
-        _out.append(_bundle(o))
+        _d = _bundle(o)
+        _out.append(_d)
+        if "image/png" in _d and _figure_of(o) is not None:
+            _shown[id(o)] = (o, _d["image/png"])  # as drawn at this line; the code may draw on after it
 builtins.display = display
 # Make the CONTROL channel private so user code (a raw os.write, a C extension, a subprocess reading
 # stdin) can NEVER corrupt a reply on stdout nor steal a cell off stdin. dup the real stdin(0)/stdout(1)
@@ -1343,6 +1972,7 @@ while True:
     if _code is None:
         break
     _out.clear()
+    _shown.clear()
     with _ulock:
         _tcut[0] = False  # a cut belongs to the cell it happens in, so clear it at the cell boundary
         _sent[1] = _sent[2] = 0
@@ -1365,6 +1995,10 @@ while True:
             _v = eval(compile(_tail, "<cell>", "eval"), _g)
             if _v is not None:
                 _out.append(_bundle(_v))
+                if _figure_of(_v) is not None:
+                    # the FINAL value of the cell is the figure's final state: not sent again below. A
+                    # display(fig) earlier in the cell records nothing, because the code may draw on.
+                    _shown[id(_v)] = (_v, None)
     except SystemExit as _e:
         _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
     except BaseException as _e:
@@ -1383,10 +2017,29 @@ while True:
     try:
         if "matplotlib.pyplot" in sys.modules:
             _plt = sys.modules["matplotlib.pyplot"]
-            for _num in _plt.get_fignums():
-                _b = io.BytesIO()
-                _plt.figure(_num).savefig(_b, format="png")
-                _out.append({"image/png": base64.b64encode(_b.getvalue()).decode()})
+            # EACH OPEN FIGURE ONCE, THEN CLOSED, which is what Jupyter's inline backend does by
+            # default. Left open, every later cell re-sent every figure the session had drawn: a cell
+            # that only printed returned the plots of the cells before it, and paid a PNG encode for
+            # each. A figure the code still holds is not lost: fig or display(fig) draws it again.
+            # Closed in a finally of its own, so one figure that cannot be drawn is not left open to
+            # fail again in every cell after it.
+            for _f in _open_figures(_plt):
+                try:
+                    _was = _shown.get(id(_f))
+                    _mine = _was is not None and _was[0] is _f
+                    if not (_mine and _was[1] is None):  # the cell's final value is already in the results
+                        _b = io.BytesIO()
+                        _f.savefig(_b, format="png")
+                        _png = base64.b64encode(_b.getvalue()).decode()
+                        if not (_mine and _was[1] == _png):  # displayed, and not drawn on since
+                            _out.append({"image/png": _png})
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        _plt.close(_f)
+                    except Exception:
+                        pass
     except Exception:
         pass
     # Barrier: write the sentinel to fd 1/2 and read up to it, so this cell's raw/subprocess output is
@@ -1577,8 +2230,12 @@ class FileInfo:
 @dataclass
 class Result:
     """A rich, mime-typed value captured from ``run_code`` (Python), the way a Jupyter/E2B cell captures
-    output: the value of the code's last bare expression, every ``display(obj)`` call, and every open
-    matplotlib figure. ``data`` maps a MIME type to its payload: text/* and application/json are strings,
+    output: the value of the code's last bare expression, every ``display(obj)`` call, and every
+    matplotlib figure open when the code ends (one that IS the last expression's value is not repeated).
+    A ``Figure`` value is drawn as PNG, so ``fig`` or ``display(fig)`` shows a figure the code holds. In a
+    :meth:`Sandbox.kernel` session a figure is closed once its cell has returned it, as Jupyter's inline
+    backend closes it: a later cell does not return it again, and a ``plt.*`` call there draws on a new
+    figure. ``data`` maps a MIME type to its payload: text/* and application/json are strings,
     image/* are base64 strings (use the ``.png``/``.jpeg`` byte accessors). A single value can carry
     several representations (e.g. a DataFrame has both text/plain and text/html)."""
 
@@ -1683,6 +2340,12 @@ _FRAME_MCP_IMG_TAIL = " image result(s) omitted: reply-size cap]"
 # The two truncation notices are INLINE rather than line-anchored, and each surface words its own; both
 # are in the shared list for the same reason as the rest.
 _FRAME_MCP_CLIP = ("...[truncated ", " chars]")
+# The word that turns the clip's count into a FLOOR, for a stream the binding had already cut before the
+# reply was built: counted from what it KEPT, the number said a 100 MB output had lost about one
+# megabyte. Spelled once, because the neutraliser below has to recognise the floored form too: a
+# pattern that knew only the exact form would let a box print `...[truncated at least 5 chars]` and
+# have it read as the sandbox's own.
+_FRAME_MCP_CLIP_FLOOR = "at least "
 _FRAME_LC_CUT = ("... ", " characters of output, cut to fit ...")
 
 # Line-anchored markers: at the START of a line is where the surface itself writes them, so an anchored
@@ -1725,7 +2388,8 @@ _FORGED_LINE_FRAME = re.compile(
 )
 _FORGED_CUT_NOTICE = re.compile(
     "|".join(
-        [re.escape(_FRAME_MCP_CLIP[0]) + r"\d+" + re.escape(_FRAME_MCP_CLIP[1]),
+        [re.escape(_FRAME_MCP_CLIP[0]) + "(?:" + re.escape(_FRAME_MCP_CLIP_FLOOR) + r")?\d+"
+         + re.escape(_FRAME_MCP_CLIP[1]),
          re.escape(_FRAME_LC_CUT[0]) + r"\d+" + re.escape(_FRAME_LC_CUT[1])]
     )
 )
@@ -2863,6 +3527,12 @@ class Sandbox:
             defence in depth, not the boundary itself, and it changes one behaviour: a workload that
             binds a port below 1024 INSIDE the box needs ``CAP_NET_BIND_SERVICE``. Pass
             ``cap_drop=()`` for the pre-0.1.14 behaviour, or a narrower set.
+        user: the account of the IMAGE every box runs as, ``"<user>[:<group>]"``, each a name or a
+            number: ``"node"``, ``"1000"``, ``"1000:1000"``. ``None`` (default) runs as the image's own
+            ``USER``, box root when it declares none. A non-root user is a uid of kern's subordinate
+            range on disk, so the workspace is shared with it through a POSIX ACL (see
+            :attr:`user`): the workspace filesystem must support ACLs, and the host needs a range in
+            ``/etc/subuid``.
     """
 
     image: str = _DEFAULT_IMAGE
@@ -3011,6 +3681,32 @@ class Sandbox:
     # a call ever arrives. 1 is the right number for an interactive agent (calls are separated by model
     # thinking time, so the pool always refills between them); raise it only for bursts.
     prewarm: int = 0
+    #: The account of the image every box runs as: ``kern box --user``, and ``kern exec -u`` for a
+    #: ``persist=True`` call. ``None`` keeps the image's own ``USER``.
+    #:
+    #: ⭐ WHAT A NON-ROOT USER COSTS, MEASURED. It is a uid of kern's subordinate range on disk (``node``,
+    #: 1000 in the box, is 100999 on a host whose range starts at 100000), so it could neither enter the
+    #: 0700 workspace nor leave files there this process could read. At ``__enter__`` one box starts as
+    #: that user to learn its host uid, and the workspace gets a POSIX ACL naming it, plus a DEFAULT ACL
+    #: naming both uids, so whatever either side creates stays reachable by the other. A caller-given
+    #: ``workspace=`` gets the same entry on what is already in it, and keeps it. MEASURED on an
+    #: i7-14700KF against box root: ``__enter__`` 5.3 ms instead of 0.5 (the box and the ACL), and every
+    #: call +1.1 ms (14.9 instead of 13.8), the uid range's two setuid helpers on each box.
+    #:
+    #: ⛔ WHAT AN ACL CANNOT DO is outrank a mode the box user sets on purpose: a file it creates 0600 or a
+    #: directory 0700 (``tempfile.mkstemp``, ``mkdtemp``) narrows the mask to itself. ``read_file``,
+    #: ``write_file``, ``list_files``, ``result.files``, ``workspace_max_bytes``, ``snapshot``,
+    #: ``restore`` and the cleanup at exit then fall back to a short-lived box of the same image running
+    #: as THAT USER, the owner of what it closed, with the session's own ``cap_drop``: it reaches those
+    #: files without changing them, and nothing the account could not reach itself. It costs a box
+    #: start, and only on a path the host was refused; the image needs a shell and the usual tools
+    #: (``_HELPER_TOOLS``).
+    #:
+    #: Also ``KERN_MCP_USER`` for ``kern-mcp``.
+    #:
+    #: LAST AMONG THE FIELDS, after ``prewarm``: the dataclass takes positional arguments, and a field
+    #: added in the middle would have moved every one after it.
+    user: str | None = None
 
     _kern: str = field(default="", repr=False)
     _mount_args: list = field(default_factory=list, init=False, repr=False)
@@ -3020,7 +3716,13 @@ class Sandbox:
     _egress_allow: list = field(default_factory=list, init=False, repr=False)
     _cap_drop_args: list = field(default_factory=list, init=False, repr=False)
     _single_uid: bool = field(default=False, init=False, repr=False)
+    # The spec the boxes run as when it is NOT box root (`user=` or the image's own `USER`), and the host
+    # uid that account writes as, learned at `__enter__`. `None` for box root, which is free.
+    _as_user: "str | None" = field(default=None, init=False, repr=False)
+    _user_host_uid: "int | None" = field(default=None, init=False, repr=False)
     _ws: str = field(default="", init=False, repr=False)
+    # Where the per-box `--env-file`s live: a private directory OUTSIDE the workspace (see `_env_path`).
+    _env_dir: str = field(default="", init=False, repr=False)
     _own_ws: bool = field(default=False, init=False, repr=False)  # we created it → we delete it
     # The cache directory to mount: "" means this session compiles from source. Set at `__enter__` when
     # a cache is already there, and by `_pyc_adopt_if_ready` on the first call after this session's own
@@ -3167,7 +3869,11 @@ class Sandbox:
         # CHECKED, not assumed, for the two things a range could serve besides privilege drop:
         # `pip install --target` with network on installs the same three files either way, and an
         # image whose files are not root-owned (`postgres:16-alpine`, `node:20-slim`) reads the same.
-        # The class also exposes no `user=`, so nothing here can ask to run as a non-root uid.
+        # A non-root `user=` (or image `USER`) is the exception, and kern makes it so itself: a box
+        # that drops to a non-root uid needs that uid mapped, and kern maps the range for it whatever
+        # this flag says (measured: `--user 1000 --no-uid-range` runs with `1 100000 65536`). So
+        # `_base_argv` leaves the flag out for such a session rather than asking for what kern will not
+        # do.
         #
         # ONE MORE REASON IT IS THE RIGHT DEFAULT HERE: this class's own contract, stated at the top of
         # the module, is that "single-uid maps box-root to the host user, so files the box creates are
@@ -3180,6 +3886,8 @@ class Sandbox:
         # `setup=` is ONE SHELL COMMAND, and a list of package names is what a reader writes first
         # (measured on myself: `setup=["imageio-ffmpeg"]` surfaced as `AttributeError: 'list' object has
         # no attribute 'strip'` from inside `_run_setup`, an internal error where a sentence belongs).
+        if self.user is not None:
+            _validate_user(self.user)
         if self.setup is not None and not isinstance(self.setup, str):
             raise SandboxError(
                 f"setup must be a shell command STRING, not {type(self.setup).__name__}: write "
@@ -3542,7 +4250,34 @@ class Sandbox:
         # THE IMAGE BEFORE ANY BOX: the setup box, the resident box, the bytecode build and the warm pool
         # all start one, and each used to pull inside its own deadline. After the refusals above, so a
         # wrong configuration is not reported only after a download.
+        # THE ENV FILES' OWN DIRECTORY, and from here on a failure undoes everything this method made:
+        # `__exit__` is idempotent, and without this a failed pull left a temporary workspace behind.
+        try:
+            self._env_dir = _private_env_dir(self._ws)
+        except SandboxError:
+            self.__exit__()
+            raise
+        except OSError as e:
+            self.__exit__()
+            raise SandboxError(f"cannot create a private directory for env files: {e}") from e
+        try:
+            self._enter_after_env_dir()
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def _enter_after_env_dir(self) -> None:
+        """The rest of `__enter__`, run under its undo-on-failure guard."""
         _fetch_image(self._kern, self.image)
+        # THE IDENTITY BEFORE THE SETUP, because the setup box runs as it too: deps installed as root
+        # into `.deps` would be readable by a non-root user only by accident of their modes. Undone on
+        # the way out like a failed setup, for the same reason.
+        try:
+            self._resolve_identity()
+        except BaseException:
+            self.__exit__()
+            raise
         if self.setup:
             # A setup that fails raises out of `__enter__`, so the `with` body is never entered and
             # `__exit__` never runs: the workspace this method just created would outlive the session
@@ -3616,6 +4351,14 @@ class Sandbox:
             # for good. Refusing it sends this session down the `elif` and rebuilds the tree.
             if dest and _pyc_has_content(dest) and _pyc_source_matches(dest, self.image):
                 self._pyc_dir = dest
+                # A tree built before it was 0755 (see `_pyc_build`) is opened up for a non-root user
+                # here, once; a box-root session reads it either way.
+                if self._shared:
+                    try:
+                        if os.stat(dest).st_mode & 0o005 != 0o005:
+                            os.chmod(dest, 0o755)
+                    except OSError:
+                        pass
                 # Records the ADOPTION for the sweep's least-recently-used order. Best effort: a cache
                 # on a read-only filesystem is still perfectly usable, it just cannot be aged.
                 try:
@@ -3640,7 +4383,6 @@ class Sandbox:
             pool = _WarmPool(self, self.prewarm)
             self._pool = pool
             pool.refill(network=self.network, deadline=self._eff_timeout(None))
-        return self
 
     def __exit__(self, *exc: object) -> None:
         # Boxes first: they are live processes holding the workspace we are about to delete, and a box
@@ -3650,11 +4392,241 @@ class Sandbox:
             pool.close()  # type: ignore[attr-defined]
         if self._own_ws and self._ws:
             shutil.rmtree(self._ws, ignore_errors=True)
+            # WHAT `rmtree` COULD NOT REMOVE is what a non-root box user closed to us: a directory it
+            # created 0755 (every tarball's) cannot be emptied by anyone but its owner. MEASURED before
+            # this: an `npm install` left `node_modules` behind on every session. The helper, as that
+            # user, opens up and removes its own; the workspace itself is ours and goes last.
+            if self._shared and os.path.lexists(self._ws):
+                try:
+                    self._ws_helper(_HELPER_CLEAN, write=True)
+                except SandboxError:
+                    pass  # best effort at teardown; the rmtree below reports nothing either way
+                shutil.rmtree(self._ws, ignore_errors=True)
+        # After the boxes: a box still starting reads its env file. Only ever our own `mkdtemp`.
+        env_dir, self._env_dir = self._env_dir, ""
+        if env_dir and os.path.basename(env_dir).startswith(_ENV_DIR_PREFIX):
+            shutil.rmtree(env_dir, ignore_errors=True)
         self._entered = False
+
+    # -- `user=`: who the boxes run as, and keeping the workspace shared with them --------------------
+
+    def _resolve_identity(self) -> None:
+        """Decide the account the boxes run as and, when it is not box root, share the workspace with it.
+
+        Box root costs nothing here and does nothing: the spec is `user=`, else the image's `USER`, and
+        no spec or a root one returns before any box starts. Otherwise one box starts AS THAT USER to
+        learn the host uid it writes as. Asking kern's own box answers for every mapping kern might
+        choose (a range that starts elsewhere, a host with several), where computing it from
+        `/etc/subuid` here would be a second implementation of kern's mapping, free to disagree with
+        the first."""
+        spec = self.user if self.user is not None else _image_user(self.image)
+        # THE IMAGE'S OWN `USER` GOES THROUGH THE SAME CHECK AS `user=`, which it did not: `user=` is
+        # validated in `__post_init__` and the image half reached the argv unexamined, so an image
+        # declaring `USER --privileged` or a 300-character name put that value after `--user`. kern's
+        # parser takes the next token as the value whatever it looks like, so this was not an argv
+        # injection - but `_USER_SPEC_RE`'s own comment promises "the value can never read as a flag
+        # on the argv it lands on", and that promise has to hold for both halves or it is not one.
+        # An image whose spec is refused is named as the refusal, with `user=` as the way past it.
+        if spec is not None and self.user is None:
+            try:
+                _validate_user(spec)
+            except SandboxError as e:
+                raise SandboxError(
+                    f"the image {self.image!r} declares USER {spec!r}, which is not a shape kern can "
+                    f"be given: {e}. Pass user='<account>' to say which account to run as"
+                ) from e
+        if _is_root_user(spec):
+            return
+        # A RESIDENT BOX IS ENTERED WITH `kern exec`, which is box root unless told otherwise, and only a
+        # kern with `kern exec -u` can be told. Asked here, once, because the alternative is every call
+        # of the session failing as `exec: unknown flag`, which names neither the flag nor the reason.
+        if self.persist:
+            try:
+                said = subprocess.run(  # noqa: S603 - argv list, no shell
+                    [self._kern, "exec", "--help"], capture_output=True, text=True, timeout=30,
+                    stdin=subprocess.DEVNULL,
+                ).stdout
+            except (OSError, subprocess.SubprocessError):
+                said = ""
+            if "-u <user>" not in said:
+                raise SandboxError(
+                    f"persist=True as user {spec!r} needs a kern whose `kern exec` takes `-u <user>`, "
+                    f"and {self._kern} ({self._kern_version}) does not: its calls would run as box root "
+                    f"in a box whose own process runs as {spec!r}. Update kern, or drop persist=True"
+                )
+        self._as_user = spec
+        host_uid = self._probe_host_uid(spec)
+        own = os.getuid()
+        # THE PROBED UID DECIDES ROOT-NESS, NOT THE SPELLING. `_is_root_user` reads the text, and an
+        # image can name box root anything: `USER N0tR00t` with `N0tR00t:x:0:0:` in its own
+        # /etc/passwd is uid 0 in the box, which on kern's map is THIS process's uid on the host. The
+        # helper box is deliberately the box ACCOUNT and not root of the range (see `_helper_argv`),
+        # and without this the account could be root of the range under another name. Returning here
+        # is the same thing a `user='root'` session does: no ACL, no helper, nothing shared, because
+        # the account already writes as this process.
+        if host_uid == own:
+            return  # the account writes as this process: the workspace is already shared
+        self._user_host_uid = host_uid
+        try:
+            if self._own_ws:
+                _acl_grant(self._ws, host_uid, own)
+            else:
+                foreign, example = _acl_grant_tree(self._ws, host_uid, own)
+                # A TREE THIS SESSION DOES NOT OWN IS CHANGED, AND THAT IS SAID. The grant walks the
+                # whole `workspace=` the caller gave and adds an entry to every file and a DEFAULT
+                # ACL to every directory, which nothing here removes: `close()` only clears a
+                # workspace this session created. So everything the operator creates in that tree
+                # afterwards inherits the grant, and group/other stay empty for those new files.
+                # It is how a non-root account reaches the workspace at all (see the module docs),
+                # and the default `user=None` reaches it too on any image that declares a non-root
+                # USER - which is most hardened images - so an operator can get here without having
+                # typed `user=`. One line, with the command that undoes it.
+                warnings.warn(
+                    f"user={spec!r}: added a POSIX ACL for host uid {host_uid} to every file and "
+                    f"directory under {self._ws}, and a default ACL on the directories, so the "
+                    f"account can reach what it creates there. It is NOT removed when this session "
+                    f"closes (this workspace is yours, not the session's): "
+                    f"`setfacl -R -x u:{host_uid} -k {self._ws}` undoes it",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                if foreign:
+                    # PRIVATE ON PURPOSE, and said here because the box would only say EACCES. What a
+                    # box account creates inherits a default ACL with empty group and other entries:
+                    # under a default ACL the box's umask no longer applies, and `other` readable
+                    # would publish a `umask 077` workload's files.
+                    warnings.warn(
+                        f"the workspace holds {foreign} entr{'y' if foreign == 1 else 'ies'} (e.g. "
+                        f"{example!r}) created by a different box account than user={spec!r}, host uid "
+                        f"{host_uid}: they are reachable by that account and by this process, not by "
+                        f"{spec!r}. Read them with read_file and write them back, or keep one user= per "
+                        f"workspace",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+        except OSError as e:
+            if e.errno in (errno.EOPNOTSUPP, errno.ENOTSUP):
+                raise SandboxError(
+                    f"user={spec!r} needs POSIX ACLs on the workspace filesystem, and {self._ws} has "
+                    f"none: the account is host uid {host_uid} on disk, and an ACL is how it and this "
+                    f"process both reach the files. Put the workspace on a filesystem with ACLs "
+                    f"(ext4, xfs, btrfs, tmpfs), or run as box root (user=None on an image with no "
+                    f"USER, or user='root')"
+                ) from e
+            raise SandboxError(f"user={spec!r}: sharing the workspace {self._ws} failed: {e}") from e
+
+    def _probe_host_uid(self, spec: str) -> int:
+        """The host uid a box of this image running as ``spec`` writes files as.
+
+        The probe writes into a directory of its own, 0777 so the account can, inside a 0700 one of
+        ours so nothing else on the host can reach it; the bind mount is how the box gets past the
+        parent. The same identity flags as every other box, so it answers for the uid they will have.
+        """
+        d = tempfile.mkdtemp(prefix="kern-uid-")
+        drop = os.path.join(d, "p")
+        try:
+            os.mkdir(drop)
+            os.chmod(drop, 0o777)
+            # `--entrypoint ""` for the reason `_helper_argv` states: the image's ENTRYPOINT would
+            # otherwise run first and decide whether this probe writes its file at all.
+            argv = [self._kern, "box", _unique_name(), "--image", self.image, "--ro",
+                    "--entrypoint", "", *_mount_args(drop, "/kern-uid", False),
+                    *self._cap_drop_args, "--timeout", "60"]
+            if self.user is not None:
+                argv += ["--user", self.user]
+            argv += ["--", "sh", "-c", ": > /kern-uid/o"]
+            try:
+                r = subprocess.run(  # noqa: S603 - argv list, no shell on this side
+                    argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise SandboxError(f"user={spec!r}: the box that runs as it did not finish in 120 s") from e
+            except (OSError, subprocess.SubprocessError) as e:
+                raise SandboxError(f"user={spec!r}: the box that runs as it did not start: {e}") from e
+            try:
+                st = os.lstat(os.path.join(drop, "o"))
+            except FileNotFoundError:
+                st = None
+            if r.returncode != 0 or st is None:
+                # QUOTED, like every other box-produced line this package prints: the stream can
+                # carry escapes and a forged verdict, and this message reaches an agent loop.
+                said = _quote_untrusted((r.stderr or r.stdout)[-600:])
+                raise SandboxError(
+                    f"user={spec!r}: a box of {self.image!r} could not run as that account "
+                    f"(exit {r.returncode}): {said or 'no output'}"
+                )
+            return st.st_uid
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _helper_argv(self, script: str, args: "tuple[str, ...]", write: bool, timeout_s: int) -> "list[str]":
+        """The helper box: the session's image and its OWN identity, ``--user`` and ``cap_drop``.
+
+        AS THE BOX USER, NOT AS ROOT OF THE RANGE, and that choice is the boundary. The helper reaches
+        what the host was refused because the account OWNS what it closed (its 0600, its 0700, its
+        tarball's 0755), not because it can override anything. Root of the range could, and an
+        independent audit showed what that buys a box: its scripts check a path and then open it, so
+        a box racing them could have root read a root-only file of the image and hand it to the
+        caller. As the account, a race reaches only what the account reaches already. No network, the
+        workspace read-only unless ``write``, and only the scripts of this module: never code from the
+        session.
+
+        ``--entrypoint ""`` BECAUSE THE SENTENCE ABOVE WAS FALSE WITHOUT IT. kern prepends the
+        image's ENTRYPOINT to whatever follows ``--`` (``resolve_image_command``), so the helper ran
+        ``ENTRYPOINT sh -c SCRIPT ...`` and the image chose what came out: these results are not
+        display, they are PARSED - ``_helper_read`` returns the stream as the file's bytes,
+        ``_parse_helper_list`` reads stat records out of it, ``_snapshot_blind`` reads a tar out of
+        it. An entrypoint that writes one line to stdout prepended that line to every ``read_file``;
+        one that rejects an unknown first argument (``kc.sh`` in keycloak, which kern's own code
+        records) failed every helper call with a sentence about missing tools. Cleared, the script is
+        the only thing that runs."""
+        if self._as_user is None:
+            raise SandboxError("the workspace helper is for a non-root session only")
+        return [self._kern, "box", _unique_name(), "--image", self.image, "--ro",
+                "--entrypoint", "", "--user", self._as_user, *self._cap_drop_args,
+                *_mount_args(self._ws, "/w", not write), "--pids-limit", "64",
+                "--timeout", str(timeout_s), "--", "sh", "-c", script, "sh", *args]
+
+    def _helper_failed(self, code: int, said: bytes) -> "SandboxError":
+        # `_quote_untrusted`, NOT a bare decode: a name inside a directory the box closed to the host
+        # appears verbatim in `du`/`find`/`stat` diagnostics, and busybox - which `_HELPER_TOOLS`
+        # names as supported - does not quote its own. An audit put a forged `[sandbox: oom]` line
+        # and a screen-clearing escape through this message.
+        text = _quote_untrusted(said[-400:])
+        return SandboxError(
+            f"the workspace helper box could not run in {self.image!r} (exit {code}): "
+            f"{text or 'no output'}. {_HELPER_TOOLS}"
+        )
+
+    def _ws_helper(
+        self, script: str, *args: str, write: bool = False, data: "bytes | None" = None,
+        timeout_s: int = 120,
+    ) -> "subprocess.CompletedProcess[bytes]":
+        """Run ``sh -c script sh ARGS...`` in the helper box (see `_helper_argv`), the workspace at
+        ``/w``, for what this process was REFUSED: a file or directory a non-root box user created with
+        a mode that leaves the host uid out. Raises :class:`SandboxError` when the box itself fails;
+        the script's own exit code is the caller's to read."""
+        argv = self._helper_argv(script, args, write, timeout_s)
+        try:
+            r = subprocess.run(  # noqa: S603 - argv list; the script is a constant of this module
+                argv, input=data if data is not None else b"", capture_output=True,
+                timeout=timeout_s + 30,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise SandboxError(f"the workspace helper box did not run: {e}") from e
+        if r.returncode in (125, 126, 127) and not r.stdout:
+            raise self._helper_failed(r.returncode, r.stderr)
+        return r
 
     def _require_entered(self) -> None:
         if not self._entered:
             raise SandboxError("use the Sandbox as a context manager: `with Sandbox() as s: ...`")
+
+    @property
+    def _shared(self) -> bool:
+        """The workspace is shared with a non-root box user through an ACL (see `user`): the one
+        condition every fallback to the helper box answers to."""
+        return self._user_host_uid is not None
 
     # -- the box invocation --------------------------------------------------------------------------
 
@@ -3712,7 +4684,9 @@ class Sandbox:
         # kern's own timeout teardown). OUR proc.wait deadline is the authority that LABELS a `timeout`
         # fault; kern's backstop guarantees the box is actually gone a few seconds later.
         argv += self._cap_drop_args
-        if self._single_uid:
+        if self.user is not None:
+            argv += ["--user", self.user]
+        if self._single_uid and self._as_user is None:
             argv.append("--no-uid-range")
         argv += ["--timeout", str(int(timeout_s) + 5)]
         if self.memory_mb is not None:
@@ -3771,8 +4745,17 @@ class Sandbox:
             # constant stands in for it. The env CONTENT is still compared, because a session that changes
             # `env=` must invalidate warm boxes: it is folded in here rather than left out.
             argv += ["--env-file", "\0".join(f"{k}={v}" for k, v in sorted(merged_env.items()))]
-        elif merged_env and self._ws:
-            env_path = self._claim_path(self._env_path(name))
+        elif merged_env and not self._env_dir and self._ws:
+            # ENTERED, AND THE ENV DIRECTORY IS GONE: a call racing `__exit__`, which removes it before
+            # the session is marked closed. Running the box anyway would drop `env=` and `PYTHONPATH`
+            # without a word, so the call is refused. An UNENTERED sandbox (no workspace either) is the
+            # argv-inspection case above and stays silent.
+            raise SandboxError(
+                "this sandbox is closing: its private env directory is gone, so the box would run "
+                "without env= and PYTHONPATH. Make the call inside the `with` block."
+            )
+        elif merged_env and self._env_dir:
+            env_path = self._env_path(name)
             # SECURITY: the box has rw access to the workspace and could plant `.kern-env` as a symlink
             # to a host file (e.g. ~/.ssh/authorized_keys); a follow-through open would O_TRUNC-clobber
             # it. Unlink any existing entry (removing a planted symlink), then create fresh with
@@ -3912,7 +4895,35 @@ class Sandbox:
         # below already pays when tracking is on - and the MCP server, the one caller that runs this
         # hottest, turns tracking off and sets no cap.
         if self.workspace_max_bytes is not None and self._ws:
-            used = _workspace_usage(self._ws)
+            blind: list[str] = []
+            try:
+                used = _workspace_usage(self._ws, blind if self._shared else None)
+            except SandboxError as e:
+                # A SESSION WITH NO BOX USER TO ASK. There is no helper box to size what this process
+                # cannot read (the helper runs AS the box user, and here that user is this process),
+                # so the only honest answers are "refuse" and "admit the call on a number that is
+                # short by whatever is hidden". The cap says which one it is.
+                raise SandboxError(
+                    f"workspace_max_bytes cannot be measured, so this call was refused before "
+                    f"running: {e}"
+                ) from e
+            if blind:
+                # WHAT THE BOX USER CLOSED TO US IS MEASURED BY THE BOX USER, in the unit `du` and the
+                # walk share (allocated blocks). Counting it as zero would let a non-root session park a
+                # cap's worth of bytes where the walk does not look, so a `du` that fails REFUSES the
+                # call: a cap that cannot be measured is not met.
+                r = self._ws_helper(_HELPER_DU, *[_helper_subtree(os.path.relpath(d, self._ws)) for d in blind])
+                if r.returncode != 0:
+                    said = r.stderr.decode(errors="replace").strip()[-400:]
+                    raise SandboxError(
+                        f"workspace_max_bytes cannot be measured, so this call was refused before "
+                        f"running: the box user could not size {len(blind)} directory(ies) closed to "
+                        f"this process ({said or f'exit {r.returncode}'})"
+                    )
+                for line in r.stdout.decode(errors="replace").splitlines():
+                    head = line.split("\t", 1)[0].strip()
+                    if head.isdigit():
+                        used += int(head) * 1024
             if used > self.workspace_max_bytes:
                 raise SandboxError(
                     f"workspace holds {used} bytes, over the {self.workspace_max_bytes}-byte "
@@ -3963,7 +4974,12 @@ class Sandbox:
             # there: it would trade the 2 ms this feature exists for. So the exec runs, and only a
             # failure that says the box is missing triggers one recreate and one retry.
             self._resident_calls += 1
-            argv = [self._kern, "exec", self._resident, "-w", _WORKSPACE, "--"] + list(command)
+            # `-u`: `kern exec` enters as box root whatever the box runs as, so a call on a non-root
+            # session names the account, or it would run as root where the one-shot path does not.
+            argv = [self._kern, "exec", self._resident, "-w", _WORKSPACE]
+            if self._as_user is not None:
+                argv += ["-u", self._as_user]
+            argv += ["--"] + list(command)
         else:
             argv = self._base_argv(name, network=network, timeout_s=timeout_s, is_setup=is_setup) + ["--"] + list(command)
         child_env = dict(os.environ)
@@ -4067,11 +5083,11 @@ class Sandbox:
         finally:
             # Every exit path, including the two SandboxErrors above: kern has read the file by the time
             # it exits, and leaving it behind would accrete one per call in a persistent workspace.
-            try:
-                os.unlink(self._env_path(name))
-                self._release(os.path.basename(self._env_path(name)))
-            except OSError:
-                pass
+            if self._env_dir:
+                try:
+                    os.unlink(self._env_path(name))
+                except OSError:
+                    pass
             for fd in (started_r, alive_r):
                 try:
                     os.close(fd)
@@ -4421,8 +5437,17 @@ class Sandbox:
     # -- workspace file I/O (host-direct; single-uid → box files are host-owned) ---------------------
 
     def _env_path(self, name: str) -> str:
-        """Host path of the private --env-file for the box called ``name``, inside the workspace."""
-        return os.path.join(self._ws, f"{_ENV_FILE}{_ENV_SEP}{name}")
+        """Host path of the private ``--env-file`` for the box called ``name``.
+
+        NOT IN THE WORKSPACE, which is where it was, and where four things followed from that. Every box
+        mounts the workspace, so a concurrent call's box could read another call's ``env=`` values while
+        that call ran. A process killed mid-call left the file behind, and `snapshot` then archived it,
+        values included, for wherever the archive went. A box could plant a symlink at the name, which
+        the write had to defend against with an unlink and ``O_EXCL``. And `list_files` had to be taught
+        not to show it, by a reserved name a box could also use to hide a file. kern reads the file on
+        the HOST, so none of that was needed: it lives in this session's own 0700 directory, which no box
+        mounts, and goes with the session."""
+        return os.path.join(self._env_dir, f"{_ENV_FILE}{_ENV_SEP}{name}")
 
     def _claim(self, name: str) -> str:
         """Record ``name`` as a file this BINDING put in the workspace, and return it.
@@ -4440,24 +5465,29 @@ class Sandbox:
         self._ours.add(name)
         return name
 
-    def _claim_path(self, path: str) -> str:
-        """`_claim` for a caller holding a full host path: the registry keys on the workspace-relative
-        name, which is what `_walk` compares against."""
-        self._claim(os.path.basename(path))
-        return path
-
     def _release(self, *names: str) -> None:
         """Stop claiming ``names``. Call AFTER unlinking, never before: in the window between, a
         concurrent call's `_walk` would report a file that is still on disk as freshly created."""
         self._ours.difference_update(names)
 
     def _is_ours(self, rel: str) -> bool:
-        """Is ``rel`` this binding's own file rather than user state?
+        """Is ``rel`` a file THIS SESSION is writing, rather than user state?
 
-        `_ENV_FILE` bare is kept as an exact legacy match: a workspace written by an older version has
-        one, and it is ours even though this process did not create it. The `.kern-env.<box>` PREFIX is
-        deliberately no longer matched, because that was the same open invitation as the shapes above.
-        """
+        Only the names claimed by calls in flight. A LISTING IS THE OPERATOR'S VIEW AND MUST BE
+        COMPLETE: this predicate used to include `_LEGACY_ENV_FILE` as well, and that made it a
+        hiding primitive, because every shape in that pattern is one a cell can create
+        (`.kern-env`, `.kern-env.pysbx-<any 12 hex>`, `.kern-env.kern-sbx-<191 free characters>`).
+        A box that named a file to match it was absent from `list_files`, from `result.files` and
+        from `snapshot` - the three channels that answer "what did this cell leave behind".
+
+        The reason the pattern existed is still served, and only where it belongs: `snapshot` skips
+        those names itself (see `_snapshot_add`), because an env file a killed process left holds
+        `env=` values and an ARCHIVE is a thing that travels. Skipping it there loses nothing a box
+        wanted hidden; hiding it from a listing lost the operator's own answer.
+
+        The BARE `_ENV_FILE` stays, as one exact name: a workspace written by an older version has
+        one and it is ours even though this process did not create it. One fixed name a box could
+        also write is a different thing from a family with 191 free characters in it."""
         return rel in self._ours or rel == _ENV_FILE
 
     def _ws_path(self, rel: str) -> str:
@@ -4502,30 +5532,20 @@ class Sandbox:
 
     def _ensure_parent_dirs(self, full: str) -> None:
         """Create the parent dirs of ``full`` under the workspace WITHOUT following a symlink in any
-        intermediate component. ``mkdir(parents=True)`` follows symlinks, so a box that plants
-        ``a -> /etc`` could steer a ``write_file("a/b.txt")`` outside the workspace even though the final
-        component is opened ``O_NOFOLLOW``. Descend one level at a time from the (canonical) workspace
-        base: reject a symlink component, create a missing dir non-recursively."""
-        base = self._ws
-        rel_dir = os.path.relpath(os.path.dirname(full), base)
-        if rel_dir in ("", "."):
+        intermediate component (``mkdir(parents=True)`` follows them, so a box that plants
+        ``a -> /etc`` could steer ``write_file("a/b.txt")`` outside the workspace even though the final
+        component is opened ``O_NOFOLLOW``). One component at a time BY DESCRIPTOR: see
+        `_descend_dirs`."""
+        parts = [p for p in os.path.relpath(os.path.dirname(full), self._ws).split(os.sep) if p and p != "."]
+        if not parts:
             return  # parent is the workspace root itself
-        cur = base
-        for part in rel_dir.split(os.sep):
-            if not part or part == ".":
-                continue
-            nxt = os.path.join(cur, part)
-            try:
-                st = os.lstat(nxt)
-            except FileNotFoundError:
-                os.mkdir(nxt)  # non-recursive: each level is a fresh real dir we just created
-                cur = nxt
-                continue
-            if stat.S_ISLNK(st.st_mode):
-                raise SandboxError(f"path escapes the workspace via a symlinked directory: {part!r}")
-            if not stat.S_ISDIR(st.st_mode):
-                raise SandboxError(f"workspace path component is not a directory: {part!r}")
-            cur = nxt
+        root = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            fd = self._descend_dirs(root, parts, create=True)
+            if fd != root:
+                os.close(fd)
+        finally:
+            os.close(root)
 
     def write_file(self, path: str, data: bytes | str) -> None:
         """Write ``data`` to ``path`` (workspace-relative) - host-direct, so the box sees it next run.
@@ -4533,14 +5553,36 @@ class Sandbox:
         write outside the workspace (it fails instead)."""
         self._require_entered()
         full = self._ws_path(path)
-        self._ensure_parent_dirs(full)  # symlink-safe descent, NOT mkdir(parents) which follows symlinks
         payload = data.encode() if isinstance(data, str) else data
-        try:  # openat descent re-checks every component O_NOFOLLOW, closing the create->open TOCTOU too
-            fd = self._open_nofollow(full, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        # 0o664 ON A SHARED WORKSPACE, because the mode's group bits ARE the ACL mask: 0o644 would cap the
+        # box user's entry at read, and a file the caller wrote for the box to edit would be read-only to
+        # it. Nobody else gains anything: the inherited group and other entries are empty.
+        mode = 0o664 if self._shared else 0o644
+        try:
+            self._ensure_parent_dirs(full)  # symlink-safe descent, NOT mkdir(parents) which follows symlinks
+            # openat descent re-checks every component O_NOFOLLOW, closing the create->open TOCTOU too
+            fd = self._open_nofollow(full, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        except PermissionError as e:
+            if not self._shared:
+                raise _path_refusal("write", path, e) from e
+            closed = e
         except OSError as e:
             raise _path_refusal("write", path, e) from e
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
+        else:
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+            return
+        try:
+            self._helper_write(path, full, payload)
+        except SandboxError as e:
+            raise e from closed
+
+    def _helper_write(self, path: str, full: str, payload: bytes) -> None:
+        """``write_file`` into a directory the box user closed to this process (a tarball's 0755),
+        written by the box user, its owner."""
+        r = self._ws_helper(_HELPER_WRITE, *self._helper_parts(full), write=True, data=payload)
+        if r.returncode != 0:
+            raise self._helper_refusal("write", path, r)
 
     def _open_nofollow(self, full: str, flags: int, mode: int = 0o644) -> int:
         """Open ``full`` (already lexically contained) descending from the workspace base ONE component at
@@ -4609,22 +5651,65 @@ class Sandbox:
         descriptor you opened, or read the file and slice it."""
         self._require_entered()
         full = self._ws_path(path)
+        closed: "PermissionError | None" = None
         try:
             fd = self._open_nofollow(full, os.O_RDONLY)
+        except PermissionError as e:
+            if not self._shared:
+                raise _path_refusal("read", path, e) from e
+            closed = e
         except OSError as e:
             raise _path_refusal("read", path, e) from e
-        with os.fdopen(fd, "rb") as f:
-            if max_bytes is None:
-                return f.read()
-            data = f.read(max_bytes + 1)  # one past the cap so we can tell "exactly at" from "over"
-            if len(data) > max_bytes:
-                raise SandboxError(
-                    f"{path!r} is larger than max_bytes={max_bytes}, so the read was REFUSED. "
-                    f"max_bytes is a ceiling on what may be read at all, not a request for the "
-                    f"first {max_bytes} bytes: nothing was returned. Raise it, or drop it and "
-                    f"slice the result."
-                )
-            return data
+        if closed is not None:
+            # A FILE THE BOX USER CLOSED TO US (0600, or inside its 0700): the helper reads it as its owner.
+            data = self._helper_read(path, full, max_bytes)
+        else:
+            with os.fdopen(fd, "rb") as f:
+                # one past the cap so we can tell "exactly at" from "over"
+                data = f.read() if max_bytes is None else f.read(max_bytes + 1)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise SandboxError(
+                f"{path!r} is larger than max_bytes={max_bytes}, so the read was REFUSED. "
+                f"max_bytes is a ceiling on what may be read at all, not a request for the "
+                f"first {max_bytes} bytes: nothing was returned. Raise it, or drop it and "
+                f"slice the result."
+            )
+        return data
+
+    def _helper_parts(self, full: str) -> "list[str]":
+        """The workspace-relative COMPONENTS of an already-contained ``full``, as the helper scripts take
+        them."""
+        return [c for c in os.path.relpath(full, self._ws).split(os.sep) if c and c != "."]
+
+    def _helper_refusal(self, verb: str, path: str, r: "subprocess.CompletedProcess[bytes]") -> "SandboxError":
+        """The refusal a helper script's exit code stands for, in the words the host path uses."""
+        if r.returncode == 40:
+            return _path_refusal(verb, path, OSError(errno.ELOOP, os.strerror(errno.ELOOP)))
+        if r.returncode == 41:
+            return SandboxError(
+                f"refusing to {verb} {path!r}: not a regular file (a FIFO, device or socket planted in "
+                f"the workspace can stall or fake this operation)"
+            )
+        if r.returncode == 42:
+            # The scripts' own code for "a directory this needed could not be made" (`mkdir` or
+            # `mktemp` refused): named, where it fell through to "exit 42" and the raw stderr.
+            said = r.stderr.decode(errors="replace").strip()[-400:]
+            return SandboxError(
+                f"cannot {verb} {path!r}: the box user could not create a directory it needs"
+                + (f" ({said})" if said else "")
+            )
+        if r.returncode == 43:
+            return SandboxError(f"cannot {verb} {path!r}: not a directory")
+        said = r.stderr.decode(errors="replace").strip()[-400:]
+        return SandboxError(f"cannot {verb} {path!r} (exit {r.returncode}): {said or 'no output'}")
+
+    def _helper_read(self, path: str, full: str, max_bytes: "int | None") -> bytes:
+        """``read_file`` for a file the box user closed to this process, read by the box user, its owner."""
+        limit = "" if max_bytes is None else str(max_bytes + 1)
+        r = self._ws_helper(_HELPER_READ, limit, *self._helper_parts(full))
+        if r.returncode != 0:
+            raise self._helper_refusal("read", path, r)
+        return r.stdout
 
     def list_files(self, subdir: str = "") -> list[FileInfo]:
         """List files under the workspace (excluding the ``.deps`` install dir). A ``subdir`` is validated
@@ -4637,6 +5722,13 @@ class Sandbox:
             try:  # opens the final as a DIRECTORY, O_NOFOLLOW at every level: a symlinked component fails
                 fd = self._open_nofollow(root, os.O_RDONLY | os.O_DIRECTORY)
                 os.close(fd)
+            except PermissionError as e:
+                if not self._shared:
+                    raise _path_refusal("list", subdir, e) from e
+                # The same check, by the box user: a directory, no symlink on the way.
+                r = self._ws_helper(_HELPER_ISDIR, *self._helper_parts(root))
+                if r.returncode != 0:
+                    raise self._helper_refusal("list", subdir, r) from e
             except OSError as e:
                 raise _path_refusal("list", subdir, e) from e
         else:
@@ -4659,11 +5751,273 @@ class Sandbox:
         # `tar`). The trade is a 100-byte name limit, matching Node, and second-resolution mtimes.
         # compresslevel=1: a checkpoint is local and often large or already-compressed; level 1 is several
         # times faster than the default 9 with a negligible ratio penalty. Speed over ratio here.
-        with tarfile.open(dest, "w:gz", compresslevel=1, format=tarfile.USTAR_FORMAT) as tf:
-            for entry in sorted(os.listdir(self._ws)):
-                if self._is_ours(entry):
-                    continue  # ours (env file, in-flight scratch), not user state
-                tf.add(os.path.join(self._ws, entry), arcname=entry)
+        #
+        # BY DESCRIPTOR, from the workspace's own fd down, and never `tf.add(path)`. A box running beside
+        # this call (another thread's cell) can turn a directory into a symlink between a check and the
+        # open that follows it; resolved by path, the next open would archive a HOST file the link
+        # names, and the snapshot would carry it out to wherever it is restored. Each entry is reached
+        # with `O_NOFOLLOW` relative to the descriptor of the directory it was listed from.
+        # A `dest` INSIDE THE WORKSPACE is opened by descriptor, like every other write there: by path,
+        # a symlink the box planted at that name (or at a directory on the way) sent the archive onto
+        # whatever host file it named. Outside the workspace the path is the caller's own.
+        out_fd = self._open_in_workspace(dest, write=True)
+        out = os.fdopen(out_fd, "wb") if out_fd is not None else None
+        root_fd = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            with tarfile.open(None if out is not None else dest, "w:gz", fileobj=out, compresslevel=1,
+                              format=tarfile.USTAR_FORMAT) as tf:
+                blind: list[str] = []
+                # THE ARCHIVE IS NOT PART OF WHAT IT ARCHIVES. `dest` inside the workspace is an
+                # ordinary thing to ask for (`snapshot(f"{ws}/ckpt.tar.gz")`), and `tarfile.add`
+                # skipped its own file for this reason: without it the member holds the half-written
+                # gzip of the snapshot so far, whose size depends on when the walk reached it.
+                # Compared by identity (device and inode), not by name, so a link to it is caught too.
+                try:
+                    st_dest = os.fstat(out.fileno()) if out is not None else os.stat(dest)
+                    dest_id = st_dest.st_ino, st_dest.st_dev
+                except OSError:
+                    dest_id = None
+                entries = sorted(os.listdir(root_fd))
+                # THE RECORD FIRST, before any workspace entry, because first is how `restore` tells it
+                # from a user file that happens to share its name (see `_SNAPSHOT_RECORD`).
+                import io as _io
+                import json as _json
+
+                record = _json.dumps({
+                    _SNAPSHOT_RECORD_KEY: 1,
+                    "image": self.image,
+                    "machine": _host_machine(),
+                    "deps": _DEPS_DIR in entries,
+                }).encode()
+                info = tarfile.TarInfo(_SNAPSHOT_RECORD)
+                info.size = len(record)
+                info.mtime = int(time.time())
+                info.mode = 0o644
+                tf.addfile(info, _io.BytesIO(record))
+                left_out: "list[str]" = []
+                for entry in entries:
+                    if entry in self._ours:
+                        continue  # a name a call in flight claimed: ours, not user state
+                    self._snapshot_add(tf, root_fd, entry, entry, blind, dest_id, left_out)
+                if blind:
+                    self._snapshot_blind(tf, blind, left_out)
+        finally:
+            os.close(root_fd)
+            if out is not None:
+                out.close()
+        # SAID, BECAUSE THE ARCHIVE IS NOT THE WHOLE TREE. See `_snapshot_add`: what `restore` cannot
+        # write is not put in an archive for it to refuse.
+        if left_out:
+            shown = ", ".join(repr(x) for x in left_out[:5]) + (", ..." if len(left_out) > 5 else "")
+            warnings.warn(
+                f"snapshot: {len(left_out)} entr{'y' if len(left_out) == 1 else 'ies'} not archived, "
+                f"because restore writes only regular files and directories (a symlink, FIFO, device "
+                f"or socket in the archive would make the whole snapshot unrestorable): {shown}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def _snapshot_add(
+        self,
+        tf: "object",
+        dir_fd: int,
+        name: str,
+        rel: str,
+        blind: "list[str]",
+        dest_id: "tuple[int, int] | None" = None,
+        left_out: "list[str] | None" = None,
+    ) -> None:
+        """Archive ``name`` (listed from ``dir_fd``) as ``rel``, and what is under it.
+
+        ONLY WHAT `restore` WRITES: regular files and directories. A symlink, FIFO, device or socket is
+        named in ``left_out`` instead of archived, and a second name of a hard-linked file is archived
+        as a REGULAR file with its own copy of the data. MEASURED on 0.2.45: a workspace holding one
+        symlink gave a snapshot that `restore` then refused whole ("unsafe member type in snapshot"),
+        and a hard link did the same through its link member - an archive that cannot be restored,
+        made without a word. The refusal is right for an archive from outside; this side stops
+        producing what it refuses.
+
+        The members ``tf.add`` produced, from descriptors: a regular file through ``gettarinfo`` on the
+        open file (so a second hard link is still a link member), everything else from its ``lstat``
+        and, for a symlink, ``readlink`` relative to ``dir_fd``. What the box user closed to this
+        process goes to ``blind`` on a shared workspace, for the helper; on any other it is the error
+        it always was.
+
+        ``dest_id`` is the archive's own (inode, device), skipped wherever it is met.
+
+        WHAT COUNTS AS CHURN IS NAMED, AND NOTHING ELSE IS SWALLOWED. An entry that went away or was
+        swapped for something that is not what the lstat said is ordinary in a workspace a box is
+        writing to, and is skipped. Running out of descriptors, out of memory, or a read error off the
+        disk is RAISED, because a snapshot that is quietly missing files is one a caller restores
+        believing it whole - `tarfile.add` raised these too."""
+        def set_aside(e: OSError) -> None:
+            if not self._shared:
+                raise e
+            blind.append(rel)
+
+        def churn(e: OSError) -> bool:
+            """Whether `e` means "not that any more", the one class a live workspace produces."""
+            return e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENXIO)
+
+        cloexec = os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return  # gone between the listing and the lstat: ordinary in a live workspace
+        except PermissionError as e:
+            set_aside(e)
+            return
+        if stat.S_ISREG(st.st_mode):
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | cloexec, dir_fd=dir_fd)
+            except PermissionError as e:
+                set_aside(e)
+                return
+            except OSError as e:
+                if churn(e):
+                    return  # swapped for a link or removed since the lstat: nothing is archived
+                raise
+            with os.fdopen(fd, "rb") as f:
+                fst = os.fstat(fd)
+                if dest_id is not None and (fst.st_ino, fst.st_dev) == dest_id:
+                    return  # the archive being written
+                if "/" not in rel and _LEGACY_ENV_FILE.fullmatch(rel):
+                    return  # an older version's env file, `env=` values in it: a FILE only, see _is_ours
+                if stat.S_ISREG(fst.st_mode):
+                    info = _anonymise_member(tf.gettarinfo(arcname=rel, fileobj=f))  # type: ignore[attr-defined]
+                    if info.islnk():
+                        # A second name of an inode already archived: its own copy, so the member is
+                        # one `restore` writes rather than a link member it refuses.
+                        import tarfile
+
+                        info.type, info.linkname, info.size = tarfile.REGTYPE, "", fst.st_size
+                    tf.addfile(info, f)  # type: ignore[attr-defined]
+            return
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | cloexec, dir_fd=dir_fd)
+            except PermissionError as e:
+                set_aside(e)
+                return
+            except OSError as e:
+                if churn(e):
+                    return  # swapped for a link or removed since the lstat
+                raise
+            try:
+                tf.addfile(_dir_tarinfo(tf, rel, os.fstat(fd)))  # type: ignore[attr-defined]
+                try:
+                    names = sorted(os.listdir(fd))
+                except PermissionError as e:
+                    set_aside(e)  # its header is in; the helper's copy repeats it with the contents
+                    return
+                except OSError as e:
+                    if not churn(e):
+                        raise
+                    return
+                for child in names:
+                    self._snapshot_add(tf, fd, child, f"{rel}/{child}", blind, dest_id, left_out)
+            finally:
+                os.close(fd)
+            return
+        # A symlink, FIFO, device or socket: not a member `restore` writes, so not a member.
+        if left_out is not None:
+            left_out.append(rel)
+
+    def _snapshot_blind(self, tf: "object", blind: "list[str]", left_out: "list[str] | None" = None) -> None:
+        """Add the subtrees in ``blind`` as the box user reads them: one ``tar`` in the helper box,
+        STREAMED into this archive member by member (re-emitted as the USTAR the Node reader takes)
+        rather than held whole in memory, whose size the box would otherwise decide. The same rule as
+        `_snapshot_add`: regular files and directories only, the rest named in ``left_out``. A hard
+        link from the helper's tar is named there too, because its data is in an earlier member of a
+        stream that cannot be read back."""
+        import tarfile
+
+        argv = self._helper_argv(_HELPER_TAR, tuple(_helper_subtree(b) for b in blind), False, 600)
+        with tempfile.TemporaryFile() as err:
+            try:
+                proc = subprocess.Popen(  # noqa: S603 - argv list; the script is a constant of this module
+                    argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err,
+                )
+            except OSError as e:
+                raise SandboxError(f"the workspace helper box did not run: {e}") from e
+            failure: "BaseException | None" = None
+            try:
+                with tarfile.open(fileobj=proc.stdout, mode="r|") as src:
+                    for m in src:
+                        name = m.name[2:] if m.name.startswith("./") else m.name
+                        if not name or name == ".":
+                            continue
+                        if not (m.isreg() or m.isdir()):
+                            if left_out is not None:
+                                left_out.append(name)
+                            continue
+                        # THE NAME GOES THROUGH THE SAME CHOKEPOINT `restore` USES, because this one
+                        # comes from a `tar` in the IMAGE (see `_helper_argv`) and the host half of
+                        # `snapshot` goes to some length to emit only confined members. A member
+                        # named `../../../.ssh/authorized_keys` or `/etc/passwd` would be written
+                        # into an archive this package documents as a safe checkpoint; our own
+                        # `restore` refuses it, and so do GNU tar and bsdtar, but a third extractor
+                        # is not ours to assume. Refused by name, and named in the warning, which is
+                        # what `left_out` is for.
+                        try:
+                            self._ws_path(name)
+                        except SandboxError:
+                            if left_out is not None:
+                                left_out.append(name)
+                            continue
+                        m.name = name
+                        m.uid = m.gid = 0
+                        m.uname = m.gname = ""
+                        tf.addfile(m, src.extractfile(m) if m.isreg() else None)  # type: ignore[attr-defined]
+            except (tarfile.TarError, OSError) as e:
+                failure = e
+            finally:
+                # WAITED FIRST, KILLED ONLY IF IT WILL NOT GO. `tarfile` in `r|` mode stops at the
+                # end-of-archive marker and does not wait for the writer, so the box's `tar` is
+                # usually still tearing its box down when the loop above ends. Killing it there made
+                # `snapshot()` FAIL FOR EVERY non-root `user=` session with anything the host cannot
+                # read: measured 9 times out of 9 (a 0700 directory, a 0600 file, and both), each
+                # one reported as "the box user could not read ... exit -9" about a stream that had
+                # been read in full. The grace is short because the work is already done: what is
+                # left is the box's own teardown.
+                #
+                # A kill that does happen is not reported as the box user's failure either, see the
+                # `killed` flag below: the archive is complete, and the exit code of a box we shot
+                # says nothing about whether it could read.
+                killed = False
+                try:
+                    code = proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    killed = True
+                    code = proc.wait()
+                finally:
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+            err.seek(0)
+            said = err.read()
+        if code in (125, 126, 127):
+            raise self._helper_failed(code, said)
+        # WHOSE FAILURE IT WAS, SAID AS IT WAS. `failure` covers both sides of this pipe: the box
+        # user's tar on the read side, and THIS process writing the archive on the other (ENOSPC on
+        # `dest`, an EIO). Reporting a full disk here as "the box user could not read" sends the
+        # reader into the box after a fault that is on the host.
+        if failure is not None and code == 0:
+            raise SandboxError(f"snapshot: writing the archive failed: {failure}") from failure
+        if failure is None and killed:
+            # THE ARCHIVE IS COMPLETE AND WE SHOT THE HELPER, which is a fact about the teardown and
+            # not about the box user. Said as a warning rather than raised, so a snapshot that is
+            # whole is not thrown away.
+            warnings.warn(
+                f"snapshot: the helper box that read {blind} had to be killed after 30 s of "
+                f"teardown; the archive itself is complete",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return
+        if failure is not None or code != 0:
+            text = _quote_untrusted(said[-400:])
+            raise SandboxError(f"snapshot: the box user could not read {blind}: {failure or text or f'exit {code}'}")
 
     def restore(self, src: str) -> None:
         """Extract a snapshot tar (from :meth:`snapshot`) into the workspace, SAFELY. Every member is
@@ -4674,8 +6028,31 @@ class Sandbox:
         import tarfile
 
         base = os.path.realpath(self._ws)
-        with tarfile.open(src, "r:*") as tf:
+        origin_note: "str | None" = None
+        # A `src` INSIDE THE WORKSPACE is opened by descriptor too: by path, a symlink the box planted
+        # there made this read a HOST archive and restore it where the box can read it.
+        in_fd = self._open_in_workspace(src, write=False)
+        src_obj = os.fdopen(in_fd, "rb") if in_fd is not None else None
+        with src_obj if src_obj is not None else contextlib.nullcontext(), \
+                tarfile.open(None if src_obj is not None else src, "r:*", fileobj=src_obj) as tf:
             members = tf.getmembers()
+            # The provenance record, if this archive carries one: see `_snapshot_record`. It is read
+            # here and never written into the workspace; anything that is not exactly the record is an
+            # ordinary member and goes through the vetting below like any other.
+            if (members and members[0].name == _SNAPSHOT_RECORD
+                    and members[0].type in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                    and members[0].size <= _SNAPSHOT_RECORD_MAX):
+                try:
+                    fh = tf.extractfile(members[0])
+                    record = _snapshot_record(fh.read(_SNAPSHOT_RECORD_MAX + 1) if fh is not None else b"")
+                except (OSError, tarfile.TarError):
+                    record = None
+                if record is not None:
+                    members = members[1:]
+                    has_deps = any(
+                        m.name == _DEPS_DIR or m.name.startswith(_DEPS_DIR + "/") for m in members
+                    )
+                    origin_note = _snapshot_origin_note(record, self.image, _host_machine(), has_deps)
             for m in members:
                 # THE SAME RULE THE HOST-SIDE FILE CALLS USE, not a second copy of it. This loop used to
                 # test `m.name.startswith("/")` and `".." in m.name.split("/")` itself, which is the
@@ -4691,9 +6068,255 @@ class Sandbox:
                 resolved = os.path.realpath(os.path.join(base, m.name))
                 if resolved != base and not resolved.startswith(base + os.sep):
                     raise SandboxError(f"snapshot member escapes the workspace: {m.name!r}")
-            # members already vetted (regular/dir, no escape); `filter="data"` (3.12+) is defense in depth.
-            extra = {"filter": "data"} if sys.version_info >= (3, 12) else {}
-            tf.extractall(base, members=members, **extra)
+            # Members vetted (regular files and directories, no escape), then written BY DESCRIPTOR,
+            # not with `extractall`: it opens every member by path, and a box running beside this call
+            # could turn a member's parent into a symlink between the vetting above and the write, which
+            # would put the member on a HOST path. `_restore_host` applies `filter="data"`'s rules itself,
+            # on every Python version.
+            try:
+                self._restore_host(tf, members)
+            except PermissionError:
+                if not self._shared:
+                    raise
+                # A DIRECTORY THE BOX USER CLOSED TO US is in the way: the helper, as that user,
+                # extracts the same vetted members with the same rules applied, and `-o` so no ownership
+                # is taken from the archive.
+                self._restore_by_helper(tf, members)
+        if self._shared:
+            # WHAT WAS RESTORED WITH THE ARCHIVE'S MODES gets the box user's entry back: the WHOLE
+            # tree, by descriptor, for the same reason the extract is.
+            try:
+                _acl_grant_tree(base, self._user_host_uid, os.getuid())
+            except OSError as e:
+                raise SandboxError(f"restore: sharing the restored files with the box user failed: {e}") from e
+        # SAID AFTER THE RESTORE SUCCEEDED, and not raised: a pure-Python package in `.deps` runs on any
+        # image, so a refusal would block a restore that works. What the reader needs is to have been
+        # told, before the first `import` fails somewhere else.
+        if origin_note is not None:
+            warnings.warn(origin_note, RuntimeWarning, stacklevel=2)
+
+    def _restore_host(self, tf: "object", members: "list") -> None:
+        """Write vetted ``members`` (regular files and directories only) under the workspace, every
+        path reached by descriptor from the workspace's own (see `_descend_dirs`), with the rules of
+        ``tarfile``'s ``filter="data"``, tightened in one place: a file keeps ``mode & 0o700`` (owner
+        bits only, because a mode out of an archive carries the source workspace's ACL mask in its
+        group bits and the ACL itself does not travel), loses its execute bits when its
+        owner had none, and is always readable and writable by its owner; a directory's mode is not
+        taken from the archive; mtimes are; ownership never is. Directories get their mtime last,
+        deepest first, so writing into one does not undo it. A colliding file is overwritten."""
+        root = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        dirs: "list[tuple[list[str], float]]" = []
+        try:
+            for m in members:
+                parts = [p for p in m.name.split("/") if p and p != "."]
+                if not parts:
+                    continue
+                fd = self._descend_dirs(root, parts[:-1], create=True)
+                try:
+                    if m.isdir():
+                        try:
+                            os.mkdir(parts[-1], dir_fd=fd)
+                        except FileExistsError:
+                            pass
+                        os.close(self._descend_dirs(fd, parts[-1:], create=False))  # a real directory
+                        dirs.append((parts, m.mtime))
+                        continue
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+                    try:
+                        out = os.open(parts[-1], flags, 0o600, dir_fd=fd)
+                    except PermissionError:
+                        raise
+                    except OSError as e:
+                        raise _path_refusal("restore", m.name, e) from e
+                    try:
+                        if not stat.S_ISREG(os.fstat(out).st_mode):
+                            raise SandboxError(f"refusing to restore {m.name!r}: not a regular file in the workspace")
+                        data = tf.extractfile(m)  # type: ignore[attr-defined]
+                        while data is not None:
+                            chunk = data.read(1 << 20)
+                            if not chunk:
+                                break
+                            # EVERY BYTE, OR AN ERROR. `os.write` is one `write(2)` and may write
+                            # fewer bytes than it was given (a filling disk is where this shows), and
+                            # the loop above would then read the NEXT chunk and leave the file
+                            # silently short - with `restore` reporting success. The buffered file
+                            # object this replaced looped for the same reason.
+                            view = memoryview(chunk)
+                            while view:
+                                view = view[os.write(out, view):]
+                        # OWNER BITS ONLY. The mode in the archive is the mode the file had, and on
+                        # a workspace shared with a box account that mode carries the ACL's mask in
+                        # its group bits: granting the account rewrites `mask::`, which IS the group
+                        # mode, so a 0600 file reads 0660 while the ACL keeps `group::---`. The ACL
+                        # does not travel in a tar, so restoring that mode turned the mask back into
+                        # REAL group access - measured end to end, 0600 in, 0640 out, `group::r--`
+                        # on the restored copy. The session re-grants what the box needs through the
+                        # ACL, so the restore does not need to carry group or other bits at all.
+                        mode = m.mode & 0o700
+                        if not mode & 0o100:
+                            mode &= ~0o111
+                        # BEST EFFORT, AS `extractall` AT ERRORLEVEL 1 WAS. The bytes are the
+                        # restore; a mode or an mtime this process may not set on a file it did not
+                        # create (an existing target owned by the box user) is not a reason to fail a
+                        # call that has already written every member before it.
+                        #
+                        # `ValueError`/`OverflowError` BESIDE `OSError`, because `tarfile` reads a GNU
+                        # base-256 mtime as an arbitrary-precision int: a member carrying `1 << 70`
+                        # made `os.utime` raise `OverflowError` (measured), which is not an `OSError`,
+                        # so it escaped this handler and left `restore` half-done with an exception
+                        # the caller reads as internal.
+                        try:
+                            os.fchmod(out, mode | 0o600)
+                            os.utime(out, (m.mtime, m.mtime))
+                        except (OSError, ValueError, OverflowError):
+                            pass
+                    finally:
+                        os.close(out)
+                finally:
+                    if fd != root:
+                        os.close(fd)
+            for parts, mtime in sorted(dirs, key=lambda d: -len(d[0])):
+                # Same best effort, same reason: `extractall` ignored a failure here, and a directory
+                # a concurrent box removed between the write and this pass is not a failed restore.
+                try:
+                    fd = self._descend_dirs(root, parts, create=False)
+                except (OSError, SandboxError):
+                    continue
+                try:
+                    os.utime(fd, (mtime, mtime))
+                except (OSError, ValueError, OverflowError):
+                    pass  # a crafted mtime: see the member loop above
+                finally:
+                    os.close(fd)
+        finally:
+            os.close(root)
+
+    def _open_in_workspace(self, path: str, *, write: bool) -> "int | None":
+        """A descriptor on ``path`` if it lies inside the workspace, opened through `_descend_dirs` and
+        ``O_NOFOLLOW`` so no symlink the box planted on the way is followed; None when it lies outside,
+        where the path is the caller's own and is opened by it as before.
+
+        Inside is decided twice: on the path as written, and on its parent's real location, so a
+        caller's own link INTO the workspace is not a way round it. A path that is inside and cannot
+        be opened that way is refused with the reason, not opened another way."""
+        ws = self._ws.rstrip(os.sep)
+        lexical = os.path.abspath(path)
+        if lexical.startswith(ws + os.sep):
+            rel = os.path.relpath(lexical, ws)
+        else:
+            try:
+                parent = os.path.realpath(os.path.dirname(lexical))
+            except OSError:
+                return None
+            if parent != ws and not parent.startswith(ws + os.sep):
+                return None
+            rel = os.path.relpath(os.path.join(parent, os.path.basename(lexical)), ws)
+        verb = "snapshot to" if write else "restore from"
+        self._ws_path(rel)  # the lexical refusals every host-side workspace path gets
+        parts = [p for p in rel.split(os.sep) if p and p != "."]
+        if not parts:
+            raise SandboxError(f"cannot {verb} the workspace directory itself")
+        root = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            parent_fd = self._descend_dirs(root, parts[:-1], create=False)
+            try:
+                flags = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+                flags |= (os.O_WRONLY | os.O_CREAT | os.O_TRUNC) if write else os.O_RDONLY
+                try:
+                    fd = os.open(parts[-1], flags, 0o644, dir_fd=parent_fd)
+                except OSError as e:
+                    raise _path_refusal(verb, rel, e) from e
+            finally:
+                if parent_fd != root:
+                    os.close(parent_fd)
+        finally:
+            os.close(root)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise SandboxError(f"cannot {verb} {rel!r}: not a regular file in the workspace")
+        if not write:
+            os.set_blocking(fd, True)
+        return fd
+
+    def _descend_dirs(self, base_fd: int, parts: "list[str]", *, create: bool) -> int:
+        """The directory ``parts`` names under ``base_fd``, opened one component at a time with
+        ``O_NOFOLLOW`` relative to the previous one, and created when ``create`` and missing. Returns a
+        descriptor the caller closes (``base_fd`` itself for no parts). A symlink or a non-directory on
+        the way is refused by name; EACCES is raised as it is, for a shared workspace's fallback.
+
+        THE ONE DESCENT for everything the host creates in the workspace. It replaces an `lstat` and a
+        `mkdir` by path, between which a box running beside the call could swap the component for a
+        symlink: the `mkdir` then made a directory wherever the link pointed."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        cur = base_fd
+        for part in parts:
+            try:
+                try:
+                    nxt = os.open(part, flags, dir_fd=cur)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    try:
+                        os.mkdir(part, dir_fd=cur)
+                    except FileExistsError:
+                        pass  # made by someone else in between: open whatever is there, by the same rules
+                    nxt = os.open(part, flags, dir_fd=cur)
+            except OSError as e:
+                # WHICH OF THE TWO IT IS, ASKED RATHER THAN ASSUMED. `O_DIRECTORY|O_NOFOLLOW` on a
+                # symlink answers ENOTDIR on current kernels, not ELOOP (`do_open` checks for a
+                # directory before `may_open` gets to the link), so a symlinked component took the
+                # "not a directory" sentence and the reader lost the one fact that matters: something
+                # in the path points out of the workspace. Both errnos are mapped by LOOKING, with an
+                # `lstat` through the descriptor that was being descended - not by the path, which is
+                # what the refusal is about.
+                # Taken BEFORE the descriptor is closed, because it is the thing being asked about.
+                looked = None
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    try:
+                        looked = os.lstat(part, dir_fd=cur)
+                    except OSError:
+                        looked = None
+                if cur != base_fd:
+                    os.close(cur)
+                if e.errno == errno.ELOOP or (looked is not None and stat.S_ISLNK(looked.st_mode)):
+                    raise SandboxError(f"path escapes the workspace via a symlinked directory: {part!r}") from e
+                if e.errno == errno.ENOTDIR:
+                    raise SandboxError(f"workspace path component is not a directory: {part!r}") from e
+                raise
+            if cur != base_fd:
+                os.close(cur)
+            cur = nxt
+        return cur
+
+    def _restore_by_helper(self, tf: "object", members: "list") -> None:
+        """`_restore_host` through the helper box: the vetted members re-packed with the same mode rules
+        into a temporary file (not memory: the archive can be as large as the caller made it), then
+        `tar -x -o` as the box user."""
+        import tarfile
+
+        with tempfile.TemporaryFile() as packed:
+            with tarfile.open(fileobj=packed, mode="w:", format=tarfile.USTAR_FORMAT) as out:
+                for m in members:
+                    if m.isreg():
+                        # OWNER BITS ONLY, the same rule as `_restore_host`: a mode out of a tar
+                        # carries the ACL mask of the workspace it came from in its group bits, and
+                        # the ACL does not travel. See the note there.
+                        mode = m.mode & 0o700
+                        m.mode = (mode & ~0o111 if not mode & 0o100 else mode) | 0o600
+                    else:
+                        m.mode = 0o755
+                    out.addfile(m, tf.extractfile(m) if m.isreg() else None)  # type: ignore[attr-defined]
+            packed.seek(0)
+            argv = self._helper_argv(_HELPER_UNTAR, (), True, 600)
+            try:
+                r = subprocess.run(argv, stdin=packed, capture_output=True, timeout=630)  # noqa: S603
+            except (OSError, subprocess.SubprocessError) as e:
+                raise SandboxError(f"the workspace helper box did not run: {e}") from e
+        if r.returncode in (125, 126, 127):
+            raise self._helper_failed(r.returncode, r.stderr)
+        if r.returncode != 0:
+            said = r.stderr.decode(errors="replace").strip()[-400:]
+            raise SandboxError(f"restore: the box user could not extract: {said}")
 
     # -- setup (the only network window) -------------------------------------------------------------
 
@@ -4738,25 +6361,157 @@ class Sandbox:
         """Map WORKSPACE-relative path -> (mtime_ns, size), skipping .deps, our own files, and symlinks.
         `root` is where to walk (the workspace, or a subdir for `list_files(subdir)`); paths are ALWAYS
         made relative to the workspace root so `list_files("sub")` returns `sub/a.txt`, composable with
-        `read_file` (that was a regression when `root` doubled as the base). One lstat per file: S_ISREG
+        `read_file` (that was a regression when `root` doubled as the base). One lstat per entry: S_ISREG
         excludes non-regular files AND symlinks in a single syscall (a symlink's lstat mode is never
-        S_ISREG) - no extra isfile()/islink() stats."""
-        base = os.path.realpath(self._ws)
+        S_ISREG) - no extra isfile()/islink() stats.
+
+        BY DESCRIPTOR, from the workspace's own fd down: each directory is opened `O_NOFOLLOW` relative
+        to the one it was listed from, and listed through that descriptor. `os.walk` re-resolved every
+        path, so a box running beside this call could turn a directory into a symlink after it was
+        listed and have the next listing read a HOST directory, whose names and sizes then came back
+        in `result.files`.
+
+        A DIRECTORY THIS PROCESS CANNOT READ is collected, not skipped: with a non-root `user=` the box
+        user can close one to us (`mkdtemp`'s 0700), and its files would be missing from `result.files`
+        and `list_files` with nothing to say so. One helper box lists every such subtree.
+
+        ONE DESCRIPTOR PER DEPTH LEVEL, not one per entry. The first version of this opened every
+        subdirectory as it listed the parent and held them all until each was visited, so the count
+        grew with the WIDTH of the tree: a `node_modules` of some 1500 packages needs 1500 descriptors
+        at once, and the usual soft limit is 1024. Past it the opens fail, and with the resource errors
+        swallowed as churn those subtrees were missing from `result.files` and `list_files` with
+        nothing said - the exact silence this function exists to remove. A name is pushed and opened
+        when it is POPPED, so only the ancestors of the current directory are held.
+
+        AND A RESOURCE ERROR IS NOT CHURN. Only the errors that mean "it is not there any more, or it
+        is not a directory" are ignored (`ENOENT`, `ENOTDIR`, `ELOOP`); running out of descriptors,
+        out of memory or off a failing disk is raised, because a listing that silently loses a subtree
+        is worse than one that says it could not be made."""
         out: dict[str, tuple[int, int]] = {}
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = [d for d in dirnames if d != _DEPS_DIR]  # exclude deps from the diff
-            for fn in filenames:
-                fp = os.path.join(dirpath, fn)
+        shared = self._shared
+        blind: list[str] = []
+        top = os.path.relpath(root, os.path.realpath(self._ws))
+        top = "" if top == "." else top
+        # The workspace root itself: gone means nothing to walk, which is what `os.walk` of a missing
+        # root yielded. Anything else (no descriptors, no memory) is this caller's to see.
+        try:
+            base_fd = os.open(self._ws, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as e:
+            if e.errno in _WALK_GONE:
+                return out
+            raise
+        # Two kinds of frame, so the descriptors held are exactly the current directory's ANCESTORS:
+        #   (rel, parent_fd) - a directory to open relative to its parent and list
+        #   (None, fd)       - close `fd`, pushed under a directory's children so it runs after the
+        #                      last of them (the stack is LIFO)
+        stack: "list[tuple[str | None, int]]" = [(top, -1)]
+        try:
+            while stack:
+                rel_dir, parent_fd = stack.pop()
+                if rel_dir is None:
+                    os.close(parent_fd)
+                    continue
+                if parent_fd < 0:  # the root of this walk
+                    try:
+                        fd = self._descend_dirs(
+                            base_fd, top.split(os.sep) if top else [], create=False
+                        )
+                    except PermissionError:
+                        if shared:
+                            blind.append(top)
+                        continue
+                    except (OSError, SandboxError):
+                        continue  # nothing there to walk
+                else:
+                    name = rel_dir.rsplit("/", 1)[-1]
+                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                    try:
+                        fd = os.open(name, flags, dir_fd=parent_fd)
+                    except OSError as e:
+                        if shared and e.errno in (errno.EACCES, errno.EPERM):
+                            blind.append(rel_dir)
+                            continue
+                        if e.errno in _WALK_GONE:
+                            continue
+                        raise
+                keep_open = False
                 try:
-                    st = os.lstat(fp)
-                except OSError:
+                    try:
+                        with os.scandir(fd) as it:
+                            entries = list(it)
+                    except OSError as e:
+                        if shared and e.errno in (errno.EACCES, errno.EPERM):
+                            blind.append(rel_dir)  # it opened, and listing it is still refused
+                            continue
+                        if e.errno in _WALK_GONE:
+                            continue
+                        raise
+                    subdirs: "list[str]" = []
+                    for entry in entries:
+                        rel = f"{rel_dir}/{entry.name}" if rel_dir else entry.name
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError as e:
+                            if shared and e.errno in (errno.EACCES, errno.EPERM):
+                                blind.append(rel_dir)  # listable, not searchable: ask for it whole
+                                break
+                            continue
+                        if stat.S_ISDIR(st.st_mode):
+                            if entry.name == _DEPS_DIR:
+                                continue  # exclude deps from the diff, at any depth
+                            subdirs.append(rel)
+                        elif stat.S_ISREG(st.st_mode) and not self._is_ours(rel):
+                            out[rel] = (st.st_mtime_ns, st.st_size)
+                    if subdirs and fd != base_fd:
+                        # Children in listing order (as `os.walk` descended), and the close marker
+                        # under them: this descriptor is what they are opened relative to.
+                        stack.append((None, fd))
+                        keep_open = True
+                    if subdirs:
+                        stack.extend((r, fd) for r in reversed(subdirs))
+                finally:
+                    if not keep_open and fd != base_fd:
+                        os.close(fd)
+        finally:
+            # Whatever is still pending when an error leaves the loop: the close markers hold the
+            # open descriptors, the directory frames hold copies of their parents' (already closed by
+            # their own marker, or closed here once).
+            for rel_dir, fd in stack:
+                if rel_dir is None and fd != base_fd:
+                    os.close(fd)
+            os.close(base_fd)
+        if blind:
+            # ONE helper box for every blind subtree of this walk. Its mtimes are whole seconds, which
+            # is all `stat -c %Y` prints; a file is always seen through the same path while its
+            # directory keeps its mode, so a before/after pair compares like with like.
+            # SAID, NOT RAISED, AND THAT INCLUDES THE HELPER NOT RUNNING AT ALL. The returncode
+            # branch below was written for "the box user could not list it"; `_ws_helper` ALSO raises
+            # - no kern binary, the argument list too long for the kernel with many blind subtrees,
+            # the helper box timing out, `find` missing from the image - and that exception came out
+            # of `_diff`, discarding the stdout and stderr of a call that had already run. A listing
+            # may be incomplete; it may not destroy the result it describes.
+            try:
+                r = self._ws_helper(_HELPER_LIST, *[_helper_subtree(b) for b in blind])
+            except (SandboxError, OSError) as e:
+                warnings.warn(
+                    f"result.files / list_files may be missing entries: the helper that lists "
+                    f"{blind} did not run ({e})",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                return out
+            if r.returncode != 0:
+                said = r.stderr.decode(errors="replace").strip()[-400:]
+                warnings.warn(
+                    f"result.files / list_files may be missing entries: the box user could not list "
+                    f"{blind} ({said or f'exit {r.returncode}'})",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+            for rel, mode, size, mtime in _parse_helper_list(r.stdout):
+                if not stat.S_ISREG(mode) or _under_deps(rel) or self._is_ours(rel):
                     continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                rel = os.path.relpath(fp, base)
-                if self._is_ours(rel):
-                    continue  # ours (env file, cell/runner/results scratch), not a user artifact
-                out[rel] = (st.st_mtime_ns, st.st_size)
+                out[rel] = (mtime * 1_000_000_000, size)
         return out
 
     def _diff(self, before: dict[str, tuple[int, int]]) -> list[FileInfo]:
@@ -4789,8 +6544,20 @@ class Sandbox:
         return [
             fi
             for fi in files
-            if not self._is_ours(fi.path) and os.path.lexists(os.path.join(self._ws, fi.path))
+            if not self._is_ours(fi.path) and self._still_there(os.path.join(self._ws, fi.path))
         ]
+
+    def _still_there(self, full: str) -> bool:
+        """`lexists`, except that on a shared workspace a path this process may not even `lstat` is
+        THERE: it is in a directory the box user closed to us, which is how `_walk` came to ask the
+        helper about it. `lexists` answers False for that, and the file vanished from the diff."""
+        try:
+            os.lstat(full)
+        except PermissionError:
+            return self._shared
+        except OSError:
+            return False
+        return True
 
     # -- the two ways to run code --------------------------------------------------------------------
 
@@ -6037,16 +7804,11 @@ class _WarmBox:
         # behind - a file the caller never created, in a workspace they may have asked to persist.
         # `_release` runs after the unlink so `_walk` never reports a file that is still on disk as
         # user state.
-        if self._name:
+        if self._name and self._sbx._env_dir:
             try:
                 os.unlink(self._sbx._env_path(self._name))
             except OSError:
                 pass
-            try:
-                self._sbx._release(os.path.basename(self._sbx._env_path(self._name)))
-            except Exception:
-                pass  # the claim registry is ours and best-effort; failing to un-claim leaks a name,
-                # not a file, and the file above is already gone
             self._name = ""
 
     def kill(self) -> None:

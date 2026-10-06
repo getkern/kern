@@ -13,16 +13,7 @@ const path = require("node:path");
 // was, an immediate clean exit, which is all these unit tests depend on (they assert the argv the binding
 // BUILDS). A double that could not satisfy the contract would force an escape hatch into the product, and
 // an escape hatch is a flag an agent framework can set.
-const FAKE_KERN = (() => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), `kern-fake-${process.pid}-`));
-  const p = path.join(d, "kern");
-  fs.writeFileSync(
-    p,
-    '#!/bin/sh\ncase "$1" in\n  --version) echo "kern v0.0.0-test-double" ; exit 0 ;;\nesac\nexit 0\n',
-  );
-  fs.chmodSync(p, 0o755);
-  return p;
-})();
+const { FAKE_KERN } = require("./_fake_kern.js");
 
 const kern = require("../index.js");
 const { Sandbox, withSandbox, runCode, SandboxError, MountRefused } = kern;
@@ -1961,12 +1952,17 @@ test("concurrent calls on one Sandbox do not fight over the env file", exec, asy
   }
 });
 
-test("our env file is hidden from listings but a user file is not", () => {
-  // The filter became prefix-based when the env file went per-call. A bare startsWith would have
-  // swallowed a user's `.kern-environment` from `files` and from a snapshot, so it is anchored on the
-  // separator, and asserted in both directions.
+test("an env file an older version left is hidden from listings, and no wider shape is", () => {
+  // This version writes no env file into the workspace (see `_envPath`); what remains to hide is a
+  // LEFTOVER from an older one, killed mid-call, which holds `env` values. Hidden by its EXACT shapes:
+  // the bare legacy file, and `.kern-env.` + a box name as either binding makes one (`jssbx-`/`pysbx-`
+  // and 12 hex digits). The prefix rule this replaces let a box hide any file from `files` and from a
+  // snapshot by naming it `.kern-env.<anything>`. Asserted in both directions.
   assert.strictEqual(Sandbox._isEnvFile(".kern-env"), true);
-  assert.strictEqual(Sandbox._isEnvFile(".kern-env.box-abc123"), true);
+  assert.strictEqual(Sandbox._isEnvFile(".kern-env.jssbx-0123456789ab"), true);
+  assert.strictEqual(Sandbox._isEnvFile(".kern-env.pysbx-abcdefabcdef"), true);
+  assert.strictEqual(Sandbox._isEnvFile(".kern-env.box-abc123"), false, "a shape no binding makes");
+  assert.strictEqual(Sandbox._isEnvFile(".kern-env.jssbx-0123456789abX"), false);
   assert.strictEqual(Sandbox._isEnvFile(".kern-environment"), false);
   assert.strictEqual(Sandbox._isEnvFile("kern-env"), false);
   assert.strictEqual(Sandbox._isEnvFile("notes.txt"), false);
@@ -2195,14 +2191,26 @@ test("the prewarm key is pure and folds in every posture option", () => {
   assert.notStrictEqual(key(false), before, "a mount must change the key");
 });
 
-test("a dry argv writes no env file", () => {
+test("a dry argv writes no env file, and the live one writes it outside the workspace", () => {
+  // Every box mounts the workspace, so an env file there was readable by a box running beside the
+  // call, archived by a snapshot when a process died mid-call, and a name a box could plant a symlink
+  // at. It goes to the session's own 0700 directory instead. Mirrors Python.
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), "kern-dry-"));
+  const envDir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-sandbox-env-"));
   const s = new Sandbox({ env: { K: "V" } });
   s._ws = ws;
+  s._envDir = envDir;
   s._baseArgv("", { network: false, timeoutS: 0, dry: true });
   assert.deepStrictEqual(fs.readdirSync(ws), [], "a dry argv must leave the workspace untouched");
-  s._baseArgv("realbox", { network: false, timeoutS: 0 });
-  assert.strictEqual(fs.readdirSync(ws).length, 1, "the live path still writes exactly one env file");
+  assert.deepStrictEqual(fs.readdirSync(envDir), [], "and write no env file either");
+  const argv = s._baseArgv("realbox", { network: false, timeoutS: 0 });
+  assert.deepStrictEqual(fs.readdirSync(ws), [], "the env file must not be written into the workspace");
+  const written = fs.readdirSync(envDir);
+  assert.strictEqual(written.length, 1, "the live path writes exactly one env file");
+  assert.strictEqual(argv[argv.indexOf("--env-file") + 1], path.join(envDir, written[0]));
+  assert.strictEqual(fs.statSync(path.join(envDir, written[0])).mode & 0o777, 0o600);
+  fs.rmSync(ws, { recursive: true, force: true });
+  fs.rmSync(envDir, { recursive: true, force: true });
 });
 
 test("prewarm serves a cell identical to the cold one", exec, async () => {

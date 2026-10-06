@@ -62,6 +62,12 @@ const RESIDENT_PREFIX = "kern-sbx-";
 // The label a resident box's posture fingerprint is stamped into.
 const CFG_LABEL = "kern.sbx.cfg";
 
+/** An error that means "there, and closed to this process": what a non-root box user's 0700 or 0600 gives
+ * the host, and the only error the helper-box fallbacks answer. */
+function isClosedErr(e) {
+  return !!e && (e.code === "EACCES" || e.code === "EPERM");
+}
+
 /**
  * Bytes a directory tree occupies ON DISK, or 0 when it cannot be read.
  *
@@ -81,29 +87,46 @@ const CFG_LABEL = "kern.sbx.cfg";
  * 2000-level one is enough to end a recursive walk in a stack overflow.
  *
  * Best effort, never throwing: a file deleted mid-walk is ordinary in a live workspace, and a
- * measurement that can abort a call is worse than one that is slightly stale.
+ * measurement that can abort a call is worse than one that is slightly stale. With `blind` (a shared
+ * workspace) a directory closed to this process is pushed there whole, uncounted, for the caller to
+ * measure another way.
  */
-function workspaceUsage(root) {
+function workspaceUsage(root, blind = null) {
   let total = 0;
   const seen = new Set();
   const stack = [root];
+  // A DIRECTORY THIS PROCESS CANNOT READ is not an empty one. With a non-root `user` the box user can
+  // close one to us (`mkdtemp`'s 0700), and counting it as zero would let the code in the box keep a
+  // cap's worth of bytes where this walk does not look. It goes to `blind` WHOLE, its entries uncounted
+  // here, so the caller can measure it another way without counting any twice. Mirrors Python.
   while (stack.length) {
     const current = stack.pop();
     let entries;
     try {
       entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
+    } catch (e) {
+      if (blind && isClosedErr(e)) blind.push(current);
       continue;
     }
+    const stats = [];
+    let closed = false;
     for (const entry of entries) {
       const full = path.join(current, entry.name);
-      let st;
       try {
-        st = fs.lstatSync(full);
-      } catch {
-        continue;
+        stats.push([full, fs.lstatSync(full)]);
+      } catch (e) {
+        if (isClosedErr(e)) {
+          closed = true; // listable, not searchable
+          break;
+        }
       }
-      if (entry.isDirectory()) stack.push(full);
+    }
+    if (closed) {
+      if (blind) blind.push(current);
+      continue;
+    }
+    for (const [full, st] of stats) {
+      if (st.isDirectory()) stack.push(full); // from the lstat already taken
       const key = `${st.dev}:${st.ino}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -121,28 +144,167 @@ function workspaceUsage(root) {
  * the host process for its whole duration, and these calls talk to `kern ps` and `kern box`.
  */
 function runCapture(argv, timeoutMs, env) {
+  // `env` IS OPTIONAL AND DEFAULTS TO INHERITING, which is right for the read-only queries that use this
+  // helper (`kern ps`, `kern stop`). It exists because ONE caller must not inherit: creating a resident
+  // box has to honour the Sandbox's `enforceLimits` rather than whatever `KERN_NO_SCOPE` happened to be
+  // exported in the shell. The text view of `runBuffered`, decoded once rather than chunk by chunk, so a
+  // character split across two reads is not mangled.
+  return runBuffered(argv, { timeoutMs, env }).then((r) => ({
+    code: r.code,
+    stdout: r.stdout.toString("utf8"),
+    stderr: r.stderr,
+  }));
+}
+
+const DEPS_DIR = ".deps"; // pip --target dir inside the workspace (added to PYTHONPATH for python)
+
+// The errors that mean "this name is not a directory any more", which is ordinary churn in a
+// workspace a box is writing to: the entry went (ENOENT), or it was replaced by something that is
+// not a directory - a symlink, which `O_DIRECTORY | O_NOFOLLOW` answers ENOTDIR for on current
+// kernels, or a file. EVERYTHING ELSE IS THROWN: EMFILE and ENOMEM used to read as churn too, and a
+// walk that loses a subtree to one of those reports a workspace smaller than it is.
+const WALK_GONE = new Set(["ENOENT", "ENOTDIR", "ELOOP"]);
+
+// -- `user`: an account of the image, and what it takes for the workspace to stay shared ------------
+//
+// The SAME design as the Python binding, explained there at length (`_validate_user` and below): box
+// root writes as this process, a NON-ROOT box user is a uid of kern's subordinate range on disk
+// (`node`, 1000, is 100999 here, measured), and a POSIX ACL on the workspace shares it both ways. What
+// an ACL cannot outrank (a 0600 file, a 0700 directory the box user makes on purpose) is reached
+// through a short-lived box of the same image running as that user, its owner, only after the host
+// was refused. Node has no xattr call, so the ACL is written by `setfacl`, on descriptors (see
+// `aclGrantBatches`). The helper scripts are byte-for-byte Python's, so both bindings refuse the same
+// things in the same words.
+
+/** A `user` value: `<user>[:<group>]`, each a name or a number, no leading `-`. Mirrors Python. */
+const USER_SPEC_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$/;
+
+function validateUser(spec) {
+  if (typeof spec !== "string" || !USER_SPEC_RE.test(spec))
+    throw new SandboxError(
+      "user must be '<user>' or '<user>:<group>', each a name or a number of the image's own " +
+        `accounts (e.g. user: "node" or user: "1000:1000"), got ${JSON.stringify(spec)}`,
+    );
+  return spec;
+}
+
+/** Whether `spec` runs the box as box root: no spec, or a user half of `0` or `root`. */
+function isRootUser(spec) {
+  return !spec || ["0", "root"].includes(String(spec).split(":")[0]);
+}
+
+/** The `USER` the image declares, from kern's config sidecar, or null (none declared, or no sidecar to
+ * read, which leaves a session exactly as it was before this existed). Mirrors `_image_user`. */
+function imageUser(image) {
+  let text;
+  try {
+    const fd = fs.openSync(kernImageFile(image, ".image"), "r");
+    try {
+      // THE FILE'S OWN SIZE, bounded, and not a fixed 1 MiB buffer: zeroing that on every open() cost
+      // 45.9 us for a sidecar of a few hundred bytes (measured), five times Python's whole read.
+      const size = Math.min(fs.fstatSync(fd).size, 1 << 20);
+      const buf = Buffer.allocUnsafe(size);
+      text = buf.subarray(0, fs.readSync(fd, buf, 0, size, 0)).toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  for (const line of text.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab >= 0 && line.slice(0, tab) === "user") return line.slice(tab + 1) || null;
+  }
+  return null;
+}
+
+// The helper box's scripts (see `Sandbox._helperArgv`), byte-for-byte the Python binding's: run by
+// `sh -c SCRIPT sh ARGS...` as the box user with the workspace at `/w`, taking PATH COMPONENTS and
+// refusing a symlink in any of them. Exit 40 is a symlink, 41 not a regular file, 42 a directory that
+// could not be made, 43 not a directory.
+const HELPER_READ =
+  'l=$1; shift; p=/w; for c in "$@"; do p="$p/$c"; if [ -L "$p" ]; then exit 40; fi; done; ' +
+  '[ -f "$p" ] || exit 41; if [ -n "$l" ]; then exec head -c "$l" -- "$p"; fi; exec cat -- "$p"';
+const HELPER_WRITE =
+  'p=/w; n=$#; i=0; for c in "$@"; do i=$((i+1)); p="$p/$c"; ' +
+  'if [ -L "$p" ]; then exit 40; fi; ' +
+  'if [ "$i" -lt "$n" ]; then [ -d "$p" ] || mkdir -- "$p" || exit 42; fi; done; ' +
+  'if [ -e "$p" ] && [ ! -f "$p" ]; then exit 41; fi; ' +
+  't=$(mktemp "${p%/*}/.kern-write-XXXXXX") || exit 42; ' +
+  'chmod 664 "$t" && cat > "$t" && mv -f -- "$t" "$p"';
+const HELPER_LIST =
+  'cd /w || exit 1; find "$@" -exec sh -c ' +
+  "'for f; do stat -c \"%f %s %Y\" -- \"$f\" && printf \"%s\\0\" \"$f\"; done' sh {} +";
+const HELPER_DU = 'cd /w || exit 1; du -sk -- "$@"';
+const HELPER_ISDIR =
+  'p=/w; for c in "$@"; do p="$p/$c"; if [ -L "$p" ]; then exit 40; fi; done; [ -d "$p" ] || exit 43';
+const HELPER_CLEAN =
+  "chmod -R u+rwX -- /w/* /w/.[!.]* /w/..?* 2>/dev/null; rm -rf -- /w/* /w/.[!.]* /w/..?*";
+const HELPER_TAR = 'cd /w || exit 1; exec tar -cf - "$@"';
+const HELPER_UNTAR = "exec tar -x -o -f - -C /w";
+/** What the scripts need in the image, said by the refusal that cannot run them. Python says the same. */
+const HELPER_TOOLS =
+  "The image needs a POSIX shell with cat, head, find, stat, du, tar, mktemp, chmod, mv, mkdir and " +
+  "rm (coreutils or busybox)";
+
+/** A workspace-relative path as a helper script argument: under `./`, so a name can never read as an
+ * option, and `.` for the workspace itself. Mirrors Python's `_helper_subtree`. */
+function helperSubtree(rel) {
+  return rel && rel !== "." ? `./${rel}` : ".";
+}
+
+/** Whether a workspace-relative path is inside a `.deps` directory, at any depth: the rule the host walk
+ * applies by not descending there, for paths that came from the helper instead. Mirrors Python. */
+function underDeps(rel) {
+  return rel.split("/").slice(0, -1).includes(DEPS_DIR);
+}
+
+/** `[path relative to /w, st_mode, size, mtimeS]` per record of HELPER_LIST. Mirrors Python. */
+function parseHelperList(raw) {
+  const out = [];
+  let start = 0;
+  while (start < raw.length) {
+    let end = raw.indexOf(0, start);
+    if (end < 0) end = raw.length;
+    const rec = raw.subarray(start, end);
+    start = end + 1;
+    const nl = rec.indexOf(0x0a);
+    if (nl < 0) continue;
+    const fields = rec.subarray(0, nl).toString("utf8").trim().split(/\s+/);
+    if (fields.length !== 3) continue;
+    const [mode, size, mtime] = [parseInt(fields[0], 16), Number(fields[1]), Number(fields[2])];
+    if (![mode, size, mtime].every(Number.isFinite)) continue;
+    let p = rec.subarray(nl + 1).toString("utf8");
+    if (p.startsWith("./")) p = p.slice(2);
+    if (p && p !== ".") out.push([p, mode, size, mtime]);
+  }
+  return out;
+}
+
+/** Run `argv` and capture its output BUFFERED, without blocking the event loop. `input`, when given, is
+ * written to its stdin (otherwise stdin is /dev/null); `fds` are descriptors of this process handed to
+ * the child as its fd 3, 4, ... (for `setfacl` on `/proc/self/fd/N`); `env` replaces the inherited
+ * environment. Resolves `{ code, stdout: Buffer, stderr: string }`, -1 for a spawn failure or a timeout.
+ * The one runner: `runCapture` is its text view. */
+function runBuffered(argv, { input = null, timeoutMs = 150000, fds = [], env } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      // `env` IS OPTIONAL AND DEFAULTS TO INHERITING, which is right for the read-only queries that
-      // use this helper (`kern ps`, `kern stop`). It exists because ONE caller must not inherit:
-      // creating a resident box has to honour the Sandbox's `enforceLimits` rather than whatever
-      // `KERN_NO_SCOPE` happened to be exported in the shell.
-      const opts = { stdio: ["ignore", "pipe", "pipe"] };
+      const opts = { stdio: [input === null ? "ignore" : "pipe", "pipe", "pipe", ...fds] };
       if (env !== undefined) opts.env = env;
       child = spawn(argv[0], argv.slice(1), opts);
     } catch (e) {
-      resolve({ code: -1, stdout: "", stderr: String(e && e.message) });
+      resolve({ code: -1, stdout: Buffer.alloc(0), stderr: String(e && e.message) });
       return;
     }
-    let out = "";
+    const out = [];
     let err = "";
     let settled = false;
     const finish = (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ code, stdout: out, stderr: err });
+      resolve({ code, stdout: Buffer.concat(out), stderr: err });
     };
     const timer = setTimeout(() => {
       try {
@@ -152,21 +314,214 @@ function runCapture(argv, timeoutMs, env) {
       }
       finish(-1);
     }, timeoutMs);
-    child.stdout.on("data", (d) => {
-      out += d.toString();
-    });
-    child.stderr.on("data", (d) => {
-      err += d.toString();
-    });
+    // THE ERROR HANDLER GOES ON FIRST, AND THE STREAMS ARE NOT ASSUMED TO EXIST. When `spawn` fails
+    // for a reason it reports asynchronously - EMFILE and ENFILE are the ones reachable from here,
+    // since a workspace walk can be holding descriptors - it returns a ChildProcess with NO stdio
+    // streams: `child.stdout.on` then threw a TypeError inside this Promise executor, before any
+    // `error` listener was attached, and an unhandled `error` event on the next tick takes the whole
+    // process down. Both halves of that are fixed here: the listener is attached before anything can
+    // throw, and absent streams settle the call instead of dereferencing null.
     child.on("error", (e) => {
       err += String(e && e.message);
       finish(-1);
     });
     child.on("close", (code) => finish(code === null ? -1 : code));
+    if (!child.stdout || !child.stderr) {
+      err += "the child was spawned without stdio (the process may be out of descriptors)";
+      finish(-1);
+      return;
+    }
+    child.stdout.on("data", (d) => out.push(d));
+    child.stderr.on("data", (d) => {
+      err += d.toString();
+    });
+    if (input !== null) {
+      child.stdin.on("error", () => {}); // a child that exits before reading all of it is not ours to fail
+      child.stdin.end(input);
+    }
   });
 }
 
-const DEPS_DIR = ".deps"; // pip --target dir inside the workspace (added to PYTHONPATH for python)
+/** `O_PATH`, which `fs.constants` does not export; the value is fixed by the Linux ABI. */
+const O_PATH = 0o10000000;
+/** How many descriptors one `setfacl` is handed at a time, far under any fd or argv limit. */
+const SETFACL_BATCH = 200;
+
+/**
+ * The `setfacl` batches that give `boxUid` (the host uid the box user writes as) the OWNER's bits on
+ * `root` and on everything under it this process owns, and on each directory a default ACL naming both
+ * uids, so whatever either side creates inside stays reachable by the other. The entries Python's
+ * `_acl_grant_fd` writes; yields `[spec, fds]`, the descriptors then the caller's to close.
+ *
+ * THROUGH DESCRIPTORS, NEVER PATHS. The workspace can be written by a box while this runs (a resident
+ * box of an earlier session), and `setfacl <path>` resolves the path again: a component swapped for a
+ * symlink between the walk and the call would put the entry on a HOST file the link names. So the walk
+ * descends by directory fd (`/proc/self/fd/<dir>/<name>`, the trick `_openParentDirNofollow` uses),
+ * each entry is opened `O_PATH | O_NOFOLLOW`, and `setfacl` is handed the descriptors themselves: its
+ * `/proc/self/fd/N` names exactly that inode. In BATCHES, each applied and closed before the next
+ * fills, so a large tree never holds more than one batch of descriptors open. ONE FILESYSTEM: a mount
+ * inside the workspace is neither granted nor descended. A directory this process cannot read is the
+ * box user's own; any other error is raised, never read as "nothing there". `stats` counts entries of a
+ * THIRD uid (an earlier session's different account), which only their owner can give an entry.
+ */
+function* aclGrantBatches(root, boxUid, ownUid, recursive, stats) {
+  const pending = new Map();
+  const stack = [];
+  const skippable = (e) => e && (e.code === "ENOENT" || isClosedErr(e));
+  const bits = (m) => `${m & 4 ? "r" : "-"}${m & 2 ? "w" : "-"}${m & 1 ? "x" : "-"}`;
+  const nofollow = fs.constants.O_NOFOLLOW;
+  const dirFlags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | nofollow;
+  function* queue(fd, st) {
+    const access = `u:${boxUid}:${bits((st.mode >> 6) & 7)}`;
+    const spec = st.isDirectory()
+      ? `${access},d:u::rwx,d:u:${ownUid}:rwx,d:u:${boxUid}:rwx,d:g::---,d:o::---`
+      : access;
+    const list = pending.get(spec) || [];
+    list.push(fd);
+    pending.set(spec, list);
+    if (list.length >= SETFACL_BATCH) {
+      pending.delete(spec);
+      yield [spec, list];
+    }
+  }
+  try {
+    const rootFd = fs.openSync(root, O_PATH | nofollow);
+    const rootSt = fs.fstatSync(rootFd);
+    const device = rootSt.dev;
+    if (rootSt.uid === ownUid) yield* queue(rootFd, rootSt);
+    else fs.closeSync(rootFd);
+    if (recursive) stack.push([root, fs.openSync(root, dirFlags)]);
+    while (stack.length) {
+      const [dirPath, dirFd] = stack.pop();
+      try {
+        let names = [];
+        try {
+          names = fs.readdirSync(`/proc/self/fd/${dirFd}`);
+        } catch (e) {
+          if (!skippable(e)) throw e;
+        }
+        for (const name of names) {
+          let fd;
+          try {
+            fd = fs.openSync(`/proc/self/fd/${dirFd}/${name}`, O_PATH | nofollow);
+          } catch (e) {
+            if (skippable(e)) continue;
+            throw e;
+          }
+          let queued = false;
+          try {
+            const st = fs.fstatSync(fd);
+            if (st.isSymbolicLink() || st.dev !== device) continue;
+            if (st.uid !== ownUid && st.uid !== boxUid) {
+              stats.foreign += 1;
+              stats.example = stats.example || path.relative(root, path.join(dirPath, name));
+              continue;
+            }
+            if (st.isDirectory()) {
+              // REOPENED THROUGH THE DESCRIPTOR JUST CHECKED, not by name a second time. Two opens
+              // of `/proc/self/fd/<dirFd>/<name>` can land on two different directories if the box
+              // swaps the entry in between, and it was the FIRST that was stated and granted while
+              // the SECOND was descended. `/proc/self/fd/<fd>` names the open inode itself, so there
+              // is nothing left to resolve. (Python's `os.fwalk` compares the two instead.)
+              //
+              // WITHOUT `O_NOFOLLOW`, deliberately, and this is the one place in this file where
+              // that is right: the thing being opened IS a magic link to the inode already held, and
+              // `O_NOFOLLOW` refuses to traverse it at all (measured: ENOTDIR on
+              // `/proc/self/fd/<n>`). There is no name left for anything to swap.
+              const reopen = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY;
+              try {
+                stack.push([path.join(dirPath, name), fs.openSync(`/proc/self/fd/${fd}`, reopen)]);
+              } catch (e) {
+                if (!skippable(e)) throw e;
+              }
+            }
+            if (st.uid === ownUid) {
+              queued = true;
+              yield* queue(fd, st);
+            }
+          } finally {
+            if (!queued) fs.closeSync(fd);
+          }
+        }
+      } finally {
+        fs.closeSync(dirFd);
+      }
+    }
+    // ONE AT A TIME, REMOVED AS IT IS HANDED OVER. `[...pending]` followed by `pending.clear()`
+    // emptied the map before any of the remainder was yielded, so a consumer that stops early - the
+    // `setfacl` throw in `open()` or `restore()` - ran the `finally` below with nothing to close and
+    // leaked every batch still in the queue, up to 16 specs of 199 descriptors.
+    for (const spec of [...pending.keys()]) {
+      const list = pending.get(spec);
+      pending.delete(spec);
+      yield [spec, list];
+    }
+  } finally {
+    for (const [, fd] of stack) closeQuietly(fd);
+    for (const list of pending.values()) for (const fd of list) closeQuietly(fd);
+  }
+}
+
+function closeQuietly(fd) {
+  try {
+    fs.closeSync(fd);
+  } catch {
+    /* already closed */
+  }
+}
+
+/** `setfacl -m SPEC` on descriptors handed to it as its fd 3, 4, ...: the C locale, because its error
+ * text is what tells a missing ACL from anything else. */
+function setfaclCall(spec, fds) {
+  return {
+    argv: ["setfacl", "-m", spec, "--", ...fds.map((_, j) => `/proc/self/fd/${3 + j}`)],
+    env: { ...process.env, LC_ALL: "C" },
+  };
+}
+
+/** A failed `setfacl`, as an error whose `code` the caller turns into its sentence: `ENOSETFACL` when the
+ * tool is not installed, `ENOTSUP` when the filesystem has no ACLs. */
+function setfaclError(code, stderr) {
+  const said = String(stderr || "");
+  const e = new SandboxError(
+    code === -1 && /ENOENT/.test(said)
+      ? "setfacl is not installed"
+      : `setfacl failed: ${said.trim().slice(-400)}`,
+  );
+  e.code = code === -1 && /ENOENT/.test(said) ? "ENOSETFACL" : /Operation not supported/.test(said) ? "ENOTSUP" : "EACL";
+  return e;
+}
+
+/** `aclGrantBatches` applied from an async caller, through `runBuffered`. Returns `[foreign, example]`. */
+async function aclGrantTreeAsync(root, boxUid, ownUid, { recursive = true } = {}) {
+  const stats = { foreign: 0, example: "" };
+  for (const [spec, fds] of aclGrantBatches(root, boxUid, ownUid, recursive, stats)) {
+    try {
+      const { argv, env } = setfaclCall(spec, fds);
+      const r = await runBuffered(argv, { fds, env, timeoutMs: 60000 });
+      if (r.code !== 0) throw setfaclError(r.code, r.stderr);
+    } finally {
+      for (const fd of fds) closeQuietly(fd);
+    }
+  }
+  return [stats.foreign, stats.example];
+}
+
+/** `aclGrantBatches` applied from the synchronous `restore()`, through `spawnSync`, which that method's
+ * own synchronous file I/O already blocks on in the same way. */
+function aclGrantTreeSync(root, boxUid, ownUid) {
+  const stats = { foreign: 0, example: "" };
+  for (const [spec, fds] of aclGrantBatches(root, boxUid, ownUid, true, stats)) {
+    try {
+      const { argv, env } = setfaclCall(spec, fds);
+      const r = spawnSync(argv[0], argv.slice(1), { stdio: ["ignore", "ignore", "pipe", ...fds], env, timeout: 60000 });
+      if (r.error || r.status !== 0) throw setfaclError(r.error ? -1 : r.status, r.error ? r.error.message : r.stderr);
+    } finally {
+      for (const fd of fds) closeQuietly(fd);
+    }
+  }
+  return [stats.foreign, stats.example];
+}
 
 /** Where the shared stdlib bytecode cache is mounted inside a box, READ-ONLY.
  *
@@ -386,6 +741,12 @@ function fnv1a(s) {
   return h.toString(16).padStart(16, "0");
 }
 
+/** One of the files kern keeps next to an image in ITS cache (`.image`, `.ok`, `.layers`): the one place
+ * this package spells where they are, so a moved $XDG_CACHE_HOME moves every reader. Mirrors Python. */
+function kernImageFile(image, suffix) {
+  return path.join(cacheHome(), "kern", "images", `${sanitizeRef(image)}${suffix}`);
+}
+
 /** The directory name kern gives an image in its own cache. A PORT, verified against the original. */
 function sanitizeRef(image) {
   const ref = ociSplitTag(image) ? image : `${image}:latest`;
@@ -407,7 +768,7 @@ const IMAGE_FETCHES = new Map();
  * stat; "cannot tell" reads as not cached, which costs one `kern pull` that finds the image (2 ms). */
 function imageIsCached(image) {
   try {
-    return fs.existsSync(path.join(cacheHome(), "kern", "images", `${sanitizeRef(image)}.ok`));
+    return fs.existsSync(kernImageFile(image, ".ok"));
   } catch {
     return false;
   }
@@ -457,23 +818,21 @@ const PYC_SOURCE_ID = ".kern-source-id";
  * whose image kern has pruned, is never rebuilt in a loop. */
 function pycSourceId(image) {
   try {
-    const root = path.join(cacheHome(), "kern", "images");
-    const safe = sanitizeRef(image);
     const h = crypto.createHash("sha256");
     // THE CONFIG, which changes when ENTRYPOINT/ENV/WORKDIR/USER do.
-    h.update(fs.readFileSync(path.join(root, `${safe}.image`)).subarray(0, 4096));
+    h.update(fs.readFileSync(kernImageFile(image, ".image")).subarray(0, 4096));
     // THE SENTINEL'S STAMP, NOT ITS BYTES. `.ok` holds the REFERENCE, so its contents are the tag and
     // never move when the tag does: hashing them missed the commonest case there is, a rebuilt rootfs
     // under an unchanged config. Its mtime and length are what kern ITSELF uses to decide an image's
     // content changed, because a re-pull rewrites the sentinel last. Measured: a real re-pull leaves
     // the config byte-identical and moves this.
-    const st = fs.statSync(path.join(root, `${safe}.ok`), { bigint: true });
+    const st = fs.statSync(kernImageFile(image, ".ok"), { bigint: true });
     h.update(`${st.mtimeNs}:${st.size}`);
     // AND THE LAYER MANIFEST FOR A BUILT IMAGE, which names its layers by content. A pulled image has
     // none, and that absence is part of the identity: an image that stops being layered is not the
     // same image.
     try {
-      h.update(fs.readFileSync(path.join(root, `${safe}.layers`)).subarray(0, 8192));
+      h.update(fs.readFileSync(kernImageFile(image, ".layers")).subarray(0, 8192));
     } catch {
       h.update("\0no-layers");
     }
@@ -681,6 +1040,10 @@ function pycBuild(kernBin, image, dest, timeoutS) {
   try {
     fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
     fs.mkdirSync(tmp, { recursive: true, mode: 0o700 });
+    // THE TREE ITSELF IS 0755, its parent stays 0700: a box mounts this directory directly, so the
+    // parent keeps the host's other users out, and a NON-ROOT box user must be able to enter it. At
+    // 0700 CPython could not, ignored the prefix in silence and compiled from source. Mirrors Python.
+    fs.chmodSync(tmp, 0o755);
   } catch {
     return Promise.resolve();
   }
@@ -848,6 +1211,117 @@ const ENV_FILE = ".kern-env"; // host-side 0600 env file (kept out of argv so va
 // Measured at 30 concurrent runCode calls: 2 failed that way, and one file was left behind.
 // The `O_EXCL|O_NOFOLLOW` create is a security property and is unchanged; only the NAME is per-call.
 const ENV_SEP = ".";
+const ENV_DIR_PREFIX = "kern-sandbox-env-";
+// WHAT A SNAPSHOT'S `.deps` WAS BUILT FOR, as the archive's FIRST member; recognised only there and only
+// with its key, so a user file of the same name is a later member restored like any other. Spelled as
+// the Python binding spells it, so an archive from either is understood by both.
+const SNAPSHOT_RECORD = ".kern-snapshot.json";
+const SNAPSHOT_RECORD_KEY = "kern_snapshot";
+const SNAPSHOT_RECORD_MAX = 4096;
+
+/** The CPU a box on this host runs, as `uname -m` spells it (boxes are native). `os.machine` is Node
+ * 18.9+; the map covers the `process.arch` spellings that differ before it. */
+function hostMachine() {
+  if (typeof os.machine === "function") return os.machine();
+  return { x64: "x86_64", arm64: "aarch64", arm: "armv7l", ia32: "i686", ppc64: "ppc64le", s390x: "s390x" }[process.arch] || process.arch;
+}
+
+const SNAPSHOT_FIELD = /^[\x21-\x7e]{1,256}$/;
+
+/** The provenance record in `raw`, or null when it is not one. The SAME rule as Python's
+ * `_snapshot_record`: strict UTF-8 JSON (a BOM or UTF-16 is not), an object whose key is the number 1,
+ * and `image` and `machine` as 1 to 256 printable ASCII characters. */
+function snapshotRecord(raw) {
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw);
+  } catch {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (parsed[SNAPSHOT_RECORD_KEY] !== 1) return null;
+  for (const field of ["image", "machine"])
+    if (typeof parsed[field] !== "string" || !SNAPSHOT_FIELD.test(parsed[field])) return null;
+  return parsed;
+}
+
+/** The warning restore() gives for a snapshot whose `.deps` were built for another image or CPU, or
+ * null. Same comparison and same words as Python's `_snapshot_origin_note`. */
+function snapshotOriginNote(record, image, machine, hasDeps) {
+  if (!hasDeps || !record || typeof record !== "object") return null;
+  const wasImage = record.image;
+  const wasMachine = record.machine;
+  if (typeof wasImage !== "string" || typeof wasMachine !== "string") return null;
+  if (sanitizeRef(wasImage) === sanitizeRef(image) && wasMachine === machine) return null;
+  return (
+    `restore: this snapshot's .deps were installed in image '${wasImage}' on '${wasMachine}', and this ` +
+    `sandbox runs '${image}' on '${machine}'. A compiled package in .deps (a C or Rust extension) is built ` +
+    `for one Python, libc and CPU, and fails to import on another - as ModuleNotFoundError or ` +
+    `ImportError naming the package, not the snapshot. Run the install again in this sandbox (setup) to ` +
+    `rebuild them for its image.`
+  );
+}
+// The env-file names an OLDER version of either binding wrote into the workspace: the bare legacy
+// file, one per call box named the way both bindings name them, and the resident box's (`kern-sbx-` and
+// the sandbox's name, in kern's box-name alphabet), which no version ever removed. Those files hold
+// `env` values, so a REGULAR FILE of one of these names is kept out of listings and snapshots. EXACTLY
+// these shapes and no wider: a reserved prefix would let a box hide any file by naming it to match.
+const LEGACY_ENV_FILE = /^\.kern-env(?:\.(?:(?:py|js)sbx-[0-9a-f]{12}|kern-sbx-[A-Za-z0-9_.-]{1,191}))?$/;
+function isLegacyEnvFile(rel) {
+  return LEGACY_ENV_FILE.test(rel);
+}
+
+/** A new 0700 directory for one session's env files, OUTSIDE the workspace `avoid`: the first of
+ * $XDG_RUNTIME_DIR (when this user owns it and nobody else can enter it; a tmpfs, so a file left by a
+ * process killed mid-call goes at logout), the system temp directory, then the user's cache directory,
+ * that is not inside the workspace. A session given `workspace: "/tmp"` with no private runtime
+ * directory used to get it under /tmp, inside the workspace every box mounts. If every candidate is
+ * inside it, the session is refused. Mirrors Python's `_private_env_dir`. */
+function privateEnvDir(avoid = "") {
+  const ws = avoid ? fs.realpathSync(avoid) : "";
+  const insideWorkspace = (p) => {
+    let real;
+    try {
+      real = fs.realpathSync(p);
+    } catch {
+      return false;
+    }
+    return Boolean(ws) && (real === ws || real.startsWith(ws.replace(/\/+$/, "") + path.sep));
+  };
+  const closedToOthers = (p) => {
+    try {
+      const st = fs.statSync(p);
+      return st.isDirectory() && st.uid === process.getuid() && (st.mode & 0o077) === 0;
+    } catch {
+      return false;
+    }
+  };
+  const candidates = [];
+  const runtime = process.env.XDG_RUNTIME_DIR || "";
+  if (path.isAbsolute(runtime) && closedToOthers(runtime)) candidates.push(runtime);
+  // mkdtemp makes the directory itself 0700, so a shared temp directory is fine as a parent.
+  candidates.push(os.tmpdir());
+  const cache = path.join(cacheHome(), "kern-sandbox");
+  try {
+    fs.mkdirSync(cache, { recursive: true, mode: 0o700 });
+    candidates.push(cache);
+  } catch {
+    /* not available: the candidates above are tried */
+  }
+  for (const base of candidates)
+    if (!insideWorkspace(base)) return fs.mkdtempSync(path.join(base, ENV_DIR_PREFIX));
+  throw new SandboxError(
+    `no place for this session's env files outside its workspace (${avoid}): the runtime, temp and ` +
+      "cache directories are all inside it. Give the Sandbox a workspace that does not contain them.",
+  );
+}
+
 const INLINE_CODE_MAX = 128 * 1024; // above this, pass code via a file instead of argv (ARG_MAX guard)
 // Cap the results file the (untrusted) box writes before the binding reads it into host RAM: a malicious
 // cell could stream a multi-GB `.res` to disk (past its own memory cap) and OOM the host.
@@ -864,6 +1338,32 @@ import sys, builtins  # C builtins: no .py to recompile in the read-only slim bo
 _CELL = "__KERN_CELL__"
 _RES = "__KERN_RES__"
 _out = []
+# Figures this cell already put in _out, id -> (figure, PNG as drawn then, or None for the cell's FINAL
+# value). The figure is kept alive, so an id freed and reused within the cell cannot make an unrelated
+# figure look already sent; the PNG lets the end of the cell skip a displayed figure only if the code did
+# not draw on it after (matplotlib renders an unchanged figure to the same bytes).
+_shown = {}
+def _figure_of(o):
+    """o if it is a matplotlib Figure, a subclass included, else None. Never raises: o is the cell's."""
+    try:
+        _mf = sys.modules.get("matplotlib.figure")
+        return o if _mf is not None and isinstance(o, _mf.Figure) else None
+    except Exception:
+        return None
+def _open_figures(plt):
+    """The figures pyplot holds open, read from the manager list matplotlib's own inline backend reads,
+    and not through plt.figure(n): that call MAKES a figure for a number closed meanwhile, and user code
+    may have replaced it. The number walk is the fallback for a matplotlib without the list."""
+    try:
+        from matplotlib._pylab_helpers import Gcf
+        # By figure NUMBER, the order the number walk gave: the manager list is in the order the
+        # figures were last made active.
+        return [m.canvas.figure for m in sorted(Gcf.get_all_fig_managers(), key=lambda m: m.num)]
+    except Exception:
+        try:
+            return [plt.figure(n) for n in plt.get_fignums()]
+        except Exception:
+            return []
 def _js(s):  # minimal JSON string encoder, so the box needs no \`import json\` (~80ms in a pyc-less slim box)
     r = ['"']
     for ch in s:
@@ -886,6 +1386,15 @@ def _js(s):  # minimal JSON string encoder, so the box needs no \`import json\` 
     return "".join(r)
 def _bundle(o):
     d = {}
+    _fig = _figure_of(o)
+    if _fig is not None:
+        try:  # a Figure handed back as a value is DRAWN, as Jupyter's inline backend draws it
+            import base64, io  # lazy: a Figure exists, so matplotlib is already imported
+            _b = io.BytesIO()
+            _fig.savefig(_b, format="png")
+            d["image/png"] = base64.b64encode(_b.getvalue()).decode()
+        except Exception:
+            pass
     for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
                       ("_repr_svg_", "image/svg+xml"), ("_repr_latex_", "text/latex")):
         try:
@@ -927,7 +1436,10 @@ def _bundle(o):
     return d
 def display(o=None, **kw):
     if o is not None:
-        _out.append(_bundle(o))
+        _d = _bundle(o)
+        _out.append(_d)
+        if "image/png" in _d and _figure_of(o) is not None:
+            _shown[id(o)] = (o, _d["image/png"])  # as drawn at this line; the code may draw on after it
 builtins.display = display
 sys.argv = [_CELL]
 _g = {"__name__": "__main__", "__file__": _CELL, "display": display}
@@ -951,6 +1463,10 @@ try:
         _val = eval(compile(_tail, _CELL, "eval"), _g)
         if _val is not None:
             _out.append(_bundle(_val))
+            if _figure_of(_val) is not None:
+                # the FINAL value of the cell is the figure's final state: not sent again below. A
+                # display(fig) earlier in the cell records nothing, because the code may draw on after it.
+                _shown[id(_val)] = (_val, None)
 except SystemExit as _e:
     _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
 except BaseException as _e:
@@ -964,10 +1480,18 @@ try:
     if "matplotlib.pyplot" in sys.modules:
         import base64, io
         _plt = sys.modules["matplotlib.pyplot"]
-        for _fig in _plt.get_fignums():
-            _buf = io.BytesIO()
-            _plt.figure(_fig).savefig(_buf, format="png")
-            _out.append({"image/png": base64.b64encode(_buf.getvalue()).decode()})
+        for _f in _open_figures(_plt):
+            try:  # one figure that cannot be drawn does not stop the others, as in the kernel
+                _was = _shown.get(id(_f))
+                _mine = _was is not None and _was[0] is _f
+                if not (_mine and _was[1] is None):  # the cell's final value is already in the results
+                    _buf = io.BytesIO()
+                    _f.savefig(_buf, format="png")
+                    _png = base64.b64encode(_buf.getvalue()).decode()
+                    if not (_mine and _was[1] == _png):  # displayed, and not drawn on since
+                        _out.append({"image/png": _png})
+            except Exception:
+                pass
 except Exception:
     pass
 try:
@@ -990,8 +1514,42 @@ sys.exit(_rc)
 const PY_KERNEL_DRIVER = String.raw`import sys, io, json, base64, builtins, ast, os, threading, codecs, select, time
 _g = {"__name__": "__main__"}
 _out = []
+# Figures this cell already put in _out, id -> (figure, PNG as drawn then, or None for the cell's FINAL
+# value). The figure is kept alive, so an id freed and reused within the cell cannot make an unrelated
+# figure look already sent; the PNG lets the end of the cell skip a displayed figure only if the code did
+# not draw on it after (matplotlib renders an unchanged figure to the same bytes).
+_shown = {}
+def _figure_of(o):
+    """o if it is a matplotlib Figure, a subclass included, else None. Never raises: o is the cell's."""
+    try:
+        _mf = sys.modules.get("matplotlib.figure")
+        return o if _mf is not None and isinstance(o, _mf.Figure) else None
+    except Exception:
+        return None
+def _open_figures(plt):
+    """The figures pyplot holds open, read from the manager list matplotlib's own inline backend reads,
+    and not through plt.figure(n): that call MAKES a figure for a number closed meanwhile, and user code
+    may have replaced it. The number walk is the fallback for a matplotlib without the list."""
+    try:
+        from matplotlib._pylab_helpers import Gcf
+        # By figure NUMBER, the order the number walk gave: the manager list is in the order the
+        # figures were last made active.
+        return [m.canvas.figure for m in sorted(Gcf.get_all_fig_managers(), key=lambda m: m.num)]
+    except Exception:
+        try:
+            return [plt.figure(n) for n in plt.get_fignums()]
+        except Exception:
+            return []
 def _bundle(o):
     d = {}
+    _fig = _figure_of(o)
+    if _fig is not None:
+        try:  # a Figure handed back as a value is DRAWN, as Jupyter's inline backend draws it
+            _b = io.BytesIO()
+            _fig.savefig(_b, format="png")
+            d["image/png"] = base64.b64encode(_b.getvalue()).decode()
+        except Exception:
+            pass
     for meth, key in (("_repr_html_", "text/html"), ("_repr_markdown_", "text/markdown"),
                       ("_repr_svg_", "image/svg+xml"), ("_repr_latex_", "text/latex")):
         try:
@@ -1028,7 +1586,10 @@ def _bundle(o):
     return d
 def display(o=None, **kw):
     if o is not None:
-        _out.append(_bundle(o))
+        _d = _bundle(o)
+        _out.append(_d)
+        if "image/png" in _d and _figure_of(o) is not None:
+            _shown[id(o)] = (o, _d["image/png"])  # as drawn at this line; the code may draw on after it
 builtins.display = display
 # Make the CONTROL channel private so user code (a raw os.write, a C extension, a subprocess reading
 # stdin) can NEVER corrupt a reply on stdout nor steal a cell off stdin. dup the real stdin(0)/stdout(1)
@@ -1250,6 +1811,7 @@ while True:
     if _code is None:
         break
     _out.clear()
+    _shown.clear()
     with _ulock:
         _tcut[0] = False  # a cut belongs to the cell it happens in, so clear it at the cell boundary
         _sent[1] = _sent[2] = 0
@@ -1272,6 +1834,10 @@ while True:
             _v = eval(compile(_tail, "<cell>", "eval"), _g)
             if _v is not None:
                 _out.append(_bundle(_v))
+                if _figure_of(_v) is not None:
+                    # the FINAL value of the cell is the figure's final state: not sent again below. A
+                    # display(fig) earlier in the cell records nothing, because the code may draw on.
+                    _shown[id(_v)] = (_v, None)
     except SystemExit as _e:
         _rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
     except BaseException as _e:
@@ -1290,10 +1856,29 @@ while True:
     try:
         if "matplotlib.pyplot" in sys.modules:
             _plt = sys.modules["matplotlib.pyplot"]
-            for _num in _plt.get_fignums():
-                _b = io.BytesIO()
-                _plt.figure(_num).savefig(_b, format="png")
-                _out.append({"image/png": base64.b64encode(_b.getvalue()).decode()})
+            # EACH OPEN FIGURE ONCE, THEN CLOSED, which is what Jupyter's inline backend does by
+            # default. Left open, every later cell re-sent every figure the session had drawn: a cell
+            # that only printed returned the plots of the cells before it, and paid a PNG encode for
+            # each. A figure the code still holds is not lost: fig or display(fig) draws it again.
+            # Closed in a finally of its own, so one figure that cannot be drawn is not left open to
+            # fail again in every cell after it.
+            for _f in _open_figures(_plt):
+                try:
+                    _was = _shown.get(id(_f))
+                    _mine = _was is not None and _was[0] is _f
+                    if not (_mine and _was[1] is None):  # the cell's final value is already in the results
+                        _b = io.BytesIO()
+                        _f.savefig(_b, format="png")
+                        _png = base64.b64encode(_b.getvalue()).decode()
+                        if not (_mine and _was[1] == _png):  # displayed, and not drawn on since
+                            _out.append({"image/png": _png})
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        _plt.close(_f)
+                    except Exception:
+                        pass
     except Exception:
         pass
     # Barrier: write the sentinel to fd 1/2 and read up to it, so this cell's raw/subprocess output is
@@ -1476,16 +2061,18 @@ const REFUSED_MOUNT_PAIRS = new Set([
  * hollow result. Runtime sandbox events where the code DID run (timeout, blocked escape, OOM-kill) are
  * NOT thrown - they are data on `result.fault`. */
 class SandboxError extends Error {
-  constructor(message) {
-    super(message);
+  // `options` is Error's own (`{ cause }`): a refusal keeps the OS error it stands for, which is how a
+  // caller tells "closed to this process" (EACCES) from every other refusal without a second channel.
+  constructor(message, options) {
+    super(message, options);
     this.name = "SandboxError";
   }
 }
 
 /** A requested host mount was refused as unsafe (sensitive source, or a relative/escaping path). */
 class MountRefused extends SandboxError {
-  constructor(message) {
-    super(message);
+  constructor(message, options) {
+    super(message, options);
     this.name = "MountRefused";
   }
 }
@@ -2227,56 +2814,242 @@ function cappedCollector(stream, cap, onData) {
 // (symlinks, devices, hardlinks and any absolute or `..`-escaping name are refused), and the final
 // component is opened O_NOFOLLOW, so a hostile archive can never write outside the workspace.
 
-function tarWriteFile(out, name, content) {
-  if (Buffer.byteLength(name) > 100)
-    throw new SandboxError(`snapshot: path too long for the tar format (>100 bytes): ${name}`);
+/** The largest value an 11-digit octal ustar field can hold: 8^11 - 1, i.e. mtimes up to year 2242.
+ *
+ * A value past this does not fit the field, and writing it anyway would produce a 12-digit number
+ * that overruns into the checksum field - a header whose checksum still verifies and whose date is
+ * wrong. Clamped on the way in and on the way out (`tarParseRaw`), so neither side can emit one. */
+const TAR_MAX_OCTAL = 8 ** 11 - 1;
+
+/** `value` as the 11 octal digits + NUL that a ustar numeric field holds, clamped to the field.
+ *
+ * Non-finite, negative and fractional inputs are the ones a `stat` can really produce on a file with
+ * no usable timestamp, so each is resolved rather than trusted: `Math.floor` of a non-finite value is
+ * `NaN`, and `NaN.toString(8)` is the string "NaN", which would corrupt the header silently. */
+function tarOctalField(value) {
+  let n = Number(value);
+  if (!Number.isFinite(n) || n < 0) n = 0;
+  n = Math.min(Math.floor(n), TAR_MAX_OCTAL);
+  return `${n.toString(8).padStart(11, "0")}\0`;
+}
+
+/** Split `name` into the ustar `prefix` (155 bytes) and `name` (100 bytes) fields, or `null` when it
+ * cannot be expressed in ustar at all.
+ *
+ * WHY THIS EXISTS: the writer refused every path over 100 bytes while `tarParseRaw` has read the
+ * `prefix` field since this branch - so Node could not WRITE what it can READ, and a Python-written
+ * snapshot with a 101-to-255-byte path (which Python's USTAR writer splits exactly this way) threw
+ * from Node's own re-emission path AFTER part of the tree had been written.
+ *
+ * The split point must be a `/`, which is what makes it safe for any encoding: `/` is one byte in
+ * UTF-8 and never appears inside a multibyte sequence, so neither field can end mid-character. The
+ * LAST `/` that leaves a tail of at most 100 bytes is chosen, which is the same rule GNU tar and
+ * Python's `tarfile` apply, so a path either binding writes is read back identically by the other. */
+function tarSplitName(name) {
+  const raw = Buffer.from(name, "utf8");
+  if (raw.length <= 100) return { prefix: "", name };
+  if (raw.length > 255) return null; // 155 + 1 separator + 100: beyond ustar, whatever the split
+  for (let i = raw.length - 101; i < raw.length; i++) {
+    // `i` is the index of a candidate separator; the tail after it must fit `name` (<= 100) and the
+    // head before it must fit `prefix` (<= 155).
+    if (raw[i] !== 0x2f) continue;
+    const head = raw.subarray(0, i);
+    const tail = raw.subarray(i + 1);
+    if (head.length === 0 || head.length > 155 || tail.length === 0 || tail.length > 100) continue;
+    return { prefix: head.toString("utf8"), name: tail.toString("utf8") };
+  }
+  return null;
+}
+
+/** One ustar header, for both member kinds: THE ONLY PLACE the layout is spelled.
+ *
+ * It was spelled twice, once per member kind, and the two copies had already drifted in the one field
+ * that matters here (both wrote a constant mtime, but a future change to one would not reach the
+ * other). `mode`, `typeflag` and `size` are the only differences between the two callers.
+ *
+ * Returns the 512-byte header, or a `SandboxError` for a name ustar cannot carry - the error names
+ * which of the two limits was hit, because the remedy differs (shorten a component, or shorten the
+ * path). */
+function tarHeader(name, { mode, typeflag, size, mtime }) {
+  const split = tarSplitName(name);
+  if (split === null) {
+    const raw = Buffer.byteLength(name, "utf8");
+    throw new SandboxError(
+      raw > 255
+        ? `snapshot: path too long for the tar format (${raw} bytes, the limit is 255): ${name}`
+        : `snapshot: path cannot be split for the tar format (${raw} bytes with no '/' that leaves ` +
+          `a tail of 100 bytes or less): ${name}`,
+    );
+  }
   const h = Buffer.alloc(512);
-  h.write(name, 0, 100, "utf8");
-  h.write("0000644\0", 100, 8); // mode
-  h.write("0000000\0", 108, 8); // uid
-  h.write("0000000\0", 116, 8); // gid
-  h.write(content.length.toString(8).padStart(11, "0") + "\0", 124, 12); // size (octal)
-  h.write("00000000000\0", 136, 12); // mtime 0 (deterministic)
+  h.write(split.name, 0, 100, "utf8");
+  h.write(mode, 100, 8);
+  h.write("0000000\0", 108, 8); // uid: 0, never the host's. See `tarCollect`.
+  h.write("0000000\0", 116, 8); // gid: 0, same reason
+  h.write(tarOctalField(size), 124, 12);
+  h.write(tarOctalField(mtime), 136, 12);
   h.write("        ", 148, 8); // checksum field = 8 spaces while summing
-  h.write("0", 156, 1); // typeflag '0' = regular file
+  h.write(typeflag, 156, 1);
   h.write("ustar\0", 257, 6); // magic
   h.write("00", 263, 2); // version
+  if (split.prefix) h.write(split.prefix, 345, 155, "utf8");
   let sum = 0;
   for (const b of h) sum += b;
-  h.write(sum.toString(8).padStart(6, "0") + "\0 ", 148, 8); // checksum: 6 octal digits, NUL, space
+  h.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8); // 6 octal digits, NUL, space
+  return h;
+}
+
+/** A regular-file member: its bytes, and the MTIME IT HAD.
+ *
+ * The mtime was a constant 0, with "deterministic" as the reason, and that reason had no consumer:
+ * nothing in either package's tests, READMEs or docs asserts a byte-identical archive, while
+ * `docs/SANDBOX.md` does promise that a snapshot moves "the files the code wrote" to another machine.
+ * MEASURED against the Python binding, same tree, same archive: Python restored `2020-09-13 14:26`
+ * (the mtime the files had) and Node restored the moment of the restore, so an incremental tool -
+ * `make`, `tsc --incremental`, `pytest --lf`, and CPython's own `(mtime, size)` check on a `.pyc` in
+ * `.deps` - saw a different tree depending on which binding had restored it. */
+function tarWriteFile(out, name, content, mtime = 0, fileMode = 0o644) {
+  const h = tarHeader(name, {
+    // THE MODE THE FILE HAD, owner bits and all, because `restore` reads it: a constant 0644 here
+    // meant an executable file came back without its execute bit, measured against the Python
+    // binding, which carries the real mode. Masked to the owner's bits for the reason the restore
+    // states: on a workspace shared with a box account the group bits are the ACL's mask, and the
+    // ACL does not travel in a tar.
+    mode: `${(0o600 | (fileMode & 0o700)).toString(8).padStart(7, "0")}\0`,
+    typeflag: "0",
+    size: content.length,
+    mtime,
+  });
   out.push(h, content);
   const pad = (512 - (content.length % 512)) % 512;
   if (pad) out.push(Buffer.alloc(pad));
 }
 
-function tarCollect(dir, base, skip, out) {
-  for (const entry of fs.readdirSync(dir).sort()) {
-    const abs = path.join(dir, entry);
-    const st = fs.lstatSync(abs);
-    if (st.isSymbolicLink()) continue; // never archive a symlink
-    if (st.isDirectory()) tarCollect(abs, base, skip, out);
-    else if (st.isFile()) {
-      const rel = path.relative(base, abs);
-      // `skip` names OUR env file. Since it is now one per call, match the `<skip>.` prefix too, so a
-      // file left behind by a process that died mid-call cannot end up inside a user's snapshot.
-      if (rel === skip || rel.startsWith(skip + ENV_SEP)) continue;
-      tarWriteFile(out, rel.split(path.sep).join("/"), fs.readFileSync(abs));
+/** The workspace under `dirFd` (as `rel`), archived into `out` BY DESCRIPTOR: each entry listed through
+ * `/proc/self/fd/<dir>`, opened `O_NOFOLLOW` relative to it, and judged on the open descriptor. By path,
+ * a box running beside the snapshot could turn a directory into a symlink after the check and have the
+ * next read archive a HOST file. Regular files only, as this format always held; symlinks never.
+ * `blind`, on a shared workspace, collects what the box user closed to this process instead of failing
+ * on it; null is the old behaviour, every error raised. */
+function tarCollect(dirFd, rel, skipId, out, blind, skipped) {
+  const nofollow = fs.constants.O_NOFOLLOW;
+  const closed = (e, at) => {
+    if (!blind || !isClosedErr(e)) throw e;
+    blind.push(at);
+  };
+  let names;
+  try {
+    names = fs.readdirSync(`/proc/self/fd/${dirFd}`).sort();
+  } catch (e) {
+    closed(e, rel);
+    return;
+  }
+  for (const entry of names) {
+    const at = `/proc/self/fd/${dirFd}/${entry}`;
+    const child = rel ? `${rel}/${entry}` : entry;
+    let st;
+    try {
+      st = fs.lstatSync(at);
+    } catch (e) {
+      if (e.code === "ENOENT") continue;
+      closed(e, rel); // listable, not searchable: the helper takes it whole
+      return;
+    }
+    // ONLY WHAT restore() WRITES: regular files and directories. A symlink, FIFO, device or socket is
+    // named in `skipped` instead, so the caller can say the archive is not the whole tree; it was left
+    // out in silence, and the Python binding archived it as a member its own restore refused whole.
+    if (!st.isDirectory() && !st.isFile()) {
+      if (skipped) skipped.push(child);
+      continue;
+    }
+    if (st.isDirectory()) {
+      let fd;
+      try {
+        fd = fs.openSync(at, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | nofollow);
+      } catch (e) {
+        if (["ENOENT", "ELOOP", "ENOTDIR"].includes(e.code)) continue; // swapped since the lstat
+        closed(e, child);
+        continue;
+      }
+      try {
+        // THE MEMBER FIRST, THEN ITS CHILDREN: an extractor creates a directory before writing into
+        // it either way, and this order is what makes an EMPTY directory a member of its own. The
+        // mtime comes from the OPEN descriptor, not from the `lstat` by name above, so a directory
+        // swapped between the two cannot contribute a timestamp from somewhere else.
+        const dst = fs.fstatSync(fd);
+        if (dst.isDirectory()) tarWriteDir(out, child, Math.floor(dst.mtimeMs / 1000));
+        tarCollect(fd, child, skipId, out, blind, skipped);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else if (st.isFile()) {
+      // An env file an OLDER version left in the workspace holds `env` values: never archived.
+      if (isLegacyEnvFile(child)) continue;
+      let fd;
+      try {
+        fd = fs.openSync(at, fs.constants.O_RDONLY | nofollow | fs.constants.O_NONBLOCK);
+      } catch (e) {
+        if (["ENOENT", "ELOOP"].includes(e.code)) continue;
+        closed(e, child);
+        continue;
+      }
+      try {
+        const fst = fs.fstatSync(fd);
+        // The archive's previous self, when `dest` is inside the workspace: skipped by identity, or
+        // every checkpoint would carry the one before it.
+        //
+        // The mtime is read from the SAME `fstat` that decides the type, i.e. from the descriptor
+        // this function holds, so the timestamp belongs to the inode whose bytes are being archived.
+        if (fst.isFile() && `${fst.dev}:${fst.ino}` !== skipId)
+          tarWriteFile(out, child, fs.readFileSync(fd), Math.floor(fst.mtimeMs / 1000), fst.mode);
+      } finally {
+        fs.closeSync(fd);
+      }
     }
   }
 }
 
+/** The most a snapshot may inflate to, and the most a helper's `tar` may hand back: 1 GiB. */
+const TAR_MAX_BYTES = 1024 * 1024 * 1024;
+
+/** Close an archive: two zero blocks, then gzip at level 1 (a local checkpoint is often large or
+ * already compressed, and level 1 is several times faster for a negligible size penalty). */
+function tarFinish(out, gzip = true) {
+  const raw = Buffer.concat([...out, Buffer.alloc(1024)]);
+  return gzip ? zlib.gzipSync(raw, { level: 1 }) : raw;
+}
+
 function tarPack(base, skip) {
   const out = [];
-  tarCollect(base, base, skip, out);
-  out.push(Buffer.alloc(1024)); // two zero blocks = end of archive
-  // level 1: a local checkpoint is often large or already-compressed; level 1 is several times faster
-  // than the default with a negligible size penalty. Speed over ratio here.
-  return zlib.gzipSync(Buffer.concat(out), { level: 1 });
+  const fd = fs.openSync(base, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+  try {
+    tarCollect(fd, "", skip, out, null);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return tarFinish(out);
+}
+
+/** A directory member, so an archive carries an EMPTY directory too - and carries the directory
+ * structure at all.
+ *
+ * MEASURED before the snapshot walk emitted these: a workspace holding `emptydir/` and `full/f` gave
+ * a Node archive of `full/f` alone, and restoring it produced `full` and nothing else, so an empty
+ * directory a session had created was silently lost. Python's archive carried `emptydir/` and `full/`
+ * and restored both. `docs/SANDBOX.md` states the contract this half was missing: `restore()` writes
+ * "only regular files and directories". */
+function tarWriteDir(out, name, mtime = 0) {
+  const dir = name.endsWith("/") ? name : `${name}/`;
+  out.push(tarHeader(dir, { mode: "0000755\0", typeflag: "5", size: 0, mtime }));
 }
 
 function tarParse(gz) {
   // Cap the inflated size so a tiny gzip bomb can't force a huge allocation before we even vet members.
-  const buf = zlib.gunzipSync(gz, { maxOutputLength: 1024 * 1024 * 1024 });
+  return tarParseRaw(zlib.gunzipSync(gz, { maxOutputLength: TAR_MAX_BYTES }));
+}
+
+/** The members of an UNCOMPRESSED tar, vetted field by field (see `tarParse`). */
+function tarParseRaw(buf) {
   const members = [];
   let off = 0;
   while (off + 512 <= buf.length) {
@@ -2291,14 +3064,54 @@ function tarParse(gz) {
     // Strip a trailing slash (the ustar dir convention "d/"): otherwise path.join keeps it, and a
     // trailing slash makes lstat FOLLOW a planted symlink ("d/" resolves the link to its target dir)
     // instead of seeing the link, which would defeat the symlink-vet on a dir member.
-    const name = h.toString("utf8", 0, 100).replace(/\0.*$/s, "").replace(/\/+$/, "");
+    let name = h.toString("utf8", 0, 100).replace(/\0.*$/s, "").replace(/\/+$/, "");
+    // THE `prefix` FIELD IS PART OF THE NAME, and ignoring it silently renamed a member. ustar splits
+    // a path longer than 100 bytes across `prefix` (155 bytes at offset 345) and `name`, and Python's
+    // USTAR writer - which is what `snapshot()` uses on the other binding - does exactly that for any
+    // path of 101 to 255 bytes. Read as the name alone, such a member was written to the workspace
+    // ROOT under its tail, overwriting whatever had that name, and the archive's own directory
+    // structure was lost. The magic is checked first because `prefix` is only a prefix in ustar; in
+    // the old v7 format those bytes are padding.
+    const magic = h.toString("utf8", 257, 263).replace(/\0.*$/s, "");
+    if (magic === "ustar") {
+      const prefix = h.toString("utf8", 345, 500).replace(/\0.*$/s, "").replace(/\/+$/, "");
+      if (prefix) name = `${prefix}/${name}`;
+    }
     // Size is octal ASCII by spec; reject anything else rather than let parseInt guess ("12x" -> 10).
     // This also makes a negative size impossible (no `-` in the field), closing the spin-forever case.
     const sizeField = h.toString("utf8", 124, 136).replace(/\0.*$/s, "").trim();
     if (!/^[0-7]*$/.test(sizeField)) throw new SandboxError("malformed snapshot: non-octal member size");
     const size = parseInt(sizeField, 8) || 0;
+    // THE MTIME IS RESOLVED, NOT REJECTED, and that asymmetry with `size` above is deliberate: a
+    // size decides how the archive is FRAMED, so a size this reader cannot parse makes every member
+    // after it a guess and the archive has to be refused. An mtime decides a timestamp on one file;
+    // a field this reader cannot parse (a GNU base-256 field, which sets the high bit of the first
+    // byte, or junk) means "no usable timestamp", and refusing an archive whose BYTES are fine over
+    // one date would lose the data to save the metadata. Clamped to the field's own range so a
+    // crafted value cannot reach `futimes` - measured on the Python side, where `1 << 70` in a
+    // member raised `OverflowError` out of `restore` after part of the tree was written.
+    const mtimeField = h.toString("utf8", 136, 148).replace(/\0.*$/s, "").trim();
+    const mtime = /^[0-7]+$/.test(mtimeField)
+      ? Math.min(parseInt(mtimeField, 8), TAR_MAX_OCTAL)
+      : 0;
+    // The mode, under the same rule as the mtime: a field this reader cannot parse means "no mode in
+    // the archive" and the restore falls back to its own default. Only the PERMISSION bits are taken
+    // (`& 0o7777`), never the type bits, which are the `typeflag`'s job - a mode field claiming
+    // S_IFDIR on a `0` member must not turn the member into one.
+    const modeField = h.toString("utf8", 100, 108).replace(/\0.*$/s, "").trim();
+    const mode = /^[0-7]+$/.test(modeField) ? parseInt(modeField, 8) & 0o7777 : null;
     const flag = String.fromCharCode(h[156]);
     off += 512;
+    // A GNU LONG NAME IS REFUSED BY NAME, not met as an "other" member whose size must be zero. `L`
+    // (and `K`) carry the real path as the CONTENT of an extra header, so the member that follows has
+    // a placeholder name: treating the pair as two ordinary members wrote a file called
+    // `././@LongLink`. Neither binding writes them (both use USTAR), so a snapshot carrying one came
+    // from somewhere else and the honest answer is to say which feature is missing.
+    if (flag === "L" || flag === "K")
+      throw new SandboxError(
+        "unsupported snapshot: it uses GNU long-name headers, which this reader does not " +
+          "implement (both bindings write ustar; re-create the snapshot with `snapshot()`)",
+      );
     const type = flag === "0" || flag === "\0" ? "file" : flag === "5" ? "dir" : "other";
     // A dir/other member carries no content in ustar; a non-zero size there is malformed, so reject it
     // rather than silently ignore it (reject-not-guess).
@@ -2309,7 +3122,7 @@ function tarParse(gz) {
     if (type === "file" && off + size > buf.length)
       throw new SandboxError("malformed snapshot: member size exceeds archive");
     const content = type === "file" ? buf.subarray(off, off + size) : Buffer.alloc(0);
-    members.push({ name, type, content });
+    members.push({ name, type, content, mtime, mode });
     off += Math.ceil(size / 512) * 512;
   }
   return members;
@@ -2355,6 +3168,19 @@ class Sandbox {
    * @param {boolean} [opts.enforceLimits]   true (default) hard-enforces caps via a systemd scope.
    * @param {boolean} [opts.depsReadonly]    mount setup= deps read-only for runCode (default true).
    * @param {boolean} [opts.pycCache]        compile this image's stdlib once and mount it read-only (default true).
+   * @param {string|null} [opts.user]        the account of the IMAGE every box runs as, "<user>[:<group>]",
+   *   each a name or a number ("node", "1000", "1000:1000"): `kern box --user`, and `kern exec -u` for a
+   *   `persist` call. null (default) keeps the image's own USER. A non-root user is a uid of kern's
+   *   subordinate range on disk (node, 1000 in the box, is 100999 on a host whose range starts at
+   *   100000, measured), so open() starts one box as that user to learn its host uid and gives the
+   *   workspace a POSIX ACL naming it, plus a DEFAULT ACL naming both uids, written with `setfacl`
+   *   (the `acl` package). It costs one box at open() and the uid range on every box (measured in
+   *   Python: open 5.3 ms instead of 0.5, each call +1.1 ms). What an ACL cannot outrank - a file the
+   *   box user creates 0600 or a directory 0700 - is reached by readFile, writeFile, listFiles,
+   *   result.files, workspaceMaxBytes, snapshot, restore and close() through a short-lived box of the
+   *   same image running as THAT user, the owner of what it closed, with the session's own capDrop;
+   *   only after the host was refused, and never reaching what the account could not reach itself.
+   *   The image needs a shell and the usual tools (HELPER_TOOLS). Mirrors Python's `Sandbox.user`.
    */
   constructor(opts = {}) {
     this.image = opts.image ?? DEFAULT_IMAGE;
@@ -2484,6 +3310,7 @@ class Sandbox {
     // cost nothing. It is NOT behaviour-free: a workload binding a port below 1024 INSIDE the box
     // needs CAP_NET_BIND_SERVICE. Pass `capDrop: []` for the previous behaviour.
     this.capDrop = opts.capDrop ?? ["ALL"];
+    this.user = opts.user ?? null;
     // trackFiles=true populates result.files by walking the workspace before AND after each call (O(N)
     // in file count); a long session that accretes files slows every runCode. false = result.files [], O(1).
     this.trackFiles = opts.trackFiles ?? true;
@@ -2621,6 +3448,11 @@ class Sandbox {
     this._profileArgs = (this.profiles || []).map(validateProfile);
     this._egressAllow = (this.egressAllow || []).map(validateDomain);
     if (this.apparmor !== null) validateApparmor(this.apparmor);
+    if (this.user !== null) validateUser(this.user);
+    // The spec the boxes run as when it is NOT box root (`user` or the image's own USER), and the host
+    // uid that account writes as, learned in open(). null for box root, which is free.
+    this._asUser = null;
+    this._userHostUid = null;
     if (this._egressAllow.length && this.network)
       throw new SandboxError(
         "egressAllow and network:true are mutually exclusive: egressAllow gives a restricted domain " +
@@ -2629,6 +3461,8 @@ class Sandbox {
     this._kern = findKern();
     this._ws = "";
     this._ownWs = false;
+    // Where the per-box --env-files live: a private directory OUTSIDE the workspace (see `_envPath`).
+    this._envDir = "";
     this._entered = false;
   }
 
@@ -2672,7 +3506,29 @@ class Sandbox {
     // THE IMAGE BEFORE ANY BOX: the setup box, the resident box, the bytecode build and the warm pool
     // all start one, and each used to pull inside its own deadline. After the refusals above, so a
     // wrong configuration is not reported only after a download.
+    // THE ENV FILES' OWN DIRECTORY, and from here on a failure undoes everything open() made: close()
+    // is idempotent, and without this a failed pull or setup left a temporary workspace behind.
+    try {
+      this._envDir = privateEnvDir(this._ws);
+    } catch (e) {
+      await this.close();
+      if (e instanceof SandboxError) throw e;
+      throw new SandboxError(`cannot create a private directory for env files: ${e.message}`, { cause: e });
+    }
+    try {
+      await this._openAfterEnvDir();
+    } catch (e) {
+      await this.close();
+      throw e;
+    }
+    return this;
+  }
+
+  /** The rest of open(), run under its undo-on-failure guard. */
+  async _openAfterEnvDir() {
     await fetchImage(this._kern, this.image);
+    // THE IDENTITY BEFORE THE SETUP, because the setup box runs as it too.
+    await this._resolveIdentity();
     if (this.setup) await this._runSetup(this.setup);
     // THE RESIDENT BOX IS CREATED AFTER THE SETUP, AND THAT ORDER IS THE FIX. It used to come first,
     // so `_runSetup` was routed into it (network silently dropped), and `_baseArgv` mounts
@@ -2701,6 +3557,14 @@ class Sandbox {
         // from under a mount and recreated by kern, and adopting it silences the feature for good.
         if (pycHasContent(dest) && pycSourceMatches(dest, this.image)) {
           this._pycDir = dest;
+          // A tree built before it was 0755 is opened up for a non-root user here, once.
+          if (this._shared) {
+            try {
+              if ((fs.statSync(dest).mode & 0o005) !== 0o005) fs.chmodSync(dest, 0o755);
+            } catch {
+              /* still usable by box root; a non-root user compiles from source */
+            }
+          }
           // Records the ADOPTION for the sweep's least-recently-used order. Best effort: a cache on a
           // read-only filesystem is still usable, it just cannot be aged.
           try {
@@ -2728,7 +3592,6 @@ class Sandbox {
       this._pool = new WarmPool(this, this.prewarm);
       this._pool.refill({ network: this.network, deadlineS: this._effTimeout(undefined) });
     }
-    return this;
   }
 
   /** Close the session: tear down any prewarmed boxes, then delete the workspace iff we created it.
@@ -2952,8 +3815,243 @@ class Sandbox {
       } catch {
         /* best-effort */
       }
+      // WHAT rmSync COULD NOT REMOVE is what a non-root box user closed to us: a directory it created
+      // 0755 (every tarball's) cannot be emptied by anyone but its owner. The helper, as that user,
+      // opens up and removes its own; the workspace itself is ours and goes last. Mirrors Python.
+      if (this._shared && fs.existsSync(this._ws)) {
+        try {
+          await this._wsHelper(HELPER_CLEAN, [], { write: true });
+        } catch {
+          /* best effort at teardown */
+        }
+        try {
+          fs.rmSync(this._ws, { recursive: true, force: true });
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+    // After the boxes: a box still starting reads its env file. Only ever our own mkdtemp.
+    const envDir = this._envDir;
+    this._envDir = "";
+    if (envDir && path.basename(envDir).startsWith(ENV_DIR_PREFIX)) {
+      try {
+        fs.rmSync(envDir, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
     }
     this._entered = false;
+  }
+
+  // -- `user`: who the boxes run as, and keeping the workspace shared with them ---------------------
+
+  /** The workspace is shared with a non-root box user through an ACL (see `user`): the one condition
+   * every fallback to the helper box answers to. Mirrors Python's `_shared`. */
+  get _shared() {
+    return this._userHostUid !== null;
+  }
+
+  /** Decide the account the boxes run as and, when it is not box root, share the workspace with it.
+   * Box root costs nothing and does nothing. Otherwise one box starts AS THAT USER to learn the host
+   * uid it writes as, which answers for every mapping kern might choose. Mirrors `_resolve_identity`. */
+  async _resolveIdentity() {
+    const spec = this.user !== null ? this.user : imageUser(this.image);
+    // THE IMAGE'S OWN `USER` GOES THROUGH THE SAME CHECK AS `user`, which it did not: `user` is
+    // validated in the constructor and the image half reached the argv unexamined. `USER_SPEC_RE`'s
+    // comment promises the value can never read as a flag on the argv it lands on, and that has to
+    // hold for both halves. Mirrors Python's `_resolve_identity`.
+    if (spec !== null && this.user === null) {
+      try {
+        validateUser(spec);
+      } catch (e) {
+        throw new SandboxError(
+          `the image ${JSON.stringify(this.image)} declares USER ${JSON.stringify(spec)}, which is not a ` +
+            `shape kern can be given: ${e.message}. Pass user: "<account>" to say which account to run as`,
+          { cause: e },
+        );
+      }
+    }
+    if (isRootUser(spec)) return;
+    // A RESIDENT BOX IS ENTERED WITH `kern exec`, which is box root unless told otherwise, and only a
+    // kern with `kern exec -u` can be told. Asked once, here, rather than failing every call. Read from
+    // `kern exec --help`, whose lines are the frozen CLI surface (`tests/cli-surface.snapshot`).
+    if (this.persist) {
+      const help = await runCapture([this._kern, "exec", "--help"], 30000);
+      if (!help.stdout.includes("-u <user>"))
+        throw new SandboxError(
+          `persist with user ${JSON.stringify(spec)} needs a kern whose \`kern exec\` takes \`-u <user>\`, ` +
+            `and ${this._kern} (${verifyIsKern(this._kern)}) does not: its calls would run as box root in a ` +
+            `box whose own process runs as ${JSON.stringify(spec)}. Update kern, or drop persist`,
+        );
+    }
+    this._asUser = spec;
+    const hostUid = await this._probeHostUid(spec);
+    const own = process.getuid();
+    // THE PROBED UID DECIDES ROOT-NESS, NOT THE SPELLING: an image can name box root anything
+    // (`USER N0tR00t` with `N0tR00t:x:0:0:` in its own /etc/passwd), and box root maps to this
+    // process's uid, so the helper box would be root of the range under another name. Same line as
+    // Python's.
+    if (hostUid === own) return; // the account writes as this process: already shared
+    this._userHostUid = hostUid;
+    let foreign = 0;
+    let example = "";
+    try {
+      [foreign, example] = await aclGrantTreeAsync(this._ws, hostUid, own, { recursive: !this._ownWs });
+      // A TREE THIS SESSION DOES NOT OWN IS CHANGED, AND THAT IS SAID. Same sentence as Python's:
+      // the grant adds an entry to every file and a default ACL to every directory under the
+      // caller's `workspace`, and nothing removes it (`close()` only clears a workspace this
+      // session made), so files the operator creates there afterwards inherit it. The default
+      // `user: null` reaches this on any image that declares a non-root USER.
+      if (!this._ownWs)
+        process.emitWarning(
+          `user ${JSON.stringify(spec)}: added a POSIX ACL for host uid ${hostUid} to every file and ` +
+            `directory under ${this._ws}, and a default ACL on the directories, so the account can reach ` +
+            `what it creates there. It is NOT removed when this session closes (this workspace is yours, ` +
+            `not the session's): \`setfacl -R -x u:${hostUid} -k ${this._ws}\` undoes it`,
+          "KernWorkspaceAcl",
+        );
+    } catch (e) {
+      // THE SAME SENTENCES AS PYTHON, decided on the error's code rather than on its text.
+      const user = JSON.stringify(spec);
+      if (e.code === "ENOTSUP")
+        throw new SandboxError(
+          `user ${user} needs POSIX ACLs on the workspace filesystem, and ${this._ws} has none: the ` +
+            `account is host uid ${hostUid} on disk, and an ACL is how it and this process both reach ` +
+            "the files. Put the workspace on a filesystem with ACLs (ext4, xfs, btrfs, tmpfs), or run as " +
+            'box root (user: null on an image with no USER, or user: "root")',
+          { cause: e },
+        );
+      if (e.code === "ENOSETFACL")
+        throw new SandboxError(
+          `user ${user} needs \`setfacl\` on the host (the \`acl\` package): it writes the ACL through ` +
+            `which the account, host uid ${hostUid} on disk, and this process both reach the workspace`,
+          { cause: e },
+        );
+      throw new SandboxError(`user ${user}: sharing the workspace ${this._ws} failed: ${e.message}`, { cause: e });
+    }
+    if (foreign)
+      // PRIVATE ON PURPOSE, and said here because the box would only say EACCES: what a box account
+      // creates inherits empty group and other entries, since under a default ACL its umask no longer
+      // applies. Mirrors Python's warning.
+      process.emitWarning(
+        `the workspace holds ${foreign} entr${foreign === 1 ? "y" : "ies"} (e.g. ${JSON.stringify(example)}) ` +
+          `created by a different box account than user ${JSON.stringify(spec)}, host uid ${hostUid}: ` +
+          `they are reachable by that account and by this process, not by ${JSON.stringify(spec)}. ` +
+          "Read them with readFile and write them back, or keep one user per workspace",
+        "KernWorkspaceForeignEntries",
+      );
+  }
+
+  /** The host uid a box of this image running as `spec` writes files as. The probe writes into a
+   * directory of its own, 0777 so the account can, inside a 0700 one of ours so nothing else on the
+   * host can reach it. Same identity flags as every other box. Mirrors `_probe_host_uid`. */
+  async _probeHostUid(spec) {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "kern-uid-"));
+    const drop = path.join(d, "p");
+    try {
+      fs.mkdirSync(drop);
+      fs.chmodSync(drop, 0o777);
+      // `--entrypoint ""` for the reason `_helperArgv` states: the image's ENTRYPOINT would
+      // otherwise run first and decide whether this probe writes its file at all.
+      const argv = [
+        this._kern, "box", uniqueName(), "--image", this.image, "--ro", "--entrypoint", "",
+        ...mountArgs(drop, "/kern-uid", false), ...this._capDropArgs, "--timeout", "60",
+      ];
+      if (this.user !== null) argv.push("--user", this.user);
+      argv.push("--", "sh", "-c", ": > /kern-uid/o");
+      const r = await runCapture(argv, 120000);
+      let st = null;
+      try {
+        st = fs.lstatSync(path.join(drop, "o"));
+      } catch {
+        st = null;
+      }
+      if (r.code !== 0 || st === null) {
+        // QUOTED, like every other box-produced line this package prints: the stream can carry
+        // escapes and a forged verdict, and this message reaches an agent loop. Python's is the same.
+        const said = quoteUntrusted((r.stderr || r.stdout).slice(-600));
+        throw new SandboxError(
+          `user ${JSON.stringify(spec)}: a box of ${JSON.stringify(this.image)} could not run as that ` +
+            `account (exit ${r.code}): ${said || "no output"}`,
+        );
+      }
+      return st.uid;
+    } finally {
+      fs.rmSync(d, { recursive: true, force: true });
+    }
+  }
+
+  /** The helper box: the session's image and its OWN identity, `--user` and `capDrop`. AS THE BOX USER,
+   * NOT AS ROOT OF THE RANGE, and that choice is the boundary: it reaches what the host was refused
+   * because the account OWNS what it closed, and a box racing the scripts' check-then-open can reach
+   * only what the account reaches already. Root of the range could have been made to read a root-only
+   * file of the image. No network, the workspace read-only unless `write`, only this module's scripts.
+   * Mirrors Python's `_helper_argv`. */
+  _helperArgv(script, args, write, timeoutS) {
+    if (this._asUser === null) throw new SandboxError("the workspace helper is for a non-root session only");
+    // `--entrypoint ""` BECAUSE "only the scripts of this module" WAS FALSE WITHOUT IT: kern
+    // prepends the image's ENTRYPOINT to what follows `--`, and a helper's output is PARSED (the
+    // file's bytes, stat records, a tar stream), not displayed. See Python's `_helper_argv`.
+    return [
+      this._kern, "box", uniqueName(), "--image", this.image, "--ro", "--entrypoint", "",
+      "--user", this._asUser, ...this._capDropArgs,
+      ...mountArgs(this._ws, "/w", !write), "--pids-limit", "64",
+      "--timeout", String(timeoutS), "--", "sh", "-c", script, "sh", ...args,
+    ];
+  }
+
+  /** Read a helper run's outcome: a box that did not run (spawn failure or timeout), or one that could
+   * not run the script, is an error; the script's own exit code is the caller's. */
+  _helperResult(r) {
+    if (r.code === -1)
+      throw new SandboxError(
+        `the workspace helper box did not run: ${quoteUntrusted(String(r.stderr).slice(-400)) || "no output"}`,
+      );
+    if ([125, 126, 127].includes(r.code) && r.stdout.length === 0)
+      throw new SandboxError(
+        `the workspace helper box could not run in ${JSON.stringify(this.image)} (exit ${r.code}): ` +
+          `${quoteUntrusted(String(r.stderr).slice(-400)) || "no output"}. ${HELPER_TOOLS}`,
+      );
+    return r;
+  }
+
+  /** Run `sh -c script sh ...args` in the helper box, the workspace at /w, for what this process was
+   * REFUSED. Mirrors `_ws_helper`. */
+  async _wsHelper(script, args, { write = false, input = null, timeoutS = 120 } = {}) {
+    const argv = this._helperArgv(script, args, write, timeoutS);
+    return this._helperResult(await runBuffered(argv, { input, timeoutMs: (timeoutS + 30) * 1000 }));
+  }
+
+  /** The workspace-relative COMPONENTS of an already-contained `full`, as the helper scripts take them. */
+  _helperParts(full) {
+    return path.relative(this._ws, full).split(path.sep).filter((c) => c && c !== ".");
+  }
+
+  /** The refusal a helper script's exit code stands for, in the words the host path uses. */
+  _helperRefusal(verb, rel, r) {
+    if (r.code === 40) return pathRefusal(verb, rel, Object.assign(new Error("ELOOP"), { code: "ELOOP" }));
+    if (r.code === 41)
+      return new SandboxError(
+        `refusing to ${verb} ${JSON.stringify(rel)}: not a regular file (a FIFO, device or socket ` +
+          `planted in the workspace can stall or fake this operation)`,
+      );
+    if (r.code === 42) {
+      // The scripts' own code for "a directory this needed could not be made" (mkdir or mktemp
+      // refused): named, where it fell through to "exit 42" and the raw stderr. Mirrors Python.
+      // A name inside a directory the box closed to the host appears verbatim in `du`/`find`/`stat`
+      // diagnostics, and busybox - which `HELPER_TOOLS` names as supported - does not quote its own.
+      const said = quoteUntrusted(String(r.stderr).slice(-400));
+      return new SandboxError(
+        `cannot ${verb} ${JSON.stringify(rel)}: the box user could not create a directory it needs` +
+          (said ? ` (${said})` : ""),
+      );
+    }
+    if (r.code === 43) return new SandboxError(`cannot ${verb} ${JSON.stringify(rel)}: not a directory`);
+    return new SandboxError(
+      `cannot ${verb} ${JSON.stringify(rel)} (exit ${r.code}): ` +
+        `${quoteUntrusted(String(r.stderr).slice(-400)) || "no output"}`,
+    );
   }
 
   _requireEntered() {
@@ -2964,21 +4062,25 @@ class Sandbox {
   // -- the box invocation --------------------------------------------------------------------------
 
   /** Host path of the private --env-file for the box called `name`, inside the workspace. */
+  /** Host path of the private --env-file for the box called `name`. NOT IN THE WORKSPACE, which is
+   * where it was: every box mounts the workspace, so a box running beside a call could read that call's
+   * `env` values; a process killed mid-call left them for `snapshot` to archive; and a box could plant a
+   * symlink at the name. kern reads the file on the HOST, so it lives in this session's own 0700
+   * directory, which no box mounts, and goes with the session. Mirrors Python's `_env_path`. */
   _envPath(name) {
-    return path.join(this._ws, `${ENV_FILE}${ENV_SEP}${name}`);
+    return path.join(this._envDir, `${ENV_FILE}${ENV_SEP}${name}`);
   }
 
-  /**
-   * Is `rel` one of OUR env files rather than user state? Exact-match on the legacy name plus the
-   * `.kern-env.` prefix, never a bare startsWith: a user file called `.kern-environment` is theirs
-   * and must still show up in `files` and in a snapshot.
-   */
+  /** Is `rel` an env file an OLDER version of this package left in the workspace? See
+   * `isLegacyEnvFile`. Used by the SNAPSHOT path only: a listing must show everything, because every
+   * shape that pattern matches is one a cell can create. */
   static _isEnvFile(rel) {
-    return rel === ENV_FILE || rel.startsWith(ENV_FILE + ENV_SEP);
+    return isLegacyEnvFile(rel);
   }
 
   /** Remove this call's env file. Every exit path calls it; a missing file is the desired end state. */
   _removeEnvFile(name) {
+    if (!this._envDir) return;
     try {
       fs.unlinkSync(this._envPath(name));
     } catch {
@@ -3048,7 +4150,10 @@ class Sandbox {
     }
     // kern's own --timeout is a tight BACKSTOP just beyond our deadline; OUR wait is the authority.
     argv.push(...this._capDropArgs);
-    if (this._singleUid) argv.push("--no-uid-range");
+    if (this.user !== null) argv.push("--user", this.user);
+    // A non-root identity needs its uid mapped, and kern maps the range for it whatever this flag says
+    // (measured), so the flag is left out rather than asking for what kern will not do. Mirrors Python.
+    if (this._singleUid && this._asUser === null) argv.push("--no-uid-range");
     argv.push("--timeout", String(Math.floor(timeoutS) + 5));
     if (this.memoryMb !== null) argv.push("--memory", `${this.memoryMb}m`);
     if (this.cpus !== null) argv.push("--cpus", String(this.cpus));
@@ -3099,7 +4204,16 @@ class Sandbox {
           .map(([k, v]) => `${k}=${String(v)}`)
           .join("\0"),
       );
-    } else if (Object.keys(mergedEnv).length > 0 && this._ws) {
+    } else if (Object.keys(mergedEnv).length > 0 && !this._envDir && this._ws) {
+      // OPENED, AND THE ENV DIRECTORY IS GONE: a call racing close(), which removes it before the
+      // session is marked closed. Running the box anyway would drop `env` and PYTHONPATH without a word,
+      // so the call is refused. An unopened sandbox (no workspace either) is the argv-inspection case
+      // above and stays silent. Mirrors Python.
+      throw new SandboxError(
+        "this sandbox is closing: its private env directory is gone, so the box would run without " +
+          "env and PYTHONPATH. Make the call before close().",
+      );
+    } else if (Object.keys(mergedEnv).length > 0 && this._envDir) {
       const envPath = this._envPath(name);
       const lines = [];
       for (const [k, v] of Object.entries(mergedEnv)) {
@@ -3210,7 +4324,7 @@ class Sandbox {
     return this._spawnOnce(command, opts);
   }
 
-  _spawnOnce(command, { network, timeoutS, isSetup = false, onStdout = UNSET, onStderr = UNSET }) {
+  async _spawnOnce(command, { network, timeoutS, isSetup = false, onStdout = UNSET, onStderr = UNSET }) {
     this._pycAdoptIfReady(); // one property read once there is nothing left to wait for
     const cbOut = onStdout === UNSET ? this.onStdout : onStdout;
     const cbErr = onStderr === UNSET ? this.onStderr : onStderr;
@@ -3222,7 +4336,25 @@ class Sandbox {
     // afterwards would destroy the evidence to enforce a limit the write had already passed. Costs
     // nothing when unset, which is the default.
     if (this.workspaceMaxBytes !== null && this._ws) {
-      const used = workspaceUsage(this._ws);
+      const blind = [];
+      let used = workspaceUsage(this._ws, this._shared ? blind : null);
+      if (blind.length) {
+        // WHAT THE BOX USER CLOSED TO US IS MEASURED BY THE BOX USER, in the unit `du` and the walk
+        // share (allocated blocks). Counting it as zero would let a non-root session park a cap's worth
+        // of bytes where the walk does not look, so a `du` that fails REFUSES the call: a cap that
+        // cannot be measured is not met. Mirrors Python.
+        const r = await this._wsHelper(HELPER_DU, blind.map((d) => helperSubtree(path.relative(this._ws, d))));
+        if (r.code !== 0)
+          throw new SandboxError(
+            "workspaceMaxBytes cannot be measured, so this call was refused before running: the box user " +
+              `could not size ${blind.length} directory(ies) closed to this process ` +
+              `(${String(r.stderr).trim().slice(-400) || `exit ${r.code}`})`,
+          );
+        for (const line of r.stdout.toString("utf8").split("\n")) {
+          const head = line.split("\t")[0].trim();
+          if (/^[0-9]+$/.test(head)) used += Number(head) * 1024;
+        }
+      }
       if (used > this.workspaceMaxBytes)
         throw new SandboxError(
           `workspace holds ${used} bytes, over the ${this.workspaceMaxBytes}-byte ` +
@@ -3233,7 +4365,7 @@ class Sandbox {
             `you are willing to fill`,
         );
     }
-    const before = this.trackFiles ? this._snapshot() : null; // skip the O(N) walk when not tracked
+    const before = this.trackFiles ? await this._snapshot() : null; // skip the O(N) walk when not tracked
     const name = uniqueName();
     let argv;
     // `&& !isSetup`: A SETUP NEVER RUNS IN THE RESIDENT BOX, even if one already exists. The setup
@@ -3251,7 +4383,11 @@ class Sandbox {
       // exactly as it does on the one-shot path. `timeoutS` is NOT passed to kern here: the resident
       // box carries its own TTL, and the binding's deadline is enforced around this process.
       this._residentCalls += 1;
-      argv = [this._kern, "exec", this._resident, "-w", WORKSPACE, "--", ...command];
+      // `-u`: `kern exec` enters as box root whatever the box runs as, so a call on a non-root session
+      // names the account, or it would run as root where the one-shot path does not.
+      argv = [this._kern, "exec", this._resident, "-w", WORKSPACE];
+      if (this._asUser !== null) argv.push("-u", this._asUser);
+      argv.push("--", ...command);
     } else {
       argv = [...this._baseArgv(name, { network, timeoutS, isSetup }), "--", ...command];
     }
@@ -3429,12 +4565,17 @@ class Sandbox {
         if (rc === 125 && fault && fault.type === "startup_failed") {
           return reject(new SandboxError(fault.message || "the box failed to start"));
         }
-        const files = before ? this._diff(before) : [];
-        resolve(
-          new ExecutionResult({
-            stdout, stderr, exitCode: rc, durationMs: wallMs, fault, files,
-            truncated: out.truncated || err.truncated,
-          }),
+        // ASYNC, because a shared workspace's diff may ask the helper about what the box user closed to
+        // us; the promise is settled from its result either way.
+        (before ? this._diff(before) : Promise.resolve([])).then(
+          (files) =>
+            resolve(
+              new ExecutionResult({
+                stdout, stderr, exitCode: rc, durationMs: wallMs, fault, files,
+                truncated: out.truncated || err.truncated,
+              }),
+            ),
+          reject,
         );
       };
 
@@ -3605,37 +4746,121 @@ class Sandbox {
     return full;
   }
 
+  /** The workspace's own directory as a descriptor: where every descent into it starts. */
+  _wsFd() {
+    return fs.openSync(this._ws, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+  }
+
+  /** The directory `parts` names under `baseFd`, opened one component at a time with `O_NOFOLLOW`
+   * through the previous one (`/proc/self/fd/<fd>/<part>`), and created when `create` and missing.
+   * Returns a descriptor the caller closes (`baseFd` itself for no parts). A symlink or a
+   * non-directory on the way is refused by name; any other error (EACCES included, for a shared
+   * workspace's fallback) is raised as it is. Mirrors Python's `_descend_dirs`.
+   *
+   * THE ONE DESCENT for everything the host creates in the workspace. `mkdirSync` of
+   * `/proc/self/fd/<fd>/<part>` creates inside the directory the descriptor holds, whatever its path
+   * says now: the `mkdirat` Node does not have. It replaces an `lstat` and a `mkdir` by path, between
+   * which a box running beside the call could swap the component for a symlink and have the `mkdir`
+   * land wherever the link pointed. */
+  /** A descriptor on `p` if it lies inside the workspace, opened through `_descendDirs` and
+   * O_NOFOLLOW so no symlink the box planted on the way is followed; null when it lies outside, where
+   * the path is the caller's own. Inside is decided on the path as written and on its parent's real
+   * location, so a caller's own link into the workspace is not a way round it. Mirrors Python's
+   * `_open_in_workspace`. */
+  _openInWorkspace(p, write) {
+    const ws = this._ws.replace(/\/+$/, "");
+    const lexical = path.resolve(p);
+    let rel;
+    if (lexical.startsWith(ws + path.sep)) rel = path.relative(ws, lexical);
+    else {
+      let parent;
+      try {
+        parent = fs.realpathSync(path.dirname(lexical));
+      } catch {
+        return null;
+      }
+      if (parent !== ws && !parent.startsWith(ws + path.sep)) return null;
+      rel = path.relative(ws, path.join(parent, path.basename(lexical)));
+    }
+    const verb = write ? "snapshot to" : "restore from";
+    this._wsPath(rel); // the lexical refusals every host-side workspace path gets
+    const parts = rel.split(path.sep).filter((c) => c && c !== ".");
+    if (!parts.length) throw new SandboxError(`cannot ${verb} the workspace directory itself`);
+    const root = this._wsFd();
+    let fd;
+    try {
+      const parent = this._descendDirs(root, parts.slice(0, -1));
+      try {
+        const flags =
+          fs.constants.O_NOFOLLOW |
+          fs.constants.O_NONBLOCK |
+          (write ? fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC : fs.constants.O_RDONLY);
+        try {
+          fd = fs.openSync(`/proc/self/fd/${parent}/${parts[parts.length - 1]}`, flags, 0o644);
+        } catch (e) {
+          throw pathRefusal(verb, rel, e);
+        }
+      } finally {
+        if (parent !== root) fs.closeSync(parent);
+      }
+    } finally {
+      fs.closeSync(root);
+    }
+    if (!fs.fstatSync(fd).isFile()) {
+      fs.closeSync(fd);
+      throw new SandboxError(`cannot ${verb} ${JSON.stringify(rel)}: not a regular file in the workspace`);
+    }
+    return fd;
+  }
+
+  _descendDirs(baseFd, parts, { create = false } = {}) {
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+    let cur = baseFd;
+    for (const part of parts) {
+      const at = `/proc/self/fd/${cur}/${part}`;
+      let next;
+      try {
+        try {
+          next = fs.openSync(at, flags);
+        } catch (e) {
+          if (e.code !== "ENOENT" || !create) throw e;
+          try {
+            fs.mkdirSync(at);
+          } catch (m) {
+            if (m.code !== "EEXIST") throw m; // made by someone else in between: opened by the same rules
+          }
+          next = fs.openSync(at, flags);
+        }
+      } catch (e) {
+        if (cur !== baseFd) fs.closeSync(cur);
+        if (e.code === "ELOOP")
+          throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(part)}`, { cause: e });
+        if (e.code === "ENOTDIR")
+          throw new SandboxError(`workspace path component is not a directory: ${JSON.stringify(part)}`, { cause: e });
+        throw e;
+      }
+      if (cur !== baseFd) fs.closeSync(cur);
+      cur = next;
+    }
+    return cur;
+  }
+
   /** Create the parent directories of `full` under the workspace WITHOUT following a symlink in any
    * intermediate component. `mkdir -p` follows symlinks, so a box that plants `a -> /etc` could steer a
-   * `writeFile("a/b.txt")` outside the workspace even though the final component is O_NOFOLLOW. Descend
-   * one level at a time from the (canonical) base: reject a symlink, create a missing dir non-recursively. */
+   * `writeFile("a/b.txt")` outside the workspace even though the final component is O_NOFOLLOW. One
+   * component at a time BY DESCRIPTOR: see `_descendDirs`. */
   _ensureParentDirs(full) {
-    const base = this._ws;
-    const relDir = path.relative(base, path.dirname(full));
-    if (relDir === "" || relDir === ".") return; // parent is the workspace root itself
-    let cur = base;
-    for (const part of relDir.split(path.sep)) {
-      if (!part || part === ".") continue;
-      const next = path.join(cur, part);
-      let st = null;
-      try {
-        st = fs.lstatSync(next);
-      } catch {
-        st = null;
-      }
-      if (st === null) {
-        fs.mkdirSync(next); // non-recursive: each level is a fresh real dir we just created
-      } else if (st.isSymbolicLink()) {
-        throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(part)}`);
-      } else if (!st.isDirectory()) {
-        throw new SandboxError(`workspace path component is not a directory: ${JSON.stringify(part)}`);
-      }
-      cur = next;
+    const parts = path.relative(this._ws, path.dirname(full)).split(path.sep).filter((p) => p && p !== ".");
+    if (!parts.length) return; // parent is the workspace root itself
+    const root = this._wsFd();
+    try {
+      const fd = this._descendDirs(root, parts, { create: true });
+      if (fd !== root) fs.closeSync(fd);
+    } finally {
+      fs.closeSync(root);
     }
   }
 
-  /** Write `data` (Buffer|string) to `path` (workspace-relative) - host-direct, so the box sees it next
-   * run. The final component is opened O_NOFOLLOW: a symlink the box planted can't redirect the write. */
   /** Open the PARENT of a workspace-relative path as a directory fd, one component at a time, each with
    * `O_NOFOLLOW`, and return that fd. The caller then opens the leaf THROUGH it via
    * `/proc/self/fd/<dirfd>/<leaf>`, which the kernel resolves from the pinned descriptor rather than from
@@ -3650,7 +4875,7 @@ class Sandbox {
    * refusals, so the window is real and microseconds wide - too narrow to demonstrate cheaply and too
    * cheap to close to leave open. Python's binding never had it: it descends with `openat`.
    *
-   * The fd is the caller's to close. */
+   * The fd is the caller's to close. A refusal carries the OS error as its `cause`. */
   _openParentDirNofollow(rel) {
     const base = fs.realpathSync(this._ws);
     const full = this._wsPath(rel);
@@ -3675,14 +4900,27 @@ class Sandbox {
     return dirFd;
   }
 
+  /** Write `data` (Buffer|string) to `path` (workspace-relative) - host-direct, so the box sees it next
+   * run. The final component is opened O_NOFOLLOW: a symlink the box planted can't redirect the write. */
   async writeFile(rel, data) {
     this._requireEntered();
     const full = this._wsPath(rel);
-    this._ensureParentDirs(full); // creates missing dirs, symlink-safe, NOT mkdir -p (which follows one)
     const payload = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
-    // THE LEAF IS OPENED THROUGH A PINNED PARENT FD, not by path: see `_openParentDirNofollow`. The
-    // pre-check above still runs, because it is what CREATES the missing directories; what it cannot do
-    // is stay true between its own lstat and this open.
+    try {
+      this._writeFileHost(rel, full, payload);
+      return;
+    } catch (e) {
+      // A DIRECTORY THE BOX USER CLOSED TO US (a tarball's 0755): the helper writes it, as its owner.
+      if (!this._shared || !isClosedErr(e.cause ?? e)) throw e;
+    }
+    const r = await this._wsHelper(HELPER_WRITE, this._helperParts(full), { write: true, input: payload });
+    if (r.code !== 0) throw this._helperRefusal("write", rel, r);
+  }
+
+  /** `writeFile` on the host. */
+  _writeFileHost(rel, full, payload) {
+    this._ensureParentDirs(full); // creates missing dirs, symlink-safe, NOT mkdir -p (which follows one)
+    // THE LEAF IS OPENED THROUGH A PINNED PARENT FD, not by path: see `_openParentDirNofollow`.
     const dirFd = this._openParentDirNofollow(rel);
     let fd;
     try {
@@ -3696,7 +4934,9 @@ class Sandbox {
           fs.constants.O_TRUNC |
           fs.constants.O_NOFOLLOW |
           fs.constants.O_NONBLOCK,
-        0o644,
+        // 0o664 ON A SHARED WORKSPACE: the mode's group bits ARE the ACL mask, and 0o644 would cap the
+        // box user's entry at read. Nobody else gains: the inherited group and other entries are empty.
+        this._shared ? 0o664 : 0o644,
       );
     } catch (e) {
       throw pathRefusal("write", rel, e);
@@ -3722,7 +4962,8 @@ class Sandbox {
   /** Verify no INTERMEDIATE path component under the workspace is a symlink (read-only counterpart of
    * _ensureParentDirs). readFile follows directory components on open, so a box that plants `d -> /etc`
    * would otherwise leak host files via `readFile("d/x")` even with O_NOFOLLOW on the last component.
-   * Descend one level at a time, reject a symlinked component. */
+   * Descend one level at a time, reject a symlinked component. A refusal carries the OS error as its
+   * `cause`. */
   _verifyParentDirs(full) {
     const base = this._ws;
     const relDir = path.relative(base, path.dirname(full));
@@ -3734,8 +4975,8 @@ class Sandbox {
       let st;
       try {
         st = fs.lstatSync(next);
-      } catch {
-        throw new SandboxError(`cannot resolve workspace path component: ${JSON.stringify(part)}`);
+      } catch (e) {
+        throw new SandboxError(`cannot resolve workspace path component: ${JSON.stringify(part)}`, { cause: e });
       }
       if (st.isSymbolicLink())
         throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(part)}`);
@@ -3767,6 +5008,21 @@ class Sandbox {
   async readFile(rel, { maxBytes = null } = {}) {
     this._requireEntered();
     const full = this._wsPath(rel);
+    try {
+      return this._readFileHost(rel, full, maxBytes);
+    } catch (e) {
+      // A FILE THE BOX USER CLOSED TO US (0600, or inside its 0700): the helper reads it, as its owner.
+      if (!this._shared || !isClosedErr(e.cause ?? e)) throw e;
+    }
+    const limit = maxBytes === null ? "" : String(maxBytes + 1);
+    const r = await this._wsHelper(HELPER_READ, [limit, ...this._helperParts(full)]);
+    if (r.code !== 0) throw this._helperRefusal("read", rel, r);
+    if (maxBytes !== null && r.stdout.length > maxBytes) throw maxBytesRefusal(rel, maxBytes, null);
+    return r.stdout;
+  }
+
+  /** `readFile` on the host. */
+  _readFileHost(rel, full, maxBytes) {
     this._verifyParentDirs(full); // fast reject + nice error before we open (host-leak guard)
     let fd;
     try {
@@ -3791,12 +5047,7 @@ class Sandbox {
             `planted in the workspace can stall or fake this read)`,
         );
       // maxBytes caps the read so a file a not-fully-trusted box wrote can't OOM the host.
-      if (maxBytes !== null && st.size > maxBytes)
-        throw new SandboxError(
-          `${JSON.stringify(rel)} is ${st.size} bytes, larger than maxBytes=${maxBytes}, so the ` +
-            "read was REFUSED. maxBytes is a ceiling on what may be read at all, not a request " +
-            "for the first bytes: nothing was returned. Raise it, or drop it and slice the result.",
-        );
+      if (maxBytes !== null && st.size > maxBytes) throw maxBytesRefusal(rel, maxBytes, st.size);
       return fs.readFileSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -3811,21 +5062,31 @@ class Sandbox {
       root = this._wsPath(subdir);
       // a box that plants `peek -> /tmp` must not make listFiles("peek") enumerate a host dir's names
       // (the walk's followlinks=false does NOT stop it, since it follows the ROOT). Reject a symlinked
-      // subdir (parents via _verifyParentDirs, the final component via lstat).
-      this._verifyParentDirs(root);
-      let st;
+      // subdir (parents via _verifyParentDirs, the final component via lstat); the walk then descends by
+      // descriptor whatever the path says by then.
+      let st = null;
       try {
+        this._verifyParentDirs(root);
         st = fs.lstatSync(root);
-      } catch {
-        throw new SandboxError(`cannot list ${JSON.stringify(subdir)}`);
+      } catch (e) {
+        if (!(this._shared && isClosedErr(e.cause ?? e))) {
+          if (e instanceof SandboxError) throw e;
+          throw new SandboxError(`cannot list ${JSON.stringify(subdir)}`, { cause: e });
+        }
       }
-      if (st.isSymbolicLink())
-        throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(subdir)}`);
-      if (!st.isDirectory()) throw new SandboxError(`not a directory: ${JSON.stringify(subdir)}`);
+      if (st === null) {
+        // The same check, by the box user: a directory, no symlink on the way.
+        const r = await this._wsHelper(HELPER_ISDIR, this._helperParts(root));
+        if (r.code !== 0) throw this._helperRefusal("list", subdir, r);
+      } else {
+        if (st.isSymbolicLink())
+          throw new SandboxError(`path escapes the workspace via a symlinked directory: ${JSON.stringify(subdir)}`);
+        if (!st.isDirectory()) throw new SandboxError(`not a directory: ${JSON.stringify(subdir)}`);
+      }
     } else {
       root = this._ws;
     }
-    const walked = this._walk(root);
+    const walked = await this._walk(root);
     return Object.entries(walked).map(([p, [, size]]) => ({ path: p, size, change: "created" }));
   }
 
@@ -3848,18 +5109,153 @@ class Sandbox {
   snapshot(dest) {
     this._requireEntered();
     this._requireSnapshotOptIn();
-    fs.writeFileSync(dest, tarPack(fs.realpathSync(this._ws), ENV_FILE));  // prefix-excluded inside tarPack
+    // A `dest` INSIDE THE WORKSPACE is opened first, by descriptor (see `_openInWorkspace`): by path, a
+    // symlink the box planted at that name sent the archive onto the host file it named. Closed in the
+    // `finally` below on every path, the walk's errors included.
+    const outFd = this._openInWorkspace(dest, true);
+    try {
+      this._snapshotInto(dest, outFd);
+    } finally {
+      if (outFd !== null) closeQuietly(outFd);
+    }
+  }
+
+  /** The body of snapshot(): `outFd` is the open `dest` when it is inside the workspace, else null. */
+  _snapshotInto(dest, outFd) {
+    // BY DESCRIPTOR (see `tarCollect`). The archive is built in memory, as it always was here; the
+    // helper's part of it is bounded by the same 1 GiB `restore` refuses past.
+    const out = [];
+    const blind = this._shared ? [] : null;
+    const skipped = [];
+    // The identity of `dest`, which the walk skips, or every checkpoint written into the workspace
+    // would carry the one before it.
+    let destId = null;
+    try {
+      const st = outFd !== null ? fs.fstatSync(outFd) : fs.statSync(dest);
+      destId = `${st.dev}:${st.ino}`;
+    } catch {
+      /* not there yet */
+    }
+    const root = this._wsFd();
+    try {
+      // THE RECORD FIRST: what `.deps` was built for (see SNAPSHOT_RECORD). Mirrors Python.
+      let hasDeps = false;
+      try {
+        hasDeps = fs.lstatSync(`/proc/self/fd/${root}/${DEPS_DIR}`).isDirectory();
+      } catch {
+        hasDeps = false;
+      }
+      tarWriteFile(
+        out,
+        SNAPSHOT_RECORD,
+        Buffer.from(
+          JSON.stringify({ [SNAPSHOT_RECORD_KEY]: 1, image: this.image, machine: hostMachine(), deps: hasDeps }),
+        ),
+        // WHEN THIS SNAPSHOT WAS TAKEN. The record is this package's own member, not a file from the
+        // workspace, so its mtime is the only timestamp the archive carries about ITSELF - and
+        // Python's `tf.add` of the record has always written it. It was 0 here, which dated every
+        // Node snapshot to the epoch.
+        Math.floor(Date.now() / 1000),
+        0o644,
+      );
+      tarCollect(root, "", destId, out, blind, skipped);
+    } finally {
+      fs.closeSync(root);
+    }
+    if (blind && blind.length) {
+      // What the box user closed to us is read by the box user: one `tar` in the helper box,
+      // re-emitted file by file in this archive's own format. Mirrors Python.
+      const r = this._wsHelperSync(HELPER_TAR, blind.map(helperSubtree));
+      if (r.code !== 0)
+        throw new SandboxError(
+          `snapshot: the box user could not read ${JSON.stringify(blind)}: ${r.stderr.trim().slice(-400)}`,
+        );
+      for (const m of tarParseRaw(r.stdout)) {
+        const name = m.name.replace(/^\.\//, "");
+        // THE NAME IS VETTED, because this stream comes from a `tar` in the IMAGE (see
+        // `_helperArgv`): a member named `../../../.ssh/authorized_keys` or `/etc/passwd` would be
+        // written into an archive this package documents as a safe checkpoint. `restore` refuses
+        // such a member, and so do GNU tar and bsdtar, but a third extractor is not ours to assume.
+        // Same chokepoint and same warning as Python's `_snapshot_blind`.
+        let confined = false;
+        try {
+          this._wsPath(name);
+          confined = true;
+        } catch {
+          confined = false;
+        }
+        if (!confined) {
+          if (name) skipped.push(name);
+          continue;
+        }
+        // Directories come with their files, as on the host walk above; anything else is named.
+        if (m.type === "file") tarWriteFile(out, name, m.content);
+        else if (m.type === "other" && name) skipped.push(name);
+      }
+    }
+    const archive = tarFinish(out);
+    if (outFd === null) fs.writeFileSync(dest, archive);
+    else for (let off = 0; off < archive.length; ) off += fs.writeSync(outFd, archive, off, archive.length - off);
+    if (skipped.length)
+      process.emitWarning(
+        `snapshot: ${skipped.length} entr${skipped.length === 1 ? "y" : "ies"} not archived, because restore ` +
+          `writes only regular files and directories (a symlink, FIFO, device or socket in the archive ` +
+          `would make the whole snapshot unrestorable): ${skipped.slice(0, 5).map((x) => JSON.stringify(x)).join(", ")}` +
+          (skipped.length > 5 ? ", ..." : ""),
+        "KernSnapshotIncomplete",
+      );
+  }
+
+  /** `_wsHelper` for the synchronous `snapshot`/`restore`, through `spawnSync`: those methods already
+   * block on their own file I/O, and this is reached only after the host was refused. */
+  _wsHelperSync(script, args, { write = false, input = null, timeoutS = 120 } = {}) {
+    const argv = this._helperArgv(script, args, write, timeoutS);
+    const r = spawnSync(argv[0], argv.slice(1), {
+      input: input || Buffer.alloc(0),
+      timeout: (timeoutS + 30) * 1000,
+      maxBuffer: TAR_MAX_BYTES,
+    });
+    return this._helperResult({
+      code: r.error || r.status === null ? -1 : r.status,
+      stdout: r.stdout || Buffer.alloc(0),
+      stderr: r.error ? String(r.error.message) : String(r.stderr || ""),
+    });
   }
 
   /** Extract a snapshot (from snapshot()) into the workspace, SAFELY. Every member is vetted first:
    * absolute paths, `..` escapes and non-file/dir members (symlinks, devices, hardlinks) are refused,
-   * and each path must resolve under the workspace; the final component is opened O_NOFOLLOW. Colliding
-   * files are overwritten. */
+   * and each path must resolve under the workspace; then every member is written BY DESCRIPTOR from
+   * the workspace's own (see `_restoreHost`). Colliding files are overwritten. */
   restore(src) {
     this._requireEntered();
     this._requireSnapshotOptIn();
     const base = fs.realpathSync(this._ws);
-    const members = tarParse(fs.readFileSync(src));
+    // A `src` INSIDE THE WORKSPACE is read by descriptor: by path, a symlink the box planted there made
+    // this read a HOST archive and restore it where the box can read it.
+    const inFd = this._openInWorkspace(src, false);
+    let raw;
+    try {
+      raw = fs.readFileSync(inFd !== null ? inFd : src);
+    } finally {
+      if (inFd !== null) fs.closeSync(inFd);
+    }
+    let members = tarParse(raw);
+    // The provenance record, if this archive carries one: FIRST, a regular file, small, holding its
+    // key. Read here and never written into the workspace. Mirrors Python.
+    let originNote = null;
+    if (
+      members.length &&
+      members[0].name === SNAPSHOT_RECORD &&
+      members[0].type === "file" &&
+      members[0].content.length <= SNAPSHOT_RECORD_MAX
+    ) {
+      const record = snapshotRecord(members[0].content);
+      if (record !== null) {
+        members = members.slice(1);
+        const hasDeps = members.some((m) => m.name === DEPS_DIR || m.name.startsWith(`${DEPS_DIR}/`));
+        originNote = snapshotOriginNote(record, this.image, hostMachine(), hasDeps);
+      }
+    }
     for (const m of members) {
       if (m.name === "") continue;
       if (m.name.startsWith("/") || m.name.split("/").includes(".."))
@@ -3870,46 +5266,139 @@ class Sandbox {
       if (resolved !== base && !resolved.startsWith(base + path.sep))
         throw new SandboxError(`snapshot member escapes the workspace: ${JSON.stringify(m.name)}`);
     }
-    for (const m of members) {
-      if (m.name === "") continue;
-      const dest = path.join(base, m.name);
-      // _ensureParentDirs descends one level at a time and REFUSES a symlinked component, so a symlink
-      // the box planted in the workspace (e.g. `evil -> ~/.ssh`) can't steer a member outside it. A
-      // plain mkdir -p would follow that symlink (the lexical pre-vet above does not resolve it).
-      this._ensureParentDirs(dest);
-      if (m.type === "dir") {
-        let st = null;
-        try {
-          st = fs.lstatSync(dest);
-        } catch {
-          st = null;
-        }
-        if (st === null) {
-          // mkdirSync is not O_NOFOLLOW: a box could swap `dest` for a symlink between _ensureParentDirs
-          // and here (mkdir-through-symlink -> an empty dir created OUTSIDE the workspace). Node has no
-          // mkdirat, so close the race by re-lstat'ing after: a symlink swapped in is caught. No member
-          // content is ever written through it (file writes use O_NOFOLLOW leaves).
-          try {
-            fs.mkdirSync(dest);
-          } catch (e) {
-            if (e.code !== "EEXIST") throw e;
-          }
-          const post = fs.lstatSync(dest);
-          if (post.isSymbolicLink() || !post.isDirectory())
-            throw new SandboxError(`snapshot dir member is not a real directory: ${JSON.stringify(m.name)}`);
-        } else if (st.isSymbolicLink() || !st.isDirectory()) {
-          throw new SandboxError(`snapshot dir member collides with a non-directory: ${JSON.stringify(m.name)}`);
-        }
-        continue;
+    try {
+      this._restoreHost(members);
+    } catch (e) {
+      if (!this._shared || !isClosedErr(e.cause ?? e)) throw e;
+      // A DIRECTORY THE BOX USER CLOSED TO US is in the way: the helper, as that user, extracts the
+      // same vetted members, directories included, in one box (`-o`: no ownership from the archive).
+      const out = [];
+      for (const m of members) {
+        if (m.name === "") continue;
+        if (m.type === "dir") tarWriteDir(out, m.name);
+        else tarWriteFile(out, m.name, m.content);
       }
-      // O_NOFOLLOW: a symlink already planted at this leaf can't redirect the write outside the workspace.
-      const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
-      const fd = fs.openSync(dest, flags, 0o644);
+      const r = this._wsHelperSync(HELPER_UNTAR, [], { write: true, input: tarFinish(out, false) });
+      if (r.code !== 0)
+        throw new SandboxError(`restore: the box user could not extract: ${r.stderr.trim().slice(-400)}`);
+    }
+    if (this._shared) {
+      // The files written above are ours with this format's fixed mode: the box user gets its entry
+      // back, on the whole tree and by descriptor, for the reason `aclGrantBatches` gives. Mirrors Python.
       try {
-        fs.writeSync(fd, m.content);
-      } finally {
-        fs.closeSync(fd);
+        aclGrantTreeSync(this._ws, this._userHostUid, process.getuid());
+      } catch (e) {
+        throw new SandboxError(`restore: sharing the restored files with the box user failed: ${e.message}`, { cause: e });
       }
+    }
+    // SAID AFTER THE RESTORE SUCCEEDED, not thrown: a pure-JS or pure-Python dependency runs anywhere.
+    if (originNote !== null) process.emitWarning(originNote, "KernSnapshotOrigin");
+  }
+
+  /** The host half of `restore`: the vetted `members` written under the workspace, every path reached
+   * BY DESCRIPTOR from the workspace's own (`_descendDirs`), so a box running beside this call cannot
+   * turn a member's parent into a symlink between the vetting and the write. */
+  _restoreHost(members) {
+    const flags =
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
+    // THE CREATION MODE IS OWNER-ONLY and the member's own mode is applied after the bytes, which is
+    // the rule Python's `_restore_host` states: a mode out of an archive carries the SOURCE
+    // workspace's ACL mask in its group bits (granting a box account rewrites `mask::`, which IS the
+    // group mode), and the ACL does not travel in a tar - so restoring the group bits turns a mask
+    // back into real group access. It was `this._shared ? 0o664 : 0o644`, which widened it by
+    // construction on exactly the shared workspaces where the mask exists. A box account reaches
+    // what it needs through the ACL the session grants, not through these bits.
+    const createMode = 0o600;
+    const root = this._wsFd();
+    // DIRECTORY MTIMES GO LAST, DEEPEST FIRST, because writing a file into a directory updates that
+    // directory's mtime: set in member order, every directory with children would end up carrying
+    // the moment of the restore instead of the moment the snapshot captured. Python's restore has
+    // the same two-pass shape for the same reason; this is the Node half of it.
+    const dirTimes = [];
+    try {
+      for (const m of members) {
+        const parts = m.name.split("/").filter((p) => p && p !== ".");
+        if (!parts.length) continue;
+        const parent = this._descendDirs(root, parts.slice(0, -1), { create: true });
+        try {
+          const leaf = parts[parts.length - 1];
+          if (m.type === "dir") {
+            try {
+              fs.mkdirSync(`/proc/self/fd/${parent}/${leaf}`);
+            } catch (e) {
+              if (e.code !== "EEXIST") throw e;
+            }
+            try {
+              fs.closeSync(this._descendDirs(parent, [leaf])); // a real directory, not a link swapped in
+            } catch (e) {
+              throw new SandboxError(`snapshot dir member collides with a non-directory: ${JSON.stringify(m.name)}`, { cause: e });
+            }
+            if (m.mtime > 0) dirTimes.push([parts, m.mtime]);
+            continue;
+          }
+          let fd;
+          try {
+            fd = fs.openSync(`/proc/self/fd/${parent}/${leaf}`, flags, createMode);
+          } catch (e) {
+            throw pathRefusal("restore", m.name, e);
+          }
+          try {
+            if (!fs.fstatSync(fd).isFile())
+              throw new SandboxError(`refusing to restore ${JSON.stringify(m.name)}: not a regular file in the workspace`);
+            // EVERY BYTE, OR AN ERROR: `writeSync` is one write(2) and may write fewer bytes than it
+            // was given (a filling disk is where that shows), which left the file short with restore
+            // reporting success. Mirrors Python.
+            for (let off = 0; off < m.content.length; ) off += fs.writeSync(fd, m.content, off, m.content.length - off);
+            // THE MTIME THE MEMBER CARRIED, on the DESCRIPTOR: no path is re-resolved, so a box
+            // running beside this call cannot steer the timestamp onto another inode. Best effort,
+            // as Python's is: a target this process may not touch (one the box account owns) is not
+            // a reason to fail a restore that has already written every byte.
+            // THE MODE, THEN THE TIME, in that order: `fchmod` does not change an mtime, while a
+            // write does, so setting the time last is what makes it stick. Owner bits only, with a
+            // 0600 floor so a member whose mode was 0400 is still writable by the session that
+            // restored it, and the execute bit only when the owner had it - the same three rules
+            // `_restore_host` applies in Python, so one archive restores the same way on both.
+            const want = m.mode === null ? null : 0o600 | (m.mode & 0o700);
+            if (want !== null) {
+              try {
+                fs.fchmodSync(fd, want & 0o100 ? want : want & ~0o111);
+              } catch {
+                /* a target this process may not chmod (one the box account owns): best effort */
+              }
+            }
+            if (m.mtime > 0) {
+              try {
+                fs.futimesSync(fd, m.mtime, m.mtime);
+              } catch {
+                /* a mode or an owner this process cannot set a time on: the bytes are the restore */
+              }
+            }
+          } finally {
+            fs.closeSync(fd);
+          }
+        } finally {
+          if (parent !== root) fs.closeSync(parent);
+        }
+      }
+      // DEEPEST FIRST, so a parent's time is set after every child has been written into it.
+      dirTimes.sort((a, b) => b[0].length - a[0].length);
+      for (const [parts, mtime] of dirTimes) {
+        let fd;
+        try {
+          fd = this._descendDirs(root, parts, { create: false });
+        } catch {
+          continue; // a directory a concurrent box removed between the write and this pass
+        }
+        try {
+          fs.futimesSync(fd, mtime, mtime);
+        } catch {
+          /* best effort, as above */
+        } finally {
+          if (fd !== root) fs.closeSync(fd);
+        }
+      }
+    } finally {
+      fs.closeSync(root);
     }
   }
 
@@ -3952,46 +5441,147 @@ class Sandbox {
 
   // -- files diff (created/modified; excludes .deps and our env file) ------------------------------
 
-  _snapshot() {
+  async _snapshot() {
     return this._walk(this._ws);
   }
 
-  _walk(root) {
-    const base = this._ws;
+  async _walk(root) {
+    // BY DESCRIPTOR, from the workspace's own fd down: each directory opened `O_NOFOLLOW` through the
+    // one it was listed from, and listed through that descriptor. A walk by path re-resolved every
+    // directory, so a box running beside this call could turn one into a symlink after it was listed
+    // and have the next listing read a HOST directory, whose names and sizes then came back in
+    // `files`. Mirrors Python's `_walk`.
+    //
+    // A DIRECTORY THIS PROCESS CANNOT READ is collected, not skipped: with a non-root `user` the box
+    // user can close one to us, and its files would be missing from `files` and `listFiles` with
+    // nothing to say so.
     const out = {};
-    const stack = [root];
-    while (stack.length) {
-      const dir = stack.pop();
-      let entries;
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const ent of entries) {
-        if (ent.isDirectory()) {
-          if (ent.name === DEPS_DIR) continue; // exclude deps from the diff
-          stack.push(path.join(dir, ent.name));
+    const blind = [];
+    const dirFlags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+    const top = path.relative(this._ws, root);
+    const rootFd = this._wsFd();
+    // Two kinds of frame, so the descriptors held are the current directory's ANCESTORS and nothing
+    // else: [rel, parentFd] to open and list, and [null, fd] to close, pushed UNDER a directory's
+    // children so it runs after the last of them.
+    //
+    // ONE PER DEPTH LEVEL, NOT ONE PER ENTRY. The first version opened every subdirectory while
+    // listing the parent and held them all: a box that makes 150k directories had the diff after its
+    // own call open 150k descriptors, and `stack.push(...subdirs)` spread that many arguments, which
+    // is past V8's argument limit and throws RangeError - with every descriptor in `subdirs` leaking,
+    // so each repeat leaked another batch. On a host with a lower limit the opens failed instead and
+    // those subtrees were silently absent from `files` and `listFiles`.
+    const stack = [[top, -1]];
+    try {
+      while (stack.length) {
+        const [relDir, parentFd] = stack.pop();
+        if (relDir === null) {
+          closeQuietly(parentFd);
           continue;
         }
-        const fp = path.join(dir, ent.name);
-        let st;
+        let fd;
+        if (parentFd < 0) {
+          try {
+            fd = this._descendDirs(rootFd, top ? top.split(path.sep) : []);
+          } catch (e) {
+            if (this._shared && isClosedErr(e.cause ?? e)) blind.push(top);
+            // otherwise nothing there to walk, as a walk of a missing root yielded nothing
+            continue;
+          }
+        } else {
+          const name = relDir.slice(relDir.lastIndexOf("/") + 1);
+          try {
+            fd = fs.openSync(`/proc/self/fd/${parentFd}/${name}`, dirFlags);
+          } catch (e) {
+            if (this._shared && isClosedErr(e)) {
+              blind.push(relDir);
+              continue;
+            }
+            // GONE IS CHURN, ANYTHING ELSE IS NOT: a workspace a box is writing to loses entries
+            // (ENOENT) and has them replaced by non-directories (ENOTDIR for a symlink under
+            // O_NOFOLLOW, ELOOP). Running out of descriptors or memory is thrown, because a listing
+            // that quietly drops a subtree reports a workspace smaller than it is.
+            if (WALK_GONE.has(e.code)) continue;
+            throw e;
+          }
+        }
+        let keepOpen = false;
         try {
-          st = fs.lstatSync(fp);
-        } catch {
-          continue;
+          let entries;
+          try {
+            entries = fs.readdirSync(`/proc/self/fd/${fd}`, { withFileTypes: true });
+          } catch (e) {
+            // A directory that OPENED and will not list: on a shared workspace that is the box
+            // user's to read (`tarCollect` already treated it so), and it used to vanish in silence.
+            if (this._shared && isClosedErr(e)) {
+              blind.push(relDir);
+              continue;
+            }
+            if (WALK_GONE.has(e.code)) continue;
+            throw e;
+          }
+          const subdirs = [];
+          for (const ent of entries) {
+            const rel = relDir ? `${relDir}/${ent.name}` : ent.name;
+            let st;
+            try {
+              st = fs.lstatSync(`/proc/self/fd/${fd}/${ent.name}`);
+            } catch (e) {
+              if (this._shared && isClosedErr(e)) {
+                blind.push(relDir); // listable, not searchable: ask for it whole
+                break;
+              }
+              continue;
+            }
+            if (st.isDirectory()) {
+              if (ent.name === DEPS_DIR) continue; // exclude deps from the diff, at any depth
+              subdirs.push(rel);
+              continue;
+            }
+            if (!st.isFile()) continue; // excludes symlinks and non-regular files
+            // THE BARE NAME ONLY, not the family `isLegacyEnvFile` matches: a listing is the
+            // operator's view, and every other shape in that pattern (12 free hex digits, 191 free
+            // characters) is one a cell can create, so skipping them here let a box hide a file from
+            // `files`/`listFiles`. The snapshot path still skips the whole family, because an
+            // archive travels and a stale env file holds `env` values. Python's `_is_ours` matches.
+            if (rel === ENV_FILE) continue;
+            out[rel] = [Math.round(st.mtimeMs * 1e6), st.size];
+          }
+          if (subdirs.length) {
+            if (fd !== rootFd) {
+              stack.push([null, fd]); // closed after the last of its children
+              keepOpen = true;
+            }
+            for (let i = subdirs.length - 1; i >= 0; i--) stack.push([subdirs[i], fd]);
+          }
+        } finally {
+          if (!keepOpen && fd !== rootFd) fs.closeSync(fd);
         }
-        if (!st.isFile()) continue; // excludes symlinks and non-regular files
-        const rel = path.relative(base, fp);
-        if (Sandbox._isEnvFile(rel)) continue; // our private host-side env file, not a user artifact
-        out[rel] = [Math.round(st.mtimeMs * 1e6), st.size];
+      }
+    } finally {
+      for (const [rel, fd] of stack) if (rel === null && fd !== rootFd) closeQuietly(fd);
+      fs.closeSync(rootFd);
+    }
+    if (blind.length) {
+      // ONE helper box for every blind subtree. Its mtimes are whole seconds (`stat -c %Y`); a file is
+      // always seen through the same path while its directory keeps its mode.
+      const r = await this._wsHelper(HELPER_LIST, blind.map(helperSubtree));
+      if (r.code !== 0)
+        // SAID, NOT THROWN: `files` is a report and the call it describes already ran. Mirrors Python.
+        process.emitWarning(
+          `result.files / listFiles may be missing entries: the box user could not list ` +
+            `${JSON.stringify(blind)} (${String(r.stderr).trim().slice(-400) || `exit ${r.code}`})`,
+          "KernWorkspaceListing",
+        );
+      for (const [rel, mode, size, mtime] of parseHelperList(r.stdout)) {
+        if ((mode & 0o170000) !== 0o100000 || underDeps(rel) || rel === ENV_FILE) continue;
+        out[rel] = [mtime * 1e9, size];
       }
     }
     return out;
   }
 
-  _diff(before) {
-    const after = this._snapshot();
+  async _diff(before) {
+    const after = await this._snapshot();
     const files = [];
     for (const [rel, meta] of Object.entries(after)) {
       if (!(rel in before)) files.push({ path: rel, size: meta[1], change: "created" });
@@ -4089,7 +5679,7 @@ class Sandbox {
     if (this._pool && !streaming && !code.includes("\0")) {
       const warm = await this._pool.claim({ network: this.network, deadlineS: eff });
       if (warm) {
-        const before = this.trackFiles ? this._snapshot() : null;
+        const before = this.trackFiles ? await this._snapshot() : null;
         return warm.runCell(code, { deadlineS: eff, before });
       }
     }
@@ -4305,19 +5895,32 @@ function kernelDriver(outCap, resCap, hello = false) {
  * redirecting. Raw, it reads `ELOOP: too many symbolic links encountered`, which sends a reader looking
  * for a broken link chain when what happened is an attempt to reach a host file. */
 function pathRefusal(verb, rel, e) {
+  const cause = { cause: e };
   if (e && e.code === "ELOOP")
     return new SandboxError(
       `refusing to ${verb} ${JSON.stringify(rel)}: a component of that path is a SYMLINK. Host-side ` +
         "reads and writes never follow one (O_NOFOLLOW), because a link planted inside the workspace is " +
         "how a box reaches a host file it was not given (the kernel reports this as ELOOP). Remove it, " +
         "or name the file you meant",
+      cause,
     );
   if (e && e.code === "ENXIO")
     return new SandboxError(
       `refusing to ${verb} ${JSON.stringify(rel)}: it is a FIFO with no reader. Opening one for writing ` +
         "would block until the box chose to read, so the open is non-blocking and fails instead",
+      cause,
     );
-  return new SandboxError(`cannot ${verb} ${JSON.stringify(rel)}: ${e && e.message ? e.message : e}`);
+  return new SandboxError(`cannot ${verb} ${JSON.stringify(rel)}: ${e && e.message ? e.message : e}`, cause);
+}
+
+/** The refusal of a read past `maxBytes`, ONE spelling for the host and the helper path. `size` is the
+ * file's own when it is known (the host read it from `fstat`), null when only "more than" is. */
+function maxBytesRefusal(rel, maxBytes, size) {
+  return new SandboxError(
+    `${JSON.stringify(rel)} is ${size === null ? "larger" : `${size} bytes, larger`} than ` +
+      `maxBytes=${maxBytes}, so the read was REFUSED. maxBytes is a ceiling on what may be read at all, ` +
+      "not a request for the first bytes: nothing was returned. Raise it, or drop it and slice the result.",
+  );
 }
 /** A warm, persistent Python interpreter living in one long-lived box (see `Sandbox.kernel`). `runCode`
  * sends a cell over a length-prefixed pipe to the resident driver and resolves to an ExecutionResult with
@@ -5072,14 +6675,15 @@ class WarmBox {
   /** Assemble the result with the SAME shape the cold path returns, including the workspace diff.
    * `files` is computed here rather than left empty because a fast path that silently stopped reporting
    * created files would be a behaviour change disguised as a speed-up. */
-  _result(stdout, stderr, exitCode, started, before, { truncated = false, fault = null, results = [] } = {}) {
+  async _result(stdout, stderr, exitCode, started, before, { truncated = false, fault = null, results = [] } = {}) {
+    const durationMs = Date.now() - started; // the cell's time, not the diff's
     return new ExecutionResult({
       stdout,
       stderr,
       exitCode,
-      durationMs: Date.now() - started,
+      durationMs,
       fault,
-      files: before ? this._sbx._diff(before) : [],
+      files: before ? await this._sbx._diff(before) : [],
       truncated,
       results,
     });
@@ -5134,10 +6738,12 @@ class WarmBox {
     // The private --env-file _baseArgv wrote for THIS box. _spawn removes its own; a prewarmed box has
     // no _spawn, so without this every warm box leaves one behind in a workspace the caller may persist.
     if (this._name) {
-      try {
-        fs.unlinkSync(this._sbx._envPath(this._name));
-      } catch {
-        /* ENOENT is fine */
+      if (this._sbx._envDir) {
+        try {
+          fs.unlinkSync(this._sbx._envPath(this._name));
+        } catch {
+          /* ENOENT is fine */
+        }
       }
       this._name = "";
     }
@@ -5348,6 +6954,17 @@ module.exports = {
   _sanitizeRef: sanitizeRef,
   _imageIsCached: imageIsCached,
   _fetchImage: fetchImage,
+  // The snapshot reader, exported for its tests only: what it accepts decides where a member of a
+  // hostile or foreign archive lands, and the `prefix` field it used to ignore was a silent rename.
+  _tarParseRaw: tarParseRaw,
+  // The WRITER's pieces, for the same reason: the archive is a wire format between the two bindings,
+  // so what this side emits is as much a contract as what it accepts.
+  _tarWriteFile: tarWriteFile,
+  _tarWriteDir: tarWriteDir,
+  _tarFinish: tarFinish,
+  _tarSplitName: tarSplitName,
+  _tarOctalField: tarOctalField,
+  _TAR_MAX_OCTAL: TAR_MAX_OCTAL,
   // The streaming protocol's pieces, for tests that drive the real driver without a box.
   _kernelDriver: kernelDriver,
   _WarmBox: WarmBox,
@@ -5360,6 +6977,17 @@ module.exports = {
   // Exported for the test that proves a stale lock is swept: the marks decide what the sweep
   // collects, and a lock left out of them disables an image's cache forever.
   _PYC_DEBRIS_MARKS: PYC_DEBRIS_MARKS,
+  // `user`'s pieces, for its tests only: the spec check, the ACL walk by descriptor (a security
+  // property: an entry must never land outside the workspace), the helper scripts (asserted
+  // byte-for-byte against the Python binding's) and the closed-directory accounting.
+  _validateUser: validateUser,
+  _isRootUser: isRootUser,
+  _imageUser: imageUser,
+  _parseHelperList: parseHelperList,
+  _aclGrantBatches: aclGrantBatches,
+  _aclGrantTreeAsync: aclGrantTreeAsync,
+  _workspaceUsage: workspaceUsage,
+  _HELPER_SCRIPTS: { HELPER_READ, HELPER_WRITE, HELPER_LIST, HELPER_DU, HELPER_ISDIR, HELPER_CLEAN, HELPER_TAR, HELPER_UNTAR },
   _pycDirFor: pycDirFor,
   _pycBuild: pycBuild,
   _pycSweep: pycSweep,

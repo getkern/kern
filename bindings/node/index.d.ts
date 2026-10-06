@@ -33,7 +33,9 @@ export interface FileInfo {
 }
 
 /** A rich, mime-typed value captured from a Python `runCode` (Jupyter/E2B-style): the code's last bare
- * expression, every `display(obj)` call, and every open matplotlib figure. `data` maps a MIME type to
+ * expression, every `display(obj)` call, and every matplotlib figure open when the code ends (a
+ * `Figure` value is drawn; in a kernel session a figure is closed once its cell has returned it, as in
+ * Jupyter). `data` maps a MIME type to
  * its payload (text/* and application/json are strings; image/* are base64). One value, several forms. */
 export class Result {
   data: Record<string, string>;
@@ -179,6 +181,12 @@ export interface SandboxOptions {
   /** Capabilities dropped from every box (kern --cap-drop). Default ["ALL"]. NOT behaviour-free: a
    * workload binding a port below 1024 inside the box needs NET_BIND_SERVICE. [] drops none. */
   capDrop?: string[];
+  /** The account of the image every box runs as, "<user>[:<group>]", each a name or a number ("node",
+   * "1000", "1000:1000"); `kern exec -u` for a `persist` call. null (default) keeps the image's own USER.
+   * A non-root account shares the workspace through a POSIX ACL (needs `setfacl` and a range in
+   * /etc/subuid); what it closes to the host (0600, 0700) is reached through a short-lived box of the
+   * same image running as that account. */
+  user?: string | null;
   /** Mount setup= deps read-only for runCode (blocks cross-run dependency poisoning). Default true. */
   depsReadonly?: boolean;
   /** Compile this image's stdlib once and mount it read-only in every box (default true). */

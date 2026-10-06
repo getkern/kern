@@ -3403,13 +3403,61 @@ def test_prewarm_key_is_pure_and_folds_in_every_posture_option():
 
 def test_prewarm_dry_argv_writes_no_env_file(tmp_path):
     """`_base_argv` also WRITES the box's private env file. Keying on it created `.kern-env.` once per
-    comparison and then collided with itself, which is why `dry` exists."""
+    comparison and then collided with itself, which is why `dry` exists. The live write goes to the
+    session's env directory, and NEVER into the workspace: every box mounts the workspace."""
     s = _cfg(env={"K": "V"})
-    s._ws = str(tmp_path)
+    ws, envd = tmp_path / "ws", tmp_path / "env"
+    ws.mkdir()
+    envd.mkdir(mode=0o700)
+    s._ws, s._env_dir = str(ws), str(envd)
     s._base_argv("", network=False, timeout_s=0, dry=True)
-    assert not list(tmp_path.iterdir()), "a dry argv must leave the workspace untouched"
-    s._base_argv("realbox", network=False, timeout_s=0)
-    assert [p.name for p in tmp_path.iterdir()] == [f"{kern._ENV_FILE}{kern._ENV_SEP}realbox"]
+    assert not list(envd.iterdir()) and not list(ws.iterdir()), "a dry argv must write nothing"
+    argv = s._base_argv("realbox", network=False, timeout_s=0)
+    assert not list(ws.iterdir()), "the env file must not be written into the workspace"
+    written = envd / f"{kern._ENV_FILE}{kern._ENV_SEP}realbox"
+    assert [p.name for p in envd.iterdir()] == [written.name]
+    assert argv[argv.index("--env-file") + 1] == str(written)
+    assert (written.stat().st_mode & 0o777) == 0o600
+    assert "K=V\n" in written.read_text(), "the caller's env= is what the file carries"
+
+
+def test_the_env_files_live_outside_the_workspace_and_go_with_the_session(tmp_path, monkeypatch):
+    """The private directory is made by `__enter__`, 0700, under `$XDG_RUNTIME_DIR` when that is this
+    user's own and closed to others, and removed by `__exit__`, the failure path included.
+
+    The reasons it left the workspace, each of which the old location had: a concurrent call's box
+    could read another call's `env=` values, a process killed mid-call left them for `snapshot` to
+    archive, and a box could plant a symlink at the name the host was about to write."""
+    runtime = tmp_path / "rt"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    d = kern._private_env_dir()
+    try:
+        assert Path(d).parent == runtime and Path(d).name.startswith(kern._ENV_DIR_PREFIX)
+        assert (os.stat(d).st_mode & 0o777) == 0o700
+    finally:
+        os.rmdir(d)
+    # A runtime dir anyone else can enter is not used: the system temp dir is, still 0700.
+    runtime.chmod(0o755)
+    d = kern._private_env_dir()
+    try:
+        assert Path(d).parent != runtime and (os.stat(d).st_mode & 0o777) == 0o700
+    finally:
+        os.rmdir(d)
+    runtime.chmod(0o700)
+
+    # __exit__ removes it, and only a directory of ours.
+    s = _cfg()
+    s._env_dir = kern._private_env_dir()
+    Path(s._env_dir, "leftover").write_text("K=V\n")
+    gone = s._env_dir
+    s.__exit__()
+    assert not os.path.exists(gone) and s._env_dir == ""
+    other = tmp_path / "not-ours"
+    other.mkdir()
+    s._env_dir = str(other)
+    s.__exit__()
+    assert other.exists(), "__exit__ must never remove a directory it did not make"
 
 
 def test_kernel_driver_template_is_fully_substituted_and_compiles():
@@ -3564,6 +3612,48 @@ def test_the_kernel_driver_stays_embeddable_in_a_js_template_literal():
     ).group(1)
     offenders = [(i + 1, ln) for i, ln in enumerate(src.split("\n")) if "`" in ln or "${" in ln]
     assert not offenders, f"the driver must contain no backtick and no ${{: {offenders}"
+
+
+def test_both_bindings_carry_the_same_one_shot_runner_comments_aside():
+    """The kernel drivers are byte-identical and a test holds them so; the ONE-SHOT runners were held
+    by nothing. They differ in comments, which is why this compares Python TOKENS rather than bytes,
+    and the Node copy is a plain template literal with every backslash doubled, which is why its text
+    is taken from Node itself rather than from the source with a regex. A rule added to one runner
+    and not the other is a cold call whose result depends on which binding made it."""
+    import io as _io
+    import re
+    import shutil as _shutil
+    import tokenize
+
+    node = _shutil.which("node")
+    js_path = Path(kern.__file__).resolve().parents[2] / "node" / "index.js"
+    if not node or not js_path.exists():
+        pytest.skip("needs node and the Node binding's source beside this one")
+    js = subprocess.run(
+        [node, "-e",
+         "const src=require('fs').readFileSync(process.argv[1],'utf8');"
+         "const m=src.match(/const PY_RUNNER = (`[\\s\\S]*?`);\\n/);"
+         "if(!m){process.exit(3)};process.stdout.write(eval(m[1]))",
+         str(js_path)],
+        capture_output=True, timeout=30,
+    )
+    assert js.returncode == 0, js.stderr.decode()
+    py_src = re.search(r"_PY_RUNNER = r'''\n(.*?)\n'''", Path(kern.__file__).read_text(), re.S).group(1)
+
+    def tokens(src: str) -> list:
+        skip = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+                tokenize.ENDMARKER}
+        return [(t.type, t.string) for t in tokenize.generate_tokens(_io.StringIO(src).readline)
+                if t.type not in skip]
+
+    py_t, js_t = tokens(py_src), tokens(js.stdout.decode().strip("\n"))
+    if py_t != js_t:
+        first = next(i for i, (a, b) in enumerate(zip(py_t, js_t)) if a != b) if len(py_t) == len(js_t) \
+            else min(len(py_t), len(js_t))
+        raise AssertionError(
+            f"the one-shot runners differ at token {first}: python {py_t[first:first + 6]} vs node "
+            f"{js_t[first:first + 6]}"
+        )
 
 
 def test_the_prewarm_key_covers_the_kern_environment_not_only_the_argv():
@@ -4931,8 +5021,10 @@ def test_the_two_bindings_agree_on_when_to_skip_the_uid_range():
     # `argv.push("--no-uid-range")` and `_singleUid` both appeared somewhere, and it stayed GREEN when
     # the condition was deleted from the push and left behind in the constructor - which is the exact
     # drift it exists to catch. Falsified by making that edit, which is how the hole was found.
-    assert 'if (this._singleUid) argv.push("--no-uid-range");' in js, (
-        "the Node binding no longer passes --no-uid-range GATED on a single-uid posture"
+    # AND ON A ROOT IDENTITY: a non-root `user` gets the range from kern whatever the flag says. The
+    # behaviour is asserted in both bindings' user tests; this pins the Node spelling of the gate.
+    assert 'if (this._singleUid && this._asUser === null) argv.push("--no-uid-range");' in js, (
+        "the Node binding no longer passes --no-uid-range GATED on a single-uid, box-root posture"
     )
     assert 'replace(/^CAP_/, "")' in js and '=== "ALL"' in js, (
         "the Node binding no longer decides that posture from `ALL` being dropped"
@@ -5637,3 +5729,236 @@ def test_a_barrier_split_across_two_reads_is_held_back_not_streamed():
     assert held(b"output\x00") == 1
     assert held(b"output") == 0 and held(b"") == 0
     assert held(b"out\x00x") == 0, "a NUL that cannot start the barrier is output"
+
+
+# ---------------------------------------------------------------------------
+# A FIGURE IS RETURNED BY THE CELL THAT DREW IT, ONCE
+# ---------------------------------------------------------------------------
+# The resident kernel left every figure open, so every later cell re-sent every figure the session had
+# drawn: a cell that only printed came back with the plots of the cells before it, and paid a PNG
+# encode for each one (measured: 0.04 ms -> 65 ms for a cell after five figures). Jupyter's inline
+# backend closes a figure once it has been shown; this driver now does the same, and draws a Figure
+# handed back as a value so a figure the code still holds can be shown again on request. Run against
+# the real driver and the real matplotlib, under this interpreter: no box needed.
+
+
+def _figure_counts(cells):
+    pytest.importorskip("matplotlib")
+    p, q = _driver()
+    counts = []
+    try:
+        for code in cells:
+            _send(p, code)
+            out = kern._CellOutput(1 << 20)
+            reply = kern._next_reply(q, time.monotonic() + 60, out)
+            assert reply is not None and reply is not kern._CELL_TIMEOUT, (code, out.stderr)
+            obj = json.loads(reply)
+            assert obj["rc"] == 0, (code, out.stderr)
+            counts.append(sum(1 for d in obj.get("results", []) if "image/png" in d))
+    finally:
+        p.kill()
+        p.wait()
+    return counts
+
+
+_MPL = "import matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\n"
+
+
+def test_a_kernel_cell_does_not_return_the_figures_of_the_cells_before_it():
+    counts = _figure_counts([
+        _MPL + "plt.plot([1, 2, 3])",      # draws one
+        "print('only prints')",              # draws nothing: returns nothing
+        "x = 1",                             # nor does this
+        "plt.figure(); plt.plot([3, 2])",    # draws one more: returns that one, not two
+        "print('again')",
+    ])
+    assert counts == [1, 0, 0, 1, 0], counts
+
+
+def test_a_figure_the_code_still_holds_is_drawn_again_when_asked_for_and_never_twice_in_a_cell():
+    counts = _figure_counts([
+        _MPL + "fig, ax = plt.subplots(); ax.plot([5, 5])",  # drawn at the end of its cell, then closed
+        "ax.set_title('later'); fig",                        # held, and handed back: drawn on request
+        "display(fig)",                                      # the same through display()
+        "fig2, ax2 = plt.subplots(); ax2.plot([1]); fig2",   # the value AND open: one image, not two
+    ])
+    assert counts == [1, 1, 1, 1], counts
+
+
+def _one_shot_figure_count(code, tmp_path):
+    """The REAL one-shot runner under this interpreter, with its cell and result paths filled in the
+    way the binding fills them: what the cold `run_code` returns, without a box."""
+    pytest.importorskip("matplotlib")
+    import sys as _sys
+
+    cell, res = tmp_path / "cell.py", tmp_path / "res.json"
+    cell.write_text(code)
+    src = kern._PY_RUNNER.replace("__KERN_CELL__", str(cell)).replace("__KERN_RES__", str(res))
+    p = subprocess.run([_sys.executable, "-c", src], capture_output=True, timeout=120)
+    assert p.returncode == 0, p.stderr.decode()[-500:]
+    return sum(1 for d in json.loads(res.read_text()) if "image/png" in d)
+
+
+def test_a_figure_drawn_on_after_display_comes_back_as_it_ends_in_both_drivers(tmp_path):
+    """`display(fig)` shows the figure as it is at that line, and the code may go on drawing: the
+    end of the cell must still return the FINISHED figure. The first version recorded every
+    displayed figure as already sent, so this cell returned one PNG of empty axes. Only the cell's
+    final VALUE suppresses the end-of-cell copy, because a value is evaluated after everything."""
+    code = _MPL + "fig, ax = plt.subplots()\ndisplay(fig)\nax.plot([1, 2, 3])"
+    assert _figure_counts([code]) == [2], "kernel: the display AND the finished figure"
+    assert _one_shot_figure_count(code, tmp_path) == 2, "one-shot: the same"
+    tail = _MPL + "fig, ax = plt.subplots()\nax.plot([1, 2, 3])\nfig"
+    assert _figure_counts([tail]) == [1]
+    assert _one_shot_figure_count(tail, tmp_path) == 1
+    # Displayed and NOT drawn on after: one image, not the same picture twice. Decided by the bytes,
+    # because matplotlib renders an unchanged figure to the same PNG (checked on 3.10 and 3.11).
+    still = _MPL + "fig, ax = plt.subplots()\nax.plot([1, 2, 3])\ndisplay(fig)"
+    assert _figure_counts([still]) == [1]
+    assert _one_shot_figure_count(still, tmp_path) == 1
+
+
+def test_cold_and_kernel_runs_agree_when_one_figure_cannot_be_drawn(tmp_path):
+    """The prewarmed box runs the kernel driver and the cold box the one-shot runner, so a rule only
+    one of them follows is a call whose result depends on which box served it. Measured by review:
+    with one figure whose savefig raises, the kernel returned the good figure and the cold path none."""
+    code = _MPL + "bad = plt.figure()\nbad.savefig = lambda *a, **k: 1 / 0\nplt.figure(); plt.plot([1])"
+    assert _figure_counts([code]) == [1]
+    assert _one_shot_figure_count(code, tmp_path) == 1
+
+
+def test_a_hostile_value_cannot_turn_the_figure_check_into_an_error(tmp_path):
+    """The check on the cell's value runs on an object the cell defined, so it may not raise. Two
+    shapes, one per way of asking: a class NAMED Figure whose metaclass makes `__module__` raise (which
+    the first check, by name and module, tripped on: the cell came back rc=1 with no frame of the
+    user's in it), and an object whose `__class__` raises (which an `isinstance` check consults when
+    the real type is not a match)."""
+    pytest.importorskip("matplotlib")
+    shapes = {
+        "metaclass": (
+            "class Meta(type):\n"
+            "    @property\n"
+            "    def __module__(cls):\n"
+            "        raise RuntimeError('no')\n"
+            "class Figure(metaclass=Meta):\n"
+            "    pass\n"
+            "Figure()"
+        ),
+        "__class__": (
+            "class Odd:\n"
+            "    @property\n"
+            "    def __class__(self):\n"
+            "        raise RuntimeError('no')\n"
+            "Odd()"
+        ),
+    }
+    for what, code in shapes.items():
+        p, q = _driver()
+        try:
+            _send(p, "import matplotlib.figure\n" + code)
+            out = kern._CellOutput(1 << 20)
+            obj = json.loads(kern._next_reply(q, time.monotonic() + 30, out))
+            assert obj["rc"] == 0, (what, out.stderr)
+            assert any("text/plain" in d for d in obj["results"]), (what, obj)
+        finally:
+            p.kill()
+            p.wait()
+
+
+def test_a_figure_subclass_is_drawn_and_a_replaced_pyplot_figure_does_not_strand_the_rest():
+    """A Figure SUBCLASS (`plt.figure(FigureClass=...)`) is a figure, and the class name is not the
+    test. And the end-of-cell loop does not go through `plt.figure(n)`, which the cell may have
+    replaced: with it raising, the open figure is still returned once and closed, not left to come
+    back in the next cell."""
+    counts = _figure_counts([
+        _MPL + "import matplotlib.figure as mf\nclass Mine(mf.Figure):\n    pass\n"
+        "f = plt.figure(FigureClass=Mine)\nf.gca().plot([1])\nf",
+        "plt.figure(); plt.plot([2])\nplt.figure = lambda *a, **k: 1 / 0",
+        "print('after')",
+    ])
+    assert counts == [1, 1, 0], counts
+
+
+def test_one_figure_that_cannot_be_drawn_does_not_fail_again_in_every_later_cell():
+    """Closed in a finally of its own: a figure whose savefig raises is still closed, so the cell
+    after it neither tries again nor loses the figures that CAN be drawn."""
+    counts = _figure_counts([
+        _MPL + "bad = plt.figure()\nbad.savefig = lambda *a, **k: 1 / 0\nplt.figure(); plt.plot([1])",
+        "print('next')",
+    ])
+    assert counts == [1, 0], counts
+
+
+def test_the_fault_vocabulary_is_one_set_in_both_bindings_and_in_every_fault_the_code_builds():
+    """`fault.type` is a public contract (see the stability note at the top of CHANGELOG.md): an
+    agent loop branches on its value. It is declared twice, as this binding's `Literal` and the Node
+    typings' union, and built in a dozen places, and nothing held those together. This pins the SET,
+    the way `cli_surface_is_frozen` pins the CLI: adding, removing or renaming a value fails here
+    until both declarations agree, every constructor uses a declared value, and the frozen list below
+    is edited - which is the moment the CHANGELOG entry the policy asks for gets written."""
+    import re
+    import typing
+
+    frozen = {"timeout", "oom", "escape_blocked", "killed", "startup_failed", "exec_failed"}
+    hints = typing.get_type_hints(kern.SandboxFault)
+    declared_py = set(typing.get_args(hints["type"]))
+    assert declared_py == frozen, f"the Python Literal moved: {declared_py ^ frozen}"
+
+    dts = Path(kern.__file__).resolve().parents[2] / "node" / "index.d.ts"
+    if dts.exists():
+        m = re.search(r"export type SandboxFaultType = ([^;]+);", dts.read_text())
+        assert m, "the Node typings no longer declare SandboxFaultType"
+        declared_js = set(re.findall(r'"([a-z_]+)"', m.group(1)))
+        assert declared_js == frozen, f"the Node typings moved: {declared_js ^ frozen}"
+
+    # Every fault the code BUILDS uses a declared value, in both bindings.
+    built_py = set(re.findall(r'SandboxFault\((?:type=)?"([a-z_]+)"', Path(kern.__file__).read_text()))
+    assert built_py and built_py <= frozen, f"Python builds an undeclared fault type: {built_py - frozen}"
+    js = Path(kern.__file__).resolve().parents[2] / "node" / "index.js"
+    if js.exists():
+        src = js.read_text()
+        built_js = set(re.findall(r'sandboxFault\(\s*"([a-z_]+)"', src))
+        built_js |= set(re.findall(r'fault:\s*\{\s*type:\s*"([a-z_]+)"', src))
+        # The kernel's death classifier returns [type, message, rc] tuples.
+        start = src.index("  _kernelDeathFault(")
+        body = src[start:src.index("\n  }\n", start)]
+        built_js |= set(re.findall(r'\[\s*"([a-z_]+)",', body))
+        assert built_js and built_js <= frozen, f"Node builds an undeclared fault type: {built_js - frozen}"
+
+
+def test_open_figures_come_back_in_figure_number_order(tmp_path):
+    """Reading the open figures from matplotlib's manager list (to avoid `plt.figure(n)`, which makes
+    a figure for a number closed meanwhile) changed their order to the one in which they were last
+    made ACTIVE. The number walk it replaced gave them by figure number, and so it must stay: a caller
+    pairs results[0] with its first plot. Two figures of different widths, the first made active last;
+    the width is read from each PNG's own header."""
+    import base64
+    import struct
+
+    pytest.importorskip("matplotlib")
+    code = (_MPL + "a = plt.figure(1, figsize=(2, 2)); a.gca().plot([1])\n"
+            "b = plt.figure(2, figsize=(4, 2)); b.gca().plot([2])\n_ = plt.figure(1)")
+    # A STATEMENT last, not `plt.figure(1)`: as an expression it is the cell's value, figure 1 comes
+    # back as that value first, and the order under test is never exercised.
+
+    def widths(results):
+        return [struct.unpack(">I", base64.b64decode(d["image/png"])[16:20])[0]
+                for d in results if "image/png" in d]
+
+    p, q = _driver()
+    try:
+        _send(p, code)
+        out = kern._CellOutput(1 << 20)
+        kernel_w = widths(json.loads(kern._next_reply(q, time.monotonic() + 60, out))["results"])
+    finally:
+        p.kill()
+        p.wait()
+    assert len(kernel_w) == 2 and kernel_w[0] < kernel_w[1], kernel_w
+
+    cell, res = tmp_path / "cell.py", tmp_path / "res.json"
+    cell.write_text(code)
+    src = kern._PY_RUNNER.replace("__KERN_CELL__", str(cell)).replace("__KERN_RES__", str(res))
+    import sys as _sys
+
+    assert subprocess.run([_sys.executable, "-c", src], capture_output=True, timeout=120).returncode == 0
+    one_w = widths(json.loads(res.read_text()))
+    assert one_w == kernel_w, (one_w, kernel_w)

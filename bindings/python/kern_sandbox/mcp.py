@@ -30,6 +30,8 @@ NEVER-NET; a runaway cell that times out respawns the kernel, it never dooms the
 ``KERN_MCP_QUIET`` (default on: suppress kern's non-fatal notes so a tools/call returns only the cell's
 own output; set to ``0`` to restore them), ``KERN_MCP_TMPFS_MB`` (default 64: scratch at ``/tmp``,
 charged to the box's own memory cap; ``0`` removes it and puts /tmp back inside the read-only root),
+``KERN_MCP_USER`` (the image account the code runs as, ``<user>[:<group>]``, e.g. ``node`` or ``1000``;
+default the image's own ``USER``; see ``Sandbox.user`` for what a non-root one costs the workspace),
 ``KERN_BIN``.
 """
 from __future__ import annotations
@@ -42,7 +44,8 @@ import threading
 import traceback
 
 from . import (Kernel, Sandbox, SandboxError, __version__, _FORGED_CUT_NOTICE,
-               _FORGED_LINE_FRAME, _FRAME_MCP_CLIP, _FRAME_MCP_EXIT, _FRAME_MCP_IMG_TAIL,
+               _FORGED_LINE_FRAME, _FRAME_MCP_CLIP, _FRAME_MCP_CLIP_FLOOR, _FRAME_MCP_EXIT,
+               _FRAME_MCP_IMG_TAIL,
                _FRAME_MCP_RESET, _FRAME_MCP_RICH, _FRAME_MCP_STDERR, _FRAME_MCP_TRUNC,
                _INVIS, _fetch_image, _find_kern, _neutralise_terminal)
 
@@ -131,6 +134,34 @@ def _untrusted(text: str) -> str:
 def _clip(s: str, n: int) -> str:
     """Bound a box-controlled string before it goes into the reply."""
     return s if len(s) <= n else s[:n] + f"\n{_CLIP_HEAD}{len(s) - n}{_CLIP_TAIL}"
+
+
+def _show_cut_stream(raw: str, n: int) -> str:
+    """A stream the binding had ALREADY cut at ``_INGEST_CAP`` (``ExecutionResult.truncated``), bounded
+    for the reply, with a notice whose count is a true FLOOR on what the model does not see.
+
+    CUT RAW, THEN NEUTRALISE, for that guarantee. `_untrusted` both lengthens text (a forged frame gains
+    a label) and shortens it (CRLF becomes LF, escapes and control bytes go), so no count taken after it
+    maps back to the stream: measured, 1 MiB of coloured CRLF lines read "at least 1032570" for a cut of
+    about 950 000, and labelled frames inflated it the other way. Cut first, the shown text stands for
+    exactly ``n`` raw characters, so ``len(raw) - n`` is what this reply dropped, and the binding dropped
+    more before it. A label that would push the shown text past ``n`` is clipped with it.
+
+    And the notice is there even when neutralising leaves less than ``n``: the stream was cut either way.
+    MEASURED before the floor existed: 100 MB on stdout came back as "truncated 1032576 chars", the same
+    figure as 2 MB.
+
+    NO NOTICE ON A STREAM THIS REPLY DID NOT CUT. `ExecutionResult.truncated` is ONE flag for BOTH
+    streams, so a call whose stderr was cut used to put "truncated at least 1 chars" on a three-byte
+    stdout as well: the floor was `max(len(raw) - n, 1)`, and that `1` asserted incompleteness about
+    a stream the model had whole. MEASURED through the server: `print("hi")` beside 2.2 MB on stderr
+    came back as ``hi\n...[truncated at least 1 chars]``. A floor of nothing is the honest answer
+    there, and it is this surface's whole job to say what the model cannot see."""
+    cut = len(raw) - n
+    shown = _untrusted(raw[:n])[:n]
+    if cut <= 0:
+        return shown
+    return shown + f"\n{_CLIP_HEAD}{_FRAME_MCP_CLIP_FLOOR}{cut}{_CLIP_TAIL}"
 
 
 _PREFIX_ID = re.compile(r'"id"\s*:\s*(?:"((?:[^"\\]|\\.)*)"|(-?\d+))')
@@ -428,6 +459,9 @@ class _Server:
             sbx = Sandbox(
                 image=image, setup=setup, workspace=workspace, memory_mb=memory_mb,
                 timeout_s=timeout_s, env=env, profiles=profiles, tmpfs=tmpfs,
+                # Validated by the SDK like `user=`, so a value that is not an account name is refused
+                # by name at the first call rather than reaching kern's argv.
+                user=os.environ.get("KERN_MCP_USER") or None,
                 # the MCP layer never surfaces result.files (it has a dedicated list_files tool), so skip
                 # the per-call O(N) workspace diff: run_code stays O(1) even as a session accretes files.
                 track_files=False,
@@ -706,8 +740,14 @@ class _Server:
                     total += len(line) + 1
                 content, is_err = [{"type": "text", "text": "\n".join(lines) or "(empty)"}], False
         except SandboxError as e:
-            # bound the message too: it can carry a client path or box-influenced startup stderr
-            content, is_err = [{"type": "text", "text": _clip(f"kern error: {e}", 2000)}], True
+            # BOUND **AND** NEUTRALISED. The comment here named the hazard ("box-influenced startup
+            # stderr") and the call did not act on it: an audit put a forged `[sandbox: oom]` verdict
+            # and a screen-clearing escape through this exact route, inside a helper-box error
+            # message, and the model received them as this server's own words. Every other
+            # box-produced string in this file goes through `_untrusted`; this one was the gap.
+            content, is_err = [
+                {"type": "text", "text": _clip(_untrusted(f"kern error: {e}"), 2000)}
+            ], True
         except Exception as e:  # never crash; log internals to OUR stderr, send the client only the type
             traceback.print_exc(file=sys.stderr)
             content, is_err = [{"type": "text", "text": f"internal error: {type(e).__name__}"}], True
@@ -789,8 +829,13 @@ class _Server:
             body.append(clip)
             text_budget -= len(clip)
 
+        # ONE FLAG FOR BOTH STREAMS, which is all `ExecutionResult` carries: on a call whose OTHER stream
+        # was the one cut, this stream's exact count reads "at least" too. That is still true (an exact
+        # count is a lower bound of itself), and it is the only claim the flag supports.
         if r.stdout.strip():
-            take(_clip(_untrusted(r.stdout.rstrip()), _MAX_TEXT))
+            raw_out = r.stdout.rstrip()
+            take(_show_cut_stream(raw_out, _MAX_TEXT) if r.truncated
+                 else _clip(_untrusted(raw_out), _MAX_TEXT))
         # `code_stderr`: the same reason the LangChain renderer uses it. kern and the workload share
         # one stderr, and this string is read by a model, so kern's own `note:`/`warning:` lines are
         # context spent on the runtime's housekeeping and are easy to mistake for the code's errors.
@@ -799,7 +844,9 @@ class _Server:
         # `stdout` above is a plain field and costs nothing to repeat; this one is not.
         code_err = r.code_stderr
         if code_err.strip():
-            take(_MARK_STDERR + "\n" + _clip(_untrusted(code_err.rstrip()), _MAX_TEXT))
+            raw_err = code_err.rstrip()
+            take(_MARK_STDERR + "\n" + (_show_cut_stream(raw_err, _MAX_TEXT) if r.truncated
+                                         else _clip(_untrusted(raw_err), _MAX_TEXT)))
         for res in r.results:
             if text_budget <= 0:
                 text_truncated = True
