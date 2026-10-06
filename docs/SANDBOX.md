@@ -64,7 +64,9 @@ agent loop branches on a value instead of parsing a traceback.
 The last row is the one a loop gets wrong: the network was off, so the **code** raised and the
 sandbox did nothing. `fault` is read from a pipe kern writes rather than from stdout, so code that
 prints `[exit 0]` can't fake it. The other values are `killed`, `escape_blocked`, `exec_failed` and
-`startup_failed`.
+`startup_failed`. They and the exit codes are stable: one changes only to correct an outcome that was
+reported wrong, and the release that does it says so first in its
+[CHANGELOG](https://github.com/getkern/kern/blob/main/CHANGELOG.md) entry.
 
 ## Safe by default
 
@@ -89,6 +91,16 @@ measured:
 The caps bind only where your host delegates a cgroup. `kern doctor` says whether yours does, and
 `require_limits=True` turns a silent no into a refusal to start. See
 [Install](INSTALL.md#requirements-and-limitations).
+
+**`user="node"` runs every box as that account of the image**, a name or a number, `"1000:1000"`
+included; an image that declares `USER` runs as it with no argument. A non-root account is a uid of
+kern's range on disk (`node`, 1000 in the box, is 100999 on a host whose range starts at 100000), so
+opening the sandbox starts one box as that account to learn its uid, and the workspace gets a POSIX
+ACL naming it. `read_file`, `write_file`, `list_files`, `result.files`, `workspace_max_bytes`,
+`snapshot`, `restore` and the cleanup at exit keep working on what the account creates. What it closes
+on purpose, a 0600 file or a 0700 directory, is reached through a short-lived box of the same image
+running as that account, its owner, one box start per access. The workspace needs a filesystem with ACLs, and the Node binding needs `setfacl`. It costs one
+box when the sandbox opens and the uid range on every box: about a millisecond a call, measured.
 
 ## Choose how much survives between calls
 
@@ -130,6 +142,43 @@ fresh `python3`, so measured on one host it costs 11.4 ms against 13.9 for a fre
 accumulates, the PID namespace is shared, and a box built under another posture is refused instead
 of adopted. It ends after `persist_ttl_s` (an hour by
 default) or at `destroy()`. Node spells it `persist: true`.
+
+## Move a sandbox to another machine
+
+Every box a sandbox starts has a read-only root, so what a session builds up lives in its
+workspace: the files the code wrote, and `.deps`, where `setup=` installs packages. `snapshot()`
+writes that workspace to one archive and `restore()` puts it back, here or on another host:
+
+```python
+with kern.Sandbox(image="python:3.12-slim", setup="pip install orjson") as a:
+    a.run_code("open('/workspace/state.json','w').write('{}')")
+    a.snapshot("/tmp/ckpt.tar.gz")
+
+# later, or elsewhere
+with kern.Sandbox(image="python:3.12-slim") as b:
+    b.restore("/tmp/ckpt.tar.gz")
+```
+
+What it does not carry: running processes and a `kernel()`'s variables, which end with the session;
+and the image, which the other host pulls by name. An image that exists only locally (from
+`kern build` or `kern commit`) travels with `kern save <image> -o image.tar` and
+`kern load -i image.tar`.
+
+The archive records the image and CPU its `.deps` were installed for. A compiled package there only
+imports under the same Python, libc and CPU, so `restore()` into a different image warns, and
+`setup=` run again in the new sandbox rebuilds the packages for it. Symlinks, FIFOs and devices are not
+archived and `snapshot()` lists any it left out, because `restore()` writes only regular files and
+directories. What a restored file keeps is its **bytes, its modification time and its owner
+permission bits**, so a tool that decides by timestamp (`make`, `tsc --incremental`, Python's own
+bytecode check on `.deps`) sees the tree the snapshot captured; an empty directory is kept as well.
+Group and other bits are not carried: on a workspace shared with a `user=` account those bits are the
+POSIX ACL's mask, and the ACL does not travel in an archive. Ownership is never carried, and the two
+bindings write and read one format, so an archive either of them writes restores identically in both.
+In Node, `snapshot`/`restore` need `KERN_SANDBOX_SNAPSHOT=1`.
+
+A `kern box` started from the CLI, whose root is writable, moves the same way at the image level:
+`kern commit <box> <image>`, then `kern save` and `kern load` as above, then `kern box --image <image>`
+on the other host.
 
 ## From an MCP client
 

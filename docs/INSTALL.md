@@ -73,6 +73,24 @@ is: the `KERN_WSL_DISTRO` environment variable, then what `kern wsl use` stored,
 so two installs disagreeing become visible. `kern doctor`, which runs inside a distro, cannot see
 across the WSL boundary and says so.
 
+### Keep projects inside the distro, not under `/mnt/c`
+
+`/mnt/c` is the Windows disk seen from inside WSL2, and every file open, stat and read on it crosses
+from the Linux side to Windows. Measured on a Windows 10 host (WSL2 kernel 6.18), on one project of
+2000 small files:
+
+```
+                                            in the distro     under /mnt/c
+kern build, COPY of the 2000 files          0.18 - 0.19 s     17.2 - 19.1 s
+the same build again, nothing changed       0.04 - 0.05 s     7.8 - 9.0 s
+a box writing and reading them through -v   0.12 - 0.14 s     4.6 - 5.7 s
+```
+
+The time is the filesystem's: a plain loop that opens and reads each file once costs 6.5 s under
+`/mnt/c` and 0.06 s in the distro, and `cp -a` of the same tree takes 10 s from `/mnt/c`. A build
+reads its context once to key its cache and once to copy it, so it pays both. Keep the project, and
+anything you mount into a box, under the distro's own filesystem (`~/project`).
+
 ## macOS
 
 macOS has no containers of its own, so kern runs inside a Linux VM. With colima:

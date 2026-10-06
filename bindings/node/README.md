@@ -162,7 +162,9 @@ const r = await kern.runCode("console.log([1,2,3].map(x => x * x))", {
 | `truncated` | output hit the cap and overflow was discarded |
 
 A non-zero exit from *your code* is **not** a fault (`fault` stays `null`): it is a normal result.
-`fault` is only set when the **sandbox** acted:
+`fault` is only set when the **sandbox** acted. These values and the exit codes are stable: one changes
+only to correct an outcome that was reported wrong, and the release that does it says so first in its
+[CHANGELOG](https://github.com/getkern/kern/blob/main/CHANGELOG.md) entry.
 
 | `fault.type` | when |
 |---|---|
@@ -228,6 +230,9 @@ new Sandbox({
   pids,            // default 256
   timeoutS,        // default 30, MANDATORY per-call deadline
   network,         // default false (RELAXES ISOLATION)
+  user,            // default null: the image's own USER. "node", "1000" or "1000:1000" runs every box
+                   // as that account of the image. A non-root one shares the workspace through a
+                   // POSIX ACL (needs `setfacl` and a range in /etc/subuid): docs/SANDBOX.md#safe-by-default
   capDrop,         // default ["ALL"]: capabilities dropped from every box. kern always drops
                    // 16 dangerous ones; this drops the rest, which were held over the box's own
                    // user namespace. Pass [] to keep them (needed only if the workload binds a
@@ -358,8 +363,9 @@ package manager imports `globSync` from `node:fs`, which landed in 22.
 ## Charts, rich results, live output, and checkpoints
 
 `runCode` captures mime-typed values into `result.results` the way a notebook cell does: the **last
-bare expression**, every **`display(obj)`**, and **every open matplotlib figure automatically**, with
-no `savefig`. Accessors: `.png`, `.jpeg`, `.html`, `.svg`, `.markdown`, `.json`, `.text`.
+bare expression**, every **`display(obj)`**, and **every matplotlib figure open when the code ends**,
+with no `savefig`; `fig` or `display(fig)` draws a figure the code holds. In a `kernel()` session a
+figure is closed once its cell has returned it, as in Jupyter, so later cells do not return it again. Accessors: `.png`, `.jpeg`, `.html`, `.svg`, `.markdown`, `.json`, `.text`.
 
 ```js
 await kern.withSandbox({ setup: "pip install pandas matplotlib" }, async (sbx) => {

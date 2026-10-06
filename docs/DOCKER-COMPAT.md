@@ -47,6 +47,25 @@ says nothing about keys no file here writes, such as `deploy.replicas` or `usern
 refuses them too. The denominator keeps them, because removing the files a measurement dislikes is
 how a rate goes up.
 
+## What is frozen, and what can still change
+
+**A key kern reads keeps its meaning.** It changes only to correct a mapping that was wrong, and such
+a change leads that release's [CHANGELOG](../CHANGELOG.md) entry, naming the key. Reading a key kern
+ignores today is additive: a file that got a warning gets behaviour, and no file was depending on the
+warning.
+
+**A key kern does not read is never silent.** It is either refused, where running the file anyway
+would do something other than what it says, or reported with what kern does instead. Two silences are
+deliberate: `x-*` extension fields, which the Compose Specification reserves for the file's own use
+and which the `x-common:` + anchors idiom depends on, and the four keys Docker itself does not act on
+under Linux (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`), where naming a difference would
+be naming one that is not there.
+
+Both halves are held by a test rather than by this page: `surface_tests` in
+`crates/kern-compose/src/yaml.rs` carries the frozen list of keys, asserts each one parses without
+kern saying it does not read it, and asserts that every key kern deliberately does not apply says so.
+Removing a key from the parser fails it by name.
+
 ## The perimeter
 
 kern is a substitute for `docker compose` on files that do not need:
@@ -92,7 +111,7 @@ Outside that list, on this corpus, kern accepts every file Docker accepts.
 
 **What `kern build --check` does.** `kern build --check [ctx]` parses the file and reports what kern does with every instruction, building nothing: honoured, or `dropped` with what happens instead. A `COPY` from the context is resolved against it, so a source that escapes or is missing fails the check rather than the build; a glob or a `COPY --from` is left to the build, which is where it becomes answerable, and a `--from=` token that no stage in the file declares is NAMED in a closing note: that is an image reference, by Docker's rule as well as kern's, so a mistyped stage name is a silent change of meaning rather than an error. Exit 0 if it builds here, non-zero with the refusal if it does not, so it can gate a pipeline before a base image is pulled
 
-**What `kern build` supports.** `kern build`: all common instructions, **multi-stage** (+ `target:`), `COPY --from=…` (a build stage **or** an external image), **COPY globs**, BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **whole-build cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. The cache is keyed on the whole Dockerfile + context, NOT per layer as Docker's is: an identical build is reused (2040 ms to 24 in one measurement), and changing any instruction re-runs from the first
+**What `kern build` supports.** `kern build`: all common instructions, **multi-stage** (+ `target:`), `COPY --from=…` (a build stage **or** an external image), **COPY globs**, BuildKit **heredocs**, `ADD <url>` (+ `--checksum`/`--chmod`), `COPY --chmod` (recursive, Docker-parity), `FROM scratch`, `SHELL`, `# escape`/BOM, `--build-arg`, a **per-instruction cache**, and honours **`.dockerignore`**. Daemonless: each `RUN` is a real box. Each `COPY`, `WORKDIR` and run of `RUN`s is a content-addressed layer, reused while what it depends on is unchanged, so a source file edited after an install step re-runs only what follows it: with a 3 s install step, the rebuild took 64 ms on Linux 7.0, 61 ms on WSL2 and 46 ms on a Jetson. Where the kernel gives no unprivileged overlay that records deletions, the build is **flat**: the cache is then whole-build (unchanged is reused, any change starts over). Which path a build took, and why if it was flat, is on its `[layered · …]`/`[flat · …]` line and in `kern build inspect <id>` (`strategy`, also in `--json`) - the line is only printed to a terminal, so in CI or a script the record is the one to read
 
 ## How a stack is wired
 
@@ -344,7 +363,8 @@ manual on purpose.
 | `diff` | `diff` | overlay-upper changes: `C` changed/added, `D` deleted |
 | `events` | `events` | poll-based stream (`start`/`die`/`rename`); daemonless, best-effort |
 | `commit` | `commit` | box → reusable image (warm start) |
-| `start` (resume a stopped container) | *(none)* | a stopped box is a record, not a paused process: `kern box` starts a new one |
+| `start` (resume a stopped container) | `start`, for a box started `--keep` | a plain box is a process and its writable layer goes with it, so `kern box` starts a new one. `kern box <name> --keep` keeps that layer under `$XDG_DATA_HOME/kern/boxes/<name>` and `kern start <name>` runs the same command again on it |
+| `rm` | `rm`, for a box started `--keep` | removes the kept layer and the recorded command. There is nothing to remove for a plain box: a detached one leaves an exit record, which `kern ps -a` shows and `kern gc` prunes, and one run in the foreground leaves nothing at all |
 | `login` / `logout` | `login` / `logout` | credentials for a private registry, stored for the user |
 | `port` | `port` | `kern port <box> [<container-port>[/tcp\|/udp]]`: the host address serving that port, or every mapping when no port is named. Read from the running box, so it reports what was actually bound rather than what the file asked for |
 

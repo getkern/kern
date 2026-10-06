@@ -146,7 +146,9 @@ print(r.stdout)   # Linux, then the image's Python 3.12
 
 <!-- tab: chart.py -->
 
-**Get a chart back.** An open matplotlib figure comes back as a PNG on `r.results`.
+**Get a chart back.** A matplotlib figure open when the code ends comes back as a PNG on `r.results`,
+and `fig` or `display(fig)` draws a figure the code holds. In a `kernel()` session a figure is closed
+once its cell has returned it, as in Jupyter, so later cells do not return it again.
 
 ```python
 plot = """
@@ -181,7 +183,9 @@ or something else. This tells you. Every row was run:
 
 The fourth row is the one a loop gets wrong: the network was off, so the **code** raised and the
 sandbox did nothing. `fault` is read from a pipe kern writes rather than from stdout, so code that
-prints `[exit 0]` can't fake it. Also `killed` and `escape_blocked`.
+prints `[exit 0]` can't fake it. Also `killed` and `escape_blocked`. These values and the exit codes
+are stable: one changes only to correct an outcome that was reported wrong, and the release that does
+it says so first in its [CHANGELOG](https://github.com/getkern/kern/blob/main/CHANGELOG.md) entry.
 
 ## Works with
 
@@ -267,7 +271,10 @@ your own.)</sub>
 - **Caps bind only where your host delegates a cgroup.** `kern doctor` says whether yours does;
   `require_limits=True` refuses to start rather than run uncapped.
 - **Nothing bounds the workspace.** It is a host directory, so a job can fill your disk.
-- **No `--user`**, so an image that refuses to run as root has no answer here yet.
+- **A non-root `user=` shares the workspace through a POSIX ACL.** The account is a uid of kern's
+  range on disk, so the workspace needs a filesystem with ACLs and the host a range in `/etc/subuid`.
+  A file or directory that account closes on purpose (`mkstemp`'s 0600, `mkdtemp`'s 0700) is reached
+  through a short-lived box of the same image running as that account, one box start per access.
 - **Not inside a container without `--privileged`, and not on Google Colab.** A box mounts a fresh
   `/proc`, and the kernel allows that only where an unmasked `/proc` already exists. A container
   that masks parts of its own `/proc`, which is the default and is why it is safe, leaves none, so

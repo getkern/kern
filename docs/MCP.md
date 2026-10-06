@@ -85,6 +85,7 @@ Every knob is an environment variable in the client's `env` block. There is no c
 | `KERN_MCP_PREWARM` | `1` | how many boxes are kept started in advance, each holding a booted interpreter that has run nothing. A call claims one instead of starting its own, so the per-call cost drops from ~38 ms to ~1.6 ms **without** changing what a call gets: each prewarmed box serves exactly one cell and is destroyed. `0` turns it off |
 | `KERN_MCP_KERNEL` | off | `1` routes Python through ONE warm interpreter. Unlike prewarming, this DOES change the contract: state persists between calls. [What it costs](#what-it-costs) compares them |
 | `KERN_MCP_TMPFS_MB` | `64` | scratch at `/tmp`, charged to the box's own memory cap |
+| `KERN_MCP_USER` | the image's own `USER` | the account of the image the code runs as, e.g. `node` or `1000`. A non-root one shares the workspace through a POSIX ACL: [Safe by default](SANDBOX.md#safe-by-default) |
 | `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes, which otherwise land in the model's output as if the cell had printed them |
 | `KERN_BIN` | `kern` on `PATH` | where the binary is |
 

@@ -5,13 +5,335 @@ only on a minor bump, never on a patch, and only after a deprecation entry here 
 `--json` is additive, so consumers must ignore unknown fields. A `cli_surface_is_frozen` test fails
 the build on any undocumented change. Full detail for any entry is in the git history.
 
+**Sandbox result stability.** In kern-sandbox (Python, Node and `kern-mcp`), the `fault.type` and
+`exit_code` an outcome reports change only to correct one that was reported wrong, and such a change
+leads that release's entry, naming the outcomes it moves. kern-sandbox 0.2.45 is the example:
+`os._exit(N)` in a prewarmed box or a kernel stopped reading as `killed`, and a kernel timeout went from
+-1 to 137. New `fault.type` values are additive, so code must treat a value it does not know as a fault
+of the sandbox. A test fails the build when the set of values changes in one binding and not the other.
+
+**Compose surface stability.** A compose key kern reads keeps its meaning: it changes only to correct
+a mapping that was wrong, and such a change leads that release's entry, naming the key. Reading a key
+kern ignores today is additive. A key kern does not read is never silent, with two deliberate
+exceptions: `x-*` extension fields, and the keys Docker itself does not act on under Linux
+(`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
+both halves of that rule, so removing one from the parser fails the build by name.
+
 ## Unreleased
 
+- `kern exec -u <user>[:<group>]` runs the command as that account of the box, a name or a number,
+  where `kern exec` could only be box root. The name is looked up in the box's own `/etc/passwd` and
+  `/etc/group` as they are when the command runs, so an account created inside the box is found, and
+  the group and supplementary groups follow the rules of `kern box --user`. HOME becomes that user's
+  home unless the image or `-e` set one. An id the box does not map is refused with what the box does
+  map: on a single-uid box, `-u 1000` used to fail as "could not drop to the box's own user", exit 126.
+- `kern exec -u` works in a box started with `--cap-drop ALL`. The exec dropped every capability
+  before switching identity, `CAP_SETUID` included, and failed closed with "could not drop to the
+  box's own user"; `kern compose exec` of a service with `cap_drop: [ALL]` and a `user:` failed the
+  same way. The command still ends with every capability set empty.
+- A workload whose image group list the box refuses (one gid outside the uid range) no longer keeps
+  kern's own groups. It ran with the host user's groups as the box sees them, `0(root)` among them;
+  it now gets none, and the warning says the gid is outside the map. Box root on the single-uid map,
+  where no group can give it anything, no longer gets that warning on every run.
+- kern-sandbox: `user=` (Node `user`, `kern-mcp` `KERN_MCP_USER`) runs every box as an account of the
+  image, `persist` calls included. An image that declares a non-root `USER` now works without it:
+  every call on one failed with `Permission denied` on its own script in `/workspace`, exit 2. A
+  non-root account shares the workspace through a POSIX ACL, and what it closes to the host (0600,
+  0700) is reached through a short-lived box of the same image running as that account, its owner.
+- kern-sandbox: listing the workspace (`result.files`, `list_files`), `snapshot`, `restore` and the
+  directories `write_file` creates now reach every path by descriptor, in both bindings. By path, a
+  box running beside the call could swap a directory for a symlink at the right moment: measured on
+  0.2.45 with the swap injected there, the listing returned a host file, the snapshot archived it, the
+  restore wrote into the host directory and `write_file` created a directory in it. `restore` applies
+  `filter="data"`'s rules on every Python version, not only from 3.12.
+- A compose stack joining an `external:` network no longer writes outside the other project's box. Its
+  names were appended to that box's `/etc/hosts` through `/proc/<pid1>/root` by path, which resolves
+  an absolute symlink against the host's root: measured on 0.30.2 with the default seccomp filter, a
+  box whose PID 1 had `chroot`ed into a tree with `etc/hosts` linked to a host file had the other
+  stack's `up` append to that host file, mode 600, outside every box. The file is now resolved inside
+  the box's root, must be a regular file, and is read and written through one descriptor.
+- `kern exec` re-applies the box's `--landlock-rw` allowlist, and so does the health probe. A Landlock
+  restriction is inherited only from the process that applied it, and an exec's parent is the host
+  CLI: measured on 0.30.2, `kern exec` into a box started `--landlock-rw /data` wrote to another mount
+  that the box's own workload could not write.
+- `kern recover` and `kern gc` no longer remove the scratch of a box that another `kern` is still
+  building. That box has no registry entry yet, so it looked orphaned, and its overlay mount then
+  failed with `mount(overlay) failed: No such file or directory`: measured, 42 of 160 boxes started by
+  four workers beside a `recover` loop, none without it. kern-sandbox runs `recover` when a prewarmed
+  session closes, so several `kern-mcp` servers on one machine broke each other's calls this way. A
+  scratch directory is now kept while the process that created it runs. An older kern on the same
+  machine still sweeps them until it is updated; the error now says a directory was removed while the
+  box was being built, where it said the host could not build a box and pointed at `kern doctor`.
+- `kern commit` copies a running box by descriptor, each entry opened relative to its parent with
+  `O_NOFOLLOW`, so a directory the box replaces with a symlink while the commit walks cannot point the
+  copy at host files. The descriptors held are one per level of depth.
+- A `kern exec` command, between its fork and its `execve`, is no longer reachable through `/proc` by
+  a process in the box running as the same uid: the flag the kernel consults was restored after the
+  identity switch, and is now cleared for the whole of that window.
+- An image `/etc/group` that names the workload's user in more than 65 536 groups gives it the first
+  65 536 with a warning, where `setgroups` refused the whole list and the warning blamed the gid map.
+- kern-sandbox: listing the workspace holds one descriptor per level of depth, not one per directory.
+  The first descriptor-based walk held every sibling open, so a wide tree (a `node_modules`) ran out
+  past the soft limit and those subtrees were missing from `result.files` and `list_files` with
+  nothing said; Node also hit V8's argument limit and leaked the descriptors. A resource error in
+  the walk is now raised; only an entry that went away is skipped.
+- kern-sandbox: `workspace_max_bytes` (Node `workspaceMaxBytes`) can no longer be defeated by a
+  directory the box makes unreadable to the host. It counted as zero, so one `chmod 0` hid whatever
+  was in it from every later check; a session that cannot measure it now refuses the call.
+- kern-sandbox: `snapshot` into a path inside the workspace no longer archives the archive itself, a
+  resource or I/O error while archiving is raised instead of leaving the file out, and `restore`
+  writes every byte of a member or fails, where a short write left the file truncated. Node's
+  `restore` reads the ustar `prefix` field, so a member path of 101 to 255 bytes (as Python writes
+  them) lands in its directory instead of at the workspace root, and a GNU long-name archive is
+  refused by name. A symlink in a path given to `write_file` or `restore` is named as one again.
+- kern-sandbox: a `kernel()` cell returns the matplotlib figures it drew, once, and no longer those of
+  the cells before it. Every figure stayed open, so every later cell re-sent every figure of the
+  session and paid a PNG encode for each: measured, a cell that only assigns a variable took 65 ms
+  after five figures, 0.04 ms now. A figure is closed once its cell has returned it, as Jupyter's
+  inline backend does, so a later `plt.*` call draws on a new figure. A `Figure` value (`fig`,
+  `display(fig)`, a subclass included) is drawn as PNG, so a figure the code holds can be shown again;
+  one that is the cell's last value is not repeated by the end-of-cell capture, and one drawn on after
+  `display(fig)` still comes back finished. One figure that cannot be drawn no longer stops the others,
+  on the cold path as in the kernel. Both bindings.
+- `kern-mcp`: when the SDK had already cut a call's output at 1 MiB, the clip notice says "truncated at
+  least N chars", N counted on the stream as the code printed it. It counted from what the SDK kept,
+  so 2 MB and 100 MB both read "truncated 1032576 chars". A cell printing the floored notice is
+  labelled as printed by the code, like the exact one.
+- `kern save -o` and `kern cp` write a file beside the kern registry: `kern save -o
+  /run/user/1000/img.tar` was refused as "writing into the kern registry", and so was every write next
+  to a non-default `XDG_RUNTIME_DIR`. The mount guard refuses any ancestor of the registry, which is
+  right for a mount and wrong for one new file; a write is now refused where it lands in the registry,
+  directly in its root, or on the root's own name.
+- kern-sandbox: the file holding a call's `env=` is no longer written into the workspace, but into a
+  0700 directory of the session's own (under `$XDG_RUNTIME_DIR` when that is private), removed when the
+  session closes. In the workspace every box could read it, a box running beside the call included;
+  measured, a box on 0.2.45 saw its own `.kern-env.pysbx-...` in `/workspace`. A process killed mid-call
+  left it there for `snapshot` to archive, measured, `env=` values included. The directory is never
+  inside the workspace: with `workspace="/tmp"` and no private runtime directory it is made elsewhere,
+  and the session is refused if there is nowhere else. A call made while the session closes is refused
+  instead of running without `env=`. Regular files an older version left behind (a call's, and the
+  persistent box's, which no version removed) stay out of listings and snapshots by their exact names.
+  Both bindings; a failed `setup` in Node's `open()` now removes the temporary workspace, as Python's did.
+- kern-sandbox: a snapshot records the image and CPU its `.deps` were installed for, as its first member,
+  and `restore` into a different image or CPU warns: measured, a compiled package restored into another
+  Python failed to import as `ModuleNotFoundError: No module named 'orjson.orjson'`, naming nothing
+  else. An archive without the record restores as before. Both bindings read each other's.
+- kern-sandbox: `snapshot` no longer writes members its own `restore` refuses. On 0.2.45 a workspace
+  holding one symlink, FIFO or hard link gave a snapshot that `restore` refused whole ("unsafe member
+  type in snapshot"). Symlinks, FIFOs, devices and sockets are now left out and named in a warning, and
+  a hard link's second name is archived as a file of its own. Such a snapshot made by 0.2.45 still
+  cannot be restored by `restore`, whose refusal of link members is unchanged; `tar -x` extracts it.
+- kern-sandbox: `snapshot` and `restore` given a path inside the workspace open it by descriptor, as every
+  other host-side write there is. By path, a symlink the box planted at a predictable name such as
+  `ckpt.tar.gz` sent the archive onto the host file it named, and a planted `restore` source read a host
+  archive into the workspace. Both bindings. The record a snapshot carries is read by one rule in both
+  (strict UTF-8 JSON, the number 1, printable ASCII fields); a crafted record no longer crashes Python's
+  `restore` or reaches the terminal as escape sequences.
+- kern-sandbox (Node): `snapshot` into the workspace no longer archives the previous snapshot at that
+  path, and `restore` writes every byte of a member or fails, where a short write left it truncated.
+- docs: INSTALL.md says to keep a project inside the WSL distro and not under `/mnt/c`, with the cost
+  measured on one Windows 10 host: a `kern build` of 2000 files took 0.18 s inside and 17 to 19 s under
+  `/mnt/c`, where one read of each file alone costs 6.5 s.
+- `kern build` keeps its per-instruction cache on WSL2 and on a Jetson (tegra 5.15): editing a source
+  file after a 3 s install step rebuilds in 54 ms and 49 ms there, where it re-ran every step (3.1 s).
+  Both fell back to the flat path, whose cache is whole-build, because their kernels recorded no deletion
+  in kern's overlays. kern mounts every overlay inside a user namespace, whose root cannot write the
+  `trusted.*` attributes overlayfs keeps its whiteout and opaque markers in, and unlike 7.0 these kernels
+  do not move them to `user.*` unless asked with `userxattr`. kern asks for it where the layer being
+  written can hold `user.*`, which is a property of that filesystem and is measured per mount rather than
+  assumed: tmpfs took no `user.*` before Linux 6.6, so on tegra 5.15 asking for it turned a working
+  `rm -rf` in a box into an I/O error, while on WSL2 6.18 NOT asking was what produced one. A kernel
+  before 5.11, which does not know the option, is answered by trying the other form, and a kernel that
+  refuses it for its own reasons says so in a note instead of falling back in silence. Measured on all
+  three hosts: a box can delete a directory of its own image and it stays deleted, and a base directory
+  deleted and recreated in a build step stays deleted both in the image and through `COPY --from`.
+- `kern build inspect <id>` and `kern builds --json` carry `strategy`: `layered`, or `flat: <reason>`.
+  Whether a build had a per-instruction cache was only ever said on a progress line, which is printed to
+  a terminal and nowhere else, so in CI or a script a build that lost the cache looked like a slow
+  machine. Records written by an earlier version have no such field and read as empty.
+- `kern build` prints its step lines again on a terminal. Its log capture points stderr at a pipe for
+  the whole build, so the terminal check answered no and none were printed, the line saying why a build
+  went flat included (measured on 0.30.2 under a pty). That line now also names the probe step that
+  failed, where it said only that the probe "could not run".
+- `kern box --image` no longer waits forever on an image whose `/etc/passwd` or `/etc/group` is a FIFO,
+  and reads neither file past 8 MiB. 0.30.2 resolving `USER nobody` in an image built with
+  `mkfifo /etc/passwd` never started the box.
+- `kern ps`, `stats`, `history`, `volume ls`, `network ls` and `pod ls` line up names longer than 48
+  characters: off a terminal always, on a terminal as far as its width allows. Past 48 a row used to
+  overflow and push its other columns out of line whatever the output was going to.
 - `kern doctor` names the Windows side of WSL only inside WSL. On a native Linux host the row about
   two kern binaries that disagree on version also said that a `kern.exe` on the Windows side was not
   visible and to run `kern wsl list --probe` from Windows.
 - kern-sandbox: the error for `language="node"` on an image without node no longer says that no image
   kern defaults to carries node, which stopped being true when kern-mcp's default image carried it.
+- `kern box <name> --keep`, `kern start <name>` and `kern rm <name>`: a box whose writable layer is
+  kept, and a verb that runs it again on what it left. A kern box is a process and its layer is
+  scratch under `$XDG_RUNTIME_DIR`, so stopping one threw away everything it had written and there
+  was no verb to run it again. Measured on one workload, a counter in `/root`: a kept box reads
+  `run #1`, `run #2`, `run #3` across three starts, where an ordinary box reads `run #1` every time.
+  Nothing changes without `--keep`, which is the default this does not touch: a plain box still
+  leaves nothing behind. The layer lives under `$XDG_DATA_HOME/kern/boxes/<name>/`, which survives a
+  reboot, beside the `kern box` argv the box was made with, verbatim and byte for byte, and the
+  directory it was given in: `kern start` re-runs that command, so a flag added to `kern box` is
+  carried with no change there. A `-v` source or an `--env-file` that has gone since fails the start
+  with kern's own message and leaves the box stopped. `kern ps -a` lists kept boxes in a section of
+  their own with the exit code of their last run, in `--json`, through `--format`, in `-q` and under
+  `--filter status=kept`, which is the query that means "what `kern start` can run" and the source
+  the shell completion for both verbs reads. A kept box is in none of the plain views, whose contract
+  is the boxes that are up. A box that is up is refused by both verbs,
+  naming its pid and `kern exec <name> <cmd>` for the box that is already running. `kern gc` and
+  `kern recover`, whose job is to remove what a box left behind, leave a kept layer alone: measured
+  between two starts, and the SDK runs `recover` whenever a prewarmed session closes. `kern start`
+  checks the record before replaying it: size-bounded, and a `kern box <name> ...` command line for
+  that name, or it is reported with `kern rm` rather than run. `--overlay-upper`,
+  the one mechanism that could have carried this, could be written once and never reused: a used
+  overlay workdir holds a mode-000 `work/work` that the clearing could not traverse, so a second
+  start failed with `Permission denied`. That is fixed, and the work directory is cleared at every
+  start.
+- A test carries the compose keys kern reads, so dropping one fails the build by name, and the other
+  half of the rule at the top of this file (a key kern does not read says so) is asserted key by key.
+  It found one thing on the way in: `extends:`, which kern implements and folds in before the key
+  match runs, was listed among the keys reported as "ignored (unsupported)". That arm was unreachable
+  and says so now.
+- An audit of this branch (functionality, security, performance and a cleanliness pass) found
+  fourteen things in the work above, and they are fixed here. The ones that change what you get:
+  - A kept box's record is one file, written to a temporary name and renamed into place. In place, a
+    reader caught it mid-rewrite: measured, 20 `kern start` of one kept box at once and one of them
+    answered "no kept box", and at the unit 1968 of 4082 concurrent reads saw neither the old record
+    nor the new one. The record is also written AFTER the name is claimed, so the 19 losers of that
+    race no longer rewrite the winner's record and recreate its directory on their way out.
+  - `kern start` only replays a record that begins `box <name>` for the box being started, and the
+    image `kern ps -a` shows is read from that argv rather than from a header field. A record written
+    by hand could otherwise start a box under a DIFFERENT name with flags the operator never typed,
+    while the `ps -a` row showed the image it wanted them to see (measured, both halves).
+  - The kept-box store is refused as a mount source, as the runtime registry already was: it holds
+    the command line `kern start` runs, so a box given that tree could leave `-v $HOME:/host
+    --privileged` behind for the operator's next `kern start`. Its ancestors go with it, which is why
+    `-v ~/.local/share` is refused now; a path beside the store is unaffected.
+  - A box's writable layer is never written through a symlink planted at `upper` or `work`, and
+    `kern rm` does not walk one planted at the box's own name. Measured: the first wrote a box's
+    `etc`, `root` and `sys` into the link's target, and the second chmodded an arbitrary tree to 0700
+    and printed "removed kept box" with exit 0.
+  - A record that is a FIFO no longer hangs `kern ps -a` and `kern start` for ever (measured,
+    `timeout 10` returned 124 for both), a symlink at its name is not followed, and a record kern
+    cannot read says so and points at `kern rm` instead of claiming the box does not exist.
+  - `kern box <name> --keep` works for every name `kern box` accepts. It kept nothing, and said
+    nothing, for a name longer than 64 bytes: the store used a stricter name rule than the CLI, and 71
+    bytes is the length of the compose service name that set the CLI's limit.
+  - `kern ps -a` reads the registry once instead of once per kept box, and does not scan the store at
+    all when no kept row can survive the query. Measured: with 200 registry entries and 100 kept
+    boxes the scan cost 3.22 ms of reading one directory 101 times, now 0.57 ms; `ps -a --last 1`
+    and `--filter status=running` cost 5.6 and 6.1 ms with 1000 kept boxes, now nothing measurable.
+    `--filter name=` is answered from the directory entry, before a record is opened.
+  - `ps -a --last N` lists the N most recent boxes that RAN and no kept rows, where it printed N plus
+    every kept box (1002 rows for `--last 2`). `--filter status=created` no longer matches a kept box
+    that never ran, which contradicted the flag's own usage message.
+  - A kept box costs about 5.2 ms more to start than a plain one, and all of it is the kernel working
+    on an overlay whose upper is on a real filesystem rather than the runtime tmpfs: measured, with
+    the layer on tmpfs the difference is not measurable (+0.015 ms, 95% [-0.060, +0.088], n=300).
+    `kern start` costs 0.69 ms more than `kern box --keep` of the same workload, which is the second
+    `execve` of kern that replaying the recorded argv needs. The plain box path is unchanged
+    (+0.007 ms, 95% [-0.022, +0.040], n=300).
+  - `--secret NAME=value` now says that `--keep` writes the value into the box's record too, beside
+    `ps` and the systemd journal.
+- A functional audit of the same branch found nine more, including the two that could corrupt a
+  layer. Fixed here:
+  - Two boxes can no longer mount one kept layer. The registry's name claim does not cover it,
+    because the registry and the layer live in different places: measured two ways, `kern box w1
+    --keep -d` then `kern rename w1 w2` then `kern start w1`, and one `$XDG_DATA_HOME` with two
+    `$XDG_RUNTIME_DIR`s (which is what a `kern compose systemd` unit produces). Both gave two live
+    overlay mounts of one upperdir, which the kernel itself calls undefined behaviour in `dmesg`, and
+    the second start also cleared the live mount's work directory. The layer is now locked for as
+    long as the box runs, and a second box is refused with the pid holding it.
+  - `kern box <name> --keep --image <other>` is refused when the layer was written against a
+    different image, instead of running the new image with the old delta on top: measured, a file
+    written by an alpine run was live inside a debian box, and the record then claimed the new image
+    for a layer that was half the old one. `kern rm <name>` is the way to change image.
+  - A detached kept box records how its run ended. `-d` is the shape this feature is for, and only
+    the foreground path recorded it, so the durable record said "never ran" for ever while the
+    transient one said `exit 137`: measured, the same box in two sections of one `ps -a` saying two
+    different things, and `ps -a -q` printing its name twice for a script to act on twice. The code
+    is recorded by whichever side ends the box (its supervisor, or the `kern stop` that killed it),
+    a box that traps the signal and exits 0 is recorded as 0, and a name with a kept layer is one
+    row.
+  - `kern uninstall` lists the kept layers as data you made. Measured: 21 MB of a user's own files,
+    in a directory kern created, under a summary that said "0 B is data you made".
+  - `kern inspect <name>` of a kept box says what it is and that `kern start` runs it, where it said
+    "nothing named '<name>'" about a layer `kern ps -a` was listing.
+  - `kern ps -a` lines its columns up when a kept name is the longest one: the width came from the
+    live and exited rows only, so a long kept name pushed every column after it out of line, in a
+    pipe, where the alignment is exact.
+  - A refusal about the command line no longer leaves a kept box behind. `kern box x --keep -it -d`
+    fails on the flag pair, 600 lines after the record used to be written, and left a `ps -a` row and
+    a directory for a box that had never existed and could never start. The record is now written
+    past every argument check and still before the box runs, so a box refused by the HOST (a mount,
+    a uid map) is still one `kern start` can retry.
+- kern-sandbox: an archive one binding writes restores to the SAME TREE in the other, which it did
+  not, in four ways, each measured on one tree:
+  - **Modification times are carried and applied.** Python wrote the real ones and Node wrote `0` and
+    applied none, so a restored tree had the moment of the restore there and the moment of the
+    snapshot here. That is what an incremental tool reads: `make`, `tsc --incremental`, `pytest --lf`,
+    and CPython's own `(mtime, size)` check on a `.pyc` under `.deps`. Node's constant was there for
+    a deterministic archive, and nothing in either package's tests, READMEs or docs asked for one,
+    while the docs do promise a snapshot moves the files a session wrote to another machine.
+  - **An empty directory survives.** Node wrote no directory members at all: measured, a workspace
+    holding `emptydir/` and `full/f` gave an archive of `full/f` alone, and restoring it produced
+    `full` and nothing else.
+  - **A file keeps its owner permission bits**, so an executable comes back executable; Node wrote a
+    constant `0644` and ignored the archive's mode on restore. Group and other bits are deliberately
+    NOT carried, in both: on a workspace shared with a `user=` account the group bits are the POSIX
+    ACL's mask, and the ACL does not travel in a tar, so restoring them turned a mask into real group
+    access.
+  - **A path of 101 to 255 bytes round trips.** Node's writer refused every path over 100 bytes while
+    its own reader has read the ustar `prefix` field since this branch, so it could not write what it
+    could read, and a Python-written archive with such a path threw from its re-emission path after
+    part of the tree had been written.
+  Ownership is now `0/0` with no account names in both (a Python archive listed the host user's name
+  on every member it read directly and `0/0` on the ones it read through the helper box, so one
+  archive carried two conventions), and a crafted numeric field cannot overflow its 11 octal digits
+  on the way in or reach `utimes` on the way out. Four combinations of writer and reader are asserted
+  against one expected tree, and five sabotages of the four properties each fail it.
+- kern-sandbox: `snapshot()` works for a non-root `user=` session with anything the host cannot read,
+  which is the case the helper box exists for. It failed every time: the host side stops at the
+  archive's end-of-archive marker and then killed the helper, which was still tearing its box down,
+  and read the `-9` as the box user's failure - measured 9 times out of 9 (a 0700 directory, a 0600
+  file, and both), each reported as "the box user could not read ... exit -9" about a stream read in
+  full. Node did it correctly, so this was also a Python/Node split on a documented API.
+- `kern-mcp`: a stream this reply did not cut carries no truncation notice. `truncated` is one flag
+  for both streams, so a call whose stderr was cut told the model "truncated at least 1 chars" about
+  a stdout it had whole (measured: `print("hi")` beside 2.2 MB of stderr).
+- kern-sandbox: the helper box and the uid probe clear the image's ENTRYPOINT. kern prepends it to
+  what follows `--`, so they ran `ENTRYPOINT sh -c <script>` and the image chose what came out - and
+  those results are parsed, not displayed: `read_file` returns the stream as the file's bytes, the
+  listing reads stat records out of it, `snapshot` reads a tar. An image whose entrypoint printed one
+  line prepended that line to every `read_file`; one that rejects an unknown first argument failed
+  every call with a sentence about missing tools. Both bindings.
+- kern-sandbox: the image's own `USER` goes through the same check as `user=`. An image declaring
+  `USER --privileged`, `USER ' root'` or a 300-character name put that value on the argv unexamined,
+  and root-ness is now decided by the uid the probe measured rather than by the spelling, so an image
+  whose `USER` names box root under another name (`N0tR00t` mapped to uid 0) cannot make the helper
+  box run as root of the uid range. Both bindings.
+- kern-sandbox: a listing shows every file in the workspace again. The names an older version's env
+  file could have (`.kern-env.pysbx-<12 hex>`, `.kern-env.kern-sbx-<191 characters>`) were skipped by
+  `list_files`, `result.files` AND `snapshot`, and every one of those shapes is one a cell can create:
+  a box could hide a file from the three channels that answer "what did this cell leave behind". They
+  stay out of SNAPSHOTS, which travel and must not carry a stale `env=` value; the only name hidden
+  from a listing is the exact legacy `.kern-env`. Both bindings.
+- kern-sandbox: box-produced text that reaches a message of ours is quoted, in five more places (the
+  uid probe's output, the helper box's stderr in three messages, and a path a box chose in the
+  workspace-cap refusal). A filename inside a directory the box closed to the host appears verbatim
+  in `du`/`find`/`stat` diagnostics, and busybox does not quote its own; measured, a forged
+  `[sandbox: oom]` verdict and a screen-clearing escape reached the caller through them. `kern-mcp`
+  also neutralises its `kern error:` reply, which was the one box-influenced string in that server
+  that did not go through the labeller.
+- kern-sandbox: `snapshot` of a directory the host cannot read vets the member names it takes from
+  the box's own `tar`, so an archive cannot carry `../../../.ssh/authorized_keys`; `restore` keeps a
+  member's OWNER bits only, because a mode out of an archive carries the source workspace's ACL mask
+  in its group bits and the ACL does not travel (measured: 0600 in, 0640 out with `group::r--` on the
+  restored copy); and a crafted mtime (`1 << 70`) no longer escapes `restore` as an `OverflowError`
+  after part of the tree is written. A `user=` session that is given a workspace of yours now says
+  that it added an ACL to every file under it, that it is not removed when the session closes, and
+  which `setfacl` undoes it.
 
 ## kern-sandbox 0.2.45 - 2026-10-05
 
