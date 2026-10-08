@@ -27,10 +27,59 @@ both halves of that rule, so removing one from the parser fails the build by nam
   the group and supplementary groups follow the rules of `kern box --user`. HOME becomes that user's
   home unless the image or `-e` set one. An id the box does not map is refused with what the box does
   map: on a single-uid box, `-u 1000` used to fail as "could not drop to the box's own user", exit 126.
-- `kern exec -u` works in a box started with `--cap-drop ALL`. The exec dropped every capability
-  before switching identity, `CAP_SETUID` included, and failed closed with "could not drop to the
-  box's own user"; `kern compose exec` of a service with `cap_drop: [ALL]` and a `user:` failed the
-  same way. The command still ends with every capability set empty.
+- `kern exec -u` no longer fails on the capability switch in a box started with `--cap-drop ALL`.
+  The exec dropped every capability before switching identity, `CAP_SETUID` included, and failed
+  closed with "could not drop to the box's own user"; `kern compose exec` of a service with
+  `cap_drop: [ALL]` and a `user:` failed the same way. The command still ends with every capability
+  set empty. ONE CONDITION REMAINS, and a field report measured it because this entry did not say
+  so: `--cap-drop ALL` with no `--cap-add` also drops the box's default sub-uid range (the range is
+  there so a box can own files as another uid, which no capability makes possible anyway), so a
+  non-root account is not in the map and `kern exec -u nobody` is refused. Add `--uid-range` to such
+  a box and it works. The refusal now names that cause instead of naming `--no-uid-range` and
+  `/etc/subuid`, neither of which was the reader's, and `kern box --help` states the interaction on
+  both flags.
+- `kern rm` no longer sends the reader to a listing that contradicts it. A field report removed a
+  kept box's layer from outside, so there was no layer to remove, but the transient exit record was
+  still in the registry and `kern ps -a` listed that name in its exited section; the refusal said "no
+  kept box 'x'" and pointed at `kern ps -a` for the list. Both sentences were true and together they
+  said the opposite. It now names the section the row is in and the verb that clears it, and a name
+  in no section at all keeps the shorter sentence.
+- A detached box that cannot enforce its caps says so on the terminal, not only in its log. A
+  detached box's stderr IS its log, so `kern box -d --memory 64m` on a host with no cgroup delegation
+  printed `✔ started 'x' [pid N, detached]` and nothing else, while both notices - "`--memory`
+  accepted but NOT enforced here" and "the box runs UNCAPPED, with no OOM / fork-bomb backstop" -
+  went to a file the operator had not been told to read. The same box in the foreground printed them
+  on the terminal, so one flag decided whether kern reported its own uncapped state. A field report
+  measured it (`memory.max: max` with `--memory 64m` in force nowhere, the workload allocating 200 MB
+  under a 64 MiB request); it is reproduced in this repo's own tests. The notices now go to both, and
+  the log keeps its copy. `--allow-uncapped` and `KERN_QUIET` silence them exactly as before -
+  the second copy is the same sentence, gated at the same place - and `--require-limits` still
+  refuses to start, where the line now also appears once above the error that quotes the log.
+- `kern inspect --json` no longer reports `"memory_max_enforced": null` for a box the kernel does
+  cap. The field read `memory.max` at ONE level, reached through the gate that decides which cgroups
+  kern may `rmdir` or `cgroup.kill`, so it had two blind spots: a box kern could not place in a
+  cgroup of its own (the field report's case: `"memory_max": 67108864` next to `null`, where `null`
+  is what `kern doctor` tells a reader means "nothing in force"), and an ANCESTOR's ceiling, which is
+  the one the kernel enforces on a box whose own level says `max`. It now reads the chain the kernel
+  reads, from the box's own cgroup whoever named it, pinned to the live PID 1. `kern inspect` prints
+  `64M (in force: 256M)` where it used to print `64M (requested, NOT enforced here)` about a box held
+  to 256M. `null` now means what `doctor` says it means.
+- `kern images` says whether "no images cached yet" is the whole truth. A field report ran `rm -rf`
+  over the cache to free space: the removal took everything it could and stopped at the files a
+  uid-mapped extraction had left owned by a subordinate uid, so the index was gone and 5.2 MB were
+  not. `kern images` then said the cache was empty, and `kern rmi` - whose own error sends the reader
+  to `kern images` - said "no such image". Each sentence was true and together they said the files
+  were not kern's. The empty listing now names what is there and `kern gc --images`, which reclaims
+  it (measured: 5.1 MB freed on that wreck). The walk runs only when there is nothing to list, so a
+  normal cache pays nothing for it.
+- A box no longer inherits the supplementary groups of whoever typed `kern box`. With no `--user`
+  there was no identity to set, so nothing cleared them: a field report read it off `id` inside a
+  plain box, thirteen `65534(nobody)` entries beside `0(root)`, which are the caller's host groups
+  seen through a map that does not contain them. Measured before changing it, because the one thing
+  those groups could have bought is access to a bind mount the caller reaches only through a group: a
+  host file `----r----- alex:disk` mounted with `-v` was ALREADY refused inside the box with the
+  groups in place. So the list granted nothing and its only effect was that output. Podman drops them
+  too.
 - A workload whose image group list the box refuses (one gid outside the uid range) no longer keeps
   kern's own groups. It ran with the host user's groups as the box sees them, `0(root)` among them;
   it now gets none, and the warning says the gid is outside the map. Box root on the single-uid map,
