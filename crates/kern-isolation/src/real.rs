@@ -4874,7 +4874,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     // this is a refusal, with the note printed first because the error type carries a fixed message.
     if let Some(outer) = crate::cgroup::outer_memory_high_for_box(box_cg) {
         if spec.require_limits {
-            eprintln!("{}", outer.note());
+            crate::cgroup::cap_notice(&outer.note());
             return Err(Error::Unsupported(
                 "--require-limits (KERN_REQUIRE_LIMITS) is set and a `memory.high` above this box would \
                  throttle it below its memory cap instead of letting it be OOM-killed (the note above \
@@ -4882,7 +4882,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
             ));
         }
         if !crate::cgroup::env_flag("KERN_QUIET") {
-            eprintln!("{}", outer.note());
+            crate::cgroup::cap_notice(&outer.note());
         }
     }
 
@@ -4932,7 +4932,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
         // loudly. (Warn, not refuse, so a legit first-party best-effort build step isn't broken; the direct
         // path already hard-refuses. Mutually exclusive with the refusal: that needs NO outer-enforcer env.)
         if crate::cgroup::env_claims_enforcer_but_none_real() {
-            eprintln!(
+            crate::cgroup::cap_notice(
                 "kern: warning: an outer-enforcer env var (KERN_SCOPE/KERN_MANAGED/KERN_BUILD_STEP) is set \
                  but NO cgroup cap is in force - the box runs UNCAPPED. If kern did not set that variable, a \
                  caller may be bypassing the resource limits."
@@ -4963,15 +4963,22 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
             // The middle clause is MEASURED per host rather than fixed prose: the fixed version named
             // `XDG_RUNTIME_DIR` and `/run/user/$(id -u)` on every host, which on a colima guest with no
             // user manager at all sends the reader to set a variable that changes nothing.
-            eprintln!(
+            crate::cgroup::cap_notice(&format!(
                 "kern: warning: resource caps could not be enforced here (memory + pids, INCLUDING their \
                  defaults) - the box runs UNCAPPED, with no OOM / fork-bomb backstop. kern could not place \
                  it in a delegated cgroup: {}. `kern doctor` shows the delegation state; \
                  `--require-limits` refuses to start uncapped, `--allow-uncapped` silences this.",
                 crate::cgroup::missing_manager_clause()
-            );
+            ));
         }
     }
+    // EVERYTHING THIS START CAN SAY ABOUT ITS CAPS HAS BEEN SAID, so the launcher's descriptor is
+    // released here rather than held for the box's lifetime. A `--restart` supervisor runs this
+    // function again per attempt, and a terminal is not a log: a notice arriving on it an hour after
+    // the launcher returned would be addressed to whoever is sitting there now. Closing it also means
+    // the forked box below cannot inherit a handle on the operator's terminal, independently of the
+    // `FD_CLOEXEC` the supervisor set and of the fd shed in `child_setup_and_exec`.
+    crate::cgroup::disarm_launcher_notice();
     // Held for RAII: its Drop removes the box's cgroup dirs after waitpid (see CgroupGuard). Named
     // rather than `_`-prefixed because the forked child below reads it to join the capped cgroup: the
     // supervisor is no longer in that cgroup, so the workload is not placed there by inheritance.
@@ -5970,6 +5977,25 @@ fn drop_caps_around_identity(
     drop_cap_bounding(mask).map_err(|e| (CapDropStep::Bounding, e))?;
     if let Some((uid, gid)) = run_as {
         set_user(uid, gid, extra_gids, dumpable_after).map_err(|e| (CapDropStep::Identity, e))?;
+    } else {
+        // NO `--user`, SO NOBODY CLEARED THE INHERITED SUPPLEMENTARY GROUPS. `set_user` does it on
+        // every identity path; with no identity to set, the workload kept the list of the user who
+        // typed `kern box`, and a field report read it off `id` inside a plain box: thirteen
+        // `65534(nobody)` entries beside `0(root)`, which are the caller's host groups rendered
+        // through a map that does not contain them.
+        //
+        // MEASURED BEFORE CHANGING IT, because the one thing those groups could have bought is
+        // access to a bind mount the caller reaches only through a group: a host file `----r-----
+        // alex:disk` mounted with `-v` was ALREADY `Permission denied` inside the box, with the
+        // groups still in place. So the list grants nothing and its only effect is the confusing
+        // `id` output, which is why dropping it costs no workflow. Podman drops them by default too.
+        //
+        // SAFETY: `setgroups` with a null list and a count of 0 is the documented form. Best effort
+        // for the same reason as in `set_user`: a single-uid box has `/proc/self/setgroups` at
+        // `deny`, where this is EPERM and the one mapped group is already the whole set.
+        unsafe {
+            libc::setgroups(0, std::ptr::null());
+        }
     }
     clear_caps_from_sets(mask).map_err(|e| (CapDropStep::Sets, e))
 }

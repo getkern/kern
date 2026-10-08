@@ -209,6 +209,10 @@ pub use cgroup::CgroupGuard;
 /// Bytes the per-box scope gets ABOVE the box's `--memory`, to hold kern's supervisor without eating
 /// into the workload's budget. See [`cgroup::SCOPE_SUPERVISOR_HEADROOM`].
 pub use cgroup::SCOPE_SUPERVISOR_HEADROOM;
+/// Keep the launcher's own stderr as a second destination for a detached start's cap notices, so the
+/// warning that a `--memory` is not in force reaches the person who typed it and not only the box's
+/// log. See [`cgroup::arm_launcher_notice`].
+pub use cgroup::{arm_launcher_notice, disarm_launcher_notice};
 /// The direct-cap-path decision (skip the per-box scope iff kern's delegated `kern.slice` is usable;
 /// records itself in an in-process marker), the READ-BACK of that decision, and the scrub of an
 /// INHERITED marker (a nested kern must not be poisoned by its parent's decision).
@@ -225,6 +229,10 @@ pub use cgroup::{
 /// Which local change, if any, would make a cap bind here - so a hint cannot suggest a write that
 /// this user is not allowed to perform. See [`cgroup::delegation_blocker`].
 pub use cgroup::{delegation_blocker, DelegationBlocker};
+/// The box's cgroup whoever named it, and the memory ceiling the kernel will actually hold it to -
+/// the chain, not the one level. See [`cgroup::effective_cgroup_dir`] and
+/// [`cgroup::memory_max_in_force`].
+pub use cgroup::{effective_cgroup_dir, memory_max_in_force};
 pub use cgroup::{fleet_status, FleetStatus};
 /// The write-tested state of `--memory` enforcement on this host (`Enforced` / `PresentNotDelegated`
 /// / `Absent` / `Unknown`), by creating a throwaway child cgroup and checking a `memory.max` write

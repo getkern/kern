@@ -3008,12 +3008,25 @@ fn exec_user_identity(
     };
     let uid_ranges = id_map("uid_map");
     let gid_ranges = id_map("gid_map");
+    // THE BOX'S OWN BOUNDING SET, not the posture recorded for it: `CapBnd: 0000000000000000` is
+    // what `--cap-drop ALL` leaves, and it is the condition `range_buys_nothing` acts on. Read from
+    // the subject rather than from kern's record, so a box whose record and whose reality disagree
+    // is described by its reality. Unreadable or unparsable answers `false`, which keeps the
+    // sentence that was there before rather than inventing a cause.
+    let no_caps = std::fs::read_to_string(format!("/proc/{pid1}/status"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("CapBnd:"))
+                .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+        })
+        .is_some_and(|bnd| bnd == 0);
     for (kind, id, ranges) in [("uid", uid, &uid_ranges), ("gid", gid, &gid_ranges)] {
         let Some(ranges) = ranges else { continue };
         if !id_is_mapped(ranges, id) {
             return Err(refuse(format!(
                 "{kind} {id} does not exist in box '{box_name}', {}",
-                describe_id_map(kind, ranges)
+                describe_id_map(kind, ranges, no_caps)
             )));
         }
     }
@@ -3068,8 +3081,29 @@ fn id_is_mapped(ranges: &[(u64, u64)], id: u32) -> bool {
 
 /// The end of the sentence that refuses an unmapped id: what the box DOES map, and for the single-id
 /// map the reason it has nothing else.
-fn describe_id_map(kind: &str, ranges: &[(u64, u64)]) -> String {
+///
+/// `no_caps` IS THE THIRD CAUSE, AND IT WAS MISSING. A field report measured this: a box started
+/// `--cap-drop ALL` maps uid 0 alone, because `imagecache::range_buys_nothing` drops the DEFAULT
+/// range when the box holds no capabilities (the range exists so a box can `chown` to another uid,
+/// which `--cap-drop ALL` refuses either way, and skipping it saves 985 us of a cold box). So the
+/// reader was told two causes - `--no-uid-range`, or a host with no `/etc/subuid` entry - and
+/// NEITHER was theirs: they check `/etc/subuid`, find it fine, check their command line, find no
+/// `--no-uid-range`, and conclude the message is wrong.
+///
+/// `kern exec -u <non-root>` is what made it matter, and it arrived in this branch: it is a consumer
+/// of the range that did not exist when that default was written, and it happens AFTER the box
+/// started, so nothing can retrofit the map. The answer is to name the cause and the flag that asks
+/// for the range anyway.
+fn describe_id_map(kind: &str, ranges: &[(u64, u64)], no_caps: bool) -> String {
     if ranges == [(0, 1)] {
+        if no_caps {
+            return format!(
+                "which maps {kind} 0 alone: it holds no capabilities (`--cap-drop ALL`, or \
+                 `--security-profile untrusted`), and kern drops the default sub-uid range for such \
+                 a box because the range buys it nothing. Start it with `--uid-range` as well, which \
+                 asks for the range in as many words, and `kern exec -u` then works"
+            );
+        }
         return format!(
             "which maps {kind} 0 alone: it was started with the single-uid map (`--no-uid-range`, \
              or a host with no subordinate range in /etc/subuid), and `--uid-range` gives a box the rest"
@@ -3162,7 +3196,13 @@ fn await_box_started(
     // here would block until it gives up - FOREVER for `always` - and wedge `compose up`, which waits
     // on this launcher. So on a supervised box a first-attempt failure is reported, not awaited.
     supervised: bool,
+    // The read end of the cap-notice pipe (see `run_detached`): what the supervisor could not say on
+    // a stderr that is now the box's log. `None` when that pipe could not be created.
+    notice_rd: Option<i32>,
 ) -> Result<(), Error> {
+    // Assembled below, on whichever path resolves the start, and printed with the start line so the
+    // launcher still makes ONE write per box (see that comment).
+    let notices;
     if have_pipe {
         unsafe { libc::close(wr) };
         let mut byte = [0u8; 1];
@@ -3174,6 +3214,12 @@ fn await_box_started(
             break r;
         };
         unsafe { libc::close(rd) };
+        // DRAINED HERE, AND THE POSITION IS THE WHOLE CORRECTNESS ARGUMENT. The notices are written
+        // before the box is forked, and the readiness pipe resolves at the box's `execvp` (or at its
+        // failure byte), so by this line whatever the start had to say about its caps is already in
+        // the pipe. Nothing waits for EOF - that read is non-blocking - so the channel cannot make a
+        // launcher hang the way a held stderr did.
+        notices = notice_rd.map(drain_cap_notices).unwrap_or_default();
         // PREPARED IS A SUCCESS, AND IT IS THE ONLY BYTE THAT IS.
         //
         // The pipe carries three states, one per shape: EOF means the workload exec'd, the byte
@@ -3187,6 +3233,9 @@ fn await_box_started(
         // a box that died before starting, complete with a log tail that did not exist. So the value
         // is checked, not just the count.
         if n > 0 && byte[0] == kern_isolation::READY_PREPARED {
+            // A prepared box prints no start line here (`compose up` reports the stack), but a cap
+            // notice is about the box and not about this launcher's shape, so it is still said.
+            print_cap_notices(&notices);
             return Ok(());
         }
         if n > 0 && supervised {
@@ -3194,6 +3243,7 @@ fn await_box_started(
             // supervisor keeps retrying in the background. Hand back so the caller (and `compose up`)
             // proceeds instead of hanging on a supervisor that may never exit.
             let n = name.as_str();
+            print_cap_notices(&notices);
             eprintln!(
                 "kern: box '{n}' failed its first start attempt; the --restart supervisor is \
                  retrying (see `kern logs {n}`)"
@@ -3203,6 +3253,10 @@ fn await_box_started(
         if n > 0 {
             let mut st = 0i32;
             crate::eintr::waitpid(child, &mut st, 0);
+            // NOT printed on this path, deliberately: the error below quotes the box's log, where
+            // every notice also went, so saying them here would print the same sentence twice above a
+            // message that already carries it.
+            drop(notices);
             // The box's own error went to its per-box log (its stderr was detached there), so the
             // launcher only knows it died. `waitpid` above has reaped the supervisor, so the log is
             // now fully written - surface its tail inline. This turns the failure from an opaque
@@ -3246,6 +3300,9 @@ fn await_box_started(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        // Same drain, after the same kind of wait: on this path the registry entry is the only signal
+        // there is, so it stands in for the readiness pipe's resolution.
+        notices = notice_rd.map(drain_cap_notices).unwrap_or_default();
     }
     let p = crate::ui::Palette::detect();
     let gl = crate::ui::Glyphs::detect();
@@ -3265,12 +3322,67 @@ fn await_box_started(
     // two boxes reported. Assembling first makes it a single `write`, which a pipe delivers atomically
     // under `PIPE_BUF` and a terminal delivers as one call; the worst case left is whole lines out of
     // order, which reads fine.
+    // The cap notices go FIRST and in the same write: they are the condition under which this box is
+    // running, so a reader scanning for the tick has already passed them, and a reader who only sees
+    // the tick is the defect this channel exists to close.
     let msg = format!(
-        "{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n  {}next: kern ps {} kern logs {n} {} kern stop {n}{}\n",
+        "{notices}{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n  {}next: kern ps {} kern logs {n} {} kern stop {n}{}\n",
         p.g, gl.ok, p.z, p.b, p.z, p.d, p.z, p.d, gl.dot, gl.dot, p.z
     );
     let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
     Ok(())
+}
+
+/// Read whatever the supervisor put in the cap-notice pipe and close it. Never blocks and never waits
+/// for EOF: the write ends outlive this call by design (the supervisor keeps one until it forks the
+/// first attempt), so waiting for one would hang the launcher - which is exactly the defect the first
+/// version of this channel had when it was a `dup` of stderr instead of a pipe.
+///
+/// SCRUBBED AND BOUNDED, because this text is printed to the operator's terminal. kern is the only
+/// writer today (the supervisor and the attempt it forks; the box's own copy is `FD_CLOEXEC` and is
+/// shed before `execvp`), and that is a property of the code rather than of the kernel, so the bytes
+/// are treated as untrusted anyway: control sequences are stripped per line, exactly as the failure
+/// path already does with the log tail, and the total is capped so nothing can flood a terminal
+/// through it. Each line keeps its newline so the result drops straight into the start-line write.
+fn drain_cap_notices(fd: i32) -> String {
+    // One read of a bounded buffer: the notices are a handful of sentences, and a cap well under the
+    // 64 KiB pipe buffer means a single non-blocking read sees all of what kern wrote.
+    const CAP: usize = 8 * 1024;
+    let mut buf = vec![0u8; CAP];
+    let mut filled = 0usize;
+    // `O_NONBLOCK` on the read end only, set here rather than at creation so the supervisor's writes
+    // keep their ordinary blocking semantics.
+    unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    while filled < CAP {
+        let n = unsafe { libc::read(fd, buf[filled..].as_mut_ptr().cast(), CAP - filled) };
+        if n > 0 {
+            filled += n as usize;
+            continue;
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break; // EAGAIN (nothing more pending) or EOF
+    }
+    unsafe { libc::close(fd) };
+    let text = String::from_utf8_lossy(&buf[..filled]);
+    let mut out = String::with_capacity(filled + 8);
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        out.push_str(&crate::ui::scrub(line));
+        out.push('\n');
+    }
+    out
+}
+
+/// Print already-drained notices on the paths that have no start line to carry them.
+fn print_cap_notices(notices: &str) {
+    if notices.is_empty() {
+        return;
+    }
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), notices.as_bytes());
 }
 
 /// Should a box that just exited `code` be started again? The whole restart policy, as a pure
@@ -3603,6 +3715,15 @@ fn supervise_box(
         if attempt == 0 && have_pipe {
             unsafe { libc::close(wr) };
         }
+        // And drop the cap-notice channel, for the neighbouring reason: the FIRST attempt is the one
+        // whose notices a launcher is still there to read. Past it the launcher has returned, nothing
+        // drains that pipe, and a `--restart` box would write its notices into a buffer until the
+        // write blocked - inside the attempt, with the box not yet forked. The runner we just forked
+        // keeps its own copy and closes it as soon as the start is past the notices
+        // (`disarm_launcher_notice` in `run_in_sandbox_with`), so attempt 0 still reports in full.
+        if attempt == 0 {
+            kern_isolation::disarm_launcher_notice();
+        }
         // A fatal signal must not cost the box its exit record: swallow the first one and keep waiting,
         // so this process lives long enough to reap the box and write the record below.
         //
@@ -3794,6 +3915,26 @@ fn run_detached(
     let mut fds = [0i32; 2];
     let have_pipe = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
     let (rd, wr) = (fds[0], fds[1]);
+    // A SECOND, SEPARATE PIPE, for the cap notices the box's own stderr cannot deliver.
+    //
+    // WHY A PIPE AND NOT THE LAUNCHER'S OWN STDERR. The first version of this handed the supervisor a
+    // `dup` of fd 2 and let it write the notices there directly. It delivered them, and it also broke
+    // every caller that waits for stderr to END: a duplicate of the launcher's stderr held open for
+    // the box's whole life means the pipe behind it never reaches EOF, so `Command::output()` - the
+    // Rust test harness, `compose up`, any script doing `kern box -d 2>&1 | cat` - blocks until the
+    // box exits instead of returning when the launcher does. MEASURED: 18 integration tests stopped
+    // returning, and `kern box -d -- sleep 60 2>&1 | cat` never printed EOF (exit 124 under
+    // `timeout 8`). My own check had written stderr to a FILE, where holding a descriptor costs
+    // nothing and the defect is invisible.
+    //
+    // This pipe is nobody's EOF: the launcher DRAINS it at a known point (after the readiness pipe has
+    // resolved, so the notices are already written) and never waits on it, and the supervisor keeps
+    // its own read end so a write can never raise SIGPIPE at a launcher that has already exited.
+    // Both ends are `FD_CLOEXEC` so no exec on this path - least of all the box's own - inherits a
+    // descriptor that writes to the operator's terminal.
+    let mut nfds = [0i32; 2];
+    let have_notice = unsafe { libc::pipe2(nfds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
+    let (notice_rd, notice_wr) = (nfds[0], nfds[1]);
 
     let child = unsafe { libc::fork() };
     if child < 0 {
@@ -3803,10 +3944,30 @@ fn run_detached(
                 libc::close(wr);
             }
         }
+        if have_notice {
+            unsafe {
+                libc::close(notice_rd);
+                libc::close(notice_wr);
+            }
+        }
         return Err(Error::Sandbox("fork for detach failed".to_string()));
     }
     if child > 0 {
-        return await_box_started(name, child, rd, wr, have_pipe, restart || restart_always);
+        // The launcher reads the notices and never writes them, so its write end goes now: the
+        // supervisor's copy is the only one that matters, and one fewer descriptor is one fewer way
+        // for this process to hold anything open.
+        if have_notice {
+            unsafe { libc::close(notice_wr) };
+        }
+        return await_box_started(
+            name,
+            child,
+            rd,
+            wr,
+            have_pipe,
+            restart || restart_always,
+            have_notice.then_some(notice_rd),
+        );
     }
     // ── Supervisor ──
     // SAFETY (fork): kern is single-threaded (std + libc only, no runtime threads), so running
@@ -3817,6 +3978,20 @@ fn run_detached(
     }
     unsafe { libc::setsid() };
     let pid = std::process::id() as i32;
+    // THE CHANNEL FOR WHAT THE BOX'S OWN STDERR CANNOT DELIVER. From `detach_stdio` below onwards,
+    // this process's fd 2 IS the box's log file, so every cap notice kern prints during the start -
+    // "the `--memory` you asked for is not enforced here", "the box runs UNCAPPED" - lands in a file
+    // the operator was never told to read, and the only thing on their terminal is the green tick.
+    // MEASURED on an independent host (2026-10-08) and reproduced here: identical box, identical
+    // flags, the notice on the terminal in the foreground and nowhere in sight detached.
+    //
+    // The notices are written into the pipe the launcher drains (see its creation above for why it is
+    // a pipe and not a `dup` of the launcher's stderr), and the supervisor DISARMS it right after
+    // forking the first attempt - see `supervise_box` - so a `--restart` box cannot keep filling a
+    // pipe nobody is draining any more.
+    if have_notice {
+        kern_isolation::arm_launcher_notice(notice_wr);
+    }
     // Send the box's stdout/stderr to a per-box log file (so `kern logs` can show it).
     let log = registry::logs_dir()
         .ok()
@@ -4513,15 +4688,44 @@ mod exec_user_tests {
     }
 
     /// The refusal says what the box DOES map, and for root alone, why and what gives it the rest.
+    ///
+    /// AND IT NAMES THE CAUSE THAT APPLIES. A field report measured the gap: a box started
+    /// `--cap-drop ALL` maps uid 0 alone, and the sentence named `--no-uid-range` and a missing
+    /// `/etc/subuid` entry, neither of which was the reader's. Both forms must still point at
+    /// `--uid-range`, because that is the flag that fixes either one.
     #[test]
     fn the_refusal_names_what_the_box_maps() {
-        let single = describe_id_map("uid", &[(0, 1)]);
+        let single = describe_id_map("uid", &[(0, 1)], false);
         assert!(single.contains("uid 0 alone"), "{single}");
         assert!(single.contains("--uid-range"), "{single}");
-        assert_eq!(
-            describe_id_map("gid", &[(0, 1), (1, 65536)]),
-            "which maps gids 0, 1-65536"
+        assert!(
+            single.contains("--no-uid-range") && single.contains("/etc/subuid"),
+            "with capabilities, those are the two causes left: {single}"
         );
+        assert!(
+            !single.contains("--cap-drop"),
+            "a box that HOLDS capabilities was not refused for dropping them: {single}"
+        );
+
+        let dropped = describe_id_map("uid", &[(0, 1)], true);
+        assert!(dropped.contains("uid 0 alone"), "{dropped}");
+        assert!(
+            dropped.contains("--cap-drop ALL") && dropped.contains("--uid-range"),
+            "the cause it can prove, and the flag that answers it: {dropped}"
+        );
+        assert!(
+            dropped.contains("kern exec -u"),
+            "the reader is here because of that command: {dropped}"
+        );
+
+        // A box that maps a range is described by the range, whatever its capabilities are: the
+        // cause only exists for the single-id map.
+        for no_caps in [false, true] {
+            assert_eq!(
+                describe_id_map("gid", &[(0, 1), (1, 65536)], no_caps),
+                "which maps gids 0, 1-65536"
+            );
+        }
     }
 
     /// HOME follows the `-u` user unless the environment already set one that is not kern's own.

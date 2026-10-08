@@ -3574,7 +3574,9 @@ pub fn warn_unenforced_caps(
         _ => memory,
     };
     for (flag, why) in unenforced_caps(&dir, memory, cpus, pids) {
-        eprintln!("kern: {flag} accepted but NOT enforced here - {why}; the box can exceed it");
+        cap_notice(&format!(
+            "kern: {flag} accepted but NOT enforced here - {why}; the box can exceed it"
+        ));
     }
 }
 
@@ -3763,6 +3765,90 @@ pub fn record_memory_cap_signal(memory: Option<u64>, dir: Option<&std::path::Pat
 /// `KERN_STARTED_FD` signal. `0` undetermined, `1` enforced, `2` requested-but-not-enforced.
 pub fn memory_cap_signal() -> u8 {
     MEMORY_CAP_SIGNAL.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The write end of the pipe a detached LAUNCHER drains, so a cap notice reaches the person who typed
+/// `--memory`. `-1` = not armed, which is every path but one.
+///
+/// WHY A SECOND DESTINATION EXISTS AT ALL. A detached box's stderr IS its log (`detach_stdio` dup2s
+/// the log file over fd 2 in the supervisor, before any of this runs), so every notice below was
+/// written to a file the operator has not been told to read. MEASURED on an independent host
+/// (2026-10-08) and reproduced here: `kern box -d --memory 64m` on a host that cannot delegate a
+/// cgroup printed `✔ started 'capd' [pid N, detached]` and nothing else, while `kern logs capd`
+/// held both "`--memory` accepted but NOT enforced here" and the UNCAPPED warning, and the workload
+/// ran in a cgroup whose `memory.max` was `max`. The foreground path prints them on the terminal, so
+/// the SAME box reported its own uncapped state or not depending on one flag.
+///
+/// A PIPE, NOT A `dup` OF THE LAUNCHER'S STDERR, and the difference was measured the hard way. The
+/// first version handed this a `dup(2)` taken before `detach_stdio`. It delivered the notices, and it
+/// also held a write end of the launcher's stderr open for the box's whole life, so every caller that
+/// waits for stderr to END - `Command::output()`, `kern box -d 2>&1 | cat` - blocked until the box
+/// exited: 18 integration tests stopped returning. A pipe nobody waits on cannot do that.
+///
+/// NOT THE READINESS PIPE EITHER, and that is not a style choice. On the foreground path the fd in
+/// `run_in_sandbox_with`'s `ready_fd` slot is the SDK's `KERN_ALIVE_FD`, whose reader treats "a byte
+/// beyond the ack" as *kern reported setup failed* (`_ALIVE_PAST_SETUP` in the Python binding): a
+/// notice byte there would make an uncapped host look like a failed start to every SDK caller.
+///
+/// ONE-SHOT BY CONSTRUCTION. [`disarm_launcher_notice`] closes it in each process that holds it once
+/// that process is past the notices, so a `--restart` box cannot keep writing into a pipe whose
+/// launcher has long returned and whose buffer nobody is draining.
+static LAUNCHER_NOTICE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Hold `fd` (the write end of the launcher's notice pipe, already `FD_CLOEXEC`) as the second
+/// destination for the cap notices. Called by the DETACHED supervisor only. A negative fd disarms, so
+/// a pipe that could not be created costs the notice and nothing else.
+pub fn arm_launcher_notice(fd: i32) {
+    LAUNCHER_NOTICE_FD.store(fd, std::sync::atomic::Ordering::Release);
+}
+
+/// Close this process's copy of the notice channel and stop fanning notices out to it. Called from
+/// two places, each for its own copy: the supervisor right after forking the first attempt, and the
+/// attempt itself once the box start has emitted everything it can say about its caps.
+pub fn disarm_launcher_notice() {
+    let fd = LAUNCHER_NOTICE_FD.swap(-1, std::sync::atomic::Ordering::AcqRel);
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// Print one cap notice: always to this process's stderr (the box log on a detached start, the
+/// terminal otherwise), and additionally into the launcher's notice pipe while
+/// [`arm_launcher_notice`] holds it.
+///
+/// ONE TEXT, COMPUTED ONCE, DELIVERED TWICE. The verdict stays where it can be measured - the box's
+/// own cgroup, after `apply_limits` - and this only moves the sentence. A second place that decided
+/// for itself whether to warn is the defect this file already carries a scar from: the byte and the
+/// prose read different cgroups and disagreed on a Pi 5 and a Jetson.
+///
+/// ONE `write` PER LINE into the pipe, so the launcher reads whole lines whatever order two
+/// concurrent starts write in. The launcher then makes a single write of its own to the terminal
+/// (`compose up` runs a level's services in parallel, each sharing that stderr; a fragmented write
+/// was measured interleaving into one unreadable line).
+pub(crate) fn cap_notice(line: &str) {
+    eprintln!("{line}");
+    let fd = LAUNCHER_NOTICE_FD.load(std::sync::atomic::Ordering::Acquire);
+    if fd < 0 {
+        return;
+    }
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    let bytes = buf.as_bytes();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let n = unsafe { libc::write(fd, bytes[off..].as_ptr().cast(), bytes.len() - off) };
+        if n > 0 {
+            off += n as usize;
+            continue;
+        }
+        // EINTR retries; anything else (the launcher's terminal gone, a closed pipe) ends the
+        // attempt. A notice that cannot be delivered must not cost the box its start.
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
 }
 
 /// A `memory.high` above (or on) a box's cgroup that the kernel will apply BEFORE the box's own
@@ -3994,6 +4080,36 @@ fn tightest_memory_max_under(root: &std::path::Path, box_dir: &std::path::Path) 
     ceiling
 }
 
+/// The cgroup host-pid `pid` is in, WHATEVER it is - kern's own leaf, a systemd scope, or the ambient
+/// cgroup of an uncapped box - for a reader that wants the limits in force on it. `None` when
+/// `/proc/<pid>` is gone, on a v1-only host, or for a path containing `..`.
+///
+/// PASS THE BOX'S PID 1, for the reason [`box_cgroup_dir`] records: the supervisor sits in a sibling
+/// leaf that is uncapped by construction, so asking about it answers for the wrong cgroup.
+///
+/// WHY NOT `box_cgroup_dir`, WHICH EVERY OTHER CALLER USES. That one refuses any leaf kern did not
+/// name, and must: it decides what kern may `rmdir` or `cgroup.kill`, and a box can legitimately sit
+/// in a scope the user created. READING a limit is not acting on a cgroup, and routing a read through
+/// that gate cost `kern inspect --json` a true answer - a box kern could not place in a cgroup of its
+/// own reported `"memory_max_enforced": null` beside the `"memory_max": 67108864` it had been asked
+/// for. MEASURED by an independent host 2026-10-08 (`--memory 64m`, PID 1 in `/init.scope`,
+/// `memory.max: max`) and reproduced here with the box's PID 1 left in the launcher's own scope.
+pub fn effective_cgroup_dir(pid: i32) -> Option<PathBuf> {
+    proc_cgroup_dir(pid)
+}
+
+/// The memory ceiling the kernel will actually hold a box in `dir` to: the tightest finite
+/// `memory.max` from that level up to (not including) the root. `None` when no level caps it.
+///
+/// THE WHOLE CHAIN, NOT THE BOX'S OWN LEVEL, because that is what the kernel enforces: an ancestor's
+/// `memory.max` bounds every cgroup beneath it, so a box whose own level says `max` can still be held
+/// to an ancestor's ceiling - and a reader told `null` there would conclude the opposite. The same
+/// walk `apply_limits`' own decision uses (see [`memory_capped_at_or_below`]), so a surface that
+/// reports and a surface that decides cannot disagree about one box.
+pub fn memory_max_in_force(dir: &std::path::Path) -> Option<u64> {
+    tightest_memory_max_under(std::path::Path::new(CGROUP_V2_MOUNT), dir)
+}
+
 /// The [`OuterMemoryHigh`] for a box being started, resolved the way [`warn_unenforced_caps`] resolves
 /// its directory: the BOX's cgroup when the supervisor sits outside it (the sibling-leaf layout), else
 /// this process's own cgroup, which is the box's on the paths where the supervisor stays inside.
@@ -4070,6 +4186,75 @@ mod outer_memory_high_tests {
         assert_eq!(got.dir, t.dir("a.slice"), "named the wrong cgroup");
         assert_eq!(got.high, 80 * MIB);
         assert_eq!(got.ceiling, Some(512 * MIB));
+    }
+
+    /// What `kern inspect --json` now answers with: the ceiling the kernel will hold the box to,
+    /// wherever on the chain it was set.
+    ///
+    /// THE ANCESTOR CASE IS THE ONE THE OLD READING COULD NOT SEE. `memory_max_enforced` read
+    /// `memory.max` at the box's own level only, so a box whose level says `max` under a capped
+    /// ancestor reported `null` - "nothing is enforcing it" - about a box the kernel holds to the
+    /// ancestor's number. MEASURED on this host (2026-10-08): a 256 MiB `memory.max` on
+    /// `kerntest.slice` with the box in `kerntest.slice/probe`, where the new reading answers
+    /// 268435456 and `kern inspect` prints `64M (in force: 256M)`.
+    #[test]
+    fn the_ceiling_in_force_is_the_tightest_on_the_chain_including_an_ancestors() {
+        let t = Tree::new("inforce");
+        let walk =
+            |t: &Tree| super::tightest_memory_max_under(&t.root, &t.dir("a.slice/b.slice/box"));
+        assert_eq!(walk(&t), None, "no level caps it: nothing is in force");
+        t.set("a.slice", "memory.max", "268435456\n");
+        assert_eq!(
+            walk(&t),
+            Some(256 * MIB),
+            "an ANCESTOR's ceiling is what the kernel enforces on the box"
+        );
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        assert_eq!(
+            walk(&t),
+            Some(256 * MIB),
+            "the box's own looser level does not lift the ancestor's"
+        );
+        t.set("a.slice/b.slice/box", "memory.max", "67108864\n");
+        assert_eq!(
+            walk(&t),
+            Some(64 * MIB),
+            "the tightest of the chain, whichever level holds it"
+        );
+        t.set("a.slice", "memory.max", "max\n");
+        assert_eq!(
+            walk(&t),
+            Some(64 * MIB),
+            "`max` is not a ceiling and must not read as 0 or as absent-chain"
+        );
+    }
+
+    /// The gate that produced the `null`, pinned on the line this host actually produced, so the
+    /// before/after is one measurement rather than two stories.
+    ///
+    /// `parse_box_cgroup_line` is right to refuse this leaf - it decides what kern may `rmdir` or
+    /// `cgroup.kill`, and `probe` is not kern's - which is exactly why the REPORTING path no longer
+    /// goes through it.
+    #[test]
+    fn the_cgroup_of_a_box_kern_could_not_place_is_not_one_kern_may_act_on() {
+        let measured = "0::/user.slice/user-1000.slice/user@1000.service/kerntest.slice/probe\n";
+        assert_eq!(
+            super::parse_box_cgroup_line(measured),
+            None,
+            "not a kern-named leaf: the ownership gate must refuse it"
+        );
+        // And the reporting path reaches a directory for the same line.
+        let rel = measured
+            .trim()
+            .strip_prefix("0::")
+            .expect("a v2 line")
+            .trim_start_matches('/');
+        assert_eq!(
+            super::PathBuf::from("/sys/fs/cgroup").join(rel),
+            super::PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/kerntest.slice/probe"
+            ),
+        );
     }
 
     /// The negative control for the test above: the same tree with the limit lifted reports nothing.
@@ -4620,6 +4805,70 @@ mod tests {
                 panic!("a 1-byte cap can only read undetermined(0) or not-enforced(2), got {other}")
             }
         }
+    }
+
+    /// One lock for the tests that arm the process-wide launcher-notice descriptor: it is a single
+    /// atomic, so two of these at once would close each other's pipe. Poison is recovered so one
+    /// failure does not cascade.
+    static NOTICE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The mechanism that puts a cap notice where the person who typed `--memory` is looking.
+    ///
+    /// WHAT WENT WRONG WITHOUT IT, measured on an independent host (2026-10-08) and reproduced here: a
+    /// detached box's stderr IS its log, so `kern: --memory accepted but NOT enforced here` and the
+    /// UNCAPPED warning went to a file, and the operator's terminal carried only `✔ started`. The same
+    /// box in the foreground printed both.
+    ///
+    /// DRIVEN THROUGH A REAL PIPE, because the claim is about bytes arriving on a descriptor, and a
+    /// test that asserted on a returned string would pass against a build that writes to the wrong fd
+    /// or to none. The read end is non-blocking so "the channel is still open" and "the channel was
+    /// closed" are distinguishable (`EAGAIN` against a 0-byte read) without a test that can hang.
+    #[test]
+    fn a_cap_notice_reaches_the_launcher_and_stops_at_the_disarm() {
+        let _lock = NOTICE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe()");
+        let (rd, wr) = (fds[0], fds[1]);
+        unsafe { libc::fcntl(rd, libc::F_SETFL, libc::O_NONBLOCK) };
+        // Reads whatever is available right now: `Ok(bytes)`, or `Err(true)` for "open but empty"
+        // (EAGAIN) and `Err(false)` for EOF - the write end is gone.
+        let drain = |fd: i32| -> Result<Vec<u8>, bool> {
+            let mut buf = [0u8; 1024];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            match n {
+                0 => Err(false),
+                n if n > 0 => Ok(buf[..n as usize].to_vec()),
+                _ => Err(true),
+            }
+        };
+
+        arm_launcher_notice(wr);
+        cap_notice("kern: warning: first line");
+        cap_notice("kern: warning: second line");
+        let got = drain(rd).expect("two notices were emitted while the channel was armed");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "kern: warning: first line\nkern: warning: second line\n",
+            "the launcher's copy must be the notice text, one whole line each"
+        );
+        assert_eq!(
+            drain(rd),
+            Err(true),
+            "nothing more is pending, and the channel is still open"
+        );
+
+        // The disarm RELEASES the descriptor, which is what keeps a `--restart` supervisor from
+        // writing to that terminal hours after the launcher returned. EOF is the proof: the only write
+        // end was the one it closed.
+        disarm_launcher_notice();
+        assert_eq!(drain(rd), Err(false), "the disarm must close the write end");
+        cap_notice("kern: warning: after the disarm");
+        assert_eq!(
+            drain(rd),
+            Err(false),
+            "a notice after the disarm reaches nobody"
+        );
+        unsafe { libc::close(rd) };
     }
 
     #[test]
