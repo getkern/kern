@@ -1410,14 +1410,25 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
     // kernel will hold you to. `null` there means nothing is enforcing it.
     //
     // Resolved from `/proc/<pid1>/cgroup` rather than from a recorded path: the registry's `cgroup`
-    // field is empty for a box with no dedicated cgroup, which is precisely the case being reported
-    // on, and `box_cgroup_dir` refuses anything that is not one of kern's own leaves, so the ROOT
-    // cgroup answers `None` instead of being read as though it were the box's.
-    let box_dir = kern_isolation::box_cgroup_dir(b.pid1_recorded);
+    // field is empty for a box with no dedicated cgroup, which is precisely the case being reported on.
+    //
+    // THE BOX'S CGROUP WHOEVER NAMED IT, AND THE WHOLE CHAIN ABOVE IT. This used to read `memory.max`
+    // at a single level reached through `box_cgroup_dir`, which refuses any leaf kern did not name,
+    // and both halves cost a true answer. An independent host measured the first (2026-10-08): a
+    // detached `--memory 64m` box that kern could not place in a cgroup of its own left its PID 1 in
+    // the launcher's scope, so this answered `"memory_max_enforced": null` beside
+    // `"memory_max": 67108864` - and `null` is what `kern doctor` tells a reader means "nothing in
+    // force", on a reading that could not have told the two apart. The second is the mirror: an
+    // ANCESTOR's ceiling is the one the kernel enforces on a box whose own level says `max`, and it
+    // was invisible here. `memory_max_in_force` walks the chain the kernel walks.
+    //
+    // PINNED TO THE LIVE PID 1 (`live_pid1`, start-time checked) rather than the recorded number,
+    // because this now reads a cgroup kern does not own: a recycled pid would otherwise have this
+    // report a stranger's ceiling as the box's. `None` there answers exactly as a missing cgroup does.
+    let box_dir = b.live_pid1().and_then(kern_isolation::effective_cgroup_dir);
     let enforced_mem = box_dir
         .as_deref()
-        .and_then(|d| std::fs::read_to_string(d.join("memory.max")).ok())
-        .and_then(|v| v.trim().parse::<u64>().ok());
+        .and_then(kern_isolation::memory_max_in_force);
     // The limit the two numbers above cannot show: a `memory.high` on or above the box's cgroup that
     // the kernel applies before the cap. Same directory, so the three readings are about one box.
     let outer_mem_high = box_dir

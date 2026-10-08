@@ -2690,3 +2690,57 @@ fn recover_keeps_scratch_whose_creator_is_alive_and_removes_the_dead() {
     );
     let _ = std::fs::remove_dir_all(&runtime);
 }
+
+/// "NO IMAGES CACHED YET" SAYS WHETHER THAT IS THE WHOLE TRUTH.
+///
+/// MEASURED from a field report: `rm -rf` over the cache to free space took everything it could and
+/// stopped at the files a uid-mapped extraction had left owned by a subordinate uid, so the index was
+/// gone and 5.2 MB were not. `kern images` then said "no images cached yet", and `kern rmi` - whose
+/// own error sends the reader to `kern images` - said "no such image". Three true sentences
+/// composing into a false one, and the reader concluded the files were not kern's.
+///
+/// No box and no network: a directory under the images root is all the state this needs, which is
+/// also why the assertion is exact rather than a timing or a size range.
+#[test]
+fn an_empty_listing_names_bytes_in_the_cache_that_no_image_claims() {
+    let home = std::env::temp_dir().join(format!("kern-it-cachewreck-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let images = home.join("kern/images");
+    std::fs::create_dir_all(&images).expect("the images root");
+    let listing = |label: &str| -> String {
+        let out = kern()
+            .env("XDG_CACHE_HOME", &home)
+            .arg("images")
+            .output()
+            .unwrap_or_else(|e| panic!("{label}: run kern images: {e}"));
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // THE CONTROL FIRST: an images root that is really empty gets the plain sentence and no note.
+    let empty = listing("empty");
+    assert!(empty.contains("no images cached yet"), "{empty}");
+    assert!(
+        !empty.contains("no image claims"),
+        "an empty cache must not be accused of holding anything: {empty}"
+    );
+
+    // Now the wreck: a directory the listing cannot read as an image, holding bytes.
+    let orphan = images.join("node_22-alpine-deadbeefdeadbeef");
+    std::fs::create_dir_all(orphan.join("opt/yarn/lib")).expect("the orphan tree");
+    std::fs::write(orphan.join("opt/yarn/lib/cli.js"), vec![b'x'; 4096]).expect("some bytes");
+    let said = listing("wrecked");
+    assert!(said.contains("no images cached yet"), "{said}");
+    assert!(
+        said.contains("no image claims") && said.contains("gc --images"),
+        "the note must name the state and the tool that reclaims it: {said}"
+    );
+    assert!(
+        said.contains("1 entry"),
+        "one directory under the root is one entry, whatever it holds inside: {said}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -439,9 +439,28 @@ pub fn remove(name: &str) -> Result<(), crate::error::Error> {
     // DIRECTORY kern made; anything else at that name is reported, not walked.
     match std::fs::symlink_metadata(&dir) {
         Err(_) => {
-            return Err(crate::error::Error::NotRunning(format!(
-                "no kept box '{name}' (`kern ps -a` lists them; a box without `--keep` leaves nothing to remove)"
-            )))
+            // AND WHETHER `ps -a` IS SHOWING THAT NAME ANYWAY, because "no kept box 'x'" plus a
+            // pointer to `kern ps -a` reads as a contradiction when the reader can see a row called
+            // x there. A field report hit it after removing a kept layer from outside: the layer was
+            // gone, so there was no kept row, but the transient EXIT record was still in the
+            // registry and `ps -a` listed it in the exited section. Both sentences were true and
+            // together they said the opposite. Naming the section, and the verb that clears it, is
+            // the difference.
+            let exited = crate::registry::list_exited()
+                .into_iter()
+                .any(|e| e.name == name);
+            return Err(crate::error::Error::NotRunning(if exited {
+                format!(
+                    "no kept box '{name}': `kern ps -a` does list that name, in its EXITED section, \
+                     which is a transient record of a run and not a layer to remove - `kern gc` \
+                     clears those. `kern rm` removes a box started with `--keep`, and this one has \
+                     no layer left"
+                )
+            } else {
+                format!(
+                    "no kept box '{name}' (`kern ps -a` lists them; a box without `--keep` leaves nothing to remove)"
+                )
+            }));
         }
         Ok(m) if !m.is_dir() => {
             return Err(crate::error::Error::Sandbox(format!(

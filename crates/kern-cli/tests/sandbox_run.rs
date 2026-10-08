@@ -2663,6 +2663,130 @@ fn ps_json_carries_the_same_state_the_table_and_the_format_template_show() {
     let _ = fs::remove_dir_all(&xdg);
 }
 
+/// A DETACHED LAUNCHER'S STDERR MUST END WHEN THE LAUNCHER DOES, not when the box does.
+///
+/// Every caller that reads a detached start's output depends on this and none of them says so:
+/// `Command::output()` (this suite, and any script in any language) reads until EOF, which the kernel
+/// reports only when the LAST write end of that pipe is closed. So a descriptor on it held by the
+/// supervisor - which outlives the launcher by the box's whole lifetime - turns `kern box -d` into a
+/// command that never returns.
+///
+/// MEASURED, from the inside, on 2026-10-08: delivering the cap notices through a `dup` of the
+/// launcher's stderr did exactly that. 18 tests in this file stopped returning (they presented as
+/// unrelated failures and one 11-minute hang at the same test index), and `kern box -d -- sleep 60
+/// 2>&1 | cat` never printed EOF - `timeout 8` exited 124. The check that had passed before it was
+/// written with `2>/tmp/file`: a FILE has no EOF to wait for, so the defect was invisible to it.
+///
+/// ASKED OF THE DESCRIPTOR, NOT OF THE OUTPUT, and bounded: `poll` for `POLLHUP` on the read end
+/// after the launcher has exited. A test that called `output()` here would HANG on the regression
+/// instead of failing it, which is how this cost a suite run.
+#[test]
+fn a_detached_launchers_stderr_reaches_eof_while_the_box_is_still_running() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "eofhold");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-eofhold-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    let name = format!("eofhold-{}", std::process::id());
+
+    // A box that outlives this test by a wide margin, so "the pipe closed" can only mean the
+    // launcher's own descriptors went and not that the box happened to exit.
+    let mut child = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box",
+            &name,
+            "--rootfs",
+            rootfs,
+            "-d",
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "600",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn kern box -d");
+
+    let status = child.wait().expect("the launcher must return on its own");
+    let err_fd = {
+        use std::os::fd::AsRawFd;
+        child.stderr.as_ref().expect("piped stderr").as_raw_fd()
+    };
+
+    // Drain and wait for the hangup, with a budget. `POLLHUP` is the kernel saying every write end is
+    // gone; data still buffered shows up as `POLLIN` first, so the loop reads it away.
+    let mut hup = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut seen = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: err_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut pfd, 1, 200) };
+        if r < 0 {
+            continue;
+        }
+        if pfd.revents & libc::POLLIN != 0 {
+            let mut buf = [0u8; 1024];
+            let n = unsafe { libc::read(err_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                seen.extend_from_slice(&buf[..n as usize]);
+                continue;
+            }
+            hup = true; // read() == 0 IS end-of-file
+            break;
+        }
+        if pfd.revents & libc::POLLHUP != 0 {
+            hup = true;
+            break;
+        }
+    }
+    // The box is still alive: this is the control that makes the assertion about the DESCRIPTOR.
+    let ps = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["ps"])
+        .output()
+        .expect("kern ps");
+    let listed = String::from_utf8_lossy(&ps.stdout).contains(&name);
+
+    let _ = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["stop", &name])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+
+    let text = String::from_utf8_lossy(&seen);
+    if !status.success() && text.contains("user namespaces") {
+        eprintln!("skip: this host refuses the box ({})", text.trim());
+        return;
+    }
+    assert!(
+        status.success(),
+        "the launcher must exit 0 for a box that started: {text}"
+    );
+    assert!(
+        listed,
+        "the box must still be running while this asserts about the pipe - it was not listed"
+    );
+    assert!(
+        hup,
+        "the launcher exited but its stderr never reached EOF: something is holding a write end \
+         open for the box's lifetime, so every caller reading this output blocks. Last bytes: {text}"
+    );
+}
+
 #[test]
 fn box_detached_appears_in_ps_then_prunes() {
     let Some(busybox) = static_busybox() else {
@@ -14855,6 +14979,68 @@ fn a_layered_rebuild_reuses_the_steps_before_the_file_that_changed() {
 /// The mechanism under it was broken before: a second start on a persistent upper failed with
 /// `Permission denied`, because a used overlay workdir holds `work/work` at mode 000 and
 /// `remove_dir_all` cannot traverse it. Four runs, so the failure would show on the second.
+/// A BOX DOES NOT INHERIT THE SUPPLEMENTARY GROUPS OF WHOEVER TYPED `kern box`.
+///
+/// `set_user` clears them on every path that sets an identity; with no `--user` there was no such
+/// path, so the workload kept the caller's list. A field report read it off `id` inside a plain box:
+/// thirteen `65534(nobody)` entries beside `0(root)`, which are the caller's host groups seen
+/// through a map that does not contain them.
+///
+/// MEASURED BEFORE THE CHANGE, because the one thing those groups could have bought is access to a
+/// bind mount the caller reaches only through a group: a host file `----r----- alex:disk` mounted
+/// with `-v` was ALREADY refused inside the box with the groups in place. So the list granted
+/// nothing, and this asserts the box's identity does not depend on who started it.
+#[test]
+fn a_box_does_not_inherit_the_callers_supplementary_groups() {
+    if !a_box_can_start("groups") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    if !kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull")
+        .status
+        .success()
+    {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    // THE PREMISE: this process HAS supplementary groups, or the test proves nothing. `id -G` on the
+    // host is the control for the assertion below.
+    let mine = std::process::Command::new("id")
+        .arg("-G")
+        .output()
+        .expect("run id");
+    let mine: Vec<&str> = std::str::from_utf8(&mine.stdout)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    if mine.len() < 2 {
+        eprintln!("skip: this user has no supplementary groups, so there is nothing to inherit");
+        return;
+    }
+    for args in [
+        vec!["box", "--image", "alpine:3.19", "--", "id"],
+        vec!["box", "--image", "alpine:3.19", "--uid-range", "--", "id"],
+    ] {
+        let out = kern().args(&args).output().expect("run kern");
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.status.success() {
+            eprintln!("skip: a box does not start here: {said}");
+            return;
+        }
+        // `id` prints `groups=` only when there IS a supplementary list, so its absence is the
+        // assertion. `nobody` is what an unmapped host gid renders as, and is the shape the report
+        // showed, so it is named too.
+        assert!(
+            !said.contains("65534(nobody)"),
+            "{args:?}: the caller's host groups reached the box: {said}"
+        );
+        assert!(said.contains("uid=0(root) gid=0(root)"), "{args:?}: {said}");
+    }
+}
+
 #[test]
 fn a_kept_box_starts_again_on_the_layer_it_left_and_an_ordinary_box_does_not() {
     if !a_box_can_start("keep") {
@@ -15165,6 +15351,97 @@ fn twenty_concurrent_starts_of_one_kept_box_run_exactly_one() {
 /// The store is a 0700 directory of the user's own, so this is defence in depth rather than a
 /// boundary: it matters because the kept-box store is a sibling tree an operator may hand to a box
 /// on purpose, and a box given it could plant a link for a LATER `kern start` to write through.
+/// `kern rm` DOES NOT SEND THE READER TO A LISTING THAT CONTRADICTS IT.
+///
+/// MEASURED from a field report: a kept box's layer was removed from outside (a `rm -rf` of the data
+/// home), so there was no kept row left, but the transient EXIT record was still in the registry and
+/// `kern ps -a` listed that name in its exited section. `kern rm` then said "no kept box 'x'" and
+/// pointed at `kern ps -a` for the list. Both sentences were true and together they said the
+/// opposite, which is the defect class this project keeps finding in its own output.
+#[test]
+fn removing_a_name_that_ps_still_lists_as_exited_names_the_section() {
+    if !a_box_can_start("rmexited") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    if !kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull")
+        .status
+        .success()
+    {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    let home = std::env::temp_dir().join(format!("kern-it-rmexited-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).expect("data home");
+    let name = format!("itrmex{}", std::process::id());
+    let run = |args: &[&str]| -> (String, bool) {
+        let out = kern()
+            .env("XDG_DATA_HOME", &home)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.success(),
+        )
+    };
+    // A DETACHED box, because that is what leaves an exit record: a foreground one leaves none.
+    let (said, ok) = run(&[
+        "box",
+        &name,
+        "--image",
+        "alpine:3.19",
+        "--keep",
+        "-d",
+        "--",
+        "sh",
+        "-c",
+        "exit 0",
+    ]);
+    if !ok {
+        let _ = fs::remove_dir_all(&home);
+        eprintln!("skip: a detached box does not start here:\n{said}");
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // THE LAYER GOES AWAY AND THE EXIT RECORD STAYS, which is the state the report reached with an
+    // `rm -rf` of its data home. Reached here with kern's own verb instead, for a reason worth
+    // writing down: a used overlay workdir holds `work/work` at mode 000, which `remove_dir_all`
+    // cannot traverse, so the test's own cleanup silently left the layer in place and `kern rm`
+    // then succeeded - the first version of this test failed for that reason, not for kern's.
+    let (said, ok) = run(&["rm", &name]);
+    assert!(ok, "`kern rm` must remove the layer it made:\n{said}");
+    let (listed, _) = run(&["ps", "-a"]);
+    if !listed.contains(&name) {
+        let _ = fs::remove_dir_all(&home);
+        eprintln!("skip: the exit record was already reaped, so there is no contradiction to test");
+        return;
+    }
+    let (said, ok) = run(&["rm", &name]);
+    assert!(!ok, "there is no layer to remove:\n{said}");
+    assert!(
+        said.contains("EXITED section") && said.contains("kern gc"),
+        "the refusal must name the section the row is in and the verb that clears it:\n{said}"
+    );
+    // THE CONTROL: a name in no section at all keeps the plain sentence, or the new one would be
+    // telling every reader about an exit record that does not exist.
+    let (absent, ok) = run(&["rm", "itnosuchnameatall"]);
+    assert!(!ok);
+    assert!(
+        absent.contains("no kept box") && !absent.contains("EXITED section"),
+        "{absent}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_kept_layer_is_not_written_through_a_planted_symlink() {
     if !a_box_can_start("keepsym") {

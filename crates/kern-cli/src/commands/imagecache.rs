@@ -59,6 +59,18 @@ pub(crate) fn image_default_uid_range(args: &BoxRunArgs) -> bool {
 /// either way; what changes is whether kern spends a millisecond installing a mapping that the
 /// capability set makes unusable. An explicit `--uid-range`, `--user <non-root>` or `--ssh` asks for
 /// the range in as many words and wins over this, because those are requests and this is a default.
+///
+/// 🚨 THE RULE HAS A CONSUMER IT CANNOT SEE: `kern exec -u <non-root>`, which arrived after this was
+/// written. Every item in the list above is decided at START, and that one happens LATER, in another
+/// process, against a box whose map is already installed - so there is nothing to retrofit. A field
+/// report measured the consequence: `kern box b --cap-drop ALL -d` then `kern exec -u nobody b` is
+/// refused, because uid 65534 is not in `0 1000 1`. The same box with `--uid-range` works.
+///
+/// This is NOT fixed by widening the rule, because kern cannot know at start whether an `exec -u`
+/// will come, and installing the range for every cap-dropped box would charge the 985 us to the
+/// boxes that never exec. It is fixed where the reader meets it: `describe_id_map` names this cause
+/// when the box holds no capabilities, and `kern box --help` says so on both flags. If a third
+/// consumer appears, add it to this list first.
 fn range_buys_nothing(args: &BoxRunArgs) -> bool {
     let drops_all = matches!(args.security_profile, Some(SecurityProfile::Untrusted))
         || args.cap_drop.iter().any(|d| d.eq_ignore_ascii_case("ALL"));

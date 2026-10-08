@@ -153,6 +153,44 @@ fn glob_match(pattern: &str, subject: &str) -> bool {
     p[pi..].iter().all(|c| *c == b'*')
 }
 
+/// What a cache directory still holds when nothing in it can be LISTED: how many top-level entries
+/// no image claims, and the bytes under them.
+///
+/// A PURE FUNCTION OF A DIRECTORY, so the count can be driven by a test instead of being asserted
+/// against the one cache this machine happens to have. Built inline first, which is exactly the shape
+/// this codebase has been bitten by: a verdict assembled inside its own caller is not drivable, so it
+/// is not covered, and the arithmetic below was wrong on its first reading.
+///
+/// LOCK FILES ARE NOT ENTRIES. `<ref>.lock` is kern's own bookkeeping, zero bytes, and one exists per
+/// reference the cache has ever served. Counting them made the note say "2 entries" over a single
+/// leftover image directory, which sends a reader looking for a second thing that does not exist.
+/// Measured on a synthetic wreck (one rootfs dir plus its lock, index removed): 2 before, 1 after,
+/// with the byte figure unchanged - the bytes were always right, because a lock file holds none.
+fn orphan_cache_census(root: &std::path::Path) -> (usize, u64) {
+    let mut bytes = 0u64;
+    let mut entries = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            if dir == root && e.file_name().to_string_lossy().ends_with(".lock") {
+                continue; // kern's own bookkeeping, and it holds no bytes to reclaim
+            }
+            if dir == root {
+                entries += 1;
+            }
+            match e.metadata() {
+                Ok(m) if m.is_dir() => stack.push(e.path()),
+                Ok(m) => bytes += m.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    (entries, bytes)
+}
+
 pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) -> Result<(), Error> {
     // FILTERED ONCE, BEFORE EITHER RENDERER, so the human table and `--json` describe the same set
     // by construction - the property a script comparing the two would otherwise take on trust.
@@ -211,6 +249,29 @@ pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) ->
         // do not match `dangling=true` - it sends the reader to pull something they already have.
         if cache_empty {
             println!("no images cached yet - pull one with `kern pull <image>` (or `kern box <name> --image <image>`)");
+            // AND WHETHER THAT SENTENCE IS THE WHOLE TRUTH, which it was not once. A field report
+            // ran `rm -rf` over the cache to free space: the removal took everything it could and
+            // stopped at the files a uid-mapped extraction had left owned by a subordinate uid, so
+            // the index was gone and megabytes were not. Then `kern images` said "no images cached
+            // yet" with 5.2 MB on disk, and `kern rmi` - whose own error sends the reader HERE -
+            // said "no such image". Three true sentences that compose into a false one, and the
+            // reader concluded the files were not kern's.
+            //
+            // MEASURED IN THIS BRANCH, THE ONLY PATH THAT PAYS FOR IT. The walk runs when there is
+            // nothing to list, which is the rare case; a normal cache returns above this line and
+            // costs nothing. `gc --images` is named because it is the tool that reclaims exactly
+            // this, and it does: measured, 5.1M freed on the wreck above.
+            let root = cache_dir();
+            let (entries, bytes) = orphan_cache_census(&root);
+            if entries > 0 {
+                let what = if entries == 1 { "entry" } else { "entries" };
+                println!(
+                    "note: {} holds {entries} {what} ({}) that no image claims - a partial delete, \
+                     or a kern that was killed mid-pull. `kern gc --images` reclaims the cache",
+                    root.display(),
+                    kern_common::fmt_bytes(bytes)
+                );
+            }
         } else {
             let what: Vec<String> = filters.iter().map(|(k, v)| format!("{k}={v}")).collect();
             println!("no cached image matches {}", what.join(" "));
@@ -945,5 +1006,44 @@ mod glob_tests {
         // no tag" to whatever parses the line.
         assert!(render_image_format("{{.CreatedSince}}", &row("alpine")).is_err());
         assert!(render_image_format("{{.Repository}", &row("alpine")).is_err());
+    }
+
+    /// The census behind "N entries that no image claims", driven against a synthetic wreck rather
+    /// than against whatever this machine has cached.
+    ///
+    /// THE SHAPE IS THE ONE A PARTIAL DELETE LEAVES, which is how the sentence came to exist: the
+    /// index files (`.ok`, `.image`, `.size`) are gone and the extracted rootfs is not. The lock
+    /// file is kern's own and holds no bytes, so counting it inflated the number over a cache with
+    /// ONE leftover image - measured 2 before this, 1 after, same bytes.
+    #[test]
+    fn the_orphan_cache_census_counts_leftovers_and_not_kerns_own_locks() {
+        let root = std::env::temp_dir().join(format!("kern-census-{}-{:?}", std::process::id(), {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::thread::current().id().hash(&mut h);
+            h.finish()
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("alpine_3_19-abc/bin")).expect("synthetic cache");
+        std::fs::write(root.join("alpine_3_19-abc/bin/busybox"), vec![7u8; 1024]).unwrap();
+        std::fs::write(root.join("alpine_3_19-abc.lock"), b"").unwrap();
+
+        let (entries, bytes) = super::orphan_cache_census(&root);
+        assert_eq!(entries, 1, "one leftover image, not its lock as well");
+        assert_eq!(bytes, 1024, "the bytes come from under the leftover");
+
+        // A second leftover counts, and a second lock still does not.
+        std::fs::create_dir_all(root.join("debian_12-def")).unwrap();
+        std::fs::write(root.join("debian_12-def/rootfs.bin"), vec![1u8; 512]).unwrap();
+        std::fs::write(root.join("debian_12-def.lock"), b"").unwrap();
+        assert_eq!(super::orphan_cache_census(&root), (2, 1536));
+
+        // An empty cache has nothing to say, which is the branch that must stay silent.
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(super::orphan_cache_census(&root), (0, 0));
+        // And a directory that does not exist answers the same rather than failing.
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(super::orphan_cache_census(&root), (0, 0));
     }
 }

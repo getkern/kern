@@ -343,6 +343,10 @@ fn help_text(p: &crate::ui::Palette) -> String {
     -u, --user <u[:g]>  Run the box command as this user[:group], numeric or named in the image's /etc/passwd
     --cap-add <CAP>     Keep a capability kern would otherwise drop (e.g. NET_ADMIN, or ALL); repeatable
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
+                        `--cap-drop ALL` with no --cap-add ALSO drops the default uid RANGE: the
+                        range exists so a box can own files as another uid, which no capability
+                        makes possible anyway. Add --uid-range to keep it, which is what a later
+                        `kern exec -u <non-root>` needs
     --no-uid-range      Use the single-uid map (an --image box maps a uid RANGE by default)
     --stop-signal <s>   Signal sent before the SIGKILL on stop (name or number; default SIGTERM)
     --stop-timeout <n>  Seconds the workload gets to exit before the SIGKILL (default 10; skipped if its init has no handler for the signal)
@@ -363,8 +367,10 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         Also valid on `run`, where it is the only real confinement: it needs no
                         namespace. There it grants ONLY these paths (plus /dev/null and friends),
                         refuses if the kernel has no Landlock, and implies no-new-privs (no sudo)
-    --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data); default maps
-                        only the caller (faster + more isolated)
+    --uid-range         Map a sub-uid/gid range (needed for apt/dpkg, www-data, and for
+                        `kern exec -u <non-root>` later); an --image box maps it by DEFAULT, and
+                        this flag asks for it where the default is dropped: with --no-uid-range,
+                        on a host with no /etc/subuid entry, or with --cap-drop ALL
     --bind-rootfs       Bind --rootfs directly instead of an overlay, faster on kernels with a
                         slow overlayfs, but the source is mutable & shared (no per-box isolation)
     --privileged        Relax seccomp so a NESTED `kern box` (docker-in-docker style) can start,
