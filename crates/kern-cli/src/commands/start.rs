@@ -2511,6 +2511,54 @@ pub fn run(
         && (memory.is_some() || cpus.is_some())
         && crate::global_env("KERN_SCOPE").is_none()
     {
+        // FAIL CLOSED ON THE DIRECT PATH, exactly as `run_in_sandbox` does, and for the identical
+        // reason: when kern DELIBERATELY skipped the per-command systemd scope, the leaf it builds
+        // itself is the sole enforcer, so a `None` here means the cap the caller asked for binds
+        // NOWHERE. This verb governs resources and nothing else; accepting `--memory` and executing
+        // the command anyway is the one outcome it must not produce.
+        //
+        // MEASURED, and this is why it is a refusal and not a louder warning. 2026-10-09 20:20 on the
+        // maintainer's own desktop: `kern run --memory 16m -- sh -c 's=…; while :; do s=$s$s; done'`
+        // (a test's deliberately unbounded doubler, whose only brake is the cap). The leaf could not
+        // be created on that run, kern printed the warning below and executed the command, the shell
+        // grew to 25.5 GB in the cgroup it had inherited from the terminal, and the HOST's OOM killer
+        // took the largest process on the machine - the editor, with every session in it. The warning
+        // was printed and read by nobody, because the thing that would have read it was killed.
+        //
+        // GATED ON `--memory`, NOT ON WHICH PATH KERN TOOK. The first version of this refusal asked
+        // `took_direct_cap_path()`, mirroring the box, and the positive control killed it: on the
+        // maintainer's own delegated desktop that predicate is FALSE for this verb, so the refusal
+        // would not have fired on the very incident it was written for. The condition that matters
+        // is not how kern tried, it is that the caller NAMED a memory cap and nothing is holding it.
+        //
+        // `--cpus` alone does not qualify: an uncapped share makes a command slow, and slow does not
+        // take a machine down. Memory does. The refusal stays tied to the harm that was measured.
+        //
+        // AND THE KERNEL IS ASKED BEFORE REFUSING, the same correction `mandatory_caps_in_force`
+        // carries on the box path: `apply_limits` returning `None` says KERN wrote no cap, not that
+        // the command is uncapped. Inside an already-capped cgroup (a container, a scope with
+        // `MemoryMax=`) the ceiling binds without kern writing a byte, and refusing there would
+        // break a host where the cap demonstrably works. `None` as the directory because this verb
+        // `exec()`s the workload in place when it has no leaf of its own, so this process IS the
+        // subject and `/proc/self/cgroup` is the right chain.
+        //
+        // A bare `kern run` with no `--memory` keeps today's best-effort behaviour and its notice,
+        // and `KERN_ALLOW_UNCAPPED=1` runs anyway for a caller who means it.
+        let memory_unheld =
+            memory.is_some_and(|m| !kern_isolation::memory_cap_in_force_at_or_below(None, m));
+        if memory_unheld && !kern_common::env_flag("KERN_ALLOW_UNCAPPED") {
+            return Err(Error::Sandbox(format!(
+                "--memory was requested and nothing here enforces it: kern could not place this \
+                 command in a cgroup that carries the cap ({}), and no ancestor cgroup holds it to \
+                 that ceiling either. Refusing to run UNCAPPED, because a command that outgrows the \
+                 cap it asked for takes the HOST down with it - measured on 2026-10-09, a shell that \
+                 should have died at 16 MiB reached 25.5 GB and the kernel's OOM killer took the \
+                 largest process on the machine instead. `kern doctor` names the one local change \
+                 that would make a cap bind here; KERN_ALLOW_UNCAPPED=1 says an uncapped run is \
+                 intended and runs it.",
+                kern_isolation::missing_manager_clause()
+            )));
+        }
         eprintln!(
             "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
              delegation unavailable) - the command runs UNCAPPED."

@@ -11347,6 +11347,19 @@ fn a_kern_run_killed_by_its_own_cap_reports_the_oom() {
     }
     // A HEAP HOG WITH NO INTERPRETER, so the test does not depend on python being installed: `sh`
     // grows a shell variable, which is an ordinary heap allocation charged to the cgroup.
+    //
+    // ⛔ `ulimit -v` FIRST, AND IT IS NOT BELT AND BRACES. The loop doubles its string forever, so
+    // the ONLY thing that ends it is a limit; writing it with the cgroup as that limit made the
+    // test's safety depend on the very thing it is testing. MEASURED on 2026-10-09 at 20:20: on one
+    // run the cap did not bind, `kern run` warned and executed anyway, this shell reached 25.5 GB in
+    // the cgroup it had inherited from the terminal, and the HOST's OOM killer took the largest
+    // process on the machine - the maintainer's editor, with every session in it.
+    //
+    // 256 MiB of address space is far above the 16 MiB cgroup cap, so where the cap binds the cgroup
+    // still kills first and this test measures exactly what it measured before. Where the cap does
+    // NOT bind, the shell dies at 256 MiB with a non-137 status and the guard below SKIPS, which is
+    // the honest outcome: nothing to assert, and no crater. kern itself now refuses that start, so
+    // this is the second of two independent stops rather than the only one.
     let out = kern()
         .args([
             "run",
@@ -11355,7 +11368,7 @@ fn a_kern_run_killed_by_its_own_cap_reports_the_oom() {
             "--",
             "sh",
             "-c",
-            "s=xxxxxxxxxxxxxxxx; while :; do s=$s$s; done",
+            "ulimit -v 262144; s=xxxxxxxxxxxxxxxx; while :; do s=$s$s; done",
         ])
         .output()
         .expect("run kern");
