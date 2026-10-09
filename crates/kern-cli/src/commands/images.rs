@@ -161,11 +161,13 @@ fn glob_match(pattern: &str, subject: &str) -> bool {
 /// this codebase has been bitten by: a verdict assembled inside its own caller is not drivable, so it
 /// is not covered, and the arithmetic below was wrong on its first reading.
 ///
-/// LOCK FILES ARE NOT ENTRIES. `<ref>.lock` is kern's own bookkeeping, zero bytes, and one exists per
-/// reference the cache has ever served. Counting them made the note say "2 entries" over a single
-/// leftover image directory, which sends a reader looking for a second thing that does not exist.
-/// Measured on a synthetic wreck (one rootfs dir plus its lock, index removed): 2 before, 1 after,
-/// with the byte figure unchanged - the bytes were always right, because a lock file holds none.
+/// KERN'S OWN BOOKKEEPING IS NOT AN ENTRY. `<ref>.lock` (zero bytes, one per reference the cache has
+/// ever served) and `<ref>.size` (a cached figure, written by LISTING the image - measured while
+/// testing this) are kern's, not leftovers a reader should go looking for. Counting them made the
+/// note say "2 entries" over a single leftover image directory. Measured on a synthetic wreck: 2
+/// before, 1 after, with the byte figure unchanged, because neither file holds bytes worth
+/// reclaiming. `.ok` and `.image` are deliberately NOT excluded: when those exist the entry is
+/// listable and this function is not reached.
 fn orphan_cache_census(root: &std::path::Path) -> (usize, u64) {
     let mut bytes = 0u64;
     let mut entries = 0usize;
@@ -175,7 +177,10 @@ fn orphan_cache_census(root: &std::path::Path) -> (usize, u64) {
             continue;
         };
         for e in rd.flatten() {
-            if dir == root && e.file_name().to_string_lossy().ends_with(".lock") {
+            if dir == root && {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.ends_with(".lock") || n.ends_with(".size")
+            } {
                 continue; // kern's own bookkeeping, and it holds no bytes to reclaim
             }
             if dir == root {
@@ -189,6 +194,41 @@ fn orphan_cache_census(root: &std::path::Path) -> (usize, u64) {
         }
     }
     (entries, bytes)
+}
+
+/// The sentence `kern rmi` adds to "no such image" when the cache holds bytes that no name can
+/// remove, and the empty string otherwise.
+///
+/// ONLY WHEN THE CACHE LISTS NOTHING, which is [`orphan_cache_census`]'s own premise rather than a
+/// detail: "entries that no image claims" is true of everything in the directory exactly when
+/// nothing in it can be listed. My own negative control caught the first version doing it
+/// unconditionally - against a healthy cache it reported `187 entries (6.5G) that no image claims`
+/// about 187 perfectly good images, because the count is of the DIRECTORY and the claim is about the
+/// INDEX. A cache that does list images needs per-image accounting to answer the same question, and
+/// that is `kern gc`'s job, not this error's.
+///
+/// WHY `rmi` SAYS IT AT ALL. Its own error sends the reader to `kern images`, which since this round
+/// explains a cache whose index a partial delete removed. The two surfaces then disagreed about one
+/// cache: the listing named the leftover bytes and `kern rmi` still answered only "no such image".
+/// Reported by an independent host.
+fn unclaimed_cache_note(cache: &std::path::Path) -> String {
+    if !image_entries_in(cache, crate::listing::Detail::Read)
+        .0
+        .records
+        .is_empty()
+    {
+        return String::new();
+    }
+    let (orphans, bytes) = orphan_cache_census(cache);
+    if orphans == 0 {
+        return String::new();
+    }
+    format!(
+        ". That cache also holds {orphans} {} ({}) that no image claims, which no name can remove: \
+         `kern gc --images` reclaims them",
+        if orphans == 1 { "entry" } else { "entries" },
+        kern_common::fmt_bytes(bytes)
+    )
 }
 
 pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) -> Result<(), Error> {
@@ -373,8 +413,15 @@ pub fn image_rm(refs: &[String]) -> Result<(), Error> {
         }
     }
     if !missing.is_empty() {
+        // AND WHETHER "NO SUCH IMAGE" IS THE WHOLE TRUTH, which is the same question `kern images`
+        // answers in its empty branch. A partial delete leaves bytes with no index: there is nothing
+        // to remove BY NAME and there is something to reclaim, and sending the reader to `kern images`
+        // used to be the end of it - that listing now explains the situation while this error did not,
+        // so the two surfaces disagreed about one cache. Reported by an independent host.
+        //
+        let note = unclaimed_cache_note(&cache);
         return Err(Error::Oci(format!(
-            "no such image: {} - `kern images` lists cached images",
+            "no such image: {} - `kern images` lists cached images{note}",
             missing.join(", ")
         )));
     }
@@ -1027,9 +1074,12 @@ mod glob_tests {
         std::fs::create_dir_all(root.join("alpine_3_19-abc/bin")).expect("synthetic cache");
         std::fs::write(root.join("alpine_3_19-abc/bin/busybox"), vec![7u8; 1024]).unwrap();
         std::fs::write(root.join("alpine_3_19-abc.lock"), b"").unwrap();
+        // Written by LISTING the image, so a wreck that was ever listed carries one. Measured: it
+        // made this count say 2 over one leftover.
+        std::fs::write(root.join("alpine_3_19-abc.size"), b"7340032").unwrap();
 
         let (entries, bytes) = super::orphan_cache_census(&root);
-        assert_eq!(entries, 1, "one leftover image, not its lock as well");
+        assert_eq!(entries, 1, "one leftover image, not kern's own sidecars");
         assert_eq!(bytes, 1024, "the bytes come from under the leftover");
 
         // A second leftover counts, and a second lock still does not.
@@ -1045,5 +1095,48 @@ mod glob_tests {
         // And a directory that does not exist answers the same rather than failing.
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(super::orphan_cache_census(&root), (0, 0));
+    }
+
+    /// `kern rmi`'s extra sentence, and the PREMISE that decides whether it may be said at all.
+    ///
+    /// The first version said it unconditionally, and my own negative control against a healthy
+    /// cache reported `187 entries (6.5G) that no image claims` about 187 good images. So the
+    /// listable case is the one this test exists for; the other two only pin the message.
+    #[test]
+    fn rmi_names_unclaimed_bytes_only_when_the_cache_lists_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "kern-rminote-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 1. A cache that LISTS an image says nothing extra, even though the directory is full.
+        //    `cache_entry_complete` wants `<ref>.ok` + `<ref>.image` + a dir with no `.kern-*` blob.
+        std::fs::create_dir_all(root.join("alpine_3_19-abc")).expect("synthetic cache");
+        std::fs::write(root.join("alpine_3_19-abc/rootfs.bin"), vec![3u8; 2048]).unwrap();
+        std::fs::write(root.join("alpine_3_19-abc.ok"), b"").unwrap();
+        std::fs::write(root.join("alpine_3_19-abc.image"), b"{}").unwrap();
+        assert_eq!(
+            super::unclaimed_cache_note(&root),
+            "",
+            "a cache that lists an image must not have its own images called unclaimed"
+        );
+
+        // 2. The partial-delete shape: index gone, bytes left. Now it names them.
+        std::fs::remove_file(root.join("alpine_3_19-abc.ok")).unwrap();
+        std::fs::remove_file(root.join("alpine_3_19-abc.image")).unwrap();
+        let note = super::unclaimed_cache_note(&root);
+        assert!(
+            note.contains("1 entry") && note.contains("kern gc --images"),
+            "must name the one leftover and the verb that reclaims it: {note}"
+        );
+
+        // 3. An empty cache, and a cache that is not there, say nothing.
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(super::unclaimed_cache_note(&root), "");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(super::unclaimed_cache_note(&root), "");
     }
 }

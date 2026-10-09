@@ -4911,12 +4911,27 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
         // ANY path (best-effort included), BEFORE the warn-and-run fall-through below, so a workload
         // that depends on the ceiling never starts believing it is capped when it is not.
         if spec.require_limits && !caps_already_bound {
+            // THE CAUSE THIS PATH ALREADY KNOWS, said before the refusal, because the error type
+            // carries a fixed string and the cause is measured per host. Same shape as the
+            // `memory.high` refusal above, for the same reason.
+            //
+            // An independent host reported why this matters: on a WSL2 machine whose cgroup
+            // delegation works, the refusal below used to advise adding `cgroup_enable=memory` to
+            // the kernel command line "on WSL2 or a Raspberry Pi". The real cause there was an
+            // `XDG_RUNTIME_DIR` pointing away from the live user manager, which the warning path
+            // names exactly and the refusal path did not, so the reader was sent to edit a boot
+            // configuration that was already correct. The remedy is no longer asserted here at all:
+            // it is per host, `kern doctor` chooses it from what this host can actually do, and this
+            // names the fact instead.
+            crate::cgroup::cap_notice(&format!(
+                "kern: --require-limits: the requested cap(s) are not in force here - {}",
+                crate::cgroup::missing_manager_clause()
+            ));
             return Err(Error::Unsupported(
                 "requested resource cap(s) could not be enforced here and --require-limits \
-                 (KERN_REQUIRE_LIMITS) is set: refusing to start. Ways out: run inside a systemd user \
-                 scope, or on a host that delegates the cgroup v2 memory/pids controllers (`kern \
-                 doctor` shows the state; on WSL2 or a Raspberry Pi add `cgroup_enable=memory` to the \
-                 kernel command line); or, to accept uncapped operation, drop --require-limits and pass \
+                 (KERN_REQUIRE_LIMITS) is set: refusing to start. The line above names what failed \
+                 on this host, and `kern doctor` names the one local change that would make a cap \
+                 bind here; or, to accept uncapped operation, drop --require-limits and pass \
                  --allow-uncapped in its place (the two are mutually exclusive, not additive).",
             ));
         }

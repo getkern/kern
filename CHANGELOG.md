@@ -54,7 +54,9 @@ both halves of that rule, so removing one from the parser fails the build by nam
   under a 64 MiB request); it is reproduced in this repo's own tests. The notices now go to both, and
   the log keeps its copy. `--allow-uncapped` and `KERN_QUIET` silence them exactly as before -
   the second copy is the same sentence, gated at the same place - and `--require-limits` still
-  refuses to start, where the line now also appears once above the error that quotes the log.
+  refuses to start, where the notice appears once, inside the log the error quotes, rather than
+  twice. That refusal now also names the measured cause (which `XDG_RUNTIME_DIR`, or which missing
+  manager) instead of a remedy chosen for a host it may not be on.
 - `kern inspect --json` no longer reports `"memory_max_enforced": null` for a box the kernel does
   cap. The field read `memory.max` at ONE level, reached through the gate that decides which cgroups
   kern may `rmdir` or `cgroup.kill`, so it had two blind spots: a box kern could not place in a
