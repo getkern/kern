@@ -895,7 +895,58 @@ fn user_manager_reachable() -> bool {
         // Without XDG_RUNTIME_DIR, `systemd-run --user` cannot locate the manager either: best-effort.
         return false;
     };
-    unix_socket_live(&xdg.join("systemd/private"))
+    manager_live_under(&xdg)
+}
+
+/// Is the user manager reachable through the runtime directory `xdg` - by EITHER door `systemd-run`
+/// can use?
+///
+/// THE PRIVATE SOCKET ALONE WAS NOT THE PREDICATE IT CLAIMED TO BE, and the cost was measured on the
+/// maintainer's own desktop on 2026-10-09. There `/run/user/1000/systemd/private` answers
+/// ECONNREFUSED (the file is present, nothing accepts on it) while the manager is alive - pid 2164,
+/// `/usr/lib/systemd/systemd --user`, in its own `user@1000.service/init.scope` - the session bus is
+/// live, and `systemd-run --user --scope -- true` exits 0. So the docstring above is right that
+/// systemd-run prefers the private socket and right that a live one proves the manager, and wrong
+/// that its absence of a LISTENER means systemd-run cannot reach the manager: it falls back to the
+/// bus. kern concluded "no user manager", declined both cap paths, and ran `kern run --memory 16m`
+/// with no cap at all. A test's unbounded allocator then reached 25.5 GB and the host's OOM killer
+/// took the largest process on the machine.
+///
+/// THE BUS IS NOT ACCEPTED ON ITS OWN, because that is the regression this probe was written to
+/// avoid and that reasoning still holds: on a `dbus-launch` session with no `systemd --user` (some CI
+/// images) the bus connects, `systemd-run` then fails to find a manager, and the re-exec has already
+/// replaced kern, so the box dies with no fallback. The second half of the test is what that host
+/// lacks and this one has: the manager's own process, proven by the cgroup systemd itself puts it in.
+/// A populated `cgroup.procs` cannot be stale - a cgroup holds pids only while they live.
+fn manager_live_under(xdg: &std::path::Path) -> bool {
+    manager_live_from(
+        unix_socket_live(&xdg.join("systemd/private")),
+        unix_socket_live(&xdg.join("bus")),
+        // Asked only when it can change the answer: the private socket already decides the common
+        // host, and this is a file read rather than a connect.
+        user_manager_process_runs,
+    )
+}
+
+/// The rule alone, as a function of the three facts, so a test can drive all eight combinations
+/// instead of the one this machine happens to be in. The two that matter are opposite corners: a
+/// refusing private socket with a live bus and a running manager must be REACHABLE (the maintainer's
+/// desktop on 2026-10-09, where `systemd-run --user --scope` exits 0), and a live bus with NO
+/// manager must NOT be (the `dbus-launch` CI image, where committing to `systemd-run` kills the box
+/// after the re-exec has replaced kern).
+fn manager_live_from(private_live: bool, bus_live: bool, manager_runs: impl Fn() -> bool) -> bool {
+    private_live || (bus_live && manager_runs())
+}
+
+/// Is `systemd --user` RUNNING for this uid, read from the cgroup systemd puts it in
+/// (`user@<uid>.service/init.scope`)? One read of one file, no bus round-trip, and it answers the
+/// half of [`manager_live_under`] that a bare session bus cannot.
+fn user_manager_process_runs() -> bool {
+    let uid = unsafe { libc::getuid() };
+    let procs = PathBuf::from(CGROUP_V2_MOUNT).join(format!(
+        "user.slice/user-{uid}.slice/user@{uid}.service/init.scope/cgroup.procs"
+    ));
+    fs::read_to_string(procs).is_ok_and(|s| s.split_whitespace().next().is_some())
 }
 
 /// WHY there is no user manager to delegate a cap through, on THIS host - the clause the uncapped
@@ -913,14 +964,16 @@ pub fn missing_manager_clause() -> String {
         return "this host does not run systemd (`/run/systemd/system` is absent)".into();
     }
     let uid = unsafe { libc::getuid() };
-    let standard_live =
-        unix_socket_live(&PathBuf::from(format!("/run/user/{uid}/systemd/private")));
+    // THE SAME PREDICATE THE DECISION USES, which is the property this clause promises above: a
+    // sentence saying "nothing is listening" over a host where kern just took the scope path would
+    // be the contradiction this function exists to prevent. It said exactly that on 2026-10-09,
+    // because it asked only the private socket while `manager_live_under` now also accepts the bus
+    // plus a running manager.
+    let standard_live = manager_live_under(&PathBuf::from(format!("/run/user/{uid}")));
     let xdg = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|d| !d.as_os_str().is_empty());
-    let xdg_live = xdg
-        .as_ref()
-        .is_some_and(|d| unix_socket_live(&d.join("systemd/private")));
+    let xdg_live = xdg.as_ref().is_some_and(|d| manager_live_under(d));
     missing_manager_clause_from(uid, xdg, xdg_live, standard_live)
 }
 
@@ -4869,6 +4922,34 @@ mod tests {
             "a notice after the disarm reaches nobody"
         );
         unsafe { libc::close(rd) };
+    }
+
+    /// Every combination of the three facts behind "can `systemd-run --user` reach the manager?",
+    /// because the host a developer runs on is only ever ONE of them and both wrong answers are
+    /// expensive: a false NO runs the workload with no cap at all (measured 2026-10-09: 25.5 GB and
+    /// the host's OOM killer taking the largest process on the machine), a false YES commits to a
+    /// `systemd-run` that cannot work, after the re-exec has already replaced kern.
+    #[test]
+    fn the_user_manager_is_reachable_by_either_door_but_never_by_a_bus_alone() {
+        let yes = || true;
+        let no = || false;
+        // The private socket decides on its own, whatever the bus says: a live listener on the
+        // manager's own control socket IS the manager.
+        assert!(manager_live_from(true, false, no));
+        assert!(manager_live_from(true, true, no));
+        // THE MAINTAINER'S DESKTOP: private refuses, bus is live, the manager is running.
+        assert!(
+            manager_live_from(false, true, yes),
+            "a refusing private socket must not hide a manager systemd-run reaches on the bus"
+        );
+        // THE `dbus-launch` CI IMAGE: a bus with no manager behind it must stay a NO.
+        assert!(
+            !manager_live_from(false, true, no),
+            "a live bus alone must never commit kern to a systemd-run that will fail"
+        );
+        // Nothing reachable, and the degenerate rest.
+        assert!(!manager_live_from(false, false, yes));
+        assert!(!manager_live_from(false, false, no));
     }
 
     #[test]
