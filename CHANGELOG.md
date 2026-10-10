@@ -21,6 +21,32 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**`kern run --memory` REFUSES where it used to warn and run, and this one leads because it can stop
+a command that worked yesterday.** The verb governs resources and nothing else, and it was accepting
+a cap it could not apply: it printed "the command runs UNCAPPED" and executed the command anyway. A
+test doing `kern run --memory 16m -- sh -c 's=x; while :; do s=$s$s; done'` - a doubler whose only
+brake is the cap - then reached 25.5 GB on a maintainer's desktop and the kernel's OOM killer took
+the largest process on the machine, which was the editor, with every session in it. It now refuses,
+and only when `--memory` was named and no ceiling at or below it can be PROVEN: an ancestor cgroup
+that really caps is read and accepted, a container with a cgroup namespace is read through its own
+`/sys/fs/cgroup/memory.max`, and `--cpus` alone never refuses, because an unenforced share makes a
+command slow and slow does not take a host down. `KERN_ALLOW_UNCAPPED=1` runs anyway; a bare
+`kern run` with no cap flags is unchanged. If a host of yours starts refusing, `kern doctor` names
+the local change that would make a cap bind there, and the refusal names the cause it measured.
+
+- Caps now bind on a host whose `$XDG_RUNTIME_DIR/systemd/private` refuses connections while the
+  user manager is alive. kern asked that socket alone whether `systemd-run --user` could reach the
+  manager; where it answers ECONNREFUSED but the session bus is live and `systemd --user` is
+  running, kern concluded there was no manager, declined both cap paths, and applied no cap at all -
+  silently, every time, on an ordinary delegated desktop. The probe now accepts a second door, the
+  session bus TOGETHER with the manager's own process read from the cgroup systemd puts it in; the
+  bus alone is still refused, because a `dbus-launch` session with no manager would send kern into a
+  `systemd-run` that fails after it has replaced itself. `kern doctor` inherited the fix: it had been
+  showing a green "caps enforced" row on a host where `kern run --memory` enforced nothing.
+- kern no longer calls a command UNCAPPED when the ceiling is proven. Inside a container with a
+  cgroup namespace and a real `memory.max`, `kern run --memory 64m` correctly ran and then said it
+  was running uncapped: "kern wrote no cgroup of its own" is not the same fact as "nothing caps this
+  command", and the two sentences disagreed about one command.
 - `kern exec -u <user>[:<group>]` runs the command as that account of the box, a name or a number,
   where `kern exec` could only be box root. The name is looked up in the box's own `/etc/passwd` and
   `/etc/group` as they are when the command runs, so an account created inside the box is found, and
