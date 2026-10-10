@@ -2623,7 +2623,8 @@ pub(crate) fn proxy_child_to_exit(
             if b > a {
                 eprintln!(
                     "kern: the workload was killed by the kernel's OOM killer, which fired in \
-                     kern's cgroup while it ran. A box gets a memory cap it cannot exceed; raise it \
+                     kern's cgroup while it ran. The command was given a memory cap it cannot \
+                     exceed; raise it \
                      with `--memory <size>` (or `memory = \"<size>\"` in a vcpu: profile) if the \
                      workload needs more. On a device with unified memory, GPU allocations count \
                      against the same cap."

@@ -3608,9 +3608,66 @@ pub fn memory_cap_proven_at_or_below(bytes: u64) -> bool {
 /// at the live mount by [`in_tree`] and is exercised on a host rather than in a synthetic tree.
 fn memory_cap_proven_under(root: &Path, own: Option<&Path>, bytes: u64) -> bool {
     match own {
-        Some(d) => memory_capped_at_or_below(d, bytes),
-        None => read_limit_bytes(&root.join("memory.max")).is_some_and(|m| m <= bytes),
+        Some(d) => in_tree(d, |dir| {
+            effective_ceiling_at(dir).is_some_and(|c| c <= bytes)
+        }),
+        None => effective_ceiling_at(root).is_some_and(|c| c <= bytes),
     }
+}
+
+/// How much memory a workload at `dir` can actually consume: `memory.max` PLUS whatever swap that
+/// level allows. `None` when no ceiling at all can be stated for it.
+///
+/// SWAP IS PART OF THE CEILING, and leaving it out made the proof weaker than the cap it stands in
+/// for. kern's own cap writes `memory.swap.max = 0` (swap off, so `--memory` is a hard total), so an
+/// ancestor accepted INSTEAD of writing that cap has to be at least as strong. MEASURED by an
+/// independent reviewer on 2026-10-10: a scope with `MemoryMax=48M` and systemd's default
+/// `memory.swap.max=max` was accepted as proof of a 64 MiB request, and a command that asked for
+/// 64 MiB allocated 100 MB and exited 0 - `memory.peak` 50331648 and `memory.swap.peak` 63635456 on
+/// that scope, `oom_kill 0`. Smaller than the 25.5 GB incident and the same class: the verdict
+/// claimed a bound the kernel was not holding.
+///
+/// AN UNBOUNDED `memory.swap.max` MAKES THE LEVEL UNPROVABLE rather than merely looser, because the
+/// swap it opens is the host's, not a number this level states. The one exception is a host with no
+/// swap at all, where there is nothing to swap INTO and `memory.max` is the whole ceiling: without
+/// that case, every swapless host would start refusing a cap that binds perfectly.
+///
+/// `read_limit_bytes` answers `None` for both `max` and an absent file, which are the same thing
+/// here: neither states a swap ceiling.
+fn effective_ceiling_at(dir: &Path) -> Option<u64> {
+    effective_ceiling_from(
+        read_limit_bytes(&dir.join("memory.max")),
+        read_limit_bytes(&dir.join("memory.swap.max")),
+        host_swap_total(),
+    )
+}
+
+/// The arithmetic alone, as a function of the three facts, so a test can drive the swapless host
+/// this machine is not. Separated for the reason the rest of this file separates its verdicts: a
+/// rule assembled inside its reader is a rule no test can fail.
+fn effective_ceiling_from(mem: Option<u64>, swap: Option<u64>, host_swap: u64) -> Option<u64> {
+    let mem = mem?;
+    match swap {
+        Some(s) => Some(mem.saturating_add(s)),
+        None if host_swap == 0 => Some(mem),
+        None => None,
+    }
+}
+
+/// The host's `SwapTotal` in bytes, 0 when it cannot be read. Only consulted when a level leaves
+/// `memory.swap.max` unbounded, which is the one case where "is there any swap to take" decides
+/// whether `memory.max` is the whole ceiling.
+fn host_swap_total() -> u64 {
+    fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("SwapTotal:"))
+                .and_then(|v| v.split_whitespace().next().map(str::to_string))
+        })
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb.saturating_mul(1024))
+        .unwrap_or(0)
 }
 
 /// Warn for every cap the caller ASKED for that nothing in this process's cgroup chain enforces.
@@ -5019,14 +5076,28 @@ mod tests {
         // `max` is not a ceiling.
         fs::write(root.join("memory.max"), "max\n").unwrap();
         assert!(!memory_cap_proven_under(&root, None, 16 * mib));
-        // A namespace root that DOES cap, at or below the request: proven, so do not refuse.
+        // A `memory.max` ALONE is not a ceiling on a host that HAS swap, and this assertion is the
+        // one the swap-blind version of this test got wrong. No `memory.swap.max` is written here on
+        // purpose: that is the shape a level has before anyone sets one, and systemd's default.
         fs::write(root.join("memory.max"), "8388608\n").unwrap();
+        assert_eq!(
+            memory_cap_proven_under(&root, None, 16 * mib),
+            host_swap_total() == 0,
+            "memory.max with unbounded swap proves a ceiling only where there is no swap to take"
+        );
+        // A root that caps BOTH, at or below the request: proven, so do not refuse. This is what
+        // kern writes for itself and what a container started with a memory limit carries.
+        fs::write(root.join("memory.swap.max"), "0\n").unwrap();
         assert!(memory_cap_proven_under(&root, None, 16 * mib));
         fs::write(root.join("memory.max"), "16777216\n").unwrap();
         assert!(
             memory_cap_proven_under(&root, None, 16 * mib),
             "equal counts"
         );
+        // Swap pushes the same level over the request: 16m of RAM plus 8m of swap is not 16m.
+        fs::write(root.join("memory.swap.max"), "8388608\n").unwrap();
+        assert!(!memory_cap_proven_under(&root, None, 16 * mib));
+        fs::write(root.join("memory.swap.max"), "0\n").unwrap();
         // A ceiling LOOSER than the request does not satisfy it: the caller asked for 16m.
         fs::write(root.join("memory.max"), "67108864\n").unwrap();
         assert!(!memory_cap_proven_under(&root, None, 16 * mib));
@@ -5039,6 +5110,37 @@ mod tests {
         // warning, measured wrong for a refusal.
         assert!(memory_cap_in_force_at_or_below(None, 16 * mib) || own_cgroup_dir().is_some());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The ceiling a level really states, including the swap it opens.
+    ///
+    /// An external reviewer measured what leaving swap out cost: a scope with `MemoryMax=48M` and
+    /// systemd's default `memory.swap.max=max` was accepted as proof of a 64 MiB request, and the
+    /// command allocated 100 MB and exited 0 (`memory.peak` 50331648, `memory.swap.peak` 63635456 on
+    /// that scope, `oom_kill 0`). kern's own cap writes `swap.max = 0`, so an ancestor accepted in
+    /// its place has to be at least as strong.
+    #[test]
+    fn a_levels_ceiling_is_its_memory_plus_the_swap_it_opens() {
+        let m = |n: u64| Some(n * 1024 * 1024);
+        let swapful = 2 * 1024 * 1024 * 1024;
+        // Swap off: `memory.max` is the whole ceiling, which is what kern writes for itself.
+        assert_eq!(effective_ceiling_from(m(48), Some(0), swapful), m(48));
+        // A bounded swap allowance ADDS to it.
+        assert_eq!(effective_ceiling_from(m(48), m(8), swapful), m(56));
+        // Unbounded swap on a host that HAS swap states no ceiling at all: the room it opens is the
+        // host's, not this level's. This is the reviewer's case.
+        assert_eq!(effective_ceiling_from(m(48), None, swapful), None);
+        // ... but on a swapless host there is nothing to swap into, so `memory.max` stands. Without
+        // this, every swapless host would start refusing a cap that binds perfectly.
+        assert_eq!(effective_ceiling_from(m(48), None, 0), m(48));
+        // No memory ceiling: nothing to state, whatever swap says.
+        assert_eq!(effective_ceiling_from(None, Some(0), 0), None);
+        assert_eq!(effective_ceiling_from(None, None, 0), None);
+        // And the sum cannot wrap into a small, satisfying-looking number.
+        assert_eq!(
+            effective_ceiling_from(Some(u64::MAX), Some(u64::MAX), swapful),
+            Some(u64::MAX)
+        );
     }
 
     #[test]

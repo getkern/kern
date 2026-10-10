@@ -2577,9 +2577,14 @@ pub fn run(
         // unenforced share is still worth saying out loud.
         let memory_proven = memory.is_some() && !memory_unheld;
         if !memory_proven || cpus.is_some() {
+            // THE CAUSE THIS PATH ALREADY MEASURED, not a fixed clause. A reviewer read
+            // "cgroup delegation unavailable" on a host whose delegation works perfectly - the real
+            // cause there was an `XDG_RUNTIME_DIR` pointing away from the live manager, which the
+            // `--memory` refusal names exactly and this line did not.
             eprintln!(
-                "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
-                 delegation unavailable) - the command runs UNCAPPED."
+                "kern: warning: requested resource cap(s) could not be enforced here - {} - the \
+                 command runs UNCAPPED.",
+                kern_isolation::missing_manager_clause()
             );
         }
     } else if kern_common::env_flag("KERN_SCOPE") {
@@ -2648,16 +2653,16 @@ pub fn run(
                 "kern: warning: KERN_NO_SCOPE skipped the systemd scope, and with it kern's DEFAULT \
                  memory cap - this command runs with no RAM ceiling and no OOM backstop, in the \
                  cgroup of whatever started it. Unset KERN_NO_SCOPE to get the default back, pass an \
-                 explicit `--memory <size>` (applied best-effort on this path), or set \
-                 KERN_ALLOW_UNCAPPED=1 to say the uncapped run is intended and silence this."
+                 explicit `--memory <size>` (which REFUSES to run rather than go uncapped here), \
+                 or set KERN_ALLOW_UNCAPPED=1 to say the uncapped run is intended and silence this."
             );
         } else {
             eprintln!(
                 "kern: warning: this host could not give the command a memory cgroup, so kern's \
                  DEFAULT memory cap is not in force - it runs with no RAM ceiling and no OOM \
                  backstop, in the cgroup of whatever started it. `kern doctor` reports which part is \
-                 missing; an explicit `--memory <size>` is applied best-effort on this path, and \
-                 KERN_ALLOW_UNCAPPED=1 says the uncapped run is intended and silences this."
+                 missing; an explicit `--memory <size>` REFUSES to run rather than go uncapped \
+                 here, and KERN_ALLOW_UNCAPPED=1 says the uncapped run is intended and silences this."
             );
         }
     }
