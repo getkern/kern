@@ -19,7 +19,7 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
-## Unreleased
+## v0.31.0 - 2026-10-10
 
 **`kern run --memory` REFUSES where it used to warn and run, and this one leads because it can stop
 a command that worked yesterday.** The verb governs resources and nothing else, and it was accepting
