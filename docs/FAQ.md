@@ -79,8 +79,9 @@ The second line is the normal installer, run from inside the VM. What you give u
   namespaces. `kern doctor` names it first and prints the fix
   (`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), which a VM restart undoes.
 - **The resource caps do not bite**: no `systemd --user` manager and no delegated `memory`
-  controller, so `--memory` is accepted and never enforced. kern says so at every box start instead
-  of pretending, and `--require-limits` refuses to run uncapped. The isolation itself (namespaces,
+  controller, so a box's `--memory` is accepted and never enforced. kern says so at every box start
+  instead of pretending, `--require-limits` refuses to run uncapped, and `kern run --memory` refuses
+  there without being asked. The isolation itself (namespaces,
   pivoted root, seccomp, Landlock) is unaffected.
 
 Neither of those applies to the Fedora guest above, which is the whole reason both are documented

@@ -68,7 +68,7 @@ box's network.
 
 | Governor | Why it is not a boundary | Honest handling |
 |---|---|---|
-| Resource caps on a **non-delegated** host | with no cgroup delegation kern cannot enforce a cap | best-effort with a once-per-host warning; `--require-limits` makes the uncapped fallback **fatal** (refuse to start unless the cap reads back in force) |
+| Resource caps on a **non-delegated** host | with no cgroup delegation kern cannot enforce a cap | `kern box`: best-effort with a once-per-host warning, and `--require-limits` makes the uncapped fallback **fatal** (refuse to start unless the cap reads back in force). `kern run --memory`: refuses on its own unless a ceiling at or below the one named can be proven |
 | Egress allowlist (`--egress-allow`) | a domain sharing a CDN IP and SNI with an allowed one is reachable | an application-layer allowlist for a semi-trusted workload, SSRF-guarded (a non-public resolve is refused), documented in [EGRESS.md](EGRESS.md) as not a hard exfiltration boundary |
 | vGPIO pin list | GPIO is chip-granular: the character device exposes every line via ioctl, the kernel has no per-line mount boundary | `pins = [...]` is cooperative metadata; grant a `vgpio:` profile only to a workload you trust with that hardware |
 | The `--ssh` subtree | sshd and its shells are forked before seccomp and the cap drop, and run the image's own binaries pre-filter | for interactive access, not a hardened bastion; the interactive-trust surface you opted into |

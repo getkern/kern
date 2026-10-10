@@ -43,9 +43,12 @@ exactly what you asked for, kern's supervisor outside the blast radius so the gr
 workload and not the process that has to report it. Re-checked in both layouts on four hosts and four
 systemd versions (**249, 252, 255, 257**).
 
-**Enforce, or refuse to start.** Where the controllers are not delegated, the default is to warn once
-and run uncapped. `--require-limits` (or `KERN_REQUIRE_LIMITS`) makes that fatal: the box refuses to
-start unless the memory and pids caps are **read back** from the cgroup as in force.
+**Enforce, or refuse to start.** Where the controllers are not delegated, a `kern box` warns once and
+runs uncapped by default; `--require-limits` (or `KERN_REQUIRE_LIMITS`) makes that fatal: the box
+refuses to start unless the memory and pids caps are **read back** from the cgroup as in force.
+`kern run --memory` does not wait to be asked. Since v0.31.0 it refuses on its own when no ceiling at
+or below the one you named can be proven, because that verb governs resources and nothing else, and a
+command that outgrows a cap nothing is holding takes the host with it.
 `--allow-uncapped` (`KERN_ALLOW_UNCAPPED`) is the explicit inverse for a host with no delegation. The
 two are mutually exclusive. cpu and cpuset stay best-effort under both, carrying no OOM or fork-bomb
 role.
@@ -121,11 +124,14 @@ carries the same three. A workload past the ceiling is OOM-killed and kern names
 fix. Two ways to change it, and they are not the same:
 `--memory <size>` raises or lowers the ceiling, which is the one you want; `KERN_NO_SCOPE=1` removes
 the scope and with it all three ceilings, leaving the command in the cgroup of whatever started it,
-usually your shell's. kern warns when that happens, and `KERN_ALLOW_UNCAPPED=1` silences the warning.
+usually your shell's. With no `--memory` named, kern warns when that happens and
+`KERN_ALLOW_UNCAPPED=1` silences the warning; with one named, it refuses to run instead, and that
+same variable is what runs it anyway.
 
 **And there is a third case, which this page used to promise its way past.** A host with no systemd
 user manager whose own cgroup cannot take a capped child has neither of the two mechanisms above, so
-NO cap is in force, default or asked-for. kern warns at start rather than pretending, `kern doctor`
+NO cap is in force, default or asked-for. A `kern box` warns at start rather than pretending and a
+`kern run --memory` refuses outright, `kern doctor`
 names the directories it probed and what it found there, and for a running box the answer is a fact
 you can read rather than a promise you have to trust:
 
@@ -135,7 +141,9 @@ $ kern inspect web --json | grep memory
 ```
 
 `memory_max` is what you asked for; `memory_max_enforced` is what the kernel will hold the box to,
-read back from the box's own cgroup. `null` means nothing is enforcing it, and the human output says
+walked from the box's own cgroup up its chain, counting each level's `memory.max` plus the swap that
+level opens (an ancestor's ceiling bounds the box too, and one with unlimited swap is not a ceiling).
+`null` means nothing is enforcing it, and the human output says
 `64M (requested, NOT enforced here)`. Note that exit **137** alone does not tell you a cap bit: it is
 SIGKILL, which the system OOM killer delivers identically. A kill by the box's own cap always carries
 kern's own OOM message on stderr.
