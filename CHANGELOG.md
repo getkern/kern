@@ -34,6 +34,15 @@ command slow and slow does not take a host down. `KERN_ALLOW_UNCAPPED=1` runs an
 `kern run` with no cap flags is unchanged. If a host of yours starts refusing, `kern doctor` names
 the local change that would make a cap bind there, and the refusal names the cause it measured.
 
+- A cgroup kern did not write counts as proof of a `--memory` only when its SWAP is bounded too.
+  kern's own cap writes `memory.swap.max = 0`, so an ancestor accepted in its place has to be at
+  least as strong, and systemd's default `memory.swap.max=max` is not: an independent reviewer
+  measured a scope with `MemoryMax=48M` accepted as proof of a 64 MiB request, and the command
+  allocated 100 MB and exited 0 on 48 MiB of RAM plus the host's swap. A level now states
+  `memory.max` plus the swap it opens, unbounded swap makes it state nothing at all, and a host with
+  no swap keeps `memory.max` as the whole ceiling. `kern inspect`'s `memory_max_enforced` reads the
+  same rule, so the surface that reports and the one that refuses cannot disagree about one chain;
+  a box with its own cgroup is unaffected, because kern writes the swap limit itself.
 - Caps now bind on a host whose `$XDG_RUNTIME_DIR/systemd/private` refuses connections while the
   user manager is alive. kern asked that socket alone whether `systemd-run --user` could reach the
   manager; where it answers ECONNREFUSED but the session bus is live and `systemd --user` is

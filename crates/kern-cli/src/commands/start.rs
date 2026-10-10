@@ -2657,12 +2657,17 @@ pub fn run(
                  or set KERN_ALLOW_UNCAPPED=1 to say the uncapped run is intended and silence this."
             );
         } else {
+            // The cause, not "which part is missing". The `--cpus` warning beside this one and the
+            // `--memory` refusal below both name what this host measured; a reviewer read all three
+            // in one session and this was the only one still sending them to go and find out.
             eprintln!(
                 "kern: warning: this host could not give the command a memory cgroup, so kern's \
                  DEFAULT memory cap is not in force - it runs with no RAM ceiling and no OOM \
-                 backstop, in the cgroup of whatever started it. `kern doctor` reports which part is \
-                 missing; an explicit `--memory <size>` REFUSES to run rather than go uncapped \
-                 here, and KERN_ALLOW_UNCAPPED=1 says the uncapped run is intended and silences this."
+                 backstop, in the cgroup of whatever started it: {}. `kern doctor` shows the \
+                 delegation state; an explicit `--memory <size>` REFUSES to run rather than go \
+                 uncapped here, and KERN_ALLOW_UNCAPPED=1 says the uncapped run is intended and \
+                 silences this.",
+                kern_isolation::missing_manager_clause()
             );
         }
     }

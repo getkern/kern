@@ -4251,16 +4251,44 @@ pub fn effective_cgroup_dir(pid: i32) -> Option<PathBuf> {
     proc_cgroup_dir(pid)
 }
 
-/// The memory ceiling the kernel will actually hold a box in `dir` to: the tightest finite
-/// `memory.max` from that level up to (not including) the root. `None` when no level caps it.
+/// The memory ceiling the kernel will actually hold a box in `dir` to: the tightest EFFECTIVE
+/// ceiling from that level up to (not including) the root, where a level's ceiling is its
+/// `memory.max` plus the swap it opens. `None` when no level states one.
 ///
 /// THE WHOLE CHAIN, NOT THE BOX'S OWN LEVEL, because that is what the kernel enforces: an ancestor's
 /// `memory.max` bounds every cgroup beneath it, so a box whose own level says `max` can still be held
-/// to an ancestor's ceiling - and a reader told `null` there would conclude the opposite. The same
-/// walk `apply_limits`' own decision uses (see [`memory_capped_at_or_below`]), so a surface that
-/// reports and a surface that decides cannot disagree about one box.
+/// to an ancestor's ceiling - and a reader told `null` there would conclude the opposite.
+///
+/// AND SWAP COUNTS HERE TOO, which it did not for a day. This docstring claimed that a surface which
+/// REPORTS and a surface which DECIDES cannot disagree about one box; the deciding side learned to
+/// add `memory.swap.max` (see [`effective_ceiling_at`], and the measurement that forced it) and this
+/// one did not, so for a day the claim was false in exactly the direction that matters: a level with
+/// `memory.max=48M` and unbounded swap would have been reported as a 48 MiB ceiling the kernel does
+/// not hold. An external reviewer raised it as an opinion rather than a finding, having no way to
+/// build a box in that position; the property was mine to keep either way.
 pub fn memory_max_in_force(dir: &std::path::Path) -> Option<u64> {
-    tightest_memory_max_under(std::path::Path::new(CGROUP_V2_MOUNT), dir)
+    tightest_effective_ceiling_under(std::path::Path::new(CGROUP_V2_MOUNT), dir)
+}
+
+/// The tightest EFFECTIVE ceiling from `box_dir` up to (not including) `root`, or `None` when no
+/// level states one. The reporting counterpart of [`memory_cap_proven_under`], reading the same
+/// per-level rule so the two cannot drift apart again.
+fn tightest_effective_ceiling_under(
+    root: &std::path::Path,
+    box_dir: &std::path::Path,
+) -> Option<u64> {
+    let mut cur = PathBuf::with_capacity(box_dir.as_os_str().len().saturating_add(16));
+    cur.push(box_dir);
+    let mut ceiling: Option<u64> = None;
+    loop {
+        if let Some(c) = effective_ceiling_at(&cur) {
+            ceiling = Some(ceiling.map_or(c, |t: u64| t.min(c)));
+        }
+        if !cur.pop() || cur.as_path() == root || !cur.starts_with(root) {
+            break;
+        }
+    }
+    ceiling
 }
 
 /// The [`OuterMemoryHigh`] for a box being started, resolved the way [`warn_unenforced_caps`] resolves
@@ -4408,6 +4436,41 @@ mod outer_memory_high_tests {
                 "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/kerntest.slice/probe"
             ),
         );
+    }
+
+    /// What `kern inspect --json` reports, over a chain where each level states its own ceiling.
+    ///
+    /// Every `memory.swap.max` here is written explicitly, so the result does not depend on whether
+    /// THIS machine has swap - which is the dependency that made the first version of the sibling
+    /// test pass or fail by host. The rule under test is the one the refusal uses, which is the
+    /// property the reporting side had quietly stopped sharing for a day.
+    #[test]
+    fn the_reported_ceiling_is_the_tightest_memory_plus_swap_on_the_chain() {
+        let t = Tree::new("report");
+        let walk = |t: &Tree| {
+            super::tightest_effective_ceiling_under(&t.root, &t.dir("a.slice/b.slice/box"))
+        };
+        // Nothing stated anywhere.
+        assert_eq!(walk(&t), None);
+        // The box's own level, swap off: its `memory.max` is the whole ceiling.
+        t.set("a.slice/b.slice/box", "memory.max", "536870912\n");
+        t.set("a.slice/b.slice/box", "memory.swap.max", "0\n");
+        assert_eq!(walk(&t), Some(512 * MIB));
+        // A TIGHTER ancestor wins, which is the case `inspect` was blind to before this chain walk.
+        t.set("a.slice", "memory.max", "268435456\n");
+        t.set("a.slice", "memory.swap.max", "0\n");
+        assert_eq!(walk(&t), Some(256 * MIB));
+        // Swap on that ancestor RAISES what it really holds, so it stops being the tightest.
+        t.set("a.slice", "memory.swap.max", "335544320\n"); // 256M + 320M = 576M
+        assert_eq!(
+            walk(&t),
+            Some(512 * MIB),
+            "the box's own 512M is now tighter"
+        );
+        // And a level that states nothing is skipped rather than counted as zero.
+        t.set("a.slice/b.slice", "memory.max", "max\n");
+        t.set("a.slice/b.slice", "memory.swap.max", "0\n");
+        assert_eq!(walk(&t), Some(512 * MIB));
     }
 
     /// The negative control for the test above: the same tree with the limit lifted reports nothing.
