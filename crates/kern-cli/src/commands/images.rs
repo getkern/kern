@@ -153,6 +153,18 @@ fn glob_match(pattern: &str, subject: &str) -> bool {
     p[pi..].iter().all(|c| *c == b'*')
 }
 
+/// The half-sentence both surfaces say about the same bytes: "N entr(y|ies) (SIZE) that no image
+/// claims". Shared because the two wordings around it are deliberately different and the CLAIM inside
+/// them must not be: these two surfaces drifted apart once already, which is what the census was
+/// added to fix, and the plural rule and the byte formatting were the parts written twice.
+fn unclaimed_clause(entries: usize, bytes: u64) -> String {
+    format!(
+        "{entries} {} ({}) that no image claims",
+        if entries == 1 { "entry" } else { "entries" },
+        kern_common::fmt_bytes(bytes)
+    )
+}
+
 /// What a cache directory still holds when nothing in it can be LISTED: how many top-level entries
 /// no image claims, and the bytes under them.
 ///
@@ -177,13 +189,18 @@ fn orphan_cache_census(root: &std::path::Path) -> (usize, u64) {
             continue;
         };
         for e in rd.flatten() {
-            if dir == root && {
-                let n = e.file_name().to_string_lossy().into_owned();
-                n.ends_with(".lock") || n.ends_with(".size")
-            } {
-                continue; // kern's own bookkeeping, and it holds no bytes to reclaim
-            }
             if dir == root {
+                // kern's own bookkeeping, read from the ONE list that owns it, so the next sidecar
+                // cannot be added to the remover and forgotten here - which is how `.lock` and then
+                // `.size` each got counted as a leftover a reader should go looking for.
+                let name = e.file_name();
+                let name = name.as_encoded_bytes();
+                if super::imagecache::CACHE_SIDECARS
+                    .iter()
+                    .any(|sfx| name.ends_with(sfx.as_bytes()))
+                {
+                    continue;
+                }
                 entries += 1;
             }
             match e.metadata() {
@@ -212,10 +229,14 @@ fn orphan_cache_census(root: &std::path::Path) -> (usize, u64) {
 /// cache: the listing named the leftover bytes and `kern rmi` still answered only "no such image".
 /// Reported by an independent host.
 fn unclaimed_cache_note(cache: &std::path::Path) -> String {
-    if !image_entries_in(cache, crate::listing::Detail::Read)
+    // `Detail::Skip` is "a single `read_dir` and nothing else", and `total` counts the same stems
+    // `Read` would turn into rows, so this is the identical predicate without sizing the whole cache:
+    // `Read` opens every layer sidecar (889 of them on a 316-image cache, per its own docstring) to
+    // answer a question that needs none of them. This is an error path, so the cost bought nothing.
+    if image_entries_in(cache, crate::listing::Detail::Skip)
         .0
-        .records
-        .is_empty()
+        .total
+        != 0
     {
         return String::new();
     }
@@ -224,10 +245,8 @@ fn unclaimed_cache_note(cache: &std::path::Path) -> String {
         return String::new();
     }
     format!(
-        ". That cache also holds {orphans} {} ({}) that no image claims, which no name can remove: \
-         `kern gc --images` reclaims them",
-        if orphans == 1 { "entry" } else { "entries" },
-        kern_common::fmt_bytes(bytes)
+        ". That cache also holds {}, which no name can remove: `kern gc --images` reclaims them",
+        unclaimed_clause(orphans, bytes)
     )
 }
 
@@ -304,12 +323,11 @@ pub fn images(json: bool, filters: &[(String, String)], format: Option<&str>) ->
             let root = cache_dir();
             let (entries, bytes) = orphan_cache_census(&root);
             if entries > 0 {
-                let what = if entries == 1 { "entry" } else { "entries" };
                 println!(
-                    "note: {} holds {entries} {what} ({}) that no image claims - a partial delete, \
-                     or a kern that was killed mid-pull. `kern gc --images` reclaims the cache",
+                    "note: {} holds {} - a partial delete, or a kern that was killed mid-pull. \
+                     `kern gc --images` reclaims the cache",
                     root.display(),
-                    kern_common::fmt_bytes(bytes)
+                    unclaimed_clause(entries, bytes)
                 );
             }
         } else {

@@ -897,16 +897,7 @@ pub(crate) fn drop_image_artifacts(cache: &std::path::Path, stem: &str) -> bool 
         eprintln!("kern: warning: {e}");
     }
     let complete = root.is_ok() && diff.is_ok();
-    for suffix in [
-        ".layers",
-        ".base",
-        ".image",
-        ".ok",
-        ".lock",
-        ".flatkey",
-        ".size",
-        ".diff.size",
-    ] {
+    for suffix in CACHE_SIDECARS {
         let _ = std::fs::remove_file(cache.join(format!("{stem}{suffix}")));
     }
     complete
@@ -1281,6 +1272,26 @@ pub(crate) fn resolve_image_depth(
 /// Keeping it in one function also closes a `--pull never` hole: with the sentinel present and the
 /// sidecar missing, the old top-of-function check passed, the fast path was skipped, and control fell
 /// into the fetch block - so `--pull never` went to the network.
+/// Every file kern writes BESIDE an image's directory, as one list.
+///
+/// ONE PLACE OWNS IT, which the remover below already argued for ("every remover deletes the SAME set
+/// and can't drift") and which a second reader then proved by drifting: `kern images`' orphan census
+/// carried its own two-element copy and counted the rest as leftovers a reader should go looking for.
+/// That cost two rounds of the same defect, `.lock` and then `.size`, each found by a count saying
+/// "2 entries" over one leftover image. `.layers`, `.base`, `.flatkey` and `.diff.size` are the four
+/// that would have been round three: `drop_image_artifacts` removes `.ok` and `.image` FIRST, so an
+/// interrupted delete leaves exactly them.
+pub(crate) const CACHE_SIDECARS: [&str; 8] = [
+    ".layers",
+    ".base",
+    ".image",
+    ".ok",
+    ".lock",
+    ".flatkey",
+    ".size",
+    ".diff.size",
+];
+
 pub(crate) fn cache_entry_complete(cache: &std::path::Path, safe: &str) -> bool {
     if !cache.join(format!("{safe}.ok")).exists() || !cache.join(format!("{safe}.image")).exists() {
         return false;

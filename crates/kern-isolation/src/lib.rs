@@ -167,6 +167,10 @@ pub use cgroup::memory_cap_enforceable;
 /// Is a memory cap of at most `bytes` actually in force on the chain above a cgroup?
 /// See [`cgroup::memory_cap_in_force_at_or_below`]: `true` when it cannot be told.
 pub use cgroup::memory_cap_in_force_at_or_below;
+/// Can kern PROVE a memory ceiling at or below a request binds here? Unknown answers NO, which is
+/// what a fail-closed decision needs and the opposite of the warn-oriented helper directly above.
+/// See [`cgroup::memory_cap_proven_at_or_below`].
+pub use cgroup::memory_cap_proven_at_or_below;
 /// Why no systemd user manager is reachable on THIS host, for the uncapped warning's middle clause.
 /// See [`cgroup::missing_manager_clause`].
 pub use cgroup::missing_manager_clause;
@@ -174,10 +178,6 @@ pub use cgroup::oom_kill_count;
 /// `oom_kill` read from a directory already resolved. See [`cgroup::oom_kill_count_at`].
 pub use cgroup::oom_kill_count_at;
 
-/// Can kern PROVE a memory ceiling at or below a request binds here? Unknown answers NO, which is
-/// what a fail-closed decision needs and the opposite of the warn-oriented helper beside it. See
-/// [`cgroup::memory_cap_proven_at_or_below`].
-pub use cgroup::memory_cap_proven_at_or_below;
 /// The cgroup directory whose `oom_kill` counter covers the box a pid runs in, resolved while that
 /// pid is alive. See [`cgroup::oom_kill_dir_for_pid`].
 pub use cgroup::oom_kill_dir_for_pid;

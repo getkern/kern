@@ -921,7 +921,11 @@ fn user_manager_reachable() -> bool {
 fn manager_live_under(xdg: &std::path::Path) -> bool {
     manager_live_from(
         unix_socket_live(&xdg.join("systemd/private")),
-        unix_socket_live(&xdg.join("bus")),
+        // Lazy for the same reason as the third fact, and this one is on the BOX-START path: the
+        // common host answers on the private socket, and an eager probe here spends a second
+        // `connect()` (and wakes the bus daemon) for an answer already decided. The reuse invariant
+        // `choose_direct_cap_path_given` exists for is about exactly this.
+        || unix_socket_live(&xdg.join("bus")),
         // Asked only when it can change the answer: the private socket already decides the common
         // host, and this is a file read rather than a connect.
         user_manager_process_runs,
@@ -934,8 +938,12 @@ fn manager_live_under(xdg: &std::path::Path) -> bool {
 /// desktop on 2026-10-09, where `systemd-run --user --scope` exits 0), and a live bus with NO
 /// manager must NOT be (the `dbus-launch` CI image, where committing to `systemd-run` kills the box
 /// after the re-exec has replaced kern).
-fn manager_live_from(private_live: bool, bus_live: bool, manager_runs: impl Fn() -> bool) -> bool {
-    private_live || (bus_live && manager_runs())
+fn manager_live_from(
+    private_live: bool,
+    bus_live: impl FnOnce() -> bool,
+    manager_runs: impl FnOnce() -> bool,
+) -> bool {
+    private_live || (bus_live() && manager_runs())
 }
 
 /// Is `systemd --user` RUNNING for this uid, read from the cgroup systemd puts it in
@@ -943,9 +951,11 @@ fn manager_live_from(private_live: bool, bus_live: bool, manager_runs: impl Fn()
 /// half of [`manager_live_under`] that a bare session bus cannot.
 fn user_manager_process_runs() -> bool {
     let uid = unsafe { libc::getuid() };
-    let procs = PathBuf::from(CGROUP_V2_MOUNT).join(format!(
-        "user.slice/user-{uid}.slice/user@{uid}.service/init.scope/cgroup.procs"
-    ));
+    // The path has an owner already, and its docstring says why one spelling matters: "a typo in it
+    // would silently mean 'no delegated slice here' on every host. That failure is invisible." Here
+    // an invisible typo answers "no manager" on a host that has one, which is the incident this
+    // branch is about.
+    let procs = canonical_delegation_root(uid).join("init.scope/cgroup.procs");
     fs::read_to_string(procs).is_ok_and(|s| s.split_whitespace().next().is_some())
 }
 
@@ -969,11 +979,20 @@ pub fn missing_manager_clause() -> String {
     // be the contradiction this function exists to prevent. It said exactly that on 2026-10-09,
     // because it asked only the private socket while `manager_live_under` now also accepts the bus
     // plus a running manager.
-    let standard_live = manager_live_under(&PathBuf::from(format!("/run/user/{uid}")));
+    let standard = PathBuf::from(format!("/run/user/{uid}"));
+    let standard_live = manager_live_under(&standard);
     let xdg = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|d| !d.as_os_str().is_empty());
-    let xdg_live = xdg.as_ref().is_some_and(|d| manager_live_under(d));
+    // ONE PROBE WHEN IT IS ONE DIRECTORY. On the common host `XDG_RUNTIME_DIR` IS `/run/user/<uid>`,
+    // and probing it twice measures the same fact twice to answer one sentence.
+    let xdg_live = xdg.as_ref().is_some_and(|d| {
+        if d == &standard {
+            standard_live
+        } else {
+            manager_live_under(d)
+        }
+    });
     missing_manager_clause_from(uid, xdg, xdg_live, standard_live)
 }
 
@@ -3638,36 +3657,44 @@ fn effective_ceiling_at(dir: &Path) -> Option<u64> {
     effective_ceiling_from(
         read_limit_bytes(&dir.join("memory.max")),
         read_limit_bytes(&dir.join("memory.swap.max")),
-        host_swap_total(),
+        host_swap_total,
     )
 }
 
 /// The arithmetic alone, as a function of the three facts, so a test can drive the swapless host
 /// this machine is not. Separated for the reason the rest of this file separates its verdicts: a
 /// rule assembled inside its reader is a rule no test can fail.
-fn effective_ceiling_from(mem: Option<u64>, swap: Option<u64>, host_swap: u64) -> Option<u64> {
+fn effective_ceiling_from(
+    mem: Option<u64>,
+    swap: Option<u64>,
+    host_swap: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
     let mem = mem?;
     match swap {
         Some(s) => Some(mem.saturating_add(s)),
-        None if host_swap == 0 => Some(mem),
-        None => None,
+        // ASKED LAST AND ONLY WHEN IT DECIDES, which is what this function's own docstring claimed
+        // while the call site evaluated it eagerly at every level of every walk. `/proc/meminfo` is
+        // the most expensive read in the walk (measured 3.6 us against 0.5 us for a cgroup limit
+        // file), and the levels that need it are the minority.
+        //
+        // AND `None` FROM IT IS NOT ZERO. An unreadable `/proc/meminfo` used to arrive here as `0`,
+        // which reads as "no swap on this host" and turns an unbounded-swap level into a proven
+        // ceiling - fail-OPEN on the one path built to fail closed, through the same in-band
+        // sentinel this file refuses `0::/` for. Unknown stays unproven.
+        None => host_swap().filter(|&total| total == 0).map(|_| mem),
     }
 }
 
 /// The host's `SwapTotal` in bytes, 0 when it cannot be read. Only consulted when a level leaves
 /// `memory.swap.max` unbounded, which is the one case where "is there any swap to take" decides
 /// whether `memory.max` is the whole ceiling.
-fn host_swap_total() -> u64 {
-    fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|t| {
-            t.lines()
-                .find_map(|l| l.strip_prefix("SwapTotal:"))
-                .and_then(|v| v.split_whitespace().next().map(str::to_string))
-        })
-        .and_then(|kb| kb.parse::<u64>().ok())
-        .map(|kb| kb.saturating_mul(1024))
-        .unwrap_or(0)
+fn host_swap_total() -> Option<u64> {
+    fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+        t.lines()
+            .find_map(|l| l.strip_prefix("SwapTotal:"))
+            .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+            .map(|kb| kb.saturating_mul(1024))
+    })
 }
 
 /// Warn for every cap the caller ASKED for that nothing in this process's cgroup chain enforces.
@@ -4277,14 +4304,21 @@ fn tightest_effective_ceiling_under(
     root: &std::path::Path,
     box_dir: &std::path::Path,
 ) -> Option<u64> {
-    let mut cur = PathBuf::with_capacity(box_dir.as_os_str().len().saturating_add(16));
-    cur.push(box_dir);
+    let mut cur = box_dir.to_path_buf();
     let mut ceiling: Option<u64> = None;
     loop {
         if let Some(c) = effective_ceiling_at(&cur) {
-            ceiling = Some(ceiling.map_or(c, |t: u64| t.min(c)));
+            ceiling = Some(ceiling.map_or(c, |t| t.min(c)));
         }
-        if !cur.pop() || cur.as_path() == root || !cur.starts_with(root) {
+        // THE ROOT LEVEL IS READ, unlike the `memory.max`-only walk beside this one, and the
+        // difference is not cosmetic: `in_tree` - which the DECIDING side uses - evaluates its
+        // predicate at `/sys/fs/cgroup` before stopping, so a box one level under a cgroup-NAMESPACE
+        // root had the refusal read that root's ceiling and this walk stop short of it. The same box
+        // was "proven capped" to `kern run` and `null` to `kern inspect`, which is exactly the
+        // contradiction the docstring above promises cannot happen. Found by review, not by a test:
+        // both walks were written from the same shape and only one of them was anchored like the
+        // predicate it has to agree with.
+        if cur.as_path() == root || !cur.pop() || !cur.starts_with(root) {
             break;
         }
     }
@@ -5098,21 +5132,21 @@ mod tests {
         let no = || false;
         // The private socket decides on its own, whatever the bus says: a live listener on the
         // manager's own control socket IS the manager.
-        assert!(manager_live_from(true, false, no));
-        assert!(manager_live_from(true, true, no));
+        assert!(manager_live_from(true, || false, no));
+        assert!(manager_live_from(true, || true, no));
         // THE MAINTAINER'S DESKTOP: private refuses, bus is live, the manager is running.
         assert!(
-            manager_live_from(false, true, yes),
+            manager_live_from(false, || true, yes),
             "a refusing private socket must not hide a manager systemd-run reaches on the bus"
         );
         // THE `dbus-launch` CI IMAGE: a bus with no manager behind it must stay a NO.
         assert!(
-            !manager_live_from(false, true, no),
+            !manager_live_from(false, || true, no),
             "a live bus alone must never commit kern to a systemd-run that will fail"
         );
         // Nothing reachable, and the degenerate rest.
-        assert!(!manager_live_from(false, false, yes));
-        assert!(!manager_live_from(false, false, no));
+        assert!(!manager_live_from(false, || false, yes));
+        assert!(!manager_live_from(false, || false, no));
     }
 
     /// The fail-closed predicate, driven over the case this machine cannot be in.
@@ -5145,7 +5179,7 @@ mod tests {
         fs::write(root.join("memory.max"), "8388608\n").unwrap();
         assert_eq!(
             memory_cap_proven_under(&root, None, 16 * mib),
-            host_swap_total() == 0,
+            host_swap_total() == Some(0),
             "memory.max with unbounded swap proves a ceiling only where there is no swap to take"
         );
         // A root that caps BOTH, at or below the request: proven, so do not refuse. This is what
@@ -5185,7 +5219,10 @@ mod tests {
     #[test]
     fn a_levels_ceiling_is_its_memory_plus_the_swap_it_opens() {
         let m = |n: u64| Some(n * 1024 * 1024);
-        let swapful = 2 * 1024 * 1024 * 1024;
+        // The host facts, as closures, because the real one is only consulted when it decides.
+        let swapful = || Some(2u64 * 1024 * 1024 * 1024);
+        let swapless = || Some(0u64);
+        let unreadable = || None;
         // Swap off: `memory.max` is the whole ceiling, which is what kern writes for itself.
         assert_eq!(effective_ceiling_from(m(48), Some(0), swapful), m(48));
         // A bounded swap allowance ADDS to it.
@@ -5195,10 +5232,13 @@ mod tests {
         assert_eq!(effective_ceiling_from(m(48), None, swapful), None);
         // ... but on a swapless host there is nothing to swap into, so `memory.max` stands. Without
         // this, every swapless host would start refusing a cap that binds perfectly.
-        assert_eq!(effective_ceiling_from(m(48), None, 0), m(48));
+        assert_eq!(effective_ceiling_from(m(48), None, swapless), m(48));
+        // ... and an unreadable /proc/meminfo is NOT "no swap": unknown stays unproven, which is
+        // what a fail-closed caller needs and what returning a bare 0 used to destroy.
+        assert_eq!(effective_ceiling_from(m(48), None, unreadable), None);
         // No memory ceiling: nothing to state, whatever swap says.
-        assert_eq!(effective_ceiling_from(None, Some(0), 0), None);
-        assert_eq!(effective_ceiling_from(None, None, 0), None);
+        assert_eq!(effective_ceiling_from(None, Some(0), swapless), None);
+        assert_eq!(effective_ceiling_from(None, None, swapless), None);
         // And the sum cannot wrap into a small, satisfying-looking number.
         assert_eq!(
             effective_ceiling_from(Some(u64::MAX), Some(u64::MAX), swapful),

@@ -2435,6 +2435,10 @@ pub fn run(
     // than assumed: see `run_forked_under_direct_caps` below. It is granted ONLY together with that
     // fork - on any path that still `exec()`s in place, `took_direct_cap_path()` is false and the
     // scope stays exactly as it was.
+    // BOUND ONCE, READ THREE TIMES, for the reason the `forking` note below gives: one decision,
+    // not three that happen to agree. Nothing between the three sites writes it, and the refusal
+    // added to this function made it a third reader of an expression already written out twice.
+    let allow_uncapped = kern_common::env_flag("KERN_ALLOW_UNCAPPED");
     reexec_in_scope_if_possible(ScopeReexec {
         memory,
         memory_swap_max,
@@ -2443,7 +2447,7 @@ pub fn run(
         pids_max: None,
         allow_direct: true, // `kern run` forks its workload below, so it can hold the guard and clean up
         die_with_parent: false,
-        allow_uncapped: kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
+        allow_uncapped,
     });
     // TWO INDEPENDENT DECISIONS, AND CONFLATING THEM IS WHAT LEFT A LEAK ON THE HOSTS THAT HAD IT.
     //
@@ -2469,6 +2473,11 @@ pub fn run(
     // reason. Forking under any of them adds a third process to the chain and buys none of it, which
     // is exactly the question `outer_enforcer_present` already answers for the cap path.
     let outer_enforcer = kern_isolation::outer_enforcer_present();
+    // BOUND ONCE, READ THREE TIMES, for the reason the note below gives about `forking`: one
+    // decision, not three that happen to agree. Nothing between the three sites writes this
+    // variable, and the refusal added to this function made it a third reader of an expression that
+    // was already written out twice.
+    let allow_uncapped = kern_common::env_flag("KERN_ALLOW_UNCAPPED");
     // BOUND ONCE, USED THREE TIMES, because it is one decision and not three that happen to agree.
     // `cap_built` is `true` here because the two later uses are both inside `cg.is_some()`, and the
     // first one is what MAKES the cgroup: if none is built, the fork re-asks with the real value and
@@ -2551,7 +2560,7 @@ pub fn run(
         // host, measured, same day).
         let memory_unheld =
             memory.is_some_and(|m| !kern_isolation::memory_cap_proven_at_or_below(m));
-        if memory_unheld && !kern_common::env_flag("KERN_ALLOW_UNCAPPED") {
+        if memory_unheld && !allow_uncapped {
             return Err(Error::Sandbox(format!(
                 "--memory was requested and nothing here enforces it: kern could not place this \
                  command in a cgroup that carries the cap ({}), and no ancestor cgroup holds it to \
@@ -2573,10 +2582,10 @@ pub fn run(
         // exactly 64 MiB. kern wrote no cgroup of its own, which is what this branch tests, and that
         // is not the same fact as the command being uncapped.
         //
-        // `--cpus` keeps the warning whatever memory does: nothing here proves a CPU ceiling, and an
-        // unenforced share is still worth saying out loud.
-        let memory_proven = memory.is_some() && !memory_unheld;
-        if !memory_proven || cpus.is_some() {
+        // Reaching this line with `--memory` means the ceiling WAS proven (the refusal above is the
+        // only other way out), so `memory_unheld` is false and only `--cpus` can still want the
+        // warning: nothing here proves a CPU ceiling, and an unenforced share is worth saying.
+        if memory_unheld || cpus.is_some() {
             // THE CAUSE THIS PATH ALREADY MEASURED, not a fixed clause. A reviewer read
             // "cgroup delegation unavailable" on a host whose delegation works perfectly - the real
             // cause there was an `XDG_RUNTIME_DIR` pointing away from the live manager, which the
@@ -2598,7 +2607,7 @@ pub fn run(
     } else if memory.is_none()
         && cpus.is_none()
         && !kern_common::env_flag("KERN_QUIET")
-        && !kern_common::env_flag("KERN_ALLOW_UNCAPPED")
+        && !allow_uncapped
         && !kern_isolation::memory_cap_in_force_at_or_below(
             // THE WORKLOAD'S CGROUP, NOT THIS PROCESS'S, WHEREVER THE TWO DIFFER.
             //
