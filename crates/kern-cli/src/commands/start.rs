@@ -2544,8 +2544,13 @@ pub fn run(
         //
         // A bare `kern run` with no `--memory` keeps today's best-effort behaviour and its notice,
         // and `KERN_ALLOW_UNCAPPED=1` runs anyway for a caller who means it.
+        // PROVEN, not "not disproven": the first version of this asked the warn-oriented helper,
+        // whose documented default is that an unreadable or unmodelled cgroup counts as capped. On a
+        // root container reporting `0::/` that default skipped the refusal entirely and the command
+        // ran uncapped, which is the defect this whole block exists to stop (reported from such a
+        // host, measured, same day).
         let memory_unheld =
-            memory.is_some_and(|m| !kern_isolation::memory_cap_in_force_at_or_below(None, m));
+            memory.is_some_and(|m| !kern_isolation::memory_cap_proven_at_or_below(m));
         if memory_unheld && !kern_common::env_flag("KERN_ALLOW_UNCAPPED") {
             return Err(Error::Sandbox(format!(
                 "--memory was requested and nothing here enforces it: kern could not place this \

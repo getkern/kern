@@ -3570,6 +3570,49 @@ pub fn memory_cap_in_force_at_or_below(dir: Option<&Path>, bytes: u64) -> bool {
     }
 }
 
+/// Can kern **prove** that a memory ceiling at or below `bytes` binds this process? Unknown answers
+/// NO.
+///
+/// THE SAME QUESTION AS [`memory_cap_in_force_at_or_below`] WITH THE OPPOSITE DEFAULT, and the two
+/// must not be merged: that one exists to decide whether to WARN, where "I cannot tell" must stay
+/// quiet or it cries wolf on every host it does not model. This one exists to decide whether to
+/// REFUSE, where "I cannot tell" is the whole reason to refuse.
+///
+/// MEASURED, and the inversion was shipped for a day. An independent host reported it from a root
+/// container (kernel 6.12.8, `XDG_RUNTIME_DIR` unset, no systemd, `/proc/self/cgroup` = `0::/`,
+/// `/sys/fs/cgroup/memory.max` = `max`): `kern run --memory 16m -- /bin/true` printed the uncapped
+/// warning and exited 0, with nothing enforcing the cap. `cgroup_dir_from_proc_line` deliberately
+/// refuses `0::/` (it cannot tell the host root from a cgroup-namespace root), the refusal asked the
+/// warn-oriented helper, `Option::is_none_or` turned that `None` into "in force", and the fail-closed
+/// branch was skipped on exactly the host shape it was written for. Same outcome as the incident that
+/// produced the refusal - `--memory` accepted, nothing enforcing it - reached through a different
+/// predicate.
+///
+/// `0::/` IS STILL READ, rather than treated as an automatic refusal, because the ambiguity that
+/// makes it useless for naming a directory does not make it useless for reading a LIMIT: both
+/// readings resolve to the same place, and in a cgroup namespace the mount shows the namespace root,
+/// so a container started with `-m 512m` carries its ceiling in `/sys/fs/cgroup/memory.max`. Reading
+/// it is what keeps a legitimately capped container from being refused. On a true host root the file
+/// does not exist, which reads as "cannot prove" and refuses, which is correct: a bare host that
+/// delegates nothing cannot enforce `--memory`.
+pub fn memory_cap_proven_at_or_below(bytes: u64) -> bool {
+    memory_cap_proven_under(
+        std::path::Path::new(CGROUP_V2_MOUNT),
+        own_cgroup_dir().as_deref(),
+        bytes,
+    )
+}
+
+/// Testable core of [`memory_cap_proven_at_or_below`]. `root` is only consulted for the `None` case
+/// (the `0::/` reading); the `Some` case walks the real chain from that directory, which is anchored
+/// at the live mount by [`in_tree`] and is exercised on a host rather than in a synthetic tree.
+fn memory_cap_proven_under(root: &Path, own: Option<&Path>, bytes: u64) -> bool {
+    match own {
+        Some(d) => memory_capped_at_or_below(d, bytes),
+        None => read_limit_bytes(&root.join("memory.max")).is_some_and(|m| m <= bytes),
+    }
+}
+
 /// Warn for every cap the caller ASKED for that nothing in this process's cgroup chain enforces.
 ///
 /// The direct path already does this at the inner cgroup (see the `capped_in_tree` warnings above),
@@ -4950,6 +4993,52 @@ mod tests {
         // Nothing reachable, and the degenerate rest.
         assert!(!manager_live_from(false, false, yes));
         assert!(!manager_live_from(false, false, no));
+    }
+
+    /// The fail-closed predicate, driven over the case this machine cannot be in.
+    ///
+    /// `0::/` is what a container with a cgroup namespace reports, and the directory parser refuses
+    /// it on purpose, so the question reaches this function as `None`. An independent host measured
+    /// what the warn-oriented default did with that `None`: it answered "capped", the refusal was
+    /// skipped, and `kern run --memory 16m` ran with nothing enforcing it. Unknown must answer NO
+    /// here, and a namespace root that really carries a ceiling must still answer YES, or every
+    /// capped container starts being refused.
+    #[test]
+    fn a_cap_is_proven_only_when_the_kernel_shows_one_at_or_below_the_request() {
+        let root = std::env::temp_dir().join(format!(
+            "kern-proven-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("synthetic mount");
+        let mib = 1024 * 1024;
+
+        // Nothing to read: the host root has no `memory.max`, so nothing is proven. REFUSE.
+        assert!(!memory_cap_proven_under(&root, None, 16 * mib));
+        // `max` is not a ceiling.
+        fs::write(root.join("memory.max"), "max\n").unwrap();
+        assert!(!memory_cap_proven_under(&root, None, 16 * mib));
+        // A namespace root that DOES cap, at or below the request: proven, so do not refuse.
+        fs::write(root.join("memory.max"), "8388608\n").unwrap();
+        assert!(memory_cap_proven_under(&root, None, 16 * mib));
+        fs::write(root.join("memory.max"), "16777216\n").unwrap();
+        assert!(
+            memory_cap_proven_under(&root, None, 16 * mib),
+            "equal counts"
+        );
+        // A ceiling LOOSER than the request does not satisfy it: the caller asked for 16m.
+        fs::write(root.join("memory.max"), "67108864\n").unwrap();
+        assert!(!memory_cap_proven_under(&root, None, 16 * mib));
+        // Garbage reads as unknown, which is a refusal.
+        fs::write(root.join("memory.max"), "not-a-number\n").unwrap();
+        assert!(!memory_cap_proven_under(&root, None, 16 * mib));
+
+        // THE CONTRAST THAT MAKES THESE TWO SEPARATE FUNCTIONS, on the same unknown: the
+        // warn-oriented helper answers "in force" where this one answers "not proven". Right for a
+        // warning, measured wrong for a refusal.
+        assert!(memory_cap_in_force_at_or_below(None, 16 * mib) || own_cgroup_dir().is_some());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
