@@ -2564,10 +2564,24 @@ pub fn run(
                 kern_isolation::missing_manager_clause()
             )));
         }
-        eprintln!(
-            "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
-             delegation unavailable) - the command runs UNCAPPED."
-        );
+        // AND THE WARNING ANSWERS THE SAME QUESTION THE REFUSAL JUST ANSWERED. Reaching this line
+        // with `--memory` means the ceiling WAS proven - that is the only way past the refusal above
+        // without the opt-out - so saying "runs UNCAPPED" here is kern contradicting itself about
+        // one command. MEASURED inside a cgroup namespace whose root carries `memory.max` 67108864,
+        // the shape `docker run -m 64m` produces: `kern run --memory 64m` correctly declined to
+        // refuse and then printed "the command runs UNCAPPED" over a command the kernel holds to
+        // exactly 64 MiB. kern wrote no cgroup of its own, which is what this branch tests, and that
+        // is not the same fact as the command being uncapped.
+        //
+        // `--cpus` keeps the warning whatever memory does: nothing here proves a CPU ceiling, and an
+        // unenforced share is still worth saying out loud.
+        let memory_proven = memory.is_some() && !memory_unheld;
+        if !memory_proven || cpus.is_some() {
+            eprintln!(
+                "kern: warning: requested resource cap(s) could not be enforced on this host (cgroup \
+                 delegation unavailable) - the command runs UNCAPPED."
+            );
+        }
     } else if kern_common::env_flag("KERN_SCOPE") {
         // The branch above stays quiet under a scope because the scope is ASSUMED to enforce the
         // caps it was given. systemd accepts `MemoryMax=`/`CPUQuota=` that the kernel cannot honour
