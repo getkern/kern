@@ -13,7 +13,7 @@ on:
     # main and the runner's host shape is the one thing a local gate cannot reproduce (no
     # `cgroup.procs` to write, the musl and gnu lints, the arm64 cross build). Remove this line in
     # the push that merges it.
-    branches: [main, dev, sandbox-gaps_2026-10-06_0742]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch: {}
 
