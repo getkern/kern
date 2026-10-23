@@ -190,10 +190,11 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Roadmap
 
-Under consideration, with no dates: **a desktop for computer use**, so an agent can drive a virtual
-screen with Chromium, mouse, keyboard and screenshots on your own machine; a VM tier for hostile
-code; kern inside a Kubernetes pod; a per-box GPU limit; snapshots; and a `kern` command on the
-macOS side. Where each one stands: [ROADMAP.md](ROADMAP.md).
+In development, with no dates: a VM tier for hostile code, and a per-box GPU limit so two boxes
+can share one card. Under consideration: **a desktop for computer use**, so an agent can drive a
+virtual screen with Chromium, mouse, keyboard and screenshots on your own machine; kern inside a
+Kubernetes pod; snapshots; and a `kern` command on the macOS side. Where each one stands:
+[ROADMAP.md](ROADMAP.md).
 
 ## Documentation
 
