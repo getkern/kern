@@ -190,11 +190,8 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Roadmap
 
-In development, with no dates: a VM tier for hostile code, and a per-box GPU limit so two boxes
-can share one card. Under consideration: **a desktop for computer use**, so an agent can drive a
-virtual screen with Chromium, mouse, keyboard and screenshots on your own machine; kern inside a
-Kubernetes pod; snapshots; and a `kern` command on the macOS side. Where each one stands:
-[ROADMAP.md](ROADMAP.md).
+In development: a VM tier and a per-box GPU limit. Under consideration: a desktop for computer use,
+kern in a Kubernetes pod, snapshots, a `kern` command on macOS. Details: [ROADMAP.md](ROADMAP.md).
 
 ## Documentation
 
