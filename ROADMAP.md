@@ -6,8 +6,7 @@ Nothing here is a commitment or a date. Shipped work is in [CHANGELOG.md](CHANGE
 
 - **VM tier**: a microVM boundary for hostile, multi-tenant code, as its own command
   ([SECURITY.md](SECURITY.md)).
-- **Per-box GPU limit**: two boxes sharing one card. Today a box gets a whole GPU
-  ([docs/CONFIG.md](docs/CONFIG.md)).
+- **Full GPU support**.
 
 ## Under consideration
 

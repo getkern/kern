@@ -190,7 +190,7 @@ Report a vulnerability privately via GitHub Security Advisories or hello@getkern
 
 ## Roadmap
 
-In development: a VM tier and a per-box GPU limit. Under consideration: a desktop for computer use,
+In development: a VM tier and full GPU support. Under consideration: a desktop for computer use,
 kern in a Kubernetes pod, snapshots, a `kern` command on macOS. Details: [ROADMAP.md](ROADMAP.md).
 
 ## Documentation
