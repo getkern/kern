@@ -11,10 +11,8 @@ over.**
 
 [![CI](https://github.com/getkern/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/getkern/kern/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/getkern/kern/blob/main/LICENSE)
-[![Release](https://img.shields.io/github/v/release/getkern/kern?color=blue)](https://github.com/getkern/kern/releases/latest)
 [![PyPI](https://img.shields.io/pypi/v/kern-sandbox?label=pypi%20kern-sandbox&color=blue)](https://pypi.org/project/kern-sandbox/)
 [![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm%20kern-sandbox&color=blue)](https://www.npmjs.com/package/kern-sandbox)
-[![Runs on](https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20Windows%20via%20WSL2%20%C2%B7%20macOS%20via%20a%20Linux%20VM-informational.svg)](https://github.com/getkern/kern/blob/main/docs/INSTALL.md)
 
 <sub>rootless · no daemon · no socket · no VM · no cloud · no account</sub>
 
@@ -25,22 +23,17 @@ over.**
 
 </div>
 
-An agent's tool-call, a generated snippet, a notebook cell, a CI step: it arrives, you run it, and
-nobody has read it first.
-
-In a terminal:
+An agent's tool-call, a generated snippet, a notebook cell, a CI step: code nobody has read, run in
+a container of its own.
 
 ```bash
-# if the venv line fails, your distribution ships it separately:
-#     sudo apt install python3-venv
+# if the venv line fails: sudo apt install python3-venv
 python3 -m venv .venv && . .venv/bin/activate
 pip install -U kern-sandbox   # on Linux x86_64 and aarch64, this brings kern with it
 ```
 
-On a Mac, run these inside a Linux VM, with your code:
+On a Mac, run it inside a Linux VM, with your code:
 [macOS](https://github.com/getkern/kern/blob/main/docs/INSTALL.md#macos).
-
-Then in a Python file:
 
 ```python
 import kern_sandbox as kern
@@ -49,43 +42,30 @@ r = kern.run_code("print(sum(range(100)))")
 print(r.stdout, r.fault)   # 4950  None
 ```
 
-That call ran the code in a fresh container from an OCI image, with **no network**, memory and PID
-caps and a deadline applied from outside, and threw the container away before returning.
+That ran in a fresh container from an OCI image, with **no network**, memory and PID caps and a
+deadline set from outside, and the container was thrown away before the call returned.
 
-- **Cheap enough for every call**: a hundred calls are a hundred containers, and nothing is left
-  behind.
-- **State when you want it**: a `Sandbox()` you keep open shares `/workspace`, and `kernel()` keeps
-  one warm interpreter where variables carry too.
-- **Imports are precompiled once**: the image's standard library is compiled in the background the
-  first time you use that image and mounted READ-ONLY into every box after it, so `import json, re`
-  in a fresh container is about 3x cheaper. `pyc_cache=False` turns it off.
-- **Two parts, one install**: the `kern` binary is the isolation, this package is the API in front
-  of it. The Linux wheels carry the binary, so the venv has `kern doctor` and `kern ps` too.
+- **Cheap enough for every call**: a hundred calls are a hundred containers, nothing left behind.
+- **State when you want it**: a `Sandbox()` you keep open shares `/workspace`; `kernel()` keeps one
+  warm interpreter where variables carry too.
+- **Imports compiled once**: the image's standard library is precompiled the first time you use it
+  and mounted READ-ONLY into later boxes, so `import json, re` is about 3x cheaper.
+  `pyc_cache=False` turns it off.
+- **One install**: the Linux wheels carry the `kern` binary, so the venv has `kern doctor` and
+  `kern ps` too.
 
-## When you would use this
-
-**Your model just wrote a script and you are about to run it.** Paste it into `run_code` instead of
-your terminal. It runs in a container built from an image, so there is no home directory of yours in
-there to delete and no key to read. A hallucinated `rm -rf ~` resolves to the container's own
-`/root`, which is mounted read-only, so it fails there too.
-
-**An agent writing and running code in a loop.** Give it the LangChain tool or the MCP server.
-Nothing step 3 left behind is waiting for step 12, and a step that hangs or runs out of memory comes
-back as a value your loop can branch on.
-
-**Analysis you did not write.** A chart comes back as an image the model can see, and a failure
-comes back labelled, so you can tell a bug in the code from the sandbox stopping it.
+A hallucinated `rm -rf ~` hits the container's own `/root`, mounted read-only. A step that hangs or
+runs out of memory comes back as a value your loop can branch on.
 
 ## The basics, one call each
 
-Each block starts from `import kern_sandbox as kern`, as above, and prints what the comment says.
+Each block starts from `import kern_sandbox as kern` and prints what the comment says.
 
 <!-- tabs -->
 
 <!-- tab: files.py -->
 
-**Give it a file, get a file back.** A `Sandbox()` you keep open has a `/workspace` that you and the
-code both see.
+**Give it a file, get a file back.** A `Sandbox()` has a `/workspace` you and the code both see.
 
 ```python
 job = """
@@ -102,7 +82,7 @@ with kern.Sandbox() as sb:
 
 <!-- tab: state.py -->
 
-**Keep variables between steps.** `kernel()` is one warm interpreter, the way a notebook is.
+**Keep variables between steps.** `kernel()` is one warm interpreter, like a notebook.
 
 ```python
 with kern.Sandbox() as sb, sb.kernel() as k:
@@ -113,8 +93,7 @@ with kern.Sandbox() as sb, sb.kernel() as k:
 
 <!-- tab: package.py -->
 
-**Install a package first.** `setup=` runs once, with network, before any of your code. The code
-itself still runs without network.
+**Install a package first.** `setup=` runs once, with network; your code still runs without.
 
 ```python
 with kern.Sandbox(setup="pip install numpy") as sb:
@@ -124,8 +103,8 @@ with kern.Sandbox(setup="pip install numpy") as sb:
 
 <!-- tab: network.py -->
 
-**Let it reach one host.** There is no network by default. `egress_allow` opens the hosts you name
-and nothing else; `network=True` opens everything, your own loopback included.
+**Let it reach one host.** No network by default. `egress_allow` opens the hosts you name and
+nothing else; `network=True` opens everything, your own loopback included.
 
 ```python
 code = ("import urllib.request as u; "
@@ -147,9 +126,9 @@ print(r.stdout)   # Linux, then the image's Python 3.12
 
 <!-- tab: chart.py -->
 
-**Get a chart back.** A matplotlib figure open when the code ends comes back as a PNG on `r.results`,
-and `fig` or `display(fig)` draws a figure the code holds. In a `kernel()` session a figure is closed
-once its cell has returned it, as in Jupyter, so later cells do not return it again.
+**Get a chart back.** A matplotlib figure open when the code ends comes back as a PNG on
+`r.results`; `fig` or `display(fig)` draws one the code holds. In a `kernel()` a figure is closed
+once its cell returned it, as in Jupyter.
 
 ```python
 plot = """
@@ -166,12 +145,8 @@ with kern.Sandbox(setup="pip install matplotlib") as sb:
 
 ## The result says who stopped the run
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-demo.gif" width="860" alt="A scrolling Python session, seven calls. run_code returns ('4950', None); an infinite loop under timeout_s=3 returns fault.type 'timeout' and exit 137; a 400 MiB allocation under memory_mb=128 returns 'oom' and 137; a urlopen with the network off returns fault None and exit 1, so the code raised and the sandbox stopped nothing; os.remove('/root/.bashrc') comes back OSError [Errno 30] Read-only file system; print(1) on alpine:3.19 returns 'exec_failed' and 127 because alpine ships no python3; and print(1) on an image that does not exist returns 'startup_failed' and 1. Exit 137 does not say which of those it was; the fault field does.">
-</p>
-
-`docker run` gives you exit 137 and leaves you to guess whether that was your timeout, the OOM killer
-or something else. This tells you. Every row was run:
+Exit 137 alone does not say whether it was your timeout or the OOM killer. `fault` does. Every row
+was run:
 
 | the code | `fault.type` | `exit_code` |
 |---|---|---|
@@ -182,24 +157,24 @@ or something else. This tells you. Every row was run:
 | `print(1)` on `alpine:3.19`, no python3 | **`exec_failed`** | 127 |
 | `print(1)` on an image that is not there | **`startup_failed`** | 1 |
 
-The fourth row is the one a loop gets wrong: the network was off, so the **code** raised and the
-sandbox did nothing. `fault` is read from a pipe kern writes rather than from stdout, so code that
-prints `[exit 0]` can't fake it. Also `killed`, `workspace_full` and `escape_blocked`. These values and the exit codes
-are stable: one changes only to correct an outcome that was reported wrong, and the release that does
-it says so first in its [CHANGELOG](https://github.com/getkern/kern/blob/main/CHANGELOG.md) entry.
+In the fourth row the **code** raised and the sandbox did nothing. `fault` is read from a pipe kern
+writes, not from stdout, so code that prints `[exit 0]` can't fake it. Also `killed`,
+`workspace_full` and `escape_blocked`. These values and exit codes are stable: one changes only to
+correct an outcome reported wrong, and that release's
+[CHANGELOG](https://github.com/getkern/kern/blob/main/CHANGELOG.md) entry says so first.
 
 ## Works with
 
-- **Any MCP client**: Claude Code, Cursor, Claude Desktop, LM Studio, Zed. The package
-  ships `kern-mcp`, a stdio server, and charts come back as images the model can see. One session
-  backs the connection, so files carry between tool calls and variables do not, unless
-  `KERN_MCP_KERNEL=1`: [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
+- **Any MCP client**: Claude Code, Cursor, Claude Desktop, LM Studio, Zed. The package ships
+  `kern-mcp`, a stdio server; charts come back as images the model can see. One session backs the
+  connection, so files carry between tool calls and variables do not, unless `KERN_MCP_KERNEL=1`:
+  [docs/MCP.md](https://github.com/getkern/kern/blob/main/docs/MCP.md).
 - **LangChain**: `kern_code_tool()` is a `StructuredTool`, and a fault comes back labelled for the
-  model. There is a shell policy too:
+  model. Shell policy:
   [LANGCHAIN-SHELL.md](https://github.com/getkern/kern/blob/main/bindings/python/LANGCHAIN-SHELL.md).
 - **[pi](https://github.com/earendil-works/pi)**: [`kern-pi`](https://www.npmjs.com/package/kern-pi)
   routes its file and shell tools into a box, your working directory at `/workspace`.
-- **Python and Node**: the same API on both, `pip install kern-sandbox` and
+- **Python and Node**: the same API, `pip install kern-sandbox` and
   [`npm i kern-sandbox`](https://www.npmjs.com/package/kern-sandbox).
 
 ```json
@@ -210,95 +185,63 @@ it says so first in its [CHANGELOG](https://github.com/getkern/kern/blob/main/CH
 }
 ```
 
-A client spawns the server from **its own** PATH, so a venv is invisible to it: `uvx` fetches the
-package, kern included on Linux, and `pipx install kern-sandbox` is the other way. From macOS or
-Windows swap the command for `wsl` or `ssh`.
+A client spawns the server from **its own** PATH, so it cannot see a venv: `uvx` fetches the
+package, kern included on Linux, or use `pipx install kern-sandbox`. From macOS or Windows, swap the
+command for `wsl` or `ssh`.
 
 ## Safe by default
 
-**Two threats, and the second is not covered by the first.** A compromised dependency is stopped by
-the filesystem and the network: no network unless you ask, a read-only root, and only the paths you
-name. A prompt-injected agent is not, because it runs the code you asked for. The defence there is
-that the credentials were never in the box at all, which is why mounts over them are refused rather
-than discouraged.
-
 A bare `Sandbox()` runs `python:3.12-slim` with a 30 second deadline, no network, no host mounts,
-seccomp on and capabilities dropped. The timeout is **mandatory**: there is no value that disables
-it. Every relaxation is a named argument, and two have surprised people, both measured:
+seccomp on and capabilities dropped. The timeout is **mandatory**: no value disables it. Every
+relaxation is a named argument.
 
-- **Mounts over sensitive sources are refused even if you ask**: the host's own directories, kern's
+- **A compromised dependency** is stopped by the filesystem and the network. **A prompt-injected
+  agent** runs the code you asked for, so the defence is that credentials are never in the box.
+- **Mounts over sensitive sources are refused, with no opt-out**: the host's own directories, kern's
   own state, and 17 credential directories by name (`.ssh`, `.aws`, `.kube`, `.gnupg`, `.netrc`,
-  `.npmrc`, `.git-credentials` and the rest), plus `~/.config/gh` and `~/.config/gcloud`. No opt-out.
-  Mount a copy.
-- **`network=True` includes the host's loopback**, where unauthenticated services live. A test read
-  the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the middle setting and is route-level.
+  `.npmrc`, `.git-credentials` and the rest), plus `~/.config/gh` and `~/.config/gcloud`. Mount a
+  copy.
+- **`network=True` includes the host's loopback**, where unauthenticated services live: a test read
+  the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the route-level middle setting.
 
 ## How fast
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/getkern/kern/main/assets/kern-sandbox-vs.png" width="880" alt="Horizontal bar chart on a log scale, times the cost of one kern-sandbox call: kern-sandbox with a prewarm pool 21x faster, kern-sandbox 1x, llm-sandbox with its session kept alive 5x, podman run --rm 19x, docker run --rm 20x, and Docker Sandboxes (sbx) into an already running sandbox 29x. One tool-call, print(1), rootless, 2026-09-21; a heavier call is 7x rather than 20x.">
-</p>
-
-<sub>**A tool-call costs a twentieth of `docker run`.** Most of what is left is CPython starting
-inside the box, not the box, so a heavier call narrows it: `import json,re` is 7x rather than 20x,
-and 3x of that is the stock image compiling its standard library, which a
-[precompiled one](https://github.com/getkern/kern/tree/main/examples/precompiled-image) removes. The
-prewarm bar is what a call gets while the pool keeps up.
-([BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md) has the method. Measure
-your own.)</sub>
-
-## Compared to what you are probably doing
-
-- **a venv** isolates imports, not the process: the code still has your files, your keys and your
-  network.
-- **`docker run` per call** is the same idea with a daemon in front of it, and costs 20x as much
-  per call.
-- **[nono](https://github.com/nolabs-ai/nono)** fences the environment you already have with
-  Landlock, so your own tools are there and state carries between commands. This builds a new
-  one from an image instead. Measured both ways in
-  [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
-- **bubblewrap and nsjail** are the building blocks kern uses: no images, no cgroup caps, and no
-  verdict, so you get an exit code and work out the rest.
-- **a microVM (Firecracker, Kata) or gVisor** is a stronger boundary than this one, and the right
-  answer when the code is actively hostile. It costs what a machine costs.
-- **E2B, Modal, Daytona** do the same job in someone else's cloud, with an account and your code
-  leaving the machine.
+Most of a call's cost is CPython starting inside the box, not the box. A
+[precompiled image](https://github.com/getkern/kern/tree/main/examples/precompiled-image) removes
+the stock image's compile step, and a prewarm pool serves calls from boxes already started. Method
+and numbers: [BENCHMARKS.md](https://github.com/getkern/kern/blob/main/BENCHMARKS.md).
 
 ## Current limitations
 
-- **Not a boundary against deliberately hostile code.** Namespaces, cgroups and seccomp, for your
-  own or semi-trusted code. If it is hostile or someone else's, use a microVM or gVisor:
+- **Not a boundary against deliberately hostile code.** Namespaces, cgroups and seccomp are for your
+  own or semi-trusted code. For hostile or someone else's code, use a microVM or gVisor:
   [SECURITY.md](https://github.com/getkern/kern/blob/main/SECURITY.md).
 - **Caps bind only where your host delegates a cgroup.** `kern doctor` says whether yours does;
   `require_limits=True` refuses to start rather than run uncapped.
-- **The workspace is bounded only if you ask.** It is a host directory, so by default a job can
-  fill your disk; `workspace_max_bytes` is measured WHILE a call runs and stops the box with a
-  `workspace_full` fault. How far past it a box gets depends on what the workspace costs to measure:
-  the interval scales to the headroom but can never be shorter than one walk of the tree, so a
-  workspace of a few files is crossed by ~1.2x and one of 50,000 files by ~13x. It is still a
-  measurement and a kill rather than a refusal from the filesystem.
-- **A directory the box closes to the host comes back at `0o500`.** The host has to walk the
-  workspace to report what changed, so read and search are restored on a directory it owns, never
-  write, and a warning says how many were touched. A file at mode 0 is left alone.
-- **A non-root `user=` shares the workspace through a POSIX ACL.** The account is a uid of kern's
-  range on disk, so the workspace needs a filesystem with ACLs and the host a range in `/etc/subuid`.
-  A file or directory that account closes on purpose (`mkstemp`'s 0600, `mkdtemp`'s 0700) is reached
-  through a short-lived box of the same image running as that account, one box start per access.
+- **The workspace is bounded only if you ask.** It is a host directory, so by default a job can fill
+  your disk. `workspace_max_bytes` is measured while a call runs and stops the box with a
+  `workspace_full` fault. The overshoot depends on what the tree costs to walk: ~1.2x for a few
+  files, ~13x for 50,000. A measurement and a kill, not a refusal from the filesystem.
+- **A directory the box closes to the host comes back at `0o500`.** The host walks the workspace to
+  report changes, so read and search are restored on directories it owns, never write, and a warning
+  says how many. A file at mode 0 is left alone.
+- **A non-root `user=` shares the workspace through a POSIX ACL.** It needs a filesystem with ACLs
+  and a host range in `/etc/subuid`. A file that account closes on purpose (`mkstemp`'s 0600,
+  `mkdtemp`'s 0700) is reached through a short-lived box running as that account, one box start per
+  access.
 - **Not inside a container without `--privileged`, and not on Google Colab.** A box mounts a fresh
-  `/proc`, and the kernel allows that only where an unmasked `/proc` already exists. A container
-  that masks parts of its own `/proc`, which is the default and is why it is safe, leaves none, so
-  the box stops at `mount(proc) failed: Permission denied`. Measured on Colab, kernel 6.6.122.
-- **The binary comes with the package only on Linux x86_64 and aarch64.** Anywhere else pip picks
-  the wheel without it, and the package drives a `kern` on `PATH` or in `$KERN_BIN`, installed with
-  the [install script](https://github.com/getkern/kern/blob/main/docs/INSTALL.md). `$KERN_BIN`
-  always wins over the bundled one.
+  `/proc`, which the kernel allows only where an unmasked `/proc` exists; a container masks its own,
+  so the box stops at `mount(proc) failed: Permission denied`. Measured on Colab, kernel 6.6.122.
+- **The binary ships with the package only on Linux x86_64 and aarch64.** Elsewhere pip picks the
+  wheel without it, and the package drives a `kern` on `PATH` or in `$KERN_BIN`, installed with the
+  [install script](https://github.com/getkern/kern/blob/main/docs/INSTALL.md). `$KERN_BIN` always
+  wins over the bundled one.
 
 ## More
 
-Charts and mime-typed results without a Jupyter kernel, the full API, snapshots, and the measured
-sharp edges:
+The full API, mime-typed results, snapshots and the measured sharp edges:
 [SANDBOX-NOTES.md](https://github.com/getkern/kern/blob/main/bindings/python/SANDBOX-NOTES.md).
 
-Runs on Linux, with unprivileged user namespaces and cgroup v2, and Python 3.9+. Windows through
-WSL2; on a Mac, inside a Linux VM, where the same `pip install` is the whole install.
+Linux with unprivileged user namespaces and cgroup v2, Python 3.9+. Windows through WSL2; on a Mac,
+inside a Linux VM, where the same `pip install` is the whole install:
 [install notes](https://github.com/getkern/kern/blob/main/docs/INSTALL.md). Apache-2.0.
