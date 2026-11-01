@@ -159,7 +159,7 @@ Each service gets its own network namespace and they reach each other by name.
 ## Speed and footprint
 
 <p align="center">
-  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern is 80x faster than docker run. A real OCI image, rootless, a static binary, no daemon, measured on x86 on 2026-09-20, and you should measure your own.">
+  <img src="assets/kern-demo.gif" width="720" alt="Terminal: 'kern box app --image alpine -- echo hello from a real container' prints the greeting, then reports that kern is 80x faster than docker run. A real OCI image, rootless, a static binary, no daemon, measured on x86 on 2026-09-20 with the image already pulled, and you should measure your own.">
 </p>
 
 | one isolated `/bin/true`&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp;&emsp; | kern is |
