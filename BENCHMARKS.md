@@ -24,6 +24,23 @@ measure it yourself on a working machine you should expect something closer to 4
 regression, it is the same box on a different afternoon. The reproduction command is at the bottom
 of this page and it is the only number that matters for your hardware.
 
+**EVERY ROW ABOVE IS WARM, AND A FIRST RUN IS NOT.** The table starts a container whose image is
+already local, which is the only way to compare start costs instead of comparing networks. A first
+run pays a registry pull, and the pull is almost the whole measurement. Measured 2026-11-01 on this
+host, `alpine:3.19`, both caches cleared before every replica and the arm order alternated between
+them: fetched and unpacked in 11.06, 11.48 and 12.14 s through `kern pull` against 10.77, 9.98 and
+10.57 s through `docker pull`. Starting the image after that pull costs 3.6 ms through kern, the
+table's figure, which `/usr/bin/time` here cannot resolve at all and reads as 0.00, against 0.30 s
+through `docker run`. So kern's own start is about 0.03% of a first run on this link and docker's is
+about 3%, and end to end the two land inside each other's noise: 9.50 to 11.29 s for kern against
+10.68 to 15.18 s for docker.
+
+That figure is mostly this connection rather than either runtime, which is why it is not a row in the
+table. On a faster link both collapse and the ratio moves with the bandwidth, and one replica in six
+read kern slower than docker purely on pull jitter. It is published here so the reader knows exactly
+what the warm figures leave out: the part of a first run that the runtime controls is the start, and
+the start is the only number on this page that transfers to other hardware.
+
 **The parallel cell on the `--image` row is a day later and a different build**, measured 2026-09-21
 on kern **v0.10.0-2-gdcb1d1a**, built the same way: three replicas of 200 starts fanned out at once,
 alternating with docker, 0.10 / 0.12 / 0.12 s with 200 of 200 succeeding in every replica. The 0.12

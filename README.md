@@ -174,8 +174,10 @@ Each service gets its own network namespace and they reach each other by name.
 | Resident memory, nothing running | **0** | 154 to 160 MB | 0 |
 | Root required | **never** | opt-in to avoid it | never |
 
-<sub>Same machine, same workload, same day, rounded down. The method and every runtime:
-[BENCHMARKS.md](BENCHMARKS.md).</sub>
+<sub>Same machine, same workload, same day, rounded down, with the image already local. A first run is
+a registry pull, and the pull dominates: fetching and unpacking `alpine:3.19` took about 11 s on this
+link against 3.6 ms to start the box, so cold against cold kern and `docker run` land inside each
+other's noise. The method and every runtime: [BENCHMARKS.md](BENCHMARKS.md).</sub>
 
 ## Security
 
