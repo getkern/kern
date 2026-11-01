@@ -426,7 +426,10 @@ function workspaceUsage(root, blind = null, regranted = null, biggest = null) {
       `the workspace cannot be measured: ${unreadable.length} directory(ies) under ${root} cannot be ` +
         `read by this process and the owner bits could not be restored (not ours, or no /proc to ` +
         `reach the pinned descriptor), and counting them as empty would let a cap's worth of bytes ` +
-        `sit where the walk does not look (first: ${JSON.stringify(unreadable[0])})`,
+        // The LOWEST name, not `unreadable[0]`: the walk appends in readdir order, so the example
+        // used to change with the filesystem and the same workspace threw two different strings.
+        // The count beside it was already stable. Python picks the same one.
+        `sit where the walk does not look (first: ${JSON.stringify(unreadable.reduce((lo, p) => (p < lo ? p : lo)))})`,
     );
   return total;
 }

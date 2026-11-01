@@ -676,7 +676,11 @@ def test_a_directory_that_is_NOT_ours_is_still_reported_whole_and_not_counted(tm
         # those bytes as nothing and was admitted.
         with pytest.raises(SandboxError) as e:
             kern._workspace_usage(str(tmp_path))
-        assert "cannot be measured" in str(e.value) and str(closed) in str(e.value)
+        # THE EXAMPLE IS THE LOWEST NAME, not whichever one readdir handed back first. This named
+        # `closed` and passed only because the local filesystem happened to walk it first; a runner
+        # that walked `half` first turned it red while the code was doing exactly what it always did.
+        assert "cannot be measured" in str(e.value)
+        assert min(str(closed), str(half)) in str(e.value), "the example is not the lowest name"
     finally:
         os.chmod(closed, 0o700)
         os.chmod(half, 0o700)

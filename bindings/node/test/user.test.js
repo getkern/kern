@@ -831,6 +831,14 @@ test("a directory that is NOT ours is still reported whole and not counted", { s
     // WITHOUT A LIST THERE IS NO ONE TO ASK, so this refuses rather than returning a number that is
     // short by whatever is hidden. Python's `_workspace_usage` raises in the same words.
     assert.throws(() => kern._workspaceUsage(t), /cannot be measured/);
+    // AND IT NAMES THE LOWEST ONE. This side only matched the sentence, so when the example was
+    // whichever name readdir returned first it was Python's copy of this test that went red on a
+    // runner and this one that stayed green. Both pick the minimum now, so assert it on both.
+    assert.throws(
+      () => kern._workspaceUsage(t),
+      (e) => e.message.includes([closed, half].sort()[0]),
+      "the example is not the lowest name",
+    );
   } finally {
     process.geteuid = realUid;
     for (const d of [closed, half])

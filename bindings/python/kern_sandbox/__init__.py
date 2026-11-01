@@ -297,7 +297,10 @@ def _workspace_usage(
                 f"{root} cannot be read by this process and the owner bits could not be restored "
                 f"(not ours, or no /proc to reach the pinned descriptor), and counting them as "
                 f"empty would let a cap's worth of bytes sit where the walk does not look "
-                f"(first: {_quote_untrusted(unreadable[0])})"
+                # The LOWEST name, not `unreadable[0]`: the walk appends in readdir order, so the
+                # example used to change with the filesystem and the same workspace raised two
+                # different strings. The count beside it was already stable.
+                f"(first: {_quote_untrusted(min(unreadable))})"
             )
         blind.extend(unreadable)
     return total
