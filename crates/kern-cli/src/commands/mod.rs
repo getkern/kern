@@ -6347,8 +6347,89 @@ pub(crate) fn apply_privileged_grant(
 /// device, and following can only ever widen what is gated. A source that is not a device node, does
 /// not exist, or is a named volume contributes nothing, so a stack that binds no hardware is not
 /// gated by this and the common case stays unaffected.
+///
+/// ⛔ A DIRECTORY OF DEVICE NODES IS A DEVICE GRANT, and asking only "is the source itself a node"
+/// missed it. MEASURED on 2026-11-12 with the binary that had the fix above:
+///
+/// ```text
+/// volumes: ["/dev/nvidia0:/dev/nvidia0"]   refused, names the node
+/// volumes: ["/dev/dri:/dev/dri"]           RAN, and the box held crw-rw----+ 226,0 card0
+/// volumes: ["/dev/input:/dev/input"]       RAN, and the box held crw-rw---- 13,64 event0
+/// volumes: ["/dev/snd:/dev/snd"]           RAN, and the box held crw-rw----+ 116,17 controlC0
+/// ```
+///
+/// The parent directory is the EASIER thing to write, and it is how a vendor's own file names a
+/// device group: `/dev/dri` is the DRM pair, `/dev/snd` the sound cards, `/dev/bus/usb` every USB
+/// device on the machine. So the gate caught the careful spelling and missed the ordinary one, and a
+/// file from a registry reached hardware with no operator decision. `/dev:/hostdev` was refused in
+/// that measurement, but by the KERNEL (a non-recursive bind of a source holding submounts), which
+/// is an accident of `/dev/pts` and not a policy.
+///
+/// THE WALK IS BOUNDED AND CONFINED TO `/dev`. Depth and entry count are capped so a bind of a large
+/// tree cannot turn this check into a filesystem crawl, and only a source at or under `/dev` is
+/// walked at all: a device node elsewhere needs `mknod`, which needs root, so a compose file cannot
+/// put one there. NAMED LIMIT, so it is not mistaken for completeness: a directory OUTSIDE `/dev`
+/// that root has filled with device nodes is not walked, and a bind of it is not gated by this.
 fn host_device_sources(specs: &[String]) -> Vec<String> {
+    host_device_sources_under(specs, std::path::Path::new("/dev"))
+}
+
+/// [`host_device_sources`] with the device root as a parameter, so both halves can be tested.
+///
+/// The production caller passes `/dev`. A test passes a directory it can write, which is the only
+/// way to assert the directory half at all: building the real case needs `mknod` under `/dev`, and
+/// that needs root.
+fn host_device_sources_under(specs: &[String], dev_root: &std::path::Path) -> Vec<String> {
     use std::os::unix::fs::FileTypeExt;
+    /// How deep under a `/dev` source to look. `/dev/bus/usb/001/002` is four levels under `/dev`,
+    /// which is the deepest real shape on this host.
+    const MAX_DEPTH: usize = 5;
+    /// How many entries to look at before stopping. `/dev` on this host has 330.
+    const MAX_ENTRIES: usize = 4096;
+
+    /// The first device node at or under `dir`, if the bounded walk finds one.
+    fn first_node_under(
+        dir: &std::path::Path,
+        budget: &mut usize,
+        depth: usize,
+    ) -> Option<std::path::PathBuf> {
+        if depth > MAX_DEPTH || *budget == 0 {
+            return None;
+        }
+        // `read_dir` SORTED, so the answer does not depend on the order the filesystem hands the
+        // entries back: a gate that names a different node on each run is a gate whose message
+        // cannot be tested.
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if *budget == 0 {
+                return None;
+            }
+            *budget -= 1;
+            // `symlink_metadata` HERE, unlike the source check above: inside the walk a symlink is
+            // a NAME for something already counted (`/dev/dri/by-path/...` points back into
+            // `/dev/dri`), and following it would both double the answer and let a link out of the
+            // tree decide it.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let kind = meta.file_type();
+            if kind.is_char_device() || kind.is_block_device() {
+                return Some(path);
+            }
+            if kind.is_dir() {
+                if let Some(found) = first_node_under(&path, budget, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
     let mut out: Vec<String> = Vec::new();
     for spec in specs {
         let source = spec.split(':').next().unwrap_or(spec.as_str());
@@ -6361,6 +6442,31 @@ fn host_device_sources(specs: &[String]) -> Vec<String> {
         let kind = meta.file_type();
         if kind.is_char_device() || kind.is_block_device() {
             out.push(source.to_string());
+            continue;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        // CANONICALISED BEFORE THE `/dev` TEST, so `/dev/../dev/dri` and a symlinked path are the
+        // same question as `/dev/dri`. A source that cannot be canonicalised is left to the node
+        // check above.
+        let Ok(real) = std::fs::canonicalize(source) else {
+            continue;
+        };
+        // THE DEVICE ROOT ITSELF CANONICALISED TOO: on a host where `/dev` is reached through a
+        // link, comparing a resolved source against an unresolved root would answer no for every
+        // path and silently disable this half.
+        let dev = std::fs::canonicalize(dev_root).unwrap_or_else(|_| dev_root.to_path_buf());
+        if real != dev && !real.starts_with(&dev) {
+            continue;
+        }
+        let mut budget = MAX_ENTRIES;
+        if let Some(node) = first_node_under(&real, &mut budget, 0) {
+            // RELATIVE TO THE SOURCE, because a basename is ambiguous: on this host
+            // /dev/bus/usb holds a DIRECTORY named 001 whose first entry is a NODE named 001, and
+            // the message said "the device node 001" for both. `usb/001/001` is one thing.
+            let shown = node.strip_prefix(&real).unwrap_or(&node).display();
+            out.push(format!("{source} (holds the device node {shown})"));
         }
     }
     out.sort();
@@ -6402,7 +6508,9 @@ fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Op
                  file may reach is the operator's decision, not the file's: check the list with \
                  `kern compose <file> config`, then pass --allow-device-grants to run it.",
                 b.service_name(),
-                granted.join(" ")
+                // ", " AND NOT " ": an entry can now be `/dev/dri (holds the device node card0)`,
+                // and space-joined parentheses run into each other.
+                granted.join(", ")
             ));
         }
         let toks = b.profile_tokens();
@@ -9796,6 +9904,114 @@ pub use config::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod device_source_gate {
+    use super::host_device_sources_under;
+    use std::path::Path;
+
+    /// A character device, unprivileged. `c 0 0` is a whiteout, the one a non-root caller may
+    /// create, and the gate's question is the file TYPE.
+    fn node(path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map(|p| unsafe { libc::mknod(p.as_ptr(), libc::S_IFCHR | 0o666, 0) } == 0)
+            .unwrap_or(false)
+    }
+
+    /// A DIRECTORY OF DEVICE NODES IS A DEVICE GRANT, and a directory with none is not.
+    ///
+    /// THE FIELD CASE, measured 2026-11-12 on the binary that already refused the node spelling:
+    /// `volumes: ["/dev/dri:/dev/dri"]` ran with no flag and the box held `crw-rw----+ 226,0
+    /// card0`; `/dev/input` and `/dev/snd` the same, with `event0` and `controlC0`. The gate asked
+    /// whether the SOURCE was a node, and the parent directory is both the easier thing to write
+    /// and how a vendor's own file names a device group.
+    ///
+    /// Every case is built under a temp directory passed as the device root, because the real one
+    /// needs `mknod` under `/dev` and that needs root.
+    #[test]
+    fn a_directory_of_nodes_is_gated_and_a_directory_without_them_is_not() {
+        let base = std::env::temp_dir().join(format!("kern-devsrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dev = base.join("dev");
+        for d in [
+            dev.join("dri"),
+            dev.join("shm"),
+            dev.join("bus/usb/001"),
+            dev.join("deep/a/b/c/d/e/f"),
+            base.join("outside"),
+        ] {
+            std::fs::create_dir_all(&d).expect("fixture dirs");
+        }
+        // POSITIVE CONTROL: without a real node every assertion below is about an empty list.
+        if !node(&dev.join("dri/card0")) {
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        std::fs::write(dev.join("shm/afile"), b"not a device").expect("regular file");
+        assert!(node(&dev.join("bus/usb/001/002")), "deep node");
+        assert!(node(&dev.join("deep/a/b/c/d/e/f/node")), "too-deep node");
+        assert!(
+            node(&base.join("outside/thing")),
+            "node outside the device root"
+        );
+
+        let spec = |p: &Path| vec![format!("{}:/x", p.display())];
+
+        // 1. THE CASE THAT SHIPPED BROKEN: a directory holding a node, gated, and the message names
+        //    the node so an operator can see what they are being asked about.
+        let got = host_device_sources_under(&spec(&dev.join("dri")), &dev);
+        assert_eq!(got.len(), 1, "a directory of nodes must be gated: {got:?}");
+        assert!(
+            got[0].contains("card0"),
+            "the entry must name the node: {got:?}"
+        );
+
+        // 2. AND A DIRECTORY WITH NO NODE IS NOT GATED. `/dev/shm:/dev/shm` is an ordinary compose
+        //    idiom; gating it would cost every such stack a flag for no hardware.
+        assert!(
+            host_device_sources_under(&spec(&dev.join("shm")), &dev).is_empty(),
+            "a tmpfs directory with no device node must stay ungated"
+        );
+
+        // 3. DEPTH: a node three levels down IS found (`/dev/bus/usb/001/002` is the real shape),
+        //    and the entry names it RELATIVE to the bound source. A basename would be ambiguous:
+        //    on this host /dev/bus/usb holds a directory named 001 whose own first entry is a node
+        //    named 001, and the first version of the message printed "001" for either.
+        let deep = host_device_sources_under(&spec(&dev.join("bus")), &dev);
+        assert_eq!(deep.len(), 1, "a node under bus/usb/001 must be found");
+        assert!(
+            deep[0].contains("usb/001/002"),
+            "the entry must name the node's path under the source: {deep:?}"
+        );
+
+        // 4. AND THE BOUND IS REAL, which is a limit and not a defect: past it the walk stops. It is
+        //    asserted so the number in the code is the number in the behaviour.
+        assert!(
+            host_device_sources_under(&spec(&dev.join("deep")), &dev).is_empty(),
+            "the depth bound must stop the walk rather than crawl a tree"
+        );
+
+        // 5. THE SOURCE BEING A NODE IS STILL GATED WHEREVER IT IS, which is the half that already
+        //    worked and must not have been traded away.
+        let direct = host_device_sources_under(&spec(&base.join("outside/thing")), &dev);
+        assert_eq!(
+            direct.len(),
+            1,
+            "a node source is gated anywhere: {direct:?}"
+        );
+
+        // 6. THE NAMED LIMIT: a DIRECTORY outside the device root is not walked. Putting a node
+        //    there needs root, so a compose file cannot arrange it, and walking every bind source
+        //    would turn this check into a filesystem crawl.
+        assert!(
+            host_device_sources_under(&spec(&base.join("outside")), &dev).is_empty(),
+            "a directory outside the device root is not walked, by decision"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
 
 #[cfg(test)]
 mod tmpfs_devpts_message {
