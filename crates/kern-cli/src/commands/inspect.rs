@@ -2788,10 +2788,8 @@ mod tests {
         // answers nothing. The host's own `/dev` is the only place a character device can be found
         // without privilege; a host with no card says so rather than passing in silence.
         if std::path::Path::new("/dev/nvidia0").exists() {
-            let real = super::gpu_nodes_in(
-                std::path::Path::new("/dev"),
-                std::path::Path::new("/dev"),
-            );
+            let real =
+                super::gpu_nodes_in(std::path::Path::new("/dev"), std::path::Path::new("/dev"));
             assert!(
                 real.split_whitespace().any(|n| n == "nvidia0"),
                 "the host's own card node must read as a card: {real}"

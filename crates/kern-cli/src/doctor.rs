@@ -2150,8 +2150,20 @@ fn gpu_row(
                 "gpu {id}: --gpus device={index} refused, {} of its nodes need a group",
                 gated.len()
             ),
+            // WHICH MAP, NOT "A BOX". This row said "a box carries no supplementary group" and
+            // refused, and that is true of the ranged map only: a single-uid box keeps the caller's
+            // whole inherited set, because the kernel wants `/proc/self/setgroups` at `deny` before
+            // it will write that map and the clear is EPERM from then on. Measured 2026-11-11: a
+            // `--no-uid-range` box READ a `syslog:adm 0640` host file that the default box was
+            // denied. So on a headless host, where the nodes are commonly `root:video 0660`, the
+            // flat sentence turned a card that one box shape can use into a refusal with no way
+            // forward. The row names the lever and what it costs, and does not recommend it.
             format!(
-                "a box carries no supplementary group. Those nodes need gid {}: {}",
+                "those nodes need gid {}: {}. A default box drops the caller's groups, so this is a \
+                 refusal for it; a single-uid box (`--no-uid-range`, or a host with no range in \
+                 /etc/subuid) keeps them and reaches the nodes, at the price of keeping EVERY \
+                 inherited group, which on a typical host also reaches the raw disk and the docker \
+                 socket",
                 join_short(&gids.iter().map(u32::to_string).collect::<Vec<_>>()),
                 join_paths(&gated)
             ),
@@ -2581,9 +2593,22 @@ mod tests {
             row.contains("44"),
             "the gid the node needs is not named: {row}"
         );
+        // WHICH BOX, and this assertion is the second one it has had. It used to pin the sentence
+        // "a box carries no supplementary group", which is true of the ranged map and false of the
+        // single-uid map, where the clear is EPERM and the caller's whole inherited set survives
+        // (measured 2026-11-11). A flat claim turned a card that one box shape can use into a
+        // refusal with no way forward, which on a headless host is the common case.
         assert!(
-            row.contains("no supplementary group"),
-            "the reason a box cannot keep it is not given: {row}"
+            row.contains("A default box drops the caller's groups"),
+            "the row does not say which box the refusal is about: {row}"
+        );
+        assert!(
+            row.contains("--no-uid-range") && row.contains("/etc/subuid"),
+            "the row names no lever for the box shape that CAN reach the nodes: {row}"
+        );
+        assert!(
+            row.contains("EVERY"),
+            "the row offers the lever without its price, which is every inherited group: {row}"
         );
         // THE SAME NODE, A CALLER IN NO GROUP: that is a different fact and gets a different row.
         // The host itself refuses them, so telling them a box cannot carry groups would send them

@@ -5287,8 +5287,9 @@ mod port_collision_tests {
         };
         b.volumes = vec!["/dev/null:/dev/null".into()];
         let boxes = vec![b];
-        let msg = device_grant_problem(&boxes, false)
-            .expect("a device bound through volumes: must be refused like one bound through devices:");
+        let msg = device_grant_problem(&boxes, false).expect(
+            "a device bound through volumes: must be refused like one bound through devices:",
+        );
         assert!(
             msg.contains("/dev/null") && msg.contains("volumes:") && msg.contains("sneaky"),
             "the refusal names the node, the key that carried it and the service: {msg}"

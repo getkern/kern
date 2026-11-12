@@ -15,8 +15,17 @@
 //! 580.173.02, kernel 7.0.0-38), because three of the four decisions below were wrong on the first
 //! reading and only the measurement corrected them:
 //!
-//! 1. **A box carries no supplementary group.** `getgroups()` is empty in a default box and after
-//!    `--user`. A node reachable only through a group is therefore unreachable from a box.
+//! 1. **A box carries no supplementary group ON THE RANGED MAP, which is the default and not every
+//!    box.** `getgroups()` is empty in a default `--image` box and after `--user`, because
+//!    `newgidmap` is the privileged writer there and the clear in `drop_caps_around_identity`
+//!    succeeds. A SINGLE-UID box (`--no-uid-range`, or a host with no range in `/etc/subuid`) keeps
+//!    the caller's whole inherited set, because that map requires `/proc/self/setgroups` to be
+//!    `deny` before the kernel will write it and the clear is then EPERM for the life of the
+//!    namespace: measured 2026-11-11 over six orderings, none of which drops the groups, with the
+//!    ranged path as the positive control that does. So axiom 2 below is not hypothetical, it is
+//!    what a `--no-uid-range` box IS, and a node reachable only through a group is unreachable from
+//!    a default box and reachable from that one. Anything built on this axiom has to say which map
+//!    it is talking about.
 //!
 //! 2. **An inherited kgid that is NOT mapped still counts for permission checks.** In a user
 //!    namespace where `setgroups` was never called, the caller's 14 groups are all displayed as

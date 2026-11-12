@@ -6277,15 +6277,46 @@ fn drop_caps_around_identity(
         // `65534(nobody)` entries beside `0(root)`, which are the caller's host groups rendered
         // through a map that does not contain them.
         //
-        // MEASURED BEFORE CHANGING IT, because the one thing those groups could have bought is
-        // access to a bind mount the caller reaches only through a group: a host file `----r-----
-        // alex:disk` mounted with `-v` was ALREADY `Permission denied` inside the box, with the
-        // groups still in place. So the list grants nothing and its only effect is the confusing
-        // `id` output, which is why dropping it costs no workflow. Podman drops them by default too.
+        // THE MEASUREMENT THAT JUSTIFIED THIS COULD NOT HAVE FAILED, and it stood here for months.
+        // It read: a host file `----r----- alex:disk` mounted with `-v` was ALREADY `Permission
+        // denied` inside the box with the groups in place, "so the list grants nothing". That file
+        // is owned by ALEX and the box runs as alex's mapped uid, so POSIX stops at the owner class
+        // and never consults the group class at all: the probe sat where the group could not decide.
         //
-        // SAFETY: `setgroups` with a null list and a count of 0 is the documented form. Best effort
-        // for the same reason as in `set_user`: a single-uid box has `/proc/self/setgroups` at
-        // `deny`, where this is EPERM and the one mapped group is already the whole set.
+        // RE-MEASURED 2026-11-11 where it does decide, on `/var/log/kern.log.2.gz`
+        // (`syslog:adm 0640`, no ACL, no `other` bit, and the caller is in `adm`), through `-v`:
+        //
+        //   host, as the caller   READ_OK    the group IS what grants it (positive control)
+        //   default box           DENIED     groups=0, the clear below succeeded
+        //   --no-uid-range box    READ_OK    groups=0 65534, the clear below was EPERM
+        //
+        // So the list grants a real thing, and the second line of the old comment ("the one mapped
+        // group is already the whole set") is false: the inherited kgids are unmapped, unnameable
+        // through `getgroups`, and still counted by every permission check outside the namespace.
+        //
+        // AND THERE IS NO ORDER THAT FIXES IT, which is why this stays best-effort rather than
+        // becoming a sequencing change. `userns_may_setgroups` wants a gid_map established AND
+        // `USERNS_SETGROUPS_ALLOWED` intact, while `new_idmap_permitted` only lets an unprivileged
+        // single-gid map through once setgroups is already DENIED, and `deny` is irreversible and
+        // inherited by a nested namespace. Measured on 7.0.0-38, six orderings: clear first (EPERM,
+        // no gid_map yet), gid_map without deny (EPERM), uid_map first then gid_map (EPERM), the one
+        // accepted order deny/gid_map/uid_map with a clear attempted at every point (EPERM at each,
+        // and `allow` refused afterwards), a nested userns created as its own root (inherits `deny`,
+        // EPERM). The sixth is the POSITIVE CONTROL and the path a default box takes: with
+        // `newgidmap` as the privileged writer, `deny` is never needed, setgroups reads `allow`, and
+        // the clear SUCCEEDS. The single-uid box cannot get there from here. The probe that produced
+        // that table is `pentest/userns-groups-probe.py`, kept because this comment rests on it: it
+        // reads the group list from OUTSIDE the namespace, which is the only place the difference is
+        // visible, and exits 3 rather than 0 if its own positive control did not run.
+        //
+        // What kern owes the operator is therefore the truth rather than the axiom: see the `gpu`
+        // group rows in `kern doctor`, which name the map that decides instead of stating that a box
+        // carries no supplementary group.
+        //
+        // SAFETY: `setgroups` with a null list and a count of 0 is the documented form. The result is
+        // discarded because EPERM here is the kernel's answer and not an anomaly to fail closed on,
+        // and because this runs after `fork` and before `execve`, where there is no channel to
+        // report on that the workload does not also own.
         unsafe {
             libc::setgroups(0, std::ptr::null());
         }
