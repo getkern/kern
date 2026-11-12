@@ -1042,6 +1042,17 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                             // the claim and what to do, because the name being valid is exactly
                             // what makes this confusing: the spec is not corrupt, it is about
                             // somewhere else.
+                            // A FORMAT THIS BUILD DOES NOT READ IS NOT A BROKEN FILE. Saying
+                            // "bad line 1" about a valid JSON spec sends the reader looking for a
+                            // typo; naming the format and the flag that does not need a spec at
+                            // all is the answer they can act on.
+                            D::JsonSpec { path } => format!(
+                                "--device: {} is a JSON CDI spec and this build reads the YAML \
+                                 form only. Regenerate it with `nvidia-ctk cdi generate \
+                                 --format=yaml`, or use --gpus device=N, which reads this host's \
+                                 own /dev and needs no spec",
+                                path.display()
+                            ),
                             D::DescribesAnotherHost { reference, path } => format!(
                                 "--device {reference}: {} names that device and none of its \
                                  device nodes exists here, so the spec describes a different \

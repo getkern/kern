@@ -1655,6 +1655,82 @@ containerEdits:
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// ONE JUNK FILE MUST NOT DISABLE `--device` FOR EVERY NAME ON THE HOST.
+    ///
+    /// The walk returned on the FIRST unparseable spec, and a spec directory is writable by
+    /// whoever can write it. The walk continues now and the failures are reported only when nothing
+    /// matched, which keeps the diagnosis without the blast radius: a file that cannot be read is a
+    /// reason the answer might be wrong, not an answer.
+    ///
+    /// AND JSON GETS ITS OWN ANSWER. `find_specs` accepts `.json` because the CDI specification
+    /// does and `nvidia-ctk cdi generate --format=json` writes one, while this lexer reads a
+    /// line-based YAML subset. Measured: a JSON document, one-line or pretty-printed, answers
+    /// `BadLine { line: 1 }`, so it already failed CLOSED and what was missing was the diagnosis.
+    /// "bad line 1" about a valid JSON file sends the reader looking for a typo.
+    #[test]
+    fn a_bad_spec_beside_a_good_one_does_not_disable_the_good_one() {
+        let root = std::env::temp_dir().join(format!("kern-cdi-junk-{}", std::process::id()));
+        let dir = root.join("etc/cdi");
+        let _ = std::fs::remove_dir_all(&root);
+        if std::fs::create_dir_all(&dir).is_err()
+            || std::os::unix::fs::symlink("/dev", root.join("dev")).is_err()
+        {
+            eprintln!("skip: no writable temp dir");
+            return;
+        }
+        let good = concat!(
+            "cdiVersion: 0.5.0\n",
+            "kind: nvidia.com/gpu\n",
+            "devices:\n",
+            "  - name: \"0\"\n",
+            "    containerEdits:\n",
+            "      deviceNodes:\n",
+            "        - path: /dev/null\n",
+        );
+
+        // The junk sorts BEFORE the good one, which is what makes this a test of continuing rather
+        // than of luck in the directory order.
+        let _ = std::fs::write(dir.join("aa-junk.yaml"), "\t\tnot: [a, spec\n");
+        let _ = std::fs::write(dir.join("zz-good.yaml"), good);
+        assert_eq!(
+            resolve_device_ref(&root, "nvidia.com/gpu=0"),
+            Ok(0),
+            "a junk file before the good one must not disable it"
+        );
+
+        // WITH NO GOOD SPEC the junk becomes the answer, because reporting "no spec offers that
+        // kind" while an unparsed spec might have offered it sends the reader to the wrong place.
+        let _ = std::fs::remove_file(dir.join("zz-good.yaml"));
+        match resolve_device_ref(&root, "nvidia.com/gpu=0") {
+            Err(DeviceRefError::Unreadable { path, .. }) => {
+                assert!(path.ends_with("aa-junk.yaml"), "{path:?}");
+            }
+            other => panic!("expected the junk file to be named, got {other:?}"),
+        }
+
+        // A JSON SPEC IS NAMED AS JSON, and it wins over the generic answer because it is the more
+        // specific one.
+        let _ = std::fs::remove_file(dir.join("aa-junk.yaml"));
+        let json = r#"{"cdiVersion":"0.5.0","kind":"nvidia.com/gpu","devices":[{"name":"0"}]}"#;
+        let _ = std::fs::write(dir.join("nvidia.json"), json);
+        match resolve_device_ref(&root, "nvidia.com/gpu=0") {
+            Err(DeviceRefError::JsonSpec { path }) => {
+                assert!(path.ends_with("nvidia.json"), "{path:?}");
+            }
+            other => panic!("a JSON spec must be named as JSON, got {other:?}"),
+        }
+        // And it does NOT shadow a YAML spec that works: the specific answer is only reached when
+        // nothing matched.
+        let _ = std::fs::write(dir.join("zz-good.yaml"), good);
+        assert_eq!(
+            resolve_device_ref(&root, "nvidia.com/gpu=0"),
+            Ok(0),
+            "a JSON file beside a working YAML spec must not disable it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// THE REAL SPEC ON THIS HOST, if there is one. Skips with a stated reason, never in silence.
     #[test]
     fn the_hosts_own_spec_parses_into_the_figures_it_was_measured_to_have() {
@@ -1719,6 +1795,17 @@ pub enum DeviceRefError {
     UnknownUuid {
         /// The UUID that was asked for.
         uuid: String,
+    },
+    /// A spec file is JSON and this reader is YAML-only.
+    ///
+    /// `find_specs` accepts `.json` because the CDI specification does and `nvidia-ctk cdi
+    /// generate --format=json` writes one, while the lexer here reads a line-based YAML subset.
+    /// Measured: a JSON document, one-line or pretty-printed, answers `BadLine { line: 1 }`, so the
+    /// failure is closed and the only thing missing was the DIAGNOSIS. "bad line 1" sends the
+    /// reader to look for a typo in a file that is perfectly valid in the other format.
+    JsonSpec {
+        /// The file.
+        path: PathBuf,
     },
     /// The spec names the device, and none of the device's paths is a real device node here.
     ///
@@ -1803,6 +1890,8 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<u32, DeviceRef
 
     let mut kinds_found: Vec<String> = Vec::new();
     let mut offered: Vec<String> = Vec::new();
+    let mut unreadable: Vec<(PathBuf, CdiError)> = Vec::new();
+    let mut json_specs: Vec<PathBuf> = Vec::new();
     for path in find_specs(root, None) {
         // THE READ THAT HAD NO BOUND AND NO TYPE CHECK, and the one a hostile file reaches most
         // easily: `find_specs` walks a directory any process that can write it can fill. Measured
@@ -1817,7 +1906,21 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<u32, DeviceRef
         };
         let spec = match parse_spec(&text) {
             Ok(s) => s,
-            Err(why) => return Err(DeviceRefError::Unreadable { path, why }),
+            // SKIPPED AND REMEMBERED, NOT FATAL. This returned on the FIRST unparseable file, so a
+            // single junk file in a directory any process that can write it may fill disabled
+            // `--device` for every name on the host. The walk continues and the failures are
+            // reported only if nothing matched, which keeps the diagnosis without the blast radius:
+            // a spec that cannot be read is a reason the answer might be wrong, not an answer.
+            Err(why) => {
+                // THE JSON CASE GETS ITS OWN ANSWER, because `BadLine { line: 1 }` on a valid JSON
+                // document is a true statement that teaches the reader nothing.
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    json_specs.push(path);
+                } else {
+                    unreadable.push((path, why));
+                }
+                continue;
+            }
         };
         if spec.kind != kind {
             kinds_found.push(spec.kind);
@@ -1854,6 +1957,19 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<u32, DeviceRef
         return Err(DeviceRefError::UnknownUuid {
             uuid: device.name.clone(),
         });
+    }
+
+    // NOTHING MATCHED, SO THE FILES THAT COULD NOT BE READ ARE NOW THE ANSWER. Reporting
+    // "no spec offers that kind" while a spec that might have offered it sat unparsed would send
+    // the reader to the wrong place: they would check the name, not the file.
+    if !json_specs.is_empty() {
+        return Err(DeviceRefError::JsonSpec {
+            path: json_specs.swap_remove(0),
+        });
+    }
+    if !unreadable.is_empty() {
+        let (path, why) = unreadable.swap_remove(0);
+        return Err(DeviceRefError::Unreadable { path, why });
     }
 
     kinds_found.sort();
