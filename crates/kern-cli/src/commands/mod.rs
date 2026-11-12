@@ -7730,7 +7730,13 @@ fn run_terminal_verb(
             if let Some(msg) = device_grant_problem(boxes, allow_device_grants) {
                 return Err(Error::Compose(msg));
             }
-            crate::systemd::print_unit(file, pod)?;
+            // THE UNIT HAS TO CARRY THE PERMISSION IT WAS GENERATED UNDER. The refusal above
+            // passes once the operator supplies `--allow-device-grants`, and the unit was then
+            // emitted WITHOUT it, so at boot it met that same refusal on a machine nobody is
+            // watching. Asked of the FILE and not of the flag, so a stack with no device grant does
+            // not carry a permission it never needed.
+            let needs_grants = device_grant_problem(boxes, false).is_some();
+            crate::systemd::print_unit(file, pod, needs_grants)?;
             return Ok(true);
         }
         ComposeAction::Config => {

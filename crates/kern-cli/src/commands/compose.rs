@@ -3873,6 +3873,7 @@ mod tests {
             workdir: "/srv/app",
             project: "app",
             scope: crate::systemd::UnitScope::User,
+            allow_device_grants: false,
         })
         .expect("the unit renders");
         assert!(

@@ -111,6 +111,17 @@ pub struct UnitSpec<'a> {
     /// Stack name, used for the unit description only. The unit's FILE name is the caller's choice.
     pub project: &'a str,
     pub scope: UnitScope,
+    /// Whether the emitted `ExecStart` needs `--allow-device-grants`.
+    ///
+    /// THE UNIT COULD NOT START THE STACK IT WAS GENERATED FOR. `kern compose <file> systemd`
+    /// refuses to emit anything for a file that binds host hardware unless the operator passes
+    /// `--allow-device-grants`, and then emitted an `ExecStart` WITHOUT it, so the unit met that
+    /// same refusal at boot, on a machine nobody is watching. It fails closed, which is why this is
+    /// a defect of the generated artefact and not of the boundary.
+    ///
+    /// Set from the file, not from the flag: it is true when the file WOULD need the flag, so a
+    /// stack with no device grant does not carry a permission it never asked for.
+    pub allow_device_grants: bool,
 }
 
 /// Render the unit text. Pure: no I/O, no environment reads, so it is testable and cannot surprise a
@@ -122,6 +133,15 @@ pub fn render_unit(spec: &UnitSpec<'_>) -> Result<String, Error> {
     let project = unit_safe("the project name", spec.project)?;
 
     let (bin_q, file_q, dir_q) = (exec_arg(&bin), exec_arg(&file), exec_arg(&dir));
+
+    // ON `up` ONLY. `down` tears the stack back out and grants nothing, so the flag there would be
+    // a permission with no effect, and a unit that asks for more than it uses teaches a reader that
+    // the flag is decoration.
+    let grants = if spec.allow_device_grants {
+        " --allow-device-grants"
+    } else {
+        ""
+    };
 
     // `network-online.target` exists in the SYSTEM manager. The user manager has no such unit, and
     // ordering against a unit that does not exist is not an error but is not a guarantee either, so
@@ -167,7 +187,7 @@ pub fn render_unit(spec: &UnitSpec<'_>) -> Result<String, Error> {
          Type=oneshot\n\
          RemainAfterExit=yes\n\
          WorkingDirectory={dir_q}\n\
-         ExecStart={bin_q} compose {file_q} up -d\n\
+         ExecStart={bin_q} compose {file_q} up -d{grants}\n\
          ExecStop={bin_q} compose {file_q} down\n\
          # `up` pulls images on first boot, which can outlast the default 90s.\n\
          TimeoutStartSec=600\n\
@@ -200,7 +220,7 @@ pub fn render_unit(spec: &UnitSpec<'_>) -> Result<String, Error> {
 
 /// Resolve the machine-dependent inputs and print the unit. The ONLY function here that touches the
 /// environment, so [`render_unit`] stays pure and the failure modes are all reported from one place.
-pub fn print_unit(file: &str, project: &str) -> Result<(), Error> {
+pub fn print_unit(file: &str, project: &str, allow_device_grants: bool) -> Result<(), Error> {
     // systemd requires the first token of `ExecStart=` to be an ABSOLUTE path: it does not search
     // `PATH`. `current_exe` is the binary actually running, which is also the one the user just
     // invoked, so the unit cannot end up pointing at a different kern than the one that wrote it.
@@ -223,6 +243,7 @@ pub fn print_unit(file: &str, project: &str) -> Result<(), Error> {
         workdir: &dir.to_string_lossy(),
         project,
         scope: UnitScope::detect(),
+        allow_device_grants,
     })?;
     print!("{unit}");
     Ok(())
@@ -232,12 +253,60 @@ pub fn print_unit(file: &str, project: &str) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    /// THE UNIT COULD NOT START THE STACK IT WAS GENERATED FOR.
+    ///
+    /// `kern compose <file> systemd` refuses to emit anything for a file that binds host hardware
+    /// unless the operator passes `--allow-device-grants`, and then emitted an `ExecStart` WITHOUT
+    /// it. The unit met that same refusal at boot, on a machine nobody is watching. It fails
+    /// closed, so this is a defect of the generated artefact and not of the boundary, and it is the
+    /// kind nobody sees until a reboot.
+    ///
+    /// Measured end to end with the real binary: a `devices:` stack emitted with the flag now
+    /// carries it on `up`, the same stack without the flag is still refused outright, and a stack
+    /// with no device grant does NOT carry the permission, because the question is asked of the
+    /// FILE and not of the flag.
+    #[test]
+    fn the_unit_carries_the_grant_permission_only_when_the_stack_needs_it() {
+        let needs = render_unit(&UnitSpec {
+            allow_device_grants: true,
+            ..spec("/srv/app/compose.yaml", UnitScope::User)
+        })
+        .expect("the unit renders");
+        assert!(
+            needs.contains("up -d --allow-device-grants"),
+            "ExecStart must carry the permission the unit was generated under: {needs}"
+        );
+        // ON `up` ONLY. `down` grants nothing, so the flag there would be a permission with no
+        // effect, and a unit that asks for more than it uses teaches a reader that it is decoration.
+        let stop = needs
+            .lines()
+            .find(|l| l.starts_with("ExecStop="))
+            .unwrap_or_default();
+        assert!(
+            !stop.contains("--allow-device-grants"),
+            "ExecStop must not ask for a grant: {stop}"
+        );
+
+        // POSITIVE CONTROL in the other direction: a stack that needs nothing carries nothing.
+        let plain =
+            render_unit(&spec("/srv/app/compose.yaml", UnitScope::User)).expect("the unit renders");
+        assert!(
+            plain.contains("up -d\n"),
+            "ExecStart must still end at `-d`: {plain}"
+        );
+        assert!(
+            !plain.contains("--allow-device-grants"),
+            "a stack with no device grant must not carry the permission: {plain}"
+        );
+    }
+
     fn spec<'a>(file: &'a str, scope: UnitScope) -> UnitSpec<'a> {
         UnitSpec {
             kern_bin: "/usr/local/bin/kern",
             compose_file: file,
             workdir: "/srv/app",
             project: "app",
+            allow_device_grants: false,
             scope,
         }
     }
