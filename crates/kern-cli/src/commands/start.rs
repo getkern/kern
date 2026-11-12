@@ -1082,6 +1082,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // was an empty vector that the mask read as "leave the host's listing alone", so every box on
     // this host, GPU or not, read both cards' UUID and video BIOS.
     let mut gpu_enumeration = kern_isolation::GpuEnumeration::NoneGranted;
+    // THE NODES A BOX LOSES BY NOT BEING THE CALLER, collected here because this is where the grant
+    // exists and reported further down because that is where `run_as` exists. The grant is resolved
+    // before the image config, so the box's identity is not yet known at this point; carrying the
+    // list is what lets both facts meet without reordering the two resolutions.
+    let mut gpu_uid_dependent: Vec<std::path::PathBuf> = Vec::new();
     if let Some(selection) = gpu_selection {
         let selected = selection?;
         let caller = crate::gpu_grant::Caller::current();
@@ -1157,6 +1162,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     ))
                 }
             })?;
+
+        gpu_uid_dependent = crate::gpu_grant::uid_dependent_nodes(&grant, &selected, &caller);
 
         gpu_enumeration = match crate::gpu_grant::pci_addresses_of(&grant, &selected) {
             Some(addresses) => kern_isolation::GpuEnumeration::Only(addresses),
@@ -1780,6 +1787,41 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `run_as` already folded in the image's own `USER`, which is why this has to be known BEFORE
     // the heads-up below: that message speaks about the map the box will get.
     let non_root_user = matches!(run_as, Some((u, _)) if u != 0);
+
+    // THE GRANT MET THE BOX IDENTITY, which are the two facts this function resolves at opposite
+    // ends of itself. A node reached only by the caller's uid (`Owner`, or an `ACL_USER` entry for
+    // them) is NOT reached by a box running as a subordinate uid, so the mount succeeds and the
+    // workload meets `CUDA_ERROR_NO_DEVICE` with nothing from kern to explain it.
+    //
+    // A WARNING AND NOT A REFUSAL. `--gpus --user nobody` works on every host whose nodes are
+    // world-accessible, which is the common shape and what pentest case C1 measures, so refusing it
+    // would break that shape to describe a rare one. The operator gets the node names, the cause
+    // and the one flag that avoids it; the box still starts. `kern: warning:` is the prefix both
+    // SDKs file as a runtime note rather than a failed start.
+    if non_root_user && !gpu_uid_dependent.is_empty() {
+        let names: Vec<String> = gpu_uid_dependent
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        // NAME WHAT FAILS, NOT WHAT MIGHT. The first wording said "CUDA may fail inside with no
+        // device", and on this host that is false: the compute nodes are `0666` and only the DRM
+        // nodes are uid-gated, so `cuInit` works and a Vulkan or display workload does not.
+        // Measured both ways with `--gpus device=0`: a default box opens all three nodes read-write,
+        // and the same box `--user nobody` is refused on exactly the two named here and opens
+        // `/dev/nvidia0`. A warning that overstates its own consequence teaches a reader to skip
+        // the next one.
+        eprintln!(
+            "kern: warning: this box runs as a non-root user, so {} of the granted GPU node(s) \
+             will NOT open inside it: {}. They are reachable only by your uid (their owner, or an \
+             ACL entry naming you) and a box running as a subordinate uid is neither. Compute on \
+             the card still works if its /dev/nvidia* nodes are world-accessible; anything needing \
+             a refused node (display, Vulkan, video encode) fails there. Run without --user, or \
+             without the image's own USER, to keep your uid, or give those nodes an `other` bit on \
+             the host.",
+            gpu_uid_dependent.len(),
+            names.join(", ")
+        );
+    }
 
     let declared_user = image_config
         .user

@@ -140,9 +140,18 @@ pub struct Gpu {
     /// The card's PCI address, read from where `/sys/class/drm/<card>/device` points.
     ///
     /// IT IS THE JOIN KEY, and it is here so there is only one. A DRM card and the `/dev/nvidiaN`
-    /// a grant names are two views of one device, and on this host their numbering is INVERTED:
-    /// `nvidia0` is `card1`. Pairing them by number would report the wrong card's grant, and would
+    /// a grant names are two views of one device, and the number in one name does not determine the
+    /// number in the other. Pairing them by number would report the wrong card's grant, and would
     /// pass on any host whose two numberings happened to agree.
+    ///
+    /// THE PAIRING IS NOT EVEN STABLE ON ONE MACHINE, which is better evidence than the static
+    /// claim that used to stand here. This file said "on this host their numbering is INVERTED:
+    /// `nvidia0` is `card1`", measured and true when written. After a reboot on 2026-11-12 the same
+    /// machine reports `0000:01:00.0` as `nvidia0` AND `card0`, derived from
+    /// `/sys/bus/pci/devices/<addr>/drm` and `Device Minor:` in the driver's own directory. DRM
+    /// minors are handed out in probe order, so a kernel or firmware change reorders them. Anything
+    /// that caches the pairing, or states it in prose, expires without warning; the address does
+    /// not.
     ///
     /// `None` for a device with no PCI identity, which is the normal case on an ARM board.
     pub pci_address: Option<String>,

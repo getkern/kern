@@ -331,7 +331,13 @@ pub enum AccessPath {
 }
 
 impl AccessPath {
-    /// Whether this path still works from inside a box that dropped its supplementary groups.
+    /// Whether this path still works from inside a box that dropped its supplementary GROUPS.
+    ///
+    /// GROUPS AND NOTHING ELSE. It says nothing about the box's UID, and `Owner` and `AclUser` both
+    /// depend on one: a box started `--user <non-root>` or from an image with a `USER` runs as a
+    /// subordinate uid, where neither applies. [`uid_dependent_nodes`] answers that question, and
+    /// the two are separate because the answers arrive at different times, the groups at resolve and
+    /// the identity only once `run_as` has folded in the image's own declaration.
     pub const fn survives_a_box(self) -> bool {
         matches!(
             self,
@@ -1245,6 +1251,62 @@ fn node_facts(path: &Path) -> Option<NodeFacts> {
         mode: meta.mode() & 0o777,
         acl: acl_facts(path),
     })
+}
+
+/// The nodes in this selection that only a particular UID reaches, and therefore the nodes a box
+/// running as somebody else loses.
+///
+/// [`AccessPath::survives_a_box`] answers whether a path survives the loss of the caller's GROUPS,
+/// which is what a default box drops. It cannot answer whether the path survives the loss of the
+/// caller's UID, and `--user <non-root>` or an image `USER` is exactly that: the workload runs as
+/// an in-box uid that maps to a SUBORDINATE uid on the host, so `Owner` and `AclUser` stop applying
+/// while `Other` still does. A grant whose nodes are reached only by uid would be reported fine and
+/// die at `cuInit`, which is the same failure the rest of this policy exists to prevent.
+///
+/// ANSWERED BY ASKING THE POLICY AGAIN with a caller that holds nothing: a uid no account can name
+/// and no group at all. Whatever that probe still reaches is reached through the `other` class, so
+/// whatever it does NOT reach is uid-dependent. One spelling, and the probe cannot drift from the
+/// rule because it IS the rule.
+///
+/// NOT A REFUSAL, and that is deliberate. `--gpus --user nobody` works on any host whose nodes are
+/// world-accessible, which is this host and which pentest case C1 measures, so refusing it would
+/// break the common shape in order to describe a rare one. The caller warns and still binds, the
+/// way the vgpio path does. Nodes the CALLER cannot reach either are not listed: `mount_plan`
+/// already refuses those, and repeating them here would blame the box identity for a host problem.
+pub fn uid_dependent_nodes(
+    grant: &GpuGrant,
+    selection: &GpuSelection,
+    who: &Caller,
+) -> Vec<PathBuf> {
+    // A uid that cannot be an account: `(uid_t)-1` is reserved by `setuid` as "no change" and
+    // `65534` is a real `nobody`, so neither would be a safe probe. No groups at all, because a
+    // default box carries none.
+    let holds_nothing = Caller {
+        uid: u32::MAX - 1,
+        gids: Vec::new(),
+    };
+    let Ok(cards) = cards_of(grant, selection) else {
+        // An unresolvable selection is `mount_plan`'s error to report, with its own message. There
+        // is nothing to warn about yet.
+        return Vec::new();
+    };
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    for (path, facts) in grant
+        .shared
+        .iter()
+        .chain(cards.iter().flat_map(|card| card.nodes.iter()))
+    {
+        if access_path(facts, who) == AccessPath::Unreachable {
+            continue;
+        }
+        if access_path(facts, &holds_nothing) == AccessPath::Unreachable {
+            out.push(path.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The one group decision for a whole set of nodes, computed from [`access_path`] and nothing else.
@@ -3668,6 +3730,91 @@ mod tests {
             }
             other => panic!("expected Unreachable, got {other:?}"),
         }
+    }
+
+    /// A NODE REACHED ONLY BY THE CALLER'S UID IS NOT REACHED BY A BOX RUNNING AS SOMEBODY ELSE.
+    ///
+    /// `survives_a_box` answers for the loss of GROUPS and cannot answer for the loss of the UID,
+    /// and `--user <non-root>` or an image `USER` is exactly that: the workload runs as a
+    /// subordinate uid, so `Owner` and `AclUser` stop applying while `Other` still does. Reported
+    /// fine, such a grant mounts and the workload meets `CUDA_ERROR_NO_DEVICE` with nothing from
+    /// kern to explain it.
+    ///
+    /// NOT A REFUSAL: the caller warns and still binds, because `--gpus --user nobody` works on
+    /// every host whose nodes are world-accessible, which pentest case C1 measures on this one.
+    #[test]
+    fn a_node_reached_only_by_uid_is_named_for_a_box_that_changes_identity() {
+        let who = caller(1000, &[1000, 44]);
+        let selection = GpuSelection::These(vec![0]);
+
+        // THE OWNER CASE: `0o600` owned by the caller. They open it; a subordinate uid does not.
+        let owned = two_card_grant(plain(1000, 1000, 0o600));
+        assert_eq!(
+            access_path(&owned.cards[0].nodes[0].1, &who),
+            AccessPath::Owner
+        );
+        assert_eq!(
+            uid_dependent_nodes(&owned, &selection, &who),
+            vec![PathBuf::from("/dev/nvidia0")],
+            "a node the caller owns and nobody else can open must be named"
+        );
+
+        // THE ACL CASE, which is the shape of this host's DRM nodes: root-owned, no `other` bit,
+        // with a named entry for the caller.
+        let acl = two_card_grant(acl_node(
+            0,
+            44,
+            WANT_RW,
+            0,
+            0,
+            &[(1000, WANT_RW)],
+            &[],
+            Some(WANT_RW),
+        ));
+        assert_eq!(
+            access_path(&acl.cards[0].nodes[0].1, &who),
+            AccessPath::AclUser
+        );
+        assert_eq!(
+            uid_dependent_nodes(&acl, &selection, &who),
+            vec![PathBuf::from("/dev/nvidia0")],
+            "a node reached through an ACL_USER entry for the caller must be named"
+        );
+
+        // POSITIVE CONTROL, and the one that matters: this host's actual shape. `0o666` is reached
+        // by `other`, so NOTHING is uid-dependent and no warning may fire. Without this the
+        // function could be one that always answers "everything" and both cases above would pass.
+        let open = two_card_grant(plain(0, 0, 0o666));
+        assert!(
+            uid_dependent_nodes(&open, &selection, &who).is_empty(),
+            "a world-accessible grant must name nothing, or every box would be warned"
+        );
+
+        // A node the CALLER cannot reach either is `mount_plan`'s refusal to report, not this
+        // function's: blaming the box identity for a host problem would send the operator to the
+        // wrong flag.
+        let dead = two_card_grant(plain(0, 0, 0o000));
+        assert_eq!(
+            access_path(&dead.cards[0].nodes[0].1, &who),
+            AccessPath::Unreachable
+        );
+        assert!(
+            uid_dependent_nodes(&dead, &selection, &who).is_empty(),
+            "a node nobody reaches is not a uid-dependence finding"
+        );
+
+        // THE SELECTION IS RESPECTED. Card 1 is world-accessible in the fixture, so asking for it
+        // names nothing even when card 0 is uid-dependent: a warning about a card nobody asked for
+        // is a warning the operator cannot act on.
+        assert!(
+            uid_dependent_nodes(&owned, &GpuSelection::These(vec![1]), &who).is_empty(),
+            "the answer must follow the selection and not the whole grant"
+        );
+        // And asking for BOTH names the one that is.
+        assert_eq!(
+            uid_dependent_nodes(&owned, &GpuSelection::These(vec![0, 1]), &who),
+            vec![PathBuf::from("/dev/nvidia0")]
+        );
     }
 
     /// A GATED NODE ON ANOTHER CARD MUST NOT REFUSE THIS ONE. The policy is a function of the

@@ -2586,10 +2586,17 @@ mod tests {
 
     /// THE ROW NAMES THE INDEX THAT BELONGS TO THAT CARD, and the pairing is by PCI address.
     ///
-    /// The fixture puts `card0` at the address of `/dev/nvidia1`, which is the shape this host
-    /// actually has: the DRM numbering and the NVIDIA numbering are inverted. A row that paired
-    /// them by number would tell the reader to run `--gpus device=0` for a card that answers to
-    /// would pass on any host where the two agreed.
+    /// The fixture puts `card0` at the address of `/dev/nvidia1`, so the two numberings DISAGREE
+    /// and a row that paired them by number would tell the reader to run `--gpus device=0` for a
+    /// card that answers to the other index. On a host where the two happened to agree such a row
+    /// would pass.
+    ///
+    /// THE FIXTURE IS DELIBERATELY NOT THIS HOST, and that is the point rather than an accident.
+    /// This comment used to say the fixture matched "the shape this host actually has", which was
+    /// measured and true when written and stopped being true at a reboot on 2026-11-12: the same
+    /// machine now reports `0000:01:00.0` as `nvidia0` AND `card0`. DRM minors are handed out in
+    /// probe order, so the pairing is a property of the boot and not of the hardware. A fixture
+    /// pinned to the local shape would have started agreeing with a buggy implementation.
     #[test]
     fn the_row_pairs_a_card_with_its_grant_by_address_not_by_number() {
         let grant = fake_grant("0000:06:00.0", 1, open_node());
