@@ -949,8 +949,18 @@ fn linker_dirs(root: &Path) -> Vec<PathBuf> {
     }
 
     let mut pending: Vec<(PathBuf, u8)> = vec![(root.join(LD_SO_CONF_REL), 0)];
+    // EVERY CONF FILE IS READ ONCE. `MAX_LD_CONF_DEPTH` bounds how DEEP the includes nest and
+    // bounded nothing about how WIDE they are: a file whose glob matches N files, each including a
+    // glob matching N more, is N^depth reads, and two files that include each other are re-read at
+    // every level until the depth runs out. Keyed on the canonical path, so the same file reached
+    // through `/etc` and through a symlinked `/usr/etc` is one entry.
+    let mut read_already: BTreeSet<PathBuf> = BTreeSet::new();
     while let Some((conf, depth)) = pending.pop() {
         if depth > MAX_LD_CONF_DEPTH {
+            continue;
+        }
+        let key = std::fs::canonicalize(&conf).unwrap_or_else(|_| conf.clone());
+        if !read_already.insert(key) {
             continue;
         }
         // THE SAME SHAPE AS THE CDI READ, and the same reach: a FIFO at `/etc/ld.so.conf` hung the
@@ -963,39 +973,65 @@ fn linker_dirs(root: &Path) -> Vec<PathBuf> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("include ") {
-                let pattern = rest.trim();
-                // An `include` is relative to the root. The wildcard is ONE `*` anywhere in the
-                // file name, matched as a prefix and a suffix around it, which is the form every
-                // Debian-family host actually ships: `include /etc/ld.so.conf.d/*.conf`. A parser
-                // that only handled a TRAILING star read that line, found no match and silently
-                // included nothing; the library sweep still answered 29 on this host because the
-                // directory it needed was already a default, so the fault was invisible until a
-                // synthetic root put a library somewhere only the include could reach.
-                let as_path = pattern.trim_start_matches('/');
-                let joined = root.join(as_path);
-                if let (Some(parent), Some(name)) = (joined.parent(), joined.file_name()) {
-                    let name = name.to_string_lossy().to_string();
-                    match name.split_once('*') {
-                        Some((prefix, suffix)) => {
-                            if let Ok(entries) = std::fs::read_dir(parent) {
-                                for entry in entries.flatten() {
-                                    let file = entry.file_name();
-                                    let file = file.to_string_lossy();
-                                    // Both ends must match AND the name must be long enough to
-                                    // carry them without overlapping, or `ab*ba` would accept `aba`.
-                                    if file.len() >= prefix.len().saturating_add(suffix.len())
-                                        && file.starts_with(prefix)
-                                        && file.ends_with(suffix)
-                                    {
-                                        pending.push((entry.path(), depth.saturating_add(1)));
+            // ANY WHITESPACE AFTER `include`, AND EVERY PATTERN ON THE LINE. This matched
+            // `"include "` with a single space and took the whole remainder as ONE pattern. glibc's
+            // own parser skips any run of whitespace and reads a LIST, so `include<TAB>/a/*.conf`
+            // was read as a directory called `include\t/a/*.conf` and
+            // `include /a/*.conf /b/*.conf` found only the first. Both forms are in the wild and
+            // both failed silently: the line was consumed and nothing was included.
+            let include_patterns = line.strip_prefix("include").and_then(|rest| {
+                // `include` must be a WORD: `included/lib` is a directory, not a directive.
+                let trimmed = rest.trim_start();
+                (trimmed.len() < rest.len()).then_some(trimmed)
+            });
+            if let Some(patterns) = include_patterns {
+                for pattern in patterns.split_whitespace() {
+                    // An `include` is relative to the root. The wildcard is ONE `*` anywhere in the
+                    // file name, matched as a prefix and a suffix around it, which is the form every
+                    // Debian-family host actually ships: `include /etc/ld.so.conf.d/*.conf`. A parser
+                    // that only handled a TRAILING star read that line, found no match and silently
+                    // included nothing; the library sweep still answered 29 on this host because the
+                    // directory it needed was already a default, so the fault was invisible until a
+                    // synthetic root put a library somewhere only the include could reach.
+                    // A `..` IN A CONF LINE IS REFUSED, not rewritten. `trim_start_matches('/')`
+                    // made a path relative to the root and a `..` then climbed straight back out of
+                    // it, which on a synthetic root means reading the real host's files. There is no
+                    // legitimate `..` in a linker configuration, so refusing is free.
+                    if pattern.split('/').any(|c| c == "..") {
+                        continue;
+                    }
+                    let as_path = pattern.trim_start_matches('/');
+                    let joined = root.join(as_path);
+                    if let (Some(parent), Some(name)) = (joined.parent(), joined.file_name()) {
+                        let name = name.to_string_lossy().to_string();
+                        match name.split_once('*') {
+                            Some((prefix, suffix)) => {
+                                if let Ok(entries) = std::fs::read_dir(parent) {
+                                    for entry in entries.flatten() {
+                                        let file = entry.file_name();
+                                        let file = file.to_string_lossy();
+                                        // Both ends must match AND the name must be long enough to
+                                        // carry them without overlapping, or `ab*ba` would accept
+                                        // `aba`.
+                                        if file.len() >= prefix.len().saturating_add(suffix.len())
+                                            && file.starts_with(prefix)
+                                            && file.ends_with(suffix)
+                                        {
+                                            pending.push((entry.path(), depth.saturating_add(1)));
+                                        }
                                     }
                                 }
                             }
+                            None => pending.push((joined.clone(), depth.saturating_add(1))),
                         }
-                        None => pending.push((joined.clone(), depth.saturating_add(1))),
                     }
                 }
+                continue;
+            }
+            // THE SAME REFUSAL FOR A BARE DIRECTORY LINE, which is the half that would otherwise
+            // leave the hole open: `../../etc` as a directory entry climbs out exactly as an
+            // include pattern does.
+            if line.split('/').any(|c| c == "..") {
                 continue;
             }
             let dir = line.trim_start_matches('/');
@@ -3875,6 +3911,168 @@ mod tests {
             }
             other => panic!("expected Unreachable, got {other:?}"),
         }
+    }
+
+    /// THE LINKER CONFIGURATION PARSER, OVER THE FORMS GLIBC ACCEPTS AND IT DID NOT.
+    ///
+    /// Four defects, each failing SILENTLY: the line was consumed and nothing was included, so the
+    /// library sweep answered a smaller number with no sign that a directory had been missed. On
+    /// this host they were invisible because every directory the sweep needs is already a default,
+    /// which is exactly why they need a synthetic root.
+    ///
+    ///   * `include` was matched as `"include "`, one space, so `include<TAB>/a/*.conf` was read as
+    ///     a DIRECTORY whose name begins `include\t`. glibc skips any run of whitespace.
+    ///   * the remainder was taken as ONE pattern, so `include /a/*.conf /b/*.conf` found only the
+    ///     first. glibc reads a list.
+    ///   * `..` was rewritten rather than refused: `trim_start_matches('/')` makes a path relative
+    ///     to the root and a `..` climbs straight back out, which on a synthetic root means reading
+    ///     the real host's files.
+    ///   * nothing bounded the BREADTH. `MAX_LD_CONF_DEPTH` bounds nesting; a file whose glob
+    ///     matches N files each including N more is N^depth reads, and two files that include each
+    ///     other are re-read at every level.
+    #[test]
+    fn the_linker_config_reads_every_form_glibc_accepts_and_refuses_the_escape() {
+        let root = std::env::temp_dir().join(format!("kern-ldconf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        if std::fs::create_dir_all(root.join("etc/ld.so.conf.d")).is_err() {
+            eprintln!("skip: no writable temp dir");
+            return;
+        }
+        for d in ["aa", "bb", "tabbed", "listed"] {
+            let _ = std::fs::create_dir_all(root.join("opt").join(d));
+        }
+        let conf = root.join("etc/ld.so.conf");
+
+        // A TAB AFTER `include`, which is the form that read as a directory name.
+        let _ = std::fs::write(&conf, "include\t/etc/ld.so.conf.d/*.conf\n");
+        let _ = std::fs::write(root.join("etc/ld.so.conf.d/t.conf"), "/opt/tabbed\n");
+        assert!(
+            linker_dirs(&root).contains(&root.join("opt/tabbed")),
+            "a tab after `include` must be whitespace, not part of a path"
+        );
+
+        // TWO PATTERNS ON ONE LINE, where only the first used to be read.
+        let _ = std::fs::write(
+            &conf,
+            "include /etc/ld.so.conf.d/a-*.conf /etc/ld.so.conf.d/b-*.conf\n",
+        );
+        let _ = std::fs::write(root.join("etc/ld.so.conf.d/a-x.conf"), "/opt/aa\n");
+        let _ = std::fs::write(root.join("etc/ld.so.conf.d/b-x.conf"), "/opt/bb\n");
+        let dirs = linker_dirs(&root);
+        assert!(
+            dirs.contains(&root.join("opt/aa")),
+            "the first pattern must still be read: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&root.join("opt/bb")),
+            "every pattern on the line must be read: {dirs:?}"
+        );
+
+        // `include` MUST BE A WORD. A directory called `included` is not a directive, and treating
+        // it as one would drop a real directory.
+        let _ = std::fs::create_dir_all(root.join("included/lib"));
+        let _ = std::fs::write(&conf, "/included/lib\n");
+        assert!(
+            linker_dirs(&root).contains(&root.join("included/lib")),
+            "`included/lib` is a directory, not an `include` directive"
+        );
+
+        // `..` IN AN INCLUDE PATTERN IS THE LOAD-BEARING HALF, and it took a sabotage to find out
+        // which half was. An include pattern is used DIRECTLY as a file to read, so a `..` in one
+        // reaches outside the root; a bare directory line goes through `canonical_dir_under`, which
+        // drops every `ParentDir` component, so the escape never existed there and removing that
+        // refusal changes no answer. Both refusals stay, and this case proves the one that matters:
+        // a conf file OUTSIDE the root, whose content names a directory nothing else would add.
+        let outside_conf =
+            std::env::temp_dir().join(format!("kern-ldconf-out-{}.conf", std::process::id()));
+        let _ = std::fs::write(&outside_conf, "/opt/from-outside\n");
+        let _ = std::fs::create_dir_all(root.join("opt/from-outside"));
+        if let Some(name) = outside_conf.file_name().and_then(|n| n.to_str()) {
+            let _ = std::fs::write(&conf, format!("include ../{name}\n"));
+            let dirs = linker_dirs(&root);
+            assert!(
+                !dirs.contains(&root.join("opt/from-outside")),
+                "an include pattern climbed out of the root and its file was read: {dirs:?}"
+            );
+            // POSITIVE CONTROL: the SAME file inside the root IS read, so the refusal above is the
+            // `..` and not the include machinery failing.
+            let inside = root.join("etc/ld.so.conf.d/from-inside.conf");
+            let _ = std::fs::write(&inside, "/opt/from-outside\n");
+            let _ = std::fs::write(&conf, "include /etc/ld.so.conf.d/from-inside.conf\n");
+            assert!(
+                linker_dirs(&root).contains(&root.join("opt/from-outside")),
+                "the same content inside the root must be read"
+            );
+            let _ = std::fs::remove_file(&inside);
+        }
+        let _ = std::fs::remove_file(&outside_conf);
+
+        // AND NO RETURNED PATH CARRIES A `..`, for the directory-line half. Not `starts_with`,
+        // which is COMPONENT-BASED and therefore blind here: `<root>/../../etc` starts with
+        // `<root>` by that test, so the first version of this assertion passed with the escape
+        // wide open.
+        for line in [
+            "include ../../etc/ld.so.conf.d/*.conf\n",
+            "/../../../etc\n",
+            "../../usr/lib\n",
+        ] {
+            let _ = std::fs::write(&conf, line);
+            for dir in linker_dirs(&root) {
+                // NOT `starts_with`, which is COMPONENT-BASED and therefore blind here:
+                // `<root>/../../etc` starts with `<root>` by that test, so the first version of
+                // this assertion passed with the escape wide open (found by sabotage). The
+                // property is that no returned path carries a `..` at all, which is also what a
+                // later `openat2(O_NOFOLLOW)` needs.
+                assert!(
+                    !dir.components()
+                        .any(|c| c == std::path::Component::ParentDir),
+                    "a `..` survived into a linker directory: {} from {line:?}",
+                    dir.display()
+                );
+            }
+        }
+
+        // THE EXPONENTIAL, SIZED SO THAT IT IS VISIBLE. A two-file cycle terminates either way,
+        // because `MAX_LD_CONF_DEPTH` bounds the nesting, so timing it proves nothing: that was the
+        // first version of this case and the sabotage passed. The cost is BREADTH to the power of
+        // the depth, so N files each including every other is N reads with the visited set and N^4
+        // without it. 48 files is 48 reads against 5.3 million, which the clock can tell apart
+        // without making the passing case slow.
+        let _ = std::fs::remove_dir_all(root.join("etc/ld.so.conf.d"));
+        let _ = std::fs::create_dir_all(root.join("etc/ld.so.conf.d"));
+        const CYCLE: usize = 48;
+        let every: String = (0..CYCLE)
+            .map(|i| format!("include /etc/ld.so.conf.d/c{i}.conf\n"))
+            .collect();
+        for i in 0..CYCLE {
+            let mut body = String::from("/opt/listed\n");
+            body.push_str(&every);
+            let _ = std::fs::write(root.join(format!("etc/ld.so.conf.d/c{i}.conf")), &body);
+        }
+        let _ = std::fs::write(&conf, &every);
+        let started = std::time::Instant::now();
+        let dirs = linker_dirs(&root);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "{CYCLE} mutually-including files took {took:?}, so each was read once per path \
+             through the graph instead of once"
+        );
+        assert!(
+            dirs.contains(&root.join("opt/listed")),
+            "the directory behind the cycle must still be found: {dirs:?}"
+        );
+
+        // AND THE DEFAULTS ARE ALWAYS THERE, which is the positive control: a parser that returned
+        // nothing would satisfy the `..` assertion above.
+        let _ = std::fs::write(&conf, "#only a comment\n");
+        let dirs = linker_dirs(&root);
+        assert!(
+            !dirs.is_empty(),
+            "the default library directories must always be returned"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A SYMLINK IS RESOLVED UNDER THE ROOT, OR IT IS NOT FOLLOWED AT ALL.
