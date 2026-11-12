@@ -482,6 +482,18 @@ class _Server:
                 # Validated by the SDK like `user=`, so a value that is not an account name is refused
                 # by name at the first call rather than reaching kern's argv.
                 user=os.environ.get("KERN_MCP_USER") or None,
+                # THE OPERATOR'S KNOB, NEVER THE MODEL'S, and that is why it is an environment
+                # variable and not a tool argument. Every other GPU surface in kern makes the same
+                # split: a compose file cannot grant itself a card without `--allow-device-grants`,
+                # because a policy a downloaded file can defeat is not a policy, and a model asking
+                # for hardware over a tool call is the same shape with a faster feedback loop.
+                # Whoever starts this server decides, once, and every box it starts gets what they
+                # decided.
+                #
+                # The spec travels to kern unparsed, so a value kern refuses is refused by name at
+                # the first call: there is no copy of the grammar here to drift from the one that
+                # owns it.
+                gpus=os.environ.get("KERN_MCP_GPUS") or None,
                 # the MCP layer never surfaces result.files (it has a dedicated list_files tool), so skip
                 # the per-call O(N) workspace diff: run_code stays O(1) even as a session accretes files.
                 track_files=False,

@@ -6271,6 +6271,18 @@ fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Op
         return None;
     }
     for b in boxes {
+        // A GPU IS A DEVICE GRANT, and this gate is the operator's half. `gpus:` and
+        // `deploy.resources.reservations.devices` both land in one field, so one check covers
+        // both spellings and a file cannot reach the hardware by picking the other one.
+        if let Some(spec) = &b.gpus {
+            return Some(format!(
+                "service '{}' asks for a GPU ({spec}) and nothing granted it. A GPU is a device \
+                 grant: pass --allow-device-grants to `kern compose`, or set \
+                 allow_device_grants in YOUR OWN kern.toml. A compose file cannot grant itself \
+                 hardware, and a file that could would not be a policy",
+                b.service_name()
+            ));
+        }
         if let Some(msg) = compose_devices_refusal(b.service_name(), &b.devices) {
             return Some(msg);
         }

@@ -290,6 +290,17 @@ pub struct ComposeBox {
     /// `No such file or directory`, from the same tree, in the same second. Order-dependence in a
     /// parser is a defect even when the order happens to be right.
     pub devices: Vec<String>,
+    /// `gpus:` and `deploy.resources.reservations.devices`, as a `--gpus` spec.
+    ///
+    /// THE SPEC TRAVELS AS WRITTEN and is parsed where `--gpus` is parsed, because compose's
+    /// `gpus: 2` and docker's `--gpus 2` are the same request in the same grammar; translating it
+    /// here would be a second parser to disagree with the first. The two compose keys that can ask
+    /// for a GPU both land in this one field, so a file that writes both does not get two grants.
+    ///
+    /// NOT HONOURED FROM THE FILE ALONE. A GPU is a device grant, and a policy a downloaded file
+    /// can defeat is not a policy: this needs `--allow-device-grants` exactly as `devices:` does.
+    /// `device_grant_problem` is the gate, and it reads this field.
+    pub gpus: Option<String>,
     /// tmpfs mounts that came from a LONG-FORM `volumes:` entry (`{type: tmpfs, target: …}`), kept
     /// apart from `tmpfs` for the same reason `devices` is kept apart from `volumes`: the `tmpfs:`
     /// key ASSIGNS its field, and the service keys are read in file order, so anything appended to
@@ -691,6 +702,13 @@ impl ComposeBox {
                 cmd.env(format!("KERN_SECRET_{name}"), value);
                 cmd.arg("--secret-env").arg(name);
             }
+        }
+        // THE SPEC UNTOUCHED, so `kern box` parses compose's words with the same code that parses
+        // the command line's. A service that asked for a GPU and started without one is the "runs
+        // and lies" outcome: the workload meets a CUDA error with nothing to connect it to the key
+        // it wrote.
+        if let Some(spec) = &self.gpus {
+            cmd.arg("--gpus").arg(spec);
         }
         if let Some(p) = &self.apparmor {
             cmd.arg("--apparmor").arg(p);

@@ -3524,6 +3524,7 @@ class Sandbox {
    * @param {number} [opts.maxOutputBytes]   cap on captured stdout/stderr EACH. Default 64 MiB.
    * @param {boolean} [opts.enforceLimits]   true (default) hard-enforces caps via a systemd scope.
    * @param {boolean} [opts.depsReadonly]    mount setup= deps read-only for runCode (default true).
+   * @param {string}  [opts.gpus]            NVIDIA cards for every box: "2", "all", "device=0,1" (default none).
    * @param {boolean} [opts.pycCache]        compile this image's stdlib once and mount it read-only (default true).
    * @param {string|null} [opts.user]        the account of the IMAGE every box runs as, "<user>[:<group>]",
    *   each a name or a number ("node", "1000", "1000:1000"): `kern box --user`, and `kern exec -u` for a
@@ -3652,6 +3653,21 @@ class Sandbox {
     // `--security-opt apparmor=`), a kernel-enforced LSM layer over namespaces + seccomp. The profile
     // must be loaded on the host; kern fails the box CLOSED if it is not. null (default) applies none.
     this.apparmor = opts.apparmor ?? null;
+    // `gpus: "2" | "all" | "device=0" | "device=0,1"`: hand the box NVIDIA cards, in kern's and
+    // docker's shared grammar (a bare number is HOW MANY, device=N names WHICH). The spec travels
+    // to `kern box --gpus` as written: parsing it here would be a second grammar to disagree with
+    // the first, and a disagreement shows up as a box holding a card the caller did not ask for.
+    //
+    // EVERY BOX THIS SESSION STARTS GETS THEM, the setup box included. That is deliberate: a
+    // `setup: "pip install torch"` whose wheel picks its build from the visible card is the common
+    // case, and a setup box without the GPU would resolve a different wheel than the run boxes
+    // then need.
+    //
+    // null (the default) passes no flag, which is NOT the same as passing zero: kern refuses
+    // `--gpus 0` because docker reads it as "no gpus" and this project's examples read it as
+    // "card 0", so a binding that turned its default into that argument would hand the refusal to
+    // a caller who wrote nothing. Python's `gpus=` is the same field with the same rule.
+    this.gpus = opts.gpus ?? null;
     this.depsReadonly = opts.depsReadonly ?? true;
     this.pycCache = opts.pycCache ?? true;
     /** The cache to mount: "" means this session compiles from source. Set at open() when one is already
@@ -4526,6 +4542,10 @@ class Sandbox {
     if (this.requireLimits) argv.push("--require-limits");
     if (this.securityProfile !== null) argv.push("--security-profile", this.securityProfile);
     if (this.apparmor !== null) argv.push("--apparmor", this.apparmor);
+    // THE SPEC UNTOUCHED, so kern parses the caller's words with the code that parses the command
+    // line's. A spec kern refuses is reported by kern, naming the flag and the forms it takes,
+    // which is a better message than any this layer could invent for a grammar it does not own.
+    if (this.gpus !== null) argv.push("--gpus", String(this.gpus));
     // Network mode: egressAllow (a domain allowlist via an isolated netns + kern's filtering proxy)
     // governs the untrusted runCode/run boxes; the setup box keeps the full network it needs to install
     // deps. egressAllow and network are mutually exclusive (checked at construction).

@@ -204,6 +204,13 @@ relaxation is a named argument.
 - **`network=True` includes the host's loopback**, where unauthenticated services live: a test read
   the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the route-level middle setting.
 
+`gpus=` hands the box NVIDIA cards, in docker's grammar: `gpus="2"` is how many, `gpus="device=0,1"`
+is which, `gpus="all"` is all. The host's driver libraries come with them, so the image does not
+have to be a CUDA one. A granted card talks to the host's driver and is **not** a boundary against
+the code in the box; a card you did not ask for has no device node there, so CUDA cannot initialise
+it. Every box the session starts gets the cards, the `setup=` box included, because a wheel that
+picks its build from the visible card has to see the same one the later calls will.
+
 ## How fast
 
 Most of a call's cost is CPython starting inside the box, not the box. A

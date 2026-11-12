@@ -4056,6 +4056,21 @@ class Sandbox:
     # is O(workspace file count): a long session that accumulates thousands of files makes every run_code
     # slower. Set False (result.files always []) when you don't need the per-call file diff - O(1) then.
     track_files: bool = True
+    # gpus="2" / "all" / "device=0" / "device=0,1": hand the box NVIDIA cards, in kern's and docker's
+    # shared grammar (a bare number is HOW MANY, device=N names WHICH). The spec travels to
+    # `kern box --gpus` as written: parsing it here would be a second grammar to disagree with the
+    # first, and a disagreement would show up as a box holding a card the caller did not ask for.
+    #
+    # EVERY BOX THIS SESSION STARTS GETS THEM, including the setup box that installs deps. That is
+    # deliberate: a `setup="pip install torch"` whose wheel picks its build from the visible card is
+    # the common case, and a setup box without the GPU would resolve a different wheel than the one
+    # the run boxes then need.
+    #
+    # None (the default) passes no flag at all, which is not the same as passing zero: `--gpus 0` is
+    # refused by kern because docker reads it as "no gpus" and this project's examples read it as
+    # "card 0", and a binding that turned a default into that argument would make the refusal
+    # arrive for a caller who wrote nothing.
+    gpus: "str | None" = None
     # live output callbacks: called with each raw chunk (bytes) as it arrives, in a reader thread. The
     # full capped output is still captured in the result, so you can stream AND read result.stdout.
     on_stdout: "Callable[[bytes], None] | None" = None
@@ -5090,6 +5105,12 @@ class Sandbox:
             argv += ["--security-profile", self.security_profile]
         if self.apparmor is not None:
             argv += ["--apparmor", self.apparmor]
+        # THE SPEC UNTOUCHED, so kern parses the caller's words with the code that parses the
+        # command line's. A spec kern refuses is reported by kern, naming the flag and the forms
+        # it takes, which is a better message than any this layer could invent for a grammar it
+        # does not own.
+        if self.gpus is not None:
+            argv += ["--gpus", str(self.gpus)]
         # Network mode for THIS box. egress_allow (a domain allowlist via an isolated netns + kern's
         # filtering proxy) governs the untrusted run_code/run boxes; the setup box keeps the full network
         # it needs to install deps. egress_allow and network are mutually exclusive (checked at construct).

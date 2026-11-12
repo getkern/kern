@@ -8049,4 +8049,53 @@ mod exec_scope_decision_tests {
             "the predicate and this process's own cgroup line must not disagree: {raw:?}"
         );
     }
+
+    /// A GPU ASKED FOR BY A COMPOSE FILE NEEDS THE OPERATOR'S GRANT, in both of the file's spellings.
+    ///
+    /// A GPU is a device grant, and the rule that governs `devices:` governs this: a policy a
+    /// downloaded file can defeat is not a policy. The two compose keys that can ask for a card
+    /// (`gpus:` and `deploy.resources.reservations.devices`) are folded into ONE field by the parser,
+    /// so the gate reads one thing and a file cannot reach the hardware by picking the other spelling.
+    ///
+    /// Asserted through the gate itself with the acknowledgement off AND on, because a refusal nobody
+    /// can lift is a different defect from one that never fires.
+    #[test]
+    fn a_compose_gpu_request_needs_the_operators_grant() {
+        // `device_grant_problem` reads the operator's config, located through process-global env.
+        let _g = crate::env_guard();
+        for spec in ["all", "2", "device=0,1"] {
+            let b = crate::compose::ComposeBox {
+                name: "trainer".into(),
+                image: Some("alpine".into()),
+                gpus: Some(spec.to_string()),
+                ..Default::default()
+            };
+            let boxes = vec![b];
+            let msg = device_grant_problem(&boxes, false)
+                .unwrap_or_else(|| panic!("`gpus: {spec}` without the grant must be refused"));
+            assert!(
+                msg.contains("trainer") && msg.contains(spec),
+                "the refusal names the service and what it asked for: {msg}"
+            );
+            assert!(
+                msg.contains("--allow-device-grants"),
+                "and the acknowledgement that lifts it, which lives where the file cannot reach: {msg}"
+            );
+            assert!(
+                device_grant_problem(&boxes, true).is_none(),
+                "the operator's flag lifts it, as it does for `devices:` and a vgpio profile"
+            );
+        }
+        // POSITIVE CONTROL: a service that asks for no card is never gated, or every stack would need
+        // the flag to start.
+        let plain = vec![crate::compose::ComposeBox {
+            name: "web".into(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        }];
+        assert!(
+            device_grant_problem(&plain, false).is_none(),
+            "a service with no GPU request must not need the operator's grant"
+        );
+    }
 }

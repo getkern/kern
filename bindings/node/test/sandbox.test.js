@@ -4251,3 +4251,26 @@ test("every pathRefusal call site hands over the path", () => {
   }
   assert.strictEqual(c, 3, "the counter must see three commas in a four-argument call");
 });
+
+test("gpus reaches the argv verbatim and the default adds no flag", () => {
+  // THE SPEC IS NOT PARSED HERE, on purpose. `--gpus` takes docker's grammar (a bare number is how
+  // many, `device=N` is which, `all` is all) and kern owns it; a copy in this layer would be a
+  // second grammar to disagree with the first, and the disagreement would show up as a box holding
+  // a card the caller did not ask for. Every form travels as written, including the ones kern
+  // refuses: the refusal is kern's and arrives naming the flag and its forms.
+  //
+  // THE DEFAULT ADDS NO FLAG, which is not the same as adding `--gpus 0`. kern refuses a bare `0`
+  // because docker reads it as "no gpus" and this project's examples read it as "card 0", so a
+  // binding that turned its default into that argument would hand the refusal to a caller who
+  // wrote nothing. Python's test asserts the same two properties on the same inputs: they are one
+  // surface and a check on one side of it is half a gate.
+  for (const spec of ["2", "all", "device=0", "device=0,1", "gpu=1", "count=all", "0", "nonsense"]) {
+    const argv = new Sandbox({ gpus: spec })._baseArgv("n", { network: false, timeoutS: 30 });
+    assert.ok(argv.includes("--gpus"), spec);
+    assert.strictEqual(argv[argv.indexOf("--gpus") + 1], spec, spec);
+  }
+  assert.ok(!new Sandbox()._baseArgv("n", { network: false, timeoutS: 30 }).includes("--gpus"));
+  assert.ok(
+    !new Sandbox({ gpus: null })._baseArgv("n", { network: false, timeoutS: 30 }).includes("--gpus"),
+  );
+});

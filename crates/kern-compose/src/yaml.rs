@@ -4129,13 +4129,48 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             // mean `cpus:`? ... the key as written does nothing here or under Docker", which is false
             // twice.
             "gpus" => {
-                warn(&format!(
-                    "service '{name}': `gpus:` is NOT applied - kern does not read Docker's GPU \
-                     request. The GPU is a DEVICE GRANT here: name the nodes the service needs \
-                     under `devices:` and pass `--allow-device-grants` to `kern compose`. WHAT YOU \
-                     WILL SEE without them: the service starts without the GPU and fails inside \
-                     with a CUDA or driver error"
-                ));
+                // APPLIED NOW, and the value travels as written: compose's `gpus: 2` and docker's
+                // `--gpus 2` are the same request in the same grammar, so the only honest thing to
+                // do with the string is hand it to the code that already reads it. A translation
+                // here would be a second parser, and the two would disagree the first time one of
+                // them learned a spelling.
+                //
+                // It still needs `--allow-device-grants`: a GPU is a device grant, and a policy a
+                // downloaded file can defeat is not a policy. `device_grant_problem` refuses, so
+                // this arm records the request and never decides it.
+                // TWO SHAPES, BOTH DOCKER'S. `gpus: all` is a scalar, and `gpus:` followed by a
+                // list of `- driver: nvidia / count: 1` is the long form compose also accepts.
+                // The long form is the SAME shape as `deploy.resources.reservations.devices`, so
+                // it is read by the same function: two readers for one shape would be two places
+                // to teach a new key, and the one nobody updated would be the one a file used.
+                let v = node
+                    .scalar
+                    .as_deref()
+                    .map(scalar_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if !v.is_empty() {
+                    b.gpus = Some(v);
+                } else if !node.items.is_empty() {
+                    match gpu_reservation_spec(name, node, true) {
+                        Some(Ok(spec)) => b.gpus = Some(spec),
+                        Some(Err(msg)) => warn(&msg),
+                        // A LIST WITH NO GPU ENTRY under a key whose whole purpose is the GPU.
+                        // Docker would read the entry and find no `capabilities: [gpu]` either,
+                        // so this says what is missing rather than inventing the capability.
+                        None => warn(&format!(
+                            "service '{name}': `gpus:` lists no entry with \
+                             `capabilities: [gpu]`, so nothing in it asks for a GPU and no card \
+                             is granted"
+                        )),
+                    }
+                } else {
+                    warn(&format!(
+                        "service '{name}': `gpus:` needs a value - a count like `gpus: 2`, \
+                         `gpus: all`, or `gpus: device=0`. Written empty it grants nothing"
+                    ));
+                }
             }
             // `extends` IS IMPLEMENTED, and is here as a backstop only: `resolve_extends` folds the
             // base in and removes the key before this match runs, and an `extends` it cannot resolve
@@ -4373,6 +4408,112 @@ fn parse_binary_size_str(s: &str) -> Option<u64> {
 /// The device half gets its own sentence because the remedy is different in kind: a device is granted by
 /// an operator through an `x-kern-vgpio:` profile plus `--allow-device-grants`, never by a downloaded
 /// file, and no wording of the compose key can change that.
+/// The `--gpus` spec a `deploy.resources.reservations.devices` list asks for, if any.
+///
+/// COMPOSE'S OTHER SPELLING FOR THE SAME REQUEST. Docker reads this list and `gpus:` into one
+/// thing, and so does kern: the entry is translated into the grammar `--gpus` already parses,
+/// rather than into a second notion of what a GPU request is.
+///
+/// A BLOCK-MAPPING LIST ITEM ARRIVES AS AN INLINE STRING. `build_tree` folds
+/// `- driver: nvidia\n  count: 2` into the one item `{driver: nvidia, count: 2}`, so the entries
+/// are re-read with [`parse_inline_table`] rather than walked as children; an entry written in
+/// flow style was already that shape and goes down the same path.
+///
+/// `None` means no entry asked for a GPU, and the caller keeps its note: the list can reserve
+/// things kern grants nothing for, and silence about those would be the defect this note exists
+/// to prevent. `Some(Err(..))` is an entry that asked for one in a shape with no translation, and
+/// it is named rather than approximated: a count this function invented would be a number nobody
+/// wrote.
+fn gpu_reservation_spec(
+    service: &str,
+    devices: &Node,
+    gpu_is_implied: bool,
+) -> Option<Result<String, String>> {
+    // The messages below name `deploy.resources.reservations.devices` because that is where this
+    // shape is usually written; `gpus:`'s long form is the same shape and reaches the same text.
+    // Naming both spellings in every message would be noise, and the shape in front of the reader
+    // is the one they wrote.
+    let entries: Vec<Node> = if devices.items.is_empty() {
+        Vec::new()
+    } else {
+        devices
+            .items
+            .iter()
+            .map(|i| parse_inline_table(i))
+            .collect()
+    };
+    for entry in &entries {
+        // `capabilities: [gpu]` is what makes this entry a GPU and not some other reservation.
+        // The list arrives as a scalar `[gpu]` or as items, so both are read.
+        let caps = entry.child("capabilities");
+        // UNDER `gpus:` THE KEY IS THE CAPABILITY. `deploy.resources.reservations.devices` can
+        // reserve anything, so there an entry has to say `capabilities: [gpu]` to be one; under
+        // `gpus:` every entry is a GPU request by virtue of the key it is written under, and
+        // demanding the word there would refuse a file docker accepts.
+        let mentions_gpu = gpu_is_implied
+            || caps.is_some_and(|c| {
+                let inline = c.scalar.as_deref().unwrap_or_default().to_ascii_lowercase();
+                inline.contains("gpu")
+                    || c.items.iter().any(|i| i.trim().eq_ignore_ascii_case("gpu"))
+            });
+        if !mentions_gpu {
+            continue;
+        }
+        // `device_ids` NAMES WHICH, and wins over a count: an entry carrying both has said which
+        // cards it wants, and a count beside them adds nothing a reader could act on.
+        if let Some(ids) = entry.child("device_ids") {
+            let raw = ids.scalar.as_deref().unwrap_or_default();
+            let listed: Vec<String> = if ids.items.is_empty() {
+                raw.trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .map(|x| x.trim().trim_matches('"').trim_matches('\'').to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            } else {
+                ids.items
+                    .iter()
+                    .map(|x| x.trim().trim_matches('"').trim_matches('\'').to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            };
+            if listed.is_empty() {
+                return Some(Err(format!(
+                    "service '{service}': deploy.resources.reservations.devices names a GPU with \
+                     an empty `device_ids`. Write the cards (device_ids: [\"0\", \"1\"]) or a \
+                     count (count: 2)"
+                )));
+            }
+            return Some(Ok(format!("device={}", listed.join(","))));
+        }
+        if let Some(count) = entry.child("count") {
+            let v = count
+                .scalar
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            if v.is_empty() {
+                return Some(Err(format!(
+                    "service '{service}': deploy.resources.reservations.devices names a GPU with \
+                     an empty `count`. Write a number (count: 2) or `count: all`"
+                )));
+            }
+            return Some(Ok(v));
+        }
+        // NEITHER, so there is nothing to translate and nothing to guess. Docker's own default
+        // here is not something kern should reproduce from memory, so the entry is named.
+        return Some(Err(format!(
+            "service '{service}': deploy.resources.reservations.devices names a GPU and says \
+             neither how many nor which. Write `count: 2`, `count: all`, or \
+             `device_ids: [\"0\"]`"
+        )));
+    }
+    None
+}
+
 fn deploy_reservation_note(service: &str, key: &str) -> String {
     if key == "devices" {
         return format!(
@@ -4460,9 +4601,36 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
     let resources = node.child("resources");
     if let Some(res) = resources.and_then(|r| r.child("reservations")) {
         for k in ["devices", "cpus", "memory", "generic_resources"] {
-            if res.child(k).is_some() {
-                warn(&deploy_reservation_note(name, k));
+            let Some(child) = res.child(k) else { continue };
+            // A GPU RESERVATION IS APPLIED; everything else in this subtree is still a scheduling
+            // request kern has no scheduler for, and still says so. The note was the only honest
+            // answer while nothing could be granted, and keeping it for a key that now works
+            // would be the same defect pointing the other way.
+            if k == "devices" {
+                match gpu_reservation_spec(name, child, false) {
+                    Some(Ok(spec)) => {
+                        // `gpus:` WINS, and the file is told. Two keys asking for the same thing
+                        // is the file's ambiguity, and resolving it in silence would leave a
+                        // reader unable to tell which of their two lines took effect.
+                        if b.gpus.is_some() {
+                            warn(&format!(
+                                "service '{name}': both `gpus:` and \
+                                 deploy.resources.reservations.devices ask for a GPU. `gpus:` is \
+                                 applied and the reservation is ignored; delete one of them"
+                            ));
+                        } else {
+                            b.gpus = Some(spec);
+                        }
+                        continue;
+                    }
+                    Some(Err(msg)) => {
+                        warn(&msg);
+                        continue;
+                    }
+                    None => {}
+                }
             }
+            warn(&deploy_reservation_note(name, k));
         }
     }
     let Some(limits) = resources.and_then(|r| r.child("limits")) else {
@@ -10271,34 +10439,134 @@ services:
     /// is an EMPTY STRING and legal, so "nothing follows the tag" cannot be the test; only the next
     /// content line separates the empty scalar from the block collection. A guard that refused on the
     /// bare tag alone would reject the last case here, which is why it is asserted.
-    /// `gpus:` IS A COMPOSE KEY, AND THE NOTE MUST SAY WHAT KERN DOES INSTEAD.
+    /// `gpus:` IS A COMPOSE KEY, IS APPLIED, AND IS NOT A TYPO FOR `cpus:`.
     ///
     /// MEASURED with kern 0.30.0: `gpus: all` reached the unknown-key path, which answered "did you
-    /// mean `cpus:`? ... the key as written does nothing here or under Docker". Under Docker it is the
-    /// GPU request (docker compose v2.30+), so the suggestion pointed at the wrong key and the
-    /// explanation was false. Both forms docker compose accepts are asserted.
+    /// mean `cpus:`? ... the key as written does nothing here or under Docker". Under Docker it is
+    /// the GPU request (docker compose v2.30+), so the suggestion pointed at the wrong key and the
+    /// explanation was false. It then became an honest refusal, and is now applied; the two
+    /// sentences this test forbids are the same two in all three worlds.
+    ///
+    /// BOTH SHAPES DOCKER COMPOSE ACCEPTS. The scalar is the spec as written; the long form is a
+    /// list of mappings, where the capability is IMPLIED by the key, so an entry carrying only a
+    /// count is a complete request there and would not be one under `reservations.devices`.
     #[test]
-    fn gpus_is_named_as_a_gpu_request_and_not_as_a_typo_for_cpus() {
-        for value in ["all", "\n      - driver: nvidia\n        count: 1"] {
+    fn gpus_is_applied_in_both_shapes_and_is_not_a_typo_for_cpus() {
+        for (value, want) in [
+            ("all", "all"),
+            ("2", "2"),
+            ("device=0,1", "device=0,1"),
+            ("\n      - driver: nvidia\n        count: 1", "1"),
+            (
+                "\n      - driver: nvidia\n        device_ids: [\"1\"]",
+                "device=1",
+            ),
+        ] {
             let _ = take_warnings();
             let src = format!("services:\n  a:\n    image: alpine\n    gpus: {value}\n");
-            parse(&src).expect("parses");
-            let warned = take_warnings();
-            let w = warned
-                .iter()
-                .find(|w| w.contains("gpus:"))
-                .unwrap_or_else(|| panic!("no note for gpus:, got {warned:?}"));
-            assert!(!w.contains("did you mean"), "not a typo: {w}");
-            assert!(
-                !w.contains("does nothing here or under Docker"),
-                "false under Docker: {w}"
+            let boxes = parse(&src).expect("parses");
+            assert_eq!(
+                boxes.first().and_then(|b| b.gpus.clone()),
+                Some(want.to_string()),
+                "gpus: {value:?}"
             );
-            assert!(w.contains("NOT applied") && w.contains("GPU"), "{w}");
-            assert!(
-                w.contains("devices:") && w.contains("--allow-device-grants"),
-                "it names what does work here: {w}"
+            // APPLIED MEANS SILENT. The two sentences below were both wrong about this key and
+            // neither may come back by way of the unknown-key path.
+            for w in take_warnings() {
+                assert!(!w.contains("did you mean"), "not a typo: {w}");
+                assert!(
+                    !w.contains("does nothing here or under Docker"),
+                    "false under Docker: {w}"
+                );
+                assert!(!w.contains("NOT applied"), "it is applied now: {w}");
+            }
+        }
+    }
+
+    /// BOTH COMPOSE SPELLINGS LAND IN ONE FIELD, so a file cannot reach the hardware by picking
+    /// the other one and a gate written once covers both.
+    ///
+    /// `gpus:` is docker's own key since compose v2.30 and carries the same grammar as the flag,
+    /// so the value travels as written. `deploy.resources.reservations.devices` is the older
+    /// spelling and is TRANSLATED, because its shape is a list of mappings rather than a spec:
+    /// `count` becomes the count, `device_ids` becomes `device=`, and an entry with neither is
+    /// named rather than guessed at.
+    #[test]
+    fn both_compose_spellings_of_a_gpu_request_become_one_gpus_spec() {
+        let _ = take_warnings();
+        let one = |yaml: &str| -> Option<String> {
+            let boxes = parse(yaml).expect("parses");
+            boxes.first().and_then(|b| b.gpus.clone())
+        };
+        // `gpus:` verbatim, every form the flag takes.
+        for spec in ["all", "2", "device=0", "device=0,1", "count=all"] {
+            assert_eq!(
+                one(&format!(
+                    "services:\n  a:\n    image: alpine\n    gpus: {spec}\n"
+                )),
+                Some(spec.to_string()),
+                "gpus: {spec}"
             );
         }
+        let _ = take_warnings();
+        // The reservations list, translated.
+        let res = |body: &str| {
+            one(&format!(
+                "services:\n  a:\n    image: alpine\n    deploy:\n      resources:\n        \
+                 reservations:\n          devices:\n{body}"
+            ))
+        };
+        assert_eq!(
+            res("            - driver: nvidia\n              count: 2\n              capabilities: [gpu]\n"),
+            Some("2".to_string())
+        );
+        assert_eq!(
+            res("            - driver: nvidia\n              count: all\n              capabilities: [gpu]\n"),
+            Some("all".to_string())
+        );
+        assert_eq!(
+            res("            - driver: nvidia\n              device_ids: [\"0\", \"1\"]\n              capabilities: [gpu]\n"),
+            Some("device=0,1".to_string())
+        );
+        let _ = take_warnings();
+        // AN ENTRY THAT IS NOT A GPU IS NOT A GRANT, and still gets the note it always got: the
+        // list can reserve things kern hands over nothing for, and silence about those is the
+        // defect that note exists to prevent.
+        assert_eq!(
+            res("            - driver: some-fpga\n              count: 1\n              capabilities: [fpga]\n"),
+            None
+        );
+        assert!(
+            take_warnings()
+                .iter()
+                .any(|w| w.contains("reservations.devices ignored")),
+            "a non-GPU reservation lost its note"
+        );
+        // A GPU ENTRY THAT SAYS NEITHER HOW MANY NOR WHICH is named, not approximated: a count
+        // invented here would be a number nobody wrote.
+        assert_eq!(
+            res("            - driver: nvidia\n              capabilities: [gpu]\n"),
+            None
+        );
+        assert!(
+            take_warnings()
+                .iter()
+                .any(|w| w.contains("neither how many nor which")),
+            "an underspecified GPU entry was silent"
+        );
+        // BOTH KEYS AT ONCE is the file's ambiguity, and the file is told which one won.
+        let both = one(
+            "services:\n  a:\n    image: alpine\n    gpus: device=0\n    deploy:\n      \
+             resources:\n        reservations:\n          devices:\n            - driver: nvidia\n\
+             \x20             count: 2\n              capabilities: [gpu]\n",
+        );
+        assert_eq!(both, Some("device=0".to_string()), "gpus: must win");
+        assert!(
+            take_warnings()
+                .iter()
+                .any(|w| w.contains("both `gpus:` and")),
+            "the ambiguity was resolved in silence"
+        );
     }
 
     #[test]
@@ -10392,10 +10660,14 @@ services:
         let _ = take_warnings(); // start from a clean slate on this thread
         parse(file).expect("a reservations-only deploy block still parses");
         let warned = take_warnings();
+        // The SENTENCE changed when the key started being applied: an entry naming a GPU and
+        // neither how many nor which is now named for what it is missing. The PLACEMENT is what
+        // this test holds, and any word out of that subtree proves the check still runs before
+        // the early return.
         assert!(
             warned
                 .iter()
-                .any(|w| w.contains("reservations.devices") && w.contains("WITHOUT the device")),
+                .any(|w| w.contains("reservations.devices") && w.contains("neither how many")),
             "a GPU request with no `limits:` must still be named, got {warned:?}"
         );
         // AND THE CATCH-ALL ARM: a key kern does not map at all is named too, which is what stops the
@@ -10847,7 +11119,6 @@ mod surface_tests {
         let cases: &[(&str, &str)] = &[
             ("configs", "services:\n  s:\n    image: alpine\n    configs:\n      - c\n"),
             ("domainname", "services:\n  s:\n    image: alpine\n    domainname: d\n"),
-            ("gpus", "services:\n  s:\n    image: alpine\n    gpus: all\n"),
             ("runtime", "services:\n  s:\n    image: alpine\n    runtime: nvidia\n"),
             ("ipc", "services:\n  s:\n    image: alpine\n    ipc: host\n"),
             ("pid", "services:\n  s:\n    image: alpine\n    pid: host\n"),

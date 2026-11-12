@@ -6132,3 +6132,25 @@ def test_every_path_refusal_call_site_hands_over_the_path():
         f"{len(bare)} `_path_refusal` call(s) pass no path, so they cannot name their subject and "
         f"will say 'a directory on that path' for a mode-0 file: line(s) {bare}"
     )
+
+
+def test_gpus_reaches_the_argv_verbatim_and_the_default_adds_no_flag():
+    """`gpus=` emits `--gpus <spec>` with the spec UNCHANGED, and `None` emits nothing at all.
+
+    THE SPEC IS NOT PARSED HERE, on purpose. `--gpus` takes docker's grammar (a bare number is how
+    many, `device=N` is which, `all` is all) and kern owns it; a copy in this layer would be a
+    second grammar to disagree with the first, and the disagreement would show up as a box holding
+    a card the caller did not ask for. So every form travels as written, including the ones kern
+    refuses: the refusal is kern's and arrives naming the flag and its forms.
+
+    THE DEFAULT ADDS NO FLAG, which is not the same as adding `--gpus 0`. kern refuses a bare `0`
+    because docker reads it as "no gpus" and this project's own examples read it as "card 0", so a
+    binding that turned its default into that argument would hand the refusal to a caller who
+    wrote nothing.
+    """
+    for spec in ("2", "all", "device=0", "device=0,1", "gpu=1", "count=all", "0", "nonsense"):
+        argv = _cfg(gpus=spec)._base_argv("n", network=False, timeout_s=30)
+        assert "--gpus" in argv, spec
+        assert argv[argv.index("--gpus") + 1] == spec, spec
+    assert "--gpus" not in _cfg()._base_argv("n", network=False, timeout_s=30)
+    assert "--gpus" not in _cfg(gpus=None)._base_argv("n", network=False, timeout_s=30)

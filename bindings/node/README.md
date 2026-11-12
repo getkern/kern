@@ -249,6 +249,9 @@ new Sandbox({
   securityProfile, // "untrusted" = seccomp allowlist + cap-drop ALL + read-only root, one opt-in bundle
   apparmor,        // a PRE-LOADED AppArmor profile the box enters on exec (Docker's --security-opt
                    // apparmor=), an LSM layer over seccomp; kern fails the box CLOSED if it isn't loaded.
+  gpus,            // NVIDIA cards for EVERY box this session starts, in docker's grammar: "2" is how
+                   // many, "device=0,1" is which, "all" is all. A granted card talks to the host's
+                   // driver, so it is not a boundary against the code you run in the box.
   requireLimits,   // default false; true = FAIL-CLOSED (refuse to start unless caps enforced). NOT
                    // enforceLimits (that picks the cap PATH); mutually exclusive with KERN_ALLOW_UNCAPPED env.
   depsReadonly,    // default TRUE: runCode cannot modify what setup= installed

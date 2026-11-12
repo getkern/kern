@@ -75,6 +75,7 @@ Every knob is an environment variable in the client's `env` block. There is no c
 | `KERN_MCP_TMPFS_MB` | `64` | scratch at `/tmp`, charged to the box's own memory cap |
 | `KERN_MCP_WORKSPACE_MAX_MB` | `0` (no cap) | a size in MiB for the workspace, measured **while a call runs**, so one runaway cell is stopped mid-call |
 | `KERN_MCP_USER` | the image's own `USER` | the account the code runs as, e.g. `node` or `1000`. A non-root one shares the workspace through a POSIX ACL: [Safe by default](SANDBOX.md#safe-by-default) |
+| `KERN_MCP_GPUS` | none | NVIDIA cards for every box this server starts: `2` (how many), `all`, `device=0,1` (which). It is the OPERATOR's knob and not a tool argument, so a model cannot ask for hardware: whoever starts the server decides once. A granted card is not a boundary against the code in the box, so grant one only to code you would trust with the card |
 | `KERN_MCP_QUIET` | on | `0` restores kern's non-fatal notes, which otherwise land in the model's output as if the cell had printed them |
 | `KERN_BIN` | `kern` on `PATH` | where the binary is |
 

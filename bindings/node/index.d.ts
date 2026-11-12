@@ -178,6 +178,9 @@ export interface SandboxOptions {
   /** Enter this pre-loaded AppArmor profile on the box's exec. kern fails the box CLOSED if it is not
    * loaded on the host. null (default) applies none. */
   apparmor?: string | null;
+  /** NVIDIA cards for every box: "2" (how many), "all", "device=0" or "device=0,1" (which).
+   *  Docker's grammar, handed to `kern box --gpus` as written. Default none. */
+  gpus?: string | null;
   /** Capabilities dropped from every box (kern --cap-drop). Default ["ALL"]. NOT behaviour-free: a
    * workload binding a port below 1024 inside the box needs NET_BIND_SERVICE. [] drops none. */
   capDrop?: string[];
