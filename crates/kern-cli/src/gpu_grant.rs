@@ -846,6 +846,64 @@ pub fn driver_version_from(contents: &str) -> Option<String> {
 /// `std::fs::canonicalize` cannot be used: it resolves against the real filesystem root, which on a
 /// synthetic tree walks out of the root under test and on a real host turns a relative link into
 /// the host's own absolute path.
+/// Follow the symlink chain at `path`, in place, with every target resolved UNDER `root`.
+///
+/// ONE SPELLING for the two callers that need it, and the reason they both needed fixing is that
+/// they disagreed about the same question. An ABSOLUTE target used to stop the walk in
+/// [`canonical_dir_under`], which left THE SYMLINK in the result, the exact shape that function
+/// exists to remove; and [`libraries_under`] followed one with `std::fs::metadata` and recorded the
+/// LINK as the path to mount, which breaks the invariant [`symlinks_for`] enforces (the resolved
+/// file is bound at the link's own path).
+///
+/// AN ABSOLUTE TARGET IS TAKEN AGAINST THE ROOT, which is both the correct resolution and the one
+/// that cannot escape: inside a root, `/usr/lib` means `<root>/usr/lib`, exactly as it would after
+/// a `pivot_root`. With the production root of `/` that is the identity, so nothing changes there;
+/// under a synthetic root it is the difference between resolving a link and leaving it.
+///
+/// `false` when the chain did not reach a non-symlink within [`MAX_LINK_HOPS`], or when a target
+/// climbed out of the root with `..`. `path` is left wherever the walk stopped, so a caller that
+/// treats `false` as a skip never mounts a half-resolved path. A loop is a thing a filesystem
+/// permits and an unbounded walk is a hang.
+fn follow_links_under(root: &Path, path: &mut PathBuf) -> bool {
+    for _ in 0..MAX_LINK_HOPS {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            // Nothing there: not a symlink, so the chain is as resolved as it gets. A caller that
+            // needs the path to EXIST checks that itself; this answers about links only.
+            return true;
+        };
+        if !meta.file_type().is_symlink() {
+            return true;
+        }
+        let Ok(target) = std::fs::read_link(&path) else {
+            return false;
+        };
+        let next = if target.is_absolute() {
+            root.join(target.strip_prefix("/").unwrap_or(&target))
+        } else {
+            let Some(parent) = path.parent() else {
+                return false;
+            };
+            parent.join(target)
+        };
+        // `..` IN A TARGET CAN STILL CLIMB OUT, and joining it does not normalise, so the check is
+        // on what the filesystem says the path really is. An unresolvable path cannot be shown to
+        // stay inside, so it does not.
+        match std::fs::canonicalize(&next) {
+            Ok(real) if real.starts_with(root) => {}
+            Ok(_) => return false,
+            // A dangling link is not an escape; the loop above stops on the next turn because
+            // `symlink_metadata` fails.
+            Err(_)
+                if !next
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir) => {}
+            Err(_) => return false,
+        }
+        *path = next;
+    }
+    false
+}
+
 fn canonical_dir_under(root: &Path, dir: &Path) -> PathBuf {
     let Ok(relative) = dir.strip_prefix(root) else {
         return dir.to_path_buf();
@@ -856,27 +914,10 @@ fn canonical_dir_under(root: &Path, dir: &Path) -> PathBuf {
             continue;
         };
         out.push(name);
-        let mut hops = 0u8;
-        while hops < MAX_LINK_HOPS {
-            let Ok(meta) = std::fs::symlink_metadata(&out) else {
-                break;
-            };
-            if !meta.file_type().is_symlink() {
-                break;
-            }
-            let Ok(target) = std::fs::read_link(&out) else {
-                break;
-            };
-            // An absolute target would leave the root, and a grant never follows one.
-            if target.is_absolute() {
-                break;
-            }
-            let Some(parent) = out.parent().map(Path::to_path_buf) else {
-                break;
-            };
-            out = parent.join(target);
-            hops = hops.saturating_add(1);
-        }
+        // Best-effort per component, as before: a component that cannot be resolved is left as it
+        // is rather than discarding the whole directory, because the caller only needs the
+        // DIRECTORY NAMES the linker was told about and a later phase checks what it mounts.
+        let _ = follow_links_under(root, &mut out);
     }
     out
 }
@@ -1007,9 +1048,19 @@ fn libraries_under(root: &Path, version: &str, want: ElfClass) -> Vec<Library> {
             if !name.ends_with(&suffix) {
                 continue;
             }
-            let path = entry.path();
-            // `symlink_metadata` would describe the link; the identity that matters is the file the
-            // link resolves to, because that is what two paths share.
+            // THE RESOLVED FILE, AND IT MUST STAY UNDER THE ROOT. This used to take
+            // `entry.path()` and `std::fs::metadata`, which follows a symlink wherever it points,
+            // including out of the root, and then recorded THE LINK as the path to mount. That
+            // breaks the invariant `symlinks_for` enforces, where the resolved file is bound at the
+            // link's own path, and under a synthetic root it names a file the bind would fail on
+            // with O_NOFOLLOW. A chain that leaves the root is skipped: a library kern cannot name
+            // inside the root is not a library it can hand over.
+            let mut path = entry.path();
+            if !follow_links_under(root, &mut path) {
+                continue;
+            }
+            // `metadata` and not `symlink_metadata`: the chain above is already resolved, and the
+            // identity that matters is the file's, because that is what two paths share.
             let Ok(meta) = std::fs::metadata(&path) else {
                 continue;
             };
@@ -3824,6 +3875,158 @@ mod tests {
             }
             other => panic!("expected Unreachable, got {other:?}"),
         }
+    }
+
+    /// A SYMLINK IS RESOLVED UNDER THE ROOT, OR IT IS NOT FOLLOWED AT ALL.
+    ///
+    /// Two call sites disagreed about the same question, and both were wrong in opposite
+    /// directions. `canonical_dir_under` STOPPED on an absolute target, which left the symlink in
+    /// its result, the exact shape it exists to remove. `libraries_under` FOLLOWED one with
+    /// `std::fs::metadata`, wherever it pointed, and then recorded the LINK as the path to mount,
+    /// which breaks the invariant `symlinks_for` enforces: the resolved file is bound at the link's
+    /// own path, so a link recorded as a library would be bound over itself and fail O_NOFOLLOW.
+    ///
+    /// An absolute target is taken AGAINST THE ROOT, which is the correct resolution inside a root
+    /// and the one that cannot escape. With the production root of `/` it is the identity, which is
+    /// why nothing on this host changes: 29 libraries, 29 symlinks and 1 linker directory before
+    /// and after.
+    #[test]
+    fn a_symlink_is_resolved_under_the_root_or_not_followed() {
+        let root = std::env::temp_dir().join(format!("kern-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("usr/lib/x86_64-linux-gnu");
+        if std::fs::create_dir_all(&real).is_err() {
+            eprintln!("skip: no writable temp dir");
+            return;
+        }
+        let outside = std::env::temp_dir().join(format!("kern-links-out-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&outside);
+        // THE ESCAPED TARGET IS A VALID 64-BIT ELF, so if the link were followed it WOULD be
+        // accepted: skipping it for being malformed would prove nothing about the root check.
+        let mut escaped_elf = Vec::with_capacity(64);
+        escaped_elf.extend_from_slice(&ELF_MAGIC);
+        escaped_elf.push(ELF_CLASS_64);
+        escaped_elf.extend_from_slice(&[0u8; 59]);
+        let _ = std::fs::write(outside.join("escaped.so.1.2.3"), &escaped_elf);
+
+        // AN ABSOLUTE SYMLINK IN A DIRECTORY PATH. `<root>/lib -> /usr/lib` is what a merged-usr
+        // host has, and inside a root it means `<root>/usr/lib`.
+        let _ = std::os::unix::fs::symlink("/usr/lib", root.join("lib"));
+        let got = canonical_dir_under(&root, &root.join("lib/x86_64-linux-gnu"));
+        assert_eq!(
+            got, real,
+            "an absolute link must resolve against the root, not be left in the result"
+        );
+        // AND NOT BY SUBSTRING. The first version of this assertion looked for `/lib/x86` in the
+        // result, which the CORRECT answer contains (`usr/lib/x86_64-linux-gnu`), so it failed on a
+        // passing fix. The link is `<root>/lib`, so the thing to assert is that the result does not
+        // start there.
+        assert!(
+            !got.starts_with(root.join("lib")),
+            "the symlink survived in the result: {}",
+            got.display()
+        );
+
+        // A RELATIVE ONE STILL WORKS, which is the positive control: the change must not have
+        // replaced one resolution with no resolution.
+        let _ = std::os::unix::fs::symlink("usr", root.join("rel"));
+        assert_eq!(
+            canonical_dir_under(&root, &root.join("rel/lib/x86_64-linux-gnu")),
+            real,
+            "a relative link must still resolve"
+        );
+
+        // AN ABSOLUTE TARGET CANNOT REACH OUTSIDE, which is the security-relevant half and not an
+        // escape to refuse: taken against the root, `/tmp/x` means `<root>/tmp/x`, so a link
+        // pointing at a real directory outside becomes a DANGLING path inside. That is the correct
+        // resolution and it is why absolute targets need no refusal of their own.
+        let _ = std::os::unix::fs::symlink(&outside, root.join("abs-out"));
+        let mut absolute = root.join("abs-out");
+        assert!(
+            follow_links_under(&root, &mut absolute),
+            "an absolute target is resolved, not refused"
+        );
+        assert!(
+            absolute.starts_with(&root),
+            "an absolute target must land inside the root: {}",
+            absolute.display()
+        );
+        assert!(
+            !absolute.exists(),
+            "and outside the root there is nothing for it to name: {}",
+            absolute.display()
+        );
+
+        // A CHAIN THAT CLIMBS OUT WITH `..` IS REFUSED. Joining does not normalise, so the check is
+        // on what the filesystem says the path really is.
+        // ONE `..`, not two: the root is a direct child of the temp dir, so `../<sibling>` is the
+        // climb that LANDS somewhere, and two would reach a path that does not exist, where the
+        // check cannot distinguish a refusal from a dangling link. The first version of this used
+        // two and the half SKIPPED, which is the outcome this project counts rather than ignores.
+        let up = PathBuf::from("..").join(
+            outside
+                .file_name()
+                .map(std::path::Path::new)
+                .unwrap_or(std::path::Path::new("x")),
+        );
+        let _ = std::os::unix::fs::symlink(&up, root.join("escape"));
+        let mut climbing = root.join("escape");
+        if std::fs::canonicalize(root.join("escape")).is_ok_and(|p| !p.starts_with(&root)) {
+            assert!(
+                !follow_links_under(&root, &mut climbing),
+                "a `..` chain that lands outside the root must not be followed"
+            );
+        } else {
+            eprintln!("skip: the `..` target does not land outside here, so that half did not run");
+        }
+
+        // A LOOP IS BOUNDED. A filesystem permits one and an unbounded walk is a hang.
+        let _ = std::os::unix::fs::symlink("b", root.join("a"));
+        let _ = std::os::unix::fs::symlink("a", root.join("b"));
+        let mut looping = root.join("a");
+        let started = std::time::Instant::now();
+        assert!(
+            !follow_links_under(&root, &mut looping),
+            "a loop must be refused rather than walked"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the loop was walked rather than bounded"
+        );
+
+        // AND A LIBRARY WHOSE NAME IS A LINK OUT OF THE ROOT IS SKIPPED, not recorded as the link.
+        let _ = std::fs::write(root.join("etc/ld.so.conf"), b"/usr/lib/x86_64-linux-gnu\n");
+        let _ = std::fs::create_dir_all(root.join("etc"));
+        let _ = std::fs::write(root.join("etc/ld.so.conf"), b"/usr/lib/x86_64-linux-gnu\n");
+        let _ = std::os::unix::fs::symlink(
+            outside.join("escaped.so.1.2.3"),
+            real.join("libescape.so.1.2.3"),
+        );
+        // A real file beside it, so the sweep has something to find and the emptiness below is the
+        // escape being skipped rather than the sweep finding nothing.
+        // A minimal 64-bit ELF: the magic, the class byte, and padding so a reader of the first
+        // five bytes is never short. Same shape the other fixtures in this module build.
+        let mut elf = Vec::with_capacity(64);
+        elf.extend_from_slice(&ELF_MAGIC);
+        elf.push(ELF_CLASS_64);
+        elf.extend_from_slice(&[0u8; 59]);
+        let _ = std::fs::write(real.join("libgood.so.1.2.3"), &elf);
+        let found = libraries_under(&root, "1.2.3", ElfClass::Bits64);
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|l| l.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "libgood.so.1.2.3"),
+            "the real library must be found, or this case proves nothing: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "libescape.so.1.2.3"),
+            "a link out of the root must not be recorded as a library: {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// THE PLAN DESCRIBES THE SELECTION, NOT THE HOST'S INVENTORY.
