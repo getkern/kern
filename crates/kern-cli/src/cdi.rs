@@ -60,6 +60,20 @@ pub const DEFAULT_SPEC_DIRS: [&str; 2] = ["etc/cdi", "var/run/cdi"];
 /// Bounds. A spec arriving from somewhere kern does not control gets a size it cannot exceed.
 const MAX_LINES: usize = 20_000;
 const MAX_LINE_LEN: usize = 4_096;
+
+/// The most bytes a spec file is READ, derived from the two bounds above rather than chosen.
+///
+/// The lexer already refuses more than `MAX_LINES` lines of more than `MAX_LINE_LEN` each, so
+/// reading past their product can only produce text the parser will refuse: the bound is the widest
+/// input that could still be accepted, which is why it is multiplied here instead of picked. Before
+/// this existed the read had no bound at all, and a 2 GB file at a spec's name became 2 GB resident
+/// (measured 2026-11-12).
+const MAX_SPEC_BYTES: u64 = (MAX_LINES as u64) * (MAX_LINE_LEN as u64);
+
+/// The most bytes one of the driver's own `information` files is read. Not a spec bound: this file
+/// is written by the kernel module and is a few hundred bytes, so the limit only has to exclude a
+/// path that is not that file at all.
+const MAX_DRIVER_INFO_BYTES: u64 = 64 * 1024;
 const MAX_INDENT: usize = 64;
 
 /// Why a CDI document was refused. Every variant carries the line, so a message can point at it.
@@ -1230,6 +1244,78 @@ containerEdits:
         );
     }
 
+    /// A SPEC DIRECTORY IS WRITABLE BY WHOEVER CAN WRITE IT, so what it holds is not kern's choice.
+    ///
+    /// `find_specs` walks `/etc/cdi` and `/var/run/cdi` and `resolve_device_ref` read every match
+    /// with an unbounded `read_to_string` and no type check. Measured 2026-11-12: a FIFO named
+    /// `nvidia.yaml` made plain `kern doctor` hang for ever, and a 2 GB file at a spec's name became
+    /// 2 GB resident. Both are reachable without `--device`, because the doctor row reads the specs
+    /// to say whether this build can parse them.
+    ///
+    /// AN UNUSABLE FILE IS SKIPPED AND THE WALK CONTINUES, which is the behaviour that matters as
+    /// much as the refusal: one bad file in a shared directory must not disable every device name on
+    /// the host. The good spec beside the bad ones is what proves it.
+    ///
+    /// Timed, because a regression here HANGS rather than fails.
+    #[test]
+    fn an_unusable_file_in_a_spec_directory_is_skipped_and_does_not_hang() {
+        let root = std::env::temp_dir().join(format!("kern-cdi-bad-{}", std::process::id()));
+        let dir = root.join("etc/cdi");
+        let _ = std::fs::remove_dir_all(&root);
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("skip: no writable temp dir");
+            return;
+        }
+
+        // A spec that names a device, so the walk has something to find AFTER the bad files. The
+        // name sorts after both, which is what makes this a test of continuing rather than of order.
+        let good = "cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices:\n  - name: \"0\"\n    containerEdits:\n      deviceNodes:\n        - path: /dev/nvidia0\n";
+        let _ = std::fs::write(dir.join("zz-good.yaml"), good);
+
+        let fifo_made =
+            std::ffi::CString::new(dir.join("aa-fifo.yaml").as_os_str().as_encoded_bytes())
+                .map(|p| unsafe { libc::mkfifo(p.as_ptr(), 0o644) })
+                .unwrap_or(-1);
+        if let Ok(file) = std::fs::File::create(dir.join("bb-huge.yaml")) {
+            // Past MAX_SPEC_BYTES, sparse so the test costs no disk.
+            let _ = file.set_len(MAX_SPEC_BYTES + 1);
+        }
+
+        // Every match is listed, including the ones that cannot be used: the filter is the READ and
+        // not the directory walk, so this count is what the reader has to survive.
+        let found = find_specs(&root, None);
+        assert!(
+            found.len() >= 2,
+            "the walk must still list what it finds: {found:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let got = resolve_device_ref(&root, "nvidia.com/gpu=0");
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "resolving took {took:?}, so a FIFO or the size was read instead of refused"
+        );
+        assert_eq!(
+            got,
+            Ok(0),
+            "the good spec beside the unusable ones must still resolve"
+        );
+        if fifo_made != 0 {
+            eprintln!("note: mkfifo failed, so only the size half of this case ran");
+        }
+
+        // POSITIVE CONTROL: a name the good spec does not carry is still a clean refusal and not a
+        // hang either, so the pass above is the spec being read and not the function giving up.
+        let missing = resolve_device_ref(&root, "nvidia.com/gpu=7");
+        assert!(
+            matches!(missing, Err(DeviceRefError::NoSuchDevice { .. })),
+            "expected NoSuchDevice, got {missing:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// THE REAL SPEC ON THIS HOST, if there is one. Skips with a stated reason, never in silence.
     #[test]
     fn the_hosts_own_spec_parses_into_the_figures_it_was_measured_to_have() {
@@ -1313,7 +1399,12 @@ fn minor_for_uuid(root: &Path, uuid: &str) -> Option<u32> {
     let gpus = root.join("proc/driver/nvidia/gpus");
     let entries = std::fs::read_dir(gpus).ok()?;
     for entry in entries.flatten() {
-        let Ok(text) = std::fs::read_to_string(entry.path().join("information")) else {
+        // BOUNDED AND TYPE-CHECKED. `read_to_string` here would block for ever on a FIFO planted
+        // at the name, and this walk is reachable from plain `kern doctor`.
+        let Ok(Some(text)) = crate::openat2::read_regular_path(
+            &entry.path().join("information"),
+            MAX_DRIVER_INFO_BYTES,
+        ) else {
             continue;
         };
         let mut found_uuid = None;
@@ -1362,7 +1453,15 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<u32, DeviceRef
     let mut kinds_found: Vec<String> = Vec::new();
     let mut offered: Vec<String> = Vec::new();
     for path in find_specs(root, None) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        // THE READ THAT HAD NO BOUND AND NO TYPE CHECK, and the one a hostile file reaches most
+        // easily: `find_specs` walks a directory any process that can write it can fill. Measured
+        // 2026-11-12 against the old call: a 2 GB file became 2 GB resident, and a FIFO named
+        // `nvidia.yaml` hung plain `kern doctor` for ever.
+        //
+        // AN UNUSABLE FILE IS SKIPPED, NOT FATAL, which is the same answer the old code gave for an
+        // unreadable one. One oversized or FIFO file in a spec directory must not disable `--device`
+        // for every name on the host.
+        let Ok(Some(text)) = crate::openat2::read_regular_path(&path, MAX_SPEC_BYTES) else {
             continue;
         };
         let spec = match parse_spec(&text) {

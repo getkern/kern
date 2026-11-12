@@ -153,6 +153,17 @@ const ACL_READ: u8 = 0x04;
 const ACL_WRITE: u8 = 0x02;
 const ACL_EXECUTE: u8 = 0x01;
 
+/// The most bytes read from one of the driver's own `information` files, and from a linker
+/// configuration file.
+///
+/// Neither is a parser bound: both files are small by construction (the driver's is written by the
+/// kernel module, a linker conf is a handful of lines), so the limit only has to exclude a path that
+/// is not that file at all. Before these existed the reads were unbounded `read_to_string` calls
+/// with no type check, and a FIFO at either name hung `kern doctor`, `kern run --gpus` and
+/// `kern box --plan` for ever (measured 2026-11-12).
+const MAX_DRIVER_INFO_BYTES: u64 = 64 * 1024;
+const MAX_LINKER_CONF_BYTES: u64 = 1024 * 1024;
+
 /// Every bit of a triad, the value a MISSING `ACL_MASK` stands for.
 ///
 /// A minimal ACL (three entries, no mask) is what a filesystem stores for a node that has no named
@@ -681,7 +692,9 @@ fn shared_node_paths(root: &Path) -> Vec<PathBuf> {
 /// and `nv.c` returns the same value from `nv_get_dev_minor()`. Reading it is the difference between
 /// knowing which card a PCI address is and guessing from the order a directory happens to list.
 fn device_minor_of(information: &Path) -> Option<u32> {
-    let text = std::fs::read_to_string(information).ok()?;
+    // Bounded and type-checked: this walk runs on `kern doctor`, `kern run --gpus` and `--plan`,
+    // and a FIFO at the name would hang all three.
+    let text = crate::openat2::read_regular_path(information, MAX_DRIVER_INFO_BYTES).ok()??;
     text.lines()
         .find_map(|l| l.strip_prefix("Device Minor:"))?
         .trim()
@@ -692,10 +705,13 @@ fn device_minor_of(information: &Path) -> Option<u32> {
 /// The DRM nodes that belong to the same physical card as `/dev/nvidiaN`, resolved through the PCI
 /// address and never through the index.
 ///
-/// 🚨 THE INDEX IS NOT A SOURCE, and this host proves it: `nvidia0` is PCI `0000:01:00.0`, whose DRM
-/// nodes are **`card1`** and `renderD128`, while `nvidia1` is `0000:06:00.0` with **`card0`** and
-/// `renderD129`. The two numberings are INVERTED here. A grant that paired `nvidia0` with `card0`
-/// would hand the box the other card's display node, silently, and every test on a single-GPU host
+/// 🚨 THE INDEX IS NOT A SOURCE, and the reason is stronger than a static example: THE PAIRING IS
+/// NOT STABLE ON ONE MACHINE. This comment used to read "this host proves it: `nvidia0` is PCI
+/// `0000:01:00.0`, whose DRM nodes are `card1` and `renderD128`", which was measured and true when
+/// written. After a reboot on 2026-11-12 the same machine derives `0000:01:00.0` as `nvidia0` AND
+/// `card0`. DRM minors are handed out in probe order, so a kernel or firmware change reorders them
+/// while the PCI address does not move. A grant that paired `nvidia0` with `card0` would hand the
+/// box the other card's display node on SOME BOOTS, silently, and every test on a single-GPU host
 /// would pass.
 ///
 /// The chain is: `proc/driver/nvidia/gpus/<bdf>/information` gives the minor, the directory name
@@ -891,7 +907,9 @@ fn linker_dirs(root: &Path) -> Vec<PathBuf> {
         if depth > MAX_LD_CONF_DEPTH {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&conf) else {
+        // THE SAME SHAPE AS THE CDI READ, and the same reach: a FIFO at `/etc/ld.so.conf` hung the
+        // resolver, which runs on `kern doctor`, `kern run --gpus` and `kern box --plan`.
+        let Ok(Some(text)) = crate::openat2::read_regular_path(&conf, MAX_LINKER_CONF_BYTES) else {
             continue;
         };
         for line in text.lines() {
