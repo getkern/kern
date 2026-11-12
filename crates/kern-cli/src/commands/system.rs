@@ -328,17 +328,18 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --egress-allow d,d  Restrict outbound to an allowlist of domains via a filtering proxy (foreground-only)
     --hostname <name>   Set the box's hostname (default: the box name)
     --tun               Expose /dev/net/tun in the box (WireGuard / userspace VPN)
-    --gpus <n>          Hand the box ONE NVIDIA card: 0, device=0 or gpu=0. The nodes and
-                        the host's driver libraries are resolved from the driver's own
-                        version and bound read-only. A card you did not name has no device
-                        node in the box, so CUDA cannot initialise it, and the driver's
-                        per-card directory names only the card you got. The host's PCI bus
-                        stays readable, so how many cards it has is still discoverable
-                        `all` is refused by name: this build grants one card, and a flag
-                        that takes a word should not do something narrower than the word
-    --device <ref>      The same card, named as CDI names it: nvidia.com/gpu=0, or by UUID.
-                        An alias over --gpus: the spec says which card the name means and
-                        the mounts come from the driver's own layout. Pass one, not both
+    --gpus <spec>       Hand the box NVIDIA cards: 0, 0,1, all, device=0 or gpu=0. The
+                        nodes and the host's driver libraries are resolved from the
+                        driver's own version and bound read-only. A card you did not name
+                        has no device node in the box, so CUDA cannot initialise it, and
+                        the driver's per-card directory names only the cards you got. The
+                        host's PCI bus stays readable, so how many cards it has is still
+                        discoverable. One request: if any card you named is missing or
+                        unreachable the whole grant is refused, never granted in part
+    --device <ref>      ONE card, named as CDI names it: nvidia.com/gpu=0, or by UUID. An
+                        alias over --gpus: the spec says which card the name means and the
+                        mounts come from the driver's own layout. Several cards are asked
+                        for with the other flag. Pass one of the two, not both
     --init              Run a built-in reaping init as PID 1 (no zombies; forwards SIGTERM)
     --pids-limit <N>    Cap the box's process count (pids.max), fork-bomb containment
     --io-weight <N>     cgroup-v2 io.weight, relative I/O priority (1-10000; best-effort)

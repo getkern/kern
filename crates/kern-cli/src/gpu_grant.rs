@@ -1149,9 +1149,20 @@ pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveErr
 pub enum GpuSpecError {
     /// The value was empty.
     Empty,
-    /// `all` names more than one card, and this phase grants one. Refused rather than narrowed:
-    /// a flag that takes a word and does something smaller than the word says is a defect.
-    AllNotYet,
+    /// `all` was written beside an index, as in `0,all`. The two mean different things and only
+    /// one of them can be true, so this is refused rather than resolved one way: whichever way it
+    /// went, half of what the caller wrote would be silently discarded.
+    AllWithIndex {
+        /// What was passed, so the message can quote it.
+        given: String,
+    },
+    /// An index was named twice, as in `0,0`. Deduplicating silently would make `--gpus 0,0` and
+    /// `--gpus 0` the same command, and the caller who wrote the first almost certainly meant two
+    /// different cards.
+    Duplicate {
+        /// The index that repeats.
+        index: u32,
+    },
     /// The value is not a card index.
     NotAnIndex {
         /// What was passed, so the message can quote it.
@@ -1159,30 +1170,76 @@ pub enum GpuSpecError {
     },
 }
 
-/// Read `--gpus`: one card, by index.
+/// Which cards `--gpus` asked for.
+///
+/// `all` STAYS A WORD HERE, and that is the whole reason this type exists rather than a
+/// `Vec<u32>`. The parser has no host in front of it: it cannot know which cards exist, and
+/// turning `all` into indices at parse time would mean either reading the filesystem from a pure
+/// function or guessing a range. The expansion happens in [`mount_plan`], where the grant is, so
+/// there is exactly one place that decides what `all` meant and exactly one place to test it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuSelection {
+    /// Every card the driver lists on this host, however many that turns out to be.
+    All,
+    /// The indices the caller named, in the order they wrote them, with no repeats.
+    These(Vec<u32>),
+}
+
+/// Read `--gpus`: cards, by index, or every card.
 ///
 /// Accepts `0`, `device=0` and `gpu=0`, which are the three spellings a reader arrives with from
-/// other runtimes. Refuses `all` by name rather than treating it as "the first one".
-pub fn parse_gpu_spec(value: &str) -> Result<u32, GpuSpecError> {
+/// other runtimes, a comma-separated list of any of them (`0,1`, `device=0,gpu=1`), and `all`.
+///
+/// `all` IS NOW A VALUE AND NO LONGER A REFUSAL. It was refused by name while the grant handed
+/// over one card, on the rule that a flag taking a word must not do something narrower than the
+/// word says; the narrower thing is gone, so the refusal goes with it. It stays a word until
+/// [`mount_plan`] has a host to expand it against.
+///
+/// Every refusal names what was passed, because the three ways this goes wrong (a word beside an
+/// index, the same index twice, something that is not an index at all) need three different
+/// corrections from the caller.
+pub fn parse_gpu_spec(value: &str) -> Result<GpuSelection, GpuSpecError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(GpuSpecError::Empty);
     }
-    if trimmed.eq_ignore_ascii_case("all") {
-        return Err(GpuSpecError::AllNotYet);
+    // A LIST OF ONE IS THE COMMON CASE and goes down the same path, so there is no second parser
+    // for it to disagree with. An empty element (`0,,1` or a trailing comma) reaches the digit
+    // check below and is refused there, quoting the whole value rather than the empty fragment,
+    // which on its own would read as "" and tell the caller nothing.
+    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    let says_all = parts.iter().any(|p| p.eq_ignore_ascii_case("all"));
+    if says_all {
+        if parts.len() > 1 {
+            return Err(GpuSpecError::AllWithIndex {
+                given: trimmed.to_string(),
+            });
+        }
+        return Ok(GpuSelection::All);
     }
-    let digits = trimmed
-        .strip_prefix("device=")
-        .or_else(|| trimmed.strip_prefix("gpu="))
-        .unwrap_or(trimmed);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(GpuSpecError::NotAnIndex {
-            given: trimmed.to_string(),
-        });
+
+    let mut out: Vec<u32> = Vec::with_capacity(parts.len());
+    for part in parts {
+        let digits = part
+            .strip_prefix("device=")
+            .or_else(|| part.strip_prefix("gpu="))
+            .unwrap_or(part);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(GpuSpecError::NotAnIndex {
+                given: trimmed.to_string(),
+            });
+        }
+        let index = digits
+            .parse::<u32>()
+            .map_err(|_| GpuSpecError::NotAnIndex {
+                given: trimmed.to_string(),
+            })?;
+        if out.contains(&index) {
+            return Err(GpuSpecError::Duplicate { index });
+        }
+        out.push(index);
     }
-    digits.parse::<u32>().map_err(|_| GpuSpecError::NotAnIndex {
-        given: trimmed.to_string(),
-    })
+    Ok(GpuSelection::These(out))
 }
 
 /// Why a grant cannot be turned into mounts.
@@ -1234,35 +1291,80 @@ pub type Bind = (String, String, bool);
 /// THE SYMLINKS BECOME BINDS OF THEIR RESOLVED FILE, placed at the link's own path. The box gets
 /// `libcuda.so.1` as a real file rather than as a link, which loads identically and needs no
 /// writable directory inside the box: `dlopen("libcuda.so.1")` is a name lookup, not a link walk.
-/// The PCI address of the card a grant is about to hand over, for the box's `/proc` mask.
+/// Turn a selection into the cards it names, in the order the caller wrote them.
 ///
-/// It answers `None` for a card that exists with no address and for a card that does not exist,
-/// and the caller treats both the same way: WITHOUT AN ADDRESS THERE IS NOTHING TO KEEP, so the
-/// mask does not run and the box sees the driver's directory as the host writes it. Masking on a
-/// guess would be worse than not masking: the one directory kept would be the wrong card's, and the
-/// granted card would be the one that vanished.
-#[must_use]
-pub fn pci_address_of(grant: &GpuGrant, card: u32) -> Option<&str> {
-    grant
-        .cards
-        .iter()
-        .find(|c| c.index == card)
-        .and_then(|c| c.pci_address.as_deref())
+/// THE ONE PLACE `all` BECOMES A LIST. The parser cannot do it, because it has no host in front of
+/// it; every other caller reads the result of this function, so there is one expansion to test and
+/// one to get wrong. `all` on a host the driver lists no card for is refused with the same error
+/// as a named index that does not exist, because it is the same disappointment: the caller asked
+/// for cards and there are none.
+fn cards_of<'g>(
+    grant: &'g GpuGrant,
+    selection: &GpuSelection,
+) -> Result<Vec<&'g CardNodes>, MountPlanError> {
+    match selection {
+        GpuSelection::All => {
+            if grant.cards.is_empty() {
+                return Err(MountPlanError::NoSuchCard {
+                    wanted: 0,
+                    present: Vec::new(),
+                });
+            }
+            Ok(grant.cards.iter().collect())
+        }
+        GpuSelection::These(indices) => {
+            let mut out = Vec::with_capacity(indices.len());
+            for &index in indices {
+                let Some(card) = grant.cards.iter().find(|c| c.index == index) else {
+                    return Err(MountPlanError::NoSuchCard {
+                        wanted: index,
+                        present: grant.cards.iter().map(|c| c.index).collect(),
+                    });
+                };
+                out.push(card);
+            }
+            Ok(out)
+        }
+    }
 }
 
-pub fn mount_plan(grant: &GpuGrant, card: u32, who: &Caller) -> Result<Vec<Bind>, MountPlanError> {
-    let Some(wanted) = grant.cards.iter().find(|c| c.index == card) else {
-        return Err(MountPlanError::NoSuchCard {
-            wanted: card,
-            present: grant.cards.iter().map(|c| c.index).collect(),
-        });
-    };
+/// The PCI addresses of the cards a grant is about to hand over, for the box's `/proc` mask.
+///
+/// ONE ADDRESS PER CARD THAT HAS ONE, and a card with no address contributes nothing rather than
+/// a placeholder. The caller masks to exactly this list, so a card missing from it is a card whose
+/// directory the box will not see; that is the honest failure, because masking on a guessed
+/// address would keep the wrong card's directory and hide a granted one.
+///
+/// An empty result is the instruction not to mask at all: with nothing to keep, a mask would leave
+/// the box an empty directory where its own cards should be.
+#[must_use]
+pub fn pci_addresses_of(grant: &GpuGrant, selection: &GpuSelection) -> Vec<String> {
+    cards_of(grant, selection)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c.pci_address.clone())
+        .collect()
+}
 
-    // The selection, and the policy over EXACTLY it: the shared nodes plus this card's, never the
-    // other cards'. A grant for card 0 refusing because card 1's display node is group-gated would
-    // be answering a question nobody asked.
+pub fn mount_plan(
+    grant: &GpuGrant,
+    selection: &GpuSelection,
+    who: &Caller,
+) -> Result<Vec<Bind>, MountPlanError> {
+    let wanted = cards_of(grant, selection)?;
+
+    // The selection, and the policy over EXACTLY it: the shared nodes plus the nodes of the cards
+    // that were asked for, never the others'. A grant for card 0 refusing because card 1's display
+    // node is group-gated would be answering a question nobody asked.
+    //
+    // ASKING FOR MORE CARDS CAN TURN A GRANT THAT WOULD HAVE WORKED INTO A REFUSAL, and that is
+    // correct rather than unfortunate: `--gpus 0,1` is one request, so it succeeds or fails as
+    // one. Granting the half that is reachable would hand back a box with fewer cards than the
+    // command named, and nothing in the box could tell that from a card that failed later.
     let mut selected: Vec<(PathBuf, NodeFacts)> = grant.shared.clone();
-    selected.extend(wanted.nodes.iter().cloned());
+    for card in &wanted {
+        selected.extend(card.nodes.iter().cloned());
+    }
 
     match group_policy(&selected, who) {
         GroupPolicy::Unreachable { nodes } => return Err(MountPlanError::Unreachable { nodes }),
@@ -2364,25 +2466,59 @@ mod tests {
     /// `--gpus` over its whole input space, including the forms a reader arrives with from other
     /// runtimes and the ones that must be refused by name.
     #[test]
-    fn the_gpus_spec_accepts_three_spellings_of_one_card_and_refuses_the_rest() {
-        for good in ["0", "1", "7", "device=0", "gpu=3", " 2 "] {
-            let Ok(n) = parse_gpu_spec(good) else {
-                panic!("{good:?} should parse");
-            };
-            let digits: String = good
-                .trim()
-                .trim_start_matches("device=")
-                .trim_start_matches("gpu=")
-                .to_string();
-            assert_eq!(n.to_string(), digits, "{good:?} parsed to the wrong index");
+    fn the_gpus_spec_accepts_the_spellings_of_one_card_a_list_and_all() {
+        for (good, want) in [
+            ("0", vec![0]),
+            ("1", vec![1]),
+            ("7", vec![7]),
+            ("device=0", vec![0]),
+            ("gpu=3", vec![3]),
+            (" 2 ", vec![2]),
+            // A LIST, in the order it was written. Not sorted: `--gpus 1,0` is a request for two
+            // cards and nothing downstream reads meaning into which came first, but reordering a
+            // caller's input is a liberty this parser has no reason to take.
+            ("0,1", vec![0, 1]),
+            ("1,0", vec![1, 0]),
+            ("device=0,gpu=1", vec![0, 1]),
+            (" 0 , 1 ", vec![0, 1]),
+            ("3,1,2", vec![3, 1, 2]),
+        ] {
+            match parse_gpu_spec(good) {
+                Ok(GpuSelection::These(got)) => {
+                    assert_eq!(got, want, "{good:?} parsed to the wrong indices")
+                }
+                other => panic!("{good:?} should parse to a list, got {other:?}"),
+            }
+        }
+        // `all` IS A VALUE NOW. It stays a word through the parser, which has no host to expand
+        // it against; `mount_plan` is the one place that turns it into cards.
+        for word in ["all", "ALL", "All", " all "] {
+            assert_eq!(parse_gpu_spec(word), Ok(GpuSelection::All), "{word:?}");
         }
         assert_eq!(parse_gpu_spec(""), Err(GpuSpecError::Empty));
         assert_eq!(parse_gpu_spec("   "), Err(GpuSpecError::Empty));
-        // `all` is refused BY NAME. A flag that takes a word and grants something narrower than
-        // the word says is the defect this refusal exists to prevent.
-        assert_eq!(parse_gpu_spec("all"), Err(GpuSpecError::AllNotYet));
-        assert_eq!(parse_gpu_spec("ALL"), Err(GpuSpecError::AllNotYet));
-        for bad in ["-1", "0,1", "0.5", "first", "device=", "gpu=x", "0x1"] {
+        // `all` BESIDE AN INDEX is refused rather than resolved either way: whichever way it went,
+        // half of what the caller wrote would be discarded in silence.
+        for mixed in ["0,all", "all,1", "ALL,0,1"] {
+            match parse_gpu_spec(mixed) {
+                Err(GpuSpecError::AllWithIndex { given }) => assert_eq!(given, mixed),
+                other => panic!("{mixed:?} should be AllWithIndex, got {other:?}"),
+            }
+        }
+        // THE SAME CARD TWICE is refused, not deduplicated. Silently collapsing it would make
+        // `--gpus 0,0` and `--gpus 0` the same command, and the caller who wrote the first almost
+        // certainly meant two different cards.
+        for (dup, index) in [("0,0", 0), ("1,2,1", 1), ("device=3,gpu=3", 3)] {
+            match parse_gpu_spec(dup) {
+                Err(GpuSpecError::Duplicate { index: got }) => assert_eq!(got, index, "{dup:?}"),
+                other => panic!("{dup:?} should be Duplicate, got {other:?}"),
+            }
+        }
+        // An empty element quotes the WHOLE value: on its own a trailing comma reads as "" and
+        // would tell the caller nothing about where to look.
+        for bad in [
+            "-1", "0.5", "first", "device=", "gpu=x", "0x1", "0,", ",0", "0,,1", ",",
+        ] {
             match parse_gpu_spec(bad) {
                 Err(GpuSpecError::NotAnIndex { given }) => assert_eq!(given, bad.trim()),
                 other => panic!("{bad:?} should be NotAnIndex, got {other:?}"),
@@ -2400,8 +2536,14 @@ mod tests {
     /// the digit filter, so it is the only refusal here that comes from the integer conversion.
     #[test]
     fn the_spec_holds_at_the_top_of_u32_and_refuses_a_digit_that_is_not_ascii() {
-        assert_eq!(parse_gpu_spec("4294967295"), Ok(u32::MAX));
-        assert_eq!(parse_gpu_spec("device=4294967295"), Ok(u32::MAX));
+        assert_eq!(
+            parse_gpu_spec("4294967295"),
+            Ok(GpuSelection::These(vec![u32::MAX]))
+        );
+        assert_eq!(
+            parse_gpu_spec("device=4294967295"),
+            Ok(GpuSelection::These(vec![u32::MAX]))
+        );
         for over in ["4294967296", "99999999999999999999"] {
             match parse_gpu_spec(over) {
                 Err(GpuSpecError::NotAnIndex { given }) => assert_eq!(given, over),
@@ -2423,8 +2565,11 @@ mod tests {
             }
         }
         // Leading zeros name the same card and are not a spelling error: `00` is card 0.
-        assert_eq!(parse_gpu_spec("00"), Ok(0));
-        assert_eq!(parse_gpu_spec("0000000001"), Ok(1));
+        assert_eq!(parse_gpu_spec("00"), Ok(GpuSelection::These(vec![0])));
+        assert_eq!(
+            parse_gpu_spec("0000000001"),
+            Ok(GpuSelection::These(vec![1]))
+        );
     }
 
     /// A grant with two cards, used by the mount-plan tests. The nodes carry the FACTS the policy
@@ -2438,15 +2583,43 @@ mod tests {
     /// directory and hide the granted one, and on a host whose two numberings agreed, or on a
     /// fixture that copied the index into the address, it would pass.
     #[test]
-    fn the_masked_address_follows_the_card_and_not_its_index() {
+    fn the_masked_addresses_follow_the_cards_and_not_their_indices() {
         let grant = two_card_grant(plain(0, 0, 0o666));
-        assert_eq!(pci_address_of(&grant, 0), Some("0000:06:00.0"));
-        assert_eq!(pci_address_of(&grant, 1), Some("0000:01:00.0"));
-        // A card that is not on this host has no address, and so does a card whose directory the
-        // driver never published. The caller cannot tell them apart and must not need to: both
-        // mean the same thing, which is that there is nothing to keep and the mask does not run.
-        assert_eq!(pci_address_of(&grant, 2), None);
-        assert_eq!(pci_address_of(&grant, u32::MAX), None);
+        let these = |v: Vec<u32>| GpuSelection::These(v);
+        assert_eq!(
+            pci_addresses_of(&grant, &these(vec![0])),
+            vec!["0000:06:00.0"]
+        );
+        assert_eq!(
+            pci_addresses_of(&grant, &these(vec![1])),
+            vec!["0000:01:00.0"]
+        );
+        // TWO CARDS KEEP TWO DIRECTORIES, in the order they were asked for. A mask that kept one
+        // would leave a box holding two cards able to see only one of them in the driver's own
+        // listing, which is a shape a reader would trust and should not.
+        assert_eq!(
+            pci_addresses_of(&grant, &these(vec![0, 1])),
+            vec!["0000:06:00.0", "0000:01:00.0"]
+        );
+        assert_eq!(
+            pci_addresses_of(&grant, &these(vec![1, 0])),
+            vec!["0000:01:00.0", "0000:06:00.0"]
+        );
+        // `all` RESOLVES HERE AND NOWHERE ELSE, to every card the grant lists.
+        assert_eq!(
+            pci_addresses_of(&grant, &GpuSelection::All),
+            vec!["0000:06:00.0", "0000:01:00.0"]
+        );
+        // A card that is not on this host contributes no address, and neither does a card whose
+        // directory the driver never published. The caller cannot tell them apart and must not
+        // need to: both mean there is nothing to keep, and an empty list means no mask runs.
+        assert!(pci_addresses_of(&grant, &these(vec![2])).is_empty());
+        assert!(pci_addresses_of(&grant, &these(vec![u32::MAX])).is_empty());
+        // AND A SELECTION THAT CANNOT BE SATISFIED MASKS NOTHING, rather than masking the part of
+        // it that exists: `mount_plan` refuses the same selection, so a box never reaches the
+        // mask with it, and if one ever did it would see the host's directory instead of a
+        // listing missing the card it asked for.
+        assert!(pci_addresses_of(&grant, &these(vec![0, 9])).is_empty());
     }
 
     fn two_card_grant(card0: NodeFacts) -> GpuGrant {
@@ -2492,7 +2665,11 @@ mod tests {
     #[test]
     fn the_mount_plan_takes_one_card_and_every_shared_node() {
         let grant = two_card_grant(plain(0, 0, 0o666));
-        let Ok(binds) = mount_plan(&grant, 0, &caller(1000, &[1000])) else {
+        let Ok(binds) = mount_plan(
+            &grant,
+            &GpuSelection::These(vec![0]),
+            &caller(1000, &[1000]),
+        ) else {
             panic!("expected a plan for card 0");
         };
         let targets: Vec<&str> = binds.iter().map(|(_, t, _)| t.as_str()).collect();
@@ -2505,7 +2682,11 @@ mod tests {
         );
 
         // And the other way round, so the filter is not accidentally keeping the first card.
-        let Ok(binds) = mount_plan(&grant, 1, &caller(1000, &[1000])) else {
+        let Ok(binds) = mount_plan(
+            &grant,
+            &GpuSelection::These(vec![1]),
+            &caller(1000, &[1000]),
+        ) else {
             panic!("expected a plan for card 1");
         };
         let targets: Vec<&str> = binds.iter().map(|(_, t, _)| t.as_str()).collect();
@@ -2513,12 +2694,100 @@ mod tests {
         assert!(!targets.contains(&"/dev/nvidia0"), "{targets:?}");
     }
 
+    /// TWO CARDS ARE ONE REQUEST, and the shared nodes are still mounted once.
+    ///
+    /// The shared set (`nvidiactl`, `nvidia-uvm`, and the rest) goes with ANY card, so a plan built
+    /// by concatenating per-card plans would bind each of them as many times as there are cards.
+    /// Two binds onto the same target is not an error the kernel reports: the second simply
+    /// shadows the first, and the only sign of it is a mount table twice the size it should be.
+    #[test]
+    fn two_cards_are_granted_together_and_the_shared_nodes_are_bound_once() {
+        let grant = two_card_grant(plain(0, 0, 0o666));
+        for selection in [
+            GpuSelection::These(vec![0, 1]),
+            GpuSelection::These(vec![1, 0]),
+            GpuSelection::All,
+        ] {
+            let Ok(binds) = mount_plan(&grant, &selection, &caller(1000, &[1000])) else {
+                panic!("expected a plan for {selection:?}");
+            };
+            let targets: Vec<&str> = binds.iter().map(|(_, t, _)| t.as_str()).collect();
+            assert!(
+                targets.contains(&"/dev/nvidia0"),
+                "{selection:?}: {targets:?}"
+            );
+            assert!(
+                targets.contains(&"/dev/nvidia1"),
+                "{selection:?}: {targets:?}"
+            );
+            for shared in ["/dev/nvidiactl", "/dev/nvidia-uvm"] {
+                assert_eq!(
+                    targets.iter().filter(|t| **t == shared).count(),
+                    1,
+                    "{shared} bound more than once for {selection:?}: {targets:?}"
+                );
+            }
+            // NO TARGET IS BOUND TWICE, whatever it is. The check above names the two shared nodes
+            // because they are the ones a concatenating plan would duplicate; this one holds the
+            // property for every path, including the libraries and the symlinks.
+            let mut seen = targets.clone();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(before, seen.len(), "a target repeats for {selection:?}");
+        }
+    }
+
+    /// A SELECTION IS SATISFIED WHOLE OR REFUSED WHOLE.
+    ///
+    /// `--gpus 0,9` on a host with two cards is a request for a card that is not there, and the
+    /// honest answer is a refusal naming the indices that exist. Granting the half that is
+    /// reachable would hand back a box with fewer cards than the command named, and nothing
+    /// inside it could tell that from a card that failed later.
+    #[test]
+    fn a_selection_naming_a_card_that_is_not_here_is_refused_whole() {
+        let grant = two_card_grant(plain(0, 0, 0o666));
+        for selection in [
+            GpuSelection::These(vec![0, 9]),
+            GpuSelection::These(vec![9, 0]),
+            GpuSelection::These(vec![9]),
+        ] {
+            match mount_plan(&grant, &selection, &caller(1000, &[1000])) {
+                Err(MountPlanError::NoSuchCard { wanted, present }) => {
+                    assert_eq!(wanted, 9, "{selection:?}");
+                    assert_eq!(present, vec![0, 1], "{selection:?}");
+                }
+                other => panic!("{selection:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// `all` ON A HOST WITH NO CARD is the same disappointment as naming one that is not there,
+    /// and gets the same refusal rather than an empty plan.
+    ///
+    /// An empty plan would start the box with no GPU and no error, which is the "runs and lies"
+    /// outcome: the workload meets its first CUDA call and has no way to learn that the flag it
+    /// passed did nothing.
+    #[test]
+    fn all_on_a_host_with_no_card_is_refused_rather_than_granting_nothing() {
+        let mut grant = two_card_grant(plain(0, 0, 0o666));
+        grant.cards.clear();
+        match mount_plan(&grant, &GpuSelection::All, &caller(1000, &[1000])) {
+            Err(MountPlanError::NoSuchCard { present, .. }) => assert!(present.is_empty()),
+            other => panic!("all with no cards must be refused, got {other:?}"),
+        }
+    }
+
     /// Libraries and links are READ-ONLY, device nodes are not. A read-only device node would
     /// break the driver's own ioctls; a writable host library is a write into the host.
     #[test]
     fn libraries_are_read_only_and_nodes_are_not() {
         let grant = two_card_grant(plain(0, 0, 0o666));
-        let Ok(binds) = mount_plan(&grant, 0, &caller(1000, &[1000])) else {
+        let Ok(binds) = mount_plan(
+            &grant,
+            &GpuSelection::These(vec![0]),
+            &caller(1000, &[1000]),
+        ) else {
             panic!("expected a plan");
         };
         for (source, target, read_only) in &binds {
@@ -2535,7 +2804,11 @@ mod tests {
     #[test]
     fn a_link_is_mounted_as_its_resolved_file_at_the_links_path() {
         let grant = two_card_grant(plain(0, 0, 0o666));
-        let Ok(binds) = mount_plan(&grant, 0, &caller(1000, &[1000])) else {
+        let Ok(binds) = mount_plan(
+            &grant,
+            &GpuSelection::These(vec![0]),
+            &caller(1000, &[1000]),
+        ) else {
             panic!("expected a plan");
         };
         let found = binds.iter().find(|(_, t, _)| t.ends_with("libcuda.so.1"));
@@ -2551,7 +2824,11 @@ mod tests {
     #[test]
     fn a_card_that_does_not_exist_is_refused_with_the_ones_that_do() {
         let grant = two_card_grant(plain(0, 0, 0o666));
-        match mount_plan(&grant, 7, &caller(1000, &[1000])) {
+        match mount_plan(
+            &grant,
+            &GpuSelection::These(vec![7]),
+            &caller(1000, &[1000]),
+        ) {
             Err(MountPlanError::NoSuchCard { wanted, present }) => {
                 assert_eq!(wanted, 7);
                 assert_eq!(present, vec![0, 1]);
@@ -2571,7 +2848,7 @@ mod tests {
         let who = caller(1000, &[1000, 44]);
         // `root:video 0660`, no ACL: the server shape, where the only way in is the group.
         let grant = two_card_grant(plain(0, 44, 0o660));
-        match mount_plan(&grant, 0, &who) {
+        match mount_plan(&grant, &GpuSelection::These(vec![0]), &who) {
             Err(MountPlanError::GroupsNeeded { gids, nodes }) => {
                 assert_eq!(gids, vec![44]);
                 assert_eq!(nodes, vec![PathBuf::from("/dev/nvidia0")]);
@@ -2581,7 +2858,7 @@ mod tests {
 
         // And a node the caller cannot open at all, with or without groups.
         let grant = two_card_grant(plain(0, 0, 0o600));
-        match mount_plan(&grant, 0, &who) {
+        match mount_plan(&grant, &GpuSelection::These(vec![0]), &who) {
             Err(MountPlanError::Unreachable { nodes }) => {
                 assert_eq!(nodes, vec![PathBuf::from("/dev/nvidia0")]);
             }
@@ -2600,10 +2877,10 @@ mod tests {
         grant.cards[1].nodes = vec![(PathBuf::from("/dev/nvidia1"), plain(0, 44, 0o660))];
 
         assert!(
-            mount_plan(&grant, 0, &who).is_ok(),
+            mount_plan(&grant, &GpuSelection::These(vec![0]), &who).is_ok(),
             "card 0 must be grantable while card 1 is gated"
         );
-        match mount_plan(&grant, 1, &who) {
+        match mount_plan(&grant, &GpuSelection::These(vec![1]), &who) {
             Err(MountPlanError::GroupsNeeded { gids, .. }) => assert_eq!(gids, vec![44]),
             other => panic!("card 1 should be refused, got {other:?}"),
         }

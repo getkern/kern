@@ -214,11 +214,12 @@ pub struct SandboxSpec {
     /// vGPIO sysfs directories (host `/sys/*` paths) to expose in the box's `/sys` (pwm/adc/1-wire/
     /// leds). Bound before pivot.
     pub vgpio_sysfs: Vec<String>,
-    /// `--gpus`/`--device`: the PCI address of the ONE card this box was granted, as
-    /// `/proc/driver/nvidia/gpus` spells it. `None` when no card was granted, and also when the
-    /// grant found no address for it, which is the same instruction either way: leave the driver's
-    /// directory as the host writes it. See [`mask_other_gpus`], which is the only reader.
-    pub gpu_pci_address: Option<String>,
+    /// `--gpus`/`--device`: the PCI addresses of the cards this box was granted, as
+    /// `/proc/driver/nvidia/gpus` spells them. EMPTY when no card was granted, and also when the
+    /// grant found no address for the cards it did hand over, which is the same instruction either
+    /// way: leave the driver's directory as the host writes it. See [`mask_other_gpus`], which is
+    /// the only reader.
+    pub gpu_pci_addresses: Vec<String>,
     /// vDisk profiles to mount at `/vdisk/<name>` in the box (from `vdisk:` profiles).
     pub vdisks: Vec<VdiskMount>,
     /// Secrets to expose as `/run/secrets/<name>` (mode 0400), from `--secret`. The bytes were read
@@ -950,42 +951,64 @@ fn null_over(path: &str) -> Result<(), Error> {
 /// unmasked one, because the card it was actually given would be missing from the driver's own
 /// listing and nothing in the box asked for that. The masks in `mask_proc_paths` carry a boundary
 /// and fail closed; this one carries cosmetics and says so.
-fn mask_other_gpus(keep: &str) -> Result<(), Error> {
+fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
     const GPUS: &str = "/proc/driver/nvidia/gpus";
+    // NOTHING TO KEEP IS NOT A MASK, it is the instruction to leave the directory alone. Mounting
+    // an empty tmpfs here would hide the box's own cards, which is the one outcome worse than
+    // showing it the host's.
+    if keep.is_empty() {
+        return Ok(());
+    }
     // A PCI address is ONE path component. Anything else did not come from the directory listing
     // this mask is built from, and joining it would aim the mount at a path of someone else's
-    // choosing. The check is cheap and it is the only place the name is trusted.
-    if keep.is_empty() || keep == "." || keep == ".." || keep.contains('/') {
-        return Err(Error::Spec(format!(
-            "gpu mask: {keep:?} is not a single PCI address component"
-        )));
+    // choosing. The check is cheap and it is the only place these names are trusted.
+    for name in keep {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(Error::Spec(format!(
+                "gpu mask: {name:?} is not a single PCI address component"
+            )));
+        }
     }
     let gpus_c = cstr(GPUS)?;
-    let kept = format!("{GPUS}/{keep}");
-    let kept_c = cstr(&kept)?;
 
-    // 1. PIN THE GRANTED DIRECTORY FIRST. `O_PATH` opens no file and reads nothing; it only holds
-    //    the dentry so the bind below can still reach it once the tmpfs covers the name.
-    //    `O_NOFOLLOW` because procfs hands out no symlink here and a symlink would mean the shape
-    //    changed under us.
-    let fd = unsafe {
-        libc::open(
-            kept_c.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    // 1. PIN EVERY GRANTED DIRECTORY FIRST, all of them before the tmpfs covers any. `O_PATH`
+    //    opens no file and reads nothing; it only holds the dentry so the binds below can still
+    //    reach it once the name is covered. `O_NOFOLLOW` because procfs hands out no symlink here
+    //    and one would mean the shape changed under us.
+    //
+    //    The descriptors are taken in one pass rather than one per restore: after the tmpfs is
+    //    mounted there is nothing left to open, so a loop that opened and bound each card in turn
+    //    would succeed for the first and find an empty directory for every other.
+    let mut pinned: Vec<(&str, i32)> = Vec::with_capacity(keep.len());
+    let close_all = |pinned: &Vec<(&str, i32)>| {
+        for (_, fd) in pinned {
+            unsafe { libc::close(*fd) };
+        }
     };
-    if fd < 0 {
-        return Err(Error::last("open(granted gpu dir)"));
+    for name in keep {
+        let path = cstr(&format!("{GPUS}/{name}"))?;
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let e = Error::last("open(granted gpu dir)");
+            close_all(&pinned);
+            return Err(e);
+        }
+        pinned.push((name.as_str(), fd));
     }
-    // From here every exit closes the descriptor, and every exit after the tmfps also removes it.
-    let close_fd = || unsafe {
-        libc::close(fd);
-    };
 
     // 2. The mask itself. `mode=0555` matches what the driver gives the real directory, so a box
-    //    that lists it sees the permissions it would have seen.
+    //    that lists it sees the permissions it would have seen. `nr_inodes` is sized to what will
+    //    be created and nothing more.
     let ty = cstr("tmpfs")?;
-    let opts = cstr("mode=0555,nr_inodes=16")?;
+    let opts = cstr(&format!(
+        "mode=0555,nr_inodes={}",
+        keep.len().saturating_add(8)
+    ))?;
     if unsafe {
         libc::mount(
             ty.as_ptr(),
@@ -996,41 +1019,61 @@ fn mask_other_gpus(keep: &str) -> Result<(), Error> {
         )
     } != 0
     {
-        close_fd();
-        return Err(Error::last("mount(tmpfs over nvidia gpus)"));
+        let e = Error::last("mount(tmpfs over nvidia gpus)");
+        close_all(&pinned);
+        return Err(e);
     }
     // Undo the mask and give the box the host's directory back. Used for every failure below.
     let undo = || unsafe {
         libc::umount2(gpus_c.as_ptr(), libc::MNT_DETACH);
     };
 
-    // 3. The mountpoint for the card that was granted, created inside the tmpfs while it is still
-    //    writable.
-    if unsafe { libc::mkdir(kept_c.as_ptr(), 0o555) } != 0 {
-        let e = Error::last("mkdir(granted gpu dir)");
-        undo();
-        close_fd();
-        return Err(e);
+    // 3. and 4. One mountpoint per granted card, created inside the tmpfs while it is still
+    //    writable, then the ORIGINAL directory bound back through the descriptor from step 1.
+    //
+    //    ALL OR NOTHING: a failure on the second card undoes the whole mask rather than leaving a
+    //    box that can see one of the two it was given. A partial listing is the shape a reader
+    //    would trust and should not.
+    for (name, fd) in &pinned {
+        let kept_c = match cstr(&format!("{GPUS}/{name}")) {
+            Ok(c) => c,
+            Err(e) => {
+                undo();
+                close_all(&pinned);
+                return Err(e);
+            }
+        };
+        if unsafe { libc::mkdir(kept_c.as_ptr(), 0o555) } != 0 {
+            let e = Error::last("mkdir(granted gpu dir)");
+            undo();
+            close_all(&pinned);
+            return Err(e);
+        }
+        let via_fd = match cstr(&format!("/proc/self/fd/{fd}")) {
+            Ok(c) => c,
+            Err(e) => {
+                undo();
+                close_all(&pinned);
+                return Err(e);
+            }
+        };
+        if unsafe {
+            libc::mount(
+                via_fd.as_ptr(),
+                kept_c.as_ptr(),
+                ptr::null(),
+                libc::MS_BIND,
+                ptr::null(),
+            )
+        } != 0
+        {
+            let e = Error::last("mount(bind granted gpu dir)");
+            undo();
+            close_all(&pinned);
+            return Err(e);
+        }
     }
-
-    // 4. Bind the ORIGINAL directory back, reached through the descriptor taken in step 1.
-    let via_fd = cstr(&format!("/proc/self/fd/{fd}"))?;
-    if unsafe {
-        libc::mount(
-            via_fd.as_ptr(),
-            kept_c.as_ptr(),
-            ptr::null(),
-            libc::MS_BIND,
-            ptr::null(),
-        )
-    } != 0
-    {
-        let e = Error::last("mount(bind granted gpu dir)");
-        undo();
-        close_fd();
-        return Err(e);
-    }
-    close_fd();
+    close_all(&pinned);
 
     // 5. Seal the tmpfs. Without this the box could create a directory named like a card that is
     //    not there, which is not an escape but is a lie the box can tell its own tooling. A failed
@@ -1704,8 +1747,8 @@ fn child_setup_and_exec(
         // Skipped for a nesting box for the same reason the masks above are: `--privileged`
         // presents a fully visible `/proc`, and a locked submount here is exactly what makes the
         // kernel's `mount_too_revealing` check refuse the NESTED box's own `/proc`.
-        if let Some(addr) = spec.gpu_pci_address.as_deref() {
-            if let Err(e) = mask_other_gpus(addr) {
+        if !spec.gpu_pci_addresses.is_empty() {
+            if let Err(e) = mask_other_gpus(&spec.gpu_pci_addresses) {
                 // Cosmetic, so it does not fail the box, and SAID, so it is not a silent gap: the
                 // box is running with the driver's full card listing and the operator can see that
                 // on the same line as the reason.

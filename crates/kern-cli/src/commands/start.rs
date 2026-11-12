@@ -990,68 +990,83 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--device` is the CDI spelling of `--gpus`, resolved to the same index through the spec and
     // then built from discovery. The plan's rule is that CDI is an ALIAS: the spec says which card
     // a name means, and the mounts come from the discovery a test proves equivalent to it.
-    let gpu_selection: Option<Result<u32, Error>> = match (args.gpus, args.device) {
-        (Some(_), Some(_)) => Some(Err(Error::Cli(
-            "--gpus and --device name the same thing two ways: pass one".to_string(),
-        ))),
-        (None, Some(reference)) => Some(
-            crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference).map_err(|e| {
-                use crate::cdi::DeviceRefError as D;
-                Error::Cli(match e {
-                    D::NotQualified { given } => {
-                        format!("--device {given}: not a CDI name. Use --device nvidia.com/gpu=0")
-                    }
-                    D::NoSuchKind { kind, found } => format!(
-                        "--device: no CDI spec on this host offers {kind}. Found: {}",
-                        if found.is_empty() {
-                            "none".to_string()
-                        } else {
-                            found.join(", ")
-                        }
-                    ),
-                    D::NoSuchDevice { name, offered } => format!(
-                        "--device: the spec offers no device {name:?}. It offers: {}",
-                        offered.join(", ")
-                    ),
-                    D::AllNotYet => "--device ...=all is not accepted yet: this build grants \
-                         exactly one card, so name it"
-                        .to_string(),
-                    D::UnknownUuid { uuid } => format!(
+    let gpu_selection: Option<Result<crate::gpu_grant::GpuSelection, Error>> =
+        match (args.gpus, args.device) {
+            (Some(_), Some(_)) => Some(Err(Error::Cli(
+                "--gpus and --device name the same thing two ways: pass one".to_string(),
+            ))),
+            // `--device` NAMES ONE CARD AND KEEPS DOING SO. CDI spells a device by name, and the
+            // name resolves to one index; a box that wants several cards asks for them with
+            // `--gpus 0,1`, which is the flag that takes a list. The alias claim is unchanged and is
+            // about the MOUNTS: the same card reached either way produces the same nodes.
+            (None, Some(reference)) => Some(
+                crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference)
+                    .map(|index| crate::gpu_grant::GpuSelection::These(vec![index]))
+                    .map_err(|e| {
+                        use crate::cdi::DeviceRefError as D;
+                        Error::Cli(match e {
+                            D::NotQualified { given } => {
+                                format!(
+                                "--device {given}: not a CDI name. Use --device nvidia.com/gpu=0"
+                            )
+                            }
+                            D::NoSuchKind { kind, found } => format!(
+                                "--device: no CDI spec on this host offers {kind}. Found: {}",
+                                if found.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    found.join(", ")
+                                }
+                            ),
+                            D::NoSuchDevice { name, offered } => format!(
+                                "--device: the spec offers no device {name:?}. It offers: {}",
+                                offered.join(", ")
+                            ),
+                            D::AllNotYet => {
+                                "--device ...=all is not accepted: --device names one card \
+                         by its CDI name. For every card, use --gpus all"
+                                    .to_string()
+                            }
+                            D::UnknownUuid { uuid } => format!(
                         "--device: the spec names {uuid} and this host's driver reports no card \
                          with that UUID"
                     ),
-                    D::Unreadable { path, why } => format!(
-                        "--device: {} could not be read: {}",
-                        path.display(),
-                        why.describe()
-                    ),
-                })
-            }),
-        ),
-        (Some(spec), None) => Some(crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| {
-            match e {
-            crate::gpu_grant::GpuSpecError::Empty => {
-                Error::Cli("--gpus needs a card index, for example --gpus 0".to_string())
-            }
-            crate::gpu_grant::GpuSpecError::AllNotYet => Error::Cli(
-                "--gpus all is not accepted yet: this build grants exactly one card, so name it \
-                 (--gpus 0). Refusing rather than quietly granting the first one."
-                    .to_string(),
+                            D::Unreadable { path, why } => format!(
+                                "--device: {} could not be read: {}",
+                                path.display(),
+                                why.describe()
+                            ),
+                        })
+                    }),
             ),
-            crate::gpu_grant::GpuSpecError::NotAnIndex { given } => Error::Cli(format!(
-                "--gpus {given}: not a card index. Use --gpus 0, --gpus device=0 or --gpus gpu=0"
+            (Some(spec), None) => {
+                Some(crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| match e {
+                    crate::gpu_grant::GpuSpecError::Empty => {
+                        Error::Cli("--gpus needs a card index, for example --gpus 0".to_string())
+                    }
+                    crate::gpu_grant::GpuSpecError::AllWithIndex { given } => Error::Cli(format!(
+                "--gpus {given}: `all` and an index name different things and only one can be \
+                 true. Use --gpus all, or list the cards you want (--gpus 0,1)."
             )),
-        }
-        })),
-        (None, None) => None,
-    };
+                    crate::gpu_grant::GpuSpecError::Duplicate { index } => Error::Cli(format!(
+                "--gpus names card {index} twice. Each card is granted once; if you meant two \
+                 cards, name two (--gpus 0,1)."
+            )),
+                    crate::gpu_grant::GpuSpecError::NotAnIndex { given } => Error::Cli(format!(
+                        "--gpus {given}: not a card index. Use --gpus 0, --gpus 0,1, --gpus all, \
+                 --gpus device=0 or --gpus gpu=0"
+                    )),
+                }))
+            }
+            (None, None) => None,
+        };
 
     // The address of the granted card, for the box's `/proc/driver/nvidia/gpus` mask. It is read
     // from the SAME grant that produced the mounts, so the directory the box keeps and the node it
     // was given are two views of one decision rather than two lookups that could disagree.
-    let mut gpu_pci_address: Option<String> = None;
+    let mut gpu_pci_addresses: Vec<String> = Vec::new();
     if let Some(selection) = gpu_selection {
-        let card = selection?;
+        let selected = selection?;
         let caller = crate::gpu_grant::Caller::current();
         let grant = crate::gpu_grant::resolve().map_err(|e| match e {
             crate::gpu_grant::ResolveError::NoDriverVersionFile { .. } => Error::Cli(
@@ -1071,41 +1086,42 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             )),
         })?;
 
-        let binds = crate::gpu_grant::mount_plan(&grant, card, &caller).map_err(|e| match e {
-            crate::gpu_grant::MountPlanError::NoSuchCard { wanted, present } => {
-                let list: Vec<String> = present.iter().map(|c| c.to_string()).collect();
-                let names = if list.is_empty() {
-                    "none".to_string()
-                } else {
-                    list.join(", ")
-                };
-                Error::Cli(format!(
-                    "--gpus {wanted}: this host has no card {wanted}. Present: {names}"
-                ))
-            }
-            crate::gpu_grant::MountPlanError::GroupsNeeded { gids, nodes } => {
-                let g: Vec<String> = gids.iter().map(|x| x.to_string()).collect();
-                let n: Vec<String> = nodes.iter().map(|p| p.display().to_string()).collect();
-                Error::Cli(format!(
-                    "--gpus: {} is reachable only through group(s) {}, and a box carries no \
+        let binds =
+            crate::gpu_grant::mount_plan(&grant, &selected, &caller).map_err(|e| match e {
+                crate::gpu_grant::MountPlanError::NoSuchCard { wanted, present } => {
+                    let list: Vec<String> = present.iter().map(|c| c.to_string()).collect();
+                    let names = if list.is_empty() {
+                        "none".to_string()
+                    } else {
+                        list.join(", ")
+                    };
+                    Error::Cli(format!(
+                        "--gpus {wanted}: this host has no card {wanted}. Present: {names}"
+                    ))
+                }
+                crate::gpu_grant::MountPlanError::GroupsNeeded { gids, nodes } => {
+                    let g: Vec<String> = gids.iter().map(|x| x.to_string()).collect();
+                    let n: Vec<String> = nodes.iter().map(|p| p.display().to_string()).collect();
+                    Error::Cli(format!(
+                        "--gpus: {} is reachable only through group(s) {}, and a box carries no \
                      supplementary group. Keeping them is all or nothing, so kern refuses rather \
                      than deciding it for you: add the invoking user's gid to /etc/subgid and map \
                      it, or relax the node's mode.",
-                    n.join(", "),
-                    g.join(", ")
-                ))
-            }
-            crate::gpu_grant::MountPlanError::Unreachable { nodes } => {
-                let n: Vec<String> = nodes.iter().map(|p| p.display().to_string()).collect();
-                Error::Cli(format!(
-                    "--gpus: the invoking user cannot open {} on this host either, so no box \
+                        n.join(", "),
+                        g.join(", ")
+                    ))
+                }
+                crate::gpu_grant::MountPlanError::Unreachable { nodes } => {
+                    let n: Vec<String> = nodes.iter().map(|p| p.display().to_string()).collect();
+                    Error::Cli(format!(
+                        "--gpus: the invoking user cannot open {} on this host either, so no box \
                      could use it",
-                    n.join(", ")
-                ))
-            }
-        })?;
+                        n.join(", ")
+                    ))
+                }
+            })?;
 
-        gpu_pci_address = crate::gpu_grant::pci_address_of(&grant, card).map(str::to_string);
+        gpu_pci_addresses = crate::gpu_grant::pci_addresses_of(&grant, &selected);
 
         for (source, target, read_only) in binds {
             volumes.push(kern_isolation::Volume {
@@ -1857,7 +1873,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         cpuset,
         vgpio_devs,
         vgpio_sysfs,
-        gpu_pci_address,
+        gpu_pci_addresses,
         vdisks,
         secrets,
         ssh,

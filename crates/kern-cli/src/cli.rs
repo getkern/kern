@@ -180,13 +180,12 @@ pub enum Command {
         /// An ALIAS over `--gpus`, which is the plan's rule: the spec says which card a name
         /// means, the mounts come from discovery, and a test proves the two name the same nodes.
         device: Option<String>,
-        /// `--gpus <spec>`: hand the box one NVIDIA GPU, resolved from native discovery.
+        /// `--gpus <spec>`: hand the box NVIDIA GPUs, resolved from native discovery.
         ///
-        /// S2 of the GPU plan grants exactly ONE card, so the accepted forms name one: `0`, `1`,
-        /// `device=0`. `all` is deliberately NOT accepted here rather than silently meaning "the
-        /// first one", because multi-GPU is a later phase and a flag that takes a word and does
-        /// something narrower than the word says is the kind of surface this project treats as a
-        /// defect.
+        /// `0`, a list (`0,1`), and `all`. The refusal of `all` belonged to the phase that granted
+        /// exactly one card: a flag taking a word must not do something narrower than the word
+        /// says, and now it does not have to. A selection is satisfied whole or refused whole, so
+        /// a box never starts with fewer cards than the command named.
         gpus: Option<String>,
         /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
         init: bool,
