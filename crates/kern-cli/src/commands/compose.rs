@@ -2525,6 +2525,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             run_env,
             run_user,
             detach,
+            _pod_guard.as_ref().map(|g| &g.started),
         );
     }
 
@@ -3385,6 +3386,18 @@ fn compose_run(
     user: Option<&str>,
     // `-d`: start the one-off and return, instead of waiting for it.
     detach: bool,
+    // WHERE THIS INVOCATION RECORDS THAT IT STARTED A BOX, for [`EmptyPodGuard`].
+    //
+    // MEASURED on 2026-11-12, running a GPU workload as a compose service: `compose run --rm`
+    // printed the one-off's output, the workload's own verdict line, and then
+    // `removed pod 'gpucases-...' again: no service started, so it held nothing`. The service HAD
+    // started; it had just exited. That is the identical sentence the count was introduced to stop
+    // printing, and it survived on this path because the count was set next to `up`'s own "N box(es)
+    // started." line instead of where a box actually starts. `run` returns before that line.
+    //
+    // A `&Cell` rather than a return value, so the fact is recorded AT THE MOMENT IT BECOMES TRUE
+    // and no error path between here and the end of the function can lose it.
+    started: Option<&std::cell::Cell<usize>>,
 ) -> Result<(), Error> {
     let Some(target) = selected.first() else {
         return Err(Error::Compose(format!(
@@ -3565,6 +3578,12 @@ fn compose_run(
     let st = c
         .status()
         .map_err(|e| Error::Compose(format!("run: launching '{one_off}': {e}")))?;
+    // THE ONE-OFF RAN. `status()` returning Ok means the child was launched and has been waited on,
+    // so from here on "no service started" is a false statement about this invocation whatever the
+    // exit code was. The `?` above is the other case: nothing was launched and the count stays 0.
+    if let Some(counter) = started {
+        counter.set(counter.get() + 1);
+    }
     if rm {
         // Best effort, and after the fact: a foreground box leaves no running entry, so this only
         // reaps an exit record the run may have left. Never fails the command, whose status is the
