@@ -256,6 +256,126 @@ pub fn is_compute_node(path: &str) -> bool {
         || path == "/dev/kfd"
 }
 
+/// WSL2's GPU node, and the directory it mounts the vendor's user-space libraries into.
+///
+/// Relative to a root, like every other path in this module, so a test can build the shape without
+/// a Windows kernel under it.
+const WSL_NODE_REL: &str = "dev/dxg";
+const WSL_LIB_REL: &str = "usr/lib/wsl/lib";
+
+/// A GPU that is PRESENT on this host and that a grant cannot read, because the host exposes it
+/// through an interface other than a vendor device node.
+///
+/// THE FIELD CASE, measured on 2026-11-12 on a Windows host reached over the network. The Windows
+/// side answers `nvidia-smi.exe` with `NVIDIA GeForce RTX 3060, 591.74, 12288 MiB`. The WSL2 guest
+/// on the same machine (Alpine 3.20.10, kernel `6.18.33.2-microsoft-standard-WSL2`) has:
+///
+///   - `/dev/dxg`, `crw-rw-rw- 10, 258`, and NO `/dev/nvidia*` and no `/dev/dri` at all,
+///   - no `/proc/driver/nvidia` directory, so no version file,
+///   - 21 files in `/usr/lib/wsl/lib`, `libcuda.so.1` among them, on an overlay of
+///     `/gpu_lib_packaged:/gpu_lib_inbox`.
+///
+/// So [`detect`] finds no DRM card and [`crate::gpu_grant::resolve`] finds no driver version, and
+/// every surface that reported those two absences told the operator of a machine with a 12 GB card
+/// that there was no GPU. The kern installed on that host said `no GPU found` with a green tick.
+/// The comment on [`detect`] already forbids exactly this for the Pi and the Jetson, where the card
+/// has no PCI identity; WSL2 is the third shape, and there the DEVICE NODE is the part that is
+/// missing, which is one layer below anything `detect` reads.
+///
+/// IT ASSERTS PRESENCE AND NOTHING ABOUT FUNCTION. On the host this was measured on, with
+/// `/usr/lib/wsl/lib` on the loader path, `cuInit` returned 100 (`CUDA_ERROR_NO_DEVICE`) and
+/// `cuDeviceGetCount` returned 0, so that paravirtual path was not carrying compute at the time.
+/// Saying "this host has a GPU kern's grant does not read" is true either way; saying anything
+/// about whether CUDA runs there would not be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignShape {
+    /// How the interface is named to a reader. Static: there is one shape, and a second one would
+    /// be a second measurement rather than a second format string.
+    pub interface: &'static str,
+    /// The device node, under the root that was passed.
+    pub node: std::path::PathBuf,
+    /// The vendor's library directory, when it is there. `None` keeps the row honest on a kernel
+    /// that exposes the node with no libraries mounted next to it.
+    pub libraries: Option<std::path::PathBuf>,
+}
+
+/// Does `root` expose a GPU through an interface no grant in this binary reads?
+///
+/// `symlink_metadata`, so a symlink at the node path is NOT followed: a link is not the device, and
+/// following one would let the answer come from a file outside the root a test or a caller named.
+///
+/// THE NODE MUST BE A CHARACTER DEVICE, which is the same first question [`crate::gpu_grant`] asks
+/// of every path it is about to bind. The rdev is NOT also checked here, and the asymmetry is
+/// deliberate: that check exists in the grant path because a forged `c 0 0` would be BOUND INTO A
+/// BOX, while the only thing this function can change is one line of prose about the host's own
+/// `/dev`, where planting a node already requires root.
+pub fn foreign_shape_in(root: &Path) -> Option<ForeignShape> {
+    use std::os::unix::fs::FileTypeExt;
+    let node = root.join(WSL_NODE_REL);
+    if !std::fs::symlink_metadata(&node)
+        .map(|m| m.file_type().is_char_device())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let lib_dir = root.join(WSL_LIB_REL);
+    let libraries = std::fs::metadata(&lib_dir)
+        .ok()
+        .filter(|m| m.is_dir())
+        .map(|_| lib_dir);
+    Some(ForeignShape {
+        interface: "WSL2's paravirtual GPU interface",
+        node,
+        libraries,
+    })
+}
+
+/// The one sentence that describes [`ForeignShape`], written once because three surfaces print it:
+/// the `doctor` row for a host with no DRM card, and both `--gpus` refusals in
+/// [`crate::commands::start`].
+///
+/// It names BOTH sides of the mismatch, the interface that is there and the two things a grant
+/// looks for, because "no NVIDIA driver is loaded on this host" is the message those refusals used
+/// to carry and on this host it is false: the driver is loaded, on the other side of the
+/// paravirtual boundary, and what is absent is the node and the version file kern reads.
+pub fn describe_foreign_shape(shape: &ForeignShape) -> String {
+    let node = shape.node.display();
+    let where_libs = match &shape.libraries {
+        Some(dir) => format!(", with the vendor libraries in {}", dir.display()),
+        None => String::new(),
+    };
+    // NEITHER FLAG, not `--gpus` alone. The sentence is printed by four surfaces and one of them is
+    // the `--device` refusal, where naming only the other flag tells the operator about a spelling
+    // they did not use. The two are documented as the same request written two ways, and this is
+    // the one sentence that has to be true on every surface that prints it.
+    format!(
+        "a GPU is present here through {} at {node}{where_libs}: a grant reads \
+         /proc/driver/nvidia/version and binds /dev/nvidia* nodes, and this kernel has neither, so \
+         neither --gpus nor --device has a node to name",
+        shape.interface
+    )
+}
+
+/// [`describe_foreign_shape`] for the root, or an empty string. The empty case is the majority of
+/// hosts and the caller prints nothing for it.
+pub fn foreign_shape_note(root: &Path) -> String {
+    foreign_shape_in(root)
+        .map(|s| describe_foreign_shape(&s))
+        .unwrap_or_default()
+}
+
+/// `base`, with the foreign-shape sentence joined onto it when the root has one.
+///
+/// For the surfaces that have one line to say everything in, where `doctor` has a note line.
+pub fn with_foreign_shape(base: &str, root: &Path) -> String {
+    let note = foreign_shape_note(root);
+    if note.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}; {note}")
+    }
+}
+
 pub fn detect() -> Vec<Gpu> {
     let mut out: Vec<Gpu> = Vec::new();
 
@@ -519,5 +639,150 @@ mod tests {
                 assert_eq!(addr.len(), 12, "not a kernel-shaped PCI address: {addr}");
             }
         }
+    }
+
+    /// A character device at `path`, unprivileged.
+    ///
+    /// `c 0 0` is a WHITEOUT, the one character device the kernel lets an unprivileged caller
+    /// create: `vfs_mknod` tests `CAP_MKNOD` only when the node is not a whiteout. It is enough
+    /// here because [`foreign_shape_in`] asks whether the node is a character device and
+    /// deliberately does not read the rdev. Returns false when the filesystem under `/tmp` refuses
+    /// it, which is a SKIP rather than a pass.
+    fn fixture_node(path: &std::path::Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map(|p| unsafe { libc::mknod(p.as_ptr(), libc::S_IFCHR | 0o666, 0) } == 0)
+            .unwrap_or(false)
+    }
+
+    /// Build `<root>/dev/dxg` as a device, and the library directory when asked.
+    fn wsl_root(tag: &str, with_libs: bool) -> Option<TmpDir> {
+        let t = TmpDir::new(tag);
+        std::fs::create_dir_all(t.0.join("dev")).expect("dev");
+        if !fixture_node(&t.0.join(WSL_NODE_REL)) {
+            return None;
+        }
+        if with_libs {
+            std::fs::create_dir_all(t.0.join(WSL_LIB_REL)).expect("lib dir");
+        }
+        Some(t)
+    }
+
+    /// THE MAJORITY CASE, and the negative half of every case below: a root with nothing in it has
+    /// no foreign shape, so a `Some` elsewhere is the node and not the function's optimism.
+    #[test]
+    fn a_root_with_nothing_in_it_has_no_foreign_shape() {
+        let t = TmpDir::new("noshape");
+        assert_eq!(foreign_shape_in(&t.0), None);
+        assert_eq!(foreign_shape_note(&t.0), "");
+        assert_eq!(with_foreign_shape("base", &t.0), "base");
+    }
+
+    /// THE PATHS COME FROM THE ROOT. A resolver that reads the literal `/dev/dxg` would pass every
+    /// other case on a WSL2 host and fail this one everywhere, which is the sabotage this case is
+    /// built to catch: it asserts the node it found is UNDER the root it was given.
+    #[test]
+    fn the_wsl_shape_is_found_and_its_paths_come_from_the_root() {
+        let Some(t) = wsl_root("wslshape", true) else {
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
+            return;
+        };
+        let shape = foreign_shape_in(&t.0).expect("the shape is there");
+        assert_eq!(shape.node, t.0.join("dev/dxg"));
+        assert_eq!(shape.libraries, Some(t.0.join("usr/lib/wsl/lib")));
+        assert!(
+            shape.node.starts_with(&t.0),
+            "the node was not read under the root: {}",
+            shape.node.display()
+        );
+    }
+
+    /// The node with no libraries next to it is still the shape, and the sentence drops the clause
+    /// rather than naming a directory that is not there.
+    #[test]
+    fn the_node_alone_is_the_shape_and_the_sentence_omits_the_libraries() {
+        let Some(t) = wsl_root("wslnolibs", false) else {
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
+            return;
+        };
+        let shape = foreign_shape_in(&t.0).expect("the shape is there");
+        assert_eq!(shape.libraries, None);
+        let text = describe_foreign_shape(&shape);
+        assert!(
+            !text.contains("vendor libraries"),
+            "named a library directory that does not exist: {text}"
+        );
+        assert!(text.contains("dev/dxg"), "{text}");
+    }
+
+    /// A REGULAR FILE WITH THE RIGHT NAME IS NOT A DEVICE. The same forgery that defeated an
+    /// earlier version of the grant path: four synthetic roots had been writing regular files where
+    /// nodes belong, and every test passed.
+    #[test]
+    fn a_regular_file_named_dxg_is_not_a_device() {
+        let t = TmpDir::new("wslfile");
+        std::fs::create_dir_all(t.0.join("dev")).expect("dev");
+        std::fs::write(t.0.join(WSL_NODE_REL), b"not a device").expect("write");
+        assert_eq!(foreign_shape_in(&t.0), None);
+    }
+
+    /// A SYMLINK IS NOT FOLLOWED, so the answer cannot be made to come from a device outside the
+    /// root. The positive control is in the same case: the link target IS a device, and pointing
+    /// the path at it directly would answer `Some`.
+    #[test]
+    fn a_symlink_at_the_node_path_is_not_followed() {
+        let t = TmpDir::new("wsllink");
+        std::fs::create_dir_all(t.0.join("dev")).expect("dev");
+        let real = t.0.join("dev").join("real-device");
+        if !fixture_node(&real) {
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
+            return;
+        }
+        // THE CONTROL: the target is a device, read directly.
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::symlink_metadata(&real)
+                .expect("stat")
+                .file_type()
+                .is_char_device(),
+            "the control failed: the fixture is not a character device"
+        );
+        std::os::unix::fs::symlink(&real, t.0.join(WSL_NODE_REL)).expect("symlink");
+        assert_eq!(
+            foreign_shape_in(&t.0),
+            None,
+            "a symlink was followed to a device outside the node path"
+        );
+    }
+
+    /// THE SENTENCE NAMES BOTH SIDES OF THE MISMATCH. Its whole reason to exist is that
+    /// "no NVIDIA driver is loaded on this host" is false on a WSL2 guest, so it must say what IS
+    /// there and what kern looked for, and it must not drift into claiming a boundary.
+    #[test]
+    fn the_sentence_names_what_is_there_and_what_kern_looked_for() {
+        let Some(t) = wsl_root("wslsentence", true) else {
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
+            return;
+        };
+        let note = foreign_shape_note(&t.0);
+        for needle in [
+            "dev/dxg",
+            "usr/lib/wsl/lib",
+            "/proc/driver/nvidia/version",
+            "/dev/nvidia*",
+            // BOTH SPELLINGS, because one of the four surfaces that prints this is the `--device`
+            // refusal and naming only `--gpus` there describes a flag the operator did not type.
+            "--gpus",
+            "--device",
+        ] {
+            assert!(
+                note.contains(needle),
+                "the note does not name {needle}: {note}"
+            );
+        }
+        assert_eq!(overclaims(&note), None, "{note}");
+        let joined = with_foreign_shape("a GPU was asked for", &t.0);
+        assert!(joined.starts_with("a GPU was asked for; "), "{joined}");
+        assert!(joined.contains("dev/dxg"), "{joined}");
     }
 }

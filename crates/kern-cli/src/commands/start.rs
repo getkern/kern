@@ -110,9 +110,16 @@ pub fn box_plan(
             }
         }
         (Some(_), Err(crate::gpu_grant::ResolveError::NoDriverVersionFile { .. })) => {
+            // IN THIS KERNEL, not "on this host": on a WSL2 guest the driver IS loaded, on the
+            // other side of the paravirtual boundary, and what is absent is the version file kern
+            // reads. `with_foreign_shape` adds the sentence naming what is there instead.
             println!(
-                "  gpu grant: a GPU was asked for and no NVIDIA driver is loaded on this host, so \
-                 `kern box` would refuse it"
+                "  gpu grant: {}",
+                crate::gpu::with_foreign_shape(
+                    "a GPU was asked for and no NVIDIA driver is loaded in this kernel, so \
+                     `kern box` would refuse it",
+                    std::path::Path::new("/"),
+                )
             );
         }
         (Some(_), Err(crate::gpu_grant::ResolveError::DriverVersionUnparsable { first_line })) => {
@@ -1072,13 +1079,24 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                                 "--device {given}: not a CDI name. Use --device nvidia.com/gpu=0"
                             )
                             }
+                            // THE FOURTH SURFACE THAT HAD TO SAY IT. Measured on a WSL2 guest with
+                            // an RTX 3060 on the Windows side: this arm answered
+                            // "Found: none" and nothing else, so the one operator who most needs
+                            // the cause got the shortest message. The sentence is appended ONLY
+                            // when the host offers no kind at all, which is that case; when a spec
+                            // IS there and offers something else, `found` already names the cause.
+                            D::NoSuchKind { kind, found } if found.is_empty() => {
+                                crate::gpu::with_foreign_shape(
+                                    &format!(
+                                        "--device: no CDI spec on this host offers {kind}. \
+                                         Found: none"
+                                    ),
+                                    std::path::Path::new("/"),
+                                )
+                            }
                             D::NoSuchKind { kind, found } => format!(
                                 "--device: no CDI spec on this host offers {kind}. Found: {}",
-                                if found.is_empty() {
-                                    "none".to_string()
-                                } else {
-                                    found.join(", ")
-                                }
+                                found.join(", ")
                             ),
                             D::NoSuchDevice { name, offered } => format!(
                                 "--device: the spec offers no device {name:?}. It offers: {}",
@@ -1183,11 +1201,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         let selected = selection?;
         let caller = crate::gpu_grant::Caller::current();
         let grant = crate::gpu_grant::resolve().map_err(|e| match e {
-            crate::gpu_grant::ResolveError::NoDriverVersionFile { .. } => Error::Cli(
-                "--gpus was passed and no NVIDIA driver is loaded on this host: \
-                 /proc/driver/nvidia/version does not exist"
-                    .to_string(),
-            ),
+            crate::gpu_grant::ResolveError::NoDriverVersionFile { .. } => {
+                Error::Cli(crate::gpu::with_foreign_shape(
+                    "--gpus was passed and no NVIDIA driver is loaded in this kernel: \
+                     /proc/driver/nvidia/version does not exist",
+                    std::path::Path::new("/"),
+                ))
+            }
             crate::gpu_grant::ResolveError::DriverVersionUnparsable { first_line } => {
                 Error::Cli(format!(
                     "--gpus was passed and the driver's version line carries no version: \

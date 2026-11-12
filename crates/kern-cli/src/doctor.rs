@@ -1992,15 +1992,37 @@ fn check_kernel() -> R {
 /// restricted and no cgroup delegation, are in the same list. A card kern cannot grant is a fact
 /// about kern, not a fault of the host, so it is an OK that says so.
 ///
+/// The row for a host with no DRM card, which is the majority of hosts and was ALSO the row a
+/// machine with a 12 GB card got.
+///
+/// `root` IS A PARAMETER so both shapes can be asserted on any host. The test that guarded this
+/// before could only act on a host with no GPU: it looked for a row starting with a wording the
+/// code no longer prints, so on every developer machine and on CI it iterated the rows, matched
+/// nothing, and passed. A check that cannot fail where it runs is the shape of a false green.
+///
+/// `gpu none` is right where there is nothing. On a WSL2 guest it was the line that told the
+/// operator of an RTX 3060 that they had no card, so where a GPU is present in a shape kern does
+/// not read, the verdict names the two things kern looked for and the note names what is there.
+fn no_card_row(root: &std::path::Path) -> R {
+    let note = crate::gpu::foreign_shape_note(root);
+    if note.is_empty() {
+        return R::ok(
+            "gpu none: no DRM card on this host, so there is nothing for --gpus to hand over"
+                .into(),
+        );
+    }
+    R::ok_note(
+        "gpu: this host has no DRM card and no vendor device node",
+        &note,
+    )
+}
+
 /// The one thing a row must never do is imply a boundary it does not have, and that contract lives
 /// in the words where `overclaims` and `pentest/pentest-gpu-claims.sh` can both hold it.
 fn check_gpu() -> Vec<R> {
     let cards = crate::gpu::detect();
     if cards.is_empty() {
-        return vec![R::ok(
-            "gpu none: no DRM card on this host, so there is nothing for --gpus to hand over"
-                .into(),
-        )];
+        return vec![no_card_row(std::path::Path::new("/"))];
     }
     // RESOLVED ONCE for every row. The resolver walks the driver's libraries, so calling it per
     // card would multiply the only expensive part of this check by the number of cards.
@@ -3106,14 +3128,61 @@ mod tests {
 
     /// `doctor` runs on hosts with no GPU at all, which is the majority case, and that must be an OK
     /// rather than a warning: nothing is degraded, the feature does not apply.
+    ///
+    /// ⛔ THE PREVIOUS VERSION OF THIS TEST COULD NOT FAIL WHERE IT RAN. It called `check_gpu` and
+    /// asserted only on a row starting with "no GPU found", a wording the code had stopped
+    /// printing; on a host with a card it also matched nothing. It passed by matching nothing,
+    /// everywhere, which is why the WSL2 row reached a real host unguarded.
+    ///
+    /// Both shapes are built under a root, so both are asserted on any host.
     #[test]
-    fn a_host_with_no_gpu_is_not_a_warning() {
-        for r in check_gpu() {
-            let t = r.text();
-            if t.starts_with("no GPU found") {
-                assert!(matches!(r, R::Ok(..)), "no GPU is not a degraded state");
+    fn the_no_card_row_is_ok_and_names_a_gpu_it_cannot_grant() {
+        let base = std::env::temp_dir().join(format!("kern-doctor-nocard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).expect("empty root");
+        match no_card_row(&empty) {
+            R::Ok(msg, note) => {
+                assert!(msg.starts_with("gpu none"), "{msg}");
+                assert!(note.is_empty(), "a note on a host with nothing: {note}");
             }
+            _ => panic!("no GPU at all is not a degraded state"),
         }
+
+        // THE WSL2 SHAPE: `c 0 0` is a whiteout, the one character device an unprivileged caller
+        // may create, and the row's question is whether the node is a character device.
+        let wsl = base.join("wsl");
+        std::fs::create_dir_all(wsl.join("dev")).expect("dev");
+        std::fs::create_dir_all(wsl.join("usr/lib/wsl/lib")).expect("libs");
+        let node = wsl.join("dev/dxg");
+        use std::os::unix::ffi::OsStrExt;
+        let made = std::ffi::CString::new(node.as_os_str().as_bytes())
+            .map(|p| unsafe { libc::mknod(p.as_ptr(), libc::S_IFCHR | 0o666, 0) } == 0)
+            .unwrap_or(false);
+        if !made {
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build the node");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        match no_card_row(&wsl) {
+            R::Ok(msg, note) => {
+                assert!(
+                    !msg.contains("none"),
+                    "the verdict still reports absence on a host with a GPU: {msg}"
+                );
+                assert!(
+                    note.contains("dxg") && note.contains("/usr/lib/wsl/lib"),
+                    "the note does not name what is present: {note}"
+                );
+                assert_eq!(
+                    crate::gpu::overclaims(&format!("{msg} {note}")),
+                    None,
+                    "{msg} {note}"
+                );
+            }
+            _ => panic!("a GPU kern cannot grant is not a degraded state either"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// THE FIELD CASE: an allocation that exists must be FOUND when `$USER` is not set.
