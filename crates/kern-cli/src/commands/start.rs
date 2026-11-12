@@ -12,7 +12,13 @@ use super::*;
 /// would perform. Privilege-free: it records the sequence via the isolation seam rather than
 /// executing it, so it works anywhere and exercises the 0.2 step-sequence + mount-ordering
 /// typestate end to end.
-pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result<(), Error> {
+pub fn box_plan(
+    name: &str,
+    profiles: &[String],
+    config: Option<&str>,
+    gpus: Option<&str>,
+    device: Option<&str>,
+) -> Result<(), Error> {
     let name = BoxName::parse(name).map_err(Error::InvalidBox)?;
     let ctx = SandboxCtx::new(name);
     println!("isolation plan for box '{}':", ctx.name.as_str());
@@ -43,23 +49,79 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
     // The two faults that ARE worth naming do get named: a driver whose version line cannot be
     // parsed, and a driver that is loaded while its device nodes are missing. Both are states a
     // reader can act on, and both are invisible without being said.
-    match crate::gpu_grant::resolve() {
-        Ok(grant) => {
+    //
+    // 🚨 AND IT NOW DEPENDS ON THE REQUEST, which it did not. `--gpus` and `--device` were dropped
+    // by the parser on the `--plan` path, so this printed the whole host inventory for a box with
+    // NO GPU flag, which previews hardware that box will never see, and printed the same inventory
+    // for `--gpus device=0`, which previews cards it did not ask for. A preview that does not
+    // depend on the request is not a preview of the request.
+    //
+    // ASKING FOR A CARD SELECTS `Detail::Full`, which had no production caller at all, so the one
+    // thing an operator needs from a device preview was unreachable: the NAMES of the host paths
+    // they are authorising. A box with no GPU flag still gets nothing, so the long form is only
+    // printed to somebody who asked for hardware AND asked to see the plan.
+    let gpu_request =
+        match (gpus, device) {
+            (Some(spec), _) => Some(crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| {
+                Error::Cli(format!("--plan: --gpus {spec} is not a selection: {e:?}"))
+            })?),
+            // A CDI name resolves to ONE card index, and this is a preview, so a spec that does not
+            // name it here is the launch's refusal to report and not the plan's.
+            (None, Some(reference)) => {
+                match crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference) {
+                    Ok(index) => Some(crate::gpu_grant::GpuSelection::These(vec![index])),
+                    Err(_) => {
+                        println!(
+                    "  gpu grant: --device {reference} does not resolve on this host, so `kern \
+                     box` would refuse it; run `kern doctor` for which CDI specs are readable"
+                );
+                        None
+                    }
+                }
+            }
+            (None, None) => None,
+        };
+
+    match (gpu_request, crate::gpu_grant::resolve()) {
+        // NO FLAG, NO PREVIEW. The box gets no card, and printing the host's inventory under the
+        // heading of this box's plan said the opposite.
+        (None, _) => {}
+        (Some(selection), Ok(grant)) => {
             println!("  gpu grant (preview, nothing is mounted by --plan):");
-            for line in
-                crate::gpu_grant::render_plan(&grant, crate::gpu_grant::Detail::Summary).lines()
-            {
-                println!("    {line}");
+            // THE SELECTION, not the grant. `mount_plan` is the same call the launch makes, so a
+            // selection this host cannot satisfy is refused here with the launch's own reason
+            // instead of being previewed as though it would work.
+            let caller = crate::gpu_grant::Caller::current();
+            match crate::gpu_grant::mount_plan(&grant, &selection, &caller) {
+                Ok(_) => {
+                    // EVERY PATH BY NAME. There is no short form any more: the enum that chose
+                    // between them had a `Summary` variant nobody constructed once the plan
+                    // started printing the full list, which is the same no-caller smell the
+                    // `Full` variant had before. An operator who typed `--plan` AND asked for a
+                    // card wants the paths they are authorising.
+                    for line in crate::gpu_grant::render_plan(&grant, &selection).lines() {
+                        println!("    {line}");
+                    }
+                }
+                Err(why) => println!(
+                    "    this selection would be refused: {}",
+                    crate::gpu_grant::describe_mount_plan_error(&why)
+                ),
             }
         }
-        Err(crate::gpu_grant::ResolveError::NoDriverVersionFile { .. }) => {}
-        Err(crate::gpu_grant::ResolveError::DriverVersionUnparsable { first_line }) => {
+        (Some(_), Err(crate::gpu_grant::ResolveError::NoDriverVersionFile { .. })) => {
+            println!(
+                "  gpu grant: a GPU was asked for and no NVIDIA driver is loaded on this host, so \
+                 `kern box` would refuse it"
+            );
+        }
+        (Some(_), Err(crate::gpu_grant::ResolveError::DriverVersionUnparsable { first_line })) => {
             println!(
                 "  gpu grant: an NVIDIA driver is loaded and its version line carries no version: \
                  {first_line:?}"
             );
         }
-        Err(crate::gpu_grant::ResolveError::NoNodes { driver_version }) => {
+        (Some(_), Err(crate::gpu_grant::ResolveError::NoNodes { driver_version })) => {
             println!(
                 "  gpu grant: driver {driver_version} is loaded and no device node exists under \
                  /dev, so no GPU can be granted"
@@ -1133,60 +1195,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             )),
         })?;
 
-        let binds =
-            crate::gpu_grant::mount_plan(&grant, &selected, &caller).map_err(|e| match e {
-                // NOT ENOUGH CARDS IS NOT A WRONG INDEX. The caller named no card, so there is
-                // nothing for them to correct except the number they asked for, and the message
-                // has to say how many are here rather than which ones.
-                crate::gpu_grant::MountPlanError::TooFewCards { wanted, present } => {
-                    Error::Cli(format!(
-                        "--gpus {wanted}: this host has {} card(s), which is fewer than the {} \
-                         asked for. Present: {}",
-                        present.len(),
-                        wanted,
-                        if present.is_empty() {
-                            "none".to_string()
-                        } else {
-                            present
-                                .iter()
-                                .map(u32::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        }
-                    ))
-                }
-                crate::gpu_grant::MountPlanError::NoSuchCard { wanted, present } => {
-                    let list: Vec<String> = present.iter().map(|c| c.to_string()).collect();
-                    let names = if list.is_empty() {
-                        "none".to_string()
-                    } else {
-                        list.join(", ")
-                    };
-                    Error::Cli(format!(
-                        "--gpus {wanted}: this host has no card {wanted}. Present: {names}"
-                    ))
-                }
-                crate::gpu_grant::MountPlanError::GroupsNeeded { gids, nodes } => {
-                    let g: Vec<String> = gids.iter().map(|x| x.to_string()).collect();
-                    let n: Vec<String> = nodes.iter().map(|p| p.display().to_string()).collect();
-                    Error::Cli(format!(
-                        "--gpus: {} is reachable only through group(s) {}, and a box carries no \
-                     supplementary group. Keeping them is all or nothing, so kern refuses rather \
-                     than deciding it for you: add the invoking user's gid to /etc/subgid and map \
-                     it, or relax the node's mode.",
-                        n.join(", "),
-                        g.join(", ")
-                    ))
-                }
-                crate::gpu_grant::MountPlanError::Unreachable { nodes } => {
-                    let n: Vec<String> = nodes.iter().map(|p| p.display().to_string()).collect();
-                    Error::Cli(format!(
-                        "--gpus: the invoking user cannot open {} on this host either, so no box \
-                     could use it",
-                        n.join(", ")
-                    ))
-                }
-            })?;
+        let binds = crate::gpu_grant::mount_plan(&grant, &selected, &caller)
+            // ONE SPELLING of every refusal, shared with `kern box --plan`. These four messages
+            // lived here and the preview had none, so a plan printed the `Debug` form of the
+            // same error and a reader could not compare the two.
+            .map_err(|e| Error::Cli(crate::gpu_grant::describe_mount_plan_error(&e)))?;
 
         gpu_uid_dependent = crate::gpu_grant::uid_dependent_nodes(&grant, &selected, &caller);
 

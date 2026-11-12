@@ -629,8 +629,13 @@ pub struct GpuGrant {
 }
 
 impl GpuGrant {
-    /// Every node in the grant, shared first then per card, for the surfaces that describe the
-    /// whole host rather than one selection.
+    /// Every node in the grant, shared first then per card.
+    ///
+    /// TEST-ONLY, because no production surface describes the whole host any more: `render_plan`
+    /// used this and now builds the SELECTION's node list instead, which is the fix that made
+    /// `--plan` describe the box being planned. Keeping it `pub` in the shipped build would be the
+    /// same smell as the `Detail::Full` that had no caller, one directory along.
+    #[cfg(test)]
     pub fn all_nodes(&self) -> Vec<(PathBuf, NodeFacts)> {
         let mut out = self.shared.clone();
         for card in &self.cards {
@@ -1799,39 +1804,101 @@ pub fn mount_plan(
     Ok(binds)
 }
 
-/// How much of the grant a render spells out.
+/// Why a selection was refused, as one sentence for a reader.
 ///
-/// ONE renderer with two verbosities rather than two renderers: the preview and the full listing
-/// would otherwise be two spellings of the same structure, and this project's recurring defect is a
-/// derived thing computed in two places.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Detail {
-    /// Counts and the group decision. What `--plan` prints, because the other sections of a plan
-    /// are three lines each and forty lines of library paths would bury them.
-    Summary,
-    /// Every node, library and directory by name.
-    Full,
+/// ONE SPELLING, because there are now two callers. `kern box` mapped every variant to prose inline
+/// and `kern box --plan` had none, so the preview printed the `Debug` form of the error:
+/// `NoSuchCard { wanted: 9, present: [0, 1] }`. A plan whose refusal reads differently from the
+/// launch's refusal is a plan the reader cannot compare with what happens next.
+///
+/// The group sentence says "a box carries no supplementary group ON THE DEFAULT MAP", because a
+/// single-uid box keeps them: the flat claim was corrected elsewhere in this crate and repeating
+/// the old one here would reintroduce it.
+pub fn describe_mount_plan_error(e: &MountPlanError) -> String {
+    match e {
+        // NOT ENOUGH CARDS IS NOT A WRONG INDEX. The caller named no card, so there is nothing for
+        // them to correct except the number they asked for, and the message has to say how many are
+        // here rather than which ones.
+        MountPlanError::TooFewCards { wanted, present } => format!(
+            "--gpus {wanted}: this host has {} card(s), which is fewer than the {} asked for. \
+             Present: {}",
+            present.len(),
+            wanted,
+            join_indices(present)
+        ),
+        MountPlanError::NoSuchCard { wanted, present } => format!(
+            "--gpus {wanted}: this host has no card {wanted}. Present: {}",
+            join_indices(present)
+        ),
+        MountPlanError::GroupsNeeded { gids, nodes } => format!(
+            "--gpus: {} is reachable only through group(s) {}, and a box on the default map \
+             carries no supplementary group. Keeping them is all or nothing, so kern refuses \
+             rather than deciding it for you: relax the node's mode on the host, or start the box \
+             with --no-uid-range, which keeps EVERY inherited group and is the price of that map",
+            join_paths_for_message(nodes),
+            gids.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        MountPlanError::Unreachable { nodes } => format!(
+            "--gpus: the invoking user cannot open {} on this host either, so no box could use it",
+            join_paths_for_message(nodes)
+        ),
+    }
+}
+
+/// Card indices for a message, or `none`.
+fn join_indices(present: &[u32]) -> String {
+    if present.is_empty() {
+        return "none".to_string();
+    }
+    present
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Paths for a message.
+fn join_paths_for_message(nodes: &[PathBuf]) -> String {
+    nodes
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The grant, rendered for `--plan`, one fact per line and no adjectives.
 ///
 /// A print surface and nothing else: it mounts nothing and decides nothing, so the preview a reader
 /// sees is the same structure a later phase would act on.
-pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
+pub fn render_plan(grant: &GpuGrant, selection: &GpuSelection) -> String {
     let mut out = String::new();
     out.push_str(&format!("driver {}\n", grant.driver_version));
-    let every = grant.all_nodes();
+
+    // THE SELECTION, NOT THE INVENTORY. This took no selection, so `--plan` described the whole
+    // host: a box asking for `--gpus device=0` was shown every card's nodes, and the caller had no
+    // way to tell which lines were about the box being planned. The cards are the ones
+    // `mount_plan` would take; a selection this host cannot satisfy renders nothing here, because
+    // the caller already prints the launch's own refusal for that case.
+    let chosen: Vec<&CardNodes> = cards_of(grant, selection).unwrap_or_default();
+    let mut every: Vec<(PathBuf, NodeFacts)> = grant.shared.clone();
+    for card in &chosen {
+        every.extend(card.nodes.iter().cloned());
+    }
     out.push_str(&format!(
-        "nodes {} ({} shared, {} card(s))\n",
+        "nodes {} ({} shared, {} of {} card(s))\n",
         every.len(),
         grant.shared.len(),
+        chosen.len(),
         grant.cards.len()
     ));
     // WHICH CARD EACH INDEX MEANS, before anything is mounted. `--gpus device=0` names an
     // reader has another number in front of them, the `cardN` their desktop and `nvidia-smi` use,
     // index, and on this host it is INVERTED against `cardN`: card 0 is `0000:01:00.0`, which
     // preview that showed only the count would let someone confirm a plan for the other card.
-    for card in &grant.cards {
+    for card in &chosen {
         match card.pci_address.as_deref() {
             Some(addr) => out.push_str(&format!("  --gpus device={} is {}\n", card.index, addr)),
             None => out.push_str(&format!(
@@ -1840,24 +1907,24 @@ pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
             )),
         }
     }
-    if detail == Detail::Full {
+    {
         for (node, _) in &grant.shared {
             out.push_str(&format!("  shared {}\n", node.display()));
         }
-        for card in &grant.cards {
+        for card in &chosen {
             for (node, _) in &card.nodes {
                 out.push_str(&format!("  card {} {}\n", card.index, node.display()));
             }
         }
     }
     out.push_str(&format!("libraries {}\n", grant.libraries.len()));
-    if detail == Detail::Full {
+    {
         for library in &grant.libraries {
             out.push_str(&format!("  lib {}\n", library.path.display()));
         }
     }
     out.push_str(&format!("symlinks {}\n", grant.symlinks.len()));
-    if detail == Detail::Full {
+    {
         for link in &grant.symlinks {
             out.push_str(&format!(
                 "  link {} -> {}\n",
@@ -1867,13 +1934,14 @@ pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
         }
     }
     out.push_str(&format!("ldconfig dirs {}\n", grant.ldconfig_dirs.len()));
-    if detail == Detail::Full {
+    {
         for dir in &grant.ldconfig_dirs {
             out.push_str(&format!("  dir {}\n", dir.display()));
         }
     }
-    // The policy is a FUNCTION of a selection, not a field: `--plan` describes the host, so it
-    // asks over every node, while `mount_plan` asks over the one card it is building.
+    // The policy is a FUNCTION of a selection, not a field, and it is now asked over the SAME
+    // nodes `mount_plan` would take rather than over the host's whole set. Asking over every node
+    // made `--plan` report a group that only the card nobody asked for needs.
     match &group_policy(&every, &Caller::current()) {
         GroupPolicy::NotNeeded => {
             out.push_str("groups not needed: every node is reached by uid or by other\n");
@@ -1881,7 +1949,7 @@ pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
         GroupPolicy::Needed { gids, nodes } => {
             let names: Vec<String> = gids.iter().map(|g| g.to_string()).collect();
             out.push_str(&format!("groups needed: {}\n", names.join(", ")));
-            if detail == Detail::Full {
+            {
                 for node in nodes {
                     out.push_str(&format!("  group-gated {}\n", node.display()));
                 }
@@ -3750,6 +3818,128 @@ mod tests {
         }
     }
 
+    /// THE PLAN DESCRIBES THE SELECTION, NOT THE HOST'S INVENTORY.
+    ///
+    /// `render_plan` took no selection, so `kern box --plan --gpus device=0` printed every card's
+    /// nodes and the reader had no way to tell which lines were about the box being planned. The
+    /// parser also dropped `--gpus` on the `--plan` path entirely, so a box with NO GPU flag
+    /// previewed the whole inventory as though it were getting one.
+    ///
+    /// AND THE LONG FORM HAD NO PRODUCTION CALLER, so the one thing an operator needs from a
+    /// device preview was unreachable: the NAMES of the host paths they are authorising. Only the
+    /// counts could be printed. The enum that chose between the two forms is gone, because once
+    /// the plan printed the names its `Summary` variant had no caller either, which is the same
+    /// smell with the sign reversed.
+    #[test]
+    fn the_plan_describes_the_cards_that_were_asked_for() {
+        let grant = two_card_grant(plain(0, 0, 0o666));
+
+        let one = render_plan(&grant, &GpuSelection::These(vec![0]));
+        assert!(
+            one.contains("1 of 2 card(s)"),
+            "the count must say which part of the host this is: {one}"
+        );
+        assert!(
+            one.contains("/dev/nvidia0"),
+            "the chosen card's node: {one}"
+        );
+        assert!(
+            !one.contains("/dev/nvidia1"),
+            "a card nobody asked for must not be previewed: {one}"
+        );
+        // The shared nodes belong to any selection, so they ARE listed.
+        assert!(one.contains("/dev/nvidiactl"), "{one}");
+        // POSITIVE CONTROL: the other card alone, so the filter is the selection and not a
+        // hard-coded index.
+        let other = render_plan(&grant, &GpuSelection::These(vec![1]));
+        assert!(other.contains("/dev/nvidia1"), "{other}");
+        assert!(!other.contains("/dev/nvidia0"), "{other}");
+        // And every card when every card is asked for.
+        let all = render_plan(&grant, &GpuSelection::All);
+        assert!(all.contains("2 of 2 card(s)"), "{all}");
+        assert!(
+            all.contains("/dev/nvidia0") && all.contains("/dev/nvidia1"),
+            "{all}"
+        );
+
+        // THE PATHS ARE NAMED, which is what had no caller: only the counts were reachable. Both
+        // are asserted, because a plan that lost its counts would be a different regression from
+        // one that lost its paths.
+        assert!(
+            one.contains("libraries 1"),
+            "the counts must survive beside the names: {one}"
+        );
+        assert!(
+            one.contains("  lib /usr/lib/x86_64-linux-gnu/libcuda.so"),
+            "the plan must name the library paths: {one}"
+        );
+        assert!(
+            one.contains("  link /usr/lib/x86_64-linux-gnu/libcuda.so.1"),
+            "the plan must name the symlinks it would create: {one}"
+        );
+        assert!(
+            one.contains("  dir /usr/lib/x86_64-linux-gnu"),
+            "the plan must name the linker directories: {one}"
+        );
+    }
+
+    /// A REFUSAL READS THE SAME FROM `kern box` AND FROM `kern box --plan`.
+    ///
+    /// The four sentences lived inline in `box_run` and the preview had none, so the plan printed
+    /// the `Debug` form of the same error: `NoSuchCard { wanted: 9, present: [0, 1] }`. A plan whose
+    /// refusal reads differently from the launch's is a plan the reader cannot compare with what
+    /// happens next.
+    #[test]
+    fn every_refusal_has_one_wording_for_both_surfaces() {
+        let said = describe_mount_plan_error(&MountPlanError::NoSuchCard {
+            wanted: 9,
+            present: vec![0, 1],
+        });
+        assert!(said.contains("no card 9"), "{said}");
+        assert!(said.contains("Present: 0, 1"), "{said}");
+        assert!(!said.contains('{'), "the Debug form leaked: {said}");
+
+        let empty = describe_mount_plan_error(&MountPlanError::NoSuchCard {
+            wanted: 0,
+            present: Vec::new(),
+        });
+        assert!(
+            empty.contains("Present: none"),
+            "an empty list must read as a word, not as nothing: {empty}"
+        );
+
+        let few = describe_mount_plan_error(&MountPlanError::TooFewCards {
+            wanted: 4,
+            present: vec![0, 1],
+        });
+        assert!(
+            few.contains("2 card(s)") && few.contains("fewer than the 4"),
+            "{few}"
+        );
+
+        // THE GROUP SENTENCE MUST NOT CARRY THE FLAT CLAIM. "a box carries no supplementary group"
+        // is true of the ranged map only, and a single-uid box keeps them; that was corrected
+        // elsewhere in this crate and repeating it here would put it back.
+        let groups = describe_mount_plan_error(&MountPlanError::GroupsNeeded {
+            gids: vec![44],
+            nodes: vec![PathBuf::from("/dev/dri/card0")],
+        });
+        assert!(groups.contains("on the default map"), "{groups}");
+        assert!(
+            groups.contains("--no-uid-range"),
+            "the lever is not named: {groups}"
+        );
+        assert!(
+            groups.contains("all or nothing"),
+            "the price is not named: {groups}"
+        );
+
+        let dead = describe_mount_plan_error(&MountPlanError::Unreachable {
+            nodes: vec![PathBuf::from("/dev/nvidia0")],
+        });
+        assert!(dead.contains("cannot open /dev/nvidia0"), "{dead}");
+    }
+
     /// A NODE REACHED ONLY BY THE CALLER'S UID IS NOT REACHED BY A BOX RUNNING AS SOMEBODY ELSE.
     ///
     /// `survives_a_box` answers for the loss of GROUPS and cannot answer for the loss of the UID,
@@ -3878,7 +4068,7 @@ mod tests {
             }],
             ldconfig_dirs: vec![PathBuf::from("/usr/lib/x86_64-linux-gnu")],
         };
-        let text = render_plan(&base, Detail::Full);
+        let text = render_plan(&base, &GpuSelection::All);
         assert!(text.contains("driver 580.173.02"));
         assert!(text.contains("groups not needed"));
 
@@ -3892,7 +4082,7 @@ mod tests {
             }],
             ..base.clone()
         };
-        let text = render_plan(&gated, Detail::Full);
+        let text = render_plan(&gated, &GpuSelection::All);
         assert!(
             text.contains("groups needed:"),
             "a gated node must be reported: {text}"
@@ -3912,7 +4102,7 @@ mod tests {
             }],
             ..base
         };
-        let text = render_plan(&refused, Detail::Full);
+        let text = render_plan(&refused, &GpuSelection::All);
         assert!(text.contains("refuse:"));
         assert!(text.contains("/dev/locked"));
     }

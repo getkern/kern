@@ -31,6 +31,15 @@ pub enum Command {
         /// plan read a DIFFERENT kern.toml from the one the launch would use, and reported
         /// "no [[vcpu]] profile named 'slim'" for a profile sitting in the file that was passed.
         config: Option<String>,
+        /// `--gpus <spec>` and `--device <cdi name>`, carried for the same reason the profiles are.
+        ///
+        /// They were DROPPED here, so the plan could not describe the box being planned: a box with
+        /// no GPU flag previewed the whole host inventory as though it were getting one, and
+        /// `--gpus device=0` previewed every card rather than the one it asked for. A preview that
+        /// does not depend on the request is not a preview of the request.
+        gpus: Option<String>,
+        /// See `gpus`.
+        device: Option<String>,
     },
     /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-- cmd...]`: run in a sandbox.
     BoxRun {
@@ -4079,6 +4088,8 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             name: name.unwrap_or_default().to_string(),
             profiles: profiles.clone(),
             config: config.clone(),
+            gpus: gpus.clone(),
+            device: device.clone(),
         }
     } else {
         Command::BoxRun {
@@ -5069,7 +5080,15 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             name,
             profiles,
             config,
-        } => commands::box_plan(&name, &profiles, config.as_deref()),
+            gpus,
+            device,
+        } => commands::box_plan(
+            &name,
+            &profiles,
+            config.as_deref(),
+            gpus.as_deref(),
+            device.as_deref(),
+        ),
         Command::BoxRun {
             name,
             rootfs,
@@ -6581,7 +6600,9 @@ mod tests {
             Command::BoxPlan {
                 name: "web".into(),
                 profiles: vec![],
-                config: None
+                config: None,
+                gpus: None,
+                device: None,
             }
         );
         // A `--plan` that carries profiles keeps them: the preview resolves the device grants, so
@@ -6598,7 +6619,9 @@ mod tests {
             Command::BoxPlan {
                 name: "web".into(),
                 profiles: vec!["vgpio:sensor".into()],
-                config: None
+                config: None,
+                gpus: None,
+                device: None,
             }
         );
         // `--config` reaches the preview. Without this the plan resolved profiles against a
@@ -6617,7 +6640,9 @@ mod tests {
             Command::BoxPlan {
                 name: "web".into(),
                 profiles: vec!["vcpu:slim".into()],
-                config: Some("/tmp/k.toml".into())
+                config: Some("/tmp/k.toml".into()),
+                gpus: None,
+                device: None,
             }
         );
         // `box <name>` with no rootfs/image still routes to BoxRun (box_run reports the missing

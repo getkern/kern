@@ -6363,7 +6363,13 @@ mod the_plan_previews_every_profile_kind {
         let path = toml.to_string_lossy().into_owned();
 
         for missing in ["vcpu:nope", "vgpio:nope", "vdisk:nope"] {
-            let r = crate::commands::start::box_plan("planrc", &[missing.to_string()], Some(&path));
+            let r = crate::commands::start::box_plan(
+                "planrc",
+                &[missing.to_string()],
+                Some(&path),
+                None,
+                None,
+            );
             assert!(
                 r.is_err(),
                 "`--plan` with {missing} must not exit 0: the launch carrying it would fail"
@@ -6376,6 +6382,8 @@ mod the_plan_previews_every_profile_kind {
             "planrc",
             &["vcpu:nope".to_string(), "vdisk:nope".to_string()],
             Some(&path),
+            None,
+            None,
         );
         match two {
             Err(crate::error::Error::Cli(m)) => assert!(
@@ -6386,12 +6394,18 @@ mod the_plan_previews_every_profile_kind {
         }
 
         assert!(
-            crate::commands::start::box_plan("planrc", &["vcpu:real".to_string()], Some(&path))
-                .is_ok(),
+            crate::commands::start::box_plan(
+                "planrc",
+                &["vcpu:real".to_string()],
+                Some(&path),
+                None,
+                None
+            )
+            .is_ok(),
             "a profile that resolves must leave the plan Ok"
         );
         assert!(
-            crate::commands::start::box_plan("planrc", &[], Some(&path)).is_ok(),
+            crate::commands::start::box_plan("planrc", &[], Some(&path), None, None).is_ok(),
             "a plan with no profiles at all must be Ok"
         );
         let _ = std::fs::remove_dir_all(&dir);
