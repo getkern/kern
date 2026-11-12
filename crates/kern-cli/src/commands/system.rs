@@ -337,10 +337,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         per-card directory names only the cards you did get. The host's
                         PCI bus stays readable, so how many cards it has is discoverable.
                         One request: if any card named is missing or unreachable the whole
-                        grant is refused, never granted in part. Several cards work and
-                        their TOPOLOGY does not report: NVML answers 999 to the topology
-                        and affinity queries because they read /sys/bus and a box has no
-                        sysfs, so a library that tunes collectives from it uses a default
+                        grant is refused, never granted in part. Compute works on every
+                        card granted and NCCL COLLECTIVES DO NOT: the first all-reduce
+                        crashes the process, with one card as well as two, so multi-GPU
+                        training through NCCL is not available in a box. The topology
+                        does not report either: NVML answers 999 because it reads /sys/bus
+                        and a box has no sysfs
     --device <ref>      ONE card, named as CDI names it: nvidia.com/gpu=0, or by UUID. An
                         alias over --gpus: the spec says which card the name means and the
                         mounts come from the driver's own layout. Several cards are asked
