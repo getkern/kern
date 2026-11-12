@@ -138,6 +138,8 @@ pub use real::id_range_available;
 pub use real::is_root_of_ranged_userns;
 pub use real::single_threaded;
 pub use real::with_id_mapped_userns;
+/// Which of the host's NVIDIA cards a box may see in the driver's own `/proc` enumeration.
+pub use real::GpuEnumeration;
 pub use real::Secret;
 /// Bring `lo` UP in the CURRENT net namespace. Exported for the egress pump, which joins a box's
 /// net ns from outside and must not assume the box's init has already got there. See `real`.

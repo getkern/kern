@@ -214,12 +214,9 @@ pub struct SandboxSpec {
     /// vGPIO sysfs directories (host `/sys/*` paths) to expose in the box's `/sys` (pwm/adc/1-wire/
     /// leds). Bound before pivot.
     pub vgpio_sysfs: Vec<String>,
-    /// `--gpus`/`--device`: the PCI addresses of the cards this box was granted, as
-    /// `/proc/driver/nvidia/gpus` spells them. EMPTY when no card was granted, and also when the
-    /// grant found no address for the cards it did hand over, which is the same instruction either
-    /// way: leave the driver's directory as the host writes it. See [`mask_other_gpus`], which is
-    /// the only reader.
-    pub gpu_pci_addresses: Vec<String>,
+    /// Which of the host's NVIDIA cards this box may see in the driver's own `/proc` enumeration.
+    /// See [`GpuEnumeration`] and [`mask_nvidia_enumeration`], its only reader.
+    pub gpu_enumeration: GpuEnumeration,
     /// vDisk profiles to mount at `/vdisk/<name>` in the box (from `vdisk:` profiles).
     pub vdisks: Vec<VdiskMount>,
     /// Secrets to expose as `/run/secrets/<name>` (mode 0400), from `--secret`. The bytes were read
@@ -931,6 +928,39 @@ fn null_over(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Which cards a box may see in the NVIDIA driver's own `/proc` enumeration.
+///
+/// THREE STATES, BECAUSE THERE ARE THREE. This used to be a `Vec<String>` of PCI addresses whose
+/// doc said an empty vector meant "no card was granted, and also ... the grant found no address
+/// for the cards it did hand over, which is the same instruction either way". It is not the same
+/// instruction, and collapsing them cost the whole point of the mask: `keep.is_empty()` was read as
+/// "nothing to mask" when the common case means "nothing to KEEP". MEASURED on 2026-11-11, a box
+/// started with no `--gpus` at all and not one device node:
+///
+/// ```text
+/// 0000:01:00.0   0000:06:00.0
+/// GPU UUID: GPU-1950be8a-...   Video BIOS: 98.06.39.40.fe
+/// GPU UUID: GPU-cc155b8b-...   Video BIOS: 98.06.39.40.b2
+/// ```
+///
+/// So every box on a GPU host, GPU or not, carried away a stable hardware fingerprint of the
+/// machine, and granting a card REDUCED what a box could read there. The enumeration is now the
+/// caller's statement of intent and the mask no longer has to guess which of the two it was handed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum GpuEnumeration {
+    /// No card was granted, so the box may see NONE. The driver's enumeration directories are
+    /// masked to an empty tmpfs: a box with no card of its own has nothing there to hide.
+    #[default]
+    NoneGranted,
+    /// Exactly these PCI addresses, as `/proc/driver/nvidia/gpus` spells them.
+    Only(Vec<String>),
+    /// A grant was made and at least one of its cards has no PCI address, so the set to keep cannot
+    /// be named. The directory is left as the host writes it, because masking on a guessed address
+    /// would hide a card the box WAS given, and that is the one outcome worse than showing it the
+    /// host's listing.
+    Unnameable,
+}
+
 /// Leave the box's `/proc/driver/nvidia/gpus` naming ONLY the card it was granted.
 ///
 /// WHAT THIS IS, AND WHAT IT IS NOT. The boundary is which `/dev/nvidia*` nodes the box got: CUDA
@@ -951,14 +981,11 @@ fn null_over(path: &str) -> Result<(), Error> {
 /// unmasked one, because the card it was actually given would be missing from the driver's own
 /// listing and nothing in the box asked for that. The masks in `mask_proc_paths` carry a boundary
 /// and fail closed; this one carries cosmetics and says so.
-fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
-    const GPUS: &str = "/proc/driver/nvidia/gpus";
-    // NOTHING TO KEEP IS NOT A MASK, it is the instruction to leave the directory alone. Mounting
-    // an empty tmpfs here would hide the box's own cards, which is the one outcome worse than
-    // showing it the host's.
-    if keep.is_empty() {
-        return Ok(());
-    }
+fn mask_proc_dir_keeping(dir: &str, keep: &[String]) -> Result<(), Error> {
+    // NOTHING TO KEEP IS A MASK THAT KEEPS NOTHING, and reading it as "leave the directory alone"
+    // is the defect this function shipped with: see [`GpuEnumeration`] for the measurement. The
+    // state where the keep-list cannot be NAMED is a different state and the caller carries it.
+    //
     // A PCI address is ONE path component. Anything else did not come from the directory listing
     // this mask is built from, and joining it would aim the mount at a path of someone else's
     // choosing. The check is cheap and it is the only place these names are trusted.
@@ -969,7 +996,7 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
             )));
         }
     }
-    let gpus_c = cstr(GPUS)?;
+    let dir_c = cstr(dir)?;
 
     // 1. PIN EVERY GRANTED DIRECTORY FIRST, all of them before the tmpfs covers any. `O_PATH`
     //    opens no file and reads nothing; it only holds the dentry so the binds below can still
@@ -986,7 +1013,7 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
         }
     };
     for name in keep {
-        let path = cstr(&format!("{GPUS}/{name}"))?;
+        let path = cstr(&format!("{dir}/{name}"))?;
         let fd = unsafe {
             libc::open(
                 path.as_ptr(),
@@ -994,7 +1021,7 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
             )
         };
         if fd < 0 {
-            let e = Error::last("open(granted gpu dir)");
+            let e = Error::last("open(kept enumeration dir)");
             close_all(&pinned);
             return Err(e);
         }
@@ -1012,20 +1039,20 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
     if unsafe {
         libc::mount(
             ty.as_ptr(),
-            gpus_c.as_ptr(),
+            dir_c.as_ptr(),
             ty.as_ptr(),
             (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
             opts.as_ptr().cast(),
         )
     } != 0
     {
-        let e = Error::last("mount(tmpfs over nvidia gpus)");
+        let e = Error::last("mount(tmpfs over driver enumeration dir)");
         close_all(&pinned);
         return Err(e);
     }
     // Undo the mask and give the box the host's directory back. Used for every failure below.
     let undo = || unsafe {
-        libc::umount2(gpus_c.as_ptr(), libc::MNT_DETACH);
+        libc::umount2(dir_c.as_ptr(), libc::MNT_DETACH);
     };
 
     // 3. and 4. One mountpoint per granted card, created inside the tmpfs while it is still
@@ -1035,7 +1062,7 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
     //    box that can see one of the two it was given. A partial listing is the shape a reader
     //    would trust and should not.
     for (name, fd) in &pinned {
-        let kept_c = match cstr(&format!("{GPUS}/{name}")) {
+        let kept_c = match cstr(&format!("{dir}/{name}")) {
             Ok(c) => c,
             Err(e) => {
                 undo();
@@ -1044,7 +1071,7 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
             }
         };
         if unsafe { libc::mkdir(kept_c.as_ptr(), 0o555) } != 0 {
-            let e = Error::last("mkdir(granted gpu dir)");
+            let e = Error::last("mkdir(kept enumeration dir)");
             undo();
             close_all(&pinned);
             return Err(e);
@@ -1067,7 +1094,7 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
             )
         } != 0
         {
-            let e = Error::last("mount(bind granted gpu dir)");
+            let e = Error::last("mount(bind kept enumeration dir)");
             undo();
             close_all(&pinned);
             return Err(e);
@@ -1082,7 +1109,7 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
     unsafe {
         libc::mount(
             ptr::null(),
-            gpus_c.as_ptr(),
+            dir_c.as_ptr(),
             ptr::null(),
             (libc::MS_REMOUNT
                 | libc::MS_RDONLY
@@ -1091,6 +1118,46 @@ fn mask_other_gpus(keep: &[String]) -> Result<(), Error> {
                 | libc::MS_NOEXEC) as libc::c_ulong,
             opts.as_ptr().cast(),
         );
+    }
+    Ok(())
+}
+
+/// Mask every enumeration surface the NVIDIA driver publishes under `/proc/driver` down to the
+/// cards this box was granted.
+///
+/// THREE DIRECTORIES, NOT ONE, and the first version of this masked only the first. Measured in a
+/// box granted exactly one card: `nvidia/gpus` named one card as intended, while
+/// `nvidia/capabilities` still listed `gpu0` and `gpu1` (the host's card COUNT and each card's
+/// driver index) and `nvidia-uvm/gpus` still named the OTHER card by GPU UUID, which is the
+/// identifier `SECURITY.md` says a box cannot read. One surface closed and two open is not a closed
+/// leak, and the reader of a page cannot tell the difference.
+///
+/// A DIRECTORY THAT IS NOT THERE IS NOT A FAILURE. A host with no `nvidia-uvm` module, or a driver
+/// too old to publish `capabilities`, has nothing to mask, and treating that as an error would make
+/// the whole mask fail open on the hosts that need the least of it.
+fn mask_nvidia_enumeration(what: &GpuEnumeration) -> Result<(), Error> {
+    let keep: &[String] = match what {
+        // The one state where masking would hide a card the box WAS given. Left whole on purpose,
+        // and the caller says so out loud.
+        GpuEnumeration::Unnameable => return Ok(()),
+        GpuEnumeration::NoneGranted => &[],
+        GpuEnumeration::Only(addresses) => addresses,
+    };
+
+    // `gpus` is keyed by PCI address, so the granted set is named there. The other two are keyed by
+    // UUID and by driver index, which this spec does not carry: they are masked to NOTHING, and the
+    // measurement that says a granted box does not need them is the PTX kernel in
+    // `pentest/pentest-gpu-grant.sh`, which still runs on a card with all three masked.
+    let dirs: [(&str, &[String]); 3] = [
+        ("/proc/driver/nvidia/gpus", keep),
+        ("/proc/driver/nvidia/capabilities", &[]),
+        ("/proc/driver/nvidia-uvm/gpus", &[]),
+    ];
+    for (dir, keep_here) in dirs {
+        if !std::path::Path::new(dir).exists() {
+            continue;
+        }
+        mask_proc_dir_keeping(dir, keep_here)?;
     }
     Ok(())
 }
@@ -1747,17 +1814,26 @@ fn child_setup_and_exec(
         // Skipped for a nesting box for the same reason the masks above are: `--privileged`
         // presents a fully visible `/proc`, and a locked submount here is exactly what makes the
         // kernel's `mount_too_revealing` check refuse the NESTED box's own `/proc`.
-        if !spec.gpu_pci_addresses.is_empty() {
-            if let Err(e) = mask_other_gpus(&spec.gpu_pci_addresses) {
-                // Cosmetic, so it does not fail the box, and SAID, so it is not a silent gap: the
-                // box is running with the driver's full card listing and the operator can see that
-                // on the same line as the reason.
-                eprintln!(
-                    "kern: the box's /proc/driver/nvidia/gpus still lists every card on this host \
-                     ({e}); the grant itself is unaffected, only cards with a device node can be \
-                     opened"
-                );
-            }
+        // UNCONDITIONAL, and the condition it used to carry was the defect: `is_empty()` meant
+        // "no card was granted" far more often than it meant "a grant resolved no address", and the
+        // common case was being read as "nothing to mask". The three states are now the caller's
+        // word (see `GpuEnumeration`), so this asks nothing and the mask decides nothing.
+        if let Err(e) = mask_nvidia_enumeration(&spec.gpu_enumeration) {
+            // Cosmetic, so it does not fail the box, and SAID, so it is not a silent gap: the box is
+            // running with the driver's full card listing and the operator can see that on the same
+            // line as the reason.
+            //
+            // `kern: warning:` IS THE WORDING THAT REACHES A READER. Every other best-effort line in
+            // this file carries that prefix, and both SDKs classify on exactly it: measured against
+            // the Python binding's own classifier, the old bare `kern: the box's ...` was filed as
+            // the CELL's stderr with `_looks_like_startup_failure` true, which puts a cosmetic note
+            // into a model's context as a failed start, while a sibling `kern: warning:` line lands
+            // in `runtime_notes` where it belongs.
+            eprintln!(
+                "kern: warning: the box's /proc/driver/nvidia enumeration still lists every card on \
+                 this host ({e}); the grant itself is unaffected, only cards with a device node can \
+                 be opened"
+            );
         }
     }
     t.mark("proc-mask");

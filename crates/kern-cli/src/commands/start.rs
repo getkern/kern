@@ -1077,7 +1077,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The address of the granted card, for the box's `/proc/driver/nvidia/gpus` mask. It is read
     // from the SAME grant that produced the mounts, so the directory the box keeps and the node it
     // was given are two views of one decision rather than two lookups that could disagree.
-    let mut gpu_pci_addresses: Vec<String> = Vec::new();
+    // NO GRANT IS A STATE, NOT AN ABSENCE OF ONE. A box that was handed no card may see no card in
+    // the driver's enumeration either, and the default below is what says so: the earlier spelling
+    // was an empty vector that the mask read as "leave the host's listing alone", so every box on
+    // this host, GPU or not, read both cards' UUID and video BIOS.
+    let mut gpu_enumeration = kern_isolation::GpuEnumeration::NoneGranted;
     if let Some(selection) = gpu_selection {
         let selected = selection?;
         let caller = crate::gpu_grant::Caller::current();
@@ -1154,7 +1158,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 }
             })?;
 
-        gpu_pci_addresses = crate::gpu_grant::pci_addresses_of(&grant, &selected);
+        gpu_enumeration = match crate::gpu_grant::pci_addresses_of(&grant, &selected) {
+            Some(addresses) => kern_isolation::GpuEnumeration::Only(addresses),
+            // A card the driver gave no PCI address for. Masking on a guess would hide a card this
+            // box was just given, so the directory stays whole and the state says which case it is.
+            None => kern_isolation::GpuEnumeration::Unnameable,
+        };
 
         for (source, target, read_only) in binds {
             volumes.push(kern_isolation::Volume {
@@ -1906,7 +1915,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         cpuset,
         vgpio_devs,
         vgpio_sysfs,
-        gpu_pci_addresses,
+        gpu_enumeration,
         vdisks,
         secrets,
         ssh,

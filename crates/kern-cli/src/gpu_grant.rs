@@ -1420,15 +1420,22 @@ fn cards_of<'g>(
 /// directory the box will not see; that is the honest failure, because masking on a guessed
 /// address would keep the wrong card's directory and hide a granted one.
 ///
-/// An empty result is the instruction not to mask at all: with nothing to keep, a mask would leave
-/// the box an empty directory where its own cards should be.
+/// `None` means the set CANNOT BE NAMED, which is not the same as naming nothing: masking to a
+/// partial list would hand the box one of the two cards it was given and hide the other, and masking
+/// to an empty list would hide both. The caller turns this into the third state the mask understands.
+///
+/// ALL OR NOTHING, and the earlier version was not: it `filter_map`ped away every card whose address
+/// did not resolve, so a two-card grant with one unreadable `information` file was masked down to the
+/// other card, silently, which is exactly the "partial listing a reader would trust and should not"
+/// that the mask's own doc refuses to produce.
 #[must_use]
-pub fn pci_addresses_of(grant: &GpuGrant, selection: &GpuSelection) -> Vec<String> {
-    cards_of(grant, selection)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|c| c.pci_address.clone())
-        .collect()
+pub fn pci_addresses_of(grant: &GpuGrant, selection: &GpuSelection) -> Option<Vec<String>> {
+    let cards = cards_of(grant, selection).ok()?;
+    let mut out = Vec::with_capacity(cards.len());
+    for card in cards {
+        out.push(card.pci_address.clone()?);
+    }
+    Some(out)
 }
 
 pub fn mount_plan(
@@ -2722,38 +2729,55 @@ mod tests {
         let these = |v: Vec<u32>| GpuSelection::These(v);
         assert_eq!(
             pci_addresses_of(&grant, &these(vec![0])),
-            vec!["0000:06:00.0"]
+            Some(vec!["0000:06:00.0".to_string()])
         );
         assert_eq!(
             pci_addresses_of(&grant, &these(vec![1])),
-            vec!["0000:01:00.0"]
+            Some(vec!["0000:01:00.0".to_string()])
         );
         // TWO CARDS KEEP TWO DIRECTORIES, in the order they were asked for. A mask that kept one
         // would leave a box holding two cards able to see only one of them in the driver's own
         // listing, which is a shape a reader would trust and should not.
         assert_eq!(
             pci_addresses_of(&grant, &these(vec![0, 1])),
-            vec!["0000:06:00.0", "0000:01:00.0"]
+            Some(vec!["0000:06:00.0".to_string(), "0000:01:00.0".to_string()])
         );
         assert_eq!(
             pci_addresses_of(&grant, &these(vec![1, 0])),
-            vec!["0000:01:00.0", "0000:06:00.0"]
+            Some(vec!["0000:01:00.0".to_string(), "0000:06:00.0".to_string()])
         );
         // `all` RESOLVES HERE AND NOWHERE ELSE, to every card the grant lists.
         assert_eq!(
             pci_addresses_of(&grant, &GpuSelection::All),
-            vec!["0000:06:00.0", "0000:01:00.0"]
+            Some(vec!["0000:06:00.0".to_string(), "0000:01:00.0".to_string()])
         );
-        // A card that is not on this host contributes no address, and neither does a card whose
-        // directory the driver never published. The caller cannot tell them apart and must not
-        // need to: both mean there is nothing to keep, and an empty list means no mask runs.
-        assert!(pci_addresses_of(&grant, &these(vec![2])).is_empty());
-        assert!(pci_addresses_of(&grant, &these(vec![u32::MAX])).is_empty());
-        // AND A SELECTION THAT CANNOT BE SATISFIED MASKS NOTHING, rather than masking the part of
-        // it that exists: `mount_plan` refuses the same selection, so a box never reaches the
-        // mask with it, and if one ever did it would see the host's directory instead of a
-        // listing missing the card it asked for.
-        assert!(pci_addresses_of(&grant, &these(vec![0, 9])).is_empty());
+        // `None` IS "CANNOT BE NAMED", AND IT IS NOT "NAMES NOTHING". The two used to be one empty
+        // vector, and the cost of collapsing them was the whole mask: the caller could not tell a
+        // box that was granted no card, which may see none, from a grant whose addresses did not
+        // resolve, which must see the host's listing rather than lose its own card. A selection
+        // `mount_plan` refuses never reaches the mask anyway; if one ever did, it is the second case.
+        assert_eq!(pci_addresses_of(&grant, &these(vec![2])), None);
+        assert_eq!(pci_addresses_of(&grant, &these(vec![u32::MAX])), None);
+        assert_eq!(pci_addresses_of(&grant, &these(vec![0, 9])), None);
+
+        // AND A CARD THE DRIVER PUBLISHED NO ADDRESS FOR TAKES THE WHOLE ANSWER WITH IT, rather
+        // than contributing nothing to a list the caller then trusts. The earlier version
+        // `filter_map`ped it away, so a two-card grant with one unreadable `information` file was
+        // masked down to the other card: a box holding two cards, shown one, with nothing in it
+        // able to tell that from a card that failed later.
+        let mut partial = two_card_grant(plain(0, 0, 0o666));
+        partial.cards[1].pci_address = None;
+        assert_eq!(
+            pci_addresses_of(&partial, &these(vec![0])),
+            Some(vec!["0000:06:00.0".to_string()]),
+            "the card that DOES have an address is still named when it is the only one asked for"
+        );
+        assert_eq!(
+            pci_addresses_of(&partial, &these(vec![0, 1])),
+            None,
+            "but a selection containing the nameless card cannot be masked at all"
+        );
+        assert_eq!(pci_addresses_of(&partial, &GpuSelection::All), None);
     }
 
     fn two_card_grant(card0: NodeFacts) -> GpuGrant {
