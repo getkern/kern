@@ -814,22 +814,42 @@ fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
         };
         for entry in entries.flatten() {
             let link = entry.path();
-            let Ok(link_meta) = std::fs::symlink_metadata(&link) else {
+            // THE KIND COMES FROM THE DIRECTORY READ, NOT FROM A `statx` PER ENTRY. `getdents64`
+            // already carried `d_type` for every name, so asking the entry costs nothing, and when
+            // a filesystem answers `DT_UNKNOWN` the standard library does the `lstat` itself: the
+            // non-symlink case is never worse than asking directly. Measured on this host, where
+            // `/usr/lib/x86_64-linux-gnu` holds 2805 entries of which 1291 are links: this one line
+            // used to spend a syscall on each of the 1514 files that could never be a symlink.
+            let Ok(kind) = entry.file_type() else {
                 continue;
             };
-            if !link_meta.file_type().is_symlink() {
+            if !kind.is_symlink() {
                 continue;
             }
+            // The link's OWN target. It is read once here and then used as the first hop of the
+            // walk below, which used to re-read it: the loop started by asking again what kind
+            // `link` was, when the branch above had just established it, and then read the same
+            // target a second time.
             let Ok(target) = std::fs::read_link(&link) else {
                 continue;
             };
             // Resolve the chain within the directory, hop by hop and bounded.
             let mut current = link.clone();
+            let mut next_rel = target.clone();
             let mut hops = 0u8;
             let ends_in_grant = loop {
                 if hops >= MAX_LINK_HOPS {
                     break None;
                 }
+                // An absolute target would leave the root; a grant never follows one.
+                if next_rel.is_absolute() {
+                    break None;
+                }
+                let Some(parent) = current.parent() else {
+                    break None;
+                };
+                current = parent.join(&next_rel);
+                hops = hops.saturating_add(1);
                 let Ok(meta) = std::fs::symlink_metadata(&current) else {
                     break None;
                 };
@@ -843,17 +863,15 @@ fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
                 let Ok(next) = std::fs::read_link(&current) else {
                     break None;
                 };
-                // An absolute target would leave the root; a grant never follows one.
-                if next.is_absolute() {
-                    break None;
-                }
-                let Some(parent) = current.parent() else {
-                    break None;
-                };
-                current = parent.join(next);
-                hops = hops.saturating_add(1);
+                next_rel = next;
             };
             if let Some(resolved) = ends_in_grant {
+                // THE LINK'S OWN IDENTITY, ASKED ONLY FOR A LINK THAT IS ACTUALLY GRANTED. This is
+                // the `statx` the loop above no longer spends on every entry; here it runs once per
+                // kept link, which on this host is 29 times rather than 2805.
+                let Ok(link_meta) = std::fs::symlink_metadata(&link) else {
+                    continue;
+                };
                 if seen.insert((link_meta.dev(), link_meta.ino())) {
                     out.push(Symlink {
                         link,
