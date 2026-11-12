@@ -1300,12 +1300,20 @@ pub fn uid_dependent_nodes(
     grant: &GpuGrant,
     selection: &GpuSelection,
     who: &Caller,
+    box_uid: u32,
 ) -> Vec<PathBuf> {
-    // A uid that cannot be an account: `(uid_t)-1` is reserved by `setuid` as "no change" and
-    // `65534` is a real `nobody`, so neither would be a safe probe. No groups at all, because a
-    // default box carries none.
+    // THE UID THE BOX WILL ACTUALLY CARRY, not a uid chosen to be unreachable. The first version of
+    // this probed with `u32::MAX - 1`, a uid no account can name, and that models the wrong thing:
+    // on the ranged map a box started `--user N` runs as `subuid_base + N - 1`, which IS an account
+    // an operator can write an ACL for. A node carrying `user:<that subuid>:rw` beside
+    // `user:<caller>:rw` would have been reported as lost while the box reaches it perfectly well,
+    // so the warning would fire on a box that works. Probing INSIDE the range the box draws from is
+    // the only thing that answers the question that was asked.
+    //
+    // No groups, because a box on the ranged map carries none: the clear in
+    // `drop_caps_around_identity` succeeds there, which is measured in this module's axiom 1.
     let holds_nothing = Caller {
-        uid: u32::MAX - 1,
+        uid: box_uid,
         gids: Vec::new(),
     };
     let Ok(cards) = cards_of(grant, selection) else {
@@ -3954,6 +3962,9 @@ mod tests {
     fn a_node_reached_only_by_uid_is_named_for_a_box_that_changes_identity() {
         let who = caller(1000, &[1000, 44]);
         let selection = GpuSelection::These(vec![0]);
+        // The uid a box started `--user 1` carries on the ranged map: `subuid_base + N - 1`.
+        // Measured on this host, `--user nobody` (65534) runs as 165533 with a base of 100000.
+        const BOX_UID: u32 = 100_000;
 
         // THE OWNER CASE: `0o600` owned by the caller. They open it; a subordinate uid does not.
         let owned = two_card_grant(plain(1000, 1000, 0o600));
@@ -3962,7 +3973,7 @@ mod tests {
             AccessPath::Owner
         );
         assert_eq!(
-            uid_dependent_nodes(&owned, &selection, &who),
+            uid_dependent_nodes(&owned, &selection, &who, BOX_UID),
             vec![PathBuf::from("/dev/nvidia0")],
             "a node the caller owns and nobody else can open must be named"
         );
@@ -3984,17 +3995,44 @@ mod tests {
             AccessPath::AclUser
         );
         assert_eq!(
-            uid_dependent_nodes(&acl, &selection, &who),
+            uid_dependent_nodes(&acl, &selection, &who, BOX_UID),
             vec![PathBuf::from("/dev/nvidia0")],
             "a node reached through an ACL_USER entry for the caller must be named"
         );
 
-        // POSITIVE CONTROL, and the one that matters: this host's actual shape. `0o666` is reached
-        // by `other`, so NOTHING is uid-dependent and no warning may fire. Without this the
-        // function could be one that always answers "everything" and both cases above would pass.
+        // AN ACL THAT NAMES THE BOX'S OWN SUBORDINATE UID IS NOT LOST, and this is the case the
+        // first version of this function got wrong. It probed with `u32::MAX - 1`, a uid no account
+        // can name, so a node an operator had deliberately opened to the box's subuid was reported
+        // as unreachable and the box was warned about hardware it reaches perfectly well. The
+        // subuid IS an account: on the ranged map in-box uid N lands on `subuid_base + N - 1`.
+        let for_the_box = two_card_grant(acl_node(
+            0,
+            44,
+            WANT_RW,
+            0,
+            0,
+            &[(1000, WANT_RW), (BOX_UID, WANT_RW)],
+            &[],
+            Some(WANT_RW),
+        ));
+        assert!(
+            uid_dependent_nodes(&for_the_box, &selection, &who, BOX_UID).is_empty(),
+            "a node whose ACL names the box's own uid must not be reported as lost"
+        );
+        // POSITIVE CONTROL on that case: the SAME node is lost to a DIFFERENT subuid, so the pass
+        // above is the entry matching and not the function having stopped answering.
+        assert_eq!(
+            uid_dependent_nodes(&for_the_box, &selection, &who, BOX_UID + 1),
+            vec![PathBuf::from("/dev/nvidia0")],
+            "another subuid has no entry here and must still be reported"
+        );
+
+        // POSITIVE CONTROL, and the one that matters: this host's actual shape for `/dev/nvidia*`.
+        // `0o666` is reached by `other`, so NOTHING is uid-dependent and no warning may fire.
+        // Without this the function could be one that always answers "everything".
         let open = two_card_grant(plain(0, 0, 0o666));
         assert!(
-            uid_dependent_nodes(&open, &selection, &who).is_empty(),
+            uid_dependent_nodes(&open, &selection, &who, BOX_UID).is_empty(),
             "a world-accessible grant must name nothing, or every box would be warned"
         );
 
@@ -4007,7 +4045,7 @@ mod tests {
             AccessPath::Unreachable
         );
         assert!(
-            uid_dependent_nodes(&dead, &selection, &who).is_empty(),
+            uid_dependent_nodes(&dead, &selection, &who, BOX_UID).is_empty(),
             "a node nobody reaches is not a uid-dependence finding"
         );
 
@@ -4015,12 +4053,12 @@ mod tests {
         // names nothing even when card 0 is uid-dependent: a warning about a card nobody asked for
         // is a warning the operator cannot act on.
         assert!(
-            uid_dependent_nodes(&owned, &GpuSelection::These(vec![1]), &who).is_empty(),
+            uid_dependent_nodes(&owned, &GpuSelection::These(vec![1]), &who, BOX_UID).is_empty(),
             "the answer must follow the selection and not the whole grant"
         );
         // And asking for BOTH names the one that is.
         assert_eq!(
-            uid_dependent_nodes(&owned, &GpuSelection::These(vec![0, 1]), &who),
+            uid_dependent_nodes(&owned, &GpuSelection::These(vec![0, 1]), &who, BOX_UID),
             vec![PathBuf::from("/dev/nvidia0")]
         );
     }

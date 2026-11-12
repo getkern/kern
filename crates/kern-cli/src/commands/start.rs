@@ -1169,11 +1169,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // was an empty vector that the mask read as "leave the host's listing alone", so every box on
     // this host, GPU or not, read both cards' UUID and video BIOS.
     let mut gpu_enumeration = kern_isolation::GpuEnumeration::NoneGranted;
-    // THE NODES A BOX LOSES BY NOT BEING THE CALLER, collected here because this is where the grant
-    // exists and reported further down because that is where `run_as` exists. The grant is resolved
-    // before the image config, so the box's identity is not yet known at this point; carrying the
-    // list is what lets both facts meet without reordering the two resolutions.
-    let mut gpu_uid_dependent: Vec<std::path::PathBuf> = Vec::new();
+    // THE GRANT, CARRIED TO WHERE THE BOX'S IDENTITY IS KNOWN. It is resolved before the image
+    // config, so `run_as` does not exist yet at this point, and the question "which nodes does this
+    // box lose by not being the caller" cannot be answered without it.
+    //
+    // THE LIST USED TO BE COMPUTED HERE and that was the defect: it probed with a uid no account can
+    // name, while a box started `--user N` runs as `subuid_base + N - 1`, which is an account an
+    // operator can write an ACL for. Carrying the GRANT instead of a precomputed answer is what
+    // lets the probe use the uid the box will really carry.
+    let mut gpu_for_identity: Option<(crate::gpu_grant::GpuGrant, crate::gpu_grant::GpuSelection)> =
+        None;
     if let Some(selection) = gpu_selection {
         let selected = selection?;
         let caller = crate::gpu_grant::Caller::current();
@@ -1201,8 +1206,6 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // same error and a reader could not compare the two.
             .map_err(|e| Error::Cli(crate::gpu_grant::describe_mount_plan_error(&e)))?;
 
-        gpu_uid_dependent = crate::gpu_grant::uid_dependent_nodes(&grant, &selected, &caller);
-
         gpu_enumeration = match crate::gpu_grant::pci_addresses_of(&grant, &selected) {
             Some(addresses) => kern_isolation::GpuEnumeration::Only(addresses),
             // A card the driver gave no PCI address for. Masking on a guess would hide a card this
@@ -1217,6 +1220,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 read_only,
             });
         }
+        // MOVED, not cloned: nothing below this point reads the grant, and it carries 29 libraries
+        // and 29 symlinks.
+        gpu_for_identity = Some((grant, selected));
     }
     // `--mount`'s mounts, resolved from their FIELDS. They never pass through a `src:dst` string, so
     // a source containing a `:` (or, quoted, a `,`) arrives whole - which is the difference between
@@ -1836,29 +1842,64 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // would break that shape to describe a rare one. The operator gets the node names, the cause
     // and the one flag that avoids it; the box still starts. `kern: warning:` is the prefix both
     // SDKs file as a runtime note rather than a failed start.
-    if non_root_user && !gpu_uid_dependent.is_empty() {
-        let names: Vec<String> = gpu_uid_dependent
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        // NAME WHAT FAILS, NOT WHAT MIGHT. The first wording said "CUDA may fail inside with no
-        // device", and on this host that is false: the compute nodes are `0666` and only the DRM
-        // nodes are uid-gated, so `cuInit` works and a Vulkan or display workload does not.
-        // Measured both ways with `--gpus device=0`: a default box opens all three nodes read-write,
-        // and the same box `--user nobody` is refused on exactly the two named here and opens
-        // `/dev/nvidia0`. A warning that overstates its own consequence teaches a reader to skip
-        // the next one.
-        eprintln!(
-            "kern: warning: this box runs as a non-root user, so {} of the granted GPU node(s) \
-             will NOT open inside it: {}. They are reachable only by your uid (their owner, or an \
-             ACL entry naming you) and a box running as a subordinate uid is neither. Compute on \
-             the card still works if its /dev/nvidia* nodes are world-accessible; anything needing \
-             a refused node (display, Vulkan, video encode) fails there. Run without --user, or \
-             without the image's own USER, to keep your uid, or give those nodes an `other` bit on \
-             the host.",
-            gpu_uid_dependent.len(),
-            names.join(", ")
-        );
+    // THE GRANT MEETS THE BOX IDENTITY, which this function resolves at opposite ends of itself.
+    // A node reached only by the caller's uid (`Owner`, or an `ACL_USER` entry for them) is NOT
+    // reached by a box running as a subordinate uid, so the mount succeeds and the workload meets
+    // `CUDA_ERROR_NO_DEVICE` with nothing from kern to explain it.
+    //
+    // THE PROBE USES THE UID THE BOX WILL CARRY. On the ranged map, in-box uid N lands on
+    // `subuid_base + N - 1`: measured, `--user nobody` (65534) runs as host uid 165533 with a base
+    // of 100000. Probing with a uid no account can name instead would report a node carrying an ACL
+    // for that subuid as lost, warning about a box that works.
+    //
+    // NO RANGE MEANS NO WARNING. A non-zero `--user` is not mappable on the single-uid map, and
+    // kern promotes such a box to the ranged map; on a host with no `/etc/subuid` row at all the
+    // identity itself cannot be assumed, so the box fails for a different reason and a note about
+    // device nodes would be noise.
+    if let (true, Some((grant, selection)), Some((in_box_uid, _))) =
+        (non_root_user, &gpu_for_identity, run_as)
+    {
+        let caller = crate::gpu_grant::Caller::current();
+        let name = kern_isolation::username(caller.uid);
+        let base = kern_isolation::sub_range("/etc/subuid", name.as_deref(), caller.uid)
+            .map(|(start, _)| start);
+        // `checked_add` rather than a bare sum: the row is operator-written and a base near
+        // `u32::MAX` would otherwise wrap into a uid that means something else.
+        let box_host_uid = match base {
+            Some(start) if in_box_uid >= 1 => start.checked_add(in_box_uid - 1),
+            // In-box uid 0 is the caller's own uid on both maps, so there is nothing to lose.
+            Some(_) => Some(caller.uid),
+            None => None,
+        };
+        if let Some(box_host_uid) = box_host_uid {
+            let lost =
+                crate::gpu_grant::uid_dependent_nodes(grant, selection, &caller, box_host_uid);
+            if !lost.is_empty() {
+                let names: Vec<String> = lost
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                // NAME WHAT FAILS, NOT WHAT MIGHT. The first wording said "CUDA may fail inside
+                // with no device", and on this host that is false: the compute nodes are `0666` and
+                // only the DRM nodes are uid-gated, so `cuInit` works and a Vulkan or display
+                // workload does not. Measured both ways with `--gpus device=0`: a default box opens
+                // all three nodes read-write, and the same box `--user nobody` is refused on
+                // exactly the two named here. A warning that overstates its own consequence teaches
+                // a reader to skip the next one.
+                eprintln!(
+                    "kern: warning: this box runs as a non-root user (host uid {box_host_uid}), so \
+                     {} of the granted GPU node(s) will NOT open inside it: {}. They are reachable \
+                     only by your uid (their owner, or an ACL entry naming you) and the box's \
+                     subordinate uid is neither. Compute on the card still works if its \
+                     /dev/nvidia* nodes are world-accessible; anything needing a refused node \
+                     (display, Vulkan, video encode) fails there. Run without --user, or without \
+                     the image's own USER, to keep your uid, or give those nodes an `other` bit on \
+                     the host.",
+                    lost.len(),
+                    names.join(", ")
+                );
+            }
+        }
     }
 
     let declared_user = image_config
