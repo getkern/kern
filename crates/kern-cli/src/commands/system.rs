@@ -333,6 +333,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         version and bound read-only; the cards you did not name are absent.
                         `all` is refused by name: this build grants one card, and a flag
                         that takes a word should not do something narrower than the word
+    --device <ref>      The same card, named as CDI names it: nvidia.com/gpu=0, or by UUID.
+                        An alias over --gpus: the spec says which card the name means and
+                        the mounts come from the driver's own layout. Pass one, not both
     --init              Run a built-in reaping init as PID 1 (no zombies; forwards SIGTERM)
     --pids-limit <N>    Cap the box's process count (pids.max), fork-bomb containment
     --io-weight <N>     cgroup-v2 io.weight, relative I/O priority (1-10000; best-effort)

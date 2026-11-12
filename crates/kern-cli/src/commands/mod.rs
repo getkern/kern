@@ -315,6 +315,8 @@ pub struct BoxRunArgs<'a> {
     /// `--gpus <spec>`: one NVIDIA card, resolved from native discovery. See
     /// `cli::Command::BoxRun::gpus` for why `all` is not accepted at this phase.
     pub gpus: Option<&'a str>,
+    /// `--device <vendor/class=name>`: the CDI spelling of the same request.
+    pub device: Option<&'a str>,
     /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
     pub init: bool,
     /// `--pids-limit N`: cap the box's task count (`pids.max`) - fork-bomb containment.

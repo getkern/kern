@@ -983,8 +983,49 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // EVERY REFUSAL NAMES ITS CAUSE AND STOPS. A box that was asked for a GPU and started without
     // one is the "runs and lies" outcome: the workload meets `CUDA_ERROR_NO_DEVICE` at its first
     // call and has no way to learn that the flag it passed did nothing.
-    if let Some(spec) = args.gpus {
-        let card = crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| match e {
+    // `--device` is the CDI spelling of `--gpus`, resolved to the same index through the spec and
+    // then built from discovery. The plan's rule is that CDI is an ALIAS: the spec says which card
+    // a name means, and the mounts come from the discovery a test proves equivalent to it.
+    let gpu_selection: Option<Result<u32, Error>> = match (args.gpus, args.device) {
+        (Some(_), Some(_)) => Some(Err(Error::Cli(
+            "--gpus and --device name the same thing two ways: pass one".to_string(),
+        ))),
+        (None, Some(reference)) => Some(
+            crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference).map_err(|e| {
+                use crate::cdi::DeviceRefError as D;
+                Error::Cli(match e {
+                    D::NotQualified { given } => {
+                        format!("--device {given}: not a CDI name. Use --device nvidia.com/gpu=0")
+                    }
+                    D::NoSuchKind { kind, found } => format!(
+                        "--device: no CDI spec on this host offers {kind}. Found: {}",
+                        if found.is_empty() {
+                            "none".to_string()
+                        } else {
+                            found.join(", ")
+                        }
+                    ),
+                    D::NoSuchDevice { name, offered } => format!(
+                        "--device: the spec offers no device {name:?}. It offers: {}",
+                        offered.join(", ")
+                    ),
+                    D::AllNotYet => "--device ...=all is not accepted yet: this build grants \
+                         exactly one card, so name it"
+                        .to_string(),
+                    D::UnknownUuid { uuid } => format!(
+                        "--device: the spec names {uuid} and this host's driver reports no card \
+                         with that UUID"
+                    ),
+                    D::Unreadable { path, why } => format!(
+                        "--device: {} could not be read: {}",
+                        path.display(),
+                        why.describe()
+                    ),
+                })
+            }),
+        ),
+        (Some(spec), None) => Some(crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| {
+            match e {
             crate::gpu_grant::GpuSpecError::Empty => {
                 Error::Cli("--gpus needs a card index, for example --gpus 0".to_string())
             }
@@ -996,8 +1037,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             crate::gpu_grant::GpuSpecError::NotAnIndex { given } => Error::Cli(format!(
                 "--gpus {given}: not a card index. Use --gpus 0, --gpus device=0 or --gpus gpu=0"
             )),
-        })?;
+        }
+        })),
+        (None, None) => None,
+    };
 
+    if let Some(selection) = gpu_selection {
+        let card = selection?;
         let caller = crate::gpu_grant::Caller::current();
         let grant = crate::gpu_grant::resolve().map_err(|e| match e {
             crate::gpu_grant::ResolveError::NoDriverVersionFile { .. } => Error::Cli(

@@ -175,6 +175,11 @@ pub enum Command {
         hostname: Option<String>,
         /// `--tun`: expose `/dev/net/tun` in the box (WireGuard / userspace VPN).
         tun: bool,
+        /// `--device <vendor/class=name>`: the same card, named the way CDI names it.
+        ///
+        /// An ALIAS over `--gpus`, which is the plan's rule: the spec says which card a name
+        /// means, the mounts come from discovery, and a test proves the two name the same nodes.
+        device: Option<String>,
         /// `--gpus <spec>`: hand the box one NVIDIA GPU, resolved from native discovery.
         ///
         /// S2 of the GPU plan grants exactly ONE card, so the accepted forms name one: `0`, `1`,
@@ -3019,6 +3024,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut ssh_key: Option<String> = None;
     let mut hostname: Option<String> = None;
     let mut gpus: Option<String> = None;
+    let mut device: Option<String> = None;
     let mut tun = false;
     let mut init = false;
     let mut pids_limit: Option<u64> = None;
@@ -3167,6 +3173,15 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     match rest.get(i) {
                         Some(v) => gpus = Some((*v).to_string()),
                         None => return Err(Error::Usage("--gpus <index|device=N>")),
+                    }
+                }
+                // `--device vendor/class=name`: the CDI spelling of the same request. Kept
+                // verbatim and resolved where the spec is read, so the parser stays a parser.
+                "--device" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => device = Some((*v).to_string()),
+                        None => return Err(Error::Usage("--device <vendor/class=name>")),
                     }
                 }
                 "--init" => init = true,
@@ -4122,6 +4137,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             hostname,
             tun,
             gpus,
+            device,
             init,
             pids_limit,
             tmpfs,
@@ -4214,6 +4230,7 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--pod",
     "--hostname",
     "--gpus",
+    "--device",
     "--egress-allow",
     // `--landlock-rw` is deliberately NOT here: it is the one confinement that needs no mount
     // namespace, so it is the one `box` flag that `run` can honour for real. See `parse_run`.
@@ -5104,6 +5121,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             hostname,
             tun,
             gpus,
+            device,
             init,
             pids_limit,
             tmpfs,
@@ -5182,6 +5200,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             hostname: hostname.as_deref(),
             tun,
             gpus: gpus.as_deref(),
+            device: device.as_deref(),
             init,
             pids_limit,
             tmpfs: &tmpfs,

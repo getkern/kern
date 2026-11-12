@@ -237,6 +237,7 @@ mod completions;
 // The compose-file parser now lives in its own CLI-free crate (so it can be fuzzed in isolation).
 // Aliased so the existing `crate::compose::` call sites (orchestration in `commands/`) stay unchanged.
 use kern_compose as compose;
+mod cdi;
 mod config;
 mod dockerfile;
 mod dockerignore;
