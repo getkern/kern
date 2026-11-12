@@ -366,21 +366,53 @@ pub struct Symlink {
     pub resolved: PathBuf,
 }
 
+/// One card's nodes: its `/dev/nvidiaN` and the DRM nodes of the same physical device.
+///
+/// A STRUCT RATHER THAN A FLAT LIST, because the card a node belongs to used to be DERIVED from
+/// its file name in two places, and a DRM node's name does not carry the card's index at all. On
+/// this host `nvidia0`'s display node is `card1`: any rule that read the index out of the name
+/// would pair them wrongly and no single-GPU test could see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardNodes {
+    /// The `/dev/nvidiaN` index, which is the number `--gpus` names.
+    pub index: u32,
+    /// Every node of this card, with the facts the group policy turns on.
+    pub nodes: Vec<(PathBuf, NodeFacts)>,
+}
+
 /// Everything a box would need for a GPU, computed from one root and one caller.
+///
+/// THE GROUP POLICY IS NOT A FIELD. It is a function of the nodes that will actually be MOUNTED,
+/// and a grant for card 0 must not refuse because card 1's display node is group-gated. Storing it
+/// would be a derived condition kept in a second place, which is this project's recurring defect;
+/// `group_policy` is called with the selection instead, by `--plan` over everything and by
+/// `mount_plan` over the card it is building.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuGrant {
     /// The driver version the library set was computed from.
     pub driver_version: String,
-    /// The device nodes, in a stable order.
-    pub nodes: Vec<PathBuf>,
+    /// The nodes every card shares, with their facts.
+    pub shared: Vec<(PathBuf, NodeFacts)>,
+    /// The cards, by index, each with its own nodes.
+    pub cards: Vec<CardNodes>,
     /// The libraries, deduplicated by identity and filtered to one ELF class.
     pub libraries: Vec<Library>,
     /// The links that have to exist beside them, computed from the same directories.
     pub symlinks: Vec<Symlink>,
     /// The directories the loader has to search, derived from where the libraries actually are.
     pub ldconfig_dirs: Vec<PathBuf>,
-    /// The one group decision, computed once.
-    pub group_policy: GroupPolicy,
+}
+
+impl GpuGrant {
+    /// Every node in the grant, shared first then per card, for the surfaces that describe the
+    /// whole host rather than one selection.
+    pub fn all_nodes(&self) -> Vec<(PathBuf, NodeFacts)> {
+        let mut out = self.shared.clone();
+        for card in &self.cards {
+            out.extend(card.nodes.iter().cloned());
+        }
+        out
+    }
 }
 
 /// Why a grant could not be computed. Every variant names a fact, so a message can be built from it
@@ -405,16 +437,15 @@ pub enum ResolveError {
     },
 }
 
-/// The device nodes an NVIDIA grant needs, relative to the root, in the order a grant lists them.
+/// The nodes every card shares, relative to the root, in the order a grant lists them.
 ///
-/// `nvidiactl` and the per-card nodes are not interchangeable and the measurement says so: without
-/// `nvidiactl` the driver answers `100 CUDA_ERROR_NO_DEVICE`, and without `nvidia-uvm` it answers
-/// `999 CUDA_ERROR_UNKNOWN`. Both are in the set because a grant that omits either produces a
-/// working mount and a broken workload.
-fn candidate_nodes(root: &Path) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = Vec::new();
+/// `nvidiactl` and `nvidia-uvm` are not optional and the measurement says so: without `nvidiactl`
+/// the driver answers `100 CUDA_ERROR_NO_DEVICE`, without `nvidia-uvm` it answers
+/// `999 CUDA_ERROR_UNKNOWN`. A grant that omits either produces a working mount and a broken
+/// workload.
+fn shared_node_paths(root: &Path) -> Vec<PathBuf> {
     let dev = root.join("dev");
-
+    let mut found = Vec::new();
     for fixed in [
         "nvidiactl",
         "nvidia-uvm",
@@ -426,25 +457,95 @@ fn candidate_nodes(root: &Path) -> Vec<PathBuf> {
             found.push(p);
         }
     }
+    found
+}
 
-    // The per-card nodes are `nvidia0`, `nvidia1`, ... and the set is whatever the driver created,
-    // so it is read from the directory rather than assumed to be contiguous from zero.
-    let mut cards: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dev) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
+/// The `Device Minor` a card's own `information` file reports, which IS its `/dev/nvidiaN` number.
+///
+/// Established from NVIDIA's own source rather than inferred, and the citation lives in this repo
+/// already (see `gpu::mig_instances_for_card`): `nv-procfs.c` prints the field from `nvl->minor_num`
+/// and `nv.c` returns the same value from `nv_get_dev_minor()`. Reading it is the difference between
+/// knowing which card a PCI address is and guessing from the order a directory happens to list.
+fn device_minor_of(information: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(information).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("Device Minor:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The DRM nodes that belong to the same physical card as `/dev/nvidiaN`, resolved through the PCI
+/// address and never through the index.
+///
+/// 🚨 THE INDEX IS NOT A SOURCE, and this host proves it: `nvidia0` is PCI `0000:01:00.0`, whose DRM
+/// nodes are **`card1`** and `renderD128`, while `nvidia1` is `0000:06:00.0` with **`card0`** and
+/// `renderD129`. The two numberings are INVERTED here. A grant that paired `nvidia0` with `card0`
+/// would hand the box the other card's display node, silently, and every test on a single-GPU host
+/// would pass.
+///
+/// The chain is: `proc/driver/nvidia/gpus/<bdf>/information` gives the minor, the directory name
+/// gives the PCI address, and `sys/bus/pci/devices/<bdf>/drm/` lists the nodes. Only `card*` and
+/// `renderD*` are taken; `controlD*` is a legacy node no current driver uses.
+fn drm_nodes_for(root: &Path, minor: u32) -> Vec<PathBuf> {
+    let gpus = root.join("proc/driver/nvidia/gpus");
+    let Ok(entries) = std::fs::read_dir(&gpus) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        if device_minor_of(&entry.path().join("information")) != Some(minor) {
+            continue;
+        }
+        let bdf = entry.file_name();
+        let drm_dir = root.join("sys/bus/pci/devices").join(&bdf).join("drm");
+        let Ok(nodes) = std::fs::read_dir(&drm_dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = Vec::new();
+        for node in nodes.flatten() {
+            let name = node.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(rest) = name.strip_prefix("nvidia") else {
-                continue;
-            };
-            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-                cards.push(entry.path());
+            if name.starts_with("card") || name.starts_with("renderD") {
+                let path = root.join("dev/dri").join(name);
+                if path.exists() {
+                    out.push(path);
+                }
             }
         }
+        out.sort();
+        return out;
     }
-    cards.sort();
-    found.extend(cards);
-    found
+    Vec::new()
+}
+
+/// The per-card nodes: `/dev/nvidiaN` plus the DRM nodes of the same physical card.
+///
+/// The set of cards is read from the directory rather than assumed contiguous from zero, because a
+/// driver may leave a gap and a grant that counted upwards would miss the card that is there.
+fn card_node_paths(root: &Path) -> Vec<(u32, Vec<PathBuf>)> {
+    let dev = root.join("dev");
+    let mut cards: Vec<(u32, Vec<PathBuf>)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dev) else {
+        return cards;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("nvidia") else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(index) = rest.parse::<u32>() else {
+            continue;
+        };
+        let mut nodes = vec![entry.path()];
+        nodes.extend(drm_nodes_for(root, index));
+        cards.push((index, nodes));
+    }
+    cards.sort_by_key(|(i, _)| *i);
+    cards
 }
 
 /// The driver version, read from the first `N.N.N` token on the file's first line.
@@ -926,15 +1027,19 @@ pub fn group_policy(nodes: &[(PathBuf, NodeFacts)], who: &Caller) -> GroupPolicy
 }
 
 /// Resolve a grant from the real root.
-pub fn resolve(who: &Caller) -> Result<GpuGrant, ResolveError> {
-    resolve_under(Path::new("/"), who, ElfClass::native())
+///
+/// NO CALLER PARAMETER, and its absence is the design rather than an omission: the grant describes
+/// what the HOST has, and who may reach it is a question about a SELECTION. `mount_plan` asks it
+/// over the nodes it is about to bind, which is the only set the answer can be right about.
+pub fn resolve() -> Result<GpuGrant, ResolveError> {
+    resolve_under(Path::new("/"), ElfClass::native())
 }
 
 /// [`resolve`] with the root and the target class as parameters, so a test can build a tree.
 ///
 /// Nothing below reads a path the caller did not derive from `root`, which is the property that
 /// makes the whole module testable without hardware and the one a sabotage test removes first.
-pub fn resolve_under(root: &Path, who: &Caller, want: ElfClass) -> Result<GpuGrant, ResolveError> {
+pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveError> {
     let version_path = root.join(DRIVER_VERSION_REL);
     let Ok(contents) = std::fs::read_to_string(&version_path) else {
         return Err(ResolveError::NoDriverVersionFile {
@@ -949,18 +1054,33 @@ pub fn resolve_under(root: &Path, who: &Caller, want: ElfClass) -> Result<GpuGra
         });
     };
 
-    let node_paths = candidate_nodes(root);
-    if node_paths.is_empty() {
+    let shared_paths = shared_node_paths(root);
+    let card_paths = card_node_paths(root);
+    if shared_paths.is_empty() && card_paths.is_empty() {
         return Err(ResolveError::NoNodes { driver_version });
     }
 
-    let mut with_facts: Vec<(PathBuf, NodeFacts)> = Vec::with_capacity(node_paths.len());
-    for path in &node_paths {
-        if let Some(facts) = node_facts(path) {
-            with_facts.push((path.clone(), facts));
+    // Facts are read ONCE, here, and travel with the node. Reading them again where the policy is
+    // applied would be the same filesystem asked twice about the same thing, with a window between
+    // the two answers.
+    let facts_of = |paths: &[PathBuf]| -> Vec<(PathBuf, NodeFacts)> {
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            if let Some(facts) = node_facts(path) {
+                out.push((path.clone(), facts));
+            }
         }
-    }
-    let policy = group_policy(&with_facts, who);
+        out
+    };
+
+    let shared = facts_of(&shared_paths);
+    let cards: Vec<CardNodes> = card_paths
+        .into_iter()
+        .map(|(index, paths)| CardNodes {
+            index,
+            nodes: facts_of(&paths),
+        })
+        .collect();
 
     let libraries = libraries_under(root, &driver_version, want);
     let symlinks = symlinks_for(root, &libraries);
@@ -980,11 +1100,11 @@ pub fn resolve_under(root: &Path, who: &Caller, want: ElfClass) -> Result<GpuGra
 
     Ok(GpuGrant {
         driver_version,
-        nodes: node_paths,
+        shared,
+        cards,
         libraries,
         symlinks,
         ldconfig_dirs: dirs,
-        group_policy: policy,
     })
 }
 
@@ -1062,16 +1182,6 @@ pub enum MountPlanError {
 /// spelling of a thing that exists.
 pub type Bind = (String, String, bool);
 
-/// The card index a `/dev/nvidiaN` path names, if it names one.
-fn card_index_of(path: &Path) -> Option<u32> {
-    let name = path.file_name()?.to_str()?;
-    let rest = name.strip_prefix("nvidia")?;
-    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    rest.parse::<u32>().ok()
-}
-
 /// Turn a grant into the binds that give a box exactly ONE card.
 ///
 /// THE SHARED NODES COME TOO, and leaving one out is not a smaller grant but a broken one. S0
@@ -1088,43 +1198,32 @@ fn card_index_of(path: &Path) -> Option<u32> {
 /// THE SYMLINKS BECOME BINDS OF THEIR RESOLVED FILE, placed at the link's own path. The box gets
 /// `libcuda.so.1` as a real file rather than as a link, which loads identically and needs no
 /// writable directory inside the box: `dlopen("libcuda.so.1")` is a name lookup, not a link walk.
-pub fn mount_plan(grant: &GpuGrant, card: u32) -> Result<Vec<Bind>, MountPlanError> {
-    match &grant.group_policy {
-        GroupPolicy::Unreachable { nodes } => {
-            return Err(MountPlanError::Unreachable {
-                nodes: nodes.clone(),
-            })
-        }
+pub fn mount_plan(grant: &GpuGrant, card: u32, who: &Caller) -> Result<Vec<Bind>, MountPlanError> {
+    let Some(wanted) = grant.cards.iter().find(|c| c.index == card) else {
+        return Err(MountPlanError::NoSuchCard {
+            wanted: card,
+            present: grant.cards.iter().map(|c| c.index).collect(),
+        });
+    };
+
+    // The selection, and the policy over EXACTLY it: the shared nodes plus this card's, never the
+    // other cards'. A grant for card 0 refusing because card 1's display node is group-gated would
+    // be answering a question nobody asked.
+    let mut selected: Vec<(PathBuf, NodeFacts)> = grant.shared.clone();
+    selected.extend(wanted.nodes.iter().cloned());
+
+    match group_policy(&selected, who) {
+        GroupPolicy::Unreachable { nodes } => return Err(MountPlanError::Unreachable { nodes }),
         GroupPolicy::Needed { gids, nodes } => {
-            return Err(MountPlanError::GroupsNeeded {
-                gids: gids.clone(),
-                nodes: nodes.clone(),
-            })
+            return Err(MountPlanError::GroupsNeeded { gids, nodes })
         }
         GroupPolicy::NotNeeded => {}
     }
 
-    let present: Vec<u32> = grant
-        .nodes
-        .iter()
-        .filter_map(|p| card_index_of(p))
-        .collect();
-    if !present.contains(&card) {
-        return Err(MountPlanError::NoSuchCard {
-            wanted: card,
-            present,
-        });
-    }
-
     let mut binds: Vec<Bind> =
-        Vec::with_capacity(grant.nodes.len() + grant.libraries.len() + grant.symlinks.len());
+        Vec::with_capacity(selected.len() + grant.libraries.len() + grant.symlinks.len());
 
-    for node in &grant.nodes {
-        match card_index_of(node) {
-            // A per-card node that is not the one asked for stays out.
-            Some(index) if index != card => continue,
-            _ => {}
-        }
+    for (node, _) in &selected {
         let path = node.to_string_lossy().to_string();
         binds.push((path.clone(), path, false));
     }
@@ -1164,10 +1263,21 @@ pub enum Detail {
 pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
     let mut out = String::new();
     out.push_str(&format!("driver {}\n", grant.driver_version));
-    out.push_str(&format!("nodes {}\n", grant.nodes.len()));
+    let every = grant.all_nodes();
+    out.push_str(&format!(
+        "nodes {} ({} shared, {} card(s))\n",
+        every.len(),
+        grant.shared.len(),
+        grant.cards.len()
+    ));
     if detail == Detail::Full {
-        for node in &grant.nodes {
-            out.push_str(&format!("  node {}\n", node.display()));
+        for (node, _) in &grant.shared {
+            out.push_str(&format!("  shared {}\n", node.display()));
+        }
+        for card in &grant.cards {
+            for (node, _) in &card.nodes {
+                out.push_str(&format!("  card {} {}\n", card.index, node.display()));
+            }
         }
     }
     out.push_str(&format!("libraries {}\n", grant.libraries.len()));
@@ -1192,7 +1302,9 @@ pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
             out.push_str(&format!("  dir {}\n", dir.display()));
         }
     }
-    match &grant.group_policy {
+    // The policy is a FUNCTION of a selection, not a field: `--plan` describes the host, so it
+    // asks over every node, while `mount_plan` asks over the one card it is building.
+    match &group_policy(&every, &Caller::current()) {
         GroupPolicy::NotNeeded => {
             out.push_str("groups not needed: every node is reached by uid or by other\n");
         }
@@ -1546,8 +1658,7 @@ mod tests {
     fn a_root_without_a_driver_file_is_named_as_such() {
         let dir = std::env::temp_dir().join(format!("kern-gpu-grant-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let who = caller(1000, &[1000]);
-        match resolve_under(&dir, &who, ElfClass::Bits64) {
+        match resolve_under(&dir, ElfClass::Bits64) {
             Err(ResolveError::NoDriverVersionFile { looked_for }) => {
                 assert!(looked_for.ends_with(DRIVER_VERSION_REL));
             }
@@ -1573,12 +1684,11 @@ mod tests {
         let wrote_node = std::fs::write(dev_dir.join("nvidiactl"), b"");
         assert!(wrote_version.is_ok() && wrote_node.is_ok());
 
-        let who = caller(1000, &[1000]);
-        let grant = resolve_under(&dir, &who, ElfClass::Bits64);
+        let grant = resolve_under(&dir, ElfClass::Bits64);
         match grant {
             Ok(g) => {
                 assert_eq!(g.driver_version, "1.2.3");
-                assert!(g.nodes.iter().any(|n| n.ends_with("nvidiactl")));
+                assert!(g.shared.iter().any(|(n, _)| n.ends_with("nvidiactl")));
                 // No library on this synthetic root carries the `.so.1.2.3` suffix.
                 assert!(g.libraries.is_empty());
                 assert!(g.ldconfig_dirs.is_empty());
@@ -1601,8 +1711,7 @@ mod tests {
             "NVRM version: NVIDIA UNIX Kernel Module  7.8.9  Build\n",
         );
         assert!(wrote.is_ok());
-        let who = caller(1000, &[1000]);
-        match resolve_under(&dir, &who, ElfClass::Bits64) {
+        match resolve_under(&dir, ElfClass::Bits64) {
             Err(ResolveError::NoNodes { driver_version }) => {
                 assert_eq!(driver_version, "7.8.9");
             }
@@ -1627,14 +1736,13 @@ mod tests {
         for name in ["nvidia0", "nvidia3", "nvidiactl", "nvidia-uvm", "nvidiafoo"] {
             let _ = std::fs::write(dev_dir.join(name), b"");
         }
-        let who = caller(1000, &[1000]);
-        let Ok(grant) = resolve_under(&dir, &who, ElfClass::Bits64) else {
+        let Ok(grant) = resolve_under(&dir, ElfClass::Bits64) else {
             panic!("expected a grant");
         };
         let names: Vec<String> = grant
-            .nodes
+            .all_nodes()
             .iter()
-            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .filter_map(|(p, _)| p.file_name().map(|n| n.to_string_lossy().to_string()))
             .collect();
         assert!(names.contains(&"nvidia0".to_string()));
         assert!(names.contains(&"nvidia3".to_string()));
@@ -1746,8 +1854,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root.join("lib"));
         let _ = std::os::unix::fs::symlink("usr/lib", root.join("lib"));
 
-        let who = caller(1000, &[1000]);
-        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let got = resolve_under(&root, ElfClass::Bits64);
         let _ = std::fs::remove_dir_all(&root);
         let Ok(grant) = got else {
             panic!("expected a grant");
@@ -1793,8 +1900,7 @@ mod tests {
             "libchain.so.1",
         );
 
-        let who = caller(1000, &[1000]);
-        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let got = resolve_under(&root, ElfClass::Bits64);
         let _ = std::fs::remove_dir_all(&root);
         let Ok(grant) = got else {
             panic!("expected a grant");
@@ -1840,8 +1946,7 @@ mod tests {
             "libin.so.3.3.3",
         );
 
-        let who = caller(1000, &[1000]);
-        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let got = resolve_under(&root, ElfClass::Bits64);
         let _ = std::fs::remove_dir_all(&root);
         let Ok(grant) = got else {
             panic!("expected a grant");
@@ -1872,8 +1977,7 @@ mod tests {
         let target = root.join("usr/lib/x86_64-linux-gnu/libabs.so.2.2.2");
         let _ = std::os::unix::fs::symlink(&target, &full);
 
-        let who = caller(1000, &[1000]);
-        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let got = resolve_under(&root, ElfClass::Bits64);
         let _ = std::fs::remove_dir_all(&root);
         let Ok(grant) = got else {
             panic!("expected a grant");
@@ -1907,8 +2011,7 @@ mod tests {
             "libok.so.1.1.1",
         );
 
-        let who = caller(1000, &[1000]);
-        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let got = resolve_under(&root, ElfClass::Bits64);
         let _ = std::fs::remove_dir_all(&root);
         let Ok(grant) = got else {
             panic!("expected a grant");
@@ -1950,8 +2053,7 @@ mod tests {
                 ),
             ],
         );
-        let who = caller(1000, &[1000]);
-        let Ok(grant) = resolve_under(&root, &who, ElfClass::Bits64) else {
+        let Ok(grant) = resolve_under(&root, ElfClass::Bits64) else {
             let _ = std::fs::remove_dir_all(&root);
             panic!("expected a grant from the synthetic root");
         };
@@ -1990,10 +2092,9 @@ mod tests {
                 ),
             ],
         );
-        let who = caller(1000, &[1000]);
 
-        let sixty_four = resolve_under(&root, &who, ElfClass::Bits64);
-        let thirty_two = resolve_under(&root, &who, ElfClass::Bits32);
+        let sixty_four = resolve_under(&root, ElfClass::Bits64);
+        let thirty_two = resolve_under(&root, ElfClass::Bits32);
         let _ = std::fs::remove_dir_all(&root);
 
         let Ok(sixty_four) = sixty_four else {
@@ -2033,8 +2134,7 @@ mod tests {
             dir.join("libtrap.so.7.7.7"),
             b"this is not an ELF file at all",
         );
-        let who = caller(1000, &[1000]);
-        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let got = resolve_under(&root, ElfClass::Bits64);
         let _ = std::fs::remove_dir_all(&root);
         let Ok(grant) = got else {
             panic!("expected a grant");
@@ -2068,8 +2168,7 @@ mod tests {
                 ),
             ],
         );
-        let who = caller(1000, &[1000]);
-        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let got = resolve_under(&root, ElfClass::Bits64);
         let _ = std::fs::remove_dir_all(&root);
         let Ok(grant) = got else {
             panic!("expected a grant");
@@ -2084,6 +2183,117 @@ mod tests {
             vec!["libexact.so.1.2.3".to_string()],
             "got {names:?}"
         );
+    }
+
+    /// THE DRM NODES ARE PAIRED BY PCI ADDRESS, AND THE NUMBERINGS CAN BE INVERTED.
+    ///
+    /// Measured on this host: `nvidia0` is PCI `0000:01:00.0` whose display node is **`card1`**,
+    /// and `nvidia1` is `0000:06:00.0` with **`card0`**. A grant that paired `nvidiaN` with `cardN`
+    /// would hand the box the other card's node, silently, and no single-GPU host could tell. The
+    /// synthetic root reproduces exactly that inversion, so the test fails the moment the pairing
+    /// goes back to the index.
+    #[test]
+    fn the_drm_nodes_are_paired_through_pci_and_survive_an_inverted_numbering() {
+        let root = std::env::temp_dir().join(format!("kern-gpu-drm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::create_dir_all(root.join("proc/driver/nvidia"));
+        let _ = std::fs::create_dir_all(root.join("dev/dri"));
+        let _ = std::fs::write(
+            root.join("proc/driver/nvidia/version"),
+            "NVRM version: NVIDIA UNIX Kernel Module  1.2.3  Build\n",
+        );
+        for name in ["nvidiactl", "nvidia-uvm", "nvidia0", "nvidia1"] {
+            let _ = std::fs::write(root.join("dev").join(name), b"");
+        }
+        // `controlD*` EXISTS in /dev here on purpose: without it the filter would be excluded by
+        // the existence check rather than by the name, and a sabotage that added `controlD` to the
+        // filter left every test green. The node has to be present for the name rule to be the
+        // thing under test.
+        for name in [
+            "card0",
+            "card1",
+            "renderD128",
+            "renderD129",
+            "controlD64",
+            "controlD65",
+        ] {
+            let _ = std::fs::write(root.join("dev/dri").join(name), b"");
+        }
+        // THE INVERSION: minor 0 lives at 01:00.0 and owns card1; minor 1 at 06:00.0 owns card0.
+        for (bdf, minor, drm) in [
+            ("0000:01:00.0", 0u32, ["card1", "renderD128", "controlD65"]),
+            ("0000:06:00.0", 1u32, ["card0", "renderD129", "controlD64"]),
+        ] {
+            let gpu_dir = root.join("proc/driver/nvidia/gpus").join(bdf);
+            let _ = std::fs::create_dir_all(&gpu_dir);
+            let _ = std::fs::write(
+                gpu_dir.join("information"),
+                format!("Model: \t synthetic\nDevice Minor: \t {minor}\n"),
+            );
+            let drm_dir = root.join("sys/bus/pci/devices").join(bdf).join("drm");
+            let _ = std::fs::create_dir_all(&drm_dir);
+            for node in drm {
+                let _ = std::fs::write(drm_dir.join(node), b"");
+            }
+        }
+
+        let got = resolve_under(&root, ElfClass::Bits64);
+        let _ = std::fs::remove_dir_all(&root);
+        let Ok(grant) = got else {
+            panic!("expected a grant from the synthetic root");
+        };
+
+        let named = |index: u32| -> Vec<String> {
+            grant
+                .cards
+                .iter()
+                .find(|c| c.index == index)
+                .map(|c| {
+                    let mut v: Vec<String> = c
+                        .nodes
+                        .iter()
+                        .filter_map(|(p, _)| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                        .collect();
+                    v.sort();
+                    v
+                })
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            named(0),
+            vec![
+                "card1".to_string(),
+                "nvidia0".to_string(),
+                "renderD128".to_string()
+            ],
+            "card 0 must carry card1, not card0"
+        );
+        assert_eq!(
+            named(1),
+            vec![
+                "card0".to_string(),
+                "nvidia1".to_string(),
+                "renderD129".to_string()
+            ],
+            "card 1 must carry card0, not card1"
+        );
+        // `controlD*` is a legacy node no current driver uses and must not be swept in.
+        for index in [0u32, 1] {
+            assert!(
+                !named(index).iter().any(|n| n.starts_with("controlD")),
+                "controlD must not join the grant: {:?}",
+                named(index)
+            );
+        }
+        // The shared nodes stay shared and do not land on a card.
+        let shared: Vec<String> = grant
+            .shared
+            .iter()
+            .filter_map(|(p, _)| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(shared.contains(&"nvidiactl".to_string()), "{shared:?}");
+        assert!(shared.contains(&"nvidia-uvm".to_string()), "{shared:?}");
     }
 
     /// `--gpus` over its whole input space, including the forms a reader arrives with from other
@@ -2115,15 +2325,26 @@ mod tests {
         }
     }
 
-    /// A grant with two cards, used by the mount-plan tests.
-    fn two_card_grant(policy: GroupPolicy) -> GpuGrant {
+    /// A grant with two cards, used by the mount-plan tests. The nodes carry the FACTS the policy
+    /// turns on, so a test produces a refusal by building a gated node rather than by handing the
+    /// grant a verdict: there is one policy function and the tests go through it like everything
+    /// else does.
+    fn two_card_grant(card0: NodeFacts) -> GpuGrant {
         GpuGrant {
             driver_version: "580.173.02".to_string(),
-            nodes: vec![
-                PathBuf::from("/dev/nvidiactl"),
-                PathBuf::from("/dev/nvidia-uvm"),
-                PathBuf::from("/dev/nvidia0"),
-                PathBuf::from("/dev/nvidia1"),
+            shared: vec![
+                (PathBuf::from("/dev/nvidiactl"), plain(0, 0, 0o666)),
+                (PathBuf::from("/dev/nvidia-uvm"), plain(0, 0, 0o666)),
+            ],
+            cards: vec![
+                CardNodes {
+                    index: 0,
+                    nodes: vec![(PathBuf::from("/dev/nvidia0"), card0)],
+                },
+                CardNodes {
+                    index: 1,
+                    nodes: vec![(PathBuf::from("/dev/nvidia1"), plain(0, 0, 0o666))],
+                },
             ],
             libraries: vec![Library {
                 path: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
@@ -2136,7 +2357,6 @@ mod tests {
                 resolved: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
             }],
             ldconfig_dirs: vec![PathBuf::from("/usr/lib/x86_64-linux-gnu")],
-            group_policy: policy,
         }
     }
 
@@ -2145,8 +2365,8 @@ mod tests {
     /// without `nvidia-uvm` answers `999`.
     #[test]
     fn the_mount_plan_takes_one_card_and_every_shared_node() {
-        let grant = two_card_grant(GroupPolicy::NotNeeded);
-        let Ok(binds) = mount_plan(&grant, 0) else {
+        let grant = two_card_grant(plain(0, 0, 0o666));
+        let Ok(binds) = mount_plan(&grant, 0, &caller(1000, &[1000])) else {
             panic!("expected a plan for card 0");
         };
         let targets: Vec<&str> = binds.iter().map(|(_, t, _)| t.as_str()).collect();
@@ -2159,7 +2379,7 @@ mod tests {
         );
 
         // And the other way round, so the filter is not accidentally keeping the first card.
-        let Ok(binds) = mount_plan(&grant, 1) else {
+        let Ok(binds) = mount_plan(&grant, 1, &caller(1000, &[1000])) else {
             panic!("expected a plan for card 1");
         };
         let targets: Vec<&str> = binds.iter().map(|(_, t, _)| t.as_str()).collect();
@@ -2171,8 +2391,8 @@ mod tests {
     /// break the driver's own ioctls; a writable host library is a write into the host.
     #[test]
     fn libraries_are_read_only_and_nodes_are_not() {
-        let grant = two_card_grant(GroupPolicy::NotNeeded);
-        let Ok(binds) = mount_plan(&grant, 0) else {
+        let grant = two_card_grant(plain(0, 0, 0o666));
+        let Ok(binds) = mount_plan(&grant, 0, &caller(1000, &[1000])) else {
             panic!("expected a plan");
         };
         for (source, target, read_only) in &binds {
@@ -2188,8 +2408,8 @@ mod tests {
     /// needs no writable directory and `dlopen` finds the SONAME as a real file.
     #[test]
     fn a_link_is_mounted_as_its_resolved_file_at_the_links_path() {
-        let grant = two_card_grant(GroupPolicy::NotNeeded);
-        let Ok(binds) = mount_plan(&grant, 0) else {
+        let grant = two_card_grant(plain(0, 0, 0o666));
+        let Ok(binds) = mount_plan(&grant, 0, &caller(1000, &[1000])) else {
             panic!("expected a plan");
         };
         let found = binds.iter().find(|(_, t, _)| t.ends_with("libcuda.so.1"));
@@ -2204,8 +2424,8 @@ mod tests {
     /// A card this host has not got is refused, and the refusal lists the ones it has.
     #[test]
     fn a_card_that_does_not_exist_is_refused_with_the_ones_that_do() {
-        let grant = two_card_grant(GroupPolicy::NotNeeded);
-        match mount_plan(&grant, 7) {
+        let grant = two_card_grant(plain(0, 0, 0o666));
+        match mount_plan(&grant, 7, &caller(1000, &[1000])) {
             Err(MountPlanError::NoSuchCard { wanted, present }) => {
                 assert_eq!(wanted, 7);
                 assert_eq!(present, vec![0, 1]);
@@ -2217,13 +2437,15 @@ mod tests {
     /// THE GROUP POLICY STOPS THE MOUNT, which is the whole point of computing it in S1. A grant
     /// whose nodes need a group the box cannot carry must not be mounted and hoped for: the
     /// workload would meet the error with no way to learn that the flag did nothing.
+    ///
+    /// The refusal is produced by building a GATED NODE, not by handing the grant a verdict. There
+    /// is one policy function and the tests reach it the way the launch does.
     #[test]
     fn a_grant_needing_groups_is_refused_before_anything_is_mounted() {
-        let grant = two_card_grant(GroupPolicy::Needed {
-            gids: vec![44],
-            nodes: vec![PathBuf::from("/dev/nvidia0")],
-        });
-        match mount_plan(&grant, 0) {
+        let who = caller(1000, &[1000, 44]);
+        // `root:video 0660`, no ACL: the server shape, where the only way in is the group.
+        let grant = two_card_grant(plain(0, 44, 0o660));
+        match mount_plan(&grant, 0, &who) {
             Err(MountPlanError::GroupsNeeded { gids, nodes }) => {
                 assert_eq!(gids, vec![44]);
                 assert_eq!(nodes, vec![PathBuf::from("/dev/nvidia0")]);
@@ -2231,14 +2453,33 @@ mod tests {
             other => panic!("expected GroupsNeeded, got {other:?}"),
         }
 
-        let grant = two_card_grant(GroupPolicy::Unreachable {
-            nodes: vec![PathBuf::from("/dev/nvidia0")],
-        });
-        match mount_plan(&grant, 0) {
+        // And a node the caller cannot open at all, with or without groups.
+        let grant = two_card_grant(plain(0, 0, 0o600));
+        match mount_plan(&grant, 0, &who) {
             Err(MountPlanError::Unreachable { nodes }) => {
                 assert_eq!(nodes, vec![PathBuf::from("/dev/nvidia0")]);
             }
             other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    /// A GATED NODE ON ANOTHER CARD MUST NOT REFUSE THIS ONE. The policy is a function of the
+    /// selection, and a grant for card 0 that looked at card 1's nodes would answer a question
+    /// nobody asked. This is the reason the verdict is not a field on the grant.
+    #[test]
+    fn another_cards_gated_node_does_not_refuse_the_one_being_granted() {
+        let who = caller(1000, &[1000, 44]);
+        let mut grant = two_card_grant(plain(0, 0, 0o666));
+        // Card 1 gets a node reachable only through a group; card 0 stays world-readable.
+        grant.cards[1].nodes = vec![(PathBuf::from("/dev/nvidia1"), plain(0, 44, 0o660))];
+
+        assert!(
+            mount_plan(&grant, 0, &who).is_ok(),
+            "card 0 must be grantable while card 1 is gated"
+        );
+        match mount_plan(&grant, 1, &who) {
+            Err(MountPlanError::GroupsNeeded { gids, .. }) => assert_eq!(gids, vec![44]),
+            other => panic!("card 1 should be refused, got {other:?}"),
         }
     }
 
@@ -2247,7 +2488,11 @@ mod tests {
     fn the_plan_prints_the_group_decision_in_each_of_its_three_shapes() {
         let base = GpuGrant {
             driver_version: "580.173.02".to_string(),
-            nodes: vec![PathBuf::from("/dev/nvidia0")],
+            shared: vec![(PathBuf::from("/dev/nvidiactl"), plain(0, 0, 0o666))],
+            cards: vec![CardNodes {
+                index: 0,
+                nodes: vec![(PathBuf::from("/dev/nvidia0"), plain(0, 0, 0o666))],
+            }],
             libraries: vec![Library {
                 path: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
                 dev: 1,
@@ -2259,30 +2504,35 @@ mod tests {
                 resolved: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
             }],
             ldconfig_dirs: vec![PathBuf::from("/usr/lib/x86_64-linux-gnu")],
-            group_policy: GroupPolicy::NotNeeded,
         };
         let text = render_plan(&base, Detail::Full);
         assert!(text.contains("driver 580.173.02"));
         assert!(text.contains("groups not needed"));
 
-        let needed = GpuGrant {
-            group_policy: GroupPolicy::Needed {
-                gids: vec![44],
-                nodes: vec![PathBuf::from("/dev/dri/card0")],
-            },
+        // The three group shapes are produced the way the launch produces them: by the FACTS of
+        // the nodes, through the one policy function.
+        let gated = GpuGrant {
+            cards: vec![CardNodes {
+                index: 0,
+                nodes: vec![(PathBuf::from("/dev/dri/card0"), plain(0, 44, 0o660))],
+            }],
             ..base.clone()
         };
-        let text = render_plan(&needed, Detail::Full);
-        assert!(text.contains("groups needed: 44"));
+        let text = render_plan(&gated, Detail::Full);
+        assert!(
+            text.contains("groups needed:"),
+            "a gated node must be reported: {text}"
+        );
         assert!(
             text.contains("all or nothing"),
             "the plan must not imply that only the named gid would be kept"
         );
 
         let refused = GpuGrant {
-            group_policy: GroupPolicy::Unreachable {
-                nodes: vec![PathBuf::from("/dev/locked")],
-            },
+            cards: vec![CardNodes {
+                index: 0,
+                nodes: vec![(PathBuf::from("/dev/locked"), plain(0, 0, 0o600))],
+            }],
             ..base
         };
         let text = render_plan(&refused, Detail::Full);

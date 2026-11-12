@@ -43,7 +43,7 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
     // The two faults that ARE worth naming do get named: a driver whose version line cannot be
     // parsed, and a driver that is loaded while its device nodes are missing. Both are states a
     // reader can act on, and both are invisible without being said.
-    match crate::gpu_grant::resolve(&crate::gpu_grant::Caller::current()) {
+    match crate::gpu_grant::resolve() {
         Ok(grant) => {
             println!("  gpu grant (preview, nothing is mounted by --plan):");
             for line in
@@ -999,7 +999,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         })?;
 
         let caller = crate::gpu_grant::Caller::current();
-        let grant = crate::gpu_grant::resolve(&caller).map_err(|e| match e {
+        let grant = crate::gpu_grant::resolve().map_err(|e| match e {
             crate::gpu_grant::ResolveError::NoDriverVersionFile { .. } => Error::Cli(
                 "--gpus was passed and no NVIDIA driver is loaded on this host: \
                  /proc/driver/nvidia/version does not exist"
@@ -1017,7 +1017,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             )),
         })?;
 
-        let binds = crate::gpu_grant::mount_plan(&grant, card).map_err(|e| match e {
+        let binds = crate::gpu_grant::mount_plan(&grant, card, &caller).map_err(|e| match e {
             crate::gpu_grant::MountPlanError::NoSuchCard { wanted, present } => {
                 let list: Vec<String> = present.iter().map(|c| c.to_string()).collect();
                 let names = if list.is_empty() {
