@@ -376,6 +376,14 @@ pub struct Symlink {
 pub struct CardNodes {
     /// The `/dev/nvidiaN` index, which is the number `--gpus` names.
     pub index: u32,
+    /// The card's PCI address, exactly as `/proc/driver/nvidia/gpus` spells it, when the driver's
+    /// own directory names one. It is read in the SAME walk that paired this card with its DRM
+    /// nodes, so the two cannot disagree.
+    ///
+    /// `None` on a host whose driver exposes no `gpus` directory, and in a synthetic root that
+    /// builds only `/dev`. A caller that needs the address must handle its absence rather than
+    /// assume a shape the filesystem did not provide.
+    pub pci_address: Option<String>,
     /// Every node of this card, with the facts the group policy turns on.
     pub nodes: Vec<(PathBuf, NodeFacts)>,
 }
@@ -487,19 +495,27 @@ fn device_minor_of(information: &Path) -> Option<u32> {
 /// The chain is: `proc/driver/nvidia/gpus/<bdf>/information` gives the minor, the directory name
 /// gives the PCI address, and `sys/bus/pci/devices/<bdf>/drm/` lists the nodes. Only `card*` and
 /// `renderD*` are taken; `controlD*` is a legacy node no current driver uses.
-fn drm_nodes_for(root: &Path, minor: u32) -> Vec<PathBuf> {
+/// THE ADDRESS COMES BACK WITH THE NODES, from the SAME walk. It is also what masks the other
+/// cards out of the box's `/proc/driver/nvidia/gpus`, and reading it a second time elsewhere would
+/// be the same derived condition computed in two places that this file already warns about: a
+/// second walk could pair a card with one address here and another there, and the mask would hide
+/// the card that was granted.
+fn drm_nodes_for(root: &Path, minor: u32) -> (Option<String>, Vec<PathBuf>) {
     let gpus = root.join("proc/driver/nvidia/gpus");
     let Ok(entries) = std::fs::read_dir(&gpus) else {
-        return Vec::new();
+        return (None, Vec::new());
     };
     for entry in entries.flatten() {
         if device_minor_of(&entry.path().join("information")) != Some(minor) {
             continue;
         }
         let bdf = entry.file_name();
+        // A directory name that is not UTF-8 is not a PCI address, and the mask would have nothing
+        // to name. The nodes are still resolved: the two answers are independent.
+        let address = bdf.to_str().map(str::to_string);
         let drm_dir = root.join("sys/bus/pci/devices").join(&bdf).join("drm");
         let Ok(nodes) = std::fs::read_dir(&drm_dir) else {
-            return Vec::new();
+            return (address, Vec::new());
         };
         let mut out: Vec<PathBuf> = Vec::new();
         for node in nodes.flatten() {
@@ -513,18 +529,18 @@ fn drm_nodes_for(root: &Path, minor: u32) -> Vec<PathBuf> {
             }
         }
         out.sort();
-        return out;
+        return (address, out);
     }
-    Vec::new()
+    (None, Vec::new())
 }
 
 /// The per-card nodes: `/dev/nvidiaN` plus the DRM nodes of the same physical card.
 ///
 /// The set of cards is read from the directory rather than assumed contiguous from zero, because a
 /// driver may leave a gap and a grant that counted upwards would miss the card that is there.
-fn card_node_paths(root: &Path) -> Vec<(u32, Vec<PathBuf>)> {
+fn card_node_paths(root: &Path) -> Vec<(u32, Option<String>, Vec<PathBuf>)> {
     let dev = root.join("dev");
-    let mut cards: Vec<(u32, Vec<PathBuf>)> = Vec::new();
+    let mut cards: Vec<(u32, Option<String>, Vec<PathBuf>)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dev) else {
         return cards;
     };
@@ -541,10 +557,11 @@ fn card_node_paths(root: &Path) -> Vec<(u32, Vec<PathBuf>)> {
             continue;
         };
         let mut nodes = vec![entry.path()];
-        nodes.extend(drm_nodes_for(root, index));
-        cards.push((index, nodes));
+        let (address, drm) = drm_nodes_for(root, index);
+        nodes.extend(drm);
+        cards.push((index, address, nodes));
     }
-    cards.sort_by_key(|(i, _)| *i);
+    cards.sort_by_key(|(i, _, _)| *i);
     cards
 }
 
@@ -1094,8 +1111,9 @@ pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveErr
     let shared = facts_of(&shared_paths);
     let cards: Vec<CardNodes> = card_paths
         .into_iter()
-        .map(|(index, paths)| CardNodes {
+        .map(|(index, pci_address, paths)| CardNodes {
             index,
+            pci_address,
             nodes: facts_of(&paths),
         })
         .collect();
@@ -1216,6 +1234,22 @@ pub type Bind = (String, String, bool);
 /// THE SYMLINKS BECOME BINDS OF THEIR RESOLVED FILE, placed at the link's own path. The box gets
 /// `libcuda.so.1` as a real file rather than as a link, which loads identically and needs no
 /// writable directory inside the box: `dlopen("libcuda.so.1")` is a name lookup, not a link walk.
+/// The PCI address of the card a grant is about to hand over, for the box's `/proc` mask.
+///
+/// It answers `None` for a card that exists with no address and for a card that does not exist,
+/// and the caller treats both the same way: WITHOUT AN ADDRESS THERE IS NOTHING TO KEEP, so the
+/// mask does not run and the box sees the driver's directory as the host writes it. Masking on a
+/// guess would be worse than not masking: the one directory kept would be the wrong card's, and the
+/// granted card would be the one that vanished.
+#[must_use]
+pub fn pci_address_of(grant: &GpuGrant, card: u32) -> Option<&str> {
+    grant
+        .cards
+        .iter()
+        .find(|c| c.index == card)
+        .and_then(|c| c.pci_address.as_deref())
+}
+
 pub fn mount_plan(grant: &GpuGrant, card: u32, who: &Caller) -> Result<Vec<Bind>, MountPlanError> {
     let Some(wanted) = grant.cards.iter().find(|c| c.index == card) else {
         return Err(MountPlanError::NoSuchCard {
@@ -2384,6 +2418,24 @@ mod tests {
     /// turns on, so a test produces a refusal by building a gated node rather than by handing the
     /// grant a verdict: there is one policy function and the tests go through it like everything
     /// else does.
+    /// The address the box's `/proc` mask keeps comes from the CARD, never from its index.
+    ///
+    /// The fixture numbers them against each other on purpose, the way this host does: card 0 is
+    /// `0000:06:00.0`. A mask that formed the address from the index would keep the other card's
+    /// directory and hide the granted one, and on a host whose two numberings agreed, or on a
+    /// fixture that copied the index into the address, it would pass.
+    #[test]
+    fn the_masked_address_follows_the_card_and_not_its_index() {
+        let grant = two_card_grant(plain(0, 0, 0o666));
+        assert_eq!(pci_address_of(&grant, 0), Some("0000:06:00.0"));
+        assert_eq!(pci_address_of(&grant, 1), Some("0000:01:00.0"));
+        // A card that is not on this host has no address, and so does a card whose directory the
+        // driver never published. The caller cannot tell them apart and must not need to: both
+        // mean the same thing, which is that there is nothing to keep and the mask does not run.
+        assert_eq!(pci_address_of(&grant, 2), None);
+        assert_eq!(pci_address_of(&grant, u32::MAX), None);
+    }
+
     fn two_card_grant(card0: NodeFacts) -> GpuGrant {
         GpuGrant {
             driver_version: "580.173.02".to_string(),
@@ -2392,12 +2444,18 @@ mod tests {
                 (PathBuf::from("/dev/nvidia-uvm"), plain(0, 0, 0o666)),
             ],
             cards: vec![
+                // THE ADDRESSES ARE NOT IN INDEX ORDER, deliberately: `0000:06:00.0` belongs to
+                // card 0 here. A mask that derived the address from the index instead of carrying
+                // it would hide the granted card and show the other one, and on a fixture whose
+                // numbering agreed it would pass.
                 CardNodes {
                     index: 0,
+                    pci_address: Some("0000:06:00.0".to_string()),
                     nodes: vec![(PathBuf::from("/dev/nvidia0"), card0)],
                 },
                 CardNodes {
                     index: 1,
+                    pci_address: Some("0000:01:00.0".to_string()),
                     nodes: vec![(PathBuf::from("/dev/nvidia1"), plain(0, 0, 0o666))],
                 },
             ],
@@ -2546,6 +2604,7 @@ mod tests {
             shared: vec![(PathBuf::from("/dev/nvidiactl"), plain(0, 0, 0o666))],
             cards: vec![CardNodes {
                 index: 0,
+                pci_address: Some("0000:01:00.0".to_string()),
                 nodes: vec![(PathBuf::from("/dev/nvidia0"), plain(0, 0, 0o666))],
             }],
             libraries: vec![Library {
@@ -2569,6 +2628,7 @@ mod tests {
         let gated = GpuGrant {
             cards: vec![CardNodes {
                 index: 0,
+                pci_address: Some("0000:01:00.0".to_string()),
                 nodes: vec![(PathBuf::from("/dev/dri/card0"), plain(0, 44, 0o660))],
             }],
             ..base.clone()
@@ -2586,6 +2646,9 @@ mod tests {
         let refused = GpuGrant {
             cards: vec![CardNodes {
                 index: 0,
+                // No address: a host whose driver exposes no `gpus` directory still resolves its
+                // nodes, and the mask has nothing to name.
+                pci_address: None,
                 nodes: vec![(PathBuf::from("/dev/locked"), plain(0, 0, 0o600))],
             }],
             ..base

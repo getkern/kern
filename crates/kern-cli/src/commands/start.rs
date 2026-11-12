@@ -1042,6 +1042,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         (None, None) => None,
     };
 
+    // The address of the granted card, for the box's `/proc/driver/nvidia/gpus` mask. It is read
+    // from the SAME grant that produced the mounts, so the directory the box keeps and the node it
+    // was given are two views of one decision rather than two lookups that could disagree.
+    let mut gpu_pci_address: Option<String> = None;
     if let Some(selection) = gpu_selection {
         let card = selection?;
         let caller = crate::gpu_grant::Caller::current();
@@ -1096,6 +1100,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 ))
             }
         })?;
+
+        gpu_pci_address = crate::gpu_grant::pci_address_of(&grant, card).map(str::to_string);
 
         for (source, target, read_only) in binds {
             volumes.push(kern_isolation::Volume {
@@ -1847,6 +1853,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         cpuset,
         vgpio_devs,
         vgpio_sysfs,
+        gpu_pci_address,
         vdisks,
         secrets,
         ssh,

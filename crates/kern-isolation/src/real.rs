@@ -214,6 +214,11 @@ pub struct SandboxSpec {
     /// vGPIO sysfs directories (host `/sys/*` paths) to expose in the box's `/sys` (pwm/adc/1-wire/
     /// leds). Bound before pivot.
     pub vgpio_sysfs: Vec<String>,
+    /// `--gpus`/`--device`: the PCI address of the ONE card this box was granted, as
+    /// `/proc/driver/nvidia/gpus` spells it. `None` when no card was granted, and also when the
+    /// grant found no address for it, which is the same instruction either way: leave the driver's
+    /// directory as the host writes it. See [`mask_other_gpus`], which is the only reader.
+    pub gpu_pci_address: Option<String>,
     /// vDisk profiles to mount at `/vdisk/<name>` in the box (from `vdisk:` profiles).
     pub vdisks: Vec<VdiskMount>,
     /// Secrets to expose as `/run/secrets/<name>` (mode 0400), from `--secret`. The bytes were read
@@ -925,6 +930,128 @@ fn null_over(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Leave the box's `/proc/driver/nvidia/gpus` naming ONLY the card it was granted.
+///
+/// WHAT THIS IS, AND WHAT IT IS NOT. The boundary is which `/dev/nvidia*` nodes the box got: CUDA
+/// cannot initialise a card whose node is absent, and that is measured (`cuDeviceGetCount` answers
+/// 1 in a box holding one card, on a host with two). This directory is the driver's own enumeration
+/// surface, and leaving it whole let a box with one card read the model, IRQ, GPU UUID, video BIOS
+/// and bus address of every other card on the host. That is enumeration and not access, so this
+/// closes an information leak rather than adding a second boundary, and nothing here should ever be
+/// described as one.
+///
+/// THE ORDER IS THE WHOLE TRICK. A `tmpfs` over the directory hides the granted card along with the
+/// rest, so the granted directory is pinned by an `O_PATH` descriptor BEFORE the mask and bound
+/// back through `/proc/self/fd` after it: that magic link resolves to the original dentry, not to
+/// the path the tmpfs now covers. Taking the descriptor afterwards would open the empty tmpfs.
+///
+/// IT FAILS OPEN, DELIBERATELY, AND IT IS THE ONLY MASK HERE THAT DOES. If the restore cannot be
+/// made, the tmpfs is removed again: a box left with an EMPTY `gpus` directory is worse than an
+/// unmasked one, because the card it was actually given would be missing from the driver's own
+/// listing and nothing in the box asked for that. The masks in `mask_proc_paths` carry a boundary
+/// and fail closed; this one carries cosmetics and says so.
+fn mask_other_gpus(keep: &str) -> Result<(), Error> {
+    const GPUS: &str = "/proc/driver/nvidia/gpus";
+    // A PCI address is ONE path component. Anything else did not come from the directory listing
+    // this mask is built from, and joining it would aim the mount at a path of someone else's
+    // choosing. The check is cheap and it is the only place the name is trusted.
+    if keep.is_empty() || keep == "." || keep == ".." || keep.contains('/') {
+        return Err(Error::Spec(format!(
+            "gpu mask: {keep:?} is not a single PCI address component"
+        )));
+    }
+    let gpus_c = cstr(GPUS)?;
+    let kept = format!("{GPUS}/{keep}");
+    let kept_c = cstr(&kept)?;
+
+    // 1. PIN THE GRANTED DIRECTORY FIRST. `O_PATH` opens no file and reads nothing; it only holds
+    //    the dentry so the bind below can still reach it once the tmpfs covers the name.
+    //    `O_NOFOLLOW` because procfs hands out no symlink here and a symlink would mean the shape
+    //    changed under us.
+    let fd = unsafe {
+        libc::open(
+            kept_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::last("open(granted gpu dir)"));
+    }
+    // From here every exit closes the descriptor, and every exit after the tmfps also removes it.
+    let close_fd = || unsafe {
+        libc::close(fd);
+    };
+
+    // 2. The mask itself. `mode=0555` matches what the driver gives the real directory, so a box
+    //    that lists it sees the permissions it would have seen.
+    let ty = cstr("tmpfs")?;
+    let opts = cstr("mode=0555,nr_inodes=16")?;
+    if unsafe {
+        libc::mount(
+            ty.as_ptr(),
+            gpus_c.as_ptr(),
+            ty.as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+            opts.as_ptr().cast(),
+        )
+    } != 0
+    {
+        close_fd();
+        return Err(Error::last("mount(tmpfs over nvidia gpus)"));
+    }
+    // Undo the mask and give the box the host's directory back. Used for every failure below.
+    let undo = || unsafe {
+        libc::umount2(gpus_c.as_ptr(), libc::MNT_DETACH);
+    };
+
+    // 3. The mountpoint for the card that was granted, created inside the tmpfs while it is still
+    //    writable.
+    if unsafe { libc::mkdir(kept_c.as_ptr(), 0o555) } != 0 {
+        let e = Error::last("mkdir(granted gpu dir)");
+        undo();
+        close_fd();
+        return Err(e);
+    }
+
+    // 4. Bind the ORIGINAL directory back, reached through the descriptor taken in step 1.
+    let via_fd = cstr(&format!("/proc/self/fd/{fd}"))?;
+    if unsafe {
+        libc::mount(
+            via_fd.as_ptr(),
+            kept_c.as_ptr(),
+            ptr::null(),
+            libc::MS_BIND,
+            ptr::null(),
+        )
+    } != 0
+    {
+        let e = Error::last("mount(bind granted gpu dir)");
+        undo();
+        close_fd();
+        return Err(e);
+    }
+    close_fd();
+
+    // 5. Seal the tmpfs. Without this the box could create a directory named like a card that is
+    //    not there, which is not an escape but is a lie the box can tell its own tooling. A failed
+    //    reseal is NOT fatal: the listing is already correct and the writable tmpfs is the box's
+    //    own, reaching nothing of the host's.
+    unsafe {
+        libc::mount(
+            ptr::null(),
+            gpus_c.as_ptr(),
+            ptr::null(),
+            (libc::MS_REMOUNT
+                | libc::MS_RDONLY
+                | libc::MS_NOSUID
+                | libc::MS_NODEV
+                | libc::MS_NOEXEC) as libc::c_ulong,
+            opts.as_ptr().cast(),
+        );
+    }
+    Ok(())
+}
+
 /// Mount the box's OWN cgroup v2 hierarchy READ-ONLY at `/sys/fs/cgroup`, exactly like Docker/runc
 /// (`cgroupns=private` + a `cgroup2` mount). Combined with the `CLONE_NEWCGROUP` the child unshared,
 /// the box sees ONLY its own cgroup as the root of the hierarchy: memory-aware runtimes (the JVM,
@@ -983,6 +1110,18 @@ fn mask_proc_paths() -> Result<(), Error> {
         "/proc/bus",
         "/proc/fs",
         "/proc/asound",
+        // `/proc/driver` carries host-global knobs that runc's readonlyPaths does not list, and
+        // this host shows what that means: the NVIDIA driver publishes `suspend`, `suspend_depth`
+        // and `registry` there as `-rw-r--r-- root root`. They are NOT namespaced, so they are the
+        // same class as `core_pattern` above, and a write to `suspend` acts on the HOST's card.
+        // Measured here: rootless the open is refused, as uid 1000 and as uid 0 inside the user
+        // namespace alike, because the files belong to a uid the namespace does not map. The case
+        // this closes is the one the paragraph above names, kern run as real root in CI, in WSL or
+        // under sudo, where the box's root IS the host's.
+        //
+        // READ-ONLY AND NOT MASKED, because `/proc/driver/nvidia/gpus/<addr>/information` has to
+        // stay readable for the card the box was granted.
+        "/proc/driver",
     ] {
         let _ = ro_bind_ro(p);
     }
@@ -1557,6 +1696,26 @@ fn child_setup_and_exec(
     }
     if !allow_nesting {
         mask_proc_paths()?;
+        // AFTER the read-only bind of `/proc/driver`, never before it. `ro_bind_ro` binds
+        // non-recursively, so a tmpfs put under `/proc/driver` first would NOT be carried into the
+        // new bind and the box would read the host's unmasked directory through it: the mask would
+        // still be mounted, and invisible to the only process it was for.
+        //
+        // Skipped for a nesting box for the same reason the masks above are: `--privileged`
+        // presents a fully visible `/proc`, and a locked submount here is exactly what makes the
+        // kernel's `mount_too_revealing` check refuse the NESTED box's own `/proc`.
+        if let Some(addr) = spec.gpu_pci_address.as_deref() {
+            if let Err(e) = mask_other_gpus(addr) {
+                // Cosmetic, so it does not fail the box, and SAID, so it is not a silent gap: the
+                // box is running with the driver's full card listing and the operator can see that
+                // on the same line as the reason.
+                eprintln!(
+                    "kern: the box's /proc/driver/nvidia/gpus still lists every card on this host \
+                     ({e}); the grant itself is unaffected, only cards with a device node can be \
+                     opened"
+                );
+            }
+        }
     }
     t.mark("proc-mask");
     // Give the box a read-only view of its OWN cgroup at `/sys/fs/cgroup` (see `mount_cgroup`), so

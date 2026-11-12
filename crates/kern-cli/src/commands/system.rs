@@ -331,8 +331,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --gpus <n>          Hand the box ONE NVIDIA card: 0, device=0 or gpu=0. The nodes and
                         the host's driver libraries are resolved from the driver's own
                         version and bound read-only. A card you did not name has no device
-                        node in the box, so CUDA cannot initialise it; the driver's own
-                        /proc/driver/nvidia still lists every card the host has.
+                        node in the box, so CUDA cannot initialise it, and the driver's
+                        per-card directory names only the card you got. The host's PCI bus
+                        stays readable, so how many cards it has is still discoverable
                         `all` is refused by name: this build grants one card, and a flag
                         that takes a word should not do something narrower than the word
     --device <ref>      The same card, named as CDI names it: nvidia.com/gpu=0, or by UUID.
