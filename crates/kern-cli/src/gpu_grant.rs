@@ -642,6 +642,91 @@ pub struct GpuGrant {
     pub ldconfig_dirs: Vec<PathBuf>,
 }
 
+/// WHERE THE DRIVER NAMES ITS THREADS, and the half of this that is not a device node at all.
+///
+/// Found with `strace` and not by reading: under a write allowlist that named every GPU node, the
+/// one denial was `openat("/proc/self/task/<tid>/comm", O_WRONLY|O_CREAT|O_TRUNC) = EACCES`. The
+/// driver library writes a thread's name there, and on the `run` path `/proc` is the host's own, so
+/// it is not in the automatic set.
+const THREAD_NAME_DIR: &str = "/proc/self/task";
+
+/// The paths a CUDA workload needs WRITE access to and a `--landlock-rw` allowlist does not cover.
+///
+/// FOR THE `run` PATH ONLY, which has no mount namespace. Inside a box `/dev` and `/proc` are in
+/// Landlock's automatic set, because there they are the small set kern mounts rather than the
+/// host's, and `--gpus` with `--landlock-rw` was measured working.
+///
+/// MEASURED on 2026-11-12 on a host with two cards, and both halves are needed:
+///
+/// ```text
+/// kern run -- python3 gpu_work.py                              -> GPU_COMPUTE_RAN
+/// kern run --landlock-rw /tmp                                  -> cuInit 304
+/// kern run --landlock-rw /dev                                  -> cuInit 304
+/// kern run --landlock-rw /proc                                 -> cuInit 100
+/// kern run --landlock-rw /dev --landlock-rw /proc/self/task     -> GPU_COMPUTE_RAN
+/// kern run --landlock-rw <the card's nodes> --landlock-rw /proc/self/task -> GPU_COMPUTE_RAN
+/// ```
+///
+/// So 100 (`CUDA_ERROR_NO_DEVICE`) is the nodes and 304 (`CUDA_ERROR_OPERATING_SYSTEM`) is the
+/// thread name, and neither mentions the flag that caused it. The policy is right and nothing here
+/// widens it: the flag means what it says. What was missing is the prediction, before the exec, on
+/// the one path kern itself points a GPU user to.
+///
+/// ⛔ THE FIRST VERSION OF THIS NAMED A REMEDY THAT DID NOT WORK. It listed the device nodes alone,
+/// which was the obvious half, and running exactly the command it printed still failed with 304. A
+/// remedy is a claim and gets measured like one.
+///
+/// `starts_with` IS THE RIGHT TOOL HERE and was the wrong one two commits ago. It compares whole
+/// components, so it answers "is this entry an ancestor of that path" exactly; where it was wrong
+/// was an escape check, in which `<root>/../../etc` also "starts with" `<root>`.
+pub fn cuda_write_paths_outside_allowlist(grant: &GpuGrant, allow: &[String]) -> Vec<PathBuf> {
+    let covered = |node: &Path| {
+        allow
+            .iter()
+            .any(|a| node == Path::new(a) || node.starts_with(a))
+    };
+    let mut out: Vec<PathBuf> = grant
+        .shared
+        .iter()
+        .map(|(p, _)| p.clone())
+        .chain(
+            grant
+                .cards
+                .iter()
+                .flat_map(|c| c.nodes.iter().map(|(p, _)| p.clone())),
+        )
+        .chain(std::iter::once(PathBuf::from(THREAD_NAME_DIR)))
+        .filter(|p| !covered(p))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The one line for it, or nothing when the allowlist already covers every path.
+pub fn describe_cuda_write_paths(missing: &[PathBuf]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = missing.iter().map(|p| p.display().to_string()).collect();
+    let flags: String = names
+        .iter()
+        .map(|n| format!("--landlock-rw {n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "--landlock-rw confines writes to the paths you named, and a CUDA workload on this host \
+         needs write access to {} path(s) that are not among them: {}. Measured here: with the \
+         device nodes unreachable cuInit returns 100, and with only {THREAD_NAME_DIR} unreachable \
+         it returns 304, because the driver names its threads by writing \
+         {THREAD_NAME_DIR}/<tid>/comm. Neither names this flag. `kern run` has no mount namespace, \
+         so unlike a box it grants neither /dev nor /proc as a whole. If the command needs the \
+         card, this exact set was measured to work: {flags}",
+        names.len(),
+        names.join(" ")
+    ))
+}
+
 impl GpuGrant {
     /// Every node in the grant, shared first then per card.
     ///
@@ -3013,6 +3098,122 @@ mod tests {
     /// a symlink to `/usr/lib` and the same link inode is reached twice. That is the same mistake
     /// the library sweep already made once, made a second time in the same file, and the real host
     /// was again the only thing that could see it. A hard-linked tree cannot reproduce a symlink's
+    /// A WRITE ALLOWLIST THAT DOES NOT NAME THE NODES IS REPORTED, and one that does is silent.
+    ///
+    /// THE FIELD CASE, measured on 2026-11-12 on a two-card host: `kern run -- python3 gpu_work.py`
+    /// computed on the card and `kern run --landlock-rw /tmp -- python3 gpu_work.py` died with
+    /// `cuInit` 304. Correct behaviour, invisible cause. The same combination inside a BOX works,
+    /// because there `/dev` is in Landlock's automatic set, so this predicate is about `run` only.
+    #[test]
+    fn an_allowlist_that_misses_the_gpu_nodes_is_reported_and_one_that_covers_them_is_not() {
+        let root = synthetic_root(
+            "llallow",
+            "580.173.02",
+            &[(
+                "usr/lib/x86_64-linux-gnu",
+                "libnvidia-gpucomp.so.580.173.02",
+                ELF_CLASS_64,
+                None,
+            )],
+        );
+        // A CARD NODE AND NOT ONLY THE SHARED ONE. `synthetic_root` builds `/dev/nvidiactl` alone,
+        // so `grant.cards` comes back empty and the per-card half of the collection cannot be
+        // measured: deleting the `cards` branch from `nodes_outside_allowlist` left this test
+        // GREEN. A sabotage that passes means the test is wrong, not the code right.
+        if !fixture_node(&root.join("dev/nvidia0")) {
+            let _ = std::fs::remove_dir_all(&root);
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a card node");
+            return;
+        }
+        let got = resolve_under(&root, ElfClass::Bits64);
+        let Ok(grant) = got else {
+            let _ = std::fs::remove_dir_all(&root);
+            println!("SKIP: the fixture produced no grant, so there is nothing to cover");
+            return;
+        };
+        assert!(
+            !grant.cards.is_empty(),
+            "the fixture built no card, so the per-card half would not be measured"
+        );
+        // POSITIVE CONTROL: the fixture must actually carry a node, or every assertion below is
+        // about an empty list and passes without measuring anything.
+        assert!(
+            !grant.all_nodes().is_empty(),
+            "the fixture produced no device node"
+        );
+
+        // THE NODES PLUS ONE. The thread-name directory is not a device node and is the path that
+        // made the first version of this warning print a remedy that did not work, so it is counted
+        // and named here rather than left implicit.
+        let want = grant.all_nodes().len() + 1;
+
+        // 1. AN UNRELATED PATH COVERS NOTHING. `<root>/etc` exists and is not an ancestor of
+        //    `<root>/dev/...`, which is the shape of the real case (`--landlock-rw /tmp`).
+        let unrelated = root.join("etc").display().to_string();
+        let missing = cuda_write_paths_outside_allowlist(&grant, &[unrelated]);
+        assert_eq!(
+            missing.len(),
+            want,
+            "an allowlist outside /dev must leave every node AND the thread-name directory \
+             uncovered: {missing:?}"
+        );
+        assert!(
+            missing.iter().any(|p| p == Path::new("/proc/self/task")),
+            "the half that is not a device node is missing from the list: {missing:?}"
+        );
+        let msg = describe_cuda_write_paths(&missing).expect("a sentence for the gap");
+        for node in &missing {
+            let n = node.display().to_string();
+            assert!(msg.contains(&n), "the sentence omits {n}");
+            assert!(
+                msg.contains(&format!("--landlock-rw {n}")),
+                "the sentence must give the flag that fixes it for {n}"
+            );
+        }
+        // BOTH MEASURED CODES, because they tell the reader WHICH half they are missing: 100 is the
+        // device nodes, 304 is the thread name.
+        for code in ["100", "304"] {
+            assert!(
+                msg.contains(code),
+                "the sentence should carry the measured failure {code}: {msg}"
+            );
+        }
+
+        // 2. THE DEVICE DIRECTORY COVERS THE NODES AND NOT THE OTHER HALF, which is exactly the
+        //    case that was measured failing with 304 while every node was named.
+        let dev = root.join("dev").display().to_string();
+        let only_proc = cuda_write_paths_outside_allowlist(&grant, &[dev.clone()]);
+        assert_eq!(
+            only_proc,
+            vec![PathBuf::from("/proc/self/task")],
+            "naming the device directory must leave the thread-name directory and nothing else"
+        );
+
+        // 3. AND WITH BOTH NAMED THERE IS NOTHING TO SAY. This is the half that keeps the warning
+        //    off a command the caller got right.
+        assert!(
+            cuda_write_paths_outside_allowlist(&grant, &[dev, "/proc/self/task".to_string()])
+                .is_empty(),
+            "an allowlist naming the nodes and the thread-name directory covers everything"
+        );
+        assert_eq!(describe_cuda_write_paths(&[]), None);
+
+        // 4. NAMING ONE NODE COVERS THAT ONE ONLY, so the list is a real difference and not a
+        //    yes-or-no.
+        let one = grant.all_nodes()[0].0.display().to_string();
+        let rest = cuda_write_paths_outside_allowlist(&grant, &[one.clone()]);
+        assert!(
+            !rest.iter().any(|p| p.display().to_string() == one),
+            "the named node is still reported as missing"
+        );
+        assert_eq!(
+            rest.len(),
+            want - 1,
+            "naming one node must remove exactly one: {rest:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// identity, so the two directories here are made to be one.
     #[test]
     fn a_link_reached_by_two_linker_paths_is_one_link() {

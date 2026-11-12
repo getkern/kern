@@ -2702,6 +2702,26 @@ pub fn run(
             )));
         }
     }
+    // THE COMBINATION THAT FAILS LATE, INSIDE THE DRIVER, AND NAMES NOTHING.
+    //
+    // Measured on 2026-11-12: `kern run -- python3 gpu_work.py` computes on the card, and the same
+    // command with `--landlock-rw /tmp` dies with `cuInit` 304, an OS-call error. The behaviour is
+    // right (a write allowlist that does not name a device node does not grant write access to it,
+    // and `run` has no mount namespace, so it cannot hand out `/dev` the way a box does), and
+    // nothing here widens it. What is new is that the prediction is made BEFORE the exec instead of
+    // arriving from CUDA with no mention of the flag that caused it.
+    //
+    // A WARNING AND NOT A REFUSAL: a caller who confines a non-GPU command on a GPU host asked for
+    // exactly this, and pays one line. A caller whose workload needs the card would otherwise pay
+    // the afternoon.
+    if !landlock_rw.is_empty() {
+        if let Ok(grant) = crate::gpu_grant::resolve() {
+            let missing = crate::gpu_grant::cuda_write_paths_outside_allowlist(&grant, landlock_rw);
+            if let Some(msg) = crate::gpu_grant::describe_cuda_write_paths(&missing) {
+                eprintln!("kern: warning: {msg}");
+            }
+        }
+    }
     // Fold any leading resource-profile tokens (`vcpu:name` …) into the caps - explicit flags win -
     // and find where the real command begins.
     let mut ap = AppliedProfiles {
