@@ -71,10 +71,74 @@ pub(crate) fn image_default_uid_range(args: &BoxRunArgs) -> bool {
 /// boxes that never exec. It is fixed where the reader meets it: `describe_id_map` names this cause
 /// when the box holds no capabilities, and `kern box --help` says so on both flags. If a third
 /// consumer appears, add it to this list first.
+///
+/// 🚨 THE THIRD CONSUMER APPEARED, AND UNLIKE THE OTHER TWO IT IS A BOUNDARY. The paragraph above
+/// said this relaxes nothing, because the range only buys what the capability set already refuses.
+/// `setgroups` is the counter-example, and it was in neither list. The kernel will not accept an
+/// unprivileged single-gid map until `/proc/self/setgroups` is `deny`, and after `deny` setgroups is
+/// EPERM for the life of the namespace, so a single-uid box CANNOT drop the caller's inherited
+/// supplementary groups. With the range, `newgidmap` is the privileged writer, `deny` is never
+/// needed, and the clear in `drop_caps_around_identity` succeeds. Measured 2026-11-11 on a host file
+/// the group class decides (`/var/log/kern.log.2.gz`, `syslog:adm 0640`, no ACL, no `other` bit,
+/// caller in `adm`), bound with `-v`, with the host itself as the positive control:
+///
+///   default box                        DENIED    host Groups empty
+///   --cap-drop ALL                     READ_OK   host Groups: all 14 of the caller's
+///   --security-profile untrusted       READ_OK   host Groups: all 14 of the caller's
+///   --cap-drop ALL --uid-range         DENIED    the range IS the mechanism
+///   --cap-drop ALL --cap-add CHOWN     DENIED    any add already cancelled the rule
+///   host, as the caller                READ_OK   the group is what grants it
+///
+/// So the two surfaces that most explicitly promise a tighter box, one of them named `untrusted`,
+/// gave it more of the caller's host group reach than the default. The clear is what the range buys,
+/// and it is worth exactly as much as there is to clear: nothing when the caller carries no
+/// supplementary group beyond its primary gid, and a real boundary otherwise. That is the condition
+/// now, so the 985 us is still saved on a caller with no groups (a dedicated service account, which
+/// is where start latency is spent) and is spent wherever there is something to drop. Erring here
+/// costs a silent relaxation rather than a silent entrypoint failure, so the reading is the
+/// conservative one: any inherited group at all installs the range.
 fn range_buys_nothing(args: &BoxRunArgs) -> bool {
-    let drops_all = matches!(args.security_profile, Some(SecurityProfile::Untrusted))
-        || args.cap_drop.iter().any(|d| d.eq_ignore_ascii_case("ALL"));
-    drops_all && args.cap_add.is_empty()
+    range_buys_nothing_for(
+        matches!(args.security_profile, Some(SecurityProfile::Untrusted)),
+        args.cap_drop,
+        args.cap_add,
+        caller_inherits_groups(),
+    )
+}
+
+/// The same rule over the four inputs it actually reads, so a test can state every half.
+///
+/// NOT `&BoxRunArgs`, which has nearly two hundred fields and no `Default`: a rule whose test costs
+/// that much to write is a rule that goes untested, and this one was. `inherits_groups` is the only
+/// input that is not an argument, and it is the one whose absence was the defect.
+pub(crate) fn range_buys_nothing_for(
+    untrusted: bool,
+    cap_drop: &[String],
+    cap_add: &[String],
+    inherits_groups: bool,
+) -> bool {
+    let drops_all = untrusted || cap_drop.iter().any(|d| d.eq_ignore_ascii_case("ALL"));
+    drops_all && cap_add.is_empty() && !inherits_groups
+}
+
+/// Does this process carry a supplementary group that a box would inherit and that `setgid` does not
+/// already cover?
+///
+/// The primary gid is excluded because it is not the leak: `setgid` puts the box's gid 0 at the
+/// caller's primary gid on BOTH maps, so clearing it changes nothing. Everything else in the list is
+/// an unmapped kgid inside the box, unnameable through `getgroups` there, and still counted by every
+/// permission check outside it.
+///
+/// ONE SPELLING of "the groups this caller carries": [`crate::gpu_grant::Caller::current`] is the
+/// only `getgroups` reader in this crate and asks the kernel in the documented two-call form. It
+/// lives next to the GPU resolver because that is where the question was first asked; it is not a
+/// GPU fact, and a second reader here is exactly the duplication that produced this defect.
+fn caller_inherits_groups() -> bool {
+    let primary = unsafe { libc::getgid() } as u32;
+    crate::gpu_grant::Caller::current()
+        .gids
+        .iter()
+        .any(|gid| *gid != primary)
 }
 
 /// Resolve the box's effective command from the user's `-- CMD` and the image's OCI config, docker-

@@ -8203,3 +8203,73 @@ mod exec_scope_decision_tests {
         );
     }
 }
+
+/// THE SUB-UID RANGE BUYS THE `setgroups` CLEAR, so a box with groups to clear always gets it.
+///
+/// `range_buys_nothing` is a latency optimisation: it drops the default range for a box whose
+/// capability set cannot use it, worth a measured 985 us of a cold image box. Its doc said in as many
+/// words that this "is NOT a security boundary, and nothing here relaxes one", on the grounds that
+/// the range only buys what `--cap-drop ALL` already refuses. It enumerated the consumers it knew
+/// (`chown`, an identity change, and later `kern exec -u`) and missed the one that is a boundary.
+///
+/// The kernel will not accept an unprivileged single-gid map until `/proc/self/setgroups` is `deny`,
+/// and after `deny` setgroups is EPERM for the life of the namespace, so a single-uid box cannot drop
+/// the caller's inherited supplementary groups. Measured 2026-11-11 on a host file the group class
+/// decides (`/var/log/kern.log.2.gz`, `syslog:adm 0640`, no ACL, no `other` bit, caller in `adm`)
+/// bound with `-v`, with the host itself as the positive control:
+///
+///   default box                     DENIED     host Groups empty
+///   --cap-drop ALL                  READ_OK    host Groups: all 14 of the caller's
+///   --security-profile untrusted    READ_OK    host Groups: all 14 of the caller's
+///   --cap-drop ALL --uid-range      DENIED     the range IS the mechanism
+///   host, as the caller             READ_OK
+///
+/// The two surfaces that most explicitly promise a tighter box, one of them named `untrusted`, gave
+/// it more of the caller's host group reach than the default. After the fix both read DENIED and
+/// both carry an empty host `Groups` read from OUTSIDE the namespace, which is the only place the
+/// difference is visible: inside, an unmapped kgid renders as 65534 and `getgroups` cannot name it.
+#[test]
+fn the_uid_range_is_kept_whenever_there_are_groups_to_drop() {
+    use super::imagecache::range_buys_nothing_for;
+    let none: &[String] = &[];
+    let all: &[String] = &["ALL".to_string()];
+    let chown: &[String] = &["CHOWN".to_string()];
+
+    // THE DEFECT, in one line: the same capability set, and the answer now turns on whether there is
+    // anything to clear.
+    assert!(
+        !range_buys_nothing_for(false, all, none, true),
+        "a caller with inherited groups must keep the range: it is what clears them"
+    );
+    assert!(
+        range_buys_nothing_for(false, all, none, false),
+        "a caller with no inherited group has nothing to clear, so the 985 us is still saved"
+    );
+
+    // The profile promotes itself to `cap-drop ALL`, and the two must agree: a profile that stopped
+    // implying the drop would silently re-cost the millisecond, and one that stopped implying the
+    // GROUPS would silently re-open this.
+    assert!(
+        !range_buys_nothing_for(true, none, none, true),
+        "`--security-profile untrusted` with groups to clear must keep the range"
+    );
+    assert!(
+        range_buys_nothing_for(true, none, none, false),
+        "`--security-profile untrusted` with no groups keeps the old answer"
+    );
+
+    // THE PRE-EXISTING HALVES, unchanged, so this test also pins what the fix must not break.
+    assert!(
+        !range_buys_nothing_for(false, all, chown, false),
+        "any --cap-add puts the range back, groups or not"
+    );
+    assert!(
+        !range_buys_nothing_for(false, none, none, false),
+        "a box that drops nothing was never in scope for this rule"
+    );
+    // Case-insensitive, because `caps::resolve` accepts `all` and `ALL` and refuses `CAP_ALL`.
+    assert!(
+        range_buys_nothing_for(false, &["all".to_string()], none, false),
+        "lowercase `all` is the same request"
+    );
+}

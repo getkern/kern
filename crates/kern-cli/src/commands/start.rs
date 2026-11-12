@@ -3435,14 +3435,21 @@ fn id_is_mapped(ranges: &[(u64, u64)], id: u32) -> bool {
 /// of the range that did not exist when that default was written, and it happens AFTER the box
 /// started, so nothing can retrofit the map. The answer is to name the cause and the flag that asks
 /// for the range anyway.
+///
+/// THE CAUSE IT NAMED IS NARROWER NOW. It said kern drops the range for a no-caps box "because the
+/// range buys it nothing", and the range buys the `setgroups` clear, which that box then cannot do.
+/// Since `range_buys_nothing` also requires the caller to carry no inherited supplementary group,
+/// this branch is reachable only for a caller that has none, so the sentence has to say which of the
+/// two conditions the reader is in rather than implying the capability set alone decided.
 fn describe_id_map(kind: &str, ranges: &[(u64, u64)], no_caps: bool) -> String {
     if ranges == [(0, 1)] {
         if no_caps {
             return format!(
                 "which maps {kind} 0 alone: it holds no capabilities (`--cap-drop ALL`, or \
-                 `--security-profile untrusted`), and kern drops the default sub-uid range for such \
-                 a box because the range buys it nothing. Start it with `--uid-range` as well, which \
-                 asks for the range in as many words, and `kern exec -u` then works"
+                 `--security-profile untrusted`) AND the caller carries no supplementary group, so \
+                 kern skipped the default sub-uid range, which would have bought this box nothing. \
+                 Start it with `--uid-range` as well, which asks for the range in as many words, and \
+                 `kern exec -u` then works"
             );
         }
         return format!(
