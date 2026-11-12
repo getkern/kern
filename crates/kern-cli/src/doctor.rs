@@ -2012,32 +2012,62 @@ fn gpu_driver_rows(grant: &crate::gpu_grant::GpuGrant) -> Vec<R> {
     // WHERE THE ANSWER CAME FROM, so a reader who disagrees with the rows above knows which file
     // to look at. The CDI line is the `--device` spelling of the same cards, and saying it here is
     // what keeps a reader from concluding the two flags are two different grants.
-    let cdi = ["/etc/cdi", "/var/run/cdi"]
-        .iter()
-        .find(|d| {
-            std::fs::read_dir(d)
-                .map(|mut e| e.any(|f| f.is_ok()))
-                .unwrap_or(false)
-        })
-        .copied();
-    let (verdict, note) = match cdi {
+    let (verdict, note) = gpu_source_row(std::path::Path::new("/"), grant.libraries.len());
+    out.push(R::ok_note(&verdict, &note));
+    out
+}
+
+/// Where the grant's answer came from, and whether `--device` can be used beside `--gpus`.
+///
+/// `root` IS A PARAMETER SO THE THREE ANSWERS CAN BE TESTED. Without one this read `/` and the
+/// only way to exercise "a spec that is there and unreadable" would be to make the host's own
+/// unreadable, which needs root and breaks the host for everything else.
+///
+/// THE SPEC IS READ, NOT COUNTED. This looked for a non-empty directory and then told the reader
+/// that `--device` names the same cards as `--gpus`, which is a claim about a file it had never
+/// opened. It is a documented failure of the runtime this feature is modelled on: the maintainers
+/// of the NVIDIA container toolkit record that `nvidia-ctk cdi list` succeeds on specs podman then
+/// refuses to load, so listing is not a validation step. The shapes that break it are real and
+/// kern refuses all of them, which is exactly why doctor must not assert the opposite: a
+/// `cdiVersion` newer than this build understands, an `additionalGids` the parser will not apply
+/// blindly, a field from a toolkit release this one predates.
+///
+/// So the question is asked of the PARSER `--device` runs, and the row says what it answered.
+fn gpu_source_row(root: &std::path::Path, libraries: usize) -> (String, String) {
+    let specs = crate::cdi::find_specs(root, None);
+    let dir = specs
+        .first()
+        .and_then(|p| p.parent())
+        .map(|d| d.display().to_string());
+    let usable = specs.iter().any(|p| {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|t| crate::cdi::parse_spec(&t).ok())
+            .is_some()
+    });
+    match dir {
+        Some(dir) if usable => (
+            format!("gpu source: /proc/driver/nvidia, {libraries} host libraries, a CDI spec under {dir}"),
+            "--device nvidia.com/gpu=N names the same cards as --gpus N, from the same discovery"
+                .to_string(),
+        ),
+        // PRESENT AND UNREADABLE IS ITS OWN ANSWER, and the one a reader cannot work out alone:
+        // the file is there, so "no CDI on this host" would be false, and `--device` will refuse
+        // it, so "CDI works here" would be worse. The remedy is a spelling they already have.
         Some(dir) => (
             format!(
-                "gpu source: /proc/driver/nvidia, {} host libraries, a CDI spec under {dir}",
-                grant.libraries.len()
+                "gpu source: /proc/driver/nvidia, {libraries} host libraries, and a CDI spec \
+                 under {dir} this build cannot read"
             ),
-            "--device nvidia.com/gpu=N names the same cards as --gpus N, from the same discovery",
+            "--device will refuse it, so use --gpus N; `kern box --device nvidia.com/gpu=0` names \
+             the reason"
+                .to_string(),
         ),
         None => (
-            format!(
-                "gpu source: /proc/driver/nvidia and {} of the host's own libraries",
-                grant.libraries.len()
-            ),
-            "no CDI spec on this host, so --gpus N is the only spelling",
+            format!("gpu source: /proc/driver/nvidia and {libraries} of the host's own libraries"),
+            "no CDI spec on this host, so --gpus N is the only spelling".to_string(),
         ),
-    };
-    out.push(R::ok_note(&verdict, note));
-    out
+    }
 }
 
 /// The first of `names` that exists on `PATH`, or `None` when none of them does.
@@ -2554,6 +2584,61 @@ mod tests {
             !stranger.contains("supplementary group"),
             "a caller the host refuses was told it was a box limitation: {stranger}"
         );
+    }
+
+    /// THE THREE ANSWERS ABOUT CDI, including the one a reader cannot work out alone.
+    ///
+    /// The middle case is why this row stopped counting files and started reading them: a spec
+    /// that is PRESENT and that this build cannot parse. "No CDI on this host" would be false and
+    /// "CDI works here" would be worse, and `--device` is about to refuse it either way. The
+    /// NVIDIA container toolkit's own maintainers record the same shape against podman, where
+    /// `nvidia-ctk cdi list` succeeds on specs the runtime then rejects.
+    #[test]
+    fn the_cdi_row_reads_the_spec_rather_than_counting_the_directory() {
+        let tmp = std::env::temp_dir().join(format!("kern-cdi-row-{}", std::process::id()));
+        let dir = tmp.join("etc/cdi");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // NOTHING THERE: the only honest answer is that there is no second spelling.
+        let (v, n) = super::gpu_source_row(&tmp, 29);
+        assert!(v.contains("29 of the host's own libraries"), "{v}");
+        assert!(n.contains("only spelling"), "{n}");
+
+        // A SPEC THIS BUILD CANNOT READ. The version is one it refuses by name, which is the
+        // shape that broke podman against a newer toolkit.
+        let bad = dir.join("nvidia.yaml");
+        let _ = std::fs::write(
+            &bad,
+            "cdiVersion: 9.9.9\nkind: nvidia.com/gpu\ndevices: []\n",
+        );
+        let (v, n) = super::gpu_source_row(&tmp, 29);
+        assert!(
+            v.contains("cannot read"),
+            "an unreadable spec was called usable: {v}"
+        );
+        assert!(n.contains("--device will refuse it"), "{n}");
+        assert!(n.contains("--gpus"), "the remedy is not named: {n}");
+
+        // A SPEC IT CAN READ, and only then is the parity claim made.
+        let good = concat!(
+            "cdiVersion: 0.5.0\n",
+            "kind: nvidia.com/gpu\n",
+            "devices:\n",
+            "    - name: \"0\"\n",
+            "      containerEdits:\n",
+            "        deviceNodes:\n",
+            "            - path: /dev/null\n",
+        );
+        let _ = std::fs::write(&bad, good);
+        let (v, n) = super::gpu_source_row(&tmp, 29);
+        assert!(
+            !v.contains("cannot read"),
+            "a readable spec was called unreadable: {v}"
+        );
+        assert!(v.contains("a CDI spec under"), "{v}");
+        assert!(n.contains("names the same cards"), "{n}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// THE GATE. Every shape of GPU row, checked against the reserved vocabulary.
