@@ -877,6 +877,27 @@ pub(crate) fn reject_unknown_flags(
     args: &[&str],
     allowed: &[&str],
 ) -> Result<(), Error> {
+    reject_unknown_flags_attached(verb, args, allowed, &[])
+}
+
+/// [`reject_unknown_flags`], told which flags' ATTACHED form (`--flag=value`) the verb's parser
+/// honours.
+///
+/// ⛔ THE DEFAULT IS STILL TO REFUSE IT, and the comment below records why with the measurements
+/// that bought it: a gate that accepted `--json=1` while the parser ignored it printed the human
+/// table with exit 0 to a script asking for JSON. That is still the rule for every verb whose
+/// parser reads only the two-token form.
+///
+/// WHAT CHANGED on 2026-11-12 is the premise for five verbs. `box`, `run`, `exec`, `build` and
+/// `pull` now split `--flag=value` for the flags that take one (see [`split_equals_flags`]), so for
+/// THOSE flags the attached form is honoured end to end and refusing it here would be the gate
+/// contradicting the parser. The caller names them, one list per verb, so nothing is assumed.
+pub(crate) fn reject_unknown_flags_attached(
+    verb: &str,
+    args: &[&str],
+    allowed: &[&str],
+    attached_ok: &[&str],
+) -> Result<(), Error> {
     for a in args.iter().skip(1) {
         let s: &str = a;
         if s == "--" {
@@ -902,6 +923,14 @@ pub(crate) fn reject_unknown_flags(
         // function itself. `-n 5` is the documented form and it works.
         if allowed.contains(&name) {
             continue;
+        }
+        // THE ATTACHED FORM, but only for the flags the caller said its parser splits. Everything
+        // else keeps the exact match above, which is what stops `--json=1` being accepted here and
+        // ignored there.
+        if let Some((head, _)) = name.split_once('=') {
+            if attached_ok.contains(&head) {
+                continue;
+            }
         }
         // Point at `--help`, do NOT enumerate `allowed`. That list is a hand-kept duplicate of what the
         // parser accepts, and printing it tells the user, as a fact, what the verb takes - at the exact
@@ -1085,7 +1114,12 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             // because the caller that passes it is asking for the one thing kern's progress writer
             // already knows how to not do; the image reference it prints on success is the point of
             // the verb and stays.
-            reject_unknown_flags("pull", &rest, &["--dest", "--platform", "--quiet", "-q"])?;
+            reject_unknown_flags_attached(
+                "pull",
+                &rest,
+                &["--dest", "--platform", "--quiet", "-q"],
+                PULL_VALUE_FLAGS,
+            )?;
             let cmd = parse_pull(&rest).ok_or(Error::Usage("pull <image> [--dest <dir>]"))?;
             if let Command::Pull { image, .. } = &cmd {
                 check_reference(image, "pull")?;
@@ -2979,7 +3013,189 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
 
 /// real sandbox. Without a rootfs/image it still routes to `BoxRun` (which reports the missing
 /// source); `--plan` previews instead of running.
+/// The `box` flags that take a value, which is the set `--flag=value` may be split on.
+///
+/// DERIVED FROM THE PARSER, not written beside it: every entry is a match arm in [`parse_box`] whose
+/// body consumes the next argument, and `every_value_flag_really_takes_a_value` re-derives the set
+/// from this file's own source so a flag added without updating this list fails a test rather than a
+/// user. Short flags are deliberately absent: `--flag=value` is the long form's shape in docker and
+/// in pflag, and `-m=512m` is not a spelling either accepts.
+const VALUE_FLAGS: &[&str] = &[
+    "--add-host",
+    "--apparmor",
+    "--cap-add",
+    "--cap-drop",
+    "--config",
+    "--cpu-weight",
+    "--cpus",
+    "--cpuset-cpus",
+    "--def-hash",
+    "--device",
+    "--dns",
+    "--dns-option",
+    "--dns-search",
+    "--egress-allow",
+    "--entrypoint",
+    "--env",
+    "--env-file",
+    "--gpus",
+    "--health-action",
+    "--health-cmd",
+    "--health-cmd-argv",
+    "--health-interval",
+    "--health-retries",
+    "--health-start-interval",
+    "--health-start-period",
+    "--health-timeout",
+    "--hostname",
+    "--image",
+    "--io-weight",
+    "--ip",
+    "--label",
+    "--landlock-rw",
+    "--log-max-file",
+    "--log-max-size",
+    "--memory",
+    "--memory-reservation",
+    "--memory-swap",
+    "--memory-swap-max",
+    "--mount",
+    "--name",
+    "--net",
+    "--network",
+    "--nice",
+    "--overlay-lower",
+    "--overlay-upper",
+    "--pids-limit",
+    "--pod",
+    "--pod-bridge",
+    "--publish",
+    "--pull",
+    "--restart",
+    "--restart-max",
+    "--rootfs",
+    "--secret",
+    "--secret-env",
+    "--secret-mode",
+    "--security-opt",
+    "--security-profile",
+    "--shm-size",
+    "--ssh",
+    "--ssh-key",
+    "--stop-signal",
+    "--stop-timeout",
+    "--sysctl",
+    "--timeout",
+    "--tmpfs",
+    "--ulimit",
+    "--user",
+    "--volume",
+    "--workdir",
+];
+
+/// The `box` flags that take NO value, so `--flag=x` on one of them is a usage error with a name
+/// rather than the "unknown flag" it used to be.
+const NO_VALUE_FLAGS: &[&str] = &[
+    "--allow-uncapped",
+    "--bind-rootfs",
+    "--detach",
+    "--init",
+    "--interactive",
+    "--keep",
+    "--no-uid-range",
+    "--plan",
+    "--privileged",
+    "--quiet",
+    "--read-only",
+    "--require-limits",
+    "--rm",
+    "--ro",
+    "--show-config",
+    "--tty",
+    "--tun",
+    "--uid-range",
+    "--verbose",
+];
+
+/// Rewrite `--flag=value` into two arguments, which is the form docker takes for every long flag.
+///
+/// MEASURED 2026-11-12, and this is not a corner: `--memory=512m`, `--env=A=1`, `--pids-limit=64`,
+/// `--gpus=1` and `--gpus=all` all answered `error: usage: kern box: unknown flag (see --help)`,
+/// while the same flags with a space worked. The flag EXISTS, so that message is false twice: it
+/// says the flag is unknown and it sends the reader to `--help`, which lists it. NVIDIA's own Triton
+/// quickstart is `docker run --gpus=1 --rm --shm-size=1g --ulimit memlock=-1 ...`, so the shape
+/// people copy is exactly the one that failed.
+///
+/// NOTHING AFTER `--` IS TOUCHED: past the separator every token is the workload's, and a workload
+/// argument that looks like a flag is still an argument. That is the one property a split like this
+/// can get catastrophically wrong, so it is the first thing the loop below checks.
+///
+/// ONLY FLAGS THAT TAKE A VALUE ARE SPLIT. A boolean split into two tokens would leave the value
+/// where the box NAME is read and start a box called `true`, which is a silent misparse and far
+/// worse than the error it replaced. Those are refused by name instead.
+///
+/// NO ALLOCATION OF STRINGS: both halves are slices of the argument that was already there, so the
+/// returned vector borrows from the caller's argv exactly as the input did.
+/// The other four parsers that have flags, read from their own arms rather than derived: `box`
+/// spells a value `i += 1` and these do not all agree. `build` takes its values through a helper
+/// closure, `run` REFUSES `--memory-swap` outright (so it consumes nothing and goes in the no-value
+/// list, where `--memory-swap=512m` is told to write the flag alone and then meets the real
+/// refusal), and `exec`'s `--interactive` arm is empty.
+const RUN_VALUE_FLAGS: &[&str] = &[
+    "--config",
+    "--cpus",
+    "--cpuset-cpus",
+    "--landlock-rw",
+    "--memory",
+    "--memory-swap-max",
+];
+const RUN_NO_VALUE_FLAGS: &[&str] = &["--memory-swap"];
+const EXEC_VALUE_FLAGS: &[&str] = &["--env", "--user", "--workdir"];
+const EXEC_NO_VALUE_FLAGS: &[&str] = &["--interactive", "--tty"];
+const PULL_VALUE_FLAGS: &[&str] = &["--dest", "--platform"];
+const BUILD_VALUE_FLAGS: &[&str] = &["--build-arg", "--file", "--platform", "--tag", "--target"];
+const BUILD_NO_VALUE_FLAGS: &[&str] = &["--check", "--quiet"];
+
+fn split_equals_flags<'a>(
+    rest: &[&'a str],
+    value_flags: &[&str],
+    no_value_flags: &[&str],
+) -> Result<Vec<&'a str>, Error> {
+    let mut out: Vec<&'a str> = Vec::with_capacity(rest.len() + 4);
+    let mut after_dd = false;
+    for arg in rest {
+        if after_dd || !arg.starts_with("--") {
+            if *arg == "--" {
+                after_dd = true;
+            }
+            out.push(arg);
+            continue;
+        }
+        if *arg == "--" {
+            after_dd = true;
+            out.push(arg);
+            continue;
+        }
+        match arg.split_once('=') {
+            Some((flag, value)) if value_flags.contains(&flag) => {
+                out.push(flag);
+                out.push(value);
+            }
+            Some((flag, _)) if no_value_flags.contains(&flag) => {
+                return Err(Error::Cli(format!(
+                    "{flag} takes no value, so {arg:?} is not a setting: write {flag} on its own"
+                )));
+            }
+            _ => out.push(arg),
+        }
+    }
+    Ok(out)
+}
+
 fn parse_box(rest: &[&str]) -> Result<Command, Error> {
+    // `--flag=value` FIRST, so every arm below sees the two-token form it was written for.
+    let split = split_equals_flags(rest, VALUE_FLAGS, NO_VALUE_FLAGS)?;
+    let rest: &[&str] = &split;
     let mut rm = false;
     let mut name: Option<&str> = None;
     let mut rootfs: Option<String> = None;
@@ -3994,14 +4210,62 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         None => return Err(Error::Usage(USAGE_SWAP_MAX)),
                     }
                 }
+                // Docker's and podman's `--security-opt` is three different requests wearing one
+                // flag, and kern answers each by name instead of calling the flag unknown.
+                //
+                // MEASURED 2026-11-12: `--security-opt label=disable`, which every podman GPU guide
+                // prints for SELinux, answered `unknown flag "--security-opt"` while this binary's
+                // own `--help` says, in the `--apparmor` line, that `--apparmor` IS "Docker's
+                // --security-opt apparmor=". The flag the help names was the flag the parser
+                // refused, with nothing pointing from one to the other.
+                "--security-opt" => {
+                    i += 1;
+                    let v = rest.get(i).copied().unwrap_or("");
+                    let (key, val) = v.split_once('=').unwrap_or((v, ""));
+                    return Err(Error::Cli(match key {
+                        "apparmor" => format!(
+                            "--security-opt apparmor={val} is `--apparmor {val}` here: same \
+                             profile, same fail-closed behaviour, one flag of its own"
+                        ),
+                        "seccomp" => format!(
+                            "--security-opt seccomp={val}: kern's filter is a deny-by-default \
+                             allowlist and is not chosen per box. The one opt-out is the wider \
+                             denylist posture, KERN_SECCOMP=denylist in the environment, and even \
+                             there eleven syscalls still answer ENOSYS"
+                        ),
+                        "label" => format!(
+                            "--security-opt label={val}: kern applies no SELinux label to a box, so \
+                             there is none to disable. If SELinux on the host denies a device a box \
+                             was granted, that is the host's policy and `getenforce` is where to \
+                             look"
+                        ),
+                        "no-new-privileges" => {
+                            "--security-opt no-new-privileges: a kern box already runs with \
+                             no-new-privs set, and there is no flag to turn it off"
+                                .to_string()
+                        }
+                        _ => format!(
+                            "--security-opt {v:?}: kern has no such flag. The ones with an \
+                             equivalent are apparmor= (`--apparmor`), seccomp= (the KERN_SECCOMP \
+                             environment variable) and no-new-privileges (always on)"
+                        ),
+                    }));
+                }
                 // Reject Docker's `--memory-swap` explicitly (don't alias it): on pure cgroup v2 the
                 // swap limit is a SEPARATE knob (`memory.swap.max`), not Docker's combined mem+swap
                 // total - aliasing would silently mean something different. Point to the honest flag.
                 "--memory-swap" => return Err(Error::Usage(REJECT_MEMORY_SWAP)),
                 // Reject an unknown flag rather than silently ignoring it: a typo'd `--read-only`
                 // must NOT quietly run a writable box. (Flags after `--` are part of the command.)
+                // AND IT QUOTES THE FLAG. MEASURED 2026-11-12 on a WSL2 host, pasting the
+                // compute variant NVIDIA prints: `--ipc=host --ulimit memlock=-1 --ulimit
+                // stack=67108864` answered "usage: kern box: unknown flag (see --help)" and
+                // named none of the three, so the reader had to bisect their own command line.
+                // `pull` has quoted the offending flag since the day it stopped ignoring them.
                 s if s.starts_with('-') => {
-                    return Err(Error::Usage("box: unknown flag (see --help)"))
+                    return Err(Error::Cli(format!(
+                        "box: unknown flag {s:?} - run `kern box --help` for what it accepts"
+                    )))
                 }
                 // A `vcpu:`/`vgpio:`/`vdisk:`/`vgpu:` token is a resource profile, not the box name.
                 s if crate::config::classify(s).is_some() => profiles.push(s.to_string()),
@@ -4249,6 +4513,9 @@ const BOX_ONLY_FLAGS: &[&str] = &[
 ];
 
 fn parse_run(rest: &[&str]) -> Result<Command, Error> {
+    // `--flag=value`, as docker takes it on every long flag. See `split_equals_flags`.
+    let split = split_equals_flags(rest, RUN_VALUE_FLAGS, RUN_NO_VALUE_FLAGS)?;
+    let rest: &[&str] = &split;
     let mut memory: Option<u64> = None;
     let mut memory_swap_max: Option<u64> = None;
     let mut cpus: Option<f64> = None;
@@ -4423,6 +4690,8 @@ fn is_cpu_list(s: &str) -> bool {
 /// Parse `exec <name> [-u <user>] [--env K=V] [--workdir <dir>] [--] [cmd...]`. Missing name →
 /// usage error. The `--` is OPTIONAL: trailing words are the command, as `docker exec <c> ls` reads.
 fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
+    let split = split_equals_flags(rest, EXEC_VALUE_FLAGS, EXEC_NO_VALUE_FLAGS)?;
+    let rest: &[&str] = &split;
     let mut name: Option<&str> = None;
     let mut env: Vec<String> = Vec::new();
     let mut workdir: Option<String> = None;
@@ -4478,7 +4747,9 @@ fn parse_exec(rest: &[&str]) -> Result<Command, Error> {
                 "-it" | "-ti" | "-t" | "--tty" => tty = true,
                 "-i" | "--interactive" => {}
                 s if s.starts_with('-') => {
-                    return Err(Error::Usage("exec: unknown flag (see --help)"))
+                    return Err(Error::Cli(format!(
+                        "exec: unknown flag {s:?} - run `kern exec --help` for what it accepts"
+                    )))
                 }
                 s if name.is_none() => name = Some(s),
                 // The command WITHOUT the `--`, which is how `docker exec <c> ls` reads and how
@@ -4588,6 +4859,11 @@ fn check_reference(spec: &str, flag: &str) -> Result<(), Error> {
 }
 
 fn parse_pull(rest: &[&str]) -> Option<Command> {
+    // UNREACHABLE ERROR, and it is named rather than hidden: the only thing this call can refuse
+    // is a no-value flag written with a value, and `pull` has none. Falling back to the argv as
+    // typed keeps this verb total, which its `Option` return already promises.
+    let split = split_equals_flags(rest, PULL_VALUE_FLAGS, &[]).unwrap_or_else(|_| rest.to_vec());
+    let rest: &[&str] = &split;
     let mut image: Option<&str> = None;
     let mut dest: Option<String> = None;
     let mut platform: Option<String> = None;
@@ -4903,6 +5179,8 @@ fn no_compose_file_here() -> Error {
 
 /// `kern build -t <name[:tag]> [-f <Dockerfile>] [--build-arg K=V]... [-q] [<context>]`.
 fn parse_build(rest: &[&str]) -> Result<Command, Error> {
+    let split = split_equals_flags(rest, BUILD_VALUE_FLAGS, BUILD_NO_VALUE_FLAGS)?;
+    let rest: &[&str] = &split;
     // `build <sub> …` - build-history management subcommands. A bare `build … -t <name>` (an actual
     // build) never starts with one of these verbs, so the dispatch is unambiguous.
     //
@@ -7495,6 +7773,229 @@ mod tests {
         assert!(
             !msg.contains("does not need one"),
             "and must not claim the host already has it: {msg}"
+        );
+    }
+
+    /// The match arms of [`parse_box`], read out of this file's own source, with whether each one
+    /// consumes the next argument.
+    ///
+    /// The parser spells that consumption one way, `i += 1` inside the arm, which is what makes the
+    /// derivation possible at all. Nested matches (`Some("host") =>`) and guards (`Some(v) if …`)
+    /// do not start with a string literal, so they are not arms for this purpose.
+    #[cfg(test)]
+    fn parse_box_arms() -> Vec<(Vec<String>, bool)> {
+        let src = include_str!("cli.rs");
+        let start = src.find("fn parse_box").expect("parse_box exists");
+        let rest = &src[start..];
+        let end = rest[12..]
+            .find("\nfn ")
+            .map(|i| i + 12)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let mut arms: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut offset = 0usize;
+        for line in body.lines() {
+            let t = line.trim();
+            if t.starts_with('"') {
+                if let Some(cut) = t.find("=>") {
+                    let head = &t[..cut];
+                    let flags: Vec<String> = head
+                        .split('"')
+                        .skip(1)
+                        .step_by(2)
+                        .map(|s| s.to_string())
+                        .collect();
+                    if !flags.is_empty() {
+                        arms.push((offset, flags));
+                    }
+                }
+            }
+            offset += line.len() + 1;
+        }
+        let mut out = Vec::new();
+        for (i, (pos, flags)) in arms.iter().enumerate() {
+            let next = arms.get(i + 1).map(|(p, _)| *p).unwrap_or(body.len());
+            let takes = body[*pos..next].contains("i += 1");
+            out.push((flags.clone(), takes));
+        }
+        out
+    }
+
+    /// ⛔ THE TWO LISTS BEHIND `--flag=value` ARE RE-DERIVED HERE, both ways.
+    ///
+    /// [`split_equals_flags`] may only split a flag that takes a value: splitting a boolean would
+    /// put its value where the box NAME is read and start a box called `true`, which is a silent
+    /// misparse and worse than the error it replaces. So a flag that stops taking a value, or a new
+    /// flag that takes one, has to fail HERE rather than in somebody's terminal.
+    #[test]
+    fn every_value_flag_really_takes_a_value_and_every_boolean_really_does_not() {
+        let arms = parse_box_arms();
+        assert!(
+            arms.len() > 40,
+            "the arm extraction found {} arms, so it stopped working and this test proves nothing",
+            arms.len()
+        );
+        let long = |f: &String| f.starts_with("--") && f.len() > 2;
+
+        let derived_value: Vec<String> = arms
+            .iter()
+            .filter(|(_, takes)| *takes)
+            .flat_map(|(fs, _)| fs.iter().filter(|f| long(f)).cloned())
+            .collect();
+        let derived_bool: Vec<String> = arms
+            .iter()
+            .filter(|(_, takes)| !*takes)
+            .flat_map(|(fs, _)| fs.iter().filter(|f| long(f)).cloned())
+            .collect();
+
+        for f in &derived_value {
+            assert!(
+                VALUE_FLAGS.contains(&f.as_str()),
+                "{f} takes a value in the parser and is missing from VALUE_FLAGS, so --{}=x \
+                 would not be split",
+                f.trim_start_matches('-')
+            );
+        }
+        for f in VALUE_FLAGS {
+            assert!(
+                derived_value.iter().any(|d| d == f),
+                "VALUE_FLAGS names {f}, which the parser does not read a value for: splitting it \
+                 would hand the value to the next positional"
+            );
+        }
+        for f in &derived_bool {
+            if *f == "--" {
+                continue;
+            }
+            assert!(
+                NO_VALUE_FLAGS.contains(&f.as_str()),
+                "{f} takes no value and is missing from NO_VALUE_FLAGS, so {f}=x would say \
+                 'unknown flag' about a flag that exists"
+            );
+        }
+        for f in NO_VALUE_FLAGS {
+            assert!(
+                derived_bool.iter().any(|d| d == f),
+                "NO_VALUE_FLAGS names {f}, which the parser DOES read a value for"
+            );
+        }
+    }
+
+    /// THE GATE AND THE PARSER MUST AGREE ABOUT `--flag=value`, in both directions.
+    ///
+    /// The gate refuses the attached form by default, and the comment on it carries the measurement
+    /// that bought that rule: `kern images --json=1` was accepted at the gate, ignored by the
+    /// parser, and printed the human table with exit 0 to a script asking for JSON. That must not
+    /// come back. What changed is that five parsers now honour the form for their value-taking
+    /// flags, so for those the gate has to let it through or it contradicts them.
+    #[test]
+    fn the_gate_accepts_the_attached_form_only_where_the_parser_splits_it() {
+        // PULL: its parser splits `--dest=` and `--platform=`, so the gate must pass them.
+        for arg in ["--dest=/tmp/x", "--platform=linux/amd64"] {
+            assert!(
+                reject_unknown_flags_attached(
+                    "pull",
+                    &["pull", arg, "alpine"],
+                    &["--dest", "--platform", "--quiet", "-q"],
+                    PULL_VALUE_FLAGS,
+                )
+                .is_ok(),
+                "{arg} is honoured by the pull parser and must pass the gate"
+            );
+        }
+        // AND A FLAG THAT IS NOT IN THE ATTACHED LIST IS STILL REFUSED, even on the same verb: the
+        // parser reads `--quiet` as a boolean, so `--quiet=1` would be accepted here and ignored
+        // there, which is the whole defect this gate exists to prevent.
+        assert!(
+            reject_unknown_flags_attached(
+                "pull",
+                &["pull", "--quiet=1", "alpine"],
+                &["--dest", "--platform", "--quiet", "-q"],
+                PULL_VALUE_FLAGS,
+            )
+            .is_err(),
+            "--quiet=1 is not honoured by the parser and must not pass"
+        );
+        // AND THE DEFAULT IS UNCHANGED for every verb that passes no attached list: these two are
+        // the cases the comment on the gate was written for.
+        for (verb, arg, allowed) in [
+            ("images", "--json=1", &["--json"][..]),
+            ("gc", "--images=no", &["--images"][..]),
+        ] {
+            assert!(
+                reject_unknown_flags(verb, &[verb, arg], allowed).is_err(),
+                "{verb} {arg} must stay refused: its parser does not read the attached form"
+            );
+        }
+    }
+
+    /// WHAT THE SPLIT DOES AND WHAT IT REFUSES TO TOUCH.
+    ///
+    /// MEASURED 2026-11-12 before it existed: `--memory=512m`, `--env=A=1`, `--pids-limit=64`,
+    /// `--gpus=1` and `--gpus=all` each answered "unknown flag (see --help)" while the same flag
+    /// with a space worked, and NVIDIA's Triton quickstart is written `--gpus=1 --shm-size=1g`.
+    #[test]
+    fn the_equals_form_is_split_and_the_workloads_own_arguments_are_not() {
+        fn v<'a>(args: &[&'a str]) -> Vec<&'a str> {
+            split_equals_flags(args, VALUE_FLAGS, NO_VALUE_FLAGS).expect("accepted")
+        }
+
+        assert_eq!(
+            v(&["box", "x", "--memory=512m"]),
+            vec!["box", "x", "--memory", "512m"]
+        );
+        // THE VALUE'S OWN `=` SURVIVES, because the split is on the FIRST one only.
+        assert_eq!(
+            v(&["box", "x", "--env=A=1"]),
+            vec!["box", "x", "--env", "A=1"]
+        );
+        assert_eq!(
+            v(&["box", "x", "--device=nvidia.com/gpu=0"]),
+            vec!["box", "x", "--device", "nvidia.com/gpu=0"]
+        );
+        // ⛔ NOTHING AFTER `--`: past the separator a token that looks like a flag is the
+        // workload's argument, and splitting it would change the program's own command line.
+        //
+        // THE TOKEN AFTER `--` MUST ITSELF START WITH `--`, or this case proves nothing. The first
+        // version used `echo --env=A=1`, one argument beginning with "echo", which the function
+        // skips on the "not a flag" branch before the separator is ever consulted: deleting the
+        // `after_dd` guard left this test GREEN. These arguments ARE flag-shaped.
+        assert_eq!(
+            v(&["box", "x", "--rm", "--", "sh", "-c", "echo --env=A=1"]),
+            vec!["box", "x", "--rm", "--", "sh", "-c", "echo --env=A=1"]
+        );
+        assert_eq!(
+            v(&["box", "x", "--", "python3", "--env=A=1", "--memory=512m"]),
+            vec!["box", "x", "--", "python3", "--env=A=1", "--memory=512m"],
+            "a workload argument that IS a known flag with a value must survive untouched"
+        );
+        // And a boolean-shaped one after the separator must not be refused either: it is not a
+        // flag of kern's at all down there.
+        assert_eq!(
+            v(&["box", "x", "--", "myprog", "--rm=true"]),
+            vec!["box", "x", "--", "myprog", "--rm=true"]
+        );
+        // A flag nobody has is left exactly as written, so the unknown-flag message still quotes
+        // what was typed.
+        assert_eq!(
+            v(&["box", "x", "--nonesuch=1"]),
+            vec!["box", "x", "--nonesuch=1"]
+        );
+        // A SHORT FLAG IS NOT THE LONG FORM'S SHAPE: `-m=512m` is not a spelling docker takes
+        // either, and splitting it would invent one.
+        assert_eq!(v(&["box", "x", "-m=512m"]), vec!["box", "x", "-m=512m"]);
+        // AND A BOOLEAN IS REFUSED BY NAME rather than split or called unknown.
+        let err = split_equals_flags(&["box", "x", "--rm=true"], VALUE_FLAGS, NO_VALUE_FLAGS)
+            .expect_err("must refuse");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("--rm"),
+            "the refusal must name the flag: {msg}"
+        );
+        assert!(
+            msg.contains("takes no value"),
+            "and say what is wrong with it: {msg}"
         );
     }
 
