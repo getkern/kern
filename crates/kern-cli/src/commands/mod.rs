@@ -6304,6 +6304,45 @@ pub(crate) fn apply_privileged_grant(
     ))
 }
 
+/// The host device nodes a list of `-v` style bind specs would hand over, OBSERVED on the host
+/// rather than inferred from the compose key that carried them.
+///
+/// THE PREDICATE IS THE PROPERTY, which is the shape `device_grant_refusal` already argues for and
+/// the shape the two older checks lack: `compose_devices_refusal` asks whether the `devices:` list is
+/// non-empty, so it is keyed on the KEY NAME, and the same string written under `volumes:` reached
+/// the hardware with nothing asked. That is not a hypothesis. `ComposeBox::devices` exists because of
+/// it, and its own doc records the measurement that bought it: "the identical string under `volumes:`
+/// gave the workload `crw-rw---- 10, 232 /dev/kvm`". The field was split so the parser's order could
+/// not erase it; the gate was then wired to the new field only, and `volumes:` kept the hole. MEASURED
+/// again on 2026-11-11 with this binary: a stack whose only device spelling was
+/// `volumes: ["/dev/kvm:/dev/kvm"]` started with no flag, printed no warning in `config` or in `up`,
+/// and its box opened the node read-write.
+///
+/// `metadata` FOLLOWS the link, deliberately: the gate must not be escapable by naming a symlink to a
+/// device, and following can only ever widen what is gated. A source that is not a device node, does
+/// not exist, or is a named volume contributes nothing, so a stack that binds no hardware is not
+/// gated by this and the common case stays unaffected.
+fn host_device_sources(specs: &[String]) -> Vec<String> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut out: Vec<String> = Vec::new();
+    for spec in specs {
+        let source = spec.split(':').next().unwrap_or(spec.as_str());
+        if source.is_empty() {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(source) else {
+            continue;
+        };
+        let kind = meta.file_type();
+        if kind.is_char_device() || kind.is_block_device() {
+            out.push(source.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Option<String> {
     // The command line, or the operator's own config. Never the compose file, and never a config the
     // compose file named: see `device_grants_allowed_by_config`.
@@ -6325,6 +6364,21 @@ fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Op
         }
         if let Some(msg) = compose_devices_refusal(b.service_name(), &b.devices) {
             return Some(msg);
+        }
+        // THE SAME PROPERTY, ASKED OF THE OTHER KEY. `devices:` is gated above by its key being
+        // non-empty; a file that writes the identical string under `volumes:` was not gated at all,
+        // and `ComposeBox::devices`'s own doc carries the measurement that proves the two spellings
+        // deliver the same node. Asked observationally here, so a third spelling that resolves to a
+        // bind source inherits the gate instead of needing its own branch.
+        let granted = host_device_sources(&b.volumes);
+        if !granted.is_empty() {
+            return Some(format!(
+                "service '{}' binds host device(s) {} through `volumes:`. Which hardware a compose \
+                 file may reach is the operator's decision, not the file's: check the list with \
+                 `kern compose <file> config`, then pass --allow-device-grants to run it.",
+                b.service_name(),
+                granted.join(" ")
+            ));
         }
         let toks = b.profile_tokens();
         if toks.is_empty() {

@@ -5265,6 +5265,61 @@ mod port_collision_tests {
         assert!(device_grant_problem(&plain, false).is_none());
     }
 
+    /// THE SAME NODE UNDER `volumes:` IS THE SAME GRANT, AND THE GATE USED TO MISS IT ENTIRELY.
+    ///
+    /// The gate above is keyed on the `devices:` KEY being non-empty, so the identical string written
+    /// under `volumes:` reached the hardware with nothing asked and no warning printed. That the two
+    /// spellings deliver the same node was never in doubt: `ComposeBox::devices` exists because of it
+    /// and its doc carries the measurement (`crw-rw---- 10, 232 /dev/kvm` from a `volumes:` entry).
+    /// MEASURED again on 2026-11-11 before this test was written: a stack whose only device spelling
+    /// was `volumes: ["/dev/kvm:/dev/kvm"]` started with no flag and its box opened the node rw.
+    ///
+    /// `/dev/null` is the node under test rather than `/dev/kvm`: it is a character device on every
+    /// host this suite runs on, including a CI runner with no virtualisation, so the case cannot
+    /// decay into a skip that reads as a pass.
+    #[test]
+    fn the_same_device_under_volumes_needs_the_same_grant() {
+        let _g = crate::env_guard();
+        let mut b = crate::compose::ComposeBox {
+            name: "sneaky".into(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        };
+        b.volumes = vec!["/dev/null:/dev/null".into()];
+        let boxes = vec![b];
+        let msg = device_grant_problem(&boxes, false)
+            .expect("a device bound through volumes: must be refused like one bound through devices:");
+        assert!(
+            msg.contains("/dev/null") && msg.contains("volumes:") && msg.contains("sneaky"),
+            "the refusal names the node, the key that carried it and the service: {msg}"
+        );
+        assert!(msg.contains("--allow-device-grants"), "{msg}");
+        assert!(
+            device_grant_problem(&boxes, true).is_none(),
+            "the operator's flag lifts it, as it does for every other spelling"
+        );
+
+        // POSITIVE CONTROL, and the reason the predicate is observational rather than a path match:
+        // an ORDINARY volume must not be gated, or every compose file in the world would need the
+        // flag. A directory, a regular file and a path that does not exist at all, plus a named
+        // volume, which has no host path to stat.
+        let mut ordinary = crate::compose::ComposeBox {
+            name: "web".into(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        };
+        ordinary.volumes = vec![
+            "/tmp:/data".into(),
+            "/etc/hostname:/etc/hostname:ro".into(),
+            "/definitely/not/here:/x".into(),
+            "appdata:/var/lib/app".into(),
+        ];
+        assert!(
+            device_grant_problem(&[ordinary], false).is_none(),
+            "a stack that binds no hardware is not a hardware grant"
+        );
+    }
+
     /// A PROFILE NAME IS RESOLVED LOCALLY, SO `config` HAS TO SAY WHAT IT RESOLVED TO.
     ///
     /// The case this exists for: someone downloads a `docker-compose.yml` that says
