@@ -1523,6 +1523,26 @@ fn has_subid_allocation(subuid: &str, ids: &[String]) -> bool {
         .any(|owner| ids.iter().any(|id| owner.trim() == id))
 }
 
+/// The half of the missing-helpers warning that is not about convenience, as a function of the
+/// caller's inherited groups so both of its branches have a test.
+///
+/// Empty means empty: a caller carrying nothing loses nothing to the single-uid map on this axis,
+/// and warning them about a hazard they do not have is the noise that teaches readers to skip the
+/// row that matters.
+fn inherited_groups_note(inherited: &[u32]) -> String {
+    if inherited.is_empty() {
+        return String::new();
+    }
+    format!(
+        " Every box here also takes that map, so it keeps the {} supplementary group(s) you carry \
+         (gid {}) and reaches anything on the host they open: the kernel refuses the single-uid map \
+         until `setgroups` is denied, and will not allow it again afterwards. `--no-uid-range` asks \
+         for this deliberately; a host without the helpers does not.",
+        inherited.len(),
+        join_short(&inherited.iter().map(u32::to_string).collect::<Vec<_>>()),
+    )
+}
+
 fn check_uid_range() -> R {
     // SAFETY: `getuid` is infallible and takes no arguments.
     let uid = unsafe { libc::getuid() };
@@ -1564,12 +1584,31 @@ fn check_uid_range() -> R {
             "`echo {who}:100000:65536 | sudo tee -a /etc/subuid /etc/subgid`"
         ));
     }
+    // AND THE PART THAT IS NOT ABOUT CONVENIENCE. Without the helpers EVERY box on this host takes
+    // the single-uid map, not just the three flags named above, and that map is the one the kernel
+    // will not write until `/proc/self/setgroups` is `deny`. After `deny` the clear in
+    // `drop_caps_around_identity` is EPERM for the life of the namespace, so the box keeps the
+    // caller's inherited supplementary groups: unmapped and unnameable inside, still counted by
+    // every permission check outside. Measured 2026-11-11 over six orderings, none of which drops
+    // them, with the ranged map as the positive control that does.
+    //
+    // `--no-uid-range` reaches the same place and is CONSENT: it names that map in as many words.
+    // This host does not, so the one honest thing is to say it here, and to say it with a number
+    // read from the caller rather than a conditional the reader has to evaluate. Same spelling of
+    // "the groups this caller carries" as everywhere else in the crate.
+    let primary = unsafe { libc::getgid() } as u32;
+    let inherited: Vec<u32> = crate::gpu_grant::Caller::current()
+        .gids
+        .into_iter()
+        .filter(|gid| *gid != primary)
+        .collect();
+    let groups = inherited_groups_note(&inherited);
     R::Warn(
         "newuidmap/newgidmap or /etc/subuid missing: `--uid-range`, `--user` and `--ssh` get one uid"
             .into(),
         format!(
             "so an official image that chowns to a service user (redis, postgres, nginx) fails at \
-             start. Fix: {}",
+             start.{groups} Fix: {}",
             steps.join(", then ")
         ),
     )
@@ -2580,6 +2619,41 @@ mod tests {
         // And a card with no PCI identity at all cannot pair with anything.
         let board = gpu_row(&fake("card0", None), Some(&grant), &nobody()).text();
         assert!(board.contains("no grant path"), "{board}");
+    }
+
+    /// A HOST WITHOUT THE IDMAP HELPERS IS NOT THE SAME AS A CALLER WHO ASKED FOR THE TIGHT MAP.
+    #[test]
+    fn the_missing_helper_row_says_the_box_keeps_the_callers_groups() {
+        // THE CASE THE ROW DID NOT COVER. Without `newuidmap`/`newgidmap` every box on the host
+        // takes the single-uid map, not only the three flags the headline names, and that map is the
+        // one the kernel will not write until `/proc/self/setgroups` is `deny`. After `deny` the
+        // clear is EPERM for the life of the namespace, so the box keeps the caller's inherited
+        // supplementary groups. `--no-uid-range` reaches the same place and is CONSENT; a host
+        // without the helpers is not, and the row said nothing about it.
+        //
+        // Measured on both sides by running the real binary, since this host HAS the helpers and the
+        // branch would otherwise never execute: with `PATH` emptied so `which` fails, the row reads
+        // "keeps the 13 supplementary group(s) you carry (gid 4, 6, 20 and 10 more)"; the same
+        // binary run INSIDE a box, where `id -G` is `0` and so the inherited set is empty, prints
+        // the row with that sentence ABSENT and nothing else changed.
+        let note = super::inherited_groups_note(&[4, 6, 20, 44]);
+        assert!(note.contains("4 supplementary group(s)"), "{note}");
+        assert!(
+            note.contains("gid 4, 6, 20"),
+            "the gids are not named: {note}"
+        );
+        assert!(
+            note.contains("--no-uid-range"),
+            "the row does not distinguish this from the consented case: {note}"
+        );
+        // THE EMPTY HALF, which is the one a warning-everywhere version would get wrong: a caller
+        // carrying nothing loses nothing here, and saying otherwise is the noise that teaches a
+        // reader to skip the row that matters.
+        assert_eq!(
+            super::inherited_groups_note(&[]),
+            "",
+            "a caller with no inherited group was warned about a hazard they do not have"
+        );
     }
 
     /// A card whose nodes need a group is REFUSED, and the row says which group and why.
