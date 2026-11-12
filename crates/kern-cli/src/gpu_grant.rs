@@ -130,19 +130,45 @@ const ELF_CLASS_64: u8 = 2;
 /// The first four bytes of any ELF file.
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
-/// POSIX ACL tags, from `<sys/acl.h>`. Only the two that carry an id are named, because only those
-/// two change the answer: an `ACL_USER` entry is a uid path and survives a box, an `ACL_GROUP`
-/// entry is a group path and does not.
+/// POSIX ACL tags, from `<sys/acl.h>`. ALL SIX are named, and the three that were missing are the
+/// defect: `ACL_USER_OBJ`, `ACL_GROUP_OBJ` and `ACL_OTHER` carry the permissions of the owner, the
+/// owning group and everybody else when an ACL is present, and a reader that takes those three from
+/// `st_mode` instead gets the group one WRONG, because with a mask present `st_mode`'s group bits
+/// are the MASK and not the owning group's permission. Measured with `getfacl`: a node with
+/// `group::rw-` and `mask::r--` displays `-r--` in the group position of `ls -l`.
+const ACL_USER_OBJ: u16 = 0x0001;
 const ACL_USER: u16 = 0x0002;
+const ACL_GROUP_OBJ: u16 = 0x0004;
 const ACL_GROUP: u16 = 0x0008;
 const ACL_MASK: u16 = 0x0010;
+const ACL_OTHER: u16 = 0x0020;
 
 /// The version word at the head of `system.posix_acl_access`.
 const ACL_XATTR_VERSION: u32 = 2;
 
-/// The ACL entry's permission bits, in the xattr's own encoding.
-const ACL_READ: u16 = 0x04;
-const ACL_WRITE: u16 = 0x02;
+/// The ACL entry's permission bits, in the xattr's own encoding, which is also the encoding of one
+/// `st_mode` permission triad. `ACL_EXECUTE` is named for completeness of the triad and is never
+/// part of a `want`: a character device is opened, not executed.
+const ACL_READ: u8 = 0x04;
+const ACL_WRITE: u8 = 0x02;
+const ACL_EXECUTE: u8 = 0x01;
+
+/// Every bit of a triad, the value a MISSING `ACL_MASK` stands for.
+///
+/// A minimal ACL (three entries, no mask) is what a filesystem stores for a node that has no named
+/// entry at all, and there the mask bounds nothing. Using `0` for an absent mask would make every
+/// such node unreachable, which is the direction that fails CLOSED and would refuse every grant on
+/// a host with plain permissions.
+const ACL_PERM_ALL: u8 = ACL_READ | ACL_WRITE | ACL_EXECUTE;
+
+/// What a GPU node must support to be worth mounting: the driver opens its nodes `O_RDWR`.
+///
+/// This is the whole correction of 2026-11-12. The policy asked only about READ while every node in
+/// a grant is bound read-write and the driver opens it read-write, so a node the caller can read and
+/// not write was reported reachable and the workload died at `cuInit` with no diagnostic from kern.
+/// Measured on this host: all seven nodes a one-card grant touches are rw-reachable, so requiring
+/// write changes no verdict here and closes the case on a host where it would.
+const WANT_RW: u8 = ACL_READ | ACL_WRITE;
 
 /// The architecture a grant is being built for. The box inherits the host's architecture, so this
 /// is not a choice the caller makes; it is recorded so the library sweep can reject the other tree
@@ -220,32 +246,64 @@ pub struct NodeFacts {
     pub uid: u32,
     /// The owning gid.
     pub gid: u32,
-    /// The permission bits, the low nine of `st_mode`.
+    /// The permission bits, the low nine of `st_mode`. Authoritative ONLY when `acl` is `None`:
+    /// with an ACL present the group triad is the mask, which is why [`Acl`] carries its own
+    /// group-owner permission instead of deriving it from here.
     pub mode: u32,
-    /// uids named by an `ACL_USER` entry that grants at least read.
-    pub acl_users: Vec<u32>,
-    /// gids named by an `ACL_GROUP` entry that grants at least read.
-    pub acl_groups: Vec<u32>,
-    /// Whether an `ACL_MASK` entry exists and denies read to the whole group class. When a mask is
-    /// present it bounds every group-class entry, so a mask without read makes the group path dead
-    /// whatever the individual entries say.
-    pub acl_mask_denies_read: bool,
+    /// The node's POSIX access ACL, or `None` when it carries none.
+    pub acl: Option<Acl>,
 }
 
 impl NodeFacts {
-    /// The `other` class grants read.
-    fn other_reads(&self) -> bool {
-        self.mode & 0o004 != 0
+    /// The `owner` triad of `st_mode`, as ACL permission bits.
+    const fn mode_owner(&self) -> u8 {
+        ((self.mode >> 6) & 0o7) as u8
     }
 
-    /// The `owner` class grants read.
-    fn owner_reads(&self) -> bool {
-        self.mode & 0o400 != 0
+    /// The `group` triad of `st_mode`, as ACL permission bits.
+    const fn mode_group(&self) -> u8 {
+        ((self.mode >> 3) & 0o7) as u8
     }
 
-    /// The `group` class grants read, before the ACL mask is applied.
-    fn group_reads(&self) -> bool {
-        self.mode & 0o040 != 0
+    /// The `other` triad of `st_mode`, as ACL permission bits.
+    const fn mode_other(&self) -> u8 {
+        (self.mode & 0o7) as u8
+    }
+}
+
+/// A node's POSIX access ACL, as the kernel's own check consumes it.
+///
+/// ALL SIX ENTRY KINDS, because the check consults all six and the previous reduction to
+/// (`users`, `groups`, `mask_denies_read`) could not express three things the kernel decides on:
+/// that the mask bounds a NAMED USER entry and not only the group class, that a matched group-class
+/// entry must carry EVERY requested bit by itself, and that the permissions of the owning group are
+/// not `st_mode`'s group bits when a mask is present.
+///
+/// Permissions are ACL bits (`ACL_READ` | `ACL_WRITE` | `ACL_EXECUTE`), one triad per field, which
+/// is the same encoding as one `st_mode` triad.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acl {
+    /// `ACL_USER_OBJ`: the owner's permission. Never bounded by the mask.
+    pub user_obj: u8,
+    /// `ACL_USER`: named uids and their permission, bounded by the mask.
+    pub users: Vec<(u32, u8)>,
+    /// `ACL_GROUP_OBJ`: the owning group's permission, bounded by the mask.
+    pub group_obj: u8,
+    /// `ACL_GROUP`: named gids and their permission, bounded by the mask.
+    pub groups: Vec<(u32, u8)>,
+    /// `ACL_MASK`, absent on a minimal ACL, where it bounds nothing.
+    pub mask: Option<u8>,
+    /// `ACL_OTHER`: everybody else. Never bounded by the mask.
+    pub other: u8,
+}
+
+impl Acl {
+    /// The mask's bits, or every bit when there is no mask.
+    const fn mask_bits(&self) -> u8 {
+        match self.mask {
+            Some(bits) => bits,
+            None => ACL_PERM_ALL,
+        }
     }
 }
 
@@ -289,41 +347,155 @@ impl AccessPath {
 /// this project's recurring defect, and the group rule is exactly the shape that invites it: the
 /// resolver, the message and the refusal would each be tempted to ask it again.
 ///
-/// The kernel's order is reproduced exactly:
-///   1. the owner class is consulted first AND EXCLUSIVELY when the uid matches;
-///   2. then `ACL_USER` for the caller's uid;
-///   3. then the group class, which is the file's gid plus any `ACL_GROUP` entry, bounded by
-///      `ACL_MASK` when one is present;
-///   4. then `other`.
+/// The kernel's order is reproduced exactly, and the list below was WRONG until 2026-11-12: it put
+/// the mask on step 3 alone. POSIX bounds every NAMED entry by the mask, step 2 included, and the
+/// comment stating otherwise was the specification the code implemented.
+///
+///   1. the owner class is consulted first AND EXCLUSIVELY when the uid matches, and is NOT
+///      bounded by the mask;
+///   2. then `ACL_USER` for the caller's uid, exclusive once it matches, BOUNDED BY THE MASK;
+///   3. then the group class, the file's gid plus any `ACL_GROUP` entry, each entry bounded by the
+///      mask, with no union between entries and no fall-through to `other` once the caller is in
+///      any of them;
+///   4. then `other`, which is also not bounded by the mask.
+///
+/// And it answers for the access the DRIVER performs, [`WANT_RW`], not for read: a node the caller
+/// can read and not write is Unreachable, because `cuInit` opens it `O_RDWR`.
 ///
 /// Step 1 being exclusive is not a detail: a node owned by the caller with mode `0o040` is
 /// `Unreachable`, not `GroupOnly`, and a resolver that fell through to the group class would report
 /// a decision the kernel never offers.
 pub fn access_path(node: &NodeFacts, who: &Caller) -> AccessPath {
+    access_path_for(node, who, WANT_RW)
+}
+
+/// [`access_path`] for an arbitrary `want`, which is what makes the rule testable against the
+/// kernel's own behaviour one bit at a time.
+///
+/// `want` is a triad of ACL permission bits. Production asks for [`WANT_RW`] and nothing else; the
+/// parameter exists because a test that can only ask the production question cannot show that
+/// asking a DIFFERENT one changes the answer, and "read is enough" was the defect.
+pub fn access_path_for(node: &NodeFacts, who: &Caller, want: u8) -> AccessPath {
+    let granted = |perm: u8| perm & want == want;
+
+    // 1. THE OWNER CLASS, consulted first and EXCLUSIVELY, and never bounded by the mask.
+    //    `posix_acl_permission` reaches `check_perm` for `ACL_USER_OBJ` without passing through the
+    //    mask label, and `acl_permission_check` returns on the owner triad before it even looks for
+    //    an ACL. So a node owned by the caller with mode `0o040` is Unreachable and not GroupOnly.
     if node.uid == who.uid {
-        return if node.owner_reads() {
+        let perm = match &node.acl {
+            Some(acl) => acl.user_obj,
+            None => node.mode_owner(),
+        };
+        return if granted(perm) {
             AccessPath::Owner
         } else {
             AccessPath::Unreachable
         };
     }
 
-    if node.acl_users.contains(&who.uid) {
-        return AccessPath::AclUser;
+    let Some(acl) = &node.acl else {
+        // NO ACL: `acl_permission_check`'s plain path, through the same group-class spelling. The
+        // group class is still EXCLUSIVE, which is the part a fall-through gets wrong: the kernel
+        // shifts to the group triad whenever group and other differ in a requested bit, so `0o606`
+        // denies a group member the write it would have had as `other`. There is no mask to apply.
+        let (found, satisfying) = group_class_matches(node, who, want);
+        if found {
+            return if satisfying.is_empty() {
+                AccessPath::Unreachable
+            } else {
+                AccessPath::GroupOnly
+            };
+        }
+        return if granted(node.mode_other()) {
+            AccessPath::Other
+        } else {
+            AccessPath::Unreachable
+        };
+    };
+
+    // 2. A NAMED USER ENTRY, exclusive once it matches, and BOUNDED BY THE MASK. This is the
+    //    defect: the previous rule returned `AclUser` here without consulting the mask at all, so a
+    //    node carrying `user:alex:rw-` under `mask::---`, which `getfacl` itself prints as
+    //    `#effective:---`, was reported reachable. On this host BOTH DRM nodes a grant touches go
+    //    through this branch (`user:<caller>:rw-` on a root-owned node), so the case is live here
+    //    and not only on the headless shape.
+    if let Some((_, perm)) = acl.users.iter().find(|(uid, _)| *uid == who.uid) {
+        return if granted(perm & acl.mask_bits()) {
+            AccessPath::AclUser
+        } else {
+            AccessPath::Unreachable
+        };
     }
 
-    let group_class_open = !node.acl_mask_denies_read;
-    let by_file_gid = node.group_reads() && who.in_group(node.gid);
-    let by_acl_group = node.acl_groups.iter().any(|g| who.in_group(*g));
-    if group_class_open && (by_file_gid || by_acl_group) {
-        return AccessPath::GroupOnly;
+    // 3. THE GROUP CLASS: the owning group plus every named group entry. One spelling, shared with
+    //    `group_policy`, so the verdict and the message it prints cannot disagree.
+    let (found, satisfying) = group_class_matches(node, who, want);
+    if found {
+        return if !satisfying.is_empty() && granted(acl.mask_bits()) {
+            AccessPath::GroupOnly
+        } else {
+            AccessPath::Unreachable
+        };
     }
 
-    if node.other_reads() {
-        return AccessPath::Other;
+    // 4. EVERYBODY ELSE, never bounded by the mask.
+    if granted(acl.other) {
+        AccessPath::Other
+    } else {
+        AccessPath::Unreachable
+    }
+}
+
+/// The group class of a node, as the caller meets it: whether the caller is in it at all, and which
+/// of its gids carry every bit of `want` on their own entry.
+///
+/// THE ONE SPELLING of the group-class question. [`access_path_for`] decides with it and
+/// [`group_policy`] reports its gids, so a node refused for wanting a group and the list of gids
+/// printed beside the refusal are computed once. A derived condition evaluated in two places is
+/// this project's recurring defect, and this is the condition that invited it: the resolver, the
+/// refusal and the doctor row would each be tempted to ask it again.
+///
+/// TWO PROPERTIES, both of which the previous rule lacked. The kernel does not UNION entries: a
+/// single entry must carry every requested bit by itself, so `group::r--` beside `group:other:-w-`
+/// under `mask::rw-` satisfies a read check and a write check SEPARATELY and refuses `O_RDWR`.
+/// And `found` is not the same as satisfied: once the caller is in any group-class entry the
+/// decision is made there, because `posix_acl_permission` sets `found` and its `ACL_OTHER` arm then
+/// returns `-EACCES` instead of consulting `other`.
+///
+/// The mask is deliberately NOT applied here. It bounds the whole class rather than one entry, so
+/// the caller applies it once; folding it in would make an empty result mean two different things.
+fn group_class_matches(node: &NodeFacts, who: &Caller, want: u8) -> (bool, Vec<u32>) {
+    let mut found = false;
+    let mut satisfying: Vec<u32> = Vec::new();
+
+    // With an ACL present the owning group's permission is `ACL_GROUP_OBJ` and NOT `st_mode`'s
+    // group triad, which is the mask. Taking it from the mode here is the mirror of the defect this
+    // function exists to fix.
+    let group_obj = match &node.acl {
+        Some(acl) => acl.group_obj,
+        None => node.mode_group(),
+    };
+    if who.in_group(node.gid) {
+        found = true;
+        if group_obj & want == want {
+            satisfying.push(node.gid);
+        }
+    }
+    if let Some(acl) = &node.acl {
+        for (gid, perm) in &acl.groups {
+            if who.in_group(*gid) {
+                found = true;
+                if perm & want == want {
+                    satisfying.push(*gid);
+                }
+            }
+        }
     }
 
-    AccessPath::Unreachable
+    satisfying.sort_unstable();
+    satisfying.dedup();
+    (found, satisfying)
 }
 
 /// What the grant says about supplementary groups. There are two choices and the kernel offers no
@@ -935,19 +1107,24 @@ fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
 ///
 /// A node with no ACL answers with empty lists and no mask, which is the common case and the one
 /// that must not cost anything: `getxattr` returns `ENODATA` and the function is done.
-fn acl_facts(path: &Path) -> (Vec<u32>, Vec<u32>, bool) {
-    let empty = (Vec::new(), Vec::new(), false);
-
+fn acl_facts(path: &Path) -> Option<Acl> {
     let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
-        return empty;
+        return None;
     };
     let name = c"system.posix_acl_access";
 
     let needed = unsafe { libc::getxattr(c_path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
     if needed <= 0 {
-        return empty;
+        // No xattr, or a filesystem that does not carry one. Either way the node has no ACL and
+        // `st_mode` is the whole truth about it.
+        return None;
     }
-    let mut buffer = vec![0u8; needed as usize];
+    // `needed` is the kernel's own answer to the size query and is positive here, so the cast is
+    // exact on every target this builds for; it is bounded by the attribute size limit (64 KiB).
+    let Ok(size) = usize::try_from(needed) else {
+        return None;
+    };
+    let mut buffer = vec![0u8; size];
     let got = unsafe {
         libc::getxattr(
             c_path.as_ptr(),
@@ -957,10 +1134,16 @@ fn acl_facts(path: &Path) -> (Vec<u32>, Vec<u32>, bool) {
         )
     };
     if got <= 0 {
-        return empty;
+        return None;
     }
-    let got = (got as usize).min(buffer.len());
-    parse_acl_xattr(&buffer[..got])
+    let Ok(got) = usize::try_from(got) else {
+        return None;
+    };
+    // The ACL can have CHANGED between the two calls and come back longer than the buffer; the
+    // kernel would have returned ERANGE, but clamping keeps the slice in bounds without relying on
+    // that, which is the difference between a bound and a belief.
+    let got = got.min(buffer.len());
+    parse_acl_xattr(buffer.get(..got)?)
 }
 
 /// Parse `system.posix_acl_access` into (acl users, acl groups, mask denies read).
@@ -969,35 +1152,33 @@ fn acl_facts(path: &Path) -> (Vec<u32>, Vec<u32>, bool) {
 /// shapes a filesystem should never produce: a wrong version, a truncated entry, a trailing
 /// fragment. Each of those returns what it can rather than failing the whole grant, because an ACL
 /// that cannot be read is an ACL that grants nothing, which is the fail-closed answer.
-fn parse_acl_xattr(bytes: &[u8]) -> (Vec<u32>, Vec<u32>, bool) {
-    let mut users: Vec<u32> = Vec::new();
-    let mut groups: Vec<u32> = Vec::new();
-    let mut mask_denies_read = false;
-
-    if bytes.len() < 4 {
-        return (users, groups, mask_denies_read);
-    }
-    let Some(version_bytes) = bytes.get(..4) else {
-        return (users, groups, mask_denies_read);
-    };
-    let Ok(version_array) = <[u8; 4]>::try_from(version_bytes) else {
-        return (users, groups, mask_denies_read);
-    };
+fn parse_acl_xattr(bytes: &[u8]) -> Option<Acl> {
+    let version_bytes = bytes.get(..4)?;
+    let version_array = <[u8; 4]>::try_from(version_bytes).ok()?;
     if u32::from_le_bytes(version_array) != ACL_XATTR_VERSION {
-        return (users, groups, mask_denies_read);
+        return None;
     }
+
+    // A conforming ACL always carries all three class entries. They are seeded to deny rather than
+    // to allow so a truncated or malformed blob yields a node nobody reaches, which is the
+    // fail-closed direction: a grant refused with a reason beats a grant mounted and dying at
+    // `cuInit`. `mask` stays `None` until an `ACL_MASK` entry appears, because a minimal ACL has
+    // none and there it must bound nothing.
+    let mut acl = Acl {
+        user_obj: 0,
+        users: Vec::new(),
+        group_obj: 0,
+        groups: Vec::new(),
+        mask: None,
+        other: 0,
+    };
+    let mut saw_entry = false;
 
     let mut offset = 4usize;
     while offset + 8 <= bytes.len() {
-        let Some(tag_bytes) = bytes.get(offset..offset + 2) else {
-            break;
-        };
-        let Some(perm_bytes) = bytes.get(offset + 2..offset + 4) else {
-            break;
-        };
-        let Some(id_bytes) = bytes.get(offset + 4..offset + 8) else {
-            break;
-        };
+        let tag_bytes = bytes.get(offset..offset + 2)?;
+        let perm_bytes = bytes.get(offset + 2..offset + 4)?;
+        let id_bytes = bytes.get(offset + 4..offset + 8)?;
         let (Ok(tag_array), Ok(perm_array), Ok(id_array)) = (
             <[u8; 2]>::try_from(tag_bytes),
             <[u8; 2]>::try_from(perm_bytes),
@@ -1006,40 +1187,63 @@ fn parse_acl_xattr(bytes: &[u8]) -> (Vec<u32>, Vec<u32>, bool) {
             break;
         };
         let tag = u16::from_le_bytes(tag_array);
-        let perm = u16::from_le_bytes(perm_array);
+        // The permission word is 16 bits on the wire and only the low triad is defined. Masking
+        // rather than truncating: a filesystem that set a reserved high bit must not turn into a
+        // permission this code then grants.
+        let perm = (u16::from_le_bytes(perm_array) & u16::from(ACL_PERM_ALL)) as u8;
         let id = u32::from_le_bytes(id_array);
-        let grants_read = perm & ACL_READ != 0;
+        saw_entry = true;
 
         match tag {
-            ACL_USER if grants_read => users.push(id),
-            ACL_GROUP if grants_read => groups.push(id),
-            ACL_MASK => mask_denies_read = !grants_read,
+            ACL_USER_OBJ => acl.user_obj = perm,
+            ACL_USER => acl.users.push((id, perm)),
+            ACL_GROUP_OBJ => acl.group_obj = perm,
+            ACL_GROUP => acl.groups.push((id, perm)),
+            ACL_MASK => acl.mask = Some(perm),
+            ACL_OTHER => acl.other = perm,
+            // An unknown tag is skipped rather than refused: the entry length is fixed, so the
+            // walk stays in step, and a kernel that grows a seventh tag must not disable the six.
             _ => {}
         }
-        // A node is opened for reading, so the write bit is read and discarded deliberately: it is
-        // named here so a later phase that needs write access knows where the bit was dropped.
-        let _ = perm & ACL_WRITE;
         offset += 8;
     }
 
-    users.sort_unstable();
-    users.dedup();
-    groups.sort_unstable();
-    groups.dedup();
-    (users, groups, mask_denies_read)
+    if !saw_entry {
+        // A version word and nothing after it is not an ACL. Reporting `None` sends the decision
+        // back to `st_mode`, which is what a node with no ACL has, rather than to an all-deny
+        // structure that would refuse every grant on such a node.
+        return None;
+    }
+
+    // DUPLICATE IDS ARE REDUCED BY INTERSECTION, not by first or last wins. A conforming ACL cannot
+    // carry the same id twice, so this path is only reachable on a malformed blob, and intersecting
+    // is the only reduction that cannot GRANT something no single entry granted.
+    merge_acl_ids(&mut acl.users);
+    merge_acl_ids(&mut acl.groups);
+    Some(acl)
+}
+
+/// Collapse repeated ids in an ACL entry list, keeping only the bits every copy agreed on.
+fn merge_acl_ids(entries: &mut Vec<(u32, u8)>) {
+    entries.sort_unstable_by_key(|(id, _)| *id);
+    let mut merged: Vec<(u32, u8)> = Vec::with_capacity(entries.len());
+    for (id, perm) in entries.drain(..) {
+        match merged.last_mut() {
+            Some((last_id, last_perm)) if *last_id == id => *last_perm &= perm,
+            _ => merged.push((id, perm)),
+        }
+    }
+    *entries = merged;
 }
 
 /// The facts about one node, read from the filesystem.
 fn node_facts(path: &Path) -> Option<NodeFacts> {
     let meta = std::fs::metadata(path).ok()?;
-    let (acl_users, acl_groups, acl_mask_denies_read) = acl_facts(path);
     Some(NodeFacts {
         uid: meta.uid(),
         gid: meta.gid(),
         mode: meta.mode() & 0o777,
-        acl_users,
-        acl_groups,
-        acl_mask_denies_read,
+        acl: acl_facts(path),
     })
 }
 
@@ -1063,14 +1267,13 @@ pub fn group_policy(nodes: &[(PathBuf, NodeFacts)], who: &Caller) -> GroupPolicy
             // the `continue` above has already taken them.
             AccessPath::Owner | AccessPath::AclUser | AccessPath::Other => {}
             AccessPath::GroupOnly => {
-                if facts.group_reads() && who.in_group(facts.gid) {
-                    needed_gids.insert(facts.gid);
-                }
-                for g in &facts.acl_groups {
-                    if who.in_group(*g) {
-                        needed_gids.insert(*g);
-                    }
-                }
+                // THE SAME FUNCTION THE VERDICT USED. This arm used to re-derive the question with
+                // `group_reads()` and a membership test, which asked about READ while the verdict
+                // asked about `O_RDWR`, so the gids printed beside a refusal could include one
+                // whose entry does not actually unlock the node. `group_class_matches` returns
+                // exactly the gids whose own entry carries every bit of `WANT_RW`.
+                let (_, satisfying) = group_class_matches(facts, who, WANT_RW);
+                needed_gids.extend(satisfying);
                 needed_nodes.push(path.clone());
             }
             AccessPath::Unreachable => unreachable.push(path.clone()),
@@ -1635,84 +1838,187 @@ mod tests {
             uid,
             gid,
             mode,
-            acl_users: Vec::new(),
-            acl_groups: Vec::new(),
-            acl_mask_denies_read: false,
+            acl: None,
+        }
+    }
+
+    /// A node carrying an ACL, with `st_mode` built to match it the way a filesystem stores it.
+    ///
+    /// `ACL_USER_OBJ` is the owner triad and `ACL_OTHER` is the other triad, but `ACL_GROUP_OBJ` is
+    /// the OWNING GROUP's permission and `st_mode`'s group triad is the MASK whenever one exists.
+    /// The helper derives the mode from those rules rather than taking it, so no fixture can state
+    /// a node that two kernel interfaces would describe differently, and so a reader cannot repeat
+    /// the defect these cases exist for by writing the mask into `group_obj`.
+    fn acl_node(
+        uid: u32,
+        gid: u32,
+        owner: u8,
+        group_obj: u8,
+        other: u8,
+        users: &[(u32, u8)],
+        groups: &[(u32, u8)],
+        mask: Option<u8>,
+    ) -> NodeFacts {
+        NodeFacts {
+            uid,
+            gid,
+            mode: (u32::from(owner) << 6)
+                | (u32::from(mask.unwrap_or(group_obj)) << 3)
+                | u32::from(other),
+            acl: Some(Acl {
+                user_obj: owner,
+                users: users.to_vec(),
+                group_obj,
+                groups: groups.to_vec(),
+                mask,
+                other,
+            }),
         }
     }
 
     /// THE POLICY, over its whole input space rather than over the state this machine is in.
     ///
-    /// The space is (owner matches or not) x (group matches or not) x (each of the three read bits)
-    /// x (acl user present or not) x (acl group present or not) x (mask denies or not). Every
-    /// combination is generated and checked against the kernel's own order, so a rule that happens
-    /// to be right for this desktop's `0666` nodes cannot pass.
+    /// The space is (owner matches) x (group matches) x (owner triad) x (owning-group triad) x
+    /// (other triad) x (a named-user entry, absent or with any triad) x (a named-group entry, the
+    /// same) x (the mask, absent or any triad) x (the access asked for). Triads are enumerated as
+    /// the four combinations of read and write that matter, so a rule that happens to be right for
+    /// this desktop's `0666` nodes cannot pass.
+    ///
+    /// WANT IS A DIMENSION, and that is the correction of 2026-11-12. The previous version of this
+    /// test asked only the read question, which is the question the implementation also asked, so
+    /// the pair agreed and both were wrong about the access the driver performs. Running the whole
+    /// space at `ACL_READ` and again at `WANT_RW` is what makes "read is enough" visible.
+    ///
+    /// WHAT THIS TEST IS AND IS NOT. The expectation below is the POSIX algorithm written out, so
+    /// it is not an independent derivation and does not pretend to be: its value is total coverage
+    /// and regression, and the independence comes from the kernel cross-check in
+    /// `the_kernel_agrees_about_the_classes_this_caller_can_actually_produce` plus the three named
+    /// cases that cite `posix_acl_permission` directly.
     #[test]
     fn the_policy_answers_every_combination_the_way_the_kernel_orders_them() {
+        const TRIADS: [u8; 4] = [0, ACL_READ, ACL_WRITE, ACL_READ | ACL_WRITE];
+        const ENTRIES: [Option<u8>; 5] = [
+            None,
+            Some(0),
+            Some(ACL_READ),
+            Some(ACL_WRITE),
+            Some(ACL_READ | ACL_WRITE),
+        ];
         let who = caller(1000, &[1000, 44]);
         let mut seen_each_variant = [false; 5];
+        let mut cases = 0usize;
 
-        for owner_matches in [false, true] {
-            for group_matches in [false, true] {
-                for owner_bit in [false, true] {
-                    for group_bit in [false, true] {
-                        for other_bit in [false, true] {
-                            for acl_user in [false, true] {
-                                for acl_group in [false, true] {
-                                    for mask_denies in [false, true] {
-                                        let mut node = plain(
-                                            if owner_matches { 1000 } else { 4242 },
-                                            if group_matches { 44 } else { 4242 },
-                                            (if owner_bit { 0o400 } else { 0 })
-                                                | (if group_bit { 0o040 } else { 0 })
-                                                | (if other_bit { 0o004 } else { 0 }),
-                                        );
-                                        if acl_user {
-                                            node.acl_users.push(1000);
-                                        }
-                                        if acl_group {
-                                            node.acl_groups.push(44);
-                                        }
-                                        node.acl_mask_denies_read = mask_denies;
+        for want in [ACL_READ, WANT_RW] {
+            for owner_matches in [false, true] {
+                for group_matches in [false, true] {
+                    for owner in TRIADS {
+                        for group_obj in TRIADS {
+                            for other in TRIADS {
+                                for acl_present in [false, true] {
+                                    for named_user in ENTRIES {
+                                        for named_group in ENTRIES {
+                                            for mask in ENTRIES {
+                                                // Without an ACL there are no entries and no mask,
+                                                // so only the all-absent combination is a real
+                                                // node; generating the others would count cases
+                                                // that cannot exist.
+                                                if !acl_present
+                                                    && (named_user.is_some()
+                                                        || named_group.is_some()
+                                                        || mask.is_some())
+                                                {
+                                                    continue;
+                                                }
+                                                let uid = if owner_matches { 1000 } else { 4242 };
+                                                let gid = if group_matches { 44 } else { 4242 };
+                                                let users: Vec<(u32, u8)> = named_user
+                                                    .map(|p| vec![(1000u32, p)])
+                                                    .unwrap_or_default();
+                                                let groups: Vec<(u32, u8)> = named_group
+                                                    .map(|p| vec![(44u32, p)])
+                                                    .unwrap_or_default();
+                                                let node = if acl_present {
+                                                    acl_node(
+                                                        uid, gid, owner, group_obj, other, &users,
+                                                        &groups, mask,
+                                                    )
+                                                } else {
+                                                    plain(
+                                                        uid,
+                                                        gid,
+                                                        (u32::from(owner) << 6)
+                                                            | (u32::from(group_obj) << 3)
+                                                            | u32::from(other),
+                                                    )
+                                                };
 
-                                        let got = access_path(&node, &who);
+                                                let got = access_path_for(&node, &who, want);
 
-                                        // The expected answer, derived here independently of the
-                                        // implementation so the test is not the code again.
-                                        let expected = if owner_matches {
-                                            if owner_bit {
-                                                AccessPath::Owner
-                                            } else {
-                                                AccessPath::Unreachable
+                                                let has = |perm: u8| perm & want == want;
+                                                let mask_bits = mask.unwrap_or(ACL_PERM_ALL);
+                                                let expected = if owner_matches {
+                                                    // The owner class is exclusive and unmasked.
+                                                    if has(owner) {
+                                                        AccessPath::Owner
+                                                    } else {
+                                                        AccessPath::Unreachable
+                                                    }
+                                                } else if let Some(p) = named_user {
+                                                    // A named user is exclusive once it matches,
+                                                    // and the mask bounds it.
+                                                    if has(p & mask_bits) {
+                                                        AccessPath::AclUser
+                                                    } else {
+                                                        AccessPath::Unreachable
+                                                    }
+                                                } else {
+                                                    // The group class: membership makes the
+                                                    // decision final, one entry must carry every
+                                                    // wanted bit alone, and the mask bounds the
+                                                    // class.
+                                                    let mut found = false;
+                                                    let mut satisfied = false;
+                                                    if group_matches {
+                                                        found = true;
+                                                        satisfied |= has(group_obj);
+                                                    }
+                                                    if let Some(p) = named_group {
+                                                        found = true;
+                                                        satisfied |= has(p);
+                                                    }
+                                                    if found {
+                                                        if satisfied && has(mask_bits) {
+                                                            AccessPath::GroupOnly
+                                                        } else {
+                                                            AccessPath::Unreachable
+                                                        }
+                                                    } else if has(other) {
+                                                        AccessPath::Other
+                                                    } else {
+                                                        AccessPath::Unreachable
+                                                    }
+                                                };
+
+                                                assert_eq!(
+                                                    got, expected,
+                                                    "want={want:#o} owner_matches={owner_matches} \
+                                                     group_matches={group_matches} acl={acl_present} \
+                                                     triads={owner:#o}/{group_obj:#o}/{other:#o} \
+                                                     user={named_user:?} group={named_group:?} \
+                                                     mask={mask:?}"
+                                                );
+
+                                                let index = match got {
+                                                    AccessPath::Owner => 0,
+                                                    AccessPath::AclUser => 1,
+                                                    AccessPath::Other => 2,
+                                                    AccessPath::GroupOnly => 3,
+                                                    AccessPath::Unreachable => 4,
+                                                };
+                                                seen_each_variant[index] = true;
+                                                cases += 1;
                                             }
-                                        } else if acl_user {
-                                            AccessPath::AclUser
-                                        } else if !mask_denies
-                                            && ((group_bit && group_matches)
-                                                || (acl_group && who.in_group(44)))
-                                        {
-                                            AccessPath::GroupOnly
-                                        } else if other_bit {
-                                            AccessPath::Other
-                                        } else {
-                                            AccessPath::Unreachable
-                                        };
-
-                                        assert_eq!(
-                                            got, expected,
-                                            "owner_matches={owner_matches} group_matches={group_matches} \
-                                             bits={owner_bit}{group_bit}{other_bit} acl_user={acl_user} \
-                                             acl_group={acl_group} mask_denies={mask_denies}"
-                                        );
-
-                                        let index = match got {
-                                            AccessPath::Owner => 0,
-                                            AccessPath::AclUser => 1,
-                                            AccessPath::Other => 2,
-                                            AccessPath::GroupOnly => 3,
-                                            AccessPath::Unreachable => 4,
-                                        };
-                                        seen_each_variant[index] = true;
+                                        }
                                     }
                                 }
                             }
@@ -1727,6 +2033,12 @@ mod tests {
         assert!(
             seen_each_variant.iter().all(|x| *x),
             "the enumeration never produced every variant: {seen_each_variant:?}"
+        );
+        // And an enumeration whose `continue` filtered everything would also pass the line above
+        // on a single lucky case, so the count is pinned too.
+        assert!(
+            cases > 5000,
+            "the enumeration collapsed to {cases} cases, so it is not the space it claims"
         );
     }
 
@@ -1745,11 +2057,155 @@ mod tests {
     #[test]
     fn a_per_uid_acl_outranks_the_group_class_and_survives_a_box() {
         let who = caller(1000, &[1000, 44]);
-        let mut node = plain(0, 44, 0o660);
-        node.acl_users.push(1000);
+        let node = acl_node(
+            0,
+            44,
+            WANT_RW,
+            WANT_RW,
+            0,
+            &[(1000, WANT_RW)],
+            &[],
+            Some(WANT_RW),
+        );
         let got = access_path(&node, &who);
         assert_eq!(got, AccessPath::AclUser);
         assert!(got.survives_a_box());
+    }
+
+    /// THE FIRST OF THE THREE CASES THAT WERE THE DEFECT. A named-user entry is bounded by the
+    /// mask, and the previous rule returned `AclUser` from the entry alone without ever reading the
+    /// mask that `NodeFacts` already carried.
+    ///
+    /// `getfacl` prints this node's entry as `user:alex:rw-  #effective:---`, which is the kernel
+    /// stating that the entry grants nothing. `posix_acl_permission` reaches its `mask` label for
+    /// `ACL_USER` and returns `-EACCES` unless `(entry & mask & want) == want`. Reported reachable,
+    /// the grant mounts and the workload dies at `cuInit` with no diagnostic from kern, which is
+    /// the one failure mode this whole policy exists to prevent.
+    #[test]
+    fn a_named_user_entry_is_bounded_by_the_mask() {
+        let who = caller(1000, &[1000, 44]);
+        let denied = acl_node(0, 44, WANT_RW, WANT_RW, 0, &[(1000, WANT_RW)], &[], Some(0));
+        assert_eq!(
+            access_path(&denied, &who),
+            AccessPath::Unreachable,
+            "a named entry under a mask that denies everything must not read as reachable"
+        );
+
+        // POSITIVE CONTROL on the same node with the mask opened, so the refusal above is the mask
+        // and not the entry, the uid or the mode.
+        let allowed = acl_node(
+            0,
+            44,
+            WANT_RW,
+            WANT_RW,
+            0,
+            &[(1000, WANT_RW)],
+            &[],
+            Some(WANT_RW),
+        );
+        assert_eq!(access_path(&allowed, &who), AccessPath::AclUser);
+
+        // And a mask that allows READ only still refuses, because the driver opens `O_RDWR`. This
+        // is the line where the two halves of the defect meet.
+        let read_only_mask = acl_node(
+            0,
+            44,
+            WANT_RW,
+            WANT_RW,
+            0,
+            &[(1000, WANT_RW)],
+            &[],
+            Some(ACL_READ),
+        );
+        assert_eq!(access_path(&read_only_mask, &who), AccessPath::Unreachable);
+        assert_eq!(
+            access_path_for(&read_only_mask, &who, ACL_READ),
+            AccessPath::AclUser,
+            "the same node must be reachable for a READ, or this case proves nothing about rw"
+        );
+    }
+
+    /// THE SECOND CASE. A node the caller can read and not write is Unreachable, because the driver
+    /// opens its nodes `O_RDWR`. The policy used to read the write bit out of the ACL and discard
+    /// it with a comment saying so.
+    #[test]
+    fn a_read_only_node_is_unreachable_because_the_driver_opens_rw() {
+        let who = caller(1000, &[1000, 44]);
+        let node = plain(0, 0, 0o444);
+        assert_eq!(access_path(&node, &who), AccessPath::Unreachable);
+        // POSITIVE CONTROL: the same node answers for a read, so the refusal is the write bit and
+        // not the node being unreadable by anyone.
+        assert_eq!(
+            access_path_for(&node, &who, ACL_READ),
+            AccessPath::Other,
+            "0o444 must be reachable for a READ, or the rw refusal above proves nothing"
+        );
+        // And `0o666`, which is what this host's `/dev/nvidia*` nodes are, is reachable.
+        assert_eq!(access_path(&plain(0, 0, 0o666), &who), AccessPath::Other);
+    }
+
+    /// THE THIRD CASE, and the one no reading of the old code would have caught: THE KERNEL DOES
+    /// NOT UNION TWO ENTRIES FOR ONE ACCESS.
+    ///
+    /// `group::r--` beside `group:44:-w-` under `mask::rw-` satisfies a read check through the
+    /// first entry and a write check through the second, and refuses `O_RDWR`, because
+    /// `posix_acl_permission` only reaches its `mask` label from an entry for which
+    /// `(e_perm & want) == want` holds ALONE. A policy that asks about read and about write
+    /// separately concludes rw-reachable and the workload dies at `cuInit`.
+    #[test]
+    fn two_group_entries_do_not_combine_into_one_access() {
+        let who = caller(1000, &[1000, 44]);
+        let split = acl_node(
+            0,
+            44,
+            WANT_RW,
+            ACL_READ,
+            0,
+            &[],
+            &[(44, ACL_WRITE)],
+            Some(WANT_RW),
+        );
+        assert_eq!(
+            access_path(&split, &who),
+            AccessPath::Unreachable,
+            "read from one entry and write from another is not an rw access"
+        );
+        // POSITIVE CONTROLS, one per half, so the refusal is the SPLIT and not either entry being
+        // ignored: each access the entries do carry on their own must be granted.
+        assert_eq!(
+            access_path_for(&split, &who, ACL_READ),
+            AccessPath::GroupOnly,
+            "the read the owning-group entry carries alone must be granted"
+        );
+        assert_eq!(
+            access_path_for(&split, &who, ACL_WRITE),
+            AccessPath::GroupOnly,
+            "the write the named-group entry carries alone must be granted"
+        );
+        // And one entry carrying BOTH bits is reachable, which is the same node with the split
+        // repaired.
+        let whole = acl_node(0, 44, WANT_RW, WANT_RW, 0, &[], &[], Some(WANT_RW));
+        assert_eq!(access_path(&whole, &who), AccessPath::GroupOnly);
+    }
+
+    /// Being in the group class is FINAL: the kernel does not fall through to `other` once the
+    /// caller matched a group-class entry, so `0o606` denies a group member the write it would have
+    /// had as a stranger. A resolver that fell through would report a node the kernel refuses.
+    #[test]
+    fn the_group_class_does_not_fall_through_to_other() {
+        let member = caller(1000, &[1000, 44]);
+        let stranger = caller(1000, &[1000]);
+        let node = plain(0, 44, 0o606);
+        assert_eq!(
+            access_path(&node, &member),
+            AccessPath::Unreachable,
+            "a group member must not be handed the `other` triad"
+        );
+        assert_eq!(
+            access_path(&node, &stranger),
+            AccessPath::Other,
+            "and a stranger must still get it, or the case above is about something else"
+        );
     }
 
     /// The shape a server has: the same node with the ACL removed. It must answer `GroupOnly`, and
@@ -1767,21 +2223,110 @@ mod tests {
     #[test]
     fn an_acl_group_entry_is_a_group_path_and_is_lost_with_the_others() {
         let who = caller(1000, &[1000, 44]);
-        let mut node = plain(0, 4242, 0o600);
-        node.acl_groups.push(44);
+        let node = acl_node(0, 4242, WANT_RW, 0, 0, &[], &[(44, WANT_RW)], Some(WANT_RW));
         let got = access_path(&node, &who);
         assert_eq!(got, AccessPath::GroupOnly);
         assert!(!got.survives_a_box());
     }
 
-    /// A mask without read kills the whole group class, entries included.
+    /// A mask that denies kills the whole group class, entries included.
     #[test]
-    fn an_acl_mask_without_read_closes_the_group_path_entirely() {
+    fn an_acl_mask_without_the_wanted_bits_closes_the_group_path_entirely() {
         let who = caller(1000, &[1000, 44]);
-        let mut node = plain(0, 44, 0o660);
-        node.acl_groups.push(44);
-        node.acl_mask_denies_read = true;
+        let node = acl_node(0, 44, WANT_RW, WANT_RW, 0, &[], &[(44, WANT_RW)], Some(0));
         assert_eq!(access_path(&node, &who), AccessPath::Unreachable);
+        // POSITIVE CONTROL: the same node with the mask open is reachable, so the refusal is the
+        // mask.
+        let open = acl_node(
+            0,
+            44,
+            WANT_RW,
+            WANT_RW,
+            0,
+            &[],
+            &[(44, WANT_RW)],
+            Some(WANT_RW),
+        );
+        assert_eq!(access_path(&open, &who), AccessPath::GroupOnly);
+    }
+
+    /// A MINIMAL ACL HAS NO MASK, and there the mask must bound nothing.
+    ///
+    /// Treating an absent mask as zero would be the fail-closed direction and would refuse every
+    /// grant on a host whose nodes carry a three-entry ACL, which is what a filesystem stores for a
+    /// node with no named entry at all.
+    #[test]
+    fn an_absent_mask_bounds_nothing() {
+        let who = caller(1000, &[1000, 44]);
+        let node = acl_node(0, 44, WANT_RW, WANT_RW, 0, &[], &[], None);
+        assert_eq!(access_path(&node, &who), AccessPath::GroupOnly);
+        let named = acl_node(0, 4242, WANT_RW, 0, 0, &[(1000, WANT_RW)], &[], None);
+        assert_eq!(access_path(&named, &who), AccessPath::AclUser);
+    }
+
+    /// THE KERNEL ITSELF, on the classes this caller can actually produce without privilege.
+    ///
+    /// The matrix test's expectation is the POSIX algorithm written out, so it cannot be its own
+    /// independent check. This one asks the KERNEL: it creates files, opens them `O_RDWR`, and
+    /// compares the verdict with [`access_path`]. What it can reach is the owner class and the
+    /// group class (a file can be `chgrp`-ed to a group the caller already holds) and the mode
+    /// path; what it cannot reach is a named-user entry for a DIFFERENT uid, because creating a
+    /// file owned by somebody else needs privilege. That gap is the reason the three cases above
+    /// cite `posix_acl_permission` by name instead of measuring it.
+    ///
+    /// ⚠️ A file owned by the caller is decided by the OWNER class, exclusively. Putting a named
+    /// entry on one's own file and concluding anything about named entries is the exact trap that
+    /// produced the original defect, so this test never does it.
+    #[test]
+    fn the_kernel_agrees_about_the_classes_this_caller_can_actually_produce() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kern-aclk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("skip: no writable temp dir, so the kernel cannot be asked");
+            return;
+        }
+        let who = Caller::current();
+        let mut checked = 0usize;
+        for (index, mode) in [0o600u32, 0o400, 0o200, 0o000, 0o666, 0o060, 0o006]
+            .into_iter()
+            .enumerate()
+        {
+            let path = dir.join(format!("f{index}"));
+            if std::fs::write(&path, b"x").is_err() {
+                continue;
+            }
+            if std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).is_err() {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let facts = NodeFacts {
+                uid: meta.uid(),
+                gid: meta.gid(),
+                mode: meta.mode() & 0o777,
+                acl: acl_facts(&path),
+            };
+            let kernel_opens = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .is_ok();
+            let policy_says = access_path(&facts, &who) != AccessPath::Unreachable;
+            assert_eq!(
+                policy_says, kernel_opens,
+                "mode {mode:#o}: policy says reachable={policy_says}, the kernel says {kernel_opens}"
+            );
+            checked += 1;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // Both answers must have occurred, or this compared a constant with a constant.
+        assert!(
+            checked >= 4,
+            "only {checked} modes were testable, which is not a cross-check"
+        );
     }
 
     /// `/dev/nvidia0` on this host: `root:root 0666`. Nobody needs to be anybody.
@@ -1885,58 +2430,131 @@ mod tests {
         assert_eq!(driver_version_from(many).as_deref(), Some("1.2.3.4.5.6"));
     }
 
+    /// One ACL entry as the xattr encodes it: a 16-bit tag, a 16-bit permission word, a 32-bit id.
+    fn acl_entry(tag: u16, perm: u8, id: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&u16::from(perm).to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+        out
+    }
+
+    /// A whole `system.posix_acl_access` blob from a list of entries.
+    fn acl_blob(entries: &[(u16, u8, u32)]) -> Vec<u8> {
+        let mut bytes = ACL_XATTR_VERSION.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            bytes.extend_from_slice(&acl_entry(*tag, *perm, *id));
+        }
+        bytes
+    }
+
     /// The ACL parser over the shapes a filesystem should never produce.
+    ///
+    /// `None` is the answer for every one of them, and `None` means "this node has no ACL, decide
+    /// from `st_mode`". That is deliberately NOT the same as an all-deny ACL: a node whose xattr
+    /// cannot be parsed still has permission bits, and refusing it outright would refuse grants on
+    /// a host whose filesystem simply answers the query differently.
     #[test]
     fn the_acl_parser_fails_closed_on_every_malformed_shape() {
-        // Too short to carry a version.
-        assert_eq!(parse_acl_xattr(&[]), (Vec::new(), Vec::new(), false));
-        assert_eq!(parse_acl_xattr(&[2, 0, 0]), (Vec::new(), Vec::new(), false));
+        // Too short to carry a version word.
+        assert_eq!(parse_acl_xattr(&[]), None);
+        assert_eq!(parse_acl_xattr(&[2, 0, 0]), None);
+        // A version word and nothing after it is not an ACL.
+        assert_eq!(parse_acl_xattr(&ACL_XATTR_VERSION.to_le_bytes()), None);
         // A version this parser does not know grants nothing.
-        let wrong_version = [9u8, 0, 0, 0, 0x02, 0, 0x04, 0, 0xE8, 0x03, 0, 0];
-        assert_eq!(
-            parse_acl_xattr(&wrong_version),
-            (Vec::new(), Vec::new(), false)
-        );
+        let mut wrong_version = 9u32.to_le_bytes().to_vec();
+        wrong_version.extend_from_slice(&acl_entry(ACL_USER, ACL_READ, 1000));
+        assert_eq!(parse_acl_xattr(&wrong_version), None);
         // A trailing fragment shorter than one entry is dropped, and what came before survives.
-        let mut good = vec![2u8, 0, 0, 0];
-        good.extend_from_slice(&ACL_USER.to_le_bytes());
-        good.extend_from_slice(&ACL_READ.to_le_bytes());
-        good.extend_from_slice(&1000u32.to_le_bytes());
+        let mut good = acl_blob(&[(ACL_USER, ACL_READ | ACL_WRITE, 1000)]);
         good.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
-        let (users, groups, mask) = parse_acl_xattr(&good);
-        assert_eq!(users, vec![1000]);
-        assert!(groups.is_empty());
-        assert!(!mask);
+        let parsed = parse_acl_xattr(&good).expect("the complete entry must survive");
+        assert_eq!(parsed.users, vec![(1000, ACL_READ | ACL_WRITE)]);
+        assert_eq!(parsed.mask, None);
+        // A reserved high bit in the permission word must not become a permission.
+        let reserved = {
+            let mut bytes = ACL_XATTR_VERSION.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&ACL_USER.to_le_bytes());
+            bytes.extend_from_slice(&0xFF04u16.to_le_bytes());
+            bytes.extend_from_slice(&1000u32.to_le_bytes());
+            bytes
+        };
+        let parsed = parse_acl_xattr(&reserved).expect("the entry is well formed");
+        assert_eq!(
+            parsed.users,
+            vec![(1000, ACL_READ)],
+            "a reserved bit leaked into the permission triad"
+        );
+        // An unknown tag is skipped without derailing the walk, so the entry after it is still read.
+        let unknown = acl_blob(&[(0x4000, ACL_PERM_ALL, 0), (ACL_USER, ACL_READ, 1000)]);
+        let parsed = parse_acl_xattr(&unknown).expect("the known entry must survive");
+        assert_eq!(parsed.users, vec![(1000, ACL_READ)]);
     }
 
-    /// A real ACL, in the shape `getfacl` showed on this host's `/dev/dri/card0`.
+    /// A real ACL, in the shape `getfacl` shows on this host's `/dev/dri/card0`: all six entry
+    /// kinds, with the permissions each one carries.
     #[test]
-    fn the_acl_parser_reads_a_user_entry_a_group_entry_and_a_mask() {
-        let mut bytes = vec![2u8, 0, 0, 0];
-        for (tag, perm, id) in [
-            (ACL_USER, ACL_READ | ACL_WRITE, 1000u32),
-            (ACL_GROUP, ACL_READ, 44u32),
-            (ACL_MASK, ACL_READ | ACL_WRITE, 0xFFFF_FFFFu32),
+    fn the_acl_parser_reads_every_entry_kind_with_its_permissions() {
+        let bytes = acl_blob(&[
+            (ACL_USER_OBJ, ACL_READ | ACL_WRITE, 0xFFFF_FFFF),
+            (ACL_USER, ACL_READ | ACL_WRITE, 1000),
+            (ACL_GROUP_OBJ, ACL_READ | ACL_WRITE, 0xFFFF_FFFF),
+            (ACL_GROUP, ACL_READ, 44),
+            (ACL_MASK, ACL_READ | ACL_WRITE, 0xFFFF_FFFF),
+            (ACL_OTHER, 0, 0xFFFF_FFFF),
+        ]);
+        let acl = parse_acl_xattr(&bytes).expect("a conforming ACL must parse");
+        assert_eq!(acl.user_obj, ACL_READ | ACL_WRITE);
+        assert_eq!(acl.users, vec![(1000, ACL_READ | ACL_WRITE)]);
+        assert_eq!(acl.group_obj, ACL_READ | ACL_WRITE);
+        assert_eq!(acl.groups, vec![(44, ACL_READ)]);
+        assert_eq!(acl.mask, Some(ACL_READ | ACL_WRITE));
+        assert_eq!(acl.other, 0);
+    }
+
+    /// THE MASK IS A PERMISSION, NOT A FLAG, which is what the previous reduction could not say.
+    ///
+    /// It used to collapse to "the mask denies read", so a mask of `r--` over an entry of `rw-`
+    /// read as permissive and the write it removes was invisible. The parser keeps the triad and
+    /// the policy intersects with it.
+    #[test]
+    fn the_mask_is_kept_as_a_triad_and_not_as_a_deny_flag() {
+        for (bits, label) in [
+            (0u8, "no access at all"),
+            (ACL_READ, "read only"),
+            (ACL_WRITE, "write only"),
+            (ACL_READ | ACL_WRITE, "both"),
         ] {
-            bytes.extend_from_slice(&tag.to_le_bytes());
-            bytes.extend_from_slice(&perm.to_le_bytes());
-            bytes.extend_from_slice(&id.to_le_bytes());
+            let bytes = acl_blob(&[(ACL_MASK, bits, 0xFFFF_FFFF)]);
+            let acl = parse_acl_xattr(&bytes).expect("a mask entry is an ACL");
+            assert_eq!(acl.mask, Some(bits), "the mask lost its triad: {label}");
         }
-        let (users, groups, mask_denies) = parse_acl_xattr(&bytes);
-        assert_eq!(users, vec![1000]);
-        assert_eq!(groups, vec![44]);
-        assert!(!mask_denies);
     }
 
-    /// A mask with no read bit sets the flag the policy turns on.
+    /// A DUPLICATE ID IS INTERSECTED, never first-wins or last-wins.
+    ///
+    /// A conforming ACL cannot carry the same id twice, so this is only reachable on a malformed
+    /// blob. Intersection is the only reduction that cannot GRANT a permission no single entry
+    /// granted, which is the direction that matters when the input is not trusted.
     #[test]
-    fn a_mask_entry_without_read_sets_the_deny_flag() {
-        let mut bytes = vec![2u8, 0, 0, 0];
-        bytes.extend_from_slice(&ACL_MASK.to_le_bytes());
-        bytes.extend_from_slice(&ACL_WRITE.to_le_bytes());
-        bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        let (_, _, mask_denies) = parse_acl_xattr(&bytes);
-        assert!(mask_denies);
+    fn a_duplicate_acl_id_is_reduced_by_intersection() {
+        let bytes = acl_blob(&[
+            (ACL_USER, ACL_READ | ACL_WRITE, 1000),
+            (ACL_USER, ACL_READ, 1000),
+            (ACL_GROUP, ACL_WRITE, 44),
+            (ACL_GROUP, ACL_READ | ACL_WRITE, 44),
+        ]);
+        let acl = parse_acl_xattr(&bytes).expect("the blob parses");
+        assert_eq!(
+            acl.users,
+            vec![(1000, ACL_READ)],
+            "two user entries for one id must intersect, not pick one"
+        );
+        assert_eq!(
+            acl.groups,
+            vec![(44, ACL_WRITE)],
+            "two group entries for one id must intersect, not pick one"
+        );
     }
 
     /// A root with no driver file is a different fault from a root with an unreadable one, and the

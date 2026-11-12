@@ -2520,27 +2520,26 @@ mod tests {
         }
     }
 
-    /// A node every caller can open: `other` reads it, so the group question never arises.
+    /// A node every caller can open READ-WRITE: `other` carries both bits, so the group question
+    /// never arises. `0o666` and not `0o644`, because the driver opens its nodes `O_RDWR` and a
+    /// read-only `other` is now `Unreachable`, which is the whole point of the 2026-11-12 change.
     fn open_node() -> crate::gpu_grant::NodeFacts {
         crate::gpu_grant::NodeFacts {
             uid: 0,
             gid: 0,
             mode: 0o666,
-            acl_users: Vec::new(),
-            acl_groups: Vec::new(),
-            acl_mask_denies_read: false,
+            acl: None,
         }
     }
 
-    /// A node only its group can open, which is the shape a box cannot carry.
+    /// A node only its group can open, which is the shape a box cannot carry: the headless server's
+    /// `root:video 0660` with no `other` bit and no ACL.
     fn gated_node() -> crate::gpu_grant::NodeFacts {
         crate::gpu_grant::NodeFacts {
             uid: 0,
             gid: 44,
             mode: 0o660,
-            acl_users: Vec::new(),
-            acl_groups: Vec::new(),
-            acl_mask_denies_read: false,
+            acl: None,
         }
     }
 
