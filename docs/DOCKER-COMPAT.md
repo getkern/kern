@@ -180,6 +180,16 @@ and the path. Each is CANONICALISED first, so `../` and a symlink out are the sa
 
 There is **no opt-out**. Move what the stack needs inside the project directory.
 
+**The host's `/dev/shm` as a bind source.** Docker accepts `-v /dev/shm:/dev/shm`, which guides for
+Chrome, Selenium and PyTorch DataLoaders print to get a bigger shared-memory filesystem than docker's
+64 MB default. It also hands the container every POSIX shared-memory object your own processes hold,
+readable and writable, which is half of what `ipc: host` hands over, and kern refuses `ipc: host`. So
+kern refuses the bind too. A box's `/dev/shm` is already its own and sized to `--memory`; set it with
+`--shm-size` (compose: `shm_size:`). One object can still be shared by binding its own path under
+`/dev/shm`. The host's `/dev/mqueue` is refused for the same reason and more directly: POSIX message
+queues live in the IPC namespace itself, and a queue created on the host was measured visible in a
+box given that mount.
+
 ⚠️ The context is resolved when the build runs, so `compose config` renders such a file without
 complaint and `build`/`up` are where it is refused.
 
@@ -254,13 +264,59 @@ that attaches to it.
 
 `--gpus` does exist and takes docker's grammar, which was measured against docker 29.1.3 rather
 than assumed: a bare number is HOW MANY (`--gpus 2`), `device=0` and `device=0,1` name WHICH, and
-`all` takes every card; `count=2` and `count=all` work too. The one place kern is wider is that it
-accepts `device=0,1` unquoted, where docker needs `"device=0,1"` because its own value is a
-comma-separated list of pairs. `--gpus 0` is refused rather than guessed: docker reads it as no
-gpus and this project's examples read it as card 0, so kern names both readings and asks for
-`device=0`. `--device nvidia.com/gpu=0` is the CDI spelling of one card. A card you did not get has
-no device node in the box, so CUDA cannot initialise it there; the host's PCI bus stays readable,
-so how many cards it has is still discoverable.
+`all` takes every card; `count=2` and `count=all` work too. A card's UUID works where an index
+does, `--gpus device=GPU-1950be8a-…`, resolved from the driver's own `GPU UUID` field; a UUID no
+card here carries is refused with the ones that are present. kern accepts `device=0,1` unquoted
+where docker needs `"device=0,1"`, and it takes the quoted form too, including the
+`--gpus 'all,"capabilities=compute,utility"'` that NVIDIA's documentation prints: that list
+selects nothing here and nothing is missing, because a grant binds the driver's whole library set,
+and kern says so rather than refusing the flag. `--gpus 0` is refused rather than guessed: docker
+reads it as no gpus and this project's examples read it as card 0, so kern names both readings and
+asks for `device=0`. `--device nvidia.com/gpu=0` is the CDI spelling of one card, resolved through
+the spec on the host; the hooks a spec attaches are named and not run, because a grant is a set of
+binds. A card you did not get has no device node in the box, so CUDA cannot initialise it there;
+the host's PCI bus stays readable, so how many cards it has is still discoverable.
+
+THE GRAMMAR IS DOCKER'S AND THE RESULT IS NOT, which is worth knowing before you compare the two.
+Measured on one host with two cards, docker 29.1.3 with the NVIDIA toolkit against this build, the
+same `--gpus device=0` and the same `python:3.12-slim`:
+
+| | docker | kern |
+|---|---|---|
+| device nodes in the container | 4 | 7 |
+| nvidia/cuda libraries under `/usr/lib/x86_64-linux-gnu` | 20 | 50 |
+| `nvidia-smi` | injected into `/usr/bin` | not there |
+
+Docker's default capability list is `compute,utility`, so it selects a subset of the driver's
+libraries, adds the driver's command-line tools, and hands over no DRM node. kern binds the
+driver's whole library set and no binaries, and the three extra nodes are `nvidia-modeset` and the
+card's `/dev/dri` pair, which is what the vendor's own CDI spec names for that card. So a kern box
+can encode video and reach the DRM device without asking, and cannot run `nvidia-smi` without
+binding it; a box given a card has MORE of the driver in it here than the same flag gives under
+docker, and that is a wider surface for code you do not trust.
+
+In a compose file, four spellings reach a card and all four need `--allow-device-grants` from the
+operator: `gpus:` (the 2.30 shorthand), `deploy.resources.reservations.devices` with a
+`capabilities:` list that names `gpu` or sets `driver: nvidia`, a CDI name under `devices:`
+(`nvidia.com/gpu=0`), and the host nodes themselves under `devices:`. Two shapes that look like a
+GPU request are NOT one, and kern names both rather than starting a service without the card:
+`runtime: nvidia`, because kern is the runtime, and `NVIDIA_VISIBLE_DEVICES`, because that variable
+is read by the NVIDIA container runtime. Each warning prints the line to write instead.
+
+ONE MORE SHAPE CHANGES ITS ANSWER HERE, and it is the one every guide prints:
+
+```yaml
+healthcheck:
+  test: ["CMD", "nvidia-smi"]
+```
+
+Under docker that service is `healthy`, because the runtime injected the binary. In a kern box the
+probe can never pass, since a grant binds the driver's libraries and none of its binaries, so the
+service would report `unhealthy` for its whole life and a `service_healthy` gate pointed at it would
+never open. kern says so when the box starts, with the two checks that were measured passing in a
+granted box: bind the tool in (`- /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro`, with a glibc image,
+because the driver's tools are glibc), or probe what the grant does bind, `test -c /dev/nvidiactl`,
+which is present with a card and absent without one.
 
 ### Reaching the host from inside a box: `host.docker.internal`
 

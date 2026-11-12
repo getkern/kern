@@ -14,7 +14,7 @@ Every shipping cap is a real cgroup v2 or kernel control, and devices are deny-b
 | **Devices** | `vgpio:` | *Only* the named GPIO/I²C/SPI/LED nodes | fresh `/dev` + fd-pinned bind + capability deny-list |
 | **PIDs** | `--pids-limit` | Fork-bomb ceiling | cgroup `pids.max`, hard |
 | **Block I/O** | `--io-weight` | I/O bandwidth weight | cgroup `io` |
-| **GPU** | `--gpus N` · `--device nvidia.com/gpu=N` · `display` grant · compose `devices:` | Whole cards, as devices | no per-box cap |
+| **GPU** | `--gpus N\|device=N\|device=GPU-<uuid>\|all` · `--device nvidia.com/gpu=N` · `display` grant · compose `gpus:`, `deploy.resources.reservations.devices`, `devices:` | Whole cards, as devices | no per-box cap |
 
 ¹ Where the `memory` controller is not delegated to a non-root user's scope, kern warns and shows the
 one-line `.wslconfig` fix; enforced natively on Linux.

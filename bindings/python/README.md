@@ -205,7 +205,8 @@ relaxation is a named argument.
   the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the route-level middle setting.
 
 `gpus=` hands the box NVIDIA cards, in docker's grammar: `gpus="2"` is how many, `gpus="device=0,1"`
-is which, `gpus="all"` is all. The host's driver libraries come with them, so the image does not
+is which, `gpus="all"` is all, and a card's UUID works where its index does
+(`gpus="device=GPU-1950be8a-…"`), with a UUID no card carries refused and the present ones named. The host's driver libraries come with them, so the image does not
 have to be a CUDA one. A granted card talks to the host's driver and is **not** a boundary against
 the code in the box; a card you did not ask for has no device node there, so CUDA cannot initialise
 it. Every box the session starts gets the cards, the `setup=` box included, because a wheel that

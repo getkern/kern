@@ -201,7 +201,7 @@ Every relaxing option says so in its name or docs:
 - **output bounded**: `maxOutputBytes` (64 MiB each) so a flooding box cannot exhaust host RAM.
 - **env off argv**: workload env is written to a private `0600` file, never `--env K=V` on the command
   line, so a credential in `env` does not leak into `ps`.
-- **mounts refused**: the host's own sources (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`,
+- **mounts refused**: the host's own sources (`/`, `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev`, `/dev/shm`, `/dev/mqueue`,
   `$HOME`), any path with a **credential directory** in it (`.ssh`, `.aws`, `.gnupg`,
   `.kube`, `.docker`, `.azure`, `.oci`, `.terraform.d`, `.password-store`, `.netrc`, `.git-credentials`,
   `.pypirc`, `.npmrc`, `.databrickscfg`, `.boto`, `.s3cfg`, `.rclone.conf`, and under `.config`:
@@ -250,8 +250,9 @@ new Sandbox({
   apparmor,        // a PRE-LOADED AppArmor profile the box enters on exec (Docker's --security-opt
                    // apparmor=), an LSM layer over seccomp; kern fails the box CLOSED if it isn't loaded.
   gpus,            // NVIDIA cards for EVERY box this session starts, in docker's grammar: "2" is how
-                   // many, "device=0,1" is which, "all" is all. A granted card talks to the host's
-                   // driver, so it is not a boundary against the code you run in the box.
+                   // many, "device=0,1" is which, "all" is all, and "device=GPU-<uuid>" names a card
+                   // by the UUID the driver publishes. A granted card talks to the host's driver, so
+                   // it is not a boundary against the code you run in the box.
   requireLimits,   // default false; true = FAIL-CLOSED (refuse to start unless caps enforced). NOT
                    // enforceLimits (that picks the cap PATH); mutually exclusive with KERN_ALLOW_UNCAPPED env.
   depsReadonly,    // default TRUE: runCode cannot modify what setup= installed
