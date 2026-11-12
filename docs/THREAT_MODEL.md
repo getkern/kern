@@ -67,7 +67,7 @@ network.
 | vGPIO pin list | GPIO is chip-granular: the character device exposes every line via ioctl | `pins = [...]` is cooperative metadata; grant `vgpio:` only to a workload you trust with that hardware |
 | The `--ssh` subtree | sshd and its shells fork before seccomp and the cap drop, running the image's own binaries pre-filter | for interactive access, not a hardened bastion |
 | `--net host` | shares the host netns | no network isolation, by request |
-| The GPU | a device grant gives the box the whole card | kern does not split or cap a GPU |
+| The GPU | a device grant gives the box one whole card | kern does not split or cap a GPU; a card with no node in the box cannot be initialised there, but the host's PCI bus still shows how many it has |
 
 ## Surface, mitigation, residual
 

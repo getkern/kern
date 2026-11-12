@@ -140,13 +140,17 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
                         r.pins
                     );
                 }
-                // A GRANTED GPU NODE IS WHERE THE FULL CLAIM IS WORTH READING, and `kern doctor` is
-                // not. That row answers "will boxes run here" and fires on every host with a DRM
-                // node - a Pi's `v3d`, a Jetson's `nv_platform`, WSL's passthrough node - so four
-                // lines of MIG/SR-IOV vocabulary there were spent on readers who were not handing a
-                // GPU to anybody. This line prints only when a profile actually does.
+                // A GRANTED COMPUTE NODE IS WHERE THE CLAIM IS WORTH READING, and this line prints
+                // only when a profile actually hands one over.
+                //
+                // IT USED TO DESCRIBE A MECHANISM kern DOES NOT HAVE: a "cooperative VRAM quota"
+                // and, where a boundary was wanted, "a device-level partition (MIG or SR-IOV)".
+                // kern caps no VRAM and partitions no device, so the sentence spent four lines
+                // answering a question about a feature that was never offered. What a reader
+                // handing over a compute node needs is what the node IS, and the promise that does
+                // hold is the one about the cards they did not hand over.
                 if r.devs.iter().any(|d| crate::gpu::is_compute_node(d)) {
-                    println!("    {}", crate::gpu::weakest_tier().claim());
+                    println!("    {}", crate::gpu::COMPUTE_NODE_CLAIM);
                 }
             }
             Err(e) => {

@@ -337,9 +337,25 @@ everything else, and the source paths are canonicalized and re-checked to stay u
 Grant a `vgpio:` profile only to workloads you would trust with that hardware.
 
 ## GPU: a device grant, not a slice
-A box can be given the host's GPU as a device grant: the whole card, through the host's driver. kern
-does not split a GPU or cap it per box, so a workload holding the GPU has the driver's attack surface.
-Grant it only to workloads you would trust with that hardware, as with any other device.
+A box can be given one of the host's GPUs as a device grant, with `--gpus 0` or the CDI spelling
+`--device nvidia.com/gpu=0`: the whole card, through the host's driver. kern does not split a GPU
+or cap it per box. A granted card is NOT a boundary against malicious code in the box: the workload
+holding it has the driver's whole attack surface, and a process with no vendor library in its
+address space reaches that driver with a raw ioctl, which `pentest/pentest-gpu-claims.sh` measures
+on whatever host runs it. Grant a card only to workloads you would trust with that hardware, as
+with any other device.
+
+**What holding one card does and does not say about the others.** A card you did not name has no
+device node in the box, and CUDA cannot initialise a card whose node is absent: that is the line
+that holds, and it is measured rather than argued. The driver's own per-card directory under
+`/proc/driver/nvidia` names only the card you were given, so its model, UUID and video BIOS are not
+readable from the box. The host's PCI bus is still readable, so **how many cards the host has, and
+their addresses, can still be worked out** from inside: masking that would break drivers that need
+it, and a boundary you cannot keep is not worth claiming. Enumeration, not access.
+
+NVIDIA's licence terms say GeForce and Titan cards are not licensed for datacenter deployment. That
+is a fact about the cards and it is here as one: kern cannot measure whether a host is a datacenter
+and does not try to, so nothing in the tool will warn you about it.
 
 ## vDisk
 A `vdisk:` profile mounts a size-capped volume at `/vdisk/<name>`. Rootless it is a RAM-backed

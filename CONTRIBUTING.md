@@ -174,10 +174,16 @@ same class: a sentence or an exit code that said more than had been measured. No
 bug. If you are about to change something here, that is the failure mode to expect from yourself.
 
 **A tier, a mode or a guarantee ships only if the code can assign it on hardware someone can reach.**
-The GPU model has three capability tiers and the code has two, because the measurement that would
-earn the middle one failed: `dmem` accounts device memory and does not enforce it for the compute
-path a tenant allocates through. The variant was removed rather than shipped weak. A level nobody can
-be awarded is not completeness, it is a promise in the enum.
+The GPU model had three capability tiers and the code shipped two, because the measurement that
+would earn the middle one failed: `dmem` accounts device memory and does not enforce it for the
+compute path a tenant allocates through. The variant was removed rather than shipped weak. A level
+nobody can be awarded is not completeness, it is a promise in the enum.
+
+The same rule later took the other two. A tier is a statement about device-level partitioning, and
+kern grants whole cards and partitions nothing, so the vocabulary described a direction the code
+does not take; `kern doctor` now says which cards are here and which of them `--gpus` can hand to a
+box. The lesson is the one above, applied twice: the second time it cost a module rather than an
+enum variant.
 
 The test is not "is it verified", it is **"what happens when it is wrong"**. A branch that can only
 fail downward, granting less than the hardware deserves, is acceptable untested and says so. A branch
@@ -333,5 +339,7 @@ Do **not** open a public issue, see `SECURITY.md`.
 
 ## Scope reminder
 
-GPU limits are not shipped, so a report about their strength has nothing to land on yet. See
-`SECURITY.md` for what is and is not a boundary today.
+GPU limits are not shipped: kern grants a whole card and caps nothing on it, so a report about the
+strength of a cap has nothing to land on. A report about the GRANT does: which nodes a box gets,
+what a card it was not given is still able to tell it, and whether CUDA can reach a card whose node
+is absent. See `SECURITY.md` for what is and is not a boundary today.

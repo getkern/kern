@@ -414,6 +414,7 @@ pub fn info() -> Result<(), Error> {
         libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
     };
     row("userns", if userns { "enabled" } else { "DISABLED" });
+    row("gpu", &gpu_inventory());
     if let Ok(d) = crate::registry::dir() {
         if let Some(parent) = d.parent() {
             row("runtime dir", &parent.to_string_lossy());
@@ -427,6 +428,44 @@ pub fn info() -> Result<(), Error> {
             .as_str(),
     );
     Ok(())
+}
+
+/// What GPUs are here, for `kern info`, and NOTHING about whether one can be granted.
+///
+/// THE SPLIT IS THE POINT, and it is deliberate: `info` is a sheet of facts with no verdict and no
+/// remedy anywhere on it, and `doctor` is the one that says what works and why not. Answering "is
+/// a grant possible" in both would put the same derived condition in two places, which is the
+/// defect this repo keeps paying for, and the two would disagree on exactly the hosts where the
+/// answer matters.
+///
+/// COSTS ONE DIRECTORY READ AND ONE FILE. The cards come from the same `/sys/class/drm` walk the
+/// rest of this binary uses, and the version from `/sys/module/nvidia/version`, which is one small
+/// sysfs read. No CDI spec is parsed, no `/dev` node is probed and no module is loaded: `info` runs
+/// on every invocation a reader makes while orienting themselves, and it is not the place to pay
+/// for an answer they did not ask for.
+fn gpu_inventory() -> String {
+    let cards = crate::gpu::detect();
+    if cards.is_empty() {
+        return "none".to_string();
+    }
+    // Grouped by vendor so two cards of one make, which is the common shape, read as one fact.
+    let mut by_vendor: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for c in &cards {
+        *by_vendor.entry(c.vendor.label()).or_insert(0) += 1;
+    }
+    let mut parts: Vec<String> = by_vendor
+        .into_iter()
+        .map(|(v, n)| format!("{n} x {v}"))
+        .collect();
+    if let Some(v) = std::fs::read_to_string("/sys/module/nvidia/version")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!("(driver {v})"));
+    }
+    parts.join(" ")
 }
 
 /// Does this kernel expose the cgroup-v2 CPU **bandwidth** interface (`cpu.max`), as opposed to only
@@ -1892,31 +1931,133 @@ fn check_kernel() -> R {
     R::ok(format!("kernel: {ver}"))
 }
 
-/// What a VRAM cap would be worth on each GPU present, per [`crate::gpu`].
+/// Which GPUs this host has, and what `kern box --gpus` can actually hand to a box.
 ///
-/// kern does not slice GPUs today, and this row says so by describing the AUTHORITY a cap would
-/// have rather than offering one. That ordering is the point: the honest description of the
-/// boundary ships before the mechanism, so there is never a window in which kern can cap a GPU
-/// while its own documentation is still catching up with what the cap is worth.
+/// THIS ROW USED TO DESCRIBE THE DIRECTION kern DOES NOT TAKE. It read
+/// `card0 NVIDIA 0x2d04 (nvidia): TIER-SOFT, no device-level partition found`, which is the
+/// vocabulary of device-level partitioning, and this function was framed on "what a VRAM cap would
+/// be worth on each GPU present". Both described a mechanism kern does not have, and the framing
+/// carried a sentence that has since expired on its own terms: it said that `kern box --help` has
+/// no `--gpus`, and it does. A line that stayed true for yesterday's world is worse than a missing
+/// one, because a reader believes it.
 ///
-/// EVERY GPU ROW IS AN OK, AND IT USED TO BE A WARNING ON THE COOPERATIVE TIER. The warning was
-/// arguing against a misreading - "a green tick means capping this GPU is safe" - that needs a cap
-/// to exist in order to be made, and no flag in this binary caps a GPU: `kern box --help` has no
-/// `--gpus` and no `--vram`. So the `!` fired on every host with any DRM node, which on an ARM board
-/// is a display core (`v3d`, `vc4-drm`, `nv_platform`) and on WSL is a passthrough node. A warning
-/// that is true of 100% of hosts teaches the reader to skim past `!`, and the rows that need to be
-/// read - unprivileged userns restricted, no cgroup delegation - are in the same list.
+/// So the row answers the question a reader actually arrives with, in the order they need it:
+/// which cards are here, which of them `--gpus` can name, whether the grant would succeed for
+/// THIS caller, and which groups it would need. Every one of those comes from
+/// [`crate::gpu_grant`], the same code the flag runs, because a second place that decided whether
+/// a grant is possible would be the derived-condition-in-two-places defect this repo keeps paying
+/// for: doctor would say yes on a host where the box says no.
 ///
-/// What the row must still never do is imply a boundary; that contract moved from the severity to
-/// the words, where the vocabulary gate can hold it. A host with no GPU at all is an OK too.
+/// EVERY ROW IS AN OK UNLESS THE HOST IS ACTUALLY BROKEN. A warning that is true of every host
+/// teaches a reader to skim past `!`, and the rows that must be read, unprivileged userns
+/// restricted and no cgroup delegation, are in the same list. A card kern cannot grant is a fact
+/// about kern, not a fault of the host, so it is an OK that says so.
+///
+/// The one thing a row must never do is imply a boundary it does not have, and that contract lives
+/// in the words where `overclaims` and `pentest/pentest-gpu-claims.sh` can both hold it.
 fn check_gpu() -> Vec<R> {
-    let gpus = crate::gpu::detect();
-    if gpus.is_empty() {
+    let cards = crate::gpu::detect();
+    if cards.is_empty() {
         return vec![R::ok(
-            "no GPU found: GPU capability tiers do not apply on this host".into(),
+            "gpu none: no DRM card on this host, so there is nothing for --gpus to hand over"
+                .into(),
         )];
     }
-    gpus.iter().map(gpu_row).collect()
+    // RESOLVED ONCE for every row. The resolver walks the driver's libraries, so calling it per
+    // card would multiply the only expensive part of this check by the number of cards.
+    let caller = crate::gpu_grant::Caller::current();
+    let grant = crate::gpu_grant::resolve().ok();
+    let mut out: Vec<R> = cards
+        .iter()
+        .map(|g| gpu_row(g, grant.as_ref(), &caller))
+        .collect();
+    if let Some(g) = grant.as_ref() {
+        out.extend(gpu_driver_rows(g));
+    }
+    out
+}
+
+/// The rows that belong to the DRIVER rather than to any one card: where the grant is read from,
+/// and the one missing node whose absence has a single unambiguous cause.
+///
+/// `nvidia_uvm` IS THE ONLY CAUSE A CUDA CODE IDENTIFIES ON ITS OWN. Measured across the five
+/// shapes: with every node present `cuInit` returns 0; without `nvidia-uvm` it returns **999**,
+/// and 999 has no other cause. The neighbouring code, 100, does NOT distinguish "no `nvidiactl`"
+/// from "no card", which is why this looks at the nodes itself instead of inferring them from what
+/// CUDA said.
+///
+/// AND THE COMMAND IS NOT A FIXED STRING. The usual advice is `nvidia-modprobe`, which is NOT
+/// installed on every host that has the driver (measured: it is absent on the host this was
+/// written on). Telling a reader to run a program they do not have is a dead end dressed as a
+/// remedy, so the row names the one that is actually there.
+fn gpu_driver_rows(grant: &crate::gpu_grant::GpuGrant) -> Vec<R> {
+    let mut out = Vec::new();
+    let uvm = std::path::Path::new("/dev/nvidia-uvm").exists();
+    if !uvm {
+        let remedy = match first_command_on_path(&["nvidia-modprobe", "modprobe"]) {
+            Some("nvidia-modprobe") => "run `nvidia-modprobe -u -c=0`".to_string(),
+            Some(other) => format!("load it with `sudo {other} nvidia_uvm`"),
+            None => "no nvidia-modprobe and no modprobe on PATH here, so load nvidia_uvm the way \
+                     this host loads modules"
+                .to_string(),
+        };
+        out.push(R::Warn(
+            format!(
+                "gpu /dev/nvidia-uvm is missing while driver {} is loaded: CUDA fails with 999",
+                grant.driver_version
+            ),
+            remedy,
+        ));
+    }
+    // WHERE THE ANSWER CAME FROM, so a reader who disagrees with the rows above knows which file
+    // to look at. The CDI line is the `--device` spelling of the same cards, and saying it here is
+    // what keeps a reader from concluding the two flags are two different grants.
+    let cdi = ["/etc/cdi", "/var/run/cdi"]
+        .iter()
+        .find(|d| {
+            std::fs::read_dir(d)
+                .map(|mut e| e.any(|f| f.is_ok()))
+                .unwrap_or(false)
+        })
+        .copied();
+    let (verdict, note) = match cdi {
+        Some(dir) => (
+            format!(
+                "gpu source: /proc/driver/nvidia, {} host libraries, a CDI spec under {dir}",
+                grant.libraries.len()
+            ),
+            "--device nvidia.com/gpu=N names the same cards as --gpus N, from the same discovery",
+        ),
+        None => (
+            format!(
+                "gpu source: /proc/driver/nvidia and {} of the host's own libraries",
+                grant.libraries.len()
+            ),
+            "no CDI spec on this host, so --gpus N is the only spelling",
+        ),
+    };
+    out.push(R::ok_note(&verdict, note));
+    out
+}
+
+/// The first of `names` that exists on `PATH`, or `None` when none of them does.
+///
+/// Used so a remedy names a program the reader actually has. `PATH` is read from the environment
+/// and a component that is not a directory simply never matches, which is the same answer the
+/// shell would give.
+fn first_command_on_path(names: &[&'static str]) -> Option<&'static str> {
+    // `crate::global_env`, never `std::env::var_os`: the project forbids the latter because a test
+    // build has to witness TEST_ENV_LOCK before reading the environment, and the lint is what keeps
+    // a reader of PATH from racing a test that is setting it.
+    let path = crate::global_env("PATH")?;
+    for name in names {
+        for dir in std::env::split_paths(&path) {
+            if dir.join(name).is_file() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 /// The row for ONE GPU, as a pure function of the detected facts.
@@ -1925,22 +2066,89 @@ fn check_gpu() -> Vec<R> {
 /// tier, `dmem` controller and `/dev/kfd` without owning the hardware. The claim vocabulary is
 /// checked on THIS string, not on the tier's claim alone, because the appendices below are the part
 /// most likely to drift.
-fn gpu_row(g: &crate::gpu::Gpu) -> R {
-    // The VERDICT is the card, its tier and the evidence. Everything a reader needs only when they
-    // are about to hand the device to a tenant goes on the note line.
-    //
-    // `dmem` and `/dev/kfd` sit there as FACTS and never as promotions. The controller accounts
-    // faithfully and, on the driver this was measured against, does not charge the ROCm compute path
-    // to the allocating cgroup, so its presence alone changes nothing about what a cap is worth.
-    // Naming them keeps the reader from concluding that kern failed to notice.
-    let mut note = g.tier.short().to_string();
-    if g.dmem_controller {
-        note.push_str(" · dmem cgroup controller present");
+fn gpu_row(
+    g: &crate::gpu::Gpu,
+    grant: Option<&crate::gpu_grant::GpuGrant>,
+    who: &crate::gpu_grant::Caller,
+) -> R {
+    let id = crate::gpu::describe_identity(g);
+    // JOINED ON THE PCI ADDRESS, never on the number in the name. `card1` is `/dev/nvidia0` on
+    // this host and `card0` is `/dev/nvidia1`: a row paired by number would tell a reader to run
+    // `--gpus 1` for the card they are looking at and hand them the other one.
+    let matched = grant.and_then(|gr| {
+        let addr = g.pci_address.as_deref()?;
+        gr.cards
+            .iter()
+            .find(|c| c.pci_address.as_deref() == Some(addr))
+    });
+    let Some(card) = matched else {
+        // A card with no grant. Saying WHY keeps this from reading as a fault of the host: an AMD
+        // card or a display core is not broken, it is outside what this build hands over.
+        return R::ok_note(
+            &format!("gpu {id}: no grant path, --gpus does not name this card"),
+            "--gpus names the cards the NVIDIA driver lists; this one is not among them",
+        );
+    };
+    let index = card.index;
+    // THE SAME FUNCTION THE FLAG RUNS. `group_policy` is called over the nodes that would actually
+    // be mounted, which is why a card whose display node is group-gated can still be reported as
+    // grantable when the grant would not touch that node.
+    let mut nodes: Vec<(std::path::PathBuf, crate::gpu_grant::NodeFacts)> =
+        grant.map(|gr| gr.shared.clone()).unwrap_or_default();
+    nodes.extend(card.nodes.iter().cloned());
+    match crate::gpu_grant::group_policy(&nodes, who) {
+        crate::gpu_grant::GroupPolicy::NotNeeded => R::ok_note(
+            &format!("gpu {id}: --gpus {index} hands this card to a box"),
+            &format!(
+                "{} nodes, none needing a group. A granted card is NOT a boundary against \
+                 malicious code: the driver is shared",
+                nodes.len()
+            ),
+        ),
+        crate::gpu_grant::GroupPolicy::Needed { gids, nodes: gated } => R::Warn(
+            format!(
+                "gpu {id}: --gpus {index} would be refused, {} of its nodes need a group",
+                gated.len()
+            ),
+            format!(
+                "a box carries no supplementary group. Those nodes need gid {}: {}",
+                join_short(&gids.iter().map(u32::to_string).collect::<Vec<_>>()),
+                join_paths(&gated)
+            ),
+        ),
+        crate::gpu_grant::GroupPolicy::Unreachable { nodes: dead } => R::Warn(
+            format!(
+                "gpu {id}: --gpus {index} would be refused, {} of its nodes cannot be opened",
+                dead.len()
+            ),
+            format!(
+                "not by your uid, not by an ACL, not by other: {}",
+                join_paths(&dead)
+            ),
+        ),
     }
-    if g.kfd_present {
-        note.push_str(" · /dev/kfd present");
+}
+
+/// Join at most three names and say how many were left out.
+///
+/// A host with many gated nodes would otherwise push one row past the width every other row is
+/// held to, and the reader needs the shape of the problem rather than its full inventory.
+fn join_short(items: &[String]) -> String {
+    match items.len() {
+        0 => "none".to_string(),
+        1..=3 => items.join(", "),
+        n => format!("{} and {} more", items[..3].join(", "), n - 3),
     }
-    R::ok_note(&crate::gpu::describe(g), &note)
+}
+
+/// [`join_short`] over paths.
+fn join_paths(paths: &[std::path::PathBuf]) -> String {
+    join_short(
+        &paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+    )
 }
 
 // ── helpers ──
@@ -2198,7 +2406,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::gpu::{overclaims, Evidence, Gpu, Tier, Vendor};
+    use crate::gpu::{overclaims, Gpu, Vendor};
 
     impl R {
         /// Everything this row will print, message and hint together. Tests assert on the whole of
@@ -2210,84 +2418,223 @@ mod tests {
         }
     }
 
-    fn fake(tier: Tier, dmem: bool, kfd: bool) -> Gpu {
+    /// A DRM card with a chosen PCI address, so a test can decide whether it pairs with a grant.
+    fn fake(card: &str, addr: Option<&str>) -> Gpu {
         Gpu {
-            card: "card0".into(),
-            vendor: Vendor::Amd,
-            device_id: Some(0x73df),
-            driver: Some("amdgpu".into()),
-            tier,
-            evidence: match tier {
-                Tier::Hw => Evidence::SriovVirtualFunction,
-                Tier::Soft => Evidence::NoPartitionFound,
-            },
-            dmem_controller: dmem,
-            kfd_present: kfd,
+            card: card.into(),
+            vendor: Vendor::Nvidia,
+            device_id: Some(0x2d04),
+            driver: Some("nvidia".into()),
+            pci_address: addr.map(str::to_string),
         }
     }
 
-    /// THE GATE. Every assembled `doctor` row for a non-hardware GPU, across every combination of
-    /// the two facts that extend it, checked against the reserved vocabulary.
-    #[test]
-    fn no_cooperative_row_claims_a_boundary() {
-        for dmem in [false, true] {
-            for kfd in [false, true] {
-                let row = gpu_row(&fake(Tier::Soft, dmem, kfd)).text();
-                assert_eq!(
-                    overclaims(&row),
-                    None,
-                    "a TIER-SOFT row claims a boundary (dmem={dmem}, kfd={kfd}): {row}"
-                );
-                // THE EXACT STRING, because `pentest-gpu-claims.sh` A4 pins it too and the two
-                // must not drift apart. This assertion was weakened to "the whole device" once and
-                // the shell suite caught what this one then let through: a cooperative row that
-                // avoided the forbidden words and no longer said anything about the boundary reads
-                // as a capability to anyone skimming.
-                assert!(
-                    row.contains("NOT a boundary against malicious code"),
-                    "the disclaimer went missing: {row}"
-                );
-            }
+    /// A node every caller can open: `other` reads it, so the group question never arises.
+    fn open_node() -> crate::gpu_grant::NodeFacts {
+        crate::gpu_grant::NodeFacts {
+            uid: 0,
+            gid: 0,
+            mode: 0o666,
+            acl_users: Vec::new(),
+            acl_groups: Vec::new(),
+            acl_mask_denies_read: false,
         }
-        let none = check_gpu();
+    }
+
+    /// A node only its group can open, which is the shape a box cannot carry.
+    fn gated_node() -> crate::gpu_grant::NodeFacts {
+        crate::gpu_grant::NodeFacts {
+            uid: 0,
+            gid: 44,
+            mode: 0o660,
+            acl_users: Vec::new(),
+            acl_groups: Vec::new(),
+            acl_mask_denies_read: false,
+        }
+    }
+
+    /// A grant for ONE card, whose address is deliberately not the number in any DRM card name.
+    fn fake_grant(
+        addr: &str,
+        index: u32,
+        node: crate::gpu_grant::NodeFacts,
+    ) -> crate::gpu_grant::GpuGrant {
+        crate::gpu_grant::GpuGrant {
+            driver_version: "580.173.02".into(),
+            shared: vec![(std::path::PathBuf::from("/dev/nvidiactl"), open_node())],
+            cards: vec![crate::gpu_grant::CardNodes {
+                index,
+                pci_address: Some(addr.to_string()),
+                nodes: vec![(
+                    std::path::PathBuf::from(format!("/dev/nvidia{index}")),
+                    node,
+                )],
+            }],
+            libraries: Vec::new(),
+            symlinks: Vec::new(),
+            ldconfig_dirs: Vec::new(),
+        }
+    }
+
+    /// A caller in no group at all: a gated node is then not merely group-gated for them, it is
+    /// unreachable, and `group_policy` says so with a different variant.
+    fn nobody() -> crate::gpu_grant::Caller {
+        crate::gpu_grant::Caller {
+            uid: 1000,
+            gids: Vec::new(),
+        }
+    }
+
+    /// A caller who IS in the group the gated node needs. This is the case worth a message: the
+    /// host would let them open it and the box is what cannot, because it carries no groups.
+    fn in_group_44() -> crate::gpu_grant::Caller {
+        crate::gpu_grant::Caller {
+            uid: 1000,
+            gids: vec![44],
+        }
+    }
+
+    /// THE ROW NAMES THE INDEX THAT BELONGS TO THAT CARD, and the pairing is by PCI address.
+    ///
+    /// The fixture puts `card0` at the address of `/dev/nvidia1`, which is the shape this host
+    /// actually has: the DRM numbering and the NVIDIA numbering are inverted. A row that paired
+    /// them by number would tell the reader to run `--gpus 0` for a card that answers to 1, and
+    /// would pass on any host where the two agreed.
+    #[test]
+    fn the_row_pairs_a_card_with_its_grant_by_address_not_by_number() {
+        let grant = fake_grant("0000:06:00.0", 1, open_node());
+        let row = gpu_row(
+            &fake("card0", Some("0000:06:00.0")),
+            Some(&grant),
+            &nobody(),
+        )
+        .text();
+        assert!(row.contains("--gpus 1"), "wrong index for this card: {row}");
+        assert!(!row.contains("--gpus 0"), "paired by number: {row}");
+
+        // A card the grant does not know is reported as having no grant path, never as grantable.
+        let other = gpu_row(
+            &fake("card1", Some("0000:01:00.0")),
+            Some(&grant),
+            &nobody(),
+        )
+        .text();
+        assert!(other.contains("no grant path"), "{other}");
+        assert!(!other.contains("hands this card"), "{other}");
+
+        // And a card with no PCI identity at all cannot pair with anything.
+        let board = gpu_row(&fake("card0", None), Some(&grant), &nobody()).text();
+        assert!(board.contains("no grant path"), "{board}");
+    }
+
+    /// A card whose nodes need a group is REFUSED, and the row says which group and why.
+    #[test]
+    fn a_group_gated_card_is_reported_as_refused_with_the_gid_named() {
+        let grant = fake_grant("0000:06:00.0", 1, gated_node());
+        let card = fake("card0", Some("0000:06:00.0"));
+        let row = gpu_row(&card, Some(&grant), &in_group_44()).text();
+        assert!(row.contains("would be refused"), "{row}");
         assert!(
-            !none.is_empty(),
+            row.contains("44"),
+            "the gid the node needs is not named: {row}"
+        );
+        assert!(
+            row.contains("no supplementary group"),
+            "the reason a box cannot keep it is not given: {row}"
+        );
+        // THE SAME NODE, A CALLER IN NO GROUP: that is a different fact and gets a different row.
+        // The host itself refuses them, so telling them a box cannot carry groups would send them
+        // looking in the wrong place.
+        let stranger = gpu_row(&card, Some(&grant), &nobody()).text();
+        assert!(stranger.contains("cannot be opened"), "{stranger}");
+        assert!(
+            !stranger.contains("supplementary group"),
+            "a caller the host refuses was told it was a box limitation: {stranger}"
+        );
+    }
+
+    /// THE GATE. Every shape of GPU row, checked against the reserved vocabulary.
+    ///
+    /// The shapes are the four a host can produce: a card that can be granted, one whose nodes
+    /// need a group, one nothing can open, and one no grant names at all.
+    #[test]
+    fn no_gpu_row_claims_a_boundary() {
+        let open = fake_grant("0000:06:00.0", 1, open_node());
+        let gated = fake_grant("0000:06:00.0", 1, gated_node());
+        let here = fake("card0", Some("0000:06:00.0"));
+        let elsewhere = fake("card1", Some("0000:01:00.0"));
+        let rows = [
+            gpu_row(&here, Some(&open), &nobody()),
+            gpu_row(&here, Some(&gated), &nobody()),
+            gpu_row(&elsewhere, Some(&open), &nobody()),
+            gpu_row(&here, None, &nobody()),
+        ];
+        for r in &rows {
+            let text = r.text();
+            assert_eq!(
+                overclaims(&text),
+                None,
+                "a GPU row claims a boundary: {text}"
+            );
+        }
+        // THE EXACT STRING, because `pentest-gpu-claims.sh` pins it too and the two must not drift
+        // apart. A row that avoids the forbidden words and then says nothing about the boundary
+        // reads as a capability to anyone skimming, which is what this caught once before.
+        let granted = rows[0].text();
+        assert!(
+            granted.contains("NOT a boundary against malicious code"),
+            "the disclaimer went missing from the row that hands a card over: {granted}"
+        );
+        assert!(
+            !check_gpu().is_empty(),
             "doctor must always say something about GPUs"
         );
     }
 
-    /// NO GPU ROW IS A WARNING, and the row stays ONE LINE whatever the two extra facts say.
+    /// NO GPU ROW WRAPS, whichever shape it is.
     ///
-    /// Both halves are the defect this replaced. The `!` was true of every host with a screen, so it
-    /// spent the reader's attention on a feature this binary does not have; and the text it carried
-    /// was four lines in a list whose every other entry is one. The tier still has to be legible
-    /// from the row, which is what separates this from simply deleting the row.
+    /// Both halves are the defect this replaced: the `!` was true of every host with a screen, and
+    /// the text it carried was four lines in a list whose every other entry is one. A row that is
+    /// a warning here is a warning about the HOST, which is the only kind worth the reader's eye.
     #[test]
-    fn no_gpu_row_warns_and_none_of_them_wraps() {
-        for tier in [Tier::Soft, Tier::Hw] {
-            for dmem in [false, true] {
-                for kfd in [false, true] {
-                    let r = gpu_row(&fake(tier, dmem, kfd));
-                    let (msg, note) = match &r {
-                        R::Ok(m, n) => (m.clone(), n.clone()),
-                        other => panic!("a GPU row warns again: {}", other.text()),
-                    };
-                    assert!(msg.contains(tier.label()), "the tier is unreadable: {msg}");
-                    // The verdict line carries the card and its tier; the qualification is on the
-                    // note. Bounds are asserted on each PART, because the shape on screen is two
-                    // lines and a single joined length would hide one of them growing.
-                    assert!(
-                        msg.len() <= ROW_MAX,
-                        "{} chars of verdict: {msg}",
-                        msg.len()
-                    );
-                    assert!(
-                        note.len() <= NOTE_MAX,
-                        "{} chars of note: {note}",
-                        note.len()
-                    );
+    fn no_gpu_row_wraps_and_only_a_host_problem_warns() {
+        let open = fake_grant("0000:06:00.0", 1, open_node());
+        let here = fake("card0", Some("0000:06:00.0"));
+        for (r, warns) in [
+            (gpu_row(&here, Some(&open), &nobody()), false),
+            (gpu_row(&here, None, &nobody()), false),
+            (
+                gpu_row(
+                    &here,
+                    Some(&fake_grant("0000:06:00.0", 1, gated_node())),
+                    &nobody(),
+                ),
+                true,
+            ),
+        ] {
+            let (msg, note) = match &r {
+                R::Ok(m, n) => {
+                    assert!(!warns, "a host problem was reported as an OK: {m}");
+                    (m.clone(), n.clone())
                 }
-            }
+                R::Warn(m, n) => {
+                    assert!(warns, "a healthy card was reported as a warning: {m}");
+                    (m.clone(), n.clone())
+                }
+                other => panic!("a GPU row failed the host: {}", other.text()),
+            };
+            // Bounds on each PART, because the shape on screen is two lines and a single joined
+            // length would hide one of them growing.
+            assert!(
+                msg.len() <= ROW_MAX,
+                "{} chars of verdict: {msg}",
+                msg.len()
+            );
+            assert!(
+                note.len() <= NOTE_MAX,
+                "{} chars of note: {note}",
+                note.len()
+            );
         }
     }
 
@@ -2495,34 +2842,23 @@ mod tests {
         }
     }
 
-    /// Neither one-line form may claim a boundary either. The gate that guards [`Tier::claim`] runs
-    /// over the string `doctor` actually prints, which is now a different one.
+    /// The ONE standing claim this binary prints about a granted compute node, checked against
+    /// the reserved vocabulary from the module that owns it.
+    ///
+    /// It lives in `crate::gpu` as a single constant because two surfaces print it, `kern doctor`
+    /// and `kern box --plan`, and the pair used to be two sentences that could drift. The gate
+    /// that used to guard `Tier::claim` runs over this instead, which is the string a reader sees.
     #[test]
-    fn the_short_forms_never_overclaim() {
-        for tier in [Tier::Soft, Tier::Hw] {
-            assert_eq!(
-                overclaims(tier.short()),
-                None,
-                "short form claims a boundary: {}",
-                tier.short()
-            );
-        }
-    }
-
-    /// The `dmem` and `/dev/kfd` facts appear only when true, and neither changes the tier. This is
-    /// the exact confusion the row exists to prevent: `dmem` present does not mean `dmem` enforces.
-    #[test]
-    fn dmem_and_kfd_are_reported_as_facts_not_promotions() {
-        let bare = gpu_row(&fake(Tier::Soft, false, false)).text();
-        assert!(!bare.contains("dmem cgroup controller present"));
-        assert!(!bare.contains("/dev/kfd present"));
-
-        let both = gpu_row(&fake(Tier::Soft, true, true)).text();
-        assert!(both.contains("dmem cgroup controller present"));
-        assert!(both.contains("/dev/kfd present"));
+    fn the_standing_compute_node_claim_never_overclaims() {
+        assert_eq!(
+            overclaims(crate::gpu::COMPUTE_NODE_CLAIM),
+            None,
+            "the standing claim claims a boundary: {}",
+            crate::gpu::COMPUTE_NODE_CLAIM
+        );
         assert!(
-            both.contains("TIER-SOFT"),
-            "dmem must not promote the tier: {both}"
+            crate::gpu::COMPUTE_NODE_CLAIM.contains("NOT a boundary against malicious code"),
+            "the standing claim lost its disclaimer"
         );
     }
 

@@ -1322,6 +1322,19 @@ pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
         grant.shared.len(),
         grant.cards.len()
     ));
+    // WHICH CARD EACH INDEX MEANS, before anything is mounted. `--gpus 0` is a number and the
+    // reader has another number in front of them, the `cardN` their desktop and `nvidia-smi` use,
+    // and on this host the two are INVERTED: `--gpus 0` is `0000:01:00.0`, which is `card1`. A
+    // preview that showed only the count would let someone confirm a plan for the other card.
+    for card in &grant.cards {
+        match card.pci_address.as_deref() {
+            Some(addr) => out.push_str(&format!("  --gpus {} is {}\n", card.index, addr)),
+            None => out.push_str(&format!(
+                "  --gpus {} has no PCI address in /proc/driver/nvidia\n",
+                card.index
+            )),
+        }
+    }
     if detail == Detail::Full {
         for (node, _) in &grant.shared {
             out.push_str(&format!("  shared {}\n", node.display()));

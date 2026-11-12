@@ -127,5 +127,5 @@ reports `0.0.0`, which is expected and harmless.
 
 ## Does kern support GPUs?
 
-Yes, as a device. A box can be given the host's GPU as a device, the whole card: the render node as `display` in [`kern.toml`](CONFIG.md), or `devices:` plus `--allow-device-grants` in a compose file. kern does not split a GPU between boxes or cap it per box.
+Yes, as a device: one card per box, the whole card. `kern box --gpus 0` hands it over, and `--device nvidia.com/gpu=0` is the same card named the way CDI names it. The host's driver libraries are resolved from the driver's own version and bound read-only, so the box does not need a CUDA image. A compose service reaches a card through `devices:` plus `--allow-device-grants`, and a render node can also be granted as `display` in [`kern.toml`](CONFIG.md). kern does not split a GPU between boxes or cap it per box, and a card you did not name has no device node in the box, so CUDA cannot initialise it there.
 kern today virtualizes CPU (`vcpu:`), memory, disk (`vdisk:`) and devices (`vgpio:`).

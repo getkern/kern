@@ -250,8 +250,15 @@ manual on purpose.
 | **`network_mode: host`** | applied as Docker applies it, and stated: it removes the service's network isolation, peers stop resolving it by name, and `ports:` becomes a no-op |
 
 What needs a daemon does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything
-that attaches to it. Nor does `--gpus`: a GPU is a device grant (`devices:` plus
-`--allow-device-grants`), so a workload that needs the card gets the whole card.
+that attaches to it.
+
+`--gpus` does exist, and it is one card per box: `kern box --gpus 0`, or `--device
+nvidia.com/gpu=0` for the same card spelled the way CDI spells it. `--gpus all` is refused by name,
+because this build grants one card and a flag that takes a word should not do something narrower
+than the word says. A card you did not name has no device node in the box, so CUDA cannot
+initialise it there; the host's PCI bus stays readable, so how many cards it has is still
+discoverable. A compose service still reaches a card through `devices:` plus
+`--allow-device-grants`.
 
 ### Reaching the host from inside a box: `host.docker.internal`
 

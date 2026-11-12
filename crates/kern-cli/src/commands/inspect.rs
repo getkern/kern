@@ -1079,6 +1079,37 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 /// superset of one `ps`+`stats` row for a single box. Untrusted fields (rootfs, command) are
 /// scrubbed of terminal-escape sequences before display, exactly like the status panel and tables.
 /// Errors with a `kern ps` hint if no live box has that name.
+/// The GPU device nodes a running box can see, read through its PID 1.
+///
+/// `/proc/<pid1>/root` resolves into the box's own mount namespace, so this is the box's `/dev`
+/// and not the host's. It is the same node set `--gpus` binds, which makes the row a reading of
+/// what the box HAS rather than a replay of what the caller typed: a grant that silently failed,
+/// or one a later phase undid, shows here as a dash.
+///
+/// `None` for a box whose PID 1 is not known or no longer alive, which is also the answer when
+/// there is nothing to look inside. Every failure is the same answer, an empty list, because a box
+/// whose `/dev` cannot be read has not been shown to hold a card.
+fn gpu_nodes_of(pid1: Option<i32>) -> String {
+    let Some(pid) = pid1 else {
+        return String::new();
+    };
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/root/dev")) else {
+        return String::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            // The per-card nodes only. `nvidiactl`, `nvidia-uvm` and `nvidia-modeset` go with any
+            // card, so listing them would make one card look like four.
+            let rest = n.strip_prefix("nvidia")?;
+            (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())).then_some(n)
+        })
+        .collect();
+    names.sort();
+    names.join(" ")
+}
+
 /// The human `mem-cap` row: what was ASKED FOR, and whether that is what the kernel holds.
 ///
 /// A free function rather than a `match` inside `inspect` because its most important branch is the
@@ -1581,6 +1612,12 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             &cpu.map_or("-".into(), |u| format!("{:.1}s", u as f64 / 1e6)),
         );
         row("tasks", &tasks.map_or("-".into(), |t| t.to_string()));
+        // THE CARD THE BOX ACTUALLY HOLDS, read from the box's own `/dev` and not from what was
+        // asked for. The registry records no device, and persisting one would create a second
+        // answer that a later edit could let drift; this row is the box's reality, in the same
+        // register as `mem` and `tasks` above, which read live cgroup files rather than the flags.
+        let gpu = gpu_nodes_of(b.live_pid1());
+        row("gpu", if gpu.is_empty() { "-" } else { &gpu });
         // Configured caps (the REQUESTED limits, distinct from the live usage above, which reads `-`
         // when the box has no dedicated cgroup) and the 0.6.7 isolation policies, shown when set.
         row(

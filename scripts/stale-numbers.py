@@ -405,14 +405,15 @@ def gpu_claims_agree() -> list[str]:
 
     Three agreements, none of which can fire on a true statement:
 
-      1. Every ``TIER-`` label written in a document must be one the code can actually print. The
-         model has a middle tier, ``TIER-MED``, that no code path can reach, because the measurement
-         that would earn it failed; a document that starts offering it would be describing a verdict
-         kern cannot award. That is the drift this catches.
+      1. No document may name a ``TIER-`` label. The code emitted two of them, and a tier is a
+         statement about device-level partitioning, which is the direction kern does not take; the
+         labels were removed with the machinery that produced them. A page still offering one is
+         describing a verdict this binary cannot award. If tiers ever come back, the labels the
+         code emits are read from it again and this becomes the narrower check it used to be.
 
-      2. The cooperative tier's disclaimer, verbatim from ``Tier::claim()``, must appear in the two
-         pages that carry the claim to a reader. Reword it in the code and the gate names the pages
-         that still say the old thing.
+      2. The standing claim about a granted compute node, verbatim from ``COMPUTE_NODE_CLAIM``,
+         must keep its admission, and the page that carries the claim to a reader must state it
+         too. Reword it in the code and the gate names the page that still says the old thing.
 
       3. The reserved vocabulary must be identical in the Rust gate and in the shell one.
          ``pentest/pentest-gpu-claims.sh`` cannot import a Rust constant, so it keeps its own copy,
@@ -441,10 +442,10 @@ def gpu_claims_agree() -> list[str]:
 
     bad: list[str] = []
 
+    # EMPTY IS THE ANSWER NOW, not a broken gate. The tier machinery was removed because the
+    # vocabulary described partitioning, so every `TIER-` in a page is stale by construction and
+    # the loop below says which page. If the labels ever come back this needs no change.
     labels = set(re.findall(r'Tier::\w+\s*=>\s*"(TIER-[A-Z]+)"', src))
-    if not labels:
-        return ["crates/kern-cli/src/gpu.rs no longer emits any TIER- label, so nothing can be "
-                "checked against it. Restore Tier::label() or drop this check."]
 
     docs = subprocess.run(
         ["git", "ls-files", "*.md"], capture_output=True, text=True
@@ -459,10 +460,13 @@ def gpu_claims_agree() -> list[str]:
         for lineno, line in enumerate(text.split("\n"), 1):
             for said in re.findall(r"\bTIER-[A-Z]+\b", line):
                 if said not in labels:
-                    bad.append(
-                        f"{path}:{lineno} names {said}, which kern cannot print. "
+                    emits = (
                         f"The tiers the code emits are {', '.join(sorted(labels))}"
+                        if labels
+                        else "The code emits no tier at all: a GPU row says which cards are here "
+                        "and which of them --gpus can hand over"
                     )
+                    bad.append(f"{path}:{lineno} names {said}, which kern cannot print. {emits}")
 
     # Both tiers carry a caveat that a later edit could smooth away, and the two caveats fail in
     # opposite directions: dropping the cooperative one understates the danger, dropping the hardware
@@ -484,32 +488,26 @@ def gpu_claims_agree() -> list[str]:
     # Editing either is editing what kern admits it does not know. That is allowed, and it is not
     # allowed to happen by accident while rewording a paragraph, which is what this gate is for.
     for arm, marker, page_required in (
-        ("Tier::Soft => {", "NOT a boundary against malicious code", True),
-        ("Tier::Hw => {", "has not measured the VRAM split", True),
+        ("pub const COMPUTE_NODE_CLAIM: &str =", "NOT a boundary against malicious code", True),
     ):
         claim = _rust_string_literal_after(src, arm)
         if marker not in claim:
             bad.append(
-                f"crates/kern-cli/src/gpu.rs: the claim for {arm.split(' ')[0]} no longer contains "
-                f"{marker!r}. If that is deliberate, update this gate and both pages with it."
+                f"crates/kern-cli/src/gpu.rs: COMPUTE_NODE_CLAIM no longer contains "
+                f"{marker!r}. If that is deliberate, update this gate and the pages with it."
             )
             continue
         if not page_required:
             continue
-        for path in ("README.md", "SECURITY.md"):
+        for path in ("SECURITY.md",):
             try:
                 text = open(path, encoding="utf-8").read()
             except OSError:
                 continue
-            # The README states only the cooperative half, which is the half a reader meets first;
-            # SECURITY.md is the page that owns both, so only it is held to the hardware caveat.
-            if marker == "has not measured the VRAM split" and path == "README.md":
-                continue
-            # Since 2026-09-27 the pages describe a GPU only as a device grant (the whole card, no
-            # split, no cap), by the owner's decision, and name no tier. A page that makes no tier
-            # claim has no admission to carry. The moment either page names a tier or a VRAM cap
-            # again, the admission is required again, which is the part of this rule that matters.
-            if "tier-" not in text.lower() and "vram" not in text.lower():
+            # SECURITY.md is the page that owns the grant, and it owns the admission with it.
+            # The README describes a GPU only as a device grant and names no claim, so it carries
+            # no admission; the moment it describes what a grant protects, it needs one.
+            if "gpu" not in text.lower():
                 continue
             if marker.lower() not in text.lower():
                 bad.append(

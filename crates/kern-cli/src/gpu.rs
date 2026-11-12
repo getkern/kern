@@ -1,56 +1,37 @@
-//! GPU DETECTION AND CAPABILITY TIER, read-only.
+//! GPU DETECTION, read-only.
 //!
-//! This module answers one question and refuses the others: *what would a VRAM cap on this GPU
-//! actually be worth?* It does not slice, cap, intercept or load anything. It reads sysfs and
-//! `/proc`, classifies each GPU into a capability tier, and emits the claim string that tier is
-//! entitled to.
+//! This module answers one question and refuses the others: *which GPUs does this host have, and
+//! which of them can a grant pair with?* It does not slice, cap, intercept or load anything. It
+//! reads sysfs, names each card, and reads the PCI address that pairs it with the grant.
 //!
-//! WHY THIS SHIPS BEFORE ANY SLICING CODE
-//!   MEASURED, on the two NVIDIA hosts this project can reach (an RTX 5060 Ti on driver 580.173.02
-//!   and a Jetson Orin Nano on 540.4.0): a process with libc and nothing else in its address space
-//!   opens the device node and receives an answer from the driver. A cooperative VRAM quota is
-//!   installed in front of the vendor library, and that tenant never went through it. Same result
-//!   from the vendor-neutral side on a Raspberry Pi 5 (`v3d`, `vc4`). `pentest/pentest-gpu-claims.sh`
-//!   runs it.
+//! IT USED TO CLASSIFY A CAPABILITY TIER, and most of its length was that. The model asked what a
+//! VRAM cap would be worth on each card and answered `TIER-HW` or `TIER-SOFT` with the evidence
+//! for it. That vocabulary is device-level partitioning, which kern does not do: it grants whole
+//! cards. A row describing a mechanism this binary does not have spent the reader's attention on
+//! a question they could not act on, and the framing had already outlived itself, claiming that
+//! `kern box --help` has no `--gpus` after `--gpus` shipped. The tiers, the evidence, the
+//! classifier and the `dmem` and `/dev/kfd` facts that qualified them went together.
 //!
-//!   NOT MEASURED HERE, and stated as the reasoning it is: on the NVIDIA driver the allocation is
-//!   committed by a fault serviced in the kernel and on the GPU's own controller, so a syscall
-//!   filter has no size to inspect either. Nothing in this file rests on that sentence. The raw
-//!   ioctl reaching the driver settles it on its own.
+//! WHAT SURVIVED THE REMOVAL, because it was never about tiers:
 //!
-//!   A project that shipped the cap first and the honest description second would be selling the
-//!   cap as a boundary for however long the gap lasted. So the judgement ships first and the
-//!   capability follows it.
+//!   THE MEASUREMENT. On the two NVIDIA hosts this project can reach (an RTX 5060 Ti on driver
+//!   580.173.02 and a Jetson Orin Nano on 540.4.0), a process with libc and nothing else in its
+//!   address space opens the device node and receives an answer from the driver. Any cap installed
+//!   in front of the vendor library is a cap that tenant never went through. Same result from the
+//!   vendor-neutral side on a Raspberry Pi 5 (`v3d`, `vc4`). `pentest/pentest-gpu-claims.sh` runs
+//!   it, and it is why a granted card is described as not a boundary rather than as a quota.
 //!
-//! THE ONE DISTINCTION THAT GOVERNS THIS FILE
-//!   "the slice applies" and "the slice is a security boundary" are different properties, and
-//!   conflating them is the failure this tier model exists to prevent. A cooperative quota holds
-//!   for a workload that is not trying to escape it, which is genuinely useful for density,
-//!   fairness and accidental-overcommit. It holds for nothing else.
+//!   THE DISTINCTION THAT GOVERNED THE FILE, which now governs the one claim it still makes:
+//!   "the limit applies" and "the limit is a security boundary" are different properties, and
+//!   conflating them is the failure this exists to prevent.
 //!
-//! FAIL-CLOSED
-//!   Every unknown resolves to [`Tier::Soft`], the weakest claim. A GPU is promoted only on
-//!   unambiguous evidence read from the kernel, never inferred from a vendor name or a model
-//!   number. When kern cannot tell, kern says the smaller thing.
-//!
-//! THE MISSING MIDDLE TIER
-//!   The capability model has three levels, and this file can only ever produce two of them. The
-//!   middle one is a kernel-enforced device-memory limit (`dmem`) that charges the path the
-//!   workload actually allocates through. The `dmem` controller exists upstream from kernel 6.14;
-//!   what it DOES was measured on exactly one combination, and the tier turns on that measurement
-//!   rather than on the controller's existence. On an RX 6700 XT (gfx1031), amdgpu/ROCm as shipped
-//!   on kernel 6.17, `CONFIG_CGROUP_DMEM=y`: with a per-cgroup `dmem.max` of 2 GB an 8 GB
-//!   `hipMalloc` SUCCEEDED and the leaf cgroup's `dmem.current` stayed at 0 while 8 GB sat in VRAM,
-//!   while managed memory did charge the leaf 166 MiB. So on that card, that driver and that
-//!   kernel, the DRM render path is charged and the KFD compute path, the one ML tenants use, is
-//!   not. One card, one driver, one kernel: nothing here says what `dmem` does on any other.
-//!
-//!   So the middle tier is DEFINED but not ATTAINABLE, and no [`Tier`] variant exists for it.
-//!   Shipping a variant that no code path can construct would put a tier in the model that kern
-//!   cannot award and cannot test. Reaching it requires re-running that measurement per (vendor,
-//!   driver, kernel) and finding the leaf charged, which is an allocation test and therefore
-//!   outside what a read-only preflight may do. Until then, a `dmem` controller is reported as a
-//!   FACT next to the GPU and never as a promotion.
+//!   THE `dmem` FINDING, kept because it is the reason no cap is offered. On an RX 6700 XT
+//!   (gfx1031), amdgpu/ROCm on kernel 6.17, `CONFIG_CGROUP_DMEM=y`: with a per-cgroup `dmem.max`
+//!   of 2 GB an 8 GB `hipMalloc` SUCCEEDED and the leaf cgroup's `dmem.current` stayed at 0 while
+//!   8 GB sat in VRAM, while managed memory did charge the leaf 166 MiB. The DRM render path is
+//!   charged and the KFD compute path, the one ML tenants use, is not. One card, one driver, one
+//!   kernel: nothing here says what `dmem` does on any other, and that uncertainty is exactly why
+//!   it was never allowed to promote anything.
 //!
 //! ALLOCATION NOTE
 //!   This path allocates: it reads sysfs into `String`s and returns an owned `Vec`. That is
@@ -67,25 +48,6 @@ use std::path::Path;
 const PCI_VENDOR_NVIDIA: u32 = 0x10de;
 const PCI_VENDOR_AMD: u32 = 0x1002;
 const PCI_VENDOR_INTEL: u32 = 0x8086;
-
-/// What kern can honestly promise about a VRAM cap on a given GPU.
-///
-/// The tiers are not a quality ranking of the hardware. They rank the strength of the ENFORCEMENT
-/// AUTHORITY behind a cap: hardware partitioning, or nothing but the tenant's own cooperation. The
-/// model's middle tier has no variant here because nothing can construct it: see the module header.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tier {
-    /// A hardware partition is present on this card: MIG instances, or an SR-IOV virtual function.
-    /// The split such a partition makes is enforced by the device rather than by the tenant, which
-    /// is what separates this tier from the one below it.
-    ///
-    /// It is a statement about the CARD, and a tenant is confined only if it was given the partition
-    /// rather than the whole device. kern cannot see which of the two happened, and says so in the
-    /// claim string rather than letting the tier imply it.
-    Hw,
-    /// A cooperative quota. Applies to a workload that does not evade it, and to nothing else.
-    Soft,
-}
 
 /// Words that may only ever appear in text kern prints about a [`Tier::Hw`] GPU.
 ///
@@ -110,75 +72,6 @@ pub const BOUNDARY_WORDS: [&str; 3] = ["isolation", "secure", "hard"];
 pub fn overclaims(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
     BOUNDARY_WORDS.into_iter().find(|w| lower.contains(w))
-}
-
-impl Tier {
-    /// The claim string kern is entitled to emit for this tier. Contractual, not cosmetic: see
-    /// `BOUNDARY_WORDS` below.
-    ///
-    /// THE HARDWARE TIER SAYS LESS THAN IT USED TO, AND THE REASON IS THE POINT OF THIS FILE. It
-    /// read "per-tenant VRAM enforced by the device", which asserts an ENFORCEMENT. What the
-    /// detector establishes is a TOPOLOGY: a `physfn` link means this is an SR-IOV virtual function,
-    /// and a `gi*` capability means MIG instances are configured. Neither is a measurement of the
-    /// memory split. That is exactly the reasoning that refuses to promote on a `dmem` controller
-    /// being present, applied by this module to every tier except the one nobody could test, which
-    /// is how the strongest claim in the file came to be the least supported. Reported by an
-    /// measured on 2026-08-28, against a claim written the same day.
-    ///
-    /// Two gaps are named in the string rather than left for a reader to discover:
-    ///
-    ///   * kern read the partition's PRESENCE and did not measure what it partitions;
-    ///   * the verdict is PER CARD and MIG partitions PER INSTANCE ASSIGNED. A tenant handed the
-    ///     whole device node on a MIG-configured card is not inside a GPU instance, and no property
-    ///     of the card can tell you which of the two a given tenant got.
-    ///
-    /// kern has never run on MIG or SR-IOV hardware, so this branch has no positive control
-    /// anywhere in the tree. A claim with no positive control is exactly the one to state narrowly.
-    pub fn claim(self) -> &'static str {
-        match self {
-            Tier::Hw => {
-                "hardware partition present (MIG instance or SR-IOV virtual function): the split is \
-                 enforced by the device and not by the tenant's cooperation. kern read its presence \
-                 from the kernel and has not measured the VRAM split itself, and a tenant given the \
-                 whole device rather than a partition is not inside one"
-            }
-            Tier::Soft => {
-                "cooperative VRAM quota: fairness, accidental-overcommit and accounting for \
-                 trusted and semi-trusted tenants. NOT a boundary against malicious code. Where a \
-                 boundary is needed, look for a device-level partition (MIG or SR-IOV) or give the \
-                 tenant the whole device; kern has measured neither"
-            }
-        }
-    }
-
-    /// The ONE-LINE form, for a surface whose question is not "how strong is a VRAM cap".
-    ///
-    /// [`claim`] above is the full statement and belongs wherever a cap is actually being applied.
-    /// `doctor` is not that place: its contract is "will boxes run here?", and this binary has no
-    /// flag that caps a GPU at all, so the long form there was four lines of MIG/SR-IOV vocabulary
-    /// answering a question the reader had not asked. It fired on EVERY host with a DRM node - a
-    /// Raspberry Pi's `v3d`, a Jetson's `nv_platform`, WSL's passthrough node - none of which is a
-    /// GPU anybody was about to slice.
-    ///
-    /// Same vocabulary contract as `claim`: the test gate runs over both.
-    pub fn short(self) -> &'static str {
-        match self {
-            // Neither repeats what `describe` already put on the same line - the tier label and the
-            // evidence are there - so each one carries only the CONSEQUENCE for the reader.
-            Tier::Hw => "kern read its presence, not the split",
-            Tier::Soft => {
-                "NOT a boundary against malicious code: a granted render node is the whole device"
-            }
-        }
-    }
-
-    /// Short label for tables and machine-readable output.
-    pub fn label(self) -> &'static str {
-        match self {
-            Tier::Hw => "TIER-HW",
-            Tier::Soft => "TIER-SOFT",
-        }
-    }
 }
 
 /// The GPU vendor, from the PCI id rather than from a driver name or a marketing string.
@@ -219,37 +112,21 @@ impl Vendor {
     }
 }
 
-/// Why a GPU landed in the tier it did, so `kern doctor` can show the evidence and not just the
-/// verdict. A tier without its reason is an assertion; with it, the reader can check kern.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Evidence {
-    /// The device is an SR-IOV virtual function: it has a `physfn` link back to its parent.
-    SriovVirtualFunction,
-    /// MIG instances are configured FOR THIS CARD, matched by its PCI address, not merely present
-    /// somewhere on the host.
-    ///
-    /// "Configured for this card" is the whole of it. MIG partitions per GPU INSTANCE, and which
-    /// instance a tenant ends up in is decided by the capability and device nodes it is handed, none
-    /// of which is a property of the card and none of which kern hands out.
-    MigInstance,
-    /// Nothing that grants a stronger tier was found. Worded as "device-level" and not as
-    /// "hardware" because the claim gate below refuses the reserved vocabulary on a
-    /// cooperative row, and it refuses the raw substring: it cannot tell a negated `hard` from
-    /// an asserted one, and a gate that tries to would be the one that lets the real case pass.
-    NoPartitionFound,
-}
+/// What a box gets when a compute node is handed to it.
+///
+/// THE ONE CLAIM THIS MODULE MAKES, in one place, so the two surfaces that print it cannot drift.
+/// It replaced four lines describing a "cooperative VRAM quota" and pointing a reader who wanted a
+/// boundary at "a device-level partition (MIG or SR-IOV)": kern caps no VRAM and partitions no
+/// device, so both sentences answered a question about a mechanism that was never offered.
+///
+/// What is left is the promise that holds and was measured: a card with no node in the box cannot
+/// be initialised by CUDA there. `pentest/pentest-gpu-claims.sh` and `overclaims` both read this
+/// string.
+pub const COMPUTE_NODE_CLAIM: &str =
+    "a granted compute node talks to the host's driver, so it is NOT a boundary against malicious \
+     code in the box; a card with no node here cannot be initialised by CUDA at all";
 
-impl Evidence {
-    pub fn describe(self) -> &'static str {
-        match self {
-            Evidence::SriovVirtualFunction => "SR-IOV virtual function (device/physfn present)",
-            Evidence::MigInstance => "MIG instances configured for this card",
-            Evidence::NoPartitionFound => "no device-level partition found",
-        }
-    }
-}
-
-/// One GPU as kern sees it, with the tier it is entitled to and the evidence for that tier.
+/// One GPU as kern sees it: what the device is, and how to pair it with a grant.
 #[derive(Clone, Debug)]
 pub struct Gpu {
     /// The DRM card name, for example `card0`. Owned because the caller outlives the scan.
@@ -260,16 +137,15 @@ pub struct Gpu {
     /// The kernel driver bound to the card (`nvidia`, `amdgpu`, `v3d`, `nv_platform`). On a board
     /// with no PCI identity this is the ONLY thing that names the device, which is why it is here.
     pub driver: Option<String>,
-    pub tier: Tier,
-    pub evidence: Evidence,
-    /// Whether the AMD/Intel `dmem` cgroup controller is available on this host. Reported as a
-    /// FACT, never as a tier: `dmem` being present says nothing about whether it charges the path
-    /// the tenant allocates through, and that difference is the whole of the missing middle tier
-    /// described in the module header.
-    pub dmem_controller: bool,
-    /// Whether the ROCm compute device node is present. Relevant because it is exactly the path
-    /// measured NOT to be charged to the allocating cgroup.
-    pub kfd_present: bool,
+    /// The card's PCI address, read from where `/sys/class/drm/<card>/device` points.
+    ///
+    /// IT IS THE JOIN KEY, and it is here so there is only one. A DRM card and the `/dev/nvidiaN`
+    /// a grant names are two views of one device, and on this host their numbering is INVERTED:
+    /// `nvidia0` is `card1`. Pairing them by number would report the wrong card's grant, and would
+    /// pass on any host whose two numberings happened to agree.
+    ///
+    /// `None` for a device with no PCI identity, which is the normal case on an ARM board.
+    pub pci_address: Option<String>,
 }
 
 /// Read a sysfs attribute and strip the trailing newline the kernel always appends.
@@ -295,17 +171,6 @@ fn read_hex_id(path: &Path) -> Option<u32> {
     let text = read_attr(path)?;
     let digits = text.strip_prefix("0x")?;
     u32::from_str_radix(digits, 16).ok()
-}
-
-/// Is the AMD/Intel `dmem` cgroup controller available on this host?
-///
-/// Read from the ROOT cgroup's `cgroup.controllers`, because that is where the kernel advertises
-/// what it compiled in. A leaf may not have it delegated, which is a different question and not
-/// this one: the point here is only whether the mechanism exists at all on this kernel.
-fn dmem_controller_available() -> bool {
-    std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")
-        .map(|s| s.split_whitespace().any(|c| c == "dmem"))
-        .unwrap_or(false)
 }
 
 /// The PCI address (`0000:01:00.0`) behind a `/sys/class/drm/cardN/device` link.
@@ -350,102 +215,6 @@ fn driver_name(device_dir: &Path) -> Option<String> {
     ok.then_some(name)
 }
 
-/// The NVIDIA device minor for a card, from the driver's own per-PCI-address record.
-///
-/// `/proc/driver/nvidia/gpus/<bdf>/information` carries a `Device Minor:` line. This is how kern
-/// crosses from the DRM view of a card to the NVIDIA view of it, so a MIG instance can be attributed
-/// to the card that owns it rather than to whichever NVIDIA card the scan happened to be looking at.
-fn nvidia_device_minor(bdf: &str) -> Option<u32> {
-    let info =
-        std::fs::read_to_string(format!("/proc/driver/nvidia/gpus/{bdf}/information")).ok()?;
-    info.lines()
-        .find_map(|l| l.strip_prefix("Device Minor:"))?
-        .trim()
-        .parse()
-        .ok()
-}
-
-/// Are NVIDIA MIG instances configured ON THIS CARD?
-///
-/// PER CARD, AND THE DIFFERENCE IS THE WHOLE POINT. The first version of this asked whether MIG was
-/// configured ANYWHERE on the host, which on a two-NVIDIA-card machine with MIG enabled on one of
-/// them promoted BOTH to the hardware tier. That is the exact defect class this module exists to
-/// prevent, produced by the module itself: a claim of device-enforced partitioning for a card that
-/// has none.
-///
-/// The driver publishes capabilities under `capabilities/gpu<minor>/mig/gi<id>/`, keyed by the same
-/// device minor that `/proc/driver/nvidia/gpus/<bdf>/information` reports. The `mig` directory alone
-/// is not enough: a MIG-capable card with MIG disabled still exposes it, so kern requires at least
-/// one configured GPU INSTANCE (`gi*`), which is the thing that actually partitions the device.
-///
-/// THE MINOR-TO-`gpu<N>` CORRESPONDENCE IS ESTABLISHED FROM NVIDIA'S OWN SOURCE, not inferred. It
-/// was written here as unverified, on the strength of one single-GPU host where minor 0 and `gpu0`
-/// agree, which is a degenerate case that could not distinguish the two. Read in
-/// `NVIDIA/open-gpu-kernel-modules` on 2026-08-28:
-///
-///   `kernel-open/nvidia/nv-procfs.c:158`   prints `"Device Minor: \t %u"` from `nvl->minor_num`
-///   `kernel-open/nvidia/nv.c:5720`         `nv_get_dev_minor()` returns that same `nvl->minor_num`
-///   `src/nvidia/arch/nvalloc/unix/src/os.c:4907`  `osRmCapRegisterGpu` takes `nv_get_dev_minor()`
-///   `src/nvidia/arch/nvalloc/unix/src/os.c:4931`  `os_snprintf(name, ..., "gpu%u", minor)`, then
-///                                                 creates that directory and `mig` beneath it
-///
-/// One field, printed in `/proc` and used to name the capability directory, so the number this
-/// module reads from a card's own `information` file is the number that keys its capabilities. The
-/// cross-card false promotion that was the only remaining route to an unearned `TIER-HW` is closed
-/// by construction, not by a policy.
-///
-/// The path stays fail-closed anyway: every unreadable file, unparsed line and absent directory
-/// returns `false`. Being wrong about a layout is then a MIG card missing a `TIER-HW` it had earned,
-/// never a consumer card receiving one it had not.
-fn mig_instances_for_card(device_dir: &Path) -> bool {
-    let Some(bdf) = pci_address(device_dir) else {
-        return false;
-    };
-    let Some(minor) = nvidia_device_minor(&bdf) else {
-        return false;
-    };
-    let mig = format!("/proc/driver/nvidia/capabilities/gpu{minor}/mig");
-    let Ok(entries) = std::fs::read_dir(&mig) else {
-        return false;
-    };
-    entries
-        .flatten()
-        .any(|e| e.file_name().to_string_lossy().starts_with("gi"))
-}
-
-/// Classify one card.
-///
-/// The order is deliberate: the strongest evidence is tested first, and anything that is not
-/// positively established falls through to [`Tier::Soft`]. Nothing here can award the model's
-/// middle tier, and that absence is the honest encoding of a measurement that failed rather than an
-/// oversight. See the module header.
-fn classify(device_dir: &Path, vendor: Vendor) -> (Tier, Evidence) {
-    // An SR-IOV virtual function carries a `physfn` LINK back to the physical function that created
-    // it. Vendor-neutral, and made by the kernel rather than by kern.
-    //
-    // A symlink, not merely a path that exists. The kernel creates `physfn` as a symlink and only on
-    // a VF, so on real sysfs the two tests agree; they part company on anything that is not real
-    // sysfs, and this is the branch that awards the strongest tier in the file. Requiring the shape
-    // the kernel actually produces costs one syscall and means a plain file called `physfn` cannot
-    // promote a card. What raised it was noticing the unit test was passing an empty
-    // FILE, which said the check was looser than the thing it claims to detect.
-    if device_dir
-        .join("physfn")
-        .symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return (Tier::Hw, Evidence::SriovVirtualFunction);
-    }
-    // MIG is NVIDIA-only. The vendor test comes first so kern does not walk the NVIDIA proc tree for
-    // an AMD card at all; the attribution that keeps one card's MIG instances from promoting another
-    // is inside `mig_instances_for_card`, which is where it belongs.
-    if vendor == Vendor::Nvidia && mig_instances_for_card(device_dir) {
-        return (Tier::Hw, Evidence::MigInstance);
-    }
-    (Tier::Soft, Evidence::NoPartitionFound)
-}
-
 /// Enumerate the GPUs on this host.
 ///
 /// Reads `/sys/class/drm`, which the kernel populates for every DRM device, and keeps only the
@@ -478,23 +247,7 @@ pub fn is_compute_node(path: &str) -> bool {
         || path == "/dev/kfd"
 }
 
-/// The tier to quote when a GPU node is granted but nothing establishes WHICH card served it.
-///
-/// Fail-closed, the same rule the detector follows per card: with cards of different tiers kern says
-/// the smaller thing. A host with no detected GPU also answers [`Tier::Soft`] - a grant of a node
-/// kern could not classify is the least, not the most, that can be claimed.
-pub fn weakest_tier() -> Tier {
-    let gpus = detect();
-    if !gpus.is_empty() && gpus.iter().all(|g| g.tier == Tier::Hw) {
-        Tier::Hw
-    } else {
-        Tier::Soft
-    }
-}
-
 pub fn detect() -> Vec<Gpu> {
-    let dmem = dmem_controller_available();
-    let kfd = Path::new("/dev/kfd").exists();
     let mut out: Vec<Gpu> = Vec::new();
 
     let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
@@ -516,16 +269,17 @@ pub fn detect() -> Vec<Gpu> {
             None => Vendor::NonPci,
         };
         let device_id = read_hex_id(&device_dir.join("device"));
-        let (tier, evidence) = classify(&device_dir, vendor);
+        // THE VALIDATING READER, not a `read_link` of my own: `pci_address` already resolves the
+        // link and then checks the result is a `dddd:bb:dd.f` and nothing else, which matters
+        // because this string is printed and is used to pair a card with its grant. A board with
+        // no PCI identity has nothing to read here, which is an answer rather than a failure.
+        let pci_address = pci_address(&device_dir);
         out.push(Gpu {
             card: name,
             vendor,
             device_id,
             driver: driver_name(&device_dir),
-            tier,
-            evidence,
-            dmem_controller: dmem,
-            kfd_present: kfd,
+            pci_address,
         });
     }
     // Stable order, so two runs on the same host produce the same output and a diff of `kern
@@ -534,14 +288,17 @@ pub fn detect() -> Vec<Gpu> {
     out
 }
 
-/// One human-readable line per GPU: what it is, which tier it gets, and why.
+/// WHICH CARD THIS IS, with no verdict attached.
 ///
-/// Kept separate from [`detect`] so the classification can be tested without a terminal and
-/// rendered differently by a future `kern probe` without duplicating the policy.
-pub fn describe(gpu: &Gpu) -> String {
-    // Identity is built from whatever is actually there, in decreasing order of authority: the PCI
-    // vendor, the PCI device id, the bound driver. A board has only the last of the three, so the
-    // line degrades to `card0 non-PCI (v3d)` rather than to a row of "unknown".
+/// Split out of [`describe`] because the two answers have different lifetimes. The identity is a
+/// fact about the hardware and does not change; the sentence after the colon is a claim about what
+/// kern can do with it, and that one has already been rewritten twice. A caller that wants to say
+/// something new about a card should not have to take the old claim with it.
+///
+/// Built from whatever is actually there, in decreasing order of authority: the PCI vendor, the
+/// PCI device id, the bound driver. A board has only the last of the three, so the line degrades
+/// to `card0 non-PCI (v3d)` rather than to a row of "unknown".
+pub fn describe_identity(gpu: &Gpu) -> String {
     let mut ident = gpu.vendor.label();
     if let Some(d) = gpu.device_id {
         ident.push_str(&format!(" {d:#06x}"));
@@ -549,13 +306,7 @@ pub fn describe(gpu: &Gpu) -> String {
     if let Some(driver) = &gpu.driver {
         ident.push_str(&format!(" ({driver})"));
     }
-    format!(
-        "{card} {ident}: {tier}, {evidence}",
-        card = gpu.card,
-        ident = ident,
-        tier = gpu.tier.label(),
-        evidence = gpu.evidence.describe(),
-    )
+    format!("{card} {ident}", card = gpu.card)
 }
 
 #[cfg(test)]
@@ -582,56 +333,6 @@ mod tests {
     }
 
     // ── the claim contract ──
-
-    /// THE GATE THIS MODULE EXISTS FOR. Every string kern can print about a non-hardware tier is
-    /// checked against the reserved vocabulary. Written over the `match` rather than over one
-    /// hand-listed string, so a tier added later is covered without anyone remembering to add it.
-    ///
-    /// The hardware tier is PERMITTED the vocabulary and is not required to use it. It used to be
-    /// required, as a guard against the gate going vacuous, and that requirement was pressure in the
-    /// wrong direction: it made the strongest string in the file the one the test pushed to stay
-    /// strong. The guard against a vacuous gate belongs in a positive control, which is the next
-    /// test, and not in a rule that rewards an assertive claim.
-    #[test]
-    fn no_tier_below_hardware_may_use_boundary_words() {
-        for tier in [Tier::Hw, Tier::Soft] {
-            let text = format!("{} {}", tier.label(), tier.claim());
-            if tier == Tier::Hw {
-                continue;
-            }
-            assert_eq!(
-                overclaims(&text),
-                None,
-                "tier {} claims a boundary it does not have: {text}",
-                tier.label()
-            );
-        }
-    }
-
-    /// The hardware tier may claim a boundary, and it may not claim to have MEASURED one.
-    ///
-    /// `physfn` proves this is an SR-IOV virtual function and `gi*` proves MIG instances exist. What
-    /// neither proves is the VRAM split, and the claim said "per-tenant VRAM enforced by the device"
-    /// until it was pointed out that this is the same "present therefore enforcing" step
-    /// the module refuses everywhere else. Both caveats are pinned here so an edit that drops one
-    /// fails the build instead of quietly restoring the overstatement.
-    #[test]
-    fn the_hardware_claim_names_what_it_did_not_measure() {
-        let c = Tier::Hw.claim();
-        assert!(
-            c.contains("has not measured the VRAM split"),
-            "the hardware claim no longer says kern did not measure the split: {c}"
-        );
-        assert!(
-            c.contains("whole device rather than a partition is not inside one"),
-            "the hardware claim no longer warns that a per-card verdict is not a per-tenant one: {c}"
-        );
-        assert!(
-            !c.contains("enforced by the device")
-                || c.contains("the split is enforced by the device"),
-            "the claim asserts an enforcement kern has not measured: {c}"
-        );
-    }
 
     /// The gate has to be able to FAIL, or a green result proves nothing. Positive control.
     #[test]
@@ -667,195 +368,7 @@ mod tests {
         }
     }
 
-    /// The reason kern prints for a tier must not be an assertion of the tier itself: evidence
-    /// strings are shown next to a `TIER-SOFT` line too, so they carry the same restriction.
-    #[test]
-    fn evidence_strings_never_overclaim() {
-        for e in [
-            Evidence::SriovVirtualFunction,
-            Evidence::MigInstance,
-            Evidence::NoPartitionFound,
-        ] {
-            assert_eq!(
-                overclaims(e.describe()),
-                None,
-                "evidence string claims a boundary: {}",
-                e.describe()
-            );
-        }
-    }
-
     // ── classification ──
-
-    /// An SR-IOV virtual function is the one vendor-neutral hardware partition kern can see, and it
-    /// is a LINK the kernel creates, so the fixture is a link.
-    ///
-    /// It used to be an empty file, and the check used to be `Path::exists`, which is how the two
-    /// stayed in agreement while both were looser than the kernel's own shape. A test that builds a
-    /// fixture the kernel would never produce is testing the code against itself.
-    #[test]
-    fn a_physfn_symlink_promotes_to_the_hardware_tier() {
-        let d = TmpDir::new("physfn");
-        std::os::unix::fs::symlink("../0000:01:00.0", d.0.join("physfn")).expect("symlink physfn");
-        assert_eq!(
-            classify(&d.0, Vendor::Amd),
-            (Tier::Hw, Evidence::SriovVirtualFunction)
-        );
-    }
-
-    /// And a plain file of the same name does not, which is the half that was missing.
-    #[test]
-    fn a_physfn_that_is_not_a_link_does_not_promote() {
-        let d = TmpDir::new("physfn-file");
-        std::fs::write(d.0.join("physfn"), "").expect("write physfn");
-        assert_eq!(
-            classify(&d.0, Vendor::Amd),
-            (Tier::Soft, Evidence::NoPartitionFound),
-            "a regular file named physfn promoted a card to the hardware tier"
-        );
-    }
-
-    /// THE HARDWARE PATH, FORCED. kern has never run on MIG or SR-IOV hardware, so `TIER-HW` is a
-    /// branch no test could reach end to end and its fail-closed behaviour was a property asserted in
-    /// a comment rather than measured. A test's point on 2026-08-28: "fail-closed by design"
-    /// becomes "fail-closed measured" the moment something drives the path with a synthetic device
-    /// directory, and that costs nothing but a temp dir.
-    ///
-    /// This does not prove TIER-HW is correct on real hardware, and cannot. It proves the two things
-    /// that can be proved without one: the code does not panic on a card it promotes, and every
-    /// attribute around it can be garbage without changing the verdict or the shape of the output.
-    #[test]
-    fn the_hardware_path_survives_a_synthetic_card_with_garbage_around_it() {
-        let d = TmpDir::new("hw-forced");
-        std::os::unix::fs::symlink("../0000:65:00.1", d.0.join("physfn")).expect("symlink physfn");
-        // Every neighbouring attribute malformed in a different way. None may reach the verdict.
-        std::fs::write(
-            d.0.join("vendor"),
-            "not-a-hex-id
-",
-        )
-        .expect("write vendor");
-        std::fs::write(d.0.join("device"), "0xZZZZ").expect("write device");
-        std::os::unix::fs::symlink("/sys/bus/pci/drivers/amdgpu", d.0.join("driver")).expect("drv");
-
-        let (tier, evidence) = classify(&d.0, Vendor::Amd);
-        assert_eq!((tier, evidence), (Tier::Hw, Evidence::SriovVirtualFunction));
-
-        let gpu = Gpu {
-            card: "card7".into(),
-            vendor: Vendor::from_pci(0x1002),
-            device_id: read_hex_id(&d.0.join("device")), // None: the file is garbage
-            driver: driver_name(&d.0),
-            tier,
-            evidence,
-            dmem_controller: true,
-            kfd_present: true,
-        };
-        assert_eq!(gpu.device_id, None, "a malformed device id must not parse");
-        assert_eq!(gpu.driver.as_deref(), Some("amdgpu"));
-        let line = describe(&gpu);
-        assert_eq!(
-            line,
-            "card7 AMD (amdgpu): TIER-HW, SR-IOV virtual function (device/physfn present)"
-        );
-        // The one tier permitted the reserved vocabulary still has to carry its own caveats.
-        let claim = gpu.tier.claim();
-        assert!(claim.contains("has not measured the VRAM split"));
-    }
-
-    /// The other half, and the one that matters more: garbage EVERYWHERE and no partition link must
-    /// land on the weak tier rather than panic or promote. This is the fail-closed rule, measured.
-    #[test]
-    fn garbage_attributes_fall_to_the_cooperative_tier_and_never_panic() {
-        let d = TmpDir::new("hw-garbage");
-        for (name, content) in [
-            ("vendor", "\u{0}\u{1}\u{2}"),
-            ("device", "0x"),
-            ("physfn_not_really", "0x10de"),
-        ] {
-            std::fs::write(d.0.join(name), content).expect("write attr");
-        }
-        // A driver link whose target is not a plain component, so `driver_name` must yield nothing.
-        std::os::unix::fs::symlink("/a/b/../..", d.0.join("driver")).expect("symlink driver");
-
-        for v in [
-            Vendor::Nvidia,
-            Vendor::Amd,
-            Vendor::Intel,
-            Vendor::Other(0),
-            Vendor::NonPci,
-        ] {
-            assert_eq!(
-                classify(&d.0, v),
-                (Tier::Soft, Evidence::NoPartitionFound),
-                "garbage promoted a card for vendor {v:?}"
-            );
-        }
-        assert_eq!(read_hex_id(&d.0.join("vendor")), None);
-        assert_eq!(read_hex_id(&d.0.join("device")), None);
-        assert_eq!(driver_name(&d.0), None);
-        assert_eq!(pci_address(&d.0), None);
-        assert!(!mig_instances_for_card(&d.0));
-    }
-
-    /// A dangling link still promotes, and that is deliberate rather than an oversight. sysfs
-    /// `physfn` targets a sibling device directory; a target that cannot be resolved from wherever
-    /// the process happens to stand is a resolution failure, not evidence that the card is not a
-    /// virtual function. The test states the choice so the next reader does not have to guess it.
-    #[test]
-    fn a_dangling_physfn_link_still_counts_as_a_virtual_function() {
-        let d = TmpDir::new("physfn-dangling");
-        std::os::unix::fs::symlink("/nonexistent/pci/device", d.0.join("physfn")).expect("symlink");
-        assert_eq!(
-            classify(&d.0, Vendor::Amd),
-            (Tier::Hw, Evidence::SriovVirtualFunction)
-        );
-    }
-
-    /// FAIL-CLOSED, stated as a test: an empty device directory is not an error, it is a
-    /// `TIER-SOFT`. This is the branch every consumer GPU takes.
-    ///
-    /// Deterministic on EVERY host, including one with MIG configured, and that is the point of the
-    /// per-card attribution: a device directory that has no PCI address the NVIDIA driver knows
-    /// cannot inherit another card's MIG instances. Before that fix this test had to be written as a
-    /// property ("promoted only with evidence") because the answer depended on the machine.
-    #[test]
-    fn a_bare_device_falls_through_to_the_cooperative_tier() {
-        let d = TmpDir::new("bare");
-        for v in [Vendor::Nvidia, Vendor::Amd, Vendor::Intel, Vendor::Other(1)] {
-            assert_eq!(
-                classify(&d.0, v),
-                (Tier::Soft, Evidence::NoPartitionFound),
-                "vendor {v:?} was promoted with no evidence for it"
-            );
-        }
-    }
-
-    /// THE OVERCLAIM THIS MODULE ALMOST SHIPPED. MIG configured anywhere on the host must not reach
-    /// a card that does not own it. Written against the two joints where the attribution can break:
-    /// a device directory with no resolvable PCI address, and a PCI address the NVIDIA driver has no
-    /// record of. Both return `false` before any capability directory is read at all, so neither
-    /// depends on the host's MIG state.
-    ///
-    /// NO POSITIVE CONTROL, and the reason is worth stating rather than hiding: nothing here can
-    /// make this function return `true`, because that needs MIG hardware this project does not own
-    /// and `/proc` cannot be faked. So this test proves only the fail-closed half. The `physfn` path
-    /// has its positive control above precisely because a link CAN be created; the MIG path is
-    /// written to fail closed for exactly the reason that it cannot.
-    ///
-    /// What a test cannot supply here, reading the driver's source did: the four-line chain from
-    /// `nvl->minor_num` to the `gpu%u` directory name is quoted in `mig_instances_for_card`, so the
-    /// attribution rests on NVIDIA's code rather than on this host's agreement with itself.
-    #[test]
-    fn mig_is_attributed_to_a_card_and_not_to_the_host() {
-        let d = TmpDir::new("mig");
-        assert!(
-            !mig_instances_for_card(&d.0),
-            "a directory with no PCI address inherited someone else's MIG instances"
-        );
-        // A real-looking BDF that no NVIDIA card has: the lookup must fail, not fall back to a scan.
-        assert_eq!(nvidia_device_minor("ffff:ff:1f.7"), None);
-    }
 
     /// The PCI address is validated where it is READ, because it then builds a path under `/proc`.
     ///
@@ -915,36 +428,30 @@ mod tests {
     #[test]
     fn a_card_with_no_pci_identity_is_still_described() {
         let row = |vendor, device_id, driver: Option<&str>| {
-            describe(&Gpu {
+            describe_identity(&Gpu {
                 card: "card0".into(),
                 vendor,
                 device_id,
                 driver: driver.map(str::to_string),
-                tier: Tier::Soft,
-                evidence: Evidence::NoPartitionFound,
-                dmem_controller: false,
-                kfd_present: false,
+                pci_address: None,
             })
         };
         assert_eq!(
             row(Vendor::Nvidia, Some(0x2d04), Some("nvidia")),
-            "card0 NVIDIA 0x2d04 (nvidia): TIER-SOFT, no device-level partition found"
+            "card0 NVIDIA 0x2d04 (nvidia)"
         );
         assert_eq!(
             row(Vendor::NonPci, None, Some("v3d")),
-            "card0 non-PCI (v3d): TIER-SOFT, no device-level partition found"
+            "card0 non-PCI (v3d)"
         );
         assert_eq!(
             row(Vendor::NonPci, None, Some("nv_platform")),
-            "card0 non-PCI (nv_platform): TIER-SOFT, no device-level partition found"
+            "card0 non-PCI (nv_platform)"
         );
         // An unrecognised PCI vendor keeps its id rather than becoming an anonymous "unknown".
         assert!(row(Vendor::Other(0x1af4), Some(0x1050), None).contains("PCI vendor 0x1af4 0x1050"));
         // Nothing readable at all is still a line, and still not an overclaim.
-        assert_eq!(
-            row(Vendor::NonPci, None, None),
-            "card0 non-PCI: TIER-SOFT, no device-level partition found"
-        );
+        assert_eq!(row(Vendor::NonPci, None, None), "card0 non-PCI");
     }
 
     /// The driver name is read from a symlink and then printed, so it is validated where it is read.
@@ -990,15 +497,17 @@ mod tests {
                 "connector or render node leaked into the card list: {}",
                 g.card
             );
-            if g.tier == Tier::Soft {
-                assert_eq!(g.evidence, Evidence::NoPartitionFound);
-                assert_eq!(overclaims(&describe(g)), None, "{}", describe(g));
-            } else {
-                assert_ne!(
-                    g.evidence,
-                    Evidence::NoPartitionFound,
-                    "promoted with no evidence"
-                );
+            assert_eq!(
+                overclaims(&describe_identity(g)),
+                None,
+                "{}",
+                describe_identity(g)
+            );
+            // THE JOIN KEY IS A PCI ADDRESS OR IT IS ABSENT, never something in between. It pairs
+            // a DRM card with the grant that names it, and a half-read string would pair it with
+            // the wrong one or with nothing.
+            if let Some(addr) = &g.pci_address {
+                assert_eq!(addr.len(), 12, "not a kernel-shaped PCI address: {addr}");
             }
         }
     }
