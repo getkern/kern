@@ -35,6 +35,38 @@ pub fn box_plan(name: &str, profiles: &[String], config: Option<&str>) -> Result
             .filter(|n| !n.is_empty())
             .collect()
     };
+    // THE GPU GRANT IS PREVIEWED AND NOTHING ELSE. The resolver mounts nothing and changes no
+    // process state; this prints what a later phase would act on, which is the whole of S1's
+    // surface. A host with no NVIDIA driver prints NOTHING rather than a reassuring line about an
+    // absence, because the plan describes what this box would get and that host gives it none.
+    //
+    // The two faults that ARE worth naming do get named: a driver whose version line cannot be
+    // parsed, and a driver that is loaded while its device nodes are missing. Both are states a
+    // reader can act on, and both are invisible without being said.
+    match crate::gpu_grant::resolve(&crate::gpu_grant::Caller::current()) {
+        Ok(grant) => {
+            println!("  gpu grant (preview, nothing is mounted by --plan):");
+            for line in
+                crate::gpu_grant::render_plan(&grant, crate::gpu_grant::Detail::Summary).lines()
+            {
+                println!("    {line}");
+            }
+        }
+        Err(crate::gpu_grant::ResolveError::NoDriverVersionFile { .. }) => {}
+        Err(crate::gpu_grant::ResolveError::DriverVersionUnparsable { first_line }) => {
+            println!(
+                "  gpu grant: an NVIDIA driver is loaded and its version line carries no version: \
+                 {first_line:?}"
+            );
+        }
+        Err(crate::gpu_grant::ResolveError::NoNodes { driver_version }) => {
+            println!(
+                "  gpu grant: driver {driver_version} is loaded and no device node exists under \
+                 /dev, so no GPU can be granted"
+            );
+        }
+    }
+
     let (vcpu, vgpio, vdisk) = (pick("vcpu:"), pick("vgpio:"), pick("vdisk:"));
     if vcpu.is_empty() && vgpio.is_empty() && vdisk.is_empty() {
         return Ok(());
