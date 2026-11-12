@@ -44,6 +44,25 @@
 //!    `/dev/kvm`, to grant two render nodes. The resolver therefore reports WHICH gids a node
 //!    needs, and never implies that keeping them is narrow.
 //!
+//! ⚠️ THE SHAPE EVERY ONE OF THOSE FOUR DECIDES HAS NEVER BEEN RUN ON A REAL HOST. A headless
+//! server's nodes are commonly `root:video 0660` with no `other` bit, so the group class is the only
+//! way in and the whole group policy turns on it. THIS host's nodes are `0666` for `/dev/nvidia*`
+//! and `0660` plus an `ACL_USER` for `/dev/dri/*`, which means the group class never decides
+//! anything here: on this machine `access_path` answers `Other` or `AclUser` for every node a grant
+//! touches, and `GroupPolicy::Needed` is unreachable.
+//!
+//! So the headless case is covered SYNTHETICALLY and on purpose, and the fixtures say which level
+//! they reach: `plain(0, 44, 0o660)` through [`mount_plan`] in
+//! `a_grant_needing_groups_is_refused_before_anything_is_mounted`, the same facts through
+//! [`access_path`] and [`group_policy`], and `doctor`'s `gated_node()` through the `gpu` row. That is
+//! a simulation of a host, not a measurement of one, and it CANNOT answer four things: whether
+//! [`node_facts`] reads such a node off a real devtmpfs the way the fixture states it, whether the
+//! driver's own `O_RDWR` open agrees with the verdict (it asks only about read today), whether the
+//! grant then works end to end, and what group list a real headless operator's service account
+//! actually carries. Anyone reading a green test here must not read it as "kern works on a headless
+//! server". Finding one host of that shape and running `pentest/pentest-gpu-grant.sh` on it would
+//! retire this paragraph; until then it stays.
+//!
 //! THE LIBRARY SET IS COMPUTED, NOT LISTED. The driver version is read from the root's
 //! `proc/driver/nvidia/version` and every file carrying that exact suffix in the linker's
 //! directories joins the grant. Two failure modes were found by measuring rather than by reading,
