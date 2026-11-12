@@ -6226,6 +6226,46 @@ fn privileged_allowed_by_config() -> bool {
 ///
 /// WHAT IS GRANTED, EXACTLY: every capability the box's own user namespace can hold, and the relaxed
 /// seccomp a nested runtime needs. What is NOT granted, and it is the dangerous third of Docker's
+/// Why a service's `gpus:` is not a GPU request, or `None` when it is one.
+///
+/// THE SAME PARSER THE FLAG RUNS, called to CHECK and not to translate. `kern compose config` is
+/// the verb a reader uses to ask whether their file will start, and a spec kern refuses used to
+/// pass it and fail at `up`: the file was told it was fine by the command whose whole job is to
+/// say so. The spec still travels to `kern box` unparsed, because one grammar is the rule; this is
+/// that grammar, asked a question, in the crate that owns it.
+///
+/// The reason is rewritten for a FILE rather than forwarded from the flag: a compose author did
+/// not type `--gpus`, and a message telling them about a command line they never ran would send
+/// them looking in the wrong place.
+fn compose_gpu_spec_problem(b: &crate::compose::ComposeBox) -> Option<String> {
+    let spec = b.gpus.as_deref()?;
+    let err = crate::gpu_grant::parse_gpu_spec(spec).err()?;
+    use crate::gpu_grant::GpuSpecError as G;
+    let why = match err {
+        G::Empty => "it is empty".to_string(),
+        G::ZeroIsAmbiguous => "a bare 0 has two readings, docker's \"no gpus\" and this project's \
+             \"card 0\"; write device=0 for the card"
+            .to_string(),
+        G::AllWithMore { .. } => {
+            "`all` names every card and cannot stand beside another".to_string()
+        }
+        G::Duplicate { index } => {
+            format!("card {index} is named twice and each is granted once")
+        }
+        G::NotACount { .. } => {
+            "a bare value is HOW MANY cards, as in docker (gpus: 2); device=0 names which"
+                .to_string()
+        }
+        G::NotAnIndex { .. } => {
+            "the value after device= is a card index, or a list of them".to_string()
+        }
+    };
+    Some(format!(
+        "config: service '{}': `gpus: {spec}` is not a GPU request - {why}",
+        b.service_name()
+    ))
+}
+
 /// key: `/proc` and `/sys` stay masked. `/proc/sys/kernel/core_pattern` is not namespaced on Linux,
 /// and unmasking it has already been a real escape in this project.
 pub(crate) fn apply_privileged_grant(
@@ -7801,6 +7841,9 @@ fn run_terminal_verb(
                             b.service_name()
                         )));
                     }
+                }
+                if let Some(msg) = compose_gpu_spec_problem(b) {
+                    return Err(Error::Compose(msg));
                 }
             }
             println!("compose config: {} service(s) in {file}", boxes.len());

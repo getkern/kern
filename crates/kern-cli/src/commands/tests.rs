@@ -8050,6 +8050,54 @@ mod exec_scope_decision_tests {
         );
     }
 
+    /// `kern compose config` REFUSES A GPU SPEC THAT `up` WOULD REFUSE, and says why for a FILE.
+    ///
+    /// `config` is the verb a reader runs to ask whether their file will start. A spec kern cannot
+    /// parse used to pass it and fail at `up`, which is the command whose whole job is to answer
+    /// that question telling them the wrong answer.
+    ///
+    /// THE CHECK IS THE PARSER THE FLAG RUNS, not a copy. A second grammar here would drift from
+    /// the one that owns it, and the drift would show as a file `config` accepts and `up` refuses,
+    /// which is the defect this closes pointing the other way.
+    #[test]
+    fn compose_config_refuses_a_gpu_spec_that_up_would_refuse() {
+        let svc = |spec: &str| crate::compose::ComposeBox {
+            name: "trainer".into(),
+            image: Some("alpine".into()),
+            gpus: Some(spec.to_string()),
+            ..Default::default()
+        };
+        // Every shape kern accepts passes, or `config` would refuse a file that starts.
+        for good in ["all", "2", "count=all", "device=0", "device=0,1", "gpu=1"] {
+            assert!(
+                compose_gpu_spec_problem(&svc(good)).is_none(),
+                "`gpus: {good}` starts and config must not refuse it"
+            );
+        }
+        // And each refusal says why IN THE FILE'S VOCABULARY: a compose author never typed
+        // `--gpus`, so a message about a command line would send them looking in the wrong place.
+        for (bad, phrase) in [
+            ("0", "two readings"),
+            ("all,1", "cannot stand beside"),
+            ("device=0,0", "named twice"),
+            ("pippo", "HOW MANY"),
+            ("device=x", "card index"),
+        ] {
+            let msg = compose_gpu_spec_problem(&svc(bad))
+                .unwrap_or_else(|| panic!("`gpus: {bad}` must be refused by config"));
+            assert!(msg.contains(phrase), "{bad}: {msg}");
+            assert!(msg.contains("trainer") && msg.contains(bad), "{bad}: {msg}");
+            assert!(!msg.contains("--gpus"), "a file did not type a flag: {msg}");
+        }
+        // A service that asks for no card has nothing to check.
+        assert!(compose_gpu_spec_problem(&crate::compose::ComposeBox {
+            name: "web".into(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        })
+        .is_none());
+    }
+
     /// A GPU ASKED FOR BY A COMPOSE FILE NEEDS THE OPERATOR'S GRANT, in both of the file's spellings.
     ///
     /// A GPU is a device grant, and the rule that governs `devices:` governs this: a policy a
