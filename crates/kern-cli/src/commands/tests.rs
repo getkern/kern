@@ -8218,6 +8218,53 @@ mod exec_scope_decision_tests {
     }
 }
 
+/// `:ro` ON A DEVICE NODE IS A BELIEF, AND IT IS NAMED NOW.
+///
+/// `MS_RDONLY` governs the FILESYSTEM of a bind, not writes through a node to the driver. Measured
+/// 2026-11-12: a write to a `:ro`-bound `/dev/null` is ACCEPTED and reaches the driver, `O_RDWR` on
+/// one OPENS, and the control, a regular file bound `:ro`, gives EROFS. A caller writing
+/// `-v /dev/x:/dev/x:ro` to keep a box from writing to a device got nothing of the kind, in silence.
+///
+/// THE FLAG IS NOT DROPPED, which is what this pins: on a bind whose source is a DIRECTORY of nodes
+/// the read-only mount still stops the box creating entries in it, so turning the warning into a
+/// behaviour change would take a real property away. The warning itself is verified by running the
+/// binary, because it goes to stderr: a `:ro` device bind prints it, a `:ro` regular file does not,
+/// and a device bound read-write does not.
+#[test]
+fn a_read_only_device_bind_keeps_its_flag_and_is_still_accepted() {
+    // `resolve_volume` reads process-global environment to resolve a bind source, so the whole body
+    // holds the harness's lock: without it this races every other test in the binary, which the
+    // harness asserts rather than letting it be intermittent.
+    let _g = crate::env_guard();
+    use std::os::unix::fs::FileTypeExt;
+    let device = std::path::Path::new("/dev/null");
+    if !std::fs::metadata(device)
+        .map(|m| m.file_type().is_char_device())
+        .unwrap_or(false)
+    {
+        eprintln!("skip: no /dev/null character device on this host");
+        return;
+    }
+
+    let got = crate::commands::resolve_volume("/dev/null", "/d", true, "-v /dev/null:/d:ro")
+        .expect("a device bind is still accepted");
+    assert!(
+        got.read_only,
+        "the flag must survive: a read-only bind over a DIRECTORY of nodes still stops the box \
+         creating entries in it"
+    );
+    assert_eq!(got.target, "/d");
+
+    // POSITIVE CONTROL in the other direction, so the assertion above is the flag being carried
+    // rather than a field that is always true.
+    let rw = crate::commands::resolve_volume("/dev/null", "/d", false, "-v /dev/null:/d")
+        .expect("a device bind is still accepted");
+    assert!(
+        !rw.read_only,
+        "a bind with no `:ro` must not become read-only"
+    );
+}
+
 /// THE SUB-UID RANGE BUYS THE `setgroups` CLEAR, so a box with groups to clear always gets it.
 ///
 /// `range_buys_nothing` is a latency optimisation: it drops the default range for a box whose

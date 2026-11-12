@@ -1051,8 +1051,26 @@ fn mask_proc_dir_keeping(dir: &str, keep: &[String]) -> Result<(), Error> {
         return Err(e);
     }
     // Undo the mask and give the box the host's directory back. Used for every failure below.
-    let undo = || unsafe {
-        libc::umount2(dir_c.as_ptr(), libc::MNT_DETACH);
+    //
+    // THE RESULT IS CHECKED NOW, and the all-or-nothing claim this function makes rests on it. The
+    // call's value was discarded, so a failed unmount left the box with an EMPTY tmpfs over the
+    // driver's enumeration directory while the caller reported the mask as rolled back: the box
+    // would then see NO card at all, including the one it was granted, and the error the caller
+    // returns would name a different cause. `MNT_DETACH` fails for reasons that are real (EINVAL on
+    // a path that is no longer a mountpoint, EPERM if the namespace changed under us), so silence
+    // here is a claim and not an observation.
+    //
+    // It WARNS rather than failing: the caller is already returning an error, and replacing its
+    // cause with this one would hide the fault that started the rollback. `kern: warning:` is the
+    // prefix both SDKs file as a runtime note. The box has a tighter view than intended, never a
+    // wider one, which is why this is a diagnosis and not a refusal.
+    let undo = || {
+        if unsafe { libc::umount2(dir_c.as_ptr(), libc::MNT_DETACH) } != 0 {
+            let why = std::io::Error::last_os_error();
+            eprintln!(
+                "kern: warning: could not undo the GPU enumeration mask on {dir}: {why}. The box                  will see no card in the driver's own directory, including one it was granted; the                  device nodes themselves are unaffected.",
+            );
+        }
     };
 
     // 3. and 4. One mountpoint per granted card, created inside the tmpfs while it is still

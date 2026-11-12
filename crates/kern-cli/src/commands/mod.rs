@@ -1925,6 +1925,31 @@ pub(crate) fn resolve_volume(
                 )))
             }
         };
+        // `:ro` ON A DEVICE NODE CANNOT DO WHAT THE READER THINKS, and it was accepted in silence.
+        // `MS_RDONLY` governs the FILESYSTEM of the bind, not writes through the node to the
+        // driver. Measured 2026-11-12: a write to a `:ro`-bound `/dev/null` is ACCEPTED and reaches
+        // the driver, `O_RDWR` on a `:ro`-bound device node OPENS, and the control, a regular file
+        // bound `:ro`, gives EROFS. So a caller writing `-v /dev/x:/dev/x:ro` to keep a box from
+        // writing to a device got nothing of the kind and no sign of it.
+        //
+        // A WARNING AND NOT A REFUSAL: the bind is still the one the caller asked for and the node
+        // still arrives, so refusing would break a working command to correct a belief. The flag
+        // is not dropped either, because on a bind whose source is a DIRECTORY of nodes the
+        // read-only mount still stops the box creating entries in it.
+        if read_only {
+            use std::os::unix::fs::FileTypeExt;
+            if let Ok(meta) = std::fs::metadata(&source) {
+                let kind = meta.file_type();
+                if kind.is_char_device() || kind.is_block_device() {
+                    eprintln!(
+                        "kern: warning: {shown} asks for `:ro` on a device node. Read-only governs \
+                         the bind's filesystem, not the device: the box can still open {source} \
+                         read-write and write through it to the driver. To keep a device out of a \
+                         box, do not bind it."
+                    );
+                }
+            }
+        }
         Ok(Volume {
             source,
             target: target.to_string(),
