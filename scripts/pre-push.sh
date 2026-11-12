@@ -157,6 +157,34 @@ else
     step "gpu claims" gpu_claims
 fi
 
+# THE OTHER HALF: what a grant DOES, not what kern says about it. `pentest-gpu-grant.sh` hands
+# cards to real boxes, runs a kernel on them, and checks that a box which named nothing got
+# nothing and that nothing is left behind. It needs a real card and says so when there is none;
+# `gpu claims` only needs a DRM node of any vendor, which is why the two conditions differ.
+gpu_grant_skip_reason() {
+    [ -e /dev/nvidia0 ] || { echo "no /dev/nvidia0: a grant has nothing to hand over"; return 0; }
+    "$PWD/target/debug/kern" images 2>/dev/null | grep -q "kern-sandbox" \
+        || { echo "the probe image is not pulled (kern-sandbox)"; return 0; }
+    return 1
+}
+gpu_grant() {
+    cargo build -q 2>/dev/null || return 1
+    sh pentest/pentest-gpu-grant.sh "$PWD/target/debug/kern" > /tmp/prepush-grant.log 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ] || grep -q "  FAIL " /tmp/prepush-grant.log; then
+        tail -30 /tmp/prepush-grant.log
+        return 1
+    fi
+    return 0
+}
+if [ "$FULL" -eq 1 ]; then
+    if grant_skip=$(gpu_grant_skip_reason); then
+        printf '  \033[33mskip\033[0m %-38s %s\n' "gpu grant" "$grant_skip"
+    else
+        step "gpu grant" gpu_grant
+    fi
+fi
+
 # WHAT CI ACTUALLY SAID, read rather than predicted. Everything above is this host answering about
 # itself, and the sentence below used to claim it spoke for the runner. It did not: CI was red on
 # `main` for four commits while this file printed green, once because a test asked whether a user
