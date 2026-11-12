@@ -1610,8 +1610,22 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         // '{{.State.Status}}'` and `ps --format '{{.Status}}'` already print, so the three surfaces
         // agree word for word: `running`, `paused`, `exited`.
         let status = box_lifecycle_status(&b);
+        // THE HARDWARE ROW WAS HUMAN-ONLY, against this file's own contract. `--json` is additive by
+        // contract, and a consumer asking "which of my boxes hold a card" had to parse the human
+        // output or go to `kern top`'s badge. It is the one row whose answer a script most plausibly
+        // acts on, since it decides scheduling.
+        //
+        // The SAME call the human row uses, so the two cannot disagree: a string of card names, and
+        // `null` rather than `""` for a box holding none, because an empty string reads as "a card
+        // with no name" to a consumer that only checks presence.
+        let gpu = gpu_nodes_of(b.live_pid1());
+        let gpu_json = if gpu.is_empty() {
+            "null".to_string()
+        } else {
+            json_str(&gpu)
+        };
         println!(
-            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{}}}",
+            "{{\"name\":{},\"status\":{},\"pid\":{},\"pid1\":{},\"rootfs\":{},\"command\":{},\"started\":{},\"uptime\":{},\"ports\":{},\"labels\":{},\"health\":{},\"mem_bytes\":{},\"cpu_usec\":{},\"tasks\":{},\"pod\":{},\"egress\":{},\"landlock_rw\":{},\"gpu\":{},\"memory_max\":{},\"memory_max_enforced\":{},\"memory_high_outer\":{},\"memory_high_outer_cgroup\":{},\"pids_max\":{}}}",
             json_str(&b.name),
             json_str(status),
             b.pid,
@@ -1629,6 +1643,7 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
             json_str(&b.pod),
             json_str(&b.egress),
             json_str(&b.landlock_rw),
+            gpu_json,
             num(b.memory_max),
             num(enforced_mem),
             num(outer_mem_high.as_ref().map(|o| o.high)),
