@@ -1887,6 +1887,14 @@ pub(crate) fn resolve_volume(
                 // inside the registry and have the mount refused afterwards - the refusal would be
                 // correct and the directories would still be there.
                 if !std::path::Path::new(source).exists() {
+                    // ⛔ A DEVICE IS NOT A DIRECTORY, AND THIS BRANCH USED TO TREAT IT AS ONE.
+                    // Checked BEFORE anything is created, because creation is the risk: a root
+                    // caller (the WSL distro tested today runs as root) could get an empty
+                    // DIRECTORY made under /dev and bound where the workload expects a node.
+                    // See `missing_device_source` for what was measured and what follows.
+                    if let Some(msg) = missing_device_source(s, source) {
+                        return Err(Error::Sandbox(msg));
+                    }
                     if let Some(planned) = planned_bind_source(source) {
                         if !crate::registry::path_overlaps_trusted_state(&planned) {
                             let _ = std::fs::create_dir_all(source);
@@ -1909,13 +1917,30 @@ pub(crate) fn resolve_volume(
                 // seccomp posture and elevate that peer's `kern exec` (proven, adversarial pass).
                 // Refuse to bind a trust-bearing registry dir - or a parent that contains one - into
                 // any box. Named volumes resolve in the SIBLING branch above and are unaffected.
-                if crate::registry::path_overlaps_trusted_state(&canon) {
+                // ⛔ IT NAMES THE STATE, NOT THE PATH THE CALLER WROTE. The old wording was
+                // "refusing to mount the kern registry ({canon})", which asserts that the path
+                // asked for IS the registry. MEASURED on a WSLg host, where `XDG_RUNTIME_DIR` is
+                // `/mnt/wslg/runtime-dir`: `-v /mnt/wslg:/mnt/wslg`, the mount Microsoft's own
+                // container sample prints for a GUI app, was refused as "the kern registry
+                // (/mnt/wslg)" while the registry is `/mnt/wslg/runtime-dir/kern`. The reader was
+                // sent to look for a kern directory where their doc told them to find a display
+                // socket, and the two paths are now both in the sentence.
+                if let Some(state) = crate::registry::trusted_state_overlap(&canon) {
+                    let same = state == canon;
                     return Err(Error::Sandbox(format!(
-                        "{s}: refusing to mount the kern registry ({}) into a box - a box able \
-                         to write it could forge another box's recorded capability/seccomp posture \
-                         and elevate its own `kern exec`",
-                        canon.display()
+                        "{s}: refusing it - {} kern's own state ({}), and a box able to write that \
+                         could forge another box's recorded capability/seccomp posture and elevate \
+                         its own `kern exec`. Bind a path that does not contain it",
+                        if same {
+                            format!("{} IS", canon.display())
+                        } else {
+                            format!("{} contains", canon.display())
+                        },
+                        state.display()
                     )));
+                }
+                if let Some(msg) = host_ipc_source_refusal(s, &canon) {
+                    return Err(Error::Sandbox(msg));
                 }
                 canon.to_string_lossy().into_owned()
             }
@@ -6264,7 +6289,10 @@ fn privileged_allowed_by_config() -> bool {
 /// them looking in the wrong place.
 fn compose_gpu_spec_problem(b: &crate::compose::ComposeBox) -> Option<String> {
     let spec = b.gpus.as_deref()?;
-    let err = crate::gpu_grant::parse_gpu_spec(spec).err()?;
+    // THE SAME RESOLUTION THE FLAG GETS, so a file carrying a UUID is judged the way the command
+    // line judges it. `config` calling a spec fine and `up` then refusing it is the one outcome
+    // this check exists to prevent.
+    let err = crate::gpu_grant::selection_from_spec(std::path::Path::new("/"), spec).err()?;
     use crate::gpu_grant::GpuSpecError as G;
     let why = match err {
         G::Empty => "it is empty".to_string(),
@@ -6283,6 +6311,22 @@ fn compose_gpu_spec_problem(b: &crate::compose::ComposeBox) -> Option<String> {
         }
         G::NotAnIndex { .. } => {
             "the value after device= is a card index, or a list of them".to_string()
+        }
+        // THE FILE'S OWN SHAPE: `device_ids` takes indices or UUIDs, so a compose author who wrote
+        // a UUID wrote something Docker documents, and the reason has to be that THIS HOST does
+        // not have it, with what it does have.
+        G::UnknownUuid { given, known } => {
+            if known.is_empty() {
+                format!(
+                    "{given} is a GPU UUID and this host's driver publishes none, so there is \
+                     nothing to match it against"
+                )
+            } else {
+                format!(
+                    "{given} is a GPU UUID that no card here carries. This host has: {}",
+                    known.join(", ")
+                )
+            }
         }
     };
     Some(format!(
@@ -6474,17 +6518,68 @@ fn host_device_sources_under(specs: &[String], dev_root: &std::path::Path) -> Ve
     out
 }
 
+/// The gate's sentence when SEVERAL services ask for a card: every one of them, each with what it
+/// asked for, because the grant the operator is about to give reaches all of them at once.
+fn ungranted_gpu_message(askers: &[String]) -> String {
+    format!(
+        "{} services ask for a GPU and nothing granted them: {}. A GPU is a device grant, and \
+         --allow-device-grants (or allow_device_grants in YOUR OWN kern.toml) gives every one of \
+         them its card at once. A compose file cannot grant itself hardware, and a file that could \
+         would not be a policy",
+        askers.len(),
+        askers.join(", ")
+    )
+}
+
 fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Option<String> {
     // The command line, or the operator's own config. Never the compose file, and never a config the
     // compose file named: see `device_grants_allowed_by_config`.
     if allow || device_grants_allowed_by_config() {
         return None;
     }
+    // ⛔ EVERY SERVICE THAT ASKS, NOT THE FIRST ONE. MEASURED 2026-11-12 on NVIDIA's own
+    // accelerated-computing-hub stdpar tutorial: four services (`base`, `jupyter`, `nsys`, `ncu`)
+    // take the card through one shared `&gpu-config` anchor, and this gate named `base` alone. An
+    // operator who grants after reading that hands a card to FOUR services believing it is one, which
+    // is the gate under-reporting the very decision it exists to put in front of a person.
+    let askers: Vec<String> = boxes
+        .iter()
+        .filter_map(|b| match (&b.device, &b.gpus) {
+            (Some(name), None) => Some(format!("'{}' (CDI name {name})", b.service_name())),
+            (None, Some(spec)) => Some(format!("'{}' ({spec})", b.service_name())),
+            _ => None,
+        })
+        .collect();
     for b in boxes {
         // A GPU IS A DEVICE GRANT, and this gate is the operator's half. `gpus:` and
         // `deploy.resources.reservations.devices` both land in one field, so one check covers
         // both spellings and a file cannot reach the hardware by picking the other one.
+        // THE CDI SPELLING IS THE SAME REQUEST, so it meets the same gate. A file that could reach
+        // hardware by writing `devices: [nvidia.com/gpu=all]` instead of `gpus: all` would have
+        // found the policy's one unlocked door, which is precisely how the `volumes:` hole worked.
+        if let Some(name) = &b.device {
+            if b.gpus.is_some() {
+                return Some(format!(
+                    "service '{}' asks for a GPU twice, once as `devices: [{name}]` and once as a \
+                     gpus/deploy reservation. They name the same thing two ways: keep one",
+                    b.service_name()
+                ));
+            }
+            if askers.len() > 1 {
+                return Some(ungranted_gpu_message(&askers));
+            }
+            return Some(format!(
+                "service '{}' asks for a GPU by its CDI name ({name}) and nothing granted it. A \
+                 GPU is a device grant: pass --allow-device-grants to `kern compose`, or set \
+                 allow_device_grants in YOUR OWN kern.toml. A compose file cannot grant itself \
+                 hardware, and a file that could would not be a policy",
+                b.service_name()
+            ));
+        }
         if let Some(spec) = &b.gpus {
+            if askers.len() > 1 {
+                return Some(ungranted_gpu_message(&askers));
+            }
             return Some(format!(
                 "service '{}' asks for a GPU ({spec}) and nothing granted it. A GPU is a device \
                  grant: pass --allow-device-grants to `kern compose`, or set \
@@ -6811,6 +6906,95 @@ fn check_pod_global_conflicts(
         )));
     }
     Ok(())
+}
+
+/// The refusal for binding the HOST's `/dev/shm` itself into a box, or `None` for any other source.
+///
+/// ⛔ IT HANDED BACK HALF OF A BOUNDARY KERN REFUSES. `ipc: host` is refused because the box's IPC
+/// namespace is a kernel boundary kern does not give back, and the refusal tells the reader that a
+/// workload needing the host's IPC objects must run outside a box. MEASURED 2026-11-12: with
+/// `-v /dev/shm:/dev/shm` an object created on the host under /dev/shm was visible inside the box,
+/// read and write, so that sentence was false one flag away. POSIX shared memory is where the user's
+/// own processes keep live state (PyTorch DataLoader segments, `multiprocessing` semaphores, browser
+/// renderers), and code under test reaching it is a channel out of the box.
+///
+/// WHAT THE LINE IS USUALLY FOR IS ALREADY HERE. The common reason to write it is SIZE (docker's
+/// /dev/shm defaults to 64 MB, and the Chrome/Selenium and DataLoader guides say to bind the host's
+/// or raise `--shm-size`). A kern box's /dev/shm is sized to its --memory cap already, and
+/// `--shm-size` / `shm_size:` sets it explicitly, so the remedy gives the size without the sharing.
+///
+/// ONLY THE MOUNT ITSELF. A box binds volumes non-recursively, so an ANCESTOR (`-v /dev:/x`) never
+/// shows the tmpfs mounted on /dev/shm (measured: the kernel refuses that bind outright, naming
+/// /dev/shm among the mounts under it), and a single object (`-v /dev/shm/<name>:...`) is a
+/// deliberate, named share of one thing and stays allowed. `/run/shm` is a link to /dev/shm on this
+/// host and is caught by comparing canonical paths.
+///
+/// ⛔ AND THE OTHER POSIX IPC FILESYSTEM, found by closing the first. MEASURED 2026-11-12: a message
+/// queue created on the host with `mq_open` appeared in a box given `-v /dev/mqueue:/x`, owned and
+/// openable. POSIX queues live in the IPC namespace proper, so this one is not "half of" `ipc: host`
+/// by analogy, it IS that boundary handed back. A box has its own queues in its own namespace; a
+/// workload that must talk to the host's has to run outside a box, which is what the `ipc: host`
+/// refusal already says. `/dev/hugepages` is a relative (hugetlbfs) and is NOT refused here, because
+/// an object in it was not measured crossing.
+pub(crate) fn host_ipc_source_refusal(shown: &str, canon: &std::path::Path) -> Option<String> {
+    let is = |p: &str| std::fs::canonicalize(p).is_ok_and(|c| c == canon);
+    if is("/dev/shm") {
+        return Some(format!(
+            "{shown}: refusing it - {} is the host's POSIX shared memory, and every object your own \
+             processes keep there (DataLoader segments, multiprocessing semaphores, browser \
+             renderers) would be readable and writable from the box. It is half of the IPC boundary \
+             kern refuses to hand back as `ipc: host`. If what you need is a bigger /dev/shm, the box \
+             already has its own, sized to --memory; set it with --shm-size (compose: shm_size:). To \
+             share ONE object, bind its own path under /dev/shm",
+            canon.display()
+        ));
+    }
+    if is("/dev/mqueue") {
+        return Some(format!(
+            "{shown}: refusing it - {} is the host's POSIX message queues, which live in the IPC \
+             namespace kern refuses to hand back as `ipc: host`: every queue your own processes \
+             open would be readable and writable from the box. The box has queues of its own in its \
+             own namespace; a workload that must reach the host's has to run outside a box",
+            canon.display()
+        ));
+    }
+    None
+}
+
+/// The refusal for a bind source under `/dev` that is not on this host, or `None` for any other
+/// source (or one that exists).
+///
+/// ⛔ A MISSING DEVICE WAS HANDLED AS A MISSING DIRECTORY, in two ways at once:
+///
+/// * THE REMEDY WAS FALSE. MEASURED 2026-11-12: compose `devices: [/dev/nvidia-nvlink0:...]`, a node
+///   no NVIDIA driver creates, answered "Create it first, or point the mount at a path you own". A
+///   node under /dev is made by its driver when the hardware is there; "creating it first" means a
+///   `mknod` of a fake device or an empty directory, and neither is what the file asked for.
+/// * THE CREATION WAS THE RISK. The branch this guards calls `create_dir_all` on a missing source.
+///   As an unprivileged user that fails on /dev (measured here: nothing was made). It runs with the
+///   caller's rights, and a ROOT caller, which is what a WSL distro's user typically is, may write
+///   devtmpfs, so the same call would make an empty DIRECTORY under /dev and bind it where the
+///   workload expects a character device. That half follows from the code and was NOT measured on
+///   a root host; the check sits before the call so it cannot happen either way. Docker refuses
+///   the request outright, measured on 29.1.3: `error gathering device information while adding
+///   custom device "/dev/nvidia-nvlink0": no such file or directory`.
+///
+/// Compose's `devices:` travels as `--volume`, so this one check covers both surfaces, and
+/// `compose config` calls it too so the dry run cannot preview clean what `up` refuses.
+///
+/// `Path::starts_with` compares whole components, so `/devices` and `/dev2` are not `/dev`.
+pub(crate) fn missing_device_source(shown: &str, source: &str) -> Option<String> {
+    let path = std::path::Path::new(source);
+    if !path.starts_with("/dev") || path.exists() {
+        return None;
+    }
+    Some(format!(
+        "{shown}: {source} is not a device on this host. A node under /dev is made by its driver \
+         when the hardware is there, so kern does not create one (an empty directory in its place \
+         would be bound where the workload expects a device; docker refuses the same request). \
+         Check the name against `ls /dev` on this host, or drop the line where that hardware is \
+         absent"
+    ))
 }
 
 /// Where a bind source WOULD land if it were created, symlink-resolved as far as the path exists.
@@ -8037,6 +8221,31 @@ fn run_terminal_verb(
                 }
                 if let Some(msg) = compose_gpu_spec_problem(b) {
                     return Err(Error::Compose(msg));
+                }
+                // THE DRY RUN ASKS THE SAME QUESTION `up` WILL. MEASURED 2026-11-12: a `devices:`
+                // line naming `/dev/nvidia-nvlink0`, which no driver creates, gave `config` exit 0
+                // and a clean preview, and `up` refused the same file one command later. The
+                // predicate is the one `up` calls, so the two cannot answer differently; it is a
+                // `stat`, not a pull, so `config` stays a dry run.
+                for spec in b.devices.iter().chain(b.volumes.iter()) {
+                    let source = spec.split(':').next().unwrap_or("");
+                    if let Some(msg) = missing_device_source(spec, source) {
+                        return Err(Error::Compose(format!(
+                            "config: service '{}': {msg}",
+                            b.service_name()
+                        )));
+                    }
+                    // The same predicate `up` meets after canonicalising, so a link such as
+                    // /run/shm is caught here too.
+                    if let Some(msg) = std::fs::canonicalize(source)
+                        .ok()
+                        .and_then(|c| host_ipc_source_refusal(spec, &c))
+                    {
+                        return Err(Error::Compose(format!(
+                            "config: service '{}': {msg}",
+                            b.service_name()
+                        )));
+                    }
                 }
             }
             println!("compose config: {} service(s) in {file}", boxes.len());

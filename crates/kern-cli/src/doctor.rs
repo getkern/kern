@@ -2003,7 +2003,42 @@ fn check_kernel() -> R {
 /// `gpu none` is right where there is nothing. On a WSL2 guest it was the line that told the
 /// operator of an RTX 3060 that they had no card, so where a GPU is present in a shape kern does
 /// not read, the verdict names the two things kern looked for and the note names what is there.
+///
+/// AND THE THIRD SHAPE IS INSIDE A BOX, measured on 2026-11-12 by running this binary in one of its
+/// own boxes with `--gpus device=0` and a bind of itself:
+///
+/// ```text
+/// kern doctor          ->  gpu none: no DRM card on this host, so there is nothing for --gpus
+/// kern box --plan --gpus device=0  ->  gpu grant: --gpus device=0 is 0000:01:00.0
+/// ```
+///
+/// Two surfaces of the same binary, one after the other, contradicting each other. `detect` reads
+/// `/sys/class/drm`, which a box masks, while the grant reads `/proc/driver/nvidia/version` and
+/// `/dev/nvidia*`, which a granted box HAS. So "there is nothing for --gpus to hand over" was false
+/// exactly where a nested caller would act on it, and the same holds on any host whose `/sys` is
+/// restricted while its device nodes are not.
+///
+/// The condition is not a guess, it is the resolver: if a grant resolves under this root, the row
+/// says the driver and the nodes are here and the DRM view is what is missing.
 fn no_card_row(root: &std::path::Path) -> R {
+    // THE GRANT FIRST, because it is the stronger fact: a resolvable grant means `--gpus` works
+    // here whatever `/sys` shows. On a host with no driver this fails at the version file, which is
+    // one `read` and the majority case.
+    if let Ok(grant) = crate::gpu_grant::resolve_under(root, crate::gpu_grant::ElfClass::native()) {
+        let nodes: usize =
+            grant.shared.len() + grant.cards.iter().map(|c| c.nodes.len()).sum::<usize>();
+        return R::ok_note(
+            "gpu: no DRM card is visible and the driver and its device nodes are",
+            &format!(
+                "driver {} and {nodes} device node(s) are here while /sys/class/drm shows no card, \
+                 which is what this binary sees from INSIDE one of its own boxes, and on any host \
+                 whose /sys is restricted. --gpus names cards by their nodes, so it still works \
+                 here: `kern box <name> --image <ref> --plan --gpus device=0` prints what it would \
+                 bind.",
+                grant.driver_version
+            ),
+        );
+    }
     let note = crate::gpu::foreign_shape_note(root);
     if note.is_empty() {
         return R::ok(
@@ -3181,6 +3216,45 @@ mod tests {
                 );
             }
             _ => panic!("a GPU kern cannot grant is not a degraded state either"),
+        }
+
+        // THE THIRD SHAPE: a driver and its nodes with no DRM view, which is what this binary sees
+        // from inside one of its own granted boxes. Measured there: `doctor` said "nothing for
+        // --gpus to hand over" and `--plan --gpus device=0` printed the card one line later.
+        let nested = base.join("nested");
+        std::fs::create_dir_all(nested.join("proc/driver/nvidia")).expect("proc");
+        std::fs::create_dir_all(nested.join("dev")).expect("dev");
+        std::fs::write(
+            nested.join("proc/driver/nvidia/version"),
+            "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.173.02  Release Build\n",
+        )
+        .expect("version");
+        let made =
+            std::ffi::CString::new(nested.join("dev/nvidiactl").as_os_str().as_bytes().to_vec())
+                .map(|p| unsafe { libc::mknod(p.as_ptr(), libc::S_IFCHR | 0o666, 0) } == 0)
+                .unwrap_or(false);
+        if !made {
+            println!("SKIP: cannot build the nested shape without a device node");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        match no_card_row(&nested) {
+            R::Ok(msg, note) => {
+                assert!(
+                    !msg.contains("nothing for --gpus"),
+                    "the row still says there is nothing to hand over while a grant resolves: {msg}"
+                );
+                assert!(
+                    note.contains("580.173.02"),
+                    "the note must name the driver it found: {note}"
+                );
+                assert!(
+                    note.contains("--gpus"),
+                    "the note must say the flag still works here: {note}"
+                );
+                assert_eq!(crate::gpu::overclaims(&format!("{msg} {note}")), None);
+            }
+            _ => panic!("a resolvable grant is not a degraded state"),
         }
         let _ = std::fs::remove_dir_all(&base);
     }

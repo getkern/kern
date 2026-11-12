@@ -139,6 +139,7 @@ fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
         true,
         crate::StackNet::Pod,
         None,
+        false,
     )
 }
 
@@ -151,7 +152,124 @@ fn parse_no_pod(text: &str) -> Result<Vec<ComposeBox>, String> {
         true,
         crate::StackNet::PerService,
         None,
+        false,
     )
+}
+
+/// Split a stack into the services that run and the ones an inactive profile keeps out.
+///
+/// Docker profiles: a service with a non-empty profile list is INACTIVE unless one of its profiles is
+/// enabled via COMPOSE_PROFILES. A plain `up` starts only the profile-less services, so an inactive
+/// one is SKIPPED (never started by accident), with a line saying how to enable it.
+///
+/// ⛔ ONE FUNCTION, CALLED ON WHATEVER STACK IS FINAL. The skip used to sit inside the per-file
+/// parse, so with `-f base -f override` the BASE dropped its profile-gated service before the
+/// override was read, and the override's restatement of it was then ADDED as a new service with no
+/// image. MEASURED 2026-11-12 on two real projects that docker accepts: murtaza-nasir/maestro (`cli`
+/// behind `profiles: [cli]`, its GPU override restating `cli` with only a reservation) and
+/// perminder-klair/subwave (`tts-heavy`), both refused by kern with "has no `image:` ... (nothing
+/// to run)" one line after saying the same service was skipped. Docker merges and THEN applies
+/// profiles; a multi-file run now does the same, through this function and not a copy of it.
+///
+/// Returns the kept boxes, the skipped service names (so a `depends_on` pointing at one can be told
+/// apart from a typo) and the PROFILE names that gated them, kept apart from the service names
+/// because the error in [`finish_profiles`] must quote profiles: a reader who copies a service name
+/// gets a `COMPOSE_PROFILES` that activates nothing.
+pub(crate) fn split_inactive_profiles(
+    boxes: Vec<ComposeBox>,
+) -> (
+    Vec<ComposeBox>,
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    let mut kept = Vec::with_capacity(boxes.len());
+    let mut skipped = std::collections::HashSet::new();
+    let mut inactive = std::collections::HashSet::new();
+    for b in boxes {
+        if !b.profiles.is_empty() && !any_profile_active(&b.profiles) {
+            warn(&format!(
+                "service '{}': skipped - profile(s) [{}] not active (set COMPOSE_PROFILES to enable)",
+                b.name,
+                b.profiles.join(", ")
+            ));
+            skipped.insert(b.name.clone());
+            inactive.extend(b.profiles.iter().cloned());
+            continue;
+        }
+        kept.push(b);
+    }
+    (kept, skipped, inactive)
+}
+
+/// What a profile decision leaves to settle: the empty-stack error and the dependencies that now
+/// point at a skipped service. Shared by the single-file parse and the multi-file merge for the same
+/// reason [`split_inactive_profiles`] is.
+pub(crate) fn finish_profiles(
+    mut boxes: Vec<ComposeBox>,
+    skipped_by_profile: &std::collections::HashSet<String>,
+    inactive_profiles: &std::collections::HashSet<String>,
+) -> Result<Vec<ComposeBox>, String> {
+    if boxes.is_empty() {
+        // Distinguish "the block has nothing in it" from "everything in it is behind an inactive
+        // profile". Hoppscotch puts EVERY service behind one, so a plain run legitimately starts
+        // nothing (Docker behaves identically) and kern answered "`services:` is empty" about a file
+        // that defines ten of them. Correct outcome, wrong noun: the reader goes looking for a
+        // missing block instead of setting COMPOSE_PROFILES.
+        if !skipped_by_profile.is_empty() {
+            // The names quoted here are the PROFILES to activate, not the services that were
+            // skipped. It listed the services before, and told the reader to put them in
+            // COMPOSE_PROFILES: following the message exactly activated nothing, because a service
+            // name is not a profile name. Measured on a real file: the message suggested
+            // `hoppscotch-backend`, which does nothing, where `backend` is what works.
+            let mut profiles: Vec<&str> = inactive_profiles.iter().map(String::as_str).collect();
+            profiles.sort_unstable();
+            let mut services: Vec<&str> = skipped_by_profile.iter().map(String::as_str).collect();
+            services.sort_unstable();
+            return Err(format!(
+                "every service is behind an inactive profile: {} would run under COMPOSE_PROFILES={} \
+                 (or `--profile <name>`), and nothing runs without one",
+                services.join(", "),
+                profiles.join(",")
+            ));
+        }
+        return Err("`services:` is empty".to_string());
+    }
+    // A `depends_on` toward a service that was dropped as profile-inactive must not fail the topo sort
+    // with "unknown box". Docker treats a dependency on an inactive-profile service as an error only
+    // when the dependent is itself active; here we DROP the dangling edge with a warning (the depended
+    // service simply isn't part of this run). Only prune names that vanished - a truly unknown name
+    // still errors later in `topo_order`.
+    // The comment above said a truly unknown name "still errors later in topo_order". It did not:
+    // this loop pruned EVERY absent name, so `topo_order` never saw the typo and the ordering the
+    // file asked for vanished with one vague line that even suggested looking at profiles. A
+    // dependency on a name that was never defined is a mistake in the file (Docker refuses it); a
+    // dependency on a service this run skipped for a profile is not. Only the second gets pruned.
+    let present: std::collections::HashSet<String> = boxes.iter().map(|b| b.name.clone()).collect();
+    for b in boxes.iter_mut() {
+        let mut dropped = 0usize;
+        let mut prune = |list: &mut Vec<String>| {
+            list.retain(|d| {
+                if present.contains(d) {
+                    return true;
+                }
+                if skipped_by_profile.contains(d) {
+                    dropped += 1;
+                    return false;
+                }
+                true // unknown: kept, so `topo_order` reports it by name
+            });
+        };
+        prune(&mut b.depends_on);
+        prune(&mut b.depends_healthy);
+        prune(&mut b.depends_completed);
+        if dropped > 0 {
+            warn(&format!(
+                "service '{}': {dropped} dependency/ies dropped - the target is skipped by an inactive profile in this run",
+                b.name
+            ));
+        }
+    }
+    Ok(boxes)
 }
 
 pub(crate) fn parse_with_env(
@@ -160,6 +278,7 @@ pub(crate) fn parse_with_env(
     require_runnable: bool,
     net: crate::StackNet,
     dir: Option<&std::path::Path>,
+    defer_profiles: bool,
 ) -> Result<Vec<ComposeBox>, String> {
     // Fold multi-line block scalars (`|`/`>`) and multi-line flow collections onto single logical lines
     // first, so the rest of the pipeline stays line-at-a-time (block-scalar bodies become opaque values).
@@ -232,12 +351,6 @@ pub(crate) fn parse_with_env(
 
     let mut boxes = Vec::new();
 
-    let mut skipped_by_profile: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    // The PROFILE names that gated those services, kept apart from the service names. The two are
-    // not interchangeable and the error below has to quote this set: a reader who copies the other
-    // one gets a `COMPOSE_PROFILES` that activates nothing.
-    let mut inactive_profiles: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut have_services = false;
     for (key, node) in &root.children {
@@ -310,22 +423,8 @@ pub(crate) fn parse_with_env(
                             .find(|(name, _)| name == n)
                             .map(|(_, cidr)| cidr.clone())
                     });
-                    // Docker profiles: a service with a non-empty profile list is INACTIVE unless one
-                    // of its profiles is enabled via COMPOSE_PROFILES. A plain `up` starts only the
-                    // profile-less services - so we SKIP an inactive one (never start it by accident),
-                    // warning how to enable it. (kern has no `--profile` flag yet; COMPOSE_PROFILES is
-                    // the env kern honors, matching Docker's env of the same name.)
-                    if !b.profiles.is_empty() && !any_profile_active(&b.profiles) {
-                        warn(&format!(
-                            "service '{name}': skipped - profile(s) [{}] not active (set COMPOSE_PROFILES to enable)",
-                            b.profiles.join(", ")
-                        ));
-                        // Remembered, so a `depends_on` pointing here can be told apart from one
-                        // pointing at a name that was never defined at all. See the pruning below.
-                        skipped_by_profile.insert(name.clone());
-                        inactive_profiles.extend(b.profiles.iter().cloned());
-                        continue;
-                    }
+                    // PROFILES ARE DECIDED AFTER THIS LOOP, by `split_inactive_profiles`, so a merge
+                    // of several files can decide them on the MERGED stack instead. See that function.
                     boxes.push(b);
                 }
             }
@@ -350,6 +449,16 @@ pub(crate) fn parse_with_env(
     if !have_services {
         return Err("no `services:` block found".to_string());
     }
+    // THE PROFILE DECISION, once and here: after every service is read and before anything below
+    // resolves one service's key against another (`volumes_from`, `network_mode: service:`), which
+    // is exactly the set the old in-loop skip left them to see. Deferred entirely when the caller
+    // is going to merge several files: Docker merges first and applies profiles to the result.
+    let (kept, skipped_by_profile, inactive_profiles) = if defer_profiles {
+        (boxes, Default::default(), Default::default())
+    } else {
+        split_inactive_profiles(boxes)
+    };
+    let mut boxes = kept;
     // `volumes_from:` RESOLVED AFTER THE LOOP, because the service it names may be defined below the
     // one that names it and a single-pass copy would then silently inherit nothing. Docker's `:ro`
     // suffix narrows every inherited entry rather than being dropped, and an entry that is already
@@ -461,66 +570,7 @@ pub(crate) fn parse_with_env(
             warn_once(note);
         }
     }
-    if boxes.is_empty() {
-        // Distinguish "the block has nothing in it" from "everything in it is behind an inactive
-        // profile". Hoppscotch puts EVERY service behind one, so a plain run legitimately starts
-        // nothing (Docker behaves identically) and kern answered "`services:` is empty" about a file
-        // that defines ten of them. Correct outcome, wrong noun: the reader goes looking for a
-        // missing block instead of setting COMPOSE_PROFILES.
-        if !skipped_by_profile.is_empty() {
-            // The names quoted here are the PROFILES to activate, not the services that were
-            // skipped. It listed the services before, and told the reader to put them in
-            // COMPOSE_PROFILES: following the message exactly activated nothing, because a service
-            // name is not a profile name. Measured on a real file: the message suggested
-            // `hoppscotch-backend`, which does nothing, where `backend` is what works.
-            let mut profiles: Vec<&str> = inactive_profiles.iter().map(String::as_str).collect();
-            profiles.sort_unstable();
-            let mut services: Vec<&str> = skipped_by_profile.iter().map(String::as_str).collect();
-            services.sort_unstable();
-            return Err(format!(
-                "every service is behind an inactive profile: {} would run under COMPOSE_PROFILES={} \
-                 (or `--profile <name>`), and nothing runs without one",
-                services.join(", "),
-                profiles.join(",")
-            ));
-        }
-        return Err("`services:` is empty".to_string());
-    }
-    // A `depends_on` toward a service that was dropped as profile-inactive must not fail the topo sort
-    // with "unknown box". Docker treats a dependency on an inactive-profile service as an error only
-    // when the dependent is itself active; here we DROP the dangling edge with a warning (the depended
-    // service simply isn't part of this run). Only prune names that vanished - a truly unknown name
-    // still errors later in `topo_order`.
-    // The comment above said a truly unknown name "still errors later in topo_order". It did not:
-    // this loop pruned EVERY absent name, so `topo_order` never saw the typo and the ordering the
-    // file asked for vanished with one vague line that even suggested looking at profiles. A
-    // dependency on a name that was never defined is a mistake in the file (Docker refuses it); a
-    // dependency on a service this run skipped for a profile is not. Only the second gets pruned.
-    let present: std::collections::HashSet<String> = boxes.iter().map(|b| b.name.clone()).collect();
-    for b in boxes.iter_mut() {
-        let mut dropped = 0usize;
-        let mut prune = |list: &mut Vec<String>| {
-            list.retain(|d| {
-                if present.contains(d) {
-                    return true;
-                }
-                if skipped_by_profile.contains(d) {
-                    dropped += 1;
-                    return false;
-                }
-                true // unknown: kept, so `topo_order` reports it by name
-            });
-        };
-        prune(&mut b.depends_on);
-        prune(&mut b.depends_healthy);
-        prune(&mut b.depends_completed);
-        if dropped > 0 {
-            warn(&format!(
-                "service '{}': {dropped} dependency/ies dropped - the target is skipped by an inactive profile in this run",
-                b.name
-            ));
-        }
-    }
+    let mut boxes = finish_profiles(boxes, &skipped_by_profile, &inactive_profiles)?;
     // A service must resolve to something runnable: an `image` (or a `build:` that produces one). Catch
     // it HERE with a precise message, not later as an opaque "need --rootfs or --image" from the box -
     // parity with the TOML parser's image/rootfs check.
@@ -3144,6 +3194,90 @@ fn list_value(node: &Node) -> Vec<String> {
         .collect()
 }
 
+/// `devices:` in BOTH of its spellings, folded to the short one `normalise_devices` reads.
+///
+/// THE LONG FORM IS REAL AND WAS READ AS A PATH. MEASURED 2026-11-12 with Docker Compose v5.0.2:
+///
+/// ```yaml
+/// devices:
+///   - source: /dev/nvidia0
+///     target: /dev/nvidia0
+///     permissions: rwm
+/// ```
+///
+/// is accepted by `docker compose config` and the container sees `/dev/nvidia0`. kern received it
+/// folded into `{source: /dev/nvidia0, target: …}` (the same folding `env_file`'s long form gets),
+/// split it on `:` as `HOST:CONTAINER:PERMS`, printed a note about mknod whose `m` came from inside
+/// the text, previewed clean under `config`, and failed `up` with
+/// `invalid volume name '{source'`. It becomes `source:target[:permissions]` now, so everything
+/// downstream (the grant gate, the missing-device check, the mknod note) sees what a short entry
+/// would have given it.
+///
+/// ⛔ AND A GPU RESERVATION WRITTEN HERE IS REFUSED, NOT READ. Generated example lists put
+/// `driver: nvidia, count: 1, capabilities: [gpu]` directly under `devices:`, which is
+/// `deploy.resources.reservations.devices`'s grammar in the wrong place. Docker refuses it
+/// ("is missing a mount target", measured); kern failed it with
+/// `-v '{driver:nvidia, count:ro': target must be absolute`, which names neither the key nor where
+/// it belongs. Converting it into a grant would make kern the one runtime that runs such a file.
+fn devices_value(node: &Node, svc: &str) -> Result<Vec<String>, String> {
+    const RESERVATION_KEYS: [&str; 5] =
+        ["driver", "count", "capabilities", "device_ids", "options"];
+    let mut out = Vec::new();
+    for entry in list_value(node) {
+        let e = entry.trim();
+        let Some(inner) = e.strip_prefix('{').and_then(|r| r.strip_suffix('}')) else {
+            out.push(entry);
+            continue;
+        };
+        let (mut source, mut target, mut perms) = (None, None, None);
+        let mut unknown: Vec<String> = Vec::new();
+        for field in split_top_commas(inner) {
+            let Some((k, v)) = field.split_once(':') else {
+                unknown.push(field.trim().to_string());
+                continue;
+            };
+            match k.trim() {
+                "source" => source = Some(scalar_str(v.trim())),
+                "target" => target = Some(scalar_str(v.trim())),
+                "permissions" => perms = Some(scalar_str(v.trim())),
+                other => unknown.push(other.to_string()),
+            }
+        }
+        if unknown
+            .iter()
+            .any(|k| RESERVATION_KEYS.contains(&k.as_str()))
+        {
+            return Err(format!(
+                "service '{svc}': `devices:` entry `{e}` uses the grammar of a GPU RESERVATION \
+                 (driver/count/capabilities), which belongs under \
+                 `deploy.resources.reservations.devices`. Under `devices:` an entry is a host node, \
+                 `/dev/x:/dev/x` or `{{source: /dev/x, target: /dev/x}}`. Docker refuses this entry \
+                 too; for a card, `gpus: all` is the short way"
+            ));
+        }
+        if !unknown.is_empty() {
+            return Err(format!(
+                "service '{svc}': `devices:` entry `{e}`: unknown key(s) {}. The long form takes \
+                 `source`, `target` and `permissions`",
+                unknown.join(", ")
+            ));
+        }
+        match (source, target) {
+            (Some(s), Some(t)) if !s.is_empty() && !t.is_empty() => out.push(match perms {
+                Some(p) if !p.is_empty() => format!("{s}:{t}:{p}"),
+                _ => format!("{s}:{t}"),
+            }),
+            _ => {
+                return Err(format!(
+                    "service '{svc}': `devices:` entry `{e}` needs both `source` and `target`, as \
+                     Docker Compose requires (it refuses a missing target)"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// `env_file:` in BOTH of its spellings: the short one (a path, or a list of paths) and the long one
 /// the Specification added for optional files:
 ///
@@ -3508,8 +3642,8 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             // volume appends to it rather than replacing it: a file is allowed to write both.
             "volumes" => b.volumes = volumes_value(node, &mut b.tmpfs_from_volumes, name),
             "devices" => {
-                let raw = list_value(node);
-                b.devices = normalise_devices(&raw, name, &mut b.tun);
+                let raw = devices_value(node, name)?;
+                b.devices = normalise_devices(&raw, name, &mut b.tun, &mut b.device);
             }
             // `dns:` ACCEPTS A SCALAR OR A LIST in Docker, and `list_value` already normalises both
             // to a vector, so the three arms need no shape handling of their own.
@@ -4108,11 +4242,9 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     warn(&format!(
                         "service '{name}': `runtime: nvidia` is NOT applied - kern is the runtime \
                          and does not delegate to another one. The GPU is a DEVICE GRANT here: \
-                         name the devices the service needs under `devices:` and pass \
+                         write `gpus: all` (or name the nodes under `devices:`) and pass \
                          `--allow-device-grants` to `kern compose`, which is the operator's half \
-                         that a file cannot give itself. WHAT YOU WILL SEE without it: the service \
-                         starts and then fails inside with a CUDA or driver error, which reads as a \
-                         broken driver on the host rather than as this line"
+                         that a file cannot give itself. {GPU_SILENT_FAILURE_TAIL}"
                     ));
                 } else if v.is_empty() {
                     warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
@@ -4277,6 +4409,37 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             // the corpus, `cpu_count` was the ONLY difference two files had.
             "cpu_count" | "cpu_percent" | "cpus_shares" | "isolation" => {}
             other => warn(&unknown_service_key_note(name, other)),
+        }
+    }
+    // `NVIDIA_VISIBLE_DEVICES` IS A GPU REQUEST, and it was the one spelling this parser said
+    // NOTHING about.
+    //
+    // MEASURED 2026-11-12: a service carrying only `NVIDIA_VISIBLE_DEVICES=all` ran with 0 device
+    // nodes and not one word of output. That is not an exotic file. It is the shape the Ollama and
+    // vLLM compose examples all over the internet use, and on a host where `nvidia-ctk runtime
+    // configure --set-as-default` has made nvidia the default runtime it needs no `runtime:` key at
+    // all, so the `runtime: nvidia` warning above never fires for it. The toolkit's CDI form
+    // (`NVIDIA_VISIBLE_DEVICES=nvidia.com/gpu=all`) was equally silent.
+    //
+    // AFTER THE LOOP, because the condition is the SERVICE's final state: a file that also writes
+    // `gpus:` or a CDI device has already asked properly and must not be warned at for being
+    // thorough. The keys are read in file order, so asking during the loop would answer differently
+    // depending on where the author put the variable.
+    if b.gpus.is_none() && b.device.is_none() {
+        if let Some(raw) = b
+            .env
+            .iter()
+            .find_map(|e| e.strip_prefix("NVIDIA_VISIBLE_DEVICES="))
+        {
+            if let Some(remedy) = visible_devices_remedy(raw) {
+                warn(&format!(
+                    "service '{name}': `NVIDIA_VISIBLE_DEVICES={raw}` is NOT a GPU request to kern \
+                     - that variable is read by the NVIDIA container runtime, and kern IS the \
+                     runtime. Write `{remedy}` and pass `--allow-device-grants` to \
+                     `kern compose`, which is the operator's half that a file cannot give itself. \
+                     {GPU_SILENT_FAILURE_TAIL}"
+                ));
+            }
         }
     }
     // Compose entrypoint + command AFTER the loop (order-independent). Docker's rule depends on the
@@ -4450,14 +4613,57 @@ fn gpu_reservation_spec(
         // reserve anything, so there an entry has to say `capabilities: [gpu]` to be one; under
         // `gpus:` every entry is a GPU request by virtue of the key it is written under, and
         // demanding the word there would refuse a file docker accepts.
+        // `driver: nvidia` SAYS IT TOO. The spec's capability list is "generic and driver-specific
+        // values", so `capabilities: [nvidia-compute]` is a legitimate GPU request that the word
+        // test misses: MEASURED 2026-11-12, that file was accepted, the block was dropped, and the
+        // service ran with no card. The `driver` field is the one that names the hardware, and a
+        // reservation that names the nvidia driver is not asking for anything else.
+        let driver_named = entry
+            .child("driver")
+            .and_then(|d| d.scalar.as_deref())
+            .map(|v| scalar_str(v).trim().to_string())
+            .filter(|v| !v.is_empty());
+        let driver_is_nvidia = driver_named
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("nvidia"));
+        // ⛔ THE DRIVER RULE NEEDS THE FIELD TO BE THERE, and that is not a detail. `capabilities`
+        // is REQUIRED by the spec ("Otherwise, it returns an error on service deployment"), so an
+        // entry without it is a file Docker refuses. Accepting it here would make kern the only
+        // runtime that runs that file: the same dialect argument that took `mounts[].idmap` out of
+        // the CDI reader. What the driver rule buys is the VALUE being driver-specific, which the
+        // spec allows and the word test missed.
         let mentions_gpu = gpu_is_implied
             || caps.is_some_and(|c| {
                 let inline = c.scalar.as_deref().unwrap_or_default().to_ascii_lowercase();
-                inline.contains("gpu")
+                driver_is_nvidia
+                    || inline.contains("gpu")
                     || c.items.iter().any(|i| i.trim().eq_ignore_ascii_case("gpu"))
             });
         if !mentions_gpu {
             continue;
+        }
+        // ⛔ ANOTHER VENDOR'S DRIVER IS NOT AN NVIDIA CARD, and this granted one.
+        //
+        // MEASURED 2026-11-12: a reservation of `driver: amd` with `capabilities: [gpu]` handed the
+        // service `/dev/nvidia0`. The file asked for hardware kern does not grant and received
+        // different hardware, which is worse than a refusal: a workload built for ROCm meets an
+        // NVIDIA node and fails inside its own stack. kern grants NVIDIA cards only, so the vendor
+        // is named and nothing is handed over.
+        //
+        // AFTER THE GPU TEST ABOVE, and that order is the whole correctness of it: the first
+        // version refused here first, which turned an `driver: some-fpga, capabilities: [fpga]`
+        // reservation (not a GPU request at all) into a message about GPU vendors and took away the
+        // note that says the service runs without the device. A test caught it.
+        if let Some(driver) = driver_named.as_deref() {
+            if !driver.eq_ignore_ascii_case("nvidia") {
+                return Some(Err(format!(
+                    "service '{service}': deploy.resources.reservations.devices asks for \
+                     `driver: {driver}` with a gpu capability, and kern grants NVIDIA cards only. \
+                     It will not hand an NVIDIA card to a service that asked for another vendor's: \
+                     remove the driver key to take whatever this host has, or run that service \
+                     where its driver is"
+                )));
+            }
         }
         // `device_ids` NAMES WHICH, and wins over a count: an entry carrying both has said which
         // cards it wants, and a count beside them adds nothing a reader could act on.
@@ -4501,6 +4707,30 @@ fn gpu_reservation_spec(
                      an empty `count`. Write a number (count: 2) or `count: all`"
                 )));
             }
+            // `count: 0` ASKS FOR NO GPU, and in THIS key that is unambiguous.
+            //
+            // MEASURED against docker compose v5.0.2, same block, two cards: `count: 0` gave the
+            // container 0 cards and ran it, `count: 1` gave 1, `count: -1` gave both. kern passed
+            // the string to the `--gpus` grammar, where a bare `0` is deliberately refused because
+            // the FLAG has two readings (docker's "no gpus" and this project's examples' "card 0").
+            // The compose key has only one: it is a count. So a file that says `count: 0` ran on
+            // docker and died here, which is the dialect argument pointing at us.
+            //
+            // It is said out loud rather than dropped: a service that asked for zero cards and got
+            // none is correct, and a reader who wrote it by accident has to see why nothing was
+            // granted.
+            // ⛔ `Some(Err(..))` AND NOT `None`, which is the difference between one sentence and
+            // two contradicting each other. The caller WARNS an `Err` and skips the generic note;
+            // a `None` means "no GPU request here" and adds it. With `None` the output read
+            // "count: 0 is no GPU at all" followed by "nothing in it was read as a GPU request",
+            // and the second is false: the entry WAS read as one, for zero cards.
+            if v.trim() == "0" {
+                return Some(Err(format!(
+                    "service '{service}': deploy.resources.reservations.devices asks for \
+                     `count: 0`, which is no GPU at all, as it is in docker. The service runs \
+                     without one: write `count: 1`, `count: all` or `device_ids` to get a card"
+                )));
+            }
             return Some(Ok(v));
         }
         // NEITHER, so there is nothing to translate and nothing to guess. Docker's own default
@@ -4516,11 +4746,25 @@ fn gpu_reservation_spec(
 
 fn deploy_reservation_note(service: &str, key: &str) -> String {
     if key == "devices" {
+        // ⛔ THE OLD WORDING WAS FALSE AND IT CONTRADICTED ITSELF IN THREE LINES: "kern grants NO
+        // device from a compose file" followed by "a device comes from an operator ... plus
+        // --allow-device-grants". The second sentence is the true one, and MEASURED on 2026-11-12
+        // the canonical Docker block (`driver: nvidia`, `count: 1`, `capabilities: [gpu]`) with
+        // that flag hands the service `/dev/nvidia0`. So the file DOES grant, with the operator.
+        //
+        // AND THIS NOTE IS NOT THE POLICY'S. It is printed when nothing under `devices:` was read
+        // as a GPU request at all, which on that date was what a reader got for a block missing
+        // `capabilities:` (which Docker refuses outright) and for one whose capability was the
+        // driver-specific `nvidia-compute`. Naming the policy there sent them to a flag that would
+        // not have helped, so the note names WHAT KERN LOOKED FOR.
         return format!(
-            "service '{service}': deploy.resources.reservations.devices ignored - kern grants NO device \
-             from a compose file, so this service runs WITHOUT the device (a GPU included) it asks for. \
-             A device comes from an operator: the nodes under `devices:` (or an `x-kern-vgpio:` \
-             profile) plus `--allow-device-grants`"
+            "service '{service}': deploy.resources.reservations.devices: nothing in it was read as \
+             a GPU request, so this service runs WITHOUT the device it asks for. kern reads an \
+             entry as a GPU when it HAS a `capabilities:` list and either names `gpu` in it or \
+             sets `driver: nvidia`; that field is required by the compose spec, and Docker refuses \
+             a devices reservation without it. With it present the entry still needs \
+             `--allow-device-grants` from the operator, which no file can give itself; the other \
+             ways to reach hardware are the nodes under `devices:` and an `x-kern-vgpio:` profile"
         );
     }
     format!(
@@ -4673,6 +4917,24 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
     // Honesty: a `limits:` block that maps NOTHING (a mistyped key like `mem:`/`cpu:`) would leave the
     // service silently UNCAPPED - a "runs but lies" the trust model forbids. Say so out loud rather than
     // pretend the cap took. (An empty/whitespace `limits:` - no children - is a no-op, not a typo.)
+    // AND IF WHAT IS IN THERE IS A GPU REQUEST, SAY THAT TOO. Measured 2026-11-12: a file carrying
+    // `limits: {nvidia.com/gpu: 1}` (the Kubernetes habit) and one carrying the whole
+    // `devices: [{driver: nvidia, …}]` block under `limits:` instead of `reservations:` both got
+    // only the UNCAPPED line above. Neither is a GPU request in Docker either, which is why this is
+    // one sentence and not a grant: the reader wrote hardware in the wrong subtree, and "check the
+    // key names" does not tell them which key, while this does.
+    let gpu_in_limits = limits.children.iter().any(|(k, _)| {
+        let lower = k.to_ascii_lowercase();
+        lower.contains("nvidia.com/gpu") || lower == "devices" || lower == "gpus"
+    });
+    if !mapped && gpu_in_limits {
+        warn(&format!(
+            "service '{name}': deploy.resources.limits asks for a GPU, and a GPU is not a limit in \
+             Docker or here: hardware goes under deploy.resources.reservations.devices (with \
+             `capabilities: [gpu]`) or in the `gpus:` key, plus `--allow-device-grants` from the \
+             operator. Nothing under `limits:` granted a card"
+        ));
+    }
     if !mapped && !limits.children.is_empty() {
         warn(&format!(
             "service '{name}': deploy.resources.limits set none of memory/cpus/pids - the service runs UNCAPPED (check the key names)"
@@ -5557,11 +5819,108 @@ pub(crate) fn normalise_links(entries: &[String], depends_on: &mut Vec<String>) 
     out
 }
 
-pub fn normalise_devices(entries: &[String], name: &str, tun: &mut bool) -> Vec<String> {
+/// WHAT A READER SEES WHEN A GPU REQUEST WAS DROPPED, written once because two keys drop one.
+///
+/// `runtime: nvidia` and `NVIDIA_VISIBLE_DEVICES` are the two spellings a file can use to ask the
+/// NVIDIA container runtime for hardware, and kern honours neither: it IS the runtime. The sentence
+/// matters more than the key, because the failure arrives minutes later from inside CUDA and looks
+/// like a broken host.
+const GPU_SILENT_FAILURE_TAIL: &str = "WHAT YOU WILL SEE without it: the service starts and then \
+     fails inside with a CUDA or driver error, which reads as a broken driver on the host rather \
+     than as this line";
+
+/// The file line that asks kern for what `NVIDIA_VISIBLE_DEVICES=<value>` asks the NVIDIA runtime
+/// for, or `None` when the value asks for no GPU at all.
+///
+/// THE VALUES ARE THE TOOLKIT'S, not invented here: NVIDIA documents the variable as taking `all`,
+/// a comma list of indices, a comma list of UUIDs, a CDI device name (`nvidia.com/gpu=all`, from
+/// toolkit 1.12), or `void`/empty to ask for nothing. Each maps onto a spelling this file already
+/// has, so the warning can print the exact line to write instead of describing it.
+fn visible_devices_remedy(value: &str) -> Option<String> {
+    let v = value.trim().trim_matches('"').trim_matches('\'');
+    if v.is_empty() || v.eq_ignore_ascii_case("void") || v.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if v.eq_ignore_ascii_case("all") {
+        return Some("gpus: all".to_string());
+    }
+    // THE CDI FORM, which the toolkit reads as a device name. `=all` has no `--device` spelling in
+    // kern (that flag names one card), so it lands on the same `gpus: all` the other `all` does.
+    if let Some(rest) = v.strip_prefix("nvidia.com/gpu=") {
+        if rest.eq_ignore_ascii_case("all") {
+            return Some("gpus: all".to_string());
+        }
+        return Some(format!("devices: [{v}]"));
+    }
+    Some(format!("gpus: device={v}"))
+}
+
+/// Is `entry` a CDI device name rather than a path?
+///
+/// THE SHAPE IS THE SPEC'S: `<vendor>/<class>=<name>`, where the vendor is a DNS-style name (so it
+/// carries a dot) and the whole thing is not a path (so it does not start with `/`). That is what
+/// `nvidia.com/gpu=all`, `nvidia.com/gpu=0` and `nvidia.com/gpu=GPU-<uuid>` have in common and
+/// what no `devices:` bind entry has: a bind source is an absolute path on the host.
+///
+/// Deliberately NOT a vendor allowlist. `amd.com/gpu=0` is a CDI name too, and refusing it HERE
+/// would report a shape problem for a vendor problem; it travels to `--device`, which reads the
+/// specs on this host and says which kinds they offer.
+fn cdi_device_name(entry: &str) -> bool {
+    if entry.starts_with('/') {
+        return false;
+    }
+    let Some((kind, device)) = entry.split_once('=') else {
+        return false;
+    };
+    if device.trim().is_empty() {
+        return false;
+    }
+    match kind.split_once('/') {
+        Some((vendor, class)) => vendor.contains('.') && !vendor.is_empty() && !class.is_empty(),
+        None => false,
+    }
+}
+
+pub fn normalise_devices(
+    entries: &[String],
+    name: &str,
+    tun: &mut bool,
+    cdi: &mut Option<String>,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(entries.len());
     for raw in entries {
         let entry = raw.trim().to_string();
         if entry.is_empty() {
+            continue;
+        }
+        // BEFORE THE COLON SPLIT, because a CDI name has no colon and would otherwise be read as a
+        // bind source whose target defaults to itself, which is how it reached the volume layer
+        // and produced a message about absolute targets.
+        if cdi_device_name(&entry) {
+            // `=all` IS THE SHAPE THE PODMAN GUIDES PRINT, and it is the one shape `--device` does
+            // not take: that flag names ONE card. The request still travels, so the run REFUSES
+            // rather than starting a service with no card, and this line is what makes the refusal
+            // actionable in the vocabulary of the FILE: an author who wrote `devices:` never typed
+            // a flag, and a message about `--gpus all` sends them looking in the wrong place.
+            if entry
+                .rsplit('=')
+                .next()
+                .is_some_and(|d| d.eq_ignore_ascii_case("all"))
+            {
+                warn(&format!(
+                    "service '{name}': 'devices: {entry}' names EVERY card through CDI, and kern \
+                     reads one card per CDI name. In this file write `gpus: all` for every card, \
+                     or `devices: [nvidia.com/gpu=0]` for one"
+                ));
+            }
+            match cdi {
+                None => *cdi = Some(entry.clone()),
+                Some(first) => warn(&format!(
+                    "service '{name}': 'devices: {entry}' is a second CDI device name and kern \
+                     grants one card per name, so only '{first}' is honoured. For several cards \
+                     write `gpus: all` or `device_ids: [\"0\", \"1\"]`"
+                )),
+            }
             continue;
         }
         let mut parts = entry.splitn(3, ':');
@@ -6456,6 +6815,54 @@ fn sanitize_for_terminal(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⛔ `devices:` HAS A LONG FORM, and it was read as a path.
+    ///
+    /// MEASURED 2026-11-12 with Docker Compose v5.0.2: `{source, target, permissions}` under
+    /// `devices:` is accepted and the container sees the node. kern split the folded mapping on `:`,
+    /// previewed it clean and failed `up` with `invalid volume name '{source'`. The assertion is an
+    /// EQUALITY with the short spelling, so whatever `normalise_devices` does to one it must do to
+    /// the other, and this test does not have to know what that is.
+    #[test]
+    fn the_long_devices_form_means_what_the_short_one_means_and_a_reservation_there_is_refused() {
+        let one = |devs: &str| {
+            parse(&format!(
+                "services:\n  s:\n    image: alpine\n    devices:\n{devs}"
+            ))
+            .map(|mut v| v.remove(0).devices)
+        };
+        let short = one("      - /dev/nvidia0:/dev/nvidia0:rwm\n").expect("short form parses");
+        let long = one(
+            "      - source: /dev/nvidia0\n        target: /dev/nvidia0\n        permissions: rwm\n",
+        )
+        .expect("long form parses");
+        assert_eq!(long, short, "the long form must mean the short one");
+        assert!(
+            !short.is_empty(),
+            "the fixture must produce an entry, or equality proves nothing"
+        );
+        // Without `permissions`, the two-part short form.
+        assert_eq!(
+            one("      - source: /dev/null\n        target: /dev/x\n").expect("parses"),
+            one("      - /dev/null:/dev/x\n").expect("parses")
+        );
+        // ⛔ THE RESERVATION GRAMMAR IN THE WRONG PLACE, which generated examples write and Docker
+        // refuses. It must name where the keys belong, not complain about a target or a volume.
+        let err = one("      - driver: nvidia\n        count: 1\n        capabilities: [gpu]\n")
+            .expect_err("a reservation under devices: is refused");
+        assert!(
+            err.contains("deploy.resources.reservations.devices"),
+            "the refusal names where the keys belong: {err}"
+        );
+        assert!(!err.contains("volume name"), "not the old symptom: {err}");
+        // Docker refuses a missing target, so kern does.
+        let err = one("      - source: /dev/null\n").expect_err("a target is required");
+        assert!(err.contains("source") && err.contains("target"), "{err}");
+        // An unknown key is named, not split on `:`.
+        let err = one("      - source: /dev/null\n        target: /x\n        mode: rw\n")
+            .expect_err("an unknown key is refused");
+        assert!(err.contains("mode"), "the unknown key is named: {err}");
+    }
 
     /// A DIFFERENCE NOBODY IS TOLD ABOUT IS THE WORST DEFECT THIS PARSER CAN HAVE, AND IT HAD ONE.
     ///
@@ -7972,12 +8379,317 @@ mod tests {
     /// Docker's third field is a cgroup ACL kern does not have, so the only part of it with a kern
     /// equivalent is honoured: no `w` means a read-only bind. `rwm` and an absent field are the same
     /// request and must produce the same entry.
+    /// THE THREE COUNTS DOCKER HAS, and kern refused two of them.
+    ///
+    /// MEASURED against `docker compose` v5.0.2 on a two-card host, the same reservation block:
+    /// `count: -1` gave the container 2 cards, `count: 1` gave 1, `count: 0` gave 0 and ran. kern
+    /// refused `-1` ("not a number of cards") and refused `0` through the FLAG's ambiguity rule, so
+    /// two files that docker runs died here.
+    ///
+    /// `-1` is read by the grammar, where every other count is read; `0` is answered HERE, because
+    /// the ambiguity that makes the flag refuse a bare `0` (docker's "no gpus" against this
+    /// project's "card 0") does not exist in a key called `count`.
+    #[test]
+    fn the_counts_docker_accepts_are_the_counts_this_reads() {
+        let res = |count: &str| {
+            let _ = take_warnings();
+            let text = format!(
+                "services:\n  a:\n    image: alpine\n    deploy:\n      resources:\n        \
+                 reservations:\n          devices:\n            - driver: nvidia\n              \
+                 count: {count}\n              capabilities: [gpu]\n"
+            );
+            let spec = parse(&text)
+                .ok()
+                .and_then(|b| b.first().and_then(|x| x.gpus.clone()));
+            (spec, take_warnings())
+        };
+
+        assert_eq!(
+            res("-1").0.as_deref(),
+            Some("-1"),
+            "-1 must reach the grammar"
+        );
+        assert_eq!(res("1").0.as_deref(), Some("1"));
+        assert_eq!(res("all").0.as_deref(), Some("all"));
+
+        // ZERO IS NO CARD AND SAYS SO, in ONE sentence: returning "no GPU request here" instead
+        // added the generic note on top, and that note claims nothing was read as a GPU request,
+        // which is false for an entry that asked for zero of them.
+        let (spec, w) = res("0");
+        assert_eq!(spec, None, "count: 0 must not become a grant");
+        assert_eq!(
+            w.iter().filter(|x| x.contains("count: 0")).count(),
+            1,
+            "exactly one sentence about the zero: {w:?}"
+        );
+        assert!(
+            !w.iter().any(|x| x.contains("nothing in it was read")),
+            "the generic note contradicts the specific one: {w:?}"
+        );
+    }
+
+    /// ANOTHER VENDOR'S DRIVER DOES NOT GET AN NVIDIA CARD, and a non-GPU reservation is still a
+    /// non-GPU reservation.
+    ///
+    /// MEASURED 2026-11-12: `driver: amd` with `capabilities: [gpu]` handed the service
+    /// `/dev/nvidia0`. A file that asked for ROCm hardware received NVIDIA hardware, which fails
+    /// deeper inside the workload than a refusal ever would.
+    ///
+    /// BOTH DIRECTIONS, because the first fix broke the other one: refusing the vendor BEFORE the
+    /// GPU test turned `driver: some-fpga, capabilities: [fpga]`, which is not a GPU request at
+    /// all, into a message about GPU vendors and took away the note that says the service runs
+    /// without its device.
+    #[test]
+    fn a_non_nvidia_driver_is_refused_and_a_non_gpu_reservation_keeps_its_note() {
+        let res = |entry: &str| {
+            let _ = take_warnings();
+            let text = format!(
+                "services:\n  a:\n    image: alpine\n    deploy:\n      resources:\n        \
+                 reservations:\n          devices:\n{entry}"
+            );
+            let boxes = parse(&text);
+            let spec = boxes
+                .ok()
+                .and_then(|b| b.first().and_then(|x| x.gpus.clone()));
+            (spec, take_warnings())
+        };
+
+        // A GPU request naming another vendor: refused, with the vendor in the message.
+        let (spec, w) = res(
+            "            - driver: amd\n              count: 1\n              capabilities: [gpu]\n",
+        );
+        assert_eq!(
+            spec, None,
+            "an AMD request must not become a card: {spec:?}"
+        );
+        assert!(
+            w.iter()
+                .any(|x| x.contains("driver: amd") && x.contains("NVIDIA cards only")),
+            "the refusal must name the vendor: {w:?}"
+        );
+
+        // NOT A GPU AT ALL: the old note, unchanged, and no vendor sentence.
+        let (spec, w) = res(
+            "            - driver: some-fpga\n              count: 1\n              \
+             capabilities: [fpga]\n",
+        );
+        assert_eq!(spec, None);
+        assert!(
+            w.iter()
+                .any(|x| x.contains("reservations.devices") && x.contains("runs WITHOUT")),
+            "a non-GPU reservation lost its note: {w:?}"
+        );
+        assert!(
+            !w.iter().any(|x| x.contains("NVIDIA cards only")),
+            "a non-GPU reservation was answered as a GPU vendor problem: {w:?}"
+        );
+
+        // AND NVIDIA STILL WORKS, or the fix would have closed the whole key.
+        let (spec, _) = res(
+            "            - driver: nvidia\n              count: 1\n              \
+             capabilities: [gpu]\n",
+        );
+        assert_eq!(spec.as_deref(), Some("1"));
+    }
+
+    /// A GPU WRITTEN IN THE WRONG SUBTREE IS NAMED, not answered with a sentence about caps.
+    ///
+    /// MEASURED 2026-11-12: `deploy.resources.limits: {nvidia.com/gpu: 1}`, the Kubernetes habit,
+    /// and the whole `devices:` block written under `limits:` instead of `reservations:` both got
+    /// only "set none of memory/cpus/pids - the service runs UNCAPPED (check the key names)". True,
+    /// and it does not say which key or that hardware was asked for. Neither shape is a GPU request
+    /// in Docker either, so this is one sentence and not a grant.
+    #[test]
+    fn a_gpu_under_limits_is_named_rather_than_read_as_a_mistyped_cap() {
+        let one = |body: &str| {
+            let _ = take_warnings();
+            let text = format!("services:\n  a:\n    image: alpine\n{body}");
+            let _ = parse(&text);
+            take_warnings()
+        };
+
+        for body in [
+            "    deploy:\n      resources:\n        limits:\n          nvidia.com/gpu: 1\n",
+            "    deploy:\n      resources:\n        limits:\n          devices:\n            - driver: nvidia\n              count: 1\n              capabilities: [gpu]\n",
+        ] {
+            let w = one(body);
+            assert!(
+                w.iter().any(|x| x.contains("not a limit in Docker or here")
+                    && x.contains("reservations.devices")),
+                "a GPU under limits: was not named: {w:?}"
+            );
+        }
+
+        // AND NOT ON AN ORDINARY BLOCK, in either direction: a real cap must not draw the GPU
+        // sentence, and a mistyped cap must still draw the UNCAPPED one and only that.
+        let good = one("    deploy:\n      resources:\n        limits:\n          memory: 1g\n");
+        assert!(
+            !good.iter().any(|x| x.contains("not a limit in Docker")),
+            "a plain memory limit drew the GPU sentence: {good:?}"
+        );
+        let typo = one("    deploy:\n      resources:\n        limits:\n          mem: 1g\n");
+        assert!(
+            typo.iter().any(|x| x.contains("runs UNCAPPED")),
+            "the mistyped cap lost its own warning: {typo:?}"
+        );
+        assert!(
+            !typo.iter().any(|x| x.contains("not a limit in Docker")),
+            "a mistyped cap drew the GPU sentence: {typo:?}"
+        );
+    }
+
+    /// `NVIDIA_VISIBLE_DEVICES` IS A GPU REQUEST AND IS NOT ANSWERED WITH SILENCE.
+    ///
+    /// MEASURED 2026-11-12: a service carrying only that variable ran with 0 device nodes and no
+    /// output. It is the shape every Ollama and vLLM compose example uses, and on a host where
+    /// nvidia is the default runtime it needs no `runtime:` key, so the warning for that key never
+    /// fired for it.
+    ///
+    /// THE REMEDY IS THE FILE LINE TO WRITE, derived from the value the way the toolkit reads it.
+    #[test]
+    fn the_nvidia_visible_devices_variable_maps_onto_a_line_this_file_understands() {
+        for (value, want) in [
+            ("all", Some("gpus: all")),
+            ("ALL", Some("gpus: all")),
+            ("0", Some("gpus: device=0")),
+            ("0,1", Some("gpus: device=0,1")),
+            (
+                "GPU-1950be8a-cbd3-acfa-d43f-a7398d020f25",
+                Some("gpus: device=GPU-1950be8a-cbd3-acfa-d43f-a7398d020f25"),
+            ),
+            // The toolkit's CDI form, from 1.12. `=all` has no `--device` spelling here, so it
+            // lands on the same `gpus: all`.
+            ("nvidia.com/gpu=all", Some("gpus: all")),
+            ("nvidia.com/gpu=0", Some("devices: [nvidia.com/gpu=0]")),
+            // AND THE VALUES THAT ASK FOR NOTHING, which must not produce a warning at all: NVIDIA
+            // documents void and empty as "no GPU", and warning there would fire on every service
+            // that deliberately turns it off.
+            ("void", None),
+            ("", None),
+            ("   ", None),
+        ] {
+            assert_eq!(
+                visible_devices_remedy(value).as_deref(),
+                want,
+                "NVIDIA_VISIBLE_DEVICES={value:?}"
+            );
+        }
+    }
+
+    /// AND IT ONLY FIRES WHEN THE FILE ASKED FOR NOTHING ELSE. A service that also writes `gpus:`
+    /// has asked properly and must not be warned at for being thorough, which is the half that
+    /// keeps this off the Ollama files that carry BOTH the variable and a deploy block.
+    #[test]
+    fn the_visible_devices_warning_is_silent_when_the_file_also_asks_properly() {
+        let one = |body: &str| {
+            let _ = take_warnings();
+            let text = format!("services:\n  a:\n    image: alpine\n{body}");
+            let _ = parse(&text);
+            take_warnings()
+        };
+
+        let bare = one("    environment:\n      - NVIDIA_VISIBLE_DEVICES=all\n");
+        assert!(
+            bare.iter()
+                .any(|w| w.contains("NVIDIA_VISIBLE_DEVICES=all") && w.contains("gpus: all")),
+            "the bare variable was answered with silence: {bare:?}"
+        );
+
+        let asked = one("    gpus: all\n    environment:\n      - NVIDIA_VISIBLE_DEVICES=all\n");
+        assert!(
+            !asked.iter().any(|w| w.contains("NVIDIA_VISIBLE_DEVICES")),
+            "a file that already asks properly was warned at: {asked:?}"
+        );
+
+        // ORDER-INDEPENDENT, which is why the check runs after the key loop: the same file with the
+        // variable written FIRST must behave identically.
+        let reordered =
+            one("    environment:\n      - NVIDIA_VISIBLE_DEVICES=all\n    gpus: all\n");
+        assert!(
+            !reordered
+                .iter()
+                .any(|w| w.contains("NVIDIA_VISIBLE_DEVICES")),
+            "the answer depended on where in the file the variable was written: {reordered:?}"
+        );
+
+        let off = one("    environment:\n      - NVIDIA_VISIBLE_DEVICES=void\n");
+        assert!(
+            !off.iter().any(|w| w.contains("NVIDIA_VISIBLE_DEVICES")),
+            "a service that turns the variable OFF was warned at: {off:?}"
+        );
+    }
+
+    /// A CDI DEVICE NAME UNDER `devices:` IS NOT A BIND, which is the spelling the podman guides
+    /// call the recommended one for NVIDIA.
+    ///
+    /// MEASURED 2026-11-12 before this: `devices: [nvidia.com/gpu=all]` was read as a bind source
+    /// whose target defaults to itself, and the stack died with
+    /// `sandbox: -v 'nvidia.com/gpu=all:nvidia.com/gpu=all': target must be absolute`, a message
+    /// about volumes that mentions neither a GPU nor CDI.
+    ///
+    /// BOTH DIRECTIONS: a path must NOT be mistaken for a CDI name, or every `devices:` entry
+    /// would stop being a bind.
+    #[test]
+    fn a_cdi_device_name_is_not_read_as_a_bind() {
+        let take = |v: &[&str]| {
+            let owned: Vec<String> = v.iter().map(|s| (*s).to_string()).collect();
+            let mut tun = false;
+            let mut cdi = None;
+            let out = normalise_devices(&owned, "svc", &mut tun, &mut cdi);
+            (out, cdi)
+        };
+
+        for name in [
+            "nvidia.com/gpu=all",
+            "nvidia.com/gpu=0",
+            "nvidia.com/gpu=GPU-1950be8a-cbd3-acfa-d43f-a7398d020f25",
+            // NOT A VENDOR ALLOWLIST: another vendor's name is still a CDI name, and which kinds
+            // this host offers is a question for the resolver, not for a shape check.
+            "amd.com/gpu=0",
+        ] {
+            let (out, cdi) = take(&[name]);
+            assert_eq!(cdi.as_deref(), Some(name), "{name} must travel as a device");
+            assert!(out.is_empty(), "{name} must not also be bound: {out:?}");
+        }
+
+        // AND A PATH IS STILL A PATH, including the shapes that have an `=` or a dot in them.
+        for path in [
+            "/dev/nvidia0",
+            "/dev/nvidia0:/dev/nvidia0",
+            "/dev/dri/by-path/pci-0000:01:00.0-card",
+            "/dev/disk/by-id/wwn-0x5000=weird",
+        ] {
+            let (_, cdi) = take(&[path]);
+            assert_eq!(cdi, None, "{path} must stay a bind");
+        }
+        // ⛔ AND THE SHAPE RULE ITSELF IS MEASURED, not only the leading slash. Every negative case
+        // above is an ABSOLUTE path, so they are all refused by the first line of the predicate and
+        // say nothing about the rest of it: loosening the vendor rule to "anything with an =" left
+        // this test GREEN. These are not paths and not CDI names either.
+        for not_cdi in [
+            "tun=1",             // no slash at all
+            "relative/dev=0",    // a slash, but the vendor carries no dot
+            "nvidia.com/gpu=",   // a vendor and a class, and no device named
+            "nvidia.com/=0",     // no class
+            "/nvidia.com/gpu=0", // a path that happens to spell one
+        ] {
+            let (_, cdi) = take(&[not_cdi]);
+            assert_eq!(cdi, None, "{not_cdi} is not a CDI device name");
+        }
+
+        // A SECOND NAME KEEPS THE FIRST and warns, because `--device` names one card.
+        let (_, cdi) = take(&["nvidia.com/gpu=0", "nvidia.com/gpu=1"]);
+        assert_eq!(cdi.as_deref(), Some("nvidia.com/gpu=0"));
+    }
+
     #[test]
     fn a_device_becomes_a_bind_except_the_tun_node_which_becomes_a_capability() {
         let norm = |v: &[&str]| {
             let owned: Vec<String> = v.iter().map(|s| (*s).to_string()).collect();
             let mut tun = false;
-            let out = normalise_devices(&owned, "svc", &mut tun);
+            let mut cdi = None;
+            let out = normalise_devices(&owned, "svc", &mut tun, &mut cdi);
+            assert_eq!(cdi, None, "a path entry must not be read as a CDI name");
             (out, tun)
         };
 
@@ -9430,7 +10142,8 @@ mod tests {
             "      SENTRY_EVENT_RETENTION_DAYS:\n",
             "      NON_LEGATO_DA_NESSUNA_PARTE:\n",
         );
-        let boxes = parse_with_env(y, &de, false, crate::StackNet::Pod, None).expect("parses");
+        let boxes =
+            parse_with_env(y, &de, false, crate::StackNet::Pod, None, false).expect("parses");
         let env = &boxes[0].env;
         assert!(
             env.contains(&"SENTRY_EVENT_RETENTION_DAYS=90".to_string()),
@@ -9448,7 +10161,7 @@ mod tests {
         // the same distinction.
         let y2 =
             "services:\n  web:\n    image: x\n    environment:\n      K: ${KERN_UNSET_ABC_XYZ}\n";
-        let b2 = parse_with_env(y2, &de, false, crate::StackNet::Pod, None).expect("parses");
+        let b2 = parse_with_env(y2, &de, false, crate::StackNet::Pod, None, false).expect("parses");
         assert!(
             b2[0].env.contains(&"K=".to_string()),
             "an unset reference is Docker's empty string: {:?}",
@@ -9479,8 +10192,8 @@ mod tests {
             "      - EXPLICIT=1\n",
             "      - ASSENTE_OVUNQUE\n",
         );
-        let boxes =
-            parse_with_env(y, &de, false, crate::StackNet::Pod, None).expect("parses with .env");
+        let boxes = parse_with_env(y, &de, false, crate::StackNet::Pod, None, false)
+            .expect("parses with .env");
         let args = boxes[0].build.clone().expect("build directive").args;
         assert!(
             args.contains(&"SENTRY_IMAGE=ghcr.io/getsentry/sentry:nightly".to_string()),
@@ -9500,6 +10213,7 @@ mod tests {
             false,
             crate::StackNet::Pod,
             None,
+            false,
         )
         .expect("parses");
         let args = bare[0].build.clone().expect("build directive").args;
@@ -10179,6 +10893,7 @@ services:
                 true,
                 crate::StackNet::Pod,
                 Some(dir.as_path()),
+                false,
             )
         };
 
@@ -10537,9 +11252,14 @@ services:
             None
         );
         assert!(
+            // THE KEY AND THE CONSEQUENCE, not one word of the sentence. This read
+            // `reservations.devices ignored` until 2026-11-12, when the note was rewritten: its
+            // old text claimed "kern grants NO device from a compose file", which the canonical
+            // Docker block plus `--allow-device-grants` disproves on this host. The assertion's
+            // intent is that a non-GPU reservation still gets a note, and that is what it pins.
             take_warnings()
                 .iter()
-                .any(|w| w.contains("reservations.devices ignored")),
+                .any(|w| w.contains("reservations.devices") && w.contains("runs WITHOUT")),
             "a non-GPU reservation lost its note"
         );
         // A GPU ENTRY THAT SAYS NEITHER HOW MANY NOR WHICH is named, not approximated: a count

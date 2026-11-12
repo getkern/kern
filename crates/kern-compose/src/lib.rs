@@ -301,6 +301,24 @@ pub struct ComposeBox {
     /// can defeat is not a policy: this needs `--allow-device-grants` exactly as `devices:` does.
     /// `device_grant_problem` is the gate, and it reads this field.
     pub gpus: Option<String>,
+    /// A CDI device name written under `devices:`, as a `--device` spec.
+    ///
+    /// WHY IT IS ITS OWN FIELD AND NOT TRANSLATED. `nvidia.com/gpu=all` is the shape the podman
+    /// guides call the recommended one for NVIDIA, and Docker takes CDI names there too. It is NOT
+    /// a `--gpus` spec: it is a `--device` spec, and the rule this file already states for `gpus`
+    /// applies unchanged, that a request travels as written and is parsed where its own flag is
+    /// parsed. Rewriting `nvidia.com/gpu=0` into `device=0` here would skip the CDI spec, so the
+    /// grant would come from discovery while the file named a spec, and the hooks that spec carries
+    /// would go unmentioned.
+    ///
+    /// MEASURED 2026-11-12, before this field existed: `devices: [nvidia.com/gpu=all]` was read as
+    /// a bind source and the stack died with
+    /// `sandbox: -v 'nvidia.com/gpu=all:nvidia.com/gpu=all': target must be absolute`, a message
+    /// about volumes that names neither a GPU nor CDI, for the spelling a reader is most likely to
+    /// copy from a podman guide.
+    ///
+    /// NOT HONOURED FROM THE FILE ALONE either: the same gate reads it.
+    pub device: Option<String>,
     /// tmpfs mounts that came from a LONG-FORM `volumes:` entry (`{type: tmpfs, target: …}`), kept
     /// apart from `tmpfs` for the same reason `devices` is kept apart from `volumes`: the `tmpfs:`
     /// key ASSIGNS its field, and the service keys are read in file order, so anything appended to
@@ -709,6 +727,13 @@ impl ComposeBox {
         // it wrote.
         if let Some(spec) = &self.gpus {
             cmd.arg("--gpus").arg(spec);
+        }
+        // THE CDI NAME, ALSO UNTOUCHED, onto the flag whose grammar it is. `kern box` refuses both
+        // at once ("they name the same thing two ways"), and a file that writes both is caught by
+        // the gate before this, with a message about the FILE rather than about a command line the
+        // author never typed.
+        if let Some(name) = &self.device {
+            cmd.arg("--device").arg(name);
         }
         if let Some(p) = &self.apparmor {
             cmd.arg("--apparmor").arg(p);
@@ -1120,7 +1145,7 @@ pub fn parse_with_env(
     dotenv: &DotEnv,
     net: StackNet,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, true, net, None)
+    parse_layer(text, dotenv, true, net, None, false)
 }
 
 /// [`parse_with_env`] for a file that exists ON DISK, whose directory is where its own relative
@@ -1137,7 +1162,7 @@ pub fn parse_with_env_at(
     net: StackNet,
     dir: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, true, net, dir)
+    parse_layer(text, dotenv, true, net, dir, false)
 }
 
 /// Parse an OVERRIDE layer (`-f base.yml -f override.yml`, every file after the first).
@@ -1151,7 +1176,7 @@ pub fn parse_override(
     dotenv: &DotEnv,
     net: StackNet,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, false, net, None)
+    parse_layer(text, dotenv, false, net, None, false)
 }
 
 /// [`parse_override`] for an override file on disk - see [`parse_with_env_at`] for what the
@@ -1162,7 +1187,31 @@ pub fn parse_override_at(
     net: StackNet,
     dir: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, false, net, dir)
+    parse_layer(text, dotenv, false, net, dir, false)
+}
+
+/// One file of a MULTI-FILE stack (`-f a -f b`, every file including the first), read with its
+/// profiles left undecided so [`apply_profiles`] can decide them on the merged result.
+///
+/// ⛔ WHY THE FIRST FILE TOO. Deciding profiles per file made the base drop a profile-gated service
+/// before the override was read, and the override's restatement was then added as a new service
+/// with nothing to run; see `yaml::split_inactive_profiles` for the two real projects that measured
+/// it. Docker merges and then applies profiles. Not runnable-checked here, for the same reason an
+/// override is not: [`validate_runnable`] runs on the merged stack.
+pub fn parse_stack_file_at(
+    text: &str,
+    dotenv: &DotEnv,
+    net: StackNet,
+    dir: Option<&std::path::Path>,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, false, net, dir, true)
+}
+
+/// The profile decision for a merged stack: the same two functions a single-file parse runs, so a
+/// file read alone and the same file read as `-f` cannot disagree about which services start.
+pub fn apply_profiles(boxes: Vec<ComposeBox>) -> Result<Vec<ComposeBox>, String> {
+    let (kept, skipped, inactive) = yaml::split_inactive_profiles(boxes);
+    yaml::finish_profiles(kept, &skipped, &inactive)
 }
 
 /// Assert every service ended up with something to run. Called on the merged stack (see
@@ -1283,6 +1332,7 @@ fn parse_layer(
     require_runnable: bool,
     net: StackNet,
     dir: Option<&std::path::Path>,
+    defer_profiles: bool,
 ) -> Result<Vec<ComposeBox>, String> {
     // Strip a leading UTF-8 BOM (Windows editors add one) so the first key/table header is recognized
     // - Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
@@ -1296,7 +1346,7 @@ fn parse_layer(
         return Err("the file is empty: a compose file needs a `services:` block".into());
     }
     if is_yaml(text) {
-        yaml::parse_with_env(text, dotenv, require_runnable, net, dir)
+        yaml::parse_with_env(text, dotenv, require_runnable, net, dir, defer_profiles)
     } else {
         parse_toml(text)
     }
@@ -1367,6 +1417,37 @@ impl ComposeBox {
             stop_signal,
             stop_grace_period,
             security_profile,
+            // ⛔ THIRTY-TWO MORE, FORGOTTEN THE SAME WAY, AND THE GUARD BELOW COULD NOT SEE THEM.
+            // MEASURED 2026-11-12 on real projects that ship a GPU override
+            // (`-f docker-compose.yml -f docker-compose.gpu.yml`, ncoevoet/facet among them): the
+            // override alone asks for the card, merged with its base the request VANISHED and
+            // `config` said nothing, so the stack would run on the CPU in silence. `gpus`, `device`
+            // and `devices` were never in these lists, nor were `apparmor` (an override adding a
+            // profile produced a LESS confined box than the file says), `entrypoint`, `shm_size`,
+            // `dns`, `networks` or `secret_envs`. The structural guard builds its box with the TOML
+            // parser, which has none of these keys; the new guard reads this function's source.
+            //
+            // `entrypoint` sits here and not with `command`: it is an `Option`, so `Some` already
+            // means "the override wrote one" and the scalar rule IS the replace rule.
+            container_name,
+            entrypoint,
+            gpus,
+            device,
+            apparmor,
+            shm_size,
+            memory_reservation,
+            cpu_weight,
+            pull,
+            log_max_size,
+            log_max_file,
+            secret_mode,
+            config,
+            net_share,
+            // DERIVED from the DOCUMENT's top-level `networks:` rather than written on the service,
+            // so an override's value is computed against the override's declarations. The scalar
+            // and list rules are an approximation of a recompute over the merged stack, and a
+            // closer one than dropping the value, which is what happened before.
+            net_subnet,
         );
         // Booleans: an override can only turn one ON (its `false` is indistinguishable from absent).
         macro_rules! flag {
@@ -1380,7 +1461,14 @@ impl ComposeBox {
             restart,
             restart_always,
             tun,
-            init
+            init,
+            // `privileged` can only be turned ON by an override, like every flag here, and a file
+            // still cannot grant it to itself: `kern compose` needs `--allow-privileged` for that.
+            privileged,
+            net_none,
+            health_from_image,
+            only_internal_networks,
+            on_internal_network,
         );
         if o.uid_range_explicit_false {
             self.uid_range_explicit_false = true;
@@ -1409,7 +1497,40 @@ impl ComposeBox {
             depends_on,
             depends_healthy,
             depends_completed,
+            devices,
+            dns,
+            dns_search,
+            dns_options,
+            links,
+            volumes_from,
+            secret_envs,
+            networks,
+            external_networks,
+            net_ipv4,
+            degraded_health,
+            tmpfs_from_volumes,
         );
+        // AN OVERRIDE THAT RESTATES A LINE MUST NOT DOUBLE IT. The lists above that
+        // `collapse_repeated_mappings` does not know were appended blindly, so a GPU override
+        // repeating its base's `devices: [/dev/nvidia0:/dev/nvidia0]` would bind the node twice.
+        // Exact duplicates collapse to the first position, which is the shape that function keeps.
+        fn dedup_keep_first(v: &mut Vec<String>) {
+            let mut seen = std::collections::HashSet::new();
+            v.retain(|x| seen.insert(x.clone()));
+        }
+        for v in [
+            &mut self.devices,
+            &mut self.dns,
+            &mut self.dns_search,
+            &mut self.dns_options,
+            &mut self.links,
+            &mut self.volumes_from,
+            &mut self.networks,
+            &mut self.external_networks,
+            &mut self.degraded_health,
+        ] {
+            dedup_keep_first(v);
+        }
         // PROFILE LISTS REPLACE, unlike every other list above, and the difference is not tidiness.
         // A `vcpu:` profile does NOT stack (the first to set each cap wins, with a warning), so an
         // override that APPENDED would leave the base's caps in force and the override's ignored,
@@ -1810,7 +1931,9 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             "devices" => {
                 let raw = parse_string_array(val).map_err(|e| line_err(i, &e))?;
                 let svc = b.name.clone();
-                b.devices = crate::yaml::normalise_devices(&raw, &svc, &mut b.tun);
+                let mut cdi = b.device.take();
+                b.devices = crate::yaml::normalise_devices(&raw, &svc, &mut b.tun, &mut cdi);
+                b.device = cdi;
             }
             "init" => b.init = parse_bool(val).map_err(|e| line_err(i, &e))?,
             // Repeatable flags - arrays of the same CLI strings.
@@ -3679,6 +3802,147 @@ mod dotenv_tests {
     /// catch: it merges a COMPLETE box over an empty one and compares the `Debug` representation
     /// against the same box unmerged. Any field `merge_from` forgets shows up as a difference, and
     /// the next field added is covered without touching this test.
+    /// ⛔ THE GUARD BELOW WAS BLIND TO EVERY KEY ITS PARSER DOES NOT HAVE, and 32 fields went through.
+    ///
+    /// `every_optional_field_survives_a_merge` builds its complete box with the TOML parser, whose
+    /// vocabulary has no `gpus`, `devices`, `apparmor`, `entrypoint`, `shm_size`, `dns` or
+    /// `networks`. Those exist only in the YAML reader, which is the one real files use, so the
+    /// guard was green while a GPU override merged over its base lost the card in silence
+    /// (measured on ncoevoet/facet's `docker-compose.gpu.yml`).
+    ///
+    /// THIS ONE DEPENDS ON NO PARSER: it reads the struct's fields and `merge_from`'s CODE from
+    /// this file, comments stripped (a first scan counted `device` as handled because the word was
+    /// in a comment), and every field must be handled or exempted here with its reason.
+    #[test]
+    fn every_compose_box_field_is_handled_by_merge_from_or_exempted_by_name() {
+        // Identity, not data: a merge only ever runs on two boxes that already share these.
+        const EXEMPT: [&str; 2] = ["name", "service"];
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub struct ComposeBox {")
+            .expect("the struct is in this file");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("the struct closes")];
+        let fields: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter_map(|l| l.split_once(':').map(|(f, _)| f.trim()))
+            .filter(|f| f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .collect();
+        assert!(
+            fields.len() > 80,
+            "the field scan found {} fields, so it is reading the wrong thing",
+            fields.len()
+        );
+        let m = src
+            .find("fn merge_from(&mut self, o: ComposeBox)")
+            .expect("merge_from is in this file");
+        let merge = &src[m..m + src[m..].find("\n    }\n").expect("merge_from closes")];
+        let code: String = merge
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mentioned = |f: &str| {
+            code.match_indices(f).any(|(i, _)| {
+                let before = code[..i].chars().next_back();
+                let after = code[i + f.len()..].chars().next();
+                let word =
+                    |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                !word(before) && !word(after)
+            })
+        };
+        let missing: Vec<&str> = fields
+            .iter()
+            .copied()
+            .filter(|f| !EXEMPT.contains(f) && !mentioned(f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "fields an override file would drop in silence: {missing:?}. Add each to the right \
+             macro in `merge_from` (opt!/flag!/seq!) or to EXEMPT with its reason"
+        );
+    }
+
+    /// THE SHAPE THE STRUCTURAL GUARD EXISTS FOR, as real projects write it: a base with the
+    /// service, and a GPU override that only adds the reservation. Measured on ncoevoet/facet before
+    /// the fix: the override alone warned that the service asked for a GPU, the pair said nothing.
+    #[test]
+    fn a_gpu_override_keeps_its_card_and_its_other_keys_through_the_merge() {
+        let base = parse("services:\n  app:\n    image: img\n    ports: ['5000:5000']\n")
+            .expect("base parses");
+        let over = || {
+            parse_override(
+                concat!(
+                    "services:\n  app:\n",
+                    "    entrypoint: [\"/start\"]\n",
+                    "    shm_size: 2g\n",
+                    "    dns: [1.1.1.1]\n",
+                    "    devices:\n      - /dev/null:/dev/x\n",
+                    "    deploy:\n      resources:\n        reservations:\n          devices:\n",
+                    "            - driver: nvidia\n              count: all\n              capabilities: [gpu]\n",
+                ),
+                &DotEnv::default(),
+                StackNet::Pod,
+            )
+            .expect("override parses")
+        };
+        let alone = over().remove(0);
+        assert!(
+            alone.gpus.is_some(),
+            "the fixture must ask for a card on its own"
+        );
+        let merged = merge_stacks(base, over());
+        let b = &merged[0];
+        assert_eq!(b.gpus, alone.gpus, "the GPU request survives the merge");
+        assert_eq!(b.entrypoint, alone.entrypoint);
+        assert_eq!(b.shm_size, alone.shm_size);
+        assert_eq!(b.dns, alone.dns);
+        assert_eq!(b.devices, alone.devices);
+        assert_eq!(
+            b.ports,
+            vec!["5000:5000".to_string()],
+            "the base's own keys stay"
+        );
+        // AND A RESTATED LINE IS NOT DOUBLED: the same override applied twice binds the node once.
+        let twice = merge_stacks(merged, over());
+        assert_eq!(
+            twice[0].devices, alone.devices,
+            "an override restating a device must not double it"
+        );
+    }
+
+    /// ⛔ PROFILES ARE DECIDED ON THE MERGED STACK, as Docker decides them.
+    ///
+    /// The shape of murtaza-nasir/maestro and perminder-klair/subwave, both accepted by docker and
+    /// both refused by kern before: the base gates a service behind a profile, and the GPU override
+    /// restates that service with only a reservation. Per-file profiles dropped it from the base and
+    /// then ADDED the override's copy as a service with no image. This drives the exact sequence
+    /// `kern compose -f a -f b` runs.
+    #[test]
+    fn a_profile_gated_service_restated_by_an_override_stays_skipped_after_the_merge() {
+        let layer = |t: &str| {
+            parse_stack_file_at(t, &DotEnv::default(), StackNet::Pod, None).expect("layer parses")
+        };
+        let base = layer(concat!(
+            "services:\n",
+            "  backend:\n    image: img\n",
+            "  cli:\n    image: img\n    profiles: [kern-test-never-active]\n",
+        ));
+        let over = layer(concat!(
+            "services:\n  cli:\n    deploy:\n      resources:\n        reservations:\n",
+            "          devices:\n            - driver: nvidia\n              count: 1\n",
+            "              capabilities: [gpu]\n",
+        ));
+        let merged = apply_profiles(merge_stacks(base, over)).expect("the merged stack is valid");
+        let names: Vec<&str> = merged.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["backend"],
+            "the gated service stays out, the other runs"
+        );
+        validate_runnable(&merged).expect("what remains is runnable, as docker says it is");
+    }
+
     #[test]
     fn every_optional_field_survives_a_merge() {
         // Every key the parser knows, each with a non-default value.

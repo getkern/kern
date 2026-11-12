@@ -2449,6 +2449,10 @@ fn a_fifo_or_socket_volume_source_is_refused_rather_than_hanging_the_box() {
         err.contains("FIFO"),
         "the refusal must name what the source IS, or the operator looks at the target: {err}"
     );
+    assert!(
+        err.contains("404 seconds"),
+        "the FIFO's refusal keeps the measurement that justifies it: {err}"
+    );
     if let Some(st) = status {
         assert_eq!(
             st.code(),
@@ -2456,6 +2460,75 @@ fn a_fifo_or_socket_volume_source_is_refused_rather_than_hanging_the_box() {
             "a box that never started is 125, kern's own and Docker's convention: {err}"
         );
     }
+    socket_source_is_refused_in_its_own_words();
+}
+
+/// ⛔ THE SOCKET HALF OF THE TEST ABOVE NEVER EXISTED: its name said "or socket" and its fixture
+/// made a FIFO and nothing else, so the socket branch of the message was never read by anything.
+/// That is the fifth fixture today whose claim was wider than what it built.
+///
+/// AND THE BRANCH IT NOW READS WAS WRONG. The refusal printed the FIFO's measured cause for a
+/// socket too: "opening it inside the box blocks forever, because nothing on the host holds the
+/// other end". MEASURED 2026-11-12 with a python server listening and its DIRECTORY bound into a
+/// box, the client inside connected and the host answered; docker 29.1.3 binding the socket itself
+/// connected as well. A box can use a host socket, so the refusal is a policy and says so now.
+fn socket_source_is_refused_in_its_own_words() {
+    let dir = std::env::temp_dir().join(format!("kern-it-sock-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let sock = dir.join("s");
+    // A real AF_UNIX socket on disk, because the check reads `st_mode` and nothing else will do.
+    let bound = std::os::unix::net::UnixListener::bind(&sock);
+    let Ok(_listener) = bound else {
+        eprintln!("skip: could not bind a unix socket to test with");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    };
+    let out = kern()
+        .args([
+            "box",
+            &format!("sock-{}", std::process::id()),
+            "--image",
+            "alpine",
+            "-v",
+            &format!("{}:/x", sock.display()),
+            "--",
+            "true",
+        ])
+        .output();
+    let _ = fs::remove_dir_all(&dir);
+    let Ok(out) = out else {
+        eprintln!("skip: kern could not be spawned for the socket case");
+        return;
+    };
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    if err.contains("could not be BUILT") || err.contains("user namespace") {
+        eprintln!("skip: this host cannot build a box at all");
+        return;
+    }
+    assert!(
+        err.contains("socket"),
+        "the refusal must name what the source IS: {err}"
+    );
+    // ⛔ AND IT MUST NOT CARRY THE FIFO'S CAUSE. These two sentences are the defect: they were
+    // printed for a socket whose server was listening and reachable.
+    assert!(
+        !err.contains("blocks forever") && !err.contains("holds the other end"),
+        "the socket refusal is still claiming the FIFO's cause, which is false for it: {err}"
+    );
+    assert!(
+        !err.contains("404 seconds"),
+        "the FIFO's measurement must not be quoted at a socket: {err}"
+    );
+    // What a reader can act on: the form that DOES work, and why this one will not be made to.
+    assert!(
+        err.contains("DIRECTORY") && err.contains("control socket"),
+        "the refusal must give the working form and name what it is protecting: {err}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a box that never started is 125, like the FIFO case: {err}"
+    );
 }
 
 /// THE POD HOLDER MUST NOT CARRY A SECRET IT HAS NO USE FOR, and it has the longest life here.

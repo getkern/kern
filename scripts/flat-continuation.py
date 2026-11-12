@@ -39,8 +39,18 @@ REPO = Path(__file__).resolve().parent.parent
 #
 # TWELVE, AND THE NUMBER COMES FROM A MEASUREMENT, not from an impression. Count every run of spaces
 # between two lowercase letters inside a literal, across the whole tree: the longest legitimate one is
-# NINE, and every hit up to nine is YAML or a Dockerfile inside a fixture, where the alignment is
-# deliberate and is part of the data. The real defect instead carries the SOURCE'S INDENTATION, which
+# ELEVEN, and every hit up to it is YAML or a Dockerfile inside a fixture, or a column alignment in a
+# listing, where the alignment is deliberate and is part of the data.
+#
+# RE-MEASURED 2026-11-12, because the number had moved and the window it leaves is now known. Running
+# this gate with RUN = 10 reports exactly one line, `commands/system.rs` in `kern gc`'s listing:
+# `"  {d}           the link is removed…"`, where `{d}` is a colour escape and the eleven spaces put
+# the text under the column its neighbour aligns with `{:>9}`. That is data, not a flattening, so the
+# threshold stays above it. ⛔ The cost is a BLIND WINDOW at ten and eleven spaces, and a real defect
+# landed in it the same day: a message in `gpu_grant` carried a ten-space run from a continuation
+# eaten by an editing script, read wrong in the terminal, and passed this gate. Closing the window
+# would mean one false red on the line above, which is how a gate gets switched off; so it is recorded
+# here instead, and a message whose text looks spaced in the terminal is still worth reading twice. The real defect instead carries the SOURCE'S INDENTATION, which
 # for a literal nested in this codebase starts at sixteen; the one that made this gate necessary
 # carried thirty-five. Twelve sits above every legitimate case measured and far below the defect.
 #

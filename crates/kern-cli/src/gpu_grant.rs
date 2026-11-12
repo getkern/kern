@@ -1683,6 +1683,17 @@ pub enum GpuSpecError {
         /// What was passed, so the message can quote it.
         given: String,
     },
+    /// A `GPU-…` or `MIG-…` token that no card on this host carries.
+    ///
+    /// SEPARATE FROM `NotAnIndex`, because the two send a reader to different places: a typo in an
+    /// index is a typo, and a UUID that does not resolve is either the wrong machine or a card that
+    /// moved. The variant carries what the driver DOES publish so the message can show it.
+    UnknownUuid {
+        /// What was written.
+        given: String,
+        /// Every `GPU UUID` the driver lists, which is empty on a host with no driver.
+        known: Vec<String>,
+    },
 }
 
 /// Which cards `--gpus` asked for.
@@ -1750,6 +1761,19 @@ pub fn parse_gpu_spec(value: &str) -> Result<GpuSelection, GpuSpecError> {
     if lower == "all" || lower == "count=all" {
         return Ok(GpuSelection::All);
     }
+    // `-1` IS EVERY CARD, which is the Docker API's own convention (`DeviceRequest.Count = -1`) and
+    // what compose writes when a file says so directly. MEASURED against docker compose v5.0.2 on
+    // this host, two cards, the same reservation block:
+    //
+    //     count: -1   ->  the container saw 2 cards
+    //     count: 1    ->  1
+    //     count: 0    ->  0, and the container ran
+    //
+    // kern refused it with "not a number of cards", so a file docker runs died here. The grammar
+    // lives in ONE place, which is why this is read here and not translated in the compose layer.
+    if lower == "-1" || lower == "count=-1" {
+        return Ok(GpuSelection::All);
+    }
     if lower.split(',').any(|p| p.trim() == "all") {
         return Err(GpuSpecError::AllWithMore {
             given: trimmed.to_string(),
@@ -1762,6 +1786,30 @@ pub fn parse_gpu_spec(value: &str) -> Result<GpuSelection, GpuSpecError> {
         .strip_prefix("device=")
         .or_else(|| trimmed.strip_prefix("gpu="))
     {
+        // `device=all` IS EVERY CARD, and this is a measurement rather than a reading of a guide.
+        // On docker 29.1.3 on this host, with two cards:
+        //
+        //   docker run --gpus device=all alpine ls /dev/nvidia[0-9]*  ->  /dev/nvidia0 /dev/nvidia1
+        //   docker run --gpus all        alpine ls /dev/nvidia[0-9]*  ->  /dev/nvidia0 /dev/nvidia1
+        //   docker run --gpus device=0   alpine ls /dev/nvidia[0-9]*  ->  /dev/nvidia0
+        //
+        // kern refused it with "not a card index", and the form is in NVIDIA's and Triton's own
+        // pages. Note what the same measurement showed about the FLAG parse: docker accepted
+        // `--gpus device=nonsense` at the command line and only failed when it created the
+        // container, so the grammar cannot be measured without running one.
+        if list.trim().eq_ignore_ascii_case("all") {
+            return Ok(GpuSelection::All);
+        }
+        // `all` BESIDE INDICES is the same contradiction `all,2` is, and gets the same refusal:
+        // one of the two statements has to be the false one and kern does not pick.
+        if list
+            .split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("all"))
+        {
+            return Err(GpuSpecError::AllWithMore {
+                given: trimmed.to_string(),
+            });
+        }
         return parse_index_list(trimmed, list).map(GpuSelection::These);
     }
 
@@ -1809,6 +1857,192 @@ fn parse_index_list(whole: &str, list: &str) -> Result<Vec<u32>, GpuSpecError> {
         });
     }
     Ok(out)
+}
+
+/// [`parse_gpu_spec`], with any `GPU-…` token resolved to the card index the driver gives it.
+///
+/// WHY IT IS A SEPARATE FUNCTION. `parse_gpu_spec` has no host in front of it, which is what makes
+/// its grammar testable without hardware, and a UUID can only be resolved by reading what the
+/// driver publishes. So the host-reading half lives here, in one place, and every caller that has
+/// a root goes through this instead of pairing the two itself.
+///
+/// THE SHAPE COMES FROM DOCKER'S OWN REFERENCE, which documents `device_ids` as either indices or
+/// UUIDs: `device_ids: ['0', '3']` and `device_ids: ["GPU-ebc4a5d2"]`. Measured on 2026-11-12
+/// before this existed: a compose file carrying the UUID form was refused with
+/// `--gpus device=GPU-1950be8a-…: not a card index`, on a host where the CDI path resolved the very
+/// same UUID through the very same driver files. kern had the machinery and refused the shape.
+///
+/// `MIG-` IS ACCEPTED INTO THE LOOKUP and will simply not be found on a host without MIG, which is
+/// the honest outcome: the driver publishes no such UUID, and the message says what it does
+/// publish. Inventing a MIG answer here would be a claim about a mode this binary does not support.
+/// Split a `--gpus` value on commas that are NOT inside double quotes.
+///
+/// Docker's grammar needs this and documents why: "the device value must be quoted because it
+/// contains a comma", as in `--gpus '"device=0,2"'` and `--gpus 'all,"capabilities=compute,utility"'`.
+/// The shell removes the single quotes, so the value that arrives here still carries the doubles.
+fn comma_tokens(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for ch in value.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(ch),
+        }
+    }
+    out.push(cur);
+    out.into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// The `capabilities=` token Docker takes inside `--gpus`, and what kern does about it.
+///
+/// MEASURED 2026-11-12: `--gpus 'all,"capabilities=compute,utility"'`, which NVIDIA's own
+/// documentation prints, was refused with "`all` and anything beside it name different things and
+/// only one can be true" - a message about a contradiction that is not there, naming nothing the
+/// caller wrote.
+///
+/// IT IS SATISFIED BY CONSTRUCTION AND SAYING SO IS THE POINT. Docker uses the list to decide which
+/// driver libraries and binaries to inject; a kern grant binds the driver's library set wholesale
+/// (29 libraries on the host this was measured on), so `compute`, `utility`, `video` and the rest
+/// are all present whether or not they were asked for. kern therefore accepts the token and reports
+/// that it selected nothing, because a request silently exceeded is still a request whose answer the
+/// caller cannot see.
+pub fn capabilities_note(spec: &str) -> Option<String> {
+    let asked: Vec<String> = comma_tokens(spec)
+        .into_iter()
+        .filter_map(|t| {
+            let lower = t.to_ascii_lowercase();
+            lower
+                .strip_prefix("capabilities=")
+                .map(|rest| rest.to_string())
+        })
+        .collect();
+    if asked.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "--gpus capabilities={} selects nothing here, and nothing is missing: a grant binds the \
+         driver's whole library set, so every capability in that list is present and so are the \
+         others. Docker uses the list to choose which libraries to inject; kern does not choose",
+        asked.join(",")
+    ))
+}
+
+/// THE THREE WORDS THAT MEAN "NO GPU" in the device list, which docker honours and kern refused.
+///
+/// MEASURED against docker 29.1.3 on a two-card host, `--gpus '"device=<x>"'` with alpine listing
+/// `/dev/nvidia[0-9]*`:
+///
+/// ```text
+/// device=none      ->  0 cards, and the container RAN
+/// device=void      ->  0 cards, and the container RAN
+/// device=nonsense  ->  docker refuses the flag
+/// device=99        ->  docker refuses the flag
+/// ```
+///
+/// So they are sentinels, not garbage docker happens to swallow: they carry the
+/// `NVIDIA_VISIBLE_DEVICES=none|void` meaning into the flag. kern answered "not a card index",
+/// which is the same inconsistency the compose layer had with `count: 0` until today: a request
+/// for ZERO cards is a request, and refusing it kills a command that runs everywhere else.
+const NO_GPU_WORDS: [&str; 2] = ["none", "void"];
+
+/// Does this spec ask for NO card? One reader for the words, used by the surfaces that announce it.
+pub fn asks_for_no_gpu(spec: &str) -> bool {
+    let t = spec.trim().trim_matches('"').trim().to_ascii_lowercase();
+    let body = t
+        .strip_prefix("device=")
+        .or_else(|| t.strip_prefix("gpu="))
+        .unwrap_or("");
+    NO_GPU_WORDS.contains(&body)
+}
+
+/// The one line for a spec that asks for no card, so both surfaces say it the same way.
+pub fn describe_no_gpu(spec: &str) -> String {
+    format!(
+        "--gpus {spec} asks for NO card, which is what it means in docker too \
+         (NVIDIA_VISIBLE_DEVICES=none|void), so this box gets none and nothing was refused"
+    )
+}
+
+/// [`selection_from_spec`], where `Ok(None)` means the caller asked for NO card.
+///
+/// The outer `Option` is how the callers already spell "no `--gpus` given", so a spec that asks for
+/// nothing lands on the same path as not passing the flag: the box gets no grant and nothing in the
+/// GPU plumbing has to learn a fourth selection.
+pub fn selection_from_spec(root: &Path, spec: &str) -> Result<Option<GpuSelection>, GpuSpecError> {
+    // THE SENTINELS FIRST, before the grammar, because `device=none` is not an index list and the
+    // grammar is right to say so.
+    if asks_for_no_gpu(spec) {
+        return Ok(None);
+    }
+    selection_from_spec_inner(root, spec).map(Some)
+}
+
+fn selection_from_spec_inner(root: &Path, spec: &str) -> Result<GpuSelection, GpuSpecError> {
+    // THE CAPABILITIES TOKEN IS DROPPED BEFORE THE GRAMMAR SEES IT, and here rather than in
+    // `parse_gpu_spec` on purpose: that function is the grammar, it is tested without a host, and
+    // this is Docker-compatibility sugar for a request kern answers by construction. The caller
+    // prints `capabilities_note` beside the result.
+    let tokens = comma_tokens(spec);
+    let had_caps = tokens
+        .iter()
+        .any(|t| t.to_ascii_lowercase().starts_with("capabilities="));
+    let without_caps: String = tokens
+        .into_iter()
+        .filter(|t| !t.to_ascii_lowercase().starts_with("capabilities="))
+        .collect::<Vec<_>>()
+        .join(",");
+    // ONLY WHEN THERE WAS ONE, so every other spec reaches the grammar byte for byte as it was
+    // typed and the quoting the grammar already handles is not second-guessed here.
+    let spec: &str = if had_caps && !without_caps.is_empty() {
+        &without_caps
+    } else {
+        spec
+    };
+    let trimmed = spec.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let body = lower
+        .strip_prefix("device=")
+        .or_else(|| lower.strip_prefix("gpu="))
+        .is_some();
+    // ONLY INSIDE AN INDEX LIST. A bare `GPU-…` with no `device=` in front of it is not a shape
+    // either runtime accepts, and rewriting it would invent a spelling for the user.
+    if !body || (!lower.contains("gpu-") && !lower.contains("mig-")) {
+        return parse_gpu_spec(spec);
+    }
+    let (prefix, list) = trimmed.split_once('=').unwrap_or(("device", trimmed));
+    let table = crate::cdi::uuid_minors(root);
+    let mut rewritten: Vec<String> = Vec::new();
+    for part in list.split(',') {
+        let token = part.trim().trim_matches('"').trim_matches('\'');
+        let upper = token.to_ascii_uppercase();
+        if !upper.starts_with("GPU-") && !upper.starts_with("MIG-") {
+            rewritten.push(token.to_string());
+            continue;
+        }
+        // CASE-INSENSITIVE on the UUID, because `nvidia-smi` prints it lower case and a file may
+        // carry either. The driver's own string is the one compared against.
+        match table
+            .iter()
+            .find(|(u, _)| u.eq_ignore_ascii_case(token))
+            .map(|(_, m)| *m)
+        {
+            Some(minor) => rewritten.push(minor.to_string()),
+            None => {
+                return Err(GpuSpecError::UnknownUuid {
+                    given: token.to_string(),
+                    known: table.into_iter().map(|(u, _)| u).collect(),
+                });
+            }
+        }
+    }
+    parse_gpu_spec(&format!("{prefix}={}", rewritten.join(",")))
 }
 
 /// Why a grant cannot be turned into mounts.
@@ -2207,6 +2441,11 @@ mod tests {
     /// The helper derives the mode from those rules rather than taking it, so no fixture can state
     /// a node that two kernel interfaces would describe differently, and so a reader cannot repeat
     /// the defect these cases exist for by writing the mask into `group_obj`.
+    // EIGHT ARGUMENTS ON PURPOSE: they are the fields of a POSIX ACL, and the whole point of the
+    // helper is that a fixture cannot state a node the two kernel interfaces would describe
+    // differently. Grouping them into a struct would put the same eight values one indirection
+    // away and let a caller build the struct wrong, which is the defect these cases exist for.
+    #[allow(clippy::too_many_arguments)]
     fn acl_node(
         uid: u32,
         gid: u32,
@@ -3098,6 +3337,171 @@ mod tests {
     /// a symlink to `/usr/lib` and the same link inode is reached twice. That is the same mistake
     /// the library sweep already made once, made a second time in the same file, and the real host
     /// was again the only thing that could see it. A hard-linked tree cannot reproduce a symlink's
+    /// THE `capabilities=` TOKEN NVIDIA'S OWN DOCUMENTATION PRINTS is accepted, and said out loud.
+    ///
+    /// MEASURED 2026-11-12: `--gpus 'all,"capabilities=compute,utility"'`, which
+    /// docs.nvidia.com prints for Docker, was refused with "`all` and anything beside it name
+    /// different things and only one can be true" - a contradiction that is not there, and a
+    /// message naming nothing the caller wrote.
+    #[test]
+    fn the_capabilities_token_is_accepted_and_reported_rather_than_refused() {
+        let root = std::env::temp_dir().join(format!("kern-gpu-caps-{}", std::process::id()));
+        // NO DRIVER UNDER THIS ROOT ON PURPOSE: these cases carry no UUID, so nothing here should
+        // read the filesystem at all, and a root with nothing in it proves it.
+        let _ = std::fs::create_dir_all(&root);
+
+        // THE QUOTING IS DOCKER'S: the shell removes the single quotes and the doubles arrive.
+        assert_eq!(
+            selection_from_spec(&root, "all,\"capabilities=compute,utility\""),
+            Ok(Some(GpuSelection::All))
+        );
+        assert_eq!(
+            selection_from_spec(&root, "device=0,\"capabilities=compute\""),
+            Ok(Some(GpuSelection::These(vec![0])))
+        );
+        // A single capability needs no quotes, and a comma-bearing one must not be split.
+        assert_eq!(
+            selection_from_spec(&root, "all,capabilities=compute"),
+            Ok(Some(GpuSelection::All))
+        );
+        let note = capabilities_note("all,\"capabilities=compute,utility\"")
+            .expect("the token must be reported");
+        assert!(note.contains("compute,utility"), "{note}");
+        assert!(
+            note.contains("binds the driver's whole library set"),
+            "the note must say why nothing is missing: {note}"
+        );
+        // AND SILENCE WHERE THERE IS NO TOKEN, on every other shape, or the note becomes noise on
+        // every GPU box.
+        for quiet in ["all", "2", "count=2", "device=0,1", "\"device=0,2\""] {
+            assert_eq!(
+                capabilities_note(quiet),
+                None,
+                "{quiet} is not a capability"
+            );
+        }
+
+        // THE QUOTE-AWARE SPLIT, which is what makes the above work: a comma inside quotes is part
+        // of the value, and `"device=0,2"` must stay ONE token.
+        assert_eq!(
+            comma_tokens("\"device=0,2\""),
+            vec!["device=0,2".to_string()]
+        );
+        assert_eq!(
+            comma_tokens("all,\"capabilities=compute,utility\""),
+            vec![
+                "all".to_string(),
+                "capabilities=compute,utility".to_string()
+            ]
+        );
+        // AND THE GRAMMAR IS UNTOUCHED for the shape Docker documents with the whole value quoted:
+        // this host's own measurement of `--gpus '"device=0,1"'` is two cards.
+        assert_eq!(
+            selection_from_spec(&root, "\"device=0,1\""),
+            Ok(Some(GpuSelection::These(vec![0, 1])))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A GPU UUID RESOLVES TO THE CARD THE DRIVER GIVES IT, which is a shape Docker documents
+    /// (`device_ids: ["GPU-ebc4a5d2"]`) and this flag refused until 2026-11-12 with
+    /// `not a card index`, on a host where the CDI path resolved the same UUID from the same files.
+    #[test]
+    fn a_gpu_uuid_in_a_spec_resolves_to_its_card_and_an_unknown_one_names_what_is_here() {
+        let root = std::env::temp_dir().join(format!("kern-gpu-uuid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // TWO CARDS WITH THE NUMBERS CROSSED, so a resolver that answers with the directory's
+        // order, or always with zero, fails here. `0000:06:00.0` sorts second and carries minor 0.
+        for (addr, uuid, minor) in [
+            ("0000:01:00.0", "GPU-aaaaaaaa-1111", 1),
+            ("0000:06:00.0", "GPU-bbbbbbbb-2222", 0),
+        ] {
+            let dir = root.join("proc/driver/nvidia/gpus").join(addr);
+            std::fs::create_dir_all(&dir).expect("gpus dir");
+            std::fs::write(
+                dir.join("information"),
+                format!("Model: \t NVIDIA Test\nGPU UUID: \t {uuid}\nDevice Minor: \t {minor}\n"),
+            )
+            .expect("information");
+        }
+
+        assert_eq!(
+            selection_from_spec(&root, "device=GPU-aaaaaaaa-1111"),
+            Ok(Some(GpuSelection::These(vec![1]))),
+            "the UUID must resolve to the minor the driver published, not to the directory order"
+        );
+        // CASE-INSENSITIVE, because `nvidia-smi` prints lower case and a file may carry either.
+        assert_eq!(
+            selection_from_spec(&root, "device=gpu-bbbbbbbb-2222"),
+            Ok(Some(GpuSelection::These(vec![0])))
+        );
+        // MIXED, which is the shape a file ends up with when one card is pinned by UUID.
+        assert_eq!(
+            selection_from_spec(&root, "device=0,GPU-aaaaaaaa-1111"),
+            Ok(Some(GpuSelection::These(vec![0, 1])))
+        );
+        // UNKNOWN, with what the host DOES publish, sorted so the message is stable.
+        match selection_from_spec(&root, "device=GPU-nope") {
+            Err(GpuSpecError::UnknownUuid { given, known }) => {
+                assert_eq!(given, "GPU-nope");
+                assert_eq!(
+                    known,
+                    vec![
+                        "GPU-aaaaaaaa-1111".to_string(),
+                        "GPU-bbbbbbbb-2222".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected UnknownUuid, got {other:?}"),
+        }
+        // THE GRAMMAR IS UNTOUCHED where no UUID appears: these must answer exactly as the pure
+        // parser does, so the wrapper cannot become a second grammar.
+        for spec in ["all", "2", "count=2", "device=0,1", "0", ""] {
+            assert_eq!(
+                selection_from_spec(&root, spec),
+                parse_gpu_spec(spec).map(Some),
+                "the wrapper changed the answer for {spec:?}"
+            );
+        }
+        // ⛔ THE THREE WORDS THAT MEAN NO CARD. Measured against docker 29.1.3 on a two-card host:
+        // `--gpus '"device=none"'` and `device=void` run the container with 0 nodes, while
+        // `device=nonsense` and `device=99` are refused by docker itself. They are sentinels, not
+        // garbage, and kern answered "not a card index" to all four.
+        for none in [
+            "device=none",
+            "device=void",
+            "gpu=none",
+            "DEVICE=NONE",
+            "\"device=none\"",
+        ] {
+            assert_eq!(
+                selection_from_spec(&root, none),
+                Ok(None),
+                "{none:?} asks for no card"
+            );
+            assert!(asks_for_no_gpu(none), "{none:?}");
+            assert!(
+                describe_no_gpu(none).contains("NO card"),
+                "the sentence must say what happened: {}",
+                describe_no_gpu(none)
+            );
+        }
+        // AND NOT THE ONES DOCKER REFUSES, or kern would swallow a typo docker catches.
+        for bad in ["device=nonsense", "device=99", "device=no", "none", "void"] {
+            assert!(
+                !asks_for_no_gpu(bad),
+                "{bad:?} is not one of docker's sentinels"
+            );
+        }
+        // AND A BARE UUID WITH NO `device=` IS NOT REWRITTEN: inventing that spelling would accept
+        // a shape neither runtime does.
+        assert_eq!(
+            selection_from_spec(&root, "GPU-aaaaaaaa-1111"),
+            parse_gpu_spec("GPU-aaaaaaaa-1111").map(Some)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A WRITE ALLOWLIST THAT DOES NOT NAME THE NODES IS REPORTED, and one that does is silent.
     ///
     /// THE FIELD CASE, measured on 2026-11-12 on a two-card host: `kern run -- python3 gpu_work.py`
@@ -3182,7 +3586,7 @@ mod tests {
         // 2. THE DEVICE DIRECTORY COVERS THE NODES AND NOT THE OTHER HALF, which is exactly the
         //    case that was measured failing with 304 while every node was named.
         let dev = root.join("dev").display().to_string();
-        let only_proc = cuda_write_paths_outside_allowlist(&grant, &[dev.clone()]);
+        let only_proc = cuda_write_paths_outside_allowlist(&grant, std::slice::from_ref(&dev));
         assert_eq!(
             only_proc,
             vec![PathBuf::from("/proc/self/task")],
@@ -3201,7 +3605,7 @@ mod tests {
         // 4. NAMING ONE NODE COVERS THAT ONE ONLY, so the list is a real difference and not a
         //    yes-or-no.
         let one = grant.all_nodes()[0].0.display().to_string();
-        let rest = cuda_write_paths_outside_allowlist(&grant, &[one.clone()]);
+        let rest = cuda_write_paths_outside_allowlist(&grant, std::slice::from_ref(&one));
         assert!(
             !rest.iter().any(|p| p.display().to_string() == one),
             "the named node is still reported as missing"
@@ -3720,6 +4124,18 @@ mod tests {
             ("all", GpuSelection::All),
             ("ALL", GpuSelection::All),
             ("count=all", GpuSelection::All),
+            // `device=all` IS EVERY CARD, measured against docker 29.1.3 on a two-card host:
+            // `docker run --gpus device=all alpine ls /dev/nvidia[0-9]*` answers
+            // `/dev/nvidia0 /dev/nvidia1`, the same as `--gpus all`. kern refused it with "not a
+            // card index", and the form is printed in NVIDIA's and Triton's own pages.
+            ("device=all", GpuSelection::All),
+            ("device=ALL", GpuSelection::All),
+            ("gpu=all", GpuSelection::All),
+            ("\"device=all\"", GpuSelection::All),
+            // `-1` is the Docker API's "all", which is what `docker compose` writes: measured,
+            // `count: -1` on compose v5.0.2 handed the container both cards of a two-card host.
+            ("-1", GpuSelection::All),
+            ("count=-1", GpuSelection::All),
         ] {
             assert_eq!(parse_gpu_spec(good), Ok(want), "{good:?}");
         }
@@ -3732,7 +4148,18 @@ mod tests {
         );
         // `all` BESIDE ANYTHING is refused rather than resolved either way: whichever way it went,
         // half of what the caller wrote would be discarded in silence.
-        for mixed in ["all,1", "2,all", "device=0,all"] {
+        // ⛔ `all` FIRST INSIDE THE LIST IS ITS OWN CASE. The check that catches a bare `all`
+        // beside indices reads the WHOLE value and splits it on commas, so `device=0,all` has a
+        // token that trims to `all` and `device=all,0` does not: its first token is `device=all`.
+        // Deleting the guard inside the `device=` branch left this test green until these two rows
+        // were added, which is the test being wrong rather than the branch being dead.
+        for mixed in [
+            "all,1",
+            "2,all",
+            "device=0,all",
+            "device=all,0",
+            "gpu=all,1",
+        ] {
             match parse_gpu_spec(mixed) {
                 Err(GpuSpecError::AllWithMore { given }) => assert_eq!(given, mixed),
                 other => panic!("{mixed:?} should be AllWithMore, got {other:?}"),
@@ -3748,7 +4175,10 @@ mod tests {
         // A bare value that is not a number is a COUNT that failed, and the message has to say so:
         // telling a caller "not a card index" would point them at `device=` when what they wrote
         // was in the count position.
-        for bad in ["x", "first", "2.5", "-1", "0x1", "count=x", "count="] {
+        // ⛔ `-1` LEFT THIS LIST on 2026-11-12: it is the Docker API's convention for "all", and
+        // `docker compose` v5.0.2 resolves `count: -1` to every card (measured on a two-card host),
+        // so a file docker runs was dying here. `-2` and the rest stay refused.
+        for bad in ["x", "first", "2.5", "-2", "0x1", "count=x", "count="] {
             match parse_gpu_spec(bad) {
                 Err(GpuSpecError::NotACount { given }) => assert_eq!(given, bad.trim()),
                 other => panic!("{bad:?} should be NotACount, got {other:?}"),

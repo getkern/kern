@@ -580,6 +580,19 @@ fn guarded_identities() -> Vec<(u64, u64)> {
 ///  * a `mount --bind` ALIAS whose canonical path is elsewhere but whose dev/ino is the root or a
 ///    non-box-data child (identity, which the path check alone would wave through).
 pub fn path_overlaps_trusted_state(src: &Path) -> bool {
+    trusted_state_overlap(src).is_some()
+}
+
+/// WHICH piece of kern's own state `src` overlaps, so a refusal can name it.
+///
+/// ⛔ MEASURED ON A WSLg HOST, where `XDG_RUNTIME_DIR` is `/mnt/wslg/runtime-dir`: a
+/// `-v /mnt/wslg:/mnt/wslg`, which is the mount Microsoft's own container sample tells a reader to
+/// make for a GUI app, was refused with "refusing to mount the kern registry (/mnt/wslg)". That
+/// sentence asserts /mnt/wslg IS the registry. It is not: the registry is
+/// /mnt/wslg/runtime-dir/kern, two levels further down, and the reader is left looking for a kern
+/// directory where Microsoft told them to look for a display socket. The refusal is right and the
+/// naming was wrong, which is why this returns the path instead of a bool.
+pub fn trusted_state_overlap(src: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     // THE KEPT-BOX STORE IS THE SECOND ROOT, and it is refused by the same three shapes. It holds
     // the `kern box` command line `kern start` replays, which makes it the one piece of state under
@@ -601,15 +614,13 @@ pub fn path_overlaps_trusted_state(src: &Path) -> bool {
     if let Some(store) = crate::keepbox::boxes_dir().parent() {
         if let Some(verdict) = mount_refused_by_path(src, store) {
             if verdict {
-                return true;
+                return Some(store.to_path_buf());
             }
         }
     }
-    let Some(root) = registry_root() else {
-        return false;
-    };
+    let root = registry_root()?;
     if let Some(verdict) = mount_refused_by_path(src, &root) {
-        return verdict;
+        return verdict.then(|| root.clone());
     }
     // Not under the root by path. Only a `mount --bind` ALIAS remains (a different canonical path
     // carrying a registry dir's dev/ino). A bind alias shares the registry FILESYSTEM's device, so a
@@ -618,12 +629,16 @@ pub fn path_overlaps_trusted_state(src: &Path) -> bool {
     // real disk not the runtime tmpfs, hits exactly this fall-through). `root` is resolved ONCE here and
     // in `mount_refused_by_path` above.
     let (Ok(sm), Ok(rm)) = (fs::metadata(src), fs::metadata(&root)) else {
-        return false;
+        return None;
     };
     if sm.dev() != rm.dev() {
-        return false;
+        return None;
     }
-    guarded_identities().contains(&(sm.dev(), sm.ino()))
+    // A BIND ALIAS carries a registry directory's identity under another name, so the thing to name
+    // in a refusal is the registry it IS, not the alias the caller wrote.
+    guarded_identities()
+        .contains(&(sm.dev(), sm.ino()))
+        .then(|| root.clone())
 }
 
 /// Whether a FILE written at `parent/name` lands on trust-bearing registry state: the WRITE-side
@@ -1088,6 +1103,61 @@ fn runtime_subdir_uncached(leaf: &str) -> io::Result<PathBuf> {
         }
     }
     Err(last_err)
+}
+
+/// Refuse a registry directory anyone but its owner can write.
+///
+/// ⛔ THE COMMENT ABOVE STATES AN ASSUMPTION AND THIS CHECKS IT. "`$XDG_RUNTIME_DIR` /
+/// `/run/user/<uid>` are already owner-only" is true on a systemd host and FALSE on WSLg, where
+/// `XDG_RUNTIME_DIR` is `/mnt/wslg/runtime-dir`, created `drwxrwxrwx` by Microsoft's own session
+/// setup (measured 2026-11-12). `DirBuilder` sets the mode only on components it CREATES, so a
+/// `kern/` that already exists keeps whatever mode it has.
+///
+/// MEASURED, which is why this is a refusal and not a note: with `$XDG_RUNTIME_DIR/kern` created
+/// `0777` in advance, kern ADOPTED it, filled it with `claims env instances logs runstats scratch`,
+/// and started a box. That directory is the state kern's own mount refusal describes as the thing a
+/// writer could use to "forge another box's recorded capability/seccomp posture and elevate its own
+/// `kern exec`", so a world-writable one is the same hole with the door already open.
+///
+/// ⛔ IT DOES NOT `chmod`. A rule bought with a measured failure: tightening a runtime dir kern did
+/// not create broke every box on a WSL host. The refusal names the path and the mode and stops.
+///
+/// Both the leaf and the `kern/` directory above it are checked: a 0700 `instances` under a 0777
+/// `kern` can still be renamed out from under this process.
+pub(crate) fn state_dir_is_private() -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let me = unsafe { libc::geteuid() };
+    // THE ROOT AND THE DIRECTORY ABOVE IT. A 0700 `kern/` under a world-writable runtime dir can
+    // still be renamed out from under this process, so the parent is part of the question; it is
+    // reported separately below because kern does not own it and cannot fix it.
+    let Some(root) = registry_root() else {
+        return Ok(());
+    };
+    for dir in [root.as_path()] {
+        let Ok(m) = fs::metadata(dir) else {
+            continue;
+        };
+        let mode = m.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{} is mode {mode:o}: group or world writable. kern keeps the records that decide \
+                 a box's capabilities and seccomp posture there, so another writer could forge \
+                 them. kern creates its own directories 0700 and will not loosen or tighten one it \
+                 did not create: remove it, or point XDG_RUNTIME_DIR at a directory only you can \
+                 write",
+                dir.display()
+            ));
+        }
+        if m.uid() != me {
+            return Err(format!(
+                "{} belongs to uid {} and this process is uid {me}. kern keeps trust-bearing box \
+                 records there and will not adopt another user's directory",
+                dir.display(),
+                m.uid()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The first already-EXISTING candidate for a registry subdir, or `None` - the non-creating sibling of
@@ -2913,6 +2983,79 @@ mod tests {
             shown.starts_with('/') && shown.ends_with("instances"),
             "a path was expected even with nothing on disk, got {shown:?}"
         );
+    }
+
+    /// ⛔ A WORLD- OR GROUP-WRITABLE REGISTRY IS REFUSED, and an owner-only one is not.
+    ///
+    /// MEASURED 2026-11-12: with `$XDG_RUNTIME_DIR/kern` created 0777 in advance, kern adopted it,
+    /// filled it with `claims env instances logs runstats scratch waitexit` and started a box. The
+    /// records in there decide a box's capabilities and seccomp posture, and kern's own `-v` refusal
+    /// describes a writer of them as able to forge another box's posture.
+    ///
+    /// THE PARENT CASE IS REAL, NOT INVENTED: on WSLg `XDG_RUNTIME_DIR` is `/mnt/wslg/runtime-dir`,
+    /// created `drwxrwxrwx` by Microsoft's own session setup, while kern's `kern/` under it is 0700.
+    /// That is the shape this check must PASS, or kern would refuse to run on WSL at all.
+    #[test]
+    fn a_registry_dir_anyone_can_write_is_refused_and_an_owner_only_one_is_not() {
+        let _g = crate::env_guard();
+        let base = std::env::temp_dir().join(format!("kern-priv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("kern")).expect("make a runtime dir");
+        let prev = crate::global_env("XDG_RUNTIME_DIR");
+        struct Restore(Option<std::ffi::OsString>, PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+                    None => crate::unset_global_env("XDG_RUNTIME_DIR"),
+                }
+                let _ = fs::remove_dir_all(&self.1);
+            }
+        }
+        let _restore = Restore(prev, base.clone());
+        crate::set_global_env("XDG_RUNTIME_DIR", &base);
+
+        let set = |mode: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(base.join("kern"), fs::Permissions::from_mode(mode))
+                .expect("chmod the fixture");
+        };
+
+        // THE WSLg SHAPE FIRST, which is the positive control: a world-writable PARENT with kern's
+        // own directory owner-only must pass, or this check would stop kern running on WSL.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o777)).expect("chmod parent");
+        }
+        set(0o700);
+        assert_eq!(
+            state_dir_is_private(),
+            Ok(()),
+            "an owner-only kern/ under a world-writable parent is the WSLg shape and must pass"
+        );
+
+        for mode in [0o777, 0o770, 0o707, 0o702, 0o720] {
+            set(mode);
+            let err = state_dir_is_private().expect_err(&format!("{mode:o} must be refused"));
+            assert!(
+                err.contains(&format!("mode {mode:o}")),
+                "the refusal must name the mode it saw: {err}"
+            );
+            assert!(
+                err.contains("capabilities and seccomp posture"),
+                "and say what is kept there: {err}"
+            );
+        }
+        // AND EVERY OWNER-ONLY MODE PASSES, including the ones that are merely unusual.
+        for mode in [0o700, 0o750, 0o755, 0o500] {
+            set(mode);
+            assert_eq!(
+                state_dir_is_private(),
+                Ok(()),
+                "{mode:o} is owner-writable only"
+            );
+        }
+        set(0o700);
     }
 
     /// A memoised runtime path must stop being returned once the directory it names is gone.

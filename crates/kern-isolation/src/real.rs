@@ -1068,7 +1068,9 @@ fn mask_proc_dir_keeping(dir: &str, keep: &[String]) -> Result<(), Error> {
         if unsafe { libc::umount2(dir_c.as_ptr(), libc::MNT_DETACH) } != 0 {
             let why = std::io::Error::last_os_error();
             eprintln!(
-                "kern: warning: could not undo the GPU enumeration mask on {dir}: {why}. The box                  will see no card in the driver's own directory, including one it was granted; the                  device nodes themselves are unaffected.",
+                "kern: warning: could not undo the GPU enumeration mask on {dir}: {why}. The box \
+                 will see no card in the driver's own directory, including one it was granted; \
+                 the device nodes themselves are unaffected.",
             );
         }
     };
@@ -2162,6 +2164,150 @@ fn box_start_exit_code(e: &Error) -> i32 {
 /// found, missing loader, or a dropped-uid permission error), or a generic setup-failure line for any
 /// other error. Shared by the direct-exec path and the `--init` workload child so both give the same
 /// hint. Does not exit - the caller `_exit`s.
+/// The driver's own command-line tools, as the set docker's NVIDIA runtime injects for the
+/// `utility` capability.
+///
+/// MEASURED on this host, which has all of them in `/usr/bin`. The list is NVIDIA's, not a guess:
+/// `libnvidia-container` injects `nvidia-smi`, `nvidia-debugdump`, `nvidia-persistenced`,
+/// `nvidia-cuda-mps-control` and `nvidia-cuda-mps-server` when `utility` is asked for. kern binds
+/// none of them, because a grant is device nodes plus the driver's libraries.
+const DRIVER_TOOLS: [&str; 5] = [
+    "nvidia-smi",
+    "nvidia-debugdump",
+    "nvidia-persistenced",
+    "nvidia-cuda-mps-control",
+    "nvidia-cuda-mps-server",
+];
+
+/// The tool's bare name, whether the caller typed it bare or as a path.
+fn driver_tool_name(cmd: &str) -> &str {
+    cmd.rsplit('/').next().unwrap_or(cmd)
+}
+
+/// Is `cmd` one of the driver's own tools, written either way?
+///
+/// Exported because a HEALTHCHECK that runs one of them can never pass in a kern box, and the
+/// surfaces that accept a health command (`kern box --health-cmd`, compose's `healthcheck:`) have to
+/// say so before the box spends its life `unhealthy`. They ask the runtime rather than carrying a
+/// second copy of the list, which is the same rule `x-kern-security-profile` already follows.
+pub fn is_driver_tool(cmd: &str) -> bool {
+    DRIVER_TOOLS.contains(&driver_tool_name(cmd))
+}
+
+/// Where the box's own filesystem has `cmd`, if it has it at all.
+///
+/// ⛔ ENOENT FROM `execvp` DOES NOT MEAN THE FILE IS ABSENT, and the hint used to say it did.
+/// MEASURED on a WSL2 Alpine host: with `/usr/lib/wsl/lib/nvidia-smi` bound to `/usr/bin/nvidia-smi`
+/// the box's own `ls -l` shows it, 845304 bytes, and running it answers "not found", because the
+/// file is an x86-64 ELF built against glibc and that rootfs has only `/lib/ld-musl-x86_64.so.1`.
+/// The kernel reports a missing INTERPRETER with the same errno as a missing file.
+///
+/// This runs in the forked child, inside the box's mount namespace, so these paths are the BOX's.
+/// The bare-name case looks where a PATH lookup would, which is the only way to tell the two causes
+/// apart for a command written without a slash.
+fn found_in_box(cmd: &str) -> Option<String> {
+    if cmd.contains('/') {
+        return std::fs::symlink_metadata(cmd).ok().map(|_| cmd.to_string());
+    }
+    for dir in ["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"] {
+        let p = format!("{dir}/{cmd}");
+        if std::fs::symlink_metadata(&p).is_ok() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Is a GPU granted to the box this code is running inside?
+///
+/// `/dev/nvidiactl` is the one node EVERY grant binds, whichever card was named: measured in a box
+/// started with `--gpus device=0` (present) and in one started without the flag (absent). This runs
+/// in the forked child, inside the box's mount namespace, so it answers about the BOX and not about
+/// the host - the host's node would say yes on any machine with a driver installed.
+fn box_has_gpu_grant() -> bool {
+    std::fs::metadata("/dev/nvidiactl").is_ok()
+}
+
+/// The hint for one of the driver's own tools that `execvp` could not run, or `None` for any other
+/// command.
+///
+/// THE MOST COPIED VERIFICATION COMMAND IN THE GPU WORLD ends up here. Every guide, NVIDIA's own
+/// included, says to check a GPU container with `docker run --gpus all nvidia/cuda:…-base
+/// nvidia-smi`. MEASURED 2026-11-12: that image ships NO nvidia-smi (the `base` flavour has the
+/// runtime libraries and nothing else), because docker's NVIDIA runtime INJECTS the binary from the
+/// host when the capability list carries `utility`. kern binds the driver's LIBRARIES and not its
+/// BINARIES, so the command is absent and the generic hint sent the reader to look for a full path
+/// or a missing loader, which are not the cause.
+///
+/// WHAT IS ALREADY THERE IS THE CAPABILITY, measured in a granted box: `libnvidia-ml.so` and its two
+/// links are bound, `nvmlInit` returns 0, the device count is the granted card and
+/// `nvmlDeviceGetName` answers. So nothing is missing except the tool, and the remedy was RUN before
+/// being written here: with `-v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro` added, `nvidia-smi -L`
+/// inside `nvidia/cuda:12.9.0-base-ubuntu22.04` prints the granted card and only that one, and in a
+/// `debian:12` box granted `device=0` it prints that card's UUID and no other.
+///
+/// THE HOST IS NOT CONSULTED, and cannot be: this runs in the forked child, inside the box's mount
+/// namespace, so a `stat` here answers about the box.
+///
+/// ⛔ WHICH IS WHY IT NAMES BOTH PATHS. The first version printed `-v /usr/bin/nvidia-smi:...`
+/// alone, and MEASURED on a WSL2 host that path does not exist: there the driver ships under
+/// /usr/lib/wsl/lib and /usr/bin holds no nvidia-smi at all (Microsoft documents mapping
+/// /usr/lib/wsl into containers for exactly this reason). A remedy that cannot work on the host
+/// reading it is worse than no remedy.
+///
+/// ⛔ ONE SPELLING, BECAUSE ONE OF THE TWO PATHS HAD IT AND THE OTHER DID NOT. This text was written
+/// for the box's PID 1, and `kern exec` fell through to a bare `exec failed: execvp failed: No such
+/// file or directory`. That is the first command a reader types after granting a card
+/// (`kern exec <box> -- nvidia-smi`), and MEASURED 2026-11-12 it answered exit 127 and not one word
+/// about why, on a box whose grant was correct and whose two cards `kern inspect` was listing in the
+/// same second. A hint that lives on one of two paths is a hint the reader meets by luck. Both paths
+/// call this now, so the two cannot drift - the recurring defect in this repo is one derived
+/// condition computed in two places.
+///
+/// THE THIRD BRANCH IS NOT COSMETIC. A box with no grant has no device node and no driver library
+/// either, so sending its owner to bind a BINARY would hide the actual cause and cost them a round
+/// trip. One `stat` separates the two, and it is the same `stat` in both, so the three branches are
+/// exclusive by construction.
+fn driver_tool_hint(cmd: &str) -> Option<String> {
+    if !is_driver_tool(cmd) {
+        return None;
+    }
+    let tool = driver_tool_name(cmd);
+    Some(match found_in_box(cmd) {
+        // THE FILE IS IN THE BOX, so this is its loader and not the grant. MEASURED on a WSL2 Alpine
+        // host: the vendor's nvidia-smi is a glibc x86-64 ELF and that rootfs ships only musl's
+        // loader, so the bind lands the file and the exec still answers ENOENT. Saying "bind it in"
+        // there would send a reader to do what they already did.
+        Some(path) => format!(
+            "hint: {path} IS in this box, so what is missing is its interpreter: the driver's tools \
+             are built against glibc, and a musl rootfs (alpine and friends) has no \
+             /lib64/ld-linux-x86-64.so.2 to run them. Bind it into a glibc image instead, or ask \
+             NVML directly: libnvidia-ml.so.1 is already here and answers for the granted card."
+        ),
+        None if box_has_gpu_grant() => format!(
+            "hint: that is one of the driver's own tools, and a GPU grant binds the driver's \
+             LIBRARIES, not its binaries: docker's NVIDIA runtime injects them from the host and \
+             kern does not. NVML is already in the box, so anything linking libnvidia-ml.so.1 works \
+             as it is. For the tool itself, bind it in from wherever this host's driver put it \
+             (`command -v {tool}` there): -v /usr/bin/{tool}:/usr/bin/{tool}:ro on a normal \
+             install, and -v /usr/lib/wsl/lib/{tool}:/usr/bin/{tool}:ro on WSL2, where the driver \
+             ships under /usr/lib/wsl/lib and /usr/bin holds nothing. ⛔ On WSL2 that binary is \
+             glibc and most sandbox images are musl, so bind it into a glibc image or use NVML."
+        ),
+        // NO GRANT AT ALL, so the tool is the symptom and not the subject: binding it in would
+        // produce a working binary with nothing to talk to. A grant is made at START and cannot be
+        // added to a box that is already running, which is why this names the flag and not a fix
+        // for the box in hand.
+        None => format!(
+            "hint: that is one of the driver's own tools, and this box holds NO GPU grant: \
+             /dev/nvidiactl is not here, so no device node and no driver library was bound. \
+             Binding {tool} in would give you the tool and nothing for it to report on. Grant a \
+             card when the box STARTS (`kern box … --gpus all`, or `gpus: all` in compose with \
+             --allow-device-grants); a running box cannot be given one."
+        ),
+    })
+}
+
 fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
     if let Error::Syscall("execvp", io) = e {
         let cmd = spec.command.first().map(String::as_str).unwrap_or("?");
@@ -2198,6 +2344,12 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
                  hint: the AppArmor profile '{profile}' would not admit the exec - is it loaded on \
                  the host? (`apparmor_parser -r <profile>` loads it; `-R` removes it)"
             );
+        } else if let (std::io::ErrorKind::NotFound, Some(hint)) =
+            (io.kind(), driver_tool_hint(cmd))
+        {
+            // THE MOST COPIED VERIFICATION COMMAND IN THE GPU WORLD ends up here, and the text it
+            // gets is in `driver_tool_hint` because `kern exec` needs the same words.
+            eprintln!("kern: cannot start '{cmd}' in box: {io}\n{hint}");
         } else if io.kind() == std::io::ErrorKind::NotFound && cmd.starts_with('/') {
             // THREE CAUSES SHARE ONE ERRNO, and the old hint recited all three at once, so the reader
             // had to work out which. We are inside the box's mount namespace here, so ONE `stat`
@@ -2719,21 +2871,44 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
         // host is reading: the operator's intent cannot be satisfied either way, and a named refusal
         // is the only answer that says so. Character and block devices are NOT refused - `-v
         // /dev/zero:/x` works and is measured - because those a box can actually use.
+        // ⛔ TWO TYPES, TWO REASONS, AND THEY WERE SHARING THE FIFO'S. The sentence above was
+        // measured on a FIFO and was being printed for a socket as well, where it is FALSE: a box
+        // CAN use a host socket, and the proof is the remedy this very message recommends.
+        //
+        // MEASURED 2026-11-12, a python server listening on /tmp/sockdir/srv.sock with the
+        // directory bound into a box: the client inside connected and the host answered
+        // (`CONNECTED: HELLO-FROM-HOST`). On the independent channel, docker 29.1.3 binding the
+        // SOCKET ITSELF connected too, which is the whole docker-in-docker pattern. So "opening it
+        // blocks forever because nothing holds the other end" describes a DANGLING socket, and the
+        // only socket anyone binds is one with a server behind it.
+        //
+        // The refusal STAYS, and now says what it is: the one-line form of handing over a control
+        // socket. What it is not is a claim about what a box can do.
         let kind = st.st_mode & libc::S_IFMT;
         if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
             unsafe { libc::close(src_fd) };
-            let what = if kind == libc::S_IFIFO {
-                "a FIFO"
+            result = Err(Error::Spec(if kind == libc::S_IFIFO {
+                format!(
+                    "-v {}:{}: the source is a FIFO, which a box cannot be given: binding it \
+                     succeeds and then the setup pass opens the target and blocks for ever, because \
+                     nothing on the host is reading the other end (measured: the process was still \
+                     alive after 404 seconds and SIGTERM did not end it). Bind the directory that \
+                     contains it and have the workload open it itself, or pass the data on stdin.",
+                    v.source, v.target
+                )
             } else {
-                "a socket"
-            };
-            result = Err(Error::Spec(format!(
-                "-v {}:{}: the source is {what}, which a box cannot be given: binding it succeeds \
-                 and then opening it inside the box blocks forever, because nothing on the host \
-                 holds the other end. Bind the directory that contains it and have the workload \
-                 open it itself, or pass the data on stdin.",
-                v.source, v.target
-            )));
+                format!(
+                    "-v {}:{}: the source is a socket, and kern does not take one as a mount \
+                     source. ⛔ Not because a box cannot use it: bind the DIRECTORY that holds the \
+                     socket and the workload connects through it, measured with a server on the \
+                     host answering a client inside a box. What this refuses is the one-line form \
+                     of handing over a control socket, the container daemon's above all, since a \
+                     box holding that one is a box outside its own boundary. For that socket the \
+                     directory form is refused too, because it lives in /run and kern keeps its own \
+                     state there.",
+                    v.source, v.target
+                )
+            }));
             break;
         }
         let is_dir = kind == libc::S_IFDIR;
@@ -7870,7 +8045,21 @@ pub fn exec_in_box(
                  profile unloaded on the host?), or the target is not executable",
             );
         }
-        eprintln!("kern: exec failed: {err}");
+        // THE SAME WORDS PID 1 GETS WHEN ITS OWN EXEC FAILS. This path printed the bare execvp
+        // error, and `kern exec <box> -- nvidia-smi` is the first thing a reader types after
+        // granting a card: measured 2026-11-12 on a box holding two granted cards, exit 127 and
+        // nothing about why, while `report_exec_failure` had three paragraphs for the same errno on
+        // the other path. The text is `driver_tool_hint`'s, not a copy, so the two cannot drift.
+        let hint = match &err {
+            Error::Syscall(_, io) if io.kind() == std::io::ErrorKind::NotFound => command
+                .first()
+                .map(String::as_str)
+                .and_then(driver_tool_hint)
+                .map(|h| format!("\n{h}"))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        eprintln!("kern: exec failed: {err}{hint}");
         unsafe { libc::_exit(if eacces { 126 } else { 127 }) };
     }
     // Read on every return below, after the child is reaped: see `RefusalWatch`.
@@ -9590,6 +9779,130 @@ mod cpu_dir_name_tests {
             let len = cpu_dir_name(&mut buf, id);
             assert!(len > 0 && len < buf.len(), "id {id} produced len {len}");
             assert_eq!(buf[len], 0, "id {id} must be NUL-terminated for mkdirat");
+        }
+    }
+}
+
+#[cfg(test)]
+mod driver_tool_hint_tests {
+    use super::{driver_tool_name, found_in_box, is_driver_tool, DRIVER_TOOLS};
+
+    /// THE COMMAND EVERY GUIDE PRINTS gets its own hint, and nothing else does.
+    ///
+    /// MEASURED 2026-11-12: `kern box --image nvidia/cuda:12.9.0-base-ubuntu22.04 --gpus device=0
+    /// -- nvidia-smi` failed with "No such file or directory" and a hint about full paths and
+    /// dynamic loaders. The cause is neither: that image ships no `nvidia-smi` because docker's
+    /// NVIDIA runtime injects it from the host, and a kern grant binds libraries and not binaries.
+    #[test]
+    fn a_driver_tool_is_told_apart_from_an_ordinary_missing_command() {
+        // BOTH SPELLINGS, because a caller writes either and the hint must not depend on it.
+        for cmd in [
+            "nvidia-smi",
+            "/usr/bin/nvidia-smi",
+            "/some/other/path/nvidia-persistenced",
+            "nvidia-cuda-mps-control",
+        ] {
+            assert!(is_driver_tool(cmd), "{cmd} is one of the driver's tools");
+        }
+        // AND NOT A COMMAND THAT MERELY LOOKS LIKE ONE, or the hint would fire on a workload's own
+        // program and describe a cause that is not there.
+        for cmd in [
+            "nvidia-smi-wrapper",
+            "my-nvidia-smi",
+            "/bin/sh",
+            "python3",
+            "nvidia",
+            "",
+        ] {
+            assert!(
+                !is_driver_tool(cmd),
+                "{cmd} is not one of the driver's tools"
+            );
+        }
+        assert_eq!(driver_tool_name("/usr/bin/nvidia-smi"), "nvidia-smi");
+        // ⛔ AND THE TWO CAUSES ARE TOLD APART, which is what the hint branches on. MEASURED on a
+        // WSL2 Alpine host: the vendor's nvidia-smi bound to /usr/bin/nvidia-smi is PRESENT and
+        // still fails to exec, because it is a glibc ELF and that rootfs has only musl's loader.
+        // `execvp` reports both causes with the same errno, so the file has to be looked for.
+        //
+        // These assertions run on the host rather than in a box, which is the same filesystem
+        // question asked of a different mount namespace: `sh` exists in a bin directory everywhere
+        // this test runs, and a name nobody has exists nowhere.
+        assert!(
+            found_in_box("sh").is_some(),
+            "a bare name that IS in a bin directory must be found"
+        );
+        assert_eq!(found_in_box("kern-no-such-tool-xyz"), None);
+        assert_eq!(
+            found_in_box("/bin/sh").as_deref(),
+            Some("/bin/sh"),
+            "an absolute path is returned as written"
+        );
+        assert_eq!(found_in_box("/nonexistent/nvidia-smi"), None);
+        assert_eq!(driver_tool_name("nvidia-smi"), "nvidia-smi");
+        // The set is NVIDIA's `utility` injection list, and the test names its size so a silent
+        // addition has to be deliberate.
+        assert_eq!(DRIVER_TOOLS.len(), 5);
+    }
+
+    /// ⛔ THE HINT IS ONE FUNCTION BECAUSE IT WAS ONCE ONE PATH'S PRIVATE PROPERTY.
+    ///
+    /// MEASURED 2026-11-12: `kern exec <box> -- nvidia-smi` on a box holding two granted cards
+    /// printed `exec failed: execvp failed: No such file or directory` and NOTHING else, while the
+    /// box's own PID 1 had three paragraphs for the identical errno. Both call
+    /// [`super::driver_tool_hint`] now, so this test is what stops them drifting again.
+    ///
+    /// THE BRANCH IS DERIVED FROM THE HOST, NOT ASSERTED AS A CONSTANT: which of the two
+    /// "not in the box" branches is right depends on whether `/dev/nvidiactl` is there, and a test
+    /// that hard-coded either one would be green on one machine and red on the other. The same
+    /// mistake cost seven red hours earlier today in `smoke`, where three assertions named
+    /// constants the host decides.
+    #[test]
+    fn the_driver_tool_hint_names_the_grant_when_there_is_one_and_the_missing_grant_when_there_is_not(
+    ) {
+        use super::{box_has_gpu_grant, driver_tool_hint};
+        // Not a driver tool: no hint at all, so the generic branches downstream still run.
+        assert_eq!(driver_tool_hint("python3"), None);
+        assert_eq!(driver_tool_hint("/bin/sh"), None);
+        // A path nobody has, so `found_in_box` answers None and the branch is decided by the grant.
+        let hint = driver_tool_hint("/nonexistent/nvidia-smi").expect("a driver tool gets a hint");
+        if box_has_gpu_grant() {
+            assert!(
+                hint.contains("binds the driver's LIBRARIES") && hint.contains("libnvidia-ml.so.1"),
+                "with a grant the hint points at the libraries that ARE there: {hint}"
+            );
+            assert!(
+                !hint.contains("NO GPU grant"),
+                "a granted box must not be told it has no grant: {hint}"
+            );
+        } else {
+            assert!(
+                hint.contains("NO GPU grant") && hint.contains("--gpus"),
+                "with no grant the hint names the grant, not a bind: {hint}"
+            );
+            assert!(
+                !hint.contains("libnvidia-ml.so.1 works as it is"),
+                "a box with no grant has no NVML either: {hint}"
+            );
+        }
+        // Both no-grant branches must offer something that can be ACTED on, and neither may claim
+        // the tool is simply missing: that sentence is what sent a reader to look for a path.
+        assert!(hint.contains("nvidia-smi"), "the tool is named: {hint}");
+        // THE FILE-IS-THERE BRANCH, measured where the file is there. `/bin/sh` is not a driver
+        // tool, so the only way to reach this branch in a test is a driver tool that exists on
+        // this host; skipped by name when the host has no driver installed, never silently.
+        match found_in_box("nvidia-smi") {
+            Some(path) => {
+                let present = driver_tool_hint("nvidia-smi").expect("still a driver tool");
+                assert!(
+                    present.contains(&path) && present.contains("its interpreter"),
+                    "a tool that IS there is an interpreter problem, not a grant one: {present}"
+                );
+            }
+            None => eprintln!(
+                "skip: no nvidia-smi in this host's bin directories, so the \
+                 file-is-present branch has no fixture here"
+            ),
         }
     }
 }

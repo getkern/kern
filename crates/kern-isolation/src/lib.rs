@@ -135,6 +135,11 @@ pub use cgroup::{
 };
 pub use real::bring_loopback_up;
 pub use real::id_range_available;
+/// Is this command one of the NVIDIA driver's own tools (`nvidia-smi` and the four others
+/// `libnvidia-container` injects)? A grant binds the driver's libraries and none of its binaries, so
+/// a command that IS one of them cannot run in a box, and a healthcheck built on one can never pass.
+/// See [`real::is_driver_tool`].
+pub use real::is_driver_tool;
 pub use real::is_root_of_ranged_userns;
 pub use real::single_threaded;
 pub use real::with_id_mapped_userns;

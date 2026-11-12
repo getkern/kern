@@ -465,15 +465,69 @@ fn show_config_reports_the_uid_range_the_box_will_actually_get() {
     // refused: measured inside a box, `chown` to another uid fails under `--cap-drop ALL` whether
     // the range is mapped or not. Worth 937 us of the 3956 on this path. The dry run has to say so,
     // or a caller reading it would opt out of something they no longer have.
+    // ⛔ AND THE ANSWER DEPENDS ON THIS CALLER'S GROUPS, which is why the two constants that stood
+    // here were wrong from 08:40 on 2026-11-12, when `range_buys_nothing_for` gained its
+    // `inherits_groups` term: dropping the range also drops the box's ability to CLEAR the
+    // supplementary groups it inherited, so the range is kept whenever there are any. On the host
+    // this was found on the caller carries 14 groups and the field reads `true`; on a user with
+    // none it reads `false`. A constant here asserts one host and fails every other one, and it
+    // stayed red for seven hours because the only target run all day was `--bin kern`: an
+    // integration target nobody runs is not a green.
+    let primary = String::from_utf8(
+        std::process::Command::new("id")
+            .arg("-g")
+            .output()
+            .expect("id -g")
+            .stdout,
+    )
+    .expect("utf8");
+    let all = String::from_utf8(
+        std::process::Command::new("id")
+            .arg("-G")
+            .output()
+            .expect("id -G")
+            .stdout,
+    )
+    .expect("utf8");
+    let inherits_groups = all
+        .split_whitespace()
+        .any(|g| g != primary.trim() && !g.is_empty());
+
     let dropped = ["box", "t", "--image", "alpine", "--cap-drop", "ALL"];
-    assert_eq!(field(&dropped, "uid_range"), "false");
-    assert_eq!(field(&dropped, "uid_range_source"), "-");
+    let want = if inherits_groups { "true" } else { "false" };
+    assert_eq!(
+        field(&dropped, "uid_range"),
+        want,
+        "with {} supplementary group(s) the range must be {want}",
+        all.split_whitespace().count()
+    );
+    // THE SOURCE NAMES THE ORIGIN, NOT THE SURVIVAL. Measured: with the range kept it still reads
+    // `image-default`, because that is where it came from; the groups are why the `--cap-drop ALL`
+    // did not take it away. The two are different questions and this field answers the first, so
+    // a reader who wants the second reads the groups. A fourth value here would be a vocabulary
+    // change for whoever parses this output, which is not a decision to make from a test.
+    assert_eq!(
+        field(&dropped, "uid_range_source"),
+        if inherits_groups {
+            "image-default"
+        } else {
+            "-"
+        },
+        "the source names where the range came from"
+    );
 
     // `all` is the same flag: the comparison is case-insensitive, as it is where the profile below
     // promotes itself. `CAP_ALL` is NOT tested, because `caps::resolve` refuses that spelling by
     // name, which is why the rule does not strip the prefix.
+    // THE SAME HOST CONDITION AS ABOVE: what this row pins is that the spelling does not matter,
+    // so it compares `all` against `ALL` rather than against a constant that only holds for a
+    // caller with no supplementary groups.
     let lower = ["box", "t", "--image", "alpine", "--cap-drop", "all"];
-    assert_eq!(field(&lower, "uid_range"), "false");
+    assert_eq!(
+        field(&lower, "uid_range"),
+        field(&dropped, "uid_range"),
+        "the lower-case spelling must decide exactly as the upper-case one did"
+    );
 
     // ANY `--cap-add` PUTS IT BACK, and this is the case that decides the rule rather than
     // illustrating it: measured, `--cap-drop ALL --cap-add CHOWN` chowns successfully WITH the range
@@ -535,8 +589,10 @@ fn show_config_reports_the_uid_range_the_box_will_actually_get() {
         "--security-profile",
         "untrusted",
     ];
+    // THE FIRST ROW IS THE POINT and it is host-independent: the profile must decide exactly as the
+    // flag does. The second row used to repeat it as a constant, which is the same host assumption
+    // the rows above carried, so it says what the flag said instead.
     assert_eq!(field(&profile, "uid_range"), field(&dropped, "uid_range"));
-    assert_eq!(field(&profile, "uid_range"), "false");
     let profile_added = [
         "box",
         "t",

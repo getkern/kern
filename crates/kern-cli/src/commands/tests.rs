@@ -1870,8 +1870,15 @@ mod net_resource_tests {
             parse_volumes(&[format!("{src}:/r")])
                 .err()
                 .map(|e| {
-                    e.to_string()
-                        .contains("refusing to mount the kern registry")
+                    // THE PROPERTY, NOT ONE WORDING. This read "refusing to mount the kern
+                    // registry" until 2026-11-12, when that sentence was found asserting that the
+                    // path asked for IS the registry: on a WSLg host `-v /mnt/wslg:/mnt/wslg` was
+                    // refused as "the kern registry (/mnt/wslg)" while the registry sits at
+                    // /mnt/wslg/runtime-dir/kern. The refusal now names BOTH paths, so what this
+                    // pins is that the source was refused and that kern's own state was named as
+                    // the reason.
+                    let m = e.to_string();
+                    m.contains("refusing it") && m.contains("kern's own state")
                 })
                 .unwrap_or(false)
         };
@@ -8333,4 +8340,157 @@ fn the_uid_range_is_kept_whenever_there_are_groups_to_drop() {
         range_buys_nothing_for(false, &["all".to_string()], none, false),
         "lowercase `all` is the same request"
     );
+}
+
+/// ⛔ A MISSING DEVICE IS NOT A MISSING DIRECTORY.
+///
+/// MEASURED 2026-11-12: compose `devices: [/dev/nvidia-nvlink0:...]`, a node no NVIDIA driver
+/// creates, previewed clean under `config` (exit 0), and `up` then refused it telling the reader to
+/// "Create it first". A device node is made by its driver; the only things a caller can "create" in
+/// its place are a fake `mknod` or an empty directory, and the branch this guards was the one that
+/// calls `create_dir_all`. Docker refuses the same request ("error gathering device information").
+///
+/// THE PATH IS DERIVED, NOT HARD-CODED, so the test cannot go green on a host that happens to have
+/// a node by that name: it is a name made unique to this process.
+#[test]
+fn a_missing_source_under_dev_is_a_missing_device_and_nothing_else_is() {
+    use super::missing_device_source;
+    let absent = format!("/dev/kern-test-no-such-device-{}", std::process::id());
+    assert!(
+        !std::path::Path::new(&absent).exists(),
+        "the fixture must not exist, or this test measures nothing"
+    );
+    let msg = missing_device_source("x", &absent).expect("an absent /dev source is refused");
+    assert!(
+        msg.contains("not a device on this host") && msg.contains("its driver"),
+        "the cause is the hardware, not a missing path: {msg}"
+    );
+    // ⛔ AND THE OLD REMEDY IS GONE: it is the sentence that cannot work for a device.
+    assert!(
+        !msg.contains("Create it first"),
+        "a device node cannot be created by the caller: {msg}"
+    );
+    // A NODE THAT EXISTS IS NOT TOUCHED: every real grant goes through this same branch.
+    assert_eq!(missing_device_source("x", "/dev/null"), None);
+    // WHOLE COMPONENTS: these are not /dev, and a missing one of them must stay on the
+    // create-it path that docker's own samples rely on.
+    for other in [
+        "/devices/kern-test-x",
+        "/dev2/kern-test-x",
+        "/tmp/kern-test-no-such-dir-xyz",
+        "relative/dev/x",
+    ] {
+        assert_eq!(
+            missing_device_source("x", other),
+            None,
+            "{other} is not under /dev and keeps the create-it behaviour"
+        );
+    }
+}
+
+/// ⛔ THE GPU GATE NAMES EVERY SERVICE IT IS ABOUT TO HAND A CARD TO.
+///
+/// MEASURED 2026-11-12 on NVIDIA's accelerated-computing-hub stdpar tutorial: four services take the
+/// card through one `&gpu-config` anchor and the gate named `base` alone, so an operator granting
+/// after reading it gave cards to four services believing it was one. One asker keeps the old
+/// sentence word for word; several get one sentence with all of them.
+#[test]
+fn the_gpu_gate_names_every_service_that_asks_and_one_asker_keeps_its_sentence() {
+    use super::device_grant_problem;
+    // The gate reads the operator's config through `KERN_CONFIG`, which other tests set.
+    let _g = crate::env_guard();
+    if super::device_grants_allowed_by_config() {
+        eprintln!(
+            "skip: this user's own kern.toml already allows device grants, so the gate is open \
+             and there is no sentence to read"
+        );
+        return;
+    }
+    let stack = |services: &[(&str, bool)]| {
+        let mut y = String::from("services:\n");
+        for (name, gpu) in services {
+            y.push_str(&format!("  {name}:\n    image: alpine\n"));
+            if *gpu {
+                y.push_str("    gpus: all\n");
+            }
+        }
+        crate::compose::parse(&y).expect("fixture parses")
+    };
+    let many = device_grant_problem(
+        &stack(&[
+            ("base", true),
+            ("db", false),
+            ("jupyter", true),
+            ("nsys", true),
+        ]),
+        false,
+    )
+    .expect("three services ask, so the gate speaks");
+    for name in ["'base'", "'jupyter'", "'nsys'"] {
+        assert!(many.contains(name), "{name} must be named: {many}");
+    }
+    assert!(
+        !many.contains("'db'"),
+        "a service that asks for nothing is not named: {many}"
+    );
+    assert!(many.starts_with("3 services"), "{many}");
+    let one = device_grant_problem(&stack(&[("facet", true)]), false).expect("one service asks");
+    assert!(
+        one.starts_with("service 'facet' asks for a GPU (all) and nothing granted it"),
+        "a single asker keeps the sentence it always had: {one}"
+    );
+    // And the gate's own decision is untouched: granted, it says nothing.
+    assert_eq!(
+        device_grant_problem(&stack(&[("base", true), ("jupyter", true)]), true),
+        None
+    );
+}
+
+/// ⛔ THE HOST'S /dev/shm IS REFUSED AS A BIND SOURCE, ONE OBJECT IN IT IS NOT.
+///
+/// MEASURED 2026-11-12: `-v /dev/shm:/dev/shm` made an object the host created there readable and
+/// writable from inside the box, which is half of the IPC boundary kern refuses as `ipc: host`. The
+/// paths are canonicalised by the caller, so the test asks with canonical paths too, and derives
+/// /dev/shm's from the host rather than assuming it.
+#[test]
+fn the_host_shm_mount_is_refused_and_a_single_object_or_another_path_is_not() {
+    use super::host_ipc_source_refusal;
+    let Ok(shm) = std::fs::canonicalize("/dev/shm") else {
+        eprintln!("skip: this host has no /dev/shm to refuse");
+        return;
+    };
+    let msg = host_ipc_source_refusal("x", &shm).expect("the host's shm itself is refused");
+    assert!(
+        msg.contains("--shm-size") && msg.contains("ipc: host"),
+        "the refusal gives the remedy and names the boundary: {msg}"
+    );
+    assert_eq!(host_ipc_source_refusal("x", &shm.join("one-object")), None);
+    assert_eq!(
+        host_ipc_source_refusal("x", std::path::Path::new("/tmp")),
+        None
+    );
+    // THE OTHER POSIX IPC FILESYSTEM. A queue created on the host was measured visible through
+    // `-v /dev/mqueue:/x`, so the mount itself is refused with its own reason, and a name beside it
+    // is not.
+    if let Ok(mq) = std::fs::canonicalize("/dev/mqueue") {
+        let m = host_ipc_source_refusal("x", &mq).expect("the host's mqueue mount is refused");
+        assert!(
+            m.contains("message queues") && m.contains("ipc: host"),
+            "{m}"
+        );
+        assert!(
+            !m.contains("--shm-size"),
+            "the shm remedy is not offered for queues: {m}"
+        );
+    }
+    assert_eq!(
+        host_ipc_source_refusal("x", std::path::Path::new("/dev/mqueue-not")),
+        None
+    );
+    // A LINK TO IT is the same mount: where the host has one, its canonical path must be refused.
+    if let Ok(via_link) = std::fs::canonicalize("/run/shm") {
+        if via_link == shm {
+            assert!(host_ipc_source_refusal("x", &via_link).is_some());
+        }
+    }
 }

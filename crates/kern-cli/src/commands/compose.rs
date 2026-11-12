@@ -842,26 +842,42 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     };
-    let mut boxes = crate::compose::parse_with_env_at(
-        &text,
-        &dotenv,
-        stack_net,
-        Some(dir_of(&files[0]).as_path()),
-    )
-    .map_err(Error::Compose)?;
-    // Merge every additional `-f`, left to right (see `merge_stacks` for the exact rules).
-    for extra in &files[1..] {
-        let t = std::fs::read_to_string(extra)
-            .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?;
-        let over = crate::compose::parse_override_at(
-            &t,
+    // ONE FILE: profiles are decided inside the parse, as they always were. SEVERAL: every file is
+    // read with its profiles left open, merged left to right, and the decision is taken ONCE on the
+    // result, which is Docker's order. MEASURED 2026-11-12: deciding them per file refused
+    // murtaza-nasir/maestro and perminder-klair/subwave, both accepted by docker, because the base
+    // dropped a profile-gated service and its GPU override was then added as a service with no image.
+    let mut boxes = if files.len() > 1 {
+        let mut merged = crate::compose::parse_stack_file_at(
+            &text,
             &dotenv,
             stack_net,
-            Some(dir_of(extra).as_path()),
+            Some(dir_of(&files[0]).as_path()),
         )
         .map_err(Error::Compose)?;
-        boxes = crate::compose::merge_stacks(boxes, over);
-    }
+        // Merge every additional `-f`, left to right (see `merge_stacks` for the exact rules).
+        for extra in &files[1..] {
+            let t = std::fs::read_to_string(extra)
+                .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?;
+            let over = crate::compose::parse_stack_file_at(
+                &t,
+                &dotenv,
+                stack_net,
+                Some(dir_of(extra).as_path()),
+            )
+            .map_err(Error::Compose)?;
+            merged = crate::compose::merge_stacks(merged, over);
+        }
+        crate::compose::apply_profiles(merged).map_err(Error::Compose)?
+    } else {
+        crate::compose::parse_with_env_at(
+            &text,
+            &dotenv,
+            stack_net,
+            Some(dir_of(&files[0]).as_path()),
+        )
+        .map_err(Error::Compose)?
+    };
     // Per-service validation, on the MERGED stack and UNCONDITIONALLY. Merged, because an override
     // legitimately carries no `image:` and only the result must be runnable. Unconditional, because
     // these are per-service facts that do not depend on how many files stated them: gated on

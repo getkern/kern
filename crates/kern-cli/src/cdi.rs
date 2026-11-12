@@ -2171,14 +2171,21 @@ pub enum DeviceRefError {
     },
 }
 
-/// The card minor a GPU UUID belongs to, read from the driver's own `information` file.
+/// Every `(GPU UUID, card minor)` the driver publishes, in no particular order.
 ///
-/// The same file and the same field `gpu_grant` uses for the PCI pairing, asked a second question:
-/// `GPU UUID:` names the card and `Device Minor:` names its `/dev/nvidiaN`. Resolving a UUID any
-/// other way would be a second source for a fact the driver already publishes.
-fn minor_for_uuid(root: &Path, uuid: &str) -> Option<u32> {
+/// ONE WALK, TWO CALLERS. [`minor_for_uuid`] asks it for one UUID and `--gpus device=<uuid>` asks
+/// it for the whole list, so a message can name the UUIDs that DO exist when the one written does
+/// not. Two walks would be two answers about a directory that can change between them.
+///
+/// The same file and the same fields `gpu_grant` uses for the PCI pairing, asked a second
+/// question: `GPU UUID:` names the card and `Device Minor:` names its `/dev/nvidiaN`. Resolving a
+/// UUID any other way would be a second source for a fact the driver already publishes.
+pub(crate) fn uuid_minors(root: &Path) -> Vec<(String, u32)> {
     let gpus = root.join("proc/driver/nvidia/gpus");
-    let entries = std::fs::read_dir(gpus).ok()?;
+    let Ok(entries) = std::fs::read_dir(gpus) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u32)> = Vec::new();
     for entry in entries.flatten() {
         // BOUNDED AND TYPE-CHECKED. `read_to_string` here would block for ever on a FIFO planted
         // at the name, and this walk is reachable from plain `kern doctor`.
@@ -2198,11 +2205,20 @@ fn minor_for_uuid(root: &Path, uuid: &str) -> Option<u32> {
                 found_minor = rest.trim().parse::<u32>().ok();
             }
         }
-        if found_uuid.as_deref() == Some(uuid) {
-            return found_minor;
+        if let (Some(u), Some(m)) = (found_uuid, found_minor) {
+            out.push((u, m));
         }
     }
-    None
+    out.sort();
+    out
+}
+
+/// The card minor a GPU UUID belongs to.
+fn minor_for_uuid(root: &Path, uuid: &str) -> Option<u32> {
+    uuid_minors(root)
+        .into_iter()
+        .find(|(u, _)| u == uuid)
+        .map(|(_, m)| m)
 }
 
 /// Resolve `--device vendor/class=name` to the card index `--gpus` would take.

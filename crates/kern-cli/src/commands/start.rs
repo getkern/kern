@@ -60,37 +60,50 @@ pub fn box_plan(
     // thing an operator needs from a device preview was unreachable: the NAMES of the host paths
     // they are authorising. A box with no GPU flag still gets nothing, so the long form is only
     // printed to somebody who asked for hardware AND asked to see the plan.
-    let gpu_request =
-        match (gpus, device) {
-            (Some(spec), _) => Some(crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| {
-                Error::Cli(format!("--plan: --gpus {spec} is not a selection: {e:?}"))
-            })?),
-            // A CDI name resolves to ONE card index, and this is a preview, so a spec that does not
-            // name it here is the launch's refusal to report and not the plan's.
-            (None, Some(reference)) => {
-                match crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference) {
-                    Ok(resolved) => {
-                        // ON THE PLAN TOO, and in the plan's own voice: an operator reading
-                        // `--plan` to find out what a box will get is the reader most entitled to
-                        // know which part of the spec kern does not act on.
-                        if let Some(msg) =
-                            crate::cdi::describe_hooks_not_run(reference, &resolved.hooks_not_run)
-                        {
-                            println!("  gpu grant: {msg}");
-                        }
-                        Some(crate::gpu_grant::GpuSelection::These(vec![resolved.index]))
+    let gpu_request = match (gpus, device) {
+        (Some(spec), _) => {
+            // THE CAPABILITIES TOKEN, ANSWERED OUT LOUD on the plan as well: an operator reading
+            // the plan to see what a box gets is entitled to know that the list they wrote chose
+            // nothing and that nothing is missing either.
+            if let Some(note) = crate::gpu_grant::capabilities_note(spec) {
+                println!("  gpu grant: {note}");
+            }
+            // `Ok(None)` IS "no card asked for", which lands on the same path as no flag at all.
+            let asked = crate::gpu_grant::selection_from_spec(std::path::Path::new("/"), spec)
+                .map_err(|e| {
+                    Error::Cli(format!("--plan: --gpus {spec} is not a selection: {e:?}"))
+                })?;
+            if asked.is_none() {
+                println!("  gpu grant: {}", crate::gpu_grant::describe_no_gpu(spec));
+            }
+            asked
+        }
+        // A CDI name resolves to ONE card index, and this is a preview, so a spec that does not
+        // name it here is the launch's refusal to report and not the plan's.
+        (None, Some(reference)) => {
+            match crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference) {
+                Ok(resolved) => {
+                    // ON THE PLAN TOO, and in the plan's own voice: an operator reading
+                    // `--plan` to find out what a box will get is the reader most entitled to
+                    // know which part of the spec kern does not act on.
+                    if let Some(msg) =
+                        crate::cdi::describe_hooks_not_run(reference, &resolved.hooks_not_run)
+                    {
+                        println!("  gpu grant: {msg}");
                     }
-                    Err(_) => {
-                        println!(
+                    Some(crate::gpu_grant::GpuSelection::These(vec![resolved.index]))
+                }
+                Err(_) => {
+                    println!(
                     "  gpu grant: --device {reference} does not resolve on this host, so `kern \
                      box` would refuse it; run `kern doctor` for which CDI specs are readable"
                 );
-                        None
-                    }
+                    None
                 }
             }
-            (None, None) => None,
-        };
+        }
+        (None, None) => None,
+    };
 
     match (gpu_request, crate::gpu_grant::resolve()) {
         // NO FLAG, NO PREVIEW. The box gets no card, and printing the host's inventory under the
@@ -712,6 +725,58 @@ pub(crate) fn flag_health_probe(
     cmd.map(|c| kern_oci::HealthTest::Shell(c.to_string()))
 }
 
+/// What `kern box --device <host path>` says, which is docker's commonest device spelling.
+///
+/// ⛔ IT USED TO ASSUME A GPU. `--device /dev/dri/renderD128` answered "not a CDI name. Use
+/// --device nvidia.com/gpu=0", and beside `--gpus` a path answered that the two flags "name the
+/// same thing two ways". On `kern box`, `--device` names ONE card the way CDI does; a host node is a
+/// bind, and the bind was RUN before being printed here: `-v /dev/dri/renderD128:...` and
+/// `-v /dev/nvidia0:...` both opened O_RDWR inside a box on this host.
+///
+/// THE CONDITION IS SAID BECAUSE IT DECIDES THE ANSWER. renderD128 is `crw-rw---- root:render`
+/// with a `+`: the session ACL logind gives the logged-in user is what let the box open it. A box
+/// keeps no supplementary groups, so on a host where the node is reachable only through a group
+/// (a server with no seat, typically) the bind lands and `open` is refused.
+pub(crate) fn device_path_message(path: &str) -> String {
+    format!(
+        "--device {path}: on `kern box` --device names one GPU the way CDI does \
+         (nvidia.com/gpu=0, or --gpus); a host node is bound like a path: -v {path}:{path}. \
+         Whether the box can open it is the node's permission for YOUR uid: a box keeps no \
+         supplementary groups, so a node readable only through a group such as `render` or \
+         `video` lands in the box and refuses to open (a desktop session's ACL usually covers \
+         it, a headless server's group does not). A missing node is refused, not created"
+    )
+}
+
+/// The driver tool a health probe would try to run, if it names one.
+///
+/// ⛔ A HEALTHCHECK BUILT ON `nvidia-smi` CAN NEVER PASS IN A BOX, and until this existed it failed
+/// in silence for the life of the box. MEASURED 2026-11-12 on this host: a compose service with
+/// `gpus: all` and `healthcheck: test: ["CMD", "nvidia-smi"]` started, took its two cards
+/// (`kern inspect` listed `nvidia0 nvidia1`), and sat at `unhealthy` with nothing anywhere saying
+/// why; the same file is healthy under docker, whose NVIDIA runtime injects the binary. The cost is
+/// not cosmetic: a `depends_on: {condition: service_healthy}` gate pointed at that service never
+/// opens, so a stack hangs on a service whose GPU grant was perfectly correct.
+///
+/// This reads the EFFECTIVE probe, so one call covers all three origins: `kern box --health-cmd`,
+/// a compose `healthcheck:` (which reaches this binary as that flag), and an image's own
+/// `HEALTHCHECK` when the caller named none.
+///
+/// EVERY TOKEN IS SCANNED, not just the program: the shell form in the field is
+/// `["CMD-SHELL", "nvidia-smi || exit 1"]` and a wrapped one is `sh -c nvidia-smi`, and both run the
+/// tool. STATED LIMIT: the shell string is split on whitespace, so `nvidia-smi;true` is not seen.
+/// The error leans to the FALSE NEGATIVE, which for a warning is the right direction.
+pub(crate) fn health_probe_driver_tool(probe: Option<&kern_oci::HealthTest>) -> Option<String> {
+    let tokens: Vec<&str> = match probe? {
+        kern_oci::HealthTest::Exec(argv) => argv.iter().map(String::as_str).collect(),
+        kern_oci::HealthTest::Shell(cmd) => cmd.split_whitespace().collect(),
+    };
+    tokens
+        .into_iter()
+        .find(|t| kern_isolation::is_driver_tool(t))
+        .map(str::to_string)
+}
+
 /// What an image's own `HEALTHCHECK` contributes, once the caller's flags have had their say.
 ///
 /// EVERY FIELD `None` MEANS "THE IMAGE SAYS NOTHING HERE", so each falls back independently at the
@@ -990,6 +1055,27 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // spent here was invisible and nobody could optimise it, because nobody could see it. The marks
     // below cost one `getenv` when the variable is unset.
     let mut pt = kern_isolation::PhaseTimer::new();
+    // ⛔ BEFORE ANY TRUST-BEARING STATE IS WRITTEN, and at this altitude on purpose.
+    //
+    // MEASURED 2026-11-12: with `$XDG_RUNTIME_DIR/kern` created 0777 in advance, kern ADOPTED it,
+    // filled it with `claims env instances logs runstats scratch waitexit`, and started the box.
+    // That directory holds the records which decide a box's capabilities and seccomp posture, and
+    // kern's own `-v` refusal calls a writer of it able to "forge another box's recorded
+    // capability/seccomp posture and elevate its own `kern exec`".
+    //
+    // WHY NOT IN THE PLUMBING, where the first version put it: `runtime_subdir` is reached by
+    // read-only verbs that treat a missing registry as an empty one (`if let Ok(..)`), and box start
+    // itself does `registry::register(&inst).ok()`, because a box matters more than its bookkeeping.
+    // A refusal down there was returned and DISCARDED by almost every caller: a guard whose error
+    // nobody reads looks like a guard and is not one. Here it is one explicit, fatal decision, taken
+    // where the state is about to be created.
+    //
+    // A WORLD-WRITABLE RUNTIME DIR IS NOT HYPOTHETICAL: on WSLg `XDG_RUNTIME_DIR` is
+    // `/mnt/wslg/runtime-dir`, which Microsoft's session setup creates `drwxrwxrwx`. kern's own
+    // `kern/` under it is 0700 and owned by the caller, which is the case this check passes.
+    if let Err(why) = crate::registry::state_dir_is_private() {
+        return Err(Error::Cli(why));
+    }
     let name = BoxName::parse(args.name).map_err(Error::InvalidBox)?;
     // The caller's (an SDK's) "box started" fd, read and VALIDATED up front, BEFORE the box is forked.
     // CLOEXEC is deferred past the scope re-exec by `cloexec_started_fd` below (see both docstrings for
@@ -1071,6 +1157,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // a name means, and the mounts come from the discovery a test proves equivalent to it.
     let gpu_selection: Option<Result<crate::gpu_grant::GpuSelection, Error>> =
         match (args.gpus, args.device) {
+            // A HOST PATH IS NOT A SECOND NAME FOR THE CARD, so "the same thing two ways" was false
+            // for it. MEASURED 2026-11-12: `--gpus device=0 --device /dev/nvidia-caps/nvidia-cap1`
+            // answered that the two flags named the same thing; a MIG capability node is not a card.
+            (Some(_), Some(path)) if path.starts_with('/') => {
+                Some(Err(Error::Cli(device_path_message(path))))
+            }
             (Some(_), Some(_)) => Some(Err(Error::Cli(
                 "--gpus and --device name the same thing two ways: pass one".to_string(),
             ))),
@@ -1097,6 +1189,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     .map_err(|e| {
                         use crate::cdi::DeviceRefError as D;
                         Error::Cli(match e {
+                            D::NotQualified { given } if given.starts_with('/') => {
+                                device_path_message(&given)
+                            }
                             D::NotQualified { given } => {
                                 format!(
                                 "--device {given}: not a CDI name. Use --device nvidia.com/gpu=0"
@@ -1167,8 +1262,16 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                         })
                     }),
             ),
-            (Some(spec), None) => Some(crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| {
-                match e {
+            (Some(spec), None) => {
+                if let Some(note) = crate::gpu_grant::capabilities_note(spec) {
+                    eprintln!("kern: note: {note}");
+                }
+                if crate::gpu_grant::asks_for_no_gpu(spec) {
+                    eprintln!("kern: note: {}", crate::gpu_grant::describe_no_gpu(spec));
+                }
+                crate::gpu_grant::selection_from_spec(std::path::Path::new("/"), spec)
+                    .map_err(|e| {
+                        match e {
                     crate::gpu_grant::GpuSpecError::Empty => Error::Cli(
                         "--gpus needs a value: a count like 2, a card like device=0, or all"
                             .to_string(),
@@ -1197,8 +1300,31 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                         "--gpus {given}: not a card index. Use --gpus device=0, \
                          --gpus device=0,1, --gpus all, or a count like --gpus 2"
                     )),
+                    // A UUID IS A DOCUMENTED SHAPE, so the refusal is about this HOST and not
+                    // about the grammar: Docker's reference takes `device_ids: ["GPU-ebc4a5d2"]`
+                    // and so does this flag now. The message names what the driver does publish,
+                    // because the two likely causes are the wrong machine and a card that moved.
+                    crate::gpu_grant::GpuSpecError::UnknownUuid { given, known } => {
+                        Error::Cli(if known.is_empty() {
+                            format!(
+                                "--gpus device={given}: this host's driver publishes no GPU UUID \
+                                 at all, so there is nothing to match it against"
+                            )
+                        } else {
+                            format!(
+                                "--gpus device={given}: no card here carries that UUID. This host \
+                                 has: {}",
+                                known.join(", ")
+                            )
+                        })
+                    }
                 }
-            })),
+                    })
+                    // `Result<Option<_>, _>` INTO `Option<Result<_, _>>`: a spec that asks for no card
+                    // becomes the same `None` the no-flag case produces, so nothing downstream has to
+                    // learn a fourth state.
+                    .transpose()
+            }
             (None, None) => None,
         };
 
@@ -2212,6 +2338,24 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         timeout: img_health.timeout.unwrap_or(args.health_timeout),
         action: health_action,
     };
+    // SAID ONCE, WHERE THE EFFECTIVE PROBE IS KNOWN. A warning and not a refusal: the file is valid,
+    // the box runs, and the operator may well be about to bind the tool in. What it must not do is
+    // run and report `unhealthy` with nothing naming the cause. See `health_probe_driver_tool` for
+    // the measurement and for why the remedies below are the two that were RUN.
+    if let Some(tool) = health_probe_driver_tool(health_cfg.probe.as_ref()) {
+        eprintln!(
+            "kern: warning: box '{name}': the healthcheck runs `{tool}`, which no box has: a GPU \
+             grant binds the driver's LIBRARIES and none of its binaries (docker's NVIDIA runtime \
+             injects them from the host, kern does not). The probe can never pass, so this box \
+             stays `unhealthy` for its whole life and a compose `service_healthy` gate on it never \
+             opens. Two remedies, both measured passing in a granted box: bind the tool in from \
+             this host (-v /usr/bin/{tool}:/usr/bin/{tool}:ro) with a GLIBC image, since the \
+             driver's tools are glibc and a musl rootfs cannot run them; or probe what the grant \
+             DOES bind, e.g. `test -c /dev/nvidiactl`, which is present in a granted box and absent \
+             in one started without --gpus.",
+            name = name.as_str()
+        );
+    }
     // ONE POLICY OBJECT, BUILT ONCE, and computed BEFORE the branch so the detached path and the
     // systemd-managed path cannot bound their logs differently. `LogCap::default()` is what every
     // box had before the flags existed, so an unset flag changes nothing.
@@ -5660,6 +5804,70 @@ mod image_defaults_tests {
 
     fn shell_probe(c: &str) -> kern_oci::HealthTest {
         kern_oci::HealthTest::Shell(c.to_string())
+    }
+
+    /// ⛔ A HEALTHCHECK ON `nvidia-smi` IS A BOX THAT CAN NEVER BE HEALTHY, and it used to be a box
+    /// that never said so.
+    ///
+    /// MEASURED 2026-11-12: a compose service with `gpus: all` and
+    /// `healthcheck: test: ["CMD", "nvidia-smi"]` (the shape NVIDIA's own guides print, and one that
+    /// appears in field example lists verbatim) started, took both of this host's cards, and sat at
+    /// `unhealthy` with no output naming the cause. Under docker the identical file is healthy,
+    /// because its NVIDIA runtime injects the binary and kern binds no binaries. The cost is a
+    /// `depends_on: {condition: service_healthy}` gate that never opens.
+    ///
+    /// THE PREDICATE IS THE RUNTIME'S, not a copy of the tool list: `kern-isolation` owns the five
+    /// names `libnvidia-container` injects, and a surface that carried its own copy would be the
+    /// recurring defect of this repo (one derived condition computed twice).
+    #[test]
+    fn a_health_probe_that_runs_a_driver_tool_is_named_and_an_ordinary_one_is_not() {
+        // BOTH FORMS, because compose writes both: `["CMD", …]` reaches this as an exec probe and
+        // `["CMD-SHELL", …]` as a shell string.
+        assert_eq!(
+            health_probe_driver_tool(Some(&kern_oci::HealthTest::Exec(vec![
+                "nvidia-smi".to_string()
+            ])))
+            .as_deref(),
+            Some("nvidia-smi")
+        );
+        assert_eq!(
+            health_probe_driver_tool(Some(&shell_probe("nvidia-smi || exit 1"))).as_deref(),
+            Some("nvidia-smi")
+        );
+        // WRAPPED IN A SHELL, which is why every token is scanned and not just the program: this is
+        // the form a file uses when the check needs a pipe, and `sh` is not a driver tool.
+        assert_eq!(
+            health_probe_driver_tool(Some(&kern_oci::HealthTest::Exec(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "/usr/bin/nvidia-smi".to_string(),
+            ])))
+            .as_deref(),
+            Some("/usr/bin/nvidia-smi"),
+            "a path spelling is reported as the caller wrote it"
+        );
+        // ⛔ AND THE WARNING MUST NOT FIRE ON A CHECK THAT WORKS. `test -c /dev/nvidiactl` is the
+        // remedy this warning recommends, so a predicate that flagged it would send the reader in a
+        // circle; both were MEASURED in a granted box, where the node is present and the probe
+        // passes, and in one started without `--gpus`, where it is absent and the probe fails.
+        for ok in [
+            "test -c /dev/nvidiactl",
+            "pg_isready -U app",
+            "curl -f http://localhost:8000/health",
+            "python3 -c \"import torch; torch.cuda.init()\"",
+            // Names that merely LOOK like the tool: the box's own wrapper is the workload's
+            // business and a hint about grants would describe a cause that is not there.
+            "my-nvidia-smi --json",
+            "nvidia-smi-wrapper",
+        ] {
+            assert_eq!(
+                health_probe_driver_tool(Some(&shell_probe(ok))),
+                None,
+                "a probe that can pass must stay silent: {ok}"
+            );
+        }
+        // No probe at all is no warning: a box without a healthcheck has nothing to report.
+        assert_eq!(health_probe_driver_tool(None), None);
     }
 
     /// A ZERO IS "UNSET", NOT "EVERY ZERO SECONDS". The OCI config writes 0 for a field the image
