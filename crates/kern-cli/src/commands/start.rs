@@ -69,7 +69,17 @@ pub fn box_plan(
             // name it here is the launch's refusal to report and not the plan's.
             (None, Some(reference)) => {
                 match crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference) {
-                    Ok(index) => Some(crate::gpu_grant::GpuSelection::These(vec![index])),
+                    Ok(resolved) => {
+                        // ON THE PLAN TOO, and in the plan's own voice: an operator reading
+                        // `--plan` to find out what a box will get is the reader most entitled to
+                        // know which part of the spec kern does not act on.
+                        if let Some(msg) =
+                            crate::cdi::describe_hooks_not_run(reference, &resolved.hooks_not_run)
+                        {
+                            println!("  gpu grant: {msg}");
+                        }
+                        Some(crate::gpu_grant::GpuSelection::These(vec![resolved.index]))
+                    }
                     Err(_) => {
                         println!(
                     "  gpu grant: --device {reference} does not resolve on this host, so `kern \
@@ -1070,7 +1080,20 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // about the MOUNTS: the same card reached either way produces the same nodes.
             (None, Some(reference)) => Some(
                 crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference)
-                    .map(|index| crate::gpu_grant::GpuSelection::These(vec![index]))
+                    .map(|resolved| {
+                        // WHAT THE SPEC ASKED FOR THAT kern DOES NOT DO, before the box starts and
+                        // on the `--plan` path as well, because this value is computed once for
+                        // both. The nodes of a CDI device and of `--gpus` are the same set, which
+                        // is what "alias" means here; the hooks are the part that is not, and
+                        // saying nothing about them let the equality be read as a stronger claim
+                        // than it is.
+                        if let Some(msg) =
+                            crate::cdi::describe_hooks_not_run(reference, &resolved.hooks_not_run)
+                        {
+                            eprintln!("kern: warning: {msg}");
+                        }
+                        crate::gpu_grant::GpuSelection::These(vec![resolved.index])
+                    })
                     .map_err(|e| {
                         use crate::cdi::DeviceRefError as D;
                         Error::Cli(match e {

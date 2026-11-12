@@ -29,10 +29,18 @@
 //!      to read the version, refuse a spec newer than the one we know how to read, and never apply
 //!      a host gid as a container gid: measured in `gpu_grant`, `setgroups` inside a box succeeds
 //!      with the number and grants nothing, because that gid maps to a different kgid.
-//!   2. `idmap` IS IGNORED. It needs privilege on the source filesystem, which a rootless box has
-//!      not got. Ignoring it is the documented fallback, and it is named here rather than silently
-//!      dropped.
-//!   3. THE DIRECTORIES ARE CONFIGURABLE, NOT CARVED. The two standard ones are `/etc/cdi` and
+//!   2. `idmap` IS NOT A CDI FIELD, and a document carrying one is REFUSED. This reader used to
+//!      accept it and report that it had ignored it, on the belief that the reference's `Mount`
+//!      might have it. Read from `specs-go/config.go` on 2026-11-12: `Mount` is `hostPath`,
+//!      `containerPath`, `options`, `type`, and nothing else, so the reference refuses the document
+//!      and kern was accepting a dialect no other reader takes. The refusal is the unknown-field
+//!      one, which names the key.
+//!   3. HOOKS ARE PARSED, NOT RUN, AND NOW SAID SO. A grant is a set of binds; kern starts no
+//!      process a spec names. `nvidia-ctk` 1.18.2 attaches a `createContainer` hook to every device
+//!      on this host (`nvidia-cdi-hook create-symlinks`), so the box gets the nodes and not the
+//!      `/dev/dri/by-path` links that hook would have made. Silence there was a functional gap read
+//!      as an alias: `--device` names what it does not run.
+//!   4. THE DIRECTORIES ARE CONFIGURABLE, NOT CARVED. The two standard ones are `/etc/cdi` and
 //!      `/var/run/cdi`. `$XDG_RUNTIME_DIR/cdi` is NOT standard, and on this host it does not exist.
 //!      Reading only one of the two finds nothing here, because `/etc/cdi` exists and is empty
 //!      while the real spec is in `/var/run/cdi`.
@@ -663,11 +671,6 @@ pub struct CdiSpec {
     pub devices: Vec<CdiDevice>,
     /// The edits every device gets.
     pub common: ContainerEdits,
-    /// Whether the document carried an `idmap`, which this reader ignores by rule.
-    ///
-    /// REPORTED rather than dropped in silence: an operator who wrote one is entitled to know it
-    /// did nothing, and the plan's rule is to ignore the field, not to hide that it was there.
-    pub idmap_ignored: bool,
 }
 
 /// Read `containerEdits` out of a tree node.
@@ -734,20 +737,35 @@ const DEVICE_NODE_FIELDS: &[&str] = &[
 ];
 /// `Mount`, one entry of `mounts`.
 ///
-/// `idmap` IS IN THIS SET AND IS NOT IN THE REFERENCE'S, which is a discrepancy rather than a
-/// decision. kern looks for `mounts[].idmap` deliberately, to record that it was ignored, while the
-/// measured `Mount` at HEAD `9e21b8b` carries only the four below. Refusing a key kern itself reads
-/// would be strictly worse than accepting one the reference refuses, so it stays until the
-/// discrepancy is resolved: either kern is reading a field that does not exist, or the enumeration
-/// missed it.
-const MOUNT_FIELDS: &[&str] = &["hostPath", "containerPath", "options", "type", "idmap"];
+/// THE DISCREPANCY IS RESOLVED AND `idmap` IS GONE FROM THIS SET. It used to be here so a spec
+/// carrying one would parse and the reader could report that it had been ignored, recorded as "a
+/// discrepancy rather than a decision: either kern is reading a field that does not exist, or the
+/// enumeration missed it". It was the first of those. Read from the reference's own source on
+/// 2026-11-12, `specs-go/config.go`:
+///
+/// ```text
+/// type Mount struct {
+///     HostPath      string   `json:"hostPath"          yaml:"hostPath"`
+///     ContainerPath string   `json:"containerPath"     yaml:"containerPath"`
+///     Options       []string `json:"options,omitempty" yaml:"options,omitempty"`
+///     Type          string   `json:"type,omitempty"    yaml:"type,omitempty"`
+/// }
+/// ```
+///
+/// There is no `idmap` on a CDI mount at all, so the reference's `KnownFields(true)` REFUSES a
+/// document that has one, and kern was accepting a document every other reader rejects. That is a
+/// dialect, and a spec that works here and nowhere else is worse for its author than a refusal:
+/// kern now refuses it with the same unknown-field error, naming the key.
+///
+/// Confirmed against the only real spec this project can reach: `nvidia-ctk` 1.18.2 writes 619
+/// lines to `/var/run/cdi/nvidia.yaml` on this host and not one `idmap` among them.
+const MOUNT_FIELDS: &[&str] = &["hostPath", "containerPath", "options", "type"];
 /// `Hook`, one entry of `hooks`.
 const HOOK_FIELDS: &[&str] = &["hookName", "path", "args", "env", "timeout"];
 
-fn container_edits(node: &Value, line_hint: usize) -> Result<(ContainerEdits, bool), CdiError> {
+fn container_edits(node: &Value, line_hint: usize) -> Result<ContainerEdits, CdiError> {
     check_fields(node, EDITS_FIELDS, "containerEdits")?;
     let mut edits = ContainerEdits::default();
-    let mut idmap = false;
 
     if let Some(nodes) = node.get("deviceNodes") {
         for item in nodes.items() {
@@ -777,9 +795,6 @@ fn container_edits(node: &Value, line_hint: usize) -> Result<(ContainerEdits, bo
                         .collect()
                 })
                 .unwrap_or_default();
-            if item.get("idmap").is_some() {
-                idmap = true;
-            }
             edits.mounts.push(CdiMount {
                 host_path: PathBuf::from(host),
                 container_path: PathBuf::from(container),
@@ -808,7 +823,7 @@ fn container_edits(node: &Value, line_hint: usize) -> Result<(ContainerEdits, bo
         return Err(CdiError::AdditionalGids { line: line_hint });
     }
 
-    Ok((edits, idmap))
+    Ok(edits)
 }
 
 /// Read a whole CDI document.
@@ -844,7 +859,6 @@ pub fn parse_spec(text: &str) -> Result<CdiSpec, CdiError> {
         return Err(CdiError::NoKind);
     };
 
-    let mut idmap_ignored = false;
     let mut devices: Vec<CdiDevice> = Vec::new();
     if let Some(list) = tree.get("devices") {
         for item in list.items() {
@@ -853,11 +867,7 @@ pub fn parse_spec(text: &str) -> Result<CdiSpec, CdiError> {
                 continue;
             };
             let edits = match item.get("containerEdits") {
-                Some(node) => {
-                    let (edits, idmap) = container_edits(node, 0)?;
-                    idmap_ignored |= idmap;
-                    edits
-                }
+                Some(node) => container_edits(node, 0)?,
                 None => ContainerEdits::default(),
             };
             devices.push(CdiDevice {
@@ -868,11 +878,7 @@ pub fn parse_spec(text: &str) -> Result<CdiSpec, CdiError> {
     }
 
     let common = match tree.get("containerEdits") {
-        Some(node) => {
-            let (edits, idmap) = container_edits(node, 0)?;
-            idmap_ignored |= idmap;
-            edits
-        }
+        Some(node) => container_edits(node, 0)?,
         None => ContainerEdits::default(),
     };
 
@@ -881,7 +887,6 @@ pub fn parse_spec(text: &str) -> Result<CdiSpec, CdiError> {
         kind: kind.to_string(),
         devices,
         common,
-        idmap_ignored,
     })
 }
 
@@ -1057,7 +1062,6 @@ containerEdits:
         // The hook is READ and never executed; a report may name it.
         assert_eq!(spec.devices[0].edits.hooks.len(), 1);
         assert_eq!(spec.devices[0].edits.hooks[0].hook_name, "createContainer");
-        assert!(!spec.idmap_ignored);
     }
 
     /// A VERSION NEWER THAN THIS READER IS REFUSED, and the equal case is accepted, which is the
@@ -1131,23 +1135,112 @@ containerEdits:
         ));
     }
 
-    /// `idmap` is IGNORED and REPORTED. Dropping it in silence would leave an operator believing a
-    /// field they wrote had an effect.
+    /// `idmap` IS REFUSED, exactly as the reference refuses it.
+    ///
+    /// THIS TEST ASSERTED THE OPPOSITE UNTIL 2026-11-12, when the reference's own
+    /// `specs-go/config.go` was read: `Mount` has `hostPath`, `containerPath`, `options` and
+    /// `type`, so there is no `idmap` on a CDI mount and a reader with `KnownFields(true)` rejects
+    /// the document. kern accepted it and reported that it had ignored the field, which made this
+    /// build the only one that would run such a spec. The field is unknown, and the unknown-field
+    /// refusal names it.
     #[test]
-    fn an_idmap_is_ignored_and_said_to_have_been() {
+    fn an_idmap_is_refused_because_the_reference_has_no_such_field() {
         let text = SAMPLE.replace(
             "          options:\n",
             "          idmap:\n            - containerID: 0\n          options:\n",
         );
-        let Ok(spec) = parse_spec(&text) else {
-            panic!("an idmap must not fail the parse");
-        };
-        assert!(
-            spec.idmap_ignored,
-            "the spec carried an idmap and the reader must say so"
+        match parse_spec(&text) {
+            Err(CdiError::UnknownField { field, .. }) => {
+                assert_eq!(field, "idmap", "the refusal must name the key");
+            }
+            Err(other) => panic!("refused for the wrong reason: {other:?}"),
+            Ok(_) => panic!("a spec with mounts[].idmap was accepted; the reference refuses it"),
+        }
+    }
+
+    /// THE HOOKS TRAVEL WITH THE RESOLUTION, from the device AND from the common edits.
+    ///
+    /// WHY IT MATTERS, measured on 2026-11-12: `nvidia-ctk` 1.18.2 attaches a `createContainer`
+    /// hook to every device in `/var/run/cdi/nvidia.yaml`, and kern ran none of them and said
+    /// nothing. The device NODES of a CDI name and of `--gpus` are the same set, so a reader
+    /// comparing node lists read "alias" as a complete equivalence. It is not: no hook runs, and
+    /// what a hook would have created is not in the box.
+    #[test]
+    fn a_resolved_device_carries_the_hooks_kern_will_not_run() {
+        let root = std::env::temp_dir().join(format!("kern-cdi-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        if std::fs::create_dir_all(root.join("etc/cdi")).is_err() {
+            eprintln!("skip: no writable temp dir");
+            return;
+        }
+        // `/dev` from the host, because the nesting rule wants a real character device and an
+        // unprivileged test cannot make one. `/dev/null` is one everywhere.
+        if std::os::unix::fs::symlink("/dev", root.join("dev")).is_err() {
+            eprintln!("skip: cannot link a dev directory");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        // THE DOCUMENT CARRIES A HOOK THAT THE DEVICE DOES NOT, and that is the whole shape of this
+        // fixture. The first version put the document's only hook on the device as well, to
+        // exercise the deduplication, which made the document half of the collection invisible:
+        // deleting `hook_labels(&spec.common)` from the resolver left this test GREEN. A sabotage
+        // that passes is the test being wrong, not the code being right.
+        //
+        // So: one hook in both places (the deduplication), one only on the device, one only on the
+        // document.
+        std::fs::write(
+            root.join("etc/cdi/a.yaml"),
+            concat!(
+                "cdiVersion: 0.5.0\n",
+                "kind: nvidia.com/gpu\n",
+                "containerEdits:\n",
+                "  hooks:\n",
+                "    - hookName: createContainer\n",
+                "      path: /usr/bin/nvidia-cdi-hook\n",
+                "    - hookName: postStart\n",
+                "      path: /opt/vendor/document-only-hook\n",
+                "devices:\n",
+                "  - name: \"0\"\n",
+                "    containerEdits:\n",
+                "      deviceNodes:\n",
+                "        - path: /dev/null\n",
+                "      hooks:\n",
+                "        - hookName: createContainer\n",
+                "          path: /usr/bin/nvidia-cdi-hook\n",
+                "        - hookName: startContainer\n",
+                "          path: /opt/vendor/second-hook\n",
+            ),
+        )
+        .expect("write spec");
+
+        let resolved = resolve_device_ref(&root, "nvidia.com/gpu=0").expect("must resolve");
+        assert_eq!(resolved.index, 0);
+        assert_eq!(
+            resolved.hooks_not_run,
+            vec![
+                "createContainer /usr/bin/nvidia-cdi-hook".to_string(),
+                "postStart /opt/vendor/document-only-hook".to_string(),
+                "startContainer /opt/vendor/second-hook".to_string(),
+            ],
+            "the device's hooks, the document's, once each, sorted"
         );
-        // And the mount it was attached to is still read.
-        assert_eq!(spec.common.mounts.len(), 1);
+
+        let msg = describe_hooks_not_run("nvidia.com/gpu=0", &resolved.hooks_not_run)
+            .expect("a device with hooks must produce a sentence");
+        for needle in [
+            "3 hook(s)",
+            "nvidia.com/gpu=0",
+            "createContainer",
+            "startContainer",
+            "/opt/vendor/document-only-hook",
+            "/usr/bin/nvidia-cdi-hook",
+        ] {
+            assert!(msg.contains(needle), "the sentence omits {needle}: {msg}");
+        }
+        // AND NO SENTENCE WHERE THERE ARE NO HOOKS, which is the majority of specs and must stay
+        // silent: a warning on every `--device` would be noise an operator learns to skip.
+        assert_eq!(describe_hooks_not_run("nvidia.com/gpu=0", &[]), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// EVERY CONSTRUCT THIS READER DOES NOT IMPLEMENT IS REFUSED BY NAME. A permissive parser that
@@ -1615,7 +1708,7 @@ containerEdits:
             eprintln!("skip: no writable temp dir");
             return;
         };
-        let got = resolve_device_ref(&root, "nvidia.com/gpu=0");
+        let got = resolve_device_ref(&root, "nvidia.com/gpu=0").map(|r| r.index);
         assert_eq!(
             got,
             Ok(0),
@@ -1879,7 +1972,7 @@ containerEdits:
         );
 
         let started = std::time::Instant::now();
-        let got = resolve_device_ref(&root, "nvidia.com/gpu=0");
+        let got = resolve_device_ref(&root, "nvidia.com/gpu=0").map(|r| r.index);
         let took = started.elapsed();
         assert!(
             took < std::time::Duration::from_secs(5),
@@ -1943,7 +2036,7 @@ containerEdits:
         let _ = std::fs::write(dir.join("aa-junk.yaml"), "\t\tnot: [a, spec\n");
         let _ = std::fs::write(dir.join("zz-good.yaml"), good);
         assert_eq!(
-            resolve_device_ref(&root, "nvidia.com/gpu=0"),
+            resolve_device_ref(&root, "nvidia.com/gpu=0").map(|r| r.index),
             Ok(0),
             "a junk file before the good one must not disable it"
         );
@@ -1973,7 +2066,7 @@ containerEdits:
         // nothing matched.
         let _ = std::fs::write(dir.join("zz-good.yaml"), good);
         assert_eq!(
-            resolve_device_ref(&root, "nvidia.com/gpu=0"),
+            resolve_device_ref(&root, "nvidia.com/gpu=0").map(|r| r.index),
             Ok(0),
             "a JSON file beside a working YAML spec must not disable it"
         );
@@ -2122,7 +2215,52 @@ fn minor_for_uuid(root: &Path, uuid: &str) -> Option<u32> {
 ///
 /// The equivalence that makes this honest is measured rather than asserted: on this host the spec
 /// and the discovery name the same seven nodes for card 0, and a test fails if they ever diverge.
-pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<u32, DeviceRefError> {
+/// What `--device <kind>=<name>` resolved to, and what that spec asked for which kern does not do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDevice {
+    /// The card index the name means.
+    pub index: u32,
+    /// The hooks the spec attaches to this device, each `<hookName> <program>`.
+    ///
+    /// THEY TRAVEL WITH THE RESOLUTION instead of being fetched by a second walk of the spec
+    /// directories, and that is not a convenience: `find_specs` walks a directory any process that
+    /// can write it may fill, so a second read is a second measurement and can answer about a
+    /// different file than the one that decided the index.
+    pub hooks_not_run: Vec<String>,
+}
+
+/// `<hookName> <program>` for every hook in `edits`, which is what a reader needs to find it in the
+/// spec and to recognise what it would have done.
+fn hook_labels(edits: &ContainerEdits) -> Vec<String> {
+    edits
+        .hooks
+        .iter()
+        .map(|h| format!("{} {}", h.hook_name, h.path.display()))
+        .collect()
+}
+
+/// The one sentence for hooks a spec names and kern does not run.
+///
+/// MEASURED, and the reason this exists: `nvidia-ctk` 1.18.2 attaches a `createContainer` hook to
+/// every device in `/var/run/cdi/nvidia.yaml` on this host, running
+/// `nvidia-cdi-hook create-symlinks`. kern bound the nodes, ran nothing, and said nothing, so a
+/// reader comparing the node lists concluded `--device` was a faithful alias of the spec. The nodes
+/// do match; the hook does not run, and a workload that resolves a card through
+/// `/dev/dri/by-path/...` finds nothing there.
+pub fn describe_hooks_not_run(reference: &str, hooks: &[String]) -> Option<String> {
+    if hooks.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the CDI spec attaches {} hook(s) to {reference} and kern runs none: {}. A grant is a set \
+         of binds and starts no program a spec names, so whatever those hooks would have created \
+         is absent: a `create-symlinks` hook, for one, is what makes the /dev/dri/by-path entries.",
+        hooks.len(),
+        hooks.join(", ")
+    ))
+}
+
+pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<ResolvedDevice, DeviceRefError> {
     let trimmed = reference.trim();
     let Some((kind, name)) = trimmed.split_once('=') else {
         return Err(DeviceRefError::NotQualified {
@@ -2198,11 +2336,24 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<u32, DeviceRef
             });
         }
 
+        // THE COMMON EDITS COUNT TOO: a spec may hang its hooks off the document rather than off
+        // each device, and both reach a box that asks for this name. Sorted and deduplicated so a
+        // hook written in both places is reported once.
+        let mut hooks_not_run = hook_labels(&spec.common);
+        hooks_not_run.extend(hook_labels(&device.edits));
+        hooks_not_run.sort();
+        hooks_not_run.dedup();
         if let Ok(index) = device.name.parse::<u32>() {
-            return Ok(index);
+            return Ok(ResolvedDevice {
+                index,
+                hooks_not_run,
+            });
         }
         if let Some(minor) = minor_for_uuid(root, &device.name) {
-            return Ok(minor);
+            return Ok(ResolvedDevice {
+                index: minor,
+                hooks_not_run,
+            });
         }
         return Err(DeviceRefError::UnknownUuid {
             uuid: device.name.clone(),
