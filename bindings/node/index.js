@@ -2258,6 +2258,13 @@ const REFUSED_MOUNT_SOURCES = new Set([
   "/proc",
   "/sys",
   "/dev",
+  // The host's POSIX shared memory: every shm object the user's own processes hold, readable and
+  // writable from the box. Half of the IPC boundary kern refuses as `ipc: host`; kern refuses it
+  // too, and this keeps the refusal a MountRefused here like every other source in this set.
+  "/dev/shm",
+  // The host's POSIX message queues, which live in the IPC namespace itself: measured visible in a
+  // box given the mount.
+  "/dev/mqueue",
   "/var/run/docker.sock",
   "/run/docker.sock",
 ]);

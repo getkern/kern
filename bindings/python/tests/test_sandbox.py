@@ -464,6 +464,9 @@ def test_network_is_opt_in_and_session_level():
         {"/": "/host"},
         {"/etc": "/etc-host"},
         {"/var/run/docker.sock": "/sock"},
+        # The host's POSIX shared memory, half of the IPC boundary `ipc: host` would hand over.
+        {"/dev/shm": "/dev/shm"},
+        {"/dev/mqueue": "/dev/mqueue"},
         {"/tmp": "/"},
         {"/tmp": "/proc"},
         {"/tmp": "/foo/../bar"},

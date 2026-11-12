@@ -1083,6 +1083,9 @@ test("the binary identity is re-asserted per box, not once per Sandbox", () => {
 test("sensitive mount source is refused", () => {
   assert.throws(() => new Sandbox({ mounts: { "/etc": "/host-etc" } }), MountRefused);
   assert.throws(() => new Sandbox({ mounts: { "/": "/root-fs" } }), MountRefused);
+  // The host's POSIX shared memory, half of the IPC boundary `ipc: host` would hand over.
+  assert.throws(() => new Sandbox({ mounts: { "/dev/shm": "/dev/shm" } }), MountRefused);
+  assert.throws(() => new Sandbox({ mounts: { "/dev/mqueue": "/dev/mqueue" } }), MountRefused);
 });
 
 test("relative mount target is refused", () => {
