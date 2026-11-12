@@ -1089,7 +1089,7 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 /// `None` for a box whose PID 1 is not known or no longer alive, which is also the answer when
 /// there is nothing to look inside. Every failure is the same answer, an empty list, because a box
 /// whose `/dev` cannot be read has not been shown to hold a card.
-fn gpu_nodes_of(pid1: Option<i32>) -> String {
+pub(crate) fn gpu_nodes_of(pid1: Option<i32>) -> String {
     let Some(pid) = pid1 else {
         return String::new();
     };
@@ -2625,6 +2625,45 @@ pub fn remove_kept(names: &[String]) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE CARD NODES AND ONLY THOSE, for the row `kern inspect` prints and the badge `kern top`
+    /// shows. The two read this one function so they cannot disagree about one box.
+    ///
+    /// `nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools` and `nvidia-modeset` go with ANY card, so
+    /// listing them would make a box holding one card look like it holds four. `/proc/self/root`
+    /// is this process's own root and has no card nodes under `/dev`, which is the honest empty
+    /// case; a pid that is gone, and `None`, are the same answer for the same reason.
+    #[test]
+    fn the_gpu_row_names_cards_and_not_the_shared_nodes() {
+        // This process: a real, readable `/proc/<pid>/root/dev` with no `/dev/nvidiaN` in it.
+        let mine = super::gpu_nodes_of(Some(std::process::id() as i32));
+        for shared in [
+            "nvidiactl",
+            "nvidia-uvm",
+            "nvidia-uvm-tools",
+            "nvidia-modeset",
+        ] {
+            assert!(
+                !mine.contains(shared),
+                "a shared node leaked into the card list: {mine}"
+            );
+        }
+        for name in mine.split_whitespace() {
+            let rest = name
+                .strip_prefix("nvidia")
+                .unwrap_or_else(|| panic!("not a card node: {name}"));
+            assert!(
+                !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+                "not a card node: {name}"
+            );
+        }
+        // NO PID AND A DEAD PID ARE THE SAME ANSWER, and it is empty rather than an error: a box
+        // whose `/dev` cannot be read has not been shown to hold a card, and saying so with a
+        // dash is what both callers render.
+        assert_eq!(super::gpu_nodes_of(None), "");
+        assert_eq!(super::gpu_nodes_of(Some(-1)), "");
+        assert_eq!(super::gpu_nodes_of(Some(0)), "");
+    }
     use super::mem_cap_row;
 
     /// THE BRANCH THIS HOST CANNOT PRODUCE, which is the only reason the row exists.

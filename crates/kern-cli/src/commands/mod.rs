@@ -9688,7 +9688,7 @@ pub(crate) use imagecache::*;
 mod start;
 pub use start::*;
 
-mod inspect;
+pub(crate) mod inspect;
 pub use inspect::*;
 
 mod compose;

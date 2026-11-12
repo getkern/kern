@@ -2236,6 +2236,28 @@ fn box_isolation(pid: i32) -> String {
             }
         }
     }
+    // A GRANTED CARD IS A DEVICE GRANT, so it belongs with the flags above and not with the
+    // more-confined badge: the box reaches real hardware through the host's driver, which is a
+    // deviation from the isolated default in exactly the way `net:host` is.
+    //
+    // WHICH CARDS, NEVER HOW BUSY. NVML attributes nothing to a cgroup or a uid, so a per-box
+    // utilisation number would be the host's figure wearing a box's name; this table would be
+    // claiming an attribution the driver does not make. Ownership IS attributable, and it is the
+    // question a reader of `kern top` is asking: who has the card.
+    //
+    // Read through the SAME function `kern inspect` uses, from the box's own `/dev`, so the two
+    // views cannot disagree about one box. That disagreement has already happened in this file
+    // once, over `orphaned`, and the comment on that field says what it cost.
+    let gpus = crate::commands::inspect::gpu_nodes_of(Some(pid));
+    let gpu_flag;
+    if !gpus.is_empty() {
+        let idx: Vec<&str> = gpus
+            .split_whitespace()
+            .filter_map(|n| n.strip_prefix("nvidia"))
+            .collect();
+        gpu_flag = format!("gpu:{}", idx.join(","));
+        flags.push(&gpu_flag);
+    }
     flags.join(" ")
 }
 
@@ -2671,7 +2693,8 @@ fn help_text() -> String {
      TABS - what each one shows\n\
        1 Overview   host CPU / RAM / load and the box totals\n\
        2 Boxes      every running box (pods grouped): MEM, CPU%, PIDS, HEALTH, PORTS\n\
-     \x20                (yellow net:host / root-mapped / caps:+ flags a box LESS isolated than default)\n\
+     \x20                (yellow net:host / root-mapped / caps:+ / gpu:N flags a box LESS\n\
+     \x20                 isolated than default; gpu:N says WHICH cards, never how busy)\n\
        3 Runs       kern run throughput: rate/sec, avg latency, peak, total (aggregate)\n\
        4 Images     cached OCI images: repository:tag, size, pulled age (like kern images)\n\
        5 Builds     build history: status, duration, size, age (like kern builds)\n\
@@ -4065,7 +4088,7 @@ mod tests {
             !safe.contains("net:host") && !safe.contains("root-mapped"),
             "an isolated box shows no deviation flag: {safe}"
         );
-        // A box that deviates (net:host / root-mapped / caps:+) surfaces exactly that, as a heads-up.
+        // A box that deviates (net:host / root-mapped / caps:+ / gpu:N) surfaces exactly that.
         let mut r = row("loose", false);
         r.iso = "net:host root-mapped caps:+".into();
         let out2 = boxes_table(&plain(), &[r], 10, usize::MAX, &HostStats::default());
