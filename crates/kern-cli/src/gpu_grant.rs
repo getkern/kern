@@ -395,6 +395,20 @@ pub fn access_path(node: &NodeFacts, who: &Caller) -> AccessPath {
 pub fn access_path_for(node: &NodeFacts, who: &Caller, want: u8) -> AccessPath {
     let granted = |perm: u8| perm & want == want;
 
+    // ROOT IS NOT SUBJECT TO THE MODE, and this answered as though it were: `sudo kern --gpus`
+    // refused a node root can open, because the arithmetic below is the DAC check and root carries
+    // `CAP_DAC_OVERRIDE` in the initial user namespace, which skips it. The caller here is the
+    // host-side process running `kern`, so uid 0 means real root.
+    //
+    // `Owner` is the honest variant: it is uid-based, so it survives a box for the same reason the
+    // owner class does, and `uid_dependent_nodes` separately asks whether the BOX's identity still
+    // reaches the node. A box's own root is a different thing from this one, which holds
+    // `CAP_DAC_OVERRIDE` only over objects whose owner is mapped into its namespace, and that
+    // question is not this function's.
+    if who.uid == 0 {
+        return AccessPath::Owner;
+    }
+
     // 1. THE OWNER CLASS, consulted first and EXCLUSIVELY, and never bounded by the mask.
     //    `posix_acl_permission` reaches `check_perm` for `ACL_USER_OBJ` without passing through the
     //    mask label, and `acl_permission_check` returns on the owner triad before it even looks for
@@ -1166,37 +1180,20 @@ fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
             let Ok(target) = std::fs::read_link(&link) else {
                 continue;
             };
-            // Resolve the chain within the directory, hop by hop and bounded.
-            let mut current = link.clone();
-            let mut next_rel = target.clone();
-            let mut hops = 0u8;
-            let ends_in_grant = loop {
-                if hops >= MAX_LINK_HOPS {
-                    break None;
-                }
-                // An absolute target would leave the root; a grant never follows one.
-                if next_rel.is_absolute() {
-                    break None;
-                }
-                let Some(parent) = current.parent() else {
-                    break None;
-                };
-                current = parent.join(&next_rel);
-                hops = hops.saturating_add(1);
-                let Ok(meta) = std::fs::symlink_metadata(&current) else {
-                    break None;
-                };
-                if !meta.file_type().is_symlink() {
-                    break if identities.contains(&(meta.dev(), meta.ino())) {
-                        Some(current.clone())
-                    } else {
-                        None
-                    };
-                }
-                let Ok(next) = std::fs::read_link(&current) else {
-                    break None;
-                };
-                next_rel = next;
+            // THE ONE RESOLVER, and this was the THIRD copy of the same hop loop. It carried the
+            // same absolute-target bug the other two did, in the same direction as
+            // `canonical_dir_under`'s: it gave up, so a library reached through an absolute link
+            // inside the root had no symlink recorded and the box got the file with no SONAME
+            // pointing at it. A derived condition evaluated in three places is this project's
+            // recurring defect, and this one took three fixes to notice.
+            let mut resolved = link.clone();
+            let ends_in_grant = if follow_links_under(root, &mut resolved) {
+                std::fs::metadata(&resolved)
+                    .ok()
+                    .filter(|meta| identities.contains(&(meta.dev(), meta.ino())))
+                    .map(|_| resolved)
+            } else {
+                None
             };
             if let Some(resolved) = ends_in_grant {
                 // THE LINK'S OWN IDENTITY, ASKED ONLY FOR A LINK THAT IS ACTUALLY GRANTED. This is
@@ -1355,6 +1352,20 @@ fn merge_acl_ids(entries: &mut Vec<(u32, u8)>) {
 /// The facts about one node, read from the filesystem.
 fn node_facts(path: &Path) -> Option<NodeFacts> {
     let meta = std::fs::metadata(path).ok()?;
+    // A GRANT MOUNTS CHARACTER DEVICES AND NOTHING ELSE, and this did not check. `metadata`
+    // FOLLOWS a symlink, so a path named like a node and pointing at a regular file was described
+    // as that file, given an access verdict from its mode, and handed to the mount plan. The
+    // candidate paths come from fixed names and from a directory read, so neither is third-party
+    // input today, which is why this is the layer rather than the hole; it is also the ONE place
+    // the question is asked, so a future caller that builds a path differently cannot skip it.
+    //
+    // `metadata` and not `symlink_metadata`: a host whose `/dev/nvidia0` is a symlink to the real
+    // node is a host kern should still work on, and following to a real character device is right.
+    // What is refused is following to something that is not one.
+    use std::os::unix::fs::FileTypeExt;
+    if !meta.file_type().is_char_device() {
+        return None;
+    }
     Some(NodeFacts {
         uid: meta.uid(),
         gid: meta.gid(),
@@ -2066,6 +2077,25 @@ pub fn render_plan(grant: &GpuGrant, selection: &GpuSelection) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Put a stand-in DEVICE NODE at `path`, the way an unprivileged test can.
+    ///
+    /// These fixtures used regular files, and `node_facts` now requires a character device, which
+    /// is what a grant actually mounts. A whiteout (`c 0 0`) is the only character device an
+    /// unprivileged process may create: `vfs_mknod` tests CAP_MKNOD only
+    /// `if ((S_ISCHR || S_ISBLK) && !is_whiteout && !capable(...))`. So the fixture is now the right
+    /// KIND, which is closer to the real thing than a regular file was, and `false` says the kernel
+    /// refused it rather than leaving a caller to wonder.
+    ///
+    /// ⚠️ The device NUMBER is 0:0 and no real node has that, which is why the hardware row and the
+    /// CDI nesting rule both check `rdev` on top of the kind. `node_facts` deliberately does not:
+    /// its job is to describe a node the resolver already found by name under `dev`, and requiring a
+    /// vendor's major there would make every synthetic root untestable for no boundary.
+    fn fixture_node(path: &Path) -> bool {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map(|p| unsafe { libc::mknod(p.as_ptr(), libc::S_IFCHR | 0o666, 0) } == 0)
+            .unwrap_or(false)
+    }
 
     /// A caller with the given uid and groups, written once so a test reads as its own case.
     fn caller(uid: u32, gids: &[u32]) -> Caller {
@@ -2829,8 +2859,12 @@ mod tests {
             proc_dir.join("version"),
             "NVRM version: NVIDIA UNIX Kernel Module  1.2.3  Build\n",
         );
-        let wrote_node = std::fs::write(dev_dir.join("nvidiactl"), b"");
-        assert!(wrote_version.is_ok() && wrote_node.is_ok());
+        let wrote_node = fixture_node(&dev_dir.join("nvidiactl"));
+        assert!(wrote_version.is_ok());
+        if !wrote_node {
+            eprintln!("skip: this kernel refused a whiteout, so no stand-in node can be made");
+            return;
+        }
 
         let grant = resolve_under(&dir, ElfClass::Bits64);
         match grant {
@@ -2882,7 +2916,7 @@ mod tests {
             "NVRM version: NVIDIA UNIX Kernel Module  1.2.3  Build\n",
         );
         for name in ["nvidia0", "nvidia3", "nvidiactl", "nvidia-uvm", "nvidiafoo"] {
-            let _ = std::fs::write(dev_dir.join(name), b"");
+            let _ = fixture_node(&dev_dir.join(name));
         }
         let Ok(grant) = resolve_under(&dir, ElfClass::Bits64) else {
             panic!("expected a grant");
@@ -2924,7 +2958,7 @@ mod tests {
             proc_dir.join("version"),
             format!("NVRM version: NVIDIA UNIX Kernel Module  {version}  Build\n"),
         );
-        let _ = std::fs::write(root.join("dev/nvidiactl"), b"");
+        let _ = fixture_node(&root.join("dev/nvidiactl"));
 
         // The loader's configuration, written with an `include` and a glob so the parser's two
         // other paths are exercised by every test that builds a root rather than by none of them.
@@ -3351,7 +3385,7 @@ mod tests {
             "NVRM version: NVIDIA UNIX Kernel Module  1.2.3  Build\n",
         );
         for name in ["nvidiactl", "nvidia-uvm", "nvidia0", "nvidia1"] {
-            let _ = std::fs::write(root.join("dev").join(name), b"");
+            let _ = fixture_node(&root.join("dev").join(name));
         }
         // `controlD*` EXISTS in /dev here on purpose: without it the filter would be excluded by
         // the existence check rather than by the name, and a sabotage that added `controlD` to the
@@ -3365,7 +3399,7 @@ mod tests {
             "controlD64",
             "controlD65",
         ] {
-            let _ = std::fs::write(root.join("dev/dri").join(name), b"");
+            let _ = fixture_node(&root.join("dev/dri").join(name));
         }
         // THE INVERSION: minor 0 lives at 01:00.0 and owns card1; minor 1 at 06:00.0 owns card0.
         for (bdf, minor, drm) in [
@@ -3911,6 +3945,97 @@ mod tests {
             }
             other => panic!("expected Unreachable, got {other:?}"),
         }
+    }
+
+    /// A GRANT MOUNTS CHARACTER DEVICES, AND ROOT IS NOT SUBJECT TO THE MODE.
+    ///
+    /// Two separate gaps in the same decision path. `node_facts` used `std::fs::metadata`, which
+    /// FOLLOWS a symlink, with no check on the KIND, so a path named like a node and pointing at a
+    /// regular file was described as that file, given an access verdict from its mode, and handed to
+    /// the mount plan. And `access_path` computed the DAC check for uid 0, which the kernel skips:
+    /// root carries `CAP_DAC_OVERRIDE` in the initial user namespace, so `sudo kern --gpus` was
+    /// refused a node root can open.
+    #[test]
+    fn a_non_device_is_not_a_node_and_root_is_not_refused_by_a_mode() {
+        let dir = std::env::temp_dir().join(format!("kern-nodekind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("skip: no writable temp dir");
+            return;
+        }
+
+        // POSITIVE CONTROL FIRST: a character device IS a node, so every refusal below is the kind
+        // being checked and not a function that answers nothing.
+        let node = dir.join("nvidia0");
+        if !fixture_node(&node) {
+            eprintln!("skip: this kernel refused a whiteout, so no stand-in node can be made");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            node_facts(&node).is_some(),
+            "a character device must read as a node"
+        );
+
+        // A REGULAR FILE IS NOT A NODE, which is what every synthetic fixture in this module used
+        // to be: they were testing a shape the resolver never sees.
+        let plain_file = dir.join("nvidia1");
+        let _ = std::fs::write(&plain_file, b"not a device");
+        assert!(
+            node_facts(&plain_file).is_none(),
+            "a regular file named like a node is not a node"
+        );
+
+        // A DIRECTORY IS NOT A NODE EITHER.
+        let as_dir = dir.join("nvidia2");
+        let _ = std::fs::create_dir_all(&as_dir);
+        assert!(node_facts(&as_dir).is_none(), "a directory is not a node");
+
+        // A SYMLINK TO A REGULAR FILE IS NOT A NODE, and this is the case `metadata` alone missed:
+        // it follows the link and describes the target without asking what kind it is.
+        let link_to_file = dir.join("nvidia3");
+        let _ = std::os::unix::fs::symlink(&plain_file, &link_to_file);
+        assert!(
+            node_facts(&link_to_file).is_none(),
+            "a symlink to a regular file is not a node"
+        );
+
+        // A SYMLINK TO A REAL NODE *IS* ONE, which is why the check follows rather than refusing
+        // every link: a host whose `/dev/nvidia0` is a symlink to the real node is a host kern
+        // should still work on.
+        let link_to_node = dir.join("nvidia4");
+        let _ = std::os::unix::fs::symlink(&node, &link_to_node);
+        assert!(
+            node_facts(&link_to_node).is_some(),
+            "a symlink to a character device is still a node"
+        );
+
+        // ROOT IS NOT SUBJECT TO THE MODE. `0o000` owned by somebody else is `Unreachable` for an
+        // ordinary caller and reachable for root, because the arithmetic in `access_path` is the
+        // DAC check and root skips it.
+        let shut = NodeFacts {
+            uid: 4242,
+            gid: 4242,
+            mode: 0o000,
+            acl: None,
+        };
+        assert_eq!(
+            access_path(&shut, &caller(1000, &[1000])),
+            AccessPath::Unreachable,
+            "an ordinary caller cannot open a 0o000 node"
+        );
+        let as_root = access_path(&shut, &caller(0, &[0]));
+        assert_eq!(
+            as_root,
+            AccessPath::Owner,
+            "root is not refused by a mode it overrides"
+        );
+        assert!(
+            as_root.survives_a_box(),
+            "and the verdict is uid-based, so it survives the loss of groups"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE LINKER CONFIGURATION PARSER, OVER THE FORMS GLIBC ACCEPTS AND IT DID NOT.
