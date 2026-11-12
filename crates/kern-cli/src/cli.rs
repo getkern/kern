@@ -175,6 +175,14 @@ pub enum Command {
         hostname: Option<String>,
         /// `--tun`: expose `/dev/net/tun` in the box (WireGuard / userspace VPN).
         tun: bool,
+        /// `--gpus <spec>`: hand the box one NVIDIA GPU, resolved from native discovery.
+        ///
+        /// S2 of the GPU plan grants exactly ONE card, so the accepted forms name one: `0`, `1`,
+        /// `device=0`. `all` is deliberately NOT accepted here rather than silently meaning "the
+        /// first one", because multi-GPU is a later phase and a flag that takes a word and does
+        /// something narrower than the word says is the kind of surface this project treats as a
+        /// defect.
+        gpus: Option<String>,
         /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
         init: bool,
         /// `--pids-limit N`: cap the box's process/thread count (`pids.max`) - fork-bomb containment.
@@ -3010,6 +3018,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut ssh_port: Option<u16> = None;
     let mut ssh_key: Option<String> = None;
     let mut hostname: Option<String> = None;
+    let mut gpus: Option<String> = None;
     let mut tun = false;
     let mut init = false;
     let mut pids_limit: Option<u64> = None;
@@ -3150,6 +3159,16 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 // `--tun`: expose /dev/net/tun so a WireGuard / userspace-VPN workload can create a
                 // tunnel inside the box's own network namespace.
                 "--tun" => tun = true,
+                // `--gpus <spec>`: one NVIDIA card, from native discovery. The value is kept
+                // verbatim and validated where the grant is built, so the parser stays a parser
+                // and the one place that knows what a card index means stays one place.
+                "--gpus" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => gpus = Some((*v).to_string()),
+                        None => return Err(Error::Usage("--gpus <index|device=N>")),
+                    }
+                }
                 "--init" => init = true,
                 // `--keep`: see `crate::keepbox`. One flag, no value: where the layer lives is kern's
                 // to choose, under `$XDG_DATA_HOME/kern/boxes/<name>`, so two boxes of the same name
@@ -4102,6 +4121,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             ssh_key,
             hostname,
             tun,
+            gpus,
             init,
             pids_limit,
             tmpfs,
@@ -4193,6 +4213,7 @@ const BOX_ONLY_FLAGS: &[&str] = &[
     "--ssh",
     "--pod",
     "--hostname",
+    "--gpus",
     "--egress-allow",
     // `--landlock-rw` is deliberately NOT here: it is the one confinement that needs no mount
     // namespace, so it is the one `box` flag that `run` can honour for real. See `parse_run`.
@@ -5082,6 +5103,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ssh_key,
             hostname,
             tun,
+            gpus,
             init,
             pids_limit,
             tmpfs,
@@ -5159,6 +5181,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             ssh_key: ssh_key.as_deref(),
             hostname: hostname.as_deref(),
             tun,
+            gpus: gpus.as_deref(),
             init,
             pids_limit,
             tmpfs: &tmpfs,

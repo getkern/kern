@@ -974,6 +974,91 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             crate::volume::is_named(src) && crate::volume::size_limit(src).is_some()
         });
     let mut volumes = parse_volumes(&plain_specs)?;
+
+    // `--gpus`: ONE card, resolved from native discovery and mounted through the SAME `Volume`
+    // list `-v` uses. There is no second mount path and no hook: a GPU grant is a set of binds,
+    // and giving it its own machinery would mean two places that can disagree about what a bind
+    // is. The resolver is pure and was tested without hardware in S1; this is the plumbing.
+    //
+    // EVERY REFUSAL NAMES ITS CAUSE AND STOPS. A box that was asked for a GPU and started without
+    // one is the "runs and lies" outcome: the workload meets `CUDA_ERROR_NO_DEVICE` at its first
+    // call and has no way to learn that the flag it passed did nothing.
+    if let Some(spec) = args.gpus {
+        let card = crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| match e {
+            crate::gpu_grant::GpuSpecError::Empty => {
+                Error::Cli("--gpus needs a card index, for example --gpus 0".to_string())
+            }
+            crate::gpu_grant::GpuSpecError::AllNotYet => Error::Cli(
+                "--gpus all is not accepted yet: this build grants exactly one card, so name it \
+                 (--gpus 0). Refusing rather than quietly granting the first one."
+                    .to_string(),
+            ),
+            crate::gpu_grant::GpuSpecError::NotAnIndex { given } => Error::Cli(format!(
+                "--gpus {given}: not a card index. Use --gpus 0, --gpus device=0 or --gpus gpu=0"
+            )),
+        })?;
+
+        let caller = crate::gpu_grant::Caller::current();
+        let grant = crate::gpu_grant::resolve(&caller).map_err(|e| match e {
+            crate::gpu_grant::ResolveError::NoDriverVersionFile { .. } => Error::Cli(
+                "--gpus was passed and no NVIDIA driver is loaded on this host: \
+                 /proc/driver/nvidia/version does not exist"
+                    .to_string(),
+            ),
+            crate::gpu_grant::ResolveError::DriverVersionUnparsable { first_line } => {
+                Error::Cli(format!(
+                    "--gpus was passed and the driver's version line carries no version: \
+                     {first_line:?}"
+                ))
+            }
+            crate::gpu_grant::ResolveError::NoNodes { driver_version } => Error::Cli(format!(
+                "--gpus was passed, driver {driver_version} is loaded, and no device node exists \
+                 under /dev"
+            )),
+        })?;
+
+        let binds = crate::gpu_grant::mount_plan(&grant, card).map_err(|e| match e {
+            crate::gpu_grant::MountPlanError::NoSuchCard { wanted, present } => {
+                let list: Vec<String> = present.iter().map(|c| c.to_string()).collect();
+                let names = if list.is_empty() {
+                    "none".to_string()
+                } else {
+                    list.join(", ")
+                };
+                Error::Cli(format!(
+                    "--gpus {wanted}: this host has no card {wanted}. Present: {names}"
+                ))
+            }
+            crate::gpu_grant::MountPlanError::GroupsNeeded { gids, nodes } => {
+                let g: Vec<String> = gids.iter().map(|x| x.to_string()).collect();
+                let n: Vec<String> = nodes.iter().map(|p| p.display().to_string()).collect();
+                Error::Cli(format!(
+                    "--gpus: {} is reachable only through group(s) {}, and a box carries no \
+                     supplementary group. Keeping them is all or nothing, so kern refuses rather \
+                     than deciding it for you: add the invoking user's gid to /etc/subgid and map \
+                     it, or relax the node's mode.",
+                    n.join(", "),
+                    g.join(", ")
+                ))
+            }
+            crate::gpu_grant::MountPlanError::Unreachable { nodes } => {
+                let n: Vec<String> = nodes.iter().map(|p| p.display().to_string()).collect();
+                Error::Cli(format!(
+                    "--gpus: the invoking user cannot open {} on this host either, so no box \
+                     could use it",
+                    n.join(", ")
+                ))
+            }
+        })?;
+
+        for (source, target, read_only) in binds {
+            volumes.push(kern_isolation::Volume {
+                source,
+                target,
+                read_only,
+            });
+        }
+    }
     // `--mount`'s mounts, resolved from their FIELDS. They never pass through a `src:dst` string, so
     // a source containing a `:` (or, quoted, a `,`) arrives whole - which is the difference between
     // `--mount` and `-v` now, and the reason the cache under a `colon:cache` path can be mounted.

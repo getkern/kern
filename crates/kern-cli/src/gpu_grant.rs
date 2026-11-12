@@ -86,6 +86,11 @@ const DEFAULT_LIB_DIRS: [&str; 6] = [
     "usr/lib",
 ];
 
+/// How many symlink hops a library's chain may take before the sweep gives up. A chain on this
+/// host is at most two (`libcuda.so` to `libcuda.so.1` to the versioned file); a filesystem permits
+/// a loop, and an unbounded resolver meeting one would not return.
+const MAX_LINK_HOPS: u8 = 8;
+
 /// How deep `include` directives in `ld.so.conf` are followed. The format allows a glob that can
 /// name a file which includes again; a bound makes a cycle finite instead of fatal.
 const MAX_LD_CONF_DEPTH: u8 = 4;
@@ -331,6 +336,36 @@ pub struct Library {
     pub ino: u64,
 }
 
+/// One link that has to exist beside a granted library for the loader to find it.
+///
+/// WHY A GRANT WITHOUT THESE IS A GRANT THAT DOES NOT WORK. A library's file name carries the
+/// driver version, and nothing loads it by that name: `dlopen` is called with the SONAME, and the
+/// SONAME is a symlink that does NOT carry the version and is therefore not in the computed set.
+/// Measured on this host: 29 versioned files, and beside them 19 SONAME links
+/// (`libnvidia-ml.so.1 -> libnvidia-ml.so.580.173.02`) plus 10 development links
+/// (`libnvidia-ml.so -> libnvidia-ml.so.1`). Ten of the 29 have no link at all, because the driver
+/// loads them by their full versioned name.
+///
+/// COMPUTED LIKE THE LIBRARIES, NEVER LISTED. The sweep walks the same linker directories looking
+/// for symlinks, resolves each chain to its end, and keeps the link when the end is one of the
+/// granted identities. A hand-written list of SONAMEs would be the "curated discovery" the plan
+/// names as a way to fail: it would be right on this driver and wrong on the next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symlink {
+    /// The link itself, as found under the root.
+    pub link: PathBuf,
+    /// What the link says, verbatim. A relative target is kept relative, because the link and its
+    /// target sit in the same directory and rewriting it to an absolute path would make the box's
+    /// copy point outside the box.
+    pub target: PathBuf,
+    /// The granted library the chain ends at, recorded while the chain is walked.
+    ///
+    /// Carried rather than re-derived: the mount plan needs to know which real file to put at this
+    /// link's path, and resolving the chain a second time there would be the same derived
+    /// condition computed in two places that this project keeps paying for.
+    pub resolved: PathBuf,
+}
+
 /// Everything a box would need for a GPU, computed from one root and one caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuGrant {
@@ -340,6 +375,8 @@ pub struct GpuGrant {
     pub nodes: Vec<PathBuf>,
     /// The libraries, deduplicated by identity and filtered to one ELF class.
     pub libraries: Vec<Library>,
+    /// The links that have to exist beside them, computed from the same directories.
+    pub symlinks: Vec<Symlink>,
     /// The directories the loader has to search, derived from where the libraries actually are.
     pub ldconfig_dirs: Vec<PathBuf>,
     /// The one group decision, computed once.
@@ -451,6 +488,54 @@ pub fn driver_version_from(contents: &str) -> Option<String> {
     None
 }
 
+/// Resolve a directory to its canonical form WITHIN the root, following relative symlinks on the
+/// way and refusing absolute ones.
+///
+/// WHY A GRANT CANNOT SKIP THIS. On a usrmerge host `/lib` is a symlink to `usr/lib`, so the same
+/// directory is reachable by two names and the sweep may produce either. The name matters because
+/// it becomes the bind's TARGET inside the box, and the box's own filesystem has the same symlink:
+/// kern resolves a bind target without traversing symlinked components, so a target under `/lib`
+/// is refused with `ENOTDIR` and the whole box fails to build. Measured: with `/lib/...` paths the
+/// box died with `openat(volume source, O_NOFOLLOW) failed: Not a directory`.
+///
+/// `std::fs::canonicalize` cannot be used: it resolves against the real filesystem root, which on a
+/// synthetic tree walks out of the root under test and on a real host turns a relative link into
+/// the host's own absolute path.
+fn canonical_dir_under(root: &Path, dir: &Path) -> PathBuf {
+    let Ok(relative) = dir.strip_prefix(root) else {
+        return dir.to_path_buf();
+    };
+    let mut out = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        out.push(name);
+        let mut hops = 0u8;
+        while hops < MAX_LINK_HOPS {
+            let Ok(meta) = std::fs::symlink_metadata(&out) else {
+                break;
+            };
+            if !meta.file_type().is_symlink() {
+                break;
+            }
+            let Ok(target) = std::fs::read_link(&out) else {
+                break;
+            };
+            // An absolute target would leave the root, and a grant never follows one.
+            if target.is_absolute() {
+                break;
+            }
+            let Some(parent) = out.parent().map(Path::to_path_buf) else {
+                break;
+            };
+            out = parent.join(target);
+            hops = hops.saturating_add(1);
+        }
+    }
+    out
+}
+
 /// Every directory the dynamic loader searches under this root.
 ///
 /// The defaults come first so a host with no `ld.so.conf` still resolves, then the configuration is
@@ -460,7 +545,14 @@ fn linker_dirs(root: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
 
+    // CANONICALISED BEFORE THE DUPLICATE CHECK, so `/lib/...` and `/usr/lib/...` collapse into one
+    // entry and the only form that leaves this function is one a box can mount at. The name is not
+    // cosmetic: it becomes the bind's TARGET, the image has the same `/lib` symlink, and kern
+    // resolves a target without traversing symlinked components. Measured before this: a grant
+    // carrying `/lib/...` paths failed the whole box with
+    // `openat(volume source, O_NOFOLLOW) failed: Not a directory`.
     let push = |dir: PathBuf, out: &mut Vec<PathBuf>, seen: &mut BTreeSet<PathBuf>| {
+        let dir = canonical_dir_under(root, &dir);
         if seen.insert(dir.clone()) {
             out.push(dir);
         }
@@ -592,6 +684,86 @@ fn libraries_under(root: &Path, version: &str, want: ElfClass) -> Vec<Library> {
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// Every symlink in the linker's directories whose chain ends at one of the granted libraries.
+///
+/// The chain is followed by hand rather than with `std::fs::canonicalize`, for one reason that a
+/// grant cannot afford to get wrong: `canonicalize` resolves against the REAL filesystem root, so
+/// on a synthetic tree it would walk out of the root it was given, and on a real host it would
+/// follow an absolute target to the host's own path. The walk here stays inside the directory the
+/// link lives in, which is where a library's SONAME link always points.
+///
+/// `MAX_LINK_HOPS` bounds it. A symlink loop is a thing a filesystem permits, and an unbounded
+/// resolver meeting one would not return.
+fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
+    let identities: BTreeSet<(u64, u64)> = granted.iter().map(|l| (l.dev, l.ino)).collect();
+    let mut out: Vec<Symlink> = Vec::new();
+    // DEDUPLICATED BY THE LINK'S OWN IDENTITY, not by its path, for exactly the reason the library
+    // sweep is: `/lib` is a symlink to `/usr/lib`, so the same link inode is reached by two paths.
+    // Keying on the path answered 58 on this host where the truth is 29. This is the second time
+    // the same mistake was made in this file, once for the files and once for the links, which is
+    // why both now use the same key.
+    let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+
+    for dir in linker_dirs(root) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let link = entry.path();
+            let Ok(link_meta) = std::fs::symlink_metadata(&link) else {
+                continue;
+            };
+            if !link_meta.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(target) = std::fs::read_link(&link) else {
+                continue;
+            };
+            // Resolve the chain within the directory, hop by hop and bounded.
+            let mut current = link.clone();
+            let mut hops = 0u8;
+            let ends_in_grant = loop {
+                if hops >= MAX_LINK_HOPS {
+                    break None;
+                }
+                let Ok(meta) = std::fs::symlink_metadata(&current) else {
+                    break None;
+                };
+                if !meta.file_type().is_symlink() {
+                    break if identities.contains(&(meta.dev(), meta.ino())) {
+                        Some(current.clone())
+                    } else {
+                        None
+                    };
+                }
+                let Ok(next) = std::fs::read_link(&current) else {
+                    break None;
+                };
+                // An absolute target would leave the root; a grant never follows one.
+                if next.is_absolute() {
+                    break None;
+                }
+                let Some(parent) = current.parent() else {
+                    break None;
+                };
+                current = parent.join(next);
+                hops = hops.saturating_add(1);
+            };
+            if let Some(resolved) = ends_in_grant {
+                if seen.insert((link_meta.dev(), link_meta.ino())) {
+                    out.push(Symlink {
+                        link,
+                        target,
+                        resolved,
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.link.cmp(&b.link));
     out
 }
 
@@ -791,6 +963,7 @@ pub fn resolve_under(root: &Path, who: &Caller, want: ElfClass) -> Result<GpuGra
     let policy = group_policy(&with_facts, who);
 
     let libraries = libraries_under(root, &driver_version, want);
+    let symlinks = symlinks_for(root, &libraries);
 
     // The loader's directories are DERIVED from where the libraries are, not copied from the host's
     // configuration: a directory with no library in it would tell the box to search a path that has
@@ -809,9 +982,165 @@ pub fn resolve_under(root: &Path, who: &Caller, want: ElfClass) -> Result<GpuGra
         driver_version,
         nodes: node_paths,
         libraries,
+        symlinks,
         ldconfig_dirs: dirs,
         group_policy: policy,
     })
+}
+
+/// Why `--gpus` could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuSpecError {
+    /// The value was empty.
+    Empty,
+    /// `all` names more than one card, and this phase grants one. Refused rather than narrowed:
+    /// a flag that takes a word and does something smaller than the word says is a defect.
+    AllNotYet,
+    /// The value is not a card index.
+    NotAnIndex {
+        /// What was passed, so the message can quote it.
+        given: String,
+    },
+}
+
+/// Read `--gpus`: one card, by index.
+///
+/// Accepts `0`, `device=0` and `gpu=0`, which are the three spellings a reader arrives with from
+/// other runtimes. Refuses `all` by name rather than treating it as "the first one".
+pub fn parse_gpu_spec(value: &str) -> Result<u32, GpuSpecError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(GpuSpecError::Empty);
+    }
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Err(GpuSpecError::AllNotYet);
+    }
+    let digits = trimmed
+        .strip_prefix("device=")
+        .or_else(|| trimmed.strip_prefix("gpu="))
+        .unwrap_or(trimmed);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(GpuSpecError::NotAnIndex {
+            given: trimmed.to_string(),
+        });
+    }
+    digits.parse::<u32>().map_err(|_| GpuSpecError::NotAnIndex {
+        given: trimmed.to_string(),
+    })
+}
+
+/// Why a grant cannot be turned into mounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountPlanError {
+    /// The card the caller asked for does not exist on this host.
+    NoSuchCard {
+        /// The index that was asked for.
+        wanted: u32,
+        /// The indices that do exist, so the message can list them.
+        present: Vec<u32>,
+    },
+    /// A node in the grant is reachable only through a group the box cannot carry. Refused, per
+    /// the roadmap's §5.4: keeping the groups is all-or-nothing and is not something a GPU flag
+    /// may decide on the caller's behalf.
+    GroupsNeeded {
+        /// The gids that would unlock them.
+        gids: Vec<u32>,
+        /// The nodes that need them.
+        nodes: Vec<PathBuf>,
+    },
+    /// A node cannot be opened by the invoking user at all, with or without groups.
+    Unreachable {
+        /// The nodes in question.
+        nodes: Vec<PathBuf>,
+    },
+}
+
+/// One bind the box needs: a host path, where it appears inside, and whether it is read-only.
+///
+/// A plain triple rather than a type of its own: the launch converts it straight into the
+/// `Volume` the `-v` path already uses, and introducing a parallel type here would be a second
+/// spelling of a thing that exists.
+pub type Bind = (String, String, bool);
+
+/// The card index a `/dev/nvidiaN` path names, if it names one.
+fn card_index_of(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("nvidia")?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<u32>().ok()
+}
+
+/// Turn a grant into the binds that give a box exactly ONE card.
+///
+/// THE SHARED NODES COME TOO, and leaving one out is not a smaller grant but a broken one. S0
+/// measured what each absence does: without `nvidiactl` the driver answers `100
+/// CUDA_ERROR_NO_DEVICE`, without `nvidia-uvm` it answers `999 CUDA_ERROR_UNKNOWN`. A plan that
+/// mounted the card alone would produce a box that looks granted and fails at `cuInit`.
+///
+/// THE OTHER CARDS ARE NOT MOUNTED, which is how a non-granted card fails: it is absent, and S0's
+/// control showed a box cannot fabricate it (`mknod` answers `EPERM`).
+///
+/// EVERY LIBRARY IS READ-ONLY. The host's libraries are mounted, never copied and never modified,
+/// which is also what the vendor licence requires of them.
+///
+/// THE SYMLINKS BECOME BINDS OF THEIR RESOLVED FILE, placed at the link's own path. The box gets
+/// `libcuda.so.1` as a real file rather than as a link, which loads identically and needs no
+/// writable directory inside the box: `dlopen("libcuda.so.1")` is a name lookup, not a link walk.
+pub fn mount_plan(grant: &GpuGrant, card: u32) -> Result<Vec<Bind>, MountPlanError> {
+    match &grant.group_policy {
+        GroupPolicy::Unreachable { nodes } => {
+            return Err(MountPlanError::Unreachable {
+                nodes: nodes.clone(),
+            })
+        }
+        GroupPolicy::Needed { gids, nodes } => {
+            return Err(MountPlanError::GroupsNeeded {
+                gids: gids.clone(),
+                nodes: nodes.clone(),
+            })
+        }
+        GroupPolicy::NotNeeded => {}
+    }
+
+    let present: Vec<u32> = grant
+        .nodes
+        .iter()
+        .filter_map(|p| card_index_of(p))
+        .collect();
+    if !present.contains(&card) {
+        return Err(MountPlanError::NoSuchCard {
+            wanted: card,
+            present,
+        });
+    }
+
+    let mut binds: Vec<Bind> =
+        Vec::with_capacity(grant.nodes.len() + grant.libraries.len() + grant.symlinks.len());
+
+    for node in &grant.nodes {
+        match card_index_of(node) {
+            // A per-card node that is not the one asked for stays out.
+            Some(index) if index != card => continue,
+            _ => {}
+        }
+        let path = node.to_string_lossy().to_string();
+        binds.push((path.clone(), path, false));
+    }
+
+    for library in &grant.libraries {
+        let path = library.path.to_string_lossy().to_string();
+        binds.push((path.clone(), path, true));
+    }
+
+    for link in &grant.symlinks {
+        let source = link.resolved.to_string_lossy().to_string();
+        let target = link.link.to_string_lossy().to_string();
+        binds.push((source, target, true));
+    }
+
+    Ok(binds)
 }
 
 /// How much of the grant a render spells out.
@@ -845,6 +1174,16 @@ pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
     if detail == Detail::Full {
         for library in &grant.libraries {
             out.push_str(&format!("  lib {}\n", library.path.display()));
+        }
+    }
+    out.push_str(&format!("symlinks {}\n", grant.symlinks.len()));
+    if detail == Detail::Full {
+        for link in &grant.symlinks {
+            out.push_str(&format!(
+                "  link {} -> {}\n",
+                link.link.display(),
+                link.target.display()
+            ));
         }
     }
     out.push_str(&format!("ldconfig dirs {}\n", grant.ldconfig_dirs.len()));
@@ -1371,6 +1710,221 @@ mod tests {
         root
     }
 
+    /// Put a symlink beside a library in the synthetic root.
+    fn link_in(root: &Path, dir: &str, name: &str, target: &str) {
+        let full = root.join(dir).join(name);
+        let _ = std::fs::remove_file(&full);
+        let _ = std::os::unix::fs::symlink(target, &full);
+    }
+
+    /// THE SONAME LINKS, computed and not listed, and deduplicated by the LINK'S identity.
+    ///
+    /// Keying on the link's path answered 58 on this host where the truth is 29, because `/lib` is
+    /// a symlink to `/usr/lib` and the same link inode is reached twice. That is the same mistake
+    /// the library sweep already made once, made a second time in the same file, and the real host
+    /// was again the only thing that could see it. A hard-linked tree cannot reproduce a symlink's
+    /// identity, so the two directories here are made to be one.
+    #[test]
+    fn a_link_reached_by_two_linker_paths_is_one_link() {
+        let root = synthetic_root(
+            "linkdedup",
+            "5.5.5",
+            &[(
+                "usr/lib/x86_64-linux-gnu",
+                "libz.so.5.5.5",
+                ELF_CLASS_64,
+                None,
+            )],
+        );
+        link_in(
+            &root,
+            "usr/lib/x86_64-linux-gnu",
+            "libz.so.1",
+            "libz.so.5.5.5",
+        );
+        // `lib` IS `usr/lib`, the usrmerge shape, so both linker defaults reach one directory.
+        let _ = std::fs::remove_dir_all(root.join("lib"));
+        let _ = std::os::unix::fs::symlink("usr/lib", root.join("lib"));
+
+        let who = caller(1000, &[1000]);
+        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let _ = std::fs::remove_dir_all(&root);
+        let Ok(grant) = got else {
+            panic!("expected a grant");
+        };
+        assert_eq!(
+            grant.libraries.len(),
+            1,
+            "one library reached twice is one: {:?}",
+            grant.libraries
+        );
+        assert_eq!(
+            grant.symlinks.len(),
+            1,
+            "one link reached twice is one: {:?}",
+            grant.symlinks
+        );
+    }
+
+    /// A chain of two links is followed to its end, which is the `libcuda.so -> libcuda.so.1 ->
+    /// libcuda.so.580.173.02` shape this host actually has.
+    #[test]
+    fn a_two_hop_chain_ending_in_a_granted_library_is_taken() {
+        let root = synthetic_root(
+            "chain",
+            "4.4.4",
+            &[(
+                "usr/lib/x86_64-linux-gnu",
+                "libchain.so.4.4.4",
+                ELF_CLASS_64,
+                None,
+            )],
+        );
+        link_in(
+            &root,
+            "usr/lib/x86_64-linux-gnu",
+            "libchain.so.1",
+            "libchain.so.4.4.4",
+        );
+        link_in(
+            &root,
+            "usr/lib/x86_64-linux-gnu",
+            "libchain.so",
+            "libchain.so.1",
+        );
+
+        let who = caller(1000, &[1000]);
+        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let _ = std::fs::remove_dir_all(&root);
+        let Ok(grant) = got else {
+            panic!("expected a grant");
+        };
+        let names: Vec<String> = grant
+            .symlinks
+            .iter()
+            .filter_map(|s| s.link.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            names.contains(&"libchain.so.1".to_string()),
+            "got {names:?}"
+        );
+        assert!(names.contains(&"libchain.so".to_string()), "got {names:?}");
+        assert_eq!(names.len(), 2, "and nothing else: {names:?}");
+    }
+
+    /// A link whose chain ends somewhere that is not in the grant is not in the grant either.
+    #[test]
+    fn a_link_pointing_outside_the_grant_is_not_taken() {
+        let root = synthetic_root(
+            "outside",
+            "3.3.3",
+            &[(
+                "usr/lib/x86_64-linux-gnu",
+                "libin.so.3.3.3",
+                ELF_CLASS_64,
+                None,
+            )],
+        );
+        let dir = root.join("usr/lib/x86_64-linux-gnu");
+        let _ = std::fs::write(dir.join("libother.so.9.9.9"), b"\x7fELF\x02 not granted");
+        link_in(
+            &root,
+            "usr/lib/x86_64-linux-gnu",
+            "libother.so.1",
+            "libother.so.9.9.9",
+        );
+        link_in(
+            &root,
+            "usr/lib/x86_64-linux-gnu",
+            "libin.so.1",
+            "libin.so.3.3.3",
+        );
+
+        let who = caller(1000, &[1000]);
+        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let _ = std::fs::remove_dir_all(&root);
+        let Ok(grant) = got else {
+            panic!("expected a grant");
+        };
+        let names: Vec<String> = grant
+            .symlinks
+            .iter()
+            .filter_map(|s| s.link.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(names, vec!["libin.so.1".to_string()], "got {names:?}");
+    }
+
+    /// An ABSOLUTE target would leave the root, so the grant refuses to follow it. On a synthetic
+    /// tree that is the difference between reading the test's files and reading this machine's.
+    #[test]
+    fn a_link_with_an_absolute_target_is_refused() {
+        let root = synthetic_root(
+            "absolute",
+            "2.2.2",
+            &[(
+                "usr/lib/x86_64-linux-gnu",
+                "libabs.so.2.2.2",
+                ELF_CLASS_64,
+                None,
+            )],
+        );
+        let full = root.join("usr/lib/x86_64-linux-gnu/libabs.so.1");
+        let target = root.join("usr/lib/x86_64-linux-gnu/libabs.so.2.2.2");
+        let _ = std::os::unix::fs::symlink(&target, &full);
+
+        let who = caller(1000, &[1000]);
+        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let _ = std::fs::remove_dir_all(&root);
+        let Ok(grant) = got else {
+            panic!("expected a grant");
+        };
+        assert!(
+            grant.symlinks.is_empty(),
+            "an absolute target leaves the root and must not be followed: {:?}",
+            grant.symlinks
+        );
+    }
+
+    /// A loop is a thing a filesystem permits. The sweep must return.
+    #[test]
+    fn a_symlink_loop_terminates_instead_of_hanging() {
+        let root = synthetic_root(
+            "loop",
+            "1.1.1",
+            &[(
+                "usr/lib/x86_64-linux-gnu",
+                "libok.so.1.1.1",
+                ELF_CLASS_64,
+                None,
+            )],
+        );
+        link_in(&root, "usr/lib/x86_64-linux-gnu", "liba.so.1", "libb.so.1");
+        link_in(&root, "usr/lib/x86_64-linux-gnu", "libb.so.1", "liba.so.1");
+        link_in(
+            &root,
+            "usr/lib/x86_64-linux-gnu",
+            "libok.so.1",
+            "libok.so.1.1.1",
+        );
+
+        let who = caller(1000, &[1000]);
+        let got = resolve_under(&root, &who, ElfClass::Bits64);
+        let _ = std::fs::remove_dir_all(&root);
+        let Ok(grant) = got else {
+            panic!("expected a grant");
+        };
+        let names: Vec<String> = grant
+            .symlinks
+            .iter()
+            .filter_map(|s| s.link.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["libok.so.1".to_string()],
+            "the loop must be dropped and the good link kept: {names:?}"
+        );
+    }
+
     /// THE DEDUPLICATION, which a sabotage proved the rest of the suite could not see.
     ///
     /// Removing the `(dev, ino)` check left all 21 other tests green while the count on this host
@@ -1532,6 +2086,162 @@ mod tests {
         );
     }
 
+    /// `--gpus` over its whole input space, including the forms a reader arrives with from other
+    /// runtimes and the ones that must be refused by name.
+    #[test]
+    fn the_gpus_spec_accepts_three_spellings_of_one_card_and_refuses_the_rest() {
+        for good in ["0", "1", "7", "device=0", "gpu=3", " 2 "] {
+            let Ok(n) = parse_gpu_spec(good) else {
+                panic!("{good:?} should parse");
+            };
+            let digits: String = good
+                .trim()
+                .trim_start_matches("device=")
+                .trim_start_matches("gpu=")
+                .to_string();
+            assert_eq!(n.to_string(), digits, "{good:?} parsed to the wrong index");
+        }
+        assert_eq!(parse_gpu_spec(""), Err(GpuSpecError::Empty));
+        assert_eq!(parse_gpu_spec("   "), Err(GpuSpecError::Empty));
+        // `all` is refused BY NAME. A flag that takes a word and grants something narrower than
+        // the word says is the defect this refusal exists to prevent.
+        assert_eq!(parse_gpu_spec("all"), Err(GpuSpecError::AllNotYet));
+        assert_eq!(parse_gpu_spec("ALL"), Err(GpuSpecError::AllNotYet));
+        for bad in ["-1", "0,1", "0.5", "first", "device=", "gpu=x", "0x1"] {
+            match parse_gpu_spec(bad) {
+                Err(GpuSpecError::NotAnIndex { given }) => assert_eq!(given, bad.trim()),
+                other => panic!("{bad:?} should be NotAnIndex, got {other:?}"),
+            }
+        }
+    }
+
+    /// A grant with two cards, used by the mount-plan tests.
+    fn two_card_grant(policy: GroupPolicy) -> GpuGrant {
+        GpuGrant {
+            driver_version: "580.173.02".to_string(),
+            nodes: vec![
+                PathBuf::from("/dev/nvidiactl"),
+                PathBuf::from("/dev/nvidia-uvm"),
+                PathBuf::from("/dev/nvidia0"),
+                PathBuf::from("/dev/nvidia1"),
+            ],
+            libraries: vec![Library {
+                path: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
+                dev: 1,
+                ino: 2,
+            }],
+            symlinks: vec![Symlink {
+                link: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.1"),
+                target: PathBuf::from("libcuda.so.580.173.02"),
+                resolved: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
+            }],
+            ldconfig_dirs: vec![PathBuf::from("/usr/lib/x86_64-linux-gnu")],
+            group_policy: policy,
+        }
+    }
+
+    /// ONE card, and the shared nodes with it. Leaving a shared node out is not a smaller grant,
+    /// it is a broken one: S0 measured that a box without `nvidiactl` answers `100` and a box
+    /// without `nvidia-uvm` answers `999`.
+    #[test]
+    fn the_mount_plan_takes_one_card_and_every_shared_node() {
+        let grant = two_card_grant(GroupPolicy::NotNeeded);
+        let Ok(binds) = mount_plan(&grant, 0) else {
+            panic!("expected a plan for card 0");
+        };
+        let targets: Vec<&str> = binds.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert!(targets.contains(&"/dev/nvidiactl"), "{targets:?}");
+        assert!(targets.contains(&"/dev/nvidia-uvm"), "{targets:?}");
+        assert!(targets.contains(&"/dev/nvidia0"), "{targets:?}");
+        assert!(
+            !targets.contains(&"/dev/nvidia1"),
+            "the other card must stay out: {targets:?}"
+        );
+
+        // And the other way round, so the filter is not accidentally keeping the first card.
+        let Ok(binds) = mount_plan(&grant, 1) else {
+            panic!("expected a plan for card 1");
+        };
+        let targets: Vec<&str> = binds.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert!(targets.contains(&"/dev/nvidia1"), "{targets:?}");
+        assert!(!targets.contains(&"/dev/nvidia0"), "{targets:?}");
+    }
+
+    /// Libraries and links are READ-ONLY, device nodes are not. A read-only device node would
+    /// break the driver's own ioctls; a writable host library is a write into the host.
+    #[test]
+    fn libraries_are_read_only_and_nodes_are_not() {
+        let grant = two_card_grant(GroupPolicy::NotNeeded);
+        let Ok(binds) = mount_plan(&grant, 0) else {
+            panic!("expected a plan");
+        };
+        for (source, target, read_only) in &binds {
+            if target.starts_with("/dev/") {
+                assert!(!read_only, "a device node must stay writable: {target}");
+            } else {
+                assert!(read_only, "a host library must be read-only: {source}");
+            }
+        }
+    }
+
+    /// A link becomes a bind of the file it RESOLVES to, placed at the link's own path, so the box
+    /// needs no writable directory and `dlopen` finds the SONAME as a real file.
+    #[test]
+    fn a_link_is_mounted_as_its_resolved_file_at_the_links_path() {
+        let grant = two_card_grant(GroupPolicy::NotNeeded);
+        let Ok(binds) = mount_plan(&grant, 0) else {
+            panic!("expected a plan");
+        };
+        let found = binds.iter().find(|(_, t, _)| t.ends_with("libcuda.so.1"));
+        let Some((source, target, read_only)) = found else {
+            panic!("the SONAME link is not in the plan: {binds:?}");
+        };
+        assert_eq!(source, "/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02");
+        assert_eq!(target, "/usr/lib/x86_64-linux-gnu/libcuda.so.1");
+        assert!(read_only);
+    }
+
+    /// A card this host has not got is refused, and the refusal lists the ones it has.
+    #[test]
+    fn a_card_that_does_not_exist_is_refused_with_the_ones_that_do() {
+        let grant = two_card_grant(GroupPolicy::NotNeeded);
+        match mount_plan(&grant, 7) {
+            Err(MountPlanError::NoSuchCard { wanted, present }) => {
+                assert_eq!(wanted, 7);
+                assert_eq!(present, vec![0, 1]);
+            }
+            other => panic!("expected NoSuchCard, got {other:?}"),
+        }
+    }
+
+    /// THE GROUP POLICY STOPS THE MOUNT, which is the whole point of computing it in S1. A grant
+    /// whose nodes need a group the box cannot carry must not be mounted and hoped for: the
+    /// workload would meet the error with no way to learn that the flag did nothing.
+    #[test]
+    fn a_grant_needing_groups_is_refused_before_anything_is_mounted() {
+        let grant = two_card_grant(GroupPolicy::Needed {
+            gids: vec![44],
+            nodes: vec![PathBuf::from("/dev/nvidia0")],
+        });
+        match mount_plan(&grant, 0) {
+            Err(MountPlanError::GroupsNeeded { gids, nodes }) => {
+                assert_eq!(gids, vec![44]);
+                assert_eq!(nodes, vec![PathBuf::from("/dev/nvidia0")]);
+            }
+            other => panic!("expected GroupsNeeded, got {other:?}"),
+        }
+
+        let grant = two_card_grant(GroupPolicy::Unreachable {
+            nodes: vec![PathBuf::from("/dev/nvidia0")],
+        });
+        match mount_plan(&grant, 0) {
+            Err(MountPlanError::Unreachable { nodes }) => {
+                assert_eq!(nodes, vec![PathBuf::from("/dev/nvidia0")]);
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
     /// `render_plan` prints what the grant says and invents nothing.
     #[test]
     fn the_plan_prints_the_group_decision_in_each_of_its_three_shapes() {
@@ -1542,6 +2252,11 @@ mod tests {
                 path: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
                 dev: 1,
                 ino: 2,
+            }],
+            symlinks: vec![Symlink {
+                link: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.1"),
+                target: PathBuf::from("libcuda.so.580.173.02"),
+                resolved: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
             }],
             ldconfig_dirs: vec![PathBuf::from("/usr/lib/x86_64-linux-gnu")],
             group_policy: GroupPolicy::NotNeeded,
