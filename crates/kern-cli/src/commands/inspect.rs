@@ -1093,16 +1093,21 @@ pub(crate) fn gpu_nodes_of(pid1: Option<i32>) -> String {
     let Some(pid) = pid1 else {
         return String::new();
     };
-    gpu_nodes_in(std::path::Path::new(&format!("/proc/{pid}/root/dev")))
+    gpu_nodes_in(
+        std::path::Path::new(&format!("/proc/{pid}/root/dev")),
+        std::path::Path::new("/dev"),
+    )
 }
 
-/// The same reading, over a directory a test can build.
+/// The same reading, over a directory a test can build, against the host nodes to agree with.
 ///
 /// Split out because the property worth asserting is the PREDICATE, and the only way to reach it
 /// through `gpu_nodes_of` is to have a live box: the forged shapes (a regular file, a directory, a
-/// symlink to another character device) need no privilege to create and are exactly what a box does.
-pub(crate) fn gpu_nodes_in(dev: &std::path::Path) -> String {
+/// symlink to another character device, a whiteout) need no privilege to create and are exactly
+/// what a box does. `host_dev` is `/dev` in production and is the half a box cannot write.
+pub(crate) fn gpu_nodes_in(dev: &std::path::Path, host_dev: &std::path::Path) -> String {
     use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(dev) else {
         return String::new();
     };
@@ -1129,11 +1134,32 @@ pub(crate) fn gpu_nodes_in(dev: &std::path::Path) -> String {
             // while still refusing to follow a symlink there, which is exactly the pair of
             // properties this needs: the granted node reads as a character device, and a symlink
             // the box made to one (`/dev/nvidia8 -> /dev/null`) reads as a symlink.
-            let kind = std::fs::symlink_metadata(e.path()).ok()?.file_type();
-            if !kind.is_char_device() {
+            //
+            // THE KIND IS NOT ENOUGH EITHER, and the reason is that the measurement above enumerated
+            // the majors a GPU uses instead of the exemption the kernel writes: `vfs_mknod` tests
+            // CAP_MKNOD only `if (S_ISCHR(mode) || S_ISBLK(mode)) && !is_whiteout`, and a whiteout is
+            // exactly `c 0 0`. So an unprivileged process CAN make a character device, measured on
+            // ext4 and on a box's own tmpfs, and `python3 -c 'os.mknod("/dev/nvidia9", S_IFCHR, 0)'`
+            // in a box holding `--gpus device=0` made this row read `nvidia0 nvidia9`, while a box
+            // holding nothing read `nvidia7 nvidia8`. Measured 2026-11-11, after the kind check.
+            //
+            // So the device NUMBER has to agree with the host node of that name, which is the half
+            // of the pair the box cannot write: the whiteout is 0:0 and the real card is 195:N, and
+            // the two ways to carry a real number across are both refused. `mknod` of major 195, 226
+            // or 510 is EPERM, and a hardlink from a granted node to a second name is EXDEV, because
+            // the grant arrives as a bind mount and `link(2)` does not cross one (measured: `ln
+            // /dev/nvidia0 /dev/nvidia7` in a box that holds nvidia0). Agreement also makes the row
+            // fail closed on a host whose node is gone, which is the honest answer: a card kern can
+            // no longer name is not a card it can report.
+            let kind = std::fs::symlink_metadata(e.path()).ok()?;
+            if !kind.file_type().is_char_device() {
                 return None;
             }
             let n = e.file_name().to_string_lossy().into_owned();
+            let host = std::fs::symlink_metadata(host_dev.join(&n)).ok()?;
+            if !host.file_type().is_char_device() || host.rdev() != kind.rdev() {
+                return None;
+            }
             // The per-card nodes only. `nvidiactl`, `nvidia-uvm` and `nvidia-modeset` go with any
             // card, so listing them would make one card look like four.
             let rest = n.strip_prefix("nvidia")?;
@@ -2708,14 +2734,23 @@ mod tests {
     /// legend describes as a box less isolated than the default. An operator asking which boxes hold
     /// hardware was answered by the boxes.
     ///
-    /// All three forged shapes need no privilege, which is the point. The real thing does: a box
-    /// cannot `mknod` a character device at all (EPERM for majors 195, 226 and 510 on every
-    /// filesystem it can write, because `vfs_mknod` resolves CAP_MKNOD against the initial user
-    /// namespace), and it cannot mount one either (`mount` is in the seccomp denylist). The symlink
-    /// case is the one a careless fix reintroduces: `metadata` would follow it to a real character
-    /// device and report a card.
+    /// All four forged shapes need no privilege, which is the point, and the fourth is the one that
+    /// defeated the first fix. The symlink case is what a careless `metadata` reintroduces: it would
+    /// follow the link to a real character device and report a card. The WHITEOUT is sharper, and it
+    /// says the earlier measurement asked the wrong question: `mknod` of majors 195, 226 and 510 is
+    /// EPERM because `vfs_mknod` resolves CAP_MKNOD against the initial user namespace, but that test
+    /// reads `if ((S_ISCHR(mode) || S_ISBLK(mode)) && !is_whiteout && !capable(CAP_MKNOD))`, and a
+    /// whiteout is `c 0 0`. Measured 2026-11-11: an unprivileged `mknod("nvidia9", S_IFCHR, 0)`
+    /// SUCCEEDS on ext4 and on a box's own `/dev` tmpfs, and with the kind check alone a box holding
+    /// `--gpus device=0` printed `gpu  nvidia0 nvidia9`.
+    ///
+    /// Hence the device number, and hence `host_dev`: what the box cannot write is the host's own
+    /// node. The positive control is the half that matters, because this is the second fix to this
+    /// predicate and the first one broke the honest case while passing its own negative.
     #[test]
     fn a_box_cannot_forge_the_gpu_row_by_making_files_named_like_cards() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
         let dir = std::env::temp_dir().join(format!("kern-gpurow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dev dir");
@@ -2724,17 +2759,39 @@ mod tests {
         // A symlink to a character device that really is one, which is how a box would borrow the
         // kind it cannot create. `/dev/null` is a character device on every host this runs on.
         std::os::unix::fs::symlink("/dev/null", dir.join("nvidia8")).expect("symlink");
+        // The whiteout, named after a card the host DOES have, so the name half of the old predicate
+        // matches and only the device number can refuse it. `mknod` through libc because
+        // `std::fs` has no interface for it; the call is the same one a box makes.
+        let white = std::ffi::CString::new(dir.join("nvidia0").as_os_str().as_bytes())
+            .expect("no NUL in a temp path");
+        let made = unsafe { libc::mknod(white.as_ptr(), libc::S_IFCHR | 0o600, 0) };
         assert_eq!(
-            super::gpu_nodes_in(&dir),
+            made,
+            0,
+            "the whiteout case cannot run if the kernel refuses the whiteout: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.join("nvidia0"))
+                .expect("the whiteout")
+                .file_type()
+                .is_char_device(),
+            "a whiteout that does not read as a character device would make this test vacuous"
+        );
+        assert_eq!(
+            super::gpu_nodes_in(&dir, std::path::Path::new("/dev")),
             "",
-            "a regular file, a directory and a symlink named like cards are not cards"
+            "a regular file, a directory, a symlink and a whiteout named like cards are not cards"
         );
 
         // POSITIVE CONTROL, so the emptiness above is the predicate and not a function that always
         // answers nothing. The host's own `/dev` is the only place a character device can be found
         // without privilege; a host with no card says so rather than passing in silence.
         if std::path::Path::new("/dev/nvidia0").exists() {
-            let real = super::gpu_nodes_in(std::path::Path::new("/dev"));
+            let real = super::gpu_nodes_in(
+                std::path::Path::new("/dev"),
+                std::path::Path::new("/dev"),
+            );
             assert!(
                 real.split_whitespace().any(|n| n == "nvidia0"),
                 "the host's own card node must read as a card: {real}"
