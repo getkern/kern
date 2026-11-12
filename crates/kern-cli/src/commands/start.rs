@@ -1036,6 +1036,20 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                                 path.display(),
                                 why.describe()
                             ),
+                            // THE NESTING RULE REACHING THE READER. A spec describes the host it
+                            // was generated on, so inside a nested container its paths are wrong
+                            // unless that runtime regenerated it. The message says which file made
+                            // the claim and what to do, because the name being valid is exactly
+                            // what makes this confusing: the spec is not corrupt, it is about
+                            // somewhere else.
+                            D::DescribesAnotherHost { reference, path } => format!(
+                                "--device {reference}: {} names that device and none of its \
+                                 device nodes exists here, so the spec describes a different \
+                                 host (a nested container sees the outer host's paths unless its \
+                                 runtime regenerated the spec). Use --gpus device=N, which reads \
+                                 this host's own /dev, or regenerate the spec here",
+                                path.display()
+                            ),
                         })
                     }),
             ),

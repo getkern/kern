@@ -832,14 +832,42 @@ pub fn find_specs(root: &Path, override_dirs: Option<&[String]>) -> Vec<PathBuf>
 pub fn nodes_for_device(root: &Path, spec: &CdiSpec, device: &str) -> Option<Vec<PathBuf>> {
     let found = spec.devices.iter().find(|d| d.name == device)?;
     let mut out: Vec<PathBuf> = Vec::new();
+    // CANONICAL ON BOTH SIDES. The prefix test compares the resolved path against the resolved
+    // `dev` directory, because `<root>/dev` can itself be a symlink: on a host where `/dev` is one,
+    // comparing a canonical path against a written one would refuse every node. An unresolvable
+    // `dev` means there is nothing under this root to validate against.
+    let Some(dev_root) = std::fs::canonicalize(root.join("dev")).ok() else {
+        return Some(Vec::new());
+    };
     let push_if_real = |p: &Path, out: &mut Vec<PathBuf>| {
         let full = root.join(p.strip_prefix("/").unwrap_or(p));
-        let Ok(meta) = std::fs::metadata(&full) else {
+
+        // UNDER THE ROOT'S OWN `/dev`, resolved. A spec is third-party input and its paths are
+        // strings: `/dev/../etc/shadow` joins to something outside `dev` entirely, and a symlink in
+        // the middle can leave it too. `canonicalize` is what answers where the path really lands,
+        // and the prefix test is on the ANSWER rather than on what was written.
+        let Ok(real) = std::fs::canonicalize(&full) else {
+            return;
+        };
+        if !real.starts_with(&dev_root) {
+            return;
+        }
+
+        // THE KIND AND THE DEVICE NUMBER, not the kind alone. A lone `is_char_device()` is exactly
+        // the predicate a whiteout beats: `vfs_mknod` tests CAP_MKNOD only `if ((S_ISCHR ||
+        // S_ISBLK) && !is_whiteout && !capable(...))` and a whiteout is `c 0 0`, so an unprivileged
+        // process CAN create a character device (measured 2026-11-12 on ext4 and on a box's own
+        // tmpfs). It cannot choose the number: the kernel forces 0:0, and no device has that.
+        //
+        // `symlink_metadata` on the canonical path, so the classified inode is the one the prefix
+        // test accepted and not whatever a final-component symlink points at.
+        let Ok(meta) = std::fs::symlink_metadata(&real) else {
             return;
         };
         use std::os::unix::fs::FileTypeExt;
-        if meta.file_type().is_char_device() {
-            out.push(full);
+        use std::os::unix::fs::MetadataExt;
+        if meta.file_type().is_char_device() && meta.rdev() != 0 {
+            out.push(real);
         }
     };
     for p in &spec.common.device_nodes {
@@ -1281,6 +1309,160 @@ containerEdits:
         );
     }
 
+    /// THE NESTING RULE, WHICH WAS A NO-OP, and the predicate it rests on, which a whiteout beat.
+    ///
+    /// `resolve_device_ref` computed `nodes_for_device` and threw it away with `let _ = ...`, so the
+    /// documented rule did nothing: a spec naming a device whose paths do not exist here was
+    /// believed. A spec describes the host it was generated on, and inside a nested container those
+    /// paths are wrong unless that runtime regenerated it.
+    ///
+    /// AND THE PREDICATE WAS ONE `is_char_device()`, which is exactly what the whiteout defeats:
+    /// `vfs_mknod` tests CAP_MKNOD only `if ((S_ISCHR || S_ISBLK) && !is_whiteout && !capable(...))`
+    /// and a whiteout is `c 0 0`, so an unprivileged process can create a character device
+    /// (measured 2026-11-12). It cannot choose the number, which is why the rule is the kind AND a
+    /// non-zero `rdev`.
+    #[test]
+    fn the_nesting_rule_refuses_a_spec_whose_nodes_are_not_here() {
+        // ONE ROOT PER CASE. The first version of this test reused one directory and the positive
+        // control failed on state left by the case before it, which is a test defect that reads
+        // exactly like a code defect. A case that cannot be run alone is a case whose failure
+        // cannot be located.
+        let make_root = |tag: &str, node: &str, link_dev: bool| -> Option<std::path::PathBuf> {
+            let root =
+                std::env::temp_dir().join(format!("kern-cdi-nest-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("etc/cdi")).ok()?;
+            if link_dev {
+                // `dev` points at the HOST's, because the rule requires a real character device and
+                // an unprivileged test cannot `mknod` one. This is also why `nodes_for_device`
+                // canonicalizes both sides of its prefix test: `<root>/dev` is a symlink here.
+                std::os::unix::fs::symlink("/dev", root.join("dev")).ok()?;
+            } else {
+                std::fs::create_dir_all(root.join("dev")).ok()?;
+            }
+            std::fs::write(
+                root.join("etc/cdi/a.yaml"),
+                format!(
+                    concat!(
+                        "cdiVersion: 0.5.0\n",
+                        "kind: nvidia.com/gpu\n",
+                        "devices:\n",
+                        "  - name: \"0\"\n",
+                        "    containerEdits:\n",
+                        "      deviceNodes:\n",
+                        "        - path: {}\n",
+                    ),
+                    node
+                ),
+            )
+            .ok()?;
+            Some(root)
+        };
+
+        // POSITIVE CONTROL FIRST, because every refusal below is worthless if the rule refuses
+        // everything. `/dev/null` is a real character device on every host this runs on.
+        let Some(root) = make_root("ok", "/dev/null", true) else {
+            eprintln!("skip: no writable temp dir");
+            return;
+        };
+        let got = resolve_device_ref(&root, "nvidia.com/gpu=0");
+        assert_eq!(
+            got,
+            Ok(0),
+            "a spec whose node IS here must resolve, or this rule refuses every host: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 1. A PATH THAT IS NOT HERE: the name is valid and the node is absent, which is the whole
+        //    shape of the nested case, and the discarded call accepted it.
+        if let Some(root) = make_root("absent", "/dev/nvidia-not-here", false) {
+            match resolve_device_ref(&root, "nvidia.com/gpu=0") {
+                Err(DeviceRefError::DescribesAnotherHost { reference, .. }) => {
+                    assert_eq!(reference, "nvidia.com/gpu=0");
+                }
+                other => panic!("a spec whose node is absent here must be refused: {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // 2. A WHITEOUT AT THE PATH. An unprivileged process can create one and it IS a character
+        //    device by kind, so the old lone `is_char_device()` would have taken it.
+        if let Some(root) = make_root("white", "/dev/nvidia0", false) {
+            let white = root.join("dev/nvidia0");
+            let made = std::ffi::CString::new(white.as_os_str().as_encoded_bytes())
+                .map(|p| unsafe { libc::mknod(p.as_ptr(), libc::S_IFCHR | 0o600, 0) })
+                .unwrap_or(-1);
+            if made == 0 {
+                use std::os::unix::fs::FileTypeExt;
+                assert!(
+                    std::fs::symlink_metadata(&white)
+                        .map(|m| m.file_type().is_char_device())
+                        .unwrap_or(false),
+                    "the whiteout must read as a character device, or this case is vacuous"
+                );
+                match resolve_device_ref(&root, "nvidia.com/gpu=0") {
+                    Err(DeviceRefError::DescribesAnotherHost { .. }) => {}
+                    other => panic!("a whiteout is not a device node: {other:?}"),
+                }
+            } else {
+                eprintln!("skip: this kernel refused the whiteout, so that half did not run");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // 3. A PATH THAT LEAVES `dev`. A spec's paths are strings and `..` is one of them, so the
+        //    prefix test is on the CANONICAL answer and not on what was written.
+        if let Some(root) = make_root("escape", "/dev/../etc/cdi/a.yaml", true) {
+            match resolve_device_ref(&root, "nvidia.com/gpu=0") {
+                Err(DeviceRefError::DescribesAnotherHost { .. }) => {}
+                other => panic!("a path outside dev must not count as a node: {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // 4. AN ESCAPE THAT LANDS ON A REAL CHARACTER DEVICE, which is the only case that makes
+        //    the prefix test load-bearing. Case 3's `..` resolves to a regular file, so the KIND
+        //    check already refuses it and dropping the prefix test would not change the answer:
+        //    that was measured by sabotage, and this case is why the sabotage now fails. The root
+        //    here has a real `dev` directory, so `dev_root` is `<root>/dev`, and the path climbs
+        //    out to the host's `/dev/null`, which passes every other test in the predicate.
+        if let Some(root) = make_root("escape_dev", "/../../dev/null", false) {
+            let full = root.join("../../dev/null");
+            let lands_on_dev_null = std::fs::canonicalize(&full)
+                .map(|p| p == std::path::Path::new("/dev/null"))
+                .unwrap_or(false);
+            if lands_on_dev_null {
+                match resolve_device_ref(&root, "nvidia.com/gpu=0") {
+                    Err(DeviceRefError::DescribesAnotherHost { .. }) => {}
+                    other => panic!(
+                        "a path climbing out of the root onto a real device must be refused: {other:?}"
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "skip: {} does not resolve to /dev/null here, so the escape case cannot run",
+                    full.display()
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // 5. A REGULAR FILE AND A DIRECTORY at the path, which are what a spec naming a stale or
+        //    wrong location finds.
+        for (tag, node) in [("file", "/dev/../etc/cdi/a.yaml"), ("dir", "/dev")] {
+            if let Some(root) = make_root(tag, node, true) {
+                assert!(
+                    matches!(
+                        resolve_device_ref(&root, "nvidia.com/gpu=0"),
+                        Err(DeviceRefError::DescribesAnotherHost { .. })
+                    ),
+                    "a {tag} at the path must not count as a device node"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+    }
+
     /// A DUPLICATE MAPPING KEY IS REFUSED, and the case that matters is the one it used to bypass.
     ///
     /// `Value::get` is first-wins, so a document carrying `cdiVersion: 0.5.0` and then
@@ -1419,6 +1601,11 @@ containerEdits:
             return;
         }
 
+        // `dev` POINTS AT THE HOST'S, because the nesting rule now requires the spec's paths to be
+        // real character devices under this root and an unprivileged test cannot `mknod` one. The
+        // symlink is why `nodes_for_device` canonicalizes both sides of its prefix test.
+        let _ = std::os::unix::fs::symlink("/dev", root.join("dev"));
+
         // A spec that names a device, so the walk has something to find AFTER the bad files. The
         // name sorts after both, which is what makes this a test of continuing rather than of order.
         let good = "cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices:\n  - name: \"0\"\n    containerEdits:\n      deviceNodes:\n        - path: /dev/nvidia0\n";
@@ -1533,6 +1720,18 @@ pub enum DeviceRefError {
         /// The UUID that was asked for.
         uuid: String,
     },
+    /// The spec names the device, and none of the device's paths is a real device node here.
+    ///
+    /// THE NESTING RULE, and it was a no-op: the call that computes this was `let _ = ...`. A spec
+    /// describes the host it was generated on, and its paths are wrong inside a nested container
+    /// unless that runtime regenerated it. Believing the NAME while every PATH is absent hands the
+    /// box a reference to hardware that is not there.
+    DescribesAnotherHost {
+        /// The reference that was asked for.
+        reference: String,
+        /// The spec that named it.
+        path: PathBuf,
+    },
     /// A spec was found and could not be read.
     Unreadable {
         /// The file.
@@ -1630,10 +1829,21 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<u32, DeviceRef
         let Some(device) = spec.devices.iter().find(|d| d.name == name) else {
             continue;
         };
-        // THE NESTING RULE, applied before the name is believed: the spec's paths have to be real
-        // device nodes under THIS root, or the spec is describing a host that is not the one kern
-        // is running on.
-        let _ = nodes_for_device(root, &spec, &device.name);
+        // THE NESTING RULE, APPLIED. It was computed and discarded with `let _ = ...`, so the
+        // documented rule did nothing and the only check that a spec's paths are real device nodes
+        // under this root never ran. A spec describes the host it was generated on; inside a nested
+        // container those paths are wrong unless that runtime regenerated it, and believing the
+        // name while every path is absent hands the box a reference to hardware that is not there.
+        //
+        // EMPTY IS THE REFUSAL, not an error from the call: `nodes_for_device` answers `None` only
+        // when the name is unknown, and the name was just found.
+        let resolved = nodes_for_device(root, &spec, &device.name).unwrap_or_default();
+        if resolved.is_empty() {
+            return Err(DeviceRefError::DescribesAnotherHost {
+                reference: trimmed.to_string(),
+                path: path.clone(),
+            });
+        }
 
         if let Ok(index) = device.name.parse::<u32>() {
             return Ok(index);
