@@ -107,6 +107,56 @@ if [ "$FULL" -eq 1 ]; then
     step "integration suite" cargo test -q -p getkern
 fi
 
+# THE GPU CLAIM SUITE, WHICH WAS NOT IN THIS GATE AND SHOULD HAVE BEEN.
+#
+# MEASURED on 2026-11-10: this file printed green while `pentest-gpu-claims.sh` was RED, and the
+# only reason it was caught is that it was run by hand. A7 had been pinned to `--gpus [0-9]+` and
+# the flag had moved to docker's grammar, where a bare number is a count; the suite went red on the
+# commit that corrected `kern doctor`, which is the gate working, and nothing here was listening.
+# A discipline that depends on remembering to run something is not a gate.
+#
+# IT SAYS WHY IT DID NOT RUN, which is the whole point of putting it here rather than leaving it
+# out. It needs a C compiler for the raw-ioctl probe and a GPU to have anything to claim about, and
+# a host with neither is not a failure; a host with neither that stays SILENT is, because the next
+# reader cannot tell "passed" from "never ran". `warm cache reports a check that never ran` is the
+# same class and this project has paid for it before.
+# WHY THE REASON IS DECIDED OUT HERE AND NOT INSIDE THE STEP. `step` sends the command's stdout to
+# a log and prints `ok` on a zero exit, so a skip printed from inside the function was swallowed and
+# the terminal read `ok`: a skip that looks like a pass, which is the exact thing this step exists
+# to stop. Measured on the first version of it.
+gpu_claims_skip_reason() {
+    if ! command -v cc >/dev/null && ! command -v gcc >/dev/null; then
+        echo "no C compiler for the ioctl probe"
+        return 0
+    fi
+    if [ ! -d /sys/class/drm ] || [ -z "$(ls /sys/class/drm 2>/dev/null)" ]; then
+        echo "no DRM card on this host"
+        return 0
+    fi
+    return 1
+}
+
+gpu_claims() {
+    # THE BINARY IS BUILT HERE AND PASSED AS AN ARGUMENT. The suite reads `kern doctor`, so it
+    # needs the binary this gate is about to vouch for; a stale one would have it checking a claim
+    # nobody is pushing, which this project has paid for three times. The first version of this
+    # step set `KERN_BIN` and the suite ignored it, so it silently read whatever was in
+    # `target/release` and reported green on a tree where the claim had been sabotaged.
+    cargo build -q 2>/dev/null || return 1
+    sh pentest/pentest-gpu-claims.sh "$PWD/target/debug/kern" > /tmp/prepush-gpu.log 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ] || grep -q "  FAIL " /tmp/prepush-gpu.log; then
+        tail -30 /tmp/prepush-gpu.log
+        return 1
+    fi
+    return 0
+}
+if gpu_skip=$(gpu_claims_skip_reason); then
+    printf '  \033[33mskip\033[0m %-38s %s\n' "gpu claims" "$gpu_skip"
+else
+    step "gpu claims" gpu_claims
+fi
+
 # WHAT CI ACTUALLY SAID, read rather than predicted. Everything above is this host answering about
 # itself, and the sentence below used to claim it spoke for the runner. It did not: CI was red on
 # `main` for four commits while this file printed green, once because a test asked whether a user
