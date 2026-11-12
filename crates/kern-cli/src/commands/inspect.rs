@@ -1089,6 +1089,104 @@ pub fn stats(json: bool, names: &[String]) -> Result<(), Error> {
 /// `None` for a box whose PID 1 is not known or no longer alive, which is also the answer when
 /// there is nothing to look inside. Every failure is the same answer, an empty list, because a box
 /// whose `/dev` cannot be read has not been shown to hold a card.
+/// The driver userspace a RUNNING box is holding, read from its own mount table, and the host's
+/// current one beside it when the two have diverged.
+///
+/// WHY THIS EXISTS. A grant binds the host's driver libraries by path, and a bind pins the INODE.
+/// Measured 2026-11-12 with a file this user owns, through the same mechanism: a running box kept
+/// `VERSION-1` after the host file was replaced at the same path, and a box started afterwards got
+/// `VERSION-2`. So after a driver upgrade a live box keeps the userspace it was granted while a new
+/// one gets the new, and two boxes on one host run different driver userspace against one kernel
+/// module. NVIDIA requires the two to match, and the error it produces, `Driver/library version
+/// mismatch`, names neither the box nor the upgrade.
+///
+/// NOTHING RECORDED OR COMPARED IT. The grant knows `driver_version` and threw it away: it reached
+/// no registry field and no surface, so the skew was invisible from outside the workload's own
+/// crash. It is DERIVED here rather than recorded, from the version in the bound library's own
+/// NAME, for the reason the node row is read rather than replayed: a recorded version can disagree
+/// with what the box actually holds, and a reading cannot.
+///
+/// Empty when there is nothing to say: no pid, no granted library, or the two versions agree. A row
+/// that printed on every box would bury the one case that matters.
+pub(crate) fn gpu_driver_skew_of(pid1: Option<i32>) -> String {
+    let Some(pid) = pid1 else {
+        return String::new();
+    };
+    let Some(theirs) = box_driver_version(pid) else {
+        return String::new();
+    };
+    // The host's own version line, through the same parser shape the resolver uses: the first
+    // `N.N.N` token on it, because the open kernel module and the proprietary one word the rest of
+    // the line differently and a reader keyed on position gets the empty string from one of them.
+    let Ok(line) = std::fs::read_to_string("/proc/driver/nvidia/version") else {
+        return String::new();
+    };
+    let Some(ours) = first_version_token(&line) else {
+        return String::new();
+    };
+    skew_between(&theirs, ours)
+}
+
+/// The first `N.N.N` token on a line, which is how the driver's own version is found.
+///
+/// KEYED ON THE SHAPE, not on a position. The open kernel module writes `NVIDIA UNIX Open Kernel
+/// Module for x86_64  580.173.02  Release Build` and the proprietary one words the prefix
+/// differently, so a reader counting words gets the empty string from one of them. The resolver
+/// learned this once already; this is the same rule and not a second one.
+fn first_version_token(line: &str) -> Option<&str> {
+    line.split_whitespace().find(|t| is_three_part_version(t))
+}
+
+/// `580.173.02` and not `580.173` or `5.8.0.1` or `x.y.z`.
+fn is_three_part_version(token: &str) -> bool {
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The version a library file name carries, from the `.so.` marker.
+///
+/// `libcuda.so.580.173.02` answers `580.173.02`. Keyed on the marker AND on the shape of what
+/// follows, so `libfoo.so.1` and a name that merely contains digits do not answer.
+fn driver_version_in_name(name: &str) -> Option<String> {
+    let (_, version) = name.split_once(".so.")?;
+    is_three_part_version(version).then(|| version.to_string())
+}
+
+/// The sentence, or nothing when the two agree.
+///
+/// EMPTY IS THE COMMON CASE and it has to stay empty: a row printed on every box would bury the one
+/// case that matters, which is a host somebody upgraded under a box that is still running.
+fn skew_between(theirs: &str, ours: &str) -> String {
+    if theirs == ours {
+        return String::new();
+    }
+    format!("granted under {theirs}, host now has {ours}")
+}
+
+/// The driver version a box's bound libraries carry, from the version in their own file names.
+///
+/// `mountinfo` and not the box's filesystem: the bound path is what the grant chose, and reading it
+/// from the mount table cannot be confused by anything the box later created at the same name. The
+/// FIRST such mount answers, because a grant binds one version's files and nothing else.
+fn box_driver_version(pid: i32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).ok()?;
+    for line in text.lines() {
+        let Some(path) = line.split_whitespace().nth(4) else {
+            continue;
+        };
+        let Some(name) = path.rsplit('/').next() else {
+            continue;
+        };
+        if let Some(version) = driver_version_in_name(name) {
+            return Some(version);
+        }
+    }
+    None
+}
+
 pub(crate) fn gpu_nodes_of(pid1: Option<i32>) -> String {
     let Some(pid) = pid1 else {
         return String::new();
@@ -1693,6 +1791,12 @@ pub fn inspect(name: &str, json: bool) -> Result<(), Error> {
         // register as `mem` and `tasks` above, which read live cgroup files rather than the flags.
         let gpu = gpu_nodes_of(b.live_pid1());
         row("gpu", if gpu.is_empty() { "-" } else { &gpu });
+        // ONLY WHEN THE TWO HAVE DIVERGED. A row on every box would bury the one case that matters,
+        // and on a host nobody has upgraded this is silent.
+        let skew = gpu_driver_skew_of(b.live_pid1());
+        if !skew.is_empty() {
+            row("driver", &skew);
+        }
         // Configured caps (the REQUESTED limits, distinct from the live usage above, which reads `-`
         // when the box has no dedicated cgroup) and the 0.6.7 isolation policies, shown when set.
         row(
@@ -2738,6 +2842,83 @@ mod tests {
         assert_eq!(super::gpu_nodes_of(None), "");
         assert_eq!(super::gpu_nodes_of(Some(-1)), "");
         assert_eq!(super::gpu_nodes_of(Some(0)), "");
+    }
+
+    /// A DRIVER UPGRADE UNDER A RUNNING BOX IS INVISIBLE, AND NOW IT IS NOT.
+    ///
+    /// A grant binds the host's driver libraries by path, and a bind pins the INODE. Measured
+    /// 2026-11-12 through the same mechanism, on a file this user owns so no driver was touched: a
+    /// running box kept `VERSION-1` after the host file was REPLACED at the same path (a new inode,
+    /// which is what a package upgrade does), and a box started afterwards got `VERSION-2`.
+    ///
+    /// So after an upgrade a live box keeps the driver userspace it was granted while a new one
+    /// gets the new, and two boxes on one host run different userspace against one kernel module.
+    /// NVIDIA requires the two to match and the error it produces, `Driver/library version
+    /// mismatch`, names neither the box nor the upgrade. The grant knew `driver_version` and threw
+    /// it away: it reached no registry field and no surface.
+    ///
+    /// DERIVED, NOT RECORDED, for the reason the node row is read rather than replayed: a recorded
+    /// version can disagree with what the box actually holds and a reading cannot. It also needs no
+    /// new persisted state, so an older kern's records stay readable.
+    #[test]
+    fn a_driver_upgrade_under_a_running_box_is_named() {
+        // THE VERSION IN A LIBRARY NAME.
+        assert_eq!(
+            super::driver_version_in_name("libcuda.so.580.173.02").as_deref(),
+            Some("580.173.02")
+        );
+        assert_eq!(
+            super::driver_version_in_name("libnvidia-ml.so.585.1.2").as_deref(),
+            Some("585.1.2")
+        );
+        // NOT every name with digits: a SONAME link and an ordinary library must not answer, or the
+        // row would report a version from a file that carries none.
+        for name in [
+            "libcuda.so.1",
+            "libcuda.so",
+            "libc.so.6",
+            "libfoo.so.1.2",
+            "libfoo.so.1.2.3.4",
+            "libfoo.so.a.b.c",
+            "libfoo.so..",
+            "nvidia0",
+        ] {
+            assert_eq!(
+                super::driver_version_in_name(name),
+                None,
+                "{name} must not read as a driver version"
+            );
+        }
+
+        // THE VERSION LINE, in BOTH wordings. The open kernel module and the proprietary one differ in
+        // the prefix, so a reader keyed on a position gets the empty string from one of them; the
+        // resolver learned this once already and this is the same rule.
+        let open =
+            "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.173.02  Release Build\n";
+        let proprietary =
+            "NVRM version: NVIDIA UNIX x86_64 Kernel Module  535.183.01  Fri May 10\n";
+        assert_eq!(super::first_version_token(open), Some("580.173.02"));
+        assert_eq!(super::first_version_token(proprietary), Some("535.183.01"));
+        assert_eq!(
+            super::first_version_token("NVRM version: no numbers here"),
+            None
+        );
+
+        // THE SENTENCE, and the empty case is the one that must stay empty: a row on every box
+        // would bury the one case that matters.
+        assert_eq!(super::skew_between("580.173.02", "580.173.02"), "");
+        let said = super::skew_between("580.173.02", "585.1.2");
+        assert!(said.contains("granted under 580.173.02"), "{said}");
+        assert!(said.contains("host now has 585.1.2"), "{said}");
+
+        // AND THE LIVE HALF: this process holds no granted library, so it reports nothing. A box
+        // that does is covered by the pentest, which can start one.
+        assert_eq!(
+            super::gpu_driver_skew_of(Some(std::process::id() as i32)),
+            "",
+            "a process with no granted library must say nothing"
+        );
+        assert_eq!(super::gpu_driver_skew_of(None), "");
     }
 
     /// A BOX CANNOT TALK ITS WAY INTO THE ROW, which is what "a reading of what the box HAS rather
