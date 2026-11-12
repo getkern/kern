@@ -2343,6 +2343,43 @@ mod tests {
         }
     }
 
+    /// The two edges where a digit check usually breaks: the top of the type, and a character that
+    /// is a digit to a human and to `char::is_numeric` but not to `is_ascii_digit`.
+    ///
+    /// `u32::MAX` must PARSE and then be refused later for not existing, because those are two
+    /// different answers and the caller is owed the right one: "no card 4294967295 on this host,
+    /// present: 0, 1" tells them to look at their index, "not a card index" tells them to look at
+    /// their spelling. One past the top is a spelling problem, and it reaches `parse` rather than
+    /// the digit filter, so it is the only refusal here that comes from the integer conversion.
+    #[test]
+    fn the_spec_holds_at_the_top_of_u32_and_refuses_a_digit_that_is_not_ascii() {
+        assert_eq!(parse_gpu_spec("4294967295"), Ok(u32::MAX));
+        assert_eq!(parse_gpu_spec("device=4294967295"), Ok(u32::MAX));
+        for over in ["4294967296", "99999999999999999999"] {
+            match parse_gpu_spec(over) {
+                Err(GpuSpecError::NotAnIndex { given }) => assert_eq!(given, over),
+                other => panic!("{over:?} is past u32 and must not parse, got {other:?}"),
+            }
+        }
+        // FULLWIDTH ZERO, U+FF10, then Arabic-Indic and Devanagari. `char::is_numeric` answers
+        // true for all three where `is_ascii_digit` does not.
+        //
+        // MEASURED, because the obvious claim about this is wrong: swapping the filter to
+        // `is_numeric` leaves every assertion here green, since `parse::<u32>` refuses a
+        // non-ASCII digit on its own and returns the SAME `NotAnIndex`. So this test pins the
+        // behaviour a caller sees, not which of the two guards catches it, and the ASCII filter
+        // earns its place by rejecting earlier rather than by rejecting more.
+        for wide in ["\u{FF10}", "\u{0660}", "\u{0966}", "0\u{FF10}"] {
+            match parse_gpu_spec(wide) {
+                Err(GpuSpecError::NotAnIndex { given }) => assert_eq!(given, wide),
+                other => panic!("{wide:?} is not an ASCII index, got {other:?}"),
+            }
+        }
+        // Leading zeros name the same card and are not a spelling error: `00` is card 0.
+        assert_eq!(parse_gpu_spec("00"), Ok(0));
+        assert_eq!(parse_gpu_spec("0000000001"), Ok(1));
+    }
+
     /// A grant with two cards, used by the mount-plan tests. The nodes carry the FACTS the policy
     /// turns on, so a test produces a refusal by building a gated node rather than by handing the
     /// grant a verdict: there is one policy function and the tests go through it like everything
