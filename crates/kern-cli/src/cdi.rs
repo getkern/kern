@@ -134,6 +134,23 @@ pub enum CdiError {
     /// cannot receive them: `setgroups` takes only mapped gids, so the number would land on a
     /// different kgid and grant nothing. Applying it blindly would be a grant that looks wider than
     /// it is; ignoring it silently would be a spec whose author's intent kern pretended to honour.
+    /// The same mapping key appears twice in one mapping.
+    ///
+    /// REFUSED, AND THE REFERENCE REFUSES IT TOO, which is why this is not a "pick one" decision.
+    /// The CDI reference reader (cncf-tags/container-device-interface, `go.yaml.in/yaml/v3` with
+    /// `KnownFields(true)`) answers `mapping key "<k>" already defined` and rejects the whole
+    /// document. last-wins was `yaml.v2` and is not what the CDI path uses.
+    ///
+    /// IT ALSO DEFEATED A REFUSAL THAT EXISTS HERE. `Value::get` is first-wins, so a document with
+    /// `cdiVersion: 0.5.0` first and `cdiVersion: 9.9.9` later parsed as 0.5.0 and walked straight
+    /// past [`CdiError::VersionTooNew`], which exists for exactly that. kern was ACCEPTING a spec
+    /// the reference rejects.
+    DuplicateKey {
+        /// The key that appeared twice.
+        key: String,
+        /// The line of the SECOND appearance, which is the one to delete.
+        line: usize,
+    },
     AdditionalGids {
         /// 1-based line number.
         line: usize,
@@ -167,6 +184,13 @@ impl CdiError {
                  Refusing rather than reading it as an older one"
             ),
             CdiError::NoKind => "the CDI spec carries no kind".to_string(),
+            CdiError::DuplicateKey { key, line } => format!(
+                "the CDI spec defines {key:?} twice, the second time at line {line}. The reference \
+                 CDI reader rejects a duplicate mapping key rather than choosing one, and so does \
+                 this: a document where `cdiVersion` appears twice would otherwise be read as \
+                 whichever copy came first, which is how a version this build refuses can slip \
+                 through. Delete the duplicate"
+            ),
             CdiError::AdditionalGids { line } => format!(
                 "the CDI spec sets additionalGids at line {line}. A box cannot receive a host gid: \
                  setgroups takes mapped gids only, so the number would land on a different kgid. \
@@ -407,6 +431,19 @@ struct Frame {
 }
 
 impl Frame {
+    /// File `value` under `key`, refusing a key this mapping already has.
+    ///
+    /// ONE SPELLING for both push sites: a scalar entry and a nested frame being closed into its
+    /// parent. They are far apart in `build` and a duplicate arriving through either is the same
+    /// defect, which is how one of them would have kept it.
+    fn insert(&mut self, key: String, value: Value, line: usize) -> Result<(), CdiError> {
+        if self.map.iter().any(|(existing, _)| *existing == key) {
+            return Err(CdiError::DuplicateKey { key, line });
+        }
+        self.map.push((key, value));
+        Ok(())
+    }
+
     fn into_value(self) -> Value {
         if self.is_seq {
             Value::Seq(self.seq)
@@ -449,7 +486,7 @@ fn build(lines: &[Lexed]) -> Result<Value, CdiError> {
                 return Err(CdiError::BadIndent { line });
             };
             match key {
-                Some(k) => parent.map.push((k, value)),
+                Some(k) => parent.insert(k, value, line)?,
                 None => parent.seq.push(value),
             }
         }
@@ -473,7 +510,7 @@ fn build(lines: &[Lexed]) -> Result<Value, CdiError> {
                 let Some(top) = stack.last_mut() else {
                     return Err(CdiError::BadIndent { line: lexed.line });
                 };
-                top.map.push((key.clone(), Value::Scalar(value.clone())));
+                top.insert(key.clone(), Value::Scalar(value.clone()), lexed.line)?;
             }
             Shape::SeqScalar(value) => {
                 close_to(&mut stack, lexed.indent, lexed.line)?;
@@ -1242,6 +1279,121 @@ containerEdits:
             checked > 10_000,
             "the fuzz must actually exercise the reader, it ran {checked} cases"
         );
+    }
+
+    /// A DUPLICATE MAPPING KEY IS REFUSED, and the case that matters is the one it used to bypass.
+    ///
+    /// `Value::get` is first-wins, so a document carrying `cdiVersion: 0.5.0` and then
+    /// `cdiVersion: 9.9.9` parsed as 0.5.0 and walked straight past `VersionTooNew`, which exists
+    /// to refuse a spec this build cannot read. kern was ACCEPTING a document the reference reader
+    /// rejects: cncf-tags/container-device-interface at HEAD `9e21b8b` with
+    /// `go.yaml.in/yaml/v3 v3.0.5` and `KnownFields(true)` answers `mapping key "cdiVersion"
+    /// already defined`. last-wins was `yaml.v2` and is not the CDI path.
+    ///
+    /// Refusing beats either choice: picking the first silently honours the attacker's framing and
+    /// picking the last silently honours the other one, while the document is malformed either way.
+    #[test]
+    fn a_duplicate_mapping_key_is_refused_instead_of_resolved() {
+        // THE BYPASS. Without the refusal this parses, reports 0.5.0 and is accepted.
+        let bypass = "cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ncdiVersion: 9.9.9\n";
+        match parse_spec(bypass) {
+            Err(CdiError::DuplicateKey { key, line }) => {
+                assert_eq!(key, "cdiVersion");
+                assert_eq!(
+                    line, 3,
+                    "the line must name the SECOND appearance, the one to delete"
+                );
+            }
+            other => panic!("a duplicated cdiVersion must be refused, got {other:?}"),
+        }
+
+        // POSITIVE CONTROL: the same document without the duplicate is accepted, so the refusal is
+        // the duplicate and not the content.
+        let clean = "cdiVersion: 0.5.0\nkind: nvidia.com/gpu\n";
+        assert!(
+            parse_spec(clean).is_ok(),
+            "the same spec without the duplicate must still parse"
+        );
+
+        // AND THE REFUSAL IT WAS BYPASSING still fires on its own, so this case did not simply
+        // replace one error with another.
+        let too_new = "cdiVersion: 9.9.9\nkind: nvidia.com/gpu\n";
+        assert!(
+            matches!(parse_spec(too_new), Err(CdiError::VersionTooNew { .. })),
+            "VersionTooNew must still be reachable"
+        );
+
+        // BOTH PUSH SITES. A duplicate arrives either as a scalar entry or as a nested block closed
+        // into its parent, and the two are far apart in `build`: one of them would have kept the
+        // defect. `devices` here is a nested mapping, not a scalar.
+        let nested = concat!(
+            "cdiVersion: 0.5.0\n",
+            "kind: nvidia.com/gpu\n",
+            "containerEdits:\n",
+            "  env:\n",
+            "    - A=1\n",
+            "containerEdits:\n",
+            "  env:\n",
+            "    - B=2\n",
+        );
+        match parse_spec(nested) {
+            Err(CdiError::DuplicateKey { key, .. }) => assert_eq!(key, "containerEdits"),
+            other => panic!("a duplicated nested block must be refused, got {other:?}"),
+        }
+
+        // A REPEATED KEY IN A DIFFERENT MAPPING IS NOT A DUPLICATE. Two devices may each carry
+        // `name`, which is the common shape of every real spec, so a check on the key alone rather
+        // than on the key within its mapping would refuse every host's file.
+        let siblings = concat!(
+            "cdiVersion: 0.5.0\n",
+            "kind: nvidia.com/gpu\n",
+            "devices:\n",
+            "  - name: \"0\"\n",
+            "    containerEdits:\n",
+            "      deviceNodes:\n",
+            "        - path: /dev/nvidia0\n",
+            "  - name: \"1\"\n",
+            "    containerEdits:\n",
+            "      deviceNodes:\n",
+            "        - path: /dev/nvidia1\n",
+        );
+        let spec = match parse_spec(siblings) {
+            Ok(spec) => spec,
+            Err(e) => panic!(
+                "two devices each with a `name` must parse: {}",
+                e.describe()
+            ),
+        };
+        assert_eq!(spec.devices.len(), 2, "both devices must survive");
+
+        // A DUPLICATE INSIDE A SEQUENCE ITEM. The first key of such an item is built directly into
+        // the new frame's map (`Shape::SeqKeyValue`), which is a THIRD construction site that does
+        // not go through `insert`; it cannot itself be a duplicate because the map starts empty,
+        // but every later key in the item must still be checked.
+        let dup_in_item = concat!(
+            "cdiVersion: 0.5.0\n",
+            "kind: nvidia.com/gpu\n",
+            "devices:\n",
+            "  - name: \"0\"\n",
+            "    name: \"1\"\n",
+        );
+        match parse_spec(dup_in_item) {
+            Err(CdiError::DuplicateKey { key, line }) => {
+                assert_eq!(key, "name");
+                assert_eq!(line, 5);
+            }
+            other => panic!("a duplicate inside a sequence item must be refused, got {other:?}"),
+        }
+
+        // And the message says what to do about it.
+        let described = CdiError::DuplicateKey {
+            key: "cdiVersion".to_string(),
+            line: 3,
+        }
+        .describe();
+        assert!(described.contains("twice"), "{described}");
+        assert!(described.contains("line 3"), "{described}");
+        assert!(described.contains("Delete the duplicate"), "{described}");
     }
 
     /// A SPEC DIRECTORY IS WRITABLE BY WHOEVER CAN WRITE IT, so what it holds is not kern's choice.
