@@ -2048,7 +2048,17 @@ fn gpu_source_row(root: &std::path::Path, libraries: usize) -> (String, String) 
     match dir {
         Some(dir) if usable => (
             format!("gpu source: /proc/driver/nvidia, {libraries} host libraries, a CDI spec under {dir}"),
-            "--device nvidia.com/gpu=N names the same cards as --gpus N, from the same discovery"
+            // `--gpus device=N` AND NOT `--gpus N`, and the difference is the card that gets handed
+            // over. A bare number is a COUNT in docker's grammar and this branch adopted it, so
+            // `--gpus 1` is "one card" and resolves to the LOWEST index, while
+            // `--device nvidia.com/gpu=1` is index 1. Measured on this host: `--gpus 1` gives
+            // nvidia0 (0000:01:00.0) and `--device nvidia.com/gpu=1` gives nvidia1 (0000:06:00.0).
+            // The note said they were the same, which is false for every value typable here, and an
+            // operator following it withholds the card they meant to hand over and hands over the
+            // other. The per-card rows above have always said `--gpus device=N`; only this line
+            // disagreed with them.
+            "--device nvidia.com/gpu=N names the same card as --gpus device=N, from the same \
+             discovery; a BARE --gpus N is a count, not an index"
                 .to_string(),
         ),
         // PRESENT AND UNREADABLE IS ITS OWN ANSWER, and the one a reader cannot work out alone:
@@ -2636,7 +2646,19 @@ mod tests {
             "a readable spec was called unreadable: {v}"
         );
         assert!(v.contains("a CDI spec under"), "{v}");
-        assert!(n.contains("names the same cards"), "{n}");
+        // THE SPELLING IS THE WHOLE CLAIM. `--gpus device=N` is an index and a bare `--gpus N` is a
+        // count, so a note offering the bare form as the equivalent of `nvidia.com/gpu=N` sends the
+        // operator to the other card: measured, `--gpus 1` gives nvidia0 and `--device
+        // nvidia.com/gpu=1` gives nvidia1. Pinned here because the note is the only surface that
+        // ever disagreed with the per-card rows.
+        assert!(
+            n.contains("--gpus device=N"),
+            "the note must name the INDEX spelling: {n}"
+        );
+        assert!(
+            n.contains("count"),
+            "and must say what a bare number means instead: {n}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

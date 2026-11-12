@@ -1093,12 +1093,46 @@ pub(crate) fn gpu_nodes_of(pid1: Option<i32>) -> String {
     let Some(pid) = pid1 else {
         return String::new();
     };
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/root/dev")) else {
+    gpu_nodes_in(std::path::Path::new(&format!("/proc/{pid}/root/dev")))
+}
+
+/// The same reading, over a directory a test can build.
+///
+/// Split out because the property worth asserting is the PREDICATE, and the only way to reach it
+/// through `gpu_nodes_of` is to have a live box: the forged shapes (a regular file, a directory, a
+/// symlink to another character device) need no privilege to create and are exactly what a box does.
+pub(crate) fn gpu_nodes_in(dev: &std::path::Path) -> String {
+    use std::os::unix::fs::FileTypeExt;
+    let Ok(entries) = std::fs::read_dir(dev) else {
         return String::new();
     };
     let mut names: Vec<String> = entries
         .flatten()
         .filter_map(|e| {
+            // THE KIND, NOT ONLY THE NAME, and the row claimed to be a reading of what the box HAS
+            // while matching on the name alone. A box's `/dev` is its own writable tmpfs, so
+            // `touch /dev/nvidia7; mkdir /dev/nvidia9` in a box with no grant at all made
+            // `kern inspect` report `gpu  nvidia7 nvidia9` and lit `kern top`'s `gpu:N` badge, which
+            // the TUI legend describes as a box LESS isolated than the default. Measured 2026-11-11.
+            //
+            // The kind comes from the directory read, so a SYMLINK to the box's own granted node
+            // under a second name is a symlink here and not a character device: following it would
+            // let one card report as two. That a box cannot manufacture the real thing is measured
+            // rather than assumed: `mknod` for majors 195, 226 and 510 answers EPERM on every
+            // filesystem a box can write, because `vfs_mknod` resolves CAP_MKNOD against the INITIAL
+            // user namespace, and the positive control is a FIFO, which succeeds.
+            // `symlink_metadata` AND NOT `file_type()`, which is the first fix this got and it was
+            // wrong in the direction that matters least loudly: `readdir` does not cross mount
+            // points, so the `d_type` of a granted node is the type of the PLACEHOLDER the bind was
+            // mounted over, a regular file. Measured: with `e.file_type()` a box genuinely holding
+            // `--gpus device=1` reported `gpu  -`. `lstat` resolves the mount at the final component
+            // while still refusing to follow a symlink there, which is exactly the pair of
+            // properties this needs: the granted node reads as a character device, and a symlink
+            // the box made to one (`/dev/nvidia8 -> /dev/null`) reads as a symlink.
+            let kind = std::fs::symlink_metadata(e.path()).ok()?.file_type();
+            if !kind.is_char_device() {
+                return None;
+            }
             let n = e.file_name().to_string_lossy().into_owned();
             // The per-card nodes only. `nvidiactl`, `nvidia-uvm` and `nvidia-modeset` go with any
             // card, so listing them would make one card look like four.
@@ -2663,6 +2697,52 @@ mod tests {
         assert_eq!(super::gpu_nodes_of(None), "");
         assert_eq!(super::gpu_nodes_of(Some(-1)), "");
         assert_eq!(super::gpu_nodes_of(Some(0)), "");
+    }
+
+    /// A BOX CANNOT TALK ITS WAY INTO THE ROW, which is what "a reading of what the box HAS rather
+    /// than a replay of what the caller typed" has to mean to be worth printing.
+    ///
+    /// The row matched on the NAME alone, and a box's `/dev` is its own writable tmpfs: measured on
+    /// 2026-11-11, `touch /dev/nvidia7; mkdir /dev/nvidia9` in a box with NO grant made
+    /// `kern inspect` print `gpu  nvidia7 nvidia9` and lit `kern top`'s `gpu:N` badge, which that
+    /// legend describes as a box less isolated than the default. An operator asking which boxes hold
+    /// hardware was answered by the boxes.
+    ///
+    /// All three forged shapes need no privilege, which is the point. The real thing does: a box
+    /// cannot `mknod` a character device at all (EPERM for majors 195, 226 and 510 on every
+    /// filesystem it can write, because `vfs_mknod` resolves CAP_MKNOD against the initial user
+    /// namespace), and it cannot mount one either (`mount` is in the seccomp denylist). The symlink
+    /// case is the one a careless fix reintroduces: `metadata` would follow it to a real character
+    /// device and report a card.
+    #[test]
+    fn a_box_cannot_forge_the_gpu_row_by_making_files_named_like_cards() {
+        let dir = std::env::temp_dir().join(format!("kern-gpurow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dev dir");
+        std::fs::write(dir.join("nvidia7"), b"not a card").expect("regular file");
+        std::fs::create_dir_all(dir.join("nvidia9")).expect("directory");
+        // A symlink to a character device that really is one, which is how a box would borrow the
+        // kind it cannot create. `/dev/null` is a character device on every host this runs on.
+        std::os::unix::fs::symlink("/dev/null", dir.join("nvidia8")).expect("symlink");
+        assert_eq!(
+            super::gpu_nodes_in(&dir),
+            "",
+            "a regular file, a directory and a symlink named like cards are not cards"
+        );
+
+        // POSITIVE CONTROL, so the emptiness above is the predicate and not a function that always
+        // answers nothing. The host's own `/dev` is the only place a character device can be found
+        // without privilege; a host with no card says so rather than passing in silence.
+        if std::path::Path::new("/dev/nvidia0").exists() {
+            let real = super::gpu_nodes_in(std::path::Path::new("/dev"));
+            assert!(
+                real.split_whitespace().any(|n| n == "nvidia0"),
+                "the host's own card node must read as a card: {real}"
+            );
+        } else {
+            eprintln!("skip: no /dev/nvidia0 on this host, so the positive half cannot run");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
     use super::mem_cap_row;
 
