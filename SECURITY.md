@@ -353,6 +353,18 @@ readable from the box. The host's PCI bus is still readable, so **how many cards
 their addresses, can still be worked out** from inside: masking that would break drivers that need
 it, and a boundary you cannot keep is not worth claiming. Enumeration, not access.
 
+**NVML reports HOST process ids for the card's other users.** A box holding a card can call
+`nvmlDeviceGetProcessUtilization` and read back the pids of processes using that GPU in the host's
+pid namespace, including other tenants': measured, two host-namespace pids of processes the box
+cannot see, signal or reach by any other route. `nvmlDeviceGetComputeRunningProcesses_v3` is
+correctly filtered to the box's own pid namespace, which is why this is a gap in one call rather
+than a general one. What it discloses is the existence, the pid number and the GPU utilisation of
+other work on the same card, not its memory, its data or any way to touch it. kern does not filter
+it, because the call is the driver's and a userspace filter over a device a box legitimately holds
+is the kind of boundary that cannot be kept. **If two workloads must not learn that the other
+exists, do not grant them the same card.** That is the same rule as the paragraph above, stated for
+the one call that makes it concrete.
+
 NVIDIA's licence terms say GeForce and Titan cards are not licensed for datacenter deployment. That
 is a fact about the cards and it is here as one: kern cannot measure whether a host is a datacenter
 and does not try to, so nothing in the tool will warn you about it.
