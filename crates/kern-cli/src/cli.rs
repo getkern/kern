@@ -4332,6 +4332,28 @@ fn parse_run(rest: &[&str]) -> Result<Command, Error> {
             // and is not. The generic answer below made it worse: it read "put `--` before the
             // command", so the next attempt is `kern run -- --image alpine`, which passes the flag
             // to the workload. Name the flag, say what `run` is, and name the verb that does it.
+            // THE GPU FLAGS GET THEIR OWN ANSWER, because the generic redirect is actively wrong
+            // advice for them. It reads "that flag belongs to `kern box`", which sends somebody who
+            // wanted a memory-capped training run on their own machine to build a sandbox they did
+            // not ask for. The truth is the opposite and it is measured: a process under `kern run`
+            // is a HOST process, so `/dev/nvidia*` are already there and it sees every card the
+            // caller can open. Measured 2026-11-12: `kern run --memory 2g -- python3 <cuda probe>`
+            // reports 2 cards and loads a PTX module with rc=0, identical to running it bare.
+            //
+            // So the flag is not missing, it is UNNECESSARY, and the honest instruction is to drop
+            // it. The other reading, restricting WHICH cards a host process may see, is not
+            // something this verb can do at all: hiding a node needs a mount namespace, which is
+            // what makes it a box. Both directions are named, because the flag is ambiguous between
+            // them and only one of the two has an answer here.
+            flag @ ("--gpus" | "--device") => {
+                return Err(Error::Cli(format!(
+                    "`kern run` has no {flag}, and does not need one: it caps a process on the \
+                     HOST, where every card you can open is already there. Drop the flag and the \
+                     process sees your GPUs. To hand a card to an ISOLATED box instead, or to let \
+                     a workload see only some of your cards, that needs a mount namespace: \
+                     kern box <name> --image <ref> {flag} <spec> [-- CMD...]"
+                )))
+            }
             s if BOX_ONLY_FLAGS.contains(&s) => {
                 return Err(Error::Cli(format!(
                     "`kern run` has no {s}. It caps a process on the host: no image, \
@@ -7412,6 +7434,68 @@ mod tests {
         // and neither does `box`, so there is no verb to redirect to.
         let err = parse(&["run".into(), "--frobnicate".into()]).expect_err("unknown flag");
         assert!(err.to_string().contains("unknown flag"), "{err}");
+    }
+
+    /// THE GPU FLAGS ON `kern run` GOT THE WRONG ADVICE, which is worse than no advice.
+    ///
+    /// The generic redirect reads "that flag belongs to `kern box`", and for `--gpus` that sends
+    /// somebody who wanted a memory-capped training run on their own machine to build a sandbox
+    /// they did not ask for. The truth is the opposite and it is measured: a process under
+    /// `kern run` is a HOST process, so `/dev/nvidia*` are already there.
+    ///
+    /// Measured 2026-11-12: `kern run --memory 2g -- python3 <cuda probe>` reports 2 cards and
+    /// loads a PTX module with rc=0, identical to running the same probe bare on the host. So the
+    /// flag is not missing, it is UNNECESSARY, and the instruction is to drop it.
+    ///
+    /// The flag is still REFUSED rather than ignored, because the other reading of it, restricting
+    /// WHICH cards a host process may see, is not something this verb can do at all: hiding a node
+    /// needs a mount namespace, which is what makes it a box. Accepting it silently would promise
+    /// that second thing.
+    #[test]
+    fn the_gpu_flags_on_run_say_the_card_is_already_there() {
+        for flag in ["--gpus", "--device"] {
+            let err = parse(&["run".into(), flag.into(), "device=0".into()])
+                .expect_err("the flag is still refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not need one"),
+                "{flag}: the message must say the flag is unnecessary, not merely absent: {msg}"
+            );
+            assert!(
+                msg.contains("Drop the flag"),
+                "{flag}: the message must give the instruction: {msg}"
+            );
+            assert!(
+                msg.contains("already there"),
+                "{flag}: the message must say the cards are already present: {msg}"
+            );
+            // AND THE OTHER READING IS NAMED, because the flag is ambiguous between "give me a
+            // card" and "give me only this card", and only the first has an answer here.
+            assert!(
+                msg.contains("only some of your cards") && msg.contains("mount namespace"),
+                "{flag}: the restricting reading is unanswered: {msg}"
+            );
+            // It must NOT repeat the generic sentence, which is the wrong advice for this flag.
+            assert!(
+                !msg.contains("That flag belongs to the sandboxed verb"),
+                "{flag}: the generic redirect is still being given: {msg}"
+            );
+            assert!(msg.contains(flag), "{flag}: the flag is not named: {msg}");
+        }
+
+        // POSITIVE CONTROL: a flag that really is box-only keeps the generic answer, so the arm
+        // above is the two GPU flags and not every flag losing its redirect.
+        let err = parse(&["run".into(), "--image".into(), "alpine".into()])
+            .expect_err("--image is box-only");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("That flag belongs to the sandboxed verb"),
+            "a box-only flag must keep its redirect: {msg}"
+        );
+        assert!(
+            !msg.contains("does not need one"),
+            "and must not claim the host already has it: {msg}"
+        );
     }
 
     /// Every entry in [`BOX_ONLY_FLAGS`] must really be a `box` flag, or the redirect sends someone
