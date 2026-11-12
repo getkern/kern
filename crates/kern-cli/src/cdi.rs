@@ -134,6 +134,26 @@ pub enum CdiError {
     /// cannot receive them: `setgroups` takes only mapped gids, so the number would land on a
     /// different kgid and grant nothing. Applying it blindly would be a grant that looks wider than
     /// it is; ignoring it silently would be a spec whose author's intent kern pretended to honour.
+    /// A mapping consumed as a struct carries a key the reference reader would refuse.
+    ///
+    /// MEASURED ON THE REFERENCE, not inferred: cncf-tags/container-device-interface at HEAD
+    /// `9e21b8b` decodes with `go.yaml.in/yaml/v3` and `KnownFields(true)`, which rejects an
+    /// unknown field PER STRUCT, wherever a struct is decoded, with `field not found in type
+    /// <T>`. A key outside the set is not forward compatibility: the reference refuses the whole
+    /// document, so kern accepting it is the same skew `DuplicateKey` closes.
+    ///
+    /// The set is FLAT, not versioned: every field is always known, and a field belonging to a
+    /// LATER `cdiVersion` than the document declares is accepted by the decoder and refused by a
+    /// separate version check. That second level is NOT implemented here, deliberately: the fields
+    /// it protects (`netDevices`, `intelRdt`, and `additionalGids`, which kern refuses outright)
+    /// are fields kern never reads, so walking the tree to version-check a payload with no
+    /// consumer would be work with no effect.
+    UnknownField {
+        /// The key that does not belong.
+        field: String,
+        /// The structure it appeared in, named as the reference names it.
+        in_struct: String,
+    },
     /// The same mapping key appears twice in one mapping.
     ///
     /// REFUSED, AND THE REFERENCE REFUSES IT TOO, which is why this is not a "pick one" decision.
@@ -184,6 +204,13 @@ impl CdiError {
                  Refusing rather than reading it as an older one"
             ),
             CdiError::NoKind => "the CDI spec carries no kind".to_string(),
+            CdiError::UnknownField { field, in_struct } => format!(
+                "the CDI spec carries {field:?} in its {in_struct}, which is not a field of that \
+                 structure. The reference CDI reader decodes with KnownFields and refuses the whole \
+                 document for an unknown field, so accepting it here would make kern read specs no \
+                 other runtime will. Remove it, or regenerate the spec with the toolkit that \
+                 matches this host"
+            ),
             CdiError::DuplicateKey { key, line } => format!(
                 "the CDI spec defines {key:?} twice, the second time at line {line}. The reference \
                  CDI reader rejects a duplicate mapping key rather than choosing one, and so does \
@@ -644,12 +671,87 @@ pub struct CdiSpec {
 }
 
 /// Read `containerEdits` out of a tree node.
+/// Refuse a mapping that carries a key the named structure does not have.
+///
+/// ONE SPELLING for all six structures, each with the field set measured on the reference reader at
+/// HEAD `9e21b8b`. A non-mapping is not an error here: the callers already handle a scalar or a
+/// sequence where they expect a mapping, and failing twice on the same input would report the wrong
+/// fault.
+///
+/// TWO GAPS, both deliberate and both named because an undocumented gap is the defect this whole
+/// arc was about:
+///
+///   * `annotations` is a `map[string]string` in the reference, so ANY key in it is accepted. This
+///     function is never called on one.
+///   * `intelRdt` is a struct whose field set has not been measured, so this never descends into
+///     it. kern reads nothing from it, and guessing its fields would refuse specs real hosts carry.
+fn check_fields(node: &Value, allowed: &[&str], in_struct: &str) -> Result<(), CdiError> {
+    let Value::Map(entries) = node else {
+        return Ok(());
+    };
+    for (key, _) in entries {
+        if !allowed.contains(&key.as_str()) {
+            return Err(CdiError::UnknownField {
+                field: key.clone(),
+                in_struct: in_struct.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `Spec`, the document itself.
+const SPEC_FIELDS: &[&str] = &[
+    "cdiVersion",
+    "kind",
+    "annotations",
+    "devices",
+    "containerEdits",
+];
+/// `Device`, one entry of `devices`.
+const DEVICE_FIELDS: &[&str] = &["name", "annotations", "containerEdits"];
+/// `ContainerEdits`, at the document level and per device.
+const EDITS_FIELDS: &[&str] = &[
+    "env",
+    "deviceNodes",
+    "netDevices",
+    "hooks",
+    "mounts",
+    "intelRdt",
+    "additionalGids",
+];
+/// `DeviceNode`, one entry of `deviceNodes`.
+const DEVICE_NODE_FIELDS: &[&str] = &[
+    "path",
+    "hostPath",
+    "type",
+    "major",
+    "minor",
+    "fileMode",
+    "permissions",
+    "uid",
+    "gid",
+];
+/// `Mount`, one entry of `mounts`.
+///
+/// `idmap` IS IN THIS SET AND IS NOT IN THE REFERENCE'S, which is a discrepancy rather than a
+/// decision. kern looks for `mounts[].idmap` deliberately, to record that it was ignored, while the
+/// measured `Mount` at HEAD `9e21b8b` carries only the four below. Refusing a key kern itself reads
+/// would be strictly worse than accepting one the reference refuses, so it stays until the
+/// discrepancy is resolved: either kern is reading a field that does not exist, or the enumeration
+/// missed it.
+const MOUNT_FIELDS: &[&str] = &["hostPath", "containerPath", "options", "type", "idmap"];
+/// `Hook`, one entry of `hooks`.
+const HOOK_FIELDS: &[&str] = &["hookName", "path", "args", "env", "timeout"];
+
 fn container_edits(node: &Value, line_hint: usize) -> Result<(ContainerEdits, bool), CdiError> {
+    check_fields(node, EDITS_FIELDS, "containerEdits")?;
     let mut edits = ContainerEdits::default();
     let mut idmap = false;
 
     if let Some(nodes) = node.get("deviceNodes") {
         for item in nodes.items() {
+            check_fields(item, DEVICE_NODE_FIELDS, "deviceNodes entry")?;
             if let Some(path) = item.get("path").and_then(Value::as_str) {
                 edits.device_nodes.push(PathBuf::from(path));
             }
@@ -658,6 +760,7 @@ fn container_edits(node: &Value, line_hint: usize) -> Result<(ContainerEdits, bo
 
     if let Some(mounts) = node.get("mounts") {
         for item in mounts.items() {
+            check_fields(item, MOUNT_FIELDS, "mounts entry")?;
             let Some(host) = item.get("hostPath").and_then(Value::as_str) else {
                 continue;
             };
@@ -687,6 +790,7 @@ fn container_edits(node: &Value, line_hint: usize) -> Result<(ContainerEdits, bo
 
     if let Some(hooks) = node.get("hooks") {
         for item in hooks.items() {
+            check_fields(item, HOOK_FIELDS, "hooks entry")?;
             let name = item
                 .get("hookName")
                 .and_then(Value::as_str)
@@ -718,6 +822,7 @@ pub fn parse_spec(text: &str) -> Result<CdiSpec, CdiError> {
     }
 
     let tree = parse_strict(text)?;
+    check_fields(&tree, SPEC_FIELDS, "document")?;
 
     let Some(version) = tree.get("cdiVersion").and_then(Value::as_str) else {
         return Err(CdiError::NoVersion);
@@ -743,6 +848,7 @@ pub fn parse_spec(text: &str) -> Result<CdiSpec, CdiError> {
     let mut devices: Vec<CdiDevice> = Vec::new();
     if let Some(list) = tree.get("devices") {
         for item in list.items() {
+            check_fields(item, DEVICE_FIELDS, "devices entry")?;
             let Some(name) = item.get("name").and_then(Value::as_str) else {
                 continue;
             };
@@ -1307,6 +1413,150 @@ containerEdits:
             checked > 10_000,
             "the fuzz must actually exercise the reader, it ran {checked} cases"
         );
+    }
+
+    /// AN UNKNOWN FIELD IS REFUSED PER STRUCT, which is what the reference reader does.
+    ///
+    /// Measured on cncf-tags/container-device-interface at HEAD `9e21b8b`, decoding with
+    /// `go.yaml.in/yaml/v3 v3.0.5` and `KnownFields(true)`: an unknown key is rejected wherever a
+    /// struct is decoded, with `field not found in type <T>`, and the whole document goes with it.
+    /// kern accepted every one of them, which is the same skew `DuplicateKey` closes: reading specs
+    /// no other runtime will.
+    ///
+    /// PER STRUCT AND NOT PER DOCUMENT, which is why this is a tree walk and not a flat allowlist:
+    /// `path` is a field of `deviceNodes` and of `hooks` and of neither `Spec` nor `Mount`, so a
+    /// single set of every legal key anywhere would accept `cdiVersion` inside a mount.
+    #[test]
+    fn an_unknown_field_is_refused_in_the_structure_it_appears_in() {
+        let spec =
+            |body: &str| -> String { format!("cdiVersion: 0.5.0\nkind: nvidia.com/gpu\n{body}") };
+
+        // POSITIVE CONTROL FIRST: the shape this host's own generator writes, with every field set
+        // the reference carries, must parse. Without it every refusal below is satisfied by a
+        // reader that refuses everything.
+        let real = spec(concat!(
+            "containerEdits:\n",
+            "  env:\n",
+            "    - A=1\n",
+            "  mounts:\n",
+            "    - hostPath: /usr/lib/x\n",
+            "      containerPath: /usr/lib/x\n",
+            "      options:\n",
+            "        - ro\n",
+            "devices:\n",
+            "  - name: \"0\"\n",
+            "    containerEdits:\n",
+            "      deviceNodes:\n",
+            "        - path: /dev/nvidia0\n",
+            "          hostPath: /dev/nvidia0\n",
+            "      hooks:\n",
+            "        - hookName: createContainer\n",
+            "          path: /usr/bin/nvidia-cdi-hook\n",
+            "          args:\n",
+            "            - hook\n",
+            "          env:\n",
+            "            - B=2\n",
+        ));
+        if let Err(e) = parse_spec(&real) {
+            panic!("the generated shape must parse: {}", e.describe());
+        }
+
+        // EACH STRUCTURE, named in its own refusal, because "unknown field" without the place is a
+        // message the reader cannot act on.
+        for (body, field, place) in [
+            ("bogusTop: 1\n", "bogusTop", "document"),
+            (
+                "devices:\n  - name: \"0\"\n    bogusDev: 1\n",
+                "bogusDev",
+                "devices entry",
+            ),
+            (
+                "containerEdits:\n  bogusEdit: 1\n",
+                "bogusEdit",
+                "containerEdits",
+            ),
+            (
+                "containerEdits:\n  deviceNodes:\n    - path: /dev/null\n      bogusNode: 1\n",
+                "bogusNode",
+                "deviceNodes entry",
+            ),
+            (
+                "containerEdits:\n  mounts:\n    - hostPath: /a\n      bogusMount: 1\n",
+                "bogusMount",
+                "mounts entry",
+            ),
+            (
+                "containerEdits:\n  hooks:\n    - hookName: x\n      bogusHook: 1\n",
+                "bogusHook",
+                "hooks entry",
+            ),
+        ] {
+            match parse_spec(&spec(body)) {
+                Err(CdiError::UnknownField {
+                    field: got,
+                    in_struct,
+                }) => {
+                    assert_eq!(got, field);
+                    assert_eq!(in_struct, place, "the refusal must name where it was found");
+                }
+                other => panic!("{field} in {place} must be refused, got {other:?}"),
+            }
+        }
+
+        // A FIELD LEGAL SOMEWHERE ELSE IS STILL UNKNOWN HERE, which is the whole reason this is a
+        // tree walk. `path` belongs to a deviceNodes entry and to a hook, and to neither a mount
+        // nor the document.
+        match parse_spec(&spec("path: /dev/null\n")) {
+            Err(CdiError::UnknownField { field, in_struct }) => {
+                assert_eq!(field, "path");
+                assert_eq!(in_struct, "document");
+            }
+            other => panic!("`path` at the document level must be refused, got {other:?}"),
+        }
+        match parse_spec(&spec(
+            "containerEdits:\n  mounts:\n    - hostPath: /a\n      cdiVersion: 0.5.0\n",
+        )) {
+            Err(CdiError::UnknownField { field, in_struct }) => {
+                assert_eq!(field, "cdiVersion");
+                assert_eq!(in_struct, "mounts entry");
+            }
+            other => panic!("`cdiVersion` inside a mount must be refused, got {other:?}"),
+        }
+
+        // THE FIELDS KERN NEVER READS ARE STILL FIELDS. `netDevices` and `intelRdt` belong to
+        // `containerEdits` in the reference, so refusing them would refuse a valid spec; kern does
+        // not descend into `intelRdt`, whose own field set has not been measured.
+        assert!(
+            parse_spec(&spec(
+                "containerEdits:\n  intelRdt:\n    closID: x\n    schemata:\n      - y\n"
+            ))
+            .is_ok(),
+            "a field kern does not read is not an unknown field"
+        );
+        assert!(
+            parse_spec(&spec("containerEdits:\n  netDevices:\n    - name: eth0\n")).is_ok(),
+            "netDevices belongs to containerEdits in the reference"
+        );
+        // `annotations` is a free-form `map[string]string` there, so any key inside it is accepted.
+        assert!(
+            parse_spec(&spec(
+                "annotations:\n  anything.example.com/at-all: \"1\"\n"
+            ))
+            .is_ok(),
+            "annotations takes arbitrary keys"
+        );
+
+        // AND THE MESSAGE SAYS WHAT TO DO.
+        let said = CdiError::UnknownField {
+            field: "bogus".to_string(),
+            in_struct: "mounts entry".to_string(),
+        }
+        .describe();
+        assert!(
+            said.contains("\"bogus\"") && said.contains("mounts entry"),
+            "{said}"
+        );
+        assert!(said.contains("KnownFields"), "{said}");
     }
 
     /// THE NESTING RULE, WHICH WAS A NO-OP, and the predicate it rests on, which a whiteout beat.
