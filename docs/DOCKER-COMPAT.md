@@ -252,13 +252,15 @@ manual on purpose.
 What needs a daemon does not exist here: `swarm` / `service` / `stack`, `docker.sock`, and anything
 that attaches to it.
 
-`--gpus` does exist, and it is one card per box: `kern box --gpus 0`, or `--device
-nvidia.com/gpu=0` for the same card spelled the way CDI spells it. `--gpus all` is refused by name,
-because this build grants one card and a flag that takes a word should not do something narrower
-than the word says. A card you did not name has no device node in the box, so CUDA cannot
-initialise it there; the host's PCI bus stays readable, so how many cards it has is still
-discoverable. A compose service still reaches a card through `devices:` plus
-`--allow-device-grants`.
+`--gpus` does exist and takes docker's grammar, which was measured against docker 29.1.3 rather
+than assumed: a bare number is HOW MANY (`--gpus 2`), `device=0` and `device=0,1` name WHICH, and
+`all` takes every card; `count=2` and `count=all` work too. The one place kern is wider is that it
+accepts `device=0,1` unquoted, where docker needs `"device=0,1"` because its own value is a
+comma-separated list of pairs. `--gpus 0` is refused rather than guessed: docker reads it as no
+gpus and this project's examples read it as card 0, so kern names both readings and asks for
+`device=0`. `--device nvidia.com/gpu=0` is the CDI spelling of one card. A card you did not get has
+no device node in the box, so CUDA cannot initialise it there; the host's PCI bus stays readable,
+so how many cards it has is still discoverable.
 
 ### Reaching the host from inside a box: `host.docker.internal`
 

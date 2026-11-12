@@ -2098,7 +2098,7 @@ fn gpu_row(
     nodes.extend(card.nodes.iter().cloned());
     match crate::gpu_grant::group_policy(&nodes, who) {
         crate::gpu_grant::GroupPolicy::NotNeeded => R::ok_note(
-            &format!("gpu {id}: --gpus {index} hands this card to a box"),
+            &format!("gpu {id}: --gpus device={index} hands this card to a box"),
             &format!(
                 "{} nodes, none needing a group. A granted card is NOT a boundary against \
                  malicious code: the driver is shared",
@@ -2107,7 +2107,7 @@ fn gpu_row(
         ),
         crate::gpu_grant::GroupPolicy::Needed { gids, nodes: gated } => R::Warn(
             format!(
-                "gpu {id}: --gpus {index} would be refused, {} of its nodes need a group",
+                "gpu {id}: --gpus device={index} refused, {} of its nodes need a group",
                 gated.len()
             ),
             format!(
@@ -2118,7 +2118,7 @@ fn gpu_row(
         ),
         crate::gpu_grant::GroupPolicy::Unreachable { nodes: dead } => R::Warn(
             format!(
-                "gpu {id}: --gpus {index} would be refused, {} of its nodes cannot be opened",
+                "gpu {id}: --gpus device={index} refused, {} of its nodes cannot be opened",
                 dead.len()
             ),
             format!(
@@ -2498,7 +2498,7 @@ mod tests {
     ///
     /// The fixture puts `card0` at the address of `/dev/nvidia1`, which is the shape this host
     /// actually has: the DRM numbering and the NVIDIA numbering are inverted. A row that paired
-    /// them by number would tell the reader to run `--gpus 0` for a card that answers to 1, and
+    /// them by number would tell the reader to run `--gpus device=0` for a card that answers to
     /// would pass on any host where the two agreed.
     #[test]
     fn the_row_pairs_a_card_with_its_grant_by_address_not_by_number() {
@@ -2509,8 +2509,11 @@ mod tests {
             &nobody(),
         )
         .text();
-        assert!(row.contains("--gpus 1"), "wrong index for this card: {row}");
-        assert!(!row.contains("--gpus 0"), "paired by number: {row}");
+        assert!(
+            row.contains("--gpus device=1"),
+            "wrong index for this card: {row}"
+        );
+        assert!(!row.contains("--gpus device=0"), "paired by number: {row}");
 
         // A card the grant does not know is reported as having no grant path, never as grantable.
         let other = gpu_row(
@@ -2533,7 +2536,7 @@ mod tests {
         let grant = fake_grant("0000:06:00.0", 1, gated_node());
         let card = fake("card0", Some("0000:06:00.0"));
         let row = gpu_row(&card, Some(&grant), &in_group_44()).text();
-        assert!(row.contains("would be refused"), "{row}");
+        assert!(row.contains("refused"), "{row}");
         assert!(
             row.contains("44"),
             "the gid the node needs is not named: {row}"

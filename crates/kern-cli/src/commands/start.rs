@@ -997,7 +997,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             ))),
             // `--device` NAMES ONE CARD AND KEEPS DOING SO. CDI spells a device by name, and the
             // name resolves to one index; a box that wants several cards asks for them with
-            // `--gpus 0,1`, which is the flag that takes a list. The alias claim is unchanged and is
+            // `--gpus device=0,1`, the flag that takes a list. The alias claim is unchanged and is
             // about the MOUNTS: the same card reached either way produces the same nodes.
             (None, Some(reference)) => Some(
                 crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference)
@@ -1039,25 +1039,38 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                         })
                     }),
             ),
-            (Some(spec), None) => {
-                Some(crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| match e {
-                    crate::gpu_grant::GpuSpecError::Empty => {
-                        Error::Cli("--gpus needs a card index, for example --gpus 0".to_string())
-                    }
-                    crate::gpu_grant::GpuSpecError::AllWithIndex { given } => Error::Cli(format!(
-                "--gpus {given}: `all` and an index name different things and only one can be \
-                 true. Use --gpus all, or list the cards you want (--gpus 0,1)."
-            )),
-                    crate::gpu_grant::GpuSpecError::Duplicate { index } => Error::Cli(format!(
-                "--gpus names card {index} twice. Each card is granted once; if you meant two \
-                 cards, name two (--gpus 0,1)."
-            )),
-                    crate::gpu_grant::GpuSpecError::NotAnIndex { given } => Error::Cli(format!(
-                        "--gpus {given}: not a card index. Use --gpus 0, --gpus 0,1, --gpus all, \
-                 --gpus device=0 or --gpus gpu=0"
+            (Some(spec), None) => Some(crate::gpu_grant::parse_gpu_spec(spec).map_err(|e| {
+                match e {
+                    crate::gpu_grant::GpuSpecError::Empty => Error::Cli(
+                        "--gpus needs a value: a count like 2, a card like device=0, or all"
+                            .to_string(),
+                    ),
+                    crate::gpu_grant::GpuSpecError::AllWithMore { given } => Error::Cli(format!(
+                        "--gpus {given}: `all` and anything beside it name different things and \
+                         only one can be true. Use --gpus all, or name the cards \
+                         (--gpus device=0,1)"
                     )),
-                }))
-            }
+                    crate::gpu_grant::GpuSpecError::Duplicate { index } => Error::Cli(format!(
+                        "--gpus names card {index} twice. Each card is granted once; if you meant \
+                         two cards, name two (--gpus device=0,1)"
+                    )),
+                    crate::gpu_grant::GpuSpecError::ZeroIsAmbiguous => Error::Cli(
+                        "--gpus 0 has two readings and is refused rather than guessed: docker \
+                         reads it as NO gpus, and this project's own examples read it as card 0. \
+                         For card 0 write --gpus device=0; for no gpu, pass no flag"
+                            .to_string(),
+                    ),
+                    crate::gpu_grant::GpuSpecError::NotACount { given } => Error::Cli(format!(
+                        "--gpus {given}: not a number of cards. A bare number is HOW MANY you \
+                         want, as it is in docker: --gpus 2. For a particular card use \
+                         --gpus device=0, and for every card --gpus all"
+                    )),
+                    crate::gpu_grant::GpuSpecError::NotAnIndex { given } => Error::Cli(format!(
+                        "--gpus {given}: not a card index. Use --gpus device=0, \
+                         --gpus device=0,1, --gpus all, or a count like --gpus 2"
+                    )),
+                }
+            })),
             (None, None) => None,
         };
 
@@ -1088,6 +1101,26 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
 
         let binds =
             crate::gpu_grant::mount_plan(&grant, &selected, &caller).map_err(|e| match e {
+                // NOT ENOUGH CARDS IS NOT A WRONG INDEX. The caller named no card, so there is
+                // nothing for them to correct except the number they asked for, and the message
+                // has to say how many are here rather than which ones.
+                crate::gpu_grant::MountPlanError::TooFewCards { wanted, present } => {
+                    Error::Cli(format!(
+                        "--gpus {wanted}: this host has {} card(s), which is fewer than the {} \
+                         asked for. Present: {}",
+                        present.len(),
+                        wanted,
+                        if present.is_empty() {
+                            "none".to_string()
+                        } else {
+                            present
+                                .iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    ))
+                }
                 crate::gpu_grant::MountPlanError::NoSuchCard { wanted, present } => {
                     let list: Vec<String> = present.iter().map(|c| c.to_string()).collect();
                     let names = if list.is_empty() {

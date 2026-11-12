@@ -1149,19 +1149,27 @@ pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveErr
 pub enum GpuSpecError {
     /// The value was empty.
     Empty,
-    /// `all` was written beside an index, as in `0,all`. The two mean different things and only
-    /// one of them can be true, so this is refused rather than resolved one way: whichever way it
-    /// went, half of what the caller wrote would be silently discarded.
-    AllWithIndex {
+    /// `all` was written beside something else, as in `0,all`. The two mean different things and
+    /// only one of them can be true, so this is refused rather than resolved one way: whichever
+    /// way it went, half of what the caller wrote would be silently discarded.
+    AllWithMore {
         /// What was passed, so the message can quote it.
         given: String,
     },
-    /// An index was named twice, as in `0,0`. Deduplicating silently would make `--gpus 0,0` and
-    /// `--gpus 0` the same command, and the caller who wrote the first almost certainly meant two
-    /// different cards.
+    /// An index was named twice, as in `device=0,0`. Deduplicating silently would make it the same
+    /// command as naming it once, and the caller who wrote it almost certainly meant two cards.
     Duplicate {
         /// The index that repeats.
         index: u32,
+    },
+    /// A bare `0`, which Docker reads as "no GPUs" and a reader of this project's own examples
+    /// reads as "card 0". Refused rather than resolved, because the two are both plausible and
+    /// the cost of guessing wrong is a workload that fails at its first CUDA call.
+    ZeroIsAmbiguous,
+    /// A count of more cards than a request can mean, or a count that is not a number.
+    NotACount {
+        /// What was passed, so the message can quote it.
+        given: String,
     },
     /// The value is not a card index.
     NotAnIndex {
@@ -1172,79 +1180,142 @@ pub enum GpuSpecError {
 
 /// Which cards `--gpus` asked for.
 ///
-/// `all` STAYS A WORD HERE, and that is the whole reason this type exists rather than a
-/// `Vec<u32>`. The parser has no host in front of it: it cannot know which cards exist, and
-/// turning `all` into indices at parse time would mean either reading the filesystem from a pure
-/// function or guessing a range. The expansion happens in [`mount_plan`], where the grant is, so
-/// there is exactly one place that decides what `all` meant and exactly one place to test it.
+/// `all` AND A COUNT STAY UNRESOLVED HERE, and that is the whole reason this type exists rather
+/// than a `Vec<u32>`. The parser has no host in front of it: it cannot know which cards exist, nor
+/// how many, and turning either into indices at parse time would mean reading the filesystem from
+/// a pure function or assuming the indices run from zero without gaps. The driver is allowed to
+/// leave a gap, and [`card_node_paths`] reads the set from the directory for exactly that reason.
+/// The expansion happens in [`mount_plan`], where the grant is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GpuSelection {
     /// Every card the driver lists on this host, however many that turns out to be.
     All,
+    /// ANY `n` cards, which is what Docker's `--gpus 2` and `--gpus count=2` ask for. Resolved to
+    /// the `n` lowest indices the host actually has, so a host whose cards are 0 and 2 answers
+    /// with both rather than refusing for a card 1 that was never named.
+    Count(u32),
     /// The indices the caller named, in the order they wrote them, with no repeats.
     These(Vec<u32>),
 }
 
-/// Read `--gpus`: cards, by index, or every card.
+/// Read `--gpus`, with Docker's grammar, because the flag carries Docker's name.
 ///
-/// Accepts `0`, `device=0` and `gpu=0`, which are the three spellings a reader arrives with from
-/// other runtimes, a comma-separated list of any of them (`0,1`, `device=0,gpu=1`), and `all`.
+/// 🚨 A BARE NUMBER IS A COUNT, NOT AN INDEX, and this is a correction rather than a choice.
+/// MEASURED against docker 29.1.3 on this host: `--gpus 2` hands over `/dev/nvidia0` AND
+/// `/dev/nvidia1`, `--gpus 1` hands over `/dev/nvidia0`, and `--gpus 0` hands over NOTHING while
+/// the container still runs. This flag shipped reading the bare number as an index, so
+/// `--gpus 2` gave card 2 where Docker gives two cards. The project's rule is that a flag taking
+/// Docker's name takes Docker's meaning with it; a flag that looks identical and does something
+/// else is worse than one that is missing, because nobody checks a flag they already know.
 ///
-/// `all` IS NOW A VALUE AND NO LONGER A REFUSAL. It was refused by name while the grant handed
-/// over one card, on the rule that a flag taking a word must not do something narrower than the
-/// word says; the narrower thing is gone, so the refusal goes with it. It stays a word until
-/// [`mount_plan`] has a host to expand it against.
+/// The accepted grammar, every form of it measured against docker first:
 ///
-/// Every refusal names what was passed, because the three ways this goes wrong (a word beside an
-/// index, the same index twice, something that is not an index at all) need three different
-/// corrections from the caller.
+///   - `all`, and `count=all`, which Docker also accepts: every card.
+///   - `2`, and `count=2`: any two cards.
+///   - `device=1`: card 1 by index. `gpu=1` is kern's own spelling of the same thing.
+///   - `device=0,1`: cards 0 and 1. Docker needs the quotes written INSIDE the value for this,
+///     `--gpus "device=0,1"`, because its own value is a comma-separated list of `key=value` and
+///     the comma would otherwise end the pair; measured, the unquoted form is a usage error there.
+///     kern takes one argv token, so it needs no quoting, and it strips a surrounding pair anyway
+///     so a command pasted from a Docker example works as written.
+///
+/// `0` IS REFUSED RATHER THAN RESOLVED. Docker reads it as "no GPUs"; every example this project
+/// has written reads it as "card 0". Both are plausible, and a caller who meant card 0 and got a
+/// box with no GPU learns it at their first CUDA call, from an error that says nothing about the
+/// flag. So it is named, with both readings and the spelling for each.
 pub fn parse_gpu_spec(value: &str) -> Result<GpuSelection, GpuSpecError> {
+    // A pasted Docker example carries its own quotes inside the value. Stripping ONE surrounding
+    // pair is enough and is not a general unquoting: a value with a quote anywhere else is not a
+    // shape either runtime accepts, and it reaches the refusals below with the quote still in it,
+    // which is what lets the message quote back what the caller actually typed.
     let trimmed = value.trim();
+    let trimmed = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .trim();
     if trimmed.is_empty() {
         return Err(GpuSpecError::Empty);
     }
-    // A LIST OF ONE IS THE COMMON CASE and goes down the same path, so there is no second parser
-    // for it to disagree with. An empty element (`0,,1` or a trailing comma) reaches the digit
-    // check below and is refused there, quoting the whole value rather than the empty fragment,
-    // which on its own would read as "" and tell the caller nothing.
-    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
-    let says_all = parts.iter().any(|p| p.eq_ignore_ascii_case("all"));
-    if says_all {
-        if parts.len() > 1 {
-            return Err(GpuSpecError::AllWithIndex {
-                given: trimmed.to_string(),
-            });
-        }
+
+    // `all`, alone. Written beside anything else it is a contradiction rather than an addition.
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "all" || lower == "count=all" {
         return Ok(GpuSelection::All);
     }
+    if lower.split(',').any(|p| p.trim() == "all") {
+        return Err(GpuSpecError::AllWithMore {
+            given: trimmed.to_string(),
+        });
+    }
 
-    let mut out: Vec<u32> = Vec::with_capacity(parts.len());
-    for part in parts {
-        let digits = part
-            .strip_prefix("device=")
-            .or_else(|| part.strip_prefix("gpu="))
-            .unwrap_or(part);
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    // Indices: `device=<list>` or `gpu=<list>`. The list lives inside the value, so it is split
+    // here and not by the caller.
+    if let Some(list) = trimmed
+        .strip_prefix("device=")
+        .or_else(|| trimmed.strip_prefix("gpu="))
+    {
+        return parse_index_list(trimmed, list).map(GpuSelection::These);
+    }
+
+    // A count, written either way.
+    let digits = trimmed.strip_prefix("count=").unwrap_or(trimmed);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(GpuSpecError::NotACount {
+            given: trimmed.to_string(),
+        });
+    }
+    let n = digits.parse::<u32>().map_err(|_| GpuSpecError::NotACount {
+        given: trimmed.to_string(),
+    })?;
+    if n == 0 {
+        return Err(GpuSpecError::ZeroIsAmbiguous);
+    }
+    Ok(GpuSelection::Count(n))
+}
+
+/// The index list inside a `device=` or `gpu=` value.
+///
+/// `whole` is the value as the caller wrote it, and every refusal quotes THAT rather than the
+/// fragment that failed: on its own an empty element reads as `""` and tells a caller nothing
+/// about where in their command to look.
+fn parse_index_list(whole: &str, list: &str) -> Result<Vec<u32>, GpuSpecError> {
+    let mut out: Vec<u32> = Vec::new();
+    for part in list.split(',') {
+        let part = part.trim();
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
             return Err(GpuSpecError::NotAnIndex {
-                given: trimmed.to_string(),
+                given: whole.to_string(),
             });
         }
-        let index = digits
-            .parse::<u32>()
-            .map_err(|_| GpuSpecError::NotAnIndex {
-                given: trimmed.to_string(),
-            })?;
+        let index = part.parse::<u32>().map_err(|_| GpuSpecError::NotAnIndex {
+            given: whole.to_string(),
+        })?;
         if out.contains(&index) {
             return Err(GpuSpecError::Duplicate { index });
         }
         out.push(index);
     }
-    Ok(GpuSelection::These(out))
+    if out.is_empty() {
+        return Err(GpuSpecError::NotAnIndex {
+            given: whole.to_string(),
+        });
+    }
+    Ok(out)
 }
 
 /// Why a grant cannot be turned into mounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountPlanError {
+    /// The caller asked for more cards than this host has. Distinct from [`Self::NoSuchCard`]
+    /// because the correction is different: there is no index to fix, there are simply not enough
+    /// cards, and the message has to say how many there are rather than which ones.
+    TooFewCards {
+        /// How many were asked for.
+        wanted: u32,
+        /// The indices that do exist, so the message can count and list them.
+        present: Vec<u32>,
+    },
     /// The card the caller asked for does not exist on this host.
     NoSuchCard {
         /// The index that was asked for.
@@ -1312,6 +1383,20 @@ fn cards_of<'g>(
             }
             Ok(grant.cards.iter().collect())
         }
+        // ANY `n` CARDS, resolved to the `n` LOWEST indices the host has. `grant.cards` is sorted
+        // by index and read from the directory rather than counted from zero, so a host whose
+        // cards are 0 and 2 answers `count=2` with both instead of refusing for a card 1 that was
+        // never named and does not exist.
+        GpuSelection::Count(n) => {
+            let want = *n as usize;
+            if grant.cards.len() < want {
+                return Err(MountPlanError::TooFewCards {
+                    wanted: *n,
+                    present: grant.cards.iter().map(|c| c.index).collect(),
+                });
+            }
+            Ok(grant.cards.iter().take(want).collect())
+        }
         GpuSelection::These(indices) => {
             let mut out = Vec::with_capacity(indices.len());
             for &index in indices {
@@ -1358,7 +1443,7 @@ pub fn mount_plan(
     // node is group-gated would be answering a question nobody asked.
     //
     // ASKING FOR MORE CARDS CAN TURN A GRANT THAT WOULD HAVE WORKED INTO A REFUSAL, and that is
-    // correct rather than unfortunate: `--gpus 0,1` is one request, so it succeeds or fails as
+    // correct rather than unfortunate: `--gpus device=0,1` is one request, so it succeeds or
     // one. Granting the half that is reachable would hand back a box with fewer cards than the
     // command named, and nothing in the box could tell that from a card that failed later.
     let mut selected: Vec<(PathBuf, NodeFacts)> = grant.shared.clone();
@@ -1424,15 +1509,15 @@ pub fn render_plan(grant: &GpuGrant, detail: Detail) -> String {
         grant.shared.len(),
         grant.cards.len()
     ));
-    // WHICH CARD EACH INDEX MEANS, before anything is mounted. `--gpus 0` is a number and the
+    // WHICH CARD EACH INDEX MEANS, before anything is mounted. `--gpus device=0` names an
     // reader has another number in front of them, the `cardN` their desktop and `nvidia-smi` use,
-    // and on this host the two are INVERTED: `--gpus 0` is `0000:01:00.0`, which is `card1`. A
+    // index, and on this host it is INVERTED against `cardN`: card 0 is `0000:01:00.0`, which
     // preview that showed only the count would let someone confirm a plan for the other card.
     for card in &grant.cards {
         match card.pci_address.as_deref() {
-            Some(addr) => out.push_str(&format!("  --gpus {} is {}\n", card.index, addr)),
+            Some(addr) => out.push_str(&format!("  --gpus device={} is {}\n", card.index, addr)),
             None => out.push_str(&format!(
-                "  --gpus {} has no PCI address in /proc/driver/nvidia\n",
+                "  --gpus device={} has no PCI address in /proc/driver/nvidia\n",
                 card.index
             )),
         }
@@ -2464,60 +2549,89 @@ mod tests {
     }
 
     /// `--gpus` over its whole input space, including the forms a reader arrives with from other
-    /// runtimes and the ones that must be refused by name.
+    /// THE GRAMMAR IS DOCKER'S, and every row of this test was measured against docker 29.1.3 on
+    /// a two-card host before it was written here.
+    ///
+    /// | written            | docker gave            | so kern gives |
+    /// |--------------------|------------------------|---------------|
+    /// | `all`, `count=all` | nvidia0 nvidia1        | every card    |
+    /// | `2`, `count=2`     | nvidia0 nvidia1        | any two       |
+    /// | `1`                | nvidia0                | any one       |
+    /// | `device=1`         | nvidia1                | card 1        |
+    /// | `"device=0,1"`     | nvidia0 nvidia1        | cards 0 and 1 |
+    /// | `device=0,1`       | a usage error          | cards 0 and 1 |
+    /// | `0`                | NOTHING, and it ran    | refused       |
+    ///
+    /// The last two rows are the only places kern is not identical, and both are deliberate: the
+    /// unquoted list is a superset, because kern takes one argv token and has no comma problem to
+    /// solve; and `0` is refused because its two readings, docker's "no gpus" and this project's
+    /// own "card 0", are both plausible and guessing costs a workload its first CUDA call.
     #[test]
-    fn the_gpus_spec_accepts_the_spellings_of_one_card_a_list_and_all() {
+    fn the_gpus_spec_reads_docker_grammar_a_count_an_index_or_all() {
         for (good, want) in [
-            ("0", vec![0]),
-            ("1", vec![1]),
-            ("7", vec![7]),
-            ("device=0", vec![0]),
-            ("gpu=3", vec![3]),
-            (" 2 ", vec![2]),
-            // A LIST, in the order it was written. Not sorted: `--gpus 1,0` is a request for two
-            // cards and nothing downstream reads meaning into which came first, but reordering a
-            // caller's input is a liberty this parser has no reason to take.
-            ("0,1", vec![0, 1]),
-            ("1,0", vec![1, 0]),
-            ("device=0,gpu=1", vec![0, 1]),
-            (" 0 , 1 ", vec![0, 1]),
-            ("3,1,2", vec![3, 1, 2]),
+            ("2", GpuSelection::Count(2)),
+            ("1", GpuSelection::Count(1)),
+            ("7", GpuSelection::Count(7)),
+            ("count=2", GpuSelection::Count(2)),
+            (" 3 ", GpuSelection::Count(3)),
+            ("device=1", GpuSelection::These(vec![1])),
+            ("gpu=3", GpuSelection::These(vec![3])),
+            ("device=0,1", GpuSelection::These(vec![0, 1])),
+            // ORDER IS THE CALLER'S. Nothing downstream reads meaning into which came first, and
+            // reordering their input is a liberty this parser has no reason to take.
+            ("device=1,0", GpuSelection::These(vec![1, 0])),
+            ("gpu=3,1,2", GpuSelection::These(vec![3, 1, 2])),
+            ("device= 0 , 1 ", GpuSelection::These(vec![0, 1])),
+            // The quotes a docker example carries inside its value. Stripped so a pasted command
+            // works as written.
+            ("\"device=0,1\"", GpuSelection::These(vec![0, 1])),
+            ("\"all\"", GpuSelection::All),
+            ("all", GpuSelection::All),
+            ("ALL", GpuSelection::All),
+            ("count=all", GpuSelection::All),
         ] {
-            match parse_gpu_spec(good) {
-                Ok(GpuSelection::These(got)) => {
-                    assert_eq!(got, want, "{good:?} parsed to the wrong indices")
-                }
-                other => panic!("{good:?} should parse to a list, got {other:?}"),
-            }
-        }
-        // `all` IS A VALUE NOW. It stays a word through the parser, which has no host to expand
-        // it against; `mount_plan` is the one place that turns it into cards.
-        for word in ["all", "ALL", "All", " all "] {
-            assert_eq!(parse_gpu_spec(word), Ok(GpuSelection::All), "{word:?}");
+            assert_eq!(parse_gpu_spec(good), Ok(want), "{good:?}");
         }
         assert_eq!(parse_gpu_spec(""), Err(GpuSpecError::Empty));
         assert_eq!(parse_gpu_spec("   "), Err(GpuSpecError::Empty));
-        // `all` BESIDE AN INDEX is refused rather than resolved either way: whichever way it went,
+        assert_eq!(parse_gpu_spec("0"), Err(GpuSpecError::ZeroIsAmbiguous));
+        assert_eq!(
+            parse_gpu_spec("count=0"),
+            Err(GpuSpecError::ZeroIsAmbiguous)
+        );
+        // `all` BESIDE ANYTHING is refused rather than resolved either way: whichever way it went,
         // half of what the caller wrote would be discarded in silence.
-        for mixed in ["0,all", "all,1", "ALL,0,1"] {
+        for mixed in ["all,1", "2,all", "device=0,all"] {
             match parse_gpu_spec(mixed) {
-                Err(GpuSpecError::AllWithIndex { given }) => assert_eq!(given, mixed),
-                other => panic!("{mixed:?} should be AllWithIndex, got {other:?}"),
+                Err(GpuSpecError::AllWithMore { given }) => assert_eq!(given, mixed),
+                other => panic!("{mixed:?} should be AllWithMore, got {other:?}"),
             }
         }
-        // THE SAME CARD TWICE is refused, not deduplicated. Silently collapsing it would make
-        // `--gpus 0,0` and `--gpus 0` the same command, and the caller who wrote the first almost
-        // certainly meant two different cards.
-        for (dup, index) in [("0,0", 0), ("1,2,1", 1), ("device=3,gpu=3", 3)] {
+        // THE SAME CARD TWICE is refused, not deduplicated.
+        for (dup, index) in [("device=0,0", 0), ("gpu=1,2,1", 1)] {
             match parse_gpu_spec(dup) {
                 Err(GpuSpecError::Duplicate { index: got }) => assert_eq!(got, index, "{dup:?}"),
                 other => panic!("{dup:?} should be Duplicate, got {other:?}"),
             }
         }
-        // An empty element quotes the WHOLE value: on its own a trailing comma reads as "" and
-        // would tell the caller nothing about where to look.
+        // A bare value that is not a number is a COUNT that failed, and the message has to say so:
+        // telling a caller "not a card index" would point them at `device=` when what they wrote
+        // was in the count position.
+        for bad in ["x", "first", "2.5", "-1", "0x1", "count=x", "count="] {
+            match parse_gpu_spec(bad) {
+                Err(GpuSpecError::NotACount { given }) => assert_eq!(given, bad.trim()),
+                other => panic!("{bad:?} should be NotACount, got {other:?}"),
+            }
+        }
+        // Inside `device=` the position IS an index, so the same garbage gets the other message.
+        // An empty element quotes the WHOLE value: on its own it reads as "" and says nothing.
         for bad in [
-            "-1", "0.5", "first", "device=", "gpu=x", "0x1", "0,", ",0", "0,,1", ",",
+            "device=",
+            "gpu=x",
+            "device=0,",
+            "device=,0",
+            "device=0,,1",
+            "device=-1",
         ] {
             match parse_gpu_spec(bad) {
                 Err(GpuSpecError::NotAnIndex { given }) => assert_eq!(given, bad.trim()),
@@ -2526,19 +2640,27 @@ mod tests {
         }
     }
 
-    /// The two edges where a digit check usually breaks: the top of the type, and a character that
-    /// is a digit to a human and to `char::is_numeric` but not to `is_ascii_digit`.
+    /// The two edges where a digit check usually breaks, in BOTH positions the grammar has.
     ///
     /// `u32::MAX` must PARSE and then be refused later for not existing, because those are two
-    /// different answers and the caller is owed the right one: "no card 4294967295 on this host,
-    /// present: 0, 1" tells them to look at their index, "not a card index" tells them to look at
-    /// their spelling. One past the top is a spelling problem, and it reaches `parse` rather than
-    /// the digit filter, so it is the only refusal here that comes from the integer conversion.
+    /// different answers and the caller is owed the right one: "this host has 2 card(s), fewer
+    /// than the 4294967295 asked for" tells them to look at their number, "not a number of cards"
+    /// tells them to look at their spelling. One past the top is a spelling problem and reaches
+    /// `parse` rather than the digit filter.
+    ///
+    /// The count position and the index position give DIFFERENT errors for the same garbage, and
+    /// that is the point of testing both: a caller who wrote `2x` was counting and one who wrote
+    /// `device=2x` was naming, and sending either to the other's message sends them to the wrong
+    /// half of their command.
     #[test]
-    fn the_spec_holds_at_the_top_of_u32_and_refuses_a_digit_that_is_not_ascii() {
+    fn the_spec_holds_at_the_top_of_u32_in_both_positions() {
         assert_eq!(
             parse_gpu_spec("4294967295"),
-            Ok(GpuSelection::These(vec![u32::MAX]))
+            Ok(GpuSelection::Count(u32::MAX))
+        );
+        assert_eq!(
+            parse_gpu_spec("count=4294967295"),
+            Ok(GpuSelection::Count(u32::MAX))
         );
         assert_eq!(
             parse_gpu_spec("device=4294967295"),
@@ -2546,28 +2668,40 @@ mod tests {
         );
         for over in ["4294967296", "99999999999999999999"] {
             match parse_gpu_spec(over) {
+                Err(GpuSpecError::NotACount { given }) => assert_eq!(given, over),
+                other => panic!("{over:?} is past u32 and must not count, got {other:?}"),
+            }
+        }
+        for over in ["device=4294967296", "gpu=99999999999999999999"] {
+            match parse_gpu_spec(over) {
                 Err(GpuSpecError::NotAnIndex { given }) => assert_eq!(given, over),
-                other => panic!("{over:?} is past u32 and must not parse, got {other:?}"),
+                other => panic!("{over:?} is past u32 and must not index, got {other:?}"),
             }
         }
         // FULLWIDTH ZERO, U+FF10, then Arabic-Indic and Devanagari. `char::is_numeric` answers
         // true for all three where `is_ascii_digit` does not.
         //
-        // MEASURED, because the obvious claim about this is wrong: swapping the filter to
+        // MEASURED, because the obvious claim about this is wrong: swapping either filter to
         // `is_numeric` leaves every assertion here green, since `parse::<u32>` refuses a
-        // non-ASCII digit on its own and returns the SAME `NotAnIndex`. So this test pins the
-        // behaviour a caller sees, not which of the two guards catches it, and the ASCII filter
-        // earns its place by rejecting earlier rather than by rejecting more.
-        for wide in ["\u{FF10}", "\u{0660}", "\u{0966}", "0\u{FF10}"] {
+        // non-ASCII digit on its own and returns the SAME error. So this pins the behaviour a
+        // caller sees, not which of the two guards catches it, and the ASCII filter earns its
+        // place by rejecting earlier rather than by rejecting more.
+        for wide in ["\u{FF10}", "\u{0660}", "\u{0966}", "2\u{FF10}"] {
+            match parse_gpu_spec(wide) {
+                Err(GpuSpecError::NotACount { given }) => assert_eq!(given, wide),
+                other => panic!("{wide:?} is not an ASCII count, got {other:?}"),
+            }
+        }
+        for wide in ["device=\u{FF10}", "gpu=0,\u{0660}"] {
             match parse_gpu_spec(wide) {
                 Err(GpuSpecError::NotAnIndex { given }) => assert_eq!(given, wide),
                 other => panic!("{wide:?} is not an ASCII index, got {other:?}"),
             }
         }
-        // Leading zeros name the same card and are not a spelling error: `00` is card 0.
-        assert_eq!(parse_gpu_spec("00"), Ok(GpuSelection::These(vec![0])));
+        // Leading zeros name the same thing and are not a spelling error.
+        assert_eq!(parse_gpu_spec("02"), Ok(GpuSelection::Count(2)));
         assert_eq!(
-            parse_gpu_spec("0000000001"),
+            parse_gpu_spec("device=0000000001"),
             Ok(GpuSelection::These(vec![1]))
         );
     }
@@ -2740,7 +2874,7 @@ mod tests {
 
     /// A SELECTION IS SATISFIED WHOLE OR REFUSED WHOLE.
     ///
-    /// `--gpus 0,9` on a host with two cards is a request for a card that is not there, and the
+    /// `--gpus device=0,9` on a two-card host is a request for a card that is not there, and
     /// honest answer is a refusal naming the indices that exist. Granting the half that is
     /// reachable would hand back a box with fewer cards than the command named, and nothing
     /// inside it could tell that from a card that failed later.

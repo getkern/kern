@@ -328,14 +328,16 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --egress-allow d,d  Restrict outbound to an allowlist of domains via a filtering proxy (foreground-only)
     --hostname <name>   Set the box's hostname (default: the box name)
     --tun               Expose /dev/net/tun in the box (WireGuard / userspace VPN)
-    --gpus <spec>       Hand the box NVIDIA cards: 0, 0,1, all, device=0 or gpu=0. The
-                        nodes and the host's driver libraries are resolved from the
-                        driver's own version and bound read-only. A card you did not name
-                        has no device node in the box, so CUDA cannot initialise it, and
-                        the driver's per-card directory names only the cards you got. The
-                        host's PCI bus stays readable, so how many cards it has is still
-                        discoverable. One request: if any card you named is missing or
-                        unreachable the whole grant is refused, never granted in part
+    --gpus <spec>       Hand the box NVIDIA cards, with docker's grammar: a bare number
+                        is HOW MANY (--gpus 2), device=0 or device=0,1 names which, and
+                        all takes every one. count=2 and count=all also work. The nodes
+                        and the host's driver libraries are resolved from the driver's own
+                        version and bound read-only. A card you did not get has no device
+                        node in the box, so CUDA cannot initialise it, and the driver's
+                        per-card directory names only the cards you did get. The host's
+                        PCI bus stays readable, so how many cards it has is discoverable.
+                        One request: if any card named is missing or unreachable the whole
+                        grant is refused, never granted in part
     --device <ref>      ONE card, named as CDI names it: nvidia.com/gpu=0, or by UUID. An
                         alias over --gpus: the spec says which card the name means and the
                         mounts come from the driver's own layout. Several cards are asked

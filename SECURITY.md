@@ -337,7 +337,7 @@ everything else, and the source paths are canonicalized and re-checked to stay u
 Grant a `vgpio:` profile only to workloads you would trust with that hardware.
 
 ## GPU: a device grant, not a slice
-A box can be given one of the host's GPUs as a device grant, with `--gpus 0` or the CDI spelling
+A box can be given one of the host's GPUs as a device grant, with `--gpus device=0` or the CDI spelling
 `--device nvidia.com/gpu=0`: the whole card, through the host's driver. kern does not split a GPU
 or cap it per box. A granted card is NOT a boundary against malicious code in the box: the workload
 holding it has the driver's whole attack surface, and a process with no vendor library in its

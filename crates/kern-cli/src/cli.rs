@@ -182,10 +182,12 @@ pub enum Command {
         device: Option<String>,
         /// `--gpus <spec>`: hand the box NVIDIA GPUs, resolved from native discovery.
         ///
-        /// `0`, a list (`0,1`), and `all`. The refusal of `all` belonged to the phase that granted
-        /// exactly one card: a flag taking a word must not do something narrower than the word
-        /// says, and now it does not have to. A selection is satisfied whole or refused whole, so
-        /// a box never starts with fewer cards than the command named.
+        /// DOCKER'S GRAMMAR, measured rather than assumed: a bare number is a COUNT, `device=N`
+        /// is an index, and `all` is every card. This flag shipped reading the bare number as an
+        /// index, which made `--gpus 2` mean card 2 where docker means two cards; a flag that
+        /// carries docker's name and does something else is worse than one that is missing.
+        /// A selection is satisfied whole or refused whole, so a box never starts with fewer
+        /// cards than the command named.
         gpus: Option<String>,
         /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
         init: bool,
