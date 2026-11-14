@@ -3460,6 +3460,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // A BOX WITH NO GATE IS NOT AN ERROR. `levels` may name a box that was filtered out of this run
     // by reconciliation, and `gates` only holds the ones this `up` prepared. The lookup misses and
     // the loop moves on, which is the same tolerance the prepare loop applies to the same case.
+    // How many services were given a NAT and how many did not get one, for the closing line: it
+    // said "reaches the internet through its own NAT" on a host without pasta, two lines under the
+    // warning that every service had no outbound. MEASURED on a Jetson with no `passt` installed.
+    let mut nat_tried = 0usize;
+    let mut nat_failed = 0usize;
     if gate_active {
         let released = match gates.lock() {
             Ok(g) => g,
@@ -3542,6 +3547,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             // ONE THREAD EACH, SCOPED, so nothing outlives this block and no pool has to be owned.
             // A single subject is done inline: a thread to serialise on would be pure overhead, and
             // most stacks that get here have two or three services.
+            nat_tried = subject.len();
             if subject.len() < 2 {
                 outbound_warnings.extend(subject.iter().filter_map(|b| attach(b)));
             } else {
@@ -3568,6 +3574,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         for w in &outbound_warnings {
             eprintln!("{w}");
         }
+        nat_failed = outbound_warnings.len();
         for level in &levels {
             for name in level {
                 let Some(b) = boxes.iter().find(|b| &b.name == name) else {
@@ -3648,9 +3655,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // `evdns_base_new` because of it. Saying what is true is the least this can do until a
         // member gets a route out.
         let net = if want_bridge {
-            "each service has its own namespace and its own 127.0.0.1, meets its peers on the pod's \
-             bridge, and reaches the internet through its own NAT (pasta)"
-                .to_string()
+            let egress = if nat_tried == 0 {
+                "and has no NAT: no service in it is given one (internal networks only)"
+            } else if nat_failed == 0 {
+                "and reaches the internet through its own NAT (pasta)"
+            } else if nat_failed >= nat_tried {
+                "and has NO route to the internet: no service got its NAT (the warnings above say why)"
+            } else {
+                "and reaches the internet through its own NAT (pasta), except the services named above"
+            };
+            format!(
+                "each service has its own namespace and its own 127.0.0.1, meets its peers on the \
+                 pod's bridge, {egress}"
+            )
         } else {
             crate::pod::network_summary(&pod)
         };

@@ -1410,11 +1410,58 @@ pub fn mark_stopping(name: &str, pid: i32) {
     }
 }
 
-/// Consume the [`mark_stopping`] marker: `true` for exactly one caller, whichever removes it first.
-pub fn take_stopping(name: &str, pid: i32) -> bool {
+/// What the OWNER of a box finds when it is about to write that box's history line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopClaim {
+    /// A stop ended the box and left the line to the owner: write it, as `stopped`.
+    OwnerWrites,
+    /// A stop ended the box and wrote the line itself: write nothing.
+    AlreadyWritten,
+    /// No stop: write the outcome the owner observed.
+    NotStopped,
+}
+
+/// The owner's claim on the [`mark_stopping`] marker, made once, when its box has ended.
+///
+/// ONE ATOMIC STEP DECIDES WHO WRITES, and it is the reason this is not a wait. The stop claims
+/// with a RENAME of the marker to `<name>-<pid>.done` ([`claim_stop_record`]); the owner claims with
+/// an UNLINK of the marker. Both act on one name, so exactly one succeeds; the owner that lost then
+/// finds `.done`, removes it, and writes nothing. MEASURED before this, when the stop instead waited
+/// up to 500 ms for the owner and left the line to it if it was still alive: the Python SDK runs
+/// `kern stop` and then SIGKILLs the launcher's process group, so the owner died before writing and
+/// a box ended by its deadline had no line at all, three runs out of three on a Jetson.
+pub fn owner_stop_claim(name: &str, pid: i32) -> StopClaim {
+    let Ok(d) = runtime_subdir("stopping") else {
+        return StopClaim::NotStopped;
+    };
+    if fs::remove_file(d.join(format!("{name}-{pid}"))).is_ok() {
+        StopClaim::OwnerWrites
+    } else if fs::remove_file(d.join(format!("{name}-{pid}.done"))).is_ok() {
+        StopClaim::AlreadyWritten
+    } else {
+        StopClaim::NotStopped
+    }
+}
+
+/// The stop's claim on the marker: `true` when this stop is the one that writes the line (it
+/// renamed the marker before the owner removed it). See [`owner_stop_claim`].
+pub fn claim_stop_record(name: &str, pid: i32) -> bool {
     runtime_subdir("stopping")
-        .map(|d| fs::remove_file(d.join(format!("{name}-{pid}"))).is_ok())
+        .map(|d| {
+            fs::rename(
+                d.join(format!("{name}-{pid}")),
+                d.join(format!("{name}-{pid}.done")),
+            )
+            .is_ok()
+        })
         .unwrap_or(false)
+}
+
+/// Remove the `.done` mark a stop left for an owner that is gone and will never read it.
+pub fn forget_stop_record(name: &str, pid: i32) {
+    if let Ok(d) = runtime_subdir("stopping") {
+        let _ = fs::remove_file(d.join(format!("{name}-{pid}.done")));
+    }
 }
 
 /// Whether the process `pid` started at `starttime` is still running, for a caller outside this
@@ -3431,6 +3478,42 @@ mod tests {
             let again = parse(&encode(&inst));
             assert_eq!(again.map(|i| i.keep_groups), Some(want), "round trip");
         }
+    }
+
+    /// THE STOP CLAIM, IN BOTH ORDERS. Exactly one of the stop and the owner writes a stopped box's
+    /// line: whoever claims the marker first, and the owner that lost to the stop is told so and
+    /// writes nothing. Without a stop, the owner writes its own outcome and the stop has nothing.
+    #[test]
+    fn exactly_one_of_the_stop_and_the_owner_writes_a_stopped_boxs_line() {
+        let _g = crate::env_guard();
+        let base = std::env::temp_dir().join(format!("kern-stopclaim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let prev = crate::global_env("XDG_RUNTIME_DIR");
+        crate::set_global_env("XDG_RUNTIME_DIR", &base);
+        // The owner first: it writes `stopped`, the stop then has nothing to claim.
+        mark_stopping("a", 10);
+        assert_eq!(owner_stop_claim("a", 10), StopClaim::OwnerWrites);
+        assert!(!claim_stop_record("a", 10));
+        // The stop first: it writes, and the owner is told the line exists.
+        mark_stopping("b", 11);
+        assert!(claim_stop_record("b", 11));
+        assert_eq!(owner_stop_claim("b", 11), StopClaim::AlreadyWritten);
+        // ...and only once: a second look finds nothing left.
+        assert_eq!(owner_stop_claim("b", 11), StopClaim::NotStopped);
+        // No stop at all.
+        assert_eq!(owner_stop_claim("c", 12), StopClaim::NotStopped);
+        assert!(!claim_stop_record("c", 12));
+        // A stop whose owner is gone cleans its own mark.
+        mark_stopping("d", 13);
+        assert!(claim_stop_record("d", 13));
+        forget_stop_record("d", 13);
+        assert_eq!(owner_stop_claim("d", 13), StopClaim::NotStopped);
+        match prev {
+            Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+            None => crate::unset_global_env("XDG_RUNTIME_DIR"),
+        }
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// The image, GPUs and timeout a box was started with survive the record, for the writers of its

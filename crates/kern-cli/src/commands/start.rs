@@ -3226,7 +3226,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // THE BOX'S LINE IN THE HISTORY, from what kern observed outside it: see `history.rs`. Here,
     // after teardown and before the exit code is handed back, because this is the one place every
     // foreground box (every SDK and MCP call) passes on its way out with its outcome known.
-    if let Ok(code) = &result {
+    // A STOP MAY HAVE WRITTEN THIS BOX'S LINE ALREADY, and then this writes none: see
+    // `registry::owner_stop_claim`.
+    let stop_claim = registry::owner_stop_claim(name.as_str(), launcher_pid);
+    if let (Ok(code), false) = (&result, stop_claim == registry::StopClaim::AlreadyWritten) {
         let ran_ms = crate::runstats::since_start_us()
             .map_or(0, |us| u64::try_from(us / 1000).unwrap_or(u64::MAX));
         crate::history::record(&crate::history::Entry {
@@ -3237,7 +3240,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             code: *code,
             // A `kern stop` that ended this box left a marker: the line says `stopped`, and it is
             // the only line (see `registry::mark_stopping`).
-            outcome: if registry::take_stopping(name.as_str(), launcher_pid) {
+            outcome: if stop_claim == registry::StopClaim::OwnerWrites {
                 crate::history::Outcome::Stopped
             } else {
                 crate::history::classify(
@@ -5163,25 +5166,28 @@ fn supervise_box(
             s.to_string()
         }
     };
-    crate::history::record(&crate::history::Entry {
-        ended_ms: crate::history::now_ms(),
-        name: inst.name.clone(),
-        image: dash(&inst.image),
-        ran_ms: last_ran_ms,
-        code: final_code,
-        outcome: if registry::take_stopping(&inst.name, inst.pid) {
-            crate::history::Outcome::Stopped
-        } else {
-            crate::history::classify(
-                final_code,
-                last_verdict.0,
-                last_verdict.1,
-                inst.timeout_s,
-                last_ran_ms,
-            )
-        },
-        gpu: dash(&inst.gpus),
-    });
+    let stop_claim = registry::owner_stop_claim(&inst.name, inst.pid);
+    if stop_claim != registry::StopClaim::AlreadyWritten {
+        crate::history::record(&crate::history::Entry {
+            ended_ms: crate::history::now_ms(),
+            name: inst.name.clone(),
+            image: dash(&inst.image),
+            ran_ms: last_ran_ms,
+            code: final_code,
+            outcome: if stop_claim == registry::StopClaim::OwnerWrites {
+                crate::history::Outcome::Stopped
+            } else {
+                crate::history::classify(
+                    final_code,
+                    last_verdict.0,
+                    last_verdict.1,
+                    inst.timeout_s,
+                    last_ran_ms,
+                )
+            },
+            gpu: dash(&inst.gpus),
+        });
+    }
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
     }

@@ -3157,20 +3157,18 @@ mod driver_row_tests {
 
 /// A box ended by `kern stop` / `kern kill`, in the history: the SDKs' own deadline arrives this way,
 /// so this is the line that says a call was stopped rather than that it died. See `history.rs`.
-/// The stopped box's line in the sandbox history, written HERE only when its owner cannot write it.
+/// The stopped box's line in the sandbox history, written HERE unless its owner already wrote it.
 ///
-/// The owner (the foreground launcher, or a detached box's supervisor) writes the line itself and,
-/// finding the `stopping` marker this command left, writes `stopped`. This writes it only when the
-/// owner is gone and the marker is still there: an orphaned box, or a supervisor the stop's SIGKILL
-/// took before it could write. The owner gets up to half a second to finish, which is longer than a
-/// supervisor or launcher takes between its box's death and its own.
+/// One atomic claim decides between the two, with no waiting: see `registry::owner_stop_claim`. If
+/// the owner (the foreground launcher, or a detached box's supervisor) consumed the marker first,
+/// it wrote `stopped` and this writes nothing; otherwise this writes it now and leaves the owner a
+/// `.done` mark, which an owner that is already gone never reads, so it is removed here.
 fn record_stopped(b: &registry::Instance, code: i32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while registry::owner_alive(b.pid, b.starttime) && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    if registry::owner_alive(b.pid, b.starttime) || !registry::take_stopping(&b.name, b.pid) {
+    if !registry::claim_stop_record(&b.name, b.pid) {
         return;
+    }
+    if !registry::owner_alive(b.pid, b.starttime) {
+        registry::forget_stop_record(&b.name, b.pid);
     }
     let dash = |s: &str| {
         if s.is_empty() {

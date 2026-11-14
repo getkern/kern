@@ -18446,6 +18446,45 @@ fn a_finished_box_leaves_one_history_line_that_names_what_ended_it() {
     assert_eq!(l.len(), 1, "one line per stopped box: {l:?}");
     assert!(l[0].contains("\"outcome\":\"stopped\""), "{l:?}");
 
+    // 4. THE SDK'S SHAPE: `kern stop`, then the launcher's process group SIGKILLed at once, so the
+    //    owner dies before it can write anything. MEASURED before the atomic claim: no line at all.
+    let mut sdk = kern();
+    env(&mut sdk);
+    {
+        use std::os::unix::process::CommandExt;
+        sdk.process_group(0);
+    }
+    let mut child = sdk
+        .args([
+            "box",
+            "hist-sdk",
+            "--rootfs",
+            &rootfs,
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the foreground box");
+    assert!(wait_for(&|| running("hist-sdk")), "hist-sdk never ran");
+    let _ = run(&["stop", "hist-sdk"]);
+    if let Ok(pgid) = i32::try_from(child.id()) {
+        // SAFETY: signalling the process group this test created for the launcher.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    let _ = child.wait();
+    assert!(
+        wait_for(&|| !lines_of("hist-sdk").is_empty()),
+        "a box stopped and then SIGKILLed left no line"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let l = lines_of("hist-sdk");
+    assert_eq!(l.len(), 1, "one line per stopped box: {l:?}");
+    assert!(l[0].contains("\"outcome\":\"stopped\""), "{l:?}");
+
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&base);
 }
