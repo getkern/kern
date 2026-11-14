@@ -65,6 +65,13 @@ read-only once instead of remounting each file. On WSL2 the search of the Window
 is mounted over 9p, is remembered and re-checked instead of walked for every box. A box without a GPU
 is unchanged.
 
+**Compose names the right reason when `ipc:`/`pid:` names another service:** every service has its own
+namespace; the warning said the stack shared one network namespace, which is no longer so.
+
+**A killed box no longer leaves its environment file behind.** A box ended by SIGKILL (as the SDKs and
+the MCP server end a prewarmed box) left its `env/` and `health/` files in the runtime directory;
+500 MCP calls left 99 of them. The record and its files now go together.
+
 **The SDKs re-extract an older cached image when the session opens.** An image cached by an older kern
 (without its setuid bits) was downloaded again by the first box, inside the first call's deadline: a
 first `kernel()` cell could time out at 30 s. The session's own image fetch now does it, on its 900 s
