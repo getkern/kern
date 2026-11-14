@@ -247,8 +247,8 @@ pub struct BoxRunArgs<'a> {
     pub landlock_rw: &'a [String],
     /// `--ip <addr>` (repeatable): extra IPv4 addresses this box's loopback answers on.
     pub net_ips: &'a [std::net::Ipv4Addr],
-    /// `--pod-bridge <ip>/<prefix>`: this box's place on the pod's bridge, when it has one.
-    pub pod_bridge: Option<kern_isolation::BridgeAttach>,
+    /// `--pod-bridge <ip>/<prefix>[@n]`: this box's place on each of the pod's bridges it joins.
+    pub pod_bridges: Vec<kern_isolation::BridgeAttach>,
     /// `--apparmor <profile>`: a pre-loaded AppArmor profile the box enters on exec, or None.
     pub apparmor: Option<&'a str>,
     pub workdir: Option<&'a str>,
@@ -1350,7 +1350,7 @@ struct BuildSpec<'a> {
     read_only: bool,
     landlock_rw: Vec<String>,
     net_ips: Vec<std::net::Ipv4Addr>,
-    pod_bridge: Option<kern_isolation::BridgeAttach>,
+    pod_bridges: Vec<kern_isolation::BridgeAttach>,
     apparmor: Option<String>,
     volumes: Vec<Volume>,
     env: Vec<(String, String)>,
@@ -1675,7 +1675,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         read_only: b.read_only,
         landlock_rw: b.landlock_rw,
         net_ips: b.net_ips,
-        pod_bridge: b.pod_bridge,
+        pod_bridges: b.pod_bridges,
         apparmor: b.apparmor,
         command: b.cmd,
         hostname,

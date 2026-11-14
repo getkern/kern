@@ -221,11 +221,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}compose{z} <file> {c}ps{z} [-q] [--services] [--format json]            Ids only, service names from the file, or NDJSON for a script
     {c}up{z} [-d] [--wait [--wait-timeout N]] / {c}down{z} [-v] [--remove-orphans]  --wait holds until every service is ready; down -v deletes this project's named volumes
     {c}up{z} [--abort-on-container-exit] [--exit-code-from <service>]        Stop the stack when a service exits, and adopt that service's status
-    {c}pod{z} create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>]  Shared-network pod: peers reach each other by name.
+    {c}pod{z} create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>]...  Shared-network pod: peers reach each other by name.
                                                                         Members share the user and network namespaces; a sub-uid
                                                                         range is mapped by default, --no-uid-range asks for the
                                                                         single-uid map instead. With --bridge each member keeps its
-                                                                        own namespace and a 127.0.0.1 no peer can reach
+                                                                        own namespace and a 127.0.0.1 no peer can reach; each further
+                                                                        --bridge is another network, with no forwarding between them
     {c}pod{z} ls [--json] | {c}pod{z} rm <name>                                List pods, or remove one
     {c}network{z} create <name> | {c}network{z} ls [--json] | {c}network{z} inspect <name> [--json] [-f T] | {c}network{z} rm <name>  A network shared BETWEEN projects, which is what a
                                                                      compose file names with `external: true`. Services of
@@ -391,10 +392,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --restart-max <n>   How many times --restart retries before giving up (default 10)
     --ulimit <n=s[:h]>  Set a resource limit (e.g. nofile=1024:2048); rootless can only LOWER; repeatable
     --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable
-    --pod-bridge <ip>/<n> Join the pod through its BRIDGE with this address, instead of sharing the
-                        pod's network namespace. The box then keeps its own 127.0.0.1, which no
+    --pod-bridge <ip>/<n>[@b] Join the pod through its BRIDGE with this address, instead of sharing
+                        the pod's network namespace. The box then keeps its own 127.0.0.1, which no
                         peer can reach, and meets its peers at their addresses, each on its own
-                        network namespace. Needs a pod made with `pod create --bridge <cidr>`
+                        network namespace. Needs a pod made with `pod create --bridge <cidr>`.
+                        Repeatable, once per network: `@b` names the pod's bridge b (its b+1th
+                        `--bridge`), and the box gets eth0, eth1, ... in the order given
     --ip <addr>         Extra IPv4 address the box's loopback answers on, as a /32; repeatable.
                         This is what a compose file's `ipv4_address:` becomes: the literal address
                         a peer hard-codes exists inside the box's network namespace instead of

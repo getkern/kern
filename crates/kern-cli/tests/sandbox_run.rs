@@ -7518,7 +7518,12 @@ fn an_internal_network_leaves_a_service_with_no_route_at_all() {
     // document with a single `format!` and its `\n  ` continuations produced a file whose second
     // key sat at column 0, which the parser correctly read as a second service called `rootfs`. A
     // YAML fixture is indentation, so the indentation has to be visible in the source.
-    let probe = "echo ROUTES=$(tail -n +2 /proc/net/route | wc -l); sleep 4";
+    // DEFAULT ROUTES, not routes. Since a file whose networks separate services gets a bridge per
+    // network, the confined service has the on-link route of its own network (its peers on `priv`),
+    // which is Docker's arrangement for an internal network; what it must not have is a way OUT,
+    // and that is a default route (destination 00000000). Counting every route made the bridge's
+    // link route read as a leak. No quotes in the probe: it travels inside a YAML flow string.
+    let probe = "echo DEFAULT=$(tail -n +2 /proc/net/route | cut -f2 | grep -cx 00000000); sleep 4";
     let doc = [
         "networks:".to_string(),
         "  pub: {}".to_string(),
@@ -7572,26 +7577,26 @@ fn an_internal_network_leaves_a_service_with_no_route_at_all() {
     // reported an empty log and no reason, which cost a manual reproduction to find that the stack
     // had not come up at all.
     assert!(
-        shut.contains("ROUTES="),
+        shut.contains("DEFAULT="),
         "the confined service printed nothing, so the stack did not run: up said: {up_err}"
     );
-    // The confined service: no route, therefore no way out of its namespace at all.
+    // The confined service: no default route, therefore no way out of its namespace at all.
     assert!(
-        shut.contains("ROUTES=0"),
-        "a service confined to an internal network must have no route: {shut}"
+        shut.contains("DEFAULT=0"),
+        "a service confined to an internal network must have no route out: {shut}"
     );
     // THE POSITIVE CONTROL. Without it, a build that attached no NAT to anything would pass the
     // assertion above while having removed the feature rather than enforced the boundary. `pasta`
     // may be absent on the machine running this, and that is a skip and not a failure: what cannot
     // be tolerated is a NAT that exists and reaches the confined service too.
-    if open.contains("ROUTES=0") {
+    if open.contains("DEFAULT=0") {
         eprintln!(
             "skip: the unconfined service has no route either, so this host attached no NAT \
              (pasta absent or refused); the boundary cannot be told from its absence here"
         );
     } else {
         assert!(
-            !shut.contains("ROUTES=0\n") || shut.contains("ROUTES=0"),
+            !shut.contains("DEFAULT=0\n") || shut.contains("DEFAULT=0"),
             "unreachable: kept so the two branches read symmetrically"
         );
     }

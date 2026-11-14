@@ -821,11 +821,12 @@ pub fn create_with_range(
     name: &str,
     want_outbound: bool,
     uid_range: kern_isolation::UidRange,
-    bridge: Option<&str>,
+    // The bridges, one per network: empty for a pod that shares one namespace.
+    bridges: &[&str],
     origin: PodOrigin,
 ) -> Result<(), Error> {
     validate_name(name)?;
-    if let Some(cidr) = bridge {
+    for cidr in bridges {
         if let Some(route) = host_route_overlapping(cidr) {
             // NOT A REFUSAL. The caller named this network, and someone who knows their topology may
             // mean it; refusing would take a decision that is theirs. But the silence was the defect:
@@ -959,8 +960,11 @@ pub fn create_with_range(
     // A BRIDGE POD, where each member keeps its own network namespace and loopback. Passed by
     // environment for the reason the uid range is: the holder is a forked process and this is the
     // channel that already exists for telling it what kind of pod it is holding.
-    if let Some(cidr) = bridge {
-        cmd.env("KERN_POD_BRIDGE", cidr);
+    if let Some((first, rest)) = bridges.split_first() {
+        cmd.env("KERN_POD_BRIDGE", first);
+        if !rest.is_empty() {
+            cmd.env("KERN_POD_BRIDGES", rest.join(","));
+        }
     }
     let mut child = cmd
         .spawn()

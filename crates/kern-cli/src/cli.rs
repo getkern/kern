@@ -87,8 +87,9 @@ pub enum Command {
         egress_allow: Vec<String>,
         /// `--landlock-rw <path>` (repeatable): a Landlock write-allowlist (box RO except these paths).
         landlock_rw: Vec<String>,
-        /// `--pod-bridge <ip>/<prefix>`: join the pod through its bridge with this address.
-        pod_bridge: Option<kern_isolation::BridgeAttach>,
+        /// `--pod-bridge <ip>/<prefix>[@<n>]` (repeatable): join the pod through its bridge number
+        /// `n` (0 when absent) with this address, once per network the box is on.
+        pod_bridges: Vec<kern_isolation::BridgeAttach>,
         /// `--ip <addr>` (repeatable): extra IPv4 addresses this box's `lo` answers on, each a `/32`.
         /// Parsed into `Ipv4Addr` here rather than carried as a string, so a value that is not an
         /// address is refused before a box exists instead of failing where nothing can point at it.
@@ -407,9 +408,10 @@ pub enum Command {
         /// tighter map, and it is a choice to make deliberately rather than to arrive at because a
         /// flag was forgotten.
         no_uid_range: bool,
-        /// `--bridge <cidr>`: hold a bridge instead of a shared loopback, so every member gets its
-        /// own network namespace and its own `127.0.0.1` while still reaching its peers.
-        bridge: Option<String>,
+        /// `--bridge <cidr>` (repeatable): hold a bridge instead of a shared loopback, so every
+        /// member gets its own network namespace and its own `127.0.0.1` while still reaching its
+        /// peers. A second `--bridge` is a second network (`kbr1`), joined with `--pod-bridge ..@1`.
+        bridges: Vec<String>,
     },
     PodList {
         /// `--json`: the same scan as the table, machine-readable. Every read verb takes it; a verb
@@ -3347,7 +3349,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut read_only = false;
     let mut share_net = false;
     let mut pod: Option<String> = None;
-    let mut pod_bridge: Option<kern_isolation::BridgeAttach> = None;
+    let mut pod_bridges: Vec<kern_isolation::BridgeAttach> = Vec::new();
     let mut uid_range = false;
     let mut no_uid_range = false;
     let mut bind_rootfs = false;
@@ -3483,21 +3485,32 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--pod-bridge" => {
                     i += 1;
                     let v = rest.get(i).copied().ok_or(Error::Usage(
-                        "--pod-bridge <ip>/<prefix> (e.g. 10.89.0.2/24)",
+                        "--pod-bridge <ip>/<prefix>[@<bridge>] (e.g. 10.89.0.2/24)",
                     ))?;
                     let bad = || {
                         Error::Cli(format!(
                             "--pod-bridge '{v}' is not an address and a prefix. Write it like \
-                             10.89.0.2/24, inside the network the pod was created with"
+                             10.89.0.2/24, inside the network the pod was created with, and \
+                             `@1` after it for the pod's second bridge"
                         ))
                     };
-                    let (ip, prefix) = v.split_once('/').ok_or_else(bad)?;
+                    // `@<n>`: which of the pod's bridges, for a pod with one per network.
+                    let (addr, bridge) = match v.split_once('@') {
+                        Some((a, n)) => (a, n.trim().parse::<u8>().map_err(|_| bad())?),
+                        None => (v, 0u8),
+                    };
+                    if pod_bridges.iter().any(|b| b.bridge == bridge) {
+                        return Err(Error::Cli(format!(
+                            "--pod-bridge '{v}': this box already has an address on bridge {bridge}"
+                        )));
+                    }
+                    let (ip, prefix) = addr.split_once('/').ok_or_else(bad)?;
                     let ip: std::net::Ipv4Addr = ip.trim().parse().map_err(|_| bad())?;
                     let prefix: u8 = prefix.trim().parse().map_err(|_| bad())?;
                     if !(8..=30).contains(&prefix) {
                         return Err(bad());
                     }
-                    pod_bridge = Some(kern_isolation::BridgeAttach { ip, prefix });
+                    pod_bridges.push(kern_isolation::BridgeAttach { ip, prefix, bridge });
                 }
                 // `--network host|none`: the Docker-style spelling. `host` shares the host network
                 // (= `--net`); `none` is the default isolated loopback-only namespace, made explicit.
@@ -4598,7 +4611,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             egress_allow,
             landlock_rw,
             net_ips,
-            pod_bridge,
+            pod_bridges,
             apparmor,
             workdir,
             share_net,
@@ -5148,7 +5161,11 @@ fn parse_pod(rest: &[&str]) -> Result<Command, Error> {
                 ))?;
             Ok(Command::PodCreate {
                 name: name.to_string(),
-                bridge: flag_value(rest, "--bridge"),
+                bridges: rest
+                    .windows(2)
+                    .filter(|w| w[0] == "--bridge")
+                    .map(|w| w[1].to_string())
+                    .collect(),
                 outbound: !rest.contains(&"--no-outbound"),
                 // A subordinate uid range is mapped into the pod's shared user namespace BY DEFAULT,
                 // so member OCI images that drop privilege or chown to a fixed uid (postgres, mysql)
@@ -5631,7 +5648,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             egress_allow,
             landlock_rw,
             net_ips,
-            pod_bridge,
+            pod_bridges,
             apparmor,
             workdir,
             share_net,
@@ -5722,7 +5739,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             egress_allow: &egress_allow,
             landlock_rw: &landlock_rw,
             net_ips: &net_ips,
-            pod_bridge: pod_bridge.clone(),
+            pod_bridges: pod_bridges.clone(),
             apparmor: apparmor.as_deref(),
             workdir: workdir.as_deref(),
             share_net,
@@ -5871,7 +5888,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             outbound,
             uid_range,
             no_uid_range,
-            bridge,
+            bridges,
         } => crate::pod::create_with_range(
             &name,
             outbound,
@@ -5892,7 +5909,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             } else {
                 kern_isolation::UidRange::ImageDefault
             },
-            bridge.as_deref(),
+            &bridges.iter().map(String::as_str).collect::<Vec<_>>(),
             // NAMED: the operator typed `kern pod create`. It changes one thing, in `stop`: a pod
             // named into existence is not torn down merely because its last member stopped, the way
             // a stack's derived pod is. `kern pod rm` is the verb that removes it.
@@ -7476,15 +7493,53 @@ mod tests {
         ])
         .expect("parses");
         match cmd {
-            Command::BoxRun { pod_bridge, .. } => assert_eq!(
-                pod_bridge,
-                Some(kern_isolation::BridgeAttach {
+            Command::BoxRun { pod_bridges, .. } => assert_eq!(
+                pod_bridges,
+                vec![kern_isolation::BridgeAttach {
                     ip: "10.89.0.2".parse().expect("literal"),
                     prefix: 24,
-                })
+                    bridge: 0,
+                }]
             ),
             other => panic!("expected BoxRun, got {other:?}"),
         }
+        // One `--pod-bridge` per network, each naming its bridge with `@<n>`; two on one bridge is
+        // a contradiction and is refused.
+        let (_, two) = parse(&[
+            "box".into(),
+            "x".into(),
+            "--image".into(),
+            "alpine".into(),
+            "--pod-bridge".into(),
+            "10.89.0.2/24".into(),
+            "--pod-bridge".into(),
+            "172.30.0.5/16@1".into(),
+        ])
+        .expect("parses");
+        match two {
+            Command::BoxRun { pod_bridges, .. } => assert_eq!(
+                pod_bridges
+                    .iter()
+                    .map(|b| (b.ip.to_string(), b.prefix, b.bridge))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("10.89.0.2".to_string(), 24, 0),
+                    ("172.30.0.5".to_string(), 16, 1)
+                ]
+            ),
+            other => panic!("expected BoxRun, got {other:?}"),
+        }
+        assert!(parse(&[
+            "box".into(),
+            "x".into(),
+            "--image".into(),
+            "alpine".into(),
+            "--pod-bridge".into(),
+            "10.89.0.2/24@1".into(),
+            "--pod-bridge".into(),
+            "10.89.0.3/24@1".into(),
+        ])
+        .is_err());
         // A flag with NO value at all is still the flag's own usage error: there is no value to name.
         assert!(matches!(
             parse(&["box".into(), "x".into(), "--memory".into()]),

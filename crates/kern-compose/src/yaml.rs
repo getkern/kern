@@ -80,6 +80,12 @@ const NETWORKS_IGNORED: &str = "'networks:' ignored - every service shares ONE n
 /// `networks:` key is on the implicit `default` network, so it is segregated FROM the services that
 /// name one. That is the Compose Specification's rule, NOT measured against a Docker daemon here
 /// (none is installed on this host), and it surprises anyone who thinks an absent key means "all".
+/// What `networks:` means on a bridge per network, where it is enforced by the topology itself.
+const NETWORKS_BRIDGED: &str = "'networks:' is ENFORCED: each network is its own bridge and each \
+     service is attached to the bridges of its networks and no other, so a service on no shared \
+     network has neither a route to it nor its name. A service with no `networks:` key is on the \
+     implicit `default` network, so it is separated from the services that name one";
+
 const NETWORKS_SEGREGATED: &str =
     "'networks:' is ENFORCED under --no-pod: each service has its own \
      namespace and only services sharing a network get a peer relay, so a service on no shared \
@@ -500,6 +506,17 @@ fn parse_document(
                             .find(|(name, _)| name == n)
                             .map(|(_, cidr)| cidr.clone())
                     });
+                    // And every one of them, for a stack that gets a bridge per network.
+                    b.net_subnets = b
+                        .networks
+                        .iter()
+                        .filter_map(|n| {
+                            network_subnets
+                                .iter()
+                                .find(|(name, _)| name == n)
+                                .map(|(name, cidr)| (name.clone(), cidr.clone()))
+                        })
+                        .collect();
                     // PROFILES ARE DECIDED AFTER THIS LOOP, by `split_inactive_profiles`, so a merge
                     // of several files can decide them on the MERGED stack instead. See that function.
                     boxes.push(b);
@@ -3435,7 +3452,11 @@ pub const fn internal_note(
     match net {
         crate::StackNet::Pod if stack_internal_only => None,
         crate::StackNet::Pod => Some(INTERNAL_NOT_APPLIED),
-        crate::StackNet::PerService => Some(INTERNAL_SATISFIED_BY_NO_POD),
+        // A bridge member has its own namespace and its own NAT, exactly as under `--no-pod`, and
+        // a member whose networks are all internal gets none: the same fact, the same sentence.
+        crate::StackNet::PerService | crate::StackNet::Bridged => {
+            Some(INTERNAL_SATISFIED_BY_NO_POD)
+        }
         // The driver has not chosen the wiring yet and will say this itself once it has.
         crate::StackNet::Undecided => None,
     }
@@ -3446,6 +3467,7 @@ pub const fn networks_note(net: crate::StackNet) -> Option<&'static str> {
     match net {
         crate::StackNet::Pod => Some(NETWORKS_IGNORED),
         crate::StackNet::PerService => Some(NETWORKS_SEGREGATED),
+        crate::StackNet::Bridged => Some(NETWORKS_BRIDGED),
         crate::StackNet::Undecided => None,
     }
 }
@@ -3482,7 +3504,9 @@ pub fn net_ipv4_note(net: crate::StackNet, pairs: &[(String, String)]) -> Option
              name, so use the service name rather than a fixed address, which also keeps the file \
              working under Docker"
         )),
-        crate::StackNet::Undecided => None,
+        // A bridge honours the address exactly, and the driver says so with
+        // `net_ipv4_bridge_note`, which knows the network it is honoured on.
+        crate::StackNet::Bridged | crate::StackNet::Undecided => None,
     }
 }
 
@@ -3539,7 +3563,7 @@ pub fn net_share_note(net: crate::StackNet, pairs: &[(String, String)]) -> Optio
              ONE network namespace, so each of these reaches the service it names on 127.0.0.1 and \
              leaves through the same route"
         )),
-        crate::StackNet::PerService => Some(format!(
+        crate::StackNet::PerService | crate::StackNet::Bridged => Some(format!(
             "'network_mode: service:' is NOT given a shared namespace here ({list}), because this \
              stack is wired with one namespace per service. Each of these services inherits the \
              `networks:` of the one it names, so it resolves it by name and reaches it through a \

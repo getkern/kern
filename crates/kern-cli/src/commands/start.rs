@@ -1775,7 +1775,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         &mut volumes,
         dns_requested,
         &mut inherited_nameservers,
-        args.pod_bridge.is_some(),
+        !args.pod_bridges.is_empty(),
     )?;
     // `--env-file` first (K=V lines from a file), then `--env` on top (explicit wins).
     let mut env = parse_env_files(args.env_file)?;
@@ -2691,7 +2691,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         seccomp_mode, // resolved above (explicit KERN_SECCOMP > profile > default), not from env here
         landlock_rw: args.landlock_rw.to_vec(),
         net_ips: args.net_ips.to_vec(),
-        pod_bridge: args.pod_bridge.clone(),
+        pod_bridges: args.pod_bridges.clone(),
         apparmor: args.apparmor.map(|s| s.to_string()),
         volumes,
         env,

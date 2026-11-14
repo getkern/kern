@@ -292,6 +292,13 @@ pub struct ComposeBox {
     /// `ipv4_address:` fall outside it, and a peer that hard-codes one has no route: the key is
     /// approximated instead of honoured.
     pub net_subnet: Option<String>,
+    /// Every network this service joins that DECLARES a subnet, as `(network, cidr)`.
+    ///
+    /// [`Self::net_subnet`] answers for the one bridge of a stack whose networks all meet; a stack
+    /// whose `networks:` separate services gets a bridge PER network, and each of those is built on
+    /// the subnet its own network declared, so an `ipv4_address:` on a second network is honoured
+    /// there too.
+    pub net_subnets: Vec<(String, String)>,
     pub uid_range: bool,
     /// Set when the compose file wrote `uid_range = false` explicitly, so the per-image default
     /// (turn it ON for OCI images) does NOT override a deliberate opt-out.
@@ -1134,7 +1141,7 @@ pub const fn wiring_note(net: StackNet, service_count: usize) -> Option<&'static
         StackNet::Pod if service_count >= 2 => Some(POD_SHARED_LOOPBACK),
         // One service: nobody to be reached from. Per service: a namespace each, so each keeps its
         // own 127.0.0.1 and the choice was already announced. Undecided: the driver has not decided.
-        StackNet::Pod | StackNet::PerService | StackNet::Undecided => None,
+        StackNet::Pod | StackNet::PerService | StackNet::Bridged | StackNet::Undecided => None,
     }
 }
 
@@ -1167,6 +1174,10 @@ pub enum StackNet {
     /// One namespace per service, peers reached through relays: `networks:` decides which edges
     /// exist, so segregation is real.
     PerService,
+    /// One namespace per service on a BRIDGE PER NETWORK, each service attached to the bridges of
+    /// its own networks: `networks:` decides which segments a service is on, so segregation is real
+    /// and a peer is reached on every port.
+    Bridged,
     /// The caller has not chosen yet, because the choice depends on what the file turns out to say.
     ///
     /// A DRIVER THAT AUTO-SELECTS THE WIRING CANNOT KNOW THE MODE BEFORE PARSING: it selects the
@@ -1613,6 +1624,7 @@ impl ComposeBox {
             networks,
             external_networks,
             net_ipv4,
+            net_subnets,
             degraded_health,
             tmpfs_from_volumes,
         );
@@ -1636,6 +1648,11 @@ impl ComposeBox {
             &mut self.degraded_health,
         ] {
             dedup_keep_first(v);
+        }
+        // One subnet per network, the first stated: the same rule `net_subnet` keeps.
+        {
+            let mut seen = std::collections::HashSet::new();
+            self.net_subnets.retain(|(n, _)| seen.insert(n.clone()));
         }
         // PROFILE LISTS REPLACE, unlike every other list above, and the difference is not tidiness.
         // A `vcpu:` profile does NOT stack (the first to set each cap wins, with a warning), so an
@@ -4881,6 +4898,12 @@ mod contract_tests {
                 "the compose driver builds the pod's bridge on this network instead of one kern \
                  invents, which is what makes an `ipv4_address:` from the file the address the \
                  service actually answers on",
+            ),
+            (
+                "net_subnets",
+                "the compose driver builds each network's bridge on the subnet that network \
+                 declared, when a stack whose `networks:` separate services gets a bridge per \
+                 network",
             ),
             (
                 "net_ipv4",

@@ -79,6 +79,79 @@ pub struct Assigned {
     /// wiring and not in the other. MEASURED on a real dev stack whose postgres declares
     /// `aliases: [db]`: `getent hosts db` answered in the pod and answered nothing on the bridge.
     pub aliases: Vec<String>,
+    /// The service's address on EACH network it joins, `(network, address)` in the service's own
+    /// network order, when the stack has a bridge per network. Empty otherwise, and then
+    /// [`Self::alias`] is the one address. A peer resolves the address on the first network the two
+    /// share ([`peer_addr`]): the same name is a different address depending on who asks, which is
+    /// what a container on two networks has under Docker.
+    pub net_addrs: Vec<NetAddr>,
+}
+
+/// A service's place on one network of a stack with a bridge per network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetAddr {
+    /// The compose network, as written (`default` for the implicit one).
+    pub network: String,
+    /// The address on it, host byte order.
+    pub addr: u32,
+    /// Which of the pod's bridges carries it (`kbr<bridge>`).
+    pub bridge: u8,
+    /// The network's prefix length.
+    pub prefix: u8,
+}
+
+/// The `--pod-bridge` values a service is started with: `<ip>/<prefix>@<bridge>` per network on a
+/// stack with a bridge per network, the one `<ip>/<prefix>` on a stack with one bridge (`single`),
+/// nothing otherwise.
+pub fn pod_bridge_flags(a: &Assigned, single: Option<u8>) -> Vec<String> {
+    if !a.net_addrs.is_empty() {
+        return a
+            .net_addrs
+            .iter()
+            .map(|n| {
+                format!(
+                    "{}/{}@{}",
+                    std::net::Ipv4Addr::from(n.addr),
+                    n.prefix,
+                    n.bridge
+                )
+            })
+            .collect();
+    }
+    single
+        .map(|prefix| vec![format!("{}/{prefix}", std::net::Ipv4Addr::from(a.alias))])
+        .unwrap_or_default()
+}
+
+/// The networks a service is on, with an absent `networks:` read as the implicit `default` network:
+/// the rule [`shares_network`] applies, spelled as a list.
+pub fn effective_networks(nets: &[String]) -> Vec<String> {
+    if nets.is_empty() {
+        vec![DEFAULT_NETWORK.to_string()]
+    } else {
+        nets.to_vec()
+    }
+}
+
+/// The address `peer` answers on AS SEEN FROM `me`: on a stack with a bridge per network, its
+/// address on the first of `me`'s networks it is also on; otherwise its one address.
+pub fn peer_addr(plan: &[Assigned], me: &str, peer: &Assigned) -> u32 {
+    if peer.net_addrs.is_empty() {
+        return peer.alias;
+    }
+    let mine = plan
+        .iter()
+        .find(|a| a.service == me)
+        .map(|a| effective_networks(&a.networks))
+        .unwrap_or_default();
+    mine.iter()
+        .find_map(|n| {
+            peer.net_addrs
+                .iter()
+                .find(|p| &p.network == n)
+                .map(|p| p.addr)
+        })
+        .unwrap_or(peer.alias)
 }
 
 /// Docker's implicit network: the one a service with no `networks:` key joins.
@@ -187,6 +260,7 @@ pub fn assign_aliases(services: &[ServiceInput]) -> Result<Vec<Assigned>, String
             ports: ports.clone(),
             networks: networks.clone(),
             aliases: aliases.clone(),
+            net_addrs: Vec::new(),
         });
     }
     Ok(out)
@@ -283,7 +357,7 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
         if via_relay && a.ports.iter().any(|p| my_ports.contains(p)) {
             continue;
         }
-        let addr = alias_to_dotted(a.alias, &mut buf).to_string();
+        let addr = alias_to_dotted(peer_addr(plan, me, a), &mut buf).to_string();
         out.push(format!("{}:{}", a.service, addr));
         // AND THE PEER'S BOX NAME, which is the name it ANNOUNCES rather than the name the file
         // calls it by.
@@ -330,7 +404,18 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
 /// the parser, which is the layer that can see the whole file.
 ///
 /// `me`'s own links only: a link is a statement about the SOURCE service's hosts file.
-pub fn link_host_args(links: &[String], plan: &[Assigned], use_pod: bool) -> Vec<String> {
+///
+/// `shared_ns` is ONE NAMESPACE FOR THE STACK, not "a pod": a bridge stack is a pod too, but each of
+/// its members has its own loopback, and a link alias pointed at `127.0.0.1` there reached the
+/// service itself instead of the peer. `me` is the service the entries are for, so a peer on a
+/// stack with a bridge per network is named at the address the two share.
+pub fn link_host_args(
+    links: &[String],
+    plan: &[Assigned],
+    shared_ns: bool,
+    me: &str,
+) -> Vec<String> {
+    let use_pod = shared_ns;
     let mut out = Vec::with_capacity(links.len());
     let mut buf = [0u8; 15];
     for l in links {
@@ -347,7 +432,10 @@ pub fn link_host_args(links: &[String], plan: &[Assigned], use_pod: bool) -> Vec
             continue;
         }
         if let Some(a) = plan.iter().find(|a| a.service == service) {
-            out.push(format!("{alias}:{}", alias_to_dotted(a.alias, &mut buf)));
+            out.push(format!(
+                "{alias}:{}",
+                alias_to_dotted(peer_addr(plan, me, a), &mut buf)
+            ));
         }
     }
     out

@@ -173,7 +173,12 @@ pub struct SandboxSpec {
     /// of one `veth` per service. The wiring kern had for a private loopback cost a TCP relay per
     /// ORDERED PAIR PER PORT instead: measured on six services, 170-183 ms to bring up against
     /// 247-352 ms, and 56 processes against 122.
-    pub pod_bridge: Option<BridgeAttach>,
+    ///
+    /// ONE ENTRY PER NETWORK THE MEMBER JOINS, in order: the first becomes `eth0`, the next `eth1`.
+    /// Two members on no common network share no bridge, so no frame and no route joins them: the
+    /// separation a compose file asks for with `networks:` is the absence of a path, not a filter.
+    /// Empty: the member shares the holder's network namespace instead.
+    pub pod_bridges: Vec<BridgeAttach>,
     /// Map a subordinate uid/gid *range* into the box (`--uid-range`) instead of just the caller.
     /// Opt-in because it (a) costs two `newuidmap`/`newgidmap` subprocesses at start and (b) maps
     /// 65k extra ids into the namespace; the default single-uid map is both faster and more
@@ -5935,22 +5940,21 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
         // network namespace is the default and the fast one. With `--pod-bridge` the member unshares
         // its OWN network namespace and reaches its peers over the pod's bridge, which is what gives
         // it a `127.0.0.1` no peer can reach.
-        match &spec.pod_bridge {
-            None => {
-                if unsafe { libc::setns(net, libc::CLONE_NEWNET) } != 0 {
-                    let e = std::io::Error::last_os_error();
-                    return Err(Error::Syscall("setns(pod net)", e));
-                }
+        if spec.pod_bridges.is_empty() {
+            if unsafe { libc::setns(net, libc::CLONE_NEWNET) } != 0 {
+                let e = std::io::Error::last_os_error();
+                return Err(Error::Syscall("setns(pod net)", e));
             }
-            Some(at) => {
-                if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
-                    let e = std::io::Error::last_os_error();
-                    return Err(Error::Syscall("unshare(net) for the pod bridge", e));
-                }
-                // The member's OWN loopback, brought up before the bridge end arrives so a workload
-                // that binds `127.0.0.1` finds it there whatever the bridge does.
-                bring_loopback_up();
-                attach_to_pod_bridge(holder, at)?;
+        } else {
+            if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+                let e = std::io::Error::last_os_error();
+                return Err(Error::Syscall("unshare(net) for the pod bridge", e));
+            }
+            // The member's OWN loopback, brought up before the bridge end arrives so a workload
+            // that binds `127.0.0.1` finds it there whatever the bridge does.
+            bring_loopback_up();
+            for (n, at) in spec.pod_bridges.iter().enumerate() {
+                attach_to_pod_bridge(holder, at, &format!("eth{n}"))?;
             }
         }
         unsafe {
@@ -7442,13 +7446,23 @@ fn ipv4_is_local(_probe: libc::c_int, ip: std::net::Ipv4Addr) -> bool {
 /// The bridge interface a pod holder builds, and the one its members attach to.
 pub const POD_BRIDGE: &str = "kbr0";
 
-/// A member's place on the pod bridge: the address it takes and the size of the network.
+/// The name of the pod holder's bridge number `i`: `kbr0` for the first, which is [`POD_BRIDGE`],
+/// then `kbr1`, `kbr2`, one per compose network of a stack whose `networks:` separate services.
+#[must_use]
+pub fn pod_bridge_name(i: u8) -> String {
+    format!("kbr{i}")
+}
+
+/// A member's place on one of the pod's bridges: the address it takes, the size of the network,
+/// and which bridge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BridgeAttach {
-    /// The address this box answers on, reachable from every other member.
+    /// The address this box answers on, reachable from every other member of the same network.
     pub ip: std::net::Ipv4Addr,
     /// Prefix length of the pod's network, so the member knows which peers are directly connected.
     pub prefix: u8,
+    /// Which of the holder's bridges ([`pod_bridge_name`]): 0 for a pod with one network.
+    pub bridge: u8,
 }
 
 /// The link-layer address a pod member takes, derived from the address it answers on.
@@ -7537,10 +7551,13 @@ pub fn mask_of(prefix: u8) -> std::net::Ipv4Addr {
 /// as `veth` has, but this is the one step in a box's setup that has no alternative if it fails: a
 /// member that cannot attach cannot start at all. So a refusal falls back to build-then-move, which
 /// is what every kern before this did, and the box comes up 20 ms slower instead of not at all.
-fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
+fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach, ifname: &str) -> Result<(), Error> {
     let me = std::process::id() as i32;
-    let vname = format!("kv{me}");
-    let pname = format!("kp{me}");
+    // One pair per network: the bridge number keeps the names apart (and under IFNAMSIZ: `kp`, a
+    // pid of at most seven digits, `b`, at most three).
+    let vname = format!("kv{me}b{}", at.bridge);
+    let pname = format!("kp{me}b{}", at.bridge);
+    let bridge = pod_bridge_name(at.bridge);
     let mac = member_mac(at.ip);
     // SAFETY: a fork from the single-threaded box setup path; the child only does namespace and
     // netlink work and then `_exit`s without touching the parent's state.
@@ -7594,7 +7611,7 @@ fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
                 } else {
                     match (
                         crate::netlink::index_of(&vname),
-                        crate::netlink::index_of(POD_BRIDGE),
+                        crate::netlink::index_of(&bridge),
                     ) {
                         (Some(v), Some(b)) => {
                             if crate::netlink::set_master(v, b).is_err() {
@@ -7653,14 +7670,15 @@ fn attach_to_pod_bridge(holder: i32, at: &BridgeAttach) -> Result<(), Error> {
              the pod created with a bridge?)",
         ));
     }
-    // The end is here now, under the unique name it was born with. `eth0` is what a workload
-    // expects to find, and the name only has to be ordinary once it is on this side.
-    if !iface_rename(&pname, "eth0") {
+    // The end is here now, under the unique name it was born with. `eth0` (then `eth1`, one per
+    // network) is what a workload expects to find, and the name only has to be ordinary once it is
+    // on this side.
+    if !iface_rename(&pname, ifname) {
         return Err(Error::Unsupported(
-            "the pod bridge interface arrived but could not be renamed to eth0",
+            "the pod bridge interface arrived but could not be renamed to eth<n>",
         ));
     }
-    if !iface_set_ipv4("eth0", at.ip, mask_of(at.prefix)) || !iface_up("eth0") {
+    if !iface_set_ipv4(ifname, at.ip, mask_of(at.prefix)) || !iface_up(ifname) {
         return Err(Error::Unsupported(
             "the pod bridge interface could not be addressed",
         ));
@@ -7736,25 +7754,67 @@ pub fn run_pod_holder() -> ! {
     // FAIL-CLOSED. A member that cannot reach the bridge has no peers at all, so a holder that could
     // not build one must not report itself ready: the alternative is a pod that starts, looks fine
     // and silently isolates every service in it.
+    //
+    // `KERN_POD_BRIDGES=<cidr>,<cidr>`: the FURTHER bridges, `kbr1` onwards, one per compose network
+    // of a stack whose `networks:` separate services. Built the same way, and fail-closed the same
+    // way.
     if let Ok(cidr) = std::env::var("KERN_POD_BRIDGE") {
-        match pod_bridge_parts(&cidr) {
-            Some((gw, mask, _)) => {
-                if crate::netlink::add_bridge(POD_BRIDGE).is_err()
-                    || !iface_set_ipv4(POD_BRIDGE, gw, mask)
-                    || !iface_up(POD_BRIDGE)
-                {
-                    eprintln!("kern: pod: could not build the pod bridge ({cidr})");
-                    unsafe { libc::_exit(1) };
-                }
-            }
-            None => {
+        let extra = std::env::var("KERN_POD_BRIDGES").unwrap_or_default();
+        let all: Vec<String> = std::iter::once(cidr.clone())
+            .chain(
+                extra
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string),
+            )
+            .collect();
+        if all.len() > 1 {
+            // NO FORWARDING BETWEEN THE BRIDGES. Members never route through the holder (their way
+            // out is their own NAT), but a member is root in its own namespace and can add a route
+            // via the holder's address on its bridge; with forwarding on, the holder would then
+            // carry that member's packets onto a network the file kept it off. A fresh network
+            // namespace starts with forwarding off; it is written here anyway and READ BACK, and a
+            // holder that cannot show 0 does not report ready.
+            let path = "/proc/sys/net/ipv4/ip_forward";
+            let _ = std::fs::write(path, "0");
+            if !std::fs::read_to_string(path).is_ok_and(|v| v.trim() == "0") {
                 eprintln!(
+                    "kern: pod: could not make sure the pod does not forward between its networks \
+                     ({path} does not read 0), so it is not started: its `networks:` would not \
+                     separate anything"
+                );
+                unsafe { libc::_exit(1) };
+            }
+        }
+        if all.len() > usize::from(u8::MAX) {
+            eprintln!(
+                "kern: pod: {} networks is more than a pod can carry",
+                all.len()
+            );
+            unsafe { libc::_exit(1) };
+        }
+        for (i, cidr) in all.iter().enumerate() {
+            let name = pod_bridge_name(u8::try_from(i).unwrap_or(u8::MAX));
+            match pod_bridge_parts(cidr) {
+                Some((gw, mask, _)) => {
+                    if crate::netlink::add_bridge(&name).is_err()
+                        || !iface_set_ipv4(&name, gw, mask)
+                        || !iface_up(&name)
+                    {
+                        eprintln!("kern: pod: could not build the pod bridge {name} ({cidr})");
+                        unsafe { libc::_exit(1) };
+                    }
+                }
+                None => {
+                    eprintln!(
                     "kern: pod: '{cidr}' is not a network kern can build a bridge on (expected \
                      something like 10.89.0.0/24: an IPv4 network, prefix between 8 and 30, and not \
                      loopback - the kernel routes 127/8 to `lo`, so members would get addresses that \
                      never cross the bridge)"
                 );
-                unsafe { libc::_exit(1) };
+                    unsafe { libc::_exit(1) };
+                }
             }
         }
     }
