@@ -2400,10 +2400,14 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                         // "reading immich-machine-learning: No such file or directory". kern's own
                         // positional file comes BEFORE the verb, and a file named after it still
                         // works when it looks like one.
+                        // ⛔ AFTER `cp` A WORD IS A PATH, and an existing file is the ordinary case:
+                        // `compose cp ask.py agent:/tmp/ask.py`, from the directory holding both,
+                        // read `ask.py` as the compose file ("line 1: expected `key: value`").
+                        let after_paths = matches!(action, Some(commands::ComposeAction::Cp));
                         let looks_like_a_file = w.ends_with(".yml")
                             || w.ends_with(".yaml")
                             || w.ends_with(".toml")
-                            || std::path::Path::new(w).is_file();
+                            || (!after_paths && std::path::Path::new(w).is_file());
                         if file.is_none() && (action.is_none() || looks_like_a_file) {
                             file = Some(w.to_string());
                             files.push(w.to_string());
@@ -6368,6 +6372,36 @@ mod tests {
     /// flag whose meaning kern's reconciler could express exactly. `kern up` (the directory
     /// shorthand) takes them too: a flag that parses on one spelling and not the other is a
     /// difference nobody can hold in their head.
+    /// AFTER `cp` AN EXISTING FILE IS A PATH, not the compose file: `compose cp ask.py agent:/x`
+    /// from the directory holding both read `ask.py` as the stack.
+    #[test]
+    fn a_local_file_after_cp_is_a_path_not_the_compose_file() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let local = std::env::temp_dir().join(format!("kern-cp-arg-{}.py", std::process::id()));
+        std::fs::write(&local, b"print(1)\n").unwrap();
+        let l = local.to_string_lossy().into_owned();
+        // With the file named, the two words are the copy's paths.
+        match p(&["compose", "f.yml", "cp", &l, "agent:/tmp/x.py"]) {
+            Ok((
+                _,
+                Command::Compose {
+                    files, services, ..
+                },
+            )) => {
+                assert_eq!(files, vec!["f.yml".to_string()]);
+                assert_eq!(services, vec![l.clone(), "agent:/tmp/x.py".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Without it, the local file is still not taken for the stack.
+        let r = p(&["compose", "cp", &l, "agent:/tmp/x.py"]);
+        let _ = std::fs::remove_file(&local);
+        assert!(
+            !matches!(&r, Ok((_, Command::Compose { files, .. })) if files.contains(&l)),
+            "the copy's source was read as the compose file: {r:?}"
+        );
+    }
+
     #[test]
     fn the_recreate_overrides_parse_and_refuse_their_own_contradiction() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());

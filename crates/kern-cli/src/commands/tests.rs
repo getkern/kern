@@ -5396,6 +5396,47 @@ mod port_collision_tests {
         assert!(device_grant_problem(&plain, false).is_none());
     }
 
+    /// THE GATE ASKS ABOUT WHAT THE VERB STARTS. `up agent` on a file whose `ollama` asks for a GPU
+    /// starts `agent` alone and needs no grant; `up web` where `web` depends on `ollama` starts both
+    /// and does; no selection is the whole file; `--no-deps web` is `web` alone.
+    #[test]
+    fn the_gpu_gate_reads_only_the_services_being_started() {
+        let _g = crate::env_guard();
+        use super::super::compose::{only, services_started};
+        let svc = |name: &str, gpu: bool, deps: &[&str]| crate::compose::ComposeBox {
+            name: name.into(),
+            image: Some("alpine".into()),
+            gpus: gpu.then(|| "device=1".to_string()),
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        };
+        let boxes = vec![
+            svc("ollama", true, &[]),
+            svc("agent", false, &[]),
+            svc("web", false, &["ollama"]),
+        ];
+        let gate = |services: &[&str], no_deps: bool| {
+            let s: Vec<String> = services.iter().map(|x| x.to_string()).collect();
+            device_grant_problem(
+                only(&boxes, services_started(&boxes, &s, no_deps).as_deref()),
+                false,
+            )
+        };
+        assert!(
+            gate(&["agent"], false).is_none(),
+            "agent asks for no GPU and starts alone"
+        );
+        assert!(
+            gate(&["web"], false).is_some(),
+            "web starts ollama, which asks for one"
+        );
+        assert!(
+            gate(&["web"], true).is_none(),
+            "--no-deps web starts web alone"
+        );
+        assert!(gate(&[], false).is_some(), "the whole file includes ollama");
+    }
+
     /// `restart` OF A STACK WHOSE GPU IS NOT GRANTED STOPS NOTHING: the refusal comes back from the
     /// terminal verb itself, before `stop_stack`. MEASURED 2026-11-14: it came after, so two GPU
     /// services of a running web stack were killed and left down.

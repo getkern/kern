@@ -2189,8 +2189,17 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // file on WSL2): `up --allow-device-grants` brought the service up healthy, and every following
     // `kern compose exec jellyfin ...` was refused with "asks for a GPU and nothing granted it".
     // docker asks nothing at exec, and neither does `kern exec` on the same box.
+    // THE SERVICES THIS VERB STARTS, the one rule both the device gate and the builds read: no
+    // selection is the whole file, `--no-deps` the services named, otherwise those and what they
+    // depend on, as docker reads `up <svc>` and `run <svc>`.
+    let starting = services_started(&boxes, services, no_deps);
+    // ⛔ ONLY THOSE ARE GATED. MEASURED 2026-11-14: `up -d agent` and `run --rm agent ...`, on a
+    // file whose `ollama` service asks for a GPU, were refused over `ollama`, which neither verb
+    // was starting; docker starts `agent`.
     if action != ComposeAction::Exec {
-        if let Some(msg) = device_grant_problem(&boxes, allow_device_grants) {
+        if let Some(msg) =
+            device_grant_problem(only(&boxes, starting.as_deref()), allow_device_grants)
+        {
             return Err(Error::Compose(msg));
         }
     }
@@ -2276,17 +2285,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // service and its dependencies, `--no-deps` the service alone, and no selection the whole
         // file. MEASURED in the field: `kern compose up ollama ollama-webui` on
         // valiantlynx/ollama-docker built the file's `app` service too, which nothing was starting.
-        let needed: Option<Vec<String>> = if services.is_empty() {
-            None
-        } else if no_deps {
-            Some(services.to_vec())
-        } else {
-            Some(
-                crate::compose::with_dependencies(&boxes, services)
-                    .into_iter()
-                    .collect(),
-            )
-        };
+        let needed = starting.clone();
         crate::commands::resolve_builds_for(
             &mut boxes,
             file,
@@ -4903,4 +4902,35 @@ networks:
             "{err}"
         );
     }
+}
+
+/// The services a verb starts: `None` for the whole file (no service named), the services named
+/// under `--no-deps`, otherwise those and every service they depend on.
+pub(super) fn services_started(
+    boxes: &[crate::compose::ComposeBox],
+    services: &[String],
+    no_deps: bool,
+) -> Option<Vec<String>> {
+    if services.is_empty() {
+        None
+    } else if no_deps {
+        Some(services.to_vec())
+    } else {
+        Some(
+            crate::compose::with_dependencies(boxes, services)
+                .into_iter()
+                .collect(),
+        )
+    }
+}
+
+/// `boxes` narrowed to `names`, every box when `names` is `None`.
+pub(super) fn only<'a>(
+    boxes: &'a [crate::compose::ComposeBox],
+    names: Option<&[String]>,
+) -> Vec<&'a crate::compose::ComposeBox> {
+    boxes
+        .iter()
+        .filter(|b| names.is_none_or(|n| n.contains(&b.name)))
+        .collect()
 }

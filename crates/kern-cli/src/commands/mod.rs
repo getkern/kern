@@ -7141,7 +7141,10 @@ fn ungranted_gpu_message(askers: &[String]) -> String {
     )
 }
 
-fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Option<String> {
+fn device_grant_problem<'a, I>(boxes: I, allow: bool) -> Option<String>
+where
+    I: IntoIterator<Item = &'a crate::compose::ComposeBox> + Clone,
+{
     // The command line, or the operator's own config. Never the compose file, and never a config the
     // compose file named: see `device_grants_allowed_by_config`.
     if allow || device_grants_allowed_by_config() {
@@ -7153,7 +7156,8 @@ fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Op
     // operator who grants after reading that hands a card to FOUR services believing it is one, which
     // is the gate under-reporting the very decision it exists to put in front of a person.
     let askers: Vec<String> = boxes
-        .iter()
+        .clone()
+        .into_iter()
         .filter_map(|b| match (&b.device, &b.gpus) {
             (Some(name), None) => Some(format!("'{}' (CDI name {name})", b.service_name())),
             (None, Some(spec)) => Some(format!("'{}' ({spec})", b.service_name())),
@@ -8695,7 +8699,7 @@ fn run_terminal_verb(
             check_pod_global_conflicts(boxes, own_namespaces)?;
             // REFUSES, unlike `config` below: this emits a unit that a machine will run unattended,
             // so it is a bring-up with a delay rather than a dry run.
-            if let Some(msg) = device_grant_problem(boxes, allow_device_grants) {
+            if let Some(msg) = device_grant_problem(&*boxes, allow_device_grants) {
                 return Err(Error::Compose(msg));
             }
             // THE UNIT HAS TO CARRY THE PERMISSION IT WAS GENERATED UNDER. The refusal above
@@ -8703,7 +8707,7 @@ fn run_terminal_verb(
             // emitted WITHOUT it, so at boot it met that same refusal on a machine nobody is
             // watching. Asked of the FILE and not of the flag, so a stack with no device grant does
             // not carry a permission it never needed.
-            let needs_grants = device_grant_problem(boxes, false).is_some();
+            let needs_grants = device_grant_problem(&*boxes, false).is_some();
             crate::systemd::print_unit(file, pod, needs_grants)?;
             return Ok(true);
         }
@@ -8772,7 +8776,7 @@ fn run_terminal_verb(
             // that advice circular, and the flag exists to be passed by somebody who has read this
             // output. The single deliberate exception to "a dry run refuses what the bring-up
             // refuses", and it is stated here rather than left as an inconsistency to be discovered.
-            if let Some(msg) = device_grant_problem(boxes, allow_device_grants) {
+            if let Some(msg) = device_grant_problem(&*boxes, allow_device_grants) {
                 // THE LIST DECIDES, not this branch: drop the entry from
                 // `DRY_RUN_REFUSAL_EXCEPTIONS` and `config` goes back to refusing, which is what
                 // makes the list a mechanism rather than a note somebody has to remember.
@@ -9592,7 +9596,10 @@ fn run_terminal_verb(
             // without `--allow-device-grants` killed both (exit 137) and then refused to start
             // them, leaving nginx answering 502. The same question, of the same boxes, as the
             // bring-up below asks, so the two cannot disagree.
-            if let Some(msg) = device_grant_problem(boxes, allow_device_grants) {
+            // Of the services being restarted, as the bring-up below asks it.
+            let restarting: Vec<&crate::compose::ComposeBox> =
+                boxes.iter().filter(|b| selected(b)).collect();
+            if let Some(msg) = device_grant_problem(restarting, allow_device_grants) {
                 return Err(Error::Compose(msg));
             }
             // Same selection as `stop`; the bring-up below narrows to the same names, so
