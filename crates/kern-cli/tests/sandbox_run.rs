@@ -18488,3 +18488,58 @@ fn a_finished_box_leaves_one_history_line_that_names_what_ended_it() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&base);
 }
+
+/// A FILE BOUND AFTER A DIRECTORY THAT COVERS ITS PARENT IS STILL VISIBLE.
+///
+/// Mount targets reuse the parent directory a previous FILE bind opened, which is what took a GPU
+/// grant's hundreds of binds from a full path walk each to one. A directory bound over that parent
+/// covers it, and a mountpoint made under the remembered descriptor would land in the hidden
+/// directory underneath and be invisible in the box. Three binds in that order, read from inside.
+#[test]
+fn a_file_bound_after_a_directory_over_its_parent_is_visible() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "parentcache");
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let host = std::env::temp_dir().join(format!("kern-it-pc-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&host);
+    fs::create_dir_all(host.join("cover")).unwrap();
+    fs::write(host.join("one"), "ONE").unwrap();
+    fs::write(host.join("two"), "TWO").unwrap();
+    fs::write(host.join("cover/inside"), "COVER").unwrap();
+    let h = |p: &str| host.join(p).to_string_lossy().into_owned();
+    let out = kern()
+        .args([
+            "box",
+            "pc",
+            "--rootfs",
+            &rootfs,
+            "-v",
+            &format!("{}:/x/one", h("one")),
+            "-v",
+            &format!("{}:/x", h("cover")),
+            "-v",
+            &format!("{}:/x/two", h("two")),
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "/bin/busybox cat /x/inside /x/two",
+        ])
+        .output()
+        .expect("run kern");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&host);
+    if stderr.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    assert!(
+        stdout.contains("COVER") && stdout.contains("TWO"),
+        "the directory and the file bound after it must both be visible: {stdout} {stderr}"
+    );
+}

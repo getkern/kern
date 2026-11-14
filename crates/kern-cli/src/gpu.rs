@@ -570,6 +570,62 @@ pub fn wsl_check_selection(
 /// and a `stat` in each of the 795 took 720 ms, on every box start. The 12 `nv*` names took 11 ms
 /// and include the one that matters. The name only narrows WHERE to look; what makes a directory
 /// the NVIDIA one is the CUDA driver inside it.
+/// [`wsl_nvidia_store_dirs`], remembered across boxes and re-read only when the store changed.
+///
+/// MEASURED BOTTLENECK, the largest in a GPU box on WSL2: `/usr/lib/wsl/drivers` is the Windows
+/// driver store over 9p, where a `stat` costs 0.5-0.7 ms, and the walk tests every `nv*` directory
+/// of it (on the guest measured, about twenty) for the CUDA driver, on every `--gpus` box. A box
+/// with the grant took 24.4 ms against 5.2 ms without, 15.2 of the difference in this one phase.
+///
+/// THE KEY is the store's device, inode and modification time, which change when Windows adds or
+/// removes a driver directory. The cache lives in kern's runtime directory, which no box can mount,
+/// and is believed only as far as it can be checked: a listed directory must sit directly in the
+/// store, be named like the ones the walk accepts and still hold the CUDA driver, so a forged line
+/// can neither name a directory outside the store nor one the walk would not have chosen.
+fn wsl_nvidia_store_dirs_cached(drivers: &Path) -> Option<Vec<std::path::PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(drivers).ok()?;
+    let key = format!(
+        "v1 {} {} {} {}",
+        m.dev(),
+        m.ino(),
+        m.mtime(),
+        m.mtime_nsec()
+    );
+    let cache = crate::registry::runtime_subdir_public("gpu")
+        .ok()
+        .map(|d| d.join("wsl-store"));
+    if let Some(text) = cache.as_ref().and_then(|c| std::fs::read_to_string(c).ok()) {
+        let mut lines = text.lines();
+        if lines.next() == Some(key.as_str()) {
+            let dirs: Vec<std::path::PathBuf> = lines
+                .map(std::path::PathBuf::from)
+                .filter(|d| {
+                    d.parent() == Some(drivers)
+                        && d.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.to_ascii_lowercase().starts_with("nv"))
+                        && d.join(WSL_STORE_CUDA).is_file()
+                })
+                .collect();
+            if !dirs.is_empty() {
+                return Some(dirs);
+            }
+        }
+    }
+    let dirs = wsl_nvidia_store_dirs(drivers)?;
+    if let Some(c) = cache {
+        let mut body = key;
+        for d in &dirs {
+            body.push('\n');
+            body.push_str(&d.to_string_lossy());
+        }
+        body.push('\n');
+        let _ = crate::config::write_atomic(&c, &body);
+    }
+    Some(dirs)
+}
+
 fn wsl_nvidia_store_dirs(drivers: &Path) -> Option<Vec<std::path::PathBuf>> {
     let mut out: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(drivers).ok()?.flatten() {
@@ -766,17 +822,28 @@ pub fn wsl_grant(root: &Path) -> Option<Result<WslGrant, WslGrantError>> {
     )];
     // THE LIBRARIES BY NAME, symlinks resolved so the bind lands the file: the directory holds 21
     // `.so` entries on the guest measured, one of them a link (`libnvoptix_loader.so.1`).
+    //
+    // ONE `canonicalize` FOR THE DIRECTORY, and one more per entry that IS a link. Resolving every
+    // entry walked each path component with a `readlink` (`/usr`, `/usr/lib`, ...): MEASURED, 136
+    // of them per GPU box on that guest, for 21 libraries of which one is a link. The entry's type
+    // comes with the directory listing, so a regular file is its directory's path plus its name.
     let mut libraries: Vec<(String, String)> = Vec::new();
+    let lib_real = std::fs::canonicalize(&lib).unwrap_or_else(|_| lib.clone());
     if let Ok(entries) = std::fs::read_dir(&lib) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.contains(".so") {
                 continue;
             }
-            if let Ok(real) = std::fs::canonicalize(entry.path()) {
-                if real.is_file() {
-                    libraries.push((real.to_string_lossy().into_owned(), name));
-                }
+            let real = match entry.file_type() {
+                Ok(t) if t.is_file() => Some(lib_real.join(&name)),
+                Ok(t) if t.is_symlink() => std::fs::canonicalize(entry.path())
+                    .ok()
+                    .filter(|r| r.is_file()),
+                _ => None,
+            };
+            if let Some(real) = real {
+                libraries.push((real.to_string_lossy().into_owned(), name));
             }
         }
     }
@@ -785,7 +852,13 @@ pub fn wsl_grant(root: &Path) -> Option<Result<WslGrant, WslGrantError>> {
     // can be told to be NVIDIA's, which is the shape measured working before the narrowing existed.
     let drivers = root.join(WSL_DRIVERS_REL);
     if drivers.is_dir() {
-        match wsl_nvidia_store_dirs(&drivers) {
+        // The cache is for the HOST's store: a root other than `/` (a test's fixture) walks its own.
+        let found = if root == Path::new("/") {
+            wsl_nvidia_store_dirs_cached(&drivers)
+        } else {
+            wsl_nvidia_store_dirs(&drivers)
+        };
+        match found {
             Some(dirs) => {
                 for dir in dirs {
                     let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
@@ -952,6 +1025,62 @@ pub fn describe_identity(gpu: &Gpu) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The driver-store cache is believed only where it can be checked: with the key unchanged a
+    /// forged line naming `/etc`, a directory outside the store or one without the CUDA driver is
+    /// dropped, and a change to the store (a new directory moves its mtime) re-walks it.
+    #[test]
+    fn the_wsl_store_cache_is_checked_and_follows_the_store() {
+        let _g = crate::env_guard();
+        let base = std::env::temp_dir().join(format!("kern-wslstore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = base.join("drivers");
+        for d in [
+            "nvreal.inf_amd64_1",
+            "nvaudio.inf_amd64_2",
+            "intel.inf_amd64_3",
+        ] {
+            std::fs::create_dir_all(store.join(d)).unwrap();
+        }
+        std::fs::write(store.join("nvreal.inf_amd64_1").join(WSL_STORE_CUDA), b"x").unwrap();
+        std::fs::create_dir_all(base.join("run")).unwrap();
+        let prev = crate::global_env("XDG_RUNTIME_DIR");
+        crate::set_global_env("XDG_RUNTIME_DIR", base.join("run"));
+        let real = vec![store.join("nvreal.inf_amd64_1")];
+        assert_eq!(wsl_nvidia_store_dirs_cached(&store), Some(real.clone()));
+        let cache = crate::registry::runtime_subdir_public("gpu")
+            .unwrap()
+            .join("wsl-store");
+        let text = std::fs::read_to_string(&cache).unwrap();
+        let key = text.lines().next().unwrap_or_default().to_string();
+        // Forged lines under the SAME key: only the real directory survives the check.
+        std::fs::write(
+            &cache,
+            format!(
+                "{key}\n/etc\n{}\n{}\n{}\n",
+                base.display(),
+                store.join("nvaudio.inf_amd64_2").display(),
+                store.join("nvreal.inf_amd64_1").display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(wsl_nvidia_store_dirs_cached(&store), Some(real.clone()));
+        // A new driver directory changes the store, and the walk finds it.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::create_dir_all(store.join("nvnew.inf_amd64_4")).unwrap();
+        std::fs::write(store.join("nvnew.inf_amd64_4").join(WSL_STORE_CUDA), b"x").unwrap();
+        let mut both = vec![
+            store.join("nvnew.inf_amd64_4"),
+            store.join("nvreal.inf_amd64_1"),
+        ];
+        both.sort();
+        assert_eq!(wsl_nvidia_store_dirs_cached(&store), Some(both));
+        match prev {
+            Some(v) => crate::set_global_env("XDG_RUNTIME_DIR", v),
+            None => crate::unset_global_env("XDG_RUNTIME_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     use super::*;
 
     /// A temporary directory that cleans itself up, so a failing assertion cannot leave a fake

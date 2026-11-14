@@ -2906,6 +2906,9 @@ mod tests {
     /// need a group, one nothing can open, and one no grant names at all.
     #[test]
     fn no_gpu_row_claims_a_boundary() {
+        // On a WSL2 host the rows read the real driver store, whose walk is cached under
+        // `XDG_RUNTIME_DIR`: the environment is touched, so the lock is held.
+        let _g = crate::env_guard();
         let open = fake_grant("0000:06:00.0", 1, open_node());
         let gated = fake_grant("0000:06:00.0", 1, gated_node());
         let here = fake("card0", Some("0000:06:00.0"));

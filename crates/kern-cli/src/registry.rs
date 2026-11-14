@@ -441,7 +441,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 13] = [
+const AUTHORITATIVE_DIRS: [&str; 14] = [
     "instances",
     "claims",
     "exit",
@@ -470,6 +470,10 @@ const AUTHORITATIVE_DIRS: [&str; 13] = [
     // line is written ONCE, as `stopped`, by whichever of the stop and the owner claims it first. AUTHORITATIVE for `history`'s reason: a box
     // able to place a marker there relabels how a peer's run ended.
     "stopping",
+    // `gpu/` remembers which directories of the WSL2 driver store hold the NVIDIA driver, and kern
+    // binds what it lists into every `--gpus` box. A box able to write it would choose host
+    // directories other boxes get, so it is authoritative; the reader also re-checks every line.
+    "gpu",
     // `mounts/` is where a network volume (sshfs/nfs/smb) is staged before it is bound into a box,
     // and it is AUTHORITATIVE for two reasons rather than one: what is mounted there is a PEER's
     // remote filesystem, and the path itself is a location kern acts on during that peer's start, so

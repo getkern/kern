@@ -2710,6 +2710,43 @@ fn expand_cpu_list(s: &str) -> Vec<usize> {
 /// Resolving it ourselves with `O_NOFOLLOW` and mounting from the pinned fd makes a swap FAIL the walk,
 /// never redirect it: the bind is either the checked inode or an error. Symmetric with the target side.
 fn open_source_nofollow(src: &str) -> Result<libc::c_int, Error> {
+    // ONE SYSCALL FOR THE DIRECTORIES WHERE THE KERNEL HAS IT. `openat2` with `RESOLVE_NO_SYMLINKS`
+    // refuses a link anywhere on the path, which is what the walk below does one `openat` per
+    // component: MEASURED on a Jetson, a GPU grant's 300 file binds spent about six `openat` each
+    // here. The LAST component keeps its own `O_NOFOLLOW` open, so a link there opens as the link
+    // and is judged by the caller exactly as before. A kernel without `openat2` (before 5.6) walks.
+    let comps: Vec<&str> = src.split('/').filter(|c| !c.is_empty()).collect();
+    if comps.iter().any(|c| *c == "." || *c == "..") {
+        return Err(Error::Unsupported(
+            "volume source must be canonical (no '.'/'..')",
+        ));
+    }
+    if let Some((last, parents)) = comps.split_last() {
+        if !parents.is_empty() {
+            let parent = cstr(&format!("/{}", parents.join("/")))?;
+            match open_dir_no_symlinks(&parent) {
+                Some(Ok(pfd)) => {
+                    let name = cstr(last)?;
+                    let fd = unsafe {
+                        libc::openat(
+                            pfd,
+                            name.as_ptr(),
+                            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                        )
+                    };
+                    let e = std::io::Error::last_os_error();
+                    unsafe { libc::close(pfd) };
+                    return if fd < 0 {
+                        Err(Error::Syscall("openat(volume source, O_NOFOLLOW)", e))
+                    } else {
+                        Ok(fd)
+                    };
+                }
+                Some(Err(e)) => return Err(Error::Syscall("openat(volume source, O_NOFOLLOW)", e)),
+                None => {}
+            }
+        }
+    }
     let mut dir = unsafe {
         libc::open(
             cstr("/")?.as_ptr(),
@@ -2759,6 +2796,44 @@ fn open_source_nofollow(src: &str) -> Result<libc::c_int, Error> {
 /// HOST's RAM. Deliberately NOT Docker's fixed 64 MB default, which is the footgun the previous comment
 /// here was avoiding: it is what breaks Postgres under load, and it has no relationship to the box.
 /// An uncapped box keeps the previous behaviour, because there is no honest number to use.
+/// `path` opened as an `O_PATH` directory with no symlink anywhere on it, in ONE `openat2`, or
+/// `None` where the kernel has no `openat2` (before 5.6) and the caller walks instead.
+fn open_dir_no_symlinks(path: &CString) -> Option<Result<libc::c_int, std::io::Error>> {
+    /// `struct open_how` (`linux/openat2.h`), spelled here so no libc version has to carry it.
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+    };
+    // SAFETY: `path` is NUL-terminated and `how` lives on this frame for the call; the size passed
+    // is the struct's own.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            &raw const how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd >= 0 {
+        return libc::c_int::try_from(fd).ok().map(Ok);
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::E2BIG) => None,
+        _ => Some(Err(e)),
+    }
+}
+
 const fn shm_size_for(explicit: Option<u64>, memory_max: Option<u64>) -> Option<u64> {
     match explicit {
         Some(n) => Some(n),
@@ -3154,6 +3229,7 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
         return Err(Error::last("open(root)"));
     }
     let mut result = Ok(());
+    let mut parents = ParentCache(None);
     for v in vols {
         // Resolve and PIN the source symlink-free (race-close the check->mount window, see
         // `open_source_nofollow`). `fstat` on the pinned fd gives the type without re-touching the path.
@@ -3230,7 +3306,11 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
             break;
         }
         let is_dir = kind == libc::S_IFDIR;
-        let tgt_fd = match open_in_root(root_fd, &v.target, is_dir) {
+        // A DIRECTORY MOUNT MAY COVER A REMEMBERED PARENT, so it is forgotten before one is made.
+        if is_dir {
+            parents.forget();
+        }
+        let tgt_fd = match open_target(root_fd, &v.target, is_dir, &mut parents) {
             Ok(fd) => fd,
             Err(e) => {
                 unsafe { libc::close(src_fd) };
@@ -3333,7 +3413,7 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
             //
             // Re-resolve the target (it now points *into* the bind mount). The pre-bind fd refers to
             // the underlying dir, which can't be remounted.
-            let ro_fd = match open_in_root(root_fd, &v.target, is_dir) {
+            let ro_fd = match open_target(root_fd, &v.target, is_dir, &mut parents) {
                 Ok(fd) => fd,
                 Err(e) => {
                     result = Err(e);
@@ -3378,6 +3458,7 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
             }
         }
     }
+    drop(parents);
     unsafe { libc::close(root_fd) };
     result
 }
@@ -3386,6 +3467,99 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
 /// symlink (`O_NOFOLLOW` per component) - so the path can never escape the new root. Returns an
 /// `O_PATH` fd to the final component (a directory, or a freshly-created empty file when
 /// `is_dir` is false), suitable as a bind-mount target via `/proc/self/fd`.
+/// The final component of a FILE mount target, under the directory `dir`: created if absent
+/// (no-follow), then returned as an `O_PATH` fd. (`O_PATH` ignores `O_CREAT`, so the create is a
+/// separate open.) `dir` stays open: the caller owns it.
+fn open_file_mountpoint(
+    dir: libc::c_int,
+    name: &CString,
+    target: &str,
+) -> Result<libc::c_int, Error> {
+    let cf = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o644,
+        )
+    };
+    if cf >= 0 {
+        unsafe { libc::close(cf) };
+    }
+    let f = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if f < 0 {
+        let e = std::io::Error::last_os_error();
+        // NAME THE PATH. A bare `openat(volume file target) failed` was all a box said when a `-v`
+        // over a directory the grant also binds files into made one of them impossible to create
+        // (measured on a Jetson, `-v` over the driver directory beside `--gpus`).
+        return Err(Error::Spec(format!(
+            "cannot create the mount point {target} for a file mount: {e}. Another mount over one \
+             of its directories (a `-v` or a `--gpus` grant) may have put it on a filesystem the \
+             box cannot write"
+        )));
+    }
+    Ok(f)
+}
+
+/// The directory a file mount's parent resolved to, kept open across the volumes of one box.
+///
+/// A GPU GRANT IS HUNDREDS OF FILE BINDS INTO A FEW DIRECTORIES, and each one walked its whole path
+/// from the root again (and a read-only one twice, for the mount and the remount): MEASURED on a
+/// Jetson, 614 mounts, 6201 `openat` and 2364 `mkdirat` for one `--gpus all` box, 29 ms of setup.
+/// The parent of the previous file target is reused when the next one shares it. It was reached
+/// with the same no-follow walk, so it is the same directory the walk would reach again, UNTIL a
+/// directory is bound somewhere: that may cover it, so a directory mount drops the cache.
+struct ParentCache(Option<(String, libc::c_int)>);
+
+impl ParentCache {
+    fn forget(&mut self) {
+        if let Some((_, fd)) = self.0.take() {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+impl Drop for ParentCache {
+    fn drop(&mut self) {
+        self.forget();
+    }
+}
+
+/// [`open_in_root`] for a mount target, reusing the parent directory a previous FILE target opened
+/// (see [`ParentCache`]). A directory target, or one with no parent below the root, walks as before.
+fn open_target(
+    root_fd: libc::c_int,
+    target: &str,
+    is_dir: bool,
+    cache: &mut ParentCache,
+) -> Result<libc::c_int, Error> {
+    let trimmed = target.trim_end_matches('/');
+    let split = trimmed.rsplit_once('/');
+    let plain = |p: &str, n: &str| {
+        !n.is_empty() && n != "." && n != ".." && p.split('/').any(|c| !c.is_empty())
+    };
+    let (parent, name) = match split {
+        Some((p, n)) if !is_dir && plain(p, n) => (p, n),
+        _ => return open_in_root(root_fd, target, is_dir),
+    };
+    let dir = match &cache.0 {
+        Some((p, fd)) if p == parent => *fd,
+        _ => {
+            let fd = open_in_root(root_fd, parent, true)?;
+            cache.forget();
+            cache.0 = Some((parent.to_string(), fd));
+            fd
+        }
+    };
+    open_file_mountpoint(dir, &cstr(name)?, target)
+}
+
 fn open_in_root(root_fd: libc::c_int, target: &str, is_dir: bool) -> Result<libc::c_int, Error> {
     let comps: Vec<&str> = target.split('/').filter(|c| !c.is_empty()).collect();
     if comps.is_empty() {
@@ -3413,49 +3587,26 @@ fn open_in_root(root_fd: libc::c_int, target: &str, is_dir: bool) -> Result<libc
         };
         let last = i == comps.len() - 1;
         if last && !is_dir {
-            // Final component of a file volume: ensure it exists (no-follow), then return an
-            // O_PATH fd. (O_PATH ignores O_CREAT, so the create is a separate open.)
-            let cf = unsafe {
-                libc::openat(
-                    dir,
-                    c.as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                    0o644,
-                )
-            };
-            if cf >= 0 {
-                unsafe { libc::close(cf) };
-            }
-            let f = unsafe {
-                libc::openat(
-                    dir,
-                    c.as_ptr(),
-                    libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                )
-            };
-            let e = std::io::Error::last_os_error();
+            let f = open_file_mountpoint(dir, &c, target);
             unsafe { libc::close(dir) };
-            if f < 0 {
-                // NAME THE PATH. A bare `openat(volume file target) failed` was all a box said when a
-                // `-v` over a directory the grant also binds files into made one of them impossible
-                // to create (measured on a Jetson, `-v` over the driver directory beside `--gpus`).
-                return Err(Error::Spec(format!(
-                    "cannot create the mount point {target} for a file mount: {e}. Another mount \
-                     over one of its directories (a `-v` or a `--gpus` grant) may have put it on a \
-                     filesystem the box cannot write"
-                )));
-            }
-            return Ok(f);
+            return f;
         }
-        // Directory component: ensure it exists, then descend without following a symlink.
-        unsafe { libc::mkdirat(dir, c.as_ptr(), 0o755) };
-        let next = unsafe {
+        // Directory component: descend without following a symlink, creating it only when it is
+        // not there. OPEN FIRST: almost every component exists already (`usr`, `lib`, ...), and a
+        // `mkdir` first failed with EEXIST on each of them, MEASURED 2325 failing `mkdirat` of 2364
+        // in one GPU box on a Jetson.
+        let open_dir = || unsafe {
             libc::openat(
                 dir,
                 c.as_ptr(),
                 libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
+        let mut next = open_dir();
+        if next < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            unsafe { libc::mkdirat(dir, c.as_ptr(), 0o755) };
+            next = open_dir();
+        }
         unsafe { libc::close(dir) };
         if next < 0 {
             // A symlink (or non-directory) on the path → refuse rather than escape the root.
@@ -10881,5 +11032,46 @@ mod idmapped_bind_tests {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
         }
+    }
+}
+
+#[cfg(test)]
+mod source_open_tests {
+    use super::open_source_nofollow;
+
+    /// The source of a bind is opened without following a link ANYWHERE on its path: the race this
+    /// closes is a directory swapped for a link between the CLI's check and the mount. A regular file
+    /// opens; a link in a directory component is refused; a link as the LAST component opens as the
+    /// link itself (the caller then judges its type), which is what the per-component walk did and
+    /// what the single `openat2` must keep doing.
+    #[test]
+    fn a_link_on_the_source_path_is_never_followed() {
+        let base = std::env::temp_dir().join(format!("kern-srcopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/dir")).unwrap();
+        std::fs::write(base.join("real/dir/file"), b"x").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("hop")).unwrap();
+        std::os::unix::fs::symlink(base.join("real/dir/file"), base.join("real/dir/link")).unwrap();
+        let path = |p: &str| base.join(p).to_string_lossy().into_owned();
+        let kind = |fd: libc::c_int| {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            unsafe { libc::fstat(fd, &mut st) };
+            unsafe { libc::close(fd) };
+            st.st_mode & libc::S_IFMT
+        };
+        // A regular file opens, as a file.
+        let fd = open_source_nofollow(&path("real/dir/file")).expect("a plain file opens");
+        assert_eq!(kind(fd), libc::S_IFREG);
+        // A link in a DIRECTORY component is refused.
+        assert!(
+            open_source_nofollow(&path("hop/dir/file")).is_err(),
+            "a link in the middle of the path was followed"
+        );
+        // A link as the LAST component opens as the link, not as its target.
+        let fd = open_source_nofollow(&path("real/dir/link")).expect("the last link opens");
+        assert_eq!(kind(fd), libc::S_IFLNK);
+        // `..` is refused before anything is opened.
+        assert!(open_source_nofollow(&path("real/dir/../dir/file")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
