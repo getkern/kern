@@ -40,7 +40,7 @@ identity, environment and mount rules, decided by runc and the daemon rather tha
 | 22 | `up` without `-d` | attaches, streams, Ctrl-C stops the stack | not measured | same **on a terminal**; unchanged when piped | kern follows Docker where it cannot hang a script |
 | 23 | `run --rm web sh -c 'exit 7'` | 7, deps up, ports not published | not measured | same on all three | agree |
 | 24 | `up --wait`, four cases | 0 / 0 / 1 / 1 | not measured | same | agree |
-| 25 | `up --build` after editing the Dockerfile | the OLD image without the flag | not measured | rebuilds either way | kern deviates: always current |
+| 25 | `up --build` after editing the Dockerfile | the OLD image without the flag | not measured | `build:` alone: rebuilds either way; with `image:`, as Docker | kern deviates for `build:` alone: always current |
 | 26 | `--exit-code-from db` while `tests` exits 3 | **137** (the abort ended db) | not measured | same | agree |
 | 27 | `compose ps --format json` | NDJSON since Compose 2.21 | not measured | `kern ps --json`'s shape, own field names | differs in the FIELD NAMES |
 
@@ -326,7 +326,10 @@ failed interpolations (`${VAR:?}` with nothing to substitute), and the rest unpa
 Nine of the twelve are not compose files at all by name (`.bak`, `.dist`, `.old`, `.md`, `-e`).
 
 The refusals are agreement with Docker, so the 95% ceiling on the neutral corpus is bounded by files
-Docker cannot read either, not by kern's parser.
+Docker cannot read either, not by kern's parser. That held when it was measured. Since 2026-11-12
+`compose config` also refuses a path that leaves the project directory, which `up` always refused and
+Docker accepts; on a 110-file local sample that moved 8 files from accepted to refused, and the
+259-file corpus has not been re-run since. See DOCKER-COMPAT.md.
 
 ## 24. `compose run`
 
@@ -371,8 +374,12 @@ Dockerfile edited between two runs, then `up`:
   kern, always             VERSIONE_DUE
 ```
 
-kern rebuilds a `build:` service whose context changed, so `--build` names what already happens and
-is accepted silently. `--no-build` asks for the stale image and is refused by name.
+A service with `build:` and no `image:` is rebuilt by kern on every `up`, from the layer cache, so
+`--build` names what already happens there and `--no-build` cannot be honoured for it.
+
+A service that names an `image:` AND declares `build:` follows Docker (Compose v5.0.2, measured): the
+image is used when it is here or can be pulled, built when it cannot be, and built when `--build` or
+`pull_policy: build` asks. `--no-build` never builds it. kern says which of the two images it runs.
 
 ## 27. `--exit-code-from` and `--abort-on-container-exit`
 
@@ -871,5 +878,5 @@ and a stack whose `networks:` segregate failed with an errno that pointed at the
 
 The box now restores the flag immediately after the uid switch. The exposure is unchanged: the only
 interval affected is the one in which kern's own setup code is the only thing running, and the
-classic reason to leave a uid-changed process undumpable is a setuid `execve` afterwards, which
-`PR_SET_NO_NEW_PRIVS` already makes inert here.
+classic reason to leave a uid-changed process undumpable is a setuid `execve` afterwards, and that
+`execve` recomputes the flag from its own credentials whatever the box set before it.

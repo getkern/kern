@@ -47,7 +47,8 @@ afternoon looking for the flag:
   rootful Docker daemon can, this cannot. DNS, TCP and HTTP are unaffected.
 - **`mount`** dies on the seccomp filter where Docker returns `permission denied`, because a
   deny-by-default allowlist is what kern is.
-- **The setuid bit** is not visible on files, because the rootfs is mounted `nosuid`.
+- **A setuid program** (`sudo`, `su`) does not raise its caller, because every sandbox runs with
+  no-new-privileges, the code it runs being untrusted. A plain `kern box` lets it, as docker does.
 
 ## What it costs
 

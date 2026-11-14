@@ -127,17 +127,16 @@ reports `0.0.0`, which is expected and harmless.
 
 ## Does kern support GPUs?
 
-Yes, as a device: whole cards, never a slice of one. `kern box --gpus 2` hands over two cards, `--gpus all` hands over every card, and `--gpus device=0` hands over that one, which is docker's grammar: a bare number is a COUNT and `device=N` is an INDEX. A card's UUID works where the index does (`--gpus device=GPU-1950be8a-…`), read from the driver's own `GPU UUID` field, and `--device nvidia.com/gpu=0` is the CDI spelling of a single card. The host's driver libraries are resolved from the driver's own version and bound read-only, so the box does not need a CUDA image. A compose service reaches a card four ways, each needing `--allow-device-grants` from the operator: `gpus:`, `deploy.resources.reservations.devices`, a CDI name under `devices:`, or the host nodes under `devices:`. Two lines that look like a GPU request are not one, and kern names each with the line to write instead: `runtime: nvidia` (kern is the runtime) and `NVIDIA_VISIBLE_DEVICES` (that variable is read by the NVIDIA container runtime). A render node can also be granted as `display` in [`kern.toml`](CONFIG.md). kern does not split a GPU between boxes or cap it per box, and a card you did not name has no device node in the box, so CUDA cannot initialise it there.
+Yes, as a device: whole cards, never a slice of one. `kern box --gpus 2` hands over two cards, `--gpus all` hands over every card, and `--gpus device=0` hands over that one, which is docker's grammar: a bare number is a COUNT and `device=N` is an INDEX. A card's UUID works where the index does (`--gpus device=GPU-1950be8a-…`), read from the driver's own `GPU UUID` field, and `--device nvidia.com/gpu=0` is the CDI spelling of a card (`=all` for every card; the flag repeats, as in docker and podman). The host's driver libraries are resolved from the driver's own version and bound read-only into the image's library directory, where docker puts them, so the box does not need a CUDA image. A compose service reaches a card four ways, each needing `--allow-device-grants` from the operator: `gpus:`, `deploy.resources.reservations.devices`, a CDI name under `devices:`, or the host nodes under `devices:`. `runtime: nvidia` is read with NVIDIA's meaning (the GPUs the image's `NVIDIA_VISIBLE_DEVICES` names, `kern box --runtime nvidia` on the command line), under the same operator gate. `NVIDIA_VISIBLE_DEVICES` alone is not a request, and kern names it with the line to write instead. A render node can also be granted as `display` in [`kern.toml`](CONFIG.md). kern does not split a GPU between boxes or cap it per box, and a card you did not name has no device node in the box, so CUDA cannot initialise it there.
 
-**`nvidia-smi` is not in the box, and the capability it needs is.** A grant binds the driver's
-LIBRARIES and not its binaries: docker's NVIDIA runtime injects `nvidia-smi` and its four
-neighbours from the host when a capability list carries `utility`, and kern does not. So the
-command every guide prints, `--gpus all nvidia/cuda:…-base nvidia-smi`, reports that the command
-does not exist, because that image ships none. What IS in the box is NVML: `libnvidia-ml.so` is
-bound, `nvmlInit` returns 0, and the device count is the granted card. For the tool itself, bind it
-in, which was measured to print the granted card and only that one:
-`-v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro`. kern says this where it happens, in the hint under
-the failure.
+**`nvidia-smi` is in the box, where docker puts it.** A grant binds the driver's tools the host
+has (`nvidia-smi`, `nvidia-debugdump`, `nvidia-persistenced`, `nvidia-cuda-mps-control`,
+`nvidia-cuda-mps-server`) read-only at `/usr/bin`, which is what docker's NVIDIA runtime injects, and
+sets `NVIDIA_VISIBLE_DEVICES` to the value docker sets for the same `--gpus`. So the command every
+guide prints, `--gpus all nvidia/cuda:…-base nvidia-smi`, runs and lists the granted cards. The tools
+are glibc builds: on an alpine image they are in the box and cannot run, under docker too, and kern
+says that in the hint under the failure. NVML is there either way: `libnvidia-ml.so` is bound,
+`nvmlInit` returns 0, and the device count is the granted card.
 
 **Two cards in one box work for compute, and so do NCCL collectives.** `--gpus all` hands over both, CUDA counts both, kernels execute (a hand-written PTX kernel runs and returns the right answer inside a box), and `ncclAllReduce` across both cards returns the right answer too.
 

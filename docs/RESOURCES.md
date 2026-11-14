@@ -64,13 +64,14 @@ exec'd binary and on whether the box is detached: measured at 2 on one box, so `
 They compose: `run` inside `box`. Both carry a default memory cap of **512 MiB** where the host can hold
 one, plus no swap and a ceiling of 512 tasks.
 
-### What memory ceiling you get, in four cases
+### What memory ceiling you get, in five cases
 
 The first two differ on purpose, and a reader who meets them one at a time concludes one is a bug:
 
 | what you ran | ceiling with no flag or key | why |
 |---|---|---|
 | `kern box` / `kern run` | **512 MiB** | kern's own default: a sandbox is capped until you say otherwise |
+| `kern box --gpus` (or `--device`, `--runtime nvidia`) | **the host's RAM** | a GPU workload is never 512 MiB: on a WSL2 guest each CUDA context took about 75 MiB of host memory. On a Jetson the cap bounds GPU memory only with nvmap's page pool off (`kern doctor`) |
 | a `kern compose` service with no `mem_limit:` | **the host's RAM** | compose parity. Docker does not cap a service by default |
 
 Measured on a host with 33465040896 bytes of RAM: `kern box --image alpine -- cat

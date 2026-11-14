@@ -257,7 +257,14 @@ any of these paths.
 ## Flags that change the posture
 - **`--security-profile untrusted`** is an opt-in bundle for code nobody has read: the seccomp
   **allowlist** (deny-by-default, the same posture the default now installs), **`--cap-drop ALL`**,
-  and **`--read-only`** root, applied as a BASE that explicit flags still override.
+  **`--read-only`** root and **no-new-privileges**, applied as a BASE that explicit flags still
+  override.
+
+- **`--security-opt no-new-privileges`** (compose `security_opt`) stops a setuid or file-capability
+  program from raising its caller, as in docker. Without it a box behaves as a docker container does:
+  `sudo` works, and the most it can reach is the bounding set, which equals the box's own `CapEff`
+  (measured: uid 1000 runs a setuid-root program and gets EUID 0 with `CapEff` = `CapBnd` =
+  `00000110bd84efff`). The sandbox SDKs always pass it.
 
 - **`--apparmor <profile>`** enters a pre-loaded AppArmor (LSM) profile on the box's `exec`,
   layering kernel-enforced file/capability confinement over namespaces + seccomp - Docker's
@@ -293,17 +300,25 @@ any of these paths.
   against a compromised or MITM registry beyond TLS.
 
 - **Layer vetting, in-process.** Absolute and `..` paths, device nodes, escaping hardlink and
-  symlink targets, a 2 GiB decompression-bomb cap and an entry-count cap are rejected before
-  anything is written.
+  symlink targets, a decompression-bomb cap and an entry-count cap are rejected before anything
+  is written. The bomb cap is a ratio: a layer may expand to 20 times its compressed size, never
+  less than 2 GiB and never more than 64 GiB.
 
 - **Isolated staging, no-follow merge**: each layer extracts into a fresh staging dir, then merges
   into the rootfs refusing to traverse any symlink, so the cross-layer escape class is closed
   structurally rather than by trusting tar.
 
-- **Image file modes are preserved as-is**, so an image's `/tmp` keeps its sticky `1777`.
+- **Image file modes are preserved as-is**, so an image's `/tmp` keeps its sticky `1777` and its
+  `sudo` its setuid bit, as docker keeps them. That holds in kern's cache, a directory only the
+  caller can enter (`0700`), as docker's `/var/lib/docker` is root's alone. `kern pull --dest`
+  clears setuid and setgid, because that tree may be put where other users can reach it, and a
+  setuid-root file pulled by root would then be a way to host root.
 
-- **`push`** packs the rootfs with ownership normalized to uid/gid 0 and setuid/setgid bits
-  stripped, so an untrusted base cannot smuggle a privilege bit into what you publish.
+- **`push`** and **`save`** pack the rootfs with ownership normalized to uid/gid 0, deciding each
+  setuid/setgid bit on the tar stream: a file the box's root owned keeps it, as docker's `save` and
+  `push` keep it, and one of another owner or group loses it, because making it 0:0 would forge a
+  setuid-root binary the image never had. The tree itself is only read, so the cached image keeps
+  its bits.
 
 ## Registry authentication
 - Auth follows the standard registry-v2 challenge, so any compliant registry works, anonymously or

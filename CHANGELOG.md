@@ -21,6 +21,19 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**CLI surface, additive.** `kern rm -f` stops and removes a running box, and a missing name exits 0,
+as `docker rm -f` does. `kern box --group-add <name|gid>` (compose `group_add:`) adds a supplementary
+group, a name resolved in the image's `/etc/group`. `kern box --device /dev/X[:/dev/Y[:rwm]]` binds a
+host node as docker does, beside `--gpus` too. `kern top` shows the GPUs: the title bar their count
+and memory (`GPU none` without one), the Overview one row per card with memory, load, temperature,
+power and the boxes holding it, a Jetson's integrated GPU included (its `nvidia-smi` is in `/usr/sbin` and
+answers `[N/A]`, so the load and temperature come from `/sys`, and its memory is named as the RAM's). Its lists page with PgUp/PgDn and Home/End, and the Storage and
+Profiles tabs no longer push their footer off the screen when a list is long. `kern sandbox ls|history|stats`
+lists the SDK and MCP sandboxes running now and the ones that finished: one line of metadata per box
+(time, name, image, run time, exit code, GPU and how it ended: `ok`, `exit-N`, `oom`, `timeout`,
+`stopped`, `signal-N`), never its output; `--failed`, `--all`, `--json`, and p50/p99 in `stats`. `kern top` has the same as an eighth tab, **Sandboxes** (key `8`): the last hour, the ones running, the finished ones with Enter for one in full, and a line in the Overview. `kern compose --help` names the flags every verb
+takes (`--allow-device-grants`, `--allow-privileged`, `--project-root`, `--pod`/`--no-pod`/`--bridge`).
+
 **A box could hand the host kernel checksum metadata of its own choosing, and two socket families
 were reachable with nothing behind them.** `virtio_net_hdr` is how a sender supplies
 `csum_start`/`csum_offset` instead of a finished checksum, and the parser behind it is what a VM
