@@ -19,7 +19,9 @@ What a grant does NOT give, so a caller does not assume it:
     whoever starts the server and never by the model (docs/MCP.md).
 
 The code is the CUDA driver API through ctypes, so `python:3.12-slim` is the whole image: no torch, no
-download beyond it. On one card both sandboxes share it; with no NVIDIA card this says so and exits 0.
+download beyond it. A CUDA FRAMEWORK NEEDS MORE RAM THAN THE DEFAULT `memory_mb=512`: PyTorch 2.15 with
+CUDA 13.2, training a small CNN, was OOM-killed at 1 GiB and trained at 1.5 GiB, under kern and docker
+alike (measured on an RTX 5060 Ti); its resident size afterwards is about 350 MB, the peak is loading. On one card both sandboxes share it; with no NVIDIA card this says so and exits 0.
 
 Run:  KERN_BIN=/path/to/kern python3 examples/agents/gpu-sandbox.py   (or have `kern` on PATH)
 """
