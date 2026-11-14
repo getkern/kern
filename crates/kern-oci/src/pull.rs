@@ -20,7 +20,7 @@
 //! layer's writes, so the cross-layer escape class is closed structurally, not by trusting tar.
 
 use crate::json::{
-    all_str_values, array_after, first_str, object_after, split_objects, str_array_after,
+    all_str_values, array_after, first_str, object_after, split_objects, str_array_after, u64_field,
 };
 use crate::net::curl;
 use crate::whiteout_dir_symlink_free;
@@ -386,6 +386,12 @@ pub fn pull(
     // merged no-follow, byte-identical to before. A no-op for Basic-credential registries (leaves that
     // audited off-argv `-K` path untouched) and on any failure (tmps cleaned → the per-blob path re-runs).
     download_blobs_oneconn(&registry, &repo, &manifest, &layers, &auth, dest);
+    // A LAYER OF HUNDREDS OF MEGABYTES COMES OVER SEVERAL CONNECTIONS AT ONCE (see
+    // `download_large_layers_ranged`). AFTER the batch, which leaves such layers to it: the batch
+    // uses the token it was given, and a registry's token outlives a few seconds of small blobs and
+    // not the minutes a large layer takes. MEASURED the other way round: Docker Hub's token expired
+    // during the 3.25 GB layer and the batch that followed was refused 401 for every blob it asked.
+    download_large_layers_ranged(&registry, &repo, &manifest, &layers, &auth, dest);
     // The image's runtime config (entrypoint/env/…) - now usually already fetched above; `fetch_config`
     // reuses the pre-downloaded tmp when present. Best-effort: a missing/odd config yields defaults.
     let config = fetch_config(&registry, &repo, &manifest, &auth, dest);
@@ -1277,7 +1283,22 @@ fn download_blobs_oneconn(
         ));
         blob_digests.push(d.to_string());
     }
+    // The layers the ranged download takes, which this batch leaves to it.
+    let ranged = !kern_common::env_flag("KERN_NO_RANGED_PULL");
+    let sizes = if ranged {
+        layer_sizes(manifest)
+    } else {
+        Vec::new()
+    };
+    let is_large = |dig: &str| {
+        sizes
+            .iter()
+            .any(|(d, s)| d == dig && !ranged_plan(*s).is_empty())
+    };
     for (i, dig) in layers.iter().enumerate() {
+        if is_large(dig) {
+            continue;
+        }
         let tmp = layer_tmp_path(dest, i, dig);
         // A LAYER ALREADY HERE AND VERIFIED IS NOT DOWNLOADED AGAIN: it was kept from an interrupted
         // pull (see `salvage_layer_blobs`). One that does not verify is a partial download: removed,
@@ -1344,6 +1365,238 @@ fn download_blobs_oneconn(
             let _ = std::fs::remove_file(t);
         }
     }
+}
+
+/// A layer at least this large is fetched in byte ranges over several connections at once.
+const RANGED_MIN_BYTES: u64 = 256 << 20;
+/// About how much of a blob one connection carries, which sets how many connections a blob gets.
+const RANGED_PART_BYTES: u64 = 128 << 20;
+/// The most connections one blob gets.
+const RANGED_MAX_PARTS: u64 = 8;
+
+/// The inclusive byte ranges `(first, last)`, as HTTP writes them, a blob of `size` bytes is fetched
+/// in: none below [`RANGED_MIN_BYTES`], else one per [`RANGED_PART_BYTES`], between 2 and
+/// [`RANGED_MAX_PARTS`], covering every byte once and in order.
+fn ranged_plan(size: u64) -> Vec<(u64, u64)> {
+    if size < RANGED_MIN_BYTES {
+        return Vec::new();
+    }
+    let parts = (size / RANGED_PART_BYTES).clamp(2, RANGED_MAX_PARTS);
+    let chunk = size.div_ceil(parts);
+    (0..parts)
+        .map(|i| (i * chunk, ((i + 1) * chunk).min(size) - 1))
+        .filter(|(first, last)| first <= last)
+        .collect()
+}
+
+/// Each layer's digest and the size its manifest declares, in manifest order.
+fn layer_sizes(manifest: &str) -> Vec<(String, u64)> {
+    let Some(arr) = array_after(manifest, "layers") else {
+        return Vec::new();
+    };
+    split_objects(arr)
+        .into_iter()
+        .filter_map(|o| Some((first_str(o, "digest")?, u64_field(o, "size")?)))
+        .collect()
+}
+
+/// Pre-download every layer of at least [`RANGED_MIN_BYTES`] in byte ranges, several connections
+/// at once, to the tmp path `download_layer` reads.
+///
+/// MEASURED BOTTLENECK, the images an AI stack runs: `ollama/ollama` is four layers, one of them
+/// 3.25 GB, and one connection to Docker Hub's CDN carried it at 0.7 to 1.7 MB/s while a second,
+/// independent connection to the same blob took 2.1 MB/s on top: the link had room and the single
+/// stream did not use it. Docker parallelises across layers, so a single large one is one stream
+/// there too.
+///
+/// TRANSPORT-ONLY, like the batch beside it: the joined blob is sha256-verified against the
+/// manifest's digest before it is left in place, and the extraction path checks it again. Anything
+/// else (a registry that does not answer a range with 206, a part that is not its exact length, a
+/// digest mismatch) removes every file it wrote, and the ordinary path fetches the layer whole.
+/// Bearer and anonymous only, for the reason the batch gives: a Basic credential travels off-argv.
+fn download_large_layers_ranged(
+    registry: &str,
+    repo: &str,
+    manifest: &str,
+    layers: &[String],
+    auth: &Auth,
+    dest: &Path,
+) {
+    if kern_common::env_flag("KERN_NO_RANGED_PULL") {
+        return;
+    }
+    if matches!(auth, Auth::Basic { .. }) {
+        return;
+    }
+    // A FRESH TOKEN EACH TIME ONE IS NEEDED: a large layer takes longer than a registry's token
+    // lives (Docker Hub's: five minutes). The one this pull started with is the fallback.
+    let header = || {
+        let fresh = match auth {
+            Auth::Bearer(_) => discover_auth(registry, repo).ok(),
+            _ => None,
+        };
+        match fresh.as_ref().unwrap_or(auth) {
+            Auth::Bearer(t) => Some(format!("Authorization: Bearer {t}")),
+            _ => None,
+        }
+    };
+    let sizes = layer_sizes(manifest);
+    for (i, dig) in layers.iter().enumerate() {
+        let Some(size) = sizes.iter().find(|(d, _)| d == dig).map(|(_, s)| *s) else {
+            continue;
+        };
+        let plan = ranged_plan(size);
+        if plan.is_empty() {
+            continue;
+        }
+        let tmp = layer_tmp_path(dest, i, dig);
+        if tmp.exists() && verify_digest(&tmp, dig).is_ok() {
+            continue;
+        }
+        let url = format!("{}/v2/{repo}/blobs/{dig}", reg_base(registry));
+        kern_common::progress!(
+            "→ layer {}: {:.2} GB over {} connections at once",
+            i + 1,
+            size as f64 / 1e9,
+            plan.len()
+        );
+        if !download_ranged(&url, &tmp, dig, &plan, &header) {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// The curl arguments for one byte range of `url` written to `out`: the batch's own options, plus
+/// the range, a size cap equal to the range, and the status code on stdout.
+fn ranged_args<'a>(
+    url: &'a str,
+    out: &'a str,
+    range: &'a str,
+    cap: &'a str,
+    bearer: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args: Vec<&str> = vec!["--no-progress-meter", "-S", "-L", "--fail"];
+    args.extend_from_slice(pin_for_url(url));
+    args.extend_from_slice(&[
+        "--max-redirs",
+        "10",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        BLOB_MAX_SECONDS,
+    ]);
+    args.extend_from_slice(&STALL_GUARD);
+    // A RANGE THE SERVER IGNORES IS STOPPED AT ONCE: a 200 carrying the whole blob declares a length
+    // above this cap, and curl refuses it before the body.
+    args.extend_from_slice(&[
+        "--max-filesize",
+        cap,
+        "-r",
+        range,
+        "-o",
+        out,
+        "-w",
+        "%{http_code}",
+    ]);
+    if let Some(h) = bearer {
+        args.extend_from_slice(&["-H", h]);
+    }
+    args.push(url);
+    args
+}
+
+/// Fetch `url` into `tmp` in the ranges of `plan`, all at once, then join and verify the blob
+/// against `digest`. `true` only when the blob at `tmp` is the one the digest names; every part is
+/// removed either way.
+fn download_ranged(
+    url: &str,
+    tmp: &Path,
+    digest: &str,
+    plan: &[(u64, u64)],
+    header: &dyn Fn() -> Option<String>,
+) -> bool {
+    let first_header = header();
+    let bearer = first_header.as_deref();
+    let part = |j: usize| tmp.with_extension(format!("part{j}"));
+    let cleanup = || {
+        for j in 0..plan.len() {
+            let _ = std::fs::remove_file(part(j));
+        }
+    };
+    // A PROBE FIRST, ONE BYTE: a server that does not answer a range with 206 would otherwise be
+    // asked for the whole blob once per connection.
+    let probe = part(plan.len());
+    let probe_s = probe.to_string_lossy().into_owned();
+    let answered = curl(&ranged_args(url, &probe_s, "0-0", "1", bearer));
+    let probe_ok = answered.as_deref().is_ok_and(|o| o == b"206")
+        && std::fs::metadata(&probe).is_ok_and(|m| m.len() == 1);
+    let _ = std::fs::remove_file(&probe);
+    if !probe_ok {
+        return false;
+    }
+    let ranges: Vec<(String, String, String)> = plan
+        .iter()
+        .enumerate()
+        .map(|(j, (first, last))| {
+            (
+                part(j).to_string_lossy().into_owned(),
+                format!("{first}-{last}"),
+                (last - first + 1).to_string(),
+            )
+        })
+        .collect();
+    let run = |j: usize, bearer: Option<&str>| -> bool {
+        let (Some((out, range, cap)), Some((first, last))) = (ranges.get(j), plan.get(j)) else {
+            return false;
+        };
+        let args = ranged_args(url, out, range, cap, bearer);
+        let got = Command::new("curl")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        let want = last - first + 1;
+        got.is_ok_and(|o| o.status.success() && o.stdout == b"206")
+            && std::fs::metadata(out).is_ok_and(|m| m.len() == want)
+    };
+    // All at once, one thread per range; a range that failed gets ONE more attempt, alone.
+    let firsts: Vec<bool> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..plan.len())
+            .map(|j| sc.spawn(move || run(j, bearer)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(false))
+            .collect()
+    });
+    // The retry asks for its own token: the first may have expired while the others finished.
+    let retry_header = if firsts.iter().all(|ok| *ok) {
+        None
+    } else {
+        header()
+    };
+    let whole = firsts
+        .iter()
+        .enumerate()
+        .all(|(j, ok)| *ok || run(j, retry_header.as_deref()));
+    if !whole {
+        cleanup();
+        return false;
+    }
+    // Joined in order, each part removed as soon as it is copied, so the disk holds the blob and at
+    // most one part beside it.
+    let joined = (|| -> std::io::Result<()> {
+        let mut out = std::fs::File::create(tmp)?;
+        for j in 0..plan.len() {
+            let mut f = std::fs::File::open(part(j))?;
+            std::io::copy(&mut f, &mut out)?;
+            drop(f);
+            std::fs::remove_file(part(j))?;
+        }
+        out.sync_all()
+    })();
+    cleanup();
+    joined.is_ok() && verify_digest(tmp, digest).is_ok()
 }
 
 /// Drop every control character. The single definition of that rule in this crate: it is a security
@@ -6533,5 +6786,255 @@ mod export_tests {
             seen.iter().all(|(_, _, o)| *o == (Some(0), Some(0))),
             "an owner was not normalized: {seen:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ranged_tests {
+    use super::{download_ranged, layer_sizes, ranged_plan, RANGED_MAX_PARTS, RANGED_MIN_BYTES};
+    use std::io::{Read, Write};
+
+    /// The plan covers every byte once and in order, and asks for neither one connection nor more
+    /// than the cap.
+    #[test]
+    fn a_ranged_plan_covers_the_blob_exactly() {
+        assert!(ranged_plan(RANGED_MIN_BYTES - 1).is_empty());
+        for size in [
+            RANGED_MIN_BYTES,
+            RANGED_MIN_BYTES + 7,
+            3_249_000_001,
+            8_000_000_000,
+        ] {
+            let plan = ranged_plan(size);
+            assert!(
+                plan.len() >= 2 && plan.len() as u64 <= RANGED_MAX_PARTS,
+                "{size}: {plan:?}"
+            );
+            assert_eq!(plan.first().map(|p| p.0), Some(0));
+            assert_eq!(plan.last().map(|p| p.1), Some(size - 1));
+            for w in plan.windows(2) {
+                assert_eq!(
+                    w[0].1 + 1,
+                    w[1].0,
+                    "{size}: a gap or an overlap in {plan:?}"
+                );
+            }
+            assert_eq!(plan.iter().map(|(a, b)| b - a + 1).sum::<u64>(), size);
+        }
+    }
+
+    #[test]
+    fn the_layer_sizes_come_from_the_manifest() {
+        let m = r#"{"schemaVersion":2,"config":{"digest":"sha256:cc","size":9},"layers":[
+            {"mediaType":"x","digest":"sha256:aa","size":30000000},
+            {"mediaType":"x","size":3249000001,"digest":"sha256:bb"}]}"#;
+        assert_eq!(
+            layer_sizes(m),
+            vec![
+                ("sha256:aa".to_string(), 30_000_000),
+                ("sha256:bb".to_string(), 3_249_000_001)
+            ]
+        );
+    }
+
+    /// A loopback server for one blob: `honour` answers a range with 206 and the slice; otherwise
+    /// it sends 200 and the whole blob, as a server that ignores `Range` does.
+    fn serve(blob: Vec<u8>, honour: bool) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let blob = std::sync::Arc::new(blob);
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let blob = blob.clone();
+                std::thread::spawn(move || {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).to_lowercase();
+                    let range = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes="))
+                        .and_then(|r| {
+                            let (a, b) = r.trim().split_once('-')?;
+                            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                        });
+                    // `Bearer old` is an expired token for the ranges (the one-byte probe passes).
+                    let expired = text.contains("authorization: bearer old");
+                    let (head, body) = match range {
+                        Some((a, b)) if expired && b > a => (
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                            Vec::new(),
+                        ),
+                        Some((a, b)) if honour && b < blob.len() => (
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                blob.len(),
+                                b - a + 1
+                            ),
+                            blob[a..=b].to_vec(),
+                        ),
+                        _ => (
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", blob.len()),
+                            blob.to_vec(),
+                        ),
+                    };
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(&body);
+                });
+            }
+        });
+        (port, asked)
+    }
+
+    /// The digest the way the crate itself computes it, with `sha256sum`.
+    fn digest_of(b: &[u8]) -> String {
+        let f = std::env::temp_dir().join(format!(
+            "kern-ranged-digest-{}-{}",
+            std::process::id(),
+            b.len()
+        ));
+        std::fs::write(&f, b).unwrap();
+        let out = std::process::Command::new("sha256sum")
+            .arg(&f)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&f);
+        let hex = String::from_utf8_lossy(&out.stdout);
+        format!("sha256:{}", hex.split_whitespace().next().unwrap())
+    }
+
+    fn work(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kern-ranged-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn leftovers(d: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Four ranges at once from a server that honours them join into the blob, byte for byte.
+    #[test]
+    fn a_blob_fetched_in_ranges_is_the_blob() {
+        let blob: Vec<u8> = (0..1_000_003u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let (port, _) = serve(blob.clone(), true);
+        let d = work("ok");
+        let tmp = d.join("layer.tar.gz");
+        let plan = vec![
+            (0, 249_999),
+            (250_000, 499_999),
+            (500_000, 749_999),
+            (750_000, 1_000_002),
+        ];
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/b");
+        assert!(download_ranged(
+            &url,
+            &tmp,
+            &digest_of(&blob),
+            &plan,
+            &|| None
+        ));
+        assert_eq!(std::fs::read(&tmp).unwrap(), blob);
+        assert_eq!(
+            leftovers(&d),
+            vec!["layer.tar.gz".to_string()],
+            "parts left behind"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A range refused 401 because the token expired is asked again with a NEW one: the header is
+    /// fetched again for the retry, not reused.
+    #[test]
+    fn a_range_refused_for_an_expired_token_is_retried_with_a_new_one() {
+        let blob: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+        let (port, _) = serve(blob.clone(), true);
+        let d = work("expired");
+        let tmp = d.join("layer.tar.gz");
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/b");
+        let calls = std::cell::Cell::new(0);
+        let header = || {
+            calls.set(calls.get() + 1);
+            Some(
+                if calls.get() == 1 {
+                    "Authorization: Bearer old"
+                } else {
+                    "Authorization: Bearer new"
+                }
+                .to_string(),
+            )
+        };
+        let plan = [(0, 199_999), (200_000, 399_999)];
+        assert!(download_ranged(
+            &url,
+            &tmp,
+            &digest_of(&blob),
+            &plan,
+            &header
+        ));
+        assert_eq!(std::fs::read(&tmp).unwrap(), blob);
+        assert_eq!(calls.get(), 2, "the retry did not ask for a new token");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A server that ignores `Range` is caught by the one-byte probe, and nothing is written.
+    #[test]
+    fn a_server_that_ignores_ranges_is_not_asked_again() {
+        let blob = vec![7u8; 400_000];
+        let (port, asked) = serve(blob.clone(), false);
+        let d = work("norange");
+        let tmp = d.join("layer.tar.gz");
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/b");
+        assert!(!download_ranged(
+            &url,
+            &tmp,
+            &digest_of(&blob),
+            &[(0, 199_999), (200_000, 399_999)],
+            &|| None
+        ));
+        assert!(leftovers(&d).is_empty(), "{:?}", leftovers(&d));
+        // ONE request, the probe: the ranges were never asked for.
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ranges that join into something else are not the blob: refused, and nothing is left.
+    #[test]
+    fn a_joined_blob_that_does_not_verify_is_removed() {
+        let blob = vec![1u8; 300_000];
+        let (port, _) = serve(blob, true);
+        let d = work("bad");
+        let tmp = d.join("layer.tar.gz");
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/b");
+        let other = digest_of(&[2u8; 300_000]);
+        assert!(!download_ranged(
+            &url,
+            &tmp,
+            &other,
+            &[(0, 149_999), (150_000, 299_999)],
+            &|| None
+        ));
+        assert!(
+            leftovers(&d).iter().all(|n| !n.contains("part")),
+            "parts left: {:?}",
+            leftovers(&d)
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
