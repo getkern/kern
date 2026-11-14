@@ -57,6 +57,11 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
+**A GPU box starts faster: 24.8 to 15.1 ms on WSL2, 82.1 to 70.8 ms on a Jetson.** On WSL2 the
+search of the Windows driver store, which is mounted over 9p, is remembered and re-checked instead of
+walked for every box; on a Jetson the hundreds of driver binds reuse the directory they share instead
+of walking the whole path each time. A box without a GPU is unchanged.
+
 **A compose file whose `networks:` separate services gets a bridge per network.** Each network is its
 own bridge (on the subnet the file declares for it), each service is attached to the bridges of its
 networks only, and the pod does not forward between them, which is Docker's arrangement. Such files
