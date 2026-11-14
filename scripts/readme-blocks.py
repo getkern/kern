@@ -93,6 +93,20 @@ def main():
         env = dict(env_base)
         env["HOME"] = workdir
         env["XDG_CONFIG_HOME"] = os.path.join(workdir, ".config")
+        # EVERY ONE OF KERN'S ROOTS, NOT ONLY HOME. With HOME alone moved, `XDG_RUNTIME_DIR` was the
+        # caller's own, and two blocks reached it: `kern uninstall --yes` (docs/INSTALL.md) removed
+        # the machine's real `/run/user/<uid>/kern` (the box registry and the sandbox history), and
+        # the clean-up below, `kern ps -q | xargs kern stop`, stopped every box the USER had running,
+        # not only the ones a block started. MEASURED on 2026-11-14 on a desktop: 139 history lines
+        # and the registry gone between two runs of this script. With the runtime, data and cache
+        # roots inside the work dir, `ps` sees only this script's boxes and `uninstall` removes
+        # only this script's tree. A variable already exported is overridden, never trusted.
+        rt = os.path.join(workdir, "run")
+        os.makedirs(rt, mode=0o700, exist_ok=True)
+        env["XDG_RUNTIME_DIR"] = rt
+        env["XDG_DATA_HOME"] = os.path.join(workdir, ".local", "share")
+        env["XDG_CACHE_HOME"] = os.path.join(workdir, ".cache")
+        env.pop("KERN_CONFIG", None)
         for line, lang, body in blocks(doc):
             total += 1
             if lang not in RUNNABLE:
