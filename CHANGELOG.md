@@ -65,6 +65,11 @@ read-only once instead of remounting each file. On WSL2 the search of the Window
 is mounted over 9p, is remembered and re-checked instead of walked for every box. A box without a GPU
 is unchanged.
 
+**A compose stack is no longer left broken and called fine.** A service with a relative bind
+(`./app:/app`) is up to date on the next `up` instead of recreated every time; a pod whose holder died
+is named on `kern ps` and recreated by `up`/`start` instead of reported "already up to date"; a
+`restart` refused for an ungranted GPU stops nothing.
+
 **Compose GPU messages say what happens.** A service with `runtime: nvidia` and
 `NVIDIA_VISIBLE_DEVICES` is no longer told it gets no card (it gets the one named); `capabilities:`
 beside `gpu` reach `--gpus` and get its note that a grant binds the driver's whole library set; a
