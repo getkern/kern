@@ -57,10 +57,13 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
-**A GPU box starts faster: 24.8 to 15.1 ms on WSL2, 82.1 to 70.8 ms on a Jetson.** On WSL2 the
-search of the Windows driver store, which is mounted over 9p, is remembered and re-checked instead of
-walked for every box; on a Jetson the hundreds of driver binds reuse the directory they share instead
-of walking the whole path each time. A box without a GPU is unchanged.
+**A GPU box starts faster: 31.3 to 13.9 ms on WSL2, 82.0 to 44.2 ms on a Jetson** (`python:3.12-slim`).
+The image's `ldconfig` runs for the first box of an image and grant, and the next ones get its cache
+and the soname links it made back from kern's cache directory. The grant is decided once per box
+instead of twice when the box takes a systemd scope, and a directory of read-only driver files is made
+read-only once instead of remounting each file. On WSL2 the search of the Windows driver store, which
+is mounted over 9p, is remembered and re-checked instead of walked for every box. A box without a GPU
+is unchanged.
 
 **A compose file whose `networks:` separate services gets a bridge per network.** Each network is its
 own bridge (on the subnet the file declares for it), each service is attached to the bridges of its

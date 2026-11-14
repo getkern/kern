@@ -411,9 +411,13 @@ docker's does. A box with no grant has neither, under both.
 after the grant; kern did not, so `ldconfig -p` in a granted box listed no `libcuda` and Python's
 `ctypes.util.find_library("cuda")` answered `None` where docker answers `libcuda.so.1`. A granted
 box now rebuilds the cache before the workload starts, with the image's `ldconfig` run under the
-workload's own confinement (no capability, the seccomp filter, the AppArmor profile and Landlock
-allowlist when asked for, no host environment) and a deadline. Measured on a WSL2 guest: the same
-answer as docker's, `--read-only` included, at about 5 ms of the start.
+workload's own confinement (every capability dropped but `CAP_DAC_READ_SEARCH`, which reads and
+traverses and never writes; the seccomp filter, the AppArmor profile and Landlock allowlist when
+asked for, no host environment) and a deadline. Measured on a WSL2 guest: the same answer as
+docker's, `--read-only` included. The result is kept in kern's cache directory with the soname links
+that run made, keyed on the kern binary, the image's layers and every bind's source, and a later box
+of the same image and grant gets both back without running image code: measured on a Jetson, 14.1 ms
+for the first box and 0.36 ms for the next, `cuInit` answering 0 in each.
 
 **Vulkan, EGL and OptiX find the driver.** The files NVIDIA's own CDI spec mounts are bound at the
 paths it mounts them: the Vulkan ICD and layer in `/etc/vulkan`, the GLVND EGL vendor file and the
