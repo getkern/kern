@@ -1912,9 +1912,18 @@ fn load_live(path: &Path) -> Option<Instance> {
         // evaluate. Keep it unmarked and re-evaluate next pass - fail-safe in the non-destructive
         // direction. Under pressure a running-looking record is far less harmful than a dropped one.
         Liveness::Unknown => Some(inst),
-        // Gone / empty / a stranger's cgroup: the box has exited, prune the stale record.
+        // Gone / empty / a stranger's cgroup: the box has exited, prune the stale record, AND the
+        // `<name>-<pid>` sidecars beside it.
+        //
+        // ⛔ THE SIDECARS GO WITH THE RECORD. A box whose supervisor was SIGKILLed never ran the
+        // teardown that drops them, and this prune was the one that found it: MEASURED 2026-11-14,
+        // 500 calls of an MCP server (each prewarmed box is killed after its one cell) left 105
+        // `env/` files with no box alive, removed only by a `prune`/`gc` nobody runs on a server. The
+        // key is the record's own name and pid, so nothing of another box is touched.
         Liveness::Exited => {
             unregister(path);
+            clear_box_env(&inst.name, inst.pid);
+            clear_health(&inst.name, inst.pid);
             None
         }
     }
@@ -4222,6 +4231,42 @@ mod tests {
             "the exited record must be pruned from disk"
         );
         let _ = fs::remove_dir_all(&cg);
+    }
+
+    /// A box whose supervisor was SIGKILLed leaves its sidecars; the prune that finds the exited
+    /// record drops them too, by its own name and pid, and leaves another box's alone.
+    #[test]
+    fn an_exited_record_takes_its_sidecars_with_it() {
+        let _g = reg_guard();
+        let dead_pid: i32 = 0x3FFF_FFFE;
+        let name = format!("sidecar-{}", std::process::id());
+        let d = dir().expect("registry dir");
+        let entry = d.join(format!("{name}-{dead_pid}"));
+        fs::write(
+            &entry,
+            format!("name={name}\npid={dead_pid}\npid1=0\nrootfs=/r\ncommand=sleep\nstarted=1\nstarttime=2\n"),
+        )
+        .expect("write entry");
+        set_box_env(&name, dead_pid, &[("K".into(), "v".into())]);
+        set_health(&name, dead_pid, "healthy");
+        // Another box's sidecar, same name and another pid: not this record's.
+        set_box_env(&name, dead_pid - 1, &[("K".into(), "other".into())]);
+        assert!(!box_env(&name, dead_pid).is_empty() && !health_of(&name, dead_pid).is_empty());
+        assert!(find(&name).is_none(), "the exited record is pruned");
+        assert!(
+            box_env(&name, dead_pid).is_empty(),
+            "its env sidecar outlived it"
+        );
+        assert!(
+            health_of(&name, dead_pid).is_empty(),
+            "its health sidecar outlived it"
+        );
+        assert_eq!(
+            box_env(&name, dead_pid - 1),
+            vec![("K".to_string(), "other".to_string())],
+            "another box's sidecar was touched"
+        );
+        clear_box_env(&name, dead_pid - 1);
     }
 
     /// `probe_cgroup` must split "definitely gone" (`ENOENT`) from "resolved" - the errno classification
