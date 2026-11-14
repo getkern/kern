@@ -5179,10 +5179,10 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                          workload that must see the host's {ns} objects has to run outside a box"
                     )),
                     _ => warn(&format!(
-                        "service '{name}': '{key}: {v}' is NOT applied - services in a kern stack \
-                         share ONE network namespace and nothing else (measured: two members of the \
-                         same stack have distinct {ns} namespaces), so there is no way to put two \
-                         of them in one {ns} namespace"
+                        "service '{name}': '{key}: {v}' is NOT applied - every service in a kern \
+                         stack has its own {ns} namespace (measured: two members of the same stack \
+                         have distinct {ns} namespaces), so there is no way to put two of them in \
+                         one {ns} namespace"
                     )),
                 }
             }
@@ -10104,6 +10104,26 @@ mod tests {
                 .any(|w| w[0] == "--runtime" && w[1] == "nvidia"),
             "{args:?}"
         );
+    }
+
+    /// `ipc:`/`pid:` naming another service is said to be refused for the reason that is true today:
+    /// each service has its own namespace. It said the stack shared "ONE network namespace and nothing
+    /// else", which stopped being so when each service got its own on a bridge.
+    #[test]
+    fn a_shared_ipc_or_pid_request_names_the_reason_that_holds() {
+        for key in ["ipc", "pid"] {
+            let _ = take_warnings();
+            let _ = parse(&format!(
+                "services:\n  a:\n    image: alpine\n    {key}: \"service:b\"\n  b:\n    image: alpine\n"
+            ));
+            let warns = take_warnings();
+            let w = warns
+                .iter()
+                .find(|w| w.contains(&format!("'{key}: service:b' is NOT applied")))
+                .unwrap_or_else(|| panic!("{key}: no warning in {warns:?}"));
+            assert!(w.contains("has its own"), "{w}");
+            assert!(!w.contains("network namespace"), "{w}");
+        }
     }
 
     /// `runtime: nvidia` is the request `NVIDIA_VISIBLE_DEVICES` completes, so the file is not told
