@@ -327,6 +327,12 @@ fn dir() -> std::io::Result<PathBuf> {
     dir_of(keep())
 }
 
+/// The file the history is written to now (for `off`, the one that holds what came before),
+/// without reading it: what `kern top` names on every frame.
+pub fn current_file() -> Option<PathBuf> {
+    dir().ok().map(|d| d.join(CURRENT))
+}
+
 /// Append one entry, unless the history is `off`. Best-effort and silent: a box's result must
 /// never depend on its history.
 pub fn record(e: &Entry) {

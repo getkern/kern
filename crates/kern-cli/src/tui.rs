@@ -3311,6 +3311,39 @@ fn confirm_pane(p: &Palette, prompt: &str) -> String {
 }
 
 /// The Profiles "new" kind picker: vcpu / vgpio / vdisk, each attachable to a box by prefix.
+/// Where the sandbox history is kept, as one line: the three choices with the current one marked,
+/// what it means, how many sandboxes it holds and the file. The Sandboxes tab and the Overview both
+/// print it, so the choice is visible where the history is read and not only behind `m`.
+/// Reads no history file: the count is the cached list's, the path is computed.
+fn history_choice_line(p: &Palette, held: usize) -> String {
+    use crate::history::Keep;
+    let (b, c, d, g, y, z) = (p.b, p.c, p.d, p.g, p.y, p.z);
+    let now = crate::history::keep();
+    let marks: Vec<String> = Keep::ALL
+        .into_iter()
+        .map(|k| {
+            if k == now {
+                let col = if k == Keep::Off { y } else { g };
+                format!("{col}●{z} {b}{}{z}", k.word())
+            } else {
+                format!("{d}○ {}{z}", k.word())
+            }
+        })
+        .collect();
+    let what = match now {
+        Keep::Memory => "kept until reboot",
+        Keep::Disk => "kept across reboots",
+        Keep::Off => "nothing new is recorded",
+    };
+    let file = crate::history::current_file()
+        .map(|f| format!(" in {}", f.display()))
+        .unwrap_or_default();
+    format!(
+        "{}   {d}{what} · {held} sandboxes{file} ·{z} {c}m{z}{d} to change{z}",
+        marks.join("  ")
+    )
+}
+
 /// The history picker: the three places, the current one marked, and what each means.
 fn history_pane(p: &Palette, now: crate::history::Keep) -> String {
     use crate::history::Keep;
@@ -3495,8 +3528,9 @@ fn ends_per_bucket(
 /// the last three seconds carries a dot, so new work is seen arriving.
 ///
 /// BUDGET. A list pane is allowed five lines of chrome (blank, caption, blank, header, marker). This
-/// one spends five more, always the same five, so the finished list knows its rows: the live title,
-/// the live rows ([`LIVE_ROWS`], blank-padded) and the finished title. The footer test holds it.
+/// one spends six more, always the same six, so the finished list knows its rows: the history line,
+/// the live title, the live rows ([`LIVE_ROWS`], blank-padded) and the finished title. The footer
+/// test holds it.
 fn sandboxes_table(
     p: &Palette,
     rows: &[Row],
@@ -3518,18 +3552,16 @@ fn sandboxes_table_at(
 ) -> String {
     const LIVE_ROWS: usize = 3;
     let (b, c, d, g, r, y, z) = (p.b, p.c, p.d, p.g, p.r, p.y, p.z);
-    // THE CAPTION SAYS WHERE THE HISTORY IS, because the default clears it at reboot and a reader
-    // should learn that here rather than from a reboot; `m` is the way to change it.
-    let keep = crate::history::keep();
-    let kc = if keep == crate::history::Keep::Off {
-        y
-    } else {
-        c
-    };
     let mut s = format!(
-        "\n  {d}code an SDK or the MCP server ran, live and finished · history {z}{kc}{}{z}{d} · {z}{c}m{z}{d} to change{z}\n",
-        keep.meaning()
+        "\n  {d}code an SDK or the MCP server ran, live and finished · {z}{c}kern sandbox history{z}{d} on the CLI{z}\n"
     );
+    // HISTORY, A LINE OF ITS OWN: where the finished ones are kept is a choice, and the default
+    // clears them at reboot. A reader learns that here, with the other two choices beside it, rather
+    // than from a reboot; `m` opens the picker.
+    s.push_str(&format!(
+        "  {b}HISTORY{z}  {}\n",
+        history_choice_line(p, done.len())
+    ));
 
     // LIVE.
     let live = live_sandboxes(rows);
@@ -3580,7 +3612,7 @@ fn sandboxes_table_at(
         ));
         return s;
     }
-    let max_rows = max_rows.saturating_sub(LIVE_ROWS + 2).max(1);
+    let max_rows = max_rows.saturating_sub(LIVE_ROWS + 3).max(1);
     let (wstart, wend) = list_window(done.len(), max_rows, sel);
     for (i, e) in done[wstart..wend]
         .iter()
@@ -3928,6 +3960,10 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
             live_sandboxes(rows).len(),
             crate::history::last_hour_line(&crate::history::sandboxes_newest_first())
         ),
+    ));
+    s.push_str(&row(
+        "History",
+        history_choice_line(p, crate::history::sandboxes_newest_first().len()),
     ));
     // Fleet budget: the SUM cap across all boxes on `kern.slice` (KERN_FLEET_MEMORY_MAX / _PIDS_MAX),
     // the real-enforcement backstop to the cooperative KERN_MAX_CONCURRENT counter. Shown only when a
@@ -4797,6 +4833,15 @@ mod tests {
                         last.contains("help"),
                         "tab {tab}, {term_rows} rows, sel {sel}: the last line is not the footer: {last:?}"
                     );
+                    // The Overview says where the sandbox history is kept, and how to change it.
+                    if tab == TAB_OVERVIEW && term_rows >= 40 {
+                        assert!(
+                            frame.lines().any(|l| l.contains("History")
+                                && l.contains("○")
+                                && l.contains("m to change")),
+                            "{frame}"
+                        );
+                    }
                 }
             }
         }
@@ -4852,6 +4897,27 @@ mod tests {
             empty.contains("none yet") && empty.contains("0 running"),
             "{empty}"
         );
+        // WHERE THE HISTORY IS KEPT is on the tab, all three choices with one marked, the count and
+        // the key: a reader must not have to press `m` to learn the default clears at reboot.
+        let hist = out
+            .lines()
+            .find(|l| l.contains("HISTORY"))
+            .unwrap_or_default();
+        let marked = ["● memory", "● disk", "● off"]
+            .iter()
+            .filter(|m| hist.contains(*m))
+            .count();
+        let open = ["○ memory", "○ disk", "○ off"]
+            .iter()
+            .filter(|m| hist.contains(*m))
+            .count();
+        assert!(
+            marked == 1
+                && open == 2
+                && hist.contains("300 sandboxes")
+                && hist.contains("m to change"),
+            "{out}"
+        );
         // THE LIVE SECTION HAS ONE HEIGHT, whatever runs: the list under it must not jump.
         let h = |live: &[Row]| {
             sandboxes_table(&plain(), live, &done, 20, 0)
@@ -4875,8 +4941,12 @@ mod tests {
         };
         assert!(line("pysbx-000000000299").contains('●'), "{fresh}");
         let old_one = sandboxes_table_at(&plain(), &[], &newest, 20, 0, now + 10_000);
+        // The finished rows only: the HISTORY line marks the current choice with the same dot.
         assert!(
-            !old_one.contains('●'),
+            !old_one
+                .lines()
+                .filter(|l| l.contains("pysbx-"))
+                .any(|l| l.contains('●')),
             "nothing is fresh ten seconds later: {old_one}"
         );
         // The per-second activity counts the ends inside the last minute, and only those.
