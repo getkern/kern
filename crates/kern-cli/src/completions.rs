@@ -24,6 +24,7 @@ const VERBS: &[&str] = &[
     "ps",
     "top",
     "stats",
+    "sandbox",
     "inspect",
     "pause",
     "unpause",

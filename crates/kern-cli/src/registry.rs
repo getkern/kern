@@ -115,6 +115,13 @@ pub struct Instance {
     /// `seccompmode` line parses as [`SeccompFilter::Denylist`](kern_isolation::SeccompFilter): the
     /// allowlist did not exist for such a box, so this is provable, not a guess.
     pub seccomp_mode: kern_isolation::SeccompFilter,
+    /// Whether the box runs with no-new-privileges (`nnp=1`). `kern exec` applies the SAME choice. A
+    /// record with no `nnp` line predates the choice, when every box had it: `true`, the stricter side.
+    pub no_new_privs: bool,
+    /// Whether the box keeps its supplementary groups (`keepgroups=1`), set by a GPU grant whose nodes
+    /// open only through a group: `kern exec` and the health probe keep them too. A record without the
+    /// line predates it: `false`, the stricter side. See `kern_isolation::SandboxSpec::keep_groups`.
+    pub keep_groups: bool,
     /// `--apparmor <profile>` the box entered on exec (empty = none). Part of the exec POSTURE, like
     /// `seccomp_mode`/`cap_*`: `kern exec` re-enters the RECORDED profile rather than deducing it from
     /// `/proc/<pid1>/attr/apparmor/current`, which reads UNCONFINED for an `--init` box (PID 1 is the
@@ -425,7 +432,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 11] = [
+const AUTHORITATIVE_DIRS: [&str; 12] = [
     "instances",
     "claims",
     "exit",
@@ -446,6 +453,10 @@ const AUTHORITATIVE_DIRS: [&str; 11] = [
     // rather than opaque box bytes. It also holds the relay holder's pid, and a box able to rewrite
     // that would aim `compose down`'s kill at a process of its choosing.
     "relays",
+    // `history/` is printed by `kern sandbox history` and `stats` as what happened to boxes that are
+    // gone. kern reads it and reports it as fact, so a box able to write a line there invents a run, or
+    // hides one: the same forgery as `waitexit`, which is why it sits beside it. See `history.rs`.
+    "history",
     // `mounts/` is where a network volume (sshfs/nfs/smb) is staged before it is bound into a box,
     // and it is AUTHORITATIVE for two reasons rather than one: what is mounted there is a PEER's
     // remote filesystem, and the path itself is a location kern acts on during that peer's start, so
@@ -755,6 +766,34 @@ pub fn set_box_exit(pid: i32, starttime: u64, code: i32, name: &str, pod: &str, 
     }
 }
 
+/// Remove every exit record (`waitexit`) of a box named `name` whose process is gone, and say how
+/// many there were: what `kern rm` does to an exited box, as `docker rm` removes an exited container
+/// from `docker ps -a`. A record of a live process is left alone.
+pub fn clear_exited_named(name: &str) -> usize {
+    let Ok(d) = waitexit_dir() else {
+        return 0;
+    };
+    let Ok(rd) = fs::read_dir(&d) else {
+        return 0;
+    };
+    let mut cleared = 0;
+    for e in rd.flatten() {
+        let Some((pid, starttime)) = waitexit_split(&e.file_name()) else {
+            continue;
+        };
+        if is_alive(pid, starttime) {
+            continue;
+        }
+        let named = fs::read_to_string(e.path())
+            .ok()
+            .is_some_and(|body| body.lines().nth(1) == Some(name));
+        if named && fs::remove_file(e.path()).is_ok() {
+            cleared += 1;
+        }
+    }
+    cleared
+}
+
 /// A completed box's recorded exit code for `(pid, starttime)`, or `None` if it never completed here.
 /// NON-consuming: several `kern wait` on the same box all read the same code (matching Docker); the
 /// sidecar is reaped by `prune`/`gc` once the pid is dead, not on read.
@@ -1027,7 +1066,7 @@ pub(crate) fn runtime_subdir_public(leaf: &str) -> io::Result<PathBuf> {
     runtime_subdir(leaf)
 }
 
-fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
+pub(crate) fn runtime_subdir(leaf: &str) -> io::Result<PathBuf> {
     // MEMOIZED PER PROCESS, because the answer cannot change within one and the walk is not free.
     // MEASURED on a box start: `mkdir("/run/user/1000/kern/instances")` was issued FOUR times and
     // `kern` twice, each returning EEXIST, because every helper that needs a runtime path resolves it
@@ -1342,7 +1381,7 @@ pub fn now_unix() -> u64 {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\n",
         inst.name,
         inst.pid,
         inst.pid1_recorded,
@@ -1381,6 +1420,8 @@ fn encode(inst: &Instance) -> String {
             .map(|(d, i)| format!("{d}:{i}"))
             .unwrap_or_default(),
         inst.pid1_starttime,
+        u8::from(inst.no_new_privs),
+        u8::from(inst.keep_groups),
     )
 }
 
@@ -2653,6 +2694,8 @@ fn parse(body: &str) -> Option<Instance> {
     let mut cap_recorded = false;
     let mut aa_recorded = false;
     let mut seccomp_recorded = false;
+    let mut no_new_privs = true;
+    let mut keep_groups = false;
     let mut posture_corrupt = false;
     // Completeness: `encode` writes `capdropall`, `capdrops`, `capadds` together (one feature, one era),
     // so a record that has `capdropall` but is MISSING either list is TRUNCATED, and exec must refuse it
@@ -2743,6 +2786,8 @@ fn parse(body: &str) -> Option<Instance> {
             }
             // A PRESENT-but-unrecognised mode is corruption (refuse). An ABSENT line is a box from
             // before this field: it stays the default Denylist, which is what that box actually ran.
+            "nnp" => no_new_privs = v != "0",
+            "keepgroups" => keep_groups = v == "1",
             "seccompmode" => {
                 seccomp_recorded = true;
                 match kern_isolation::SeccompFilter::parse(v) {
@@ -2804,6 +2849,8 @@ fn parse(body: &str) -> Option<Instance> {
         cap_drops,
         cap_adds,
         seccomp_mode,
+        no_new_privs,
+        keep_groups,
         apparmor,
         cap_recorded,
         aa_recorded,
@@ -3282,6 +3329,52 @@ mod tests {
         );
     }
 
+    /// A box's no-new-privileges choice survives the record, so `kern exec` applies the same one; a
+    /// record without the line predates the choice, when every box had it, and reads as `true`.
+    #[test]
+    fn no_new_privs_survives_the_record_and_an_old_record_reads_as_true() {
+        let old = parse(
+            "name=b\npid=1\npid1=2\ncapdropall=1\ncapdrops=\ncapadds=\nseccompmode=denylist\n",
+        );
+        assert!(
+            old.is_some_and(|i| i.no_new_privs),
+            "an old record must read as no-new-privs"
+        );
+        for want in [false, true] {
+            let rec = format!(
+                "name=b\npid=1\npid1=2\ncapdropall=1\ncapdrops=\ncapadds=\nseccompmode=denylist\nnnp={}\n",
+                u8::from(want)
+            );
+            let Some(inst) = parse(&rec) else {
+                panic!("the record did not parse");
+            };
+            assert_eq!(inst.no_new_privs, want);
+            let again = parse(&encode(&inst));
+            assert_eq!(again.map(|i| i.no_new_privs), Some(want), "round trip");
+        }
+    }
+
+    /// A GPU box that keeps its groups must still keep them for `kern exec` and its health probe,
+    /// which read the record; a record written before the field existed is a box that cleared them.
+    #[test]
+    fn keep_groups_survives_the_record_and_an_old_record_reads_as_false() {
+        let base =
+            "name=b\npid=1\npid1=2\ncapdropall=1\ncapdrops=\ncapadds=\nseccompmode=denylist\n";
+        assert!(
+            parse(base).is_some_and(|i| !i.keep_groups),
+            "an old record must read as a box that cleared its groups"
+        );
+        for want in [false, true] {
+            let rec = format!("{base}keepgroups={}\n", u8::from(want));
+            let Some(inst) = parse(&rec) else {
+                panic!("the record did not parse");
+            };
+            assert_eq!(inst.keep_groups, want);
+            let again = parse(&encode(&inst));
+            assert_eq!(again.map(|i| i.keep_groups), Some(want), "round trip");
+        }
+    }
+
     #[test]
     fn apparmor_survives_the_record_round_trip_and_reaches_exec_posture() {
         // The `--apparmor` profile is part of the exec POSTURE: it must survive encode->parse and come
@@ -3473,6 +3566,8 @@ mod tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            no_new_privs: true,
+            keep_groups: false,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -3743,6 +3838,8 @@ mod tests {
             cap_drops: "12,13".into(),
             cap_adds: "10".into(),
             seccomp_mode: kern_isolation::SeccompFilter::Allowlist,
+            no_new_privs: true,
+            keep_groups: false,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -3786,6 +3883,8 @@ mod tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            no_new_privs: true,
+            keep_groups: false,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -4100,6 +4199,8 @@ mod tests {
                 cap_drops: String::new(),
                 cap_adds: String::new(),
                 seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+                no_new_privs: true,
+                keep_groups: false,
                 apparmor: String::new(),
                 cap_recorded: true,
                 aa_recorded: true,
@@ -4177,6 +4278,8 @@ mod tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            no_new_privs: true,
+            keep_groups: false,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -4257,6 +4360,8 @@ mod tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            no_new_privs: true,
+            keep_groups: false,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,

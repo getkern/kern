@@ -673,10 +673,39 @@ pub(crate) fn merged_view_child(
             // `dst_name = None` is the copier's own spelling of "the CONTENTS of this directory",
             // which is exactly what `Whole` uses for `.`.
             Extract::Contents(p) => {
-                copy_confined_tree(root_fd, p.trim_start_matches('/'), out_fd, None, 0)
+                let rel = p.trim_start_matches('/');
+                let code = copy_confined_tree(root_fd, rel, out_fd, None, 0);
+                own_like_source_dir(root_fd, rel, out_fd);
+                code
             }
         };
         libc::_exit(code);
+    }
+}
+
+/// Give `dst_fd` the owner and mode of the directory `src_rel` in the merged view, as Docker gives a
+/// new named volume the owner and mode of the image directory it is mounted over.
+///
+/// ⛔ WHY IN THE MERGED VIEW: the caller used to read the owner from the TOP layer only. speaches'
+/// image makes `/home/ubuntu/.cache/huggingface/hub` as `ubuntu` in a layer that is not the top one,
+/// so the read failed, the volume stayed `0:0`, and the server died on its first model download with
+/// "Permission denied: '/home/ubuntu/.cache/huggingface/hub'". MEASURED in the field on a WSL2 guest;
+/// the Dockerfile carries that very error in a comment, because docker gives the volume `ubuntu`.
+/// Read here, a directory deleted or made opaque by a higher layer lends no owner either.
+///
+/// Best effort, as every owner the copier sets: a failure leaves the volume as it was.
+unsafe fn own_like_source_dir(root_fd: libc::c_int, src_rel: &str, dst_fd: libc::c_int) {
+    let sfd = openat2_in_root(root_fd, src_rel, libc::O_PATH | libc::O_NOFOLLOW);
+    if sfd < 0 {
+        return;
+    }
+    let mut st: libc::stat = std::mem::zeroed();
+    let ok = libc::fstatat(sfd, c"".as_ptr(), &mut st, libc::AT_EMPTY_PATH) == 0;
+    libc::close(sfd);
+    if ok && st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        libc::fchown(dst_fd, st.st_uid, st.st_gid);
+        // AFTER the chown, which clears setgid.
+        libc::fchmod(dst_fd, st.st_mode & 0o7777);
     }
 }
 
@@ -1014,9 +1043,14 @@ pub(crate) fn single_threaded() -> bool {
 pub(crate) fn resolve_relative_binds(
     boxes: &mut [crate::compose::ComposeBox],
     file: &str,
+    root: &std::path::Path,
 ) -> Result<(), Error> {
     let base = std::fs::canonicalize(compose_dir(file))
         .map_err(|e| Error::Compose(format!("resolving compose dir: {e}")))?;
+    // `root` IS THE BOUNDARY, which `--project-root` may have widened (the caller asks
+    // `compose_root`); `base` stays where paths resolve from. EVERY check below compares against
+    // `root`: the first version widened the lexical check and left the two canonical ones on `base`,
+    // so `config` accepted the file and `up` still refused it.
 
     for b in boxes.iter_mut() {
         for v in b.volumes.iter_mut() {
@@ -1035,8 +1069,9 @@ pub(crate) fn resolve_relative_binds(
             // volume" rule sent the single most common bind in existence (`.:/app`, mount the project
             // root) to the volume-name validator, which refused it. Docker resolves both against the
             // project directory. Anything else without a slash really is a named volume.
-            let is_dot = src == "." || src == "..";
-            if !is_dot && (src.starts_with('/') || !src.contains('/')) {
+            // THE CLASSIFICATION AND THE GUARD ARE kern-compose's, shared with the reader of an
+            // `include:` model, so "relative path" and "inside the project" mean one thing in both.
+            if !crate::compose::is_relative_bind_source(src) {
                 continue;
             }
             // Docker CREATES a missing relative bind source. Refusing broke the most ordinary
@@ -1044,28 +1079,15 @@ pub(crate) fn resolve_relative_binds(
             // `up` failed because `./data` does not exist yet. We create it too, but SAY SO - Docker
             // creating directories silently is how a typo'd path becomes an empty mount nobody
             // notices. Only under the compose directory, and only for a path that is relative, so the
-            // traversal guard below still decides what is allowed.
-            let target = base.join(src);
-            // Containment is checked LEXICALLY first, BEFORE creating anything: `canonicalize` needs
-            // the path to exist, so a `../x` source would otherwise have its directory created and
-            // only then be refused - a filesystem side effect outside the project, caused by the very
-            // input we are about to reject.
-            // Walk the components keeping a depth counter: a `..` at depth 0 would step above the
-            // project, so `try_fold` short-circuits to `None` and that IS the escape.
-            let escapes = src
-                .split('/')
-                .try_fold(0i32, |depth, seg| match seg {
-                    "" | "." => Some(depth),
-                    ".." => (depth > 0).then_some(depth - 1),
-                    _ => Some(depth + 1),
-                })
-                .is_none();
-            if escapes {
-                return Err(Error::Compose(format!(
-                    "service '{}': bind source '{src}' escapes the compose directory (refused)",
-                    b.name
-                )));
-            }
+            // guard decides what is allowed BEFORE anything is created: it is lexical first, so a
+            // `../x` source is refused without its directory ever being made outside the project.
+            let target = crate::compose::path_under_root(root, &base, src).map_err(|e| {
+                Error::Compose(format!(
+                    "service '{}': bind source {e} (refused){}",
+                    b.name,
+                    crate::commands::WIDEN_HINT
+                ))
+            })?;
             if !target.exists() {
                 std::fs::create_dir_all(&target).map_err(|e| {
                     Error::Compose(format!(
@@ -1081,10 +1103,11 @@ pub(crate) fn resolve_relative_binds(
             let abs = std::fs::canonicalize(&target).map_err(|e| {
                 Error::Compose(format!("service '{}': bind source '{src}': {e}", b.name))
             })?;
-            if !abs.starts_with(&base) {
+            if !abs.starts_with(root) {
                 return Err(Error::Compose(format!(
-                    "service '{}': bind source '{src}' escapes the compose directory (refused)",
-                    b.name
+                    "service '{}': bind source '{src}' escapes the project directory (refused){}",
+                    b.name,
+                    crate::commands::WIDEN_HINT
                 )));
             }
             *v = format!("{}:{rest}", abs.to_string_lossy());
@@ -1101,10 +1124,11 @@ pub(crate) fn resolve_relative_binds(
             let abs = std::fs::canonicalize(base.join(file)).map_err(|e| {
                 Error::Compose(format!("service '{}': secret file '{file}': {e}", b.name))
             })?;
-            if !abs.starts_with(&base) {
+            if !abs.starts_with(root) {
                 return Err(Error::Compose(format!(
-                    "service '{}': secret file '{file}' escapes the compose directory (refused)",
-                    b.name
+                    "service '{}': secret file '{file}' escapes the project directory (refused){}",
+                    b.name,
+                    crate::commands::WIDEN_HINT
                 )));
             }
             *s = format!("{}:{nm}", abs.to_string_lossy());
@@ -1789,6 +1813,20 @@ pub(crate) fn copy_into_rootfs(
     //   - a FILE to a non-dir dest is a rename → `dst`.
     // `rootfs` is this unit's fresh (empty) layer, so a dir that exists only in a LOWER layer is found
     // via `chain` (the cached-layer build); the flat build passes an empty chain.
+    //
+    // THROUGH THE IMAGE'S SYMLINKS, as docker resolves the destination: `/bin/uv` on a usr-merged
+    // image is `/usr/bin/uv`, and writing a real `bin/` would hide the image's `/bin` (see
+    // `chain_resolve`). A trailing `/` is the caller's statement that the destination is a directory
+    // and is kept.
+    // `rootfs` IS THE TOP LAYER: the flat build passes the whole image there and an empty `chain`.
+    let mut seen: Vec<String> = chain.to_vec();
+    seen.push(rootfs.to_string_lossy().into_owned());
+    let resolved = crate::commands::imagecache::chain_resolve(&seen, &dst_abs);
+    let dst_abs = if dst.ends_with('/') && !resolved.is_empty() {
+        format!("/{resolved}/")
+    } else {
+        format!("/{resolved}")
+    };
     let dst_clean = dst_abs.trim_start_matches('/');
     let dst_is_dir =
         dst.ends_with('/') || rootfs.join(dst_clean).is_dir() || chain_has_dir(chain, dst_clean);
@@ -1821,6 +1859,10 @@ pub(crate) fn copy_into_rootfs(
     }
     let target = rootfs.join(&target_rel);
     materialize_dst_dirs(rootfs, chain, &parent_rel);
+    // THE PARENTS THE IMAGE ALREADY HAS KEEP THEIR OWNER (see `own_created_dirs`).
+    if !chain.is_empty() {
+        own_created_dirs(rootfs, &dir_owners(chain, &parent_rel, None));
+    }
     // If the target itself is an existing symlink, unlink it so we don't copy THROUGH it out of the
     // rootfs (COPY overwrites the name, following Docker).
     if let Ok(m) = std::fs::symlink_metadata(&target) {
@@ -1948,6 +1990,89 @@ pub(crate) fn sanitize_rootfs_rel(orig: &str, rel: &str) -> Result<String, Error
         )));
     }
     Ok(rel.to_string())
+}
+
+/// Who owns a directory a build step created in its own layer.
+pub(crate) enum DirOwner {
+    /// The same directory in a layer below, whose owner the new entry must carry: in an overlay the
+    /// upper directory's owner is the one the image shows.
+    Below(std::path::PathBuf),
+    /// Ids in the box's map (the build `USER`'s, for a directory `WORKDIR` creates), mode 0755 as
+    /// docker gives a directory it creates.
+    Ids(u32, u32),
+}
+
+/// The owner every component of `rel` should have in a layer stacked on `chain`: the component's own
+/// owner below when it exists there, else `new` (or none).
+pub(crate) fn dir_owners(
+    chain: &[String],
+    rel: &str,
+    new: Option<(u32, u32)>,
+) -> Vec<(String, DirOwner)> {
+    let mut out = Vec::new();
+    let mut acc = String::new();
+    for part in rel.split('/').filter(|p| !p.is_empty() && *p != ".") {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(part);
+        let below = chain.iter().rev().find_map(|d| {
+            let p = std::path::Path::new(d).join(&acc);
+            std::fs::symlink_metadata(&p).ok().map(|_| p)
+        });
+        match (below, new) {
+            (Some(p), _) => out.push((acc.clone(), DirOwner::Below(p))),
+            (None, Some((u, g))) => out.push((acc.clone(), DirOwner::Ids(u, g))),
+            (None, None) => out.push((acc.clone(), DirOwner::Ids(0, 0))),
+        }
+    }
+    out
+}
+
+/// Give the directories a build step created in `layer` their owners, in the namespace that carries
+/// the box's own uid map: there the ids a box sees can be assigned, as a normal user and as root.
+///
+/// ⛔ WHY: `WORKDIR $HOME/speaches` after `USER ubuntu` created `home/ubuntu/speaches` in a new layer,
+/// and with it `home/ubuntu`, owned by the builder. In an overlay the upper directory's owner is the
+/// one the image shows, so `/home/ubuntu` became root's and `ubuntu` could no longer write its own
+/// home: speaches' `uv sync` died with "failed to create directory `/home/ubuntu/.cache/uv`:
+/// Permission denied". MEASURED in the field on a WSL2 guest. Docker creates the missing component
+/// only, owned by the build `USER` (BuildKit), and leaves the existing ones as they are.
+///
+/// Best effort: where no mapped namespace can be made the directories keep the builder's owner, which
+/// is what every build did before.
+pub(crate) fn own_created_dirs(layer: &std::path::Path, items: &[(String, DirOwner)]) {
+    if items.is_empty() {
+        return;
+    }
+    let _ = kern_isolation::with_id_mapped_userns(|_| {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        for (rel, owner) in items {
+            // THE MODE TOO: the layer's directory is made with the builder's umask (0775 measured
+            // here), so an image's `drwxr-x--- /home/ubuntu` came out group-writable and world-
+            // readable. Below: the image's own mode; new: 0755, as docker creates one.
+            let (uid, gid, mode) = match owner {
+                DirOwner::Below(p) => match std::fs::symlink_metadata(p) {
+                    Ok(m) => (m.uid(), m.gid(), m.mode() & 0o7777),
+                    Err(_) => continue,
+                },
+                DirOwner::Ids(u, g) => (*u, *g, 0o755),
+            };
+            let here = layer.join(rel);
+            if !std::fs::symlink_metadata(&here).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            if let Ok(c) = std::ffi::CString::new(here.as_os_str().as_bytes()) {
+                // SAFETY: a NUL-terminated path that outlives both calls.
+                unsafe {
+                    libc::lchown(c.as_ptr(), uid, gid);
+                    libc::chmod(c.as_ptr(), mode as libc::mode_t);
+                }
+            }
+        }
+        0
+    });
 }
 
 /// `mkdir -p` a workdir inside the rootfs, refusing a `..` escape or a symlinked component that

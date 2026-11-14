@@ -247,6 +247,7 @@ mod eintr;
 mod error;
 mod gpu;
 mod gpu_grant;
+mod history;
 mod keepbox;
 mod listing;
 /// Peer addressing and hosts files for a `--no-pod` stack.

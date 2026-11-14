@@ -2348,19 +2348,38 @@ fn build_check_reports_without_building_and_its_status_is_the_answer() {
     assert!(!out.status.success(), "ONBUILD must fail the check");
     assert!(text.contains("ONBUILD"), "and name it: {text}");
 
-    // THE CASE THIS VERB WAS ASKED FOR: a credential a kern build cannot deliver. Refused loudly
-    // here, before a base image is pulled, instead of at the `RUN` that would have run unauthenticated.
+    // A BUILD SECRET IS HONOURED NOW (`kern build --secret`), so the check passes and names the
+    // mount by its type, where it used to refuse the file as one kern could not build.
     write(
         "Dockerfile.secret",
         "FROM alpine:3.19\nRUN --mount=type=secret,id=n,target=/r npm ci\n",
     );
     let out = check("Dockerfile.secret");
-    let text = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(!out.status.success(), "a build secret must fail the check");
-    assert!(
-        text.contains("secret"),
-        "and say which flag it cannot honour: {text}"
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
+    assert!(
+        out.status.success(),
+        "a build secret is honoured now: {text}"
+    );
+    assert!(
+        text.contains("--mount secret"),
+        "and the report names the mount: {text}"
+    );
+    // A MOUNT THAT CANNOT BE READ still fails it, by name.
+    write(
+        "Dockerfile.badmount",
+        "FROM alpine:3.19\nRUN --mount=type=volume,target=/v true\n",
+    );
+    let out = check("Dockerfile.badmount");
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "an unknown mount type must fail the check"
+    );
+    assert!(text.contains("type=volume"), "and name it: {text}");
 
     // A COPY THAT ESCAPES THE CONTEXT IS NOT "BUILDS HERE", and the first version of this verb said
     // it was. The gate's whole value is that a green means green: a file whose first COPY the build
@@ -2799,4 +2818,578 @@ fn an_empty_listing_names_bytes_in_the_cache_that_no_image_claims() {
         "one directory under the root is one entry, whatever it holds inside: {said}"
     );
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// THE DRY RUN SAYS WHAT `up` WILL SAY ABOUT A PATH THAT LEAVES THE PROJECT, AND `include:` IS READ
+/// THROUGH THE REAL COMMAND.
+///
+/// MEASURED 2026-11-12 on LLMSystems/vLLMux, which keeps its compose file in `deploy/` and builds
+/// from `..`: `compose config` printed a clean preview and `compose up` refused "build context '..'
+/// escapes the compose directory". And on NVIDIA-Omniverse/usd-search, whose services live in files
+/// it `include:`s from `infra/compose/`, kern listed none of them. Both are driven through the
+/// binary here, because each defect lived in the command and not in a function a unit test calls.
+#[test]
+fn compose_config_refuses_a_path_out_of_the_project_and_reads_include() {
+    let root = std::env::temp_dir().join(format!("kern-smoke-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("deploy")).expect("fixture dir");
+    std::fs::create_dir_all(root.join("infra/compose")).expect("fixture dir");
+    let run = |dir: &std::path::Path, body: &str| -> (bool, String) {
+        std::fs::write(dir.join("docker-compose.yml"), body).expect("write compose");
+        let out = kern()
+            .current_dir(dir)
+            .env_remove("COMPOSE_PROFILES")
+            .args(["compose", "-f", "docker-compose.yml", "config"])
+            .output()
+            .expect("run kern");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let deploy = root.join("deploy");
+    let (ok, said) = run(
+        &deploy,
+        "services:\n  b:\n    image: alpine\n    build: ..\n",
+    );
+    let (inside_ok, inside) = run(
+        &deploy,
+        "services:\n  b:\n    image: alpine\n    volumes:\n      - ./data:/data\n",
+    );
+    std::fs::write(
+        root.join("infra/compose/m.yml"),
+        "services:\n  included:\n    image: alpine\n",
+    )
+    .expect("write included");
+    let (inc_ok, inc) = run(
+        &root,
+        "include:\n  - infra/compose/m.yml\nservices:\n  top:\n    image: alpine\n",
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        !ok && said.contains("escapes the project directory"),
+        "config must refuse what up refuses:\n{said}"
+    );
+    assert!(
+        inside_ok,
+        "the CONTROL: a path inside the project still passes, or the guard is a blanket:\n{inside}"
+    );
+    assert!(
+        inc_ok && inc.contains("included") && inc.contains("2 service(s)"),
+        "an included model's services are part of the stack:\n{inc}"
+    );
+}
+
+/// ⛔ `--project-root`: THE OPERATOR WIDENS THE PROJECT, the file cannot.
+///
+/// LLMSystems/vLLMux keeps its compose file in `deploy/` and builds from `..`; docker runs it and
+/// kern refused. The refusal stays the default (a downloaded file must not reach `../../.ssh`), it
+/// now names the flag, and with the flag the same file passes; a root that does not contain the
+/// file is refused, because widening is not moving.
+#[test]
+fn compose_project_root_widens_the_boundary_and_only_around_the_file() {
+    let root = std::env::temp_dir().join(format!("kern-smoke-proot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("repo/deploy")).expect("fixture dir");
+    std::fs::create_dir_all(root.join("elsewhere")).expect("fixture dir");
+    std::fs::create_dir_all(root.join("repo/data")).expect("fixture dir");
+    std::fs::write(
+        root.join("repo/deploy/compose.yaml"),
+        "services:\n  b:\n    image: alpine\n    build: ..\n    volumes:\n      - ../data:/data\n",
+    )
+    .expect("write compose");
+    let run = |extra: &[&str]| -> (bool, String) {
+        let mut args: Vec<String> = vec!["compose".into()];
+        args.extend(extra.iter().map(|s| (*s).to_string()));
+        args.extend(["-f".into(), "deploy/compose.yaml".into(), "config".into()]);
+        let out = kern()
+            .current_dir(root.join("repo"))
+            .env_remove("COMPOSE_PROFILES")
+            .args(&args)
+            .output()
+            .expect("run kern");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (plain_ok, plain) = run(&[]);
+    let repo = root.join("repo").to_string_lossy().into_owned();
+    let (wide_ok, wide) = run(&["--project-root", &repo]);
+    let other = root.join("elsewhere").to_string_lossy().into_owned();
+    let (other_ok, other_said) = run(&["--project-root", &other]);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        !plain_ok && plain.contains("--project-root"),
+        "the default refuses, and the refusal names the way to widen it:\n{plain}"
+    );
+    assert!(
+        wide_ok,
+        "the operator's root lets the file's paths reach it:\n{wide}"
+    );
+    assert!(
+        !other_ok && other_said.contains("does not contain"),
+        "a root beside the project is refused:\n{other_said}"
+    );
+}
+
+/// `kern compose <verb> <service>` WITH NO FILE is docker's spelling: the word after the verb is a
+/// service and the file is found in the directory. MEASURED in the field: `kern compose up -d
+/// immich-machine-learning`, typed as immich's docs write it, answered "reading
+/// immich-machine-learning: No such file or directory".
+#[test]
+fn a_word_after_the_compose_verb_is_a_service_and_the_file_is_discovered() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-disc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  web:\n    image: alpine\n",
+    )
+    .expect("write");
+    let out = kern()
+        .current_dir(&dir)
+        .env_remove("COMPOSE_PROFILES")
+        .args(["compose", "ps", "web"])
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !said.contains("reading web"),
+        "the service name was read as a compose file:\n{said}"
+    );
+    assert!(out.status.success(), "{said}");
+}
+
+/// ⛔ A COMPOSE FILE CONNECTS NO BUILD TO A HOST SOCKET. FOUND BY AUDIT, rootless: `build.ssh:
+/// [x=<a socket in the project>]` and a `RUN --mount=type=ssh` reached the listener, and the same
+/// way the user's systemd manager or a docker socket. `-v` refuses a socket; so does `build.ssh`
+/// now, unless it is the operator's own agent. The listener is real here, and nothing may connect.
+#[test]
+fn compose_build_ssh_never_reaches_a_host_socket_the_file_names() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-sshsock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let listener =
+        std::os::unix::net::UnixListener::bind(dir.join("host.sock")).expect("bind a socket");
+    listener.set_nonblocking(true).expect("nonblocking");
+    std::fs::write(
+        dir.join("Dockerfile"),
+        "FROM scratch\nRUN --mount=type=ssh,id=x true\n",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("compose.yaml"),
+        "services:\n  a:\n    image: kern-smoke-sshsock:1\n    build:\n      context: .\n      ssh:\n        - x=./host.sock\n",
+    )
+    .expect("write");
+    let out = kern()
+        .current_dir(&dir)
+        .env_remove("SSH_AUTH_SOCK")
+        .args(["compose", "build"])
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let connected = listener.accept().is_ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success() && said.contains("not your SSH agent"),
+        "a compose file's socket was accepted for a build:\n{said}"
+    );
+    assert!(
+        !connected,
+        "something connected to the host socket:\n{said}"
+    );
+}
+
+/// `compose up <svc>` BUILDS ONLY WHAT IT STARTS, as docker does. MEASURED in the field: `up ollama
+/// ollama-webui` on valiantlynx/ollama-docker built the file's `app` service too. Here the other
+/// service's build would fail outright, so trying it at all is visible.
+#[test]
+fn compose_up_of_one_service_does_not_build_the_others() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-onlybuild-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("compose.yaml"),
+        "services:\n  a:\n    build: ./no-such-context\n  b:\n    image: kern-smoke-no-such-image:1\n",
+    )
+    .expect("write");
+    let out = kern()
+        .current_dir(&dir)
+        .env_remove("COMPOSE_PROFILES")
+        .args(["compose", "up", "-d", "--pull", "never", "b"])
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !said.contains("no-such-context"),
+        "the service that was not asked for was built:\n{said}"
+    );
+}
+
+/// ⛔ `image:` + `build:` FOLLOWS DOCKER, MEASURED with Compose v5.0.2: an image that is here (or can
+/// be pulled) is used and not rebuilt, one that is not is built, and `--build` builds. kern built
+/// every time, so open-webui's `up` was a full build from source where docker downloads the image.
+/// Offline: `pull_policy: never`, so "not here" can only mean "build it".
+#[test]
+fn compose_image_and_build_uses_the_image_when_it_exists_as_docker_does() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-g4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("ctx")).expect("dir");
+    std::fs::write(dir.join("ctx/Dockerfile"), "FROM scratch\nCOPY f /f\n").expect("write");
+    std::fs::write(dir.join("ctx/f"), "x").expect("write");
+    std::fs::write(
+        dir.join("compose.yaml"),
+        "services:\n  s:\n    image: kern-smoke-g4:1\n    build: ./ctx\n    pull_policy: never\n    command: [\"/f\"]\n",
+    )
+    .expect("write");
+    let up = |extra: &[&str]| {
+        let mut args = vec!["compose", "-f", "compose.yaml", "up", "-d"];
+        args.extend_from_slice(extra);
+        let out = kern()
+            .current_dir(&dir)
+            .env("XDG_CACHE_HOME", dir.join("cache"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env_remove("COMPOSE_PROFILES")
+            .args(&args)
+            .output()
+            .expect("run kern");
+        let _ = kern()
+            .current_dir(&dir)
+            .env("XDG_CACHE_HOME", dir.join("cache"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .args(["compose", "-f", "compose.yaml", "down"])
+            .output();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let first = up(&[]);
+    let second = up(&[]);
+    let forced = up(&["--build"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    if first.contains("user namespaces") {
+        eprintln!("skip: no user namespaces to build in: {first}");
+        return;
+    }
+    assert!(
+        first.contains("is not available") && first.contains("built 'kern-smoke-g4:1'"),
+        "an image that is not here was not built:\n{first}"
+    );
+    assert!(
+        second.contains("using the published image") && !second.contains("built 'kern-smoke-g4:1'"),
+        "an image that is here was built again:\n{second}"
+    );
+    assert!(
+        forced.contains("built 'kern-smoke-g4:1'"),
+        "`--build` did not build:\n{forced}"
+    );
+}
+
+/// ⛔ A SERVICE THAT RUNS ITS PUBLISHED IMAGE IS NOT REFUSED FOR A BUILD CONTEXT IT NEVER READS.
+/// InvokeAI builds from `..` and names its published image; docker uses the image. The context
+/// guard still applies the moment a build is asked for.
+#[test]
+fn an_unread_build_context_outside_the_project_is_not_refused() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-ctxout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("proj/docker")).expect("dir");
+    std::fs::write(dir.join("proj/Dockerfile"), "FROM scratch\nCOPY f /f\n").expect("write");
+    std::fs::write(dir.join("proj/f"), "x").expect("write");
+    std::fs::write(
+        dir.join("proj/docker/compose.yaml"),
+        "services:\n  s:\n    image: kern-smoke-ctxout:1\n    build:\n      context: ..\n    pull_policy: never\n    command: [\"/f\"]\n",
+    )
+    .expect("write");
+    let compose = |extra: &[&str]| {
+        let mut args = vec!["compose", "-f", "compose.yaml"];
+        args.extend_from_slice(extra);
+        let out = kern()
+            .current_dir(dir.join("proj/docker"))
+            .env("XDG_CACHE_HOME", dir.join("cache"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env_remove("COMPOSE_PROFILES")
+            .args(&args)
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    // Put the image in place the way a published one would be: built once, explicitly allowed.
+    let seeded = compose(&["--project-root", "..", "build"]);
+    let up = compose(&["up", "-d"]);
+    let _ = compose(&["down"]);
+    let forced = compose(&["up", "-d", "--build"]);
+    let _ = compose(&["down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    if seeded.contains("user namespaces") {
+        eprintln!("skip: no user namespaces to build in: {seeded}");
+        return;
+    }
+    assert!(
+        seeded.contains("built 'kern-smoke-ctxout:1'"),
+        "the fixture image was not built:\n{seeded}"
+    );
+    assert!(
+        up.contains("using the published image") && !up.contains("escapes the compose directory"),
+        "a context nothing reads was refused:\n{up}"
+    );
+    assert!(
+        forced.contains("escapes the compose directory"),
+        "`--build` with a context outside the project was not refused:\n{forced}"
+    );
+}
+
+/// ⛔ INSIDE A GIT REPOSITORY THE REPOSITORY IS THE PROJECT, AND NOTHING OUTSIDE IT IS. Kokoro-FastAPI
+/// keeps its compose file in `docker/gpu/` and binds `../../web`; docker accepts it, and kern refused
+/// it until `--project-root`. A path leaving the repository is still refused, and a repository that
+/// holds the home directory (a dotfiles repository) widens nothing.
+#[test]
+fn a_compose_file_in_a_git_repository_may_reach_the_repository_and_nothing_else() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-gitroot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).expect("dir");
+    std::fs::create_dir_all(repo.join("docker/gpu")).expect("dir");
+    std::fs::create_dir_all(repo.join("web")).expect("dir");
+    std::fs::create_dir_all(dir.join("outside")).expect("dir");
+    let config = |bind: &str, home: &std::path::Path| {
+        std::fs::write(
+            repo.join("docker/gpu/compose.yaml"),
+            format!("services:\n  s:\n    image: alpine:3.19\n    volumes:\n      - {bind}:/d\n"),
+        )
+        .expect("write");
+        let out = kern()
+            .current_dir(repo.join("docker/gpu"))
+            .env("HOME", home)
+            .env_remove("COMPOSE_PROFILES")
+            .args(["compose", "-f", "compose.yaml", "config"])
+            .output()
+            .expect("run kern");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let elsewhere = dir.join("home");
+    std::fs::create_dir_all(&elsewhere).expect("dir");
+    let (in_ok, in_out) = config("../../web", &elsewhere);
+    let (out_ok, out_out) = config("../../../outside", &elsewhere);
+    let (dot_ok, dot_out) = config("../../web", &repo);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        in_ok && in_out.contains("the project is the git repository"),
+        "a path inside the repository was refused:\n{in_out}"
+    );
+    assert!(
+        !out_ok,
+        "a path outside the repository was accepted:\n{out_out}"
+    );
+    assert!(
+        !dot_ok,
+        "a repository holding HOME widened the project:\n{dot_out}"
+    );
+}
+
+/// ⛔ `compose exec` IS NOT A DEVICE GRANT: it enters a box the `up` already granted (or refused).
+/// MEASURED in the field: jellyfin came up with `--allow-device-grants`, and every `compose exec`
+/// after it was refused for a GPU it was not asking for. With nothing running the answer must be
+/// "not running", never the grant gate.
+#[test]
+fn compose_exec_is_not_refused_by_the_device_grant_gate() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-execgate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("compose.yaml"),
+        "services:\n  g:\n    image: kern-smoke-no-such-image:1\n    gpus: all\n",
+    )
+    .expect("write");
+    let out = kern()
+        .current_dir(&dir)
+        .env_remove("COMPOSE_PROFILES")
+        .args(["compose", "-f", "compose.yaml", "exec", "-T", "g", "true"])
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !said.contains("nothing granted it"),
+        "`compose exec` met the device grant gate:\n{said}"
+    );
+}
+
+/// ⛔ A BIND KERN WILL REFUSE IS REFUSED BEFORE ANYTHING IS BUILT OR PULLED. Kokoro-FastAPI's file
+/// downloaded its image for nine minutes and was then refused for a bind outside the project.
+#[test]
+fn a_refused_bind_is_refused_before_any_build() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-bindfirst-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("proj/ctx")).expect("dir");
+    std::fs::create_dir_all(dir.join("outside")).expect("dir");
+    std::fs::write(dir.join("proj/ctx/Dockerfile"), "FROM scratch\nCOPY f /f\n").expect("write");
+    std::fs::write(dir.join("proj/ctx/f"), "x").expect("write");
+    std::fs::write(
+        dir.join("proj/compose.yaml"),
+        "services:\n  s:\n    build: ./ctx\n    volumes:\n      - ../outside:/o\n",
+    )
+    .expect("write");
+    let out = kern()
+        .current_dir(dir.join("proj"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env_remove("COMPOSE_PROFILES")
+        .args(["compose", "-f", "compose.yaml", "up", "-d"])
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success() && said.contains("outside"),
+        "the bind outside the project was not refused:\n{said}"
+    );
+    assert!(
+        !said.contains("built '"),
+        "the service was built before its bind was refused:\n{said}"
+    );
+}
+
+/// ⛔ A REGISTRY THAT CANNOT BE REACHED IS NOT A REGISTRY SAYING NO. With `image:` + `build:`, kern
+/// builds from source when the registry refuses the image (docker's rule); a transfer that broke is
+/// no answer about the image, and building the project from source on a line that just failed is the
+/// slowest way to fail. MEASURED in the field on Kokoro-FastAPI's file.
+#[test]
+fn an_unreachable_registry_does_not_turn_into_a_build_from_source() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-unreach-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("ctx")).expect("dir");
+    std::fs::write(dir.join("ctx/Dockerfile"), "FROM scratch\nCOPY f /f\n").expect("write");
+    std::fs::write(dir.join("ctx/f"), "x").expect("write");
+    std::fs::write(
+        dir.join("compose.yaml"),
+        "services:\n  s:\n    image: 127.0.0.1:1/kern-smoke/unreachable:1\n    build: ./ctx\n",
+    )
+    .expect("write");
+    let out = kern()
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env_remove("COMPOSE_PROFILES")
+        .args(["compose", "-f", "compose.yaml", "up", "-d"])
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = kern()
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .args(["compose", "-f", "compose.yaml", "down"])
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success() && said.contains("could not be fetched"),
+        "an unreachable registry was not reported as such:\n{said}"
+    );
+    assert!(
+        !said.contains("built '"),
+        "an unreachable registry was taken as \"build it from source\":\n{said}"
+    );
+}
+
+/// ⛔ A MISSING `env_file:` STOPS THE FILE BEFORE ANYTHING IS FETCHED, as docker's loader stops it
+/// ("env file <path> not found", measured with docker compose v5.0.2). kern found out when the box
+/// started, after InvokeAI's multi-GB image had been downloaded. The image here is on a registry
+/// that cannot be reached, so a fetch attempted first would answer with a different error.
+#[test]
+fn a_missing_env_file_stops_config_and_up_before_any_fetch() {
+    let dir = std::env::temp_dir().join(format!("kern-smoke-envfile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("compose.yaml"),
+        "services:\n  s:\n    image: 127.0.0.1:1/kern-smoke/envfile:1\n    env_file:\n      - .env\n  t:\n    image: 127.0.0.1:1/kern-smoke/optional:1\n    env_file:\n      - path: ./absent.env\n        required: false\n",
+    )
+    .expect("write");
+    let run = |args: &[&str]| {
+        let out = kern()
+            .current_dir(&dir)
+            .env("XDG_CACHE_HOME", dir.join("cache"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env_remove("COMPOSE_PROFILES")
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (cfg_ok, cfg) = run(&["compose", "-f", "compose.yaml", "config"]);
+    let (up_ok, up) = run(&["compose", "-f", "compose.yaml", "up", "-d", "s"]);
+    let (_, optional) = run(&["compose", "-f", "compose.yaml", "up", "-d", "t"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    for (ok, said, verb) in [(cfg_ok, &cfg, "config"), (up_ok, &up, "up")] {
+        assert!(
+            !ok && said.contains("env file") && said.contains(".env not found"),
+            "{verb} did not stop on the missing env file:\n{said}"
+        );
+        assert!(
+            !said.contains("could not be fetched") && !said.contains("curl"),
+            "{verb} fetched before reading the file:\n{said}"
+        );
+    }
+    assert!(
+        !optional.contains("absent.env not found"),
+        "`required: false` was refused:\n{optional}"
+    );
 }

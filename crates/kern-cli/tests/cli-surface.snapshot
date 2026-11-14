@@ -30,8 +30,9 @@ COMMANDS:
     build logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
   Manage boxes
-    top                                                            Interactive task manager (TUI)
+    top                                                            Interactive task manager (TUI): host, every GPU, boxes, sandboxes (finished too)
     stats [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
+    sandbox ls | history [-n N] [--failed] [--all] | stats [--all]  The SDK and MCP sandboxes: running now, finished (metadata only), outcomes
     inspect <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
     port <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     attach <name>                                                  Stream a box's output live (Ctrl-C detaches)
@@ -40,7 +41,7 @@ COMMANDS:
     unpause <name>... | --all                                      Thaw frozen box(es)
     kill <name>... | killall                                       Stop box(es) (alias of stop)
     start <name>...                                                Run a `box --keep` box again, on the layer it left behind (its recorded command line)
-    rm <name>...                                                   Remove a stopped `box --keep` box: its layer and its record (refuses a running one)
+    rm [-f] <name>...                                              Remove a stopped or exited box and its record (`--keep`: its layer too); -f stops a running one first
     rename <old> <new>                                             Give a running box a new name
     update <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
     wait <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once

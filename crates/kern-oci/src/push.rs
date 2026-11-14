@@ -27,6 +27,8 @@ use std::process::Command;
 const LAYER_MT: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 const CONFIG_MT: &str = "application/vnd.docker.container.image.v1+json";
 const MANIFEST_MT: &str = "application/vnd.docker.distribution.manifest.v2+json";
+/// The list of a multi-platform image's manifests, in the schema its manifests are written in.
+const INDEX_MT: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
 
 /// Publish the rootfs at `rootfs` (with runtime `config`) to `image` (`[registry/]repo[:tag]`).
 /// `work` is a scratch dir for the layer blob (caller creates + cleans it).
@@ -36,6 +38,64 @@ pub fn push(
     config: &ImageConfigOut,
     work: &Path,
 ) -> Result<(), OciError> {
+    push_inner(image, rootfs, config, work, false).map(|_| ())
+}
+
+/// Push one image's blobs and manifest WITHOUT moving its tag: the manifest is put under its own
+/// digest. One variant of a multi-platform image, which [`push_index`] then names under the tag.
+pub fn push_by_digest(
+    image: &str,
+    rootfs: &Path,
+    config: &ImageConfigOut,
+    work: &Path,
+) -> Result<PushedManifest, OciError> {
+    push_inner(image, rootfs, config, work, true)
+}
+
+/// Put a manifest list under `image`'s tag, naming the variants already pushed by digest: what
+/// `docker buildx build --platform a,b --push` publishes, so a pull on either machine gets its own.
+pub fn push_index(image: &str, manifests: &[PushedManifest]) -> Result<(), OciError> {
+    let (registry, repo, reference) = parse_ref(image)?;
+    let ep = Endpoint::for_registry(&registry);
+    let auth = discover_auth_scoped(&registry, &repo, "push,pull")?;
+    let index = build_index(manifests);
+    kern_common::progress!(
+        "→ pushing index {reference} ({} platforms)…",
+        manifests.len()
+    );
+    put_manifest(&ep, &repo, &reference, &index, INDEX_MT, &auth)?;
+    kern_common::progress!("✓ pushed {image}");
+    Ok(())
+}
+
+/// The manifest list naming each pushed variant with its platform.
+fn build_index(manifests: &[PushedManifest]) -> String {
+    let entries: Vec<String> = manifests
+        .iter()
+        .map(|m| {
+            format!(
+                "{{\"mediaType\":{},\"size\":{},\"digest\":{},\"platform\":{{\"architecture\":{},\"os\":\"linux\"}}}}",
+                json_str(MANIFEST_MT),
+                m.size,
+                json_str(&m.digest),
+                json_str(&m.architecture)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"schemaVersion\":2,\"mediaType\":{},\"manifests\":[{}]}}",
+        json_str(INDEX_MT),
+        entries.join(",")
+    )
+}
+
+fn push_inner(
+    image: &str,
+    rootfs: &Path,
+    config: &ImageConfigOut,
+    work: &Path,
+    by_digest: bool,
+) -> Result<PushedManifest, OciError> {
     let (registry, repo, reference) = parse_ref(image)?;
     // Loopback registries (localhost / 127.* / ::1) speak plain HTTP and are the common local-dev /
     // `registry:2` case - Docker treats loopback as insecure-OK by default, and so do we: over the
@@ -65,13 +125,31 @@ pub fn push(
     kern_common::progress!("→ uploading config…");
     upload_blob(&ep, &repo, &config_digest, &config_path, &auth)?;
 
-    // Build + PUT the manifest.
+    // Build + PUT the manifest: under the tag, or under its own digest for one variant of an index.
     let manifest = build_manifest(&config_digest, config_size, &layer_digest, layer_size);
-    kern_common::progress!("→ pushing manifest {reference}…");
-    put_manifest(&ep, &repo, &reference, &manifest, &auth)?;
+    let manifest_path = work.join("manifest.json");
+    std::fs::write(&manifest_path, &manifest)
+        .map_err(|e| OciError::Extract(format!("write manifest: {e}")))?;
+    let manifest_digest = sha256_file(&manifest_path)?;
+    let put_ref = if by_digest {
+        manifest_digest.clone()
+    } else {
+        reference
+    };
+    kern_common::progress!("→ pushing manifest {put_ref}…");
+    put_manifest(&ep, &repo, &put_ref, &manifest, MANIFEST_MT, &auth)?;
 
-    kern_common::progress!("✓ pushed {image}");
-    Ok(())
+    if !by_digest {
+        kern_common::progress!("✓ pushed {image}");
+    }
+    Ok(PushedManifest {
+        digest: manifest_digest,
+        size: manifest.len() as u64,
+        architecture: config
+            .architecture
+            .clone()
+            .unwrap_or_else(|| crate::Platform::host().as_oci_arch().to_string()),
+    })
 }
 
 /// A registry endpoint: its base URL scheme and whether to HTTPS-pin. Loopback → `http://` + no pin
@@ -170,6 +248,18 @@ pub struct ImageConfigOut {
     pub env: Vec<String>,
     pub workdir: Option<String>,
     pub user: Option<String>,
+    /// The image's own architecture; `None` is this host's. An arm64 image built here under
+    /// `--platform linux/arm64` must not be published claiming amd64.
+    pub architecture: Option<String>,
+}
+
+/// What a push of one image left at the registry: its manifest, by digest and size, and the
+/// platform it is for. An index lists these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushedManifest {
+    pub digest: String,
+    pub size: u64,
+    pub architecture: String,
 }
 
 /// `tar` the rootfs and gzip it into `work/layer.tar.gz`. Returns `(path, "sha256:<compressed>",
@@ -266,7 +356,11 @@ pub(crate) fn build_config_json(cfg: &ImageConfigOut, diff_id: &str) -> String {
     // which keeps the config, and so the image digest, the same for the same rootfs.
     format!(
         "{{\"architecture\":{},\"os\":\"linux\",\"config\":{{{}}},\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[{}]}},\"history\":[{{\"created_by\":\"kern: the image's filesystem as one layer\"}}]}}",
-        json_str(crate::Platform::host().as_oci_arch()),
+        json_str(
+            cfg.architecture
+                .as_deref()
+                .unwrap_or(crate::Platform::host().as_oci_arch())
+        ),
         config_fields.join(","),
         json_str(diff_id)
     )
@@ -369,10 +463,11 @@ fn put_manifest(
     repo: &str,
     reference: &str,
     manifest: &str,
+    media_type: &str,
     auth: &Auth,
 ) -> Result<(), OciError> {
     let url = format!("{}/v2/{repo}/manifests/{reference}", ep.base);
-    let ct = format!("Content-Type: {MANIFEST_MT}");
+    let ct = format!("Content-Type: {media_type}");
     let mut put = vec![
         "-sS",
         "-o",
@@ -471,6 +566,34 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_list_names_each_platform_by_digest() {
+        let list = build_index(&[
+            PushedManifest {
+                digest: "sha256:aa".into(),
+                size: 10,
+                architecture: "amd64".into(),
+            },
+            PushedManifest {
+                digest: "sha256:bb".into(),
+                size: 11,
+                architecture: "arm64".into(),
+            },
+        ]);
+        assert!(list.starts_with(&format!(
+            "{{\"schemaVersion\":2,\"mediaType\":\"{INDEX_MT}\""
+        )));
+        for want in [
+            "\"digest\":\"sha256:aa\"",
+            "\"size\":10",
+            "\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}",
+            "\"digest\":\"sha256:bb\"",
+            "\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\"}",
+        ] {
+            assert!(list.contains(want), "{want} in {list}");
+        }
+    }
+
+    #[test]
     fn manifest_shape_is_valid_schema2() {
         let m = build_manifest("sha256:cc", 12, "sha256:ll", 34);
         assert!(m.contains("\"schemaVersion\":2"));
@@ -488,8 +611,16 @@ mod tests {
             env: vec!["K=v".into()],
             workdir: Some("/srv".into()),
             user: None,
+            architecture: Some("arm64".into()),
         };
         let j = build_config_json(&cfg, "sha256:dd");
+        // The image's own architecture, whatever machine publishes it.
+        assert!(j.contains("\"architecture\":\"arm64\""), "{j}");
+        let host = build_config_json(&ImageConfigOut::default(), "sha256:dd");
+        assert!(host.contains(&format!(
+            "\"architecture\":\"{}\"",
+            crate::Platform::host().as_oci_arch()
+        )));
         assert!(j.contains("\"diff_ids\":[\"sha256:dd\"]"));
         assert!(j.contains("\"Entrypoint\":[\"/bin/app\"]"));
         assert!(j.contains("\"WorkingDir\":\"/srv\""));

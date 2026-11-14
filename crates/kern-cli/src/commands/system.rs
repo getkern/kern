@@ -158,6 +158,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}build{z} --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that Dockerfile, and build NOTHING
                                                                      Exit 0 if it builds here; the lines kern does not act on are marked `dropped`
                                                                      -t is repeatable: one build, every name applied (layers shared, not copied)
+                                                                     --secret id=X,src=FILE|env=VAR and --ssh default|ID=KEY: what RUN --mount=type=secret|ssh read
+                                                                     --platform A[,B]: build for those platforms (qemu-user for another arch); --no-cache: reuse nothing
     {c}images{z} [<repo>] [--json] [--filter K=V] [--format T]             List pulled (cached) images (<repo> = --filter reference=<repo>)
                                                                      --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
     {c}image{z} ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs under Docker's noun-first grouping (one parser each, not a second)
@@ -168,8 +170,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}build{z} logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
   {d}Manage boxes{z}
-    {c}top{z}                                                            Interactive task manager (TUI)
+    {c}top{z}                                                            Interactive task manager (TUI): host, every GPU, boxes, sandboxes (finished too)
     {c}stats{z} [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
+    {c}sandbox{z} ls | history [-n N] [--failed] [--all] | stats [--all]  The SDK and MCP sandboxes: running now, finished (metadata only), outcomes
     {c}inspect{z} <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
                                                                      (`-f '{{{{.State.Status}}}}'`, `docker inspect`'s own paths)
     {c}port{z} <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
@@ -179,7 +182,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}unpause{z} <name>... | --all                                      Thaw frozen box(es)
     {c}kill{z} <name>... | killall                                       Stop box(es) (alias of stop)
     {c}start{z} <name>...                                                Run a `box --keep` box again, on the layer it left behind (its recorded command line)
-    {c}rm{z} <name>...                                                   Remove a stopped `box --keep` box: its layer and its record (refuses a running one)
+    {c}rm{z} [-f] <name>...                                              Remove a stopped or exited box and its record (`--keep`: its layer too); -f stops a running one first
     {c}rename{z} <old> <new>                                             Give a running box a new name
     {c}update{z} <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
     {c}wait{z} <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
@@ -196,6 +199,12 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      up: [--force-recreate|--no-recreate] [-V|--renew-anon-volumes]; logs: [-t] [--since T] [--until T] [--no-log-prefix]
                                                                      wait/events/images/push/rm/top/version scope the box-level verb to this stack; kill is an alias of stop
                                                                      images takes --format json, as ps does; wait exits with the status of the first service to stop
+                                                                     -f FILE repeats (merged left to right, `!reset`/`!override` honoured); -p NAME; --profile P; --env-file F
+                                                                     --allow-device-grants: give the file's GPUs and `devices:` (a file cannot grant itself hardware)
+                                                                     --allow-privileged: honour `privileged: true`; --project-root DIR: let paths reach anywhere under DIR
+                                                                     --pod | --no-pod | --bridge: one namespace, one per service with relays, or a bridge (default: from the file)
+                                                                     up: -d, --wait [--wait-timeout S], --abort-on-container-exit, --exit-code-from S, --pull P, --remove-orphans
+                                                                     down: [-v|--volumes] [--rmi]
     {c}up{z} [--no-pod|--pod|--bridge] [-d] / {c}down{z}                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared)
                                                                      DEFAULT: a namespace per service, as soon as the stack has two of them.
                                                                      They meet on the pod's bridge, which is Docker's own arrangement.
@@ -271,7 +280,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     -w, --workdir <dir> Working directory inside the box
         --entrypoint <a> Replace the image's ENTRYPOINT (repeat for an exec-form list;
                          `--entrypoint \"\"` clears it). Discards the image's CMD, as docker does
-    -m, --memory <size> Hard memory cap (e.g. 512m, 1g; default 512m)
+    -m, --memory <size> Hard memory cap (e.g. 512m, 1g; default 512m, the host's RAM with --gpus)
     --cpus <n>          CPU cap in cores (e.g. 1.5, 2; default uncapped)
     --cpuset-cpus <list>  Pin to specific CPUs (e.g. 0-3, 0,2,4; default no pinning)
     --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default 0 = swap off)
@@ -346,7 +355,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --device <ref>      ONE card, named as CDI names it: nvidia.com/gpu=0, or by UUID. An
                         alias over --gpus: the spec says which card the name means and the
                         mounts come from the driver's own layout. Several cards are asked
-                        for with the other flag. Pass one of the two, not both
+                        for with the other flag. Pass one of the two, not both. A host path,
+                        /dev/X[:/dev/Y[:rwm]], binds that node as docker does (read-only
+                        without `w`), beside --gpus too; a missing node is refused
     --init              Run a built-in reaping init as PID 1 (no zombies; forwards SIGTERM)
     --pids-limit <N>    Cap the box's process count (pids.max), fork-bomb containment
     --io-weight <N>     cgroup-v2 io.weight, relative I/O priority (1-10000; best-effort)
@@ -359,7 +370,13 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --tmpfs <path[:sz]> Mount a fresh tmpfs at path in the box (e.g. /tmp:64m; repeatable)
     --shm-size <size>   Cap /dev/shm (e.g. 64m; default: the --memory cap, so what the box is
                         told matches what its cgroup enforces)
+    --runtime nvidia    The GPUs the box's own NVIDIA_VISIBLE_DEVICES names (the image's ENV or -e),
+                        as NVIDIA's runtime grants them under docker; any other runtime is refused
+    --ipc <mode>        Docker's IPC flag: every box has its own IPC namespace already (private);
+                        `host` is accepted and NOT applied, said when the box starts. For a larger
+                        /dev/shm, which is what `--ipc=host` buys most GPU examples, use --shm-size
     -u, --user <u[:g]>  Run the box command as this user[:group], numeric or named in the image's /etc/passwd
+    --group-add <g>     Add a supplementary group, numeric or named in the image's /etc/group; repeatable
     --cap-add <CAP>     Keep a capability kern would otherwise drop (e.g. NET_ADMIN, or ALL); repeatable
     --cap-drop <CAP>    Drop an extra capability (e.g. NET_RAW, or ALL); repeatable
                         `--cap-drop ALL` with no --cap-add ALSO drops the default uid RANGE: the

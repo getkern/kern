@@ -13,7 +13,8 @@
 //!    used as a token inside an inline collection (`[*a]`, `{k: *a}`) is rejected outright, and that is
 //!    exactly the construction a bomb needs (`&a [x,x]`, `&b [*a,*a]`, `&c [*b,*b]`…): measured, a
 //!    ten-level bomb is refused in 3 ms at 6.7 MB RSS. What IS expanded is the useful subset - a
-//!    block-style anchor, a merge key (`<<: *base`, `<<: [*a, *b]`), an alias as a whole value - and
+//!    block-style anchor, a merge key (`<<: *base`, `<<: [*a, *b]`), an alias as a whole value, an
+//!    anchor on a scalar list item (`- &v ./data:/data`, reused as `- *v`) - and
 //!    that expansion additionally spends from a node budget. An earlier version of this paragraph said
 //!    anchors were never expanded at all, which was a stronger claim than the code makes and the wrong
 //!    kind of claim to leave standing in a security note.
@@ -225,12 +226,30 @@ pub(crate) fn finish_profiles(
             profiles.sort_unstable();
             let mut services: Vec<&str> = skipped_by_profile.iter().map(String::as_str).collect();
             services.sort_unstable();
-            return Err(format!(
-                "every service is behind an inactive profile: {} would run under COMPOSE_PROFILES={} \
-                 (or `--profile <name>`), and nothing runs without one",
-                services.join(", "),
-                profiles.join(",")
-            ));
+            // ⛔ SEVERAL PROFILES ARE CHOICES, NOT ONE VALUE. MEASURED 2026-11-12 on
+            // NVIDIA-AI-Blueprints/nemotron-voice-agent: its 28 profiles are alternatives
+            // (`generic-assistant`, `generic-assistant/server`, `.../single-gpu`), the line used to
+            // print all 28 joined as the value to set, and setting exactly that was refused because two
+            // alternatives publish the same host port. One profile at a time, kern and docker list the
+            // same services. A remedy that fails when followed is not a remedy.
+            return Err(if profiles.len() == 1 {
+                format!(
+                    "every service is behind an inactive profile: {} would run under \
+                     COMPOSE_PROFILES={} (or `--profile {}`), and nothing runs without one",
+                    services.join(", "),
+                    profiles[0],
+                    profiles[0]
+                )
+            } else {
+                format!(
+                    "every service is behind an inactive profile, so nothing runs without one. This \
+                     file's {} profiles: {}. Choose with COMPOSE_PROFILES=<profile> (or `--profile \
+                     <profile>`), and combine several with commas only when they are meant to run \
+                     together: alternatives often publish the same port",
+                    profiles.len(),
+                    profiles.join(", ")
+                )
+            });
         }
         return Err("`services:` is empty".to_string());
     }
@@ -272,6 +291,7 @@ pub(crate) fn finish_profiles(
     Ok(boxes)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_with_env(
     text: &str,
     dotenv: &crate::DotEnv,
@@ -279,6 +299,51 @@ pub(crate) fn parse_with_env(
     net: crate::StackNet,
     dir: Option<&std::path::Path>,
     defer_profiles: bool,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_with_env_rooted(
+        text,
+        dotenv,
+        require_runnable,
+        net,
+        dir,
+        defer_profiles,
+        None,
+    )
+}
+
+/// [`parse_with_env`] with the directory an `include:` may not leave, when the operator widened it
+/// (`kern compose --project-root`); `None` keeps the document's own directory.
+pub(crate) fn parse_with_env_rooted(
+    text: &str,
+    dotenv: &crate::DotEnv,
+    require_runnable: bool,
+    net: crate::StackNet,
+    dir: Option<&std::path::Path>,
+    defer_profiles: bool,
+    root: Option<&std::path::Path>,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_document(
+        text,
+        dotenv,
+        require_runnable,
+        net,
+        dir,
+        defer_profiles,
+        &IncludeChain::top(root.or(dir)),
+    )
+}
+
+/// [`parse_with_env`] with the `include:` chain it is being read under; the top-level document
+/// starts one, and every included model is read through here with the chain extended.
+#[allow(clippy::too_many_arguments)]
+fn parse_document(
+    text: &str,
+    dotenv: &crate::DotEnv,
+    require_runnable: bool,
+    net: crate::StackNet,
+    dir: Option<&std::path::Path>,
+    defer_profiles: bool,
+    chain: &IncludeChain,
 ) -> Result<Vec<ComposeBox>, String> {
     // Fold multi-line block scalars (`|`/`>`) and multi-line flow collections onto single logical lines
     // first, so the rest of the pipeline stays line-at-a-time (block-scalar bodies become opaque values).
@@ -301,7 +366,7 @@ pub(crate) fn parse_with_env(
     // A separate clear on ENTRY was written first and then removed: nothing can run between the
     // interpolation and this line, so it was unreachable, and its comment claimed a failure mode the
     // control flow makes impossible. Defensive code whose justification is false is worse than none.
-    let missing = take_required_unset();
+    let missing = one_entry_per_variable(take_required_unset());
     if !missing.is_empty() {
         return Err(format!(
             "{} required by this file with `${{VAR:?...}}` {} no value: {}. That form exists to STOP \
@@ -320,7 +385,8 @@ pub(crate) fn parse_with_env(
     }
     let text = interpolated.as_str();
 
-    let lines = lex(text)?;
+    let mut lines = lex(text)?;
+    rewrite_merge_tags(&mut lines, true);
     let mut root = build_tree(&lines)?;
     // Expand YAML anchors (`&x`), aliases (`*x`) and merge keys (`<<: *x`) - the common `x-*` template
     // DRY pattern real compose files use - under a hard node budget (billion-laughs-safe). After this,
@@ -329,6 +395,8 @@ pub(crate) fn parse_with_env(
     // Resolve `extends:` (a service inheriting another service's fields) - a real Compose feature the
     // `x-`/anchor pattern doesn't cover, since it references another SERVICE by name. Same-file only.
     resolve_extends(&mut root, dir, dotenv)?;
+    // `!reset` in THIS file, and the keys a LATER `-f` resets or overrides: see `merge_tag_keys`.
+    drop_reset_keys(&mut root);
 
     // Top level must have `services:`. `volumes:`/`networks:`/`version:`/`name:` are recognized;
     // everything else at the top is warned and ignored.
@@ -353,6 +421,7 @@ pub(crate) fn parse_with_env(
 
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut have_services = false;
+    let mut include_node: Option<Node> = None;
     for (key, node) in &root.children {
         match key.as_str() {
             "services" => {
@@ -381,11 +450,19 @@ pub(crate) fn parse_with_env(
                     ));
                 }
                 if node.children.is_empty() {
+                    // `{}` IS A MAPPING, an empty one, and it is how a file made of `include:`
+                    // writes that it has no services of its own. MEASURED on docker compose v5.0.2:
+                    // `include: [m.yml]` with `services: {}` runs `m`, and `services: {}` alone is
+                    // accepted as an empty stack. It falls through to the emptiness check below.
+                    let is_empty_flow_map = node
+                        .scalar
+                        .as_deref()
+                        .is_some_and(|v| v.chars().filter(|c| !c.is_whitespace()).eq("{}".chars()));
                     if let Some(scalar) = node
                         .scalar
                         .as_deref()
                         .map(str::trim)
-                        .filter(|v| !v.is_empty())
+                        .filter(|v| !v.is_empty() && !is_empty_flow_map)
                     {
                         return Err(format!(
                             "`services:` must be a mapping of service names to their definitions, \
@@ -443,12 +520,47 @@ pub(crate) fn parse_with_env(
             // how the `x-common:` + anchors DRY idiom works, so warning about it means every file
             // using the most common pattern in the ecosystem gets a false alarm.
             other if other.starts_with("x-") => {}
+            // READ AFTER THIS LOOP, once every own service is known, so a name an included model
+            // also defines is refused rather than silently shadowed.
+            "include" => include_node = Some(node.clone()),
             other => warn(&format!("top-level '{other}:' ignored (unsupported)")),
         }
     }
-    if !have_services {
+    // A FILE THAT ONLY INCLUDES IS A FILE: the Specification allows a top-level document whose
+    // services all come from `include:`.
+    if !have_services && include_node.is_none() {
         return Err("no `services:` block found".to_string());
     }
+    // THE INCLUDED MODELS JOIN HERE, before the profile decision, so their services are decided with
+    // the rest, and after every own service is known, so a clash is refused by name. Compose refuses
+    // it too: an included model is not overridden by the file that includes it (an override belongs
+    // in the entry's own `path` list).
+    let mut imported = match &include_node {
+        Some(n) => load_includes(n, dir, net, chain)?,
+        None => Vec::new(),
+    };
+    // A NAME THIS FILE SHARES WITH AN INCLUDED MODEL IS AN OVERRIDE OF IT. The Specification's text
+    // says Compose reports an error; the reference implementation does not, and the reference is
+    // what files are written against. MEASURED on docker compose 5.0.2: the including file's `x`
+    // on top of the included `x` keeps the including file's image, the environment of both and the
+    // included volume. So the included service is the base and this file's is merged onto it, in
+    // this file's position, and its relative paths stay this project's (they are resolved late,
+    // against the project, as an override's are).
+    let mut combined: Vec<ComposeBox> = Vec::with_capacity(boxes.len() + imported.len());
+    for own in boxes {
+        match imported.iter().position(|i| i.name == own.name) {
+            Some(pos) => {
+                let mut base = imported.remove(pos);
+                base.merge_from(own);
+                combined.push(base);
+            }
+            None => combined.push(own),
+        }
+    }
+    let imported_names: std::collections::HashSet<String> =
+        imported.iter().map(|b| b.name.clone()).collect();
+    combined.extend(imported);
+    let boxes = combined;
     // THE PROFILE DECISION, once and here: after every service is read and before anything below
     // resolves one service's key against another (`volumes_from`, `network_mode: service:`), which
     // is exactly the set the old in-loop skip left them to see. Deferred entirely when the caller
@@ -540,7 +652,14 @@ pub(crate) fn parse_with_env(
     }
     // AFTER the `volumes_from` inheritance above: an inherited mount of an external volume is still a
     // mount of an external volume, and marking before this pass would miss exactly those.
-    mark_external_volumes(&mut boxes, &external_volumes);
+    // THIS DOCUMENT'S declarations apply to THIS document's services. The own services are a
+    // prefix (they were read before the imported ones were appended, and the profile split keeps
+    // order); an included model was already marked against its own top-level declarations.
+    let own_len = boxes
+        .iter()
+        .take_while(|b| !imported_names.contains(&b.name))
+        .count();
+    mark_external_volumes(&mut boxes[..own_len], &external_volumes);
     // AND THE EXTERNAL NETWORKS EACH SERVICE IS ON, which is the intersection of two blocks that may
     // appear in either order: the top-level `networks:` says which are external, each service's own
     // `networks:` says which it joined. Done here, after every service exists, for the same reason
@@ -552,13 +671,21 @@ pub(crate) fn parse_with_env(
     // the alternative - treating "no networks key" as "every network" - would put a database on a
     // proxy network because its author never wrote the key.
     if !external_networks.is_empty() {
-        for b in &mut boxes {
-            b.external_networks = b
+        for b in &mut boxes[..own_len] {
+            // AN UNION, NOT AN ASSIGNMENT: a service this file merged onto an included one already
+            // carries the externals its own model declared. For any other service the list starts
+            // empty, so the result is what the assignment gave.
+            let mine: Vec<String> = b
                 .networks
                 .iter()
                 .filter(|n| external_networks.iter().any(|e| e == *n))
                 .cloned()
                 .collect();
+            for n in mine {
+                if !b.external_networks.contains(&n) {
+                    b.external_networks.push(n);
+                }
+            }
         }
     }
     // SAID AFTER THE LOOP, because it is a fact about the WHOLE file. `internal: true` is
@@ -586,7 +713,15 @@ pub(crate) fn parse_with_env(
             ));
         }
     }
-    degrade_orphan_health_gates(&mut boxes);
+    // A LAYER THAT WILL BE MERGED DOES NOT DECIDE ITS GATES. MEASURED 2026-11-12 on usd-search:
+    // `gpu-plugins.yml` restates siglip2-triton only to give it a GPU, with no healthcheck, and read
+    // alone that layer concluded the service had none and degraded every `service_healthy` gate on
+    // it for good, while docker, reading the merged model, honours them (the base layer has the
+    // `test`). Like the profile decision, it is taken on the merged stack: `apply_profiles` for
+    // several `-f` files, the including document for an included model.
+    if !defer_profiles {
+        degrade_orphan_health_gates(&mut boxes);
+    }
     Ok(boxes)
 }
 
@@ -596,7 +731,7 @@ pub(crate) fn parse_with_env(
 /// plain `depends_on` (start-order) and warn ONCE with the causal chain - the honest drop-in-with-
 /// degrade posture, and what the omit-healthcheck warning already promised. (Adversarial pass: the
 /// parser must not promise a degrade it doesn't deliver.)
-fn degrade_orphan_health_gates(boxes: &mut [ComposeBox]) {
+pub(crate) fn degrade_orphan_health_gates(boxes: &mut [ComposeBox]) {
     // Which service names lack a health command (so a `service_healthy` gate toward them is unsatisfiable).
     let no_health: std::collections::HashSet<String> = boxes
         .iter()
@@ -1151,7 +1286,7 @@ fn prescreen(text: &str) -> Result<(), String> {
         // merge several templates - `resolve_anchors` expands it, so it's allowed. Everything else with
         // an aliased flow token is refused.
         let is_merge_line = colon_index(line).map(|ci| line[..ci].trim()) == Some("<<");
-        if !is_merge_line && line_has_inline_anchor(line) {
+        if !is_merge_line && line_has_inline_anchor(line) && !flow_map_of_whole_aliases(line) {
             return Err(format!(
                 "line {ln}: an anchor or alias INSIDE a flow collection (`[*x]`, `{{k: *x}}`) is \
                  not expanded. Block-level anchors, aliases and merge keys are: write `<<: *x`, or \
@@ -1291,6 +1426,11 @@ fn brackets_balanced(s: &str) -> bool {
 fn colon_index(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut q = 0u8; // 0 = none, else the quote char
+                     // FLOW DEPTH: a block key's `:` is never inside `{...}` or `[...]`. Without this,
+                     // `- {capabilities: [gpu], count: all}` read as a block-mapping item keyed `{capabilities`, and
+                     // the value checks then refused `[gpu], count: all}` as an unterminated list. A closer with no
+                     // opener on the line (a continuation of a multi-line flow value) leaves the depth at zero.
+    let mut depth = 0u32;
     for (i, &c) in bytes.iter().enumerate() {
         if q != 0 {
             if c == q {
@@ -1298,7 +1438,12 @@ fn colon_index(line: &str) -> Option<usize> {
             }
         } else if c == b'"' || c == b'\'' {
             q = c;
+        } else if c == b'{' || c == b'[' {
+            depth += 1;
+        } else if c == b'}' || c == b']' {
+            depth = depth.saturating_sub(1);
         } else if c == b':'
+            && depth == 0
             && (i + 1 >= bytes.len() || bytes[i + 1] == b' ' || bytes[i + 1] == b'\t')
         {
             return Some(i);
@@ -1325,6 +1470,57 @@ fn value_after_colon(line: &str) -> Option<&str> {
 /// flow separator is covered, and the fuzz can PROVE completeness (no unflagged token-opening `&`/`*`)
 /// instead of trusting a hand-kept opener list - the same move as `IpAddr::is_loopback()` for the push
 /// loopback check: a canonical definition, not a maintained enumeration.
+/// A `key: {k: *x, <<: *y}` line whose every alias is the WHOLE value of a top-level entry.
+///
+/// That shape is parsed into the same children a block mapping gives (`parse_inline_table`), so
+/// `resolve_anchors` expands it exactly as it expands `k: *x` written on its own line. Docker
+/// accepts it and real files write it to stamp out services from a template,
+/// `gpu1: { <<: *gpu }`; kern refused the file (measured on a Jetson, a 30-service stack). An alias
+/// anywhere else in a flow collection (`[*x]`, `{k: [*x]}`, `{k: *x y}`) is still refused, because
+/// nothing would expand it.
+fn flow_map_of_whole_aliases(line: &str) -> bool {
+    value_after_colon(line).is_some_and(|v| flow_aliases_expandable(v.trim(), 0))
+}
+
+/// Whether every alias in a flow value sits where `expand_flow_aliases` expands it: as the whole
+/// value of a mapping entry (a `<<` merge included), or as a whole sequence item, at any depth of
+/// mappings and sequences. Anything else (`{k: *x y}`, an anchor `&x` inside) is refused.
+fn flow_aliases_expandable(v: &str, depth: usize) -> bool {
+    // `line_has_inline_anchor` sees a token only inside a collection, so a fragment is asked about
+    // inside one: bare, `&a v` reads as plain text and the anchor was let through.
+    let has_token = |frag: &str| line_has_inline_anchor(&format!("k: [{frag}]"));
+    let whole_alias = |val: &str| {
+        val.strip_prefix('*').is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        })
+    };
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    if let Some(inner) = v.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        return split_top_commas(inner).into_iter().all(|entry| {
+            let entry = entry.trim();
+            let Some(ci) = colon_index_or_first(entry) else {
+                return !has_token(entry);
+            };
+            let key = entry[..ci].trim();
+            let val = entry[ci + 1..].trim();
+            !has_token(key)
+                && (whole_alias(val) || flow_aliases_expandable(val, depth + 1) || !has_token(val))
+        });
+    }
+    if let Some(inner) = v.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        return split_top_commas(inner).into_iter().all(|item| {
+            let item = item.trim();
+            whole_alias(item) || flow_aliases_expandable(item, depth + 1) || !has_token(item)
+        });
+    }
+    false
+}
+
 fn line_has_inline_anchor(line: &str) -> bool {
     fn is_scalar_content(b: u8) -> bool {
         b.is_ascii_alphanumeric()
@@ -1450,26 +1646,35 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
     // column is >= C (they've ended). Iterative - deep nesting can't overflow the stack.
     let mut path: Vec<usize> = Vec::new();
     let mut cols: Vec<usize> = Vec::new();
-    // A block-mapping list item being folded into an inline `{…}` string (long-form ports etc.):
-    // (path to the owning node, index in its `items`, the dash column). `None` when no item-map is open.
-    // Continuation lines (deeper `key: value`) append to it; anything else closes it (appends `}`).
-    let mut item_map: Option<(Vec<usize>, usize, usize)> = None;
+    // A block-mapping list item being folded into an inline `{…}` string (long-form ports, device
+    // reservations, `include:` entries): the owning node's path, the index in its `items`, the dash
+    // column, and EVERY line of the item as (column, content). `None` when no item-map is open.
+    //
+    // ⛔ IT USED TO KEEP ONLY `key: value` CONTINUATION LINES, and a nested block closed it early.
+    // MEASURED 2026-11-12, against Docker Compose v5.0.2 reading the same files:
+    //
+    //   - driver: nvidia            docker: {driver: nvidia, capabilities: [gpu], count: 1}
+    //     capabilities:             kern:   {driver: nvidia, capabilities:}  and `count: 1` LOST,
+    //       - gpu                           then "names a GPU and says neither how many nor which"
+    //     count: 1                          about a file that says `count: 1`, and no card.
+    //
+    // and `include:`'s long form (`path:` followed by a block list, then `project_directory:`)
+    // came out as `{path:}`, `c.yml`, `d.yml`, with `project_directory` gone. Every line deeper than
+    // the dash belongs to the item in YAML, so all of them are kept now and the item is rendered as
+    // flow YAML when it closes (`render_item_map`). A flat item renders byte-identically to the old
+    // fold (`{published: 80, target: 8080}`), so the readers of these strings did not change.
+    let mut item_map: Option<ItemMap> = None;
 
     for ln in lines {
-        // Close an open block-mapping item if this line is NOT its continuation (same path, deeper
-        // indent, `key: value`). Closing appends the `}` so `reconstruct_port_item` sees a valid inline.
-        if let Some((im_path, im_idx, im_col)) = item_map.clone() {
-            let is_continuation =
-                im_path == path && ln.indent > im_col && colon_index(&ln.content).is_some();
-            if !is_continuation {
-                descend_mut(&mut root, &im_path).items[im_idx].push('}');
-                item_map = None;
-            } else {
-                let acc = &mut descend_mut(&mut root, &path).items[im_idx];
-                acc.push_str(", ");
-                acc.push_str(&ln.content);
+        if let Some(im) = item_map.as_mut() {
+            if ln.indent > im.dash_col {
+                im.lines.push((ln.indent, ln.content.clone()));
                 continue;
             }
+        }
+        if let Some(im) = item_map.take() {
+            let rendered = render_item_map(&im.lines)?;
+            descend_mut(&mut root, &im.owner).items[im.idx] = rendered;
         }
 
         // A YAML sequence item is a dash FOLLOWED BY WHITESPACE (`- x`) or a bare `-` (empty). A dash
@@ -1548,9 +1753,19 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
             // WITHOUT a full list-of-maps type: start folding it into an inline `{k: v, …}` string that
             // `reconstruct_port_item` already parses; continuation lines append (see the loop top),
             // and it's closed with `}` when the mapping ends. A plain scalar item is pushed as-is.
+            // A FLOW MAPPING ITEM (`- {driver: nvidia, count: all, capabilities: [gpu]}`) has no
+            // block-key colon (see `colon_index`) and is pushed as it is, the shape the readers parse.
+            // MEASURED on a Jetson before that rule: it was wrapped a second time, `{{...}}`, its keys
+            // were lost, and a GPU reservation written that way ran WITHOUT the GPU.
             if colon_index(item).is_some() {
-                cur.items.push(format!("{{{item}"));
-                item_map = Some((path.clone(), cur.items.len() - 1, ln.indent));
+                // A placeholder, overwritten with the rendered item when it closes.
+                cur.items.push(format!("{{{item}}}"));
+                item_map = Some(ItemMap {
+                    owner: path.clone(),
+                    idx: cur.items.len() - 1,
+                    dash_col: ln.indent,
+                    lines: vec![(ln.indent + item_offset(&ln.content), item.to_string())],
+                });
             } else {
                 cur.items.push(item.to_string());
             }
@@ -1610,10 +1825,157 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
         }
     }
     // Close a block-mapping list item still open at end-of-document.
-    if let Some((im_path, im_idx, _)) = item_map {
-        descend_mut(&mut root, &im_path).items[im_idx].push('}');
+    if let Some(im) = item_map {
+        let rendered = render_item_map(&im.lines)?;
+        descend_mut(&mut root, &im.owner).items[im.idx] = rendered;
     }
     Ok(root)
+}
+
+/// One block-mapping sequence item being collected by [`build_tree`].
+struct ItemMap {
+    /// Child-index path of the node whose `items` holds this element.
+    owner: Vec<usize>,
+    /// Index of the element in that node's `items`.
+    idx: usize,
+    /// Column of the `-` that opened the element: every deeper line belongs to it.
+    dash_col: usize,
+    /// Every line of the element as (column, content); the first is the text after the dash, at the
+    /// column where that text starts.
+    lines: Vec<(usize, String)>,
+}
+
+/// Is `text` a sequence entry (`- x`, or a bare `-`)? The same rule `build_tree` applies.
+fn is_seq_entry(text: &str) -> bool {
+    text == "-"
+        || text
+            .strip_prefix('-')
+            .is_some_and(|r| r.starts_with([' ', '\t']))
+}
+
+/// How far the content of a sequence entry sits from its dash: `- x` is 2, `-   x` is 4.
+fn item_offset(text: &str) -> usize {
+    let after = text.get(1..).unwrap_or("");
+    1 + (after.len() - after.trim_start().len())
+}
+
+/// Render the lines of one block-mapping sequence item as a flow mapping, `{k: v, k2: [a], k3: {x: y}}`.
+fn render_item_map(lines: &[(usize, String)]) -> Result<String, String> {
+    Ok(format!("{{{}}}", render_mapping_entries(lines, 0)?))
+}
+
+/// The entries of a block mapping, rendered `k: v` and joined with `, `.
+///
+/// A key with no inline value takes the lines below it, and also a sequence written at the KEY'S
+/// OWN column right after it, which YAML allows (`path:` then `- a.yml` at the same indentation). A
+/// line that is neither a key nor a sequence entry continues the previous plain scalar, which is how
+/// YAML folds a multi-line plain value.
+fn render_mapping_entries(lines: &[(usize, String)], depth: usize) -> Result<String, String> {
+    if depth > MAX_DEPTH {
+        return Err(format!(
+            "nesting inside a list item is deeper than {MAX_DEPTH} levels"
+        ));
+    }
+    let Some(&(base, _)) = lines.first() else {
+        return Ok(String::new());
+    };
+    let mut entries: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let text = lines[i].1.as_str();
+        let colon = colon_index(text);
+        let opens = colon.is_some_and(|ci| text[ci + 1..].trim().is_empty());
+        let mut j = i + 1;
+        while j < lines.len()
+            && (lines[j].0 > base || (opens && lines[j].0 == base && is_seq_entry(&lines[j].1)))
+        {
+            j += 1;
+        }
+        let below = &lines[i + 1..j];
+        match colon {
+            Some(ci) => {
+                let key = text[..ci].trim();
+                let val = text[ci + 1..].trim();
+                if !val.is_empty() {
+                    let mut v = val.to_string();
+                    for (_, t) in below {
+                        v.push(' ');
+                        v.push_str(t.trim());
+                    }
+                    entries.push(format!("{key}: {v}"));
+                } else if below.is_empty() {
+                    entries.push(format!("{key}:"));
+                } else {
+                    entries.push(format!("{key}: {}", render_block_value(below, depth + 1)?));
+                }
+            }
+            None => match entries.last_mut() {
+                Some(last) => {
+                    last.push(' ');
+                    last.push_str(text.trim());
+                }
+                None => entries.push(text.trim().to_string()),
+            },
+        }
+        i = j;
+    }
+    Ok(entries.join(", "))
+}
+
+/// A nested block value: a flow sequence when it starts with an entry, a flow mapping otherwise.
+fn render_block_value(lines: &[(usize, String)], depth: usize) -> Result<String, String> {
+    match lines.first() {
+        Some((_, t)) if is_seq_entry(t) => render_sequence(lines, depth),
+        Some(_) => Ok(format!("{{{}}}", render_mapping_entries(lines, depth)?)),
+        None => Ok(String::new()),
+    }
+}
+
+/// A block sequence rendered as `[a, {k: v}, b]`. An empty entry is dropped, as `build_tree` drops
+/// one at the top level.
+fn render_sequence(lines: &[(usize, String)], depth: usize) -> Result<String, String> {
+    if depth > MAX_DEPTH {
+        return Err(format!(
+            "nesting inside a list item is deeper than {MAX_DEPTH} levels"
+        ));
+    }
+    let Some(&(base, _)) = lines.first() else {
+        return Ok("[]".to_string());
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let text = lines[i].1.as_str();
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].0 > base {
+            j += 1;
+        }
+        let below = &lines[i + 1..j];
+        if is_seq_entry(text) {
+            let item = text.get(1..).unwrap_or("").trim();
+            if item.is_empty() && below.is_empty() {
+                // a null entry
+            } else if item.is_empty() {
+                out.push(render_block_value(below, depth + 1)?);
+            } else if colon_index(item).is_some() {
+                let mut map = vec![(base + item_offset(text), item.to_string())];
+                map.extend_from_slice(below);
+                out.push(format!("{{{}}}", render_mapping_entries(&map, depth + 1)?));
+            } else {
+                let mut v = item.to_string();
+                for (_, t) in below {
+                    v.push(' ');
+                    v.push_str(t.trim());
+                }
+                out.push(v);
+            }
+        } else if let Some(last) = out.last_mut() {
+            last.push(' ');
+            last.push_str(text.trim());
+        }
+        i = j;
+    }
+    Ok(format!("[{}]", out.join(", ")))
 }
 
 /// Walk `root` down the child-index `path`, returning `&mut` to the addressed node.
@@ -1647,6 +2009,30 @@ fn collect_anchors(node: &mut Node, anchors: &mut std::collections::HashMap<Stri
     }
     if let Some(name) = node.anchor.take() {
         anchors.insert(name, node.clone());
+    }
+    // A SCALAR ITEM may carry an anchor too (`- &v1 ./data:/data`, later `- *v1`): docker accepts it,
+    // and kern refused the whole file. MEASURED on stable-diffusion-webui-docker, whose template
+    // anchors each volume of its base service that way. The marker is peeled off the item here and
+    // its value registered, so the item reads as plain `./data:/data` and an alias inlines the same.
+    // An anchor with nothing after it (on a mapping item) is left for `apply_anchors` to refuse.
+    for item in &mut node.items {
+        let Some(after) = item.trim_start().strip_prefix('&') else {
+            continue;
+        };
+        let name_len = after.find(char::is_whitespace).unwrap_or(after.len());
+        let (name, value) = (&after[..name_len], after[name_len..].trim());
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        let (name, value) = (name.to_string(), value.to_string());
+        anchors.insert(
+            name,
+            Node {
+                scalar: Some(value.clone()),
+                ..Node::default()
+            },
+        );
+        *item = value;
     }
 }
 
@@ -1683,6 +2069,78 @@ fn merge_alias_names(scalar: &str) -> Vec<String> {
 }
 
 /// In-place alias substitution + `<<` merge, recursively, against the collected `anchors`.
+/// A flow collection holding an alias, with its aliases expanded; `None` when `s` is not a flow
+/// collection or holds none.
+///
+/// A SEQUENCE ITEM THAT IS A MAPPING IS KEPT AS A FLOW STRING by `build_tree`, and so is a flow
+/// value, so `apply_anchors` never saw the aliases inside one. MEASURED: a GPU reservation written
+/// `devices:` then `- <<: *gpu` and `device_ids: ["1"]`, the usual way to share the driver and
+/// capability lines, ran WITHOUT the GPU ("nothing in it was read as a GPU request"), where docker
+/// compose v5 merges the anchor and gives the service card 1; the same in flow form was refused.
+/// The string is parsed, expanded with the same rules and the same budget, and written back.
+fn expand_flow_aliases(
+    s: &str,
+    anchors: &std::collections::HashMap<String, Node>,
+    budget: &mut usize,
+) -> Result<Option<String>, String> {
+    let t = s.trim();
+    let is_map = t.starts_with('{') && t.ends_with('}');
+    let is_seq = t.starts_with('[') && t.ends_with(']');
+    if !(is_map || is_seq) || !line_has_inline_anchor(&format!("k: {t}")) {
+        return Ok(None);
+    }
+    if is_map {
+        let mut n = parse_inline_table(t);
+        apply_anchors(&mut n, anchors, budget)?;
+        return Ok(Some(render_flow_map(&n)));
+    }
+    let mut out = Vec::new();
+    for item in split_top_commas(&t[1..t.len() - 1]) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if let Some(name) = item.strip_prefix('*').map(str::trim) {
+            let src = anchors
+                .get(name)
+                .ok_or_else(|| format!("unknown YAML anchor `*{name}`"))?;
+            // THE BLOCK RULE, for the same reason: an item that is a whole mapping alias reached
+            // readers that take a list of names as the name `{a: 1}`. `- *x` refuses it; so does this.
+            let sc = src.scalar.clone().ok_or_else(|| {
+                format!("YAML alias `*{name}` refers to a mapping - not usable as a list item")
+            })?;
+            spend(budget, 1)?;
+            out.push(sc);
+        } else {
+            out.push(
+                expand_flow_aliases(item, anchors, budget)?.unwrap_or_else(|| item.to_string()),
+            );
+        }
+    }
+    Ok(Some(format!("[{}]", out.join(", "))))
+}
+
+/// A mapping node as a flow mapping, the shape `parse_inline_table` reads back.
+fn render_flow_map(n: &Node) -> String {
+    let parts: Vec<String> = n
+        .children
+        .iter()
+        .map(|(k, v)| format!("{k}: {}", render_flow_value(v)))
+        .collect();
+    format!("{{{}}}", parts.join(", "))
+}
+
+/// A node as a flow value: a mapping, a sequence, or its scalar as written.
+fn render_flow_value(v: &Node) -> String {
+    if !v.children.is_empty() {
+        render_flow_map(v)
+    } else if !v.items.is_empty() {
+        format!("[{}]", v.items.join(", "))
+    } else {
+        v.scalar.clone().unwrap_or_default()
+    }
+}
+
 fn apply_anchors(
     node: &mut Node,
     anchors: &std::collections::HashMap<String, Node>,
@@ -1729,12 +2187,28 @@ fn apply_anchors(
             *child = src;
         } else {
             apply_anchors(child, anchors, budget)?;
+            if let Some(expanded) = child
+                .scalar
+                .as_deref()
+                .map(|v| expand_flow_aliases(v, anchors, budget))
+                .transpose()?
+                .flatten()
+            {
+                if expanded.trim_start().starts_with('{') {
+                    child.children = parse_inline_table(&expanded).children;
+                }
+                child.scalar = Some(expanded);
+            }
         }
     }
     // Sequence-item aliases (`- *name`): inline a SCALAR anchor's value. An unknown alias, an alias to
     // a MAPPING (no scalar to inline), or an ANCHOR in list position (`- &x …`) are all hard errors -
     // never left as the literal `*name`/`&x` string (the silent mis-conversion the module forbids).
     for item in &mut node.items {
+        if let Some(expanded) = expand_flow_aliases(item, anchors, budget)? {
+            *item = expanded;
+            continue;
+        }
         let t = item.trim();
         if let Some(rest) = t.strip_prefix('*') {
             let name = rest.trim().to_string();
@@ -1746,7 +2220,11 @@ fn apply_anchors(
             })?;
             *item = sc;
         } else if t.starts_with('&') {
-            return Err("YAML anchors in a sequence item are not supported".to_string());
+            return Err(format!(
+                "YAML anchor `{t}` on a list item with no value on its line is not supported: an \
+                 anchor on a scalar item (`- &x value`) is; for a mapping, anchor it under a key \
+                 (`x-name: &x`) and merge it with `<<: *x`"
+            ));
         }
     }
     Ok(())
@@ -3194,6 +3672,450 @@ fn list_value(node: &Node) -> Vec<String> {
         .collect()
 }
 
+/// How many `include:` levels deep a chain may go before it is treated as a mistake. A real
+/// project nests one or two; the bound exists so a hostile set of files cannot drive unbounded
+/// recursion, IN ADDITION to the exact-cycle guard, which gives the honest case a better message.
+const MAX_INCLUDE_DEPTH: usize = 16;
+
+/// Where an `include:` chain stands while one document is being read.
+///
+/// `root` is the PROJECT directory, the canonical directory of the top-level file: every file an
+/// include names, and every relative path inside an included model, must stay beneath it. That is
+/// kern's rule for every other path a compose file writes (a build context, a bind source, a
+/// secret file), and an included file is not allowed to be the way around it. `files` are the
+/// included files already open above this one, canonical, so a cycle is named instead of recursed.
+#[derive(Clone, Debug)]
+pub(crate) struct IncludeChain {
+    root: Option<std::path::PathBuf>,
+    files: Vec<std::path::PathBuf>,
+}
+
+impl IncludeChain {
+    /// The chain for a top-level document read from `dir`, or one with no root when the text is
+    /// not a file on disk (an `include:` there is refused with that reason).
+    pub(crate) fn top(dir: Option<&std::path::Path>) -> Self {
+        IncludeChain {
+            root: dir.and_then(|d| std::fs::canonicalize(d).ok()),
+            files: Vec::new(),
+        }
+    }
+}
+
+/// One `include:` entry, in either spelling of the Specification:
+///
+/// ```yaml
+/// include:
+///   - infra/redis.yml                       # short: one file
+///   - path: [infra/db.yml, infra/db.override.yml]
+///     project_directory: infra              # where the model's relative paths resolve
+///     env_file: infra/db.env                # what its `${VAR}` interpolate against
+/// ```
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IncludeEntry {
+    /// The model's file, then the files that override it, merged in that order.
+    paths: Vec<String>,
+    project_directory: Option<String>,
+    env_files: Vec<String>,
+}
+
+/// A scalar or an inline list, as the Specification allows for `path` and `env_file`.
+fn scalar_or_list(v: &str) -> Vec<String> {
+    let v = v.trim();
+    if v.starts_with('[') {
+        parse_inline_list(v)
+            .iter()
+            .map(|s| scalar_str(s))
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else if v.is_empty() {
+        Vec::new()
+    } else {
+        vec![scalar_str(v)]
+    }
+}
+
+/// The entries of a top-level `include:` node.
+fn include_entries(node: &Node) -> Result<Vec<IncludeEntry>, String> {
+    if !node.children.is_empty() {
+        return Err(
+            "`include:` is a LIST of files (`- path.yml`, or `- path: …` entries), not a mapping"
+                .to_string(),
+        );
+    }
+    let mut raw: Vec<String> = Vec::new();
+    if let Some(sc) = node.scalar.as_deref() {
+        let t = sc.trim();
+        if t.starts_with('[') {
+            raw.extend(parse_inline_list(t));
+        } else if !t.is_empty() {
+            return Err(format!(
+                "`include: {t}`: the value is a list of files; write `include: [{t}]` or a `- {t}` entry"
+            ));
+        }
+    }
+    raw.extend(node.items.iter().cloned());
+    let mut out = Vec::new();
+    for item in raw {
+        let t = item.trim();
+        let Some(inner) = t.strip_prefix('{').and_then(|r| r.strip_suffix('}')) else {
+            let path = scalar_str(t);
+            if !path.is_empty() {
+                out.push(IncludeEntry {
+                    paths: vec![path],
+                    ..IncludeEntry::default()
+                });
+            }
+            continue;
+        };
+        let mut e = IncludeEntry::default();
+        for field in split_top_commas(inner) {
+            let Some((k, v)) = field.split_once(':') else {
+                return Err(format!(
+                    "`include:` entry `{t}`: `{field}` is not a `key: value` pair"
+                ));
+            };
+            match k.trim() {
+                "path" => e.paths = scalar_or_list(v),
+                "project_directory" => {
+                    let d = scalar_str(v.trim());
+                    e.project_directory = (!d.is_empty()).then_some(d);
+                }
+                "env_file" => e.env_files = scalar_or_list(v),
+                other => {
+                    return Err(format!(
+                        "`include:` entry `{t}`: unknown key `{other}`. The Specification defines \
+                         `path`, `project_directory` and `env_file`"
+                    ))
+                }
+            }
+        }
+        if e.paths.is_empty() {
+            return Err(format!("`include:` entry `{t}` names no `path`"));
+        }
+        out.push(e);
+    }
+    Ok(out)
+}
+
+/// `p` with `.` and `..` removed WITHOUT touching the filesystem. A `..` at the top stays at the top,
+/// as the kernel resolves `/..`.
+fn normalize_lexically(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => out.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("/");
+                }
+                if out.as_os_str().is_empty() {
+                    out.push("/");
+                }
+            }
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    out
+}
+
+/// `rel` resolved against `base` and kept beneath `root`, or why not.
+///
+/// ONE GUARD FOR EVERY PATH A COMPOSE FILE WRITES, top-level and included alike: kern-cli's
+/// `resolve_relative_binds` asks this function too, so the two cannot come to disagree about what
+/// "inside the project" means (the recurring defect of this repo is one derived condition computed
+/// in two places).
+///
+/// LEXICAL FIRST, so a path that leaves the project is refused before anything is created or even
+/// looked at; THEN through the canonical form of the nearest part that exists, so a symlink inside
+/// the project cannot carry the path out of it. The returned path is the canonical one when the
+/// whole path exists, the lexical one otherwise (a bind source that does not exist yet is created
+/// later, beneath the same root). `root` must be canonical.
+pub fn path_under_root(
+    root: &std::path::Path,
+    base: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf, String> {
+    let joined = if std::path::Path::new(rel).is_absolute() {
+        std::path::PathBuf::from(rel)
+    } else {
+        base.join(rel)
+    };
+    // A RELATIVE BASE IS ANCHORED TO THE WORKING DIRECTORY FIRST. `kern compose` hands over the
+    // compose file's directory as written, which is `.` for a file in the current directory, and a
+    // relative result compared with an absolute root reads as "outside": MEASURED on usd-search, every
+    // include was refused as escaping the project it sits in.
+    let joined = if joined.is_absolute() {
+        joined
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("'{rel}': resolving against the working directory: {e}"))?
+            .join(joined)
+    };
+    let lexical = normalize_lexically(&joined);
+    if !lexical.starts_with(root) {
+        return Err(format!(
+            "'{rel}' resolves to {} and escapes the project directory {}",
+            lexical.display(),
+            root.display()
+        ));
+    }
+    let mut probe = lexical.clone();
+    while std::fs::symlink_metadata(&probe).is_err() {
+        if !probe.pop() {
+            break;
+        }
+    }
+    let canon = std::fs::canonicalize(&probe)
+        .map_err(|e| format!("'{rel}': resolving {}: {e}", probe.display()))?;
+    if !canon.starts_with(root) {
+        return Err(format!(
+            "'{rel}' leaves the project directory {} through a symlink ({} is {})",
+            root.display(),
+            probe.display(),
+            canon.display()
+        ));
+    }
+    Ok(if probe == lexical { canon } else { lexical })
+}
+
+/// Is a bind SOURCE a relative path (resolved against the project) rather than an absolute path or
+/// a named volume? `.` and `..` are paths with no slash in them; anything else without a slash is a
+/// volume NAME. Shared with kern-cli's `resolve_relative_binds`, for the reason `path_under_root` is.
+pub fn is_relative_bind_source(src: &str) -> bool {
+    src == "." || src == ".." || (!src.starts_with('/') && src.contains('/'))
+}
+
+/// Anchor every relative path of an INCLUDED model to its project directory, now.
+///
+/// DOCKER RESOLVES AN INCLUDED MODEL'S PATHS AGAINST THAT MODEL, AT LOAD TIME. MEASURED 2026-11-12
+/// on NVIDIA-Omniverse/usd-search, where `infra/compose/siglip2-triton.yml` writes
+/// `context: ../../services/siglip2-triton`: through `include:` docker resolved it to
+/// `<project>/services/siglip2-triton/docker`, through the same file as an extra `-f` to
+/// `/services/siglip2-triton/docker`. kern resolves a top-level file's relative paths LATE, against
+/// the project directory, which is right for `-f` layers and wrong for an included model; turning
+/// the included ones absolute here keeps both right, including a later `-f` override that adds a
+/// relative path to an included service (that one stays relative to the project, as in docker).
+fn anchor_included_paths(
+    boxes: &mut [ComposeBox],
+    project_dir: &std::path::Path,
+    root: &std::path::Path,
+    file: &str,
+) -> Result<(), String> {
+    let anchor = |svc: &str, what: &str, rel: &str| -> Result<String, String> {
+        path_under_root(root, project_dir, rel)
+            .map(|p| p.to_string_lossy().into_owned())
+            .map_err(|e| format!("service '{svc}' (included from {file}): {what} {e}"))
+    };
+    for b in boxes.iter_mut() {
+        let svc = b.name.clone();
+        for v in b.volumes.iter_mut().chain(b.devices.iter_mut()) {
+            if let Some((src, rest)) = v.split_once(':') {
+                if is_relative_bind_source(src) {
+                    *v = format!("{}:{rest}", anchor(&svc, "bind source", src)?);
+                }
+            }
+        }
+        for s in b.secrets.iter_mut() {
+            if let Some((f, name)) = s.split_once(':') {
+                if !f.starts_with('/') && !f.is_empty() {
+                    *s = format!("{}:{name}", anchor(&svc, "secret file", f)?);
+                }
+            }
+        }
+        for e in b.env_file.iter_mut() {
+            if !e.starts_with('/') && !e.is_empty() {
+                *e = anchor(&svc, "env_file", e)?;
+            }
+        }
+        if let Some(bd) = b.build.as_mut() {
+            if !bd.context.starts_with('/') && !bd.context.contains("://") {
+                bd.context = anchor(&svc, "build context", &bd.context)?;
+            }
+        }
+        for field in [&mut b.rootfs, &mut b.ssh_key, &mut b.config] {
+            if let Some(v) = field.as_mut() {
+                if !v.starts_with('/') && !v.is_empty() {
+                    *v = anchor(&svc, "path", v)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A regular file beneath the project, named from `including_dir`, or why not.
+fn included_file(
+    root: &std::path::Path,
+    including_dir: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf, String> {
+    let p = path_under_root(root, including_dir, rel).map_err(|e| format!("`include:` {e}"))?;
+    let meta =
+        std::fs::metadata(&p).map_err(|e| format!("`include:` '{rel}' ({}): {e}", p.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "`include:` '{rel}' ({}) is not a regular file",
+            p.display()
+        ));
+    }
+    std::fs::canonicalize(&p).map_err(|e| format!("`include:` '{rel}': {e}"))
+}
+
+/// Read every model a top-level `include:` names, as services ready to join this document's.
+///
+/// Each entry is an INDEPENDENT model, per the Specification: its own files (the first, then its
+/// overrides, merged as `-f` merges), its own project directory (default: the directory of its
+/// first file) and its own `.env` (its `env_file`, or the `.env` in that project directory). Its
+/// profiles are left undecided, so they are decided once on the whole stack. Its relative paths are
+/// anchored to its project directory before it is handed back.
+fn load_includes(
+    node: &Node,
+    including_dir: Option<&std::path::Path>,
+    net: crate::StackNet,
+    chain: &IncludeChain,
+) -> Result<Vec<ComposeBox>, String> {
+    let entries = include_entries(node)?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (Some(root), Some(including_dir)) = (chain.root.as_deref(), including_dir) else {
+        return Err(
+            "`include:` names files relative to the compose file, and this text was not read from a \
+             file on disk"
+                .to_string(),
+        );
+    };
+    // Canonical, because the caller passes the directory as written (`.` for a file here).
+    let including_dir = std::fs::canonicalize(including_dir).map_err(|e| {
+        format!(
+            "`include:` resolving the including file's directory {}: {e}",
+            including_dir.display()
+        )
+    })?;
+    let including_dir = including_dir.as_path();
+    if chain.files.len() >= MAX_INCLUDE_DEPTH {
+        return Err(format!(
+            "`include:` nests more than {MAX_INCLUDE_DEPTH} files deep - refusing to follow further"
+        ));
+    }
+    let mut out: Vec<ComposeBox> = Vec::new();
+    for e in &entries {
+        let files: Vec<std::path::PathBuf> = e
+            .paths
+            .iter()
+            .map(|p| included_file(root, including_dir, p))
+            .collect::<Result<_, _>>()?;
+        let Some(first) = files.first() else {
+            continue;
+        };
+        if let Some(open) = chain.files.iter().find(|f| files.contains(f)) {
+            return Err(format!(
+                "`include:` cycle: {} includes itself through the chain {}",
+                open.display(),
+                chain
+                    .files
+                    .iter()
+                    .map(|f| f.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            ));
+        }
+        let project_dir = match &e.project_directory {
+            Some(d) => {
+                let p = path_under_root(root, including_dir, d)
+                    .map_err(|err| format!("`include:` project_directory {err}"))?;
+                if !p.is_dir() {
+                    return Err(format!(
+                        "`include:` project_directory '{d}' ({}) is not a directory",
+                        p.display()
+                    ));
+                }
+                std::fs::canonicalize(&p)
+                    .map_err(|err| format!("`include:` project_directory '{d}': {err}"))?
+            }
+            None => first
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| root.to_path_buf()),
+        };
+        // ITS OWN `.env`, not the including file's: an included model is written against the
+        // variables of its own project, and the process environment still wins over both, as it does
+        // everywhere else.
+        let dotenv = if e.env_files.is_empty() {
+            let dot = project_dir.join(".env");
+            match std::fs::read_to_string(&dot) {
+                Ok(t) if dot.is_file() => crate::parse_dotenv(&t),
+                _ => crate::DotEnv::default(),
+            }
+        } else {
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for f in &e.env_files {
+                let p = included_file(root, including_dir, f)?;
+                let t = std::fs::read_to_string(&p)
+                    .map_err(|err| format!("`include:` env_file '{f}': {err}"))?;
+                pairs.extend(crate::parse_dotenv(&t).into_pairs());
+            }
+            crate::DotEnv(pairs)
+        };
+        let mut inner = chain.clone();
+        let mut model: Option<Vec<ComposeBox>> = None;
+        for f in &files {
+            inner.files.push(f.clone());
+            let text = std::fs::read_to_string(f)
+                .map_err(|err| format!("`include:` reads {}: {err}", f.display()))?;
+            let layer = parse_document(&text, &dotenv, false, net, f.parent(), true, &inner)
+                .map_err(|err| format!("`include:` {}: {err}", f.display()))?;
+            inner.files.pop();
+            model = Some(match model {
+                None => layer,
+                Some(base) => crate::merge_stacks(base, layer),
+            });
+        }
+        let mut boxes = model.unwrap_or_default();
+        anchor_included_paths(&mut boxes, &project_dir, root, &first.display().to_string())?;
+        // THE SAME NAME IN TWO INCLUDES IS MERGED, THE EARLIER ONE WINNING. MEASURED on docker
+        // compose 5.0.2, in both orders: `include: [a.yml, b.yml]` each defining `y` gives `y` the
+        // image of a.yml, the environment of both, and b.yml's volume. That is `merge_from` with the
+        // later model as the base and the earlier one on top of it.
+        for b in boxes {
+            match out.iter().position(|o| o.name == b.name) {
+                Some(pos) => {
+                    let earlier = std::mem::replace(&mut out[pos], b);
+                    out[pos].merge_from(earlier);
+                }
+                None => out.push(b),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The required-but-unset list with ONE entry per variable, keeping the author's message.
+///
+/// MEASURED 2026-11-12 on NVIDIA-Omniverse/usd-search: `LOCAL_FS_DATA_DIR` is written three times as
+/// `${...:?}` (once with the author's text, twice bare), and the refusal listed it three times,
+/// twice as "(required but not set)". A reader counts three things to set where there is one.
+/// Entries are `NAME (message)`; the first occurrence carrying a message other than the generic one
+/// wins, and the order of first appearance is kept.
+fn one_entry_per_variable(entries: Vec<String>) -> Vec<String> {
+    const GENERIC: &str = "(required but not set)";
+    let mut out: Vec<String> = Vec::new();
+    for e in entries {
+        let name = e.split(" (").next().unwrap_or(&e).to_string();
+        match out
+            .iter_mut()
+            .find(|o| o.split(" (").next() == Some(name.as_str()))
+        {
+            Some(kept) if kept.ends_with(GENERIC) && !e.ends_with(GENERIC) => *kept = e,
+            Some(_) => {}
+            None => out.push(e),
+        }
+    }
+    out
+}
+
 /// `devices:` in BOTH of its spellings, folded to the short one `normalise_devices` reads.
 ///
 /// THE LONG FORM IS REAL AND WAS READ AS A PATH. MEASURED 2026-11-12 with Docker Compose v5.0.2:
@@ -3564,6 +4486,8 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             }
         }
     }
+    // `runtime: nvidia`, decided after the loop (see there): keys arrive in file order.
+    let mut runtime_nvidia = false;
     for (key, node) in &svc.children {
         match key.as_str() {
             "image" => b.image = node.scalar.as_deref().map(scalar_str),
@@ -3659,7 +4583,17 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             "restart" => apply_restart(&mut b, node, name),
             "user" => b.user = node.scalar.as_deref().map(scalar_str),
             "working_dir" | "workdir" => b.workdir = node.scalar.as_deref().map(scalar_str),
-            "build" => b.build = Some(build_value(node, dotenv)),
+            "build" => {
+                let (build, missing) = build_value(node, dotenv, secret_files, secret_envs);
+                for m in missing {
+                    warn(&format!(
+                        "service '{name}': build secret '{m}' has no top-level `file:` or \
+                         `environment:` definition - not given to the build (a RUN that requires it \
+                         will say so)"
+                    ));
+                }
+                b.build = Some(build);
+            }
             // Resource / capability / hardening keys - these map 1:1 to `kern box` flags the runtime
             // already enforces, so CONVERT them (not warn-and-ignore): a compose that sets `mem_limit`
             // or `read_only` must get those limits, else the stack "runs but without the constraints
@@ -3769,6 +4703,7 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             }
             "hostname" => b.hostname = node.scalar.as_deref().map(scalar_str),
             "cap_add" => b.cap_add = list_value(node),
+            "group_add" => b.group_add = list_value(node),
             "cap_drop" => b.cap_drop = list_value(node),
             "tmpfs" => b.tmpfs = tmpfs_value(node),
             "read_only" => b.read_only = scalar_is_true(node),
@@ -3946,7 +4881,14 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '/' && c != '-' && c != '_')
                         .to_ascii_lowercase();
                     match head.as_str() {
-                        "no-new-privileges" => already.push("no-new-privileges"),
+                        // APPLIED, as docker applies it: a kern box no longer sets no-new-privileges
+                        // by default (docker's default), so a file asking for it gets it. `false`
+                        // is docker's default and kern's too.
+                        "no-new-privileges" => {
+                            if word != "false" {
+                                b.no_new_privs = true;
+                            }
+                        }
                         // THE ONLY ONE OF THE FOUR THAT IS STILL A DIFFERENCE, and it is one by
                         // design: the file asks for NO filter and kern keeps its deny-by-default
                         // allowlist on every box. Honouring it would let a downloaded file switch
@@ -3984,13 +4926,8 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                         _ => absent.push(format!("{v}: no kern equivalent")),
                     }
                 }
-                if !already.is_empty() {
-                    warn(&format!(
-                        "service '{name}': 'security_opt: {}' is ALREADY ENFORCED - kern sets \
-                         NoNewPrivs on every box and there is no way to switch it off",
-                        already.join(", ")
-                    ));
-                }
+                // Nothing is "already enforced" any more: no-new-privileges is applied above.
+                let _ = &mut already;
                 if !matched.is_empty() {
                     warn(&format!(
                         "service '{name}': 'security_opt: {}' is ALREADY WHAT KERN DOES - it loads \
@@ -4207,6 +5144,16 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                         "service '{name}': '{key}: {v}' is ALREADY ENFORCED - every kern box gets \
                          its own {ns} namespace and there is no way to switch it off"
                     )),
+                    // `ipc: host` IS ALMOST ALWAYS ABOUT /dev/shm: vLLM's and PyTorch's own guides
+                    // give it as the cure for docker's 64 MB default (field round 2, vllm-windows).
+                    // A kern box's /dev/shm is already sized to its memory cap, so the sentence
+                    // says that first, instead of sending the reader outside the box.
+                    "host" if key == "ipc" => warn(&format!(
+                        "service '{name}': 'ipc: host' is NOT applied - the box keeps its own IPC \
+                         namespace, a kernel boundary kern does not hand back. If the point is a \
+                         large /dev/shm (vLLM, PyTorch DataLoader workers), the box already has its \
+                         own, sized to the service's memory cap, and `shm_size:` sets it"
+                    )),
                     "host" => warn(&format!(
                         "service '{name}': '{key}: host' is NOT applied - the box keeps its own {ns} \
                          namespace, which is a real kernel boundary kern does not hand back. A \
@@ -4239,13 +5186,7 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     .to_string();
                 let v = v.as_str();
                 if v.eq_ignore_ascii_case("nvidia") {
-                    warn(&format!(
-                        "service '{name}': `runtime: nvidia` is NOT applied - kern is the runtime \
-                         and does not delegate to another one. The GPU is a DEVICE GRANT here: \
-                         write `gpus: all` (or name the nodes under `devices:`) and pass \
-                         `--allow-device-grants` to `kern compose`, which is the operator's half \
-                         that a file cannot give itself. {GPU_SILENT_FAILURE_TAIL}"
-                    ));
+                    runtime_nvidia = true;
                 } else if v.is_empty() {
                     warn(&format!("service '{name}': '{key}:' ignored (unsupported)"));
                 } else {
@@ -4286,7 +5227,8 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     b.gpus = Some(v);
                 } else if !node.items.is_empty() {
                     match gpu_reservation_spec(name, node, true) {
-                        Some(Ok(spec)) => b.gpus = Some(spec),
+                        Some(Ok(GpuAsk::Gpus(spec))) => b.gpus = Some(spec),
+                        Some(Ok(GpuAsk::Cdi(names))) => add_cdi_names(&mut b.device, &names),
                         Some(Err(msg)) => warn(&msg),
                         // A LIST WITH NO GPU ENTRY under a key whose whole purpose is the GPU.
                         // Docker would read the entry and find no `capabilities: [gpu]` either,
@@ -4425,6 +5367,16 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
     // `gpus:` or a CDI device has already asked properly and must not be warned at for being
     // thorough. The keys are read in file order, so asking during the loop would answer differently
     // depending on where the author put the variable.
+    // `runtime: nvidia` IS HONOURED WITH NVIDIA'S MEANING: the GPUs the box's own
+    // `NVIDIA_VISIBLE_DEVICES` names, decided by `kern box --runtime nvidia` once the image is known.
+    // MEASURED in the field on a WSL2 guest: devflowinc/trieve's TEI services carry `runtime: nvidia`
+    // and no reservation, and docker gave them the GPU from the CUDA image's
+    // `NVIDIA_VISIBLE_DEVICES=all`; kern warned and gave none. A reservation beside it is the explicit
+    // request and wins (Jellyfin's own example writes both). The operator's gate reads it like every
+    // other GPU request, so a file still cannot grant itself the card.
+    if runtime_nvidia {
+        b.runtime_nvidia = true;
+    }
     if b.gpus.is_none() && b.device.is_none() {
         if let Some(raw) = b
             .env
@@ -4587,24 +5539,41 @@ fn parse_binary_size_str(s: &str) -> Option<u64> {
 /// to prevent. `Some(Err(..))` is an entry that asked for one in a shape with no translation, and
 /// it is named rather than approximated: a count this function invented would be a number nobody
 /// wrote.
+/// What a GPU reservation asks for: a `--gpus` spec, or CDI names for `--device`.
+#[derive(Debug, PartialEq, Eq)]
+enum GpuAsk {
+    Gpus(String),
+    Cdi(String),
+}
+
 fn gpu_reservation_spec(
     service: &str,
     devices: &Node,
     gpu_is_implied: bool,
-) -> Option<Result<String, String>> {
+) -> Option<Result<GpuAsk, String>> {
     // The messages below name `deploy.resources.reservations.devices` because that is where this
     // shape is usually written; `gpus:`'s long form is the same shape and reaches the same text.
     // Naming both spellings in every message would be noise, and the shape in front of the reader
     // is the one they wrote.
-    let entries: Vec<Node> = if devices.items.is_empty() {
-        Vec::new()
-    } else {
-        devices
-            .items
-            .iter()
-            .map(|i| parse_inline_table(i))
-            .collect()
+    // A FLOW SEQUENCE (`devices: [ {driver: nvidia, ...} ]`, or a whole `deploy:` written in flow
+    // style) arrives as one scalar rather than as items, and is split at its top-level commas here:
+    // read as items only, it was a GPU reservation with no entries, and the service ran without one.
+    let flow_items: Vec<String> = match devices.scalar.as_deref().map(str::trim) {
+        Some(v) if devices.items.is_empty() && v.starts_with('[') && v.ends_with(']') => {
+            split_top_commas(&v[1..v.len() - 1])
+                .into_iter()
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty())
+                .collect()
+        }
+        _ => Vec::new(),
     };
+    let entries: Vec<Node> = devices
+        .items
+        .iter()
+        .chain(flow_items.iter())
+        .map(|i| parse_inline_table(i))
+        .collect();
     for entry in &entries {
         // `capabilities: [gpu]` is what makes this entry a GPU and not some other reservation.
         // The list arrives as a scalar `[gpu]` or as items, so both are read.
@@ -4626,6 +5595,46 @@ fn gpu_reservation_spec(
         let driver_is_nvidia = driver_named
             .as_deref()
             .is_some_and(|v| v.eq_ignore_ascii_case("nvidia"));
+        // `driver: cdi` NAMES DEVICES BY THEIR CDI NAME in `device_ids`. MEASURED with docker
+        // 29.1.3 on this host: `driver: cdi`, `device_ids: ["nvidia.com/gpu=all"]`,
+        // `capabilities: [gpu]` gave the service both cards; kern read `cdi` as another vendor's
+        // driver and granted nothing. The names go to `--device`, the flag whose grammar they are,
+        // and the operator's gate reads them as it reads every other GPU request.
+        if driver_named
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("cdi"))
+            && caps.is_some()
+        {
+            let listed: Vec<String> = entry
+                .child("device_ids")
+                .map(|ids| {
+                    let raw = ids.scalar.as_deref().unwrap_or_default();
+                    if ids.items.is_empty() {
+                        raw.trim()
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .split(',')
+                            .map(|x| x.trim().trim_matches('"').trim_matches('\'').to_string())
+                            .filter(|x| !x.is_empty())
+                            .collect()
+                    } else {
+                        ids.items
+                            .iter()
+                            .map(|x| x.trim().trim_matches('"').trim_matches('\'').to_string())
+                            .filter(|x| !x.is_empty())
+                            .collect()
+                    }
+                })
+                .unwrap_or_default();
+            if listed.is_empty() || !listed.iter().all(|n| cdi_device_name(n)) {
+                return Some(Err(format!(
+                    "service '{service}': deploy.resources.reservations.devices has `driver: cdi` \
+                     and its `device_ids` are not CDI names. Write them fully qualified: \
+                     device_ids: [\"nvidia.com/gpu=all\"] or [\"nvidia.com/gpu=0\"]"
+                )));
+            }
+            return Some(Ok(GpuAsk::Cdi(listed.join(","))));
+        }
         // ⛔ THE DRIVER RULE NEEDS THE FIELD TO BE THERE, and that is not a detail. `capabilities`
         // is REQUIRED by the spec ("Otherwise, it returns an error on service deployment"), so an
         // entry without it is a file Docker refuses. Accepting it here would make kern the only
@@ -4691,7 +5700,7 @@ fn gpu_reservation_spec(
                      count (count: 2)"
                 )));
             }
-            return Some(Ok(format!("device={}", listed.join(","))));
+            return Some(Ok(GpuAsk::Gpus(format!("device={}", listed.join(",")))));
         }
         if let Some(count) = entry.child("count") {
             let v = count
@@ -4731,15 +5740,17 @@ fn gpu_reservation_spec(
                      without one: write `count: 1`, `count: all` or `device_ids` to get a card"
                 )));
             }
-            return Some(Ok(v));
+            return Some(Ok(GpuAsk::Gpus(v)));
         }
-        // NEITHER, so there is nothing to translate and nothing to guess. Docker's own default
-        // here is not something kern should reproduce from memory, so the entry is named.
-        return Some(Err(format!(
-            "service '{service}': deploy.resources.reservations.devices names a GPU and says \
-             neither how many nor which. Write `count: 2`, `count: all`, or \
-             `device_ids: [\"0\"]`"
-        )));
+        // NEITHER `count` NOR `device_ids` IS EVERY CARD. This read "Docker's own default here is
+        // not something kern should reproduce from memory", and the entry was refused a card. It is
+        // not from memory any more: MEASURED 2026-11-12, docker compose 5.0.2 normalises such an
+        // entry to `count: -1` (all) in `config`, and the Specification's text says the same ("If
+        // count is set to all or not specified, Compose reserves all devices"). Found on
+        // LLMSystems/vLLMux, whose `backend` and `dcgm-exporter` write exactly this block: docker gave
+        // them every card, kern gave them none. The operator still decides: a grant needs
+        // `--allow-device-grants`, and that gate names the selection, `(all)`.
+        return Some(Ok(GpuAsk::Gpus("all".to_string())));
     }
     None
 }
@@ -4852,7 +5863,11 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
             // would be the same defect pointing the other way.
             if k == "devices" {
                 match gpu_reservation_spec(name, child, false) {
-                    Some(Ok(spec)) => {
+                    Some(Ok(GpuAsk::Cdi(names))) => {
+                        add_cdi_names(&mut b.device, &names);
+                        continue;
+                    }
+                    Some(Ok(GpuAsk::Gpus(spec))) => {
                         // `gpus:` WINS, and the file is told. Two keys asking for the same thing
                         // is the file's ambiguity, and resolving it in silence would leave a
                         // reader unable to tell which of their two lines took effect.
@@ -5855,6 +6870,14 @@ fn visible_devices_remedy(value: &str) -> Option<String> {
     Some(format!("gpus: device={v}"))
 }
 
+/// Append CDI names to a service's `--device` list.
+fn add_cdi_names(device: &mut Option<String>, names: &str) {
+    *device = Some(match device.take() {
+        Some(prev) => format!("{prev},{names}"),
+        None => names.to_string(),
+    });
+}
+
 /// Is `entry` a CDI device name rather than a path?
 ///
 /// THE SHAPE IS THE SPEC'S: `<vendor>/<class>=<name>`, where the vendor is a DNS-style name (so it
@@ -5897,30 +6920,10 @@ pub fn normalise_devices(
         // bind source whose target defaults to itself, which is how it reached the volume layer
         // and produced a message about absolute targets.
         if cdi_device_name(&entry) {
-            // `=all` IS THE SHAPE THE PODMAN GUIDES PRINT, and it is the one shape `--device` does
-            // not take: that flag names ONE card. The request still travels, so the run REFUSES
-            // rather than starting a service with no card, and this line is what makes the refusal
-            // actionable in the vocabulary of the FILE: an author who wrote `devices:` never typed
-            // a flag, and a message about `--gpus all` sends them looking in the wrong place.
-            if entry
-                .rsplit('=')
-                .next()
-                .is_some_and(|d| d.eq_ignore_ascii_case("all"))
-            {
-                warn(&format!(
-                    "service '{name}': 'devices: {entry}' names EVERY card through CDI, and kern \
-                     reads one card per CDI name. In this file write `gpus: all` for every card, \
-                     or `devices: [nvidia.com/gpu=0]` for one"
-                ));
-            }
-            match cdi {
-                None => *cdi = Some(entry.clone()),
-                Some(first) => warn(&format!(
-                    "service '{name}': 'devices: {entry}' is a second CDI device name and kern \
-                     grants one card per name, so only '{first}' is honoured. For several cards \
-                     write `gpus: all` or `device_ids: [\"0\", \"1\"]`"
-                )),
-            }
+            // EVERY CDI NAME, `=all` INCLUDED, as docker and podman read them: `--device` takes
+            // a list now (comma-separated, which a CDI name cannot contain), and `all` resolves
+            // through the spec. Measured with both runtimes on this host: two names, two cards.
+            add_cdi_names(cdi, &entry);
             continue;
         }
         let mut parts = entry.splitn(3, ':');
@@ -5979,6 +6982,22 @@ fn volumes_value(node: &Node, tmpfs: &mut Vec<String>, service: &str) -> Vec<Str
         .collect()
 }
 
+/// `~` and `~/...` at the start of a bind source are the caller's home directory, as compose-go
+/// expands them. MEASURED with docker compose v5.0.2: `~/kern-measure-tilde:/data` and a long-form
+/// `source: ~/kern-measure-tilde2` both became binds of `/home/alex/...`. kern took `~/invokeai` (what
+/// InvokeAI's file resolves `${HOST_INVOKEAI_ROOT:-${INVOKEAI_ROOT:-~/invokeai}}` to) for a path
+/// relative to the project and created a directory named `~` inside it. With no `HOME`, unchanged.
+pub(crate) fn expand_home(source: &str) -> String {
+    let home = || std::env::var("HOME").ok().filter(|h| !h.is_empty());
+    if source == "~" {
+        return home().unwrap_or_else(|| source.to_string());
+    }
+    match (source.strip_prefix("~/"), home()) {
+        (Some(rest), Some(h)) => format!("{}/{rest}", h.trim_end_matches('/')),
+        _ => source.to_string(),
+    }
+}
+
 /// A short-form entry that is JUST A PATH is Compose's ANONYMOUS VOLUME, and it needs a name here.
 ///
 /// `volumes: ["/app/node_modules"]` asks for a fresh volume mounted at that path, and it is the most
@@ -5996,7 +7015,14 @@ fn volumes_value(node: &Node, tmpfs: &mut Vec<String>, service: &str) -> Vec<Str
 /// An entry that already names a source is returned untouched: this is the ONLY shape that has no
 /// source, so it is the only one to synthesise for.
 fn anonymous_volume(item: &str, service: &str) -> String {
-    let t = item.trim();
+    let expanded;
+    let t = match item.trim().split_once(':') {
+        Some((src, rest)) if src == "~" || src.starts_with("~/") => {
+            expanded = format!("{}:{rest}", expand_home(src));
+            expanded.as_str()
+        }
+        _ => item.trim(),
+    };
     // `src:dst`, `src:dst:ro`, or a Windows-style path: anything with a separator already has a
     // source. A leading `/` with no colon is the anonymous form.
     if t.contains(':') || !t.starts_with('/') {
@@ -6034,12 +7060,30 @@ fn reconstruct_volume_item(item: &str, tmpfs: &mut Vec<String>, service: &str) -
         if let Some((k, v)) = field.split_once(':') {
             let (k, v) = (k.trim(), scalar_str(v));
             match k {
-                "source" => source = v,
+                "source" => source = expand_home(&v),
                 "target" => target = v,
                 "type" => vtype = v,
                 "read_only" => read_only = v == "true",
                 "tmpfs.size" | "size" => tsize = v,
                 "tmpfs.mode" | "mode" => tmode = v,
+                // THE SUB-MAPPING ITSELF, in both of its spellings. The block form
+                // (`tmpfs:` then `size: …` on a deeper line) used to arrive FLATTENED by the item
+                // fold, which is why `size` above is read bare; that fold now keeps YAML's structure
+                // and hands over `tmpfs: {size: …}`. The inline form written by hand had the same
+                // shape all along and was ignored here, so a size given that way was dropped.
+                "tmpfs" => {
+                    let raw = field.split_once(':').map(|(_, r)| r.trim()).unwrap_or("");
+                    let sub = raw.trim_start_matches('{').trim_end_matches('}');
+                    for f in split_top_commas(sub) {
+                        if let Some((tk, tv)) = f.split_once(':') {
+                            match tk.trim() {
+                                "size" => tsize = scalar_str(tv),
+                                "mode" => tmode = scalar_str(tv),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 _ => {} // bind/volume sub-options (bind:, volume:, consistency:) - ignored
             }
         }
@@ -6160,19 +7204,22 @@ fn apply_healthcheck(b: &mut ComposeBox, node: &Node, svc: &str) {
     {
         return;
     }
-    let Some(test) = node.child("test") else {
-        warn(&format!(
-            "service '{svc}': healthcheck has no `test` - omitted"
-        ));
-        return;
-    };
-    match healthcheck_test(test) {
+    // ⛔ NO `test` HERE IS NOT "NO HEALTHCHECK": its numbers still apply, to a `test` another layer
+    // or the image supplies. MEASURED 2026-11-12 on NVIDIA-Omniverse/usd-search: the base model
+    // writes siglip2-triton's `test` and `retries: 5`, its override writes only `retries: 10` and
+    // `start_period: 60s`, and docker resolves `test` from the base with `retries: 10`. kern returned
+    // here, dropped the override's numbers, and warned "has no `test` - omitted" about a service that
+    // has one. Whether ANY layer gave a test is a question about the merged stack, so it is asked
+    // there (`settle_deferred_health_gates`), not about one file.
+    let test = node.child("test");
+    match test.map(healthcheck_test) {
+        None => {}
         // The FORM travels with the command: `CMD` is an argv kern execs, `CMD-SHELL` (and a bare
         // string) a line kern hands to `/bin/sh -c`. Flattening the first into the second is what
         // made every image without a shell permanently unhealthy - see `ComposeBox::health_argv`.
-        Some(TestForm::Exec(argv)) => b.health_argv = argv,
-        Some(TestForm::Shell(c)) => b.health_cmd = Some(c),
-        None => {
+        Some(Some(TestForm::Exec(argv))) => b.health_argv = argv,
+        Some(Some(TestForm::Shell(c))) => b.health_cmd = Some(c),
+        Some(None) => {
             // Omit the health entirely rather than half-convert it (a partial health lies). Any
             // `depends_healthy` edge toward this box is degraded to start-order later in
             // `degrade_orphan_health_gates`, which emits the linked, direction-correct warning.
@@ -6369,17 +7416,23 @@ fn apply_restart(b: &mut ComposeBox, node: &Node, svc: &str) {
 /// `build`: resolve to a [`BuildDirective`]. `context`/`dockerfile` are kept RELATIVE (the caller in
 /// `compose()` confines them under the compose file's dir - traversal guard). `args` values are
 /// already `${VAR}`-substituted document-wide.
-fn build_value(node: &Node, dotenv: &crate::DotEnv) -> BuildDirective {
+fn build_value(
+    node: &Node,
+    dotenv: &crate::DotEnv,
+    secret_files: &std::collections::HashMap<String, String>,
+    secret_envs: &std::collections::HashMap<String, String>,
+) -> (BuildDirective, Vec<String>) {
     // Short form: `build: ./dir`
     if let Some(sc) = &node.scalar {
         let sc = scalar_str(sc);
         if !sc.is_empty() {
-            return BuildDirective {
-                context: sc,
-                dockerfile: None,
-                args: Vec::new(),
-                target: None,
-            };
+            return (
+                BuildDirective {
+                    context: sc,
+                    ..Default::default()
+                },
+                Vec::new(),
+            );
         }
     }
     // Long form: `build: {context:, dockerfile:, args:}`
@@ -6402,12 +7455,82 @@ fn build_value(node: &Node, dotenv: &crate::DotEnv) -> BuildDirective {
         .and_then(|n| n.scalar.as_deref())
         .map(scalar_str)
         .filter(|t| !t.trim().is_empty());
-    BuildDirective {
-        context,
-        dockerfile,
-        args,
-        target,
+    // `build.secrets:` - short (`- name`) or long (`- source: name` with `target:` the id the
+    // Dockerfile names), resolved against the top-level definitions the service secrets use.
+    let mut secrets = Vec::new();
+    let mut missing = Vec::new();
+    if let Some(n) = node.child("secrets") {
+        for it in list_value(n) {
+            let it = it.trim();
+            let (source, id) = if it.starts_with('{') {
+                let t = parse_inline_table(it);
+                let get = |k: &str| t.child(k).and_then(|v| v.scalar.as_deref()).map(scalar_str);
+                match get("source") {
+                    Some(s) => (s.clone(), get("target").unwrap_or(s)),
+                    None => continue,
+                }
+            } else if it.is_empty() {
+                continue;
+            } else {
+                let s = scalar_str(it);
+                (s.clone(), s)
+            };
+            match (secret_files.get(&source), secret_envs.get(&source)) {
+                (Some(f), _) => secrets.push(crate::BuildSecret {
+                    id,
+                    file: Some(f.clone()),
+                    env: None,
+                }),
+                (None, Some(v)) => secrets.push(crate::BuildSecret {
+                    id,
+                    file: None,
+                    env: Some(v.clone()),
+                }),
+                (None, None) => missing.push(source),
+            }
+        }
     }
+    // `build.ssh:` - a list (`- default`, `- id=path`) or a map (`id: path`).
+    let mut ssh = Vec::new();
+    if let Some(n) = node.child("ssh") {
+        for it in list_value(n) {
+            let it = scalar_str(it.trim());
+            if !it.is_empty() {
+                ssh.push(it);
+            }
+        }
+        for (k, v) in &n.children {
+            match v
+                .scalar
+                .as_deref()
+                .map(scalar_str)
+                .filter(|s| !s.is_empty())
+            {
+                Some(path) => ssh.push(format!("{k}={path}")),
+                None => ssh.push(k.clone()),
+            }
+        }
+    }
+    let platforms = node
+        .child("platforms")
+        .map(list_value)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| scalar_str(p.trim()))
+        .filter(|p| !p.is_empty())
+        .collect();
+    (
+        BuildDirective {
+            context,
+            dockerfile,
+            args,
+            target,
+            secrets,
+            ssh,
+            platforms,
+        },
+        missing,
+    )
 }
 
 /// What resolving every `network_mode: service:X` in a file comes to.
@@ -6641,6 +7764,111 @@ const KNOWN_SERVICE_KEYS: [&str; 47] = [
     "runtime",
 ];
 
+/// The scalar a `!reset` value is rewritten to before the tree is built, and removed after it.
+/// A control character, so no compose file can write it.
+const RESET_SENTINEL: &str = "\u{2}kern-reset";
+/// The scalar an `!override` value is rewritten to when only its KEY matters (`merge_tag_keys`).
+const OVERRIDE_SENTINEL: &str = "\u{2}kern-override";
+
+/// Compose's merge tags on a `key:` line, `!reset` and `!override`.
+///
+/// Docker reads them when it merges `-f` files: `!reset` removes the key from what the earlier
+/// files built, `!override` replaces it instead of merging into it. kern read neither and took the
+/// tag as part of the value, which turned `gpus: !reset []` (an override that REMOVES a GPU) into a
+/// GPU request named `!reset []`: MEASURED on a Jetson, the service demanded the grant docker
+/// drops. `!reset` becomes [`RESET_SENTINEL`]; `!override` loses its tag and keeps its value when
+/// `keep_override` is set (the file being parsed), and becomes [`OVERRIDE_SENTINEL`] otherwise.
+fn rewrite_merge_tags(lines: &mut [Line], keep_override: bool) {
+    for ln in lines.iter_mut() {
+        let Some(ci) = colon_index(&ln.content) else {
+            continue;
+        };
+        let value = ln.content[ci + 1..].trim_start();
+        let key = ln.content[..ci].to_string();
+        let tag_end = |tag: &str| {
+            value
+                .strip_prefix(tag)
+                .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+                .map(str::trim)
+        };
+        if tag_end("!reset").is_some() {
+            ln.content = format!("{key}: {RESET_SENTINEL}");
+        } else if let Some(rest) = tag_end("!override") {
+            ln.content = if keep_override {
+                if rest.is_empty() {
+                    format!("{key}:")
+                } else {
+                    format!("{key}: {rest}")
+                }
+            } else {
+                format!("{key}: {OVERRIDE_SENTINEL}")
+            };
+        }
+    }
+}
+
+thread_local! {
+    /// `(service, key)` pairs a LATER `-f` file resets or overrides, removed from this document's
+    /// services before they are interpreted. Set around one parse by [`with_dropped_keys`].
+    static DROPPED_KEYS: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Parse with `drop` removed from every service of the document (and of what it includes).
+pub(crate) fn with_dropped_keys<T>(drop: &[(String, String)], f: impl FnOnce() -> T) -> T {
+    DROPPED_KEYS.with(|d| *d.borrow_mut() = drop.to_vec());
+    let out = f();
+    DROPPED_KEYS.with(|d| d.borrow_mut().clear());
+    out
+}
+
+/// Remove this file's own `!reset` keys and the keys a later file resets or overrides.
+fn drop_reset_keys(root: &mut Node) {
+    let dropped = DROPPED_KEYS.with(|d| d.borrow().clone());
+    let Some(services) = root
+        .children
+        .iter_mut()
+        .find(|(k, _)| k == "services")
+        .map(|(_, n)| n)
+    else {
+        return;
+    };
+    for (svc, node) in services.children.iter_mut() {
+        node.children.retain(|(key, value)| {
+            value.scalar.as_deref() != Some(RESET_SENTINEL)
+                && !dropped.iter().any(|(s, k)| s == svc && k == key)
+        });
+    }
+}
+
+/// The `(service, key)` pairs a file marks `!reset` or `!override`, which the files BEFORE it in
+/// a `-f` list must not contribute. Read from the tree, so only a service key counts.
+pub(crate) fn merge_tag_keys(text: &str) -> Result<Vec<(String, String)>, String> {
+    let folded = fold_multiline(text)?;
+    let mut lines = lex(&folded)?;
+    if !lines
+        .iter()
+        .any(|l| l.content.contains("!reset") || l.content.contains("!override"))
+    {
+        return Ok(Vec::new());
+    }
+    rewrite_merge_tags(&mut lines, false);
+    let root = build_tree(&lines)?;
+    let mut out = Vec::new();
+    if let Some(services) = root.child("services") {
+        for (svc, node) in &services.children {
+            for (key, value) in &node.children {
+                if matches!(
+                    value.scalar.as_deref(),
+                    Some(RESET_SENTINEL) | Some(OVERRIDE_SENTINEL)
+                ) {
+                    out.push((svc.clone(), key.clone()));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 // Warnings this parser emits, collected UNDER TEST so they can be asserted.
 //
 // Every `warn` in this file is a decision ("kern does not do this, and here is what that costs you"),
@@ -6815,6 +8043,64 @@ fn sanitize_for_terminal(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One inactive profile gets its exact value; several are offered as CHOICES, because setting
+    /// them all at once was the printed remedy and it failed on nemotron-voice-agent.
+    #[test]
+    fn several_inactive_profiles_are_offered_as_choices_and_one_gets_its_exact_value() {
+        let many = parse(concat!(
+            "services:\n",
+            "  a:\n    image: alpine\n    profiles: [kern-test-alpha]\n",
+            "  b:\n    image: alpine\n    profiles: [kern-test-beta]\n",
+        ))
+        .expect_err("nothing runs");
+        assert!(many.contains("kern-test-alpha, kern-test-beta"), "{many}");
+        assert!(
+            !many.contains("COMPOSE_PROFILES=kern-test-alpha,kern-test-beta"),
+            "the profiles are not one value to set together: {many}"
+        );
+        let one = parse("services:\n  a:\n    image: alpine\n    profiles: [kern-test-only]\n")
+            .expect_err("nothing runs");
+        assert!(one.contains("COMPOSE_PROFILES=kern-test-only"), "{one}");
+    }
+
+    /// ONE VARIABLE IS ONE LINE, and the author's own words win. Measured on usd-search: three
+    /// `${LOCAL_FS_DATA_DIR:?...}` occurrences were three entries, two of them generic.
+    #[test]
+    fn a_required_variable_written_several_times_is_listed_once_with_its_authors_message() {
+        let got = one_entry_per_variable(vec![
+            "X (required but not set)".to_string(),
+            "X (Set X to your assets directory)".to_string(),
+            "Y (required but not set)".to_string(),
+            "X (required but not set)".to_string(),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                "X (Set X to your assets directory)".to_string(),
+                "Y (required but not set)".to_string()
+            ]
+        );
+        // End to end, through the parser: the refusal names the variable once and in the singular.
+        let v = "KERN_TEST_REQUIRED_ONCE_7f3a";
+        assert!(
+            std::env::var_os(v).is_none(),
+            "the fixture variable must be unset"
+        );
+        let doc = format!(
+            "services:\n  s:\n    image: alpine\n    environment:\n      A: ${{{v}:?}}\n      B: ${{{v}:?set it please}}\n      C: ${{{v}:?}}\n"
+        );
+        let err = parse(&doc).expect_err("an unset required variable refuses the file");
+        assert_eq!(
+            err.matches(v).count(),
+            1,
+            "the variable must appear once: {err}"
+        );
+        assert!(
+            err.contains("set it please") && err.starts_with("a variable"),
+            "{err}"
+        );
+    }
 
     /// ⛔ `devices:` HAS A LONG FORM, and it was read as a path.
     ///
@@ -7171,8 +8457,14 @@ mod tests {
 
         // The flow form is the one that is refused, and the message says so instead of blaming
         // anchors as a whole.
-        let err = parse("x: &a alpine\nservices:\n  s:\n    image: alpine\n    command: [*a]\n")
-            .expect_err("an alias inside a flow collection is refused");
+        // An alias as a whole flow item IS expanded now, as docker compose v5 expands it.
+        let expanded =
+            parse("x: &a alpine\nservices:\n  s:\n    image: alpine\n    command: [*a]\n")
+                .expect("a whole-item alias in a flow list expands");
+        assert_eq!(expanded[0].command, vec!["alpine".to_string()]);
+        // An ANCHOR inside a flow collection is still the refused form.
+        let err = parse("services:\n  s:\n    image: alpine\n    command: [&b x]\n")
+            .expect_err("an anchor inside a flow collection is refused");
         assert!(err.contains("flow collection"), "{err}");
         assert!(
             !err.contains("anchors/aliases not supported"),
@@ -8579,6 +9871,182 @@ mod tests {
     /// AND IT ONLY FIRES WHEN THE FILE ASKED FOR NOTHING ELSE. A service that also writes `gpus:`
     /// has asked properly and must not be warned at for being thorough, which is the half that
     /// keeps this off the Ollama files that carry BOTH the variable and a deploy block.
+    /// `runtime: nvidia` IS HONOURED, AND AN EXPLICIT REQUEST BESIDE IT WINS. Jellyfin's example writes
+    /// `runtime: nvidia` above a reservation; devflowinc/trieve's writes it alone. Neither is warned
+    /// about any more: the first gets its reservation, the second the GPUs its image's
+    /// `NVIDIA_VISIBLE_DEVICES` names, through `kern box --runtime nvidia`, as under docker.
+    /// `security_opt: [no-new-privileges:true]` reaches the box as docker applies it; `:false` and no key
+    /// leave docker's default (off). It used to be warned about as "already enforced", which stopped
+    /// being true when a box stopped setting it by default.
+    #[test]
+    fn no_new_privileges_in_a_file_reaches_the_box() {
+        let flags = |body: &str| -> Vec<String> {
+            let boxes =
+                parse(&format!("services:\n  s:\n    image: alpine\n{body}")).expect("parses");
+            let mut argv = std::process::Command::new("kern");
+            boxes[0].push_box_flags(&mut argv);
+            argv.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let asks = |args: &[String]| {
+            args.windows(2)
+                .any(|w| w[0] == "--security-opt" && w[1] == "no-new-privileges")
+        };
+        assert!(asks(&flags(
+            "    security_opt:\n      - no-new-privileges:true\n"
+        )));
+        assert!(asks(&flags(
+            "    security_opt:\n      - no-new-privileges\n"
+        )));
+        assert!(!asks(&flags(
+            "    security_opt:\n      - no-new-privileges:false\n"
+        )));
+        assert!(!asks(&flags("")));
+    }
+
+    /// A GPU RESERVATION WRITTEN AS A FLOW MAPPING ITEM IS A GPU RESERVATION. Measured on a Jetson:
+    /// `- {driver: nvidia, count: all, capabilities: [gpu]}` ran without the GPU because the item
+    /// was wrapped a second time as a block mapping and its keys were lost. Every order of the keys,
+    /// with and without spaces inside the braces, and the whole `deploy:` in flow style.
+    #[test]
+    fn a_flow_mapping_gpu_reservation_is_read() {
+        let svc = |devices: &str| {
+            format!(
+                "services:\n  j:\n    image: alpine\n    deploy:\n      resources:\n        reservations:\n          devices:\n            {devices}\n"
+            )
+        };
+        for item in [
+            "- {driver: nvidia, count: all, capabilities: [gpu]}",
+            "- { driver: nvidia, count: all, capabilities: [gpu] }",
+            "- {count: all, capabilities: [gpu]}",
+            "- {capabilities: [gpu], driver: nvidia, count: all}",
+        ] {
+            let _ = take_warnings();
+            let b = parse(&svc(item)).expect("parses");
+            assert_eq!(
+                b[0].gpus.as_deref(),
+                Some("all"),
+                "{item}: {:?}",
+                take_warnings()
+            );
+        }
+        let _ = take_warnings();
+        let flow = parse(
+            "services:\n  j:\n    image: alpine\n    deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [gpu] } ] } } }\n",
+        )
+        .expect("parses");
+        assert_eq!(flow[0].gpus.as_deref(), Some("1"), "{:?}", take_warnings());
+        // THE CONTROL: a flow item that is NOT a GPU stays not one.
+        let _ = take_warnings();
+        let other = parse(&svc("- {driver: other, capabilities: [tpu]}")).expect("parses");
+        assert_eq!(other[0].gpus, None);
+    }
+
+    /// A MERGE KEY INSIDE A SEQUENCE ITEM, the usual way to share a GPU reservation's driver and
+    /// capability lines. MEASURED on this desktop's two-GPU stack: the block form ran WITHOUT the
+    /// GPU and the flow form was refused, where docker compose v5 merges both and gives card 1.
+    #[test]
+    fn a_merge_key_inside_a_reservation_item_is_expanded_in_both_forms() {
+        let head = "x-gpu: &gpu\n  driver: nvidia\n  capabilities: [gpu]\nservices:\n  a:\n    image: alpine\n";
+        let block = format!(
+            "{head}    deploy:\n      resources:\n        reservations:\n          devices:\n            - <<: *gpu\n              device_ids: [\"1\"]\n"
+        );
+        let flow = format!(
+            "{head}    deploy: {{ resources: {{ reservations: {{ devices: [ {{ <<: *gpu, device_ids: [\"1\"] }} ] }} }} }}\n"
+        );
+        for (what, src) in [("block", block), ("flow", flow)] {
+            let _ = take_warnings();
+            let b = parse(&src).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(
+                b[0].gpus.as_deref(),
+                Some("device=1"),
+                "{what}: {:?}",
+                take_warnings()
+            );
+        }
+        // THE CONTROL: the same item with no merge has no capability, so it is no GPU request.
+        let _ = take_warnings();
+        let none = parse(
+            "services:\n  a:\n    image: alpine\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - device_ids: [\"1\"]\n",
+        )
+        .expect("parses");
+        assert_eq!(none[0].gpus, None);
+    }
+
+    /// A SERVICE STAMPED FROM A TEMPLATE IN FLOW STYLE, `g1: { <<: *gpu }`, is the template. kern
+    /// refused the whole file (measured on a Jetson, 30 services); the values must arrive expanded,
+    /// an explicit key beside the merge must win, an alias as a whole value must expand, and an
+    /// alias inside a flow LIST must still be refused because nothing expands it there.
+    #[test]
+    fn whole_value_aliases_in_a_flow_mapping_expand() {
+        let _ = take_warnings();
+        let b = parse(concat!(
+            "x-gpu: &gpu\n  image: alpine\n  gpus: all\n  command: [\"true\"]\n",
+            "x-env: &env\n  A: \"1\"\n",
+            "services:\n",
+            "  g1: { <<: *gpu }\n",
+            "  g2: { <<: *gpu, command: [\"echo\", \"hi\"] }\n",
+            "  c1: { image: alpine, environment: *env }\n",
+        ))
+        .expect("parses");
+        let by = |n: &str| b.iter().find(|x| x.name == n).expect("service");
+        assert_eq!(by("g1").gpus.as_deref(), Some("all"));
+        assert_eq!(by("g1").command, vec!["true".to_string()]);
+        assert_eq!(by("g2").gpus.as_deref(), Some("all"));
+        assert_eq!(by("g2").command, vec!["echo".to_string(), "hi".to_string()]);
+        assert!(
+            by("c1").env.iter().any(|e| e == "A=1"),
+            "{:?}",
+            by("c1").env
+        );
+        let refused =
+            parse("x-n: &n\n  a: 1\nservices:\n  s:\n    image: alpine\n    networks: [*n]\n");
+        assert!(
+            refused.is_err(),
+            "an alias inside a flow list is not expanded: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_nvidia_is_honoured_and_an_explicit_request_beside_it_wins() {
+        let svc = |body: &str| format!("services:\n  j:\n    image: alpine\n{body}");
+        let _ = take_warnings();
+        let both = parse(&svc(
+            "    runtime: nvidia\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              count: all\n              capabilities: [gpu]\n",
+        ))
+        .expect("parses");
+        let warns = take_warnings();
+        assert_eq!(both[0].gpus.as_deref(), Some("all"));
+        assert!(
+            !warns.iter().any(|w| w.contains("runtime")),
+            "a reserved GPU is not a missing one: {warns:?}"
+        );
+        let mut argv = std::process::Command::new("kern");
+        both[0].push_box_flags(&mut argv);
+        let args: Vec<String> = argv
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a == "--runtime"),
+            "the explicit request wins: {args:?}"
+        );
+        let alone = parse(&svc("    runtime: nvidia\n")).expect("parses");
+        assert!(alone[0].runtime_nvidia);
+        let mut argv = std::process::Command::new("kern");
+        alone[0].push_box_flags(&mut argv);
+        let args: Vec<String> = argv
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--runtime" && w[1] == "nvidia"),
+            "{args:?}"
+        );
+    }
+
     #[test]
     fn the_visible_devices_warning_is_silent_when_the_file_also_asks_properly() {
         let one = |body: &str| {
@@ -8677,9 +10145,43 @@ mod tests {
             assert_eq!(cdi, None, "{not_cdi} is not a CDI device name");
         }
 
-        // A SECOND NAME KEEPS THE FIRST and warns, because `--device` names one card.
+        // ⛔ EVERY NAME TRAVELS, as docker and podman read them (measured: two names, two cards).
+        // It kept the first and warned, while `--device` named one card.
         let (_, cdi) = take(&["nvidia.com/gpu=0", "nvidia.com/gpu=1"]);
-        assert_eq!(cdi.as_deref(), Some("nvidia.com/gpu=0"));
+        assert_eq!(cdi.as_deref(), Some("nvidia.com/gpu=0,nvidia.com/gpu=1"));
+    }
+
+    /// ⛔ `driver: cdi` NAMES CDI DEVICES, it is not another vendor. MEASURED with docker 29.1.3:
+    /// `driver: cdi`, `device_ids: ["nvidia.com/gpu=all"]`, `capabilities: [gpu]` gave the service
+    /// both cards, and kern granted none ("kern grants NVIDIA cards only").
+    #[test]
+    fn a_cdi_reservation_names_cdi_devices_for_the_device_flag() {
+        let one = |devices: &str| {
+            let yaml = format!(
+                "services:\n  g:\n    image: alpine\n    deploy:\n      resources:\n        \
+                 reservations:\n          devices:\n{devices}"
+            );
+            let b = crate::parse(&yaml).expect("parses");
+            (b[0].gpus.clone(), b[0].device.clone())
+        };
+        assert_eq!(
+            one("            - driver: cdi\n              device_ids: [\"nvidia.com/gpu=all\"]\n              capabilities: [gpu]\n"),
+            (None, Some("nvidia.com/gpu=all".to_string()))
+        );
+        assert_eq!(
+            one("            - driver: cdi\n              device_ids:\n                - nvidia.com/gpu=0\n                - nvidia.com/gpu=1\n              capabilities: [gpu]\n"),
+            (None, Some("nvidia.com/gpu=0,nvidia.com/gpu=1".to_string()))
+        );
+        // Not CDI names under `driver: cdi`: named, nothing granted.
+        assert_eq!(
+            one("            - driver: cdi\n              device_ids: [\"0\"]\n              capabilities: [gpu]\n"),
+            (None, None)
+        );
+        // And another vendor is still another vendor.
+        assert_eq!(
+            one("            - driver: amd\n              count: 1\n              capabilities: [gpu]\n"),
+            (None, None)
+        );
     }
 
     #[test]
@@ -10060,8 +11562,11 @@ mod tests {
         // nothing left to pop: a top-level key whose items sit at its own indentation (`include:`
         // is written this way in the spec's own examples) is followed by `services:` at the same
         // column 0. Asked for by a later pass as the case a dedent rule is most likely to get wrong.
+        // The key is an `x-` extension and not `include:` itself, because `include:` is READ now and
+        // needs its files on disk; the tree builder sees the identical shape either way, and
+        // `include:` has its own tests beside `parse_stack_file_at`.
         let top = concat!(
-            "include:\n",
+            "x-items:\n",
             "- ./other.yml\n",
             "services:\n",
             "  web:\n",
@@ -10244,9 +11749,10 @@ mod tests {
         assert!(
             parse("services:\n  a:\n    image: alpine\n    command:\n      - *boom\n").is_err()
         );
-        assert!(
-            parse("services:\n  a:\n    image: alpine\n    command:\n      - &x hi\n").is_err()
-        );
+        // An anchor on a scalar item is YAML docker accepts (see
+        // `an_anchor_on_a_list_item_is_registered_and_its_alias_reads_the_same_value`); one with no
+        // value on its line (a mapping item) is still refused, never left as a literal `&x`.
+        assert!(parse("services:\n  a:\n    image: alpine\n    command:\n      - &x\n").is_err());
         // A hyphen that is NOT a sequence marker (a value that begins with '-', e.g. a flag) must NOT
         // be mistaken for one and must still parse.
         assert!(
@@ -10413,6 +11919,57 @@ services:
             "b's own `restart: no` WINS over the merged `always`"
         );
         assert_eq!(bb.env, ["SHARED=yes"], "b still inherits the merged env");
+    }
+
+    #[test]
+    fn an_anchor_on_a_list_item_is_registered_and_its_alias_reads_the_same_value() {
+        // stable-diffusion-webui-docker's shape, MEASURED refused by kern ("YAML anchors in a sequence
+        // item are not supported") and accepted by docker compose: each volume of the template is
+        // anchored on its list item, one service merges the template, another reuses one volume.
+        let y = r#"x-base_service: &base_service
+    volumes:
+      - &v1 ./data:/data
+      - &v2 ./output:/output
+    command:
+      - &flag "--listen"
+
+services:
+  download:
+    image: alpine
+    volumes:
+      - *v1
+    command:
+      - *flag
+      - *v2
+  auto:
+    <<: *base_service
+    image: alpine
+"#;
+        let b = boxes(y);
+        let auto = b.iter().find(|x| x.name == "auto").unwrap();
+        assert_eq!(
+            auto.volumes.len(),
+            2,
+            "the merged template's volumes: {:?}",
+            auto.volumes
+        );
+        assert!(
+            auto.volumes.iter().all(|v| !v.contains('&')),
+            "the anchor marker reached a volume: {:?}",
+            auto.volumes
+        );
+        assert!(auto.volumes[0].ends_with(":/data") && auto.volumes[1].ends_with(":/output"));
+        let dl = b.iter().find(|x| x.name == "download").unwrap();
+        assert_eq!(dl.volumes.len(), 1);
+        assert_eq!(
+            dl.volumes[0], auto.volumes[0],
+            "`- *v1` is the anchored volume"
+        );
+        assert_eq!(
+            dl.command,
+            ["--listen", "./output:/output"],
+            "aliases of scalar items"
+        );
     }
 
     #[test]
@@ -11262,17 +12819,18 @@ services:
                 .any(|w| w.contains("reservations.devices") && w.contains("runs WITHOUT")),
             "a non-GPU reservation lost its note"
         );
-        // A GPU ENTRY THAT SAYS NEITHER HOW MANY NOR WHICH is named, not approximated: a count
-        // invented here would be a number nobody wrote.
+        // A GPU ENTRY THAT SAYS NEITHER HOW MANY NOR WHICH IS EVERY CARD, as docker reads it.
+        // MEASURED on docker compose 5.0.2: `config` normalises it to `count: -1`. It used to be
+        // refused a card here on the grounds that the default was not known; it is known now.
         assert_eq!(
             res("            - driver: nvidia\n              capabilities: [gpu]\n"),
-            None
+            Some("all".to_string())
         );
         assert!(
-            take_warnings()
+            !take_warnings()
                 .iter()
                 .any(|w| w.contains("neither how many nor which")),
-            "an underspecified GPU entry was silent"
+            "an entry docker reads as every card is not a mistake to report"
         );
         // BOTH KEYS AT ONCE is the file's ambiguity, and the file is told which one won.
         let both = one(
@@ -11378,17 +12936,14 @@ services:
         let file = "services:\n  a:\n    image: alpine\n    deploy:\n      resources:\n        \
                     reservations:\n          devices:\n            - capabilities: [gpu]\n";
         let _ = take_warnings(); // start from a clean slate on this thread
-        parse(file).expect("a reservations-only deploy block still parses");
-        let warned = take_warnings();
-        // The SENTENCE changed when the key started being applied: an entry naming a GPU and
-        // neither how many nor which is now named for what it is missing. The PLACEMENT is what
-        // this test holds, and any word out of that subtree proves the check still runs before
-        // the early return.
-        assert!(
-            warned
-                .iter()
-                .any(|w| w.contains("reservations.devices") && w.contains("neither how many")),
-            "a GPU request with no `limits:` must still be named, got {warned:?}"
+        let parsed = parse(file).expect("a reservations-only deploy block still parses");
+        // The PLACEMENT is what this test holds. An entry with neither `count` nor `device_ids` is
+        // every card (docker's reading, measured), so the request is visible in the RESULT: if the
+        // check ran after the early return, `gpus` would be `None`.
+        assert_eq!(
+            parsed[0].gpus.as_deref(),
+            Some("all"),
+            "a GPU request with no `limits:` must still be read"
         );
         // AND THE CATCH-ALL ARM: a key kern does not map at all is named too, which is what stops the
         // next silence instead of adding one more name to a list.
@@ -11839,7 +13394,9 @@ mod surface_tests {
         let cases: &[(&str, &str)] = &[
             ("configs", "services:\n  s:\n    image: alpine\n    configs:\n      - c\n"),
             ("domainname", "services:\n  s:\n    image: alpine\n    domainname: d\n"),
-            ("runtime", "services:\n  s:\n    image: alpine\n    runtime: nvidia\n"),
+            // `runtime: nvidia` is APPLIED now (NVIDIA's meaning, `kern box --runtime nvidia`), so
+            // the not-applied case is another runtime, which kern cannot be.
+            ("runtime", "services:\n  s:\n    image: alpine\n    runtime: runc\n"),
             ("ipc", "services:\n  s:\n    image: alpine\n    ipc: host\n"),
             ("pid", "services:\n  s:\n    image: alpine\n    pid: host\n"),
             ("health_cmd", "services:\n  s:\n    image: alpine\n    health_cmd: true\n"),
@@ -11949,5 +13506,38 @@ mod surface_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod home_expansion_tests {
+    use super::*;
+
+    /// `~` in a bind source is the home directory, in both syntaxes, as docker compose expands it
+    /// (measured); a `~` anywhere else is an ordinary character.
+    #[test]
+    fn a_tilde_bind_source_is_the_home_directory() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        assert_eq!(expand_home("~/invokeai"), format!("{home}/invokeai"));
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("./~/x"), "./~/x");
+        assert_eq!(expand_home("~user/x"), "~user/x");
+        assert_eq!(
+            anonymous_volume("~/data:/data:ro", "s"),
+            format!("{home}/data:/data:ro")
+        );
+        let long = reconstruct_volume_item(
+            "{type: bind, source: ~/cache, target: /c}",
+            &mut Vec::new(),
+            "s",
+        );
+        assert!(
+            long.as_deref()
+                .is_some_and(|v| v.starts_with(&format!("{home}/cache:"))),
+            "{long:?}"
+        );
     }
 }

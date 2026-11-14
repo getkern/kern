@@ -827,6 +827,17 @@ echo RECYCLED
             return;
         }
     }
+    // THE SCAFFOLDING'S `exec` NEEDS A SYSTEMD BUS, which a nested `unshare -Ur` on a host whose user
+    // manager does not run cannot reach: MEASURED in a WSL2 guest as root, the run got to `RECYCLED`
+    // and `exec` then answered "Failed to connect to bus" before any pid check. `kern exec` itself
+    // works there (checked outside the scaffolding), so this is the harness's environment, said.
+    if text.contains("Failed to connect to bus") && !text.contains("ENTERED") {
+        eprintln!(
+            "skip: no systemd bus reachable from the nested user namespace: {}",
+            text.trim()
+        );
+        return;
+    }
     assert!(
         text.contains("RECYCLED"),
         "the scaffolding did not reach the recycle, so nothing below was tested: {text}"
@@ -1988,7 +1999,8 @@ fn box_security_profile_untrusted_forces_read_only_root() {
             "/bin/busybox",
             "sh",
             "-c",
-            "if echo x > /w 2>/dev/null; then echo WRITABLE; else echo READONLY; fi",
+            "if echo x > /w 2>/dev/null; then echo WRITABLE; else echo READONLY; fi; \
+             /bin/busybox grep NoNewPrivs /proc/self/status",
         ])
         .output()
         .expect("run kern");
@@ -2006,6 +2018,21 @@ fn box_security_profile_untrusted_forces_read_only_root() {
     assert!(
         outp.contains("READONLY"),
         "the untrusted profile must force a read-only root (stdout: {outp}, stderr: {err})"
+    );
+    // A plain box allows a setuid gain as docker does; the profile for unread code refuses it, and
+    // says so in the line it prints.
+    let nnp = outp
+        .lines()
+        .find_map(|l| l.strip_prefix("NoNewPrivs:"))
+        .map(str::trim);
+    assert_eq!(
+        nnp,
+        Some("1"),
+        "the untrusted profile must arm no-new-privileges (stdout: {outp}, stderr: {err})"
+    );
+    assert!(
+        err.contains("no-new-privileges=on"),
+        "the profile line must name no-new-privileges (stderr: {err})"
     );
 }
 
@@ -4950,14 +4977,18 @@ fn box_run_hardening_uts_net_seccomp() {
         "/proc/sys must be mounted read-only (core_pattern escape guard):\n{mounts}"
     );
 
-    // NO_NEW_PRIVS (regression for a red-team finding): PID 1 and every child run with `NoNewPrivs=1`,
-    // so a setuid binary in the image cannot REGAIN privilege - without it the default cap-drop is a
-    // paper wall. Read it back from the box's own `/proc/self/status`.
+    // NO_NEW_PRIVS ON REQUEST (regression for a red-team finding): `--security-opt no-new-privileges`
+    // arms it for PID 1 and every child. It is docker's default to leave it off, and kern's for a box;
+    // what a setuid program gains without it is measured in
+    // `a_box_lets_setuid_raise_its_user_as_docker_and_no_new_privileges_stops_it`: the box root's own
+    // capability set and never more, because the dangerous ones are gone from the bounding set.
     let status = kern_out(&[
         "box",
         "isobox",
         "--rootfs",
         rootfs,
+        "--security-opt",
+        "no-new-privileges",
         "--",
         "/bin/busybox",
         "cat",
@@ -4969,7 +5000,7 @@ fn box_run_hardening_uts_net_seccomp() {
             let l = l.replace('\t', " ");
             l.starts_with("NoNewPrivs:") && l.trim_end().ends_with('1')
         }),
-        "the box must run with NoNewPrivs=1 (a setuid binary must not regain privilege):\n{status}"
+        "--security-opt no-new-privileges must arm NoNewPrivs=1:\n{status}"
     );
 
     // /proc/kcore is MASKED (bound over `/dev/null`): a read yields NOTHING, so a box cannot page host
@@ -6655,7 +6686,28 @@ fn as_mapped_root(cmd: &str) -> Option<bool> {
 /// A docker-archive tar of a one-layer image holding `secret/f`, `etc/os-release` and, when given, a
 /// static busybox at `/bin/busybox` so a `RUN` can execute in it.
 fn tiny_image_archive(dir: &Path, repo_tag: &str, busybox: Option<&Path>) -> PathBuf {
+    tiny_image_archive_with_config(dir, repo_tag, busybox, r#"{"Cmd":["/bin/true"]}"#, &[])
+}
+
+/// [`tiny_image_archive`] with the image's `config` object given as JSON, and `extra` files copied
+/// into the layer as `(path in the image, source, mode)`.
+fn tiny_image_archive_with_config(
+    dir: &Path,
+    repo_tag: &str,
+    busybox: Option<&Path>,
+    config: &str,
+    extra: &[(&str, &Path, u32)],
+) -> PathBuf {
     let layer_root = dir.join("rootfs");
+    for (rel, src, mode) in extra {
+        use std::os::unix::fs::PermissionsExt;
+        let at = layer_root.join(rel);
+        if let Some(parent) = at.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::copy(src, &at).unwrap();
+        fs::set_permissions(&at, fs::Permissions::from_mode(*mode)).unwrap();
+    }
     fs::create_dir_all(layer_root.join("secret")).unwrap();
     fs::create_dir_all(layer_root.join("etc")).unwrap();
     fs::create_dir_all(layer_root.join("bin")).unwrap();
@@ -6689,7 +6741,9 @@ fn tiny_image_archive(dir: &Path, repo_tag: &str, busybox: Option<&Path>) -> Pat
         .success());
     fs::write(
         layout.join("c.json"),
-        br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["/bin/true"]},"rootfs":{"type":"layers","diff_ids":[]}}"#,
+        format!(
+            r#"{{"architecture":"amd64","os":"linux","config":{config},"rootfs":{{"type":"layers","diff_ids":[]}}}}"#
+        ),
     )
     .unwrap();
     fs::write(
@@ -6772,6 +6826,15 @@ fn save_reads_a_directory_owned_by_a_subordinate_uid() {
             cleanup();
             return;
         }
+    }
+    // ROOT CANNOT HAVE THIS PREMISE: the initial namespace's root reads every directory whatever its
+    // owner, so "unreadable to this user" is false before kern is involved. MEASURED as root in a
+    // WSL2 guest, where the assertion below failed on the premise alone. Said and skipped, not
+    // asserted: what is under test is a non-root user saving an image it cannot read.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skip: running as root, which reads a subordinate-owned directory anyway");
+        cleanup();
+        return;
     }
     // THE PREMISE, measured rather than assumed: this user really cannot open the directory.
     assert!(
@@ -10936,22 +10999,16 @@ fn compose_down_removes_the_relay_directory_it_created() {
     );
 }
 
-/// `PR_SET_NO_NEW_PRIVS` is armed in every box, asserted HERE because a decision in another artifact
-/// depends on it.
+/// `PR_SET_NO_NEW_PRIVS` is armed in every box that asks for it with `--security-opt
+/// no-new-privileges`, which is what the Python and Node SDKs pass, asserted HERE because a decision
+/// in another artifact depends on it.
 ///
-/// The Python and Node SDKs mount every `-v` volume `nosuid` and let that remount FAIL without
-/// refusing to start the box. That is only safe because no-new-privs already makes the setuid bit
-/// inert process-wide, so the mount flag is depth rather than the boundary. Today the invariant holds
-/// for free (seccomp requires the prctl, and kern fails closed if it cannot set it), but "for free"
-/// is exactly the kind of coupling that goes quiet: a future path where seccomp is off could take
-/// no-new-privs with it, and the SDK's mount decision would silently become load-bearing again with
-/// nobody looking. So the assertion lives in the runtime's own suite, and it says what depends on it.
-///
-/// The MECHANISM is proved separately, in `no_new_privs_really_neutralises_a_setuid_binary`, because
-/// it cannot be proved here: patching the prctl out does not yield a weaker box, it yields a box that
-/// refuses to start. Unreachable in situ, reachable in a reduced system.
+/// A `-v` volume keeps the setuid bit, as a docker bind does, so in an SDK sandbox no-new-privs is
+/// what makes a setuid binary dropped on the shared workspace inert. A plain box does not set it
+/// (docker's default, see `a_box_lets_setuid_raise_its_user_as_docker_and_no_new_privileges_stops_it`),
+/// so the SDKs ask; this assertion is what holds the flag to its word.
 #[test]
-fn every_box_has_no_new_privs_armed_because_the_sdk_mount_decision_rests_on_it() {
+fn a_box_asked_for_no_new_privileges_has_it_armed_because_the_sdk_mount_decision_rests_on_it() {
     let Some(busybox) = static_busybox() else {
         eprintln!("skip: no busybox available");
         return;
@@ -10972,6 +11029,8 @@ fn every_box_has_no_new_privs_armed_because_the_sdk_mount_decision_rests_on_it()
         "kern-nnp-probe",
         "--rootfs",
         &rootfs,
+        "--security-opt",
+        "no-new-privileges",
         "--quiet",
         "--",
         "/bin/sh",
@@ -10987,8 +11046,295 @@ fn every_box_has_no_new_privs_armed_because_the_sdk_mount_decision_rests_on_it()
     }
     assert!(
         stdout.contains("NoNewPrivs:\t1"),
-        "no-new-privs is NOT armed in a box; the SDKs treat their nosuid mount as depth on the \
-         strength of this. Read the doc comment before changing either side. Got: {stdout:?}"
+        "no-new-privs is NOT armed in a box that asked for it; the SDKs rest on it to make a \
+         setuid binary on the workspace inert. Got: {stdout:?}"
+    );
+}
+
+/// ⛔ A SETUID PROGRAM IN A BOX RAISES ITS USER, AS UNDER DOCKER, AND `--security-opt
+/// no-new-privileges` STOPS IT, AS UNDER DOCKER. Every box used to set no-new-privileges with no way
+/// out, so an image whose start script calls `sudo` could not run: MEASURED in the field on
+/// ComfyUI-Nvidia-Docker ("sudo: The no new privileges flag is set"). The probe is a static program
+/// printing its effective uid, setuid and owned by the box's root, run as uid 1000.
+#[test]
+fn a_box_lets_setuid_raise_its_user_as_docker_and_no_new_privileges_stops_it() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let src = std::env::temp_dir().join(format!("kern-euid-{}.c", std::process::id()));
+    let bin = std::env::temp_dir().join(format!("kern-euid-{}", std::process::id()));
+    let _ = fs::write(
+        &src,
+        "#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\nint main(void){char l[256];FILE*f=fopen(\"/proc/self/status\",\"r\");printf(\"EUID=%d\\n\",(int)geteuid());while(f&&fgets(l,sizeof l,f))if(!strncmp(l,\"CapEff\",6)||!strncmp(l,\"CapBnd\",6))fputs(l,stdout);return 0;}\n",
+    );
+    let built = Command::new("cc")
+        .args(["-static", "-O1", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .is_ok_and(|s| s.success());
+    let _ = fs::remove_file(&src);
+    if !built {
+        eprintln!("skip: no C compiler with a static libc to build the euid probe");
+        return;
+    }
+    let root = build_rootfs(&busybox, "setuid");
+    let _ = fs::copy(&busybox, root.join("bin/sh"));
+    let probe = root.join("bin/euid");
+    // The same probe on a `-v` volume: a docker bind keeps the setuid bit too.
+    let vol = std::env::temp_dir().join(format!("kern-euid-vol-{}", std::process::id()));
+    let place = |at: &std::path::Path| {
+        use std::os::unix::fs::PermissionsExt;
+        fs::copy(&bin, at).is_ok()
+            && fs::set_permissions(at, fs::Permissions::from_mode(0o4755)).is_ok()
+    };
+    let placed = place(&probe)
+        && fs::create_dir_all(&vol).is_ok()
+        && {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&vol, fs::Permissions::from_mode(0o755)).is_ok()
+        }
+        && place(&vol.join("euid"));
+    let _ = fs::remove_file(&bin);
+    // A rootfs on a filesystem the HOST mounts nosuid cannot carry a setuid bit into any box.
+    let nosuid_host = {
+        let c = std::ffi::CString::new(root.to_string_lossy().as_bytes()).unwrap_or_default();
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+        rc == 0 && st.f_flag & libc::ST_NOSUID != 0
+    };
+    if !placed || nosuid_host {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&vol);
+        eprintln!("skip: the probe could not be placed setuid (or the host mounts it nosuid)");
+        return;
+    }
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let vol_arg = format!("{}:/v", vol.display());
+    let run = |extra: &[&str], probe: &str| {
+        let mut args = vec![
+            "box",
+            "kern-setuid-probe",
+            "--rootfs",
+            &rootfs,
+            "--uid-range",
+            "--user",
+            "1000",
+            "--quiet",
+            "-v",
+            &vol_arg,
+        ];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", probe]);
+        let out = kern_out(&args);
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let docker_like = run(&[], "/bin/euid");
+    let blocked = run(&["--security-opt", "no-new-privileges"], "/bin/euid");
+    let on_volume = run(&[], "/v/euid");
+    let on_volume_blocked = run(&["--security-opt", "no-new-privileges"], "/v/euid");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&vol);
+    if docker_like.contains("uid range") || docker_like.contains("user namespaces") {
+        eprintln!("skip: no uid range here, so there is no uid 1000 to start from: {docker_like}");
+        return;
+    }
+    assert!(
+        docker_like.contains("EUID=0"),
+        "a setuid-root program did not raise uid 1000 in a box, as docker lets it:\n{docker_like}"
+    );
+    // WHAT IT GAINS IS THE BOX ROOT'S SET, NEVER MORE: the dangerous capabilities are dropped from the
+    // bounding set, which no setuid crosses. MEASURED: `CapEff` = `CapBnd` = 00000110bd84efff after
+    // the elevation, against 000001ffffffffff for the full set; `CAP_SYS_ADMIN` (bit 21) absent.
+    let cap = |name: &str| -> Option<u64> {
+        docker_like
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+    };
+    let (eff, bnd) = (cap("CapEff:"), cap("CapBnd:"));
+    assert!(
+        matches!((eff, bnd), (Some(e), Some(b)) if e & !b == 0 && e & (1 << 21) == 0),
+        "the setuid program gained capabilities beyond the bounding set, or CAP_SYS_ADMIN:\n{docker_like}"
+    );
+    assert!(
+        blocked.contains("EUID=1000"),
+        "--security-opt no-new-privileges did not keep the setuid program at uid 1000:\n{blocked}"
+    );
+    // The probe on the volume is owned by the caller, which is the box's root: it raises uid 1000 to
+    // 0 as on the image's own root, and the flag stops it there too.
+    assert!(
+        on_volume.contains("EUID=0"),
+        "a setuid program on a -v volume did not raise uid 1000, as a docker bind lets it:\n{on_volume}"
+    );
+    assert!(
+        on_volume_blocked.contains("EUID=1000"),
+        "--security-opt no-new-privileges did not hold for a setuid program on a volume:\n{on_volume_blocked}"
+    );
+}
+
+/// ⛔ A SETUID PROGRAM IN A PULLED OR LOADED IMAGE RAISES ITS USER, AS UNDER DOCKER. The test above
+/// built its rootfs by hand, and the cache cleared every image's setuid bit at extraction, so it
+/// passed while no real image's `sudo` could ever raise: MEASURED in the field, ComfyUI-Nvidia-Docker
+/// stopped at "sudo: /usr/bin/sudo must be owned by uid 0 and have the setuid bit set". Here the
+/// program reaches the box the way an image's does, through `kern load` into the cache.
+#[test]
+fn a_setuid_program_from_a_loaded_image_raises_its_user_as_docker() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("kern-it-imgsuid-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let src = base.join("euid.c");
+    let bin = base.join("euid");
+    fs::write(
+        &src,
+        "#include <stdio.h>\n#include <unistd.h>\nint main(void){printf(\"EUID=%d\\n\",(int)geteuid());return 0;}\n",
+    )
+    .unwrap();
+    let built = Command::new("cc")
+        .args(["-static", "-O1", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !built {
+        let _ = fs::remove_dir_all(&base);
+        eprintln!("skip: no C compiler with a static libc to build the euid probe");
+        return;
+    }
+    let archive = tiny_image_archive_with_config(
+        &base,
+        "kern-imgsuid:1",
+        Some(&busybox),
+        r#"{"Cmd":["/bin/true"]}"#,
+        &[("usr/bin/euid", &bin, 0o4755)],
+    );
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let (loaded, said) = k.run(&["load", "-i", archive.to_str().unwrap()], &[]);
+    assert!(loaded, "load: {said}");
+    let run = |extra: &[&str]| {
+        let mut a = vec![
+            "box",
+            "imgsuid",
+            "--image",
+            "kern-imgsuid:1",
+            "--uid-range",
+            "--user",
+            "1000",
+            "--quiet",
+        ];
+        a.extend_from_slice(extra);
+        a.extend_from_slice(&["--", "/usr/bin/euid"]);
+        k.run(&a, &[]).1
+    };
+    let raised = run(&[]);
+    let blocked = run(&["--security-opt", "no-new-privileges"]);
+    let _ = fs::remove_dir_all(&base);
+    if raised.contains("uid range") || raised.contains("user namespaces") {
+        eprintln!("skip: no uid range here: {raised}");
+        return;
+    }
+    assert!(
+        raised.contains("EUID=0"),
+        "a setuid-root program from a loaded image did not raise uid 1000:\n{raised}"
+    );
+    assert!(
+        blocked.contains("EUID=1000"),
+        "--security-opt no-new-privileges did not hold for it:\n{blocked}"
+    );
+}
+
+/// ⛔ AN ENTRY AN OLDER KERN LEFT WITHOUT SETUID BITS IS REPAIRED ONCE, AND NEVER BLOCKS THE BOX. A
+/// pulled image is re-extracted (measured by hand: `/usr/bin/su` of python:3.12-slim back to
+/// `-rwsr-xr-x` on the next start). A loaded image no registry has cannot be: the box must still run
+/// from the cache, say why once, and not ask the network again on the next start.
+#[test]
+fn a_stripped_entry_no_registry_has_runs_as_cached_and_is_asked_once() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("kern-it-norepo-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let tag = format!("kern-norepo-{}:1", std::process::id());
+    let archive = tiny_image_archive_with_config(
+        &base,
+        &tag,
+        Some(&busybox),
+        r#"{"Cmd":["/bin/true"]}"#,
+        &[("usr/bin/su", &busybox, 0o755)],
+    );
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let (loaded, said) = k.run(&["load", "-i", archive.to_str().unwrap()], &[]);
+    assert!(loaded, "load: {said}");
+    // What an older kern left: no mark beside the entry, and `su` without its bit.
+    let images = base.join("cache/kern/images");
+    for e in fs::read_dir(&images).unwrap().flatten() {
+        if e.file_name().to_string_lossy().ends_with(".setuid") {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+    let run = || {
+        k.run(
+            &[
+                "box",
+                "norepo",
+                "--image",
+                &tag,
+                "--quiet",
+                "--",
+                "/bin/busybox",
+                "echo",
+                "RAN",
+            ],
+            &[],
+        )
+    };
+    let (ok1, first) = run();
+    let (ok2, second) = run();
+    let _ = fs::remove_dir_all(&base);
+    assert!(
+        ok1 && first.contains("RAN"),
+        "the box did not run from the cache:\n{first}"
+    );
+    assert!(
+        first.contains("could not be re-extracted"),
+        "the failed repair was not said:\n{first}"
+    );
+    assert!(
+        ok2 && second.contains("RAN"),
+        "the second start did not run:\n{second}"
+    );
+    assert!(
+        !second.contains("re-extract"),
+        "the second start asked the network again:\n{second}"
     );
 }
 
@@ -15149,6 +15495,112 @@ fn a_box_does_not_inherit_the_callers_supplementary_groups() {
     }
 }
 
+/// `--device <host path>` BINDS THE NODE, as docker does, at its own path or at the one given, and a
+/// node the host does not have is refused rather than created. It used to be refused with a pointer
+/// to `-v`; docker takes it (measured on a Jetson beside `--gpus`).
+#[test]
+fn device_with_a_host_path_binds_the_node_and_refuses_a_missing_one() {
+    if !a_box_can_start("devpath") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    if !kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull")
+        .status
+        .success()
+    {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    let run = |extra: &[&str], cmd: &str| {
+        let mut a = vec!["box", "--image", "alpine:3.19"];
+        a.extend_from_slice(extra);
+        a.extend_from_slice(&["--", "sh", "-c", cmd]);
+        let out = kern().args(&a).output().expect("run kern");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    // THE CONTROL: the box has no node at that path without the flag.
+    let (_, plain, _) = run(&[], "test -c /dev/kern-zero && echo NODE || echo NONE");
+    assert_eq!(plain, "NONE");
+    let (ok, out, err) = run(
+        &["--device", "/dev/zero:/dev/kern-zero"],
+        "test -c /dev/kern-zero && head -c 4 /dev/kern-zero | od -An -tx1 | tr -d ' '",
+    );
+    assert!(ok, "{err}");
+    assert_eq!(
+        out, "00000000",
+        "the bound node is the host's /dev/zero: {err}"
+    );
+    let (ok, _, err) = run(&["--device", "/dev/kern-no-such-node"], "true");
+    assert!(!ok && err.contains("no such device on this host"), "{err}");
+}
+
+/// `--group-add` GIVES THE BOX THE GROUP, by name from the image's `/etc/group` or by number, to a
+/// box that stays root and to one that runs `--user`, as docker does; and a name the image does not
+/// have is refused before the box starts. The control is the same box without the flag.
+#[test]
+fn group_add_gives_the_box_the_group_and_refuses_an_unknown_name() {
+    if !a_box_can_start("gadd") {
+        eprintln!("skip: no box starts on this host");
+        return;
+    }
+    if !kern()
+        .args(["pull", "alpine:3.19"])
+        .output()
+        .expect("run kern pull")
+        .status
+        .success()
+    {
+        eprintln!("skip: the base image is not available here");
+        return;
+    }
+    let id_g = |extra: &[&str]| {
+        let mut a = vec!["box", "--image", "alpine:3.19", "--uid-range"];
+        a.extend_from_slice(extra);
+        a.extend_from_slice(&["--", "id", "-G"]);
+        let out = kern().args(&a).output().expect("run kern");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, plain, err) = id_g(&[]);
+    if !ok {
+        eprintln!("skip: a ranged box does not start here: {err}");
+        return;
+    }
+    assert!(
+        !plain.split_whitespace().any(|g| g == "27" || g == "4321"),
+        "control: {plain}"
+    );
+    // alpine's `video` is gid 27.
+    let (ok, root, err) = id_g(&["--group-add", "video", "--group-add", "4321"]);
+    assert!(ok, "{err}");
+    let gs: Vec<&str> = root.split_whitespace().collect();
+    assert!(
+        gs.contains(&"27") && gs.contains(&"4321"),
+        "root box: {root} {err}"
+    );
+    let (ok, user, err) = id_g(&["--user", "1000", "--group-add", "video"]);
+    assert!(ok, "{err}");
+    assert!(
+        user.split_whitespace().any(|g| g == "27"),
+        "--user box: {user} {err}"
+    );
+    let (ok, _, err) = id_g(&["--group-add", "nosuchgroup"]);
+    assert!(
+        !ok && err.contains("Unable to find group nosuchgroup"),
+        "{err}"
+    );
+}
+
 #[test]
 fn a_kept_box_starts_again_on_the_layer_it_left_and_an_ordinary_box_does_not() {
     if !a_box_can_start("keep") {
@@ -15903,4 +16355,1790 @@ fn image_inspect_emits_the_labels_and_healthcheck_it_parsed() {
         "the human rendering must name the labels too: {human}"
     );
     let _ = fs::remove_dir_all(&root);
+}
+
+/// ⛔ `COPY` INTO A USR-MERGED `/bin` LANDS IN `/usr/bin` AND KEEPS THE SYMLINK.
+///
+/// On Ubuntu, Debian 12+ and Fedora `/bin` is `-> usr/bin`. kern's `COPY x /bin/x` created a real
+/// `bin/` in the new layer, which hid the image's `/bin` and with it `/bin/sh`, so the next `RUN`
+/// failed with "cannot start '/bin/sh' in box". MEASURED in the field on speaches' Dockerfile
+/// (`COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /bin/uv`), and in two lines against docker, which kept
+/// `bin -> usr/bin` and put the file beside `sh`. A tiny usr-merged image stands in for ubuntu here.
+#[test]
+fn copy_into_a_symlinked_bin_keeps_the_symlink_and_the_shell() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox to build a base image from");
+        return;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-usrmerge-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let cache = base.join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    let root = base.join("rootfs");
+    fs::create_dir_all(root.join("usr/bin")).unwrap();
+    fs::create_dir_all(root.join("etc")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::copy(&busybox, root.join("usr/bin/busybox")).unwrap();
+        fs::set_permissions(
+            root.join("usr/bin/busybox"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    for applet in ["true", "sh", "test"] {
+        std::os::unix::fs::symlink("busybox", root.join("usr/bin").join(applet)).unwrap();
+    }
+    std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+    let layout = base.join("layout");
+    fs::create_dir_all(layout.join("l1")).unwrap();
+    assert!(Command::new("tar")
+        .args(["--owner=0", "--group=0", "--numeric-owner", "-C"])
+        .arg(&root)
+        .args(["-cf"])
+        .arg(layout.join("l1/layer.tar"))
+        .arg(".")
+        .status()
+        .unwrap()
+        .success());
+    fs::write(
+        layout.join("c.json"),
+        br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["/bin/true"]},"rootfs":{"type":"layers","diff_ids":[]}}"#,
+    )
+    .unwrap();
+    fs::write(
+        layout.join("manifest.json"),
+        r#"[{"Config":"c.json","RepoTags":["usrmerge:1"],"Layers":["l1/layer.tar"]}]"#,
+    )
+    .unwrap();
+    let archive = base.join("image.tar");
+    assert!(Command::new("tar")
+        .args(["-C"])
+        .arg(&layout)
+        .args(["-cf"])
+        .arg(&archive)
+        .arg(".")
+        .status()
+        .unwrap()
+        .success());
+    let data = base.join("data");
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let loaded = run(&["load", "-i", archive.to_str().unwrap()]);
+    assert!(
+        loaded.status.success(),
+        "load: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let ctx = base.join("ctx");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(ctx.join("x"), b"x").unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM usrmerge:1\nCOPY x /bin/x\nRUN [\"/bin/sh\", \"-c\", \"test -L /bin && test -f /usr/bin/x && test -x /bin/sh\"]\n",
+    )
+    .unwrap();
+    let built = run(&["build", "-t", "usrmerge-built:1", ctx.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&built.stderr).into_owned();
+    let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+    let _ = fs::remove_dir_all(&base);
+    if !built.status.success() && err.contains("user namespaces") {
+        eprintln!("skip: no box can start here, so a RUN cannot build");
+        return;
+    }
+    assert!(
+        built.status.success(),
+        "COPY into the symlinked /bin broke the image: {err}"
+    );
+}
+
+/// ⛔ `RUN --mount=type=bind` READS THE CONTEXT, AND `RUN` AFTER `USER` RUNS AS THAT USER.
+///
+/// Both were found in the field on speaches' Dockerfile: the bind mount was dropped, so `uv sync`
+/// found no `pyproject.toml`; and every RUN ran as root, so the venv and cache a later `USER` service
+/// writes to were root's. Docker does both. The mountpoint must not stay in the image either.
+#[test]
+fn a_run_bind_mount_reads_the_context_and_user_applies_to_run() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox to build a base image from");
+        return;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-runmount-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let cache = base.join("cache");
+    let data = base.join("data");
+    fs::create_dir_all(&cache).unwrap();
+    let archive = tiny_image_archive(&base, "runmount:1", Some(&busybox));
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let loaded = run(&["load", "-i", archive.to_str().unwrap()]);
+    assert!(
+        loaded.status.success(),
+        "load: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let ctx = base.join("ctx");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(ctx.join("data.txt"), b"FROM_THE_CONTEXT").unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        concat!(
+            "FROM runmount:1\n",
+            "RUN [\"/bin/busybox\", \"mkdir\", \"-m\", \"777\", \"/w\"]\n",
+            "RUN --mount=type=bind,source=data.txt,target=/in/data.txt [\"/bin/busybox\", \"cp\", \"/in/data.txt\", \"/w/got\"]\n",
+            "USER 1000\n",
+            "RUN [\"/bin/busybox\", \"sh\", \"-c\", \"/bin/busybox id -u > /w/uid\"]\n",
+        ),
+    )
+    .unwrap();
+    let built = run(&["build", "-t", "runmount-built:1", ctx.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&built.stderr).into_owned();
+    if !built.status.success() && err.contains("user namespaces") {
+        eprintln!("skip: no box can start here, so a RUN cannot build");
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+        return;
+    }
+    assert!(built.status.success(), "build: {err}");
+    let out = run(&[
+        "box",
+        "rm1",
+        "--image",
+        "runmount-built:1",
+        "--rm",
+        "--user",
+        "0",
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "/bin/busybox cat /w/got; echo; /bin/busybox cat /w/uid; test -e /in/data.txt && echo MOUNTPOINT_LEFT || echo MOUNTPOINT_GONE",
+    ]);
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+    let _ = fs::remove_dir_all(&base);
+    assert!(
+        said.contains("FROM_THE_CONTEXT"),
+        "the bind mount was not read: {said}"
+    );
+    assert!(
+        said.contains("1000"),
+        "the RUN after USER 1000 ran as: {said}"
+    );
+    assert!(
+        said.contains("MOUNTPOINT_GONE"),
+        "the mountpoint stayed in the image: {said}"
+    );
+}
+
+/// ⛔ `WORKDIR` UNDER A USER'S HOME LEAVES THE HOME THE USER'S, AND THE NEW DIRECTORY IS THE USER'S.
+///
+/// speaches' Dockerfile, measured in the field: `USER ubuntu`, `WORKDIR $HOME/speaches`, then `RUN uv
+/// sync` as `ubuntu`. kern's WORKDIR layer re-created `home/ubuntu` owned by the builder, which in an
+/// overlay is the owner the image shows, so the user lost its own home ("failed to create directory
+/// `/home/ubuntu/.cache/uv`: Permission denied"). Docker leaves the existing directory alone and
+/// creates the missing one as the build USER.
+#[test]
+fn workdir_keeps_the_owner_of_existing_parents_and_gives_new_dirs_to_the_user() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox to build a base image from");
+        return;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-workdir-own-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let cache = base.join("cache");
+    let data = base.join("data");
+    fs::create_dir_all(&cache).unwrap();
+    let archive = tiny_image_archive(&base, "wdown:1", Some(&busybox));
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+    };
+    let loaded = run(&["load", "-i", archive.to_str().unwrap()]);
+    assert!(
+        loaded.status.success(),
+        "load: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let ctx = base.join("ctx");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        concat!(
+            "FROM wdown:1\n",
+            "RUN [\"/bin/busybox\", \"sh\", \"-c\", \"/bin/busybox mkdir -p /home/u && /bin/busybox chown 1000:1000 /home/u\"]\n",
+            // `1000:1000`, not `1000`: with no /etc/group the box runs gid 0, and a group-writable
+            // root directory would let the write through and hide the defect (measured).
+            "USER 1000:1000\n",
+            "WORKDIR /home/u/app\n",
+            "RUN [\"/bin/busybox\", \"sh\", \"-c\", \"/bin/busybox mkdir /home/u/.cache && /bin/busybox touch /home/u/app/ok\"]\n",
+        ),
+    )
+    .unwrap();
+    let built = run(&["build", "-t", "wdown-built:1", ctx.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&built.stderr).into_owned();
+    if !built.status.success()
+        && (err.contains("user namespaces")
+            || err.contains("chown") && err.contains("Invalid argument"))
+    {
+        eprintln!("skip: no uid range here, so uid 1000 cannot own anything in a box: {err}");
+        cleanup();
+        return;
+    }
+    cleanup();
+    assert!(
+        built.status.success(),
+        "the user lost its home or its WORKDIR: {err}"
+    );
+}
+
+/// A build context with a busybox base image loaded under `tag`, and a runner for `kern` that keeps
+/// the cache and data in the test's own tree. `None` when this host cannot run the suite's builds.
+/// `kern` with the cache and data kept in one test's own tree.
+struct KernIn {
+    cache: PathBuf,
+    data: PathBuf,
+}
+
+impl KernIn {
+    /// Run `kern args`, with `env` added; `(success, stdout + stderr)`.
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
+        let mut c = kern();
+        c.env("XDG_CACHE_HOME", &self.cache)
+            .env("XDG_DATA_HOME", &self.data);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.args(args).output().expect("run kern");
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    }
+}
+
+/// A build context with a busybox base image loaded under `tag`, and a `kern` that keeps the cache
+/// and data in the test's own tree. `None` when this host cannot run the suite's builds.
+fn build_mount_fixture(name: &str, tag: &str) -> Option<(PathBuf, KernIn)> {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return None;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox to build a base image from");
+        return None;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("ctx")).unwrap();
+    let archive = tiny_image_archive(&base, tag, Some(&busybox));
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let (loaded, said) = k.run(&["load", "-i", archive.to_str().unwrap()], &[]);
+    assert!(loaded, "load: {said}");
+    Some((base, k))
+}
+
+/// ⛔ `kern rm -f` IS `docker rm -f`, MEASURED with docker 29: a running container is stopped and
+/// removed (exit 0, gone from `ps -a`), `rm` without `-f` refuses it (exit 1), and `-f` on a name that
+/// is not there is said and exits 0. kern answered "unknown flag \"-f\"", so the clean-up line a docker
+/// user types first failed, and the box stayed up (found by a test that relied on it on a Jetson).
+#[test]
+fn kern_rm_force_stops_and_removes_as_docker_rm_f_does() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "rmforce");
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-rmforce-xdg-{}", std::process::id()));
+    let _ = fs::create_dir_all(&xdg);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&xdg, fs::Permissions::from_mode(0o700));
+    }
+    let k = |args: &[&str]| {
+        let out = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+            .expect("run kern");
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    let (started, said) = k(&[
+        "box",
+        "rmf-it",
+        "--rootfs",
+        &rootfs,
+        "-d",
+        "--",
+        "/bin/busybox",
+        "sleep",
+        "60",
+    ]);
+    if said.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    assert_eq!(started, Some(0), "the detached box did not start: {said}");
+    let (plain, plain_said) = k(&["rm", "rmf-it"]);
+    let (forced, forced_said) = k(&["rm", "-f", "rmf-it"]);
+    let (_, ps) = k(&["ps", "-a"]);
+    let (missing, missing_said) = k(&["rm", "-f", "kern-it-no-such-box"]);
+    let _ = k(&["stop", "rmf-it"]);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    assert_eq!(
+        plain,
+        Some(1),
+        "rm without -f did not refuse a running box: {plain_said}"
+    );
+    assert_eq!(
+        forced,
+        Some(0),
+        "rm -f did not remove a running box: {forced_said}"
+    );
+    assert!(
+        !ps.lines().any(|l| l.starts_with("rmf-it ")),
+        "the removed box is still listed by ps -a:\n{ps}"
+    );
+    assert_eq!(
+        missing,
+        Some(0),
+        "rm -f of a missing name failed, docker exits 0: {missing_said}"
+    );
+}
+
+/// ⛔ A BOX GIVEN A GPU IS BOUNDED BY THE HOST'S RAM, NOT BY THE 512 MiB SANDBOX DEFAULT, as a
+/// compose service and a docker container are. MEASURED on a WSL2 guest: a CUDA program that ran
+/// outside kern was OOM-killed in `kern box --gpus all`, every CUDA context costing about 75 MiB of
+/// host memory. A box without a GPU keeps the default, and `--memory` still wins.
+#[test]
+fn a_gpu_box_is_capped_at_the_hosts_ram_and_others_keep_the_default() {
+    if !Path::new("/dev/nvidiactl").exists() {
+        eprintln!("skip: no NVIDIA device here, so no box can be given a GPU");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "gpumem");
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let read = |extra: &[&str]| {
+        let mut a = vec!["box", "gpumem", "--rootfs", &rootfs, "--quiet"];
+        a.extend_from_slice(extra);
+        a.extend_from_slice(&["--", "/bin/busybox", "cat", "/sys/fs/cgroup/memory.max"]);
+        String::from_utf8_lossy(&kern_out(&a).stdout)
+            .trim()
+            .to_string()
+    };
+    let plain = read(&[]);
+    let gpu = read(&["--gpus", "all"]);
+    let explicit = read(&["--gpus", "all", "--memory", "300m"]);
+    let _ = fs::remove_dir_all(&root);
+    let total = fs::read_to_string("/proc/meminfo")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        .map(|kb| (kb * 1024).to_string())
+        .unwrap_or_default();
+    if plain.is_empty() || plain == "max" {
+        eprintln!("skip: no memory cap can be set here ({plain:?})");
+        return;
+    }
+    assert_eq!(
+        plain, "536870912",
+        "a box without a GPU lost the sandbox default"
+    );
+    assert_eq!(gpu, total, "a GPU box was not capped at the host's RAM");
+    assert_eq!(
+        explicit, "314572800",
+        "--memory did not win over the GPU box's ceiling"
+    );
+}
+
+/// ⛔ THE IMAGE'S `ldconfig`, RUN FOR A GPU GRANT, GETS NO INHERITED DESCRIPTOR AND LEAVES NO PROCESS.
+/// FOUND BY AUDIT, rootless: a descriptor the caller left open (`9<host file`) reached it, and a
+/// process it forked kept running beside the workload as box root. It now runs as PID 1 of its own
+/// PID namespace after shedding every descriptor but 0-2. Needs a host where `--gpus all` grants.
+#[test]
+fn the_images_ldconfig_gets_no_inherited_fd_and_leaves_no_process_behind() {
+    if !Path::new("/dev/nvidiactl").exists() {
+        eprintln!("skip: no NVIDIA device here, so no grant runs the image's ldconfig");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "ldcfg");
+    let base = std::env::temp_dir().join(format!("kern-it-ldcfg-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("out")).unwrap();
+    fs::write(base.join("hostsecret"), "HOST-ONLY").unwrap();
+    fs::create_dir_all(root.join("sbin")).unwrap();
+    fs::write(
+        root.join("sbin/ldconfig"),
+        "#!/bin/busybox sh\n[ -e /proc/self/fd/9 ] && echo FD9-OPEN > /out/fds || echo FD9-CLOSED > /out/fds\n( exec /bin/busybox sleep 30 ) &\nexit 0\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            root.join("sbin/ldconfig"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    // `/proc/self`, not `/proc/$$`: in its own PID namespace the script's `$$` is 1, which the box's
+    // `/proc` shows as another process, and the check went blind to the descriptor (caught by
+    // sabotaging the shed: still green).
+    let probe = "for p in /proc/[0-9]*; do /bin/busybox cat $p/cmdline 2>/dev/null | /bin/busybox tr '\\0' ' '; echo; done";
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "exec \"$0\" box ldcfg --gpus all --rootfs \"$1\" -v \"$2\":/out --quiet -- /bin/busybox sh -c \"$3\" 9<\"$4\"",
+        )
+        .arg(env!("CARGO_BIN_EXE_kern"))
+        .arg(&root)
+        .arg(base.join("out"))
+        .arg(probe)
+        .arg(base.join("hostsecret"))
+        .output()
+        .expect("run kern");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fds = fs::read_to_string(base.join("out/fds")).unwrap_or_default();
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&root);
+    if said.contains("user namespaces") || said.contains("no GPU") {
+        eprintln!("skip: the box or the grant cannot run here: {said}");
+        return;
+    }
+    assert!(
+        fds.contains("FD9-CLOSED"),
+        "the image's ldconfig did not run, or received the caller's descriptor 9: {fds:?}\n{said}"
+    );
+    assert!(
+        !said.contains("sleep 30"),
+        "a process the image's ldconfig started is still running beside the workload:\n{said}"
+    );
+}
+
+/// ⛔ `kern load` REPLACES AN IMAGE WHOLE. It cleared the directory alone, so a previous image of the
+/// same name left its `.platforms` (and `push` published the OLD variants as a manifest list, found by
+/// audit for `commit`) and its `.layers` beside the loaded rootfs. `tag`, `commit` and `load` clear the
+/// same list now; this checks `load`, the one that kept the least.
+#[test]
+fn kern_load_clears_every_sidecar_of_the_image_it_replaces() {
+    let base = std::env::temp_dir().join(format!("kern-it-loadclr-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let archive = tiny_image_archive(&base, "kern-loadclr:1", None);
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let (loaded, said) = k.run(&["load", "-i", archive.to_str().unwrap()], &[]);
+    assert!(loaded, "load: {said}");
+    let images = base.join("cache/kern/images");
+    let stem = fs::read_dir(&images)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find_map(|n| n.strip_suffix(".ok").map(str::to_string))
+        .expect("the loaded image's .ok marker");
+    fs::write(
+        images.join(format!("{stem}.platforms")),
+        "linux/arm64 stale\n",
+    )
+    .unwrap();
+    fs::write(
+        images.join(format!("{stem}.layers")),
+        "/nonexistent/stale-layer\n",
+    )
+    .unwrap();
+    let (again, said2) = k.run(&["load", "-i", archive.to_str().unwrap()], &[]);
+    let platforms_left = images.join(format!("{stem}.platforms")).exists();
+    let layers_left = images.join(format!("{stem}.layers")).exists();
+    let _ = fs::remove_dir_all(&base);
+    assert!(again, "second load: {said2}");
+    assert!(
+        !platforms_left,
+        "`load` kept the replaced image's .platforms"
+    );
+    assert!(!layers_left, "`load` kept the replaced image's .layers");
+}
+
+/// ⛔ AN IMAGE NEVER READS THE OPERATOR'S ENVIRONMENT. FOUND BY AUDIT, rootless: an image whose
+/// config `Env` listed a bare `KERN_AUDIT_FAKE_TOKEN` and `HOME` received the caller's token and
+/// home, because the bare form (`-e K`, the operator's) read kern's own environment for the image
+/// too; a build step whose base carried one did the same. An image entry needs `K=V`, as docker
+/// treats it, and the operator's own `-e K` still inherits, which is the positive control.
+#[test]
+fn an_image_env_without_a_value_never_reads_the_operators_environment() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox");
+        return;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-imgenv-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("ctx")).unwrap();
+    let archive = tiny_image_archive_with_config(
+        &base,
+        "kern-imgenv:1",
+        Some(&busybox),
+        r#"{"Cmd":["/bin/true"],"Env":["KERN_LEAK_PROBE","KERN_IMG_SET=image-value"]}"#,
+        &[],
+    );
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let (loaded, said) = k.run(&["load", "-i", archive.to_str().unwrap()], &[]);
+    assert!(loaded, "load: {said}");
+    let leak = [("KERN_LEAK_PROBE", "operator-secret-777")];
+    let probe = "echo LEAK=[$KERN_LEAK_PROBE] SET=[$KERN_IMG_SET]";
+    let run_box = |name: &str, extra: &[&str]| {
+        let mut a = vec!["box", name, "--image", "kern-imgenv:1", "--quiet"];
+        a.extend_from_slice(extra);
+        a.extend_from_slice(&["--", "/bin/busybox", "sh", "-c", probe]);
+        k.run(&a, &leak).1
+    };
+    let in_box = run_box("imgenv", &[]);
+    let with_e = run_box("imgenv2", &["-e", "KERN_LEAK_PROBE"]);
+    fs::write(
+        base.join("ctx/Dockerfile"),
+        "FROM kern-imgenv:1\nRUN [\"/bin/busybox\", \"sh\", \"-c\", \"echo STEP-LEAK=[$KERN_LEAK_PROBE]\"]\n",
+    )
+    .unwrap();
+    let ctx = base.join("ctx");
+    let (_, built) = k.run(
+        &[
+            "build",
+            "--no-cache",
+            "-t",
+            "kern-imgenv-out:1",
+            ctx.to_str().unwrap(),
+        ],
+        &leak,
+    );
+    let _ = fs::remove_dir_all(&base);
+    if in_box.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        return;
+    }
+    assert!(
+        in_box.contains("LEAK=[]") && in_box.contains("SET=[image-value]"),
+        "the image read the operator's variable, or lost its own:\n{in_box}"
+    );
+    assert!(
+        with_e.contains("LEAK=[operator-secret-777]"),
+        "the operator's own `-e K` no longer inherits (positive control):\n{with_e}"
+    );
+    assert!(
+        built.contains("STEP-LEAK=[]") && !built.contains("operator-secret-777"),
+        "a build step read the operator's variable through its base image's Env:\n{built}"
+    );
+}
+
+/// ⛔ A COMMA IN A CONTEXT PATH NEVER OPENS A SECOND `src=`. FOUND BY AUDIT, rootless: a context
+/// link `m -> p,src=<host dir>`, with that path made real under a directory literally named `p,src=`,
+/// passed the "inside the context" check, and the step's `--mount type=bind,src=<ctx>/p,src=<host
+/// dir>` mounted the HOST directory, the last `src=` winning. The fields are quoted now.
+#[test]
+fn a_comma_in_a_context_bind_source_never_mounts_a_host_path() {
+    let Some((base, k)) = build_mount_fixture("bkcomma", "bkcomma:1") else {
+        return;
+    };
+    let ctx = base.join("ctx");
+    let host = base.join("hostonly");
+    fs::create_dir_all(&host).unwrap();
+    fs::write(host.join("flag"), "HOST-ONLY-FLAG-4242").unwrap();
+    let trick = format!("p,src={}", host.display());
+    fs::create_dir_all(ctx.join(&trick)).unwrap();
+    std::os::unix::fs::symlink(&trick, ctx.join("m")).unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM bkcomma:1\nRUN --mount=type=bind,source=m,target=/x [\"/bin/busybox\", \"sh\", \"-c\", \"/bin/busybox cat /x/flag 2>/dev/null || echo NO-HOST-FLAG\"]\n",
+    )
+    .unwrap();
+    let (ok, said) = k.run(
+        &[
+            "build",
+            "--no-cache",
+            "-t",
+            "bkcomma-out:1",
+            ctx.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let _ = fs::remove_dir_all(&base);
+    assert!(
+        !said.contains("HOST-ONLY-FLAG-4242"),
+        "a comma in the context path mounted the host directory:\n{said}"
+    );
+    assert!(
+        ok && said.contains("NO-HOST-FLAG"),
+        "the step should have mounted the context's own (empty) directory:\n{said}"
+    );
+}
+
+/// ⛔ A `from=` MOUNT SOURCE NEVER REACHES THE HOST THROUGH A LINK. FOUND BY AUDIT, rootless: a
+/// stage with `ln -s <host dir> /c` and `RUN --mount=type=bind,from=s,source=/c` listed and read that
+/// host directory, because the source was copied out as a link and the host follows a mount
+/// source; as a cache mount the step WROTE into it. The source is resolved inside the image now, as
+/// BuildKit does, so a link that stays inside the image still works and one that leaves it fails.
+#[test]
+fn a_build_mount_from_a_stage_never_follows_a_link_onto_the_host() {
+    let Some((base, k)) = build_mount_fixture("bkfromlink", "bkfromlink:1") else {
+        return;
+    };
+    let ctx = base.join("ctx");
+    let host = base.join("hostonly");
+    fs::create_dir_all(&host).unwrap();
+    fs::write(host.join("flag"), "HOST-ONLY-FLAG-31337").unwrap();
+    let bb = |script: &str| {
+        format!(
+            "[\"/bin/busybox\", \"sh\", \"-c\", \"{}\"]",
+            script.replace('"', "\\\"")
+        )
+    };
+    let stage = format!(
+        "FROM bkfromlink:1 AS s\nRUN {}\nFROM bkfromlink:1\n",
+        bb(&format!(
+            "/bin/busybox ln -s {} /out && /bin/busybox ln -s /etc /inside",
+            host.display()
+        ))
+    );
+    let c = ctx.to_str().unwrap();
+    let build = |tag: &str, step: &str| {
+        fs::write(ctx.join("Dockerfile"), format!("{stage}{step}\n")).unwrap();
+        k.run(&["build", "--no-cache", "-t", tag, c], &[])
+    };
+    let (ok, said) = build(
+        "bkfromlink-bind:1",
+        &format!(
+            "RUN --mount=type=bind,from=s,source=/out,target=/x {}",
+            bb("/bin/busybox cat /x/flag; /bin/busybox ls /x")
+        ),
+    );
+    assert!(
+        !ok && !said.contains("HOST-ONLY-FLAG-31337"),
+        "a bind from a stage's link reached the host directory (ok={ok}):\n{said}"
+    );
+    let (ok, said) = build(
+        "bkfromlink-cache:1",
+        &format!(
+            "RUN --mount=type=cache,id=evil,from=s,source=/out,target=/x {}",
+            bb("echo WRITTEN > /x/pwned")
+        ),
+    );
+    assert!(
+        !ok && !host.join("pwned").exists(),
+        "a cache seeded from a stage's link wrote into the host directory (ok={ok}):\n{said}"
+    );
+    // The positive control: a link that resolves INSIDE the image is followed there, as BuildKit
+    // does, so the refusal above is about the host and not about links.
+    let (ok, said) = build(
+        "bkfromlink-inside:1",
+        &format!(
+            "RUN --mount=type=bind,from=s,source=/inside,target=/x {}",
+            bb("/bin/busybox cat /x/os-release")
+        ),
+    );
+    let _ = fs::remove_dir_all(&base);
+    assert!(
+        ok && said.contains("ID=tiny"),
+        "a bind of a link resolving inside the image did not mount the image's directory:\n{said}"
+    );
+}
+
+/// ⛔ `RUN --mount=type=secret|cache|tmpfs` DO WHAT BUILDKIT DOES, MEASURED FIRST with buildx v0.39.0
+/// on busybox: the secret at `/run/secrets/<id>` 0400 owned 0:0, `env=` alone a variable with no
+/// file, a secret not given no mount at all, `required=true` a failure naming it; a cache kept
+/// between builds and started empty by `--no-cache`; a real tmpfs; and none of it in the image. A
+/// secret and the SSH agent used to be refused, which left a project with a private dependency
+/// unable to build; a cache was dropped. A secret's VALUE must reach no layer and no cache file.
+#[test]
+fn build_secret_cache_and_tmpfs_mounts_behave_as_buildkits() {
+    let Some((base, k)) = build_mount_fixture("bkmounts", "bkmount:1") else {
+        return;
+    };
+    let run = |a: &[&str], e: &[(&str, &str)]| k.run(a, e);
+    let ctx = base.join("ctx");
+    fs::write(ctx.join("tok.txt"), "tok-value-4711").unwrap();
+    fs::write(ctx.join("hidden.txt"), "hidden-value-90210").unwrap();
+    let bb = |script: &str| {
+        format!(
+            "[\"/bin/busybox\", \"sh\", \"-c\", \"{}\"]",
+            script.replace('"', "\\\"")
+        )
+    };
+    let dockerfile = [
+        "FROM bkmount:1".to_string(),
+        "ARG BUST".to_string(),
+        format!(
+            "RUN --mount=type=secret,id=tok {}",
+            bb("echo FILE=$(/bin/busybox cat /run/secrets/tok) MODE=$(/bin/busybox stat -c %a:%u:%g /run/secrets/tok)")
+        ),
+        format!(
+            "RUN --mount=type=secret,id=tok,env=TOKV {}",
+            bb("echo ENV=$TOKV; /bin/busybox ls /run/secrets >/dev/null 2>&1 || echo NO-SECRET-DIR")
+        ),
+        format!(
+            "RUN --mount=type=secret,id=hidden {}",
+            bb("/bin/busybox cat /run/secrets/hidden > /dev/null && echo HIDDEN-READ")
+        ),
+        format!(
+            "RUN --mount=type=secret,id=missing {}",
+            bb("/bin/busybox test -e /run/secrets/missing || echo MISSING-ABSENT")
+        ),
+        format!(
+            "RUN --mount=type=cache,target=/c {}",
+            bb("echo $BUST >> /c/log; echo CACHE-LINES=$(/bin/busybox wc -l < /c/log) CMODE=$(/bin/busybox stat -c %a:%u /c)")
+        ),
+        format!(
+            "RUN --mount=type=tmpfs,target=/t {}",
+            bb("echo TMPFS=$(/bin/busybox stat -f -c %T /t)")
+        ),
+    ]
+    .join("\n")
+        + "\n";
+    fs::write(ctx.join("Dockerfile"), dockerfile).unwrap();
+    let c = ctx.to_str().unwrap();
+    let secrets = [
+        "--secret",
+        "id=tok,src=tok.txt",
+        "--secret",
+        "id=hidden,src=hidden.txt",
+    ];
+    let build = |bust: &str, extra: &[&str]| {
+        let mut a = vec!["build", "-t", "bkmount-out:1", "--build-arg"];
+        let bust = format!("BUST={bust}");
+        a.push(&bust);
+        a.extend_from_slice(&secrets);
+        a.extend_from_slice(extra);
+        a.push(c);
+        // The context is the build's own directory, so a relative `src=` resolves against it.
+        let mut cmdline: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+        for x in cmdline.iter_mut() {
+            if x.starts_with("id=") {
+                *x = x.replace("src=", &format!("src={c}/"));
+            }
+        }
+        let refs: Vec<&str> = cmdline.iter().map(String::as_str).collect();
+        run(&refs, &[])
+    };
+    let (ok1, first) = build("1", &[]);
+    let (ok2, second) = build("2", &[]);
+    let (ok3, nocache) = build("3", &["--no-cache"]);
+    let (_, image) = run(
+        &[
+            "box",
+            &format!("bkm-{}", std::process::id()),
+            "--image",
+            "bkmount-out:1",
+            "--rm",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "for p in /run /c /t; do /bin/busybox test -e $p && echo LEFT=$p; done; echo SCANNED",
+        ],
+        &[],
+    );
+    // The hidden secret's value in any file of the cache or the data tree is a leak.
+    let leaked = std::process::Command::new("grep")
+        .args(["-rl", "hidden-value-90210"])
+        .arg(base.join("cache"))
+        .arg(base.join("data"))
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    fs::write(
+        ctx.join("Dockerfile.req"),
+        format!(
+            "FROM bkmount:1\nRUN --mount=type=secret,id=nope,required=true {}\n",
+            bb("true")
+        ),
+    )
+    .unwrap();
+    let (req_ok, req) = run(
+        &[
+            "build",
+            "-t",
+            "bkmount-req:1",
+            "-f",
+            &format!("{c}/Dockerfile.req"),
+            c,
+        ],
+        &[],
+    );
+    let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+    let _ = fs::remove_dir_all(&base);
+    assert!(ok1, "first build:\n{first}");
+    for want in [
+        "FILE=tok-value-4711 MODE=400:0:0",
+        "ENV=tok-value-4711",
+        "NO-SECRET-DIR",
+        "HIDDEN-READ",
+        "MISSING-ABSENT",
+        "CACHE-LINES=1 CMODE=755:0",
+        "TMPFS=tmpfs",
+    ] {
+        assert!(
+            first.contains(want),
+            "missing `{want}` in the first build:\n{first}"
+        );
+    }
+    assert!(
+        ok2 && second.contains("CACHE-LINES=2"),
+        "the cache was not kept:\n{second}"
+    );
+    assert!(
+        ok3 && nocache.contains("CACHE-LINES=1"),
+        "--no-cache did not start it empty:\n{nocache}"
+    );
+    assert!(
+        image.contains("SCANNED") && !image.contains("LEFT="),
+        "a mountpoint was left in the image:\n{image}"
+    );
+    assert!(
+        leaked.trim().is_empty(),
+        "the secret's value reached: {leaked}"
+    );
+    assert!(
+        !req_ok && req.contains("secret nope: not found"),
+        "a required secret that was not given did not fail the build:\n{req}"
+    );
+}
+
+/// ⛔ `RUN --mount=type=ssh` REACHES THE CALLER'S AGENT THROUGH A SOCKET OF KERN'S OWN, as BuildKit
+/// does: `SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0`, mode 0600, owner 0:0 (measured with buildx), and
+/// a connection made there arrives at the agent. Offline: the "agent" is this test's own socket, and
+/// busybox has no client that speaks to a Unix socket, so the forwarding is proven by connecting to
+/// the proxy's socket from the host while the step runs: the same socket the box's client opens.
+/// The end-to-end `ssh-add -l` against a real agent is in the battery.
+#[test]
+fn build_ssh_mount_is_a_proxy_socket_with_buildkits_shape() {
+    use std::io::{Read, Write};
+    let Some((base, k)) = build_mount_fixture("bkssh", "bkssh:1") else {
+        return;
+    };
+    let run = |a: &[&str], e: &[(&str, &str)]| k.run(a, e);
+    let ctx = base.join("ctx");
+    let agent_path = base.join("agent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&agent_path).expect("agent socket");
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served2 = served.clone();
+    std::thread::spawn(move || {
+        for c in listener.incoming().flatten() {
+            let mut c = c;
+            let mut b = [0u8; 4];
+            if c.read_exact(&mut b).is_ok() && &b == b"PING" {
+                let _ = c.write_all(b"PONG");
+                served2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM bkssh:1\nRUN --mount=type=ssh [\"/bin/busybox\", \"sh\", \"-c\", \"echo SOCK=$SSH_AUTH_SOCK STAT=$(/bin/busybox stat -c %a:%u $SSH_AUTH_SOCK); /bin/busybox test -S $SSH_AUTH_SOCK && echo IS-SOCKET; /bin/busybox sleep 2\"]\n",
+    )
+    .unwrap();
+    // While the step runs, connect to the proxy socket from the host and talk to the "agent". The
+    // scratch area is where kern's runtime directory is: `$XDG_RUNTIME_DIR`, else `/run/user/<uid>`.
+    let agent_env = agent_path.to_string_lossy().into_owned();
+    let handle = std::thread::spawn({
+        let base = base.clone();
+        move || {
+            let uid = unsafe { libc::getuid() };
+            let scratches: Vec<PathBuf> = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .into_iter()
+                .chain([PathBuf::from(format!("/run/user/{uid}"))])
+                .map(|r| r.join("kern").join("scratch"))
+                .collect();
+            for _ in 0..200 {
+                for rd in scratches.iter().filter_map(|s| fs::read_dir(s).ok()) {
+                    for d in rd.flatten() {
+                        let sock = d.path().join("agent-0.sock");
+                        if sock.exists() {
+                            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
+                                let _ = s.write_all(b"PING");
+                                let mut b = [0u8; 4];
+                                if s.read_exact(&mut b).is_ok() {
+                                    return String::from_utf8_lossy(&b).into_owned();
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            drop(base);
+            String::new()
+        }
+    });
+    let (ok, said) = run(
+        &[
+            "build",
+            "-t",
+            "bkssh-out:1",
+            "--ssh",
+            "default",
+            ctx.to_str().unwrap(),
+        ],
+        &[("SSH_AUTH_SOCK", agent_env.as_str())],
+    );
+    let reply = handle.join().unwrap_or_default();
+    let proxies = std::process::Command::new("pgrep")
+        .args(["-f", &format!("__build-ssh-proxy .* {agent_env}")])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let (_, image) = run(
+        &[
+            "box",
+            &format!("bks-{}", std::process::id()),
+            "--image",
+            "bkssh-out:1",
+            "--rm",
+            "--",
+            "/bin/busybox",
+            "sh",
+            "-c",
+            "/bin/busybox test -e /run && echo LEFT-RUN; echo SCANNED",
+        ],
+        &[],
+    );
+    let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+    let _ = fs::remove_dir_all(&base);
+    assert!(ok, "build:\n{said}");
+    assert!(
+        said.contains("SOCK=/run/buildkit/ssh_agent.0 STAT=600:0") && said.contains("IS-SOCKET"),
+        "the agent socket is not BuildKit's shape:\n{said}"
+    );
+    assert_eq!(
+        reply, "PONG",
+        "a connection to the proxy did not reach the agent"
+    );
+    assert!(served.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert!(
+        proxies.is_empty(),
+        "an agent proxy outlived the build: {proxies}"
+    );
+    assert!(
+        image.contains("SCANNED") && !image.contains("LEFT-RUN"),
+        "the agent's mountpoint was left in the image:\n{image}"
+    );
+}
+
+/// ⛔ `kern build --platform` BUILDS FOR THAT PLATFORM AND LEAVES THE HOST'S IMAGES ALONE. Its RUN
+/// steps run that architecture's binaries (the kernel's binfmt handler, qemu-user with the F flag),
+/// its base is that platform's and cached apart from the host's, and several platforms give one name
+/// for this machine's variant plus a list `kern push` publishes. MEASURED first by hand: an arm64
+/// alpine ran in a box here, and docker ran both variants of the manifest list kern pushed to a
+/// `registry:2`. Needs the network (alpine for arm64) and the handler; says why when it skips.
+#[test]
+fn build_for_another_platform_runs_its_own_binaries_and_keeps_the_hosts() {
+    let handler = fs::read_to_string("/proc/sys/fs/binfmt_misc/qemu-aarch64").unwrap_or_default();
+    let host_is_amd64 = cfg!(target_arch = "x86_64");
+    if !host_is_amd64
+        || !handler.starts_with("enabled")
+        || !handler
+            .lines()
+            .any(|l| l.starts_with("flags:") && l.contains('F'))
+    {
+        eprintln!("skip: no aarch64 binfmt handler with the F flag on an amd64 host");
+        return;
+    }
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("kern-it-platform-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("ctx")).unwrap();
+    let k = KernIn {
+        cache: base.join("cache"),
+        data: base.join("data"),
+    };
+    let ctx = base.join("ctx");
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM alpine:3.19\nRUN uname -m > /arch\nCMD [\"cat\", \"/arch\"]\n",
+    )
+    .unwrap();
+    let c = ctx.to_str().unwrap();
+    let box_out = |image: &str, n: &str| {
+        k.run(
+            &[
+                "box",
+                &format!("plat-{n}-{}", std::process::id()),
+                "--image",
+                image,
+                "--rm",
+            ],
+            &[],
+        )
+        .1
+    };
+    let (one_ok, one) = k.run(
+        &["build", "-t", "plat:1", "--platform", "linux/arm64", c],
+        &[],
+    );
+    if !one_ok && (one.contains("resolve") || one.contains("curl failed")) {
+        eprintln!("skip: alpine for arm64 could not be fetched: {one}");
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+        return;
+    }
+    let arm = box_out("plat:1", "a");
+    let host_alpine = k
+        .run(
+            &[
+                "box",
+                &format!("plat-h-{}", std::process::id()),
+                "--image",
+                "alpine:3.19",
+                "--rm",
+                "--",
+                "uname",
+                "-m",
+            ],
+            &[],
+        )
+        .1;
+    let (multi_ok, multi) = k.run(
+        &[
+            "build",
+            "-t",
+            "plat:2",
+            "--platform",
+            "linux/amd64,linux/arm64",
+            c,
+        ],
+        &[],
+    );
+    let named = box_out("plat:2", "b");
+    let variant = box_out("plat:2__linux_arm64", "c");
+    // A local image built for this machine is not a base for an arm64 build.
+    fs::write(
+        ctx.join("Dockerfile.local"),
+        "FROM plat:2__linux_amd64\nRUN true\n",
+    )
+    .unwrap();
+    let (mixed_ok, mixed) = k.run(
+        &[
+            "build",
+            "-t",
+            "plat:3",
+            "--platform",
+            "linux/arm64",
+            "-f",
+            &format!("{c}/Dockerfile.local"),
+            c,
+        ],
+        &[],
+    );
+    let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+    let _ = fs::remove_dir_all(&base);
+    assert!(one_ok, "arm64 build:\n{one}");
+    assert!(
+        arm.contains("aarch64"),
+        "the arm64 image's RUN was not aarch64:\n{arm}"
+    );
+    assert!(
+        host_alpine.contains("x86_64"),
+        "the host's alpine was replaced by the arm64 one:\n{host_alpine}"
+    );
+    assert!(multi_ok, "multi-platform build:\n{multi}");
+    assert!(
+        named.contains("x86_64"),
+        "the name is not this machine's variant:\n{named}"
+    );
+    assert!(
+        variant.contains("aarch64"),
+        "the arm64 variant is not arm64:\n{variant}"
+    );
+    assert!(
+        !mixed_ok && mixed.contains("is a local image for amd64"),
+        "an amd64 local image was used as an arm64 base:\n{mixed}"
+    );
+}
+
+/// One image a test registry serves: manifest, config and layer bodies, and their digests.
+struct TestImage {
+    manifest: Vec<u8>,
+    manifest_digest: String,
+    config: Vec<u8>,
+    config_digest: String,
+    /// `(body, digest)`, bottom first.
+    layers: Vec<(Vec<u8>, String)>,
+}
+
+fn sha256_hex(bytes: &[u8], dir: &std::path::Path) -> String {
+    let f = dir.join("sha-input");
+    fs::write(&f, bytes).unwrap();
+    let out = Command::new("sha256sum")
+        .arg(&f)
+        .output()
+        .expect("sha256sum");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One gzip'd layer holding `files` (name, bytes), with its uncompressed digest.
+fn test_layer(
+    files: &[(&str, &[u8])],
+    tag: &str,
+    dir: &std::path::Path,
+) -> (Vec<u8>, String, String) {
+    let root = dir.join(format!("root-{tag}"));
+    let _ = fs::remove_dir_all(&root);
+    for (name, bytes) in files {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        if name.starts_with("bin/") {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let tar = dir.join(format!("layer-{tag}.tar"));
+    assert!(Command::new("tar")
+        .args([
+            "-cf",
+            tar.to_str().unwrap(),
+            "-C",
+            root.to_str().unwrap(),
+            "."
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let raw = fs::read(&tar).unwrap();
+    let diff_id = sha256_hex(&raw, dir);
+    assert!(Command::new("gzip")
+        .args(["-n", "-f", tar.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let layer = fs::read(dir.join(format!("layer-{tag}.tar.gz"))).unwrap();
+    let digest = format!("sha256:{}", sha256_hex(&layer, dir));
+    (layer, digest, format!("sha256:{diff_id}"))
+}
+
+/// An image of the given layers, its command printing `/v`.
+fn test_image_of(layers: Vec<(Vec<u8>, String, String)>, dir: &std::path::Path) -> TestImage {
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let diff_ids: Vec<String> = layers.iter().map(|(_, _, d)| format!("\"{d}\"")).collect();
+    let config = format!(
+        "{{\"architecture\":\"{arch}\",\"os\":\"linux\",\"config\":{{\"Cmd\":[\"/bin/busybox\",\"cat\",\"/v\"]}},\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[{}]}}}}",
+        diff_ids.join(",")
+    )
+    .into_bytes();
+    let config_digest = format!("sha256:{}", sha256_hex(&config, dir));
+    let descs: Vec<String> = layers
+        .iter()
+        .map(|(body, digest, _)| {
+            format!(
+                "{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"size\":{},\"digest\":\"{digest}\"}}",
+                body.len()
+            )
+        })
+        .collect();
+    let manifest = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"size\":{},\"digest\":\"{config_digest}\"}},\"layers\":[{}]}}",
+        config.len(),
+        descs.join(",")
+    )
+    .into_bytes();
+    let manifest_digest = format!("sha256:{}", sha256_hex(&manifest, dir));
+    TestImage {
+        manifest,
+        manifest_digest,
+        config,
+        config_digest,
+        layers: layers.into_iter().map(|(b, d, _)| (b, d)).collect(),
+    }
+}
+
+/// A one-layer image holding `busybox` and a file `/v` with `version`.
+fn test_image(busybox: &std::path::Path, version: &str, dir: &std::path::Path) -> TestImage {
+    let bb = fs::read(busybox).unwrap();
+    let layer = test_layer(
+        &[("bin/busybox", &bb), ("v", version.as_bytes())],
+        version,
+        dir,
+    );
+    test_image_of(vec![layer], dir)
+}
+
+/// What a test registry counted and how it misbehaves: GETs per layer digest, and whether the
+/// image's LAST layer answers 500.
+#[derive(Default)]
+struct RegistryState {
+    gets: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    fail_last_layer: std::sync::atomic::AtomicBool,
+    /// The last layer sends its headers and then nothing, until this is cleared: a download in
+    /// flight, for a test to interrupt.
+    stall_last_layer: std::sync::atomic::AtomicBool,
+}
+
+impl RegistryState {
+    fn gets_of(&self, digest: &str) -> usize {
+        self.gets
+            .lock()
+            .map(|g| g.get(digest).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+    fn all_gets(&self) -> usize {
+        self.gets.lock().map(|g| g.values().sum()).unwrap_or(0)
+    }
+}
+
+/// A minimal registry on loopback serving `t:1` as whichever image `current` holds. Keep-alive is
+/// honoured, because kern fetches a pull's blobs over one connection.
+fn serve_test_registry(
+    current: std::sync::Arc<std::sync::Mutex<TestImage>>,
+    state: std::sync::Arc<RegistryState>,
+) -> u16 {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let current = current.clone();
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let mut w = conn.try_clone().expect("clone");
+                let mut r = BufReader::new(conn);
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("").to_string();
+                    loop {
+                        let mut h = String::new();
+                        if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                            break;
+                        }
+                    }
+                    let img = current.lock().unwrap();
+                    let last = img
+                        .layers
+                        .last()
+                        .map(|(_, d)| d.clone())
+                        .unwrap_or_default();
+                    let layer = img
+                        .layers
+                        .iter()
+                        .find(|(_, d)| path == format!("/v2/t/blobs/{d}"))
+                        .cloned();
+                    let (status, ctype, body, digest): (&str, &str, Vec<u8>, Option<String>) =
+                        if path == "/v2/" {
+                            ("200 OK", "application/json", b"{}".to_vec(), None)
+                        } else if path.starts_with("/v2/t/manifests/") {
+                            (
+                                "200 OK",
+                                "application/vnd.docker.distribution.manifest.v2+json",
+                                img.manifest.clone(),
+                                Some(img.manifest_digest.clone()),
+                            )
+                        } else if path == format!("/v2/t/blobs/{}", img.config_digest) {
+                            (
+                                "200 OK",
+                                "application/octet-stream",
+                                img.config.clone(),
+                                None,
+                            )
+                        } else if let Some((body, d)) = layer {
+                            if method == "GET" {
+                                if let Ok(mut g) = state.gets.lock() {
+                                    *g.entry(d.clone()).or_insert(0) += 1;
+                                }
+                            }
+                            if d == last
+                                && state
+                                    .stall_last_layer
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                let head = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                                    body.len()
+                                );
+                                drop(img);
+                                let _ = w.write_all(head.as_bytes());
+                                let _ = w.write_all(&body[..body.len() / 2]);
+                                for _ in 0..600 {
+                                    if !state
+                                        .stall_last_layer
+                                        .load(std::sync::atomic::Ordering::SeqCst)
+                                    {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                return;
+                            }
+                            if d == last
+                                && state
+                                    .fail_last_layer
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                (
+                                    "500 Internal Server Error",
+                                    "text/plain",
+                                    b"down".to_vec(),
+                                    None,
+                                )
+                            } else {
+                                ("200 OK", "application/octet-stream", body, None)
+                            }
+                        } else {
+                            ("404 Not Found", "text/plain", b"no".to_vec(), None)
+                        };
+                    drop(img);
+                    let mut head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
+                        body.len()
+                    );
+                    if let Some(d) = digest {
+                        head.push_str(&format!("Docker-Content-Digest: {d}\r\n"));
+                    }
+                    head.push_str("\r\n");
+                    if w.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    if method != "HEAD" && w.write_all(&body).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// ⛔ AN INTERRUPTED PULL KEEPS THE LAYERS IT COMPLETED, AND THE NEXT ONE DOES NOT FETCH THEM
+/// AGAIN, as docker keeps them. MEASURED in the field: Kokoro-FastAPI's pull was cut off (a timeout
+/// killed it) with eight of nine layers complete, and the next attempt downloaded all nine. Here the
+/// last layer stalls half-way and the pull is killed, process group and all, as Ctrl-C or `timeout`
+/// would; the half-written layer must not be trusted either.
+#[test]
+fn an_interrupted_pull_keeps_the_layers_it_completed() {
+    use std::os::unix::process::CommandExt;
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox to build an image from");
+        return;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-pullkeep-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let bb = fs::read(&busybox).unwrap();
+    let bottom = test_layer(&[("bin/busybox", &bb)], "bottom", &base);
+    let filler: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+    let top = test_layer(&[("v", b"kept"), ("filler", &filler)], "top", &base);
+    let (bottom_digest, top_digest) = (bottom.1.clone(), top.1.clone());
+    let current = std::sync::Arc::new(std::sync::Mutex::new(test_image_of(
+        vec![bottom, top],
+        &base,
+    )));
+    let state = std::sync::Arc::new(RegistryState::default());
+    state
+        .stall_last_layer
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let port = serve_test_registry(current, state.clone());
+    let image = format!("127.0.0.1:{port}/t:1");
+    let cache = base.join("cache");
+    let cmd = || {
+        let mut c = kern();
+        c.env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", base.join("data"))
+            .args(["pull", &image]);
+        c
+    };
+    let cleanup = || {
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+    };
+    // FIRST PULL, killed while the top layer is half-way.
+    let mut child = match cmd()
+        .process_group(0)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup();
+            panic!("spawn kern: {e}");
+        }
+    };
+    let mut waited = 0;
+    while state.gets_of(&top_digest) == 0 && waited < 300 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        waited += 1;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pgid = child.id() as i32;
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    let _ = child.wait();
+    let bottom_first = state.gets_of(&bottom_digest);
+    state
+        .stall_last_layer
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // SECOND PULL.
+    let out = cmd().output().expect("run kern");
+    let second = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bottom_second = state.gets_of(&bottom_digest);
+    let top_second = state.gets_of(&top_digest);
+    cleanup();
+    assert_eq!(
+        bottom_first, 1,
+        "the first pull did not complete the bottom layer before the kill"
+    );
+    assert!(out.status.success(), "the second pull failed:\n{second}");
+    assert_eq!(
+        bottom_second, 1,
+        "the completed layer was downloaded again:\n{second}"
+    );
+    assert_eq!(
+        top_second, 2,
+        "the half-written layer was trusted instead of fetched again:\n{second}"
+    );
+    assert!(
+        second.contains("reusing 1 layer"),
+        "the second pull did not say it reused a layer:\n{second}"
+    );
+}
+
+/// ⛔ `--pull always` DOES NOT DOWNLOAD AN IMAGE IT ALREADY HOLDS, as docker does not, AND STILL
+/// TAKES A NEW ONE. kern re-downloaded every layer on every start: MEASURED in the field, where
+/// valiantlynx/ollama-docker's `pull_policy: always` fetched `ollama/ollama:latest` (two layers over
+/// 1 GB) again right after compose had fetched it. The third step is the opposite mistake: an
+/// `always` that stopped looking would pass the second and fail this one.
+#[test]
+fn pull_always_downloads_only_an_image_that_changed() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox to build an image from");
+        return;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-pullalways-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let one = test_image(&busybox, "one", &base);
+    let two = test_image(&busybox, "two", &base);
+    let current = std::sync::Arc::new(std::sync::Mutex::new(one));
+    let state = std::sync::Arc::new(RegistryState::default());
+    let port = serve_test_registry(current.clone(), state.clone());
+    let image = format!("127.0.0.1:{port}/t:1");
+    let cache = base.join("cache");
+    let run = |n: &str| {
+        let out = kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", base.join("data"))
+            .args(["box", n, "--image", &image, "--pull", "always"])
+            .output()
+            .expect("run kern");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let gets = || state.all_gets();
+    let first = run("pa1");
+    let after_first = gets();
+    let second = run("pa2");
+    let after_second = gets();
+    *current.lock().unwrap() = two;
+    let third = run("pa3");
+    let after_third = gets();
+    let cleanup = || {
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+    };
+    cleanup();
+    assert!(
+        first.contains("one") && after_first == 1,
+        "the first pull did not run the image (layer downloads {after_first}):\n{first}"
+    );
+    assert!(
+        second.contains("one") && after_second == 1,
+        "an image already held was downloaded again ({after_second} layer downloads):\n{second}"
+    );
+    assert!(
+        third.contains("two") && after_third == 2,
+        "a changed image was not downloaded ({after_third} layer downloads):\n{third}"
+    );
+}
+
+/// ⛔ A NEW NAMED VOLUME TAKES THE OWNER OF THE IMAGE DIRECTORY IT COVERS, FROM WHICHEVER LAYER HOLDS
+/// IT. The owner used to be read from the TOP layer only; speaches makes its HF cache directory as
+/// `ubuntu` in a lower layer, so the volume stayed root's and the first model download died with
+/// "Permission denied", measured in the field. Here `/data` is made by one step and the top layer is
+/// another step that does not touch it.
+#[test]
+fn a_named_volume_takes_its_owner_from_the_layer_that_made_the_directory() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox to build a base image from");
+        return;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-volown-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let cache = base.join("cache");
+    let data = base.join("data");
+    fs::create_dir_all(&cache).unwrap();
+    let archive = tiny_image_archive(&base, "volown:1", Some(&busybox));
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+    };
+    let loaded = run(&["load", "-i", archive.to_str().unwrap()]);
+    assert!(
+        loaded.status.success(),
+        "load: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let ctx = base.join("ctx");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        concat!(
+            "FROM volown:1\n",
+            "RUN [\"/bin/busybox\", \"sh\", \"-c\", \"/bin/busybox mkdir -p /data && /bin/busybox chown 1000:1000 /data\"]\n",
+            "RUN [\"/bin/busybox\", \"touch\", \"/top-layer-only\"]\n",
+        ),
+    )
+    .unwrap();
+    let built = run(&["build", "-t", "volown-built:1", ctx.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&built.stderr).into_owned();
+    if !built.status.success()
+        && (err.contains("user namespaces")
+            || err.contains("chown") && err.contains("Invalid argument"))
+    {
+        eprintln!("skip: no uid range here, so uid 1000 cannot own anything in a box: {err}");
+        cleanup();
+        return;
+    }
+    assert!(built.status.success(), "build: {err}");
+    let name = format!("volown-{}", std::process::id());
+    let out = run(&[
+        "box",
+        &name,
+        "--image",
+        "volown-built:1",
+        "-v",
+        "volown-vol:/data",
+        "--user",
+        "1000:1000",
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "/bin/busybox touch /data/written && echo WROTE",
+    ]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = run(&["volume", "rm", "volown-vol"]);
+    cleanup();
+    assert!(
+        said.contains("WROTE"),
+        "the volume did not take the owner of the image's /data:\n{said}"
+    );
+}
+
+/// ⛔ `RUN --mount=type=bind,from=<stage|image>` MOUNTS THAT SOURCE. open-webui's Dockerfile mounts
+/// `uv` with `from=ghcr.io/astral-sh/uv:0.12.10`, measured in the field; kern dropped it, so the
+/// command ran without the file. Both forms: an earlier stage, and an image.
+#[test]
+fn a_run_bind_mount_from_a_stage_and_from_an_image() {
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no static busybox to build a base image from");
+        return;
+    };
+    let base = std::env::temp_dir().join(format!("kern-it-runfrom-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let cache = base.join("cache");
+    let data = base.join("data");
+    fs::create_dir_all(&cache).unwrap();
+    let archive = tiny_image_archive(&base, "runfrom:1", Some(&busybox));
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+    };
+    let loaded = run(&["load", "-i", archive.to_str().unwrap()]);
+    assert!(
+        loaded.status.success(),
+        "load: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let ctx = base.join("ctx");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        concat!(
+            "FROM runfrom:1 AS tools\n",
+            "RUN [\"/bin/busybox\", \"sh\", \"-c\", \"echo FROM_A_STAGE > /tool.txt\"]\n",
+            "FROM runfrom:1\n",
+            "RUN [\"/bin/busybox\", \"mkdir\", \"-m\", \"777\", \"/w\"]\n",
+            "RUN --mount=type=bind,from=tools,source=/tool.txt,target=/t/tool.txt [\"/bin/busybox\", \"cp\", \"/t/tool.txt\", \"/w/stage\"]\n",
+            "RUN --mount=type=bind,from=runfrom:1,source=/etc/os-release,target=/o [\"/bin/busybox\", \"cp\", \"/o\", \"/w/image\"]\n",
+        ),
+    )
+    .unwrap();
+    let built = run(&["build", "-t", "runfrom-built:1", ctx.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&built.stderr).into_owned();
+    if !built.status.success() && err.contains("user namespaces") {
+        eprintln!("skip: no box can start here, so a RUN cannot build");
+        cleanup();
+        return;
+    }
+    if !built.status.success() {
+        cleanup();
+        panic!("build: {err}");
+    }
+    let out = run(&[
+        "box",
+        "rf1",
+        "--image",
+        "runfrom-built:1",
+        "--rm",
+        "--",
+        "/bin/busybox",
+        "cat",
+        "/w/stage",
+        "/w/image",
+    ]);
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    cleanup();
+    assert!(
+        said.contains("FROM_A_STAGE"),
+        "the stage's file was not mounted: {said}"
+    );
+    assert!(
+        said.contains("ID=tiny"),
+        "the image's file was not mounted: {said}"
+    );
 }

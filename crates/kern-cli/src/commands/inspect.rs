@@ -1173,18 +1173,39 @@ fn skew_between(theirs: &str, ours: &str) -> String {
 /// FIRST such mount answers, because a grant binds one version's files and nothing else.
 fn box_driver_version(pid: i32) -> Option<String> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).ok()?;
+    driver_version_in_mountinfo(&text)
+}
+
+/// [`box_driver_version`] over a mount table's text.
+///
+/// ⛔ THE VERSION MOST OF THE DRIVER'S OWN LIBRARIES CARRY, not the first one met. A Jetson's grant
+/// binds GStreamer and V4L2 libraries too, and NVIDIA ships some with a version of their own
+/// (`libnvidia-egl-gbm.so.1.1.0`, `libnvidia-egl-wayland.so.1.1.11`): MEASURED on a Jetson Orin Nano,
+/// the row read "granted under 1.0.0" and then "granted under 1.1.0, host now has 540.4.0" on a box
+/// nothing had upgraded, while a dozen `libnvidia-*.so.540.4.0` were bound beside them. A box left
+/// running across an upgrade holds the OLD version on all of them, so the majority still names it.
+fn driver_version_in_mountinfo(text: &str) -> Option<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
     for line in text.lines() {
-        let Some(path) = line.split_whitespace().nth(4) else {
+        let Some(name) = line
+            .split_whitespace()
+            .nth(4)
+            .and_then(|p| p.rsplit('/').next())
+        else {
             continue;
         };
-        let Some(name) = path.rsplit('/').next() else {
+        if !(name.starts_with("libnvidia-") || name.starts_with("libcuda.so.")) {
             continue;
-        };
-        if let Some(version) = driver_version_in_name(name) {
-            return Some(version);
+        }
+        if let Some(v) = driver_version_in_name(name) {
+            match counts.iter_mut().find(|(seen, _)| *seen == v) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((v, 1)),
+            }
         }
     }
-    None
+    let best = counts.iter().map(|(_, n)| *n).max()?;
+    counts.into_iter().find(|(_, n)| *n == best).map(|(v, _)| v)
 }
 
 pub(crate) fn gpu_nodes_of(pid1: Option<i32>) -> String {
@@ -2373,6 +2394,7 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
         if b.orphaned {
             let reaped = registry::reap_orphan(b);
             registry::set_box_exit(b.pid, b.starttime, 137, &b.name, &b.pod, &b.command);
+            record_stopped(b, 137);
             registry::clear_health(&b.name, b.pid);
             // The environment sidecar has the same lifetime as the health one: cleared together so a
             // runtime dir cannot accumulate one and not the other.
@@ -2452,6 +2474,7 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
             &b.pod,
             &b.command,
         );
+        record_stopped(b, outcome.exit_code());
         // AND THE KEPT RECORD, FOR THE SAME REASON, in the same place: the sentence above says the
         // supervisor never records its own code under a `stop`, and the kept record is the one that
         // OUTLIVES this runtime dir. The supervisor's own call covers a box that ended by itself;
@@ -2771,19 +2794,39 @@ fn start_one_kept(self_exe: &std::path::Path, name: &str) -> Result<i32, Error> 
 /// A RUNNING BOX IS REFUSED AND NOT KILLED. Docker's `rm` behaves this way, and the reason is the
 /// same: `rm` on a box that is up is as likely to be a typo as an intention, and the data it would
 /// take with it is the data the operator asked to keep. The message names `stop`.
-pub fn remove_kept(names: &[String]) -> Result<(), Error> {
+/// `force` is `docker rm -f`, MEASURED with docker 29: a running container is stopped and removed
+/// (its name printed, exit 0), and a name that does not exist is said and still exits 0. kern had no
+/// `-f` and answered "unknown flag", so the line a docker user types first to clean up failed.
+pub fn remove_kept(names: &[String], force: bool) -> Result<(), Error> {
     let p = crate::ui::Palette::detect();
     let mut failures: Vec<String> = Vec::new();
     for name in names {
         if let Some(inst) = registry::find_ref(name) {
-            failures.push(format!(
-                "'{}' is running (pid {}) - `kern stop {}` first",
-                inst.name, inst.pid, inst.name
-            ));
+            if !force {
+                failures.push(format!(
+                    "'{}' is running (pid {}) - `kern stop {}` first, or `kern rm -f`",
+                    inst.name, inst.pid, inst.name
+                ));
+                continue;
+            }
+            if let Err(e) = stop(std::slice::from_ref(&inst.name), false) {
+                failures.push(format!("'{name}': could not be stopped: {e}"));
+                continue;
+            }
+        }
+        // AN EXITED BOX'S RECORD GOES TOO, as `docker rm` takes a container out of `docker ps -a`;
+        // and a box with no `--keep` layer is then removed by exactly that, stopped or exited.
+        let kept =
+            crate::keepbox::dir_of(name).is_some_and(|d| std::fs::symlink_metadata(d).is_ok());
+        let records = registry::clear_exited_named(name);
+        if !kept && records > 0 {
+            println!("{name}");
             continue;
         }
         match crate::keepbox::remove(name) {
             Ok(()) => println!("removed kept box '{}{name}{}'", p.c, p.z),
+            // `-f` on a name that is not there: said, and not a failure, as docker answers it.
+            Err(e) if force => eprintln!("kern: '{name}': {e}"),
             Err(e) => failures.push(format!("'{name}': {e}")),
         }
     }
@@ -3076,4 +3119,49 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod driver_row_tests {
+    /// The driver's version comes from the driver's libraries and nothing else bound beside them.
+    #[test]
+    fn the_driver_version_is_read_from_the_drivers_own_libraries() {
+        let line = |p: &str| format!("36 35 0:5 / {p} ro,relatime - overlay overlay rw\n");
+        let jetson = [
+            line("/usr/lib/aarch64-linux-gnu/nvidia/libgstnvcustomhelper.so.1.0.0"),
+            line("/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-egl-gbm.so.1.1.0"),
+            line("/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-glcore.so.540.4.0"),
+            line("/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-eglcore.so.540.4.0"),
+        ]
+        .concat();
+        assert_eq!(
+            super::driver_version_in_mountinfo(&jetson).as_deref(),
+            Some("540.4.0")
+        );
+        let desktop = line("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02");
+        assert_eq!(
+            super::driver_version_in_mountinfo(&desktop).as_deref(),
+            Some("580.173.02")
+        );
+        assert_eq!(
+            super::driver_version_in_mountinfo(&line("/usr/lib/libfoo.so.1.0.0")),
+            None
+        );
+    }
+}
+
+/// A box ended by `kern stop` / `kern kill`, in the history: the SDKs' own deadline arrives this way,
+/// so this is the line that says a call was stopped rather than that it died. See `history.rs`.
+fn record_stopped(b: &registry::Instance, code: i32) {
+    crate::history::record(&crate::history::Entry {
+        ended_ms: crate::history::now_ms(),
+        name: b.name.clone(),
+        image: "-".to_string(),
+        ran_ms: registry::now_unix()
+            .saturating_sub(b.started)
+            .saturating_mul(1000),
+        code,
+        outcome: crate::history::Outcome::Stopped,
+        gpu: "-".to_string(),
+    });
 }

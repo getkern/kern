@@ -134,12 +134,16 @@ pub use cgroup::{
     outer_memory_high, outer_memory_high_above_boxes, outer_memory_high_for_box, OuterMemoryHigh,
 };
 pub use real::bring_loopback_up;
+/// The driver's tools by name, the one list both the grant and the hints read.
+pub use real::driver_tools;
 pub use real::id_range_available;
 /// Is this command one of the NVIDIA driver's own tools (`nvidia-smi` and the four others
-/// `libnvidia-container` injects)? A grant binds the driver's libraries and none of its binaries, so
-/// a command that IS one of them cannot run in a box, and a healthcheck built on one can never pass.
+/// `libnvidia-container` injects)? A grant binds the ones the host has at `/usr/bin`, as docker
+/// does, so the surfaces ask this to say why one is missing where a grant did not put it.
 /// See [`real::is_driver_tool`].
 pub use real::is_driver_tool;
+/// Real root (uid 0 of the initial user namespace), as opposed to uid 0 of a mapped one.
+pub use real::is_initial_root;
 pub use real::is_root_of_ranged_userns;
 pub use real::single_threaded;
 pub use real::with_id_mapped_userns;

@@ -682,6 +682,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         stop_timeout,
         ignore_pull_failures,
         build_args,
+        build_policy,
         rmi,
         run_name,
         run_entrypoint,
@@ -711,6 +712,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         services,
         project,
         env_file,
+        project_root,
         profiles,
         recreate,
         renew_anon_volumes,
@@ -718,6 +720,17 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         log_window,
         no_log_prefix,
     } = o;
+    // THE OPERATOR'S PROJECT ROOT, recorded once for the whole run (see `compose_root`).
+    if let Some(root) = project_root {
+        crate::commands::set_project_root(root)?;
+        // EVERY FILE INSIDE IT, checked here and not at the first path that happens to need it, so
+        // a root beside the project is refused for every stack and not only for those with binds.
+        for f in files {
+            crate::commands::compose_root(f)?;
+        }
+    } else {
+        crate::commands::adopt_git_project_root(files)?;
+    }
     // `--profile` is DEFINED by Docker as equivalent to `COMPOSE_PROFILES`, so it is applied by
     // exporting that variable once here, at the CLI boundary, before any parsing. One assignment in a
     // one-shot process, never from library code - the parser keeps reading a single source of truth.
@@ -847,34 +860,56 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // result, which is Docker's order. MEASURED 2026-11-12: deciding them per file refused
     // murtaza-nasir/maestro and perminder-klair/subwave, both accepted by docker, because the base
     // dropped a profile-gated service and its GPU override was then added as a service with no image.
+    // An `include:` is read under the same boundary as every other path: the operator's root when
+    // there is one, else each document's own directory.
+    let include_root = crate::commands::project_root_override();
     let mut boxes = if files.len() > 1 {
-        let mut merged = crate::compose::parse_stack_file_at(
-            &text,
+        // EVERY TEXT FIRST, because a `!reset` or `!override` in file N removes its key from what files
+        // 0..N built, which is Docker's merge; kern merges interpreted services, so the key is
+        // dropped from each earlier file's tree before it is read. See `merge_tag_keys`.
+        let mut texts: Vec<String> = vec![text.clone()];
+        for extra in &files[1..] {
+            texts.push(
+                std::fs::read_to_string(extra)
+                    .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?,
+            );
+        }
+        let tagged: Vec<Vec<(String, String)>> = texts
+            .iter()
+            .map(|t| crate::compose::merge_tag_keys(t))
+            .collect::<Result<_, _>>()
+            .map_err(Error::Compose)?;
+        let later = |i: usize| -> Vec<(String, String)> { tagged[i + 1..].concat() };
+        let mut merged = crate::compose::parse_stack_file_in_dropping(
+            &texts[0],
             &dotenv,
             stack_net,
             Some(dir_of(&files[0]).as_path()),
+            include_root.as_deref(),
+            &later(0),
         )
         .map_err(Error::Compose)?;
         // Merge every additional `-f`, left to right (see `merge_stacks` for the exact rules).
-        for extra in &files[1..] {
-            let t = std::fs::read_to_string(extra)
-                .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?;
-            let over = crate::compose::parse_stack_file_at(
-                &t,
+        for (i, extra) in files.iter().enumerate().skip(1) {
+            let over = crate::compose::parse_stack_file_in_dropping(
+                &texts[i],
                 &dotenv,
                 stack_net,
                 Some(dir_of(extra).as_path()),
+                include_root.as_deref(),
+                &later(i),
             )
             .map_err(Error::Compose)?;
             merged = crate::compose::merge_stacks(merged, over);
         }
         crate::compose::apply_profiles(merged).map_err(Error::Compose)?
     } else {
-        crate::compose::parse_with_env_at(
+        crate::compose::parse_with_env_in(
             &text,
             &dotenv,
             stack_net,
             Some(dir_of(&files[0]).as_path()),
+            include_root.as_deref(),
         )
         .map_err(Error::Compose)?
     };
@@ -1836,8 +1871,16 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     check_pod_global_conflicts(&boxes, own_namespaces)?;
     // Self-explaining (see its doc): a device grant a compose file asked for needs a command-line
     // acknowledgement, because the file cannot reach the command line.
-    if let Some(msg) = device_grant_problem(&boxes, allow_device_grants) {
-        return Err(Error::Compose(msg));
+    //
+    // ⛔ NOT FOR `exec`: it enters a box that is ALREADY RUNNING and grants nothing; the grant was
+    // given, or refused, by the `up` that started it. MEASURED in the field (jellyfin's documented
+    // file on WSL2): `up --allow-device-grants` brought the service up healthy, and every following
+    // `kern compose exec jellyfin ...` was refused with "asks for a GPU and nothing granted it".
+    // docker asks nothing at exec, and neither does `kern exec` on the same box.
+    if action != ComposeAction::Exec {
+        if let Some(msg) = device_grant_problem(&boxes, allow_device_grants) {
+            return Err(Error::Compose(msg));
+        }
     }
     // Softer sibling: two services whose IMAGES expose the same port without either DECLARING it (two
     // nginx on :80, two node apps on :3000). Best-effort and cache-only (never pulls just to warn),
@@ -1884,6 +1927,16 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // both the pre- and post-re-exec resolutions land in the project dir.
     let project_dir = compose_dir(file);
 
+    // A MISSING `env_file:` stops the file before any build or download: see `missing_env_file`.
+    if action != ComposeAction::Exec {
+        let starting = if services.is_empty() {
+            None
+        } else {
+            Some(crate::compose::with_dependencies(&boxes, services))
+        };
+        crate::commands::missing_env_file(&boxes, &project_dir, starting.as_ref())?;
+    }
+
     // Compose `build:` - build each service's image via `kern build` BEFORE the launch loop, so a box
     // with `build:` gets a real image to run. Four hardenings the adversarial pass demanded, because
     // `build:` is the first place the YAML parser drives a privileged operation on host paths:
@@ -1892,9 +1945,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //  3. a build failure fails the WHOLE `up` with a linked message ("service X: build failed …"),
     //     since a box whose image never built can't start (and its depends_completed/healthy peers
     //     would hang) - fail-fast beats a half-up stack.
-    //  4. `image:` + `build:` together = build AND tag as `image` (compose semantics); a `build:` with
-    //     no `image:` gets a synthesized tag. We never silently use a stale registry image for a box
-    //     the user meant to build locally.
+    //  4. `image:` + `build:` together = the image when it is here or can be pulled, else build AND
+    //     tag as `image` (Docker's rule, see `BuildPolicy`); a `build:` with no `image:` gets a
+    //     synthesized tag and is always rebuilt. Which of the two images runs is always said.
     // `run`'s stdout is the WORKLOAD'S. Every other verb here narrates to a terminal and its stdout
     // is kern's to use. See `resolve_builds_narrating`.
     //
@@ -1906,24 +1959,41 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // command's own output under it. There is nothing after this call that exec consumes from a
     // build: it reads the service's name, its workdir and its user, and finds the box in the
     // registry.
+    // Docker resolves a RELATIVE bind source (`./certs:/dst`, `.:/app`) against the compose file's
+    // directory. kern's `-v` needs an absolute path or a named volume, so rewrite relative binds here
+    // to absolute (confined under the compose dir - traversal guard, like a build context). A `named:`
+    // source or an already-absolute `/host:/dst` passes through untouched.
+    //
+    // ⛔ BEFORE THE BUILDS AND THE PULLS, because it costs nothing and they cost minutes. MEASURED
+    // in the field: Kokoro-FastAPI's file, whose `../../web` bind kern refuses outside a repository,
+    // downloaded its multi-GB image for nine minutes and was refused after it.
+    resolve_relative_binds(&mut boxes, file, &crate::commands::compose_root(file)?)?;
     if action != ComposeAction::Exec {
+        // ONLY WHAT WILL START IS BUILT, as docker does: `up <svc>` and `run <svc>` build that
+        // service and its dependencies, `--no-deps` the service alone, and no selection the whole
+        // file. MEASURED in the field: `kern compose up ollama ollama-webui` on
+        // valiantlynx/ollama-docker built the file's `app` service too, which nothing was starting.
+        let needed: Option<Vec<String>> = if services.is_empty() {
+            None
+        } else if no_deps {
+            Some(services.to_vec())
+        } else {
+            Some(
+                crate::compose::with_dependencies(&boxes, services)
+                    .into_iter()
+                    .collect(),
+            )
+        };
         crate::commands::resolve_builds_for(
             &mut boxes,
             file,
             &self_exe,
             action != ComposeAction::Run,
-            // `run --no-deps <svc>` starts exactly one service, so exactly one image can be needed.
-            // Without `--no-deps` the dependencies start too and every one of them may need building,
-            // which is the whole-file case.
-            (action == ComposeAction::Run && no_deps && !services.is_empty()).then_some(services),
+            needed.as_deref(),
             build_args,
+            build_policy,
         )?;
     }
-    // Docker resolves a RELATIVE bind source (`./certs:/dst`, `.:/app`) against the compose file's
-    // directory. kern's `-v` needs an absolute path or a named volume, so rewrite relative binds here
-    // to absolute (confined under the compose dir - traversal guard, like a build context). A `named:`
-    // source or an already-absolute `/host:/dst` passes through untouched.
-    resolve_relative_binds(&mut boxes, file)?;
 
     // `run` DIVERGES HERE, after the builds and the bind resolution and before the bring-up: it
     // needs a service's fully resolved definition and none of the stack-wide launch that follows.
@@ -2303,7 +2373,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         let services: Vec<crate::nopod::ServiceInput> = boxes
             .iter()
             .map(|b| {
-                let declared = declared_container_ports(b);
+                let declared = relay_ports(b);
                 let tcp: Vec<u16> = declared
                     .iter()
                     .filter(|(_, udp)| !*udp)
@@ -3013,7 +3083,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 // TCP ONLY, and the same derivation the intra-stack plan uses: a relay carries TCP,
                 // so a UDP port would be a peer that resolves and answers nothing. The intra-stack
                 // path names those per service; here the set simply does not include them.
-                ports: declared_container_ports(b)
+                ports: relay_ports(b)
                     .into_iter()
                     .filter(|(_, udp)| !*udp)
                     .map(|(p, _)| p)

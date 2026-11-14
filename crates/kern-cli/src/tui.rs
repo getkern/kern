@@ -28,8 +28,15 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
-const TABS: [&str; 7] = [
-    "Overview", "Boxes", "Runs", "Images", "Builds", "Profiles", "Storage",
+const TABS: [&str; 8] = [
+    "Overview",
+    "Boxes",
+    "Runs",
+    "Images",
+    "Builds",
+    "Profiles",
+    "Storage",
+    "Sandboxes",
 ];
 /// How long the FIRST poll waits before the first periodic refresh, in milliseconds.
 ///
@@ -48,6 +55,8 @@ const TAB_IMAGES: usize = 3;
 const TAB_BUILDS: usize = 4;
 const TAB_PROFILES: usize = 5;
 const TAB_STORAGE: usize = 6;
+/// The SDK and MCP sandboxes: the ones running and the ones that finished (see `history.rs`).
+const TAB_SANDBOXES: usize = 7;
 
 /// What the TUI is doing right now: plain navigation, or a modal layered over it.
 enum Mode {
@@ -518,6 +527,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             &snap.vols,
             &snap.builds,
             &snap.images,
+            &snap.sbx,
         );
         if sel >= list_len {
             sel = list_len.saturating_sub(1);
@@ -745,6 +755,7 @@ fn is_quit(key: &[u8]) -> bool {
 }
 
 /// Number of selectable rows on the active tab (0 for Overview).
+#[allow(clippy::too_many_arguments)]
 fn tab_list_len(
     tab: usize,
     rows: &[Row],
@@ -752,8 +763,10 @@ fn tab_list_len(
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
     images: &[crate::commands::ImageEntry],
+    sbx: &[crate::history::Entry],
 ) -> usize {
     match tab {
+        TAB_SANDBOXES => sbx.len(),
         TAB_BOXES => rows.len(),
         TAB_IMAGES => images.len(),
         TAB_BUILDS => builds.len(),
@@ -784,13 +797,20 @@ fn handle_nav(
         *t = nt;
         *s = 0;
     };
-    // Arrow-key escape sequences: ↑↓ select, ←→ switch tab. Pure navigation - never dirties data.
-    if key.len() >= 3 && key[0] == 0x1b && key[1] == b'[' {
-        match key[2] {
-            b'A' => up(sel),
-            b'B' => down(sel),
-            b'C' => switch(tab, sel, (*tab + 1) % TABS.len()),
-            b'D' => switch(tab, sel, (*tab + TABS.len() - 1) % TABS.len()),
+    // Arrow-key escape sequences: ↑↓ select, ←→ switch tab, PgUp/PgDn a page, Home/End the ends.
+    // Pure navigation - never dirties data. A PAGE is the rows a list pane shows, so PgDn lands on
+    // the first row that was not on screen; without it a 555-volume Storage tab took 554 presses.
+    if key.len() >= 3 && key[0] == 0x1b && (key[1] == b'[' || key[1] == b'O') {
+        let page = term_size().1.saturating_sub(17).max(1);
+        match &key[2..] {
+            b"A" => up(sel),
+            b"B" => down(sel),
+            b"C" => switch(tab, sel, (*tab + 1) % TABS.len()),
+            b"D" => switch(tab, sel, (*tab + TABS.len() - 1) % TABS.len()),
+            b"5~" => *sel = sel.saturating_sub(page),
+            b"6~" => *sel = sel.saturating_add(page).min(list_len.saturating_sub(1)),
+            b"H" | b"1~" | b"7~" => *sel = 0,
+            b"F" | b"4~" | b"8~" => *sel = list_len.saturating_sub(1),
             _ => {}
         }
         return false;
@@ -811,6 +831,7 @@ fn handle_nav(
         b'5' => switch(tab, sel, TAB_BUILDS),
         b'6' => switch(tab, sel, TAB_PROFILES),
         b'7' => switch(tab, sel, TAB_STORAGE),
+        b'8' => switch(tab, sel, TAB_SANDBOXES),
         b'j' => down(sel),
         // `k` IS UP. It was not bound here at all, so it fell through to the per-tab arms below,
         // where the Boxes tab read it as a lifecycle key and STOPPED the selected box. The help
@@ -829,6 +850,7 @@ fn handle_nav(
         _ if *tab == TAB_BUILDS => nav_builds(key[0], *sel, builds, mode),
         _ if *tab == TAB_PROFILES => nav_profiles(key[0], *sel, profs, cfg, mode),
         _ if *tab == TAB_STORAGE => nav_storage(key[0], *sel, vols, mode),
+        _ if *tab == TAB_SANDBOXES => nav_sandboxes(key[0], *sel, mode),
         _ => {}
     }
     false
@@ -2046,6 +2068,8 @@ struct Snapshot {
     images: Vec<crate::commands::ImageEntry>,
     /// Cached images ON DISK, which is what the tab bar counts. See `builds_total`.
     images_total: usize,
+    /// Finished sandboxes, newest first (cached by `history`, so cheap on every frame).
+    sbx: Vec<crate::history::Entry>,
 }
 
 impl Snapshot {
@@ -2188,6 +2212,7 @@ fn refresh_full(
         builds_total: builds.total,
         images: images.records,
         images_total: images.total,
+        sbx: crate::history::sandboxes_newest_first(),
     }
 }
 
@@ -2349,6 +2374,168 @@ struct HostStats {
     box_starts_per_sec: f64,
     box_starts_peak: f64,
     box_starts_spark: Vec<f64>,
+    /// The host's NVIDIA cards, one entry each (see [`host_gpus`]). Empty on a host with none.
+    gpus: Vec<GpuStat>,
+}
+
+/// One NVIDIA card as the Overview lists it. Every reading the driver may answer `N/A` for is an
+/// `Option`, so a card that reports no power draw still gets its row.
+#[derive(Clone, Debug, PartialEq)]
+struct GpuStat {
+    index: u32,
+    name: String,
+    /// `0000:01:00.0`, the bus as the driver's own `/proc/driver/nvidia/gpus` names it.
+    bus: String,
+    mem_used_mib: Option<u64>,
+    mem_total_mib: Option<u64>,
+    util_pct: Option<u32>,
+    temp_c: Option<u32>,
+    power_w: Option<f64>,
+}
+
+/// `nvidia-smi --query-gpu=index,name,pci.bus_id,memory.used,memory.total,utilization.gpu,
+/// temperature.gpu,power.draw --format=csv,noheader,nounits`, one card per line. A line that does
+/// not carry an index, a name and a bus is skipped; a reading the driver answered `[N/A]` for is
+/// `None`.
+fn parse_smi_gpus(text: &str) -> Vec<GpuStat> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split(',').map(str::trim).collect();
+        if f.len() < 8 {
+            continue;
+        }
+        let (Ok(index), name, raw_bus) = (f[0].parse::<u32>(), f[1], f[2]) else {
+            continue;
+        };
+        // A JETSON'S GPU HAS NO PCI BUS, and its `nvidia-smi` answers `[N/A]` there and for every
+        // reading: MEASURED on an Orin Nano, `0, Orin (nvgpu), [N/A], ...`. The line was skipped,
+        // so `kern top` said `GPU none` on a host with a GPU. An empty bus is kept as empty.
+        let bus = raw_bus.to_ascii_lowercase();
+        let bus = bus
+            .get(bus.len().saturating_sub(12)..)
+            .unwrap_or(&bus)
+            .to_string();
+        let bus = if bus.len() == 12 && bus.contains(':') {
+            bus
+        } else {
+            String::new()
+        };
+        if name.is_empty() {
+            continue;
+        }
+        out.push(GpuStat {
+            index,
+            name: name.to_string(),
+            bus,
+            mem_used_mib: f[3].parse().ok(),
+            mem_total_mib: f[4].parse().ok(),
+            util_pct: f[5].parse().ok(),
+            temp_c: f[6].parse().ok(),
+            power_w: f[7].parse().ok(),
+        });
+    }
+    out
+}
+
+/// The `/dev/nvidiaN` minor of the card on `bus`, from the driver's own record. A box holds a card
+/// as that node, which is how [`overview`] counts the boxes on each card; the minor and the
+/// nvidia-smi index are not guaranteed to agree, so the box count is keyed on the minor.
+fn gpu_minor(bus: &str) -> Option<u32> {
+    let info =
+        std::fs::read_to_string(format!("/proc/driver/nvidia/gpus/{bus}/information")).ok()?;
+    info.lines()
+        .find_map(|l| l.strip_prefix("Device Minor:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// The host's NVIDIA cards, read with the driver's `nvidia-smi` at most once every two seconds.
+///
+/// `kern top` had no GPU line at all, so on a host with two cards and seven boxes using them the
+/// one question a reader has (which card is full, which boxes hold it) was not on the screen. One
+/// query costs about 20 ms (measured, five runs, on two RTX 5060 Ti), hence the cache; it runs
+/// under `run_bounded`'s deadline, so a wedged driver cannot freeze the screen. A host without the
+/// tool, or without NVIDIA cards, gets no section.
+fn host_gpus() -> Vec<GpuStat> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Vec<GpuStat>)>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, gpus)) = guard.as_ref() {
+        if at.elapsed() < Duration::from_secs(2) {
+            return gpus.clone();
+        }
+    }
+    // `/usr/sbin` IS WHERE A JETSON KEEPS IT, and it was not looked at: measured on an Orin Nano.
+    // Then every directory on `PATH`, for a host that put it somewhere else.
+    let fixed = [
+        "/usr/bin/nvidia-smi",
+        "/usr/sbin/nvidia-smi",
+        "/usr/lib/wsl/lib/nvidia-smi",
+        "/usr/local/bin/nvidia-smi",
+    ]
+    .map(std::path::PathBuf::from);
+    let on_path = crate::global_env("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("nvidia-smi"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let smi = fixed.into_iter().chain(on_path).find(|p| p.is_file());
+    let gpus = smi
+        .and_then(|p| {
+            crate::gpu::run_bounded(
+                &p,
+                &[
+                    "--query-gpu=index,name,pci.bus_id,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw",
+                    "--format=csv,noheader,nounits",
+                ],
+            )
+        })
+        .map(|t| parse_smi_gpus(&t))
+        .unwrap_or_default();
+    let gpus = gpus
+        .into_iter()
+        .map(|g| tegra_readings(g, std::path::Path::new("/")))
+        .collect::<Vec<_>>();
+    *guard = Some((Instant::now(), gpus.clone()));
+    gpus
+}
+
+/// An integrated (Tegra) GPU's readings from `/sys` under `root`, for what its `nvidia-smi` answers
+/// `[N/A]`: the load (`<gpu>/load`, in thousandths) and the `gpu-thermal` zone (millidegrees). A
+/// card with a PCI bus, or one whose readings are already there, is returned unchanged. Its memory
+/// is the host's RAM (unified), which `gpu_rows` says rather than printing a dash.
+fn tegra_readings(mut g: GpuStat, root: &std::path::Path) -> GpuStat {
+    if !g.bus.is_empty() {
+        return g;
+    }
+    if g.util_pct.is_none() {
+        let platform = root.join("sys/devices/platform");
+        let load = std::fs::read_dir(&platform)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".gpu"))
+            .find_map(|e| std::fs::read_to_string(e.path().join("load")).ok())
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        g.util_pct = load.map(|permille| (permille / 10).min(100));
+    }
+    if g.temp_c.is_none() {
+        let zones = root.join("sys/class/thermal");
+        g.temp_c = std::fs::read_dir(&zones)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|z| {
+                std::fs::read_to_string(z.path().join("type"))
+                    .is_ok_and(|t| t.trim() == "gpu-thermal")
+            })
+            .and_then(|z| std::fs::read_to_string(z.path().join("temp")).ok())
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .and_then(|mc| u32::try_from(mc / 1000).ok());
+    }
+    g
 }
 
 impl HostStats {
@@ -2533,6 +2720,7 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
             box_starts_per_sec: 0.0,
             box_starts_peak: 0.0,
             box_starts_spark: Vec::new(),
+            gpus: host_gpus(),
         },
         sample,
     )
@@ -2574,7 +2762,7 @@ fn render(
     // Title bar - a live host header, always visible on every tab (CPU · RAM · Disk · Boxes),
     // refreshed each frame. The green figures are the "now"; the dim ones the total/context.
     s.push_str(&format!(
-        "{b}{c} kern top{z}   {d}CPU{z} {g}{:>3.0}%{z} {d}/ {} cores{z}   {d}RAM{z} {g}{}{z}{d} / {}{z}   {d}Disk{z} {g}{}{z}{d} / {}{z}   {d}Boxes{z} {g}{}{z}\n\n",
+        "{b}{c} kern top{z}   {d}CPU{z} {g}{:>3.0}%{z} {d}/ {} cores{z}   {d}RAM{z} {g}{}{z}{d} / {}{z}   {d}Disk{z} {g}{}{z}{d} / {}{z}   {d}Boxes{z} {g}{}{z}   {}\n\n",
         host.cpu_pct,
         host.cores,
         human_bytes(host.mem_used),
@@ -2582,6 +2770,7 @@ fn render(
         human_bytes(host.disk_used),
         human_bytes(host.disk_total),
         rows.len(),
+        gpu_header(p, &host.gpus),
     ));
 
     // Tab bar - active tab inverted, each data tab showing a LIVE count of its rows so you can see how
@@ -2602,6 +2791,16 @@ fn render(
             TAB_BUILDS => format!("{} ({})", TABS[i], builds_total),
             TAB_PROFILES => format!("{} ({})", TABS[i], profs.len()),
             TAB_STORAGE => format!("{} ({})", TABS[i], vols.len()),
+            // RUNNING sandboxes, as Boxes counts running boxes: the finished ones are a history,
+            // and a count that only grows says nothing at a glance.
+            // THE LIST'S LENGTH, the rule every other tab follows (Boxes its boxes, Storage its
+            // volumes, Builds its records): here the finished sandboxes held, which is what the tab
+            // scrolls. Always shown, `(0)` included, as the others are.
+            TAB_SANDBOXES => format!(
+                "{} ({})",
+                TABS[i],
+                crate::history::sandboxes_newest_first().len()
+            ),
             // Runs are fire-and-forget (~1 ms) - there's no "current items" set like the other tabs,
             // so a cumulative count would mislead (it'd only grow). Show the LIVE rate while streaming
             // (that's the only meaningful "now"); nothing when idle. The cumulative total lives on the
@@ -2618,14 +2817,28 @@ fn render(
     };
     // A rendered tab takes `label.len() + 3` visible cols (a space each side + a trailing separator);
     // the leading space adds one. Compact the whole bar if the full version won't fit.
-    let full_w = 1
-        + (0..TABS.len())
-            .map(|i| label(i, false).chars().count() + 3)
-            .sum::<usize>();
-    let compact = full_w > width;
+    //
+    // THREE STEPS, NOT TWO. Every count, then only the counts that are not `(0)`, then none. With
+    // eight tabs the full bar is wider than 100 columns, and an all-or-nothing rule took every count
+    // away there to make room for an `(0)` that says nothing; a `(0)` is the first thing to give up.
+    let zero = |l: &str| l.ends_with(" (0)");
+    let shown = |i: usize, step: usize| -> String {
+        let full = label(i, false);
+        match step {
+            0 => full,
+            1 if !zero(&full) => full,
+            _ => label(i, true),
+        }
+    };
+    let bar_w = |step: usize| {
+        1 + (0..TABS.len())
+            .map(|i| shown(i, step).chars().count() + 3)
+            .sum::<usize>()
+    };
+    let step = (0..2).find(|st| bar_w(*st) <= width).unwrap_or(2);
     s.push(' ');
     for i in 0..TABS.len() {
-        let l = label(i, compact);
+        let l = shown(i, step);
         if i == tab {
             s.push_str(&format!("{b}\x1b[7m {l} \x1b[27m{z} "));
         } else {
@@ -2661,6 +2874,13 @@ fn render(
                 TAB_BUILDS => s.push_str(&builds_table(p, builds, body_rows, sel)),
                 TAB_PROFILES => s.push_str(&profiles_table(p, profs, body_rows, sel)),
                 TAB_STORAGE => s.push_str(&storage_table(p, vols, body_rows, sel)),
+                TAB_SANDBOXES => s.push_str(&sandboxes_table(
+                    p,
+                    rows,
+                    &crate::history::sandboxes_newest_first(),
+                    body_rows,
+                    sel,
+                )),
                 _ => s.push_str(&overview(p, rows, host)),
             }
             nav_footer(p, tab, rows, profs, vols, builds, images)
@@ -2687,7 +2907,8 @@ fn help_text() -> String {
      \n\
      MOVE\n\
        Tab / → / l      next tab            ← / h      previous tab\n\
-       1 2 3 4 5 6 7    jump to a tab       ↑ ↓ / j k  select a row\n\
+       1 2 3 4 5 6 7 8  jump to a tab       ↑ ↓ / j k  select a row\n\
+       PgUp / PgDn      a page up / down    Home / End the first / last row\n\
        q  or  Ctrl-C    quit\n\
      \n\
      TABS - what each one shows\n\
@@ -2700,6 +2921,8 @@ fn help_text() -> String {
        5 Builds     build history: status, duration, size, age (like kern builds)\n\
        6 Profiles   reusable resource specs (vcpu / vgpio / vdisk) in kern.toml\n\
        7 Storage    physical disks (read-only) and your named volumes\n\
+       8 Sandboxes  SDK and MCP sandboxes: running now, and the ones that finished with how\n\
+     \x20                they ended (metadata only, never the output); Enter shows one\n\
      \n\
      BOXES tab - act on the selected box\n\
        s  stop (asks first)   S  stop ALL (asks first)\n\
@@ -2742,17 +2965,17 @@ fn nav_footer(
     let help = format!("   [{z}?{d}] help{z}");
     match tab {
         TAB_BOXES if !rows.is_empty() => format!(
-            "{d}[{z}↑↓{d}] select   [{z}s{d}]top [{z}S{d}]top-all [{z}p{d}]ause [{z}u{d}]npause [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+            "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}s{d}]top [{z}S{d}]top-all [{z}p{d}]ause [{z}u{d}]npause [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_IMAGES if !images.is_empty() => format!(
-            "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}D{d}]elete-all [{z}p{d}]rune-layers [{z}⏎{d}]detail   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+            "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}d{d}]elete [{z}D{d}]elete-all [{z}p{d}]rune-layers [{z}⏎{d}]detail   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_BUILDS if !builds.is_empty() => format!(
-            "{d}[{z}↑↓{d}] select   [{z}d{d}]elete [{z}D{d}]elete-all [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+            "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}d{d}]elete [{z}D{d}]elete-all [{z}⏎{d}]logs   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
         ),
         TAB_PROFILES => {
             let edit = if profs.is_empty() { "" } else { " [e]dit [d]elete" };
-            format!("{d}[{z}↑↓{d}] select   [{z}n{d}]ew{edit}   [{z}Tab{d}] next   [{z}q{d}] quit{help}")
+            format!("{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}n{d}]ew{edit}   [{z}Tab{d}] next   [{z}q{d}] quit{help}")
         }
         TAB_STORAGE => {
             let ops = if vols.is_empty() {
@@ -2761,11 +2984,14 @@ fn nav_footer(
                 " [e]dit [d]elete [D]elete-all [⏎]info"
             };
             format!(
-                "{d}[{z}↑↓{d}] select   [{z}n{d}]ew{ops} [{z}p{d}]rune   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+                "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}n{d}]ew{ops} [{z}p{d}]rune   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
             )
         }
+        TAB_SANDBOXES => format!(
+            "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}⏎{d}]detail   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+        ),
         _ => format!(
-            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}7{d}] jump{help}"
+            "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}8{d}] jump{help}"
         ),
     }
 }
@@ -3100,27 +3326,40 @@ fn profiles_table(p: &Palette, profs: &[ProfRow], max_rows: usize, sel: usize) -
         ("vgpio", "vGPIO", "GPIO · I²C · device passthrough"),
         ("vdisk", "vDisk", "per-box scratch disks"),
     ];
-    let mut budget = max_rows;
+    // A WINDOW OVER THE FLAT LIST, as every other pane has, and a budget that counts this pane's own
+    // chrome. It had neither: a shared row budget that stopped drawing at the limit (so a profile
+    // past it could be selected and never seen) and three section headers the frame budget did not
+    // know about, so a long list cut the footer off the screen. The pane is allowed the five lines
+    // of chrome every list pane is; beyond them it spends 2 on the caption, 6 on the three headers,
+    // and at most 3 on a line for a section with nothing in the window. Hence `max_rows - 7`.
+    let avail = max_rows.saturating_sub(7).max(1);
+    let (wstart, wend) = list_window(profs.len(), avail, sel);
     for (section, title, desc) in CATS {
         s.push_str(&format!("\n  {b}{title}{z}  {d}- {desc}{z}\n"));
-        let rows: Vec<(usize, &ProfRow)> = profs
+        let all: Vec<(usize, &ProfRow)> = profs
             .iter()
             .enumerate()
             .filter(|(_, r)| r.section == section)
             .collect();
-        if rows.is_empty() {
+        if all.is_empty() {
             s.push_str(&format!(
                 "    {d}none yet - press {z}{g}n{z}{d} to add one{z}\n"
             ));
             continue;
         }
-        for (i, r) in rows {
-            if budget == 0 {
-                s.push_str(&format!("    {d}…{z}\n"));
-                break;
-            }
-            budget -= 1;
-            let (lead, col) = sel_marker(p, i == sel);
+        let shown: Vec<&(usize, &ProfRow)> = all
+            .iter()
+            .filter(|(i, _)| (wstart..wend).contains(i))
+            .collect();
+        if shown.is_empty() {
+            s.push_str(&format!(
+                "    {d}… {} here, scroll to see them{z}\n",
+                all.len()
+            ));
+            continue;
+        }
+        for (i, r) in shown {
+            let (lead, col) = sel_marker(p, *i == sel);
             s.push_str(&format!(
                 "  {lead}{col}{:<22}{z}  {d}{}{z}\n",
                 trunc(&prof_label(r), 22),
@@ -3128,7 +3367,183 @@ fn profiles_table(p: &Palette, profs: &[ProfRow], max_rows: usize, sel: usize) -
             ));
         }
     }
+    s.push_str(&list_marker(p, profs.len(), wstart, wend));
     s
+}
+
+/// The running boxes an SDK or the MCP server started, by the names they give them.
+fn live_sandboxes(rows: &[Row]) -> Vec<&Row> {
+    rows.iter()
+        .filter(|r| crate::history::kind_of(&r.name) != "box")
+        .collect()
+}
+
+/// Sandboxes finished in each of `buckets` equal slices of the last `window_s` seconds, oldest
+/// first: the activity a list cannot show, because an SDK call lives milliseconds and is gone
+/// between two frames. 30 slices of 2 s keep the LIVE title under 100 columns; 60 of 1 s did not.
+fn ends_per_bucket(
+    done: &[crate::history::Entry],
+    now_ms: u64,
+    window_s: u64,
+    buckets: usize,
+) -> Vec<f64> {
+    let mut out = vec![0.0; buckets.max(1)];
+    let window = window_s * 1000;
+    let start = now_ms.saturating_sub(window);
+    let width = (window / out.len() as u64).max(1);
+    for e in done {
+        if e.ended_ms < start || e.ended_ms > now_ms {
+            continue;
+        }
+        let i = ((e.ended_ms - start) / width) as usize;
+        let last = out.len() - 1;
+        out[i.min(last)] += 1.0;
+    }
+    out
+}
+
+/// The Sandboxes tab, in two sections.
+///
+/// LIVE, at a FIXED height. An SDK call lives milliseconds, so the running list is usually empty or
+/// one row, and a section whose height followed it made everything under it jump every second. Its
+/// title carries what a list cannot: sandboxes finished per second over the last minute, read from
+/// the history, so the activity is visible even when nothing lives long enough to be listed.
+///
+/// FINISHED, newest first, which is the list the selection moves over. The outcome is coloured by
+/// what it means (ok, an exit or a stop, a kill the kernel or kern decided), and a row that ended in
+/// the last three seconds carries a dot, so new work is seen arriving.
+///
+/// BUDGET. A list pane is allowed five lines of chrome (blank, caption, blank, header, marker). This
+/// one spends five more, always the same five, so the finished list knows its rows: the live title,
+/// the live rows ([`LIVE_ROWS`], blank-padded) and the finished title. The footer test holds it.
+fn sandboxes_table(
+    p: &Palette,
+    rows: &[Row],
+    done: &[crate::history::Entry],
+    max_rows: usize,
+    sel: usize,
+) -> String {
+    sandboxes_table_at(p, rows, done, max_rows, sel, crate::history::now_ms())
+}
+
+/// [`sandboxes_table`] at a given time, so a test can hold "just now".
+fn sandboxes_table_at(
+    p: &Palette,
+    rows: &[Row],
+    done: &[crate::history::Entry],
+    max_rows: usize,
+    sel: usize,
+    now: u64,
+) -> String {
+    const LIVE_ROWS: usize = 3;
+    let (b, c, d, g, r, y, z) = (p.b, p.c, p.d, p.g, p.r, p.y, p.z);
+    let mut s = format!(
+        "\n  {d}code an SDK or the MCP server ran, live and finished · {z}{c}kern sandbox history{z}{d} on the CLI{z}\n"
+    );
+
+    // LIVE.
+    let live = live_sandboxes(rows);
+    let per_s = ends_per_bucket(done, now, 60, 30);
+    let last_min: f64 = per_s.iter().sum();
+    let live_col = if live.is_empty() { d } else { g };
+    s.push_str(&format!(
+        "  {b}LIVE{z}  {live_col}{} running{z}   {d}finished, last minute{z} {c}{}{z}  {d}{}{z}\n",
+        live.len(),
+        spark(&per_s),
+        last_min as u64
+    ));
+    for slot in 0..LIVE_ROWS {
+        let last = slot + 1 == LIVE_ROWS;
+        match live.get(slot) {
+            Some(_) if last && live.len() > LIVE_ROWS => s.push_str(&format!(
+                "    {d}… {} more running, all of them in the Boxes tab{z}\n",
+                live.len() - slot
+            )),
+            Some(row) => s.push_str(&format!(
+                "    {g}●{z} {:<26} {d}{:<17}{z} {:>8} {:>8}  {:>5.1}%\n",
+                trunc(&row.name, 26),
+                crate::history::kind_of(&row.name),
+                fmt_uptime(row.uptime),
+                row.mem.map_or_else(|| "-".to_string(), human_bytes),
+                row.cpu_pct
+            )),
+            None if slot == 0 => s.push_str(&format!(
+                "    {d}nothing running now (a Kernel or a persist sandbox stays here; a call is gone in ms){z}\n"
+            )),
+            None => s.push('\n'),
+        }
+    }
+
+    // FINISHED.
+    s.push_str(&format!(
+        "\n  {b}FINISHED{z}  {d}{}{z}\n",
+        crate::history::last_hour_line(done)
+    ));
+    s.push_str(&format!(
+        // Four columns in, where a row's time starts: the selection marker and the fresh dot.
+        "  {b}    {:<9} {:<26} {:<17} {:>8}  {:<12} {:<5}{z}\n",
+        "ENDED", "NAME", "KIND", "RAN", "OUTCOME", "GPU"
+    ));
+    if done.is_empty() {
+        s.push_str(&format!(
+            "  {d}none yet: a line is kept for every sandbox that ends (never its output){z}\n"
+        ));
+        return s;
+    }
+    let max_rows = max_rows.saturating_sub(LIVE_ROWS + 2).max(1);
+    let (wstart, wend) = list_window(done.len(), max_rows, sel);
+    for (i, e) in done[wstart..wend]
+        .iter()
+        .enumerate()
+        .map(|(k, e)| (k + wstart, e))
+    {
+        let (lead, col) = sel_marker(p, i == sel);
+        let (ended, ran) = crate::history::ended_and_ran(e);
+        let word = e.outcome.word();
+        let oc = match e.outcome {
+            crate::history::Outcome::Ok => g,
+            crate::history::Outcome::Exit(_)
+            | crate::history::Outcome::Stopped
+            | crate::history::Outcome::NotStarted => y,
+            _ => r,
+        };
+        let fresh = if now.saturating_sub(e.ended_ms) < 3000 {
+            format!("{g}●{z}")
+        } else {
+            " ".to_string()
+        };
+        s.push_str(&format!(
+            "  {lead}{fresh} {col}{ended:<9}{z} {col}{:<26}{z} {d}{:<17}{z} {ran:>8}  {oc}{word:<12}{z} {d}{}{z}\n",
+            trunc(&e.name, 26),
+            e.kind(),
+            e.gpu
+        ));
+    }
+    s.push_str(&list_marker(p, done.len(), wstart, wend));
+    s
+}
+
+/// Sandboxes-tab keys: Enter shows the selected finished sandbox in full.
+fn nav_sandboxes(k: u8, sel: usize, mode: &mut Mode) {
+    if !matches!(k, b'\r' | b'\n') {
+        return;
+    }
+    let done = crate::history::sandboxes_newest_first();
+    let Some(e) = done.get(sel) else {
+        return;
+    };
+    let (ended, ran) = crate::history::ended_and_ran(e);
+    *mode = Mode::Overlay(format!(
+        "sandbox {}\nkind     {}\nimage    {}\nended    {ended}\nran      {ran}\nexit     {}\noutcome  {}\ngpu      {}\n\n\
+         Its output is not kept: the SDK or MCP call returned it to whoever called. \
+         `kern sandbox history --json` has the same line for a script.",
+        e.name,
+        e.kind(),
+        e.image,
+        e.code,
+        e.outcome.word(),
+        e.gpu
+    ));
 }
 
 /// The Storage tab - the concrete data layer: the read-only physical disks, then the named volumes
@@ -3141,12 +3556,19 @@ fn storage_table(
 ) -> String {
     let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let mut s = String::new();
+    let mut max_rows = max_rows;
 
     // Physical disks - read-only hardware; where volumes and vdisks physically live.
+    //
+    // THREE LINES THE FRAME BUDGET DOES NOT KNOW ABOUT, so they come out of this pane's rows. They
+    // did not: with 555 volumes the list took every row the budget gave a list pane, the frame ran 3
+    // lines past the screen, and `render`'s cap cut the bottom off, which is the footer with the
+    // `[d]elete` key on it. MEASURED on this desktop; reported as "Storage has no footer".
     if let Some(summary) = disks_summary() {
         s.push_str(&format!(
             "\n  {b}DISKS{z} {d}(physical, read-only){z}\n    {d}{summary}{z}\n"
         ));
+        max_rows = max_rows.saturating_sub(3).max(1);
     }
 
     s.push_str(&format!(
@@ -3204,6 +3626,142 @@ fn human_count(n: u64) -> String {
     }
 }
 
+/// The title bar's GPU figure, on every tab: how many cards and their memory, summed. `GPU none`
+/// on a host without one, so the absence reads as a fact rather than as a figure that failed.
+fn gpu_header(p: &Palette, gpus: &[GpuStat]) -> String {
+    let (d, g, z) = (p.d, p.g, p.z);
+    if gpus.is_empty() {
+        return format!("{d}GPU none{z}");
+    }
+    let used: u64 = gpus.iter().filter_map(|x| x.mem_used_mib).sum();
+    let total: u64 = gpus.iter().filter_map(|x| x.mem_total_mib).sum();
+    if total == 0 {
+        return format!("{d}GPU{z} {g}{}{z}", gpus.len());
+    }
+    format!(
+        "{d}GPU{z} {g}{}{z} {d}·{z} {g}{}{z}{d} / {}{z}",
+        gpus.len(),
+        human_bytes(used.saturating_mul(1 << 20)),
+        human_bytes(total.saturating_mul(1 << 20))
+    )
+}
+
+/// The `nvidiaN` nodes a row's `gpu:0,1` flag names (see `box_isolation`), space-separated.
+fn gpu_nodes_from_flag(r: &Row) -> String {
+    r.iso
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("gpu:"))
+        .map(|list| {
+            list.split(',')
+                .filter(|n| !n.is_empty())
+                .map(|n| format!("nvidia{n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+/// A compose box's service name, `llm0` out of `aistack-e1c0723b-llm0`: what follows the stack's
+/// 8-hex-digit hash. A name without that shape (a plain `kern box`) is returned whole. Measured: the
+/// first version stripped the pod name, and a `--no-pod` stack has none, so the row printed every
+/// box's full name.
+fn service_of(name: &str) -> &str {
+    let mut rest = name;
+    while let Some((head, tail)) = rest.split_once('-') {
+        if head.len() == 8
+            && head
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            && !tail.is_empty()
+            && rest.len() < name.len()
+        {
+            return tail;
+        }
+        rest = tail;
+    }
+    name
+}
+
+/// The Overview's GPU rows. `nodes_of` answers a box's GPU nodes (`nvidia0 nvidia1`); production
+/// reads them from the row's `gpu:N` flag, which the Boxes tab computed from the box's INTERIOR
+/// init, so the two views cannot disagree. The first version asked `/proc/<pid>/root/dev` of the
+/// host-side supervisor, whose `/dev` is the host's: MEASURED, every one of seven boxes counted on
+/// both cards. A test passes its own.
+fn gpu_rows(
+    p: &Palette,
+    rows: &[Row],
+    gpus: &[GpuStat],
+    nodes_of: impl Fn(&Row) -> String,
+    minor_of: impl Fn(&str) -> Option<u32>,
+) -> String {
+    let (b, d, z) = (p.b, p.d, p.z);
+    if gpus.is_empty() {
+        return String::new();
+    }
+    let held: Vec<(String, &str)> = rows
+        .iter()
+        .map(|r| {
+            // The service, not the box: see `service_of`.
+            let short = service_of(&r.name);
+            (nodes_of(r), short)
+        })
+        .collect();
+    let mut s = String::new();
+    for g in gpus {
+        let node = minor_of(&g.bus).map(|m| format!("nvidia{m}"));
+        let names: Vec<&str> = node.as_ref().map_or(Vec::new(), |n| {
+            held.iter()
+                .filter(|(h, _)| h.split_whitespace().any(|x| x == n))
+                .map(|(_, name)| *name)
+                .collect()
+        });
+        let mem = match (g.mem_used_mib, g.mem_total_mib) {
+            (Some(u), Some(t)) => format!(
+                "{} / {}",
+                human_bytes(u.saturating_mul(1 << 20)),
+                human_bytes(t.saturating_mul(1 << 20))
+            ),
+            // An integrated GPU's memory IS the host's RAM, which is the fact a dash would hide.
+            _ if g.bus.is_empty() => "memory unified with RAM".to_string(),
+            _ => "-".to_string(),
+        };
+        let mut extra = Vec::new();
+        if let Some(u) = g.util_pct {
+            extra.push(format!("{u} % busy"));
+        }
+        if let Some(t) = g.temp_c {
+            extra.push(format!("{t} C"));
+        }
+        if let Some(w) = g.power_w {
+            extra.push(format!("{w:.0} W"));
+        }
+        // NAMES, AND NOTHING WHEN NO BOX HOLDS THE CARD. A count ("3 boxes", "no box") answered a
+        // question nobody asks of a card and read as noise; who holds it is the question.
+        let held_by = if names.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", names.join(", "))
+        };
+        let name = g.name.strip_prefix("NVIDIA ").unwrap_or(&g.name);
+        // The bus without its domain, and nothing at all for a GPU that has none. `strip_prefix`
+        // and not a slice: `&bus[5..]` panicked on the empty bus of a Jetson.
+        if let Some(bus) = g
+            .bus
+            .strip_prefix("0000:")
+            .or(Some(g.bus.as_str()))
+            .filter(|b| !b.is_empty())
+        {
+            extra.push(bus.to_string());
+        }
+        s.push_str(&format!(
+            "  {b}{:<16}{z}{name}  {mem}   {d}{}{held_by}{z}\n",
+            format!("GPU {}", g.index),
+            extra.join(" · ")
+        ));
+    }
+    s
+}
+
 /// The Overview tab: host resources first (the machine kern runs on), then the box aggregate.
 fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     let (b, d, z) = (p.b, p.d, p.z);
@@ -3233,6 +3791,14 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     if let Some(summary) = disks_summary() {
         s.push_str(&row("Disks", format!("{d}{summary}{z}")));
     }
+    // GPUs - one row per card: what it is, how full, and how many boxes hold it.
+    s.push_str(&gpu_rows(
+        p,
+        rows,
+        &host.gpus,
+        gpu_nodes_from_flag,
+        gpu_minor,
+    ));
     // `kern run` throughput lives on its own **Runs** tab (fire-and-forget capped processes) - Overview
     // stays the host + box picture. A one-line pointer only while runs actively stream (same > 0.5/s
     // threshold as the Runs-tab `⚡`, so the two never disagree), never a stale idle cumulative.
@@ -3259,6 +3825,15 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     s.push_str(&row("CPU", format!("{total_cpu:.1} %")));
     s.push_str(&row("Tasks", format!("{total_tasks}")));
     s.push_str(&row("Resource cap", format!("{d}{cap}{z}")));
+    // SANDBOXES: the ones running, and the last hour of the ones that finished; the tab has the rest.
+    s.push_str(&row(
+        "Sandboxes",
+        format!(
+            "{} running   {d}{}{z}",
+            live_sandboxes(rows).len(),
+            crate::history::last_hour_line(&crate::history::sandboxes_newest_first())
+        ),
+    ));
     // Fleet budget: the SUM cap across all boxes on `kern.slice` (KERN_FLEET_MEMORY_MAX / _PIDS_MAX),
     // the real-enforcement backstop to the cooperative KERN_MAX_CONCURRENT counter. Shown only when a
     // budget is actually set (otherwise the slice usually doesn't even exist).
@@ -3578,7 +4153,7 @@ fn boxes_table(p: &Palette, rows: &[Row], max_rows: usize, sel: usize, host: &Ho
         let rate = host.box_starts_per_sec.round().max(0.0) as u64;
         let col = if host.box_starts_per_sec > 0.5 { g } else { d };
         s.push_str(&format!(
-            "  {d}box starts {z}{col}{rate}{d}/sec{z}  {d}peak {z}{}{d}/s  total {z}{}{d}   {}{z}\n",
+            "  {d}box starts {z}{col}{rate}{d}/sec{z}  {d}peak {z}{}{d}/s  total {z}{}{d}   recent {}{z}\n",
             host.box_starts_peak.round() as u64,
             host.box_starts_total,
             spark(&host.box_starts_spark)
@@ -4018,6 +4593,8 @@ mod tests {
     /// rendered **33** lines into a **30**-row terminal, at every size, always over by exactly 3.
     #[test]
     fn no_tab_ever_renders_a_frame_taller_than_the_terminal() {
+        // `render` reads the sandbox history, which lives under `XDG_RUNTIME_DIR`.
+        let _g = crate::env_guard();
         // Far more rows than any budget: whichever pane is on screen, its list is the long case.
         let rows: Vec<Row> = (0..200).map(|i| row(&format!("box{i}"), false)).collect();
         let builds: Vec<crate::builds::Record> = (0..200)
@@ -4060,6 +4637,167 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE FOOTER IS THE LAST LINE OF EVERY TAB, WITH EVERY LIST LONG. The test above holds the
+    /// frame's HEIGHT, which `render` caps by cutting the bottom, so it passed while the cut removed
+    /// the footer: MEASURED, Storage with 555 volumes lost its `[d]elete` line, because its DISKS
+    /// section is three lines the frame budget did not know about. It also gave Storage no volumes.
+    #[test]
+    fn every_tab_ends_with_its_footer_whatever_its_lists_hold() {
+        // `render` reads the sandbox history, which lives under `XDG_RUNTIME_DIR`.
+        let _g = crate::env_guard();
+        let rows: Vec<Row> = (0..200).map(|i| row(&format!("box{i}"), false)).collect();
+        let vols: Vec<crate::volume::VolInfo> = (0..555)
+            .map(|i| crate::volume::VolInfo {
+                name: format!("vol{i}"),
+                raw: format!("vol{i}"),
+                size: Some(1024),
+                quota: None,
+            })
+            .collect();
+        let profs: Vec<ProfRow> = (0..200)
+            .map(|i| ProfRow {
+                section: "vcpu",
+                name: format!("p{i}"),
+                summary: String::new(),
+            })
+            .collect();
+        let builds: Vec<crate::builds::Record> = (0..200)
+            .map(|i| crate::builds::Record {
+                id: format!("{i}"),
+                tag: format!("t{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let images: Vec<crate::commands::ImageEntry> = (0..200)
+            .map(|i| crate::commands::ImageEntry {
+                name: format!("img{i}"),
+                size: 1024,
+                pulled: 0,
+                dangling: false,
+            })
+            .collect();
+        for term_rows in [24usize, 30, 40, 50, 80] {
+            for tab in 0..TABS.len() {
+                for sel in [0usize, 300, 554] {
+                    let frame = render(
+                        &plain(),
+                        tab,
+                        &rows,
+                        &HostStats::default(),
+                        &profs,
+                        &vols,
+                        &builds,
+                        builds.len(),
+                        &images,
+                        images.len(),
+                        100,
+                        term_rows,
+                        sel,
+                        &Mode::Nav,
+                    );
+                    let last = frame.lines().last().unwrap_or("");
+                    assert!(
+                        last.contains("help"),
+                        "tab {tab}, {term_rows} rows, sel {sel}: the last line is not the footer: {last:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE SANDBOXES TAB STAYS IN ITS BUDGET WITH A LONG HISTORY AND MANY RUNNING: the five lines
+    /// every pane has, the rows it was given, and nothing more (a pane that overflows pushes the
+    /// footer off the screen, as Storage and Profiles did). The selected row is on screen at the end
+    /// of the list, a failure is named, and the running ones past three are sent to Boxes.
+    #[test]
+    fn the_sandboxes_tab_lists_the_finished_ones_within_its_rows() {
+        let _g = crate::env_guard();
+        let done: Vec<crate::history::Entry> = (0..300)
+            .map(|i| crate::history::Entry {
+                ended_ms: 1_000 + i,
+                name: format!("pysbx-{i:012}"),
+                image: "python:3.12-slim".into(),
+                ran_ms: 40,
+                code: if i == 299 { 137 } else { 0 },
+                outcome: if i == 299 {
+                    crate::history::Outcome::Oom
+                } else {
+                    crate::history::Outcome::Ok
+                },
+                gpu: "-".into(),
+            })
+            .collect();
+        let live: Vec<Row> = (0..5)
+            .map(|i| row(&format!("kern-sbx-k{i}"), false))
+            .collect();
+        for (max_rows, sel) in [(20usize, 0usize), (20, 299), (8, 150)] {
+            let out = sandboxes_table(&plain(), &live, &done, max_rows, sel);
+            let n = out.lines().count();
+            assert!(n <= max_rows + 5, "{n} lines for {max_rows} rows:\n{out}");
+            assert!(
+                out.contains(&format!("pysbx-{sel:012}")),
+                "the selected row is shown:\n{out}"
+            );
+            assert!(
+                out.contains("3 more running, all of them in the Boxes tab"),
+                "{out}"
+            );
+            assert!(out.contains("5 running"), "{out}");
+        }
+        let out = sandboxes_table(&plain(), &live, &done, 20, 299);
+        assert!(
+            out.lines()
+                .any(|l| l.contains("pysbx-000000000299") && l.contains("oom")),
+            "{out}"
+        );
+        let empty = sandboxes_table(&plain(), &[], &[], 20, 0);
+        assert!(
+            empty.contains("none yet") && empty.contains("0 running"),
+            "{empty}"
+        );
+        // THE LIVE SECTION HAS ONE HEIGHT, whatever runs: the list under it must not jump.
+        let h = |live: &[Row]| {
+            sandboxes_table(&plain(), live, &done, 20, 0)
+                .lines()
+                .count()
+        };
+        assert_eq!(h(&[]), h(&live[..1]));
+        assert_eq!(h(&[]), h(&live));
+        // A row that ended a moment ago carries the dot and an old one does not; newest first, as
+        // the tab receives the history.
+        let mut newest: Vec<crate::history::Entry> = done.clone();
+        newest.reverse();
+        let now = newest[0].ended_ms + 500;
+        let fresh = sandboxes_table_at(&plain(), &[], &newest, 20, 0, now);
+        let line = |name: &str| {
+            fresh
+                .lines()
+                .find(|l| l.contains(name))
+                .unwrap_or("")
+                .to_string()
+        };
+        assert!(line("pysbx-000000000299").contains('●'), "{fresh}");
+        let old_one = sandboxes_table_at(&plain(), &[], &newest, 20, 0, now + 10_000);
+        assert!(
+            !old_one.contains('●'),
+            "nothing is fresh ten seconds later: {old_one}"
+        );
+        // The per-second activity counts the ends inside the last minute, and only those.
+        assert_eq!(
+            ends_per_bucket(&done, 200_000, 60, 30).iter().sum::<f64>(),
+            0.0
+        );
+        let per = ends_per_bucket(&done, 1_300, 60, 30);
+        assert_eq!((per.len(), per.iter().sum::<f64>()), (30, 300.0));
+        // AND THE TITLE FITS 100 COLUMNS, which a 60-bar line did not.
+        let title = fresh.lines().find(|l| l.contains("LIVE")).unwrap_or("");
+        assert!(
+            title.chars().count() <= 100,
+            "{} cols: {title}",
+            title.chars().count()
+        );
     }
 
     #[test]
@@ -4217,6 +4955,8 @@ mod tests {
 
     #[test]
     fn tab_bar_shows_live_counts() {
+        // `render` reads the sandbox history, which lives under `XDG_RUNTIME_DIR`.
+        let _g = crate::env_guard();
         // The tab bar shows a live count per data tab (Boxes/Profiles/Storage) so you see how many
         // items exist without entering - Overview (an aggregate) has no count.
         let host = HostStats {
@@ -4236,6 +4976,7 @@ mod tests {
             box_starts_per_sec: 0.0,
             box_starts_peak: 0.0,
             box_starts_spark: Vec::new(),
+            gpus: Vec::new(),
         };
         let boxes = [row("a", false), row("b", false), row("c", false)];
         // A wide terminal (≥ the ~87-col full bar) shows the live counts.
@@ -4274,8 +5015,44 @@ mod tests {
             out.contains("Boxes (3)"),
             "Boxes tab shows its count: {out}"
         );
-        assert!(out.contains("Profiles (0)"), "Profiles tab shows 0");
-        assert!(out.contains("Storage (0)"), "Storage tab shows 0");
+        // AT 100 COLUMNS EIGHT COUNTED TABS DO NOT FIT, and the bar gives up the `(0)`s first,
+        // keeping every count that says something: the three above.
+        assert!(
+            !out.contains("Profiles (0)"),
+            "a zero count is the first to go"
+        );
+        // With the room, every count is there, the zeros and the Sandboxes one included.
+        let wide = render(
+            &plain(),
+            TAB_BOXES,
+            &boxes,
+            &host,
+            &[],
+            &[],
+            &[],
+            // The Builds count is the STORE's total, deliberately not `builds.len()`: the records
+            // are only read on the Builds tab, so on every other tab the slice is empty while the
+            // count must still be right. Passing an empty slice with a non-zero total here is the
+            // exact shape of a non-Builds frame, and it caught nothing only because it was added
+            // after the wiring - it exists so a future refactor cannot quietly re-derive the count
+            // from the slice and show `Builds (0)` on six tabs out of seven.
+            7,
+            &[],
+            5,
+            120,
+            24,
+            0,
+            &Mode::Nav,
+        );
+        assert!(
+            wide.contains("Profiles (0)"),
+            "Profiles tab shows 0: {wide}"
+        );
+        assert!(wide.contains("Storage (0)"), "Storage tab shows 0");
+        assert!(
+            wide.contains("Sandboxes ("),
+            "Sandboxes is counted like every list tab"
+        );
         assert!(out.contains("Overview"), "Overview stays uncounted");
         assert!(
             !out.contains("Overview ("),
@@ -5631,6 +6408,123 @@ leds = [\"led0\"]
         assert!(
             pane.contains("spi") && pane.contains("none detected on this host"),
             "the note is visible:\n{pane}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gpu_overview_tests {
+    use super::*;
+
+    /// `kern top` HAD NO GPU LINE. The parser takes nvidia-smi's CSV for two cards and a card whose
+    /// power is `[N/A]`; the rows count the boxes holding each card by its `/dev/nvidiaN` minor, read
+    /// the way the Boxes tab reads them.
+    #[test]
+    fn the_overview_lists_every_card_and_the_boxes_on_it() {
+        let _g = crate::env_guard();
+        let text = "0, NVIDIA GeForce RTX 5060 Ti, 00000000:01:00.0, 2404, 16311, 7, 41, 25.64\n\
+                    1, NVIDIA GeForce RTX 5060 Ti, 00000000:06:00.0, 4895, 16311, 93, 60, [N/A]\n\
+                    garbage line\n";
+        let g = parse_smi_gpus(text);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].bus, "0000:01:00.0");
+        assert_eq!((g[1].util_pct, g[1].power_w), (Some(93), None));
+        let p = Palette::plain();
+        let row = |pid: i32, iso: &str| Row {
+            name: format!("b{pid}"),
+            pid,
+            uptime: 1,
+            mem: None,
+            cpu_pct: 0.0,
+            tasks: None,
+            paused: false,
+            health: String::new(),
+            ports: String::new(),
+            pod: String::new(),
+            iso: iso.to_string(),
+            sec: String::new(),
+            orphaned: false,
+        };
+        // Three boxes: one on card 0, one on both, one with none. The minors are SWAPPED against the
+        // nvidia-smi index on purpose (bus 01 is minor 1), so a count keyed on the index is caught.
+        // Through the PRODUCTION reader of the Boxes tab's flag, so the row and the overview agree.
+        let rows = [row(1, "gpu:1"), row(2, "net:host gpu:0,1"), row(3, "")];
+        let nodes = gpu_nodes_from_flag;
+        let minor = |bus: &str| match bus {
+            "0000:01:00.0" => Some(1),
+            "0000:06:00.0" => Some(0),
+            _ => None,
+        };
+        let out = gpu_rows(&p, &rows, &g, nodes, minor);
+        let line = |i: u32| {
+            out.lines()
+                .find(|l| l.contains(&format!("GPU {i}")))
+                .unwrap_or("")
+                .to_string()
+        };
+        assert!(
+            line(0).ends_with(" · b1, b2"),
+            "card 0 is minor 1, held by b1 and b2: {out}"
+        );
+        assert!(
+            line(1).ends_with(" · b2"),
+            "card 1 is minor 0, held by b2 alone: {out}"
+        );
+        // A JETSON: no bus, every reading `[N/A]`, then filled from a fake `/sys` (load in
+        // thousandths, `gpu-thermal` in millidegrees). Rendered without a panic, memory named as
+        // unified, counted in the title.
+        let jet = parse_smi_gpus("0, Orin (nvgpu), [N/A], [N/A], [N/A], [N/A], [N/A], [N/A]\n");
+        assert_eq!(jet.len(), 1, "the Jetson line is kept");
+        assert_eq!(jet[0].bus, "");
+        let sys = std::env::temp_dir().join(format!("kern-tegra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        std::fs::create_dir_all(sys.join("sys/devices/platform/17000000.gpu")).unwrap();
+        std::fs::write(sys.join("sys/devices/platform/17000000.gpu/load"), "457\n").unwrap();
+        std::fs::create_dir_all(sys.join("sys/class/thermal/thermal_zone3")).unwrap();
+        std::fs::write(
+            sys.join("sys/class/thermal/thermal_zone3/type"),
+            "gpu-thermal\n",
+        )
+        .unwrap();
+        std::fs::write(sys.join("sys/class/thermal/thermal_zone3/temp"), "49250\n").unwrap();
+        let filled = tegra_readings(jet[0].clone(), &sys);
+        assert_eq!((filled.util_pct, filled.temp_c), (Some(45), Some(49)));
+        // A card WITH a bus is not touched by the Tegra fallback.
+        assert_eq!(tegra_readings(g[1].clone(), &sys), g[1]);
+        let _ = std::fs::remove_dir_all(&sys);
+        let jrow = gpu_rows(&p, &[], &[filled], gpu_nodes_from_flag, |_| None);
+        assert!(
+            jrow.contains("Orin (nvgpu)")
+                && jrow.contains("memory unified with RAM")
+                && jrow.contains("45 % busy")
+                && jrow.contains("49 C"),
+            "{jrow}"
+        );
+        assert_eq!(gpu_header(&p, &jet), "GPU 1");
+        assert_eq!(gpu_header(&p, &[]), "GPU none");
+        assert_eq!(gpu_header(&p, &g), "GPU 2 · 7.1G / 31.9G");
+        assert_eq!(service_of("aistack-e1c0723b-llm0"), "llm0");
+        assert_eq!(service_of("my-app-0a1b2c3d-api-v2"), "api-v2");
+        assert_eq!(
+            service_of("e1c0723b-x"),
+            "e1c0723b-x",
+            "the hash needs a project before it"
+        );
+        assert_eq!(service_of("hello"), "hello");
+        let no_rows: Vec<Row> = Vec::new();
+        let out = gpu_rows(&p, &no_rows, &g, gpu_nodes_from_flag, |_| None);
+        assert!(out.contains("GPU 0") && out.contains("GPU 1"), "{out}");
+        assert!(out.contains("GeForce RTX 5060 Ti"), "{out}");
+        assert!(out.contains("01:00.0") && out.contains("06:00.0"), "{out}");
+        assert!(out.contains("93 % busy") && !out.contains("[N/A]"), "{out}");
+        assert!(
+            out.lines()
+                .all(|l| l.ends_with("01:00.0") || l.ends_with("06:00.0")),
+            "a card no box holds ends at its bus, with no box text: {out}"
+        );
+        assert!(
+            gpu_rows(&p, &no_rows, &[], gpu_nodes_from_flag, |_| None).is_empty(),
+            "no card, no section"
         );
     }
 }

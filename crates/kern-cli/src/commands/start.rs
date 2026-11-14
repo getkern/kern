@@ -70,6 +70,7 @@ pub fn box_plan(
             }
             // `Ok(None)` IS "no card asked for", which lands on the same path as no flag at all.
             let asked = crate::gpu_grant::selection_from_spec(std::path::Path::new("/"), spec)
+                .or_else(|e| wsl_unchecked_uuid(spec, e, |note| println!("  gpu grant: {note}")))
                 .map_err(|e| {
                     Error::Cli(format!("--plan: --gpus {spec} is not a selection: {e:?}"))
                 })?;
@@ -78,10 +79,10 @@ pub fn box_plan(
             }
             asked
         }
-        // A CDI name resolves to ONE card index, and this is a preview, so a spec that does not
-        // name it here is the launch's refusal to report and not the plan's.
+        // Every CDI name on the line, and this is a preview, so a spec that does not name one of
+        // them here is the launch's refusal to report and not the plan's.
         (None, Some(reference)) => {
-            match crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference) {
+            match crate::cdi::resolve_device_refs(std::path::Path::new("/"), reference) {
                 Ok(resolved) => {
                     // ON THE PLAN TOO, and in the plan's own voice: an operator reading
                     // `--plan` to find out what a box will get is the reader most entitled to
@@ -91,7 +92,13 @@ pub fn box_plan(
                     {
                         println!("  gpu grant: {msg}");
                     }
-                    Some(crate::gpu_grant::GpuSelection::These(vec![resolved.index]))
+                    for kv in &resolved.env {
+                        println!("  gpu grant: env {kv} (from the CDI spec)");
+                    }
+                    Some(match resolved.indices {
+                        Some(indices) => crate::gpu_grant::GpuSelection::These(indices),
+                        None => crate::gpu_grant::GpuSelection::All,
+                    })
                 }
                 Err(_) => {
                     println!(
@@ -125,11 +132,82 @@ pub fn box_plan(
                     for line in crate::gpu_grant::render_plan(&grant, &selection).lines() {
                         println!("    {line}");
                     }
+                    println!(
+                        "    the libraries go into the image's library directory: {LIB_DIR_RULE}"
+                    );
+                    if let Some(spec) = gpus {
+                        println!(
+                            "    env NVIDIA_VISIBLE_DEVICES={}",
+                            crate::gpu_grant::visible_devices(
+                                spec,
+                                &selection,
+                                crate::gpu_grant::granted_indices(&grant, &selection).as_deref()
+                            )
+                        );
+                    }
                 }
                 Err(why) => println!(
                     "    this selection would be refused: {}",
                     crate::gpu_grant::describe_mount_plan_error(&why)
                 ),
+            }
+        }
+        (Some(selection), Err(crate::gpu_grant::ResolveError::NoDriverVersionFile { .. }))
+            if crate::gpu::wsl_grant(std::path::Path::new("/")).is_some() =>
+        {
+            // THE PREVIEW OF THE WSL2 GRANT, from the same function the launch calls, so what is
+            // listed here is what `kern box` mounts.
+            match crate::gpu::wsl_grant(std::path::Path::new("/")) {
+                Some(Ok(w)) => {
+                    println!(
+                        "  gpu grant (preview, nothing is mounted by --plan): WSL2 paravirtual GPU"
+                    );
+                    for (source, target, read_only) in &w.binds {
+                        println!(
+                            "    {source} -> {target}{}",
+                            if *read_only { " (read-only)" } else { "" }
+                        );
+                    }
+                    println!(
+                        "    libraries {}, each into the image's library directory: {LIB_DIR_RULE}",
+                        w.libraries.len()
+                    );
+                    for (source, name) in &w.libraries {
+                        println!("      lib {source} as {name}");
+                    }
+                    if let Some(spec) = gpus {
+                        println!(
+                            "    env NVIDIA_VISIBLE_DEVICES={}",
+                            crate::gpu_grant::visible_devices(spec, &selection, None)
+                        );
+                    }
+                    if !matches!(selection, crate::gpu_grant::GpuSelection::All) {
+                        match crate::gpu::wsl_adapter_indices(std::path::Path::new("/")) {
+                            Some(adapters) => {
+                                match crate::gpu::wsl_check_selection(&selection, &adapters) {
+                                    Ok(true) => println!(
+                                        "    every adapter the WSL2 VM has ({}) comes with it: WSL2 \
+                                         has no per-card node",
+                                        adapters.len()
+                                    ),
+                                    Ok(false) => {}
+                                    Err(e) => println!(
+                                        "    this selection would be refused: {}",
+                                        crate::gpu_grant::describe_mount_plan_error(&e)
+                                    ),
+                                }
+                            }
+                            None => println!(
+                                "    the adapters could not be counted here, so the selection \
+                                 is not checked; every adapter comes with /dev/dxg"
+                            ),
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    println!("  gpu grant: {}", crate::gpu::describe_wsl_grant_error(&e))
+                }
+                None => {}
             }
         }
         (Some(_), Err(crate::gpu_grant::ResolveError::NoDriverVersionFile { .. })) => {
@@ -652,6 +730,13 @@ fn seed_now(lower: &[String], volumes: &[(String, String)]) {
         // THE VOLUME'S OWN ROOT, which no content copy can set: `cp -a` fills the directory and
         // leaves the directory itself alone. An image whose mount point is an EMPTY directory owned
         // by a non-root user copies nothing at all, and that is exactly the Prometheus case.
+        //
+        // ONE LAYER ONLY: there the top layer IS the image. With two or more the merged view above
+        // has already given the root its owner, from whichever layer the image shows; the top layer
+        // alone often does not hold the directory at all (speaches, measured).
+        if lower.len() >= 2 {
+            continue;
+        }
         let from = std::path::Path::new(top).join(rel);
         if let Ok(m) = std::fs::metadata(&from) {
             use std::os::unix::fs::MetadataExt;
@@ -775,6 +860,247 @@ pub(crate) fn health_probe_driver_tool(probe: Option<&kern_oci::HealthTest>) -> 
         .into_iter()
         .find(|t| kern_isolation::is_driver_tool(t))
         .map(str::to_string)
+}
+
+/// A UUID that cannot be checked on a WSL2 guest becomes every adapter, said out loud; any other
+/// error passes through untouched.
+///
+/// MEASURED on the Alpine WSL2 guest: `--gpus device=<the card's own UUID>` was refused with "this
+/// host's driver publishes no GPU UUID at all", while the card was there and `/dev/dxg` granted it.
+/// The UUID cannot be verified there (see [`crate::gpu::wsl_uuids_unreadable`]), and what the box
+/// receives is every adapter whatever was named, so refusing it was refusing a grant that works.
+fn wsl_unchecked_uuid(
+    spec: &str,
+    e: crate::gpu_grant::GpuSpecError,
+    say: impl FnOnce(&str),
+) -> Result<Option<crate::gpu_grant::GpuSelection>, crate::gpu_grant::GpuSpecError> {
+    match e {
+        crate::gpu_grant::GpuSpecError::UnknownUuid { ref known, .. }
+            if known.is_empty() && crate::gpu::wsl_uuids_unreadable(std::path::Path::new("/")) =>
+        {
+            say(&crate::gpu::describe_wsl_unchecked_uuid(spec));
+            Ok(Some(crate::gpu_grant::GpuSelection::All))
+        }
+        other => Err(other),
+    }
+}
+
+/// The cards `--runtime nvidia` grants for a `NVIDIA_VISIBLE_DEVICES` value, read as NVIDIA's runtime
+/// reads it: unset, empty, `void` and `none` are no GPU; `all` is every card; otherwise a list of
+/// indices or GPU UUIDs. `Ok(None)` is "no GPU", which the caller says out loud.
+pub(crate) fn runtime_nvidia_selection(
+    value: Option<&str>,
+) -> Result<Option<crate::gpu_grant::GpuSelection>, Error> {
+    let v = value.map(str::trim).unwrap_or("");
+    if v.is_empty() || v.eq_ignore_ascii_case("void") || v.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    if v.eq_ignore_ascii_case("all") {
+        return Ok(Some(crate::gpu_grant::GpuSelection::All));
+    }
+    crate::gpu_grant::selection_from_spec(std::path::Path::new("/"), &format!("device={v}"))
+        .map_err(|e| {
+            Error::Cli(format!(
+                "--runtime nvidia: NVIDIA_VISIBLE_DEVICES={v} names no card kern can read ({e:?}). \
+                 It takes all, none, void, or card indices or GPU UUIDs separated by commas"
+            ))
+        })
+}
+
+/// What a GPU grant decided, for the launch to apply once the image is known.
+struct GpuGrantOutcome {
+    /// Which cards the box's `/proc/driver/nvidia` keeps.
+    enumeration: kern_isolation::GpuEnumeration,
+    /// The native grant and the selection, whose binds are placed after the image is resolved.
+    for_identity: Option<(crate::gpu_grant::GpuGrant, crate::gpu_grant::GpuSelection)>,
+    /// `NVIDIA_VISIBLE_DEVICES` as docker sets it for a `--gpus` spec; `None` leaves the variable alone.
+    visible: Option<String>,
+    /// The driver tools bound at `/usr/bin`, by name.
+    tools: Option<Vec<String>>,
+    /// The WSL2 grant, whose binds are placed after the image is resolved.
+    wsl: Option<crate::gpu::WslGrant>,
+    /// Nodes reached only through the caller's supplementary groups, as `(gids, nodes)`. Whether
+    /// that refuses depends on the box's uid map, decided after the image: see `kern box`.
+    groups_needed: Option<(Vec<u32>, Vec<std::path::PathBuf>)>,
+}
+
+/// Decide a GPU grant for `selected`: native or WSL2, refused here when the host cannot honour it.
+///
+/// ONE FUNCTION, TWO CALLERS: `--gpus`/`--device` decide before the image is pulled, so a request this
+/// host cannot meet is refused in no time; `--runtime nvidia` decides after, because what it grants is
+/// named by the image's own `NVIDIA_VISIBLE_DEVICES`. A copy of this logic for the second caller is
+/// the shape this repository's recurring defect takes. `spec` is the `--gpus` text, for the
+/// `NVIDIA_VISIBLE_DEVICES` docker writes; `None` leaves the box's own value in place.
+fn decide_gpu_grant(
+    selected: crate::gpu_grant::GpuSelection,
+    spec: Option<&str>,
+) -> Result<GpuGrantOutcome, Error> {
+    let mut out = GpuGrantOutcome {
+        enumeration: kern_isolation::GpuEnumeration::NoneGranted,
+        for_identity: None,
+        visible: None,
+        tools: None,
+        wsl: None,
+        groups_needed: None,
+    };
+    let caller = crate::gpu_grant::Caller::current();
+    let resolved = crate::gpu_grant::resolve();
+    // THE WSL2 SHAPE IS TAKEN ONLY WHERE THE NATIVE GRANT HAS NOTHING: no NVIDIA driver in this
+    // kernel, and `/dev/dxg` with the vendor libraries beside it. Every other host and every other
+    // failure goes down the native path exactly as before.
+    let wsl = match &resolved {
+        Err(crate::gpu_grant::ResolveError::NoDriverVersionFile { .. }) => {
+            crate::gpu::wsl_grant(std::path::Path::new("/"))
+        }
+        _ => None,
+    };
+    if let Some(wsl) = wsl {
+        let w = wsl.map_err(|e| Error::Cli(crate::gpu::describe_wsl_grant_error(&e)))?;
+        out.tools = Some(tools_bound_at_usr_bin(&w.binds));
+        out.wsl = Some(w);
+        // A SELECTION NARROWER THAN `all` IS CHECKED AGAINST THE ADAPTERS, as docker checks it:
+        // a card the VM does not have is refused, and one it has is accepted. Only then is it
+        // said that `/dev/dxg` carries every adapter, and only when there is more than the one
+        // asked for. `all` asks nothing, so it costs no enumeration.
+        let mut granted: Option<Vec<u32>> = None;
+        if !matches!(selected, crate::gpu_grant::GpuSelection::All) {
+            match crate::gpu::wsl_adapter_indices(std::path::Path::new("/")) {
+                Some(adapters) => {
+                    let narrower = crate::gpu::wsl_check_selection(&selected, &adapters)
+                        .map_err(|e| Error::Cli(crate::gpu_grant::describe_mount_plan_error(&e)))?;
+                    if narrower {
+                        // ⛔ SAID, NOT HIDDEN: the box asked for fewer adapters than it holds.
+                        eprintln!(
+                            "kern: note: --gpus on WSL2: the GPU reaches this box through \
+                             /dev/dxg, which carries every adapter the WSL2 VM has ({}), so \
+                             this box sees all of them. WSL2 has no per-card node to narrow it \
+                             to the ones asked for",
+                            adapters.len()
+                        );
+                    }
+                    if let crate::gpu_grant::GpuSelection::Count(n) = &selected {
+                        granted = Some(adapters.iter().take(*n as usize).copied().collect());
+                    }
+                }
+                None => eprintln!(
+                    "kern: note: --gpus on WSL2: the adapters could not be counted here \
+                     (neither the vendor's nvidia-smi nor /dev/dxg answered), so the selection \
+                     was not checked. The GPU reaches this box through /dev/dxg, which carries \
+                     every adapter the WSL2 VM has"
+                ),
+            }
+        }
+        out.visible =
+            spec.map(|spec| crate::gpu_grant::visible_devices(spec, &selected, granted.as_deref()));
+    } else {
+        let grant = resolved.map_err(|e| match e {
+            crate::gpu_grant::ResolveError::NoDriverVersionFile { .. } => {
+                Error::Cli(crate::gpu::with_foreign_shape(
+                    "--gpus was passed and no NVIDIA driver is loaded in this kernel: \
+                 /proc/driver/nvidia/version does not exist",
+                    std::path::Path::new("/"),
+                ))
+            }
+            crate::gpu_grant::ResolveError::DriverVersionUnparsable { first_line } => {
+                Error::Cli(format!(
+                    "--gpus was passed and the driver's version line carries no version: \
+                 {first_line:?}"
+                ))
+            }
+            crate::gpu_grant::ResolveError::NoNodes { driver_version } => Error::Cli(format!(
+                "--gpus was passed, driver {driver_version} is loaded, and no device node exists \
+             under /dev"
+            )),
+        })?;
+
+        // ONE SPELLING of every refusal, shared with `kern box --plan`. These four messages lived
+        // here and the preview had none, so a plan printed the `Debug` form of the same error and a
+        // reader could not compare the two.
+        //
+        // ⛔ A NODE REACHED THROUGH A GROUP IS DECIDED ONCE THE BOX'S UID MAP IS KNOWN, NOT HERE. The
+        // single-uid map keeps the caller's groups and the ranged one drops them, and the map
+        // depends on the image and on whether this host has a uid range at all. MEASURED on a
+        // Jetson Orin Nano (no `newuidmap`, so every box is single-uid; nodes `root:video 0660`): the
+        // grant was refused over the `video` group, and refused again with the `--no-uid-range` its
+        // own message recommended.
+        let binds = match crate::gpu_grant::mount_plan(&grant, &selected, &caller) {
+            Ok(binds) => binds,
+            Err(crate::gpu_grant::MountPlanError::GroupsNeeded { gids, nodes }) => {
+                out.groups_needed = Some((gids, nodes));
+                crate::gpu_grant::mount_plan_keeping_groups(&grant, &selected, &caller, None)
+                    .map_err(|e| Error::Cli(crate::gpu_grant::describe_mount_plan_error(&e)))?
+            }
+            Err(e) => return Err(Error::Cli(crate::gpu_grant::describe_mount_plan_error(&e))),
+        };
+        out.tools = Some(tools_bound_at_usr_bin(&binds));
+
+        out.enumeration = match crate::gpu_grant::pci_addresses_of(&grant, &selected) {
+            Some(addresses) => kern_isolation::GpuEnumeration::Only(addresses),
+            // A card the driver gave no PCI address for. Masking on a guess would hide a card this
+            // box was just given, so the directory stays whole and the state says which case it is.
+            None => kern_isolation::GpuEnumeration::Unnameable,
+        };
+        out.visible = spec.map(|spec| {
+            crate::gpu_grant::visible_devices(
+                spec,
+                &selected,
+                crate::gpu_grant::granted_indices(&grant, &selected).as_deref(),
+            )
+        });
+        // MOVED, not cloned: it carries 29 libraries and 29 symlinks, and what reads it below
+        // (the binds once the image is known, the identity probe) borrows it.
+        out.for_identity = Some((grant, selected));
+    }
+    Ok(out)
+}
+
+/// docker's rule for the box's library directory, as `--plan` states it.
+const LIB_DIR_RULE: &str = "/usr/lib/x86_64-linux-gnu for a Debian-family image \
+     (/etc/debian_version), /usr/lib64 for any other, as docker places them";
+
+/// The driver tools among `binds`, by name: the ones a grant put at `/usr/bin`.
+fn tools_bound_at_usr_bin(binds: &[(String, String, bool)]) -> Vec<String> {
+    let dir = format!("{}/", crate::gpu_grant::DRIVER_TOOLS_IN_BOX);
+    binds
+        .iter()
+        .filter_map(|(_, target, _)| target.strip_prefix(&dir))
+        .filter(|name| kern_isolation::is_driver_tool(name))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Why a healthcheck running the driver tool `tool` cannot pass in this box, or `None` when the grant
+/// put the tool where the probe looks.
+///
+/// SINCE A GRANT BINDS THE TOOLS AT `/usr/bin`, as docker's NVIDIA runtime does, the probe NVIDIA's
+/// guides print (`test: ["CMD", "nvidia-smi"]`) passes in a granted glibc box, and warning about it
+/// would be noise on every GPU stack. What is left to say is the three cases where it still cannot:
+/// no grant at all, a host whose driver has no such tool, and a path other than the one the grant
+/// binds. `granted` is `None` for "no GPU grant".
+pub(crate) fn health_tool_absence(tool: &str, granted: Option<&[String]>) -> Option<String> {
+    let bare = tool.rsplit('/').next().unwrap_or(tool);
+    let at = format!("{}/{bare}", crate::gpu_grant::DRIVER_TOOLS_IN_BOX);
+    let Some(granted) = granted else {
+        return Some(format!(
+            "and this box holds no GPU grant, so no driver tool is bound into it. Grant a card when \
+             the box starts (--gpus, or `gpus:` in compose with --allow-device-grants), which binds \
+             {at} with it"
+        ));
+    };
+    if !granted.iter().any(|t| t == bare) {
+        return Some(format!(
+            "and this host's driver has no `{bare}` for the grant to bind (it looks where docker's \
+             NVIDIA runtime looks, /usr/local/sbin to /bin). Probe what the grant does bind, e.g. \
+             `test -c /dev/nvidiactl`, or `test -c /dev/dxg` on WSL2"
+        ));
+    }
+    if tool.contains('/') && tool != at {
+        return Some(format!(
+            "and the grant binds `{bare}` at {at}, not at {tool}. Probe it by that path, or by the \
+             bare name"
+        ));
+    }
+    None
 }
 
 /// What an image's own `HEALTHCHECK` contributes, once the caller's flags have had their say.
@@ -1143,6 +1469,23 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             crate::volume::is_named(src) && crate::volume::size_limit(src).is_some()
         });
     let mut volumes = parse_volumes(&plain_specs)?;
+    // BEFORE the GPU binds join the list: only what the caller bound is a candidate.
+    let idmap_binds =
+        crate::commands::idmap_bind_candidates(&volumes, kern_isolation::is_initial_root());
+    // A BUILD STEP'S SSH AGENT SOCKETS: binds like any other, and the only sockets a box takes (the
+    // targets go to `setup_volumes`, which refuses a socket anywhere else).
+    let socket_binds: Vec<String> = args
+        .build_ssh_agents
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect();
+    for (source, target) in args.build_ssh_agents {
+        volumes.push(Volume {
+            source: source.clone(),
+            target: target.clone(),
+            read_only: false,
+        });
+    }
 
     // `--gpus`: ONE card, resolved from native discovery and mounted through the SAME `Volume`
     // list `-v` uses. There is no second mount path and no hook: a GPU grant is a set of binds,
@@ -1155,23 +1498,62 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--device` is the CDI spelling of `--gpus`, resolved to the same index through the spec and
     // then built from discovery. The plan's rule is that CDI is an ALIAS: the spec says which card
     // a name means, and the mounts come from the discovery a test proves equivalent to it.
-    let gpu_selection: Option<Result<crate::gpu_grant::GpuSelection, Error>> =
-        match (args.gpus, args.device) {
-            // A HOST PATH IS NOT A SECOND NAME FOR THE CARD, so "the same thing two ways" was false
-            // for it. MEASURED 2026-11-12: `--gpus device=0 --device /dev/nvidia-caps/nvidia-cap1`
-            // answered that the two flags named the same thing; a MIG capability node is not a card.
-            (Some(_), Some(path)) if path.starts_with('/') => {
-                Some(Err(Error::Cli(device_path_message(path))))
+    // THE VARIABLES A CDI SPEC PUTS IN THE CONTAINER, applied once the box's environment is known.
+    let mut cdi_env: Vec<String> = Vec::new();
+    // `--device <host path>[:<box path>[:perms]]`, DOCKER'S HOST-NODE FORM: a bind of the node, which
+    // is what compose `devices:` already becomes, and read-only when the permissions name no `w`.
+    // It used to be refused with a pointer to `-v`; docker takes it, beside `--gpus` too (measured on
+    // a Jetson: `--gpus all --device /dev/nvhost-gpu` runs CUDA under docker). A name that is not a
+    // path stays CDI. A node the caller opens only through a group keeps the box's groups, the rule
+    // a `--gpus` grant follows, because a box on the uid-range map would otherwise clear it.
+    let mut device_groups: Vec<u32> = Vec::new();
+    let mut cdi_names: Vec<&str> = Vec::new();
+    for item in args
+        .device
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !item.starts_with('/') {
+            cdi_names.push(item);
+            continue;
+        }
+        let mut parts = item.splitn(3, ':');
+        let host = parts.next().unwrap_or(item);
+        let second = parts.next();
+        let (inbox, perms) = match second {
+            Some(p) if p.starts_with('/') => (p, parts.next()),
+            other => (host, other),
+        };
+        if !std::path::Path::new(host).exists() {
+            return Err(Error::Cli(format!(
+                "--device {host}: no such device on this host (a node is bound, never created)"
+            )));
+        }
+        let ro = perms.is_some_and(|p| !p.contains('w'));
+        volumes.extend(parse_volumes(&[format!(
+            "{host}:{inbox}{}",
+            if ro { ":ro" } else { "" }
+        )])?);
+        if let Some(g) = crate::gpu_grant::node_needs_a_group(std::path::Path::new(host)) {
+            if !device_groups.contains(&g) {
+                device_groups.push(g);
             }
+        }
+    }
+    let cdi_device: Option<String> = (!cdi_names.is_empty()).then(|| cdi_names.join(","));
+    let gpu_selection: Option<Result<crate::gpu_grant::GpuSelection, Error>> =
+        match (args.gpus, cdi_device.as_deref()) {
             (Some(_), Some(_)) => Some(Err(Error::Cli(
                 "--gpus and --device name the same thing two ways: pass one".to_string(),
             ))),
-            // `--device` NAMES ONE CARD AND KEEPS DOING SO. CDI spells a device by name, and the
-            // name resolves to one index; a box that wants several cards asks for them with
-            // `--gpus device=0,1`, the flag that takes a list. The alias claim is unchanged and is
-            // about the MOUNTS: the same card reached either way produces the same nodes.
+            // EVERY `--device` ON THE LINE, as docker and podman read them: repeated flags reach
+            // here as one comma-separated list (see the parser), each name resolves to a card or,
+            // for the spec's `all`, to every card. The alias claim is unchanged and is about the
+            // MOUNTS: the same card reached either way produces the same nodes.
             (None, Some(reference)) => Some(
-                crate::cdi::resolve_device_ref(std::path::Path::new("/"), reference)
+                crate::cdi::resolve_device_refs(std::path::Path::new("/"), reference)
                     .map(|resolved| {
                         // WHAT THE SPEC ASKED FOR THAT kern DOES NOT DO, before the box starts and
                         // on the `--plan` path as well, because this value is computed once for
@@ -1184,9 +1566,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                         {
                             eprintln!("kern: warning: {msg}");
                         }
-                        crate::gpu_grant::GpuSelection::These(vec![resolved.index])
+                        cdi_env = resolved.env;
+                        match resolved.indices {
+                            Some(indices) => crate::gpu_grant::GpuSelection::These(indices),
+                            None => crate::gpu_grant::GpuSelection::All,
+                        }
                     })
-                    .map_err(|e| {
+                    .map_err(|(_, e)| {
                         use crate::cdi::DeviceRefError as D;
                         Error::Cli(match e {
                             D::NotQualified { given } if given.starts_with('/') => {
@@ -1220,11 +1606,6 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                                 "--device: the spec offers no device {name:?}. It offers: {}",
                                 offered.join(", ")
                             ),
-                            D::AllNotYet => {
-                                "--device ...=all is not accepted: --device names one card \
-                         by its CDI name. For every card, use --gpus all"
-                                    .to_string()
-                            }
                             D::UnknownUuid { uuid } => format!(
                         "--device: the spec names {uuid} and this host's driver reports no card \
                          with that UUID"
@@ -1270,6 +1651,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     eprintln!("kern: note: {}", crate::gpu_grant::describe_no_gpu(spec));
                 }
                 crate::gpu_grant::selection_from_spec(std::path::Path::new("/"), spec)
+                    .or_else(|e| {
+                        wsl_unchecked_uuid(spec, e, |note| eprintln!("kern: note: {note}"))
+                    })
                     .map_err(|e| {
                         match e {
                     crate::gpu_grant::GpuSpecError::Empty => Error::Cli(
@@ -1346,52 +1730,28 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // lets the probe use the uid the box will really carry.
     let mut gpu_for_identity: Option<(crate::gpu_grant::GpuGrant, crate::gpu_grant::GpuSelection)> =
         None;
+    // `NVIDIA_VISIBLE_DEVICES` as docker sets it for the `--gpus` spec (see
+    // `crate::gpu_grant::visible_devices`), applied once the box's own environment is known.
+    let mut gpu_visible: Option<String> = None;
+    // The driver tools the grant bound at `/usr/bin`, by name, for the healthcheck warning below:
+    // `None` is "no GPU grant", which is a different sentence from "granted, and this host has no
+    // such tool".
+    let mut granted_tools: Option<Vec<String>> = None;
+    // WHERE THE GPU'S BINDS GO IN THE LIST, and the WSL2 grant they come from: the libraries land
+    // in the IMAGE's library directory, which is known only once the image is resolved below, so
+    // the binds are placed then, at this position, and the mount order is what it always was.
+    let gpu_binds_at = volumes.len();
+    let mut wsl_pending: Option<crate::gpu::WslGrant> = None;
+    // Nodes the grant reaches only through a group, decided once the box's uid map is known.
+    let mut gpu_groups_needed: Option<(Vec<u32>, Vec<std::path::PathBuf>)> = None;
     if let Some(selection) = gpu_selection {
-        let selected = selection?;
-        let caller = crate::gpu_grant::Caller::current();
-        let grant = crate::gpu_grant::resolve().map_err(|e| match e {
-            crate::gpu_grant::ResolveError::NoDriverVersionFile { .. } => {
-                Error::Cli(crate::gpu::with_foreign_shape(
-                    "--gpus was passed and no NVIDIA driver is loaded in this kernel: \
-                     /proc/driver/nvidia/version does not exist",
-                    std::path::Path::new("/"),
-                ))
-            }
-            crate::gpu_grant::ResolveError::DriverVersionUnparsable { first_line } => {
-                Error::Cli(format!(
-                    "--gpus was passed and the driver's version line carries no version: \
-                     {first_line:?}"
-                ))
-            }
-            crate::gpu_grant::ResolveError::NoNodes { driver_version } => Error::Cli(format!(
-                "--gpus was passed, driver {driver_version} is loaded, and no device node exists \
-                 under /dev"
-            )),
-        })?;
-
-        let binds = crate::gpu_grant::mount_plan(&grant, &selected, &caller)
-            // ONE SPELLING of every refusal, shared with `kern box --plan`. These four messages
-            // lived here and the preview had none, so a plan printed the `Debug` form of the
-            // same error and a reader could not compare the two.
-            .map_err(|e| Error::Cli(crate::gpu_grant::describe_mount_plan_error(&e)))?;
-
-        gpu_enumeration = match crate::gpu_grant::pci_addresses_of(&grant, &selected) {
-            Some(addresses) => kern_isolation::GpuEnumeration::Only(addresses),
-            // A card the driver gave no PCI address for. Masking on a guess would hide a card this
-            // box was just given, so the directory stays whole and the state says which case it is.
-            None => kern_isolation::GpuEnumeration::Unnameable,
-        };
-
-        for (source, target, read_only) in binds {
-            volumes.push(kern_isolation::Volume {
-                source,
-                target,
-                read_only,
-            });
-        }
-        // MOVED, not cloned: nothing below this point reads the grant, and it carries 29 libraries
-        // and 29 symlinks.
-        gpu_for_identity = Some((grant, selected));
+        let o = decide_gpu_grant(selection?, args.gpus)?;
+        gpu_enumeration = o.enumeration;
+        gpu_for_identity = o.for_identity;
+        gpu_visible = o.visible;
+        granted_tools = o.tools;
+        wsl_pending = o.wsl;
+        gpu_groups_needed = o.groups_needed;
     }
     // `--mount`'s mounts, resolved from their FIELDS. They never pass through a `src:dst` string, so
     // a source containing a `:` (or, quoted, a `,`) arrives whole - which is the difference between
@@ -1437,6 +1797,18 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         vgpio,
         vdisk,
     } = ap;
+    // ⛔ A BOX GIVEN A GPU IS BOUNDED BY THE MACHINE, NOT BY THE SANDBOX DEFAULT, as `kern compose`
+    // services are and as docker's are. 512 MiB is a sandbox's default for code nobody sized, and a
+    // GPU workload is never that: MEASURED on a WSL2 guest, every CUDA context costs about 75 MiB of
+    // host memory (18 contexts reached 1351 MiB) and a box asking only for `--gpus all` was
+    // OOM-killed while the same program ran outside kern. The host's RAM keeps the cap a real number,
+    // so a box that does exhaust memory is still killed against its own cgroup with kern's message;
+    // `--memory` still sets any cap, and the sandbox SDKs pass their own.
+    let gpu_asked = args.gpus.is_some() || cdi_device.is_some() || args.runtime_nvidia;
+    let memory = match memory {
+        None if gpu_asked => host_meminfo_bytes("MemTotal:"),
+        other => other,
+    };
     // `--nice` (an explicit flag) overrides a profile's `nice`.
     let nice: Option<i32> = args.nice.map(|n| n as i32).or(nice);
     // Flatten the resolved vGPIO profiles into the device/sysfs paths the box will expose.
@@ -1675,6 +2047,68 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // data that is already there. That is Docker's rule too, and it is the whole reason the check is
     // on the directory rather than on a first-use marker: a volume created ahead of time is empty,
     // and one emptied by hand is empty again.
+    // `--runtime nvidia`: WHAT THE BOX'S OWN `NVIDIA_VISIBLE_DEVICES` NAMES, as NVIDIA's runtime reads
+    // it, which is why it is decided only now: the value is the image's `ENV` unless `-e` or an env
+    // file set it, and the image is known only from here on. The grant itself is the one `--gpus`
+    // takes, by the same function.
+    if args.runtime_nvidia && args.gpus.is_none() && cdi_device.is_none() {
+        let set_by_caller = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "NVIDIA_VISIBLE_DEVICES")
+            .map(|(_, v)| v.clone());
+        let set_by_image = image_config
+            .env
+            .iter()
+            .rev()
+            .find_map(|kv| kv.strip_prefix("NVIDIA_VISIBLE_DEVICES="))
+            .map(str::to_string);
+        let value = set_by_caller.or(set_by_image);
+        match runtime_nvidia_selection(value.as_deref())? {
+            Some(selection) => {
+                let o = decide_gpu_grant(selection, None)?;
+                gpu_enumeration = o.enumeration;
+                gpu_for_identity = o.for_identity;
+                granted_tools = o.tools;
+                wsl_pending = o.wsl;
+                gpu_groups_needed = o.groups_needed;
+            }
+            None => eprintln!(
+                "kern: note: --runtime nvidia: NVIDIA_VISIBLE_DEVICES is {}, which NVIDIA's runtime \
+                 reads as no GPU, so none was granted",
+                value
+                    .as_deref()
+                    .map(|v| format!("{v:?}"))
+                    .unwrap_or_else(|| "not set in the image or the box".to_string())
+            ),
+        }
+    }
+    // THE GPU'S BINDS, NOW THAT THE IMAGE IS KNOWN, at the position the grant had in the list. The
+    // libraries go into the image's library directory, docker's rule (`box_library_dir`).
+    if gpu_for_identity.is_some() || wsl_pending.is_some() {
+        let lib_dir = crate::gpu_grant::box_library_dir(&lower);
+        let binds = match (&gpu_for_identity, &wsl_pending) {
+            // The group question was settled by the grant decision (and is checked against the
+            // box's uid map below), so it is not asked a second time here.
+            (Some((grant, selected)), _) => crate::gpu_grant::mount_plan_keeping_groups(
+                grant,
+                selected,
+                &crate::gpu_grant::Caller::current(),
+                Some(&lib_dir),
+            )
+            .map_err(|e| Error::Cli(crate::gpu_grant::describe_mount_plan_error(&e)))?,
+            (None, Some(w)) => w.binds_into(&lib_dir),
+            (None, None) => Vec::new(),
+        };
+        volumes.splice(
+            gpu_binds_at..gpu_binds_at,
+            binds.into_iter().map(|(source, target, read_only)| Volume {
+                source,
+                target,
+                read_only,
+            }),
+        );
+    }
     seed_empty_named_volumes(&lower, &volumes);
     // Resolve the effective command from the image config (docker semantics: Entrypoint + the user's
     // command, else the image's Cmd; a shell if nothing is set). `--ssh` with no command keeps the
@@ -1689,9 +2123,23 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The image's Env are DEFAULTS: put them first, then the user's `--env`/`--env-file` on top so an
     // explicit variable overrides the image's.
     if !image_config.env.is_empty() {
-        let mut merged = parse_envs(&image_config.env)?;
+        let mut merged = image_envs(&image_config.env);
         merged.extend(env);
         env = merged;
+    }
+    // THE GRANT'S VALUE REPLACES ANY OTHER, the image's `ENV` and `-e` included, which is what docker
+    // does (measured: `-e NVIDIA_VISIBLE_DEVICES=xyz --gpus device=1` gives `1`, once).
+    if let Some(visible) = gpu_visible {
+        env.retain(|(k, _)| k != "NVIDIA_VISIBLE_DEVICES");
+        env.push(("NVIDIA_VISIBLE_DEVICES".to_string(), visible));
+    }
+    // AND A CDI SPEC'S OWN, the same way: what docker and podman put in the container for
+    // `--device nvidia.com/gpu=…` (measured: `NVIDIA_VISIBLE_DEVICES=void` from this host's spec).
+    for kv in cdi_env {
+        if let Some((k, v)) = kv.split_once('=') {
+            env.retain(|(name, _)| name != k);
+            env.push((k.to_string(), v.to_string()));
+        }
     }
 
     // Host-side mounts happen HERE - AFTER the systemd-scope re-exec (above) and after every
@@ -1961,10 +2409,18 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         .run_as
         .filter(|u| !u.is_empty())
         .or(image_config.user.as_deref().filter(|u| !u.is_empty()));
-    let extra_gids = match user_spec {
+    let mut extra_gids = match user_spec {
         Some(spec) => supplementary_gids(spec, &image_accounts),
         None => Vec::new(),
     };
+    // `--group-add`, ON TOP of the user's own groups, as docker adds them.
+    for g in
+        super::imagecache::group_add_gids(args.group_add, &image_accounts).map_err(Error::Cli)?
+    {
+        if !extra_gids.contains(&g) {
+            extra_gids.push(g);
+        }
+    }
     // HOME FOLLOWS THE USER, as a DEFAULT under both the image's own `Env` and the caller's `-e`:
     // it is only added when neither of those named it, so an explicit `HOME=` still wins. The box
     // keeps `/root` when it runs as box root, which is that uid's home in every image that has one.
@@ -2025,9 +2481,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // kern promotes such a box to the ranged map; on a host with no `/etc/subuid` row at all the
     // identity itself cannot be assumed, so the box fails for a different reason and a note about
     // device nodes would be noise.
-    if let (true, Some((grant, selection)), Some((in_box_uid, _))) =
-        (non_root_user, &gpu_for_identity, run_as)
-    {
+    // "NO RANGE" IS THE HOST'S ANSWER, NOT ITS `/etc/subuid` ROW ALONE: a Jetson with the row and
+    // without `newuidmap` warned about nodes a box it cannot build would lose (measured).
+    if let (true, Some((grant, selection)), Some((in_box_uid, _)), true) = (
+        non_root_user,
+        &gpu_for_identity,
+        run_as,
+        kern_isolation::id_range_available(),
+    ) {
         let caller = crate::gpu_grant::Caller::current();
         let name = kern_isolation::username(caller.uid);
         let base = kern_isolation::sub_range("/etc/subuid", name.as_deref(), caller.uid)
@@ -2041,8 +2502,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             None => None,
         };
         if let Some(box_host_uid) = box_host_uid {
-            let lost =
-                crate::gpu_grant::uid_dependent_nodes(grant, selection, &caller, box_host_uid);
+            let lost = crate::gpu_grant::uid_dependent_nodes(
+                grant,
+                selection,
+                &caller,
+                box_host_uid,
+                gpu_groups_needed.is_some(),
+            );
             if !lost.is_empty() {
                 let names: Vec<String> = lost
                     .iter()
@@ -2115,6 +2581,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     )?;
     let mut cap_drops = args.cap_drop.to_vec();
     let mut read_only = args.read_only;
+    // The profile is for code nobody has read, so it also refuses a setuid gain, which a plain box
+    // allows as docker does (`--security-opt no-new-privileges` asks for it on any box).
+    let no_new_privs =
+        args.no_new_privs || matches!(args.security_profile, Some(SecurityProfile::Untrusted));
     if let Some(SecurityProfile::Untrusted) = args.security_profile {
         // cap-drop ALL as a base; an explicit `--cap-add X` is re-added by `caps::resolve` (the adds are
         // subtracted from the drop mask, see `CapSpec`), so the profile is a floor, not a ceiling.
@@ -2144,8 +2614,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // SDK capturing the box's stderr must not mistake it for a box-start failure: the classifier
         // skips benign `kern:` banner/warning/note lines before its startup-failure heuristic.
         eprintln!(
-            "kern: security-profile=untrusted: seccomp={sec}, {caps_line}, read-only=on \
-             (Landlock and --require-limits untouched)"
+            "kern: security-profile=untrusted: seccomp={sec}, {caps_line}, read-only=on, \
+             no-new-privileges=on (Landlock and --require-limits untouched)"
         );
     }
     // `--cap-add`/`--cap-drop`: resolve names to a CapSpec (unknown name → error) layered on the
@@ -2154,6 +2624,65 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
 
     // Always an overlay (image/rootfs = read-only lower, private upper takes writes).
     // `--read-only` then remounts that overlay read-only after pivot.
+    // A JETSON GRANT'S SYSFS (the chip's identity), read-only beside any a vGPIO profile asked for.
+    // AND A PCI CARD'S OWN SYSFS DIRECTORY, which NVML reads its PCI identity from: see
+    // `gpu_grant::pci_sysfs_paths`. Only the cards this box was given.
+    if let Some((grant, selection)) = &gpu_for_identity {
+        let pci = crate::gpu_grant::pci_addresses_of(grant, selection)
+            .map(|a| crate::gpu_grant::pci_sysfs_paths(std::path::Path::new("/"), &a))
+            .unwrap_or_default();
+        for p in grant
+            .sysfs
+            .iter()
+            .cloned()
+            .chain(pci.iter().map(|r| std::path::Path::new("/").join(r)))
+        {
+            let p = p.to_string_lossy().into_owned();
+            if !vgpio_sysfs.contains(&p) {
+                vgpio_sysfs.push(p);
+            }
+        }
+    }
+    // THE BOX'S UID MAP, decided once, read by the spec and by the GPU group check below.
+    let uid_range = if args.uid_range || ssh.is_some() || non_root_user {
+        UidRange::Requested
+    } else if image_default_uid_range {
+        UidRange::ImageDefault
+    } else {
+        UidRange::Off
+    };
+    // A GPU NODE REACHED ONLY THROUGH A GROUP: the box KEEPS the caller's groups, on any map.
+    //
+    // Docker's NVIDIA runtime gives the container the node's group (`additionalGids`), whatever its
+    // user. kern cleared the inherited set on the uid-range map, so on a Jetson (every node
+    // `root:video 0660`) `cuInit` failed in every pod member, under `--uid-range` and under `--user`,
+    // MEASURED once `uidmap` was installed. A first fix moved a standalone box to the single-uid map,
+    // which cannot clear; a pod member shares the pod's map and was not helped. The gid itself cannot
+    // be mapped into a range, so the inherited set is kept whole, which is what the single-uid map
+    // already does, and the note says so where the box would otherwise have cleared it.
+    let mut kept_for: Vec<u32> = gpu_groups_needed
+        .as_ref()
+        .map(|(gids, _)| gids.clone())
+        .unwrap_or_default();
+    for g in &device_groups {
+        if !kept_for.contains(g) {
+            kept_for.push(*g);
+        }
+    }
+    let keep_groups = !kept_for.is_empty();
+    if keep_groups {
+        let would_clear = (!matches!(uid_range, UidRange::Off) || args.pod.is_some())
+            && kern_isolation::id_range_available();
+        if would_clear {
+            let ids: Vec<String> = kept_for.iter().map(u32::to_string).collect();
+            eprintln!(
+                "kern: note: the granted device nodes open only through group(s) {}, so this box \
+                 keeps the supplementary groups you are in, all of them, as docker's NVIDIA runtime \
+                 adds the nodes' group to a container",
+                ids.join(", ")
+            );
+        }
+    }
     let (spec, scratch) = build_spec(BuildSpec {
         name: &name,
         lower,
@@ -2178,13 +2707,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // non-zero target uid must be mapped in. With the range (via `newgidmap`/`newuidmap`) both
         // work; if the helpers are absent the box falls back to single-uid. Those three are the
         // caller ASKING, so an unavailable range is reported; the per-image default is not.
-        uid_range: if args.uid_range || ssh.is_some() || non_root_user {
-            UidRange::Requested
-        } else if image_default_uid_range {
-            UidRange::ImageDefault
-        } else {
-            UidRange::Off
-        },
+        uid_range,
         bind_rootfs: args.bind_rootfs,
         privileged: args.privileged,
         require_limits: args.require_limits,
@@ -2206,6 +2729,23 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         vgpio_devs,
         vgpio_sysfs,
         gpu_enumeration,
+        // A GPU GRANT REBUILDS THE BOX'S LOADER CACHE, as docker's and podman's NVIDIA hook does
+        // (see `kern_isolation`'s `refresh_loader_cache` for the measurement and the confinement).
+        refresh_ldcache: gpu_for_identity.is_some() || wsl_pending.is_some(),
+        ldconfig_dirs: gpu_for_identity
+            .as_ref()
+            .filter(|(grant, _)| grant.at_host_paths)
+            .map(|(grant, _)| {
+                grant
+                    .ldconfig_dirs
+                    .iter()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        idmap_binds,
+        socket_binds,
+        no_new_privs,
         vdisks,
         secrets,
         ssh,
@@ -2215,6 +2755,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         tmpfs,
         run_as,
         extra_gids,
+        keep_groups,
         pids_max: args.pids_limit,
         caps,
         io_max: vdisk_io_max,
@@ -2343,18 +2884,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // run and report `unhealthy` with nothing naming the cause. See `health_probe_driver_tool` for
     // the measurement and for why the remedies below are the two that were RUN.
     if let Some(tool) = health_probe_driver_tool(health_cfg.probe.as_ref()) {
-        eprintln!(
-            "kern: warning: box '{name}': the healthcheck runs `{tool}`, which no box has: a GPU \
-             grant binds the driver's LIBRARIES and none of its binaries (docker's NVIDIA runtime \
-             injects them from the host, kern does not). The probe can never pass, so this box \
-             stays `unhealthy` for its whole life and a compose `service_healthy` gate on it never \
-             opens. Two remedies, both measured passing in a granted box: bind the tool in from \
-             this host (-v /usr/bin/{tool}:/usr/bin/{tool}:ro) with a GLIBC image, since the \
-             driver's tools are glibc and a musl rootfs cannot run them; or probe what the grant \
-             DOES bind, e.g. `test -c /dev/nvidiactl`, which is present in a granted box and absent \
-             in one started without --gpus.",
-            name = name.as_str()
-        );
+        if let Some(why) = health_tool_absence(&tool, granted_tools.as_deref()) {
+            eprintln!(
+                "kern: warning: box '{name}': the healthcheck runs `{tool}`, {why}. The probe can \
+                 never pass, so this box stays `unhealthy` for its whole life and a compose \
+                 `service_healthy` gate on it never opens.",
+                name = name.as_str()
+            );
+        }
     }
     // ONE POLICY OBJECT, BUILT ONCE, and computed BEFORE the branch so the detached path and the
     // systemd-managed path cannot bound their logs differently. `LogCap::default()` is what every
@@ -2485,6 +3022,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // instead of guessing: `seccomp_mode` is what PID 1 installs, `cap_recorded` marks this as
             // a box whose capability profile IS known, and the record is well-formed by construction.
             seccomp_mode: spec.seccomp_mode,
+            no_new_privs: spec.effective_no_new_privs(),
+            keep_groups: spec.keep_groups,
             apparmor: spec.apparmor.clone().unwrap_or_default(),
             cap_recorded: true,
             aa_recorded: true,
@@ -2679,6 +3218,28 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // The total comes from `runstats`' process-entry stamp, which `kern run` already measures its
     // setup against, rather than a second clock read here that would drift from it.
     pt.summary("parent:accounted", crate::runstats::since_start_us());
+    // THE BOX'S LINE IN THE HISTORY, from what kern observed outside it: see `history.rs`. Here,
+    // after teardown and before the exit code is handed back, because this is the one place every
+    // foreground box (every SDK and MCP call) passes on its way out with its outcome known.
+    if let Ok(code) = &result {
+        let ran_ms = crate::runstats::since_start_us()
+            .map_or(0, |us| u64::try_from(us / 1000).unwrap_or(u64::MAX));
+        crate::history::record(&crate::history::Entry {
+            ended_ms: crate::history::now_ms(),
+            name: name.as_str().to_string(),
+            image: args.image.unwrap_or("-").to_string(),
+            ran_ms,
+            code: *code,
+            outcome: crate::history::classify(
+                *code,
+                kern_isolation::box_workload_signal(),
+                kern_isolation::box_was_oom_killed(),
+                args.timeout,
+                ran_ms,
+            ),
+            gpu: args.gpus.unwrap_or("-").to_string(),
+        });
+    }
     match result {
         // Propagate the sandboxed command's exit code as kern's, like `docker run`. This is the
         // one place a non-0/1 exit code is produced - a deliberate terminal action.
@@ -2770,8 +3331,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                         eprintln!(
                             "kern: the workload was killed by the kernel's OOM killer against this \
                              box's own memory cap. Raise it with `--memory <size>` (or `memory = \
-                             \"<size>\"` in a vcpu: profile) if the workload needs more. On a device \
-                             with unified memory, GPU allocations count against the same cap."
+                             \"<size>\"` in a vcpu: profile) if the workload needs more. \
+                             {UNIFIED_MEMORY_NOTE}."
                         );
                     }
                 }
@@ -2858,14 +3419,6 @@ pub fn run(
     // A WARNING AND NOT A REFUSAL: a caller who confines a non-GPU command on a GPU host asked for
     // exactly this, and pays one line. A caller whose workload needs the card would otherwise pay
     // the afternoon.
-    if !landlock_rw.is_empty() {
-        if let Ok(grant) = crate::gpu_grant::resolve() {
-            let missing = crate::gpu_grant::cuda_write_paths_outside_allowlist(&grant, landlock_rw);
-            if let Some(msg) = crate::gpu_grant::describe_cuda_write_paths(&missing) {
-                eprintln!("kern: warning: {msg}");
-            }
-        }
-    }
     // Fold any leading resource-profile tokens (`vcpu:name` …) into the caps - explicit flags win -
     // and find where the real command begins.
     let mut ap = AppliedProfiles {
@@ -3013,6 +3566,18 @@ pub fn run(
         die_with_parent: false,
         allow_uncapped,
     });
+    // THE CUDA WRITE-ALLOWLIST WARNING, said once, by the process that runs the command. Before the
+    // re-exec above it was printed twice, once by the launcher and once by its copy in the scope:
+    // MEASURED on a Jetson Orin Nano, every remedy path came out doubled. And only where Landlock
+    // exists: elsewhere the command is refused below for that reason, which is the line to read.
+    if !landlock_rw.is_empty() && kern_isolation::landlock_abi().is_some() {
+        if let Ok(grant) = crate::gpu_grant::resolve() {
+            let missing = crate::gpu_grant::cuda_write_paths_outside_allowlist(&grant, landlock_rw);
+            if let Some(msg) = crate::gpu_grant::describe_cuda_write_paths(&missing) {
+                eprintln!("kern: warning: {msg}");
+            }
+        }
+    }
     // TWO INDEPENDENT DECISIONS, AND CONFLATING THEM IS WHAT LEFT A LEAK ON THE HOSTS THAT HAD IT.
     //
     // `direct` answers "may this relocate into kern's delegated `kern.slice`", which needs a systemd
@@ -3537,6 +4102,7 @@ pub fn exec(
     // returns the box's OWN (cap spec, seccomp filter) or refuses a record that predates the posture
     // fields / is corrupt - a caller can't rebuild a usable posture without passing that gate.
     let (box_caps, box_seccomp, box_aa, box_landlock) = inst.exec_posture()?;
+    let box_nnp = inst.no_new_privs;
     // With no `-w`, start where the WORKLOAD starts, not at `/`. Docker's `exec` inherits the
     // container's WorkingDir and people lean on it: a compose service with `working_dir: /app` should
     // not need `-w /app` retyped on every exec. An explicit `-w` still wins, and a box with no workdir
@@ -3568,6 +4134,7 @@ pub fn exec(
         box_has_explicit_caps,
         &box_caps,
         box_seccomp,
+        box_nnp,
         box_aa.as_deref(),
         // RESOLVED HERE, BEFORE THE FORK, because the child may not read the environment. The default
         // is to refuse: a command that steps around the box's caps while the operator believes it is
@@ -3590,6 +4157,7 @@ pub fn exec(
         }),
         identity.run_as,
         &identity.extra_gids,
+        inst.keep_groups,
         &box_landlock,
     );
 
@@ -4535,6 +5103,19 @@ fn supervise_box(
             &inst.command,
         );
     }
+    // A DETACHED BOX'S LINE IN THE HISTORY. Only the exit code reaches this supervisor, so the outcome
+    // is the code and nothing guessed from it (a `137` stays `exit-137`).
+    crate::history::record(&crate::history::Entry {
+        ended_ms: crate::history::now_ms(),
+        name: inst.name.clone(),
+        image: "-".to_string(),
+        ran_ms: crate::registry::now_unix()
+            .saturating_sub(inst.started)
+            .saturating_mul(1000),
+        code: final_code,
+        outcome: crate::history::classify(final_code, 0, false, 0, 0),
+        gpu: "-".to_string(),
+    });
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
     }
@@ -4703,6 +5284,8 @@ fn run_detached(
         // Same recorded posture as the foreground path: `exec` reproduces the box's own filter and
         // reapplies its own caps, never a value re-derived from the exec caller's environment.
         seccomp_mode: spec.seccomp_mode,
+        no_new_privs: spec.effective_no_new_privs(),
+        keep_groups: spec.keep_groups,
         apparmor: spec.apparmor.clone().unwrap_or_default(),
         cap_recorded: true,
         aa_recorded: true,
@@ -5868,6 +6451,79 @@ mod image_defaults_tests {
         }
         // No probe at all is no warning: a box without a healthcheck has nothing to report.
         assert_eq!(health_probe_driver_tool(None), None);
+    }
+
+    /// `--runtime nvidia` READS `NVIDIA_VISIBLE_DEVICES` AS NVIDIA'S RUNTIME DOES: unset, empty, void
+    /// and none grant nothing; all is every card; a list is those cards.
+    #[test]
+    fn the_nvidia_runtime_reads_the_visible_devices_value() {
+        use crate::gpu_grant::GpuSelection;
+        for none in [None, Some(""), Some("void"), Some("NONE"), Some("  ")] {
+            assert!(
+                matches!(runtime_nvidia_selection(none), Ok(None)),
+                "{none:?}"
+            );
+        }
+        assert!(matches!(
+            runtime_nvidia_selection(Some("all")),
+            Ok(Some(GpuSelection::All))
+        ));
+        assert!(matches!(
+            runtime_nvidia_selection(Some("0,1")),
+            Ok(Some(GpuSelection::These(ref v))) if v == &vec![0, 1]
+        ));
+        assert!(runtime_nvidia_selection(Some("abc")).is_err());
+    }
+
+    /// ⛔ THE WARNING FIRES ONLY WHERE THE PROBE STILL CANNOT PASS. A grant binds the driver tools
+    /// at `/usr/bin` as docker does, so `nvidia-smi` in a granted box is silent; no grant, a host
+    /// without the tool, and a path the grant does not use are the three that still speak, each with
+    /// its own cause.
+    #[test]
+    fn a_driver_tool_healthcheck_warns_only_where_the_grant_did_not_bind_it() {
+        let five: Vec<String> = kern_isolation::driver_tools()
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(health_tool_absence("nvidia-smi", Some(&five)), None);
+        assert_eq!(
+            health_tool_absence("/usr/bin/nvidia-smi", Some(&five)),
+            None
+        );
+        let none = health_tool_absence("nvidia-smi", None).expect("no grant");
+        assert!(
+            none.contains("no GPU grant") && none.contains("--gpus"),
+            "{none}"
+        );
+        let missing = health_tool_absence("nvidia-persistenced", Some(&["nvidia-smi".to_string()]))
+            .expect("host lacks it");
+        assert!(
+            missing.contains("has no `nvidia-persistenced`"),
+            "{missing}"
+        );
+        let path = health_tool_absence("/usr/local/bin/nvidia-smi", Some(&five)).expect("path");
+        assert!(
+            path.contains("/usr/bin/nvidia-smi, not at /usr/local/bin/nvidia-smi"),
+            "{path}"
+        );
+        // And the names come from the binds, only those at /usr/bin and only the driver's.
+        let binds = vec![
+            (
+                "/h/nvidia-smi".to_string(),
+                "/usr/bin/nvidia-smi".to_string(),
+                true,
+            ),
+            ("/h/x".to_string(), "/usr/bin/python3".to_string(), true),
+            (
+                "/dev/nvidia0".to_string(),
+                "/dev/nvidia0".to_string(),
+                false,
+            ),
+        ];
+        assert_eq!(
+            tools_bound_at_usr_bin(&binds),
+            vec!["nvidia-smi".to_string()]
+        );
     }
 
     /// A ZERO IS "UNSET", NOT "EVERY ZERO SECONDS". The OCI config writes 0 for a field the image

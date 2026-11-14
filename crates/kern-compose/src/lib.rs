@@ -35,6 +35,10 @@ pub use yaml::normalise_devices;
 /// says nothing about `networks:`/`internal:`, and the driver says both here. Pure functions of the
 /// decision, so what gets said can be asserted without capturing stderr.
 pub use yaml::{internal_note, net_ipv4_bridge_note, net_ipv4_note, net_share_note, networks_note};
+/// The one guard for "is this path inside the project", and the one rule for "is this bind source a
+/// relative path". Both the YAML reader (for an included model) and kern-cli (for a top-level file)
+/// ask these, so the two cannot drift. See [`yaml::path_under_root`].
+pub use yaml::{is_relative_bind_source, path_under_root};
 
 /// A resolved compose `build:` directive. `context` is a path RELATIVE to the compose file's dir (the
 /// caller confines it beneath that dir before use - traversal guard). `dockerfile` is relative to the
@@ -52,6 +56,25 @@ pub struct BuildDirective {
     /// then runs an image nobody asked for, with nothing said. That is the one failure mode this
     /// compose implementation refuses to have.
     pub target: Option<String>,
+    /// `build.secrets:` - what a `RUN --mount=type=secret` in the Dockerfile reads, resolved against
+    /// the file's top-level `secrets:`. Without them the build used to stop at the first such RUN.
+    pub secrets: Vec<BuildSecret>,
+    /// `build.ssh:` - `default`, `<id>`, or `<id>=<socket|key>`, as `kern build --ssh` takes them.
+    pub ssh: Vec<String>,
+    /// `build.platforms:` - the platforms to build for, as `kern build --platform` takes them.
+    pub platforms: Vec<String>,
+}
+
+/// One `build.secrets:` entry.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BuildSecret {
+    /// The id the Dockerfile names (`--mount=type=secret,id=`): the long form's `target:`, else the
+    /// secret's own name.
+    pub id: String,
+    /// The top-level secret's `file:`, relative to the compose file.
+    pub file: Option<String>,
+    /// The top-level secret's `environment:` variable.
+    pub env: Option<String>,
 }
 
 /// The resource-profile kinds a compose file may name.
@@ -319,6 +342,13 @@ pub struct ComposeBox {
     ///
     /// NOT HONOURED FROM THE FILE ALONE either: the same gate reads it.
     pub device: Option<String>,
+    /// `runtime: nvidia`: the GPUs the box's own `NVIDIA_VISIBLE_DEVICES` names, as NVIDIA's runtime
+    /// grants them under docker. Emitted as `kern box --runtime nvidia` only when the service has no
+    /// explicit request (`gpus:`, a reservation, a CDI name), which wins, as it does under docker.
+    /// Read by the same operator gate as every other GPU request.
+    pub runtime_nvidia: bool,
+    /// `security_opt: [no-new-privileges:true]`: `--security-opt no-new-privileges`.
+    pub no_new_privs: bool,
     /// tmpfs mounts that came from a LONG-FORM `volumes:` entry (`{type: tmpfs, target: …}`), kept
     /// apart from `tmpfs` for the same reason `devices` is kept apart from `volumes`: the `tmpfs:`
     /// key ASSIGNS its field, and the service keys are read in file order, so anything appended to
@@ -455,6 +485,8 @@ pub struct ComposeBox {
     /// Compose `sysctls:` → one `--sysctl KEY=VALUE` per entry (mapping or `KEY=VALUE` list form).
     pub sysctls: Vec<String>,
     pub cap_add: Vec<String>,
+    /// Compose `group_add:` → one `--group-add` per entry, a group name or a gid, as docker takes it.
+    pub group_add: Vec<String>,
     /// Compose `privileged: true`, RECORDED rather than acted on by the parser.
     ///
     /// WHAT DOCKER GIVES AND WHAT A ROOTLESS RUNTIME CAN GIVE ARE NOT THE SAME THING. Docker's
@@ -735,6 +767,12 @@ impl ComposeBox {
         if let Some(name) = &self.device {
             cmd.arg("--device").arg(name);
         }
+        if self.no_new_privs {
+            cmd.arg("--security-opt").arg("no-new-privileges");
+        }
+        if self.runtime_nvidia && self.gpus.is_none() && self.device.is_none() {
+            cmd.arg("--runtime").arg("nvidia");
+        }
         if let Some(p) = &self.apparmor {
             cmd.arg("--apparmor").arg(p);
         }
@@ -937,6 +975,9 @@ impl ComposeBox {
         }
         for v in &self.cap_add {
             cmd.arg("--cap-add").arg(v);
+        }
+        for v in &self.group_add {
+            cmd.arg("--group-add").arg(v);
         }
         for v in &self.cap_drop {
             cmd.arg("--cap-drop").arg(v);
@@ -1145,7 +1186,7 @@ pub fn parse_with_env(
     dotenv: &DotEnv,
     net: StackNet,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, true, net, None, false)
+    parse_layer(text, dotenv, true, net, None, false, None)
 }
 
 /// [`parse_with_env`] for a file that exists ON DISK, whose directory is where its own relative
@@ -1162,7 +1203,7 @@ pub fn parse_with_env_at(
     net: StackNet,
     dir: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, true, net, dir, false)
+    parse_layer(text, dotenv, true, net, dir, false, None)
 }
 
 /// Parse an OVERRIDE layer (`-f base.yml -f override.yml`, every file after the first).
@@ -1176,7 +1217,7 @@ pub fn parse_override(
     dotenv: &DotEnv,
     net: StackNet,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, false, net, None, false)
+    parse_layer(text, dotenv, false, net, None, false, None)
 }
 
 /// [`parse_override`] for an override file on disk - see [`parse_with_env_at`] for what the
@@ -1187,7 +1228,7 @@ pub fn parse_override_at(
     net: StackNet,
     dir: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, false, net, dir, false)
+    parse_layer(text, dotenv, false, net, dir, false, None)
 }
 
 /// One file of a MULTI-FILE stack (`-f a -f b`, every file including the first), read with its
@@ -1204,14 +1245,67 @@ pub fn parse_stack_file_at(
     net: StackNet,
     dir: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeBox>, String> {
-    parse_layer(text, dotenv, false, net, dir, true)
+    parse_layer(text, dotenv, false, net, dir, true, None)
+}
+
+/// [`parse_stack_file_in`] with the `(service, key)` pairs a LATER `-f` file marks `!reset` or
+/// `!override` removed from this file's services first, which is how Docker's merge reads the two
+/// tags. See [`merge_tag_keys`].
+pub fn parse_stack_file_in_dropping(
+    text: &str,
+    dotenv: &DotEnv,
+    net: StackNet,
+    dir: Option<&std::path::Path>,
+    root: Option<&std::path::Path>,
+    drop: &[(String, String)],
+) -> Result<Vec<ComposeBox>, String> {
+    yaml::with_dropped_keys(drop, || parse_stack_file_in(text, dotenv, net, dir, root))
+}
+
+/// The `(service, key)` pairs a compose file marks `!reset` or `!override`: the files before it in
+/// a `-f` list must not contribute those keys. Empty for a TOML file, which has no such tags.
+pub fn merge_tag_keys(text: &str) -> Result<Vec<(String, String)>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if is_yaml(text) {
+        yaml::merge_tag_keys(text)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// [`parse_with_env_at`] with the project ROOT an `include:` may not leave: the directory the
+/// operator widened the project to with `kern compose --project-root`, which must contain `dir`.
+/// Relative paths still resolve from `dir`, as docker resolves them.
+pub fn parse_with_env_in(
+    text: &str,
+    dotenv: &DotEnv,
+    net: StackNet,
+    dir: Option<&std::path::Path>,
+    root: Option<&std::path::Path>,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, true, net, dir, false, root)
+}
+
+/// [`parse_stack_file_at`] with the project root, as [`parse_with_env_in`].
+pub fn parse_stack_file_in(
+    text: &str,
+    dotenv: &DotEnv,
+    net: StackNet,
+    dir: Option<&std::path::Path>,
+    root: Option<&std::path::Path>,
+) -> Result<Vec<ComposeBox>, String> {
+    parse_layer(text, dotenv, false, net, dir, true, root)
 }
 
 /// The profile decision for a merged stack: the same two functions a single-file parse runs, so a
 /// file read alone and the same file read as `-f` cannot disagree about which services start.
 pub fn apply_profiles(boxes: Vec<ComposeBox>) -> Result<Vec<ComposeBox>, String> {
     let (kept, skipped, inactive) = yaml::split_inactive_profiles(boxes);
-    yaml::finish_profiles(kept, &skipped, &inactive)
+    let mut boxes = yaml::finish_profiles(kept, &skipped, &inactive)?;
+    // THE GATES TOO, for the same reason as the profiles: a layer read alone cannot know whether a
+    // `service_healthy` target has a healthcheck in another layer. Decided once, on the merged stack.
+    yaml::degrade_orphan_health_gates(&mut boxes);
+    Ok(boxes)
 }
 
 /// Assert every service ended up with something to run. Called on the merged stack (see
@@ -1333,6 +1427,7 @@ fn parse_layer(
     net: StackNet,
     dir: Option<&std::path::Path>,
     defer_profiles: bool,
+    root: Option<&std::path::Path>,
 ) -> Result<Vec<ComposeBox>, String> {
     // Strip a leading UTF-8 BOM (Windows editors add one) so the first key/table header is recognized
     // - Docker/YAML ignore a BOM, and without this it glues onto `services`/`[box.…]` and the file
@@ -1346,7 +1441,15 @@ fn parse_layer(
         return Err("the file is empty: a compose file needs a `services:` block".into());
     }
     if is_yaml(text) {
-        yaml::parse_with_env(text, dotenv, require_runnable, net, dir, defer_profiles)
+        yaml::parse_with_env_rooted(
+            text,
+            dotenv,
+            require_runnable,
+            net,
+            dir,
+            defer_profiles,
+            root,
+        )
     } else {
         parse_toml(text)
     }
@@ -1469,6 +1572,8 @@ impl ComposeBox {
             health_from_image,
             only_internal_networks,
             on_internal_network,
+            runtime_nvidia,
+            no_new_privs,
         );
         if o.uid_range_explicit_false {
             self.uid_range_explicit_false = true;
@@ -1487,6 +1592,7 @@ impl ComposeBox {
             secrets,
             tmpfs,
             cap_add,
+            group_add,
             cap_drop,
             add_host,
             ulimits,
@@ -3863,6 +3969,84 @@ mod dotenv_tests {
         );
     }
 
+    /// `group_add:` IS DOCKER'S, and reaches the box as `--group-add`, one per entry. Measured on a
+    /// Jetson before it was read: "'group_add:' ignored (unsupported)".
+    #[test]
+    fn group_add_becomes_one_group_add_flag_per_entry() {
+        let b = parse("services:\n  a:\n    image: alpine\n    group_add: [video, \"1234\"]\n")
+            .expect("parses")
+            .remove(0);
+        assert_eq!(b.group_add, ["video", "1234"]);
+        let mut cmd = std::process::Command::new("kern");
+        b.push_box_flags(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2).any(|w| w == ["--group-add", "video"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--group-add", "1234"]),
+            "{args:?}"
+        );
+    }
+
+    /// `!reset` AND `!override` IN AN OVERRIDE, Docker's merge tags. Measured on a Jetson before
+    /// they were read: `gpus: !reset []` in an override that was meant to REMOVE the GPU made the
+    /// service ask for one named `!reset []`. Here: a reset GPU and a reset environment are gone
+    /// after the merge, an overridden port list replaces the base's instead of appending to it, a
+    /// key the override does not tag still merges, and the base read WITHOUT the drop list keeps
+    /// everything, which is the control that the drop list is what removed them.
+    #[test]
+    fn reset_and_override_tags_shape_the_merge_as_docker_does() {
+        let base_text = concat!(
+            "services:\n  app:\n    image: img\n    gpus: all\n",
+            "    ports: ['5000:5000']\n    environment: [A=1]\n    labels: [base=1]\n",
+        );
+        let over_text = concat!(
+            "services:\n  app:\n    gpus: !reset []\n    environment: !reset {}\n",
+            "    ports: !override\n      - '6000:6000'\n    labels: [over=1]\n",
+        );
+        let drop = merge_tag_keys(over_text).expect("tags read");
+        let mut keys: Vec<&str> = drop.iter().map(|(_, k)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["environment", "gpus", "ports"]);
+        let net = StackNet::Pod;
+        let base =
+            parse_stack_file_in_dropping(base_text, &DotEnv::default(), net, None, None, &drop)
+                .expect("base parses");
+        let over =
+            parse_stack_file_in_dropping(over_text, &DotEnv::default(), net, None, None, &[])
+                .expect("override parses");
+        let m = merge_stacks(base, over);
+        let b = &m[0];
+        assert_eq!(b.gpus, None, "`!reset` removed the GPU");
+        assert!(
+            b.env.is_empty(),
+            "`!reset` removed the environment: {:?}",
+            b.env
+        );
+        assert_eq!(
+            b.ports,
+            vec!["6000:6000".to_string()],
+            "`!override` replaced the ports"
+        );
+        assert_eq!(
+            b.labels.len(),
+            2,
+            "an untagged key still merges: {:?}",
+            b.labels
+        );
+        // THE CONTROL: the same base without the drop list keeps all of it.
+        let whole =
+            parse_stack_file_in_dropping(base_text, &DotEnv::default(), net, None, None, &[])
+                .expect("base parses");
+        assert_eq!(whole[0].gpus.as_deref(), Some("all"));
+        assert_eq!(whole[0].ports.len(), 1);
+    }
+
     /// THE SHAPE THE STRUCTURAL GUARD EXISTS FOR, as real projects write it: a base with the
     /// service, and a GPU override that only adds the reservation. Measured on ncoevoet/facet before
     /// the fix: the override alone warned that the service asked for a GPU, the pair said nothing.
@@ -3909,6 +4093,445 @@ mod dotenv_tests {
             twice[0].devices, alone.devices,
             "an override restating a device must not double it"
         );
+    }
+
+    /// ⛔ A HEALTHCHECK IS MERGED FIELD BY FIELD, AND ITS GATES ARE DECIDED ON THE MERGED STACK.
+    ///
+    /// The three-layer shape of NVIDIA-Omniverse/usd-search, measured against docker 5.0.2: the base
+    /// writes siglip2-triton's `test` with `retries: 5`, an override writes only `retries: 10`, and a
+    /// third layer restates the service for its GPU (no healthcheck) next to a dependent gated on
+    /// `service_healthy`. Docker resolves `test` from the base, `retries: 10`, and honours the gate.
+    /// kern dropped the override's numbers, warned "has no `test`", and degraded the gate for good.
+    #[test]
+    fn a_healthcheck_merges_field_by_field_and_its_gate_survives_the_layers() {
+        let layer = |t: &str| {
+            parse_stack_file_at(t, &DotEnv::default(), StackNet::Pod, None).expect("layer parses")
+        };
+        let base = layer(
+            "services:\n  tgt:\n    image: img\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n      retries: 5\n",
+        );
+        let tune = layer(
+            "services:\n  tgt:\n    healthcheck:\n      retries: 10\n      start_period: 60s\n",
+        );
+        let gpu = layer(concat!(
+            "services:\n",
+            "  tgt:\n    deploy:\n      resources:\n        reservations:\n          devices:\n",
+            "            - driver: nvidia\n              count: all\n              capabilities: [gpu]\n",
+            "  dep:\n    image: img\n    depends_on:\n      tgt:\n        condition: service_healthy\n",
+        ));
+        let merged = apply_profiles(merge_stacks(merge_stacks(base, tune), gpu)).expect("merges");
+        let tgt = merged.iter().find(|b| b.name == "tgt").expect("tgt");
+        let dep = merged.iter().find(|b| b.name == "dep").expect("dep");
+        assert_eq!(
+            tgt.health_argv,
+            vec!["true".to_string()],
+            "the base's test survives"
+        );
+        assert_eq!(
+            tgt.health_retries.as_deref(),
+            Some("10"),
+            "the override's number applies"
+        );
+        assert!(tgt.gpus.is_some(), "the third layer's card is kept too");
+        assert_eq!(
+            dep.depends_healthy,
+            vec!["tgt".to_string()],
+            "the gate is honoured"
+        );
+        assert!(
+            dep.degraded_health.is_empty(),
+            "and not deferred as if it had no healthcheck"
+        );
+    }
+
+    /// A project on disk for the `include:` tests: `files` are (relative path, content), written
+    /// beneath a fresh directory that the guard is returned for, and removed when it drops.
+    struct Project(std::path::PathBuf);
+    impl Project {
+        fn new(tag: &str, files: &[(&str, &str)]) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "kern-include-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            for (rel, body) in files {
+                let f = root.join(rel);
+                if let Some(d) = f.parent() {
+                    std::fs::create_dir_all(d).expect("fixture dir");
+                }
+                std::fs::write(&f, body).expect("fixture file");
+            }
+            std::fs::create_dir_all(&root).expect("fixture root");
+            Project(std::fs::canonicalize(&root).expect("canonical root"))
+        }
+        fn parse(&self, dotenv: &DotEnv) -> Result<Vec<ComposeBox>, String> {
+            let text = std::fs::read_to_string(self.0.join("compose.yml")).expect("top file");
+            parse_with_env_at(&text, dotenv, StackNet::Pod, Some(&self.0))
+        }
+    }
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn by_name<'a>(boxes: &'a [ComposeBox], name: &str) -> &'a ComposeBox {
+        boxes.iter().find(|b| b.name == name).unwrap_or_else(|| {
+            panic!(
+                "no service '{name}' in {:?}",
+                boxes.iter().map(|b| &b.name).collect::<Vec<_>>()
+            )
+        })
+    }
+
+    /// ⛔ `include:` IS READ, IN BOTH SPELLINGS, AND AN INCLUDED MODEL'S PATHS ARE ITS OWN.
+    ///
+    /// The shape of NVIDIA-Omniverse/usd-search, which kern could not start: a top file including
+    /// models under `infra/compose/`, whose relative paths are written from THERE
+    /// (`context: ../../services/...`). MEASURED on that project, docker resolved them against the
+    /// included file's directory; read as an extra `-f` they landed outside the project.
+    #[test]
+    fn include_reads_both_spellings_and_anchors_each_models_paths_to_its_own_directory() {
+        let p = Project::new(
+            "forms",
+            &[
+                (
+                    "compose.yml",
+                    "include:\n  - infra/redis.yml\n  - path:\n      - infra/db.yml\n      - infra/db.override.yml\nservices:\n  app:\n    image: alpine\n    depends_on: [redis, db]\n    volumes:\n      - ./data:/d\n",
+                ),
+                (
+                    "infra/redis.yml",
+                    "services:\n  redis:\n    image: redis\n    volumes:\n      - ./redisdata:/data\n    build:\n      context: ../svc/redis\n    env_file: [./redis.env]\n",
+                ),
+                ("infra/redis.env", "A=1\n"),
+                ("infra/db.yml", "services:\n  db:\n    image: postgres\n"),
+                (
+                    "infra/db.override.yml",
+                    "services:\n  db:\n    environment:\n      - FROM_OVERRIDE=1\n",
+                ),
+            ],
+        );
+        let boxes = p.parse(&DotEnv::default()).expect("the stack parses");
+        let names: std::collections::BTreeSet<&str> =
+            boxes.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["app", "db", "redis"].into_iter().collect());
+        let redis = by_name(&boxes, "redis");
+        let infra = p.0.join("infra");
+        assert_eq!(
+            redis.volumes,
+            vec![format!("{}:/data", infra.join("redisdata").display())]
+        );
+        assert_eq!(
+            redis.build.as_ref().map(|b| b.context.clone()),
+            Some(p.0.join("svc/redis").display().to_string()),
+            "a context written from infra/ resolves from infra/, up to the project"
+        );
+        assert_eq!(
+            redis.env_file,
+            vec![infra.join("redis.env").display().to_string()]
+        );
+        // The model's override, in its own `path` list, was merged into it.
+        assert!(by_name(&boxes, "db")
+            .env
+            .iter()
+            .any(|e| e == "FROM_OVERRIDE=1"));
+        // The TOP file's relative path stays relative: kern-cli resolves it against the project, late,
+        // which is what keeps a later `-f` layer right too.
+        assert_eq!(
+            by_name(&boxes, "app").volumes,
+            vec!["./data:/d".to_string()]
+        );
+
+        // ⛔ AND WITH THE DIRECTORY GIVEN RELATIVE, which is what `kern compose` hands over for a file
+        // in the working directory (`.`). MEASURED on usd-search: every include was refused as
+        // escaping the project it sat in, because a relative path was compared with an absolute root.
+        // A test may not change the working directory (it is the whole process's), so the project is
+        // made under the workspace's `target/` (ignored by git) and named RELATIVELY from the crate
+        // directory cargo runs tests in. A relative path that climbs all the way to `/` would not
+        // reproduce the defect, which is why it is `../../target/...` and not a path to /tmp.
+        let local_name = format!("kern-include-relative-{}", std::process::id());
+        let local = std::path::Path::new("../../target").join(&local_name);
+        let _ = std::fs::remove_dir_all(&local);
+        for (rel, body) in [
+            ("compose.yml", "include:\n  - infra/m.yml\n"),
+            (
+                "infra/m.yml",
+                "services:\n  m:\n    image: alpine\n    volumes:\n      - ./d:/d\n",
+            ),
+        ] {
+            let f = local.join(rel);
+            std::fs::create_dir_all(f.parent().expect("parent")).expect("fixture dir");
+            std::fs::write(&f, body).expect("fixture file");
+        }
+        let text = std::fs::read_to_string(local.join("compose.yml")).expect("top file");
+        let got = parse_with_env_at(&text, &DotEnv::default(), StackNet::Pod, Some(&local));
+        let want = std::fs::canonicalize(&local)
+            .expect("canonical")
+            .join("infra/d");
+        let _ = std::fs::remove_dir_all(&local);
+        let got = got.expect("a project named by a relative directory parses");
+        assert_eq!(got[0].volumes, vec![format!("{}:/d", want.display())]);
+    }
+
+    /// ⛔ AN INCLUDED MODEL IS NOT A WAY OUT OF THE PROJECT: not by naming a file outside it, not by a
+    /// relative path inside the model, and not through a symlink.
+    #[test]
+    fn an_include_cannot_reach_outside_the_project_by_name_by_path_or_by_symlink() {
+        let outside =
+            std::env::temp_dir().join(format!("kern-include-outside-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&outside);
+        let _ = std::fs::write(
+            outside.join("m.yml"),
+            "services:\n  x:\n    image: alpine\n",
+        );
+
+        let by_name = Project::new(
+            "out-name",
+            &[("compose.yml", "include:\n  - ../m.yml\nservices: {}\n")],
+        );
+        let err = by_name
+            .parse(&DotEnv::default())
+            .expect_err("a file above the project is refused");
+        assert!(err.contains("escapes the project directory"), "{err}");
+
+        let by_path = Project::new(
+            "out-path",
+            &[
+                ("compose.yml", "include:\n  - infra/m.yml\nservices: {}\n"),
+                ("infra/m.yml", "services:\n  x:\n    image: alpine\n    volumes:\n      - ../../../etc:/host-etc\n"),
+            ],
+        );
+        let err = by_path
+            .parse(&DotEnv::default())
+            .expect_err("a bind out of the project is refused");
+        assert!(
+            err.contains("escapes the project directory") && err.contains("'x'"),
+            "{err}"
+        );
+
+        let by_link = Project::new(
+            "out-link",
+            &[("compose.yml", "include:\n  - link/m.yml\nservices: {}\n")],
+        );
+        std::os::unix::fs::symlink(&outside, by_link.0.join("link")).expect("symlink fixture");
+        let err = by_link
+            .parse(&DotEnv::default())
+            .expect_err("a symlink out of the project is refused");
+        assert!(err.contains("through a symlink"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A cycle, an unknown key, and a text that is not on disk: each is refused with its cause. And a
+    /// name defined twice is NOT refused: it is merged, with the precedence docker applies.
+    ///
+    /// MEASURED on docker compose 5.0.2 (the Specification's text says "error", the reference does
+    /// not): the including file's service on top of an included one keeps the file's image and the
+    /// environment of both; two includes defining one name give it the EARLIER include's image, the
+    /// environment of both and the later one's volume.
+    #[test]
+    fn include_refuses_a_cycle_an_unknown_key_and_a_text_with_no_file() {
+        let over = Project::new(
+            "over",
+            &[
+                (
+                    "compose.yml",
+                    "include:\n  - m.yml\nservices:\n  x:\n    image: from-file\n    environment: [FROM_FILE=1]\n",
+                ),
+                ("m.yml", "services:\n  x:\n    image: from-include\n    environment: [FROM_INCLUDE=1]\n"),
+            ],
+        );
+        let boxes = over
+            .parse(&DotEnv::default())
+            .expect("a shared name is merged, not refused");
+        let x = by_name(&boxes, "x");
+        assert_eq!(
+            x.image.as_deref(),
+            Some("from-file"),
+            "the including file wins a scalar"
+        );
+        for e in ["FROM_FILE=1", "FROM_INCLUDE=1"] {
+            assert!(
+                x.env.iter().any(|v| v == e),
+                "{e} must survive: {:?}",
+                x.env
+            );
+        }
+        assert_eq!(boxes.len(), 1, "one service, not two");
+
+        let two = Project::new(
+            "two",
+            &[
+                ("compose.yml", "include:\n  - a.yml\n  - b.yml\n"),
+                ("a.yml", "services:\n  y:\n    image: from-a\n    environment: [FROM_A=1]\n"),
+                (
+                    "b.yml",
+                    "services:\n  y:\n    image: from-b\n    environment: [FROM_B=1]\n    volumes: [./b:/b]\n",
+                ),
+            ],
+        );
+        let boxes = two.parse(&DotEnv::default()).expect("parses");
+        let y = by_name(&boxes, "y");
+        assert_eq!(
+            y.image.as_deref(),
+            Some("from-a"),
+            "the earlier include wins a scalar"
+        );
+        assert!(y.env.iter().any(|v| v == "FROM_A=1") && y.env.iter().any(|v| v == "FROM_B=1"));
+        assert_eq!(
+            y.volumes,
+            vec![format!("{}:/b", two.0.join("b").display())],
+            "the later list entry stays"
+        );
+
+        let cycle = Project::new(
+            "cycle",
+            &[
+                ("compose.yml", "include:\n  - a.yml\nservices: {}\n"),
+                (
+                    "a.yml",
+                    "include:\n  - b.yml\nservices:\n  a:\n    image: alpine\n",
+                ),
+                (
+                    "b.yml",
+                    "include:\n  - a.yml\nservices:\n  b:\n    image: alpine\n",
+                ),
+            ],
+        );
+        let err = cycle
+            .parse(&DotEnv::default())
+            .expect_err("a cycle is refused");
+        assert!(err.contains("cycle"), "{err}");
+
+        let unknown = Project::new(
+            "unknown",
+            &[
+                (
+                    "compose.yml",
+                    "include:\n  - path: m.yml\n    projectdir: x\nservices: {}\n",
+                ),
+                ("m.yml", "services:\n  m:\n    image: alpine\n"),
+            ],
+        );
+        let err = unknown
+            .parse(&DotEnv::default())
+            .expect_err("an unknown key is refused");
+        assert!(err.contains("projectdir"), "{err}");
+
+        let err = parse("include:\n  - m.yml\nservices:\n  s:\n    image: alpine\n")
+            .expect_err("text with no file cannot include");
+        assert!(err.contains("not read from a file"), "{err}");
+    }
+
+    /// An included model interpolates against ITS `.env`, the including file against its own, and a
+    /// file made only of `include:` is a valid file. The variable names are unique to this test so the
+    /// process environment, which wins over both, cannot decide it.
+    #[test]
+    fn an_included_model_uses_its_own_env_and_a_file_of_only_includes_is_valid() {
+        let v = "KERN_INCLUDE_TEST_IMAGE_9c41";
+        assert!(std::env::var_os(v).is_none());
+        let p = Project::new(
+            "env",
+            &[
+                (
+                    "compose.yml",
+                    &format!("include:\n  - infra/m.yml\nservices:\n  top:\n    image: ${{{v}}}\n"),
+                ),
+                (
+                    "infra/m.yml",
+                    &format!("services:\n  inc:\n    image: ${{{v}}}\n"),
+                ),
+                ("infra/.env", &format!("{v}=from-include-dir\n")),
+            ],
+        );
+        let boxes = p
+            .parse(&parse_dotenv(&format!("{v}=from-top\n")))
+            .expect("parses");
+        assert_eq!(by_name(&boxes, "top").image.as_deref(), Some("from-top"));
+        assert_eq!(
+            by_name(&boxes, "inc").image.as_deref(),
+            Some("from-include-dir")
+        );
+
+        let only = Project::new(
+            "only",
+            &[
+                ("compose.yml", "include:\n  - m.yml\n"),
+                ("m.yml", "services:\n  m:\n    image: alpine\n"),
+            ],
+        );
+        let boxes = only
+            .parse(&DotEnv::default())
+            .expect("a file of only includes parses");
+        assert_eq!(boxes.len(), 1);
+    }
+
+    /// AN INCLUDED SERVICE'S PROFILES ARE DECIDED WITH THE STACK'S, so a gated one stays out and the
+    /// rest of the model runs.
+    #[test]
+    fn an_included_services_profile_is_decided_with_the_rest_of_the_stack() {
+        let p = Project::new(
+            "profile",
+            &[
+                ("compose.yml", "include:\n  - m.yml\nservices:\n  top:\n    image: alpine\n"),
+                (
+                    "m.yml",
+                    "services:\n  on:\n    image: alpine\n  gated:\n    image: alpine\n    profiles: [kern-include-never-active]\n",
+                ),
+            ],
+        );
+        let boxes = p.parse(&DotEnv::default()).expect("parses");
+        let names: std::collections::BTreeSet<&str> =
+            boxes.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["on", "top"].into_iter().collect());
+    }
+
+    /// ⛔ A BLOCK SEQUENCE INSIDE A LIST ITEM IS PART OF THE ITEM. Measured against Docker Compose
+    /// v5.0.2: `capabilities:` written as a block list inside a device reservation is
+    /// `{driver: nvidia, capabilities: [gpu], count: 1}` to docker, and kern lost `count` and the card,
+    /// then said the file named no count. And a tmpfs size in the nested `tmpfs:` mapping, in both
+    /// spellings, reaches the mount.
+    #[test]
+    fn a_nested_block_inside_a_list_item_keeps_its_structure() {
+        let block = parse(
+            "services:\n  s:\n    image: alpine\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              capabilities:\n                - gpu\n              count: 1\n",
+        )
+        .expect("parses");
+        let inline = parse(
+            "services:\n  s:\n    image: alpine\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              capabilities: [gpu]\n              count: 1\n",
+        )
+        .expect("parses");
+        assert_eq!(block[0].gpus.as_deref(), Some("1"));
+        assert_eq!(
+            block[0].gpus, inline[0].gpus,
+            "block and flow spellings mean the same"
+        );
+        // THE LIST ITSELF MUST SURVIVE, not only the keys after it: with no `driver:`, the block
+        // `capabilities:` list is the ONLY thing that makes this a GPU request, so a renderer that
+        // dropped the nested sequence would leave a reservation that asks for nothing.
+        let caps_only = parse(
+            "services:\n  s:\n    image: alpine\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - capabilities:\n                - gpu\n              count: 2\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            caps_only[0].gpus.as_deref(),
+            Some("2"),
+            "the block list is what asks for the card"
+        );
+        for tmpfs in [
+            "        tmpfs:\n          size: 8388608\n",
+            "        tmpfs: {size: 8388608}\n",
+        ] {
+            let b = parse(&format!(
+                "services:\n  s:\n    image: alpine\n    volumes:\n      - type: tmpfs\n        target: /scratch\n{tmpfs}"
+            ))
+            .expect("parses");
+            assert_eq!(
+                b[0].tmpfs_from_volumes,
+                vec!["/scratch:size=8388608".to_string()],
+                "{tmpfs}"
+            );
+        }
     }
 
     /// ⛔ PROFILES ARE DECIDED ON THE MERGED STACK, as Docker decides them.

@@ -3855,20 +3855,16 @@ def _host_cannot_map_a_uid_range() -> "str | None":
 def test_no_new_privs_is_what_makes_a_setuid_binary_inert_in_a_box(tmp_path):
     """The guard that actually holds, asserted so the reasoning elsewhere can point at it.
 
-    kern arms `PR_SET_NO_NEW_PRIVS` before the workload runs (seccomp requires it), and that makes the
-    setuid bit inert process-wide however the filesystem is mounted. The `nosuid` flag on a `-v` volume
-    is depth on top of it, which is why losing that flag is not fatal.
+    A `-v` volume keeps the setuid bit, as a docker bind does, and a plain box does not set
+    `PR_SET_NO_NEW_PRIVS` (docker's default). The SDK passes `--security-opt no-new-privileges` on
+    every box, and that flag is what makes a setuid binary inert process-wide however the filesystem
+    is mounted.
 
     The cell is the real scenario and not a proxy: a box drops a setuid-root binary on the shared
-    workspace, then a SECOND box with a uid range runs as uid 1000 and executes it. A false green here
-    is asserting on the mount flags, which says nothing about whether privilege actually moved.
-
-    **The euid assertion has no positive control, and that is the finding rather than a gap.** The
-    configuration it would discriminate against cannot be produced: patching the prctl out makes kern
-    refuse to start the box at all, with `sandbox setup failed: prctl(NO_NEW_PRIVS) failed`, because
-    seccomp requires it and kern fails closed. So the assertion below can only ever pass here, and the
-    statement worth recording is the one the mutation produced: a kern box without no-new-privs is not
-    a box that runs with weaker isolation, it is a box that does not run."""
+    workspace, then a SECOND box with a uid range runs as uid 1000 and executes it, once without the
+    flag (the positive control: euid 0, as under docker) and once with it, as the SDK runs (euid
+    1000). A false green here is asserting on the mount flags, which says nothing about whether
+    privilege actually moved."""
     ws = tmp_path / "ws"
     ws.mkdir()
     ws.chmod(0o755)
@@ -3891,15 +3887,30 @@ def test_no_new_privs_is_what_makes_a_setuid_binary_inert_in_a_box(tmp_path):
     why = _host_cannot_map_a_uid_range()
     if why:
         pytest.skip(f"the second box needs a uid range and this host cannot map one: {why}")
-    out = subprocess.run(
-        [kern_bin, "box", f"nnp-{uuid.uuid4().hex[:8]}", "--image", "alpine", "--uid-range",
-         "--user", "1000", "-v", f"{ws}:/w", "--quiet", "--", "sh", "-c", "id -u; /w/id -u"],
-        capture_output=True, text=True, timeout=120,
+    # THE SAME IMAGE AS THE FIRST BOX. The setuid `id` is that image's glibc binary: under alpine it
+    # does not start ("not found", no glibc loader), and the box's own `id -u` was then the only line,
+    # which read as "the euid stayed 1000". MEASURED: that was this test's green until the positive
+    # control below went red on it.
+    def second_box(*flags):
+        out = subprocess.run(
+            [kern_bin, "box", f"nnp-{uuid.uuid4().hex[:8]}", "--image", kern._DEFAULT_IMAGE,
+             "--uid-range", "--user", "1000", *flags, "-v", f"{ws}:/w", "--quiet", "--", "sh",
+             "-c", "id -u; /w/id -u"],
+            capture_output=True, text=True, timeout=120,
+        )
+        uids = out.stdout.split()
+        assert len(uids) == 2 and uids[0] == "1000", (
+            f"the cell did not run as uid 1000 AND run the setuid id: {out.stdout!r} {out.stderr!r}"
+        )
+        return uids[1]
+
+    assert second_box() == "0", (
+        "without no-new-privileges a setuid-root binary on the volume did not raise uid 1000, as a "
+        "docker bind lets it: the positive control failed, so the next assertion would prove nothing"
     )
-    uids = out.stdout.split()
-    assert uids and uids[0] == "1000", f"the cell did not run as uid 1000: {out.stdout!r} {out.stderr!r}"
-    assert uids[-1] == "1000", (
-        f"a setuid-root binary changed the euid to {uids[-1]}: no-new-privs did not hold"
+    euid = second_box("--security-opt", "no-new-privileges")
+    assert euid == "1000", (
+        f"a setuid-root binary changed the euid to {euid}: no-new-privs did not hold"
     )
 
 

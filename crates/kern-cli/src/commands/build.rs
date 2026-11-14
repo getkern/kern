@@ -6,6 +6,78 @@
 
 use super::*;
 
+/// The version of how a file-writing step resolves its destination, part of that step's layer key.
+///
+/// BUMPED WHEN A CACHED LAYER IS WRONG FOR THE SAME INPUTS. `2`: the destination is resolved through
+/// the image's symlinks (`imagecache::chain_resolve`). `3`: the parents a COPY creates keep the
+/// image's owner and mode (`rootfs::own_created_dirs`). A layer built before that put a real `bin/`
+/// over a usr-merged image's `/bin` symlink, and with the old key it would be reused for ever by a
+/// build of the same Dockerfile: MEASURED, the fixed binary kept failing on a two-line repro until
+/// the step's inputs changed. A new key makes every such layer a miss, once.
+const DST_RESOLUTION: &str = "DSTV3";
+
+/// The version of how a layer gives owners to the directories it creates (`rootfs::own_created_dirs`).
+/// Part of the WORKDIR key for the same reason as [`DST_RESOLUTION`]: a layer from before the rule
+/// put the image's `/home/<user>` under the builder's ownership, and must not be reused.
+const DIR_OWNERSHIP: &str = "OWNV1";
+
+/// Remove from a RUN's new layer the empty mountpoints its bind mounts left, where nothing below
+/// had that path: the image must not keep an empty `pyproject.toml` that only stood in for a mount.
+fn drop_mountpoints(layer: &std::path::Path, below: &[String], binds: &[(String, String, bool)]) {
+    for (_, target, _) in binds {
+        let rel = target.trim_start_matches('/');
+        if rel.is_empty() {
+            continue;
+        }
+        let was_below = below
+            .iter()
+            .any(|d| std::fs::symlink_metadata(std::path::Path::new(d).join(rel)).is_ok());
+        if was_below {
+            continue;
+        }
+        // ⛔ NO LINK ALONG THE PATH: the step wrote this layer, and a link it put in place of a
+        // parent (`mv /a /a2 && ln -s <host dir> /a`) made the host follow it, so the empty file or
+        // directory removed was the HOST's. FOUND BY AUDIT, reproduced rootless. Every directory
+        // walked up below is a prefix of this path, so this one check covers those too.
+        if link_along(layer, rel) {
+            continue;
+        }
+        let here = layer.join(rel);
+        let removed = match std::fs::symlink_metadata(&here) {
+            Ok(m) if m.is_file() && m.len() == 0 => std::fs::remove_file(&here).is_ok(),
+            Ok(m) if m.is_dir() => std::fs::remove_dir(&here).is_ok(),
+            // A socket an SSH mount stood on is created as a file the size of nothing too.
+            Ok(m) if !m.is_dir() && m.len() == 0 => std::fs::remove_file(&here).is_ok(),
+            _ => false,
+        };
+        // AND THE DIRECTORIES THAT EXIST ONLY FOR IT: `/run/secrets/tok` in an image with no `/run`
+        // left an empty `/run/secrets` behind, and BuildKit leaves nothing (measured with buildx
+        // v0.39.0 on busybox: no `/run` in the image). Up the path, while a directory is empty and
+        // nothing below had it.
+        if removed {
+            let mut up = std::path::Path::new(rel).parent();
+            while let Some(p) = up.filter(|p| !p.as_os_str().is_empty()) {
+                let below_has = below
+                    .iter()
+                    .any(|d| std::fs::symlink_metadata(std::path::Path::new(d).join(p)).is_ok());
+                if below_has || std::fs::remove_dir(layer.join(p)).is_err() {
+                    break;
+                }
+                up = p.parent();
+            }
+        }
+    }
+}
+
+/// Whether any component of `rel` under `root`, the last included, is a symbolic link.
+fn link_along(root: &std::path::Path, rel: &str) -> bool {
+    let mut at = root.to_path_buf();
+    rel.split('/').filter(|c| !c.is_empty()).any(|c| {
+        at.push(c);
+        std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink())
+    })
+}
+
 /// One build record as a JSON object - the single emitter for both `kern builds --json` (an array of
 /// these) and `kern build inspect --json` (one of these), so the two can't drift on fields or escaping.
 fn build_json(r: &crate::builds::Record) -> String {
@@ -256,7 +328,180 @@ fn build_arg_map(args: &BuildArgs) -> Result<std::collections::HashMap<String, S
     Ok(m)
 }
 
+/// `kern build`, for this machine or for the platforms `--platform` names.
+///
+/// ONE PLATFORM builds the image under the name asked for, with its base images and every RUN that
+/// platform's (a RUN of another architecture goes through the kernel's binfmt handler; see
+/// [`check_emulation`]), and its config saying which architecture it is: what `docker build
+/// --platform` produces. SEVERAL build one variant each, under `<name>__<os>_<arch>`, then give the
+/// name to this machine's variant (else the first), and record the set in `<name>.platforms` for
+/// `kern push`, which publishes a manifest list: what `docker buildx build --platform a,b --push`
+/// publishes. Measured first that an arm64 rootfs runs here through qemu-user.
 pub fn build(args: BuildArgs) -> Result<(), Error> {
+    let mut platforms: Vec<kern_oci::Platform> = Vec::new();
+    for p in args.platforms {
+        let p = kern_oci::Platform::parse(p).map_err(|e| Error::Build(e.to_string()))?;
+        if !platforms.contains(&p) {
+            platforms.push(p);
+        }
+    }
+    let tag = args
+        .tag
+        .filter(|t| !t.is_empty())
+        .ok_or(Error::Usage("build needs -t <name[:tag]>"))?;
+    // A NAME REBUILT FOR ONE PLATFORM IS NO LONGER A LIST: its old variants would otherwise be what
+    // `kern push` publishes.
+    let drop_list = |name: &str| {
+        let _ = std::fs::remove_file(platforms_file(name));
+    };
+    match platforms.as_slice() {
+        [] => {
+            build_one(args)?;
+            drop_list(tag);
+            args.extra_tags.iter().for_each(|t| drop_list(t));
+            Ok(())
+        }
+        [one] => {
+            with_image_platform(Some(one.clone()), || build_one(args))?;
+            drop_list(tag);
+            args.extra_tags.iter().for_each(|t| drop_list(t));
+            stamp_architecture(tag, one)?;
+            for extra in args.extra_tags {
+                stamp_architecture(extra, one)?;
+            }
+            Ok(())
+        }
+        many => {
+            let mut variants: Vec<(kern_oci::Platform, String)> = Vec::new();
+            for p in many {
+                let variant = platform_variant_tag(tag, p);
+                kern_common::progress!("→ building for {}/{} as {variant}", p.os, p.arch);
+                let one = BuildArgs {
+                    tag: Some(&variant),
+                    extra_tags: &[],
+                    ..args
+                };
+                with_image_platform(Some(p.clone()), || build_one(one))?;
+                stamp_architecture(&variant, p)?;
+                variants.push((p.clone(), variant));
+            }
+            let host = kern_oci::Platform::host();
+            let primary = variants
+                .iter()
+                .find(|(p, _)| *p == host)
+                .or_else(|| variants.first())
+                .map(|(_, v)| v.clone())
+                .ok_or(Error::Usage("build --platform needs at least one platform"))?;
+            crate::commands::tag(&primary, tag)?;
+            write_platforms(tag, &variants)?;
+            for extra in args.extra_tags {
+                crate::commands::tag(tag, extra)?;
+                write_platforms(extra, &variants)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The local name of one platform's variant of `tag`: `repo:tag__linux_arm64`.
+pub(crate) fn platform_variant_tag(tag: &str, p: &kern_oci::Platform) -> String {
+    let full = kern_oci::normalize_ref(tag);
+    let (repo, t) = kern_oci::split_tag(&full).unwrap_or((full.as_str(), "latest"));
+    format!(
+        "{repo}:{t}{}",
+        crate::commands::imagecache::platform_suffix(p)
+    )
+}
+
+/// Where a multi-platform image lists its variants: `<cache>/<stem>.platforms`.
+fn platforms_file(tag: &str) -> std::path::PathBuf {
+    cache_dir().join(format!("{}.platforms", sanitize_ref(tag)))
+}
+
+/// Write which platform an image is into its config, where the build did not (a `FROM scratch`
+/// image has no base to inherit it from).
+fn stamp_architecture(tag: &str, p: &kern_oci::Platform) -> Result<(), Error> {
+    let file = cache_dir().join(format!("{}.image", sanitize_ref(tag)));
+    let mut config = read_image_config(&file);
+    if config.architecture.as_deref() != Some(p.arch.as_str()) {
+        config.architecture = Some(p.arch.clone());
+        write_image_config(&file, &config)
+            .map_err(|e| Error::Build(format!("image config for '{tag}': {e}")))?;
+    }
+    Ok(())
+}
+
+/// Record a multi-platform image's variants beside it: one `<os>/<arch> <variant tag>` per line.
+fn write_platforms(tag: &str, variants: &[(kern_oci::Platform, String)]) -> Result<(), Error> {
+    let body: String = variants
+        .iter()
+        .map(|(p, v)| format!("{}/{} {v}\n", p.os, p.arch))
+        .collect();
+    std::fs::write(platforms_file(tag), body)
+        .map_err(|e| Error::Build(format!("platforms of '{tag}': {e}")))
+}
+
+/// A multi-platform image's variants, as [`write_platforms`] recorded them, or `None` for an image
+/// of one platform.
+pub(crate) fn read_platforms(tag: &str) -> Option<Vec<(kern_oci::Platform, String)>> {
+    let body = std::fs::read_to_string(platforms_file(tag)).ok()?;
+    let list: Vec<(kern_oci::Platform, String)> = body
+        .lines()
+        .filter_map(|l| {
+            let (p, v) = l.trim().split_once(' ')?;
+            Some((kern_oci::Platform::parse(p).ok()?, v.trim().to_string()))
+        })
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// A RUN for another platform needs the kernel to run that architecture's binaries, inside a user
+/// namespace: a binfmt_misc handler for it with the F flag (the interpreter opened when it was
+/// registered, so it works whatever the box's root holds). Asked once per RUN of such a build, and
+/// refused BEFORE the box starts with what to install, instead of an "exec format error" from inside.
+pub(crate) fn check_emulation(p: &kern_oci::Platform) -> Result<(), Error> {
+    if p.is_host() {
+        return Ok(());
+    }
+    let qemu = match p.arch.as_str() {
+        "amd64" => "x86_64",
+        "arm64" => "aarch64",
+        "386" => "i386",
+        other => other,
+    };
+    let entry = format!("/proc/sys/fs/binfmt_misc/qemu-{qemu}");
+    let body = std::fs::read_to_string(&entry).unwrap_or_default();
+    let Some(why) = emulation_problem(&p.arch, &entry, &body) else {
+        return Ok(());
+    };
+    Err(Error::Build(format!(
+        "a RUN for {}/{}: {why}. Install qemu-user with its binfmt registration (Debian/Ubuntu: \
+         apt install qemu-user-static, which registers it with the F flag), or build on a {} machine",
+        p.os, p.arch, p.arch
+    )))
+}
+
+/// What is wrong with a binfmt_misc entry `body` (read from `entry`) for running `arch` in a box, or
+/// `None` when it is usable: enabled, and registered with the F flag.
+fn emulation_problem(arch: &str, entry: &str, body: &str) -> Option<String> {
+    let enabled = body.lines().next().map(str::trim) == Some("enabled");
+    let fix_binary = body
+        .lines()
+        .find_map(|l| l.strip_prefix("flags:"))
+        .is_some_and(|f| f.contains('F'));
+    if enabled && fix_binary {
+        return None;
+    }
+    Some(if body.is_empty() {
+        format!("this kernel has no binfmt handler for {arch} ({entry} does not exist)")
+    } else if !enabled {
+        format!("the binfmt handler for {arch} is disabled ({entry})")
+    } else {
+        format!("the binfmt handler for {arch} lacks the F flag ({entry}), so it cannot run inside a box")
+    })
+}
+
+fn build_one(args: BuildArgs) -> Result<(), Error> {
     let tag = args
         .tag
         .filter(|t| !t.is_empty())
@@ -266,6 +511,8 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
         .map_err(|e| Error::Build(format!("cannot read {}: {e}", dfcanon.display())))?;
     let bmap = build_arg_map(&args)?;
     let instrs = crate::dockerfile::parse(&text, &bmap).map_err(Error::Build)?;
+    // Read before anything runs, so a malformed `--secret` fails the build at its first line.
+    super::buildmounts::set_build_inputs(args.secrets, args.ssh, args.no_cache)?;
 
     let cache = cache_dir();
     own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
@@ -324,6 +571,7 @@ pub fn build(args: BuildArgs) -> Result<(), Error> {
     } else {
         build_run(args.quiet, tag, &ctx, &work, &instrs)
     };
+    super::buildmounts::finish_build(); // the key agents `--ssh id=<key>` started
     remove_build_tree(&work); // overlay leaves mode-000 workdirs; force-clean so nothing leaks
                               // Finalize the record: outcome from `result`, size read back the way `images()` computes it. Drop
                               // the capture (restores stderr) before appending the summary so it lands after the transcript.
@@ -960,12 +1208,18 @@ fn build_run(
         }
     };
     let mut cmd_from_dockerfile = false;
+    let mut run_mounts: Vec<crate::dockerfile::RunMount> = Vec::new();
     let mut i = 1; // instrs[0] is the FROM handled above
     while i < instrs.len() {
         let step = i + 1;
         match &instrs[i] {
             Instr::From { .. } => i += 1, // only one FROM in single-stage (parser+guard enforced)
+            Instr::RunMounts(m) => {
+                run_mounts = m.clone();
+                i += 1;
+            }
             Instr::Run(argv) => {
+                let mounts = std::mem::take(&mut run_mounts);
                 // Batch CONSECUTIVE shell-form RUNs into ONE box, so the per-box overhead (fork+exec
                 // + overlay mount) is paid once, not per step. Each original RUN still runs in its own
                 // `/bin/sh -c` subshell, chained with `&&` (fail-fast, and Docker's per-RUN cwd reset).
@@ -973,6 +1227,10 @@ fn build_run(
                 let mut scripts: Vec<&str> = Vec::new();
                 let mut j = i;
                 while let Some(Instr::Run(a)) = instrs.get(j) {
+                    // A RUN WITH MOUNTS RUNS ALONE: the mounts are its own, not the next RUN's.
+                    if !mounts.is_empty() && j > i {
+                        break;
+                    }
                     match run_shell_script(a) {
                         Some(s) => {
                             announce(j + 1, format!("RUN {s}"));
@@ -988,6 +1246,9 @@ fn build_run(
                 } else {
                     (combine_run_scripts(&scripts), j)
                 };
+                let step_mounts = super::buildmounts::resolve_step_mounts(
+                    ctx, &mounts, &config, work, step, &self_exe,
+                )?;
                 run_build_step(
                     &self_exe,
                     false, // flat fallback: bind-mount the copied rootfs
@@ -997,7 +1258,10 @@ fn build_run(
                     &config,
                     &run_argv,
                     step,
+                    &step_mounts,
                 )?;
+                drop_mountpoints(&write_dir, &base_lower, &step_mounts.targets());
+                drop(step_mounts);
                 i = next;
             }
             Instr::Copy {
@@ -1082,7 +1346,27 @@ fn build_run(
             }
             Instr::Workdir(d) => {
                 let wd = resolve_workdir(config.workdir.as_deref(), d);
+                // THE COMPONENTS THIS CREATES belong to the build USER, as BuildKit makes them; the
+                // ones the image already has are left alone (see `own_created_dirs`).
+                let rel = wd.trim_start_matches('/').to_string();
+                let write_dir_s = write_dir.to_string_lossy().into_owned();
+                let user = config.user.as_deref().and_then(|u| {
+                    resolve_user(u, &Accounts::Layers(std::slice::from_ref(&write_dir_s)))
+                });
+                let (uid, gid) = user.unwrap_or((0, 0));
+                let mut missing: Vec<(String, DirOwner)> = Vec::new();
+                let mut acc = String::new();
+                for part in rel.split('/').filter(|p| !p.is_empty()) {
+                    if !acc.is_empty() {
+                        acc.push('/');
+                    }
+                    acc.push_str(part);
+                    if std::fs::symlink_metadata(write_dir.join(&acc)).is_err() {
+                        missing.push((acc.clone(), DirOwner::Ids(uid, gid)));
+                    }
+                }
                 mkdir_in_rootfs(&write_dir, &wd)?;
+                own_created_dirs(&write_dir, &missing);
                 config.workdir = Some(wd);
                 i += 1;
             }
@@ -1203,6 +1487,7 @@ fn build_layered_cached(
     let ig = crate::dockerignore::DockerIgnore::load(ctx);
     let ctx_root = std::fs::canonicalize(ctx).unwrap_or_else(|_| ctx.to_path_buf());
     let mut i = 1;
+    let mut run_mounts: Vec<crate::dockerfile::RunMount> = Vec::new();
     while i < instrs.len() {
         // The overlay `lowerdir=` string (all layers + base) must fit ~one kernel page. Stop with a
         // clear message BEFORE the chain overflows and the mount fails with a cryptic EINVAL.
@@ -1218,12 +1503,21 @@ fn build_layered_cached(
         let step = i + 1;
         match &instrs[i] {
             Instr::From { .. } => i += 1,
+            Instr::RunMounts(m) => {
+                run_mounts = m.clone();
+                i += 1;
+            }
             Instr::Run(argv) => {
+                let mounts = std::mem::take(&mut run_mounts);
                 // Batch consecutive shell-form RUNs (one box + one cache unit); an exec-form RUN or a
                 // non-RUN ends the batch.
                 let mut scripts: Vec<&str> = Vec::new();
                 let mut j = i;
                 while let Some(Instr::Run(a)) = instrs.get(j) {
+                    // A RUN WITH MOUNTS RUNS ALONE: the mounts are its own, not the next RUN's.
+                    if !mounts.is_empty() && j > i {
+                        break;
+                    }
                     match run_shell_script(a) {
                         Some(s) => {
                             scripts.push(s);
@@ -1238,13 +1532,37 @@ fn build_layered_cached(
                     (combine_run_scripts(&scripts), j, scripts.join("\u{0}"))
                 };
                 // The key folds in the ENV/WORKDIR/USER the box runs with (they change the result).
+                // THE MOUNTED CONTENT IS AN INPUT, as BuildKit keys it: a changed `uv.lock` behind a
+                // bind mount must not reuse the layer built from the old one.
+                // A secret, a cache, an SSH agent and a tmpfs key on what they are, never on what they
+                // hold (see `mount_cache_key`).
+                let mount_key: Vec<String> = mounts
+                    .iter()
+                    .map(|m| {
+                        super::buildmounts::mount_cache_key(m, || {
+                            // From an image or stage the identity is its layer set (the cache
+                            // directories carry the digest); from the context it is the content.
+                            match &m.from {
+                                Some(f) => format!(
+                                    "{f}\u{3}{}\u{3}{}",
+                                    m.source,
+                                    resolve_image(f)
+                                        .map(|(l, _)| l.join(","))
+                                        .unwrap_or_default()
+                                ),
+                                None => content_hash(&ctx.join(&m.source), &ctx_root, ig.as_ref()),
+                            }
+                        })
+                    })
+                    .collect();
                 key = layer_key(
                     &key,
                     &format!(
-                        "RUN\u{0}{body}\u{0}ENV\u{0}{}\u{0}WD\u{0}{}\u{0}U\u{0}{}",
+                        "RUN\u{0}{body}\u{0}ENV\u{0}{}\u{0}WD\u{0}{}\u{0}U\u{0}{}\u{0}M\u{0}{}",
                         config.env.join("\u{1}"),
                         config.workdir.as_deref().unwrap_or(""),
                         config.user.as_deref().unwrap_or(""),
+                        mount_key.join("\u{1}"),
                     ),
                 );
                 let hit = layer_cached(&lc, &key);
@@ -1259,6 +1577,9 @@ fn build_layered_cached(
                 if !hit {
                     let fresh = work.join(format!("u{unit}"));
                     let _ = std::fs::remove_dir_all(&fresh);
+                    let step_mounts = super::buildmounts::resolve_step_mounts(
+                        ctx, &mounts, &config, work, step, &self_exe,
+                    )?;
                     run_build_step(
                         &self_exe,
                         true,
@@ -1268,8 +1589,11 @@ fn build_layered_cached(
                         &config,
                         &run_argv,
                         step,
+                        &step_mounts,
                     )?;
                     let content = build_upper_dir(&fresh);
+                    drop_mountpoints(&content, &chain, &step_mounts.targets());
+                    drop(step_mounts);
                     let _ = std::fs::remove_file(content.join("etc/resolv.conf")); // no host DNS baked in
                     commit_layer(&content, &lc, &key)?;
                     unit += 1;
@@ -1299,7 +1623,7 @@ fn build_layered_cached(
                 key = layer_key(
                     &key,
                     &format!(
-                        "COPY\u{0}{dst}\u{0}CHMOD\u{0}{}\u{0}WD\u{0}{}\u{0}{}",
+                        "COPY\u{0}{DST_RESOLUTION}\u{0}{dst}\u{0}CHMOD\u{0}{}\u{0}WD\u{0}{}\u{0}{}",
                         chmod.as_deref().unwrap_or(""),
                         config.workdir.as_deref().unwrap_or(""),
                         content.join(","),
@@ -1357,7 +1681,7 @@ fn build_layered_cached(
                 key = layer_key(
                     &key,
                     &format!(
-                        "ADDURL\u{0}{url}\u{0}{}\u{0}{}\u{0}{dst}\u{0}WD\u{0}{}",
+                        "ADDURL\u{0}{DST_RESOLUTION}\u{0}{url}\u{0}{}\u{0}{}\u{0}{dst}\u{0}WD\u{0}{}",
                         checksum.as_deref().unwrap_or(""),
                         chmod.as_deref().unwrap_or(""),
                         config.workdir.as_deref().unwrap_or(""),
@@ -1402,7 +1726,7 @@ fn build_layered_cached(
                 key = layer_key(
                     &key,
                     &format!(
-                        "WRITEFILE\u{0}{dst}\u{0}{}\u{0}WD\u{0}{}\u{0}{content}",
+                        "WRITEFILE\u{0}{DST_RESOLUTION}\u{0}{dst}\u{0}{}\u{0}WD\u{0}{}\u{0}{content}",
                         chmod.as_deref().unwrap_or(""),
                         config.workdir.as_deref().unwrap_or(""),
                     ),
@@ -1438,7 +1762,15 @@ fn build_layered_cached(
             }
             Instr::Workdir(d) => {
                 let wd = resolve_workdir(config.workdir.as_deref(), d);
-                key = layer_key(&key, &format!("WD\u{0}{wd}"));
+                // THE USER IS AN INPUT NOW (the directories it creates are the USER's), and so is the
+                // ownership rule: a WORKDIR layer from before it re-owned the image's own parents.
+                key = layer_key(
+                    &key,
+                    &format!(
+                        "WD\u{0}{DIR_OWNERSHIP}\u{0}{wd}\u{0}U\u{0}{}",
+                        config.user.as_deref().unwrap_or("")
+                    ),
+                );
                 let hit = layer_cached(&lc, &key);
                 announce(
                     step,
@@ -1450,6 +1782,17 @@ fn build_layered_cached(
                     own_only_dir(&fresh)
                         .map_err(|e| Error::Sandbox(format!("build layer: {e}")))?;
                     mkdir_in_rootfs(&fresh, &wd)?;
+                    // The image's own parents keep their owner; what WORKDIR creates is the build
+                    // USER's, as BuildKit makes it (see `own_created_dirs`).
+                    let below = chain_top_first(&chain);
+                    let user = config
+                        .user
+                        .as_deref()
+                        .and_then(|u| resolve_user(u, &Accounts::Layers(&below)));
+                    own_created_dirs(
+                        &fresh,
+                        &dir_owners(&chain, wd.trim_start_matches('/'), user),
+                    );
                     commit_layer(&fresh, &lc, &key)?;
                     unit += 1;
                 }
@@ -1518,7 +1861,12 @@ fn build_layered_cached(
     // sentinel; clear any prior form of this tag (flat dir, old .diff/.base) first.
     let cache = cache_dir();
     let safe = sanitize_ref(tag);
-    let mut manifest = String::from(base_ref);
+    // An image built for another platform names its base WITH that platform, so whatever platform
+    // asks for it later stacks it on the right one (see `resolve_image_depth`).
+    let mut manifest = match image_platform() {
+        Some(p) => format!("{base_ref} {}/{}", p.os, p.arch),
+        None => base_ref.to_string(),
+    };
     manifest.push('\n');
     for k in &layer_keys {
         manifest.push_str(k);
@@ -1595,6 +1943,16 @@ pub fn build_check(args: BuildArgs) -> Result<(), Error> {
                     },
                 )
             }
+            crate::dockerfile::Instr::RunMounts(m) => (
+                "RUN".to_string(),
+                format!(
+                    "--mount {}",
+                    m.iter()
+                        .map(|x| x.kind.name())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ),
             crate::dockerfile::Instr::Run(argv) => (
                 "RUN".to_string(),
                 truncate(&argv.join(" ").replace('\n', " "), 68),
@@ -1755,5 +2113,90 @@ mod target_tests {
         let anon = vec![None, None];
         let e = resolve_target_stage(&anon, "x").expect_err("must refuse");
         assert!(format!("{e}").contains("names none"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    /// The binfmt entry this host's qemu-user-static writes (MEASURED: flags POF), and the three ways
+    /// it is unusable inside a box.
+    #[test]
+    fn emulation_needs_an_enabled_handler_with_the_f_flag() {
+        let e = "/proc/sys/fs/binfmt_misc/qemu-aarch64";
+        let good = "enabled\ninterpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P\nflags: POF\noffset 0\n";
+        assert_eq!(emulation_problem("arm64", e, good), None);
+        assert!(emulation_problem("arm64", e, "").is_some_and(|w| w.contains("does not exist")));
+        assert!(
+            emulation_problem("arm64", e, &good.replace("enabled", "disabled"))
+                .is_some_and(|w| w.contains("disabled"))
+        );
+        assert!(emulation_problem("arm64", e, &good.replace("POF", "PO"))
+            .is_some_and(|w| w.contains("F flag")));
+        assert_eq!(check_emulation(&kern_oci::Platform::host()).ok(), Some(()));
+    }
+
+    /// A variant's local name keeps the repository and says the platform in the tag, in the
+    /// characters a tag allows.
+    #[test]
+    fn a_platform_variant_has_its_own_valid_name() {
+        let arm = kern_oci::Platform::parse("linux/arm64").unwrap();
+        assert_eq!(platform_variant_tag("app:1", &arm), "app:1__linux_arm64");
+        assert_eq!(platform_variant_tag("app", &arm), "app:latest__linux_arm64");
+        assert_eq!(
+            platform_variant_tag("localhost:5000/a/b:v2", &arm),
+            "localhost:5000/a/b:v2__linux_arm64"
+        );
+        assert!(kern_oci::valid_reference(&platform_variant_tag(
+            "ghcr.io/o/app:1.2",
+            &arm
+        )));
+        assert_eq!(
+            crate::commands::platform_stem("alpine_3_19", &arm),
+            "alpine_3_19__linux_arm64"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mountpoint_tests {
+    /// ⛔ A LINK THE STEP PUT ALONG A MOUNTPOINT'S PATH IS NEVER FOLLOWED onto the host: `mv /a /a2
+    /// && ln -s <host dir> /a` made the empty `<host dir>/b` the thing removed. The positive control:
+    /// a real empty mountpoint nothing below had is still removed, with the directory made for it.
+    #[test]
+    fn a_mountpoint_behind_a_link_is_left_alone_and_a_real_one_is_removed() {
+        let base = std::env::temp_dir().join(format!("kern-ut-mountpts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let layer = base.join("layer");
+        let victim = base.join("victim");
+        std::fs::create_dir_all(victim.join("b")).expect("dir");
+        std::fs::write(victim.join("emptyfile"), "").expect("write");
+        std::fs::create_dir_all(layer.join("real/m")).expect("dir");
+        std::fs::create_dir_all(&layer).expect("dir");
+        std::os::unix::fs::symlink(&victim, layer.join("a")).expect("link");
+        std::os::unix::fs::symlink(victim.join("emptyfile"), layer.join("c")).expect("link");
+        let binds = vec![
+            (String::new(), "/a/b".to_string(), true),
+            (String::new(), "/a/emptyfile".to_string(), true),
+            (String::new(), "/real/m".to_string(), true),
+        ];
+        super::drop_mountpoints(&layer, &[], &binds);
+        let host_dir_kept = victim.join("b").is_dir();
+        let host_file_kept = victim.join("emptyfile").is_file();
+        let real_removed = !layer.join("real").exists();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            host_dir_kept,
+            "an empty directory behind a link was removed on the host"
+        );
+        assert!(
+            host_file_kept,
+            "an empty file behind a link was removed on the host"
+        );
+        assert!(
+            real_removed,
+            "a real empty mountpoint and its directory were left in the layer"
+        );
     }
 }

@@ -283,6 +283,12 @@ pub(crate) fn write_image_config(
             &format!("{port}/{}", if *udp { "udp" } else { "tcp" }),
         );
     }
+    if let Some(d) = &c.digest {
+        line("digest", d);
+    }
+    if let Some(a) = &c.architecture {
+        line("arch", a);
+    }
     if let Some(sig) = &c.stop_signal {
         line("stopsignal", sig);
     }
@@ -336,6 +342,8 @@ pub(crate) fn read_image_config(path: &std::path::Path) -> kern_oci::ImageConfig
                 }
             }
             "stopsignal" => c.stop_signal = Some(v.to_string()),
+            "digest" => c.digest = Some(v.to_string()),
+            "arch" => c.architecture = Some(v.to_string()),
             "hctest" => c
                 .healthcheck
                 .get_or_insert_with(Default::default)
@@ -524,6 +532,32 @@ pub(crate) fn split_user_spec(spec: &str) -> Option<(&str, Option<&str>)> {
         None => (spec, None),
     };
     (!user.is_empty() && group.is_none_or(|g| !g.is_empty())).then_some((user, group))
+}
+
+/// `--group-add` / compose `group_add:`, as gids: a number as it is, a name from the IMAGE's
+/// `/etc/group`, which is where docker resolves it. A name the image does not have is refused with
+/// docker's own sentence rather than dropped: a group the file asked for and the box does not carry
+/// fails later as an EACCES nobody can trace back to it.
+pub(crate) fn group_add_gids(names: &[String], accounts: &Accounts) -> Result<Vec<u32>, String> {
+    let mut out: Vec<u32> = Vec::new();
+    for name in names {
+        let gid = match name.parse::<u32>() {
+            Ok(g) => g,
+            Err(_) => accounts
+                .entry("etc/group", name, 0)
+                .and_then(|f| f.get(2).and_then(|g| g.parse::<u32>().ok()))
+                .ok_or_else(|| {
+                    format!(
+                        "Unable to find group {name}: no matching entries in group file (the \
+                         image's /etc/group; `--group-add` also takes a numeric gid)"
+                    )
+                })?,
+        };
+        if !out.contains(&gid) {
+            out.push(gid);
+        }
+    }
+    Ok(out)
 }
 
 /// The SUPPLEMENTARY groups an image's `config.User` spec puts the workload in, from the image's own
@@ -778,7 +812,9 @@ pub(crate) fn sweep_unreachable_images(cache: &std::path::Path) -> (usize, u64) 
         if dir.exists() {
             continue; // could not reclaim it; leave every sidecar in place so the state stays whole
         }
-        for side in [".ok", ".image", ".size", ".lock", ".diff", ".base"] {
+        for side in [
+            ".ok", ".image", ".size", ".lock", ".diff", ".base", ".owners",
+        ] {
             let _ = std::fs::remove_file(cache.join(format!("{stem}{side}")));
         }
         n += 1;
@@ -1389,9 +1425,25 @@ pub(crate) fn resolve_image_depth(
         let body = std::fs::read_to_string(&layers_file)
             .map_err(|e| Error::Oci(format!("read layers of '{image}': {e}")))?;
         let mut lines = body.lines();
-        let base_ref = lines.next().unwrap_or("").trim();
+        // `<base ref>`, or `<base ref> <os>/<arch>` for an image built for another platform: its base
+        // is that platform's, whatever platform is asking now.
+        let first = lines.next().unwrap_or("").trim();
+        let (base_ref, base_platform) = match first.split_once(' ') {
+            Some((r, p)) => (
+                r.trim(),
+                Some(kern_oci::Platform::parse(p).map_err(|e| {
+                    Error::Oci(format!("corrupt layer manifest for '{image}': {e}"))
+                })?),
+            ),
+            None => (first, None),
+        };
         // Base layers of a built image are used as-is; `--pull always` never force-repulls them.
-        let (base_lower, _) = resolve_image_depth(base_ref, depth + 1, PullPolicy::Missing)?;
+        let (base_lower, _) = match base_platform {
+            Some(p) => with_image_platform(Some(p), || {
+                resolve_image_depth(base_ref, depth + 1, PullPolicy::Missing)
+            })?,
+            None => resolve_image_depth(base_ref, depth + 1, PullPolicy::Missing)?,
+        };
         let lc = layer_cache_dir();
         // This image's own layers, in manifest order: oldest first.
         let mut own: Vec<String> = Vec::new();
@@ -1413,6 +1465,7 @@ pub(crate) fn resolve_image_depth(
             )));
         }
         let config = read_image_config(&cache.join(format!("{safe}.image")));
+        refuse_other_platform(image, &config)?;
         return Ok((lower, config));
     }
     // Legacy single-diff (P3.5) image: `<tag>.base` + `<tag>.diff`.
@@ -1432,6 +1485,68 @@ pub(crate) fn resolve_image_depth(
     }
     // A pulled image is ONE directory.
     pull_to_cache(image, policy).map(|(dir, config)| (vec![dir], config))
+}
+
+/// The platform a build is producing, when it is not this machine's: images resolved while it is set
+/// are that platform's (see [`pull_to_cache`]). `None` is the host, which is every run and every
+/// build that does not say `--platform`.
+static IMAGE_PLATFORM: std::sync::Mutex<Option<kern_oci::Platform>> = std::sync::Mutex::new(None);
+
+/// The platform images resolve for now, `None` for this machine's.
+pub(crate) fn image_platform() -> Option<kern_oci::Platform> {
+    IMAGE_PLATFORM.lock().ok().and_then(|g| g.clone())
+}
+
+/// Run `f` with images resolving for `p` (the host's own platform counts as none), and put back
+/// whatever was set before, so a base resolved for its own platform cannot change the caller's.
+pub(crate) fn with_image_platform<T>(p: Option<kern_oci::Platform>, f: impl FnOnce() -> T) -> T {
+    let p = p.filter(|p| !p.is_host());
+    let before = IMAGE_PLATFORM
+        .lock()
+        .map(|mut g| std::mem::replace(&mut *g, p))
+        .unwrap_or(None);
+    let out = f();
+    if let Ok(mut g) = IMAGE_PLATFORM.lock() {
+        *g = before;
+    }
+    out
+}
+
+/// The cache name of `safe` for another platform: its own entry, in the cache's `[A-Za-z0-9_-]`.
+pub(crate) fn platform_stem(safe: &str, p: &kern_oci::Platform) -> String {
+    format!("{safe}{}", platform_suffix(p))
+}
+
+/// `__<os>_<arch>`, what tells a platform's cache entry and variant tag from the plain name: ONE
+/// spelling for both, so a variant and its cache entry cannot disagree on which platform they are.
+pub(crate) fn platform_suffix(p: &kern_oci::Platform) -> String {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    format!("__{}_{}", clean(&p.os), clean(&p.arch))
+}
+
+/// A locally built image used while another platform is being built must be that platform's: an
+/// amd64 stage under an arm64 build would give the arm64 image amd64 binaries, which runs here and
+/// fails on the machine it was built for.
+fn refuse_other_platform(image: &str, config: &kern_oci::ImageConfig) -> Result<(), Error> {
+    let Some(p) = image_platform() else {
+        return Ok(());
+    };
+    let have = config
+        .architecture
+        .clone()
+        .unwrap_or_else(|| kern_oci::Platform::host().as_oci_arch().to_string());
+    if have == p.arch {
+        return Ok(());
+    }
+    Err(Error::Build(format!(
+        "'{image}' is a local image for {have}, and this build is for {}/{}: build it for that \
+         platform first (kern build --platform {}/{} -t {image} ...)",
+        p.os, p.arch, p.os, p.arch
+    )))
 }
 
 /// Is the FLAT cache entry for `safe` complete, i.e. actually runnable?
@@ -1464,7 +1579,11 @@ pub(crate) fn resolve_image_depth(
 /// "2 entries" over one leftover image. `.layers`, `.base`, `.flatkey` and `.diff.size` are the four
 /// that would have been round three: `drop_image_artifacts` removes `.ok` and `.image` FIRST, so an
 /// interrupted delete leaves exactly them.
-pub(crate) const CACHE_SIDECARS: [&str; 8] = [
+pub(crate) const CACHE_SIDECARS: [&str; 11] = [
+    // A multi-platform image's variants (`kern build --platform a,b`).
+    ".platforms",
+    // Extracted with the image's setuid bits (`record_setuid_kept`).
+    ".setuid",
     ".layers",
     ".base",
     ".image",
@@ -1473,10 +1592,106 @@ pub(crate) const CACHE_SIDECARS: [&str; 8] = [
     ".flatkey",
     ".size",
     ".diff.size",
+    ".owners",
 ];
+
+/// The uid map an extraction gave its files, as recorded beside a cache entry (`<stem>.owners`).
+///
+/// ONLY ROOT CAN DISAGREE WITH ITSELF. A non-root caller has always extracted through the box's own
+/// map, so its entries are consistent whatever they say. Root extracted with the tar's raw owners
+/// until the fix in `kern-oci`'s `unpack_as_root`, while its boxes use its subordinate range: an
+/// entry from then is unusable for any image whose files belong to a non-root user (MEASURED in the
+/// field: apt's `_apt` directory, every `apt-get install`).
+pub(crate) fn owner_map_signature() -> &'static str {
+    // ONCE PER PROCESS: the answer cannot change while kern runs, and as root it asks the id-map
+    // helpers and reads `/etc/passwd`, `/etc/subuid` and `/etc/subgid`, two to four times per pull.
+    static SIGNATURE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    SIGNATURE.get_or_init(|| {
+        // REAL ROOT ONLY: uid 0 of a mapped namespace (how `kern save` re-runs itself) extracts and
+        // reads through that map and was always consistent. MEASURED by the suite: treating it as
+        // root asked for a re-fetch of a locally built image, which no registry has.
+        if !kern_isolation::is_initial_root() {
+            "caller"
+        } else if kern_isolation::id_range_available() {
+            "root-range"
+        } else {
+            "root-single"
+        }
+    })
+}
+
+/// Record the uid map this extraction used, beside the entry's sentinel.
+pub(crate) fn record_owner_map(cache: &std::path::Path, safe: &str) {
+    let _ = std::fs::write(
+        cache.join(format!("{safe}.owners")),
+        owner_map_signature().as_bytes(),
+    );
+}
+
+/// Mark a cache entry as extracted with the image's setuid/setgid bits (see `kern_oci::SetuidBits`).
+/// An entry without the mark was extracted by a kern that cleared them: its `sudo` cannot raise.
+pub(crate) fn record_setuid_kept(cache: &std::path::Path, safe: &str) {
+    let _ = std::fs::write(cache.join(format!("{safe}.setuid")), SETUID_MARK);
+}
+
+/// What [`record_setuid_kept`] writes. `v2`: an entry marked by the first binaries that kept the bits
+/// could still have lost them afterwards, because `kern save` and `kern push` then cleared every
+/// setuid bit IN the cache entry of a pulled image (MEASURED: `/usr/bin/su` of python:3.12-slim). The
+/// export no longer touches the tree, so only this mark vouches for the bits.
+const SETUID_MARK: &[u8] = b"kept v2\n";
+
+/// What marks an entry whose re-extraction failed (a loaded image no registry has): asked once.
+const SETUID_GIVEN_UP: &[u8] = b"not repairable v2\n";
+
+/// Whether an entry was extracted with the image's setuid/setgid bits ([`record_setuid_kept`]).
+fn setuid_kept(cache: &std::path::Path, safe: &str) -> bool {
+    std::fs::read(cache.join(format!("{safe}.setuid"))).is_ok_and(|m| m == SETUID_MARK)
+}
+
+/// Programs an image ships setuid when it ships them at all. One of them present WITHOUT the bit, in
+/// an entry with no [`record_setuid_kept`] mark, is an entry an older kern stripped.
+const USUALLY_SETUID: [&str; 6] = [
+    "usr/bin/sudo",
+    "usr/bin/su",
+    "bin/su",
+    "usr/bin/passwd",
+    "usr/bin/newgrp",
+    "bin/mount",
+];
+
+/// A program in a cached image that an older kern left without its setuid bit, or `None`. Asked only
+/// of an entry without the current mark, so a current one costs a single read.
+fn stripped_setuid(cache: &std::path::Path, safe: &str) -> Option<&'static str> {
+    use std::os::unix::fs::PermissionsExt;
+    let mark = std::fs::read(cache.join(format!("{safe}.setuid"))).unwrap_or_default();
+    if mark == SETUID_MARK || mark == SETUID_GIVEN_UP {
+        return None;
+    }
+    let dir = cache.join(safe);
+    USUALLY_SETUID.iter().copied().find(|rel| {
+        std::fs::symlink_metadata(dir.join(rel))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o4000 == 0)
+    })
+}
+
+/// Does a cache entry's ownership match the map this caller's boxes use? Always for a non-root
+/// caller; for root, only an entry extracted under the same map and recorded so.
+pub(crate) fn owners_match(cache: &std::path::Path, safe: &str) -> bool {
+    owners_match_for(owner_map_signature(), cache, safe)
+}
+
+/// [`owners_match`] with the caller's signature as a parameter, so root's answer is testable.
+fn owners_match_for(want: &str, cache: &std::path::Path, safe: &str) -> bool {
+    want == "caller"
+        || std::fs::read_to_string(cache.join(format!("{safe}.owners")))
+            .is_ok_and(|got| got.trim() == want)
+}
 
 pub(crate) fn cache_entry_complete(cache: &std::path::Path, safe: &str) -> bool {
     if !cache.join(format!("{safe}.ok")).exists() || !cache.join(format!("{safe}.image")).exists() {
+        return false;
+    }
+    if !owners_match(cache, safe) {
         return false;
     }
     // The sidecar's FORMAT is deliberately NOT part of this: an old stamp means the config must be
@@ -1507,7 +1722,29 @@ pub(crate) fn pull_to_cache(
 ) -> Result<(String, kern_oci::ImageConfig), Error> {
     use std::os::unix::io::AsRawFd;
     let cache = cache_dir();
-    let safe = sanitize_ref(image);
+    // ANOTHER PLATFORM IS ANOTHER IMAGE: its own cache entry and its own download, so an arm64
+    // `alpine` fetched for a `--platform linux/arm64` build never replaces the amd64 one a box runs.
+    let platform = image_platform();
+    let safe = match &platform {
+        Some(p) => {
+            let plain = sanitize_ref(image);
+            let stem = platform_stem(&plain, p);
+            // A FLAT image built here for that platform lives under its plain name, as every built
+            // image does, and says which architecture it is.
+            let built_for_it = !cache_entry_complete(&cache, &stem)
+                && cache_entry_complete(&cache, &plain)
+                && read_image_config(&cache.join(format!("{plain}.image")))
+                    .architecture
+                    .as_deref()
+                    == Some(p.arch.as_str());
+            if built_for_it {
+                plain
+            } else {
+                stem
+            }
+        }
+        None => sanitize_ref(image),
+    };
     let dir = cache.join(&safe);
     let sentinel = cache.join(format!("{safe}.ok"));
     let cfgfile = cache.join(format!("{safe}.image"));
@@ -1535,6 +1772,40 @@ pub(crate) fn pull_to_cache(
     // `mount(overlay) failed: No such file or directory`, naming neither the image nor the cause.
     // Reproduced on a developer machine with `node:20-slim`. Treating it as a miss re-fetches and
     // repairs it, once, without the user having to know that `--pull always` was the way out.
+    // ⛔ AN ENTRY AN OLDER KERN LEFT WITHOUT ITS SETUID BITS IS RE-EXTRACTED, ONCE, as docker's
+    // image would have them: its `sudo` cannot work otherwise, and nothing in the entry can give the
+    // bits back (the layers are gone). Said before it happens, because it is a download. Under
+    // `--pull never` there is no registry to ask, so the entry is used as it is and the line says how
+    // to repair it.
+    if policy != PullPolicy::Always && cache_entry_complete(&cache, &safe) {
+        if let Some(rel) = stripped_setuid(&cache, &safe) {
+            if policy == PullPolicy::Never {
+                eprintln!(
+                    "kern: note: image '{image}' was cached by an older kern, which cleared setuid \
+                     bits (/{rel} has none), so `sudo` and `su` in it cannot raise a user; \
+                     `--pull never` leaves it so, and one start without it re-extracts the image"
+                );
+            } else {
+                kern_common::progress!(
+                    "→ re-extracting image '{image}': it was cached by an older kern, which cleared \
+                     setuid bits (/{rel} has none)"
+                );
+                // BEST EFFORT: a loaded image may exist on no registry. Then the entry is used as it
+                // is, and marked so that later starts do not ask the network again.
+                match pull_to_cache(image, PullPolicy::Always) {
+                    Ok(done) => return Ok(done),
+                    Err(e) => {
+                        eprintln!(
+                            "kern: note: image '{image}' could not be re-extracted ({e}); it runs as \
+                             cached, and its `sudo` cannot raise a user until it is pulled again"
+                        );
+                        let _ =
+                            std::fs::write(cache.join(format!("{safe}.setuid")), SETUID_GIVEN_UP);
+                    }
+                }
+            }
+        }
+    }
     if policy != PullPolicy::Always && cache_entry_complete(&cache, &safe) {
         // fast path: already cached (and not a forced `--pull always` re-fetch)
         // `--pull never` means NO registry, and the refresh is a registry read: an entry kept by an
@@ -1556,6 +1827,24 @@ pub(crate) fn pull_to_cache(
         return Err(Error::Oci("could not acquire pull lock".into()));
     }
     if policy == PullPolicy::Always {
+        // THE SAME IMAGE IS NOT DOWNLOADED AGAIN, as docker does not: the manifest is read, and when
+        // the config digest it names is the one this cache holds, the entry is current. See
+        // `kern_oci::remote_config_digest` for the measurement. An entry recorded before the digest
+        // was kept, or a registry that cannot answer, takes the full re-pull below, as before.
+        if cache_entry_complete(&cache, &safe) {
+            let held = read_image_config(&cfgfile);
+            if let (Some(local), Ok(remote)) = (
+                held.digest.as_deref(),
+                kern_oci::remote_config_digest_for(image, platform.as_ref()),
+            ) {
+                // An entry an older kern extracted without setuid bits is NOT up to date, whatever
+                // its digest: re-extracting is the only way to get them back (see `SetuidBits`).
+                if local == remote && setuid_kept(&cache, &safe) {
+                    kern_common::progress!("✓ image '{image}' is up to date (--pull always)");
+                    return Ok((dir.to_string_lossy().into_owned(), held));
+                }
+            }
+        }
         // `--pull always`: fetch into a scratch dir, then swap it in with an atomic `rename`. A box
         // already using `dir` as its overlay lower is UNDISTURBED: overlayfs pinned that dentry at
         // mount time, so renaming the path out from under it is invisible to the live box. The retired
@@ -1566,7 +1855,12 @@ pub(crate) fn pull_to_cache(
         let _ = force_remove_dir_all(&staging);
         std::fs::create_dir_all(&staging).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
         kern_common::progress!("→ re-pulling image '{image}' (--pull always)");
-        let config = match kern_oci::pull(image, &staging, None) {
+        let config = match kern_oci::pull(
+            image,
+            &staging,
+            platform.as_ref(),
+            kern_oci::SetuidBits::Keep,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 let _ = force_remove_dir_all(&staging);
@@ -1625,6 +1919,8 @@ pub(crate) fn pull_to_cache(
         write_image_config(&cfgfile, &config)
             .map_err(|e| Error::Oci(format!("image config for '{image}': {e}")))?;
         let _ = std::fs::write(&sentinel, image.as_bytes());
+        record_owner_map(&cache, &safe);
+        record_setuid_kept(&cache, &safe);
         return Ok((dir.to_string_lossy().into_owned(), config));
     }
     // Reached when the entry is missing OR incomplete. Same predicate as the fast path above, so the
@@ -1651,6 +1947,11 @@ pub(crate) fn pull_to_cache(
         // watching a terminal. Caught by that suite, not by a later pass.
         if !sentinel.exists() {
             kern_common::progress!("→ image '{image}' not cached - pulling once (reused after)");
+        } else if !owners_match(&cache, &safe) {
+            eprintln!(
+                "kern: note: image '{image}' was unpacked by an older kern whose file owners do not \
+                 match the uid map a box gets when kern runs as root - re-fetching it once"
+            );
         } else if !rootfs_usable {
             eprintln!(
                 "kern: note: image '{image}' is cached without a usable rootfs - re-fetching it once"
@@ -1683,6 +1984,11 @@ pub(crate) fn pull_to_cache(
                 }
             }
         }
+        // THE LAYERS AN INTERRUPTED PULL COMPLETED ARE KEPT, as docker keeps them: moved aside if
+        // they match their digest, put back after the clear below, and not downloaded again. See
+        // `kern_oci::salvage_layer_blobs`. Only downloaded blobs: no extracted content survives.
+        let keep = cache.join(format!("{safe}.keep-{}", std::process::id()));
+        let (reused, reused_bytes) = kern_oci::salvage_layer_blobs(&dir, &keep);
         // Clear any partial extraction (and any prefetch blobs left by an interrupted run). Not
         // discarded: extracting on top of content this run did not produce is how a partial layer set
         // becomes an image that looks whole.
@@ -1712,6 +2018,14 @@ pub(crate) fn pull_to_cache(
             }
         }
         std::fs::create_dir_all(&dir).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
+        if reused > 0 {
+            restore_kept_blobs(&keep, &dir);
+            eprintln!(
+                "kern: note: image '{image}': reusing {reused} layer(s), {} MB, that an interrupted \
+                 pull had completed",
+                reused_bytes / 1_000_000
+            );
+        }
         // The `box --image` cache path pulls the host arch; `box --platform` (foreign-arch box) is
         // Slice B, deferred with the multi-stage work - so no platform override here yet.
         //
@@ -1722,16 +2036,35 @@ pub(crate) fn pull_to_cache(
         // sentinel) and only `kern gc --images` reaps them, so nothing ever told the user they were
         // there. Deleting only what this branch created: the `--dest <dir>` path deliberately does NOT
         // do this, because that directory is the caller's.
-        let config = match kern_oci::pull(image, &dir, None) {
+        let config = match kern_oci::pull(
+            image,
+            &dir,
+            platform.as_ref(),
+            kern_oci::SetuidBits::Keep,
+        ) {
             Ok(c) => c,
             Err(e) => {
+                // A FAILED PULL KEEPS THE LAYERS IT COMPLETED for the next attempt, and says so,
+                // because they are bytes on disk under no image name: `kern gc --images` reclaims them.
+                let (kept, kept_bytes) = kern_oci::salvage_layer_blobs(&dir, &keep);
                 let _ = std::fs::remove_dir_all(&dir);
+                if kept > 0 && std::fs::create_dir_all(&dir).is_ok() {
+                    restore_kept_blobs(&keep, &dir);
+                    eprintln!(
+                        "kern: note: image '{image}': kept {kept} downloaded layer(s), {} MB, for the \
+                         next attempt (`kern gc --images` removes them)",
+                        kept_bytes / 1_000_000
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&keep);
                 return Err(Error::Oci(e.to_string()));
             }
         };
         write_image_config(&cfgfile, &config)
             .map_err(|e| Error::Oci(format!("image config for '{image}': {e}")))?;
         let _ = std::fs::write(&sentinel, image.as_bytes());
+        record_owner_map(&cache, &safe);
+        record_setuid_kept(&cache, &safe);
     }
     // lock released when `lock` drops
     Ok((
@@ -1913,6 +2246,10 @@ pub(crate) fn content_hash(
 
 /// A completed layer's sentinel exists (`<key>.ok`) → it's a cache hit.
 pub(crate) fn layer_cached(lc: &std::path::Path, key: &str) -> bool {
+    // `kern build --no-cache`: nothing is reused, as docker's builder reuses nothing.
+    if crate::commands::buildmounts::no_cache() {
+        return false;
+    }
     // BOTH, and the directory is not redundant. The sentinel says "a layer with this key was
     // completed"; the directory IS the layer. They can disagree - anything that removes the
     // directory without removing the marker leaves the marker standing over nothing. The build then
@@ -1949,6 +2286,16 @@ pub(crate) fn commit_layer(
     key: &str,
 ) -> Result<(), Error> {
     let dest = lc.join(key);
+    // `--no-cache` REPLACES WHAT THE KEY HELD: the step ran again because it was asked to (an
+    // `apt-get update` for today's packages), so its new result is the layer, and the cache holds
+    // it afterwards, as docker's does. Kept otherwise, the rebuilt content was thrown away and the
+    // image got yesterday's. The old directory is renamed to an unreferenced random key, which a box
+    // already using it keeps (the mount holds it) and `kern gc` reclaims.
+    if dest.exists() && crate::commands::buildmounts::no_cache() {
+        if let Some(aside) = random_layer_key() {
+            let _ = std::fs::rename(&dest, lc.join(aside));
+        }
+    }
     if !dest.exists() {
         // Ignore a rename race (another build committed the identical key first) - content is equal.
         let _ = std::fs::rename(content, &dest);
@@ -1960,6 +2307,16 @@ pub(crate) fn commit_layer(
         let _ = std::fs::write(lc.join(format!("{key}.ok")), b"");
     }
     Ok(())
+}
+
+/// A fresh 32-hex name in the layer store's own shape, from the kernel's random source.
+fn random_layer_key() -> Option<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .ok()?;
+    Some(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
 /// `true` if `rel` resolves to a directory anywhere in the overlay `chain` (layer dirs + base),
@@ -1974,6 +2331,73 @@ pub(crate) fn chain_has_dir(chain: &[String], rel: &str) -> bool {
             .map(|m| m.is_dir())
             .unwrap_or(false)
     })
+}
+
+/// Put the blobs [`kern_oci::salvage_layer_blobs`] moved aside back into `dir`, and remove the
+/// holding directory. Best effort: a blob that cannot be moved back is downloaded again.
+fn restore_kept_blobs(keep: &std::path::Path, dir: &std::path::Path) {
+    if let Ok(rd) = std::fs::read_dir(keep) {
+        for e in rd.flatten() {
+            let _ = std::fs::rename(e.path(), dir.join(e.file_name()));
+        }
+    }
+    let _ = std::fs::remove_dir_all(keep);
+}
+
+/// `rel` with every symlink the MERGED image holds along it resolved, as the image itself would see the
+/// path: a relative link from its own directory, an absolute one from the image's root, `..` never
+/// above that root. The topmost layer holding a name decides it (build layers never delete). Bounded at
+/// 40 links, the kernel's own limit; past it the path is returned as far as it got. `chain` is
+/// BOTTOM first, the reverse of the TOP-first lists [`resolve_image`] returns.
+///
+/// ⛔ WHY: `COPY x /bin/x` on `ubuntu:24.04`, where `/bin -> usr/bin`, created a real `/bin` directory
+/// in the new layer that hid the image's `/bin` symlink, and with it `/bin/sh`: every later `RUN` died
+/// with "cannot start '/bin/sh' in box". MEASURED in the field on speaches' Dockerfile
+/// (`COPY --from=ghcr.io/astral-sh/uv:0.10 /uv /bin/uv`), then reproduced in two lines on this host,
+/// where docker built the same file and left `/bin -> usr/bin` with `/usr/bin/x` beside `sh`.
+pub(crate) fn chain_resolve(chain: &[String], rel: &str) -> String {
+    let mut pending: std::collections::VecDeque<String> = rel
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(str::to_string)
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut links = 0u32;
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            out.pop();
+            continue;
+        }
+        let mut cand = out.clone();
+        cand.push(part.clone());
+        let cand_rel = cand.join("/");
+        let top = chain.iter().rev().find_map(|d| {
+            let path = std::path::Path::new(d).join(&cand_rel);
+            std::fs::symlink_metadata(&path).ok().map(|m| (m, path))
+        });
+        match top {
+            Some((m, path)) if m.file_type().is_symlink() && links < 40 => {
+                links += 1;
+                let Ok(target) = std::fs::read_link(&path) else {
+                    out.push(part);
+                    continue;
+                };
+                let t = target.to_string_lossy().into_owned();
+                if t.starts_with('/') {
+                    out.clear();
+                }
+                let mut next: std::collections::VecDeque<String> = t
+                    .split('/')
+                    .filter(|s| !s.is_empty() && *s != ".")
+                    .map(str::to_string)
+                    .collect();
+                next.extend(pending.drain(..));
+                pending = next;
+            }
+            _ => out.push(part),
+        }
+    }
+    out.join("/")
 }
 
 /// The mode `rel` already has in the merged view BELOW this layer, or `None` if no layer has it as a
@@ -2106,4 +2530,70 @@ pub(crate) fn flat_image_key(
 /// one place a list becomes `lowerdir=` text is [`kern_isolation::overlay_lowerdir`], which escapes.
 pub(crate) fn chain_top_first(chain: &[String]) -> Vec<String> {
     chain.iter().rev().cloned().collect()
+}
+
+#[cfg(test)]
+mod owner_map_tests {
+    use super::owners_match_for;
+
+    /// ⛔ AN ENTRY ROOT UNPACKED BEFORE THE FIX IS NOT REUSED BY ROOT, and nobody else is affected:
+    /// a non-root caller's entries were always consistent, so no record is asked of them.
+    #[test]
+    fn root_reuses_only_an_entry_unpacked_under_its_own_map() {
+        let dir = std::env::temp_dir().join(format!("kern-owners-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(
+            owners_match_for("caller", &dir, "img"),
+            "a non-root caller needs no record"
+        );
+        assert!(
+            !owners_match_for("root-range", &dir, "img"),
+            "no record: unpacked before the fix"
+        );
+        std::fs::write(dir.join("img.owners"), b"root-single").expect("w");
+        assert!(!owners_match_for("root-range", &dir, "img"), "another map");
+        std::fs::write(dir.join("img.owners"), b"root-range").expect("w");
+        assert!(owners_match_for("root-range", &dir, "img"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod chain_resolve_tests {
+    use super::chain_resolve;
+
+    /// A destination under a symlinked directory lands where the link points, as docker puts it:
+    /// relative and absolute links, a link in a lower layer, `..` that cannot leave the root, a loop.
+    #[test]
+    fn a_path_is_resolved_through_the_images_symlinks() {
+        let base = std::env::temp_dir().join(format!("kern-chain-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let low = base.join("low");
+        let high = base.join("high");
+        std::fs::create_dir_all(low.join("usr/bin")).expect("dir");
+        std::fs::create_dir_all(low.join("usr/lib")).expect("dir");
+        std::fs::create_dir_all(&high).expect("dir");
+        std::os::unix::fs::symlink("usr/bin", low.join("bin")).expect("link");
+        std::os::unix::fs::symlink("/usr/lib", high.join("lib")).expect("link");
+        std::os::unix::fs::symlink("loop", high.join("loop")).expect("link");
+        let chain = vec![
+            low.to_string_lossy().into_owned(),
+            high.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(chain_resolve(&chain, "bin/uv"), "usr/bin/uv");
+        assert_eq!(chain_resolve(&chain, "/bin"), "usr/bin");
+        assert_eq!(chain_resolve(&chain, "lib/x.so"), "usr/lib/x.so");
+        assert_eq!(chain_resolve(&chain, "usr/local/bin/x"), "usr/local/bin/x");
+        assert_eq!(
+            chain_resolve(&chain, "../../etc/x"),
+            "etc/x",
+            "never above the root"
+        );
+        let looped = chain_resolve(&chain, "loop/x");
+        assert!(
+            looped.ends_with('x'),
+            "a loop ends, it does not hang: {looped}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

@@ -516,18 +516,12 @@ pub fn pull(
     platform: Option<&str>,
     quiet: bool,
 ) -> Result<(), Error> {
-    // `--platform` cannot go to the cache: the cache key is `sanitize_ref(image)`, derived from the
-    // REFERENCE alone with no platform component, and the cache path fetches the host arch. Storing a
-    // foreign-arch rootfs under a host-arch key is cache poisoning, a class already fixed once in this
-    // codebase. Refuse and name the flag that does work, rather than quietly writing the wrong bytes
-    // or quietly falling back to a directory now that a bare pull no longer produces one.
-    if platform.is_some() && dest.is_none() {
-        return Err(Error::Oci(
-            "--platform needs --dest <dir>: the image cache holds this host's architecture only \
-             (its key carries no platform), so a foreign-arch image cannot live in it. Extract it to \
-             a directory and run it with --rootfs, or on a matching host pull without --platform."
-                .into(),
-        ));
+    // `--platform` INTO THE CACHE goes to that platform's own entry (see `pull_to_cache`), never
+    // under the host's: a foreign-arch rootfs stored under a host-arch key was cache poisoning, which
+    // is why this used to be refused. A `--platform linux/arm64` build then finds it there.
+    if let (Some(p), None) = (platform, dest) {
+        let p = kern_oci::Platform::parse(p).map_err(|e| Error::Oci(e.to_string()))?;
+        return with_image_platform(Some(p), || pull_into_cache(image, quiet));
     }
     let Some(d) = dest else {
         return pull_into_cache(image, quiet);
@@ -540,7 +534,10 @@ pub fn pull(
         None => None,
     };
     println!("pulling {image} -> {}", dest.display());
-    kern_oci::pull(image, &dest, plat.as_ref()).map_err(|e| Error::Oci(e.to_string()))?;
+    // `--dest` is a tree the caller may put anywhere, so an image's setuid bits are cleared (see
+    // `kern_oci::SetuidBits`); the cache keeps them.
+    kern_oci::pull(image, &dest, plat.as_ref(), kern_oci::SetuidBits::Strip)
+        .map_err(|e| Error::Oci(e.to_string()))?;
     if let Some(p) = &plat {
         if !p.is_host() {
             // `kern: note:` and not a bare `note:`. The SDK reads kern's voice off a shared stderr by
@@ -633,9 +630,60 @@ fn pull_into_cache(image: &str, quiet: bool) -> Result<(), Error> {
 /// private repo needs `kern login`. The rootfs is materialized (flat cache dir, or the overlay chain
 /// squashed) and packed into one layer.
 pub fn push(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
+    // A MULTI-PLATFORM IMAGE (`kern build --platform a,b`) is published as docker's buildx publishes
+    // it: each variant by digest, then a manifest list under the name, so a pull on each machine
+    // gets its own architecture.
+    if let Some(variants) = crate::commands::read_platforms(local_ref) {
+        let remote = remote_ref.unwrap_or(local_ref);
+        let record_dir = cache_dir().join(format!(".push-index-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&record_dir);
+        std::fs::create_dir_all(&record_dir)
+            .map_err(|e| Error::Oci(format!("push work dir: {e}")))?;
+        let mut pushed = Vec::with_capacity(variants.len());
+        let mut failed = None;
+        for (n, (p, variant)) in variants.iter().enumerate() {
+            kern_common::progress!("→ {}/{}: {variant}", p.os, p.arch);
+            let record = record_dir.join(format!("{n}"));
+            let r = as_user_then_mapped(
+                "push",
+                |_| true,
+                || push_once_to(variant, remote, Some(&record)),
+            );
+            match r.and_then(|()| read_pushed(&record)) {
+                Ok(m) => pushed.push(m),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&record_dir);
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        return kern_oci::push_index(remote, &pushed).map_err(|e| Error::Oci(e.to_string()));
+    }
     // A push that failed half way has uploaded nothing a retry would corrupt: blobs are addressed by
     // digest, so sending one twice is a no-op at the registry.
     as_user_then_mapped("push", |_| true, || push_once(local_ref, remote_ref))
+}
+
+/// What [`push_once_to`] recorded for one variant: digest, size, architecture, one per line.
+fn read_pushed(record: &std::path::Path) -> Result<kern_oci::PushedManifest, Error> {
+    let body = std::fs::read_to_string(record)
+        .map_err(|e| Error::Oci(format!("push record {}: {e}", record.display())))?;
+    let mut l = body.lines();
+    match (l.next(), l.next().and_then(|s| s.parse().ok()), l.next()) {
+        (Some(d), Some(size), Some(a)) => Ok(kern_oci::PushedManifest {
+            digest: d.to_string(),
+            size,
+            architecture: a.to_string(),
+        }),
+        _ => Err(Error::Oci(format!(
+            "push record {} is incomplete",
+            record.display()
+        ))),
+    }
 }
 
 /// Run one materialize-and-pack (`save` or `push`) as this user, and once more as root of the
@@ -680,7 +728,17 @@ fn as_user_then_mapped(
 }
 
 fn push_once(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
-    let remote = remote_ref.unwrap_or(local_ref);
+    push_once_to(local_ref, remote_ref.unwrap_or(local_ref), None)
+}
+
+/// Push `local_ref` as `remote`: under the tag, or, with `record`, under its manifest's own digest
+/// (one variant of a manifest list), writing what was pushed into `record`. A file and not a return
+/// value because a retry runs in a forked child (see [`as_user_then_mapped`]).
+fn push_once_to(
+    local_ref: &str,
+    remote: &str,
+    record: Option<&std::path::Path>,
+) -> Result<(), Error> {
     // Materialize the image to a single rootfs directory. A flat pulled image IS a cache dir; a
     // layered/built image is squashed into a temp dir via its overlay chain so we push one layer.
     let (rootfs, config, cleanup) = materialize_image(local_ref)?;
@@ -690,14 +748,25 @@ fn push_once(local_ref: &str, remote_ref: Option<&str>) -> Result<(), Error> {
         env: config.env,
         workdir: config.workdir,
         user: config.user,
+        architecture: config.architecture,
     };
     // Scratch dir for the layer/config blobs, cleaned up on exit.
     let work = cache_dir().join(format!(".push-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| Error::Oci(format!("push work dir: {e}")))?;
 
-    let result =
-        kern_oci::push(remote, &rootfs, &cfg, &work).map_err(|e| Error::Oci(e.to_string()));
+    let result = match record {
+        None => kern_oci::push(remote, &rootfs, &cfg, &work).map_err(|e| Error::Oci(e.to_string())),
+        Some(rec) => kern_oci::push_by_digest(remote, &rootfs, &cfg, &work)
+            .map_err(|e| Error::Oci(e.to_string()))
+            .and_then(|m| {
+                std::fs::write(
+                    rec,
+                    format!("{}\n{}\n{}\n", m.digest, m.size, m.architecture),
+                )
+                .map_err(|e| Error::Oci(format!("push record: {e}")))
+            }),
+    };
 
     let _ = std::fs::remove_dir_all(&work);
     if let Some(tmp) = cleanup {
@@ -735,6 +804,7 @@ fn save_once(image: &str, out: Option<&str>) -> Result<(), Error> {
         env: config.env,
         workdir: config.workdir,
         user: config.user,
+        architecture: config.architecture,
     };
     let work = cache_dir().join(format!(".save-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
@@ -761,6 +831,29 @@ fn save_once(image: &str, out: Option<&str>) -> Result<(), Error> {
 /// `kern load [-i file]` - import an image from a `docker save`-format tar (kern's OR docker's), file
 /// or stdin. Every tar is vetted + extracted through the SAME hardened path as `pull` (an archive is
 /// as untrusted as a registry image).
+/// Clear what an image named `stem` was before another is written under that name: the `.ok` marker
+/// FIRST, so an interrupted replacement never leaves a half-image `images` or `push` trusts, then the
+/// rootfs forms and every sidecar that describes its content. ONE list for `tag`, `commit` and
+/// `load`. They kept three: `commit` and `load` missed `.platforms`, so after a multi-platform build
+/// a committed or loaded image of the same name was pushed as the OLD variants (found by audit), and
+/// `load` cleared the directory alone, leaving a previous image's `.layers` and `.base` beside it.
+fn clear_for_replace(cache: &std::path::Path, stem: &str) {
+    let _ = std::fs::remove_file(cache.join(format!("{stem}.ok")));
+    for suffix in [
+        "",
+        ".diff",
+        ".layers",
+        ".base",
+        ".image",
+        ".platforms",
+        ".setuid",
+    ] {
+        let p = cache.join(format!("{stem}{suffix}"));
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
 pub fn load(input: Option<&str>) -> Result<(), Error> {
     let cache = cache_dir();
     own_only_dir(&cache).map_err(|e| Error::Oci(format!("cache dir: {e}")))?;
@@ -782,7 +875,7 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
         };
         let safe = sanitize_ref(primary);
         let dest = cache.join(&safe);
-        let _ = std::fs::remove_dir_all(&dest);
+        clear_for_replace(&cache, &safe);
         // Place the assembled rootfs as the image's cache dir + write the sentinel and config sidecar,
         // the exact on-disk shape of a flat pulled image (so `box --image <tag>` / `images` see it).
         std::fs::rename(&img.rootfs, &dest).map_err(|e| Error::Oci(format!("load rootfs: {e}")))?;
@@ -790,6 +883,8 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
             .map_err(|e| Error::Oci(format!("load sentinel: {e}")))?;
         write_image_config(&cache.join(format!("{safe}.image")), &img.config)
             .map_err(|e| Error::Oci(format!("load image config: {e}")))?;
+        // `load` keeps an image's setuid bits, as the pull into the cache does.
+        super::imagecache::record_setuid_kept(&cache, &safe);
         println!("loaded '{primary}'");
         // Extra RepoTags become aliases (content-shared where possible), like `docker load`.
         for t in img.repo_tags.iter().skip(1) {
@@ -833,12 +928,7 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
     // that refused to run with "this image declares no entrypoint or command". The clear has to come
     // before anything is written to `dst`, not after.
     if src_safe != dst_safe {
-        let _ = std::fs::remove_file(cache.join(format!("{dst_safe}.ok")));
-        for suffix in ["", ".diff", ".layers", ".base", ".image"] {
-            let p = cache.join(format!("{dst_safe}{suffix}"));
-            let _ = std::fs::remove_dir_all(&p);
-            let _ = std::fs::remove_file(&p);
-        }
+        clear_for_replace(&cache, &dst_safe);
     }
     // Copy the config sidecar (best-effort: an old image may predate it).
     let cp_file = |suffix: &str| -> Result<(), Error> {
@@ -850,6 +940,10 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
         Ok(())
     };
     cp_file(".image")?;
+    // A multi-platform image's variant list travels with the name, so `push` of the new name still
+    // publishes every platform.
+    cp_file(".platforms")?;
+    cp_file(".setuid")?;
     // Copy the rootfs form. Exactly one of these exists per image (mirrors `materialize_image`):
     //  - flat pulled image:  `<safe>/`         → copy the dir (the image's own bytes)
     //  - single-diff build:  `<safe>.diff/`    → copy the dir
@@ -932,12 +1026,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     let dst_safe = sanitize_ref(image);
     // Replace any prior image at this ref (all rootfs forms + sidecars), exactly like `tag`. The `.ok`
     // marker is written LAST, so an interrupted commit never leaves a half-image that `images` trusts.
-    let _ = std::fs::remove_file(cache.join(format!("{dst_safe}.ok")));
-    for suffix in ["", ".diff", ".layers", ".base", ".image"] {
-        let p = cache.join(format!("{dst_safe}{suffix}"));
-        let _ = std::fs::remove_dir_all(&p);
-        let _ = std::fs::remove_file(&p);
-    }
+    clear_for_replace(&cache, &dst_safe);
     let out = cache.join(&dst_safe);
     // Freeze the box for the snapshot so the workload cannot swap a file between our metadata read and the
     // content copy (a commit-time TOCTOU): a frozen cgroup runs no task. Best-effort and RAII: a box with
@@ -963,6 +1052,10 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
         stop_signal: None,
         labels: Vec::new(),
         healthcheck: None,
+        // A local snapshot: no registry names it, so `--pull always` has nothing to compare.
+        digest: None,
+        // The box ran on this machine, so its filesystem is this machine's architecture.
+        architecture: Some(kern_oci::Platform::host().as_oci_arch().to_string()),
     };
     write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg)
         .map_err(|e| Error::Oci(format!("commit image config: {e}")))?;

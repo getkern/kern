@@ -173,6 +173,7 @@ pub(crate) fn spawn_health_checker(name: String, pid: i32, hc: OwnedHealth) -> O
                     workdir: wd,
                     run_as: who,
                     extra_gids: &sgids,
+                    keep_groups: entry.as_ref().is_some_and(|b| b.keep_groups),
                     landlock_rw: &ll,
                 },
             );
@@ -1068,6 +1069,9 @@ pub(crate) struct ProbeAs<'a> {
     /// with more access than the service it watches reports healthy for a service that cannot run.
     pub run_as: Option<(u32, u32)>,
     pub extra_gids: &'a [u32],
+    /// The box keeps its supplementary groups (a GPU grant that needs one): a `nvidia-smi` check
+    /// must reach the nodes the workload reaches. See `kern_isolation::SandboxSpec::keep_groups`.
+    pub keep_groups: bool,
     /// The box's `--landlock-rw` write allowlist, re-applied to the probe: see the call below.
     pub landlock_rw: &'a [String],
 }
@@ -1099,6 +1103,8 @@ pub(crate) fn run_probe(pid1: i32, probe: &[String], b: &ProbeAs<'_>) -> bool {
             false,
             &kern_isolation::CapSpec::default(),
             seccomp_mode,
+            // kern's own probe: the stricter side, whatever the box chose.
+            true,
             // A health probe is kern's OWN command (the `--health-cmd`), run to decide liveness, not
             // the workload proper: keep it at the baseline (no box AppArmor), consistent with its
             // baseline caps above, so a confining profile can't wedge the very check kern uses to
@@ -1146,6 +1152,7 @@ pub(crate) fn run_probe(pid1: i32, probe: &[String], b: &ProbeAs<'_>) -> bool {
             // cannot run.
             run_as,
             extra_gids,
+            b.keep_groups,
             // THE BOX'S WRITE ALLOWLIST APPLIES TO THE PROBE TOO, which is the opposite of the choice
             // made for its capabilities and its AppArmor profile two paragraphs up, and for a reason
             // the other two do not have: the box's own scratch set (`/dev`, `/tmp`, `/run`, `/proc`)

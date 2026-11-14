@@ -12,10 +12,12 @@ mod push;
 mod search;
 pub use archive::{load, save, Loaded};
 pub use pull::{
-    dir_mode, fetch_image_config, normalize_ref, pull, set_dir_mode, split_tag, valid_reference,
-    verify_credentials, HealthTest, ImageConfig, ImageHealthcheck, OciError, Platform, DEFAULT_TAG,
+    dir_mode, fetch_image_config, normalize_ref, pull, remote_config_digest,
+    remote_config_digest_for, salvage_layer_blobs, set_dir_mode, split_tag, valid_reference,
+    verify_credentials, HealthTest, ImageConfig, ImageHealthcheck, OciError, Platform, SetuidBits,
+    DEFAULT_TAG,
 };
-pub use push::{push, ImageConfigOut};
+pub use push::{push, push_by_digest, push_index, ImageConfigOut, PushedManifest};
 pub use search::{search, SearchResult};
 
 /// Fuzzing surface - **not** part of the public API (hidden from docs, no stability guarantee). It

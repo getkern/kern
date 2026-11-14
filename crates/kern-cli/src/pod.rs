@@ -1196,6 +1196,23 @@ fn pasta_args(
     watch_netns: bool,
     ns_ifname: &str,
 ) -> Vec<std::ffi::OsString> {
+    pasta_args_for(
+        dir,
+        holder,
+        watch_netns,
+        ns_ifname,
+        unsafe { libc::geteuid() } == 0,
+    )
+}
+
+/// [`pasta_args`] with "kern runs as root" as a parameter, so both answers are testable.
+fn pasta_args_for(
+    dir: &std::path::Path,
+    holder: i32,
+    watch_netns: bool,
+    ns_ifname: &str,
+    as_root: bool,
+) -> Vec<std::ffi::OsString> {
     let mut a: Vec<std::ffi::OsString> = Vec::with_capacity(16);
     a.push("--config-net".into());
     a.push("-q".into());
@@ -1228,6 +1245,18 @@ fn pasta_args(
     if let Some(ns) = host_resolver_to_forward() {
         a.push("--dns-forward".into());
         a.push(ns.into());
+    }
+    // ⛔ STARTED BY ROOT, PASTA TURNS ITSELF INTO `nobody` FIRST, and `nobody` cannot open the
+    // namespaces of a holder root owns. MEASURED in the field on a WSL2 Ubuntu guest, where one works
+    // as root: every box came up with "no outbound", pasta saying "Don't run as root. Changing to
+    // nobody... Couldn't open user namespace /proc/<pid>/ns/user: Permission denied", so a service
+    // that downloads its model on first start (immich's machine learning, Hugging Face's TEI) could
+    // not. `--runas` is pasta's own option for exactly this start; pasta still confines itself after
+    // setup (no capabilities, a detached filesystem, its seccomp filter). A non-root caller is
+    // untouched: pasta runs as that caller, as before.
+    if as_root {
+        a.push("--runas".into());
+        a.push("0".into());
     }
     a.push("--userns".into());
     a.push(format!("/proc/{holder}/ns/user").into());
@@ -3008,6 +3037,25 @@ mod tests {
             pick("nameserver 127.0.0.53\nnameserver 9.9.9.9\n"),
             Some("9.9.9.9".into())
         );
+    }
+
+    /// ⛔ STARTED BY ROOT, pasta must be told to stay root or it becomes `nobody` and cannot enter
+    /// the holder's namespaces (measured in the field: every box on a WSL2 guest run as root had no
+    /// outbound). A non-root caller's argv is unchanged.
+    #[test]
+    fn pasta_stays_root_only_when_kern_runs_as_root() {
+        let dir = std::path::Path::new("/tmp/kern-pasta-runas");
+        let has_runas = |as_root: bool| {
+            let a = pasta_args_for(dir, 4242, true, PASTA_IF_ALONE, as_root);
+            a.windows(2).any(|w| w[0] == "--runas" && w[1] == "0")
+        };
+        assert!(has_runas(true));
+        assert!(!has_runas(false));
+        // And before the namespaces it must open, which are the last arguments.
+        let a = pasta_args_for(dir, 4242, true, PASTA_IF_ALONE, true);
+        let runas = a.iter().position(|x| x == "--runas").expect("runas");
+        let userns = a.iter().position(|x| x == "--userns").expect("userns");
+        assert!(runas < userns);
     }
 
     #[test]

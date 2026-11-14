@@ -262,6 +262,336 @@ pub fn is_compute_node(path: &str) -> bool {
 /// a Windows kernel under it.
 const WSL_NODE_REL: &str = "dev/dxg";
 const WSL_LIB_REL: &str = "usr/lib/wsl/lib";
+/// The Windows driver store, which WSL2 mounts read-only over 9p. The vendor's user-mode driver in
+/// [`WSL_LIB_REL`] loads the rest of itself from here by absolute path, so a box needs it at the same
+/// path: MEASURED on a WSL2 Ubuntu guest, CUDA in a box ran with it bound and not without it.
+const WSL_DRIVERS_REL: &str = "usr/lib/wsl/drivers";
+/// The library without which there is no CUDA driver to hand over.
+const WSL_CUDA_LIB: &str = "libcuda.so.1";
+
+/// The vendor's `nvidia-smi` on a WSL2 guest, relative to the root. It is the only reader of the
+/// adapter list this binary can use: docker's toolkit asks `libdxcore` (a glibc library kern does
+/// not load), and on WSL2 there is no `/proc/driver/nvidia` to read the cards from.
+const WSL_SMI_REL: &str = "usr/lib/wsl/lib/nvidia-smi";
+
+/// The file that marks a driver-store directory as the NVIDIA one: the real CUDA driver, which the
+/// `libcuda.so.1` in the vendor directory loads from there.
+const WSL_STORE_CUDA: &str = "libcuda.so.1.1";
+
+/// The adapters a WSL2 VM has, as `(index, UUID)` in the order `nvidia-smi` lists them, or `None`
+/// when the list cannot be read here.
+///
+/// `None` IS NOT "NO ADAPTER". The vendor's tool is a glibc build, so on a musl guest (the Alpine
+/// distribution this was measured on) it cannot run at all, and the caller says the selection went
+/// unchecked rather than refusing a card that may well exist.
+///
+/// BOUNDED: a tool that hangs costs a deadline and not the box start. MEASURED on a WSL2 Ubuntu
+/// guest: 53 to 69 ms, which is why the launch asks only when the selection is narrower than `all`.
+pub fn wsl_adapters(root: &Path) -> Option<Vec<(u32, String)>> {
+    // ONCE PER PROCESS FOR THE REAL ROOT: one box start asked up to three times (the selection, the
+    // UUID check and the grant), each a 53 to 69 ms `nvidia-smi`, and the adapters cannot change
+    // while kern runs. Any other root is a test's, which rewrites its tool between calls.
+    if root == Path::new("/") {
+        static REAL: std::sync::OnceLock<Option<Vec<(u32, String)>>> = std::sync::OnceLock::new();
+        return REAL.get_or_init(|| wsl_adapters_asked(root)).clone();
+    }
+    wsl_adapters_asked(root)
+}
+
+/// [`wsl_adapters`], asked of the tool every time.
+fn wsl_adapters_asked(root: &Path) -> Option<Vec<(u32, String)>> {
+    foreign_shape_in(root)?;
+    let text = run_bounded(
+        &root.join(WSL_SMI_REL),
+        &["--query-gpu=index,uuid", "--format=csv,noheader"],
+    )?;
+    let adapters = parse_adapters(&text);
+    if adapters.is_empty() {
+        None
+    } else {
+        Some(adapters)
+    }
+}
+
+/// The indices of the NVIDIA adapters a WSL2 VM has, or `None` when they cannot be known here.
+///
+/// FROM THE VENDOR'S TOOL WHEN IT RUNS, and otherwise from `/dev/dxg` itself, which answers without
+/// any C library: on the Alpine guest, where the glibc `nvidia-smi` cannot start, kern accepted
+/// `--gpus device=1` unchecked. nvidia-smi numbers the NVIDIA adapters 0 to n-1, so a count is
+/// enough to check an index or a count; it is not enough to resolve a UUID, which only the tool
+/// prints.
+pub fn wsl_adapter_indices(root: &Path) -> Option<Vec<u32>> {
+    if let Some(listed) = wsl_adapters(root) {
+        return Some(listed.into_iter().map(|(index, _)| index).collect());
+    }
+    let shape = foreign_shape_in(root)?;
+    match dxg_nvidia_adapters(&shape.node)? {
+        0 => None,
+        n => Some((0..n).collect()),
+    }
+}
+
+/// Is this a WSL2 guest whose adapters' UUIDs cannot be read? Only the vendor's `nvidia-smi` prints
+/// them, and on a musl guest it cannot start; `/dev/dxg` gives ids and a count, never a UUID.
+pub fn wsl_uuids_unreadable(root: &Path) -> bool {
+    foreign_shape_in(root).is_some() && wsl_adapters(root).is_none()
+}
+
+/// The note for a `device=GPU-…` accepted unchecked on such a guest, one spelling for both surfaces.
+pub fn describe_wsl_unchecked_uuid(spec: &str) -> String {
+    format!(
+        "--gpus {spec}: this WSL2 guest cannot read its adapters' UUIDs (only the vendor's \
+         nvidia-smi prints them, and it is a glibc build that cannot start here), so the UUID is \
+         not checked. The GPU reaches the box through /dev/dxg, which carries every adapter"
+    )
+}
+
+/// PCI vendor id the WSL2 host reports for an NVIDIA adapter.
+const DXG_VENDOR_NVIDIA: u32 = 0x10de;
+/// `D3DKMT_ADAPTERS_MAX` in the WSL kernel's `d3dkmthk.h`: more is not an answer, it is garbage.
+const DXG_ADAPTERS_MAX: u32 = 64;
+/// `KMTQAITYPE_PHYSICALADAPTERDEVICEIDS`, a Windows query type the WSL kernel passes to the host
+/// unfiltered (`dxgvmb_send_query_adapter_info`), answered with the adapter's PCI ids.
+const KMTQAITYPE_PHYSICALADAPTERDEVICEIDS: u32 = 31;
+
+/// `_IOWR(0x47, nr, size)`, the dxgkrnl ioctl encoding.
+const fn dxg_iowr(nr: u64, size: usize) -> u64 {
+    (3u64 << 30) | ((size as u64) << 16) | (0x47u64 << 8) | nr
+}
+
+/// `struct d3dkmt_adapterinfo`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DxgAdapterInfo {
+    handle: u32,
+    luid_low: u32,
+    luid_high: u32,
+    num_sources: u32,
+    present_move_regions_preferred: u32,
+}
+
+/// `struct d3dkmt_enumadapters2`, user-space layout.
+#[repr(C)]
+struct DxgEnumAdapters2 {
+    num_adapters: u32,
+    reserved: u32,
+    adapters: u64,
+}
+
+/// `struct d3dkmt_queryadapterinfo`, user-space layout (24 bytes with its padding).
+#[repr(C)]
+struct DxgQueryAdapterInfo {
+    adapter: u32,
+    kind: u32,
+    private_data: u64,
+    private_data_size: u32,
+}
+
+/// `D3DKMT_QUERY_DEVICE_IDS`: the physical adapter index, then `D3DKMT_DEVICE_IDS`.
+#[repr(C)]
+#[derive(Default)]
+struct DxgDeviceIds {
+    physical_adapter_index: u32,
+    vendor_id: u32,
+    device_id: u32,
+    sub_vendor_id: u32,
+    sub_system_id: u32,
+    revision_id: u32,
+    bus_type: u32,
+}
+
+/// How many adapters behind `node` are NVIDIA's, asked of the kernel driver directly.
+///
+/// MEASURED on the Alpine WSL2 guest with a static probe of exactly these calls before they were
+/// written here: one adapter, vendor `0x10de`, device `0x2504` (the RTX 3060 Windows shows), every
+/// ioctl returning 0. Every handle the enumeration opens is closed again.
+fn dxg_nvidia_adapters(node: &Path) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .ok()?;
+    let fd = file.as_raw_fd();
+    let enum_req = dxg_iowr(0x14, std::mem::size_of::<DxgEnumAdapters2>());
+    let mut e = DxgEnumAdapters2 {
+        num_adapters: 0,
+        reserved: 0,
+        adapters: 0,
+    };
+    // SAFETY: `e` is a live, correctly laid out `d3dkmt_enumadapters2` with no adapter buffer, which
+    // the driver answers with the count alone.
+    if unsafe { libc::ioctl(fd, enum_req as _, &mut e as *mut DxgEnumAdapters2) } != 0 {
+        return None;
+    }
+    if e.num_adapters == 0 || e.num_adapters > DXG_ADAPTERS_MAX {
+        return None;
+    }
+    let mut infos = vec![DxgAdapterInfo::default(); e.num_adapters as usize];
+    e.adapters = infos.as_mut_ptr() as u64;
+    // SAFETY: the buffer holds `num_adapters` entries and outlives the call.
+    if unsafe { libc::ioctl(fd, enum_req as _, &mut e as *mut DxgEnumAdapters2) } != 0 {
+        return None;
+    }
+    let filled = (e.num_adapters as usize).min(infos.len());
+    let query_req = dxg_iowr(0x09, std::mem::size_of::<DxgQueryAdapterInfo>());
+    let close_req = dxg_iowr(0x15, std::mem::size_of::<u32>());
+    let mut nvidia = 0u32;
+    let mut every_query_answered = true;
+    for info in &infos[..filled] {
+        let mut ids = DxgDeviceIds::default();
+        let mut q = DxgQueryAdapterInfo {
+            adapter: info.handle,
+            kind: KMTQAITYPE_PHYSICALADAPTERDEVICEIDS,
+            private_data: &mut ids as *mut DxgDeviceIds as u64,
+            private_data_size: std::mem::size_of::<DxgDeviceIds>() as u32,
+        };
+        // SAFETY: `q` points at `ids`, which is `private_data_size` bytes and outlives the call.
+        let rc = unsafe { libc::ioctl(fd, query_req as _, &mut q as *mut DxgQueryAdapterInfo) };
+        if rc != 0 {
+            every_query_answered = false;
+        } else if ids.vendor_id == DXG_VENDOR_NVIDIA {
+            nvidia += 1;
+        }
+        let mut handle = info.handle;
+        // SAFETY: a `d3dkmt_closeadapter` is the one handle the enumeration opened.
+        let _ = unsafe { libc::ioctl(fd, close_req as _, &mut handle as *mut u32) };
+    }
+    // AN ADAPTER THAT DID NOT ANSWER MAKES THE COUNT A GUESS, and a guess would refuse a card that
+    // may exist: no answer then, and the caller says the selection went unchecked.
+    if every_query_answered {
+        Some(nvidia)
+    } else {
+        None
+    }
+}
+
+/// `nvidia-smi --query-gpu=index,uuid --format=csv,noheader`, read. A line that is not an index and
+/// a `GPU-` UUID is skipped rather than guessed at.
+pub fn parse_adapters(text: &str) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
+    for line in text.lines() {
+        let Some((index, uuid)) = line.split_once(',') else {
+            continue;
+        };
+        let (Ok(index), uuid) = (index.trim().parse::<u32>(), uuid.trim()) else {
+            continue;
+        };
+        if uuid.len() > 4 && uuid[..4].eq_ignore_ascii_case("GPU-") {
+            out.push((index, uuid.to_string()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Run `program args` with a deadline and return its stdout, or `None` if it could not start, did
+/// not exit in time, or failed. The child is killed AND reaped on the deadline.
+pub(crate) fn run_bounded(program: &Path, args: &[&str]) -> Option<String> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    const BUDGET: Duration = Duration::from_secs(5);
+    const READ_MAX: u64 = 64 * 1024;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + BUDGET;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) | Err(_) => break None,
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        let _ = out.take(READ_MAX).read_to_end(&mut buf);
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// What a selection narrower than `all` means on a WSL2 guest whose adapters are known.
+///
+/// DOCKER'S REFUSALS, MEASURED with toolkit 1.20.2 on a one-adapter guest: `--gpus device=1` and
+/// `--gpus 2` both fail with `nvidia-container-cli: device error: 1: unknown device`, while
+/// `device=0`, `1` and `all` run. kern refuses the same two, with the sentences the native grant
+/// uses for the same cases, so a reader meets one wording for one mistake.
+///
+/// `Ok(true)` means the selection names FEWER adapters than the VM has: it is accepted, and the
+/// caller says that `/dev/dxg` still carries all of them.
+pub fn wsl_check_selection(
+    selection: &crate::gpu_grant::GpuSelection,
+    present: &[u32],
+) -> Result<bool, crate::gpu_grant::MountPlanError> {
+    use crate::gpu_grant::{GpuSelection, MountPlanError};
+    let present: Vec<u32> = present.to_vec();
+    match selection {
+        GpuSelection::All => Ok(false),
+        GpuSelection::Count(n) => {
+            if (*n as usize) > present.len() {
+                return Err(MountPlanError::TooFewCards {
+                    wanted: *n,
+                    present,
+                });
+            }
+            Ok((*n as usize) < present.len())
+        }
+        GpuSelection::These(wanted) => {
+            if let Some(missing) = wanted.iter().find(|w| !present.contains(w)) {
+                return Err(MountPlanError::NoSuchCard {
+                    wanted: *missing,
+                    present,
+                });
+            }
+            Ok(wanted.len() < present.len())
+        }
+    }
+}
+
+/// The NVIDIA directories of the WSL2 driver store, or `None` when none can be told apart.
+///
+/// DOCKER BINDS ONE DIRECTORY OF THE STORE, NOT THE STORE. Measured with toolkit 1.20.2: the box gets
+/// `nvmdi.inf_amd64_<hash>` and nothing else from `/usr/lib/wsl/drivers`, which on the guest this was
+/// measured on holds 795 directories, every vendor's driver for every device Windows ever saw.
+///
+/// ONLY THE `nv*` NAMES ARE OPENED, and that is a cost measured, not a style: the store is a 9p share,
+/// and a `stat` in each of the 795 took 720 ms, on every box start. The 12 `nv*` names took 11 ms
+/// and include the one that matters. The name only narrows WHERE to look; what makes a directory
+/// the NVIDIA one is the CUDA driver inside it.
+fn wsl_nvidia_store_dirs(drivers: &Path) -> Option<Vec<std::path::PathBuf>> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(drivers).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().starts_with("nv") {
+            continue;
+        }
+        let dir = entry.path();
+        if dir.join(WSL_STORE_CUDA).is_file() {
+            out.push(dir);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        out.sort();
+        Some(out)
+    }
+}
 
 /// A GPU that is PRESENT on this host and that a grant cannot read, because the host exposes it
 /// through an interface other than a vendor device node.
@@ -282,11 +612,11 @@ const WSL_LIB_REL: &str = "usr/lib/wsl/lib";
 /// has no PCI identity; WSL2 is the third shape, and there the DEVICE NODE is the part that is
 /// missing, which is one layer below anything `detect` reads.
 ///
-/// IT ASSERTS PRESENCE AND NOTHING ABOUT FUNCTION. On the host this was measured on, with
-/// `/usr/lib/wsl/lib` on the loader path, `cuInit` returned 100 (`CUDA_ERROR_NO_DEVICE`) and
-/// `cuDeviceGetCount` returned 0, so that paravirtual path was not carrying compute at the time.
-/// Saying "this host has a GPU kern's grant does not read" is true either way; saying anything
-/// about whether CUDA runs there would not be.
+/// IT IS GRANTED NOW, BY [`wsl_grant`], and the first measurement explains why it was not. On the
+/// Alpine guest above `cuInit` returned 100 (`CUDA_ERROR_NO_DEVICE`): the vendor libraries are glibc
+/// builds and that distribution is musl, so nothing there could load them. On an Ubuntu 24.04 guest
+/// of the same machine a CUDA kernel ran and returned the right answer, outside kern and then inside
+/// a box given `/dev/dxg`, the library directory, the driver store and the loader path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignShape {
     /// How the interface is named to a reader. Static: there is one shape, and a second one would
@@ -330,30 +660,183 @@ pub fn foreign_shape_in(root: &Path) -> Option<ForeignShape> {
     })
 }
 
-/// The one sentence that describes [`ForeignShape`], written once because three surfaces print it:
-/// the `doctor` row for a host with no DRM card, and both `--gpus` refusals in
-/// [`crate::commands::start`].
+/// The one sentence that describes [`ForeignShape`], written once because several surfaces print it:
+/// the `doctor` row for a host with no DRM card, the `--gpus` refusal when the shape cannot be
+/// granted, and the `--device` refusal.
 ///
-/// It names BOTH sides of the mismatch, the interface that is there and the two things a grant
-/// looks for, because "no NVIDIA driver is loaded on this host" is the message those refusals used
-/// to carry and on this host it is false: the driver is loaded, on the other side of the
-/// paravirtual boundary, and what is absent is the node and the version file kern reads.
+/// ⛔ IT USED TO SAY "neither --gpus nor --device has a node to name", which became false for
+/// `--gpus` the day [`wsl_grant`] existed. It now says what is TRUE on the host it is printed on:
+/// whether the CUDA driver is there to hand over, and why `--device` still has nothing to resolve
+/// to (CDI names one card, and WSL2 gives no per-card node).
 pub fn describe_foreign_shape(shape: &ForeignShape) -> String {
     let node = shape.node.display();
-    let where_libs = match &shape.libraries {
-        Some(dir) => format!(", with the vendor libraries in {}", dir.display()),
-        None => String::new(),
+    match &shape.libraries {
+        Some(dir) if dir.join(WSL_CUDA_LIB).exists() => format!(
+            "a GPU is present here through {} at {node}, with the vendor libraries in {}: \
+             `--gpus` grants it, as that node and those libraries. Every adapter comes with it, \
+             because WSL2 gives no per-card node, and for the same reason a CDI name for one card \
+             (`--device`) has nothing to resolve to",
+            shape.interface,
+            dir.display()
+        ),
+        Some(dir) => format!(
+            "a GPU is present here through {} at {node}, and {} holds no {WSL_CUDA_LIB}, so there \
+             is no CUDA driver for `--gpus` or `--device` to hand over",
+            shape.interface,
+            dir.display()
+        ),
+        None => format!(
+            "a GPU is present here through {} at {node}, with no vendor library directory next to \
+             it, so there is nothing for `--gpus` or `--device` to hand over",
+            shape.interface
+        ),
+    }
+}
+
+/// What a box is given for a WSL2 GPU: every bind, as (host source, box target, read-only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WslGrant {
+    /// The node, the NVIDIA part of the driver store and the tools: binds whose target does not
+    /// depend on the image.
+    pub binds: Vec<(String, String, bool)>,
+    /// The vendor's libraries, as (host file, name), placed by [`WslGrant::binds_into`] in the
+    /// image's library directory once the image is known.
+    pub libraries: Vec<(String, String)>,
+}
+
+impl WslGrant {
+    /// Every bind, the libraries in `lib_dir` (see [`crate::gpu_grant::box_library_dir`]).
+    ///
+    /// DOCKER'S SHAPE, MEASURED with toolkit 1.20.2 on a WSL2 Ubuntu guest: the libraries are bound
+    /// file by file into `/usr/lib/x86_64-linux-gnu`, `/usr/lib/wsl/lib` is not mounted, and
+    /// `LD_LIBRARY_PATH` is empty. kern bound the directory and put it first on `LD_LIBRARY_PATH`,
+    /// so an image whose entrypoint set its own value lost the driver; in the image's own library
+    /// directory nothing an image does to its environment can take it away. Every library of the
+    /// directory comes, where docker takes the five its default capabilities name, which is the
+    /// native grant's rule too: the whole set.
+    pub fn binds_into(&self, lib_dir: &str) -> Vec<(String, String, bool)> {
+        let mut out = self.binds.clone();
+        for (source, name) in &self.libraries {
+            out.push((source.clone(), format!("{lib_dir}/{name}"), true));
+        }
+        out
+    }
+}
+
+/// Why a WSL2 GPU that is present cannot be granted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WslGrantError {
+    /// The node is there and the vendor library directory is not.
+    NoLibraries { node: std::path::PathBuf },
+    /// The directory is there and holds no CUDA driver.
+    NoCudaLibrary { dir: std::path::PathBuf },
+}
+
+/// The grant for WSL2's paravirtual GPU, or `None` when `root` has no such shape.
+///
+/// THE RECIPE WAS MEASURED BEFORE IT WAS WRITTEN, on a WSL2 Ubuntu 24.04 guest (RTX 3060 on the
+/// Windows side, driver 591.74), with the battery's own CUDA probe:
+///
+/// ```text
+/// no grant                                                 NO-LIBCUDA   (the control)
+/// /dev/dxg + /usr/lib/wsl/lib + /usr/lib/wsl/drivers
+///   + /usr/lib/wsl/lib first on LD_LIBRARY_PATH            KERNEL-OK
+/// ```
+///
+/// and then reshaped to docker's: the libraries file by file into the image's library directory
+/// (see [`WslGrant::binds_into`]), no `LD_LIBRARY_PATH`, and of the driver store only the NVIDIA
+/// directory, which the driver loads its pieces from by absolute path and so keeps its own path.
+///
+/// ⛔ NO PER-CARD SELECTION EXISTS. `/dev/dxg` carries every adapter the WSL2 VM has, so a box
+/// granted it sees all of them whatever `--gpus` named; the caller says so rather than pretending
+/// `device=0` narrowed anything.
+pub fn wsl_grant(root: &Path) -> Option<Result<WslGrant, WslGrantError>> {
+    let shape = foreign_shape_in(root)?;
+    let Some(lib) = shape.libraries.clone() else {
+        return Some(Err(WslGrantError::NoLibraries { node: shape.node }));
     };
-    // NEITHER FLAG, not `--gpus` alone. The sentence is printed by four surfaces and one of them is
-    // the `--device` refusal, where naming only the other flag tells the operator about a spelling
-    // they did not use. The two are documented as the same request written two ways, and this is
-    // the one sentence that has to be true on every surface that prints it.
-    format!(
-        "a GPU is present here through {} at {node}{where_libs}: a grant reads \
-         /proc/driver/nvidia/version and binds /dev/nvidia* nodes, and this kernel has neither, so \
-         neither --gpus nor --device has a node to name",
-        shape.interface
-    )
+    if !lib.join(WSL_CUDA_LIB).exists() {
+        return Some(Err(WslGrantError::NoCudaLibrary { dir: lib }));
+    }
+    let as_box = |rel: &str| format!("/{rel}");
+    let mut binds = vec![(
+        shape.node.to_string_lossy().into_owned(),
+        as_box(WSL_NODE_REL),
+        false,
+    )];
+    // THE LIBRARIES BY NAME, symlinks resolved so the bind lands the file: the directory holds 21
+    // `.so` entries on the guest measured, one of them a link (`libnvoptix_loader.so.1`).
+    let mut libraries: Vec<(String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&lib) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.contains(".so") {
+                continue;
+            }
+            if let Ok(real) = std::fs::canonicalize(entry.path()) {
+                if real.is_file() {
+                    libraries.push((real.to_string_lossy().into_owned(), name));
+                }
+            }
+        }
+    }
+    libraries.sort_by(|a, b| a.1.cmp(&b.1));
+    // THE NVIDIA PART OF THE STORE, as docker binds it; the whole store only when no directory in it
+    // can be told to be NVIDIA's, which is the shape measured working before the narrowing existed.
+    let drivers = root.join(WSL_DRIVERS_REL);
+    if drivers.is_dir() {
+        match wsl_nvidia_store_dirs(&drivers) {
+            Some(dirs) => {
+                for dir in dirs {
+                    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    binds.push((
+                        dir.to_string_lossy().into_owned(),
+                        format!("/{WSL_DRIVERS_REL}/{name}"),
+                        true,
+                    ));
+                }
+            }
+            None => binds.push((
+                drivers.to_string_lossy().into_owned(),
+                as_box(WSL_DRIVERS_REL),
+                true,
+            )),
+        }
+    }
+    // THE DRIVER'S TOOLS AT `/usr/bin`, where docker puts them on WSL2 as well (measured: `nvidia-smi`
+    // there, from this directory). Bound from the vendor directory, never copied.
+    for name in kern_isolation::driver_tools() {
+        if let Ok(real) = std::fs::canonicalize(lib.join(name)) {
+            if real.is_file() {
+                binds.push((
+                    real.to_string_lossy().into_owned(),
+                    format!("{}/{name}", crate::gpu_grant::DRIVER_TOOLS_IN_BOX),
+                    true,
+                ));
+            }
+        }
+    }
+    Some(Ok(WslGrant { binds, libraries }))
+}
+
+/// One sentence for a WSL2 GPU that cannot be granted.
+pub fn describe_wsl_grant_error(e: &WslGrantError) -> String {
+    match e {
+        WslGrantError::NoLibraries { node } => format!(
+            "--gpus: WSL2's GPU node {} is here and its vendor library directory /{WSL_LIB_REL} is \
+             not, so there is no driver to hand a box. It is mounted by WSL when the Windows driver \
+             supports WSL; `wsl --update` on the Windows side and a restart of the distribution is \
+             the usual repair",
+            node.display()
+        ),
+        WslGrantError::NoCudaLibrary { dir } => format!(
+            "--gpus: {} holds no {WSL_CUDA_LIB}, so the Windows driver exposes no CUDA to this \
+             distribution and there is nothing for a box to run",
+            dir.display()
+        ),
+    }
 }
 
 /// [`describe_foreign_shape`] for the root, or an empty string. The empty case is the majority of
@@ -362,6 +845,35 @@ pub fn foreign_shape_note(root: &Path) -> String {
     foreign_shape_in(root)
         .map(|s| describe_foreign_shape(&s))
         .unwrap_or_default()
+}
+
+/// [`foreign_shape_note`] at the length a `kern doctor` note line holds (140 characters).
+///
+/// THE LONG SENTENCE IS RIGHT IN A REFUSAL AND WRONG IN `doctor`, whose rows are held to a terminal's
+/// width by a test: on a WSL2 guest the note was 329 characters and the test failed there, while on
+/// a host without `/dev/dxg` it never ran. MEASURED 2026-11-14 in `kern-ubuntu`. The row's TITLE
+/// already says whether `--gpus` grants the GPU, so the note carries only what the title cannot.
+pub fn foreign_shape_short(root: &Path) -> String {
+    let Some(shape) = foreign_shape_in(root) else {
+        return String::new();
+    };
+    match &shape.libraries {
+        Some(dir) if dir.join(WSL_CUDA_LIB).exists() => {
+            "every adapter comes with it (WSL2 gives no per-card node), so --device, which names one \
+             card, has nothing to resolve to"
+                .to_string()
+        }
+        Some(dir) => format!(
+            "{} is here, but {} holds no {WSL_CUDA_LIB}: no CUDA driver for --gpus or --device to \
+             hand over",
+            shape.node.display(),
+            dir.display()
+        ),
+        None => format!(
+            "{} with no vendor library directory beside it: nothing for --gpus to hand over",
+            shape.node.display()
+        ),
+    }
 }
 
 /// `base`, with the foreign-shape sentence joined onto it when the root has one.
@@ -668,6 +1180,39 @@ mod tests {
         Some(t)
     }
 
+    /// EVERY WSL SHAPE'S DOCTOR NOTE FITS THE NOTE LINE (140), measured as it prints on a real host,
+    /// where the root is `/`: the fixture's own directory is taken out of the count. The long
+    /// sentence was 329 characters and only the host the test ran on was checked.
+    #[test]
+    fn every_wsl_doctor_note_fits_the_note_line() {
+        for (tag, libs, cuda) in [
+            ("wsl-cuda", true, true),
+            ("wsl-nocuda", true, false),
+            ("wsl-nolib", false, false),
+        ] {
+            let Some(t) = wsl_root(tag, libs) else {
+                println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
+                return;
+            };
+            if cuda {
+                std::fs::write(t.0.join(WSL_LIB_REL).join(WSL_CUDA_LIB), b"").expect("lib");
+            }
+            let note = foreign_shape_short(&t.0);
+            let as_printed = note.replace(&*t.0.to_string_lossy(), "");
+            assert!(!note.is_empty(), "{tag}: a shape is there");
+            assert!(
+                as_printed.len() <= 140,
+                "{tag}: {} chars: {as_printed}",
+                as_printed.len()
+            );
+            assert!(
+                foreign_shape_note(&t.0).len() > as_printed.len(),
+                "{tag}: the short one IS shorter"
+            );
+        }
+        assert_eq!(foreign_shape_short(&TmpDir::new("wsl-none").0), "");
+    }
+
     /// THE MAJORITY CASE, and the negative half of every case below: a root with nothing in it has
     /// no foreign shape, so a `Some` elsewhere is the node and not the function's optimism.
     #[test]
@@ -755,34 +1300,295 @@ mod tests {
         );
     }
 
-    /// THE SENTENCE NAMES BOTH SIDES OF THE MISMATCH. Its whole reason to exist is that
-    /// "no NVIDIA driver is loaded on this host" is false on a WSL2 guest, so it must say what IS
-    /// there and what kern looked for, and it must not drift into claiming a boundary.
+    /// THE SENTENCE SAYS WHAT IS TRUE ON THE HOST IT IS PRINTED ON. It used to say "neither --gpus
+    /// nor --device has a node to name" everywhere, which became false for `--gpus` once
+    /// `wsl_grant` existed. With the CUDA driver present it says `--gpus` grants it and why
+    /// `--device` still cannot; with the directory but no driver it says there is nothing to hand
+    /// over. Both name the node, and neither may claim a boundary.
     #[test]
-    fn the_sentence_names_what_is_there_and_what_kern_looked_for() {
+    fn the_sentence_says_whether_the_wsl_gpu_can_be_granted_on_this_host() {
         let Some(t) = wsl_root("wslsentence", true) else {
             println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
             return;
         };
-        let note = foreign_shape_note(&t.0);
+        // The directory with no CUDA driver in it.
+        let none = foreign_shape_note(&t.0);
+        assert!(
+            none.contains("dev/dxg") && none.contains("libcuda.so.1"),
+            "{none}"
+        );
+        assert!(
+            !none.contains("grants it"),
+            "nothing to grant, and it said grants: {none}"
+        );
+        // The CUDA driver present: `--gpus` grants it, `--device` still cannot.
+        std::fs::write(t.0.join(WSL_LIB_REL).join(WSL_CUDA_LIB), b"stub").expect("lib");
+        let some = foreign_shape_note(&t.0);
         for needle in [
             "dev/dxg",
             "usr/lib/wsl/lib",
-            "/proc/driver/nvidia/version",
-            "/dev/nvidia*",
-            // BOTH SPELLINGS, because one of the four surfaces that prints this is the `--device`
-            // refusal and naming only `--gpus` there describes a flag the operator did not type.
-            "--gpus",
+            "`--gpus` grants it",
             "--device",
         ] {
             assert!(
-                note.contains(needle),
-                "the note does not name {needle}: {note}"
+                some.contains(needle),
+                "the note does not name {needle}: {some}"
             );
         }
-        assert_eq!(overclaims(&note), None, "{note}");
+        assert_eq!(overclaims(&some), None, "{some}");
         let joined = with_foreign_shape("a GPU was asked for", &t.0);
         assert!(joined.starts_with("a GPU was asked for; "), "{joined}");
-        assert!(joined.contains("dev/dxg"), "{joined}");
+    }
+
+    /// ⛔ THE WSL2 GRANT, IN EVERY OUTCOME, FROM THE ROOT IT IS GIVEN.
+    ///
+    /// The recipe was measured before it was written (a CUDA kernel in a box on a WSL2 Ubuntu
+    /// guest: NO-LIBCUDA without the grant, KERNEL-OK with it), so what is pinned here is that the
+    /// function hands over exactly that recipe and refuses with its cause when a piece is missing.
+    #[test]
+    fn the_wsl_grant_binds_node_libraries_and_driver_store_or_says_what_is_missing() {
+        // No shape at all: not a WSL2 host, nothing to say.
+        let plain = TmpDir::new("wslgrant-none");
+        assert_eq!(wsl_grant(&plain.0), None);
+
+        // The node alone.
+        let Some(t) = wsl_root("wslgrant-nolib", false) else {
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
+            return;
+        };
+        assert!(matches!(
+            wsl_grant(&t.0),
+            Some(Err(WslGrantError::NoLibraries { .. }))
+        ));
+
+        // The directory with no CUDA driver in it.
+        let Some(t) = wsl_root("wslgrant-nocuda", true) else {
+            return;
+        };
+        match wsl_grant(&t.0) {
+            Some(Err(WslGrantError::NoCudaLibrary { dir })) => {
+                assert_eq!(dir, t.0.join(WSL_LIB_REL));
+            }
+            other => panic!("expected NoCudaLibrary, got {other:?}"),
+        }
+
+        // The driver: the node read-write, and each library read-only, BY NAME, in the image's
+        // library directory as docker binds them: not the directory, and nothing that is not a
+        // library (the tool goes to /usr/bin, below). A link lands its file.
+        std::fs::write(t.0.join(WSL_LIB_REL).join(WSL_CUDA_LIB), b"stub").expect("lib");
+        std::fs::write(t.0.join(WSL_LIB_REL).join("libnvoptix.so.1"), b"stub").expect("lib");
+        std::os::unix::fs::symlink(
+            "libnvoptix.so.1",
+            t.0.join(WSL_LIB_REL).join("libnvoptix_loader.so.1"),
+        )
+        .expect("link");
+        let g = wsl_grant(&t.0).expect("the shape").expect("grantable");
+        let src = |rel: &str| t.0.join(rel).to_string_lossy().into_owned();
+        let canon = |rel: &str| {
+            std::fs::canonicalize(t.0.join(rel))
+                .expect("canonical")
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(
+            g.binds_into("/usr/lib/x86_64-linux-gnu"),
+            vec![
+                (src(WSL_NODE_REL), "/dev/dxg".to_string(), false),
+                (
+                    canon("usr/lib/wsl/lib/libcuda.so.1"),
+                    "/usr/lib/x86_64-linux-gnu/libcuda.so.1".to_string(),
+                    true
+                ),
+                (
+                    canon("usr/lib/wsl/lib/libnvoptix.so.1"),
+                    "/usr/lib/x86_64-linux-gnu/libnvoptix.so.1".to_string(),
+                    true
+                ),
+                (
+                    canon("usr/lib/wsl/lib/libnvoptix.so.1"),
+                    "/usr/lib/x86_64-linux-gnu/libnvoptix_loader.so.1".to_string(),
+                    true
+                ),
+            ],
+            "with no driver store on the host, nothing is invented for it"
+        );
+        assert!(
+            g.binds_into("/usr/lib64")
+                .iter()
+                .skip(1)
+                .all(|(_, t, _)| t.starts_with("/usr/lib64/")),
+            "the directory is the one the image asks for"
+        );
+
+        // And the driver store, when the host has one, at the same path.
+        std::fs::create_dir_all(t.0.join(WSL_DRIVERS_REL)).expect("drivers");
+        let g = wsl_grant(&t.0).expect("the shape").expect("grantable");
+        assert_eq!(g.binds.len(), 2);
+        assert_eq!(
+            g.binds[1],
+            (
+                src(WSL_DRIVERS_REL),
+                "/usr/lib/wsl/drivers".to_string(),
+                true
+            )
+        );
+        assert!(
+            g.binds
+                .iter()
+                .all(|(s, _, _)| s.starts_with(&*t.0.to_string_lossy())),
+            "every source comes from the root, not from this host's /: {:?}",
+            g.binds
+        );
+
+        // ONLY THE NVIDIA DIRECTORY OF A STORE THAT HAS ONE, as docker binds it. A `nv*` name
+        // without the CUDA driver (the audio driver) stays out, and so does a CUDA file under a
+        // name that is not NVIDIA's: the name narrows where to look, the file decides.
+        let store = t.0.join(WSL_DRIVERS_REL);
+        for (dir, cuda) in [
+            ("nvmdi.inf_amd64_98af", true),
+            ("nvhda.inf_amd64_17d2", false),
+            ("iigd_dch.inf_amd64_aaaa", true),
+        ] {
+            std::fs::create_dir_all(store.join(dir)).expect("store dir");
+            if cuda {
+                std::fs::write(store.join(dir).join(WSL_STORE_CUDA), b"stub").expect("cuda");
+            }
+        }
+        // And the tool, which goes to `/usr/bin` as docker puts it.
+        std::fs::write(t.0.join(WSL_LIB_REL).join("nvidia-smi"), b"stub").expect("smi");
+        let g = wsl_grant(&t.0).expect("the shape").expect("grantable");
+        let canonical_smi = std::fs::canonicalize(t.0.join(WSL_LIB_REL).join("nvidia-smi"))
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            g.binds[1..],
+            [
+                (
+                    src("usr/lib/wsl/drivers/nvmdi.inf_amd64_98af"),
+                    "/usr/lib/wsl/drivers/nvmdi.inf_amd64_98af".to_string(),
+                    true
+                ),
+                (canonical_smi, "/usr/bin/nvidia-smi".to_string(), true),
+            ],
+            "the store narrowed to NVIDIA's directory and the tool at /usr/bin: {:?}",
+            g.binds
+        );
+        assert!(
+            g.libraries.iter().all(|(_, name)| name.contains(".so")),
+            "the tool is not a library and does not land in the library directory: {:?}",
+            g.libraries
+        );
+    }
+
+    /// ⛔ THE DXG LAYOUT IS THE KERNEL'S, byte for byte: `include/uapi/misc/d3dkmthk.h` of the WSL
+    /// kernel (linux-msft-wsl-6.6.y). A size off by one is an ioctl the driver rejects or, worse, one
+    /// it reads past. The request numbers are the header's `_IOWR(0x47, nr, struct)`.
+    #[test]
+    fn the_dxg_structures_and_requests_match_the_wsl_kernel_header() {
+        assert_eq!(std::mem::size_of::<DxgAdapterInfo>(), 20);
+        assert_eq!(std::mem::size_of::<DxgEnumAdapters2>(), 16);
+        assert_eq!(std::mem::size_of::<DxgQueryAdapterInfo>(), 24);
+        assert_eq!(std::mem::size_of::<DxgDeviceIds>(), 28);
+        // LX_DXENUMADAPTERS2, LX_DXQUERYADAPTERINFO, LX_DXCLOSEADAPTER.
+        assert_eq!(dxg_iowr(0x14, 16), 0xC010_4714);
+        assert_eq!(dxg_iowr(0x09, 24), 0xC018_4709);
+        assert_eq!(dxg_iowr(0x15, 4), 0xC004_4715);
+        // And a node that is not the driver answers nothing rather than a count.
+        let plain = TmpDir::new("dxg-notadevice");
+        let fake = plain.0.join("dxg");
+        std::fs::write(&fake, b"").expect("file");
+        assert_eq!(dxg_nvidia_adapters(&fake), None);
+    }
+
+    /// The adapter list as `nvidia-smi` prints it, and nothing it did not print.
+    #[test]
+    fn the_adapter_list_reads_index_and_uuid_and_skips_anything_else() {
+        assert_eq!(
+            parse_adapters("1, GPU-bbb-2\n0, GPU-aaa-1\n"),
+            vec![(0, "GPU-aaa-1".to_string()), (1, "GPU-bbb-2".to_string())]
+        );
+        assert_eq!(
+            parse_adapters("No devices were found\n,\nx, GPU-1\n2, MIG-x\n"),
+            Vec::<(u32, String)>::new()
+        );
+    }
+
+    /// ⛔ DOCKER'S TWO REFUSALS ON WSL2, and the cases it runs. Measured with toolkit 1.20.2 on a
+    /// one-adapter guest: `device=1` and `--gpus 2` fail with "unknown device"; `device=0`, `1`
+    /// and `all` run.
+    #[test]
+    fn a_wsl_selection_is_refused_where_docker_refuses_it_and_says_when_it_is_narrower() {
+        use crate::gpu_grant::{GpuSelection, MountPlanError};
+        let one = vec![0];
+        assert_eq!(wsl_check_selection(&GpuSelection::All, &one), Ok(false));
+        assert_eq!(
+            wsl_check_selection(&GpuSelection::Count(1), &one),
+            Ok(false)
+        );
+        assert_eq!(
+            wsl_check_selection(&GpuSelection::These(vec![0]), &one),
+            Ok(false)
+        );
+        assert_eq!(
+            wsl_check_selection(&GpuSelection::These(vec![1]), &one),
+            Err(MountPlanError::NoSuchCard {
+                wanted: 1,
+                present: vec![0]
+            })
+        );
+        assert_eq!(
+            wsl_check_selection(&GpuSelection::Count(2), &one),
+            Err(MountPlanError::TooFewCards {
+                wanted: 2,
+                present: vec![0]
+            })
+        );
+        let two = vec![0, 1];
+        assert_eq!(
+            wsl_check_selection(&GpuSelection::These(vec![1]), &two),
+            Ok(true),
+            "one of two adapters is narrower than what /dev/dxg carries"
+        );
+        assert_eq!(wsl_check_selection(&GpuSelection::Count(1), &two), Ok(true));
+    }
+
+    /// The list comes from the vendor's tool UNDER THE ROOT, run with a deadline, and a tool that
+    /// cannot run is `None`, never an empty list a caller would read as "no adapter".
+    #[test]
+    fn the_wsl_adapters_come_from_the_vendor_tool_under_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(t) = wsl_root("wsladapters", true) else {
+            println!("SKIP: /tmp refused an unprivileged whiteout, cannot build a device node");
+            return;
+        };
+        assert_eq!(wsl_adapters(&t.0), None, "no tool, no list");
+        let smi = t.0.join(WSL_SMI_REL);
+        std::fs::write(&smi, "#!/bin/sh\necho '0, GPU-aaa'\necho '1, GPU-bbb'\n").expect("tool");
+        std::fs::set_permissions(&smi, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(
+            wsl_adapters(&t.0),
+            Some(vec![(0, "GPU-aaa".to_string()), (1, "GPU-bbb".to_string())])
+        );
+        // A VALID LINE AND A FAILURE: the exit code decides, not whether the output parses.
+        assert!(
+            !wsl_uuids_unreadable(&t.0),
+            "the tool lists UUIDs, so they are readable"
+        );
+        std::fs::write(&smi, "#!/bin/sh\necho '0, GPU-aaa'\nexit 9\n").expect("tool");
+        assert!(
+            wsl_uuids_unreadable(&t.0),
+            "a tool that fails leaves the UUIDs unreadable, and only then is one accepted unchecked"
+        );
+        let plain = TmpDir::new("wsl-uuid-plain");
+        assert!(
+            !wsl_uuids_unreadable(&plain.0),
+            "not a WSL2 guest: a UUID there is the native grant's question"
+        );
+        assert_eq!(
+            wsl_adapters(&t.0),
+            None,
+            "a tool that failed is not believed"
+        );
     }
 }

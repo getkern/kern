@@ -2039,17 +2039,21 @@ fn no_card_row(root: &std::path::Path) -> R {
             ),
         );
     }
-    let note = crate::gpu::foreign_shape_note(root);
+    let note = crate::gpu::foreign_shape_short(root);
     if note.is_empty() {
         return R::ok(
             "gpu none: no DRM card on this host, so there is nothing for --gpus to hand over"
                 .into(),
         );
     }
-    R::ok_note(
-        "gpu: this host has no DRM card and no vendor device node",
-        &note,
-    )
+    // A WSL2 GPU THAT CAN BE GRANTED SAYS SO IN ITS TITLE, not only in the note: the title is the
+    // line a reader scans, and "no vendor device node" alone read as "no GPU for kern" on the host
+    // where `--gpus` now works.
+    let title = match crate::gpu::wsl_grant(root) {
+        Some(Ok(_)) => "gpu: a WSL2 GPU at /dev/dxg, which --gpus grants",
+        _ => "gpu: this host has no DRM card and no vendor device node",
+    };
+    R::ok_note(title, &note)
 }
 
 /// The one thing a row must never do is imply a boundary it does not have, and that contract lives
@@ -2073,6 +2077,25 @@ fn check_gpu() -> Vec<R> {
     out
 }
 
+/// Whether a box's memory cap bounds GPU memory on a Jetson, from nvmap's `enable_page_pools`.
+///
+/// ⛔ MEASURED on a Jetson Orin Nano: with the pool on (the default), pages another process freed are
+/// zeroed into it within about 30 s, and a box capped at 256 MiB then allocated and wrote 1 GiB of GPU
+/// memory from it, charged to no cgroup. With `enable_page_pools=N` the same box was stopped every
+/// time and an uncapped one still allocated. Only on a Jetson grant (`at_host_paths`), and only when
+/// the switch reads `Y`: nothing to say anywhere else.
+fn nvmap_pool_row(jetson: bool, enable_page_pools: Option<&str>) -> Option<R> {
+    if !jetson || enable_page_pools.map(str::trim) != Some("Y") {
+        return None;
+    }
+    Some(R::Warn(
+        "gpu box memory caps do not bound GPU memory: nvmap's page pool is on".to_string(),
+        "pages served from the pool are charged to no cgroup; as root, `echo N > \
+         /sys/module/nvmap/parameters/enable_page_pools` (until reboot) makes them count"
+            .to_string(),
+    ))
+}
+
 /// The rows that belong to the DRIVER rather than to any one card: where the grant is read from,
 /// and the one missing node whose absence has a single unambiguous cause.
 ///
@@ -2089,7 +2112,10 @@ fn check_gpu() -> Vec<R> {
 fn gpu_driver_rows(grant: &crate::gpu_grant::GpuGrant) -> Vec<R> {
     let mut out = Vec::new();
     let uvm = std::path::Path::new("/dev/nvidia-uvm").exists();
-    if !uvm {
+    // ⛔ NOT ON A JETSON, whose CUDA goes through `nvgpu` and has no `nvidia-uvm` at all: MEASURED on
+    // a Jetson Orin Nano, this row said "CUDA fails with 999" on a host where `cuInit` returns 0, on
+    // the host and in a box. A grant read from NVIDIA's CSV list is the Jetson shape.
+    if !uvm && !grant.at_host_paths {
         let remedy = match first_command_on_path(&["nvidia-modprobe", "modprobe"]) {
             Some("nvidia-modprobe") => "run `nvidia-modprobe -u -c=0`".to_string(),
             Some(other) => format!("load it with `sudo {other} nvidia_uvm`"),
@@ -2104,6 +2130,15 @@ fn gpu_driver_rows(grant: &crate::gpu_grant::GpuGrant) -> Vec<R> {
             ),
             remedy,
         ));
+    }
+    // A JETSON'S MEMORY CAPS AND ITS GPU, from the driver's own switch.
+    if let Some(row) = nvmap_pool_row(
+        grant.at_host_paths,
+        std::fs::read_to_string("/sys/module/nvmap/parameters/enable_page_pools")
+            .ok()
+            .as_deref(),
+    ) {
+        out.push(row);
     }
     // WHERE THE ANSWER CAME FROM, so a reader who disagrees with the rows above knows which file
     // to look at. The CDI line is the `--device` spelling of the same cards, and saying it here is
@@ -2141,6 +2176,32 @@ fn gpu_source_row(root: &std::path::Path, libraries: usize) -> (String, String) 
             .and_then(|t| crate::cdi::parse_spec(&t).ok())
             .is_some()
     });
+    // THE KINDS THE SPECS DECLARE, read off their top-level `kind:` line. A spec for another device
+    // is not a GPU spec this build failed to read: MEASURED on a Jetson Orin Nano, whose only spec is
+    // `nvidia.com/pva` (its vision accelerator), and this row said "a CDI spec this build cannot
+    // read" and sent the reader to `--gpus` as the workaround for a GPU spec that does not exist.
+    let kinds: Vec<String> = specs
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .filter_map(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("kind:"))
+                .map(|k| k.trim().trim_matches('"').to_string())
+        })
+        .collect();
+    if dir.is_some() && !kinds.is_empty() && !kinds.iter().any(|k| k == "nvidia.com/gpu") {
+        return (
+            format!(
+                "gpu source: /proc/driver/nvidia and {libraries} host libraries; the CDI specs under \
+                 {} are for {} only, none for the GPU",
+                dir.unwrap_or_default(),
+                kinds.join(", ")
+            ),
+            "--device nvidia.com/gpu=N has no spec here to read; --gpus is the spelling for this \
+             GPU"
+                .to_string(),
+        );
+    }
     match dir {
         Some(dir) if usable => (
             format!("gpu source: /proc/driver/nvidia, {libraries} host libraries, a CDI spec under {dir}"),
@@ -2226,6 +2287,13 @@ fn gpu_row(
         );
     };
     let index = card.index;
+    // THE BUS IN THE ROW, because the pairing above is right and looked wrong: on a host where the
+    // kernel numbered the cards in the other order, `card0 ... device=1` read as a swap (asked by a
+    // user looking at this very output). The address is what makes the pairing checkable.
+    let id = match g.pci_address.as_deref() {
+        Some(a) => format!("{id} {}", a.strip_prefix("0000:").unwrap_or(a)),
+        None => id,
+    };
     // THE SAME FUNCTION THE FLAG RUNS. `group_policy` is called over the nodes that would actually
     // be mounted, which is why a card whose display node is group-gated can still be reported as
     // grantable when the grant would not touch that node.
@@ -2620,6 +2688,12 @@ mod tests {
             libraries: Vec::new(),
             symlinks: Vec::new(),
             ldconfig_dirs: Vec::new(),
+            tools: Vec::new(),
+            configs: Vec::new(),
+            dirs: Vec::new(),
+            at_host_paths: false,
+            sysfs: Vec::new(),
+            listed_nodes: std::collections::BTreeSet::new(),
         }
     }
 
@@ -3669,5 +3743,47 @@ mod duplicate_install_tests {
             t.contains("/c/kern"),
             "the foreign file must still be named: {t}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cdi_kind_row_tests {
+    /// A CDI spec for another device is said to be for that device, not unreadable; a GPU spec is
+    /// not reported that way (the positive control).
+    #[test]
+    fn a_spec_for_another_device_is_named_as_such() {
+        let root = std::env::temp_dir().join(format!("kern-ut-cdikind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("etc/cdi")).expect("dir");
+        std::fs::write(
+            root.join("etc/cdi/nvidia-pva.yaml"),
+            "---\ncdiVersion: 0.5.0\ncontainerEdits: {}\ndevices: []\nkind: nvidia.com/pva\n",
+        )
+        .expect("write");
+        let (pva, _) = super::gpu_source_row(&root, 12);
+        std::fs::write(
+            root.join("etc/cdi/nvidia-pva.yaml"),
+            "---\ncdiVersion: 0.5.0\ncontainerEdits: {}\ndevices: []\nkind: nvidia.com/gpu\n",
+        )
+        .expect("write");
+        let (gpu, _) = super::gpu_source_row(&root, 12);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            pva.contains("for nvidia.com/pva only") && !pva.contains("cannot read"),
+            "{pva}"
+        );
+        assert!(!gpu.contains("none for the GPU"), "{gpu}");
+    }
+}
+
+#[cfg(test)]
+mod nvmap_pool_row_tests {
+    /// Said only on a Jetson whose pool is on.
+    #[test]
+    fn the_pool_row_appears_only_on_a_jetson_with_the_pool_on() {
+        assert!(super::nvmap_pool_row(true, Some("Y\n")).is_some());
+        assert!(super::nvmap_pool_row(true, Some("N\n")).is_none());
+        assert!(super::nvmap_pool_row(true, None).is_none());
+        assert!(super::nvmap_pool_row(false, Some("Y\n")).is_none());
     }
 }

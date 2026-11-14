@@ -115,6 +115,14 @@ pub struct ImageConfig {
     /// file, so a stack whose dependency waited for a health an image defined got `HEALTH = "-"`
     /// forever, or started its dependents against a service that was not ready.
     pub healthcheck: Option<ImageHealthcheck>,
+    /// The digest of the config blob, `sha256:...`: the image's identity, what docker calls its ID.
+    /// Set only when the blob was verified against it. `--pull always` compares it with the
+    /// registry's before downloading anything (see [`remote_config_digest`]).
+    pub digest: Option<String>,
+    /// The config's `architecture` (`amd64`, `arm64`, ...). Read from what was pulled, carried by a
+    /// build from its base, stamped by a `--platform` build: what a push writes and what a build for
+    /// another platform checks before it reuses an image.
+    pub architecture: Option<String>,
 }
 
 /// An image's own `HEALTHCHECK`, as the OCI config spells it.
@@ -298,10 +306,52 @@ pub fn fetch_image_config(
     Ok(fetch_config(&registry, &repo, &manifest, &auth, scratch))
 }
 
+/// The config digest the registry names for `image` now, reading the manifest only: no blob, no
+/// layer. What docker compares under `pull_policy: always` before it downloads anything.
+///
+/// ⛔ WHY: kern's `--pull always` re-downloaded the WHOLE image on every start. MEASURED in the
+/// field on a WSL2 guest: valiantlynx/ollama-docker sets `pull_policy: always` on `ollama`, and
+/// `up` fetched every layer of `ollama/ollama:latest` (two of them over 1 GB) a second time right
+/// after compose had fetched them, and would again on every restart. Docker re-reads the manifest
+/// and downloads only what changed.
+pub fn remote_config_digest(image: &str) -> Result<String, OciError> {
+    remote_config_digest_for(image, None)
+}
+
+/// [`remote_config_digest`] for one platform of a multi-arch image (`None`: this host's).
+pub fn remote_config_digest_for(
+    image: &str,
+    platform: Option<&Platform>,
+) -> Result<String, OciError> {
+    let (registry, repo, manifest, _) = resolve_manifest(image, platform, false)?;
+    object_after(&manifest, "config")
+        .and_then(|d| first_str(d, "digest"))
+        .ok_or_else(|| manifest_error(&manifest, &registry, &repo))
+}
+
+/// What an extraction does with an image file's setuid/setgid bit.
+///
+/// ⛔ KEPT IN KERN'S OWN CACHE, AS DOCKER KEEPS IT. A box lets a setuid program raise its user, as a
+/// docker container does, and an image's `sudo` cannot do that without its bit: MEASURED in the field
+/// on ComfyUI-Nvidia-Docker, whose start script stopped at "sudo: /usr/bin/sudo must be owned by uid
+/// 0 and have the setuid bit set" once no-new-privileges was no longer forced. The cache directory is
+/// the caller's alone (`0700`), as docker's `/var/lib/docker` is root's alone, so no other host user
+/// can reach a setuid file in it. STRIPPED for `kern pull --dest`, whose tree the caller may put
+/// anywhere: there a setuid-root file pulled by root would be a way to host root for whoever can
+/// reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetuidBits {
+    /// Extract the bits as the image has them (kern's private cache).
+    Keep,
+    /// Clear `0o6000` from every regular file (a tree outside the cache).
+    Strip,
+}
+
 pub fn pull(
     image: &str,
     dest: &Path,
     platform: Option<&Platform>,
+    setuid: SetuidBits,
 ) -> Result<ImageConfig, OciError> {
     let (registry, repo, manifest, auth) = resolve_manifest(image, platform, true)?;
 
@@ -390,7 +440,7 @@ pub fn pull(
         // long as that download (the error is worth more than the wait; a detached writer is worse) -
         // and unlink its blob whatever the outcome (`download_layer` cleans up its own curl failures;
         // the deterministic tmp name covers a panicked thread).
-        if let Err(e) = process_layer(&tmp, &layers[i], dest, i + 1, total) {
+        if let Err(e) = process_layer(&tmp, &layers[i], dest, i + 1, total, setuid) {
             if let Some(h) = next.take() {
                 kern_common::progress!(
                     "✗ layer {}/{total} failed - stopping the in-flight prefetch…",
@@ -438,7 +488,9 @@ fn fetch_config(
         && within_cap()
         && verify_digest(&tmp, &digest).is_ok()
     {
-        parse_image_config(&std::fs::read_to_string(&tmp).unwrap_or_default())
+        let mut c = parse_image_config(&std::fs::read_to_string(&tmp).unwrap_or_default());
+        c.digest = Some(digest.to_string());
+        c
     } else {
         ImageConfig::default()
     };
@@ -503,6 +555,9 @@ fn parse_image_config(blob: &str) -> ImageConfig {
         stop_signal: first_str(cfg, "StopSignal").and_then(nonempty),
         labels: labels_after(cfg),
         healthcheck: healthcheck_after(cfg),
+        // Set by the caller, which holds the digest the blob was verified against.
+        digest: None,
+        architecture: first_str(blob, "architecture").and_then(nonempty),
     }
 }
 
@@ -994,19 +1049,143 @@ impl Platform {
 /// redirects (registries hand blobs off to a CDN) but `--proto-redir =https` (in `TLS_PIN`) keeps
 /// every hop on TLS - a hostile registry can't redirect a blob to `http://`/`file://`. Bearer creds
 /// go in a header; Basic creds go via `-K` STDIN (off-argv).
-fn curl_download(url: &str, tmp: &str, auth: &Auth) -> Result<(), OciError> {
-    curl_download_guarded(url, tmp, auth, &STALL_GUARD)
+/// curl's exit codes for a TRANSFER THAT BROKE, as opposed to a registry that said no: the name did
+/// not resolve (6), no connection (7), HTTP/2 framing or a stream reset (16, 92), a body cut short
+/// (18), a stall or timeout (28), a TLS handshake that failed (35), an empty reply (52), a send or
+/// receive that failed (55, 56). An HTTP error is exit 22 and is not here: a 401 or a 404 is an
+/// answer, and asking again gets the same one.
+const TRANSIENT_CURL_EXITS: [i32; 10] = [6, 7, 16, 18, 28, 35, 52, 55, 56, 92];
+
+/// How many times a broken blob transfer is tried again, and the longest wait between two.
+const BLOB_RETRIES: u32 = 5;
+const BLOB_RETRY_MAX_WAIT_SECS: u64 = 16;
+
+/// Download one blob, CONTINUING it when the connection breaks, as docker's puller does.
+///
+/// ⛔ WHY: a 5 GB pull died at its last layer with curl exit 92 (an HTTP/2 stream reset by the CDN)
+/// and the whole image was lost; the WSL2 guest's DNS then timed out for a while (exit 28 while
+/// resolving). MEASURED in the field with Kokoro-FastAPI's image. curl's own `--retry` does not
+/// treat 92 as transient, and a retry from byte 0 of a multi-GB layer on a line that just broke is
+/// the slowest way to finish. So kern retries the transient codes itself, up to [`BLOB_RETRIES`]
+/// times with a doubling wait, and resumes from the bytes already on disk (`-C -`). A server that
+/// will not resume (curl 33 or 36) gets a fresh download. Every blob is still verified against its
+/// digest afterwards, so a resumed one that came out wrong is refused like any other.
+///
+/// ⛔ AND A TOKEN THAT EXPIRES MID-PULL IS RENEWED. Docker Hub's anonymous token lasts five minutes,
+/// and kern fetched it once per pull: MEASURED in the field, `mmartial/comfyui-nvidia-docker` (a
+/// multi-GB CUDA image on a slow line) got `401 Unauthorized` on a blob thirteen minutes in, and the
+/// pull died. Docker asks the token endpoint again on a 401; so does kern, through `reauth`, twice at
+/// most per blob, so a repository that really is private still fails, with the registry's answer.
+fn curl_download_resilient(
+    url: &str,
+    tmp: &str,
+    auth: &Auth,
+    what: &str,
+    reauth: &dyn Fn() -> Result<Auth, OciError>,
+) -> Result<(), OciError> {
+    curl_download_resilient_with(url, tmp, auth, what, &STALL_GUARD, 1, reauth)
 }
 
-/// [`curl_download`] with the stall guard as a parameter, so a test can shrink its thirty seconds.
+/// [`curl_download_resilient`] with the stall guard and the first wait as parameters, for a test.
+#[allow(clippy::too_many_arguments)]
+fn curl_download_resilient_with(
+    url: &str,
+    tmp: &str,
+    auth: &Auth,
+    what: &str,
+    stall_guard: &[&str],
+    first_wait_secs: u64,
+    reauth: &dyn Fn() -> Result<Auth, OciError>,
+) -> Result<(), OciError> {
+    let mut wait = first_wait_secs;
+    let mut resume = false;
+    let mut attempt = 0;
+    let mut renewed = 0;
+    let mut auth = auth.clone();
+    loop {
+        match curl_download_code(url, tmp, &auth, stall_guard, resume) {
+            Ok(()) => return Ok(()),
+            Err(fail) => {
+                let code = fail.exit;
+                let c = code.unwrap_or(-1);
+                // The token ran out under a long transfer: a new one, and the blob continues.
+                if fail.http == 401 && renewed < 2 {
+                    renewed += 1;
+                    eprintln!(
+                        "kern: note: {what}: the registry's token expired (401); asking for a new one"
+                    );
+                    auth = reauth()?;
+                    resume = std::fs::metadata(tmp).is_ok_and(|m| m.len() > 0);
+                    continue;
+                }
+                // The server will not continue a partial transfer: start this blob again.
+                if c == 33 || c == 36 {
+                    let _ = std::fs::remove_file(tmp);
+                    resume = false;
+                    if attempt < BLOB_RETRIES {
+                        attempt += 1;
+                        continue;
+                    }
+                }
+                if !TRANSIENT_CURL_EXITS.contains(&c) || attempt >= BLOB_RETRIES {
+                    return Err(OciError::Tool(
+                        "curl",
+                        format!("download failed (exit {code:?})"),
+                    ));
+                }
+                attempt += 1;
+                eprintln!(
+                    "kern: note: {what}: the transfer broke (curl exit {c}); continuing it in {wait} s \
+                     ({attempt}/{BLOB_RETRIES})"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+                wait = (wait * 2).min(BLOB_RETRY_MAX_WAIT_SECS);
+                resume = std::fs::metadata(tmp).is_ok_and(|m| m.len() > 0);
+            }
+        }
+    }
+}
+
+/// One blob, one curl run, with the stall guard as a parameter so a test can shrink its thirty
+/// seconds. Production goes through [`curl_download_resilient`], which is this plus the retries.
+#[cfg(test)]
 fn curl_download_guarded(
     url: &str,
     tmp: &str,
     auth: &Auth,
     stall_guard: &[&str],
 ) -> Result<(), OciError> {
+    curl_download_code(url, tmp, auth, stall_guard, false)
+        .map_err(|f| OciError::Tool("curl", format!("download failed (exit {:?})", f.exit)))
+}
+
+/// One curl run for a blob; `Err` carries curl's exit code. `resume` continues `tmp` from its size.
+/// Why one curl run for a blob failed: its exit code, and the last HTTP status it saw (0 for none),
+/// which is what tells a token that expired (401) from a blob that is not there (404): curl exits 22
+/// for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CurlFail {
+    exit: Option<i32>,
+    http: u16,
+}
+
+fn curl_download_code(
+    url: &str,
+    tmp: &str,
+    auth: &Auth,
+    stall_guard: &[&str],
+    resume: bool,
+) -> Result<(), CurlFail> {
     let mut cmd = Command::new("curl");
-    cmd.args(["--no-progress-meter", "-S", "-L"])
+    if resume {
+        cmd.args(["-C", "-"]);
+    }
+    // The status, on stdout (the body goes to `-o`): the one way to see a 401 behind exit 22.
+    cmd.args(["-w", "%{http_code}"]).stdout(Stdio::piped());
+    // `--fail`: AN HTTP ERROR IS NOT A BLOB. Without it curl writes a 403 or 503 body to `-o` and
+    // exits 0 (measured: curl 8.5.0, a 503 answered with exit 0 and an empty file), and the caller
+    // then refuses the pull as a digest mismatch with no retry.
+    cmd.args(["--no-progress-meter", "-S", "-L", "--fail"])
         .args(pin_for_url(url))
         .args(stall_guard)
         .args([
@@ -1015,7 +1194,7 @@ fn curl_download_guarded(
             "--connect-timeout",
             "10",
             "--max-time",
-            "600",
+            BLOB_MAX_SECONDS,
             // Bound the download itself: a hostile registry could otherwise stream an arbitrarily large
             // body for the whole `--max-time` window and fill the disk before any size check runs. The
             // uncompressed layer is separately capped in `check_layer_safe`; this bounds the compressed
@@ -1036,21 +1215,25 @@ fn curl_download_guarded(
         cmd.args(["-K", "-"]).stdin(Stdio::piped());
     }
     cmd.arg("--").arg(url).stderr(Stdio::inherit()); // curl's `-S` errors (if any) to the terminal
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| OciError::Tool("curl", e.to_string()))?;
+    let none = CurlFail {
+        exit: None,
+        http: 0,
+    };
+    let mut child = cmd.spawn().map_err(|_| none)?;
     if let (Some(cfg), Some(mut sin)) = (basic_cfg, child.stdin.take()) {
         use std::io::Write;
         let _ = sin.write_all(cfg.as_bytes()); // drop closes stdin → curl proceeds
     }
-    let status = child
-        .wait()
-        .map_err(|e| OciError::Tool("curl", e.to_string()))?;
-    if !status.success() {
-        return Err(OciError::Tool(
-            "curl",
-            format!("download failed (exit {:?})", status.code()),
-        ));
+    let out = child.wait_with_output().map_err(|_| none)?;
+    if !out.status.success() {
+        let http = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        return Err(CurlFail {
+            exit: out.status.code(),
+            http,
+        });
     }
     Ok(())
 }
@@ -1086,17 +1269,27 @@ fn download_blobs_oneconn(
     // (url, tmp_path) for the config blob (if present) then each layer, in order - the exact tmp paths
     // `fetch_config` and `download_layer` expect.
     let mut blobs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut blob_digests: Vec<String> = Vec::new();
     if let Some(d) = object_after(manifest, "config").and_then(|d| first_str(d, "digest")) {
         blobs.push((
             format!("{}/v2/{repo}/blobs/{d}", reg_base(registry)),
             dest.join(".kern-image-config.json"),
         ));
+        blob_digests.push(d.to_string());
     }
     for (i, dig) in layers.iter().enumerate() {
-        blobs.push((
-            format!("{}/v2/{repo}/blobs/{dig}", reg_base(registry)),
-            layer_tmp_path(dest, i, dig),
-        ));
+        let tmp = layer_tmp_path(dest, i, dig);
+        // A LAYER ALREADY HERE AND VERIFIED IS NOT DOWNLOADED AGAIN: it was kept from an interrupted
+        // pull (see `salvage_layer_blobs`). One that does not verify is a partial download: removed,
+        // and fetched in full below.
+        if tmp.exists() {
+            if verify_digest(&tmp, dig).is_ok() {
+                continue;
+            }
+            let _ = std::fs::remove_file(&tmp);
+        }
+        blobs.push((format!("{}/v2/{repo}/blobs/{dig}", reg_base(registry)), tmp));
+        blob_digests.push(dig.clone());
     }
     if blobs.len() < 2 {
         return; // 0-1 blobs: no second request to share a connection with - nothing to save.
@@ -1117,13 +1310,14 @@ fn download_blobs_oneconn(
         args.push("--no-progress-meter");
         args.push("-S");
         args.push("-L");
+        args.push("--fail");
         args.extend_from_slice(pin_for_url(url));
         args.push("--max-redirs");
         args.push("10");
         args.push("--connect-timeout");
         args.push("10");
         args.push("--max-time");
-        args.push("600");
+        args.push(BLOB_MAX_SECONDS);
         args.extend_from_slice(&STALL_GUARD);
         args.push("--max-filesize");
         args.push(MAX_LAYER_DOWNLOAD_BYTES);
@@ -1139,10 +1333,14 @@ fn download_blobs_oneconn(
         // and `--proto =https` above rejects any non-https anyway.
         args.push(url.as_str());
     }
-    if crate::net::curl(&args).is_err() {
-        // Partial/failed batch: remove every tmp so the caller's per-blob path re-downloads cleanly -
-        // a leftover partial would otherwise be picked up and (correctly) fail digest verification.
-        for (_, t) in &blobs {
+    // EVERY BLOB IS VERIFIED, WHATEVER CURL RETURNS: a `--next` batch exits with the status of its
+    // LAST transfer only, so a blob that failed in the middle of a successful-looking batch was used
+    // as it was (measured in the field). And a FAILED BATCH KEEPS WHAT IT GOT RIGHT: it used to delete
+    // every blob it had written, so a connection that dropped on the last layer threw away the layers
+    // already complete. Only a blob that does not match is removed; the per-blob path fetches it.
+    let _ = crate::net::curl(&args);
+    for ((_, t), digest) in blobs.iter().zip(blob_digests.iter()) {
+        if verify_digest(t, digest).is_err() {
             let _ = std::fs::remove_file(t);
         }
     }
@@ -1632,7 +1830,10 @@ fn download_layer(
     // blob is still sha256-verified + vetted by `process_layer` afterwards, so a bad batch download is
     // caught there exactly as a bad per-blob download would be.
     if !tmp.exists() {
-        if let Err(e) = curl_download(&url, &tmp_s, auth) {
+        let reauth = || discover_auth(registry, repo);
+        if let Err(e) =
+            curl_download_resilient(&url, &tmp_s, auth, &format!("layer {short}"), &reauth)
+        {
             // curl `-o` may have written a partial blob before failing - never leave it inside `dest`
             // (which can be the user's rootfs dir): a junk `.kern-layer-*` would end up visible at `/`
             // in every box booted from that rootfs.
@@ -1641,6 +1842,51 @@ fn download_layer(
         }
     }
     Ok(tmp)
+}
+
+/// Move every layer blob in `dir` that matches its own digest into `keep`, and return how many and
+/// how many bytes. What does not match (a download cut off part-way) is left behind, to be cleared
+/// with the rest of a partial image.
+///
+/// ⛔ WHY: an interrupted pull lost EVERYTHING it had downloaded, because the next attempt clears the
+/// partial image directory. MEASURED in the field on a WSL2 guest: Kokoro-FastAPI's image had eight
+/// of its nine layers complete when the pull was interrupted, and the next `up` fetched all of them
+/// again. Docker keeps the layers a pull completed. The digest is in the blob's own name, so a kept
+/// blob is checked against the manifest's digest again when it is used.
+pub fn salvage_layer_blobs(dir: &Path, keep: &Path) -> (usize, u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut kept = (0usize, 0u64);
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(digest) = layer_blob_digest(&name) else {
+            continue;
+        };
+        let path = e.path();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        if verify_digest(&path, &digest).is_err() {
+            continue;
+        }
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if std::fs::create_dir_all(keep).is_ok() && std::fs::rename(&path, keep.join(&name)).is_ok()
+        {
+            kept.0 += 1;
+            kept.1 += size;
+        }
+    }
+    kept
+}
+
+/// The `sha256:<hex>` a layer blob's file name carries (see [`layer_tmp_path`]), or `None` for any
+/// other file.
+fn layer_blob_digest(name: &str) -> Option<String> {
+    let rest = name.strip_prefix(".kern-layer-")?.strip_suffix(".tar.gz")?;
+    let (_, digest) = rest.split_once('-')?;
+    let hex = digest.strip_prefix("sha256_")?;
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256:{hex}"))
 }
 
 /// The tmp blob path for layer `idx` - per-INDEX (not per-digest): adjacent layers may legally
@@ -1662,6 +1908,7 @@ fn process_layer(
     dest: &Path,
     idx: usize,
     total: usize,
+    setuid: SetuidBits,
 ) -> Result<(), OciError> {
     let short = short_digest(digest);
 
@@ -1689,7 +1936,7 @@ fn process_layer(
     // that ships an inert device node (amazonlinux's base layer) now pulls; the box's own fresh `/dev`
     // and dropped CAP_MKNOD keep the image's device PATHS inert regardless. Because the filtered layer is
     // a plain tar, the extraction below collapses to a single `tar -xf` - no codec branch, no zstd pipe.
-    let filtered = match filter_layer(tmp, comp) {
+    let filtered = match filter_layer(tmp, comp, setuid) {
         Ok(p) => p,
         Err(e) => {
             let _ = std::fs::remove_file(tmp);
@@ -1813,9 +2060,61 @@ fn sha256_stdout_matches(stdout: &[u8], expected_hex: &str, noun: &str) -> Resul
     Ok(())
 }
 
-/// Verify `file` hashes to `digest` (`sha256:HEX`). Uses `sha256sum` (coreutils). An unknown
-/// algorithm is skipped (not failed); a mismatch is a hard error.
+/// What a file IS, for [`verify_digest`]'s memory: the same path with another inode, size or mtime
+/// is another file, and is hashed again.
+#[derive(Clone, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileIdentity {
+    fn of(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        FileIdentity {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+        }
+    }
+}
+
+/// Every `(file, digest)` this process has already proven, with the identity it had when it was
+/// hashed. ⛔ WHY: once the batch download verified every blob (a blob broken in the middle of a
+/// batch went unnoticed before), each layer was hashed again before extraction, a `sha256sum` reading
+/// the whole blob for the same answer. MEASURED on a cold pull of `python:3.12-slim`: 11 runs of
+/// `sha256sum` without this memory, 6 with it, as many as before the batch verified every blob.
+static VERIFIED: std::sync::Mutex<Vec<(std::path::PathBuf, String, FileIdentity)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Verify `file` hashes to `digest` (`sha256:HEX`); a mismatch is a hard error, as is a digest that
+/// is not sha256. A file this process already proved against the same digest, and that is still the
+/// same file (see [`FileIdentity`]), is not hashed again.
 fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
+    let now = std::fs::metadata(file).ok().map(|m| FileIdentity::of(&m));
+    if let (Some(id), Ok(seen)) = (&now, VERIFIED.lock()) {
+        if seen
+            .iter()
+            .any(|(p, d, i)| p == file && d == digest && i == id)
+        {
+            return Ok(());
+        }
+    }
+    let hashed = hash_and_compare(file, digest)?;
+    if let Ok(mut seen) = VERIFIED.lock() {
+        seen.push((file.to_path_buf(), digest.to_string(), hashed));
+    }
+    Ok(())
+}
+
+/// [`verify_digest`]'s actual check, returning the identity of the file it hashed: taken from the
+/// OPEN handle that `sha256sum` reads, so what is remembered is what was hashed.
+fn hash_and_compare(file: &Path, digest: &str) -> Result<FileIdentity, OciError> {
     let Some(expected) = digest.strip_prefix("sha256:") else {
         // Refuse any digest we can't verify - a non-sha256 algorithm must not be a free pass for
         // a compromised registry to serve unverified bytes.
@@ -1831,6 +2130,10 @@ fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
     // which has nothing to escape and cannot be read as an option.
     let input = std::fs::File::open(file)
         .map_err(|e| OciError::Tool("sha256sum", format!("open {}: {e}", file.display())))?;
+    let identity = input
+        .metadata()
+        .map(|m| FileIdentity::of(&m))
+        .map_err(|e| OciError::Tool("sha256sum", format!("stat {}: {e}", file.display())))?;
     let out = Command::new("sha256sum")
         .stdin(input)
         .output()
@@ -1838,7 +2141,8 @@ fn verify_digest(file: &Path, digest: &str) -> Result<(), OciError> {
     if !out.status.success() {
         return Err(OciError::Tool("sha256sum", "hashing failed".into()));
     }
-    sha256_stdout_matches(&out.stdout, expected, "blob")
+    sha256_stdout_matches(&out.stdout, expected, "blob")?;
+    Ok(identity)
 }
 
 /// Verify in-memory bytes (a manifest) against a `sha256:<hex>` digest, mirroring [`verify_digest`]
@@ -1912,8 +2216,28 @@ pub(crate) fn under_escaping(p: &str, set: &std::collections::HashSet<String>) -
     false
 }
 
-/// Max uncompressed bytes per layer - a decompression-bomb ceiling (2 GiB).
+/// Max uncompressed bytes per layer for a SMALL layer - the decompression-bomb floor (2 GiB). A large
+/// layer gets [`layer_byte_cap`] instead.
 pub(crate) const MAX_LAYER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// How far a layer may expand over its compressed size before it is read as a bomb.
+const MAX_LAYER_EXPANSION: u64 = 20;
+/// The absolute ceiling, whatever the compressed size.
+const MAX_LAYER_BYTES_CEILING: u64 = 64 * 1024 * 1024 * 1024;
+
+/// The uncompressed-size cap for a layer whose compressed blob is `compressed` bytes.
+///
+/// ⛔ A BOMB IS A RATIO, NOT A SIZE. The cap was a flat 2 GiB, and MEASURED in the field on a WSL2
+/// guest it refused `ghcr.io/ggml-org/llama.cpp:server-cuda`, whose CUDA layer is 2058 MB COMPRESSED
+/// and larger than that expanded: a published image docker runs, refused as "a possible decompression
+/// bomb", while kern accepts downloads of 8 GB. What makes a bomb is a small blob that expands without
+/// end, so a small layer keeps the 2 GiB floor exactly as before, and a large one may expand
+/// [`MAX_LAYER_EXPANSION`] times what was downloaded (shared libraries compress 2 to 4 times), up to
+/// [`MAX_LAYER_BYTES_CEILING`].
+pub(crate) fn layer_byte_cap(compressed: u64) -> u64 {
+    compressed
+        .saturating_mul(MAX_LAYER_EXPANSION)
+        .clamp(MAX_LAYER_BYTES, MAX_LAYER_BYTES_CEILING)
+}
 /// Max entries per layer - a dir/empty-file *inode* bomb has ~0 byte total but still exhausts the fs.
 const MAX_LAYER_ENTRIES: u64 = 2_000_000;
 /// Max COMPRESSED bytes for a single layer download (curl `--max-filesize`), as a string for the argv.
@@ -1928,6 +2252,14 @@ const MAX_LAYER_DOWNLOAD_BYTES: &str = "8000000000";
 /// transient, and a retry rewrites `-o` from the start (measured: the file held one attempt's bytes,
 /// not three). Two retries, a second apart: a registry that keeps stalling still fails, in about a
 /// minute and a half, with curl's own message on stderr.
+/// How long one blob may take, in seconds: SIX HOURS, a bound and not a speed requirement.
+///
+/// It was 600, which is a speed requirement: a 2058 MB layer needs 3.4 MB/s to fit, and a WSL2 guest
+/// measured at about 4 MB/s with other traffic did not make it (the pull died at 614 s). A stalled
+/// transfer is ended by [`STALL_GUARD`] (under 1 KiB/s for 30 s), so this only has to stop one that
+/// keeps moving for ever; at the 8 GB [`MAX_LAYER_DOWNLOAD_BYTES`] cap six hours is 370 KB/s.
+const BLOB_MAX_SECONDS: &str = "21600";
+
 const STALL_GUARD: [&str; 8] = [
     "--speed-limit",
     "1024",
@@ -2048,8 +2380,20 @@ fn userns_ok() -> bool {
 pub(crate) fn unpack_as_root<F: FnOnce(bool) -> Result<(), OciError>>(
     f: F,
 ) -> Result<(), OciError> {
-    // ROOT ALREADY HAS BOTH, so it gets `true` and no fork, byte-identical to before.
-    if unsafe { libc::geteuid() == 0 } {
+    // ⛔ ROOT GOES THROUGH THE SAME MAP, NOT AROUND IT. This ran as root with no namespace and kept
+    // the tar's raw owners, while root's BOXES use root's subordinate range (box uid N = host
+    // 100000+N-1 on a stock `/etc/subuid`): the two disagreed by exactly that offset. MEASURED in the
+    // field on a WSL2 Ubuntu guest, where one works as root: `/var/cache/apt/archives/partial` of
+    // `ubuntu:24.04` was host uid 42, apt's `_apt` in the box is host 100041, so every
+    // `apt-get install` in a box and in every `kern build` RUN step failed with "Permission denied".
+    // Through the box's own map the image's uid 42 lands on 100041 and apt works; with no range the
+    // map is one id and the extraction gives everything to it, as for any caller.
+    //
+    // ROOT OF A MAPPED NAMESPACE IS NOT ROOT, and keeps the direct path: there uid 42 already IS the
+    // mapped id, so the tar's owners are the box's (this is how `kern save` re-runs itself as root of
+    // the caller's range, and a nested namespace would lose that access).
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 && !kern_isolation::is_initial_root() {
         return f(true);
     }
     // Flush our own buffered output so the forked child doesn't duplicate it on exit.
@@ -2145,10 +2489,11 @@ fn zstd_missing() -> OciError {
 /// structurally by isolated staging + no-follow merge in [`merge_layer`].)
 pub(crate) fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(), OciError> {
     let path = tar_path.to_string_lossy();
+    let cap = layer_byte_cap(std::fs::metadata(tar_path).map(|m| m.len()).unwrap_or(0));
     // Plain (uncompressed) tar: vet the file directly, no decompressor process.
     if comp == Compression::Plain {
         let mut f = std::fs::File::open(tar_path).map_err(|e| OciError::Extract(e.to_string()))?;
-        return vet_tar_stream(&mut f);
+        return vet_tar_stream_capped(&mut f, cap);
     }
     // gzip / zstd: the decompressor does ONLY the decompression; `vet_tar_stream` (the fuzzed core)
     // reads the DECOMPRESSED stream and is codec-agnostic - so the entire hardening surface (bomb
@@ -2192,7 +2537,7 @@ pub(crate) fn check_layer_safe(tar_path: &Path, comp: Compression) -> Result<(),
             "child stdout was not piped".to_string(),
         ));
     };
-    let res = vet_tar_stream(&mut stdout);
+    let res = vet_tar_stream_capped(&mut stdout, cap);
     // We stop reading at the end-of-archive marker (or on rejection), so the decompressor may take a
     // SIGPIPE - its exit status isn't meaningful here. Truncation/corruption is caught inside
     // `vet_tar_stream` (a short read before the end-of-archive marker is an error), so a cut-off unsafe
@@ -2324,6 +2669,115 @@ fn read_raw_blocks(r: &mut impl std::io::Read, size: u64) -> Result<Vec<u8>, Oci
     Ok(out)
 }
 
+/// Recompute a tar header's checksum after a field changed: the chksum field (148..156) counts as 8
+/// spaces while summing, then holds `<6 octal digits>\0<space>`.
+fn rechecksum(header: &mut [u8; TAR_BLOCK]) {
+    header[148..156].fill(b' ');
+    let sum: u32 = header.iter().map(|&b| b as u32).sum();
+    let chk = format!("{sum:06o}");
+    header[148..154].copy_from_slice(chk.as_bytes());
+    header[154] = 0;
+    header[155] = b' ';
+}
+
+/// Re-emit a tar stream `r` for EXPORT (`save`, `push`) to `w`: every member's owner and group become
+/// 0, and a regular file keeps its setuid bit only when it already belonged to the box's root
+/// (`root_uid`, the uid the archiving process sees for it), its setgid bit only when its group was
+/// the root group (`root_gid`).
+///
+/// ⛔ WHY ON THE STREAM AND NOT ON THE TREE. The packer used to `chmod a-s` the rootfs before tarring
+/// it, and for a pulled image that rootfs IS the cache entry: MEASURED, `kern save python:3.12-slim`
+/// left the cached image's `/usr/bin/su` at `-rwxr-xr-x`, so every later box of that image had lost
+/// it. And it cleared every bit, so a saved or pushed image's `sudo` stopped working, which docker's
+/// `save` and `push` never do.
+///
+/// ⛔ WHY NOT EVERY BIT. Export makes every file root-owned, as docker layers are; a setuid file of
+/// another owner kept as it was would come out setuid-ROOT, a privilege the image never had. Only
+/// those lose the bit. A PAX record carrying `uid`/`gid` would override the fields rewritten here, so
+/// one is refused rather than exported with an owner this pass did not set.
+pub(crate) fn normalize_for_export(
+    r: &mut impl std::io::Read,
+    w: &mut impl std::io::Write,
+    root_uid: u64,
+    root_gid: u64,
+) -> Result<(), OciError> {
+    let bad = |m: &str| OciError::Extract(m.to_string());
+    let wr = |w: &mut dyn std::io::Write, b: &[u8]| -> Result<(), OciError> {
+        w.write_all(b)
+            .map_err(|e| OciError::Extract(format!("write exported layer: {e}")))
+    };
+    let mut header = [0u8; TAR_BLOCK];
+    loop {
+        let n = read_block(r, &mut header).map_err(|e| OciError::Tool("tar", e.to_string()))?;
+        if n == 0 {
+            return Ok(());
+        }
+        if n < TAR_BLOCK {
+            return Err(bad("truncated tar header while exporting"));
+        }
+        // The end-of-archive zero blocks, and anything after them: copied as they are.
+        if header.iter().all(|&b| b == 0) {
+            wr(w, &header)?;
+            let mut rest = Vec::new();
+            r.read_to_end(&mut rest)
+                .map_err(|e| OciError::Tool("tar", e.to_string()))?;
+            return wr(w, &rest);
+        }
+        let typeflag = header[156];
+        let size = tar_num(&header[124..136]).ok_or_else(|| bad("unreadable member size"))?;
+        match typeflag {
+            // Long names and PAX records: their data is the record. A PAX owner would override ours.
+            b'L' | b'K' | b'x' | b'g' => {
+                if size > TAR_MAX_LONG {
+                    return Err(bad("oversized long-name/PAX record"));
+                }
+                let raw = read_raw_blocks(r, size)?;
+                if matches!(typeflag, b'x' | b'g') {
+                    let text = String::from_utf8_lossy(&raw[..size as usize]);
+                    if text
+                        .split('\n')
+                        .any(|rec| rec.contains(" uid=") || rec.contains(" gid="))
+                    {
+                        return Err(bad(
+                            "a PAX record sets an owner, which export cannot normalize",
+                        ));
+                    }
+                }
+                wr(w, &header)?;
+                wr(w, &raw)?;
+            }
+            _ => {
+                if header[100] & 0x80 == 0 && matches!(typeflag, b'0' | 0 | b'7') {
+                    let mode = tar_num(&header[100..108]).unwrap_or(0);
+                    let uid = tar_num(&header[108..116]);
+                    let gid = tar_num(&header[116..124]);
+                    let mut kept = mode;
+                    if mode & 0o4000 != 0 && uid != Some(root_uid) {
+                        kept &= !0o4000;
+                    }
+                    if mode & 0o2000 != 0 && gid != Some(root_gid) {
+                        kept &= !0o2000;
+                    }
+                    if kept != mode {
+                        let m = format!("{kept:07o}");
+                        header[100..107].copy_from_slice(m.as_bytes());
+                        header[107] = 0;
+                    }
+                }
+                header[108..115].copy_from_slice(b"0000000");
+                header[115] = 0;
+                header[116..123].copy_from_slice(b"0000000");
+                header[123] = 0;
+                // Names of the owner, as `--numeric-owner` leaves them: empty.
+                header[265..329].fill(0);
+                rechecksum(&mut header);
+                wr(w, &header)?;
+                pipe_data(r, size, w)?;
+            }
+        }
+    }
+}
+
 /// Clear the setuid/setgid bits (`0o6000`) from a regular-file tar header IN PLACE, recomputing the
 /// header checksum so `tar` still accepts the block. A setuid/setgid bit on an image file is a
 /// privilege lever ONLY if the file is later executed where its owner is privileged; in kern it is not:
@@ -2379,6 +2833,16 @@ pub(crate) fn strip_device_members(
     r: &mut impl std::io::Read,
     w: &mut impl std::io::Write,
 ) -> Result<(), OciError> {
+    strip_device_members_capped(r, w, MAX_LAYER_BYTES, SetuidBits::Strip)
+}
+
+/// [`strip_device_members`] with the size cap of the layer at hand (see [`layer_byte_cap`]).
+pub(crate) fn strip_device_members_capped(
+    r: &mut impl std::io::Read,
+    w: &mut impl std::io::Write,
+    cap: u64,
+    setuid: SetuidBits,
+) -> Result<(), OciError> {
     let bad = |m: &str| OciError::Extract(m.to_string());
     let wr = |w: &mut dyn std::io::Write, b: &[u8]| -> Result<(), OciError> {
         w.write_all(b)
@@ -2408,7 +2872,7 @@ pub(crate) fn strip_device_members(
         // Bound emitted bytes up front (a decompression bomb would otherwise stream forever). The
         // re-vet caps again, but a gate must not depend on another gate.
         total = total.saturating_add(size);
-        if size > MAX_LAYER_BYTES || total > MAX_LAYER_BYTES {
+        if size > cap || total > cap {
             return Err(bad(
                 "layer exceeds the size cap (possible decompression bomb)",
             ));
@@ -2461,13 +2925,11 @@ pub(crate) fn strip_device_members(
                     wr(w, &pending)?;
                     pending.clear();
                 }
-                // Strip setuid/setgid from image FILES (regular members only - setgid on a directory is
-                // legitimate group-inheritance, not a privilege lever). The bit is already inert in a box
-                // (root mount is `MS_NOSUID`) and on a rootless `--dest` tree (files owned by the
-                // unprivileged extractor), so this changes nothing there; it hardens the one path those
-                // two defenses don't cover - a tree used OUTSIDE a box, or a `pull` run as real root -
-                // making the artifact safe-by-construction. Same stance as the device drop above.
-                if matches!(typeflag, b'0' | 0 | b'7') {
+                // Strip setuid/setgid from image FILES when asked (regular members only - setgid on a
+                // directory is legitimate group-inheritance, not a privilege lever): a tree outside
+                // kern's cache, where a setuid-root file pulled by root would be reachable from the
+                // host. In the cache the bits stay, as docker keeps them: see `SetuidBits`.
+                if setuid == SetuidBits::Strip && matches!(typeflag, b'0' | 0 | b'7') {
                     clear_suid_sgid(&mut header);
                 }
                 wr(w, &header)?;
@@ -2494,15 +2956,17 @@ pub(crate) fn strip_device_members(
 pub(crate) fn filter_layer(
     tar_path: &Path,
     comp: Compression,
+    setuid: SetuidBits,
 ) -> Result<std::path::PathBuf, OciError> {
     let path = tar_path.to_string_lossy();
+    let cap = layer_byte_cap(std::fs::metadata(tar_path).map(|m| m.len()).unwrap_or(0));
     let out_path = tar_path.with_extension("kernflt");
     let mut out = std::fs::File::create(&out_path)
         .map_err(|e| OciError::Extract(format!("create filtered layer: {e}")))?;
     let strip_res = match comp {
         Compression::Plain => std::fs::File::open(tar_path)
             .map_err(|e| OciError::Extract(e.to_string()))
-            .and_then(|mut f| strip_device_members(&mut f, &mut out)),
+            .and_then(|mut f| strip_device_members_capped(&mut f, &mut out, cap, setuid)),
         Compression::Gzip | Compression::Zstd => {
             let is_zstd = comp == Compression::Zstd;
             if is_zstd && !zstd_available() {
@@ -2524,7 +2988,9 @@ pub(crate) fn filter_layer(
                 Ok(mut child) => {
                     let res = match child.stdout.take() {
                         None => Err(OciError::Extract("no decompressor stdout".into())),
-                        Some(mut stdout) => strip_device_members(&mut stdout, &mut out),
+                        Some(mut stdout) => {
+                            strip_device_members_capped(&mut stdout, &mut out, cap, setuid)
+                        }
                     };
                     // We stop reading at the end-of-archive marker, so the decompressor may take a
                     // SIGPIPE - its status is not meaningful; a truncated input is caught by `strip`.
@@ -2615,6 +3081,11 @@ fn parse_pax(data: &[u8]) -> PaxInfo {
 /// through ustar `prefix`, GNU `L`/`K` long name/link, and PAX `x`/`g` `path=`/`linkpath=`, so what we
 /// check is what tar will actually create - never a truncated or text-desynced approximation.
 pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError> {
+    vet_tar_stream_capped(r, MAX_LAYER_BYTES)
+}
+
+/// [`vet_tar_stream`] with the size cap of the layer at hand (see [`layer_byte_cap`]).
+pub(crate) fn vet_tar_stream_capped(r: &mut impl std::io::Read, cap: u64) -> Result<(), OciError> {
     let bad = |m: &str| OciError::Extract(m.to_string());
     let mut header = [0u8; TAR_BLOCK];
     let mut total: u64 = 0;
@@ -2882,7 +3353,7 @@ pub(crate) fn vet_tar_stream(r: &mut impl std::io::Read) -> Result<(), OciError>
         // entire (decompressed) body from gzip before the running total tripped the cap - a per-member
         // DoS. Checking the declared size up front bounds the work to one block.
         total = total.saturating_add(size);
-        if size > MAX_LAYER_BYTES || total > MAX_LAYER_BYTES {
+        if size > cap || total > cap {
             return Err(bad(
                 "layer exceeds the size cap (possible decompression bomb)",
             ));
@@ -3627,6 +4098,151 @@ mod tests {
                 "1"
             ]
         );
+    }
+
+    /// ⛔ A BATCH THAT LOOKS SUCCESSFUL CAN HOLD A BAD BLOB, and none may survive it. curl's exit code
+    /// is the LAST transfer's, so a transfer cut at the time limit on an earlier blob left a file the
+    /// per-blob path then trusted and refused as a digest mismatch, with no second fetch.
+    /// Found in the field: `ghcr.io/ggml-org/llama.cpp:server-cuda` on a WSL2 guest at 4 MB/s.
+    #[test]
+    fn a_blob_the_batch_got_wrong_is_removed_and_the_good_ones_are_kept() {
+        use std::io::{Read, Write};
+        let sha = |b: &[u8]| -> String {
+            let out = std::process::Command::new("sha256sum")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    if let Some(mut i) = c.stdin.take() {
+                        i.write_all(b)?;
+                    }
+                    c.wait_with_output()
+                })
+                .expect("sha256sum");
+            let hex = String::from_utf8_lossy(&out.stdout);
+            format!("sha256:{}", hex.split_whitespace().next().unwrap_or(""))
+        };
+        let config = b"{\"config\":{}}".to_vec();
+        let good = vec![b'g'; 4096];
+        let bad_body = vec![b'b'; 4096];
+        let (dc, dg, db) = (sha(&config), sha(&good), sha(&bad_body));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let routes: Vec<(String, Option<Vec<u8>>)> = vec![
+            (format!("/v2/x/blobs/{dc}"), Some(config.clone())),
+            // 200 WITH THE WRONG BYTES: what a transfer cut at the time limit leaves, and what
+            // `--fail` cannot see (a 503 never creates the file once `--fail` is on).
+            (format!("/v2/x/blobs/{db}"), Some(vec![b'b'; 1000])),
+            (format!("/v2/x/blobs/{dg}"), Some(good.clone())),
+        ];
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut req = [0u8; 4096];
+                let n = s.read(&mut req).unwrap_or(0);
+                let line = String::from_utf8_lossy(&req[..n]);
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                match routes.iter().find(|(p, _)| *p == path) {
+                    Some((_, Some(body))) => {
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = s.write_all(body);
+                    }
+                    _ => {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+            }
+        });
+        let dest = std::env::temp_dir().join(format!("kern-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).expect("dest");
+        let manifest = format!("{{\"config\":{{\"digest\":\"{dc}\"}}}}");
+        let layers = vec![db.clone(), dg.clone()];
+        download_blobs_oneconn(
+            &format!("127.0.0.1:{port}"),
+            "x",
+            &manifest,
+            &layers,
+            &Auth::None,
+            &dest,
+        );
+        let config_kept = dest.join(".kern-image-config.json").exists();
+        let bad_kept = layer_tmp_path(&dest, 0, &db).exists();
+        let good_kept = layer_tmp_path(&dest, 1, &dg).exists();
+        let _ = std::fs::remove_dir_all(&dest);
+        assert!(!bad_kept, "the blob the batch got wrong survived it");
+        assert!(good_kept && config_kept, "a good blob was thrown away");
+    }
+
+    /// A BOMB IS A RATIO: a small layer keeps the 2 GiB floor, a large one may expand twenty times
+    /// what was downloaded, and nothing passes the 64 GiB ceiling. The field case was a 2058 MB
+    /// compressed CUDA layer, refused under the flat 2 GiB cap.
+    #[test]
+    fn the_layer_cap_scales_with_what_was_downloaded() {
+        assert_eq!(layer_byte_cap(0), MAX_LAYER_BYTES);
+        assert_eq!(
+            layer_byte_cap(1 << 20),
+            MAX_LAYER_BYTES,
+            "a 1 MiB blob gets the floor"
+        );
+        let cuda = 2_058_000_000u64;
+        assert_eq!(layer_byte_cap(cuda), cuda * 20);
+        assert!(layer_byte_cap(cuda) > 3 * MAX_LAYER_BYTES);
+        assert_eq!(layer_byte_cap(u64::MAX), MAX_LAYER_BYTES_CEILING);
+        // And the checker uses the cap it is given: one member just over it is refused.
+        let mut tar = vec![0u8; 512];
+        tar[..4].copy_from_slice(b"big\0");
+        let size = format!("{:011o}\0", 4096u64);
+        tar[124..136].copy_from_slice(size.as_bytes());
+        tar[156] = b'0';
+        tar[257..263].copy_from_slice(b"ustar\0");
+        let sum: u32 = tar
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if (148..156).contains(&i) {
+                    32
+                } else {
+                    *b as u32
+                }
+            })
+            .sum();
+        let chk = format!("{sum:06o}\0 ");
+        tar[148..156].copy_from_slice(chk.as_bytes());
+        tar.extend(vec![b'x'; 4096]);
+        tar.extend(vec![0u8; 1024]);
+        assert!(vet_tar_stream_capped(&mut std::io::Cursor::new(tar.clone()), 4096).is_ok());
+        assert!(vet_tar_stream_capped(&mut std::io::Cursor::new(tar), 4095).is_err());
+    }
+
+    /// AN HTTP ERROR IS NOT A BLOB: without `--fail` curl wrote a 503's body to the blob's path and
+    /// exited 0 (measured, curl 8.5.0), and the pull died later as a digest mismatch.
+    #[test]
+    fn a_blob_answered_with_an_http_error_is_a_failed_download() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut req = [0u8; 2048];
+                let _ = s.read(&mut req);
+                let _ = s.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\nConnection: close\r\n\r\nnope\n",
+                );
+            }
+        });
+        let tmp = std::env::temp_dir().join(format!("kern-http-err-{}.blob", std::process::id()));
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/sha256:00");
+        let r = curl_download_guarded(&url, tmp.to_str().unwrap(), &Auth::None, &STALL_GUARD);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(r.is_err(), "an HTTP 404 was reported as a downloaded blob");
     }
 
     #[test]
@@ -5493,5 +6109,429 @@ mod label_tests {
         assert_eq!(labels_after(r#"{"Labels":{"a":"1","b"}}"#), ["a=1"]);
         // An empty key is not a label.
         assert_eq!(labels_after(r#"{"Labels":{"":"1","b":"2"}}"#), ["b=2"]);
+    }
+}
+
+#[cfg(test)]
+mod salvage_tests {
+    use super::*;
+
+    /// Only kern's own layer blob names carry a digest, and only a full sha256 is believed: anything
+    /// else in an image directory (a rootfs file named like one, a truncated name) keeps nothing.
+    #[test]
+    fn a_layer_blob_name_yields_its_digest_and_nothing_else_does() {
+        let hex = "09675ba1127c055a5b7b417945af6b9d26d46572a499ab40028ecd624b950544";
+        assert_eq!(
+            layer_blob_digest(&format!(".kern-layer-8-sha256_{hex}.tar.gz")),
+            Some(format!("sha256:{hex}"))
+        );
+        assert_eq!(layer_blob_digest(".kern-image-config.json"), None);
+        assert_eq!(
+            layer_blob_digest(&format!(".kern-layer-8-sha256_{}.tar.gz", &hex[..63])),
+            None
+        );
+        assert_eq!(
+            layer_blob_digest(&format!(".kern-layer-8-sha512_{hex}.tar.gz")),
+            None
+        );
+        assert_eq!(
+            layer_blob_digest(&format!("kern-layer-8-sha256_{hex}.tar.gz")),
+            None
+        );
+        assert_eq!(
+            layer_blob_digest(&format!(".kern-layer-8-sha256_{hex}.tar")),
+            None
+        );
+    }
+
+    /// A blob that matches its name is moved; one cut off part-way stays behind to be cleared.
+    #[test]
+    fn salvage_moves_what_verifies_and_leaves_a_partial_blob() {
+        let d = std::env::temp_dir().join(format!("kern-salvage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (dir, keep) = (d.join("img"), d.join("keep"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"a whole layer";
+        let out = Command::new("sha256sum")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                if let Some(mut i) = c.stdin.take() {
+                    let _ = i.write_all(body);
+                }
+                c.wait_with_output()
+            })
+            .unwrap();
+        let hex = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let whole = format!(".kern-layer-0-sha256_{hex}.tar.gz");
+        let partial = format!(".kern-layer-1-sha256_{hex}.tar.gz");
+        std::fs::write(dir.join(&whole), body).unwrap();
+        std::fs::write(dir.join(&partial), &body[..4]).unwrap();
+        std::fs::write(dir.join("etc-file"), b"rootfs content").unwrap();
+        let (n, bytes) = salvage_layer_blobs(&dir, &keep);
+        assert_eq!((n, bytes), (1, body.len() as u64));
+        assert!(keep.join(&whole).exists());
+        assert!(dir.join(&partial).exists() && !keep.join(&partial).exists());
+        assert!(dir.join("etc-file").exists() && !keep.join("etc-file").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod resilient_download_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// ⛔ A TRANSFER THAT BREAKS IS CONTINUED, NOT LOST. The first connection sends half the body and
+    /// closes (curl exit 18, a body cut short); the second must ask for the rest with a `Range`
+    /// header, and the file must come out whole. MEASURED in the field: a 5 GB pull died at its last
+    /// layer on an HTTP/2 stream reset and lost the whole image.
+    #[test]
+    fn a_broken_blob_transfer_is_continued_from_where_it_stopped() {
+        let body: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let total = body.len();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let ranges = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (h2, r2, b2) = (hits.clone(), ranges.clone(), body.clone());
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                let mut s = s;
+                let n = h2.fetch_add(1, Ordering::SeqCst);
+                let mut req = vec![0u8; 8192];
+                let got = s.read(&mut req).unwrap_or(0);
+                let text = String::from_utf8_lossy(&req[..got]).to_string();
+                let range = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Range: bytes="))
+                    .map(|r| r.trim_end_matches('-').trim().to_string());
+                if let Ok(mut r) = r2.lock() {
+                    r.push(range.clone().unwrap_or_default());
+                }
+                if n == 0 {
+                    let _ = s.write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n").as_bytes(),
+                    );
+                    let _ = s.write_all(&b2[..total / 2]);
+                    continue; // dropped: the connection closes here
+                }
+                let from: usize = range.and_then(|r| r.parse().ok()).unwrap_or(0);
+                let head = if from > 0 {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{}/{total}\r\nContent-Length: {}\r\n\r\n",
+                        total - 1,
+                        total - from
+                    )
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n")
+                };
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&b2[from..]);
+            }
+        });
+        let tmp = std::env::temp_dir().join(format!("kern-resume-{}.blob", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/sha256:00");
+        // No curl-level retry here: the continuation under test is kern's own.
+        let guard = ["--speed-limit", "1024", "--speed-time", "5"];
+        let r = curl_download_resilient_with(
+            &url,
+            tmp.to_str().unwrap(),
+            &Auth::None,
+            "test",
+            &guard,
+            0,
+            &|| Ok(Auth::None),
+        );
+        let got = std::fs::read(&tmp).unwrap_or_default();
+        let _ = std::fs::remove_file(&tmp);
+        let seen = ranges.lock().map(|r| r.clone()).unwrap_or_default();
+        assert!(r.is_ok(), "the broken transfer was not completed: {r:?}");
+        assert_eq!(got.len(), total, "the file is not whole");
+        assert!(got == body, "the continued file is not the body");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "ranges asked: {seen:?}");
+        assert_eq!(
+            seen.get(1).map(String::as_str),
+            Some((total / 2).to_string().as_str())
+        );
+    }
+
+    /// ⛔ A TOKEN THAT EXPIRED MID-PULL IS RENEWED AND THE BLOB CONTINUES. The server refuses the
+    /// old token with 401 and serves the new one; exactly one renewal, and the file is whole.
+    /// MEASURED in the field: Docker Hub's five-minute token ran out thirteen minutes into a
+    /// multi-GB pull and kern gave up on the image.
+    #[test]
+    fn an_expired_token_is_renewed_and_the_blob_completes() {
+        let body = b"the whole blob".to_vec();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let b2 = body.clone();
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                let mut s = s;
+                let mut req = vec![0u8; 8192];
+                let got = s.read(&mut req).unwrap_or(0);
+                let text = String::from_utf8_lossy(&req[..got]).to_string();
+                if text.contains("Authorization: Bearer fresh") {
+                    let _ = s.write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", b2.len())
+                            .as_bytes(),
+                    );
+                    let _ = s.write_all(&b2);
+                } else {
+                    let _ = s.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+                }
+            }
+        });
+        let tmp = std::env::temp_dir().join(format!("kern-reauth-{}.blob", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/sha256:00");
+        let renewals = AtomicUsize::new(0);
+        let reauth = || {
+            renewals.fetch_add(1, Ordering::SeqCst);
+            Ok(Auth::Bearer("fresh".into()))
+        };
+        let r = curl_download_resilient_with(
+            &url,
+            tmp.to_str().unwrap(),
+            &Auth::Bearer("expired".into()),
+            "test",
+            &[],
+            0,
+            &reauth,
+        );
+        let got = std::fs::read(&tmp).unwrap_or_default();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(got, body);
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+    }
+
+    /// An HTTP error is an answer, and asking again gets the same one: no retry, no wait.
+    #[test]
+    fn an_http_error_is_not_retried() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let h2 = hits.clone();
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                let mut s = s;
+                h2.fetch_add(1, Ordering::SeqCst);
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let tmp = std::env::temp_dir().join(format!("kern-404-{}.blob", std::process::id()));
+        let url = format!("http://127.0.0.1:{port}/v2/x/blobs/sha256:00");
+        let r = curl_download_resilient_with(
+            &url,
+            tmp.to_str().unwrap(),
+            &Auth::None,
+            "test",
+            &[],
+            0,
+            &|| Ok(Auth::None),
+        );
+        let _ = std::fs::remove_file(&tmp);
+        assert!(r.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod verified_memory_tests {
+    use super::*;
+
+    fn digest_of(bytes: &[u8]) -> String {
+        let mut child = Command::new("sha256sum")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sha256sum");
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(bytes)
+            .expect("write");
+        let out = child.wait_with_output().expect("wait");
+        let hex = String::from_utf8_lossy(&out.stdout);
+        format!(
+            "sha256:{}",
+            hex.split_whitespace().next().unwrap_or_default()
+        )
+    }
+
+    /// ⛔ THE MEMORY NEVER VOUCHES FOR A CHANGED FILE. A blob proven once is not hashed again while it
+    /// is the same file; overwritten in place (another size) or replaced by a rename (another inode),
+    /// it is hashed again and the old digest refused.
+    #[test]
+    fn a_verified_blob_is_trusted_only_while_it_is_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("kern-ut-verified-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let blob = dir.join("blob");
+        std::fs::write(&blob, b"layer bytes A").expect("write");
+        let good = digest_of(b"layer bytes A");
+        let first = verify_digest(&blob, &good).is_ok();
+        let again = verify_digest(&blob, &good).is_ok();
+        std::fs::write(&blob, b"layer bytes A, then tampered").expect("rewrite");
+        let after_rewrite = verify_digest(&blob, &good).is_err();
+        let other = dir.join("other");
+        std::fs::write(&other, b"layer bytes B").expect("write");
+        std::fs::rename(&other, &blob).expect("rename");
+        let after_rename = verify_digest(&blob, &good).is_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(first && again, "a good blob was refused");
+        assert!(
+            after_rewrite,
+            "a blob rewritten in place passed on the old digest"
+        );
+        assert!(
+            after_rename,
+            "a blob replaced by a rename passed on the old digest"
+        );
+    }
+}
+
+#[cfg(test)]
+mod setuid_bits_tests {
+    use super::*;
+
+    /// The mode of the first member of a plain tar, read from its header.
+    fn first_mode(tar: &[u8]) -> u64 {
+        tar_num(&tar[100..108]).unwrap_or(0)
+    }
+
+    /// ⛔ THE CACHE KEEPS AN IMAGE'S SETUID BIT AND `--dest` CLEARS IT. The cache kept nothing, so an
+    /// image's `sudo` could never raise in a box (MEASURED on ComfyUI-Nvidia-Docker); a `--dest` tree
+    /// may be anywhere, where a setuid-root file pulled by root is a way to host root.
+    #[test]
+    fn the_filter_keeps_setuid_for_the_cache_and_strips_it_for_a_dest_tree() {
+        let dir = std::env::temp_dir().join(format!("kern-ut-suidbits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("root")).expect("dir");
+        std::fs::write(dir.join("root/sudo"), b"#!/bin/sh\n").expect("write");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("root/sudo"),
+                std::fs::Permissions::from_mode(0o4755),
+            )
+            .expect("chmod");
+        }
+        let made = Command::new("tar")
+            .args(["--owner=0", "--group=0", "--numeric-owner", "-C"])
+            .arg(dir.join("root"))
+            .arg("-cf")
+            .arg(dir.join("layer.tar"))
+            .arg("sudo")
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(made, "tar");
+        let tar = std::fs::read(dir.join("layer.tar")).expect("read");
+        let run = |setuid: SetuidBits| {
+            let mut out = Vec::new();
+            strip_device_members_capped(&mut &tar[..], &mut out, MAX_LAYER_BYTES, setuid)
+                .expect("filter");
+            first_mode(&out)
+        };
+        let kept = run(SetuidBits::Keep);
+        let stripped = run(SetuidBits::Strip);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(kept & 0o7777, 0o4755, "the cache lost the setuid bit");
+        assert_eq!(
+            stripped & 0o7777,
+            0o0755,
+            "a --dest tree kept the setuid bit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    /// ⛔ EXPORT KEEPS A ROOT-OWNED SETUID BIT AND FORGES NONE. Every member comes out 0:0, so a
+    /// setuid file of another owner would become setuid-root: that one loses the bit, as does a setgid
+    /// file of another group, while root's own `sudo` keeps it, as docker's save and push keep it.
+    #[test]
+    fn export_keeps_roots_setuid_and_clears_the_bits_ownership_would_forge() {
+        let dir = std::env::temp_dir().join(format!("kern-ut-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("t")).expect("dir");
+        for f in ["mine", "theirs", "grp"] {
+            std::fs::write(dir.join("t").join(f), b"x").expect("write");
+        }
+        let tar_one = |name: &str, mode: &str, owner: &str, group: &str| {
+            Command::new("tar")
+                .args([
+                    "--numeric-owner",
+                    "--owner",
+                    owner,
+                    "--group",
+                    group,
+                    "--mode",
+                    mode,
+                    "-C",
+                ])
+                .arg(dir.join("t"))
+                .arg("-rf")
+                .arg(dir.join("in.tar"))
+                .arg(name)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let made = tar_one("mine", "4755", "1000", "1000")
+            && tar_one("theirs", "4755", "1999", "1000")
+            && tar_one("grp", "2755", "1000", "1999");
+        assert!(made, "GNU tar is needed to build the fixture");
+        let input = std::fs::read(dir.join("in.tar")).expect("read");
+        let mut out = Vec::new();
+        normalize_for_export(&mut &input[..], &mut out, 1000, 1000).expect("export");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut seen = Vec::new();
+        let mut off = 0;
+        while off + TAR_BLOCK <= out.len() && out[off..off + TAR_BLOCK].iter().any(|&b| b != 0) {
+            let h = &out[off..off + TAR_BLOCK];
+            let name = tar_field(&h[0..100]);
+            let mode = tar_num(&h[100..108]).unwrap_or(0) & 0o7777;
+            let owner = (tar_num(&h[108..116]), tar_num(&h[116..124]));
+            let size = tar_num(&h[124..136]).unwrap_or(0);
+            seen.push((name, mode, owner));
+            off += TAR_BLOCK + (size.div_ceil(TAR_BLOCK as u64) * TAR_BLOCK as u64) as usize;
+        }
+        let find = |n: &str| seen.iter().find(|(name, _, _)| name == n).cloned();
+        assert_eq!(
+            find("mine").map(|e| e.1),
+            Some(0o4755),
+            "root's own setuid was lost: {seen:?}"
+        );
+        assert_eq!(
+            find("theirs").map(|e| e.1),
+            Some(0o0755),
+            "another owner's setuid became root's: {seen:?}"
+        );
+        assert_eq!(
+            find("grp").map(|e| e.1),
+            Some(0o0755),
+            "another group's setgid became root's: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, _, o)| *o == (Some(0), Some(0))),
+            "an owner was not normalized: {seen:?}"
+        );
     }
 }

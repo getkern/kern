@@ -860,7 +860,21 @@ pub fn is_installed() -> bool {
 }
 
 pub fn install(mode: SeccompFilter, allow_nesting: bool) -> Result<(), Error> {
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+    install_with(mode, allow_nesting, true)
+}
+
+/// [`install`], with `no_new_privs` a choice. WITHOUT it the kernel takes a filter only from a task
+/// holding `CAP_SYS_ADMIN` in its user namespace, so the caller installs it BEFORE dropping its
+/// capabilities, as runc does for a container started without `no-new-privileges`: the filter then
+/// also covers the capability drop and the identity switch that follow it. What it gives back is
+/// docker's default: a setuid program in the box (`sudo`) can raise its user to the box's root, still
+/// inside the filter, the dropped bounding set and the namespaces.
+pub fn install_with(
+    mode: SeccompFilter,
+    allow_nesting: bool,
+    no_new_privs: bool,
+) -> Result<(), Error> {
+    if no_new_privs && unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(Error::last("prctl(NO_NEW_PRIVS)"));
     }
 

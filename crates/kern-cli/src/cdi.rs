@@ -528,6 +528,23 @@ fn build(lines: &[Lexed]) -> Result<Value, CdiError> {
         Ok(())
     }
 
+    // A SEQUENCE ITEM AT ITS KEY'S OWN COLUMN BELONGS TO THAT KEY: `devices:` then `- name: "0"`
+    // both at column 0 is YAML's compact form, and NVIDIA writes it so. `close_to` ended the key's
+    // frame at that column and the item became the DOCUMENT: MEASURED on a Jetson Orin Nano, the
+    // board's own `nvidia-pva.yaml` read as a bare list and `--device` said it "carries no
+    // cdiVersion". So a dash line first closes only what is deeper than it, and stays in a key frame
+    // opened at its own column that holds no mapping yet.
+    fn close_for_item(stack: &mut Vec<Frame>, indent: usize, line: usize) -> Result<(), CdiError> {
+        close_to(stack, indent.saturating_add(1), line)?;
+        let open_key_here = stack
+            .last()
+            .is_some_and(|top| top.indent == indent && top.key.is_some() && top.map.is_empty());
+        if open_key_here {
+            return Ok(());
+        }
+        close_to(stack, indent, line)
+    }
+
     for lexed in lines {
         match &lexed.shape {
             Shape::KeyOnly(key) => {
@@ -548,7 +565,7 @@ fn build(lines: &[Lexed]) -> Result<Value, CdiError> {
                 top.insert(key.clone(), Value::Scalar(value.clone()), lexed.line)?;
             }
             Shape::SeqScalar(value) => {
-                close_to(&mut stack, lexed.indent, lexed.line)?;
+                close_for_item(&mut stack, lexed.indent, lexed.line)?;
                 let Some(top) = stack.last_mut() else {
                     return Err(CdiError::BadIndent { line: lexed.line });
                 };
@@ -556,7 +573,7 @@ fn build(lines: &[Lexed]) -> Result<Value, CdiError> {
                 top.seq.push(Value::Scalar(value.clone()));
             }
             Shape::SeqKeyValue(key, value) => {
-                close_to(&mut stack, lexed.indent, lexed.line)?;
+                close_for_item(&mut stack, lexed.indent, lexed.line)?;
                 let Some(top) = stack.last_mut() else {
                     return Err(CdiError::BadIndent { line: lexed.line });
                 };
@@ -572,7 +589,7 @@ fn build(lines: &[Lexed]) -> Result<Value, CdiError> {
                 });
             }
             Shape::SeqKeyOnly(key) => {
-                close_to(&mut stack, lexed.indent, lexed.line)?;
+                close_for_item(&mut stack, lexed.indent, lexed.line)?;
                 let Some(top) = stack.last_mut() else {
                     return Err(CdiError::BadIndent { line: lexed.line });
                 };
@@ -643,6 +660,8 @@ pub struct CdiHook {
 /// The edits a device or the document as a whole asks for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerEdits {
+    /// `KEY=VALUE` entries the spec puts in the container's environment.
+    pub env: Vec<String>,
     /// Device nodes to expose.
     pub device_nodes: Vec<PathBuf>,
     /// Mounts to make.
@@ -766,6 +785,20 @@ const HOOK_FIELDS: &[&str] = &["hookName", "path", "args", "env", "timeout"];
 fn container_edits(node: &Value, line_hint: usize) -> Result<ContainerEdits, CdiError> {
     check_fields(node, EDITS_FIELDS, "containerEdits")?;
     let mut edits = ContainerEdits::default();
+
+    // THE CONTAINER'S VARIABLES, which docker and podman apply. MEASURED with docker 29.1.3 and
+    // podman 4.9.3 on this host's spec: `NVIDIA_VISIBLE_DEVICES=void` in the container for every
+    // `--device nvidia.com/gpu=…`, and kern set nothing because it did not read the list. A hook's
+    // own `env` is a different list (the hook's process) and is not read here.
+    if let Some(env) = node.get("env") {
+        for item in env.items() {
+            if let Some(kv) = item.as_str() {
+                if kv.split_once('=').is_some_and(|(k, _)| !k.is_empty()) {
+                    edits.env.push(kv.to_string());
+                }
+            }
+        }
+    }
 
     if let Some(nodes) = node.get("deviceNodes") {
         for item in nodes.items() {
@@ -993,6 +1026,41 @@ pub fn nodes_for_device(root: &Path, spec: &CdiSpec, device: &str) -> Option<Vec
 }
 
 #[cfg(test)]
+mod compact_sequence_tests {
+    /// NVIDIA's PVA spec on a Jetson, as the board ships it (shortened), opening with `---`.
+    const PVA: &str = "---\ncdiVersion: 0.5.0\ncontainerEdits:\n  mounts:\n  - containerPath: /run/nvidia-pva-allowd\n    hostPath: /run/nvidia-pva-allowd\n    options:\n    - ro\n    - bind\n  hooks:\n  - path: /usr/bin/nvidia-pva-hook\n    hookName: createContainer\n    args:\n    - nvidia-pva-hook\n    - create\ndevices:\n- name: \"0\"\n  containerEdits:\n    env:\n    - NVIDIA_PVA_DEVICE=0\nkind: nvidia.com/pva\n";
+
+    /// ⛔ NVIDIA'S JETSON SPEC IS READ. It writes its sequences in the compact form (`devices:` then
+    /// `- name:` at the same column), and the whole document came back as a bare list, so `--device`
+    /// said it "carries no cdiVersion". Its opening `---` was never the cause (the lexer takes it,
+    /// and a sabotage of a second handling of it changed nothing), and a second document is still
+    /// refused.
+    #[test]
+    fn nvidias_jetson_spec_with_compact_sequences_is_read() {
+        let spec = super::parse_spec(PVA);
+        assert!(
+            matches!(&spec, Ok(s) if s.kind == "nvidia.com/pva"),
+            "NVIDIA's PVA spec was not read: {spec:?}"
+        );
+        let two = format!("{PVA}---\ncdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices: []\n");
+        assert!(
+            super::parse_spec(&two).is_err(),
+            "a second document was taken"
+        );
+        let commented = format!("# generated\n\n{PVA}");
+        assert!(
+            super::parse_spec(&commented).is_ok(),
+            "a comment above the marker broke it"
+        );
+        // The compact form and the indented one are the same document.
+        let compact = "a: 1\nlist:\n- x: 1\n  y:\n  - p\n  - q\n- x: 2\nb: 2\n";
+        let indented = "a: 1\nlist:\n  - x: 1\n    y:\n      - p\n      - q\n  - x: 2\nb: 2\n";
+        assert_eq!(super::parse_strict(compact), super::parse_strict(indented));
+        assert!(super::parse_strict(compact).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1158,6 +1226,93 @@ containerEdits:
         }
     }
 
+    /// ⛔ EVERY NAME ON THE LINE, `all` INCLUDED, AND THE SPEC'S VARIABLES. Measured with docker and
+    /// podman on this host: two `--device` flags are two cards, `nvidia.com/gpu=all` is every card,
+    /// and `NVIDIA_VISIBLE_DEVICES=void` from the spec is in the container. kern kept the last flag,
+    /// refused `all`, and read no `env`.
+    #[test]
+    fn a_list_of_cdi_names_resolves_every_one_with_all_and_the_spec_env() {
+        let root = std::env::temp_dir().join(format!("kern-cdi-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        if std::fs::create_dir_all(root.join("etc/cdi")).is_err() {
+            eprintln!("skip: no writable temp dir");
+            return;
+        }
+        if std::os::unix::fs::symlink("/dev", root.join("dev")).is_err() {
+            eprintln!("skip: cannot link a dev directory");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        std::fs::write(
+            root.join("etc/cdi/a.yaml"),
+            concat!(
+                "cdiVersion: 0.5.0\n",
+                "kind: nvidia.com/gpu\n",
+                "containerEdits:\n",
+                "  env:\n",
+                "    - NVIDIA_VISIBLE_DEVICES=void\n",
+                "  hooks:\n",
+                "    - hookName: createContainer\n",
+                "      path: /usr/bin/nvidia-cdi-hook\n",
+                "      env:\n",
+                "        - NVIDIA_CTK_DEBUG=false\n",
+                "devices:\n",
+                "  - name: \"0\"\n",
+                "    containerEdits:\n",
+                "      deviceNodes:\n",
+                "        - path: /dev/null\n",
+                "  - name: \"1\"\n",
+                "    containerEdits:\n",
+                "      env:\n",
+                "        - ONLY_ONE=yes\n",
+                "      deviceNodes:\n",
+                "        - path: /dev/zero\n",
+                "  - name: all\n",
+                "    containerEdits:\n",
+                "      deviceNodes:\n",
+                "        - path: /dev/null\n",
+                "        - path: /dev/zero\n",
+            ),
+        )
+        .expect("write spec");
+
+        let two = resolve_device_refs(&root, "nvidia.com/gpu=0,nvidia.com/gpu=1,nvidia.com/gpu=0")
+            .expect("both resolve");
+        assert_eq!(
+            two.indices,
+            Some(vec![0, 1]),
+            "both cards, once each, in order"
+        );
+        assert!(two.env.contains(&"NVIDIA_VISIBLE_DEVICES=void".to_string()));
+        assert!(
+            two.env.contains(&"ONLY_ONE=yes".to_string()),
+            "{:?}",
+            two.env
+        );
+        assert!(
+            !two.env.iter().any(|kv| kv.starts_with("NVIDIA_CTK_DEBUG")),
+            "a hook's own env is the hook's, not the container's: {:?}",
+            two.env
+        );
+
+        let all = resolve_device_refs(&root, "nvidia.com/gpu=all").expect("all resolves");
+        assert_eq!(all.indices, None, "the spec's `all` is every card");
+        let mixed =
+            resolve_device_refs(&root, "nvidia.com/gpu=0,nvidia.com/gpu=all").expect("mixed");
+        assert_eq!(mixed.indices, None);
+
+        match resolve_device_refs(&root, "nvidia.com/gpu=0,nvidia.com/gpu=7") {
+            Err((name, DeviceRefError::NoSuchDevice { .. })) => {
+                assert_eq!(
+                    name, "nvidia.com/gpu=7",
+                    "the name that failed is the one named"
+                )
+            }
+            other => panic!("one bad name must fail the request: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// THE HOOKS TRAVEL WITH THE RESOLUTION, from the device AND from the common edits.
     ///
     /// WHY IT MATTERS, measured on 2026-11-12: `nvidia-ctk` 1.18.2 attaches a `createContainer`
@@ -1214,7 +1369,7 @@ containerEdits:
         .expect("write spec");
 
         let resolved = resolve_device_ref(&root, "nvidia.com/gpu=0").expect("must resolve");
-        assert_eq!(resolved.index, 0);
+        assert_eq!(resolved.index, Some(0));
         assert_eq!(
             resolved.hooks_not_run,
             vec![
@@ -1711,7 +1866,7 @@ containerEdits:
         let got = resolve_device_ref(&root, "nvidia.com/gpu=0").map(|r| r.index);
         assert_eq!(
             got,
-            Ok(0),
+            Ok(Some(0)),
             "a spec whose node IS here must resolve, or this rule refuses every host: {got:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1951,7 +2106,10 @@ containerEdits:
 
         // A spec that names a device, so the walk has something to find AFTER the bad files. The
         // name sorts after both, which is what makes this a test of continuing rather than of order.
-        let good = "cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices:\n  - name: \"0\"\n    containerEdits:\n      deviceNodes:\n        - path: /dev/nvidia0\n";
+        // `/dev/null`, NOT `/dev/nvidia0`: the walk is what is under test, and a node only an NVIDIA
+        // host has made this fail on every host without one (a WSL2 guest, a CI runner), where the
+        // spec rightly reads as describing another machine. MEASURED in `kern-ubuntu`.
+        let good = "cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices:\n  - name: \"0\"\n    containerEdits:\n      deviceNodes:\n        - path: /dev/null\n";
         let _ = std::fs::write(dir.join("zz-good.yaml"), good);
 
         let fifo_made =
@@ -1980,7 +2138,7 @@ containerEdits:
         );
         assert_eq!(
             got,
-            Ok(0),
+            Ok(Some(0)),
             "the good spec beside the unusable ones must still resolve"
         );
         if fifo_made != 0 {
@@ -2037,7 +2195,7 @@ containerEdits:
         let _ = std::fs::write(dir.join("zz-good.yaml"), good);
         assert_eq!(
             resolve_device_ref(&root, "nvidia.com/gpu=0").map(|r| r.index),
-            Ok(0),
+            Ok(Some(0)),
             "a junk file before the good one must not disable it"
         );
 
@@ -2067,7 +2225,7 @@ containerEdits:
         let _ = std::fs::write(dir.join("zz-good.yaml"), good);
         assert_eq!(
             resolve_device_ref(&root, "nvidia.com/gpu=0").map(|r| r.index),
-            Ok(0),
+            Ok(Some(0)),
             "a JSON file beside a working YAML spec must not disable it"
         );
 
@@ -2132,8 +2290,6 @@ pub enum DeviceRefError {
         /// The names the spec offers.
         offered: Vec<String>,
     },
-    /// `all` names more than one card and this build grants one.
-    AllNotYet,
     /// The name is a UUID the host's driver does not report for any card.
     UnknownUuid {
         /// The UUID that was asked for.
@@ -2234,8 +2390,11 @@ fn minor_for_uuid(root: &Path, uuid: &str) -> Option<u32> {
 /// What `--device <kind>=<name>` resolved to, and what that spec asked for which kern does not do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDevice {
-    /// The card index the name means.
-    pub index: u32,
+    /// The card index the name means, or `None` for the spec's `all`, which is every card.
+    pub index: Option<u32>,
+    /// The `KEY=VALUE` variables the spec puts in the container for this name: the document's
+    /// common edits, then the device's own.
+    pub env: Vec<String>,
     /// The hooks the spec attaches to this device, each `<hookName> <program>`.
     ///
     /// THEY TRAVEL WITH THE RESOLUTION instead of being fetched by a second walk of the spec
@@ -2288,10 +2447,6 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<ResolvedDevice
             given: trimmed.to_string(),
         });
     }
-    if name.eq_ignore_ascii_case("all") {
-        return Err(DeviceRefError::AllNotYet);
-    }
-
     let mut kinds_found: Vec<String> = Vec::new();
     let mut offered: Vec<String> = Vec::new();
     let mut unreadable: Vec<(PathBuf, CdiError)> = Vec::new();
@@ -2359,15 +2514,30 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<ResolvedDevice
         hooks_not_run.extend(hook_labels(&device.edits));
         hooks_not_run.sort();
         hooks_not_run.dedup();
+        let mut env = spec.common.env.clone();
+        env.extend(device.edits.env.iter().cloned());
+        // `all` IS A NAME THE SPEC OFFERS, resolved through the same checks as any other: the spec
+        // must carry it and its nodes must be real here. MEASURED: docker and podman both run
+        // `--device nvidia.com/gpu=all` from this host's spec (two cards), and on a WSL2 guest the
+        // spec `nvidia-ctk` writes offers `all` and nothing else.
+        if device.name == "all" {
+            return Ok(ResolvedDevice {
+                index: None,
+                env,
+                hooks_not_run,
+            });
+        }
         if let Ok(index) = device.name.parse::<u32>() {
             return Ok(ResolvedDevice {
-                index,
+                index: Some(index),
+                env,
                 hooks_not_run,
             });
         }
         if let Some(minor) = minor_for_uuid(root, &device.name) {
             return Ok(ResolvedDevice {
-                index: minor,
+                index: Some(minor),
+                env,
                 hooks_not_run,
             });
         }
@@ -2400,5 +2570,51 @@ pub fn resolve_device_ref(root: &Path, reference: &str) -> Result<ResolvedDevice
     Err(DeviceRefError::NoSuchDevice {
         name: name.to_string(),
         offered,
+    })
+}
+
+/// Several CDI names resolved together, as every `--device` on one command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDevices {
+    /// The cards, in the order first named and without repeats; `None` when a name was `all`.
+    pub indices: Option<Vec<u32>>,
+    /// The variables of every name, in order.
+    pub env: Vec<String>,
+    /// The hooks of every name, sorted and once each.
+    pub hooks_not_run: Vec<String>,
+}
+
+/// Resolve a comma-separated list of CDI names, the way the parser carries repeated `--device`.
+///
+/// ⛔ EVERY NAME COUNTS. MEASURED on this host: `--device nvidia.com/gpu=0 --device
+/// nvidia.com/gpu=1` gave docker and podman both cards and gave kern ONE, the last, without a word,
+/// because the parser kept a single value. A comma cannot appear in a CDI name (the specification's
+/// grammar is letters, digits, `-`, `_`, `.` and `:`), so the list is unambiguous. The first name
+/// that does not resolve fails the whole request, with that name, because a box that got some of
+/// the cards it asked for cannot tell that from a card that failed later.
+pub fn resolve_device_refs(
+    root: &Path,
+    list: &str,
+) -> Result<ResolvedDevices, (String, DeviceRefError)> {
+    let mut indices: Vec<u32> = Vec::new();
+    let mut every = false;
+    let mut env: Vec<String> = Vec::new();
+    let mut hooks: Vec<String> = Vec::new();
+    for reference in list.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+        let one = resolve_device_ref(root, reference).map_err(|e| (reference.to_string(), e))?;
+        match one.index {
+            None => every = true,
+            Some(i) if !indices.contains(&i) => indices.push(i),
+            Some(_) => {}
+        }
+        env.extend(one.env);
+        hooks.extend(one.hooks_not_run);
+    }
+    hooks.sort();
+    hooks.dedup();
+    Ok(ResolvedDevices {
+        indices: (!every).then_some(indices),
+        env,
+        hooks_not_run: hooks,
     })
 }

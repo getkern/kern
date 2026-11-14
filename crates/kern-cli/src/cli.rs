@@ -189,6 +189,14 @@ pub enum Command {
         /// An ALIAS over `--gpus`, which is the plan's rule: the spec says which card a name
         /// means, the mounts come from discovery, and a test proves the two name the same nodes.
         device: Option<String>,
+        /// `--runtime nvidia`: the GPUs the box's own `NVIDIA_VISIBLE_DEVICES` names, as NVIDIA's
+        /// runtime grants them under docker.
+        runtime_nvidia: bool,
+        /// INTERNAL (build steps only): `--build-ssh-agent <socket>:<target>`, an SSH agent socket a
+        /// `RUN --mount=type=ssh` reaches. See `buildmounts`.
+        build_ssh_agents: Vec<(String, String)>,
+        /// `--security-opt no-new-privileges[:true]`: no setuid program in the box raises its user.
+        no_new_privs: bool,
         /// `--gpus <spec>`: hand the box NVIDIA GPUs, resolved from native discovery.
         ///
         /// DOCKER'S GRAMMAR, measured rather than assumed: a bare number is a COUNT, `device=N`
@@ -225,6 +233,8 @@ pub enum Command {
         stop_grace: u64,
         /// `--user UID[:GID]` / `-u`: drop to this uid/gid inside the box before the command runs.
         run_as: Option<String>,
+        /// `--group-add <name|gid>` (repeatable): an extra supplementary group, docker's flag.
+        group_add: Vec<String>,
         /// `--cap-add CAP` (repeatable): keep a capability kern would otherwise drop (or `ALL`).
         cap_add: Vec<String>,
         /// `--cap-drop CAP` (repeatable): drop an extra capability (or `ALL`).
@@ -376,6 +386,14 @@ pub enum Command {
         /// `--target <stage>`: stop at that stage of a multi-stage Dockerfile (compose's
         /// `build.target:`).
         target: Option<String>,
+        /// `--secret id=...[,src=...|,env=...]`, repeatable: what `RUN --mount=type=secret` reads.
+        secrets: Vec<String>,
+        /// `--ssh default|<id>[=...]`, repeatable: what `RUN --mount=type=ssh` reaches.
+        ssh: Vec<String>,
+        /// `--no-cache`: reuse no layer, and start every `type=cache` mount empty.
+        no_cache: bool,
+        /// `--platform <os/arch>`, as many as given: the platforms to build for (none: this machine).
+        platforms: Vec<String>,
     },
     /// `kern pod create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>]` / `pod ls` / `pod rm
     /// <name>`: a pod is a shared network, either one namespace or one bridge.
@@ -437,6 +455,11 @@ pub enum Command {
     EgressProxy {
         sock: String,
         allow: String,
+    },
+    /// Hidden: a build step's SSH agent proxy (spawned by `RUN --mount=type=ssh`).
+    BuildSshProxy {
+        listen: String,
+        upstream: String,
     },
     /// Hidden: the re-exec'd egress box-netns pump (spawned by `--egress-allow`, not user-facing).
     /// `read_fd` is an inherited pipe from box_run over which the box init pid arrives (the pump is
@@ -525,6 +548,8 @@ pub enum Command {
         /// holds. See [`commands::PsView`].
         view: commands::PsView,
     },
+    /// `kern sandbox ls|history|stats`: the SDK and MCP sandboxes, live and finished.
+    Sandbox(crate::history::SandboxCmd),
     /// `kern stats [--json] [name...]`: per-box memory + CPU (all boxes, or just the named ones).
     Stats {
         json: bool,
@@ -586,6 +611,8 @@ pub enum Command {
     /// `kern rm <name>...`: remove a stopped `--keep` box - its layer and its record.
     Rm {
         names: Vec<String>,
+        /// `-f`/`--force`: stop a running box first, as `docker rm -f` does.
+        force: bool,
     },
     /// `kern rename <old> <new>`: give a running box a new name.
     Rename {
@@ -665,6 +692,8 @@ pub enum Command {
         ignore_pull_failures: bool,
         /// `build --build-arg K=V`, repeatable: forwarded to every service built by this invocation.
         build_args: Vec<String>,
+        /// `--build` / `--no-build` on `up`: see [`commands::BuildPolicy`].
+        build_policy: commands::BuildPolicy,
         /// `run --name <n>`: the one-off's box name.
         run_name: Option<String>,
         /// `run --entrypoint <cmd>`: replaces the image's entrypoint for this run.
@@ -766,6 +795,8 @@ pub enum Command {
         project: Option<String>,
         /// `--env-file`: interpolation table instead of the project `.env`.
         env_file: Option<String>,
+        /// `--project-root <dir>`: the directory the file's paths may reach, wider than its own.
+        project_root: Option<String>,
         /// `--profile` (repeatable).
         profiles: Vec<String>,
     },
@@ -1086,6 +1117,10 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // Hidden: the relay holder (spawned by `compose up --no-pod`).
         Some("__relay-holder") => Command::RelayHolder {
             dir: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
+        },
+        Some("__build-ssh-proxy") => Command::BuildSshProxy {
+            listen: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
+            upstream: rest.get(2).map(|s| s.to_string()).unwrap_or_default(),
         },
         Some("__egress-proxy") => Command::EgressProxy {
             sock: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
@@ -1495,6 +1530,54 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 view: commands::PsView { no_trunc, last },
             }
         }
+        // `sandbox ls|history|stats`: the SDK and MCP sandboxes, live and finished (see `history.rs`).
+        Some("sandbox") => {
+            use crate::history::SandboxCmd;
+            let json = rest.contains(&"--json");
+            let all = rest.contains(&"--all");
+            match rest.get(1).copied() {
+                Some("ls") => {
+                    reject_unknown_flags("sandbox ls", &rest[1..], &["--json"])?;
+                    Command::Sandbox(SandboxCmd::Ls { json })
+                }
+                Some("history") => {
+                    let mut n = 20usize;
+                    let mut i = 2;
+                    while i < rest.len() {
+                        match rest[i] {
+                            "-n" => {
+                                i += 1;
+                                n = rest
+                                    .get(i)
+                                    .and_then(|v| v.parse().ok())
+                                    .filter(|v| *v > 0)
+                                    .ok_or(Error::Usage("sandbox history -n <count>"))?;
+                            }
+                            "--json" | "--failed" | "--all" => {}
+                            _ => return Err(Error::Usage(
+                                "sandbox history [-n N] [--failed] [--all] [--json]",
+                            )),
+                        }
+                        i += 1;
+                    }
+                    Command::Sandbox(SandboxCmd::History {
+                        json,
+                        n,
+                        failed: rest.contains(&"--failed"),
+                        all,
+                    })
+                }
+                Some("stats") => {
+                    reject_unknown_flags("sandbox stats", &rest[1..], &["--json", "--all"])?;
+                    Command::Sandbox(SandboxCmd::Stats { json, all })
+                }
+                _ => {
+                    return Err(Error::Usage(
+                        "sandbox ls | history [-n N] [--failed] [--all] | stats [--all]  (each takes --json)",
+                    ))
+                }
+            }
+        }
         // `stats`: per-box memory + CPU.
         Some("stats") => {
             // `--no-stream` NAMES WHAT ALREADY HAPPENS. `docker stats` streams a live table and
@@ -1717,7 +1800,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `rm <name>...`: removes a KEPT box. Deliberately not an alias of `stop`: Docker's `rm`
         // refuses a running container, and so does this, naming `stop` instead of killing anything.
         Some("rm") => {
-            reject_unknown_flags("rm", &rest, &[])?;
+            reject_unknown_flags("rm", &rest, &["-f", "--force"])?;
+            let force = rest.iter().skip(1).any(|a| *a == "-f" || *a == "--force");
             let names: Vec<String> = rest
                 .iter()
                 .skip(1)
@@ -1729,7 +1813,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     "rm <name>...  (a stopped box created with `box --keep`)",
                 ));
             }
-            Command::Rm { names }
+            Command::Rm { names, force }
         }
         // `update <box> [--memory M] [--cpus N] [--pids-limit P]`: change a running box's caps live.
         Some("update") => {
@@ -1920,6 +2004,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut files: Vec<String> = Vec::new();
             let mut project: Option<String> = None;
             let mut env_file: Option<String> = None;
+            let mut project_root: Option<String> = None;
             let mut profiles: Vec<String> = Vec::new();
             let mut file: Option<String> = None;
             let mut action: Option<commands::ComposeAction> = None;
@@ -1932,6 +2017,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut stop_timeout: Option<u64> = None;
             let mut ignore_pull_failures = false;
             let mut build_args: Vec<String> = Vec::new();
+            let mut build_policy = commands::BuildPolicy::default();
             let mut run_name: Option<String> = None;
             let mut run_entrypoint: Option<String> = None;
             let mut run_env: Vec<String> = Vec::new();
@@ -2135,6 +2221,20 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                                 .ok_or(Error::Usage("compose --env-file <path>"))?,
                         );
                     }
+                    // `--project-root <dir>`: THE OPERATOR WIDENS THE PROJECT, the file cannot.
+                    // MEASURED on LLMSystems/vLLMux: its compose file is in `deploy/` and builds
+                    // from `..`; docker runs it, kern refused "escapes the compose directory". The
+                    // refusal stays the default, because a downloaded file must not reach
+                    // `../../.ssh`; this names a directory that contains the file and lets its
+                    // paths reach anywhere inside it. Paths still RESOLVE from the file's
+                    // directory, as docker's do, so the meaning of every path is unchanged.
+                    "--project-root" => {
+                        project_root = Some(
+                            inline_or_next(inline, &mut it)
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("compose --project-root <dir>"))?,
+                        );
+                    }
                     "--profile" => {
                         profiles.push(
                             inline_or_next(inline, &mut it)
@@ -2244,20 +2344,13 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                         );
                         wait_ready = true;
                     }
-                    // `--build` names what kern ALREADY does, and this one is measured rather than
-                    // assumed: with the Dockerfile edited between two runs, Docker without the flag
-                    // printed the OLD marker and kern printed the new one. So the flag is accepted
-                    // silently, and `--no-build` is refused loudly for the same reason: kern cannot
-                    // promise the stale image the flag is asking for.
-                    "--build" => {}
-                    "--no-build" => {
-                        eprintln!(
-                            "kern: warning: compose: '--no-build' cannot be honoured - kern rebuilds \
-                             a `build:` service whose context changed, where Docker would reuse the \
-                             image it built before. Run `kern compose <file> build` when you want \
-                             the build on its own."
-                        );
-                    }
+                    // `--build` and `--no-build` mean what they mean to docker for a service that
+                    // names an image AND declares `build:` (see `commands::BuildPolicy`). A service
+                    // with `build:` alone is rebuilt on every `up` regardless, from kern's layer
+                    // cache: with the Dockerfile edited between two runs, docker without `--build`
+                    // printed the OLD marker and kern the new one (measured).
+                    "--build" => build_policy = commands::BuildPolicy::Always,
+                    "--no-build" => build_policy = commands::BuildPolicy::Never,
                     "--tail" => {
                         // A non-numeric `--tail` is a typo, not "show everything": refuse it.
                         tail = Some(
@@ -2287,7 +2380,18 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                                 return Err(Error::Compose(why));
                             }
                         }
-                        if file.is_none() {
+                        // AFTER THE VERB A WORD IS A SERVICE, as docker reads it, unless it is
+                        // plainly a compose file. MEASURED in the field: `kern compose up -d
+                        // immich-machine-learning`, typed in a directory holding
+                        // `docker-compose.yml` exactly as immich's docs write it, answered
+                        // "reading immich-machine-learning: No such file or directory". kern's own
+                        // positional file comes BEFORE the verb, and a file named after it still
+                        // works when it looks like one.
+                        let looks_like_a_file = w.ends_with(".yml")
+                            || w.ends_with(".yaml")
+                            || w.ends_with(".toml")
+                            || std::path::Path::new(w).is_file();
+                        if file.is_none() && (action.is_none() || looks_like_a_file) {
                             file = Some(w.to_string());
                             files.push(w.to_string());
                         } else if action.is_none()
@@ -2357,6 +2461,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 stop_timeout,
                 ignore_pull_failures,
                 build_args,
+                build_policy,
                 run_name,
                 run_entrypoint,
                 run_env,
@@ -2391,6 +2496,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 services,
                 project,
                 env_file,
+                project_root,
                 profiles,
             }
         }
@@ -2418,6 +2524,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 stop_timeout: None,
                 ignore_pull_failures: false,
                 build_args: Vec::new(),
+                build_policy: commands::BuildPolicy::default(),
                 run_name: None,
                 run_entrypoint: None,
                 run_env: Vec::new(),
@@ -2473,6 +2580,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 services: Vec::new(),
                 project: None,
                 env_file: None,
+                project_root: None,
                 profiles: Vec::new(),
             }
         }
@@ -2733,7 +2841,7 @@ enum MountSpec {
 /// Char-by-char rather than byte indexing: `,` and `"` are ASCII, but a path is not, and slicing a
 /// `&str` at a computed byte offset is a panic this function has no reason to risk. Allocation is
 /// acceptable here because argument parsing runs once per process, not on a box-start path.
-fn csv_fields(spec: &str) -> Result<Vec<String>, Error> {
+pub(crate) fn csv_fields(spec: &str) -> Result<Vec<String>, Error> {
     const UNCLOSED: Error = Error::Usage(
         "--mount: a double quote is never closed. A field may be quoted to carry a comma \
          (`\"src=/a,b\"`), and the quote has to be closed before the field ends",
@@ -3011,6 +3119,24 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
     }
 }
 
+/// What `kern box --ipc <mode>` does, as one sentence: a box always has its own IPC namespace.
+pub(crate) fn ipc_flag_note(mode: &str) -> String {
+    match mode.split(':').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "private" | "shareable" | "" => format!(
+            "--ipc {mode} is what every box already has: its own IPC namespace"
+        ),
+        "host" => format!(
+            "--ipc {mode} is NOT applied: the box keeps its own IPC namespace, a kernel boundary \
+             kern does not hand back. If the point was a large /dev/shm (docker's --ipc=host gives \
+             the host's), the box has its own, sized to its --memory cap; --shm-size sets it"
+        ),
+        _ => format!(
+            "--ipc {mode} is NOT applied: there is no way to put two boxes in one IPC namespace, so \
+             this box keeps its own"
+        ),
+    }
+}
+
 /// real sandbox. Without a rootfs/image it still routes to `BoxRun` (which reports the missing
 /// source); `--plan` previews instead of running.
 /// The `box` flags that take a value, which is the set `--flag=value` may be split on.
@@ -3023,6 +3149,7 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
 const VALUE_FLAGS: &[&str] = &[
     "--add-host",
     "--apparmor",
+    "--build-ssh-agent",
     "--cap-add",
     "--cap-drop",
     "--config",
@@ -3039,6 +3166,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--env",
     "--env-file",
     "--gpus",
+    "--group-add",
     "--health-action",
     "--health-cmd",
     "--health-cmd-argv",
@@ -3051,6 +3179,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--image",
     "--io-weight",
     "--ip",
+    "--ipc",
     "--label",
     "--landlock-rw",
     "--log-max-file",
@@ -3074,6 +3203,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--restart",
     "--restart-max",
     "--rootfs",
+    "--runtime",
     "--secret",
     "--secret-env",
     "--secret-mode",
@@ -3251,6 +3381,9 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut hostname: Option<String> = None;
     let mut gpus: Option<String> = None;
     let mut device: Option<String> = None;
+    let mut runtime_nvidia = false;
+    let mut build_ssh_agents: Vec<(String, String)> = Vec::new();
+    let mut no_new_privs = false;
     let mut tun = false;
     let mut init = false;
     let mut pids_limit: Option<u64> = None;
@@ -3271,6 +3404,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut stop_signal: Option<i32> = None;
     let mut stop_grace: u64 = 10;
     let mut run_as: Option<String> = None;
+    let mut group_add: Vec<String> = Vec::new();
     let mut cap_add: Vec<String> = Vec::new();
     let mut cap_drop: Vec<String> = Vec::new();
     let mut memory: Option<u64> = None;
@@ -3403,12 +3537,55 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 }
                 // `--device vendor/class=name`: the CDI spelling of the same request. Kept
                 // verbatim and resolved where the spec is read, so the parser stays a parser.
+                // ⛔ REPEATABLE, as in docker and podman: `--device nvidia.com/gpu=0 --device
+                // nvidia.com/gpu=1` is two cards. This kept the LAST one only, so the box got one
+                // card and nothing said so (measured against both runtimes, which gave two). The
+                // names travel as one comma-separated list; a CDI name cannot contain a comma.
                 "--device" => {
                     i += 1;
                     match rest.get(i) {
-                        Some(v) => device = Some((*v).to_string()),
+                        Some(v) => {
+                            device = Some(match device.take() {
+                                Some(prev) => format!("{prev},{v}"),
+                                None => (*v).to_string(),
+                            })
+                        }
                         None => return Err(Error::Usage("--device <vendor/class=name>")),
                     }
+                }
+                // `--runtime NAME`, docker's flag. `nvidia` is honoured with NVIDIA's meaning: the box
+                // gets the GPUs its own `NVIDIA_VISIBLE_DEVICES` names (the image's `ENV`, or `-e`),
+                // decided once the image is known. MEASURED in the field on a WSL2 guest: a compose
+                // file with `runtime: nvidia` and no reservation (devflowinc/trieve's TEI services)
+                // got the GPU under docker, from the CUDA image's `NVIDIA_VISIBLE_DEVICES=all`, and
+                // none under kern. Any other runtime is refused: kern IS the runtime.
+                "--runtime" => {
+                    i += 1;
+                    match rest.get(i).map(|v| v.trim()) {
+                        Some(v) if v.eq_ignore_ascii_case("nvidia") => runtime_nvidia = true,
+                        Some(v) => {
+                            return Err(Error::Cli(format!(
+                                "--runtime {v}: kern IS the runtime and cannot hand the box to \
+                                 another one. `--runtime nvidia` is the one name it reads, with \
+                                 NVIDIA's meaning: the GPUs the box's NVIDIA_VISIBLE_DEVICES names"
+                            )))
+                        }
+                        None => return Err(Error::Usage("--runtime nvidia")),
+                    }
+                }
+                // INTERNAL, and only inside a build: the one way a socket reaches a box as a bind,
+                // which `-v` refuses on purpose (it is how a control socket is handed over). The
+                // socket is kern's own agent proxy (see `buildmounts`), and `kern build` is the only
+                // caller; anywhere else the flag does not exist.
+                "--build-ssh-agent" if crate::global_env("KERN_BUILD_STEP").is_some() => {
+                    i += 1;
+                    let v = rest
+                        .get(i)
+                        .ok_or(Error::Usage("--build-ssh-agent <socket>:<target>"))?;
+                    let (src, dst) = v
+                        .split_once(":/")
+                        .ok_or(Error::Usage("--build-ssh-agent <socket>:<target>"))?;
+                    build_ssh_agents.push((src.to_string(), format!("/{dst}")));
                 }
                 "--init" => init = true,
                 // `--keep`: see `crate::keepbox`. One flag, no value: where the layer lives is kern's
@@ -3563,6 +3740,20 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         None => return Err(Error::Usage("--shm-size SIZE (e.g. 64m, 1g)")),
                     }
                 }
+                // `--ipc MODE`, docker's flag, which NVIDIA's own examples carry (`--ipc=host`).
+                // MEASURED: it ended `kern box` at "unknown flag", so a command pasted from those
+                // pages never started. A box always has its own IPC namespace, as compose's `ipc:`
+                // key already says: `private`/`shareable` are that, and `host` is accepted and NOT
+                // applied, out loud. What `--ipc=host` buys those examples is the host's large
+                // /dev/shm (measured 16G under docker, against 64M by default); a box's is sized to
+                // its `--memory` cap (512M measured with no flag) and `--shm-size` sets it.
+                "--ipc" => {
+                    i += 1;
+                    let Some(v) = rest.get(i) else {
+                        return Err(Error::Usage("--ipc <private|shareable|host>"));
+                    };
+                    eprintln!("kern: note: {}", ipc_flag_note(v));
+                }
                 "--tmpfs" => {
                     i += 1;
                     match rest.get(i) {
@@ -3578,6 +3769,15 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         None => {
                             return Err(Error::Usage("--user <uid[:gid]> (e.g. 1000 or 1000:1000)"))
                         }
+                    }
+                }
+                // `--group-add <name|gid>` (repeatable): docker's flag, resolved against the IMAGE's
+                // `/etc/group` when the box starts.
+                "--group-add" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => group_add.push((*v).to_string()),
+                        None => return Err(Error::Usage("--group-add <name|gid>")),
                     }
                 }
                 // `--cap-add CAP` / `--cap-drop CAP` (repeatable; CAP name or ALL).
@@ -4221,6 +4421,22 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--security-opt" => {
                     i += 1;
                     let v = rest.get(i).copied().unwrap_or("");
+                    // `no-new-privileges`, docker's spellings: bare or `:true`/`=true` turns the
+                    // block on, `:false`/`=false` off. Off is docker's default and kern's for a box;
+                    // see `kern_isolation::SandboxSpec::no_new_privs`.
+                    if let Some(rest_of) = v.strip_prefix("no-new-privileges") {
+                        match rest_of {
+                            "" | ":true" | "=true" => no_new_privs = true,
+                            ":false" | "=false" => no_new_privs = false,
+                            _ => {
+                                return Err(Error::Cli(format!(
+                                    "--security-opt {v:?}: no-new-privileges takes :true or :false"
+                                )))
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
                     let (key, val) = v.split_once('=').unwrap_or((v, ""));
                     return Err(Error::Cli(match key {
                         "apparmor" => format!(
@@ -4239,15 +4455,10 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                              was granted, that is the host's policy and `getenforce` is where to \
                              look"
                         ),
-                        "no-new-privileges" => {
-                            "--security-opt no-new-privileges: a kern box already runs with \
-                             no-new-privs set, and there is no flag to turn it off"
-                                .to_string()
-                        }
                         _ => format!(
                             "--security-opt {v:?}: kern has no such flag. The ones with an \
                              equivalent are apparmor= (`--apparmor`), seccomp= (the KERN_SECCOMP \
-                             environment variable) and no-new-privileges (always on)"
+                             environment variable) and no-new-privileges[:true|:false]"
                         ),
                     }));
                 }
@@ -4414,6 +4625,9 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             tun,
             gpus,
             device,
+            runtime_nvidia,
+            build_ssh_agents,
+            no_new_privs,
             init,
             pids_limit,
             tmpfs,
@@ -4426,6 +4640,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             stop_signal,
             stop_grace,
             run_as,
+            group_add,
             cap_add,
             cap_drop,
             restart,
@@ -5062,8 +5277,10 @@ fn unknown_compose_flag(flag: &str) -> String {
         ),
         (
             "--project-directory",
-            "kern resolves a service's relative paths against the FILE's directory; \
-             `-p/--project-name` sets the name the pod and the volumes are scoped by",
+            "kern resolves a service's relative paths against the FILE's directory, as docker \
+             does by default; `-p/--project-name` sets the name the pod and the volumes are \
+             scoped by, and `--project-root <dir>` lets the file's paths reach a wider directory \
+             that contains it",
         ),
         (
             "--attach-dependencies",
@@ -5262,6 +5479,10 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
     let mut build_args: Vec<String> = Vec::new();
     let mut target: Option<String> = None;
     let mut quiet = false;
+    let mut secrets: Vec<String> = Vec::new();
+    let mut ssh: Vec<String> = Vec::new();
+    let mut no_cache = false;
+    let mut platforms: Vec<String> = Vec::new();
     let mut i = 1; // rest[0] == "build"
     while i < rest.len() {
         // `--flag=value` IS THE SAME FLAG HERE TOO, and a build is where scripts use it most:
@@ -5297,31 +5518,18 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
             "--build-arg" => {
                 build_args.push(value("--build-arg K=V")?);
             }
-            // `--platform <os/arch>`: ACCEPTED WHEN IT IS THIS MACHINE, REFUSED OTHERWISE. kern runs
-            // the host's architecture and emulates nothing, so honouring a foreign platform is not
-            // something it can do and ignoring the flag would build the wrong image quietly. The
-            // same rule and the same words the compose parser already applies to `platform:`.
-            //
-            // MEASURED: Sentry's `install.sh` builds every one of its images with
-            // `--platform=linux/amd64`, which on this machine IS the host, and kern refused the flag
-            // outright - so the official installer stopped at its first build.
+            // `--platform <os/arch>[,<os/arch>...]`, repeatable, buildx's grammar. This machine's own
+            // platform is a native build; another one runs its RUN steps through the kernel's binfmt
+            // handler (qemu-user), and several build one image per platform under one name, which
+            // `kern push` publishes as a manifest list. MEASURED first: an arm64 alpine rootfs ran in a
+            // kern box on this amd64 host (`uname -m` = aarch64, `apk add` from the network). Sentry's
+            // `install.sh` builds every image with `--platform=linux/amd64`, the host here.
             "--platform" => {
-                let want = value("--platform <os/arch> (e.g. linux/amd64)")?;
-                let host_os = "linux";
-                let host_arch = match std::env::consts::ARCH {
-                    "x86_64" => "amd64",
-                    "aarch64" => "arm64",
-                    other => other,
-                };
-                let w = want.trim().to_ascii_lowercase();
-                let matches = w.is_empty()
-                    || w == host_arch
-                    || w == format!("{host_os}/{host_arch}")
-                    || w.starts_with(&format!("{host_os}/{host_arch}/"));
-                if !matches {
-                    return Err(Error::Build(format!(
-                        "--platform {want}: kern builds for this machine ({host_os}/{host_arch}) and emulates nothing, so the image would build and then fail to exec. Build it on a matching host"
-                    )));
+                let want = value("--platform <os/arch>[,<os/arch>] (e.g. linux/amd64,linux/arm64)")?;
+                for one in want.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    kern_oci::Platform::parse(one)
+                        .map_err(|e| Error::Build(format!("--platform {want}: {e}")))?;
+                    platforms.push(one.to_string());
                 }
             }
             // `--target <stage>`: stop at that stage of a multi-stage Dockerfile. Compose spells the
@@ -5338,11 +5546,15 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
             }
             "-q" | "--quiet" => quiet = true,
             "--check" => check = true,
+            // `RUN --mount=type=secret|ssh` and `--no-cache`, docker's grammar (see `buildmounts`).
+            "--secret" => secrets.push(value("--secret id=<id>[,src=<file>|,env=<VAR>]")?),
+            "--ssh" => ssh.push(value("--ssh default|<id>[=<socket>|<key>]")?),
+            "--no-cache" => no_cache = true,
             // NAMED, because "unknown build flag" sent a reader to re-read their whole command line
             // to find which word kern meant.
             s if s.starts_with('-') => {
                 return Err(Error::Build(format!(
-                    "unknown build flag '{s}' - `kern build` takes -t/--tag, -f/--file, --build-arg, --target, --platform, -q/--quiet, --check"
+                    "unknown build flag '{s}' - `kern build` takes -t/--tag, -f/--file, --build-arg, --target, --platform, --secret, --ssh, --no-cache, -q/--quiet, --check"
                 )))
             }
             s if context.is_none() => context = Some(s.to_string()),
@@ -5365,6 +5577,10 @@ fn parse_build(rest: &[&str]) -> Result<Command, Error> {
         build_args,
         quiet,
         target,
+        secrets,
+        ssh,
+        no_cache,
+        platforms,
     })
 }
 
@@ -5442,6 +5658,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             tun,
             gpus,
             device,
+            runtime_nvidia,
+            build_ssh_agents,
+            no_new_privs,
             init,
             pids_limit,
             tmpfs,
@@ -5454,6 +5673,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             stop_signal,
             stop_grace,
             run_as,
+            group_add,
             cap_add,
             cap_drop,
             restart,
@@ -5521,6 +5741,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             tun,
             gpus: gpus.as_deref(),
             device: device.as_deref(),
+            runtime_nvidia,
+            build_ssh_agents: &build_ssh_agents,
+            no_new_privs,
             init,
             pids_limit,
             tmpfs: &tmpfs,
@@ -5533,6 +5756,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             stop_signal,
             stop_grace,
             run_as: run_as.as_deref(),
+            group_add: &group_add,
             cap_add: &cap_add,
             cap_drop: &cap_drop,
             restart,
@@ -5604,6 +5828,10 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             build_args,
             quiet,
             target,
+            secrets,
+            ssh,
+            no_cache,
+            platforms,
         } => {
             let a = commands::BuildArgs {
                 tag: tag.as_deref(),
@@ -5613,6 +5841,10 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 build_args: &build_args,
                 quiet,
                 target: target.as_deref(),
+                secrets: &secrets,
+                ssh: &ssh,
+                no_cache,
+                platforms: &platforms,
             };
             // ONE ARGUMENT STRUCT FOR BOTH, so `--check` resolves the Dockerfile, the context and
             // the build args through exactly the fields a real build does: a report about a
@@ -5676,6 +5908,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::PodHolder => crate::pod::run_holder(),
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
         Command::EgressProxy { sock, allow } => crate::egress::proxy_reexec(&sock, &allow),
+        Command::BuildSshProxy { listen, upstream } => {
+            commands::ssh_agent_proxy(&listen, &upstream)
+        }
         Command::EgressPump {
             read_fd,
             box_port,
@@ -5734,6 +5969,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             view,
         ),
         Command::Stats { json, names } => commands::stats(json, &names),
+        Command::Sandbox(cmd) => crate::history::sandbox_cmd(&cmd),
         Command::Logs {
             name,
             tail,
@@ -5757,7 +5993,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         } => commands::bench(rootfs.as_deref(), image.as_deref(), bind_rootfs, count),
         Command::Recover => commands::recover(),
         Command::Start { names } => commands::start_kept(&names),
-        Command::Rm { names } => commands::remove_kept(&names),
+        Command::Rm { names, force } => commands::remove_kept(&names, force),
         Command::Rename { old, new } => commands::rename(&old, &new),
         Command::Port {
             name,
@@ -5794,6 +6030,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             stop_timeout,
             ignore_pull_failures,
             build_args,
+            build_policy,
             run_name,
             run_entrypoint,
             run_env,
@@ -5828,6 +6065,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             services,
             project,
             env_file,
+            project_root,
             profiles,
         } => commands::compose(commands::ComposeOpts {
             files: &files,
@@ -5836,6 +6074,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             stop_timeout,
             ignore_pull_failures,
             build_args: &build_args,
+            build_policy,
             run_name: run_name.as_deref(),
             run_entrypoint: run_entrypoint.as_deref(),
             recreate,
@@ -5870,6 +6109,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             services: &services,
             project: project.as_deref(),
             env_file: env_file.as_deref(),
+            project_root: project_root.as_deref(),
             profiles: &profiles,
         }),
         Command::Config { sub, force, json } => commands::config_cmd(&sub, force, json),
@@ -6630,6 +6870,27 @@ mod tests {
 
     /// `--wait-timeout N` implies `--wait`, because a bound with nothing to bound is a typo that
     /// would otherwise return instantly and look like success.
+    /// `kern box --ipc` IS ACCEPTED, as docker's commands carry it, and says what it does: a box has
+    /// its own IPC namespace, `host` is not applied, and the /dev/shm remedy is named.
+    #[test]
+    fn the_ipc_flag_is_accepted_and_says_what_it_does() {
+        let parsed = parse(
+            &["box", "x", "--image", "alpine", "--ipc=host", "--", "true"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+        );
+        assert!(parsed.is_ok(), "{parsed:?}");
+        assert!(ipc_flag_note("private").contains("already has"));
+        assert!(ipc_flag_note("shareable").contains("already has"));
+        let host = ipc_flag_note("host");
+        assert!(
+            host.contains("NOT applied") && host.contains("--shm-size"),
+            "{host}"
+        );
+        assert!(ipc_flag_note("container:db").contains("NOT applied"));
+    }
+
     #[test]
     fn wait_timeout_implies_wait_and_takes_seconds() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
@@ -8077,6 +8338,27 @@ mod tests {
     // THE CSV GRAMMAR, every rule measured on Docker 29.1.3 and asserted in both directions. The
     // toggler this replaced answered the first case with a DIFFERENT PATH and accepted the next
     // four, so three of these are refusals kern was not making and one is a silent misread.
+    #[test]
+    fn a_quoted_mount_field_reads_back_as_one_field_whatever_the_path_holds() {
+        // The build step writes its binds with `quoted_mount_field`; a path with a comma, a quote or
+        // a `src=` inside must come back as the ONE field it was, never as a second `src=`.
+        let src = r#"/ctx/p,src=/home/alex"#;
+        let dst = r#"/x"y,readonly"#;
+        let spec = format!(
+            "type=bind,{},{}",
+            crate::commands::quoted_mount_field("src", src),
+            crate::commands::quoted_mount_field("dst", dst)
+        );
+        assert_eq!(
+            csv_fields(&spec).unwrap_or_default(),
+            vec![
+                "type=bind".to_string(),
+                format!("src={src}"),
+                format!("dst={dst}")
+            ]
+        );
+    }
+
     #[test]
     fn csv_fields_follows_the_reference_grammar() {
         let f = |s: &str| csv_fields(s);

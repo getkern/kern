@@ -217,6 +217,25 @@ pub struct SandboxSpec {
     /// Which of the host's NVIDIA cards this box may see in the driver's own `/proc` enumeration.
     /// See [`GpuEnumeration`] and [`mask_nvidia_enumeration`], its only reader.
     pub gpu_enumeration: GpuEnumeration,
+    /// Rebuild the box's loader cache (`ldconfig`) before the workload, as docker and podman do for
+    /// a GPU grant. See [`refresh_loader_cache`].
+    pub refresh_ldcache: bool,
+    /// Directories the box's loader is told about before its cache is rebuilt, written to
+    /// `/etc/ld.so.conf.d/00-kern-gpu.conf` in the box: a Jetson grant keeps NVIDIA's library paths,
+    /// as docker's toolkit does with its `00-nvcr-*.conf`. Empty everywhere else.
+    pub ldconfig_dirs: Vec<String>,
+    /// `--security-opt no-new-privileges`: set `PR_SET_NO_NEW_PRIVS` and mount the box root `nosuid`,
+    /// so no setuid program in the box can raise its user. Docker's default is OFF, and so is kern's
+    /// for a box, a compose service and a build step; the SDK sandboxes ask for it. `--landlock-rw`
+    /// needs it and turns it on.
+    pub no_new_privs: bool,
+    /// The host-path binds (`source`, `target`, both as in [`SandboxSpec::volumes`]) to present with
+    /// the ownership docker gives them: a file uid 1000 owns on disk is uid 1000's in the box. Asked
+    /// for only when kern runs as real root; see [`prepare_idmapped_binds`]. Empty = plain binds.
+    pub idmap_binds: Vec<(String, String)>,
+    /// Box targets where a bind may be a SOCKET: a build step's SSH agent proxies. Everywhere else a
+    /// socket source is refused (see [`setup_volumes`]).
+    pub socket_binds: Vec<String>,
     /// vDisk profiles to mount at `/vdisk/<name>` in the box (from `vdisk:` profiles).
     pub vdisks: Vec<VdiskMount>,
     /// Secrets to expose as `/run/secrets/<name>` (mode 0400), from `--secret`. The bytes were read
@@ -246,6 +265,16 @@ pub struct SandboxSpec {
     /// RESOLVED OUTSIDE, APPLIED HERE, because the resolution reads a file in the image rootfs and
     /// this code runs after the pivot with no allocation budget and no message path.
     pub extra_gids: Vec<u32>,
+    /// Keep the supplementary groups the box was started with instead of clearing them.
+    ///
+    /// SET BY A GPU GRANT WHOSE NODES OPEN ONLY THROUGH A GROUP, and nothing else. On a Jetson every
+    /// GPU node is `root:video 0660`; docker's NVIDIA runtime gives the container the node's group
+    /// (`additionalGids`), and a kern box on the uid-range map cleared it, so `cuInit` failed in every
+    /// pod member, under `--uid-range` and under `--user` (measured: `NvRmMemInitNvmap failed with
+    /// Permission denied`). The node's gid cannot be mapped into the range (`newgidmap` maps only the
+    /// caller's own gid and `/etc/subgid`), so the one way to keep it is to keep the inherited set,
+    /// which is exactly what the single-uid map already does because it cannot clear.
+    pub keep_groups: bool,
     /// `--pids-limit N`: the box's `pids.max` (task ceiling). `None` → the default. Fork-bomb cap.
     pub pids_max: Option<u64>,
     /// `--cap-add`/`--cap-drop` policy on top of the always-dropped dangerous caps. Default drops
@@ -338,6 +367,20 @@ pub struct SandboxSpec {
     /// instance registry so `kern exec` reproduces the SAME filter instead of re-reading the
     /// environment - which would let an exec into an allowlist box fall back to the wider denylist.
     pub seccomp_mode: crate::SeccompFilter,
+}
+
+/// Whether a box runs with no-new-privileges: asked for, or implied by `--landlock-rw`, which the
+/// kernel applies only under it. ONE spelling, because the box's setup, its overlay's `nosuid`, the
+/// record `kern exec` reads and `kern exec` itself must agree on it.
+pub fn effective_no_new_privs(asked: bool, landlock_rw: &[String]) -> bool {
+    asked || !landlock_rw.is_empty()
+}
+
+impl SandboxSpec {
+    /// [`effective_no_new_privs`] for this box.
+    pub fn effective_no_new_privs(&self) -> bool {
+        effective_no_new_privs(self.no_new_privs, &self.landlock_rw)
+    }
 }
 
 /// One `--tmpfs` mount, fully resolved by the CLI so this layer parses nothing.
@@ -773,7 +816,13 @@ impl OverlayMount {
 /// Mount an overlayfs at `merged` (read-only `lower` image + writable `upper`/`work`). The
 /// kernel holds references to the dirs, so the box's root stays writable; changes land in
 /// `upper` and the image is untouched.
-fn mount_overlay(lower: &[String], upper: &str, work: &str, merged: &str) -> Result<(), Error> {
+fn mount_overlay(
+    lower: &[String],
+    upper: &str,
+    work: &str,
+    merged: &str,
+    nosuid: bool,
+) -> Result<(), Error> {
     // An overlay needs a lower, and an empty `lowerdir=` is a kernel `EINVAL` naming nothing. No
     // caller can produce one today; the message says what is missing if a later one does.
     if lower.is_empty() {
@@ -794,12 +843,16 @@ fn mount_overlay(lower: &[String], upper: &str, work: &str, merged: &str) -> Res
         ),
         Some(std::path::Path::new(upper)),
     )?;
-    // `NODEV|NOSUID` on the box root: a device node on the rootfs is inert and a setuid binary can't
-    // elevate. Both are already assured (userns superblocks are `SB_I_NODEV`; the workload runs under
-    // `NO_NEW_PRIVS` + the bounding-set cap drop), so this is defense-in-depth that doesn't rely on
-    // that implicit kernel behaviour. Device nodes the box legitimately uses live on the separate
-    // `/dev` tmpfs, not here.
-    let hardening = (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong;
+    // `NODEV` on the box root: a device node on the rootfs is inert (userns superblocks are
+    // `SB_I_NODEV` already; device nodes the box uses live on the separate `/dev` tmpfs). `NOSUID`
+    // only with `no-new-privileges`: docker mounts an image's root without it, and a setuid program
+    // the image ships (`sudo`) is what an image built for docker expects to work. See
+    // [`SandboxSpec::no_new_privs`].
+    let hardening = if nosuid {
+        (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong
+    } else {
+        libc::MS_NODEV as libc::c_ulong
+    };
     let asked_userxattr = opts.prefers_userxattr();
     let how = unsafe { mount_overlay_c(merged_c.as_ptr(), hardening, &opts) };
     if how == OverlayMount::Second && asked_userxattr {
@@ -1717,7 +1770,13 @@ fn child_setup_and_exec(
                 .overlay
                 .as_ref()
                 .ok_or(Error::Unsupported("overlay mode without overlay dirs"))?;
-            mount_overlay(&o.lower, &o.upper, &o.work, &spec.root)?;
+            mount_overlay(
+                &o.lower,
+                &o.upper,
+                &o.work,
+                &spec.root,
+                spec.effective_no_new_privs(),
+            )?;
             Rootfs::premounted(&spec.root)
         }
         MountMode::Bind | MountMode::Tmpfs => Rootfs::mount(&mut ops, spec.mode, &spec.root)?,
@@ -1779,8 +1838,12 @@ fn child_setup_and_exec(
     // lands on top of the tmpfs, which is writable, so its mountpoint can be created there. `vgpio`'s
     // sysfs grants mount a tmpfs over the whole of `/sys` and must stay underneath, which is why this
     // follows them.
-    setup_cpu_topology(&spec.root, spec.cpuset.as_deref());
-    setup_volumes(&spec.root, &spec.volumes)?;
+    setup_cpu_topology(
+        &spec.root,
+        spec.cpuset.as_deref(),
+        !spec.vgpio_sysfs.is_empty(),
+    );
+    setup_volumes(&spec.root, &spec.volumes, &spec.socket_binds)?;
     setup_vdisk(&spec.root, &spec.vdisks)?;
     setup_tmpfs(&spec.root, &spec.tmpfs)?;
     // `--ssh` needs a box-owned tmpfs over ALL of `/run` (so `/run/sshd` is namespace-root-owned for
@@ -1866,6 +1929,11 @@ fn child_setup_and_exec(
         mount_cgroup();
     }
     t.mark("cgroup-view");
+    // THE LOADER CACHE, while the root is still writable (before the read-only remount below).
+    if spec.refresh_ldcache {
+        refresh_loader_cache(spec, allow_nesting);
+        t.mark("ldcache");
+    }
     // Optional read-only remount LAST - the typestate makes any other order a compile error.
     // Overlay leaves the root writable (writes land in the upper layer). Volume submounts keep
     // their own flags, so a writable `-v` stays writable even under a read-only root. `MS_REMOUNT`
@@ -1963,11 +2031,27 @@ fn child_setup_and_exec(
         apply_apparmor_onexec(profile)?;
         t.mark("apparmor");
     }
+    // WITHOUT `no-new-privileges` (docker's default) THE FILTER GOES IN HERE, while this process still
+    // holds `CAP_SYS_ADMIN` in the box's namespace, which is the only way the kernel takes a filter
+    // without `PR_SET_NO_NEW_PRIVS`; runc orders it the same way. It then also covers the capability
+    // drop and identity switch below. `--landlock-rw` needs no-new-privs, so it keeps the late install.
+    let nnp = spec.effective_no_new_privs();
+    if !nnp {
+        crate::seccomp::install_with(spec.seccomp_mode, allow_nesting, false)?;
+        t.mark("seccomp");
+    }
     // Least-privilege, in the three ordered steps of `drop_caps_around_identity`, so `--user` +
     // `--cap-drop ALL` (the canonical hardened profile) composes correctly. All run after privileged
     // setup (mount/pivot/loopback), so they only affect the workload.
     let cap_mask = cap_drop_mask(&spec.caps, spec.tun, spec.privileged);
-    drop_caps_around_identity(cap_mask, spec.run_as, &spec.extra_gids, true).map_err(|(_, e)| e)?;
+    drop_caps_around_identity(
+        cap_mask,
+        spec.run_as,
+        &spec.extra_gids,
+        spec.keep_groups,
+        true,
+    )
+    .map_err(|(_, e)| e)?;
 
     // Landlock (LSM) write-allowlist, applied BEFORE seccomp (whose filter would otherwise block the
     // `landlock_*` syscalls). Defense-in-depth over the mount namespace: the box root is read+exec and
@@ -2003,8 +2087,10 @@ fn child_setup_and_exec(
     // only constrains the workload. Then exec (or hand off to the built-in init). `allow_nesting`
     // (a rootless `--privileged` box) leaves the namespace + classic-mount syscalls allowed so a
     // nested `kern box` can start; everything else stays blocked.
-    crate::seccomp::install(spec.seccomp_mode, allow_nesting)?;
-    t.mark("seccomp");
+    if nnp {
+        crate::seccomp::install(spec.seccomp_mode, allow_nesting)?;
+        t.mark("seccomp");
+    }
     // SECURITY (CVE-2016-9962 class): shed every inherited fd `>= 3` before handing control to the
     // workload, keeping ONLY the readiness pipe (`ready_fd`, whose CLOEXEC close on a successful
     // `execvp` signals the launcher). kern marks every descriptor IT opens `CLOEXEC`, but a descriptor
@@ -2169,8 +2255,9 @@ fn box_start_exit_code(e: &Error) -> i32 {
 ///
 /// MEASURED on this host, which has all of them in `/usr/bin`. The list is NVIDIA's, not a guess:
 /// `libnvidia-container` injects `nvidia-smi`, `nvidia-debugdump`, `nvidia-persistenced`,
-/// `nvidia-cuda-mps-control` and `nvidia-cuda-mps-server` when `utility` is asked for. kern binds
-/// none of them, because a grant is device nodes plus the driver's libraries.
+/// `nvidia-cuda-mps-control` and `nvidia-cuda-mps-server` when `utility` is asked for, and a kern
+/// grant binds the ones the host has at the same place, `/usr/bin` (measured against docker 29.1.3:
+/// the same five, the same directory).
 const DRIVER_TOOLS: [&str; 5] = [
     "nvidia-smi",
     "nvidia-debugdump",
@@ -2184,11 +2271,17 @@ fn driver_tool_name(cmd: &str) -> &str {
     cmd.rsplit('/').next().unwrap_or(cmd)
 }
 
+/// The driver's own tools, by name: the set docker's NVIDIA runtime injects into `/usr/bin`, and the
+/// set a kern grant now binds there too (measured on docker 29.1.3: exactly these five).
+pub fn driver_tools() -> &'static [&'static str] {
+    &DRIVER_TOOLS
+}
+
 /// Is `cmd` one of the driver's own tools, written either way?
 ///
-/// Exported because a HEALTHCHECK that runs one of them can never pass in a kern box, and the
-/// surfaces that accept a health command (`kern box --health-cmd`, compose's `healthcheck:`) have to
-/// say so before the box spends its life `unhealthy`. They ask the runtime rather than carrying a
+/// Exported because a HEALTHCHECK that runs one of them cannot pass in a box the grant did not give
+/// it to, and the surfaces that accept a health command (`kern box --health-cmd`, compose's
+/// `healthcheck:`) have to say so before the box spends its life `unhealthy`. They ask the runtime rather than carrying a
 /// second copy of the list, which is the same rule `x-kern-security-profile` already follows.
 pub fn is_driver_tool(cmd: &str) -> bool {
     DRIVER_TOOLS.contains(&driver_tool_name(cmd))
@@ -2225,26 +2318,26 @@ fn found_in_box(cmd: &str) -> Option<String> {
 /// in the forked child, inside the box's mount namespace, so it answers about the BOX and not about
 /// the host - the host's node would say yes on any machine with a driver installed.
 fn box_has_gpu_grant() -> bool {
-    std::fs::metadata("/dev/nvidiactl").is_ok()
+    // `/dev/dxg` IS THE WSL2 GRANT, which has no `/dev/nvidiactl`: a box granted the card there was
+    // being told it held no grant at all.
+    std::fs::metadata("/dev/nvidiactl").is_ok() || std::fs::metadata("/dev/dxg").is_ok()
 }
 
 /// The hint for one of the driver's own tools that `execvp` could not run, or `None` for any other
 /// command.
 ///
-/// THE MOST COPIED VERIFICATION COMMAND IN THE GPU WORLD ends up here. Every guide, NVIDIA's own
-/// included, says to check a GPU container with `docker run --gpus all nvidia/cuda:…-base
-/// nvidia-smi`. MEASURED 2026-11-12: that image ships NO nvidia-smi (the `base` flavour has the
-/// runtime libraries and nothing else), because docker's NVIDIA runtime INJECTS the binary from the
-/// host when the capability list carries `utility`. kern binds the driver's LIBRARIES and not its
-/// BINARIES, so the command is absent and the generic hint sent the reader to look for a full path
-/// or a missing loader, which are not the cause.
+/// THE MOST COPIED VERIFICATION COMMAND IN THE GPU WORLD ends up here when it fails. Every guide,
+/// NVIDIA's own included, says to check a GPU container with `docker run --gpus all
+/// nvidia/cuda:…-base nvidia-smi`, and that image ships NO nvidia-smi: docker's NVIDIA runtime
+/// INJECTS the binary from the host. A kern grant binds it the same way now, at `/usr/bin`, so in a
+/// granted glibc box the command runs (measured in `nvidia/cuda:12.9.0-base-ubuntu22.04`: the
+/// driver's banner and the granted card). What is left for this hint is the three ways it still
+/// fails: no grant, a musl rootfs that cannot run the glibc tool, and a host whose driver has no
+/// such tool.
 ///
-/// WHAT IS ALREADY THERE IS THE CAPABILITY, measured in a granted box: `libnvidia-ml.so` and its two
-/// links are bound, `nvmlInit` returns 0, the device count is the granted card and
-/// `nvmlDeviceGetName` answers. So nothing is missing except the tool, and the remedy was RUN before
-/// being written here: with `-v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro` added, `nvidia-smi -L`
-/// inside `nvidia/cuda:12.9.0-base-ubuntu22.04` prints the granted card and only that one, and in a
-/// `debian:12` box granted `device=0` it prints that card's UUID and no other.
+/// WHAT IS THERE EVEN THEN IS THE CAPABILITY, measured in a granted box: `libnvidia-ml.so` and its
+/// two links are bound, `nvmlInit` returns 0, the device count is the granted card and
+/// `nvmlDeviceGetName` answers.
 ///
 /// THE HOST IS NOT CONSULTED, and cannot be: this runs in the forked child, inside the box's mount
 /// namespace, so a `stat` here answers about the box.
@@ -2284,15 +2377,14 @@ fn driver_tool_hint(cmd: &str) -> Option<String> {
              /lib64/ld-linux-x86-64.so.2 to run them. Bind it into a glibc image instead, or ask \
              NVML directly: libnvidia-ml.so.1 is already here and answers for the granted card."
         ),
+        // GRANTED, AND THE TOOL IS NOT HERE: the grant binds every driver tool the host has at
+        // /usr/bin, so this host's driver did not have this one where docker's runtime looks.
         None if box_has_gpu_grant() => format!(
-            "hint: that is one of the driver's own tools, and a GPU grant binds the driver's \
-             LIBRARIES, not its binaries: docker's NVIDIA runtime injects them from the host and \
-             kern does not. NVML is already in the box, so anything linking libnvidia-ml.so.1 works \
-             as it is. For the tool itself, bind it in from wherever this host's driver put it \
-             (`command -v {tool}` there): -v /usr/bin/{tool}:/usr/bin/{tool}:ro on a normal \
-             install, and -v /usr/lib/wsl/lib/{tool}:/usr/bin/{tool}:ro on WSL2, where the driver \
-             ships under /usr/lib/wsl/lib and /usr/bin holds nothing. ⛔ On WSL2 that binary is \
-             glibc and most sandbox images are musl, so bind it into a glibc image or use NVML."
+            "hint: that is one of the driver's own tools, and a GPU grant binds each one the host \
+             has at /usr/bin, as docker's NVIDIA runtime does; this host's driver has no {tool} \
+             where that search looks (/usr/local/sbin to /bin), so there was nothing to bind. NVML \
+             is in the box, so anything linking libnvidia-ml.so.1 works as it is. If the tool is \
+             installed elsewhere on the host, bind it in: -v <host path>:/usr/bin/{tool}:ro"
         ),
         // NO GRANT AT ALL, so the tool is the symptom and not the subject: binding it in would
         // produce a working binary with nothing to talk to. A grant is made at START and cannot be
@@ -2300,8 +2392,8 @@ fn driver_tool_hint(cmd: &str) -> Option<String> {
         // for the box in hand.
         None => format!(
             "hint: that is one of the driver's own tools, and this box holds NO GPU grant: \
-             /dev/nvidiactl is not here, so no device node and no driver library was bound. \
-             Binding {tool} in would give you the tool and nothing for it to report on. Grant a \
+             /dev/nvidiactl is not here, so no device node, no driver library and no driver tool \
+             was bound. Binding {tool} in would give you the tool and nothing for it to report on. Grant a \
              card when the box STARTS (`kern box … --gpus all`, or `gpus: all` in compose with \
              --allow-device-grants); a running box cannot be given one."
         ),
@@ -2414,9 +2506,20 @@ fn report_exec_failure(spec: &SandboxSpec, e: &Error) {
 /// without `newuidmap`/`newgidmap` fell back to the single-uid map), return `Err` so the box
 /// **refuses to exec** rather than silently running the workload as in-box root. Dropping privilege
 /// must never *grant* it. `--user 0` (explicitly root) is a successful no-op.
-fn set_user(uid: u32, gid: u32, extra_gids: &[u32], dumpable_after: bool) -> Result<(), Error> {
+fn set_user(
+    uid: u32,
+    gid: u32,
+    extra_gids: &[u32],
+    keep_groups: bool,
+    dumpable_after: bool,
+) -> Result<(), Error> {
     unsafe {
-        if extra_gids.is_empty() {
+        if keep_groups {
+            // A GPU GRANT THAT NEEDS A GROUP (see `SandboxSpec::keep_groups`): the inherited set stays,
+            // because replacing it with the image's groups would drop the one the GPU's nodes need,
+            // and that gid cannot be named in this box's map to be put back. Docker's container gets
+            // the node's group the same way, on top of the user's.
+        } else if extra_gids.is_empty() {
             // Best-effort: setgroups may be EPERM under `/proc/self/setgroups=deny` (single-uid box);
             // the single mapped group is already the whole set, so a failure here is harmless.
             libc::setgroups(0, std::ptr::null());
@@ -2724,21 +2827,13 @@ fn current_mount_flags(fd: libc::c_int) -> libc::c_ulong {
 /// its real path). BOTH ends are resolved **symlink-free** via an `openat(O_NOFOLLOW)` component walk
 /// and the bind runs fd-to-fd through `/proc/self/fd/<n>` - so neither a hostile image's symlink at the
 /// mount point NOR a symlink swapped into the source path between check and mount can redirect the bind
-/// onto a host path. Every volume is then remounted with `nosuid`, and a `:ro` one also read-only.
+/// onto a host path. A `:ro` volume is then remounted read-only.
 ///
-/// `nosuid` here is DEFENCE IN DEPTH and is deliberately best-effort, which is a correction of an
-/// earlier belief in this file. The reasoning that made it load-bearing (that under `--uid-range` a
-/// setuid-root file on a volume lets an in-box uid become box-root) is wrong for a kern box: kern arms
-/// `PR_SET_NO_NEW_PRIVS` before the workload runs, because seccomp requires it, and no-new-privs makes
-/// the setuid bit inert process-wide no matter how the filesystem is mounted. Measured: `NoNewPrivs: 1`
-/// in every reachable configuration, and a setuid-root binary on a `-v` volume executed by an in-box
-/// uid 1000 under `--uid-range` returns euid 1000 with the remount removed as well as with it.
-///
-/// So a failed `nosuid` remount is never fatal. Making it fatal would refuse to start a box for a
-/// property something else already guarantees, on exactly the kernels that reject bind remounts
-/// outright (Android-derived board kernels, as the `:ro` path below records). A `:ro` volume is
-/// different and still fatal: read-only is a contract the caller asked for, and nothing else provides
-/// it.
+/// No `nosuid`, as in docker, whose binds keep the setuid bit: a setuid program on a volume raises its
+/// caller to the file's owner within the box's bounding set, and `--security-opt no-new-privileges`
+/// (which the SDKs always pass) makes the bit inert process-wide however the filesystem is mounted.
+/// A failed `:ro` remount is fatal: read-only is a contract the caller asked for, and nothing else
+/// provides it.
 /// Decode the four escapes the kernel writes into a `mountinfo` path field (`\040` space, `\011`
 /// tab, `\012` newline, `\134` backslash). Anything else is copied through byte for byte.
 fn unescape_mountinfo(s: &str) -> String {
@@ -2823,7 +2918,223 @@ pub(crate) fn submounts_in(body: &str, src: &str, max: usize) -> (Vec<String>, u
     (seen, total)
 }
 
-fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
+/// `mount_setattr(2)`'s argument, as `<linux/mount.h>` lays it out (four `__u64`, 32 bytes).
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
+const OPEN_TREE_CLONE: libc::c_uint = 1;
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x0000_0040;
+
+/// The idmapped binds prepared for THIS box: (`source`, `target`, detached mount fd). Set once, by
+/// the supervisor, before the fork that makes the box; read by [`setup_volumes`] in the child.
+static IDMAPPED_BINDS: std::sync::OnceLock<Vec<(String, String, libc::c_int)>> =
+    std::sync::OnceLock::new();
+
+/// Whether a bind source's owner says it was prepared for kern's EARLIER mapping, where box uid N
+/// is host uid `sub + N - 1`: an operator who followed that (`chown 100999` for a `user: 1000`
+/// service) keeps exactly what they had, and an idmapped view would hand them `nobody`.
+fn owner_is_in_subordinate_range(owner: u32, sub: Option<(u32, u32)>) -> bool {
+    match sub {
+        Some((start, count)) => owner >= start && owner - start < count,
+        None => false,
+    }
+}
+
+/// Make the detached, idmapped mounts for `spec.idmap_binds` against the box's user namespace
+/// `userns_fd`. Runs where the caller still holds real root's privilege in the HOST user namespace,
+/// which an idmapped mount requires: before a pod member's `setns`, or in the id-map helper of a box
+/// that makes its own namespace.
+///
+/// ⛔ WHY: kern as real root maps box uid N to host uid `sub + N - 1`, so a bind a docker user
+/// prepared the docker way (`chown 1000:1000 ./config` for a `user: 1000` service) reached the box
+/// as `nobody`, and the service could not write it. MEASURED in the field on a WSL2 guest with
+/// jellyfin's documented compose file: it ran only after `chown 100999`, a number no docker guide
+/// prints. An idmapped mount carrying the box's own map shows on-disk uid N as box uid N, and a file
+/// the box writes lands on disk as uid N: docker's ownership, while the box's ids stay unprivileged
+/// on the host. MEASURED on the same kernel (6.18) before this was written: through the mount, box
+/// uid 1000 wrote a file owned by 1000 on disk; through a plain bind of the same directory it got
+/// `Permission denied`.
+///
+/// ONE CLONE, NOT RECURSIVE, as every kern volume: `OPEN_TREE_CLONE` without `AT_RECURSIVE`.
+/// `nosuid`/`nodev`, and `rdonly` for `:ro`, are set in the SAME call as the idmap, so the mount
+/// never exists without them; [`setup_volumes`] still applies its own remount pass after attaching.
+///
+/// Nothing here can fail the box: a source this cannot handle (a filesystem without idmap support,
+/// such as WSL's 9p `/mnt/c`, or an older kernel) keeps the plain bind it always had, and says so.
+fn prepare_idmapped_binds(
+    spec: &SandboxSpec,
+    userns_fd: libc::c_int,
+    sub: Option<(u32, u32)>,
+) -> Vec<(String, String, libc::c_int)> {
+    let mut out = Vec::new();
+    for (source, target) in &spec.idmap_binds {
+        let Some(v) = spec
+            .volumes
+            .iter()
+            .find(|v| &v.source == source && &v.target == target)
+        else {
+            continue;
+        };
+        // The box's own setup reports a source it cannot open; this only prepares.
+        let Ok(sfd) = open_source_nofollow(source) else {
+            continue;
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(sfd, &mut st) } != 0 {
+            unsafe { libc::close(sfd) };
+            continue;
+        }
+        if owner_is_in_subordinate_range(st.st_uid, sub) {
+            unsafe { libc::close(sfd) };
+            eprintln!(
+                "kern: note: -v {source}:{target} keeps kern's earlier ownership: its owner is host \
+                 uid {} (a box uid under the old mapping); `chown` it to the uid the service runs as, \
+                 as for docker, to have docker's",
+                st.st_uid
+            );
+            continue;
+        }
+        // SAFETY: `open_tree(2)` on a pinned fd with an empty path; returns a new fd or -1.
+        let mfd = unsafe {
+            libc::syscall(
+                libc::SYS_open_tree,
+                sfd,
+                c"".as_ptr(),
+                OPEN_TREE_CLONE
+                    | libc::O_CLOEXEC as libc::c_uint
+                    | libc::AT_EMPTY_PATH as libc::c_uint,
+            )
+        } as libc::c_int;
+        unsafe { libc::close(sfd) };
+        if mfd < 0 {
+            let e = std::io::Error::last_os_error();
+            eprintln!(
+                "kern: note: -v {source}:{target} keeps a plain bind: open_tree failed ({e}), so its \
+                 files keep the ownership kern's id map gives them"
+            );
+            continue;
+        }
+        let attr = MountAttr {
+            // No `nosuid`: a docker bind keeps the setuid bit, and no-new-privileges, when asked
+            // for, is what makes it inert (as in docker).
+            attr_set: MOUNT_ATTR_IDMAP
+                | MOUNT_ATTR_NODEV
+                | if v.read_only { MOUNT_ATTR_RDONLY } else { 0 },
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: userns_fd as u64,
+        };
+        // SAFETY: `mount_setattr(2)` on the detached tree with a correctly sized `mount_attr`.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                mfd,
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH as libc::c_uint,
+                &attr as *const MountAttr,
+                std::mem::size_of::<MountAttr>(),
+            )
+        };
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(mfd) };
+            eprintln!(
+                "kern: note: -v {source}:{target} keeps a plain bind: this filesystem or kernel \
+                 cannot present it with docker's ownership ({e})"
+            );
+            continue;
+        }
+        out.push((source.clone(), target.clone(), mfd));
+    }
+    out
+}
+
+/// The prepared idmapped mount for this volume, if there is one.
+fn idmapped_bind_for(v: &Volume) -> Option<libc::c_int> {
+    IDMAPPED_BINDS.get().and_then(|all| {
+        all.iter()
+            .find(|(s, t, _)| s == &v.source && t == &v.target)
+            .map(|(_, _, fd)| *fd)
+    })
+}
+
+/// Send one fd over a `SOCK_SEQPACKET` socket with a 4-byte index, as `SCM_RIGHTS`.
+fn send_indexed_fd(sock: libc::c_int, index: u32, fd: libc::c_int) -> bool {
+    let data = index.to_ne_bytes();
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
+    // u64 storage: `cmsghdr` needs 8-byte alignment, and 64 bytes holds one fd's control message.
+    let mut cbuf = [0u64; 8];
+    // SAFETY: a zeroed msghdr is a valid empty message; every pointer set below outlives the call.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1 as _;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) } as _;
+    // SAFETY: the control buffer is large enough for one header, so CMSG_FIRSTHDR is non-null.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return false;
+    }
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut libc::c_int, fd);
+    }
+    let sent = unsafe { libc::sendmsg(sock, &msg, 0) };
+    sent == data.len() as isize
+}
+
+/// Receive one [`send_indexed_fd`] message: `(index, fd)`, or `None` when the peer sent none.
+fn recv_indexed_fd(sock: libc::c_int) -> Option<(u32, libc::c_int)> {
+    let mut data = [0u8; 4];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
+    let mut cbuf = [0u64; 8];
+    // SAFETY: as in `send_indexed_fd`.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1 as _;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
+    let n = loop {
+        let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break n;
+    };
+    if n != data.len() as isize {
+        return None;
+    }
+    // SAFETY: recvmsg filled `msg`; CMSG_FIRSTHDR reads only within msg_controllen.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return None;
+    }
+    let (level, kind) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type) };
+    if level != libc::SOL_SOCKET || kind != libc::SCM_RIGHTS {
+        return None;
+    }
+    let fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::c_int) };
+    Some((u32::from_ne_bytes(data), fd))
+}
+
+fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Result<(), Error> {
     if vols.is_empty() {
         return Ok(());
     }
@@ -2885,7 +3196,9 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
         // The refusal STAYS, and now says what it is: the one-line form of handing over a control
         // socket. What it is not is a claim about what a box can do.
         let kind = st.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
+        // THE ONE SOCKET A BOX TAKES: a build step's SSH agent, at the target kern itself named.
+        let allowed_socket = kind == libc::S_IFSOCK && socket_targets.contains(&v.target);
+        if !allowed_socket && (kind == libc::S_IFIFO || kind == libc::S_IFSOCK) {
             unsafe { libc::close(src_fd) };
             result = Err(Error::Spec(if kind == libc::S_IFIFO {
                 format!(
@@ -2944,14 +3257,33 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
         // anyone reaches for `mount_setattr(MOUNT_ATTR_RDONLY, AT_RECURSIVE)`, which has covered
         // submounts since 5.12. An argument with an expiry date is the wrong one to build a refusal
         // on, and the wrong one to put in the operator's error message.
-        let r = unsafe {
-            libc::mount(
-                src.as_ptr(),
-                tgt.as_ptr(),
-                ptr::null(),
-                libc::MS_BIND as libc::c_ulong,
-                ptr::null(),
-            )
+        // A PREPARED IDMAPPED MOUNT IS ATTACHED INSTEAD OF BINDING THE SOURCE; see
+        // `prepare_idmapped_binds`. The source checks above ran on it all the same.
+        let r = match idmapped_bind_for(v) {
+            Some(mfd) => {
+                // SAFETY: `move_mount(2)` from the detached tree to the pinned target, both by fd.
+                let r = unsafe {
+                    libc::syscall(
+                        libc::SYS_move_mount,
+                        mfd,
+                        c"".as_ptr(),
+                        tgt_fd,
+                        c"".as_ptr(),
+                        MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+                    )
+                } as libc::c_int;
+                unsafe { libc::close(mfd) };
+                r
+            }
+            None => unsafe {
+                libc::mount(
+                    src.as_ptr(),
+                    tgt.as_ptr(),
+                    ptr::null(),
+                    libc::MS_BIND as libc::c_ulong,
+                    ptr::null(),
+                )
+            },
         };
         unsafe {
             libc::close(tgt_fd);
@@ -2989,12 +3321,10 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             });
             break;
         }
-        {
-            // Lock the per-mount flags ON the bind. A FIRST bind ignores them - they take an
-            // `MS_REMOUNT` - so without this pass a `-v` volume honours a setuid binary sitting on it
-            // and a `:ro` volume is writable. ONE remount and not two: `nosuid` and `rdonly` are flags
-            // of the same syscall, and setting them separately would leave a window where the volume is
-            // bound with neither, plus a second chance to fail.
+        if v.read_only {
+            // `:ro` is a per-mount flag, and a FIRST bind ignores it - it takes an `MS_REMOUNT` - so
+            // without this pass a `:ro` volume is writable. No `nosuid`: a docker bind keeps the
+            // setuid bit, and no-new-privileges, when asked for, is what makes it inert.
             //
             // Re-resolve the target (it now points *into* the bind mount). The pre-bind fd refers to
             // the underlying dir, which can't be remounted.
@@ -3007,11 +3337,8 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
             };
             // Everything already in force, plus what we are adding. See `current_mount_flags`: a bind
             // remount SETS flags, and a userns refuses one that clears a locked one.
-            let mut flags = current_mount_flags(ro_fd)
-                | (libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID) as libc::c_ulong;
-            if v.read_only {
-                flags |= libc::MS_RDONLY as libc::c_ulong;
-            }
+            let flags = current_mount_flags(ro_fd)
+                | (libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY) as libc::c_ulong;
             let ro_tgt = cstr(&format!("/proc/self/fd/{ro_fd}"))?; // decimal fd, but stated not asserted
             let r2 = unsafe {
                 libc::mount(
@@ -3023,10 +3350,8 @@ fn setup_volumes(root: &str, vols: &[Volume]) -> Result<(), Error> {
                 )
             };
             unsafe { libc::close(ro_fd) };
-            // Losing `nosuid` is not worth refusing to start for: `PR_SET_NO_NEW_PRIVS` already makes
-            // the setuid bit inert in this box (see this function's doc), so the remount is depth and
-            // not the guard. Losing `:ro` IS fatal - nothing else provides it.
-            if r2 != 0 && v.read_only {
+            // Losing `:ro` is fatal: nothing else provides it.
+            if r2 != 0 {
                 let e = std::io::Error::last_os_error();
                 result = Err(if e.raw_os_error() == Some(libc::EPERM) {
                     // EPERM on a bind remount-RO has more than one cause: the kernel may not support
@@ -3103,9 +3428,17 @@ fn open_in_root(root_fd: libc::c_int, target: &str, is_dir: bool) -> Result<libc
                     libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 )
             };
+            let e = std::io::Error::last_os_error();
             unsafe { libc::close(dir) };
             if f < 0 {
-                return Err(Error::last("openat(volume file target)"));
+                // NAME THE PATH. A bare `openat(volume file target) failed` was all a box said when a
+                // `-v` over a directory the grant also binds files into made one of them impossible
+                // to create (measured on a Jetson, `-v` over the driver directory beside `--gpus`).
+                return Err(Error::Spec(format!(
+                    "cannot create the mount point {target} for a file mount: {e}. Another mount \
+                     over one of its directories (a `-v` or a `--gpus` grant) may have put it on a \
+                     filesystem the box cannot write"
+                )));
             }
             return Ok(f);
         }
@@ -3983,7 +4316,7 @@ fn setup_tmpfs(root: &str, entries: &[TmpfsMount]) -> Result<(), Error> {
 ///
 /// Best-effort in every branch, like its neighbours: a box that cannot be given these still starts,
 /// exactly as it did before they existed.
-fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
+fn setup_cpu_topology(root: &str, cpuset: Option<&str>, sys_is_box_tmpfs: bool) {
     use std::os::fd::{AsRawFd, FromRawFd};
     // The range the box may run on. A `--cpuset-cpus` is already validated as a CPU list by the CLI;
     // without one, the host's own `possible` line is the truthful answer, and `0` is the floor for a
@@ -4026,8 +4359,15 @@ fn setup_cpu_topology(root: &str, cpuset: Option<&str>) {
     // BEST EFFORT, AND THE FALLBACK IS TODAY'S BEHAVIOUR. A host that refuses the mount still gets the
     // topology, written into the upper exactly as before: `create_dir_all` below runs either way. A
     // performance change must not become a correctness one on the host that cannot take it.
+    // ⛔ NOT OVER A `/sys` THE BOX ALREADY HAS. When sysfs paths were granted (`setup_vgpio`, which
+    // runs first), `/sys` is a box tmpfs holding their binds, and a fresh tmpfs on `sys/devices` hid
+    // every one of them below it. MEASURED on a Jetson Orin Nano: the chip identity granted at
+    // `/sys/devices/soc0` was not there, and CUDA could not tell which chip it ran on. The three files
+    // then go into that tmpfs, which is still a tmpfs, so the teardown cost above stays away.
     let _ = std::fs::create_dir_all(format!("{root}/sys"));
-    let _ = make_box_tmpfs(root, "sys/devices");
+    if !sys_is_box_tmpfs {
+        let _ = make_box_tmpfs(root, "sys/devices");
+    }
     let dir = format!("{root}/sys/devices/system/cpu");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -4896,12 +5236,29 @@ fn apply_userns_range(
     egid: u32,
     r: &IdRange,
     pt: Option<&mut PhaseTimer>,
-) -> Result<(), Error> {
+    idmap: Option<&SandboxSpec>,
+) -> Result<Vec<(String, String, libc::c_int)>, Error> {
     let mut p2h = [0 as libc::c_int; 2]; // parent → helper: "I've unshared, map me"
     let mut h2p = [0 as libc::c_int; 2]; // helper → parent: '1' mapped / '0' failed
     if unsafe { libc::pipe(p2h.as_mut_ptr()) } != 0 || unsafe { libc::pipe(h2p.as_mut_ptr()) } != 0
     {
         return Err(Error::last("pipe"));
+    }
+    // THE IDMAPPED BINDS' CHANNEL, only when there are some: the helper is the one process still in
+    // the host user namespace once the box's exists, so it makes them (see
+    // `prepare_idmapped_binds`) and hands the mount fds back. SEQPACKET keeps one fd per message.
+    let mut fdsock = [-1 as libc::c_int; 2];
+    if idmap.is_some()
+        && unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fdsock.as_mut_ptr(),
+            )
+        } != 0
+    {
+        fdsock = [-1, -1];
     }
     let helper = unsafe { libc::fork() };
     if helper < 0 {
@@ -4917,6 +5274,29 @@ fn apply_userns_range(
         let mut b = [0u8; 1];
         let _ = unsafe { libc::read(p2h[0], b.as_mut_ptr() as *mut libc::c_void, 1) };
         let ok = run_both_idmaps(r, ppid, euid, egid);
+        // The parent's namespace is mapped and this process is still the host's root: make the
+        // idmapped mounts against it and send them, BEFORE the verdict, so they are queued when the
+        // parent reads it.
+        if let (true, Some(spec), true) = (ok, idmap, fdsock[1] >= 0) {
+            unsafe { libc::close(fdsock[0]) };
+            if let Ok(path) = CString::new(format!("/proc/{ppid}/ns/user")) {
+                let ns = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                if ns >= 0 {
+                    let made = prepare_idmapped_binds(spec, ns, Some((r.sub_uid, r.uid_count)));
+                    for (i, (s, t, fd)) in made.iter().enumerate() {
+                        let index = spec
+                            .idmap_binds
+                            .iter()
+                            .position(|(a, b)| a == s && b == t)
+                            .unwrap_or(i) as u32;
+                        let _ = send_indexed_fd(fdsock[1], index, *fd);
+                        unsafe { libc::close(*fd) };
+                    }
+                    unsafe { libc::close(ns) };
+                }
+            }
+            unsafe { libc::close(fdsock[1]) };
+        }
         let msg: &[u8] = if ok { b"1" } else { b"0" };
         let _ = unsafe { libc::write(h2p[1], msg.as_ptr() as *const libc::c_void, 1) };
         unsafe { libc::_exit(0) };
@@ -4925,6 +5305,9 @@ fn apply_userns_range(
         libc::close(p2h[0]);
         libc::close(h2p[1]);
     }
+    if fdsock[1] >= 0 {
+        unsafe { libc::close(fdsock[1]) };
+    }
     let unshared = unsafe { libc::unshare(ns_flags) };
     if unshared != 0 {
         let e = std::io::Error::last_os_error();
@@ -4932,6 +5315,9 @@ fn apply_userns_range(
             libc::close(p2h[1]);
             libc::close(h2p[0]);
             libc::waitpid(helper, ptr::null_mut(), 0);
+        }
+        if fdsock[0] >= 0 {
+            unsafe { libc::close(fdsock[0]) };
         }
         if e.raw_os_error() == Some(libc::EPERM) {
             return Err(Error::Unsupported(USERNS_UNAVAILABLE));
@@ -4958,6 +5344,19 @@ fn apply_userns_range(
         libc::close(h2p[0]);
         libc::waitpid(helper, ptr::null_mut(), 0);
     }
+    // The helper has exited, so every message it sent is queued and the socket reads EOF after them.
+    let mut prepared = Vec::new();
+    if let (Some(spec), true) = (idmap, fdsock[0] >= 0) {
+        while let Some((index, fd)) = recv_indexed_fd(fdsock[0]) {
+            match spec.idmap_binds.get(index as usize) {
+                Some((s, t)) => prepared.push((s.clone(), t.clone(), fd)),
+                None => unsafe {
+                    libc::close(fd);
+                },
+            }
+        }
+        unsafe { libc::close(fdsock[0]) };
+    }
     if n != 1 || got[0] != b'1' {
         // newuidmap/newgidmap are present (detect_id_range found them + a sub-id allocation) but
         // couldn't actually apply the range here - typically the helper isn't setuid-root, or there
@@ -4969,9 +5368,13 @@ fn apply_userns_range(
         eprintln!(
             "kern: --uid-range mapping via newuidmap/newgidmap failed (helper present but not usable here) - using single-uid map"
         );
-        return write_single_uid_map(euid, egid);
+        // No range, so no idmapped bind can describe this box: release any that arrived.
+        for (_, _, fd) in prepared {
+            unsafe { libc::close(fd) };
+        }
+        return write_single_uid_map(euid, egid).map(|()| Vec::new());
     }
-    Ok(())
+    Ok(prepared)
 }
 
 /// Is a subordinate id RANGE usable on this host (a `newuidmap`/`newgidmap` pair plus an
@@ -5027,7 +5430,7 @@ pub fn with_id_mapped_userns<F: FnOnce(bool) -> i32>(f: F) -> Result<i32, Error>
         let mapped = match &range {
             // `apply_userns_range` unshares AND maps, and degrades to the single-uid map itself when
             // the helpers turn out to be unusable here.
-            Some(r) => apply_userns_range(libc::CLONE_NEWUSER, euid, egid, r, None).is_ok(),
+            Some(r) => apply_userns_range(libc::CLONE_NEWUSER, euid, egid, r, None, None).is_ok(),
             None => {
                 let unshared = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0;
                 unshared && write_single_uid_map(euid, egid).is_ok()
@@ -5086,6 +5489,25 @@ fn uid_map_is_ranged() -> bool {
 /// the access to subordinate-owned files the mapped namespace exists to give. MEASURED: `podman
 /// unshare kern save` failed exactly like plain `kern save`, because the merged-view child nested its
 /// own namespace.
+/// Is this process the REAL root: uid 0 of the initial user namespace, whose map is the identity over
+/// every id (`0 0 4294967295`)? `false` for uid 0 of any namespace kern or a tool built, where uid 0 is
+/// a mapped id and ownership is already consistent with the map by construction.
+pub fn is_initial_root() -> bool {
+    let euid = unsafe { libc::geteuid() };
+    euid == 0 && std::fs::read_to_string("/proc/self/uid_map").is_ok_and(|s| uid_map_is_initial(&s))
+}
+
+/// The parse half of [`is_initial_root`]: the initial namespace's map is one row mapping 0 onto 0 for
+/// every id there is.
+fn uid_map_is_initial(text: &str) -> bool {
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .filter(|r: &Vec<&str>| !r.is_empty())
+        .collect();
+    rows.len() == 1 && rows[0] == ["0", "0", "4294967295"]
+}
+
 pub fn is_root_of_ranged_userns() -> bool {
     let euid = unsafe { libc::geteuid() };
     euid == 0 && uid_map_is_ranged()
@@ -5499,6 +5921,12 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
                 "pod holder is gone (create the pod first with `kern pod create`)",
             ));
         }
+        // STILL IN THE HOST USER NAMESPACE, holding the pod's: the one moment an idmapped mount
+        // against that namespace can be made. See `prepare_idmapped_binds`.
+        if !spec.idmap_binds.is_empty() && is_initial_root() {
+            let sub = detect_id_range(euid, egid).map(|r| (r.sub_uid, r.uid_count));
+            let _ = IDMAPPED_BINDS.set(prepare_idmapped_binds(spec, user, sub));
+        }
         if unsafe { libc::setns(user, libc::CLONE_NEWUSER) } != 0 {
             let e = std::io::Error::last_os_error();
             return Err(Error::Syscall("setns(pod user)", e));
@@ -5587,7 +6015,12 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
                 // millisecond to nothing; then it had one, and the one hid which half was paying. The
                 // inner `parent:unshare(ns)` is emitted by `apply_userns_range` itself, so the
                 // difference between the two arms is exactly the id map and nothing else.
-                apply_userns_range(ns_flags, euid, egid, &range, Some(&mut pt_spawn))?;
+                let idmap = (!spec.idmap_binds.is_empty() && is_initial_root()).then_some(spec);
+                let prepared =
+                    apply_userns_range(ns_flags, euid, egid, &range, Some(&mut pt_spawn), idmap)?;
+                if !prepared.is_empty() {
+                    let _ = IDMAPPED_BINDS.set(prepared);
+                }
                 pt_spawn.mark("parent:idmap");
             }
             None => {
@@ -5955,6 +6388,8 @@ fn write_all(fd: i32, mut data: &[u8]) {
 /// mount/sethostname/keyctl cap) - the two conditionally-kept caps. Named once here because each number
 /// appears in BOTH [`DEFAULT_DROP`] (the default drops them) AND [`cap_drop_mask`] (a flag re-keeps
 /// them); a literal in two places is the derived-condition trap this codebase keeps closing.
+/// Read and traverse any file or directory the namespace maps, whatever its mode.
+const CAP_DAC_READ_SEARCH: u32 = 2;
 const CAP_NET_ADMIN: u32 = 12;
 const CAP_SYS_ADMIN: u32 = 21;
 
@@ -6458,11 +6893,36 @@ fn drop_caps_around_identity(
     mask: u64,
     run_as: Option<(u32, u32)>,
     extra_gids: &[u32],
+    keep_groups: bool,
     dumpable_after: bool,
 ) -> Result<(), (CapDropStep, Error)> {
     drop_cap_bounding(mask).map_err(|e| (CapDropStep::Bounding, e))?;
     if let Some((uid, gid)) = run_as {
-        set_user(uid, gid, extra_gids, dumpable_after).map_err(|e| (CapDropStep::Identity, e))?;
+        set_user(uid, gid, extra_gids, keep_groups, dumpable_after)
+            .map_err(|e| (CapDropStep::Identity, e))?;
+    } else if keep_groups {
+        // A GPU GRANT THAT NEEDS A GROUP: see `SandboxSpec::keep_groups`. Nothing to clear.
+    } else if !extra_gids.is_empty() {
+        // `--group-add` FOR A BOX THAT STAYS ROOT: docker gives the container's root those groups
+        // too. Only gids mapped into the box's user namespace are accepted, so this reaches nothing
+        // the box could not already name; a refusal falls back to the clear below and is said.
+        let gids: Vec<libc::gid_t> = extra_gids.iter().map(|g| *g as libc::gid_t).collect();
+        // SAFETY: `gids` is a live slice of `gid_t` and its length is passed with it.
+        if unsafe { libc::setgroups(gids.len(), gids.as_ptr()) } != 0 {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: the documented clearing form, as below.
+            unsafe { libc::setgroups(0, std::ptr::null()) };
+            eprintln!(
+                "kern: warning: could not give the box the group(s) it was added to ({}): {e}; it \
+                 runs with none. The single-uid map refuses supplementary groups; `--uid-range` maps \
+                 a range of gids.",
+                extra_gids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
     } else {
         // NO `--user`, SO NOBODY CLEARED THE INHERITED SUPPLEMENTARY GROUPS. `set_user` does it on
         // every identity path; with no identity to set, the workload kept the list of the user who
@@ -6515,6 +6975,162 @@ fn drop_caps_around_identity(
         }
     }
     clear_caps_from_sets(mask).map_err(|e| (CapDropStep::Sets, e))
+}
+
+/// Where an image keeps `ldconfig`, in the order a root shell's `PATH` finds it.
+const LDCONFIG_PATHS: [&str; 2] = ["/sbin/ldconfig", "/usr/sbin/ldconfig"];
+/// How long the image's `ldconfig` may take before it is killed. A real one takes milliseconds.
+const LDCONFIG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Rebuild the box's loader cache so the granted driver libraries are in it, as docker and podman do.
+///
+/// MEASURED with docker 29.1.3 and podman 4.9.3 on this host and on a WSL2 guest: after a GPU grant
+/// `ldconfig -p` lists `libcuda.so` in the container and `ctypes.util.find_library("cuda")` answers
+/// `libcuda.so.1`, because the NVIDIA hook runs the container's `ldconfig`. In a kern box it answered
+/// `None`: the libraries were there and loadable by name, and the cache did not list them, so every
+/// program that asks the cache (Python's `find_library` reads `ldconfig -p`) concluded there was no
+/// CUDA.
+///
+/// ⛔ THE IMAGE'S `ldconfig` IS IMAGE CODE, and this point of the setup comes before the workload's
+/// confinement is applied. So it runs in a child that takes the same confinement the workload does
+/// before it executes anything: every capability dropped but read-and-traverse (it stays the box's
+/// root, which owns `/etc` and so needs none to write the cache; see the drop below for the one kept), the `--apparmor` profile if one was asked for, the
+/// `--landlock-rw` allowlist if one was given, and the seccomp filter; with an environment of `PATH`
+/// alone, never the host's; killed after [`LDCONFIG_DEADLINE`]. Its output is discarded and its
+/// failure is not the box's: a cache that could not be rebuilt leaves the box as it was before this
+/// existed.
+fn refresh_loader_cache(spec: &SandboxSpec, allow_nesting: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    // THE GRANT'S LIBRARY DIRECTORIES, IN THE BOX'S OWN CONFIGURATION, before its loader runs: the
+    // file lands in the box's writable layer (this runs after the pivot, before any read-only
+    // remount), so it survives a later `ldconfig` in the box as docker's `00-nvcr-*.conf` does, and
+    // the image itself is not touched. Best effort, like the rebuild it feeds.
+    if !spec.ldconfig_dirs.is_empty() {
+        let body: String = spec
+            .ldconfig_dirs
+            .iter()
+            .map(|d| format!("{d}\n"))
+            .collect();
+        let _ = std::fs::create_dir_all("/etc/ld.so.conf.d");
+        let _ = std::fs::write("/etc/ld.so.conf.d/00-kern-gpu.conf", body);
+    }
+    let Some(ldconfig) = LDCONFIG_PATHS.iter().find(|p| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }) else {
+        return;
+    };
+    let Ok(path) = CString::new(*ldconfig) else {
+        return;
+    };
+    let Ok(env_path) = CString::new("PATH=/usr/sbin:/usr/bin:/sbin:/bin") else {
+        return;
+    };
+    // SAFETY: this process is the box's single-threaded setup child; `fork` here is the same shape as
+    // the `--init` split below it.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return;
+    }
+    if pid == 0 {
+        // ⛔ ITS OWN PID NAMESPACE, with the image's `ldconfig` as its PID 1: when that exits, or is
+        // killed at the deadline (through `PDEATHSIG` from this process), the kernel kills whatever
+        // it started. Without it a process the image's `ldconfig` forked lived on beside the
+        // workload as box root holding `CAP_DAC_READ_SEARCH`, whatever `--user` and `--cap-drop`
+        // said. FOUND BY AUDIT, reproduced rootless: `( exec sleep 5 ) &` from a fake `ldconfig`
+        // was still running as uid 0 under `--user 1000 --cap-drop ALL`. A namespace that cannot be
+        // made means no image code runs here: the box keeps the cache it came with.
+        // SAFETY: unshare/fork/waitpid/_exit in this single-threaded setup child.
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWPID) != 0 {
+                libc::_exit(126);
+            }
+            let inner = libc::fork();
+            if inner < 0 {
+                libc::_exit(126);
+            }
+            if inner > 0 {
+                let mut status = 0i32;
+                while libc::waitpid(inner, &mut status, 0) < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                {
+                }
+                libc::_exit(0);
+            }
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        }
+        let confine = || -> Result<(), Error> {
+            if let Some(profile) = &spec.apparmor {
+                apply_apparmor_onexec(profile)?;
+            }
+            // ⛔ EVERY CAPABILITY BUT ONE: `CAP_DAC_READ_SEARCH`, read and traverse, never write.
+            // With all of them dropped the box's root could not enter a home directory like
+            // ubuntu's `drwxr-x--- ubuntu`, and `ldconfig` SKIPS a directory it cannot read without
+            // a word: speaches registers its venv's CUDA libraries from `/home/ubuntu/...` in
+            // `/etc/ld.so.conf.d/`, the image's own cache listed cuDNN, and the rebuilt one did not,
+            // so the first transcription died "Unable to load any of {libcudnn_cnn.so.9...}". MEASURED
+            // in the field on a WSL2 guest. Docker's hook runs with the container's root, which
+            // keeps `CAP_DAC_OVERRIDE`; so does the workload of a kern box run as root. This keeps
+            // less than either: nothing that writes.
+            let all = cap_drop_mask(
+                &CapSpec {
+                    drop_all: true,
+                    adds: vec![CAP_DAC_READ_SEARCH],
+                    ..Default::default()
+                },
+                false,
+                false,
+            );
+            drop_caps_around_identity(all, None, &[], false, false).map_err(|(_, e)| e)?;
+            if !spec.landlock_rw.is_empty()
+                && !crate::landlock::apply_rw_allowlist(&spec.landlock_rw)?
+            {
+                return Err(Error::Unsupported("landlock unavailable"));
+            }
+            crate::seccomp::install(spec.seccomp_mode, allow_nesting)
+        };
+        if confine().is_ok() {
+            // SAFETY: open("/dev/null") and dup2 onto the standard descriptors, then execve with a
+            // NUL-terminated argv and envp built from CStrings that outlive the call.
+            unsafe {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+                if null >= 0 {
+                    libc::dup2(null, 0);
+                    libc::dup2(null, 1);
+                    libc::dup2(null, 2);
+                }
+                // ⛔ NOTHING BUT 0-2 REACHES IMAGE CODE, as on the workload's own path
+                // (CVE-2016-9962). FOUND BY AUDIT, reproduced rootless: a descriptor kern's caller
+                // left open (`9<host file`) reached the image's `ldconfig`, which read the host file
+                // through it and walked from it to the host's `/home`.
+                shed_inherited_fds(-1);
+                let argv = [path.as_ptr(), std::ptr::null()];
+                let envp = [env_path.as_ptr(), std::ptr::null()];
+                libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            }
+        }
+        // SAFETY: the child never returns into the setup it was forked from.
+        unsafe { libc::_exit(127) };
+    }
+    let deadline = std::time::Instant::now() + LDCONFIG_DEADLINE;
+    loop {
+        let mut status = 0i32;
+        // SAFETY: waiting on the one child forked above.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid
+            || (r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR))
+        {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: killing and reaping our own child.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 /// After `fork()`, close every inherited fd `>= 3` except `keep` (pass `-1` to keep none). Two callers
@@ -7081,7 +7697,7 @@ pub fn run_pod_holder() -> ! {
             // `None`: the pod holder is created by `kern pod create`, which has no `PhaseTimer` in
             // scope and is not on a box's hot path. Passing one would time a different operation
             // under the box's labels, which is worse than not timing it.
-            if let Err(e) = apply_userns_range(ns, euid, egid, &r, None) {
+            if let Err(e) = apply_userns_range(ns, euid, egid, &r, None, None) {
                 eprintln!(
                     "kern: pod: ranged user-ns map failed ({e}) - falling back to single-uid"
                 );
@@ -7545,6 +8161,9 @@ pub fn exec_in_box(
     box_has_explicit_caps: bool,
     box_caps: &CapSpec,
     seccomp_mode: crate::SeccompFilter,
+    // The box's recorded `no-new-privileges`: the exec runs under the same choice as PID 1 (a box
+    // recorded before it existed counts as `true`, the stricter side). See [`SandboxSpec::no_new_privs`].
+    no_new_privs: bool,
     // The box's `--apparmor` profile, taken from the RECORDED exec posture (`Instance::apparmor` via
     // `exec_posture()`), or `None` if it ran unconfined. NOT read back from `/proc/<pid1>/attr/...`:
     // for an `--init` box PID 1 is the unconfined reaper, so that read would deduce "unconfined" and
@@ -7571,6 +8190,10 @@ pub fn exec_in_box(
     // Measured on Elastic's own stack, whose certificates are `root:root` mode 640.
     run_as: Option<(u32, u32)>,
     extra_gids: &[u32],
+    // The box's recorded `keep_groups` (a GPU grant whose nodes open only through a group): an exec,
+    // a health probe included, keeps the caller's groups as the box's PID 1 did, or a `nvidia-smi`
+    // probe in a GPU service on the uid-range map fails where the workload succeeds.
+    keep_groups: bool,
     // The box's `--landlock-rw` write-allowlist, from the same RECORDED posture as `box_caps`,
     // `seccomp_mode` and `apparmor`. Empty for a box that named none.
     //
@@ -7972,8 +8595,15 @@ pub fn exec_in_box(
         // FAIL CLOSED on every step. An identity that did not switch would run the command as box
         // root where the caller (a health probe, `compose exec`, `kern exec -u`) asked for an account,
         // and a probe running as root is exactly the false green the identity exists to remove.
+        // WITHOUT `no-new-privileges`, the filter first, while this child still holds the box
+        // namespace's capabilities: the one way the kernel takes it without no-new-privs (the box's
+        // PID 1 does the same). It then covers the capability drop and identity switch below.
+        let nnp = effective_no_new_privs(no_new_privs, landlock_rw);
+        if !nnp && crate::seccomp::install_with(seccomp_mode, false, false).is_err() {
+            exec_fail_closed("seccomp filter could not be installed");
+        }
         let cap_mask = cap_drop_mask(box_caps, false, false);
-        match drop_caps_around_identity(cap_mask, run_as, extra_gids, false) {
+        match drop_caps_around_identity(cap_mask, run_as, extra_gids, keep_groups, false) {
             Ok(()) => {}
             Err((CapDropStep::Identity, _)) => {
                 exec_fail_closed("could not switch to the requested user")
@@ -8021,7 +8651,7 @@ pub fn exec_in_box(
                 exec_fail_closed("could not re-enter the box's AppArmor profile");
             }
         }
-        if crate::seccomp::install(seccomp_mode, false).is_err() {
+        if nnp && crate::seccomp::install(seccomp_mode, false).is_err() {
             exec_fail_closed("seccomp filter could not be installed");
         }
         // SECURITY (CVE-2016-9962 class): same fd shed as the box workload path - a descriptor this
@@ -9430,7 +10060,7 @@ mod cpu_topology_tests {
         };
 
         // An explicit cpuset is what the box is told, in all three files.
-        setup_cpu_topology(&root.to_string_lossy(), Some("0-1"));
+        setup_cpu_topology(&root.to_string_lossy(), Some("0-1"), false);
         for f in ["possible", "present", "online"] {
             assert_eq!(read(f).as_deref(), Some("0-1\n"), "{f}");
         }
@@ -9438,14 +10068,14 @@ mod cpu_topology_tests {
         // A list form, not just a range.
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
-        setup_cpu_topology(&root.to_string_lossy(), Some("0,2,4"));
+        setup_cpu_topology(&root.to_string_lossy(), Some("0,2,4"), false);
         assert_eq!(read("possible").as_deref(), Some("0,2,4\n"));
 
         // Anything that is not a CPU list writes NOTHING rather than a file nothing can parse.
         for bad in ["0-1; rm -rf /", "all", "0-1\n0-2", "0 1"] {
             let _ = std::fs::remove_dir_all(&root);
             let _ = std::fs::create_dir_all(&root);
-            setup_cpu_topology(&root.to_string_lossy(), Some(bad));
+            setup_cpu_topology(&root.to_string_lossy(), Some(bad), false);
             assert!(read("possible").is_none(), "must refuse {bad:?}");
         }
 
@@ -9453,7 +10083,7 @@ mod cpu_topology_tests {
         // value is whatever this machine says, so the assertion is on the SHAPE, not the number.
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::create_dir_all(&root);
-        setup_cpu_topology(&root.to_string_lossy(), None);
+        setup_cpu_topology(&root.to_string_lossy(), None, false);
         let got = read("possible").unwrap_or_default();
         assert!(
             !got.trim().is_empty()
@@ -9784,6 +10414,21 @@ mod cpu_dir_name_tests {
 }
 
 #[cfg(test)]
+mod initial_root_tests {
+    use super::uid_map_is_initial;
+
+    /// The initial namespace is ONE row, 0 onto 0, over every id; a box's map, a single-uid map and an
+    /// empty read are not it.
+    #[test]
+    fn only_the_identity_over_every_id_is_the_initial_namespace() {
+        assert!(uid_map_is_initial("         0          0 4294967295\n"));
+        assert!(!uid_map_is_initial("0 1000 1\n1 100000 65536\n"));
+        assert!(!uid_map_is_initial("0 0 1\n"));
+        assert!(!uid_map_is_initial(""));
+    }
+}
+
+#[cfg(test)]
 mod driver_tool_hint_tests {
     use super::{driver_tool_name, found_in_box, is_driver_tool, DRIVER_TOOLS};
 
@@ -9868,8 +10513,9 @@ mod driver_tool_hint_tests {
         let hint = driver_tool_hint("/nonexistent/nvidia-smi").expect("a driver tool gets a hint");
         if box_has_gpu_grant() {
             assert!(
-                hint.contains("binds the driver's LIBRARIES") && hint.contains("libnvidia-ml.so.1"),
-                "with a grant the hint points at the libraries that ARE there: {hint}"
+                hint.contains("binds each one the host has at /usr/bin")
+                    && hint.contains("libnvidia-ml.so.1"),
+                "with a grant the hint says the tool was not on the host, and that NVML is here: {hint}"
             );
             assert!(
                 !hint.contains("NO GPU grant"),
@@ -10118,5 +10764,69 @@ mod overlay_option_tests {
         );
         let (lower, up, _) = kernel_reads("lowerdir=/l,upperdir=/a,b/upper,workdir=/w");
         assert_eq!((lower, up), (vec!["/l".to_string()], "/a".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod idmapped_bind_tests {
+    use super::*;
+
+    /// The kernel reads `mount_attr` by size; a wrong layout is EINVAL on every bind, or worse, a
+    /// field read from the wrong offset.
+    #[test]
+    fn mount_attr_is_the_kernels_32_bytes() {
+        assert_eq!(std::mem::size_of::<MountAttr>(), 32);
+    }
+
+    /// A directory prepared for the earlier mapping keeps it; anything else gets docker's view.
+    #[test]
+    fn only_an_owner_inside_the_subordinate_range_keeps_the_old_mapping() {
+        let sub = Some((100_000, 65_536));
+        assert!(owner_is_in_subordinate_range(100_000, sub));
+        assert!(owner_is_in_subordinate_range(100_999, sub));
+        assert!(owner_is_in_subordinate_range(165_535, sub));
+        assert!(!owner_is_in_subordinate_range(165_536, sub));
+        assert!(!owner_is_in_subordinate_range(99_999, sub));
+        assert!(!owner_is_in_subordinate_range(1000, sub));
+        assert!(!owner_is_in_subordinate_range(0, sub));
+        assert!(!owner_is_in_subordinate_range(100_999, None));
+    }
+
+    /// The channel the id-map helper hands mount fds back on: index and descriptor both arrive, the
+    /// descriptor is a live one (it reads what was written through the original), and the end of the
+    /// sender reads as the end of the list.
+    #[test]
+    fn an_indexed_fd_crosses_the_socket_and_the_end_reads_as_none() {
+        let mut sp = [-1 as libc::c_int; 2];
+        let made = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                sp.as_mut_ptr(),
+            )
+        };
+        assert_eq!(made, 0, "socketpair");
+        let mut pipe = [-1 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        assert!(send_indexed_fd(sp[1], 7, pipe[0]));
+        unsafe { libc::close(sp[1]) };
+        let got = recv_indexed_fd(sp[0]);
+        let Some((index, fd)) = got else {
+            panic!("nothing received");
+        };
+        assert_eq!(index, 7);
+        assert_ne!(fd, pipe[0], "a new descriptor, not the sender's number");
+        assert_eq!(unsafe { libc::write(pipe[1], b"k".as_ptr().cast(), 1) }, 1);
+        let mut b = [0u8; 1];
+        assert_eq!(unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) }, 1);
+        assert_eq!(&b, b"k");
+        assert!(recv_indexed_fd(sp[0]).is_none(), "the end of the list");
+        unsafe {
+            libc::close(fd);
+            libc::close(sp[0]);
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
     }
 }

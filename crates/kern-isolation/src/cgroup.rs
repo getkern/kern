@@ -5182,9 +5182,31 @@ mod tests {
     fn a_cap_notice_reaches_the_launcher_and_stops_at_the_disarm() {
         let _lock = NOTICE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe()");
+        // CLOEXEC, and EOF awaited below rather than read once. The test process runs other tests
+        // on other threads, and many of them fork: a child born between `pipe()` and the disarm holds
+        // a copy of the write end until it execs or exits, so a single read saw "open but empty".
+        // MEASURED: red once in a full `cargo test --workspace`, green 20 of 20 alone.
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "pipe2()"
+        );
         let (rd, wr) = (fds[0], fds[1]);
         unsafe { libc::fcntl(rd, libc::F_SETFL, libc::O_NONBLOCK) };
+        // EOF within a bound: a sibling's inherited copy goes at its exec or exit; a write end the
+        // disarm did NOT close never goes, and this still fails.
+        let eof_within = |fd: i32| -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let mut b = [0u8; 64];
+                match unsafe { libc::read(fd, b.as_mut_ptr().cast(), b.len()) } {
+                    0 => return true,
+                    n if n > 0 => return false,
+                    _ if std::time::Instant::now() >= deadline => return false,
+                    _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        };
         // Reads whatever is available right now: `Ok(bytes)`, or `Err(true)` for "open but empty"
         // (EAGAIN) and `Err(false)` for EOF - the write end is gone.
         let drain = |fd: i32| -> Result<Vec<u8>, bool> {
@@ -5216,7 +5238,7 @@ mod tests {
         // writing to that terminal hours after the launcher returned. EOF is the proof: the only write
         // end was the one it closed.
         disarm_launcher_notice();
-        assert_eq!(drain(rd), Err(false), "the disarm must close the write end");
+        assert!(eof_within(rd), "the disarm must close the write end");
         cap_notice("kern: warning: after the disarm");
         assert_eq!(
             drain(rd),

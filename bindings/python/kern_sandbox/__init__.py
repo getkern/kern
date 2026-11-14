@@ -90,6 +90,11 @@ _DEFAULT_IMAGE = "python:3.12-slim"
 # started working. MEASURED on python:3.12-slim: python, sh and bash 5.2 are present, node is not.
 _DEFAULT_IMAGE_HAS_NODE = False
 
+# EVERY SANDBOX RUNS WITH NO-NEW-PRIVILEGES. A kern box follows docker and leaves it off unless asked,
+# so that a setuid `sudo` in an image built for docker works; the code a sandbox runs is untrusted,
+# and its volumes keep the setuid bit as docker binds do, so the SDK asks for it on every box.
+_NO_NEW_PRIVS = ("--security-opt", "no-new-privileges")
+
 _WORKSPACE = "/workspace"  # where the persistent workspace is mounted inside every box
 #: What `kern exec` says when the box it was asked for is not running. Matched rather than inferred
 #: from an exit code, because `exec` reports a MISSING BOX and a workload that exited non-zero through
@@ -1521,7 +1526,7 @@ def _pyc_build(kern_bin: str, image: str, dest: str, timeout_s: float) -> None:
         # being written. Nothing of the caller's session is in this box.
         argv = [
             kern_bin, "box", f"kern-pyc-{uuid.uuid4().hex[:8]}",
-            "--image", image, "--ro",
+            "--image", image, "--ro", *_NO_NEW_PRIVS,
             *_mount_args(tmp, _PYC_MOUNT, False),
             "--env", f"PYTHONPYCACHEPREFIX={_PYC_MOUNT}",
             "--cap-drop", "ALL",
@@ -2415,11 +2420,12 @@ class MountRefused(SandboxError):
 @dataclass
 class SandboxFault:
     """A SANDBOX-level event, reported as DATA on ``ExecutionResult.fault``. ``None`` means the sandbox
-    did nothing: any non-zero exit is the user's code. NOTE: ``startup_failed`` is the one type that is
-    RAISED (:class:`SandboxError`) rather than returned - a box that never started ran no code, so the
-    result would be hollow - so a fault actually seen on a result is only ``timeout``/``oom``/
-    ``escape_blocked``/``killed``. The label is kept here because it is how the box-start failure is
-    classified internally.
+    did nothing: any non-zero exit is the user's code. ``startup_failed`` is RAISED
+    (:class:`SandboxError`) when kern says the box began and failed to start (exit 125), because the
+    result would be hollow; when kern REFUSES the request before any box exists (exit 1 with its own
+    error: an image that is not there, ``gpus="device=7"`` on a two-card host) it is returned as data
+    with that type and kern's message on ``stderr``, as the README's fault table shows. Every other
+    type is returned as data.
 
     ``startup_failed`` is decided from an UNFORGEABLE kern signal (a byte on ``KERN_STARTED_FD`` that a
     workload can neither write nor suppress). Against a kern too old to send it, the binding falls back
@@ -4941,7 +4947,7 @@ class Sandbox:
             # `--entrypoint ""` for the reason `_helper_argv` states: the image's ENTRYPOINT would
             # otherwise run first and decide whether this probe writes its file at all.
             argv = [self._kern, "box", _unique_name(), "--image", self.image, "--ro",
-                    "--entrypoint", "", *_mount_args(drop, "/kern-uid", False),
+                    *_NO_NEW_PRIVS, "--entrypoint", "", *_mount_args(drop, "/kern-uid", False),
                     *self._cap_drop_args, "--timeout", "60"]
             if self.user is not None:
                 argv += ["--user", self.user]
@@ -4994,7 +5000,7 @@ class Sandbox:
         if self._as_user is None:
             raise SandboxError("the workspace helper is for a non-root session only")
         return [self._kern, "box", _unique_name(), "--image", self.image, "--ro",
-                "--entrypoint", "", "--user", self._as_user, *self._cap_drop_args,
+                *_NO_NEW_PRIVS, "--entrypoint", "", "--user", self._as_user, *self._cap_drop_args,
                 *_mount_args(self._ws, "/w", not write), "--pids-limit", "64",
                 "--timeout", str(timeout_s), "--", "sh", "-c", script, "sh", *args]
 
@@ -5067,7 +5073,7 @@ class Sandbox:
             # so 0.25%. A file that HAS changed pays one `--version` (0.44 ms) and is refused by name if
             # it is no longer kern.
             self._kern_version = _verify_is_kern(self._kern)
-        argv = [self._kern, "box", name, "--image", self.image, "--ro",
+        argv = [self._kern, "box", name, "--image", self.image, "--ro", *_NO_NEW_PRIVS,
                 *_mount_args(self._ws, _WORKSPACE, False),
                 "--workdir", _WORKSPACE]
         # deps_readonly: mount <workspace>/.deps read-only OVER the writable workspace for run_code boxes

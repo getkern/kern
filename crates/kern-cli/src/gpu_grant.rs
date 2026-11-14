@@ -640,6 +640,374 @@ pub struct GpuGrant {
     pub symlinks: Vec<Symlink>,
     /// The directories the loader has to search, derived from where the libraries actually are.
     pub ldconfig_dirs: Vec<PathBuf>,
+    /// The driver's own tools this host has, each bound read-only at `/usr/bin/<name>` in the box.
+    pub tools: Vec<DriverTool>,
+    /// The driver's configuration files this host has (Vulkan, EGL, OptiX), as (host file, path in
+    /// the box). See [`DRIVER_CONFIG_FILES`].
+    pub configs: Vec<(PathBuf, String)>,
+    /// Directories bound whole, read-only (`dir` rows of a Jetson's CSV, such as `/dev/dri/by-path`).
+    pub dirs: Vec<PathBuf>,
+    /// The libraries and links go at the HOST's paths, and the box's loader is told their
+    /// directories (see [`TegraCsv`]), instead of being placed in the image's library directory.
+    pub at_host_paths: bool,
+    /// The sysfs paths a Jetson's GPU runtime reads to identify the chip, bound read-only into the
+    /// box's `/sys` (see [`TEGRA_SYSFS`]). Empty everywhere else.
+    pub sysfs: Vec<PathBuf>,
+    /// The nodes in `shared` that came from a Jetson's CSV rather than from every NVIDIA host. One
+    /// of them the caller cannot open is left out rather than refusing the grant (see
+    /// `plan_binds`): the list names debug and profiler nodes of a group the caller is not in.
+    pub listed_nodes: BTreeSet<PathBuf>,
+}
+
+/// Where NVIDIA's container toolkit lists, on a Jetson, every file a GPU container is given: the
+/// toolkit's "CSV mode", which it auto-detects from [`TEGRA_RELEASE_REL`].
+const TEGRA_CSV_DIR_REL: &str = "etc/nvidia-container-runtime/host-files-for-container.d";
+/// What marks a Jetson (L4T) host, as the toolkit's mode detection reads it.
+const TEGRA_RELEASE_REL: &str = "etc/nv_tegra_release";
+
+/// The sysfs a Jetson's GPU runtime reads before `cuInit` can succeed, and nothing more.
+///
+/// ⛔ A KERN BOX MOUNTS NO SYSFS, and docker gives its container the whole of `/sys` read-only. With
+/// none, `libnvrm_gpu` said "No matching chip spec found for chip Id=0" and `NvRmGpuLibOpen failed`.
+/// MEASURED with `strace` around `cuInit` on a Jetson Orin Nano: it reads `/sys/devices/soc0/
+/// {soc_id,revision,major,platform}`, `/sys/devices/system/cpu/online` (which a box already has, as
+/// kern's own CPU topology), and the chip's fuses (`/sys/bus/nvmem/devices/fuse/nvmem`), which are
+/// left out: they are the chip's unique identifiers, root-only on the host, and the runtime does
+/// without them.
+const TEGRA_SYSFS: [&str; 1] = ["sys/devices/soc0"];
+
+/// A Jetson's GPU, as NVIDIA's own CSV lists it: device nodes, directories, libraries, links.
+///
+/// ⛔ WHY THE LIST AND NOT THE DESKTOP SWEEP. On a Jetson the desktop rule (every library carrying
+/// the driver version) found 12 graphics libraries and NOT `libcuda.so.1.1`, whose name carries no
+/// version, nor the Tegra libraries CUDA loads (`libnvrm_gpu.so`, `libnvos.so`...): MEASURED on a
+/// Jetson Orin Nano (JetPack R36.4.7), `cuInit` worked on the host and the box had no `libcuda.so.1`.
+/// Docker there runs the toolkit in CSV mode: `--runtime nvidia` with `NVIDIA_VISIBLE_DEVICES` mounts
+/// the 39 nodes of `devices.csv` and the 239 libraries and 46 links of `drivers.csv` at their host
+/// paths, writes their directories to `/etc/ld.so.conf.d/00-nvcr-*.conf`, and CUDA initialises (same
+/// board, measured). kern reads the same files and does the same.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TegraCsv {
+    pub devs: Vec<PathBuf>,
+    pub dirs: Vec<PathBuf>,
+    pub libs: Vec<PathBuf>,
+    pub syms: Vec<PathBuf>,
+}
+
+/// Add the rows of one CSV file (`<kind>, <absolute path>`) to `into`, each path placed under
+/// `root`. Comments, blank lines, unknown kinds and relative paths are skipped.
+pub fn parse_tegra_csv(text: &str, root: &Path, into: &mut TegraCsv) {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((kind, path)) = line.split_once(',') else {
+            continue;
+        };
+        let path = path.trim();
+        if !path.starts_with('/') || path.split('/').any(|c| c == "..") {
+            continue;
+        }
+        let at = root.join(path.trim_start_matches('/'));
+        // A ROW MAY BE A PATTERN: `dev, /dev/dri/card*` and `dev, /dev/dri/renderD*` on JetPack 6.
+        // Read literally they named no file, and the box had no DRM node: MEASURED on a Jetson Orin
+        // Nano, `cuInit` then died with SIGSEGV in the box while docker's container, given the four
+        // nodes, initialised.
+        let found = expand_last_component(&at);
+        let list = match kind.trim() {
+            "dev" => &mut into.devs,
+            "dir" => &mut into.dirs,
+            "lib" => &mut into.libs,
+            "sym" => &mut into.syms,
+            _ => continue,
+        };
+        list.extend(found);
+    }
+}
+
+/// `path` itself, or, when its last component holds `*` or `?`, the entries of its directory that
+/// match it, sorted. A pattern in an earlier component is not expanded: NVIDIA's lists put them last.
+fn expand_last_component(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return vec![path.to_path_buf()];
+    };
+    if !name.contains(['*', '?']) {
+        return vec![path.to_path_buf()];
+    }
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| wildcard_match(name, n))
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Shell-style match of `name` against `pattern`, where `*` is any run and `?` any one character.
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// The Jetson CSV lists under `root`, when this is a Jetson that has them. A list file must be a
+/// regular file owned by root and writable by nobody else, as the CDI specs kern reads must be: it
+/// decides what a box is handed. A synthetic root (a test's) is not held to the owner.
+fn tegra_csv_under(root: &Path) -> Option<TegraCsv> {
+    use std::os::unix::fs::MetadataExt;
+    if !root.join(TEGRA_RELEASE_REL).exists() {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(root.join(TEGRA_CSV_DIR_REL))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "csv"))
+        .collect();
+    files.sort();
+    let real_root = root == Path::new("/");
+    let mut csv = TegraCsv::default();
+    for f in files {
+        let Ok(m) = std::fs::symlink_metadata(&f) else {
+            continue;
+        };
+        if !m.is_file() || (real_root && (m.uid() != 0 || m.mode() & 0o022 != 0)) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            parse_tegra_csv(&text, root, &mut csv);
+        }
+    }
+    (!csv.libs.is_empty()).then_some(csv)
+}
+
+/// `path`, already resolved by [`follow_links_under`], as the canonical path it names, when that stays
+/// under `root`. NVIDIA's list holds links like `gbm/tegra_gbm.so -> ../nvidia/libnvidia-allocator.so`,
+/// and a bind source with a `..` in it is refused by the box: MEASURED on a Jetson Orin Nano, "volume
+/// source must be canonical".
+fn canonical_under(root: &Path, path: &Path) -> Option<PathBuf> {
+    let real = std::fs::canonicalize(path).ok()?;
+    let real_root = std::fs::canonicalize(root).ok()?;
+    real.starts_with(&real_root).then_some(real)
+}
+
+/// The CSV's libraries that exist under `root`, resolved, of the wanted class, deduplicated by
+/// identity: the same rules as the desktop sweep, applied to NVIDIA's list instead of a suffix.
+fn csv_libraries(root: &Path, csv: &TegraCsv, want: ElfClass) -> Vec<Library> {
+    let mut out: Vec<Library> = Vec::new();
+    let mut identities: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for listed in &csv.libs {
+        let mut path = listed.clone();
+        if !follow_links_under(root, &mut path) {
+            continue;
+        }
+        let Some(path) = canonical_under(root, &path) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || elf_class_of(&path) != Some(want) {
+            continue;
+        }
+        if identities.insert((meta.dev(), meta.ino())) {
+            out.push(Library {
+                path,
+                dev: meta.dev(),
+                ino: meta.ino(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// The CSV's links that exist under `root` and end, inside it, at a regular file.
+fn csv_symlinks(root: &Path, csv: &TegraCsv) -> Vec<Symlink> {
+    let mut out: Vec<Symlink> = Vec::new();
+    for link in &csv.syms {
+        let Ok(target) = std::fs::read_link(link) else {
+            continue;
+        };
+        let mut resolved = link.clone();
+        if !follow_links_under(root, &mut resolved) {
+            continue;
+        }
+        let Some(resolved) = canonical_under(root, &resolved) else {
+            continue;
+        };
+        if std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
+            out.push(Symlink {
+                link: link.clone(),
+                target,
+                resolved,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.link.cmp(&b.link));
+    out
+}
+
+/// The NVIDIA configuration files a grant binds, as (path under the root, path in the box): the set
+/// NVIDIA's own CDI spec mounts, at the paths it mounts them.
+///
+/// MEASURED on this host, `nvidia-ctk` 1.18.2's spec against a docker 29.1.3 container given
+/// `--device nvidia.com/gpu=0`: the Vulkan ICD and layer files land in `/etc/vulkan/…`, the EGL and
+/// OptiX ones at their own path, and with them `vulkaninfo` in `ubuntu:24.04` lists the RTX 5060 Ti
+/// as an NVIDIA device. A kern box had none of the files, so the Vulkan and EGL loaders could not
+/// learn that an NVIDIA driver exists, whatever libraries were bound.
+///
+/// Two rows can fill one box path (a host that keeps the ICD in `/etc` rather than `/usr/share`); the
+/// first found wins. Left out on purpose, though the spec mounts them: the GSP firmware (the host's
+/// kernel loads it, a box has no use for it), `xorg.conf.d` (a box runs no X server), and the
+/// `nvidia-persistenced` socket, which would be a channel from the box to a root daemon on the host.
+pub const DRIVER_CONFIG_FILES: [(&str, &str); 8] = [
+    (
+        "usr/share/vulkan/icd.d/nvidia_icd.json",
+        "/etc/vulkan/icd.d/nvidia_icd.json",
+    ),
+    (
+        "etc/vulkan/icd.d/nvidia_icd.json",
+        "/etc/vulkan/icd.d/nvidia_icd.json",
+    ),
+    (
+        "usr/share/vulkan/implicit_layer.d/nvidia_layers.json",
+        "/etc/vulkan/implicit_layer.d/nvidia_layers.json",
+    ),
+    (
+        "etc/vulkan/implicit_layer.d/nvidia_layers.json",
+        "/etc/vulkan/implicit_layer.d/nvidia_layers.json",
+    ),
+    (
+        "usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+        "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+    ),
+    (
+        "usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json",
+        "/usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json",
+    ),
+    (
+        "usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json",
+        "/usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json",
+    ),
+    (
+        "usr/share/nvidia/nvoptix.bin",
+        "/usr/share/nvidia/nvoptix.bin",
+    ),
+];
+
+/// The configuration files of [`DRIVER_CONFIG_FILES`] that exist under `root` as regular files.
+pub fn driver_configs_under(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    for (rel, target) in DRIVER_CONFIG_FILES {
+        if out.iter().any(|(_, t)| t == target) {
+            continue;
+        }
+        let Ok(real) = std::fs::canonicalize(root.join(rel)) else {
+            continue;
+        };
+        if std::fs::metadata(&real)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            out.push((real, target.to_string()));
+        }
+    }
+    out
+}
+
+/// The links NVIDIA's CDI hook creates beside the libraries, as (library file prefix, link path under
+/// the library directory). kern binds the file at the link's path, as it does for every other link.
+///
+/// MEASURED in the docker container given the spec: `libGLX_indirect.so.0 -> libGLX_nvidia.so.<v>`
+/// and `gbm/nvidia-drm_gbm.so -> ../libnvidia-allocator.so.1`; GLVND's indirect GLX and GBM's
+/// backend loader open those names.
+const DRIVER_ALIAS_LINKS: [(&str, &str); 2] = [
+    ("libGLX_nvidia.so.", "libGLX_indirect.so.0"),
+    ("libnvidia-allocator.so.", "gbm/nvidia-drm_gbm.so"),
+];
+
+/// One of the driver's own tools (`nvidia-smi` and the four beside it), found on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverTool {
+    /// The bare name, which is also its name in the box.
+    pub name: String,
+    /// The host file, symlinks resolved, so the bind lands the binary and not a dangling link.
+    pub source: PathBuf,
+}
+
+/// Where a box finds the driver's tools: the directory docker's NVIDIA runtime puts them in.
+///
+/// MEASURED against docker 29.1.3 with toolkit 1.20.2, on this host (`--gpus device=1`, ubuntu:24.04)
+/// and on a WSL2 guest: `/usr/bin/nvidia-smi` is there in both, plus `nvidia-debugdump`,
+/// `nvidia-persistenced`, `nvidia-cuda-mps-control` and `nvidia-cuda-mps-server` on the native host.
+/// Every guide checks a GPU container with `nvidia-smi`, and the `nvidia/cuda:*-base` images ship
+/// none, so a grant without the tools failed the first command anyone types.
+pub const DRIVER_TOOLS_IN_BOX: &str = "/usr/bin";
+
+/// Where the host's tools are looked for, in this order, relative to the root: the
+/// `PATH` libnvidia-container searches, so the file found is the one docker would have bound.
+const DRIVER_TOOL_DIRS_REL: [&str; 6] = [
+    "usr/local/sbin",
+    "usr/local/bin",
+    "usr/sbin",
+    "usr/bin",
+    "sbin",
+    "bin",
+];
+
+/// The driver tools under `root`, at most one per name, each a regular file once resolved.
+///
+/// A NAME THE HOST DOES NOT HAVE IS SIMPLY ABSENT, which is what docker does too: a driver installed
+/// without `nvidia-persistenced` gives a box without it, and the four others still come.
+pub fn driver_tools_under(root: &Path) -> Vec<DriverTool> {
+    let mut out: Vec<DriverTool> = Vec::new();
+    for name in kern_isolation::driver_tools() {
+        for dir in DRIVER_TOOL_DIRS_REL {
+            let Ok(real) = std::fs::canonicalize(root.join(dir).join(name)) else {
+                continue;
+            };
+            if std::fs::metadata(&real)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                out.push(DriverTool {
+                    name: (*name).to_string(),
+                    source: real,
+                });
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// WHERE THE DRIVER NAMES ITS THREADS, and the half of this that is not a device node at all.
@@ -1434,6 +1802,14 @@ fn merge_acl_ids(entries: &mut Vec<(u32, u8)>) {
     *entries = merged;
 }
 
+/// The gid through which the caller ALONE reaches a character device, or `None` when the node opens
+/// for the caller's uid (owner, ACL, other) or is not a node. `kern box --device <host path>` asks
+/// it, to keep the groups a box would otherwise clear, as a `--gpus` grant does.
+pub(crate) fn node_needs_a_group(path: &Path) -> Option<u32> {
+    let facts = node_facts(path)?;
+    (access_path(&facts, &Caller::current()) == AccessPath::GroupOnly).then_some(facts.gid)
+}
+
 /// The facts about one node, read from the filesystem.
 fn node_facts(path: &Path) -> Option<NodeFacts> {
     let meta = std::fs::metadata(path).ok()?;
@@ -1484,6 +1860,7 @@ pub fn uid_dependent_nodes(
     selection: &GpuSelection,
     who: &Caller,
     box_uid: u32,
+    keeps_groups: bool,
 ) -> Vec<PathBuf> {
     // THE UID THE BOX WILL ACTUALLY CARRY, not a uid chosen to be unreachable. The first version of
     // this probed with `u32::MAX - 1`, a uid no account can name, and that models the wrong thing:
@@ -1494,10 +1871,17 @@ pub fn uid_dependent_nodes(
     // the only thing that answers the question that was asked.
     //
     // No groups, because a box on the ranged map carries none: the clear in
-    // `drop_caps_around_identity` succeeds there, which is measured in this module's axiom 1.
+    // `drop_caps_around_identity` succeeds there, which is measured in this module's axiom 1. EXCEPT
+    // a box that keeps them (`keeps_groups`, a grant whose nodes open only through a group), whose
+    // workload carries the caller's groups whatever its uid: on a Jetson the warning named all 16
+    // nodes of a `--user 1000` box that `video` opens.
     let holds_nothing = Caller {
         uid: box_uid,
-        gids: Vec::new(),
+        gids: if keeps_groups {
+            who.gids.clone()
+        } else {
+            Vec::new()
+        },
     };
     let Ok(cards) = cards_of(grant, selection) else {
         // An unresolvable selection is `mount_plan`'s error to report, with its own message. There
@@ -1615,7 +1999,22 @@ pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveErr
         out
     };
 
-    let shared = facts_of(&shared_paths);
+    let csv = tegra_csv_under(root);
+    let mut shared = facts_of(&shared_paths);
+    // A Jetson's own nodes, as NVIDIA's list names them, beside the ones every NVIDIA host has.
+    let mut listed_nodes: BTreeSet<PathBuf> = BTreeSet::new();
+    if let Some(c) = &csv {
+        let known: BTreeSet<PathBuf> = shared.iter().map(|(p, _)| p.clone()).collect();
+        let listed: Vec<PathBuf> = c
+            .devs
+            .iter()
+            .filter(|p| !known.contains(*p))
+            .cloned()
+            .collect();
+        let found = facts_of(&listed);
+        listed_nodes = found.iter().map(|(p, _)| p.clone()).collect();
+        shared.extend(found);
+    }
     let cards: Vec<CardNodes> = card_paths
         .into_iter()
         .map(|(index, pci_address, paths)| CardNodes {
@@ -1625,16 +2024,29 @@ pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveErr
         })
         .collect();
 
-    let libraries = libraries_under(root, &driver_version, want);
-    let symlinks = symlinks_for(root, &libraries);
+    let (libraries, symlinks) = match &csv {
+        Some(c) => (csv_libraries(root, c, want), csv_symlinks(root, c)),
+        None => {
+            let libraries = libraries_under(root, &driver_version, want);
+            let symlinks = symlinks_for(root, &libraries);
+            (libraries, symlinks)
+        }
+    };
 
     // The loader's directories are DERIVED from where the libraries are, not copied from the host's
     // configuration: a directory with no library in it would tell the box to search a path that has
     // nothing in it, and a library in a directory the list omits would not be found.
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    // ONLY A DIRECTORY HOLDING A SHARED OBJECT: a Jetson's list names a few executables as `lib`
+    // (`/usr/sbin/nvidia-smi`), and docker's `00-nvcr-*.conf` lists no `/usr/bin` either.
     for library in &libraries {
-        if let Some(parent) = library.path.parent() {
+        let shared_object = library
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".so"));
+        if let (true, Some(parent)) = (shared_object, library.path.parent()) {
             if seen.insert(parent.to_path_buf()) {
                 dirs.push(parent.to_path_buf());
             }
@@ -1648,6 +2060,23 @@ pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveErr
         libraries,
         symlinks,
         ldconfig_dirs: dirs,
+        tools: driver_tools_under(root),
+        configs: driver_configs_under(root),
+        dirs: csv
+            .as_ref()
+            .map(|c| c.dirs.iter().filter(|d| d.is_dir()).cloned().collect())
+            .unwrap_or_default(),
+        at_host_paths: csv.is_some(),
+        sysfs: if csv.is_some() {
+            TEGRA_SYSFS
+                .iter()
+                .map(|rel| root.join(rel))
+                .filter(|p| p.exists())
+                .collect()
+        } else {
+            Vec::new()
+        },
+        listed_nodes,
     })
 }
 
@@ -1909,7 +2338,7 @@ fn comma_tokens(value: &str) -> Vec<String> {
 ///
 /// IT IS SATISFIED BY CONSTRUCTION AND SAYING SO IS THE POINT. Docker uses the list to decide which
 /// driver libraries and binaries to inject; a kern grant binds the driver's library set wholesale
-/// (29 libraries on the host this was measured on), so `compute`, `utility`, `video` and the rest
+/// (29 libraries on the host this was measured on) and every driver tool the host has, so `compute`, `utility`, `video` and the rest
 /// are all present whether or not they were asked for. kern therefore accepts the token and reports
 /// that it selected nothing, because a request silently exceeded is still a request whose answer the
 /// caller cannot see.
@@ -1928,8 +2357,8 @@ pub fn capabilities_note(spec: &str) -> Option<String> {
     }
     Some(format!(
         "--gpus capabilities={} selects nothing here, and nothing is missing: a grant binds the \
-         driver's whole library set, so every capability in that list is present and so are the \
-         others. Docker uses the list to choose which libraries to inject; kern does not choose",
+         driver's whole library set and its tools, so every capability in that list is present \
+         and so are the others. Docker uses the list to choose what to inject; kern does not choose",
         asked.join(",")
     ))
 }
@@ -2013,16 +2442,46 @@ fn selection_from_spec_inner(root: &Path, spec: &str) -> Result<GpuSelection, Gp
         .is_some();
     // ONLY INSIDE AN INDEX LIST. A bare `GPU-…` with no `device=` in front of it is not a shape
     // either runtime accepts, and rewriting it would invent a spelling for the user.
-    if !body || (!lower.contains("gpu-") && !lower.contains("mig-")) {
+    let names_a_uuid = |t: &str| {
+        let u = t
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_uppercase();
+        u.starts_with("GPU-") || u.starts_with("MIG-") || bare_uuid(&u)
+    };
+    let list_has_uuid = trimmed
+        .split_once('=')
+        .is_some_and(|(_, l)| l.split(',').any(names_a_uuid));
+    if !body || !list_has_uuid {
         return parse_gpu_spec(spec);
     }
     let (prefix, list) = trimmed.split_once('=').unwrap_or(("device", trimmed));
-    let table = crate::cdi::uuid_minors(root);
+    // ON WSL2 THE DRIVER PUBLISHES NO `/proc/driver/nvidia`, so the table is the adapter list the
+    // vendor's tool prints. MEASURED: docker resolves `device=GPU-…` there, and kern answered
+    // "this host's driver publishes no GPU UUID at all" for the very UUID `nvidia-smi -L` showed.
+    let mut table = crate::cdi::uuid_minors(root);
+    if table.is_empty() {
+        table = crate::gpu::wsl_adapters(root)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(index, uuid)| (uuid, index))
+            .collect();
+    }
+    // ON A JETSON THE DRIVER PUBLISHES NO `gpus` DIRECTORY EITHER, and the UUID `nvidia-smi` prints
+    // has no `GPU-` prefix. MEASURED on a Jetson Orin Nano: `--gpus device=ed5c5ba5-abef-…`, the UUID
+    // `nvidia-smi -L` showed, was answered "not a card index".
+    if table.is_empty() {
+        table = tegra_adapters(root)
+            .into_iter()
+            .map(|(index, uuid)| (uuid, index))
+            .collect();
+    }
     let mut rewritten: Vec<String> = Vec::new();
     for part in list.split(',') {
         let token = part.trim().trim_matches('"').trim_matches('\'');
         let upper = token.to_ascii_uppercase();
-        if !upper.starts_with("GPU-") && !upper.starts_with("MIG-") {
+        if !upper.starts_with("GPU-") && !upper.starts_with("MIG-") && !bare_uuid(&upper) {
             rewritten.push(token.to_string());
             continue;
         }
@@ -2043,6 +2502,109 @@ fn selection_from_spec_inner(root: &Path, spec: &str) -> Result<GpuSelection, Gp
         }
     }
     parse_gpu_spec(&format!("{prefix}={}", rewritten.join(",")))
+}
+
+/// Whether `s` is a UUID written without a prefix, `8-4-4-4-12` hex digits: how a Jetson's
+/// `nvidia-smi` prints its GPU's.
+fn bare_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A Jetson's GPUs as `(index, UUID)`, from the vendor's own `nvidia-smi` under `root`, bounded in
+/// time like the WSL2 list. Empty anywhere that is not a Jetson or that has no tool.
+fn tegra_adapters(root: &Path) -> Vec<(u32, String)> {
+    if !root.join(TEGRA_RELEASE_REL).exists() {
+        return Vec::new();
+    }
+    ["usr/bin/nvidia-smi", "usr/sbin/nvidia-smi"]
+        .iter()
+        .map(|rel| root.join(rel))
+        .find(|p| p.is_file())
+        .and_then(|smi| {
+            crate::gpu::run_bounded(&smi, &["--query-gpu=index,uuid", "--format=csv,noheader"])
+        })
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| {
+                    let (index, uuid) = line.split_once(',')?;
+                    let (index, uuid) = (index.trim().parse::<u32>().ok()?, uuid.trim());
+                    let upper = uuid.to_ascii_uppercase();
+                    (upper.starts_with("GPU-") || bare_uuid(&upper))
+                        .then(|| (index, uuid.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `NVIDIA_VISIBLE_DEVICES` a box is given for a `--gpus` spec: the value docker gives it.
+///
+/// MEASURED against docker 29.1.3 with toolkit 1.20.2, two cards, `env` in the container:
+///
+/// ```text
+/// --gpus all                ->  all
+/// --gpus device=0           ->  0
+/// --gpus '"device=0,1"'     ->  0,1
+/// --gpus 2                  ->  0,1
+/// --gpus 1                  ->  0
+/// --gpus device=GPU-1950…   ->  GPU-1950…   (as written)
+/// -e NVIDIA_VISIBLE_DEVICES=xyz --gpus device=1  ->  1   (the grant's value replaces the caller's)
+/// ```
+///
+/// Images and entrypoints read it (the CUDA images' scripts, the device plugins, a `test -n` in a
+/// start script), so a box granted a card with the variable unset looked to them like a box with none.
+///
+/// A COUNT IS THE CARDS GRANTED when they are known, which is docker's `0..n` on any host whose
+/// cards have no gap; on one that has (cards 0 and 2) docker would name a card 1 the box does not
+/// hold, and this names the two it does. `granted` is `None` where nothing lists them.
+pub fn visible_devices(spec: &str, selection: &GpuSelection, granted: Option<&[u32]>) -> String {
+    let csv = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    match selection {
+        // A DEVICE LIST THAT RESOLVED TO EVERY CARD is still written back as it was given: on a WSL2
+        // guest that cannot read UUIDs, `device=GPU-…` grants every adapter and docker would write
+        // the UUID. `device=all` writes `all` either way.
+        GpuSelection::All => written_device_list(spec).unwrap_or_else(|| "all".to_string()),
+        GpuSelection::Count(n) => match granted {
+            Some(g) => csv(g),
+            None => csv(&(0..*n).collect::<Vec<u32>>()),
+        },
+        // AS WRITTEN, so a UUID stays a UUID: docker hands the spec's list through untouched.
+        GpuSelection::These(indices) => written_device_list(spec).unwrap_or_else(|| csv(indices)),
+    }
+}
+
+/// The list after `device=` (or `gpu=`), quotes and a `capabilities=` token removed, as written.
+fn written_device_list(spec: &str) -> Option<String> {
+    let joined = comma_tokens(spec)
+        .into_iter()
+        .filter(|t| !t.to_ascii_lowercase().starts_with("capabilities="))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = joined
+        .strip_prefix("device=")
+        .or_else(|| joined.strip_prefix("gpu="))?;
+    let parts: Vec<&str> = body
+        .split(',')
+        .map(|p| p.trim().trim_matches('"').trim_matches('\''))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
+}
+
+/// The indices a selection resolves to on this grant, for [`visible_devices`].
+pub fn granted_indices(grant: &GpuGrant, selection: &GpuSelection) -> Option<Vec<u32>> {
+    cards_of(grant, selection)
+        .ok()
+        .map(|cards| cards.iter().map(|c| c.index).collect())
 }
 
 /// Why a grant cannot be turned into mounts.
@@ -2179,10 +2741,133 @@ pub fn pci_addresses_of(grant: &GpuGrant, selection: &GpuSelection) -> Option<Ve
     Some(out)
 }
 
+/// The sysfs a granted card needs read under `root`, RELATIVE to it: the card's own PCI device
+/// directory and its name under `sys/bus/pci/devices`, for every address that resolves to a
+/// directory under `sys/devices`.
+///
+/// NVML READS A CARD'S PCI IDENTITY FROM SYSFS, and a box has no sysfs: MEASURED on this host with
+/// two RTX 5060 Ti, `nvidia-smi --query-gpu=pci.bus_id` (and `pci.domain`, `pci.device_id`) answered
+/// `[Unknown Error]` in a kern box and `00000000:06:00.0` under docker 29, which mounts the host's
+/// whole `/sys` read-only. The box gets the granted card's directory and nothing else: no other
+/// device, no other card. An address that is not a plain PCI address, or whose link leaves
+/// `sys/devices`, contributes nothing.
+pub fn pci_sysfs_paths(root: &Path, addresses: &[String]) -> Vec<PathBuf> {
+    let devices = root.join("sys/devices");
+    let mut out = Vec::new();
+    for a in addresses {
+        if a.is_empty()
+            || !a
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            continue;
+        }
+        let bus = PathBuf::from("sys/bus/pci/devices").join(a);
+        let Ok(real) = std::fs::canonicalize(root.join(&bus)) else {
+            continue;
+        };
+        let Ok(rel) = real.strip_prefix(root) else {
+            continue;
+        };
+        if !real.starts_with(&devices) || !real.is_dir() {
+            continue;
+        }
+        out.push(rel.to_path_buf());
+        out.push(bus);
+    }
+    out
+}
+
 pub fn mount_plan(
     grant: &GpuGrant,
     selection: &GpuSelection,
     who: &Caller,
+) -> Result<Vec<Bind>, MountPlanError> {
+    plan_binds(grant, selection, who, None, Groups::Enforce)
+}
+
+/// [`mount_plan`] with the libraries placed in the box's library directory, `lib_dir`, the way
+/// docker places them (see [`box_library_dir`]), instead of at the host's own paths. The launch uses
+/// [`mount_plan_keeping_groups`], having settled the group question against the box's uid map.
+#[cfg(test)]
+pub fn mount_plan_into(
+    grant: &GpuGrant,
+    selection: &GpuSelection,
+    who: &Caller,
+    lib_dir: &str,
+) -> Result<Vec<Bind>, MountPlanError> {
+    plan_binds(grant, selection, who, Some(lib_dir), Groups::Enforce)
+}
+
+/// [`mount_plan`] for a box that keeps the caller's supplementary groups (the single-uid map), so a
+/// node reached only through one of them is reachable in the box too. A node nobody can open is
+/// still refused. The caller decides which map the box gets; see `kern box`'s grant check.
+pub fn mount_plan_keeping_groups(
+    grant: &GpuGrant,
+    selection: &GpuSelection,
+    who: &Caller,
+    lib_dir: Option<&str>,
+) -> Result<Vec<Bind>, MountPlanError> {
+    plan_binds(grant, selection, who, lib_dir, Groups::KeptByTheBox)
+}
+
+/// Whether a node reached only through a supplementary group refuses the plan.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Groups {
+    /// The box drops supplementary groups (the ranged map): such a node refuses.
+    Enforce,
+    /// The box keeps them (the single-uid map): such a node is reachable.
+    KeptByTheBox,
+}
+
+/// The Debian multiarch directory for this build's architecture, the one docker's toolkit uses.
+#[cfg(target_arch = "aarch64")]
+const MULTIARCH_LIB_DIR: &str = "/usr/lib/aarch64-linux-gnu";
+#[cfg(not(target_arch = "aarch64"))]
+const MULTIARCH_LIB_DIR: &str = "/usr/lib/x86_64-linux-gnu";
+
+/// Where the driver's libraries go in a box whose root is `layers` (top first): docker's rule.
+///
+/// MEASURED against docker 29.1.3 + toolkit 1.20.2, `grep libcuda /proc/mounts` in the container:
+///
+/// ```text
+/// ubuntu:24.04        /etc/debian_version yes   ->  /usr/lib/x86_64-linux-gnu  (it has /usr/lib64 too)
+/// fedora:41           no                        ->  /usr/lib64
+/// alpine:3.20         no                        ->  /usr/lib64                 (created)
+/// python:3.12-alpine  no                        ->  /usr/lib64                 (created)
+/// ```
+///
+/// kern mounted them at the HOST's path, which is right for a Debian-family image on a Debian-family
+/// host and nothing else: in `fedora:41`, whose loader searches `/usr/lib64`, `nvidia-smi` answered
+/// "couldn't find libnvidia-ml.so" under kern and listed the card under docker.
+///
+/// The marker is looked up layer by layer and never followed: a symlink there is an image's own
+/// file, and a whiteout (a 0/0 character device) in a higher layer means the image deleted it.
+pub fn box_library_dir(layers: &[String]) -> String {
+    use std::os::unix::fs::FileTypeExt;
+    let debian = layers
+        .iter()
+        .find_map(|layer| {
+            match std::fs::symlink_metadata(Path::new(layer).join("etc/debian_version")) {
+                Ok(m) if m.file_type().is_char_device() => Some(false),
+                Ok(_) => Some(true),
+                Err(_) => None,
+            }
+        })
+        .unwrap_or(false);
+    if debian {
+        MULTIARCH_LIB_DIR.to_string()
+    } else {
+        "/usr/lib64".to_string()
+    }
+}
+
+fn plan_binds(
+    grant: &GpuGrant,
+    selection: &GpuSelection,
+    who: &Caller,
+    lib_dir: Option<&str>,
+    groups: Groups,
 ) -> Result<Vec<Bind>, MountPlanError> {
     let wanted = cards_of(grant, selection)?;
 
@@ -2198,15 +2883,35 @@ pub fn mount_plan(
     for card in &wanted {
         selected.extend(card.nodes.iter().cloned());
     }
+    // ⛔ A JETSON'S LISTED NODE THE CALLER CANNOT OPEN IS LEFT OUT, NOT A REASON TO REFUSE. NVIDIA's
+    // CSV names the profiler and debugger nodes too, `root:debug 0660`: MEASURED on a Jetson Orin
+    // Nano, a user in `video` and not in `debug` was refused the whole GPU over 13 of them. Docker
+    // mounts them because it runs as root; in a box they could not be opened either. If none of the
+    // listed nodes can be opened, the grant is refused as before, by the policy below.
+    if !grant.listed_nodes.is_empty() {
+        let unreachable = |(p, f): &(PathBuf, NodeFacts)| {
+            grant.listed_nodes.contains(p) && access_path(f, who) == AccessPath::Unreachable
+        };
+        let listed = selected
+            .iter()
+            .filter(|(p, _)| grant.listed_nodes.contains(p))
+            .count();
+        let dropped = selected.iter().filter(|e| unreachable(e)).count();
+        if dropped < listed {
+            selected.retain(|e| !unreachable(e));
+        }
+    }
 
     match group_policy(&selected, who) {
         GroupPolicy::Unreachable { nodes } => return Err(MountPlanError::Unreachable { nodes }),
-        GroupPolicy::Needed { gids, nodes } => {
+        GroupPolicy::Needed { gids, nodes } if groups == Groups::Enforce => {
             return Err(MountPlanError::GroupsNeeded { gids, nodes })
         }
-        GroupPolicy::NotNeeded => {}
+        GroupPolicy::Needed { .. } | GroupPolicy::NotNeeded => {}
     }
 
+    // A Jetson's grant keeps NVIDIA's paths (see `TegraCsv`); the box's loader is told them.
+    let lib_dir = if grant.at_host_paths { None } else { lib_dir };
     let mut binds: Vec<Bind> =
         Vec::with_capacity(selected.len() + grant.libraries.len() + grant.symlinks.len());
 
@@ -2215,15 +2920,72 @@ pub fn mount_plan(
         binds.push((path.clone(), path, false));
     }
 
+    // IN THE BOX'S LIBRARY DIRECTORY when one is given, by file name, which is how docker flattens
+    // them; the first file to claim a name keeps it, so two host directories cannot bind twice onto
+    // one target.
+    let place = |host: &Path| -> String {
+        match (lib_dir, host.file_name()) {
+            (Some(dir), Some(name)) => format!("{dir}/{}", name.to_string_lossy()),
+            _ => host.to_string_lossy().to_string(),
+        }
+    };
+    let mut lib_targets: BTreeSet<String> = BTreeSet::new();
     for library in &grant.libraries {
-        let path = library.path.to_string_lossy().to_string();
-        binds.push((path.clone(), path, true));
+        let target = place(&library.path);
+        if lib_targets.insert(target.clone()) {
+            binds.push((library.path.to_string_lossy().to_string(), target, true));
+        }
     }
 
     for link in &grant.symlinks {
-        let source = link.resolved.to_string_lossy().to_string();
-        let target = link.link.to_string_lossy().to_string();
-        binds.push((source, target, true));
+        let target = place(&link.link);
+        if lib_targets.insert(target.clone()) {
+            binds.push((link.resolved.to_string_lossy().to_string(), target, true));
+        }
+    }
+
+    // THE LINKS THE CDI HOOK WOULD CREATE, as binds of the file they point at, beside the libraries.
+    for (prefix, link) in DRIVER_ALIAS_LINKS {
+        let Some(library) = grant.libraries.iter().find(|l| {
+            l.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(prefix))
+        }) else {
+            continue;
+        };
+        let dir = match lib_dir {
+            Some(d) => d.to_string(),
+            None => library
+                .path
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        };
+        let target = format!("{dir}/{link}");
+        if lib_targets.insert(target.clone()) {
+            binds.push((library.path.to_string_lossy().to_string(), target, true));
+        }
+    }
+
+    // THE LISTED DIRECTORIES, read-only, at their own paths (`/dev/dri/by-path` on a Jetson).
+    for dir in &grant.dirs {
+        let path = dir.to_string_lossy().to_string();
+        binds.push((path.clone(), path, true));
+    }
+
+    // THE CONFIGURATION FILES, read-only, at the paths NVIDIA's own spec gives them.
+    for (host, target) in &grant.configs {
+        binds.push((host.to_string_lossy().to_string(), target.clone(), true));
+    }
+
+    // THE TOOLS, READ-ONLY, where docker puts them. Bound and never copied, like the libraries.
+    for tool in &grant.tools {
+        binds.push((
+            tool.source.to_string_lossy().to_string(),
+            format!("{DRIVER_TOOLS_IN_BOX}/{}", tool.name),
+            true,
+        ));
     }
 
     Ok(binds)
@@ -2252,7 +3014,10 @@ pub fn describe_mount_plan_error(e: &MountPlanError) -> String {
             join_indices(present)
         ),
         MountPlanError::NoSuchCard { wanted, present } => format!(
-            "--gpus {wanted}: this host has no card {wanted}. Present: {}",
+            // `device=`, BECAUSE A BARE NUMBER IS A COUNT in this grammar. MEASURED in the field on
+            // a WSL2 guest, docker's own docs example `device_ids: ['0', '3']`: the refusal read
+            // "--gpus 3: this host has no card 3", which names a request for THREE cards.
+            "--gpus device={wanted}: this host has no card {wanted}. Present: {}",
             join_indices(present)
         ),
         MountPlanError::GroupsNeeded { gids, nodes } => format!(
@@ -2299,6 +3064,13 @@ fn join_paths_for_message(nodes: &[PathBuf]) -> String {
 /// A print surface and nothing else: it mounts nothing and decides nothing, so the preview a reader
 /// sees is the same structure a later phase would act on.
 pub fn render_plan(grant: &GpuGrant, selection: &GpuSelection) -> String {
+    render_plan_for(grant, selection, &Caller::current())
+}
+
+/// [`render_plan`] for a given caller. The group decision depends on who asks, and a test that
+/// asked the process answered differently as root (no node is gated for root) and as a user outside
+/// the node's group: MEASURED as root in a WSL2 guest, "a gated node must be reported" failed.
+pub fn render_plan_for(grant: &GpuGrant, selection: &GpuSelection, who: &Caller) -> String {
     let mut out = String::new();
     out.push_str(&format!("driver {}\n", grant.driver_version));
 
@@ -2364,10 +3136,22 @@ pub fn render_plan(grant: &GpuGrant, selection: &GpuSelection) -> String {
             out.push_str(&format!("  dir {}\n", dir.display()));
         }
     }
+    out.push_str(&format!("configs {}\n", grant.configs.len()));
+    for (host, target) in &grant.configs {
+        out.push_str(&format!("  config {} -> {target}\n", host.display()));
+    }
+    out.push_str(&format!("tools {}\n", grant.tools.len()));
+    for tool in &grant.tools {
+        out.push_str(&format!(
+            "  tool {} -> {DRIVER_TOOLS_IN_BOX}/{}\n",
+            tool.source.display(),
+            tool.name
+        ));
+    }
     // The policy is a FUNCTION of a selection, not a field, and it is now asked over the SAME
     // nodes `mount_plan` would take rather than over the host's whole set. Asking over every node
     // made `--plan` report a group that only the card nobody asked for needs.
-    match &group_policy(&every, &Caller::current()) {
+    match &group_policy(&every, who) {
         GroupPolicy::NotNeeded => {
             out.push_str("groups not needed: every node is reached by uid or by other\n");
         }
@@ -3322,6 +4106,205 @@ mod tests {
             }
         }
         root
+    }
+
+    /// ⛔ A JETSON'S GRANT IS NVIDIA'S CSV LIST, AT THE HOST'S PATHS. The desktop rule (the driver
+    /// version in the file name) missed `libcuda.so.1.1` on a Jetson Orin Nano, and a row may be a
+    /// pattern (`/dev/dri/card*`). The positive control: the same tree without `nv_tegra_release` is
+    /// a desktop host again and gets the desktop rule.
+    #[test]
+    fn a_jetson_grant_reads_nvidias_csv_and_keeps_its_paths() {
+        let class = if cfg!(target_pointer_width = "64") {
+            2
+        } else {
+            1
+        };
+        let root = synthetic_root(
+            "tegra",
+            "540.4.0",
+            &[
+                (
+                    "usr/lib/aarch64-linux-gnu/nvidia",
+                    "libcuda.so.1.1",
+                    class,
+                    None,
+                ),
+                (
+                    "usr/lib/aarch64-linux-gnu/nvidia",
+                    "libnvidia-glcore.so.540.4.0",
+                    class,
+                    None,
+                ),
+                ("usr/sbin", "nvidia-smi", class, None),
+            ],
+        );
+        link_in(
+            &root,
+            "usr/lib/aarch64-linux-gnu",
+            "libcuda.so",
+            "nvidia/libcuda.so.1.1",
+        );
+        let made = [
+            "dev/nvidia0",
+            "dev/nvhost-gpu",
+            "dev/dri/card0",
+            "dev/dri/card1",
+        ]
+        .iter()
+        .all(|n| {
+            let _ = std::fs::create_dir_all(root.join(n).parent().unwrap_or(&root));
+            fixture_node(&root.join(n))
+        });
+        if !made {
+            let _ = std::fs::remove_dir_all(&root);
+            eprintln!("skip: this kernel refused a whiteout, so no stand-in node can be made");
+            return;
+        }
+        let _ = std::fs::create_dir_all(root.join("dev/dri/by-path"));
+        let _ = std::fs::create_dir_all(root.join("sys/devices/soc0"));
+        let csv = root.join(TEGRA_CSV_DIR_REL);
+        let _ = std::fs::create_dir_all(&csv);
+        let _ = std::fs::write(
+            csv.join("devices.csv"),
+            "# devices\ndev, /dev/nvhost-gpu\ndev, /dev/dri/card*\ndir, /dev/dri/by-path\n",
+        );
+        let _ = std::fs::write(
+            csv.join("drivers.csv"),
+            "lib, /usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1.1\nlib, /usr/sbin/nvidia-smi\n\
+             sym, /usr/lib/aarch64-linux-gnu/libcuda.so\n",
+        );
+        let desktop = resolve_under(&root, ElfClass::native());
+        let _ = std::fs::write(root.join(TEGRA_RELEASE_REL), "# R36 (release)\n");
+        let jetson = resolve_under(&root, ElfClass::native());
+        let _ = std::fs::remove_dir_all(&root);
+        let (Ok(desktop), Ok(g)) = (desktop, jetson) else {
+            panic!("a synthetic root did not resolve");
+        };
+        let has = |libs: &[Library], name: &str| {
+            libs.iter()
+                .any(|l| l.path.file_name().is_some_and(|n| n == name))
+        };
+        assert!(
+            !desktop.at_host_paths && !has(&desktop.libraries, "libcuda.so.1.1"),
+            "without nv_tegra_release the desktop rule must apply (the positive control)"
+        );
+        assert!(g.at_host_paths, "a Jetson grant must keep NVIDIA's paths");
+        assert!(
+            has(&g.libraries, "libcuda.so.1.1"),
+            "libcuda.so.1.1 is not in the grant: {:?}",
+            g.libraries
+        );
+        let shared: Vec<String> = g
+            .shared
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().into_owned())
+            .collect();
+        for n in ["dev/nvhost-gpu", "dev/dri/card0", "dev/dri/card1"] {
+            assert!(
+                shared.iter().any(|p| p.ends_with(n)),
+                "{n} missing (a pattern row?): {shared:?}"
+            );
+        }
+        assert!(
+            g.dirs.iter().any(|d| d.ends_with("dev/dri/by-path")),
+            "the dir row is missing"
+        );
+        assert!(
+            g.ldconfig_dirs.iter().all(|d| !d.ends_with("usr/sbin")),
+            "an executable's directory reached the loader: {:?}",
+            g.ldconfig_dirs
+        );
+        assert!(g
+            .ldconfig_dirs
+            .iter()
+            .any(|d| d.ends_with("aarch64-linux-gnu/nvidia")));
+        assert!(
+            g.sysfs.iter().any(|d| d.ends_with("sys/devices/soc0")),
+            "soc0 is not granted"
+        );
+        let planned =
+            mount_plan_keeping_groups(&g, &GpuSelection::All, &caller(0, &[0]), Some("/usr/lib64"));
+        let Ok(binds) = planned else {
+            panic!("the Jetson grant did not plan: {planned:?}");
+        };
+        assert!(
+            binds
+                .iter()
+                .any(|(src, dst, _)| src == dst && dst.ends_with("nvidia/libcuda.so.1.1")),
+            "libcuda was moved away from its host path: {binds:?}"
+        );
+    }
+
+    /// ⛔ ON A JETSON, A LISTED NODE THE CALLER CANNOT OPEN IS LEFT OUT, AND A NODE REACHED THROUGH A
+    /// GROUP IS THE BOX'S MAP'S QUESTION. A user in `video` and not in `debug` was refused the whole
+    /// GPU over 13 debugger nodes, and then refused again with the `--no-uid-range` the message
+    /// recommended. If NO listed node can be opened, the grant is still refused.
+    #[test]
+    fn listed_nodes_the_caller_cannot_open_are_left_out_and_groups_follow_the_map() {
+        let grant = |shared: Vec<(PathBuf, NodeFacts)>| {
+            let listed_nodes = shared.iter().map(|(p, _)| p.clone()).collect();
+            GpuGrant {
+                driver_version: "540.4.0".into(),
+                shared,
+                // A Jetson has its card node too (`/dev/nvidia0`, measured).
+                cards: vec![CardNodes {
+                    index: 0,
+                    pci_address: None,
+                    nodes: Vec::new(),
+                }],
+                libraries: Vec::new(),
+                symlinks: Vec::new(),
+                ldconfig_dirs: Vec::new(),
+                tools: Vec::new(),
+                configs: Vec::new(),
+                dirs: Vec::new(),
+                at_host_paths: true,
+                sysfs: Vec::new(),
+                listed_nodes,
+            }
+        };
+        let g = grant(vec![
+            (PathBuf::from("/dev/nvhost-gpu"), plain(0, 44, 0o20660)),
+            (PathBuf::from("/dev/nvhost-dbg-gpu"), plain(0, 77, 0o20660)),
+        ]);
+        let in_video = caller(1000, &[1000, 44]);
+        let enforced = mount_plan(&g, &GpuSelection::All, &in_video);
+        assert!(
+            matches!(enforced, Err(MountPlanError::GroupsNeeded { .. })),
+            "a group-only node must refuse a box that drops its groups: {enforced:?}"
+        );
+        let kept = mount_plan_keeping_groups(&g, &GpuSelection::All, &in_video, None);
+        let Ok(binds) = kept else {
+            panic!("a box that keeps its groups was refused: {kept:?}");
+        };
+        let targets: Vec<&str> = binds.iter().map(|(_, d, _)| d.as_str()).collect();
+        assert!(
+            targets.contains(&"/dev/nvhost-gpu"),
+            "the GPU node is missing: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&"/dev/nvhost-dbg-gpu"),
+            "the debug node nobody can open was bound"
+        );
+        let nobody = caller(1000, &[1000]);
+        assert!(
+            mount_plan_keeping_groups(&g, &GpuSelection::All, &nobody, None).is_err(),
+            "with no listed node openable the grant must still be refused"
+        );
+    }
+
+    /// Shell-style patterns as NVIDIA's lists write them, and the bare UUID a Jetson prints.
+    #[test]
+    fn csv_patterns_and_bare_uuids_are_read_as_written() {
+        assert!(wildcard_match("card*", "card0") && wildcard_match("renderD*", "renderD128"));
+        assert!(wildcard_match("lib?.so", "libx.so") && !wildcard_match("card*", "renderD128"));
+        assert!(!wildcard_match("card*", "xcard0") && wildcard_match("*", ""));
+        assert!(bare_uuid("ED5C5BA5-ABEF-55DD-9C02-71B8EBDAE1D8"));
+        assert!(
+            !bare_uuid("GPU-ED5C5BA5")
+                && !bare_uuid("0")
+                && !bare_uuid("ED5C5BA5-ABEF-55DD-9C02-71B8EBDAE1DZ")
+        );
     }
 
     /// Put a symlink beside a library in the synthetic root.
@@ -4368,6 +5351,12 @@ mod tests {
                 resolved: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
             }],
             ldconfig_dirs: vec![PathBuf::from("/usr/lib/x86_64-linux-gnu")],
+            tools: Vec::new(),
+            configs: Vec::new(),
+            dirs: Vec::new(),
+            at_host_paths: false,
+            sysfs: Vec::new(),
+            listed_nodes: BTreeSet::new(),
         }
     }
 
@@ -5130,7 +6119,7 @@ mod tests {
             AccessPath::Owner
         );
         assert_eq!(
-            uid_dependent_nodes(&owned, &selection, &who, BOX_UID),
+            uid_dependent_nodes(&owned, &selection, &who, BOX_UID, false),
             vec![PathBuf::from("/dev/nvidia0")],
             "a node the caller owns and nobody else can open must be named"
         );
@@ -5152,7 +6141,7 @@ mod tests {
             AccessPath::AclUser
         );
         assert_eq!(
-            uid_dependent_nodes(&acl, &selection, &who, BOX_UID),
+            uid_dependent_nodes(&acl, &selection, &who, BOX_UID, false),
             vec![PathBuf::from("/dev/nvidia0")],
             "a node reached through an ACL_USER entry for the caller must be named"
         );
@@ -5173,13 +6162,13 @@ mod tests {
             Some(WANT_RW),
         ));
         assert!(
-            uid_dependent_nodes(&for_the_box, &selection, &who, BOX_UID).is_empty(),
+            uid_dependent_nodes(&for_the_box, &selection, &who, BOX_UID, false).is_empty(),
             "a node whose ACL names the box's own uid must not be reported as lost"
         );
         // POSITIVE CONTROL on that case: the SAME node is lost to a DIFFERENT subuid, so the pass
         // above is the entry matching and not the function having stopped answering.
         assert_eq!(
-            uid_dependent_nodes(&for_the_box, &selection, &who, BOX_UID + 1),
+            uid_dependent_nodes(&for_the_box, &selection, &who, BOX_UID + 1, false),
             vec![PathBuf::from("/dev/nvidia0")],
             "another subuid has no entry here and must still be reported"
         );
@@ -5189,7 +6178,7 @@ mod tests {
         // Without this the function could be one that always answers "everything".
         let open = two_card_grant(plain(0, 0, 0o666));
         assert!(
-            uid_dependent_nodes(&open, &selection, &who, BOX_UID).is_empty(),
+            uid_dependent_nodes(&open, &selection, &who, BOX_UID, false).is_empty(),
             "a world-accessible grant must name nothing, or every box would be warned"
         );
 
@@ -5202,7 +6191,7 @@ mod tests {
             AccessPath::Unreachable
         );
         assert!(
-            uid_dependent_nodes(&dead, &selection, &who, BOX_UID).is_empty(),
+            uid_dependent_nodes(&dead, &selection, &who, BOX_UID, false).is_empty(),
             "a node nobody reaches is not a uid-dependence finding"
         );
 
@@ -5210,14 +6199,73 @@ mod tests {
         // names nothing even when card 0 is uid-dependent: a warning about a card nobody asked for
         // is a warning the operator cannot act on.
         assert!(
-            uid_dependent_nodes(&owned, &GpuSelection::These(vec![1]), &who, BOX_UID).is_empty(),
+            uid_dependent_nodes(&owned, &GpuSelection::These(vec![1]), &who, BOX_UID, false)
+                .is_empty(),
             "the answer must follow the selection and not the whole grant"
         );
         // And asking for BOTH names the one that is.
         assert_eq!(
-            uid_dependent_nodes(&owned, &GpuSelection::These(vec![0, 1]), &who, BOX_UID),
+            uid_dependent_nodes(
+                &owned,
+                &GpuSelection::These(vec![0, 1]),
+                &who,
+                BOX_UID,
+                false
+            ),
             vec![PathBuf::from("/dev/nvidia0")]
         );
+
+        // A NODE THE CALLER REACHES THROUGH A GROUP, in a box that KEEPS its groups (a Jetson's
+        // `root:video 0660`): the workload's uid changes and its groups do not, so nothing is lost.
+        // Without the kept groups the same node is named, which is the box that clears them.
+        let video = two_card_grant(plain(0, 44, 0o660));
+        assert!(
+            uid_dependent_nodes(&video, &selection, &who, BOX_UID, true).is_empty(),
+            "a kept `video` group still opens the node"
+        );
+        assert_eq!(
+            uid_dependent_nodes(&video, &selection, &who, BOX_UID, false),
+            vec![PathBuf::from("/dev/nvidia0")]
+        );
+    }
+
+    /// THE GRANTED CARD'S PCI DIRECTORY AND ITS BUS NAME, and nothing that leaves `sys/devices` or
+    /// is not a PCI address. A fake sysfs: one card under a bridge, one link pointing outside.
+    #[test]
+    fn a_granted_cards_pci_sysfs_is_its_directory_and_its_bus_name() {
+        let root = std::env::temp_dir().join(format!("kern-pcisys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let card = root.join("sys/devices/pci0000:00/0000:00:01.1/0000:06:00.0");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::create_dir_all(root.join("sys/bus/pci/devices")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../devices/pci0000:00/0000:00:01.1/0000:06:00.0",
+            root.join("sys/bus/pci/devices/0000:06:00.0"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../../../../elsewhere",
+            root.join("sys/bus/pci/devices/0000:07:00.0"),
+        )
+        .unwrap();
+        let got = pci_sysfs_paths(
+            &root,
+            &[
+                "0000:06:00.0".into(),
+                "0000:07:00.0".into(),
+                "../../etc".into(),
+                "0000:09:00.0".into(),
+            ],
+        );
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("sys/devices/pci0000:00/0000:00:01.1/0000:06:00.0"),
+                PathBuf::from("sys/bus/pci/devices/0000:06:00.0"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A GATED NODE ON ANOTHER CARD MUST NOT REFUSE THIS ONE. The policy is a function of the
@@ -5243,6 +6291,8 @@ mod tests {
     /// `render_plan` prints what the grant says and invents nothing.
     #[test]
     fn the_plan_prints_the_group_decision_in_each_of_its_three_shapes() {
+        // A non-root user in `video` (44), whoever runs the test: see `render_plan_for`.
+        let who = caller(1000, &[1000, 44]);
         let base = GpuGrant {
             driver_version: "580.173.02".to_string(),
             shared: vec![(PathBuf::from("/dev/nvidiactl"), plain(0, 0, 0o666))],
@@ -5262,9 +6312,22 @@ mod tests {
                 resolved: PathBuf::from("/usr/lib/x86_64-linux-gnu/libcuda.so.580.173.02"),
             }],
             ldconfig_dirs: vec![PathBuf::from("/usr/lib/x86_64-linux-gnu")],
+            tools: vec![DriverTool {
+                name: "nvidia-smi".to_string(),
+                source: PathBuf::from("/usr/bin/nvidia-smi"),
+            }],
+            configs: Vec::new(),
+            dirs: Vec::new(),
+            at_host_paths: false,
+            sysfs: Vec::new(),
+            listed_nodes: BTreeSet::new(),
         };
-        let text = render_plan(&base, &GpuSelection::All);
+        let text = render_plan_for(&base, &GpuSelection::All, &who);
         assert!(text.contains("driver 580.173.02"));
+        assert!(
+            text.contains("tools 1\n  tool /usr/bin/nvidia-smi -> /usr/bin/nvidia-smi\n"),
+            "the plan names the tools the box gets: {text}"
+        );
         assert!(text.contains("groups not needed"));
 
         // The three group shapes are produced the way the launch produces them: by the FACTS of
@@ -5277,7 +6340,7 @@ mod tests {
             }],
             ..base.clone()
         };
-        let text = render_plan(&gated, &GpuSelection::All);
+        let text = render_plan_for(&gated, &GpuSelection::All, &who);
         assert!(
             text.contains("groups needed:"),
             "a gated node must be reported: {text}"
@@ -5297,8 +6360,275 @@ mod tests {
             }],
             ..base
         };
-        let text = render_plan(&refused, &GpuSelection::All);
+        let text = render_plan_for(&refused, &GpuSelection::All, &who);
         assert!(text.contains("refuse:"));
         assert!(text.contains("/dev/locked"));
+    }
+
+    /// A missing card is named as the INDEX it is, never in the count's spelling.
+    #[test]
+    fn a_missing_card_is_named_as_an_index_not_a_count() {
+        let msg = describe_mount_plan_error(&MountPlanError::NoSuchCard {
+            wanted: 3,
+            present: vec![0],
+        });
+        assert!(
+            msg.starts_with("--gpus device=3: this host has no card 3"),
+            "{msg}"
+        );
+    }
+
+    /// ⛔ THE VALUE DOCKER GIVES `NVIDIA_VISIBLE_DEVICES`, for every spelling it was measured on.
+    #[test]
+    fn the_visible_devices_value_is_dockers_for_every_spelling() {
+        let v = |spec: &str, granted: Option<&[u32]>| {
+            let sel = parse_gpu_spec(spec)
+                .or_else(|_| {
+                    // A UUID never reaches the grammar unresolved; stand in the index it maps to.
+                    parse_gpu_spec("device=0")
+                })
+                .expect("a selection");
+            visible_devices(spec, &sel, granted)
+        };
+        assert_eq!(v("all", None), "all");
+        assert_eq!(v("device=all", None), "all");
+        assert_eq!(v("count=all", None), "all");
+        assert_eq!(v("device=0", None), "0");
+        assert_eq!(v("\"device=0,1\"", None), "0,1");
+        assert_eq!(v("device=0,1", None), "0,1");
+        assert_eq!(v("device=1,0", None), "1,0", "the order written is kept");
+        assert_eq!(v("2", None), "0,1");
+        assert_eq!(v("1", None), "0");
+        assert_eq!(
+            v("count=2", Some(&[0, 2])),
+            "0,2",
+            "the cards granted, gap and all"
+        );
+        assert_eq!(
+            v("device=GPU-1950be8a-cbd3", None),
+            "GPU-1950be8a-cbd3",
+            "a UUID is handed through as written"
+        );
+        assert_eq!(
+            visible_devices("device=GPU-e02e0ecf", &GpuSelection::All, None),
+            "GPU-e02e0ecf",
+            "a UUID granted as every adapter (WSL2, unreadable UUIDs) is still written as given"
+        );
+        assert_eq!(
+            v("device=0,capabilities=compute", None),
+            "0",
+            "the capabilities token is not a card"
+        );
+    }
+
+    /// ⛔ DOCKER'S LIBRARY DIRECTORY: Debian-family images get the multiarch directory, every other
+    /// image `/usr/lib64`, decided by `/etc/debian_version` layer by layer, a whiteout counting as
+    /// deleted. And the plan places every library and link there by name, once.
+    #[test]
+    fn the_libraries_go_where_docker_puts_them_for_the_image() {
+        let base = std::env::temp_dir().join(format!("kern-gpu-libdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let layer = |n: &str| {
+            let d = base.join(n);
+            std::fs::create_dir_all(d.join("etc")).expect("layer");
+            d.to_string_lossy().into_owned()
+        };
+        let (deb, bare, top) = (layer("deb"), layer("bare"), layer("top"));
+        std::fs::write(Path::new(&deb).join("etc/debian_version"), b"12\n").expect("w");
+        assert_eq!(
+            box_library_dir(std::slice::from_ref(&deb)),
+            MULTIARCH_LIB_DIR
+        );
+        assert_eq!(box_library_dir(std::slice::from_ref(&bare)), "/usr/lib64");
+        assert_eq!(box_library_dir(&[]), "/usr/lib64");
+        assert_eq!(
+            box_library_dir(&[bare.clone(), deb.clone()]),
+            MULTIARCH_LIB_DIR,
+            "the marker in a lower layer is the image's"
+        );
+        // A symlink is the image's own file and is not followed.
+        std::os::unix::fs::symlink("/nonexistent", Path::new(&top).join("etc/debian_version"))
+            .expect("link");
+        assert_eq!(
+            box_library_dir(std::slice::from_ref(&top)),
+            MULTIARCH_LIB_DIR
+        );
+        // A whiteout above it deletes it, when this kernel lets us make one.
+        let wo = layer("wo");
+        if fixture_node(&Path::new(&wo).join("etc/debian_version")) {
+            assert_eq!(box_library_dir(&[wo, deb]), "/usr/lib64");
+        }
+
+        let mut grant = two_card_grant(plain(0, 0, 0o666));
+        grant.libraries.push(Library {
+            path: PathBuf::from("/usr/lib/x86_64-linux-gnu/nvidia/current/libcuda.so.580.173.02"),
+            dev: 9,
+            ino: 9,
+        });
+        let Ok(binds) = mount_plan_into(
+            &grant,
+            &GpuSelection::These(vec![0]),
+            &caller(1000, &[1000]),
+            "/usr/lib64",
+        ) else {
+            panic!("expected a plan");
+        };
+        let libs: Vec<&(String, String, bool)> =
+            binds.iter().filter(|(_, t, _)| t.contains("lib")).collect();
+        assert!(!libs.is_empty());
+        for (_, target, ro) in &libs {
+            assert!(target.starts_with("/usr/lib64/") && *ro, "{target}");
+        }
+        let mut targets: Vec<&String> = libs.iter().map(|(_, t, _)| t).collect();
+        let n = targets.len();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(targets.len(), n, "one bind per name: {libs:?}");
+        assert!(
+            binds.iter().any(|(_, t, _)| t == "/dev/nvidia0"),
+            "the nodes stay where they are"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⛔ THE VULKAN, EGL AND OPTIX FILES, AND THE TWO LINKS, where NVIDIA's own spec puts them.
+    /// Measured: with them, `vulkaninfo` in a docker container lists the NVIDIA device; a kern box
+    /// had none of them.
+    #[test]
+    fn the_graphics_files_and_links_are_bound_where_the_cdi_spec_puts_them() {
+        let dir = std::env::temp_dir().join(format!("kern-gpu-configs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (rel, _) in DRIVER_CONFIG_FILES {
+            if rel.starts_with("etc/") {
+                continue; // the /usr/share row is present, so the /etc one must lose
+            }
+            let f = dir.join(rel);
+            std::fs::create_dir_all(f.parent().expect("parent")).expect("dir");
+            std::fs::write(&f, b"{}").expect("w");
+        }
+        // The /etc spelling of the ICD too: one box path, the first row wins.
+        std::fs::create_dir_all(dir.join("etc/vulkan/icd.d")).expect("dir");
+        std::fs::write(dir.join("etc/vulkan/icd.d/nvidia_icd.json"), b"{}").expect("w");
+        let configs = driver_configs_under(&dir);
+        let targets: Vec<&str> = configs.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                "/etc/vulkan/icd.d/nvidia_icd.json",
+                "/etc/vulkan/implicit_layer.d/nvidia_layers.json",
+                "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+                "/usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json",
+                "/usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json",
+                "/usr/share/nvidia/nvoptix.bin",
+            ]
+        );
+        assert!(
+            configs[0]
+                .0
+                .ends_with("usr/share/vulkan/icd.d/nvidia_icd.json"),
+            "the first row wins a shared box path: {:?}",
+            configs[0]
+        );
+
+        let mut grant = two_card_grant(plain(0, 0, 0o666));
+        grant.configs = configs;
+        for name in [
+            "libGLX_nvidia.so.580.173.02",
+            "libnvidia-allocator.so.580.173.02",
+        ] {
+            grant.libraries.push(Library {
+                path: PathBuf::from(format!("/usr/lib/x86_64-linux-gnu/{name}")),
+                dev: 3,
+                ino: name.len() as u64,
+            });
+        }
+        let Ok(binds) = mount_plan_into(
+            &grant,
+            &GpuSelection::These(vec![0]),
+            &caller(1000, &[1000]),
+            "/usr/lib64",
+        ) else {
+            panic!("expected a plan");
+        };
+        for (source, target) in [
+            (
+                "/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.580.173.02",
+                "/usr/lib64/libGLX_indirect.so.0",
+            ),
+            (
+                "/usr/lib/x86_64-linux-gnu/libnvidia-allocator.so.580.173.02",
+                "/usr/lib64/gbm/nvidia-drm_gbm.so",
+            ),
+        ] {
+            let want = (source.to_string(), target.to_string(), true);
+            assert!(binds.contains(&want), "{want:?} not in {binds:?}");
+        }
+        assert!(
+            binds
+                .iter()
+                .any(|(_, t, ro)| t == "/etc/vulkan/icd.d/nvidia_icd.json" && *ro),
+            "the ICD is bound read-only at the spec's path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE TOOLS ARE FOUND UNDER THE ROOT, one per name, in the `PATH` order docker's toolkit
+    /// searches, symlinks resolved; and the plan binds each read-only at `/usr/bin/<name>`.
+    #[test]
+    fn the_driver_tools_are_found_under_the_root_and_bound_at_usr_bin() {
+        let dir = std::env::temp_dir().join(format!("kern-gpu-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["usr/local/bin", "usr/bin", "opt/nvidia"] {
+            std::fs::create_dir_all(dir.join(sub)).expect("dir");
+        }
+        // `nvidia-smi` in two places: the earlier directory in the search order wins.
+        std::fs::write(dir.join("usr/local/bin/nvidia-smi"), b"local").expect("w");
+        std::fs::write(dir.join("usr/bin/nvidia-smi"), b"usr").expect("w");
+        // `nvidia-debugdump` as a link, as an alternatives system writes it.
+        std::fs::write(dir.join("opt/nvidia/nvidia-debugdump"), b"real").expect("w");
+        std::os::unix::fs::symlink(
+            dir.join("opt/nvidia/nvidia-debugdump"),
+            dir.join("usr/bin/nvidia-debugdump"),
+        )
+        .expect("link");
+        // A directory with a tool's name is not the tool.
+        std::fs::create_dir_all(dir.join("usr/bin/nvidia-persistenced")).expect("dir");
+        let tools = driver_tools_under(&dir);
+        let canon = |rel: &str| std::fs::canonicalize(dir.join(rel)).expect("canonical");
+        assert_eq!(
+            tools,
+            vec![
+                DriverTool {
+                    name: "nvidia-smi".to_string(),
+                    source: canon("usr/local/bin/nvidia-smi"),
+                },
+                DriverTool {
+                    name: "nvidia-debugdump".to_string(),
+                    source: canon("opt/nvidia/nvidia-debugdump"),
+                },
+            ]
+        );
+
+        let mut grant = two_card_grant(plain(0, 0, 0o666));
+        grant.tools = tools;
+        let Ok(binds) = mount_plan(
+            &grant,
+            &GpuSelection::These(vec![0]),
+            &caller(1000, &[1000]),
+        ) else {
+            panic!("expected a plan");
+        };
+        for (name, rel) in [
+            ("nvidia-smi", "usr/local/bin/nvidia-smi"),
+            ("nvidia-debugdump", "opt/nvidia/nvidia-debugdump"),
+        ] {
+            let want = (
+                canon(rel).to_string_lossy().into_owned(),
+                format!("/usr/bin/{name}"),
+                true,
+            );
+            assert!(binds.contains(&want), "{want:?} not in {binds:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

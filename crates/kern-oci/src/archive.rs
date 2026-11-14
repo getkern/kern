@@ -116,71 +116,47 @@ pub fn save(
     Ok(())
 }
 
-/// Is the system `tar` GNU tar? Only GNU tar supports `--owner=`/`--group=` to force ownership at
-/// create time; BusyBox tar (Alpine, many WSL distros) does NOT and errors on them (the exact failure
-/// that broke `kern save` on WSL). Probed once per process.
-fn tar_is_gnu() -> bool {
-    use std::sync::OnceLock;
-    static GNU: OnceLock<bool> = OnceLock::new();
-    *GNU.get_or_init(|| {
-        Command::new("tar")
-            .arg("--version")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
-            .unwrap_or(false)
-    })
-}
-
-/// Tar `rootfs`'s contents (`.`) into `out` (uncompressed), setuid/setgid-STRIPPED and ownership
-/// normalized to root - the layer form both `push` and `save` need. GNU tar forces it with
-/// `--owner=0 --group=0`; BusyBox tar (no such flags) gets `--numeric-owner` only, which records the
-/// on-disk owners: root(0) for a root-run build/save (the WSL case → still root-owned layers), or the
-/// real uid for a rootless BusyBox save (functional, just not renumbered). The setuid strip runs on
-/// BOTH paths FIRST, so normalizing owner to 0 can never forge a setuid-root binary.
+/// Tar `rootfs`'s contents (`.`) into `out` (uncompressed), owners normalized to root and each
+/// setuid/setgid bit kept only where that cannot forge a privilege - the layer form both `push` and
+/// `save` need. The normalization is kern's own pass over the stream, so GNU and BusyBox tar give the
+/// same layer (BusyBox has no `--owner`).
 pub(crate) fn tar_rootfs_root_owned(rootfs: &Path, out: &Path) -> Result<(), OciError> {
-    // stderr CAPTURED, not inherited: the caller retries an ownership failure as root of the
-    // subordinate range, and an inherited stderr printed "find: ... Permission denied" above a save
-    // that then succeeded. The lines go into the error instead, where they belong when it is final.
-    let stripped = Command::new("find")
+    // THE TREE IS ONLY READ. `tar` records the real owners, and `normalize_for_export` makes them 0
+    // and decides each setuid/setgid bit on the stream (see there for why the tree is never touched).
+    // The box's root is whoever this process is: the caller outside a namespace, 0 inside the mapped
+    // one a retry runs in, and 0 for kern run as root.
+    // SAFETY: geteuid/getegid cannot fail.
+    let (root_uid, root_gid) = unsafe { (libc::geteuid() as u64, libc::getegid() as u64) };
+    let mut child = Command::new("tar")
+        .arg("-C")
         .arg(rootfs)
-        .args([
-            "-type", "f", "-perm", "/6000", "-exec", "chmod", "a-s", "{}", "+",
-        ])
+        .arg("--numeric-owner")
+        .args(["-cf", "-", "."])
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output();
-    match stripped {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            let said = String::from_utf8_lossy(&o.stderr);
-            let said: Vec<&str> = said.lines().take(3).collect();
-            return Err(OciError::Extract(format!(
-                "stripping setuid before archiving failed: {}",
-                said.join("; ")
-            )));
+        .spawn()
+        .map_err(|e| OciError::Tool("tar", e.to_string()))?;
+    let mut file = std::fs::File::create(out)
+        .map_err(|e| OciError::Extract(format!("create {}: {e}", out.display())))?;
+    let filtered = match child.stdout.take() {
+        Some(mut stdout) => {
+            crate::pull::normalize_for_export(&mut stdout, &mut file, root_uid, root_gid)
         }
-        Err(e) => {
-            return Err(OciError::Extract(format!(
-                "stripping setuid before archiving failed: {e}"
-            )))
-        }
+        None => Err(OciError::Tool("tar", "no stdout".into())),
+    };
+    let done = child
+        .wait_with_output()
+        .map_err(|e| OciError::Tool("tar", e.to_string()))?;
+    filtered?;
+    if !done.status.success() {
+        let said = String::from_utf8_lossy(&done.stderr);
+        let said: Vec<&str> = said.lines().take(3).collect();
+        return Err(OciError::Extract(format!(
+            "tar of rootfs failed: {}",
+            said.join("; ")
+        )));
     }
-    let mut cmd = Command::new("tar");
-    cmd.arg("-C").arg(rootfs).arg("--numeric-owner");
-    if tar_is_gnu() {
-        cmd.args(["--owner=0", "--group=0"]);
-    }
-    let ok = cmd
-        .arg("-cf")
-        .arg(out)
-        .arg(".")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err(OciError::Extract("tar of rootfs failed".into()))
-    }
+    Ok(())
 }
 
 /// sha256 of an in-memory byte slice → `sha256:<hex>`, via `sha256sum` (coreutils).
@@ -285,7 +261,8 @@ pub fn load(src: Option<&Path>, work: &Path) -> Result<Vec<Loaded>, OciError> {
             // Strip device members into a fresh PLAIN tar and RE-VET it (the same gate as pull's
             // `filter_layer`), so a saved image that ships an inert device node loads identically to how
             // it pulls. A device the strip missed is rejected by the re-vet (fail-closed).
-            let filtered = filter_layer(&layer, comp)?;
+            // `load` fills kern's own cache, so an image's setuid bits stay (see `SetuidBits`).
+            let filtered = filter_layer(&layer, comp, crate::pull::SetuidBits::Keep)?;
             let staging = work.join(format!("stg-{i}-{j}"));
             let rootfs_c = rootfs.clone();
             let filtered_c = filtered.clone();
@@ -415,6 +392,9 @@ fn parse_image_config(json: &str) -> ImageConfig {
         // difference between two doors into the same picture.
         stop_signal: str_field(cfg, "StopSignal").filter(|s| !s.is_empty()),
         healthcheck: crate::pull::healthcheck_after(cfg),
+        // Nothing to compare a registry against: a loaded archive has no tag to re-pull.
+        digest: None,
+        architecture: str_field(json, "architecture").filter(|s| !s.is_empty()),
     }
 }
 

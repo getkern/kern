@@ -52,6 +52,11 @@ const DEFAULT_IMAGE = "python:3.12-slim";
 // refusing a path that had started working the day the default changed. Same spelling, same reason,
 // as `_DEFAULT_IMAGE_HAS_NODE` in the Python binding.
 const DEFAULT_IMAGE_HAS_NODE = false;
+// EVERY SANDBOX RUNS WITH NO-NEW-PRIVILEGES. A kern box follows docker and leaves it off unless asked,
+// so that a setuid `sudo` in an image built for docker works; the code a sandbox runs is untrusted,
+// and its volumes keep the setuid bit as docker binds do, so the SDK asks for it on every box.
+const NO_NEW_PRIVS = ["--security-opt", "no-new-privileges"];
+
 const WORKSPACE = "/workspace"; // where the persistent workspace is mounted inside every box
 // What `kern exec` says when the box it was asked for is not running. Matched rather than inferred
 // from an exit code, because `exec` reports a MISSING BOX and a workload that exited non-zero through
@@ -1393,7 +1398,7 @@ function pycBuild(kernBin, image, dest, timeoutS) {
     // and would add THIS cache read-only, which is what must not happen while it is being written.
     const argv = [
       "box", `kern-pyc-${crypto.randomBytes(4).toString("hex")}`,
-      "--image", image, "--ro",
+      "--image", image, "--ro", ...NO_NEW_PRIVS,
       ...mountArgs(tmp, PYC_MOUNT, false),
       "--env", `PYTHONPYCACHEPREFIX=${PYC_MOUNT}`,
       "--cap-drop", "ALL",
@@ -4341,8 +4346,9 @@ class Sandbox {
       // `--entrypoint ""` for the reason `_helperArgv` states: the image's ENTRYPOINT would
       // otherwise run first and decide whether this probe writes its file at all.
       const argv = [
-        this._kern, "box", uniqueName(), "--image", this.image, "--ro", "--entrypoint", "",
-        ...mountArgs(drop, "/kern-uid", false), ...this._capDropArgs, "--timeout", "60",
+        this._kern, "box", uniqueName(), "--image", this.image, "--ro", ...NO_NEW_PRIVS,
+        "--entrypoint", "", ...mountArgs(drop, "/kern-uid", false), ...this._capDropArgs,
+        "--timeout", "60",
       ];
       if (this.user !== null) argv.push("--user", this.user);
       argv.push("--", "sh", "-c", ": > /kern-uid/o");
@@ -4380,8 +4386,8 @@ class Sandbox {
     // prepends the image's ENTRYPOINT to what follows `--`, and a helper's output is PARSED (the
     // file's bytes, stat records, a tar stream), not displayed. See Python's `_helper_argv`.
     return [
-      this._kern, "box", uniqueName(), "--image", this.image, "--ro", "--entrypoint", "",
-      "--user", this._asUser, ...this._capDropArgs,
+      this._kern, "box", uniqueName(), "--image", this.image, "--ro", ...NO_NEW_PRIVS,
+      "--entrypoint", "", "--user", this._asUser, ...this._capDropArgs,
       ...mountArgs(this._ws, "/w", !write), "--pids-limit", "64",
       "--timeout", String(timeoutS), "--", "sh", "-c", script, "sh", ...args,
     ];
@@ -4516,7 +4522,7 @@ class Sandbox {
     // Mirrors the same call in `_base_argv`.
     if (!dry) verifyIsKern(this._kern);
     const argv = [
-      this._kern, "box", name, "--image", this.image, "--ro",
+      this._kern, "box", name, "--image", this.image, "--ro", ...NO_NEW_PRIVS,
       ...mountArgs(this._ws, WORKSPACE, false), "--workdir", WORKSPACE,
     ];
     // The image's precompiled stdlib, read-only. Never on the setup box: that one compiles `.deps`

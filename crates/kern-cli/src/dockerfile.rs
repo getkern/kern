@@ -37,6 +37,88 @@ use std::collections::HashMap;
 /// One resolved build step. `RUN`/`CMD`/`ENTRYPOINT` are already reduced to an argv (shell form
 /// `X` becomes `["/bin/sh","-c","X"]`, exec form `["a","b"]` stays as given). `ARG`/`LABEL` produce
 /// no instruction (they only affect variable substitution / are ignored).
+/// One `RUN --mount=...`, with BuildKit's meaning. `kind` says which of BuildKit's five mount types it
+/// is; the fields below are the ones they share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunMount {
+    /// The path in the build context (`source=`, default the whole context), or in `from=`.
+    pub source: String,
+    /// Where it appears for the command: absolute, or relative to the `WORKDIR`. Empty only for a
+    /// secret exposed as an environment variable alone (`env=` with no `target=`).
+    pub target: String,
+    /// The command may write to it. For `bind` what it writes is thrown away, as BuildKit does; for
+    /// `cache` it is kept for the next build.
+    pub rw: bool,
+    /// `from=`: an earlier stage or an image the source is taken from, instead of the context. The
+    /// multi-stage driver rewrites a stage name to that stage's local tag, so the executor sees an
+    /// image reference either way. For `cache` it seeds a new cache.
+    pub from: Option<String>,
+    /// Which mount, and what only that type carries.
+    pub kind: MountKind,
+}
+
+/// How concurrent builds share one `type=cache` mount: BuildKit's `sharing=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheSharing {
+    /// Every build uses it at once (the default).
+    Shared,
+    /// A build that finds it in use gets a fresh, throwaway one.
+    Private,
+    /// A build that finds it in use waits for it.
+    Locked,
+}
+
+/// BuildKit's mount types. Defaults are BuildKit's, MEASURED with buildx v0.39.0: a secret is
+/// `/run/secrets/<id>`, mode 0400, owner 0:0; an SSH agent socket is `/run/buildkit/ssh_agent.<n>`,
+/// mode 0600, owner 0:0; a cache directory is mode 0755, owner 0:0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountKind {
+    /// Files from the context, a stage or an image.
+    Bind,
+    /// A directory kept between builds under `id` (default: the target as written).
+    Cache {
+        id: String,
+        sharing: CacheSharing,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+    /// A secret the build was given (`kern build --secret id=...`): a file at `target`, the variable
+    /// `env`, or both. Never part of the layer or of its cache key.
+    Secret {
+        id: String,
+        env: Option<String>,
+        required: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+    /// The SSH agent the build was given (`kern build --ssh <id>`), as a socket at `target` with
+    /// `SSH_AUTH_SOCK` pointing at it.
+    Ssh {
+        id: String,
+        required: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+    /// An empty tmpfs, gone when the command ends.
+    Tmpfs,
+}
+
+impl MountKind {
+    /// The `type=` that names this kind in a Dockerfile.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MountKind::Bind => "bind",
+            MountKind::Cache { .. } => "cache",
+            MountKind::Secret { .. } => "secret",
+            MountKind::Ssh { .. } => "ssh",
+            MountKind::Tmpfs => "tmpfs",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instr {
     /// `FROM <image> [AS <name>]`. `as_name` is `Some` only in a multi-stage build; a plain single-stage
@@ -46,6 +128,9 @@ pub enum Instr {
         as_name: Option<String>,
     },
     Run(Vec<String>),
+    /// The `RUN --mount=...` mounts of the `Run` that FOLLOWS this instruction, which alone sees them.
+    /// A separate instruction so the many readers of `Run` stay as they are.
+    RunMounts(Vec<RunMount>),
     /// `COPY [--from=<stage|image>] <srcs...> <dst>`. `from` is `Some(_)` for a `COPY --from`; a normal
     /// `COPY` from the build context leaves it `None`. The [`CopyFrom`] variant records whether the
     /// source is an earlier build STAGE or an external IMAGE, so the executor takes the right path.
@@ -546,12 +631,14 @@ pub fn parse(text: &str, build_args: &HashMap<String, String>) -> Result<Vec<Ins
             "RUN" => {
                 // A BuildKit heredoc (`RUN <<EOF … EOF`) is folded here: `heredocs` holds the body
                 // lines the parser consumed verbatim. Reduce it to a single `/bin/sh -c` argv.
-                // Strip leading BuildKit RUN flags (`--mount=…`, `--network=…`, `--security=…`) -
-                // kern runs the command without the cache/network sandbox plumbing, so they're
-                // accepted and dropped rather than mistaken for the command. The two that carry a
-                // CREDENTIAL are refused instead of dropped: see `unsupported_run_mount`.
-                let rest =
+                // Leading BuildKit RUN flags: every `--mount=` is read (see `run_mount`), and
+                // `--network=`/`--security=` are accepted and dropped rather than mistaken for the
+                // command.
+                let (rest, mounts) =
                     strip_run_flags(rest).map_err(|m| format!("Dockerfile line {lineno}: {m}"))?;
+                if !mounts.is_empty() {
+                    out.push(Instr::RunMounts(mounts));
+                }
                 if heredocs.is_empty() {
                     out.push(Instr::Run(cmd_argv(rest, &vars, &shell)))
                 } else {
@@ -1080,60 +1167,182 @@ fn cmd_argv(rest: &str, vars: &HashMap<String, String>, shell: &[String]) -> Vec
 /// commas), so a whitespace-delimited token that starts with `--` is a flag; the first token that
 /// doesn't begins the command (a real command never starts with `--`).
 ///
-/// `Err` for the flags whose ABSENCE changes what the command does, which is the whole distinction
-/// this function now draws (see [`unsupported_run_mount`]).
-fn strip_run_flags(rest: &str) -> Result<&str, String> {
+/// `Err` for a `--mount` that cannot be read (no target where one is needed, an unknown type, a mode
+/// that is not octal): a mount the command depends on must not be dropped quietly.
+fn strip_run_flags(rest: &str) -> Result<(&str, Vec<RunMount>), String> {
     let mut r = rest.trim_start();
+    let mut mounts: Vec<RunMount> = Vec::new();
+    let mut ssh_n = 0usize;
     while r.starts_with("--") {
         let end = r.find(char::is_whitespace).unwrap_or(r.len());
-        if let Some(msg) = unsupported_run_mount(&r[..end]) {
-            return Err(msg);
+        if let Some(mut m) = run_mount(&r[..end])? {
+            // BuildKit numbers the agent sockets of one RUN from 0 when no target is given.
+            if matches!(m.kind, MountKind::Ssh { .. }) {
+                if m.target.is_empty() {
+                    m.target = format!("/run/buildkit/ssh_agent.{ssh_n}");
+                }
+                ssh_n += 1;
+            }
+            mounts.push(m);
         }
         r = r[end..].trim_start();
     }
-    Ok(r)
+    Ok((r, mounts))
 }
 
-/// Whether a BuildKit `RUN` flag is one that CANNOT be dropped, and the sentence saying why.
+/// A `--mount=...` flag, read with BuildKit's grammar, or `None` for any other flag.
 ///
-/// DROPPING A FLAG IS ONLY HONEST WHEN THE COMMAND STILL MEANS WHAT IT SAID. `--mount=type=cache`
-/// and `--mount=type=bind` are performance and layout: the command runs, does the same work, and is
-/// merely slower or reading from a path the build already has. `--mount=type=secret` and
-/// `--mount=type=ssh` are the opposite - the command was written BECAUSE the credential would be
-/// there, and without it `npm ci`, `pip install` against a private index, or `git clone` over SSH
-/// runs UNAUTHENTICATED. Two outcomes follow and both are bad: a 401 whose message points at the
-/// registry and the credentials rather than at a flag kern discarded, or, worse, a build that
-/// succeeds against a public mirror and ships something other than what was asked for.
+/// ⛔ A BIND MOUNT IS NOT LAYOUT, IT IS INPUT, and dropping it was wrong. MEASURED in the field on
+/// speaches' Dockerfile: `RUN --mount=type=bind,source=pyproject.toml,target=pyproject.toml uv sync`
+/// mounts files the image does not have yet (the pattern that lets the dependency layer be cached
+/// apart from the code), and with the flag dropped `uv` answered "No `pyproject.toml` found". The
+/// common case, a path from the build context, is honoured, and so is `from=` (another stage or an
+/// image): open-webui's Dockerfile mounts `uv` that way (`from=ghcr.io/astral-sh/uv:0.12.10`).
 ///
-/// MEASURED BEFORE THE CHANGE: `RUN --mount=type=cache,target=/root/.cache echo … > /m.txt` built
-/// successfully with the flag silently gone, so a `type=secret` mount built successfully too. kern
-/// has no secret-mount implementation to offer, so the honest answer is the refusal: a build that
-/// cannot be performed correctly must not report success.
-///
-/// The pass-through cases stay dropped ON PURPOSE. Refusing everything would fail the large majority
-/// of modern Dockerfiles, which carry a cache mount and nothing else, for a difference that costs
-/// them a rebuild rather than a wrong result.
-fn unsupported_run_mount(flag: &str) -> Option<String> {
-    let spec = flag.strip_prefix("--mount=")?;
-    // `type=` may sit anywhere in the comma-separated spec, and defaults to `bind` when absent.
-    let kind = spec
-        .split(',')
-        .find_map(|f| f.trim().strip_prefix("type="))
-        .unwrap_or("bind")
-        .trim();
-    let what = match kind {
-        "secret" => "a build secret",
-        "ssh" => "the SSH agent",
-        _ => return None,
+/// ⛔ AND THE OTHER FOUR TYPES ARE PERFORMED TOO. `secret` and `ssh` used to be refused, because
+/// dropping them runs `npm ci` or `git clone` unauthenticated; refusing was honest and still left a
+/// project with a private dependency unable to build at all. `cache` was dropped, which costs a full
+/// download on every build. Each now does what BuildKit does, with BuildKit's defaults (see
+/// [`MountKind`]).
+fn run_mount(flag: &str) -> Result<Option<RunMount>, String> {
+    let Some(spec) = flag.strip_prefix("--mount=") else {
+        return Ok(None);
     };
-    Some(format!(
-        "`RUN --mount=type={kind}` needs {what} inside the build, and kern's builder has no way to \
-         provide one. kern will NOT drop the flag and run the command without it: the command was \
-         written because the credential would be there, so it would run unauthenticated and either \
-         fail with an error pointing at the registry instead of at the missing credential, or \
-         succeed against something public and ship the wrong result. Bake the credential in with a \
-         build arg (and a squashed final stage), or build this image with BuildKit"
-    ))
+    let fields: Vec<&str> = spec.split(',').map(str::trim).collect();
+    let kind = fields
+        .iter()
+        .find_map(|f| f.strip_prefix("type="))
+        .unwrap_or("bind")
+        .to_ascii_lowercase();
+    let value = |names: &[&str]| -> Option<String> {
+        fields.iter().find_map(|f| {
+            let (k, v) = f.split_once('=')?;
+            names.contains(&k).then(|| v.to_string())
+        })
+    };
+    // A boolean option is true written bare (`ro`) or `=true`, false with `=false`.
+    let flag_on = |names: &[&str]| -> bool {
+        fields.iter().any(|f| match f.split_once('=') {
+            None => names.contains(f),
+            Some((k, v)) => names.contains(&k) && !v.eq_ignore_ascii_case("false"),
+        })
+    };
+    let number = |name: &str, radix: u32, default: u32| -> Result<u32, String> {
+        match value(&[name]) {
+            None => Ok(default),
+            Some(v) => u32::from_str_radix(v.trim(), radix).map_err(|_| {
+                format!("`RUN --mount=type={kind}`: `{name}={v}` is not a valid number")
+            }),
+        }
+    };
+    let target = value(&["target", "dst", "destination"]);
+    let from = value(&["from"]);
+    let source = value(&["source", "src"]).unwrap_or_else(|| ".".to_string());
+    let ro = flag_on(&["ro", "readonly"]);
+    let needs_target = |t: Option<String>| -> Result<String, String> {
+        t.filter(|t| !t.is_empty())
+            .ok_or_else(|| format!("`RUN --mount=type={kind}` needs a `target=`"))
+    };
+    let mount = match kind.as_str() {
+        "bind" => RunMount {
+            source,
+            target: needs_target(target)?,
+            rw: flag_on(&["rw", "readwrite"]),
+            from,
+            kind: MountKind::Bind,
+        },
+        "cache" => {
+            let target = needs_target(target)?;
+            let sharing = match value(&["sharing"]).as_deref() {
+                None | Some("shared") => CacheSharing::Shared,
+                Some("private") => CacheSharing::Private,
+                Some("locked") => CacheSharing::Locked,
+                Some(other) => {
+                    return Err(format!(
+                    "`RUN --mount=type=cache`: `sharing={other}` is not one of shared, private, \
+                         locked"
+                ))
+                }
+            };
+            RunMount {
+                source,
+                kind: MountKind::Cache {
+                    id: value(&["id"]).unwrap_or_else(|| target.clone()),
+                    sharing,
+                    mode: number("mode", 8, 0o755)?,
+                    uid: number("uid", 10, 0)?,
+                    gid: number("gid", 10, 0)?,
+                },
+                target,
+                rw: !ro,
+                from,
+            }
+        }
+        "secret" => {
+            let env = value(&["env"]);
+            // The id defaults to the target's file name, as BuildKit's does.
+            let id = match (value(&["id"]), target.as_deref()) {
+                (Some(id), _) => id,
+                (None, Some(t)) => std::path::Path::new(t)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                (None, None) => String::new(),
+            };
+            if id.is_empty() {
+                return Err("`RUN --mount=type=secret` needs an `id=` (or a `target=`)".to_string());
+            }
+            // A file unless the secret is asked for as a variable alone (measured: `env=` with no
+            // `target=` leaves no `/run/secrets` at all).
+            let target = match (target, &env) {
+                (Some(t), _) => t,
+                (None, Some(_)) => String::new(),
+                (None, None) => format!("/run/secrets/{id}"),
+            };
+            RunMount {
+                source: String::new(),
+                target,
+                rw: false,
+                from: None,
+                kind: MountKind::Secret {
+                    id,
+                    env,
+                    required: flag_on(&["required"]),
+                    mode: number("mode", 8, 0o400)?,
+                    uid: number("uid", 10, 0)?,
+                    gid: number("gid", 10, 0)?,
+                },
+            }
+        }
+        "ssh" => RunMount {
+            source: String::new(),
+            // Filled in by `strip_run_flags`, which knows this socket's number within the RUN.
+            target: target.unwrap_or_default(),
+            rw: false,
+            from: None,
+            kind: MountKind::Ssh {
+                id: value(&["id"]).unwrap_or_else(|| "default".to_string()),
+                required: flag_on(&["required"]),
+                mode: number("mode", 8, 0o600)?,
+                uid: number("uid", 10, 0)?,
+                gid: number("gid", 10, 0)?,
+            },
+        },
+        "tmpfs" => RunMount {
+            source: String::new(),
+            target: needs_target(target)?,
+            rw: true,
+            from: None,
+            kind: MountKind::Tmpfs,
+        },
+        other => {
+            return Err(format!(
+            "`RUN --mount=type={other}` is not a BuildKit mount type (bind, cache, secret, ssh, \
+                 tmpfs)"
+        ))
+        }
+    };
+    Ok(Some(mount))
 }
 
 /// Whether a `COPY`/`ADD` `--flag` is one kern accepts and drops (no bearing on kern's copy, which
@@ -1408,57 +1617,165 @@ mod tests {
         assert!(labels("FROM alpine\nMAINTAINER\n").is_empty());
     }
 
-    /// DROPPING A FLAG IS ONLY HONEST WHEN THE COMMAND STILL MEANS WHAT IT SAID, and this test pins
-    /// the line between the two kinds. MEASURED before the change: a `--mount=type=cache` RUN built
-    /// successfully with the flag silently gone, so a `type=secret` one did too - and that build
-    /// reports success having run `npm ci` unauthenticated.
+    /// ⛔ EVERY BUILDKIT MOUNT TYPE IS READ, WITH BUILDKIT'S DEFAULTS, measured with buildx v0.39.0:
+    /// a secret is `/run/secrets/<id>` at 0400 owned 0:0 and takes its id from the target when none is
+    /// given; `env=` alone is a variable with no file; an SSH socket is `/run/buildkit/ssh_agent.<n>`
+    /// at 0600, numbered per RUN; a cache keys on its target and is 0755. A secret and an SSH agent
+    /// used to be REFUSED, which left a project with a private dependency unable to build at all.
     #[test]
-    fn a_run_mount_that_carries_a_credential_is_refused_and_the_rest_stay_dropped() {
-        // REFUSED: without the credential the command does something else and says nothing.
-        for (flag, word) in [
-            ("--mount=type=secret,id=npm,target=/root/.npmrc", "secret"),
-            ("--mount=type=ssh", "ssh"),
-            // `type=` may sit anywhere in the spec, so a scan that only reads the first field would
-            // pass this one straight through.
-            ("--mount=id=npm,type=secret", "secret"),
-        ] {
-            let msg = super::unsupported_run_mount(flag)
-                .unwrap_or_else(|| panic!("must be refused: {flag}"));
-            assert!(msg.contains(word), "must name the mount kind: {msg}");
-            assert!(
-                super::strip_run_flags(&format!("{flag} npm ci")).is_err(),
-                "the refusal must reach the caller: {flag}"
-            );
-        }
-
-        // DROPPED, deliberately: these cost a rebuild, not a wrong result, and refusing them would
-        // fail the large majority of modern Dockerfiles for no benefit.
-        for flag in [
-            "--mount=type=cache,target=/root/.cache",
-            "--mount=type=bind,from=src,target=/s",
-            // No `type=` at all: BuildKit's default is `bind`, which is not a credential.
-            "--mount=target=/s,from=src",
-            "--network=none",
-            "--security=insecure",
-        ] {
-            assert_eq!(super::unsupported_run_mount(flag), None, "{flag}");
-            assert_eq!(
-                super::strip_run_flags(&format!("{flag} echo hi")).unwrap(),
-                "echo hi",
-                "{flag}"
-            );
-        }
-
-        // The command still survives a run of several flags, refusal or not.
+    fn every_buildkit_mount_type_is_read_with_buildkits_defaults() {
+        let one = |flag: &str| {
+            let line = format!("{flag} npm ci");
+            let (cmd, m) = super::strip_run_flags(&line).unwrap();
+            assert_eq!(cmd, "npm ci", "{flag}");
+            assert_eq!(m.len(), 1, "{flag}");
+            m[0].clone()
+        };
+        let s = one("--mount=type=secret,id=npm");
+        assert_eq!(s.target, "/run/secrets/npm");
         assert_eq!(
-            super::strip_run_flags("--mount=type=cache,target=/c --network=none echo hi").unwrap(),
-            "echo hi"
+            s.kind,
+            MountKind::Secret {
+                id: "npm".into(),
+                env: None,
+                required: false,
+                mode: 0o400,
+                uid: 0,
+                gid: 0
+            }
         );
+        let s = one("--mount=type=secret,target=/root/.npmrc,uid=1000,mode=0440,required");
+        assert_eq!(s.target, "/root/.npmrc");
+        assert_eq!(
+            s.kind,
+            MountKind::Secret {
+                id: ".npmrc".into(),
+                env: None,
+                required: true,
+                mode: 0o440,
+                uid: 1000,
+                gid: 0
+            }
+        );
+        let s = one("--mount=type=secret,id=tok,env=TOKEN,required=false");
+        assert_eq!(s.target, "", "env= alone is a variable and no file");
         assert!(
-            super::strip_run_flags("--mount=type=cache,target=/c --mount=type=secret,id=k npm ci")
-                .is_err(),
-            "a credential mount anywhere in the run is still a credential mount"
+            matches!(s.kind, MountKind::Secret { env: Some(ref e), required: false, .. } if e == "TOKEN")
         );
+        let (_, two) = super::strip_run_flags(
+            "--mount=type=ssh --mount=type=ssh,id=gh,target=/a.sock,uid=1000 git clone x",
+        )
+        .unwrap();
+        assert_eq!(two[0].target, "/run/buildkit/ssh_agent.0");
+        assert_eq!(
+            two[0].kind,
+            MountKind::Ssh {
+                id: "default".into(),
+                required: false,
+                mode: 0o600,
+                uid: 0,
+                gid: 0
+            }
+        );
+        assert_eq!(two[1].target, "/a.sock");
+        assert!(matches!(two[1].kind, MountKind::Ssh { ref id, uid: 1000, .. } if id == "gh"));
+        let c = one("--mount=type=cache,target=/root/.cache/pip");
+        assert!(c.rw);
+        assert_eq!(
+            c.kind,
+            MountKind::Cache {
+                id: "/root/.cache/pip".into(),
+                sharing: CacheSharing::Shared,
+                mode: 0o755,
+                uid: 0,
+                gid: 0
+            }
+        );
+        let c = one("--mount=type=cache,id=apt,target=/var/cache/apt,sharing=locked,ro");
+        assert!(!c.rw);
+        assert!(
+            matches!(c.kind, MountKind::Cache { ref id, sharing: CacheSharing::Locked, .. } if id == "apt")
+        );
+        assert_eq!(one("--mount=type=tmpfs,target=/t").kind, MountKind::Tmpfs);
+        // NOT A MOUNT: dropped, and the command survives.
+        for flag in ["--network=none", "--security=insecure"] {
+            let line = format!("{flag} echo hi");
+            let (cmd, m) = super::strip_run_flags(&line).unwrap();
+            assert_eq!(cmd, "echo hi", "{flag}");
+            assert!(m.is_empty(), "{flag}");
+        }
+        // REFUSED, never dropped: a mount the command depends on that cannot be read.
+        for bad in [
+            "--mount=type=cache",
+            "--mount=type=tmpfs",
+            "--mount=type=secret",
+            "--mount=type=cache,target=/c,sharing=sometimes",
+            "--mount=type=secret,id=a,mode=rw",
+            "--mount=type=volume,target=/v",
+        ] {
+            assert!(
+                super::strip_run_flags(&format!("{bad} true")).is_err(),
+                "must be refused: {bad}"
+            );
+        }
+        // A BIND MOUNT FROM ANOTHER STAGE OR IMAGE is kept, with its source, as is one with no
+        // `type=` (BuildKit's default is `bind`).
+        for flag in [
+            "--mount=type=bind,from=src,target=/s",
+            "--mount=target=/s,from=src",
+        ] {
+            let m = one(flag);
+            assert_eq!(m.from.as_deref(), Some("src"), "{flag}");
+            assert_eq!(m.kind, MountKind::Bind, "{flag}");
+        }
+    }
+
+    /// ⛔ A BIND MOUNT FROM THE CONTEXT IS KEPT, with BuildKit's fields: `source`/`src` (the whole
+    /// context by default), `target`/`dst`/`destination`, and `rw`. Measured in the field on speaches'
+    /// Dockerfile, where dropping it left `uv sync` without its `pyproject.toml`.
+    #[test]
+    fn a_context_bind_mount_is_kept_with_buildkits_fields() {
+        let (cmd, m) = super::strip_run_flags(
+            "--mount=type=bind,source=pyproject.toml,target=pyproject.toml --mount=type=bind,src=a,dst=/b,rw uv sync",
+        )
+        .unwrap();
+        assert_eq!(cmd, "uv sync");
+        assert_eq!(
+            m,
+            vec![
+                super::RunMount {
+                    source: "pyproject.toml".into(),
+                    target: "pyproject.toml".into(),
+                    rw: false,
+                    from: None,
+                    kind: super::MountKind::Bind,
+                },
+                super::RunMount {
+                    source: "a".into(),
+                    target: "/b".into(),
+                    rw: true,
+                    from: None,
+                    kind: super::MountKind::Bind,
+                },
+            ]
+        );
+        let (_, whole) = super::strip_run_flags("--mount=target=/ctx echo").unwrap();
+        assert_eq!(whole[0].source, ".", "the whole context by default");
+        assert!(
+            super::strip_run_flags("--mount=type=bind,source=a echo").is_err(),
+            "no target"
+        );
+        // And the parse emits it right before its RUN.
+        let got = parse(
+            "FROM a\nRUN --mount=type=bind,source=x,target=/x cat /x\n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&got[1], Instr::RunMounts(m) if m.len() == 1),
+            "{got:?}"
+        );
+        assert!(matches!(&got[2], Instr::Run(_)), "{got:?}");
     }
 
     use super::*;
@@ -2101,8 +2418,8 @@ mod tests {
 
     #[test]
     fn from_run_copy_buildkit_flags_are_accepted_and_dropped() {
-        // `FROM --platform=…`, `RUN --mount=…`, and `COPY --chown/--link` all parse and drop; `--chmod`
-        // parses too but is CAPTURED (the executor applies it), not dropped.
+        // `FROM --platform=…`, `RUN --network=…` and `COPY --chown/--link` parse and drop; `--chmod`
+        // and `RUN --mount=…` parse too but are CAPTURED (the executor applies them), not dropped.
         let df = "FROM --platform=$BUILDPLATFORM alpine AS b\n\
                   RUN --mount=type=cache,target=/c --network=none echo hi\n\
                   COPY --chown=1000:1000 --chmod=644 --link a b /dst/\n";
@@ -2114,9 +2431,13 @@ mod tests {
                 as_name: Some("b".into())
             }
         );
-        assert_eq!(run_script(&got[1]), "echo hi");
+        assert!(
+            matches!(&got[1], Instr::RunMounts(m) if matches!(m[0].kind, MountKind::Cache { .. })),
+            "{got:?}"
+        );
+        assert_eq!(run_script(&got[2]), "echo hi");
         assert_eq!(
-            got[2],
+            got[3],
             Instr::Copy {
                 srcs: vec!["a".into(), "b".into()],
                 dst: "/dst/".into(),

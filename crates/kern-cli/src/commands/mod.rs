@@ -81,8 +81,11 @@ pub fn banner() -> Result<(), Error> {
     {b}kern ps{z} {d}·{z} {b}logs{z} {d}·{z} {b}exec{z} {d}·{z} {b}stop{z}            {d}manage running boxes{z}
     {b}kern pull{z} {d}·{z} {b}build{z} {d}·{z} {b}push{z} {d}·{z} {b}images{z}       {d}work with OCI images{z}
     {b}kern compose{z} stack.yml                  {d}bring up a stack (docker-compose.yml too){z}
+    {b}kern box{z} g --image <img> --gpus all    {d}a box with the host's GPUs{z}
+    {b}kern sandbox{z} ls {d}·{z} {b}history{z} {d}·{z} {b}stats{z}       {d}SDK and MCP sandboxes: running, finished, outcomes{z}
+    {b}kern top{z}                                {d}live: host, GPUs, boxes, sandboxes{z}
 
-  {b}kern --help{z} {d}all commands{z} {d}·{z} {b}kern top{z} {d}live TUI{z} {d}·{z} {b}kern doctor{z} {d}check this host{z}
+  {b}kern --help{z} {d}all commands{z} {d}·{z} {b}kern doctor{z} {d}check this host{z}
   {d}{z}{c}https://github.com/getkern/kern{z}",
         ver = kern_common::VERSION,
         tag = kern_common::TAGLINE
@@ -317,6 +320,13 @@ pub struct BoxRunArgs<'a> {
     pub gpus: Option<&'a str>,
     /// `--device <vendor/class=name>`: the CDI spelling of the same request.
     pub device: Option<&'a str>,
+    /// `--runtime nvidia`: the GPUs the box's own `NVIDIA_VISIBLE_DEVICES` names, decided once the
+    /// image is known (see `decide_gpu_grant`).
+    pub runtime_nvidia: bool,
+    /// INTERNAL (build steps): SSH agent sockets a `RUN --mount=type=ssh` reaches, `(socket, target)`.
+    pub build_ssh_agents: &'a [(String, String)],
+    /// `--security-opt no-new-privileges`: see `kern_isolation::SandboxSpec::no_new_privs`.
+    pub no_new_privs: bool,
     /// `--init`: run a built-in reaping init as box PID 1 (no zombies; forwards SIGTERM/SIGINT).
     pub init: bool,
     /// `--pids-limit N`: cap the box's task count (`pids.max`) - fork-bomb containment.
@@ -345,6 +355,8 @@ pub struct BoxRunArgs<'a> {
     pub def_hash: &'a str,
     /// `--user UID[:GID]`: drop to this uid/gid inside the box before the command runs.
     pub run_as: Option<&'a str>,
+    /// `--group-add <name|gid>`: extra supplementary groups, resolved in the image's `/etc/group`.
+    pub group_add: &'a [String],
     /// `--cap-add CAP` (repeatable): keep a capability kern would otherwise drop (or `ALL`).
     pub cap_add: &'a [String],
     /// `--cap-drop CAP` (repeatable): drop an extra capability (or `ALL`).
@@ -407,14 +419,26 @@ pub struct BoxRunArgs<'a> {
 }
 
 /// Resolve `--add-host` entries: the `host-gateway` keyword becomes the host's reachable address -
-/// `127.0.0.1` when the box shares the host network, else the host's primary (default-route) IPv4 (the
-/// address a box with egress uses to reach the host). Other values pass through verbatim.
+/// `127.0.0.1` when the box shares the host network, else the host's DEFAULT GATEWAY. Other values
+/// pass through verbatim.
+///
+/// ⛔ THE GATEWAY, NOT THE HOST'S OWN ADDRESS. A box's egress is pasta, which answers for the gateway
+/// address inside the namespace and maps it to the host's loopback, so `<gateway>:<port>` reaches a
+/// port the host serves on `127.0.0.1`, which is where kern publishes `-p` and `ports:` by default.
+/// The host's primary address reaches only what listens on every interface. MEASURED: valiantlynx's
+/// open-webui, configured for `http://host.docker.internal:7869` (ollama's published port), got
+/// `connection refused` on a WSL2 guest; a service here reached a published port through the gateway
+/// (200) and was refused through the host's own address. Docker reaches it through its bridge.
 fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, String)> {
     let gateway = || -> String {
         if share_net {
             return "127.0.0.1".to_string();
         }
-        host_primary_ipv4().unwrap_or_else(|| "127.0.0.1".to_string())
+        std::fs::read_to_string("/proc/net/route")
+            .ok()
+            .and_then(|t| default_gateway_v4(&t))
+            .or_else(host_primary_ipv4)
+            .unwrap_or_else(|| "127.0.0.1".to_string())
     };
     raw.iter()
         .map(|(name, ip)| {
@@ -426,6 +450,23 @@ fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, 
             (name.clone(), ip)
         })
         .collect()
+}
+
+/// The IPv4 gateway of the default route in a `/proc/net/route` table, or `None`. The table writes
+/// addresses as host-order hex of the network-order bytes, so `0101A8C0` is 192.168.1.1; the default
+/// route is destination `00000000` with the gateway flag (`0x2`) set.
+fn default_gateway_v4(table: &str) -> Option<String> {
+    table.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let (dest, gw, flags) = (f.get(1)?, f.get(2)?, f.get(3)?);
+        let flags = u32::from_str_radix(flags, 16).ok()?;
+        if *dest != "00000000" || flags & 0x2 == 0 {
+            return None;
+        }
+        let raw = u32::from_str_radix(gw, 16).ok()?;
+        let ip = std::net::Ipv4Addr::from(raw.to_le_bytes());
+        (!ip.is_unspecified()).then(|| ip.to_string())
+    })
 }
 
 /// The host's primary IPv4 (the source address the default route would use), found by `connect()`ing a
@@ -1338,6 +1379,16 @@ struct BuildSpec<'a> {
     vgpio_devs: Vec<String>,
     vgpio_sysfs: Vec<String>,
     gpu_enumeration: kern_isolation::GpuEnumeration,
+    refresh_ldcache: bool,
+    /// See `kern_isolation::SandboxSpec::ldconfig_dirs`.
+    ldconfig_dirs: Vec<String>,
+    /// The host-path binds to present with docker's ownership: see `kern_isolation`'s
+    /// `prepare_idmapped_binds` and [`idmap_bind_candidates`].
+    idmap_binds: Vec<(String, String)>,
+    /// Box targets where a SOCKET may be bound: a build step's SSH agents, nothing else.
+    socket_binds: Vec<String>,
+    /// `--security-opt no-new-privileges`.
+    no_new_privs: bool,
     vdisks: Vec<kern_isolation::VdiskMount>,
     secrets: Vec<kern_isolation::Secret>,
     ssh: Option<kern_isolation::SshSetup>,
@@ -1349,6 +1400,8 @@ struct BuildSpec<'a> {
     /// The supplementary groups the image puts that user in. See
     /// [`crate::commands::supplementary_gids`] for why they are resolved and when they are not.
     extra_gids: Vec<u32>,
+    /// A GPU grant whose nodes open only through a group: see `kern_isolation::SandboxSpec::keep_groups`.
+    keep_groups: bool,
     pids_max: Option<u64>,
     caps: kern_isolation::CapSpec,
     io_max: Vec<String>,
@@ -1650,6 +1703,11 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         vgpio_devs: b.vgpio_devs,
         vgpio_sysfs: b.vgpio_sysfs,
         gpu_enumeration: b.gpu_enumeration,
+        refresh_ldcache: b.refresh_ldcache,
+        ldconfig_dirs: b.ldconfig_dirs,
+        idmap_binds: b.idmap_binds,
+        socket_binds: b.socket_binds,
+        no_new_privs: b.no_new_privs,
         vdisks: b.vdisks,
         secrets: b.secrets,
         ssh: b.ssh,
@@ -1658,6 +1716,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         tmpfs: b.tmpfs,
         run_as: b.run_as,
         extra_gids: b.extra_gids,
+        keep_groups: b.keep_groups,
         pids_max: b.pids_max,
         caps: b.caps,
         io_max: b.io_max,
@@ -1735,6 +1794,32 @@ enum VolumeOpt {
     Inert,
 }
 
+/// The binds of a box that get docker's ownership (see `kern_isolation`'s `prepare_idmapped_binds`):
+/// the caller's own HOST PATHS, and only when kern is real root, where docker's identity is the
+/// thing a docker user prepared their directories for.
+///
+/// NOT A NAMED VOLUME: its directory is kern's storage, written by the box under kern's own map since
+/// the volume was made, and docker's volumes are not the user's to `chown` either. NOT kern's own
+/// binds (the GPU driver files and device nodes), which are added after this is computed and are
+/// root's, the one id both mappings agree on. NOT rootless: there the host directory belongs to the
+/// caller, who is the box's root, exactly as under rootless docker.
+pub(crate) fn idmap_bind_candidates(
+    volumes: &[Volume],
+    initial_root: bool,
+) -> Vec<(String, String)> {
+    if !initial_root {
+        return Vec::new();
+    }
+    let named_root = crate::volume::volumes_dir();
+    volumes
+        .iter()
+        .filter(|v| {
+            crate::volume::name_of_data_dir_under(&named_root, std::path::Path::new(&v.source))
+                .is_none()
+        })
+        .map(|v| (v.source.clone(), v.target.clone()))
+        .collect()
+}
 /// Parse `-v src:dst[:opt,opt…]` specs into [`Volume`]s. The target must be absolute; the source is a
 /// volume name, an absolute path, or a `./`-style path relative to the current directory, and must
 /// exist on the host. The options are read by [`volume_option`].
@@ -1983,6 +2068,17 @@ pub(crate) fn resolve_volume(
     }
 }
 
+/// What an OOM line says about GPU memory on a device whose GPU shares the host's RAM. ONE spelling
+/// for the box and `kern run`, which said it twice.
+///
+/// ⛔ "COUNTS AGAINST THE SAME CAP" WAS TRUE ONLY UNTIL THE DRIVER'S POOL WAS WARM. MEASURED on a
+/// Jetson Orin Nano: after any process freed GPU memory, nvmap zeroed the pages into its page pool
+/// (about 950 MiB within 30 s), and a box capped at 256 MiB then allocated and wrote 1 GiB from that
+/// pool, charged to no cgroup; with `enable_page_pools=N` the same box was stopped every time.
+pub(crate) const UNIFIED_MEMORY_NOTE: &str = "On a device with unified memory, GPU allocations \
+     count against the same cap, except, on a Jetson, those the driver serves from its page pool \
+     (`kern doctor` says whether it is on)";
+
 /// The command a box/exec runs when none is given.
 const DEFAULT_SHELL: &str = "/bin/sh";
 
@@ -1995,16 +2091,43 @@ fn default_if_empty(command: &[String]) -> Vec<String> {
     }
 }
 
-/// Parse `--env K=V` specs. The value may contain `=`; the key may not be empty.
+/// Parse the OPERATOR's `--env` specs: `K=V` (the value may contain `=`, the key may not be empty),
+/// and `K` alone, which takes `K` from kern's own environment as docker's `-e K` does (and passes
+/// nothing when it is not set, as docker passes nothing). The bare form is how a build step receives
+/// a secret's value without it ever being on a command line: see `buildmounts`. An image's `Env` is
+/// read by [`image_envs`], never here.
 fn parse_envs(specs: &[String]) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::with_capacity(specs.len());
     for s in specs {
         match s.split_once('=') {
             Some((k, v)) if !k.is_empty() => out.push((k.to_string(), v.to_string())),
-            _ => return Err(Error::Sandbox(format!("bad --env '{s}' (expected K=V)"))),
+            None if !s.is_empty() && !s.contains(char::is_whitespace) => {
+                if let Ok(v) = crate::global_env_str(s) {
+                    out.push((s.to_string(), v));
+                }
+            }
+            _ => {
+                return Err(Error::Sandbox(format!(
+                    "bad --env '{s}' (expected K=V or K)"
+                )))
+            }
         }
     }
     Ok(out)
+}
+
+/// An IMAGE's `Env`, or a base image's in a build: `K=V` entries only, and an entry without `=` is
+/// dropped. The bare form belongs to the OPERATOR (`-e K` takes `K` from kern's own environment, as
+/// docker's does); read from an image, it handed the image the caller's value. FOUND BY AUDIT,
+/// reproduced rootless: an image whose config listed `KERN_AUDIT_FAKE_TOKEN` and `HOME` received
+/// the operator's token and home. Docker never fills an image's Env from the client.
+pub(crate) fn image_envs(specs: &[String]) -> Vec<(String, String)> {
+    specs
+        .iter()
+        .filter_map(|s| s.split_once('='))
+        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 /// Parse `--env-file PATH` files with Docker's `.env` rules, through the compose crate's reader -
@@ -2714,8 +2837,7 @@ pub(crate) fn proxy_child_to_exit(
                      kern's cgroup while it ran. The command was given a memory cap it cannot \
                      exceed; raise it \
                      with `--memory <size>` (or `memory = \"<size>\"` in a vcpu: profile) if the \
-                     workload needs more. On a device with unified memory, GPU allocations count \
-                     against the same cap."
+                     workload needs more. {UNIFIED_MEMORY_NOTE}."
                 );
             }
         }
@@ -3820,6 +3942,7 @@ fn mapped_uid_count() -> u32 {
 }
 
 /// Arguments for [`build`] (`kern build`).
+#[derive(Clone, Copy)]
 pub struct BuildArgs<'a> {
     /// `-t <name[:tag]>`: the local image name to store the result under. Required.
     pub tag: Option<&'a str>,
@@ -3837,6 +3960,14 @@ pub struct BuildArgs<'a> {
     pub context: &'a str,
     /// `--build-arg K=V` (repeatable): values for `ARG` substitution.
     pub build_args: &'a [String],
+    /// `--secret id=...` (repeatable): see `buildmounts::parse_secret_spec`.
+    pub secrets: &'a [String],
+    /// `--ssh <id>[=...]` (repeatable): see `buildmounts::parse_ssh_spec`.
+    pub ssh: &'a [String],
+    /// `--no-cache`: reuse no layer and start every cache mount empty.
+    pub no_cache: bool,
+    /// `--platform`, as given: the platforms to build for, none for this machine's.
+    pub platforms: &'a [String],
     /// `--quiet`: suppress per-step progress.
     pub quiet: bool,
     /// `--target <stage>`: stop at the named stage of a multi-stage Dockerfile and tag THAT.
@@ -4022,6 +4153,25 @@ fn prepare_stage(
                         }
                         None => stage_instrs.push(ins.clone()),
                     }
+                }
+                // `RUN --mount=...,from=<stage>` NAMES A STAGE the same way `COPY --from` does, and
+                // is rewritten to that stage's local tag the same way; an image reference is left.
+                Instr::RunMounts(mounts) => {
+                    let mapped = mounts
+                        .iter()
+                        .map(|mnt| {
+                            let mut mnt = mnt.clone();
+                            if let Some(f) = &mnt.from {
+                                if let Some(src_idx) =
+                                    crate::dockerfile::resolve_from(f, stage_names, si)
+                                {
+                                    mnt.from = Some(stage_tags[src_idx].clone());
+                                }
+                            }
+                            mnt
+                        })
+                        .collect();
+                    stage_instrs.push(Instr::RunMounts(mapped));
                 }
                 other => stage_instrs.push(other.clone()),
             }
@@ -4384,6 +4534,34 @@ unsafe fn probe_opaque_child(plan: &OpaquePlan, euid: libc::uid_t, egid: libc::g
     }
 }
 
+/// `key=value` as one `--mount` field, quoted so that nothing in `value` can end it: the whole field
+/// in double quotes and a quote inside doubled, which is how `csv_fields` reads a quoted field.
+/// `Err(why)` when `path` is a socket other than the caller's own agent (`$SSH_AUTH_SOCK`), compared
+/// after resolving links so another name for the agent is still the agent.
+fn refuse_foreign_socket(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    let is_socket = std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket());
+    if !is_socket {
+        return Ok(());
+    }
+    let real = std::fs::canonicalize(path).ok();
+    let agent = crate::global_env_str("SSH_AUTH_SOCK")
+        .ok()
+        .and_then(|a| std::fs::canonicalize(a).ok());
+    if real.is_some() && real == agent {
+        return Ok(());
+    }
+    Err(format!(
+        "{path} is a socket that is not your SSH agent ($SSH_AUTH_SOCK); a compose file cannot \
+         connect a build to a host socket. Use `default` for your agent, a key file, or pass \
+         `kern build --ssh` yourself"
+    ))
+}
+
+pub(crate) fn quoted_mount_field(key: &str, value: &str) -> String {
+    format!("\"{key}={}\"", value.replace('"', "\"\""))
+}
+
 /// Run one `RUN` step inside a `kern box` with host networking, so writes persist to the build layer
 /// and the command can fetch packages. **Layered:** overlay `base_lower` with the persistent upper
 /// under `work` (no base copy). **Flat:** bind-mount the copied `write_dir`. Reuses the full box
@@ -4398,7 +4576,12 @@ fn run_build_step(
     config: &kern_oci::ImageConfig,
     argv: &[String],
     step: usize,
+    mounts: &buildmounts::StepMounts,
 ) -> Result<(), Error> {
+    // A RUN of another platform: the kernel must be able to run its binaries (see `check_emulation`).
+    if let Some(p) = image_platform() {
+        check_emulation(&p)?;
+    }
     let mut cmd = std::process::Command::new(self_exe);
     cmd.env("KERN_BUILD_STEP", "1"); // skip the transient systemd-scope re-exec (build boxes are hot)
     cmd.arg("box")
@@ -4447,11 +4630,48 @@ fn run_build_step(
     if let Some(swap) = host_meminfo_bytes("SwapTotal:") {
         cmd.arg("--memory-swap-max").arg(swap.to_string());
     }
-    for e in &config.env {
-        cmd.arg("--env").arg(e);
+    // The base image's Env as `K=V` only (see `image_envs`): a bare name would make the step read
+    // it from THIS process's environment, which is the operator's.
+    for (k, v) in image_envs(&config.env) {
+        cmd.arg("--env").arg(format!("{k}={v}"));
     }
     if let Some(w) = &config.workdir {
         cmd.arg("--workdir").arg(w);
+    }
+    // ⛔ `USER` APPLIES TO `RUN`, as it does under docker. Every RUN ran as root regardless, so
+    // speaches' `USER ubuntu` + `RUN uv sync` + `RUN mkdir -p $HOME/.cache/huggingface/hub` produced a
+    // root-owned venv and cache that the service, running as `ubuntu`, could not write. MEASURED in
+    // the field on a WSL2 guest. `kern box --user` resolves a name in the image's own `/etc/passwd`.
+    if let Some(u) = config.user.as_deref().filter(|u| !u.is_empty()) {
+        cmd.arg("--user").arg(u);
+    }
+    // `RUN --mount=...`: binds (context files, secrets, caches), tmpfs, and agent sockets, where the
+    // command expects them. See `buildmounts`.
+    // EVERY PATH FIELD IS QUOTED, in the grammar `--mount` reads (`csv_fields`): a comma in a path
+    // otherwise opened a new field, and the last `src=` wins. FOUND BY AUDIT, reproduced rootless: a
+    // context link `m -> p,src=<host dir>` passed the "inside the context" check as the real
+    // directory `p,src=` and mounted the host directory named after it.
+    for (src, dst, ro) in &mounts.binds {
+        cmd.arg("--mount").arg(format!(
+            "type=bind,{},{}{}",
+            quoted_mount_field("src", src),
+            quoted_mount_field("dst", dst),
+            if *ro { ",readonly" } else { "" }
+        ));
+    }
+    for dst in &mounts.tmpfs {
+        cmd.arg("--mount")
+            .arg(format!("type=tmpfs,{}", quoted_mount_field("dst", dst)));
+    }
+    for (src, dst) in &mounts.sockets {
+        cmd.arg("--build-ssh-agent").arg(format!("{src}:{dst}"));
+    }
+    // A SECRET VALUE NEVER REACHES A COMMAND LINE: it is put in the child's environment and named
+    // with `--env NAME`, which the box reads from there, so `ps` and `/proc/<pid>/cmdline` on the
+    // host never show it.
+    for (k, v) in &mounts.env {
+        cmd.env(k, v);
+        cmd.arg("--env").arg(k);
     }
     cmd.arg("--");
     for a in argv {
@@ -4806,8 +5026,193 @@ fn exit_key_prefix(pod: &str) -> String {
     format!("{pod}-")
 }
 
-/// Resolve every service's compose `build:` into a built image via `kern build`, mutating the box's
-/// `image` to the built tag. See the call site for the four hardenings; this enforces them.
+/// A service's `env_file:` that does not exist, as docker's loader refuses it ("env file <path> not
+/// found", MEASURED with docker compose v5.0.2), asked before any build or download: kern used to find
+/// out when the box started, after InvokeAI's multi-GB image had been fetched. Entries marked
+/// `required: false` were already dropped by the parser when absent. `starting`: only those services.
+pub(crate) fn missing_env_file(
+    boxes: &[crate::compose::ComposeBox],
+    project_dir: &std::path::Path,
+    starting: Option<&std::collections::HashSet<String>>,
+) -> Result<(), Error> {
+    for b in boxes {
+        if let Some(s) = starting {
+            if !s.contains(b.service_name()) && !s.contains(&b.name) {
+                continue;
+            }
+        }
+        for f in &b.env_file {
+            let path = project_dir.join(f);
+            if !path.exists() {
+                return Err(Error::Compose(format!(
+                    "service '{}': env file {} not found",
+                    b.service_name(),
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What every "outside the project" refusal adds, so the reader learns the one way to widen it.
+pub(crate) const WIDEN_HINT: &str = ". If the directory above is the project (a compose file kept \
+     in a subdirectory such as deploy/), name it: kern compose --project-root <dir> (inside a git \
+     repository, the repository already is the project)";
+
+/// The directory `kern compose --project-root` widened the project to, canonical; unset otherwise.
+static PROJECT_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Record `--project-root`, once, for this process. A one-shot CLI process runs one compose
+/// invocation, and every confinement check reads it through [`compose_root`] so none can forget it.
+pub(crate) fn set_project_root(dir: &str) -> Result<(), Error> {
+    let canonical = std::fs::canonicalize(dir)
+        .map_err(|e| Error::Compose(format!("--project-root {dir}: {e}")))?;
+    if !canonical.is_dir() {
+        return Err(Error::Compose(format!(
+            "--project-root {dir}: not a directory"
+        )));
+    }
+    let _ = PROJECT_ROOT.set(canonical);
+    Ok(())
+}
+
+/// The git repository a compose file sits in, as the project root when the operator named none.
+///
+/// ⛔ WHY: a compose file kept in a subdirectory of its repository and building or mounting from the
+/// repository is ordinary, and docker accepts it. MEASURED in the field: Kokoro-FastAPI's
+/// `docker/gpu/docker-compose.yml` builds from `../..` and binds `../../web`, InvokeAI's
+/// `docker/docker-compose.yml` builds from `..`, vLLMux keeps its file in `deploy/`; kern refused all
+/// three until the operator typed `--project-root`. The repository is the project its author
+/// shipped, so a file stays confined to it and still cannot reach the rest of the disk.
+///
+/// ⛔ NEVER A REPOSITORY THAT HOLDS THE HOME DIRECTORY: a "dotfiles" repository at `~` (or one at
+/// `/`) would widen the boundary to `~/.ssh` and every credential beside it, which is exactly what the
+/// boundary is for. Such a repository leaves the root at the file's own directory.
+///
+/// `base` is the compose file's canonical directory, `homes` the canonical home directories the
+/// root must not contain. With none known there is no way to tell, and nothing is adopted.
+pub(crate) fn git_project_root(
+    base: &std::path::Path,
+    homes: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    if homes.is_empty() {
+        return None;
+    }
+    let repo = base
+        .ancestors()
+        .find(|d| std::fs::symlink_metadata(d.join(".git")).is_ok())?;
+    // `/` itself is never the project: it holds everything.
+    repo.parent()?;
+    if homes.iter().any(|h| h.starts_with(repo)) {
+        return None;
+    }
+    Some(repo.to_path_buf())
+}
+
+/// The home directories a widened project root must never hold, canonical: `$HOME`, and the password
+/// database's home for the real uid and for the compose file's owner. `$HOME` alone failed OPEN:
+/// unset, there was nothing to compare, and under `sudo` (`HOME=/root`) a dotfiles repository at the
+/// user's home was adopted. FOUND BY AUDIT, reproduced with `env -u HOME` and `HOME=/root`.
+fn homes_to_protect(file: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let mut uids = vec![
+        // SAFETY: getuid cannot fail.
+        unsafe { libc::getuid() },
+    ];
+    if let Ok(m) = std::fs::metadata(file) {
+        uids.push(m.uid());
+    }
+    let mut homes: Vec<std::path::PathBuf> = uids
+        .into_iter()
+        .filter_map(passwd_home)
+        .chain(crate::global_env_str("HOME").ok().map(Into::into))
+        .filter_map(|h| std::fs::canonicalize(h).ok())
+        .collect();
+    homes.sort();
+    homes.dedup();
+    homes
+}
+
+/// `uid`'s home directory from the password database (`getpwuid_r`), `None` when it has no entry.
+fn passwd_home(uid: libc::uid_t) -> Option<std::path::PathBuf> {
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: a zeroed passwd for getpwuid_r to fill; `buf` outlives every pointer it stores there.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r with a valid struct, buffer and length; `out` is NULL when there is no entry.
+    let r = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r != 0 || out.is_null() || pw.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: pw_dir points into `buf`, NUL-terminated by getpwuid_r.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) };
+    let dir = std::path::PathBuf::from(
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(dir.to_bytes()),
+    );
+    (!dir.as_os_str().is_empty()).then_some(dir)
+}
+
+/// [`git_project_root`] for the compose files of this run, applied as the project root when the
+/// operator named none and every file is inside the same repository. Said once when it widens.
+pub(crate) fn adopt_git_project_root(files: &[String]) -> Result<(), Error> {
+    if PROJECT_ROOT.get().is_some() {
+        return Ok(());
+    }
+    let Some(first) = files.first() else {
+        return Ok(());
+    };
+    let base = compose_base(first)?;
+    // The homes are asked only when there is a repository to compare them with: the password
+    // database costs a lookup per uid, and most compose files are not in one.
+    if !base
+        .ancestors()
+        .any(|d| std::fs::symlink_metadata(d.join(".git")).is_ok())
+    {
+        return Ok(());
+    }
+    let homes = homes_to_protect(std::path::Path::new(first));
+    let Some(repo) = git_project_root(&base, &homes) else {
+        return Ok(());
+    };
+    for f in files {
+        if !compose_base(f)?.starts_with(&repo) {
+            return Ok(());
+        }
+    }
+    if repo != base {
+        eprintln!(
+            "kern: note: compose: the project is the git repository {}, so the file's paths may \
+             reach it and nothing outside it; --project-root names another",
+            repo.display()
+        );
+    }
+    let _ = PROJECT_ROOT.set(repo);
+    Ok(())
+}
+
+/// The operator's `--project-root`, when one was given: the boundary an `include:` is read under.
+pub(crate) fn project_root_override() -> Option<std::path::PathBuf> {
+    PROJECT_ROOT.get().cloned()
+}
+
+/// The directory a compose file's paths may not leave: its own directory, or the wider one the
+/// OPERATOR named with `--project-root`, which must contain it. Relative paths still resolve from
+/// the file's directory ([`compose_base`]); this is only the boundary, so a widened root changes
+/// what is allowed and never what a path means.
+pub(crate) fn compose_root(file: &str) -> Result<std::path::PathBuf, Error> {
+    let base = compose_base(file)?;
+    match PROJECT_ROOT.get() {
+        None => Ok(base),
+        Some(root) if base.starts_with(root) => Ok(root.clone()),
+        Some(root) => Err(Error::Compose(format!(
+            "--project-root {} does not contain the compose file's directory {}: it widens the \
+             project around the file, it cannot move it somewhere else",
+            root.display(),
+            base.display()
+        ))),
+    }
+}
 /// The directory a `build.context` is confined under: the compose file's parent, canonical.
 ///
 /// Its own function because TWO callers need the identical base - `resolve_builds`, which builds, and
@@ -4817,6 +5222,56 @@ fn compose_base(file: &str) -> Result<std::path::PathBuf, Error> {
     let dir = compose_dir(file);
     std::fs::canonicalize(&dir)
         .map_err(|e| Error::Compose(format!("resolving compose dir '{}': {e}", dir.display())))
+}
+
+/// Whether a service that names `image` AND declares `build:` is built now: see [`BuildPolicy`].
+///
+/// The image is looked for with the service's own `pull_policy:` (`never` = only what is here), and
+/// a lookup that fails is the case docker builds in: the image was never published, or this host
+/// cannot reach it. Said either way, even when nothing is a terminal: which of the two images is
+/// running is a fact a log must carry.
+///
+/// ⛔ ONLY A REGISTRY'S "NO" IS A REASON TO BUILD. MEASURED in the field: Kokoro-FastAPI's 5 GB image
+/// broke off mid-download (curl exit 92, then DNS timing out), and kern took that as "not available"
+/// and started building the whole project from source on a line that had just failed, which failed
+/// too. docker builds when the registry has no such image or will not give it (measured: "pull access
+/// denied", then the build). A transfer that broke is not an answer about the image: it stops, and
+/// says how to go on.
+fn build_wanted(policy: BuildPolicy, pull: Option<&str>, image: &str) -> Result<bool, Error> {
+    let word = pull.map(|p| p.trim().to_ascii_lowercase());
+    if policy == BuildPolicy::Always || word.as_deref() == Some("build") {
+        return Ok(true);
+    }
+    let pull_policy = match word.as_deref().and_then(kern_compose::pull_policy_word) {
+        Some("always") => PullPolicy::Always,
+        Some("never") => PullPolicy::Never,
+        _ => PullPolicy::Missing,
+    };
+    match resolve_image_depth(image, 0, pull_policy) {
+        Ok(_) => {
+            eprintln!(
+                "kern: note: using the published image '{image}', as docker does; `--build` builds \
+                 it from the service's `build:` instead"
+            );
+            Ok(false)
+        }
+        Err(_) if policy == BuildPolicy::Never => Ok(false),
+        Err(e) => {
+            let said = e.to_string();
+            let registry_said_no =
+                said.starts_with("registry:") || pull_policy == PullPolicy::Never;
+            if registry_said_no {
+                eprintln!("kern: note: '{image}' is not available ({e}); building it from source");
+                Ok(true)
+            } else {
+                Err(Error::Compose(format!(
+                    "'{image}' could not be fetched ({e}). The registry did not say it has no such \
+                     image, so kern does not build it from source instead: run the same command \
+                     again (what was downloaded is kept), or pass --build to build it"
+                )))
+            }
+        }
+    }
 }
 
 /// Resolve ONE service's build context and dockerfile against `base`, applying the confinement rules
@@ -4833,6 +5288,7 @@ fn compose_base(file: &str) -> Result<std::path::PathBuf, Error> {
 fn resolved_build_context(
     b: &crate::compose::ComposeBox,
     base: &std::path::Path,
+    root: &std::path::Path,
 ) -> Result<Option<(std::path::PathBuf, Option<std::path::PathBuf>)>, Error> {
     let Some(bd) = b.build.as_ref() else {
         return Ok(None);
@@ -4843,10 +5299,17 @@ fn resolved_build_context(
             b.name, bd.context
         ))
     })?;
-    if !ctx_abs.starts_with(base) {
+    if !ctx_abs.starts_with(root) {
         return Err(Error::Compose(format!(
-            "service '{}': build context '{}' escapes the compose directory (refused)",
-            b.name, bd.context
+            "service '{}': build context '{}' escapes the {} (refused){}",
+            b.name,
+            bd.context,
+            if root == base {
+                "compose directory"
+            } else {
+                "project root"
+            },
+            WIDEN_HINT
         )));
     }
     let dfile = match &bd.dockerfile {
@@ -4867,17 +5330,9 @@ fn resolved_build_context(
     Ok(Some((ctx_abs, dfile)))
 }
 
-/// Resolve ONE service's build context and dockerfile against `base`, applying the confinement rules
-/// in full, or `Ok(None)` when the service declares no `build:`.
-///
-/// THE GUARDS LIVE HERE AND NOWHERE ELSE. `resolve_builds` used to hold them inline, and adding a
-/// second reader of `build.context` (`watch`) would have meant a second copy of a traversal check -
-/// the exact shape in which one copy later drifts and stops refusing `context: ../../../etc`. Both
-/// callers now get the same answer or the same refusal.
-///
-/// Guard 1: the canonical `base/context` must stay beneath `base`, so a context in a third-party
-/// compose file cannot escape the project tree. Guard 1b: a `dockerfile:`, which Docker resolves
-/// [`resolve_builds_narrating`], restricted to the services named in `only`.
+/// Resolve the compose `build:` of the services named in `only` into built images via `kern build`,
+/// setting each box's `image` to the built tag. See the call site for the four hardenings; this
+/// enforces them.
 ///
 /// `None` builds every service that declares `build:`, which is what `up` and `build` need. `Some`
 /// is for `run --no-deps`, where NOTHING else is going to start: MEASURED on Sentry's file, a single
@@ -4890,8 +5345,10 @@ pub(crate) fn resolve_builds_for(
     to_stdout: bool,
     only: Option<&[String]>,
     extra_args: &[String],
+    policy: BuildPolicy,
 ) -> Result<(), Error> {
     let base = compose_base(file)?;
+    let root = compose_root(file)?;
 
     for b in boxes.iter_mut() {
         // A service nobody is going to start does not need its image built. Matched on BOTH spellings
@@ -4913,13 +5370,23 @@ pub(crate) fn resolve_builds_for(
         // symlink buried in the tree lands in the image verbatim, dangling inside the pivoted rootfs,
         // never read at build time). Verified live: a `leak -> /host/secret` inside the context does
         // not leak the host file into the image. So root-confine here + no-follow descent = closed.
-        let Some((ctx_abs, dfile)) = resolved_build_context(b, &base)? else {
+        //
+        // DECIDED BEFORE THE CONTEXT IS CONFINED, because the confinement guards what a build READS,
+        // and a service that runs its published image reads nothing. InvokeAI's file builds from `..`
+        // and names `ghcr.io/invoke-ai/invokeai`: docker downloads the image, and kern refused the
+        // context of a build it was never going to make. `--build` still meets the guard.
+        let Some(bd) = b.build.clone() else { continue };
+        if let Some(image) = b.image.as_deref() {
+            if !build_wanted(policy, b.pull.as_deref(), image)? {
+                continue;
+            }
+        }
+        let Some((ctx_abs, dfile)) = resolved_build_context(b, &base, &root)? else {
             continue;
         };
-        let Some(bd) = b.build.clone() else { continue };
 
-        // Guard 4 - `image:` + `build:` = build AND tag as `image`; `build:` alone → synthesized tag.
-        // Either way the box RUNS the freshly built image, never a stale registry one.
+        // Guard 4 - `image:` + `build:` = Docker's rule (`build_wanted`, above), and a build is tagged
+        // as `image`; `build:` alone → synthesized tag, rebuilt every time.
         // LOWERCASED, BECAUSE KERN GENERATES THIS NAME AND OCI REPOSITORY NAMES ARE LOWERCASE.
         //
         // The box name carries the project directory, and a directory with a capital letter is
@@ -4957,6 +5424,82 @@ pub(crate) fn resolve_builds_for(
         }
         for a in &bd.args {
             cmd.arg("--build-arg").arg(a); // already ${VAR}-interpolated by the parser (guard 2)
+        }
+        // `build.secrets:` and `build.ssh:`, for `RUN --mount=type=secret|ssh` (see `buildmounts`).
+        // A secret FILE resolves against the compose file and stays inside the project, as every
+        // path in the file does; a variable travels by NAME, never by value.
+        for sec in &bd.secrets {
+            match (&sec.file, &sec.env) {
+                (Some(f), _) => {
+                    let abs = std::fs::canonicalize(base.join(f)).map_err(|e| {
+                        Error::Compose(format!(
+                            "service '{}': build secret '{}' file {f}: {e}",
+                            b.name, sec.id
+                        ))
+                    })?;
+                    if !abs.starts_with(&root) {
+                        return Err(Error::Compose(format!(
+                            "service '{}': build secret '{}' file {f} is outside the project \
+                             (refused){WIDEN_HINT}",
+                            b.name, sec.id
+                        )));
+                    }
+                    cmd.arg("--secret").arg(format!(
+                        "{},{}",
+                        quoted_mount_field("id", &sec.id),
+                        quoted_mount_field("src", &abs.to_string_lossy())
+                    ));
+                }
+                (None, Some(var)) => {
+                    cmd.arg("--secret").arg(format!(
+                        "{},{}",
+                        quoted_mount_field("id", &sec.id),
+                        quoted_mount_field("env", var)
+                    ));
+                }
+                (None, None) => {}
+            }
+        }
+        if !bd.platforms.is_empty() {
+            cmd.arg("--platform").arg(bd.platforms.join(","));
+        }
+        for s in &bd.ssh {
+            // A key path written relative to the file, or under `~`, made absolute here: `kern build`
+            // runs from wherever `compose` was started.
+            let spec = match s.split_once('=') {
+                Some((id, paths)) => {
+                    let abs: Vec<String> = paths
+                        .split(',')
+                        .map(|p| {
+                            let p = p.trim();
+                            if let Some(rest) = p.strip_prefix("~/") {
+                                crate::global_env_str("HOME")
+                                    .map(|h| format!("{h}/{rest}"))
+                                    .unwrap_or_else(|_| p.to_string())
+                            } else if p.starts_with('/') {
+                                p.to_string()
+                            } else {
+                                base.join(p).to_string_lossy().into_owned()
+                            }
+                        })
+                        .collect();
+                    // A COMPOSE FILE REACHES NO HOST SOCKET BUT THE OPERATOR'S AGENT. The step's
+                    // proxy copies bytes both ways, so a socket named here is a connection from the
+                    // build to whatever listens on it: the user's systemd manager, a docker socket.
+                    // FOUND BY AUDIT, reproduced rootless with a listener in the project. `-v`
+                    // already refuses a socket; the operator who wants one passes `kern build
+                    // --ssh` themselves. A key file stays allowed, as in docker: the agent signs
+                    // with it and never hands it over.
+                    for a in &abs {
+                        refuse_foreign_socket(a).map_err(|why| {
+                            Error::Compose(format!("service '{}': build ssh `{s}`: {why}", b.name))
+                        })?;
+                    }
+                    format!("{id}={}", abs.join(","))
+                }
+                None => s.clone(),
+            };
+            cmd.arg("--ssh").arg(spec);
         }
         cmd.arg(&ctx_abs);
         // THE CHILD'S STDOUT IS THIS PROCESS'S STDERR when the build is a side effect: its narration
@@ -5545,6 +6088,43 @@ fn declared_container_ports(b: &crate::compose::ComposeBox) -> Vec<(u16, bool)> 
                 .map(|m| (m.box_port, m.udp))
         }))
         .collect()
+}
+
+/// The ports a peer relay is built for under `--no-pod`: what the file declares, and for a service
+/// that declares NOTHING, what its image EXPOSEs.
+///
+/// WHY THE IMAGE COUNTS. In Docker a peer reaches any port a container listens on, so a file almost
+/// never declares the port of a `redis` or an `nginx` it only talks to from inside the stack. kern's
+/// relay wiring needs a port to build a relay, and before this a segregating file (which is what
+/// selects that wiring) left such a service unreachable: MEASURED on a Jetson web stack, `api1` got
+/// `Connection refused` from `cache:6379` while redis listened on `0.0.0.0:6379`. The image's
+/// `ExposedPorts` is the image author's statement of the same fact, and it is what a reader of the
+/// file expects to work.
+///
+/// ONLY FOR A SERVICE THAT DECLARES NOTHING AND RUNS THE IMAGE'S OWN COMMAND, because a service that
+/// declares ports has said what it listens on, and the relay count is capped per stack: folding an image's whole EXPOSE set into a
+/// service the file already describes could push a stack that runs today past the cap, with a
+/// refusal telling the user to declare fewer ports they never declared.
+///
+/// An image kern cannot read (`None`) contributes nothing, which is the behaviour before this.
+pub(crate) fn relay_ports(b: &crate::compose::ComposeBox) -> Vec<(u16, bool)> {
+    let declared = declared_container_ports(b);
+    if !declared.is_empty() {
+        return declared;
+    }
+    // ONLY FOR A SERVICE THAT RUNS THE IMAGE'S OWN PROCESS. `EXPOSE` describes where the image's
+    // default command listens; a service that replaces `command:` or `entrypoint:` is a different
+    // process on the same filesystem, a worker or a client. MEASURED on a VPS stack: a `worker` on
+    // `postgres:17-alpine`, there for `psql`, took 5432 like `db`, the two relays collided ("both
+    // declare that port"), and the worker could no longer reach the database. The same shape is a
+    // web app and its job worker on one image, which is most stacks that have a worker.
+    if !b.command.is_empty() || b.entrypoint.is_some() {
+        return Vec::new();
+    }
+    b.image
+        .as_deref()
+        .and_then(image_exposed_ports)
+        .unwrap_or_default()
 }
 
 /// The HOST ports a service publishes, deduplicated, in the order the file names them.
@@ -6547,6 +7127,10 @@ fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Op
         .filter_map(|b| match (&b.device, &b.gpus) {
             (Some(name), None) => Some(format!("'{}' (CDI name {name})", b.service_name())),
             (None, Some(spec)) => Some(format!("'{}' ({spec})", b.service_name())),
+            (None, None) if b.runtime_nvidia => Some(format!(
+                "'{}' (runtime: nvidia, the image's NVIDIA_VISIBLE_DEVICES)",
+                b.service_name()
+            )),
             _ => None,
         })
         .collect();
@@ -6583,6 +7167,21 @@ fn device_grant_problem(boxes: &[crate::compose::ComposeBox], allow: bool) -> Op
             return Some(format!(
                 "service '{}' asks for a GPU ({spec}) and nothing granted it. A GPU is a device \
                  grant: pass --allow-device-grants to `kern compose`, or set \
+                 allow_device_grants in YOUR OWN kern.toml. A compose file cannot grant itself \
+                 hardware, and a file that could would not be a policy",
+                b.service_name()
+            ));
+        }
+        // `runtime: nvidia` WITHOUT AN EXPLICIT REQUEST IS ONE TOO: it grants what the image's
+        // NVIDIA_VISIBLE_DEVICES names, which in a CUDA image is every card.
+        if b.runtime_nvidia {
+            if askers.len() > 1 {
+                return Some(ungranted_gpu_message(&askers));
+            }
+            return Some(format!(
+                "service '{}' has `runtime: nvidia`, which hands it the GPUs its image's \
+                 NVIDIA_VISIBLE_DEVICES names (every card, in a CUDA image), and nothing granted \
+                 it. A GPU is a device grant: pass --allow-device-grants to `kern compose`, or set \
                  allow_device_grants in YOUR OWN kern.toml. A compose file cannot grant itself \
                  hardware, and a file that could would not be a policy",
                 b.service_name()
@@ -7167,7 +7766,7 @@ fn no_pod_undeclared_ports_note(
     }
     let mute: Vec<&str> = boxes
         .iter()
-        .filter(|b| declared_container_ports(b).is_empty())
+        .filter(|b| relay_ports(b).is_empty())
         .map(|b| b.service.as_str())
         .collect();
     if mute.is_empty() {
@@ -7494,6 +8093,31 @@ fn settle_deferred_health_gates(boxes: &mut [crate::compose::ComposeBox]) {
             "kern: note: compose: service '{who}': dependency '{dep}' declares no `healthcheck:` but \
              its IMAGE carries one, so the `service_healthy` gate is honoured"
         );
+    }
+    // A HEALTHCHECK WITH NUMBERS AND NO `test` ANYWHERE, said once, on the merged stack. The parser
+    // no longer says it about one file, because one file may be the override that only tunes
+    // `retries` of a `test` another layer wrote (measured on usd-search, see `apply_healthcheck`).
+    // Here every layer has been merged and the image has been asked, so "nothing to apply to" is a
+    // fact and not a guess.
+    for b in boxes.iter() {
+        let tuned = b.health_interval.is_some()
+            || b.health_retries.is_some()
+            || b.health_timeout.is_some()
+            || b.health_start_period.is_some()
+            || b.health_start_interval.is_some();
+        let image_has = b
+            .image
+            .as_deref()
+            .and_then(|img| verdict.get(img))
+            .copied()
+            .unwrap_or(false);
+        if tuned && !b.has_health() && !image_has {
+            eprintln!(
+                "kern: warning: compose: service '{}': healthcheck has no `test` in any file and \
+                 its image declares none, so its interval/retries/timeout tune nothing - omitted",
+                b.service_name()
+            );
+        }
     }
     for (who, dep) in lost {
         eprintln!(
@@ -8061,6 +8685,7 @@ fn run_terminal_verb(
             // "is my file what I think it is" WITHOUT starting anything. Validation runs first so a
             // broken graph is reported here rather than at the next `up`.
             crate::compose::topo_levels(boxes).map_err(Error::Compose)?;
+            missing_env_file(boxes, &compose_dir(file), None)?;
             validate_conditions(boxes)?;
             check_port_collisions(boxes)?;
             // `--services`: THE NAMES, ONE PER LINE, AND NOTHING ELSE. The flag was parsed and only
@@ -8245,6 +8870,44 @@ fn run_terminal_verb(
                             "config: service '{}': {msg}",
                             b.service_name()
                         )));
+                    }
+                }
+                // THE PROJECT GUARD, ASKED BY THE DRY RUN AS `up` WILL ASK IT. MEASURED 2026-11-12 on
+                // LLMSystems/vLLMux, whose compose file sits in `deploy/` and builds from `..`:
+                // `config` printed a clean preview and `up` refused "build context '..' escapes the
+                // compose directory". The same function decides both (`path_under_root`, lexical and
+                // then canonical through what exists), so nothing has to exist for `config` to say
+                // what `up` will refuse, and nothing here is created.
+                let base = compose_base(file)?;
+                let root = compose_root(file)?;
+                let escapes = |what: &str, rel: &str| -> Result<(), Error> {
+                    crate::compose::path_under_root(&root, &base, rel)
+                        .map(|_| ())
+                        .map_err(|e| {
+                            Error::Compose(format!(
+                                "config: service '{}': {what} {e} (refused at `up`: kern keeps \
+                                 every path a compose file writes inside its project directory){}",
+                                b.service_name(),
+                                WIDEN_HINT
+                            ))
+                        })
+                };
+                for spec in &b.volumes {
+                    let source = spec.split(':').next().unwrap_or("");
+                    if crate::compose::is_relative_bind_source(source) {
+                        escapes("bind source", source)?;
+                    }
+                }
+                for s in &b.secrets {
+                    if let Some((f, _)) = s.split_once(':') {
+                        if !f.starts_with('/') && !f.is_empty() {
+                            escapes("secret file", f)?;
+                        }
+                    }
+                }
+                if let Some(bd) = b.build.as_ref() {
+                    if !bd.context.contains("://") {
+                        escapes("build context", &bd.context)?;
                     }
                 }
             }
@@ -8454,10 +9117,11 @@ fn run_terminal_verb(
             // The SAME confinement a build applies, by calling the same function: a context that
             // `resolve_builds` would refuse is refused here too, before a single watch is added.
             let base = compose_base(file)?;
+            let root = compose_root(file)?;
             let mut contexts: Vec<(String, std::path::PathBuf, Option<std::path::PathBuf>)> =
                 Vec::new();
             for b in boxes.iter().filter(|b| selected(b)) {
-                if let Some((ctx, df)) = resolved_build_context(b, &base)? {
+                if let Some((ctx, df)) = resolved_build_context(b, &base, &root)? {
                     contexts.push((b.name.clone(), ctx, df));
                 }
             }
@@ -8763,7 +9427,15 @@ fn run_terminal_verb(
         ComposeAction::Build => {
             let self_exe = std::env::current_exe()
                 .map_err(|e| Error::Compose(format!("locating kern: {e}")))?;
-            resolve_builds_for(boxes, file, &self_exe, true, None, o.build_args)?;
+            resolve_builds_for(
+                boxes,
+                file,
+                &self_exe,
+                true,
+                None,
+                o.build_args,
+                BuildPolicy::Always,
+            )?;
             println!("compose build: done");
             return Ok(true);
         }
@@ -9262,6 +9934,23 @@ fn box_processes(pid1: i32) -> Option<Vec<(i32, String)>> {
     }
     Some(out)
 }
+/// When a service that names an `image:` AND declares `build:` is built.
+///
+/// ⛔ DOCKER'S RULE, MEASURED with Compose v5.0.2: the published image is used when it is here or
+/// can be pulled, and the service is built only when it cannot (an image nobody published) or when
+/// `--build` / `pull_policy: build` asks. kern used to build every time, so open-webui's `up`
+/// meant a full node and python build from source where docker downloads the image the file names.
+/// A service with `build:` and no `image:` has no published image to prefer and is built as before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BuildPolicy {
+    /// Docker's default: the named image if it is here or can be pulled, else build.
+    #[default]
+    PreferImage,
+    /// `--build`, and `kern compose build`: build from source.
+    Always,
+    /// `--no-build`: never build a service that names an image.
+    Never,
+}
 /// `kern compose <file>` - bring up a stack of boxes (detached) in `depends_on` order. Each
 /// service is launched via a fresh `kern box -d` subprocess, so it gets its own scope + registry
 /// entry; track the stack with `kern ps`.
@@ -9312,6 +10001,8 @@ pub struct ComposeOpts<'a> {
     /// run continues, instead of ending it. kern already does this for a service that declares
     /// `build:`; the flag asks for it unconditionally, and Sentry's installer passes it.
     pub ignore_pull_failures: bool,
+    /// `--build` / `--no-build`: see [`BuildPolicy`].
+    pub build_policy: BuildPolicy,
     /// `build --build-arg K=V`, repeatable: forwarded to every service this invocation builds, ON TOP
     /// of the `build.args:` the file declares. The file's value wins for a key both set, which is
     /// Docker's order: the command line is a default for services that did not decide.
@@ -9362,6 +10053,8 @@ pub struct ComposeOpts<'a> {
     pub project: Option<&'a str>,
     /// `--env-file`: the interpolation table, instead of the project `.env`.
     pub env_file: Option<&'a str>,
+    /// `--project-root <dir>`: the directory the file's paths may reach (see [`compose_root`]).
+    pub project_root: Option<&'a str>,
     /// `--profile` (repeatable): profiles to activate, like `COMPOSE_PROFILES`.
     pub profiles: &'a [String],
     /// `logs -t/--timestamps`: prefix each line with the time the index recorded for it.
@@ -10100,6 +10793,10 @@ mod system;
 pub use system::*;
 
 mod build;
+
+/// `RUN --mount=type=secret|ssh|cache|tmpfs|bind`: the build's inputs and each step's mounts.
+mod buildmounts;
+pub(crate) use buildmounts::ssh_agent_proxy;
 
 /// `compose watch`: rebuild and restart one service when its build context changes.
 mod watch;

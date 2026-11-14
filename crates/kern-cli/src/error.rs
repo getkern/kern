@@ -274,6 +274,17 @@ fn oci_hint(msg: &str) -> String {
         // is worse than no hint: the reader has to guess which half to believe.
         "an authenticated pull has a much higher quota; `kern login <registry>` once and it persists"
             .into()
+    } else if msg.contains("possible decompression bomb") {
+        "the image exists and one of its layers expands past kern's safety cap for its size (twenty \
+         times what was downloaded, 2 GiB at least): nothing was installed"
+            .into()
+    } else if msg.contains("digest mismatch") {
+        // THE NAME RESOLVED AND THE BYTES ARRIVED WRONG. The name/tag hint below sent the reader to
+        // check a reference that had just served a manifest: MEASURED in the field, a 2058 MB layer
+        // cut short on a slow link. Nothing was installed, and another pull fetches it again.
+        "the image exists and a blob arrived damaged or incomplete, so nothing was installed: run \
+         the same pull again. If it repeats on the same layer, the link or a proxy is altering it"
+            .into()
     } else if msg.contains("could not be opened while reading its layers")
         || msg.contains("merged overlay view")
         || msg.contains("of the archive failed")

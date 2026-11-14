@@ -20,6 +20,11 @@ pub(super) mod layered {
         supplementary_gids(spec, &Accounts::Layers(lower))
     }
 
+    pub(crate) fn image_group_add(names: &[&str], lower: &[String]) -> Result<Vec<u32>, String> {
+        let names: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        crate::commands::imagecache::group_add_gids(&names, &Accounts::Layers(lower))
+    }
+
     pub(crate) fn image_user_home(uid: u32, lower: &[String]) -> String {
         user_home(uid, &Accounts::Layers(lower))
     }
@@ -531,6 +536,35 @@ mod image_user_resolution_tests {
     /// What it cost: the certificates Elastic's `setup` service writes are `root:root` mode 640, so
     /// with the set cleared Kibana died on `EACCES ... config/certs/ca/ca.crt` while the three
     /// Elasticsearch nodes, which have gid 0 outright, were green.
+    /// `--group-add` / compose `group_add:` RESOLVES A NAME IN THE IMAGE, takes a number as it is,
+    /// and REFUSES a name the image does not have with docker's sentence. Measured on a Jetson
+    /// before it existed: `group_add: [video]` was "ignored (unsupported)".
+    #[test]
+    fn group_add_resolves_names_in_the_image_and_refuses_an_unknown_one() {
+        let root = std::env::temp_dir().join(format!("kern-gadd-{}", std::process::id()));
+        let etc = root.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("group"), "root:x:0:\nvideo:x:44:\nrender:x:107:\n").unwrap();
+        let lower = vec![root.to_string_lossy().into_owned()];
+        assert_eq!(
+            image_group_add(&["video", "1234", "render"], &lower),
+            Ok(vec![44, 1234, 107])
+        );
+        assert_eq!(
+            image_group_add(&["video", "44"], &lower),
+            Ok(vec![44]),
+            "no duplicate"
+        );
+        let unknown = image_group_add(&["nosuch"], &lower);
+        assert!(
+            unknown
+                .as_ref()
+                .is_err_and(|e| e.contains("Unable to find group nosuch")),
+            "{unknown:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_supplementary_groups_come_from_the_image_and_only_for_a_group_less_user() {
         let root = std::env::temp_dir().join(format!("kern-sgid-{}", std::process::id()));
@@ -1667,6 +1701,8 @@ mod net_resource_tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            no_new_privs: true,
+            keep_groups: false,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -2286,6 +2322,14 @@ mod net_resource_tests {
         let cfg = cache.join(format!("{safe}.image"));
         // Exactly what an older kern wrote: fields, no `fmt` line.
         std::fs::write(&cfg, "entrypoint\t/entrypoint.sh\nenv\tPATH=/bin\n").unwrap();
+        // The ownership sidecar the CALLER's cache carries, so the test is about the format stamp
+        // whoever runs it: root's entries are complete only with their owner map recorded (see
+        // `owners_match`), and as root this test failed on that, not on the stamp. MEASURED in WSL.
+        std::fs::write(
+            cache.join(format!("{safe}.owners")),
+            crate::commands::imagecache::owner_map_signature(),
+        )
+        .unwrap();
         assert!(
             cache_entry_complete(&cache, safe),
             "an old sidecar must not make the entry look incomplete: that clears the rootfs"
@@ -2411,6 +2455,10 @@ mod net_resource_tests {
                 start_interval_ns: Some(5_000_000_000),
                 retries: Some(3),
             }),
+            digest: Some(
+                "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+            ),
+            architecture: Some("arm64".into()),
         };
         let path =
             std::env::temp_dir().join(format!("kern-sidecar-rt-{}.image", std::process::id()));
@@ -2792,6 +2840,10 @@ mod net_resource_tests {
                 start_interval_ns: None,
                 retries: Some(4),
             }),
+            digest: Some(
+                "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+            ),
+            architecture: Some("arm64".into()),
         };
         let dir = std::env::temp_dir().join(format!("kern-imgcfg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -4291,7 +4343,8 @@ mod relative_bind_tests {
             ..Default::default()
         }];
         let f = dir.join("docker-compose.yml");
-        resolve_relative_binds(&mut b, &f.to_string_lossy())?;
+        let root = std::fs::canonicalize(dir).map_err(|e| Error::Compose(e.to_string()))?;
+        resolve_relative_binds(&mut b, &f.to_string_lossy(), &root)?;
         Ok(b.remove(0).volumes.remove(0))
     }
 
@@ -4362,6 +4415,52 @@ mod relative_bind_tests {
             one("..:/app", &tmp).is_err(),
             "`..` escapes the compose dir"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ⛔ `--project-root` WIDENS EVERY CHECK `up` RUNS, not only the lexical one. The first version
+    /// widened `path_under_root` and left the canonical re-check and the secret check on the compose
+    /// directory, so `config` accepted vLLMux's layout and `up` still refused it.
+    #[test]
+    fn a_widened_root_lets_a_bind_and_a_secret_reach_it_and_no_further() {
+        let tmp = std::env::temp_dir().join(format!("kern-bind-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("repo/deploy")).expect("dir");
+        std::fs::create_dir_all(tmp.join("repo/data")).expect("dir");
+        std::fs::write(tmp.join("repo/token"), b"s").expect("secret");
+        std::fs::write(tmp.join("outside"), b"s").expect("outside");
+        let repo = std::fs::canonicalize(tmp.join("repo")).expect("canonical");
+        let f = tmp.join("repo/deploy/docker-compose.yml");
+        let mut b = vec![crate::compose::ComposeBox {
+            name: "a".into(),
+            volumes: vec!["../data:/data".to_string()],
+            secrets: vec!["../token:tok".to_string()],
+            ..Default::default()
+        }];
+        resolve_relative_binds(&mut b, &f.to_string_lossy(), &repo).expect("inside the root");
+        assert!(b[0].volumes[0].starts_with(&*repo.join("data").to_string_lossy()));
+        assert!(b[0].secrets[0].starts_with(&*repo.join("token").to_string_lossy()));
+        // The compose directory as the root is the default, and refuses both.
+        let deploy = std::fs::canonicalize(tmp.join("repo/deploy")).expect("canonical");
+        let mut b = vec![crate::compose::ComposeBox {
+            name: "a".into(),
+            volumes: vec!["../data:/data".to_string()],
+            ..Default::default()
+        }];
+        assert!(resolve_relative_binds(&mut b, &f.to_string_lossy(), &deploy).is_err());
+        let mut b = vec![crate::compose::ComposeBox {
+            name: "a".into(),
+            secrets: vec!["../token:tok".to_string()],
+            ..Default::default()
+        }];
+        assert!(resolve_relative_binds(&mut b, &f.to_string_lossy(), &deploy).is_err());
+        // And the widened root is still a boundary.
+        let mut b = vec![crate::compose::ComposeBox {
+            name: "a".into(),
+            secrets: vec!["../../outside:x".to_string()],
+            ..Default::default()
+        }];
+        assert!(resolve_relative_binds(&mut b, &f.to_string_lossy(), &repo).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
@@ -4486,6 +4585,8 @@ mod label_filter_tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            no_new_privs: true,
+            keep_groups: false,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -4614,6 +4715,8 @@ mod drift_tests {
             cap_drops: String::new(),
             cap_adds: String::new(),
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
+            no_new_privs: true,
+            keep_groups: false,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -5501,6 +5604,74 @@ mod port_collision_tests {
         assert!(
             no_pod_restart_gate_note(&[plain("api"), plain("db")], true).is_none(),
             "a stack where nothing sets `restart:` is fully ordered and has nothing to report"
+        );
+    }
+
+    /// A SERVICE THAT DECLARES NOTHING IS RELAYED ON WHAT ITS IMAGE EXPOSES, which is how Docker
+    /// behaves for the services a file never declares a port for (a `redis`, an `nginx`).
+    ///
+    /// MEASURED on a Jetson web stack whose `networks:` segregate, which selects the relay wiring:
+    /// `cache` (redis, EXPOSE 6379) declared no port, got no relay, and both APIs and the worker got
+    /// `Connection refused` from `cache:6379` while redis listened on `0.0.0.0:6379`.
+    ///
+    /// The EXPOSE set comes from the memo `image_exposed_ports` reads before the registry, so the
+    /// test touches no network and no image store.
+    #[test]
+    fn a_mute_service_is_relayed_on_its_images_expose() {
+        let _g = crate::env_guard();
+        let tmp = std::env::temp_dir().join(format!("kern-relayports-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let memo = tmp.join("kern/expose");
+        std::fs::create_dir_all(&memo).unwrap();
+        crate::set_global_env("XDG_CACHE_HOME", &tmp);
+        let image = "kern-test.invalid/redis-like:1";
+        std::fs::write(
+            memo.join(expose_memo_name(image)),
+            format!("{image}\n6379/tcp\n"),
+        )
+        .unwrap();
+        let svc = |name: &str, image: Option<&str>, expose: &[u16]| crate::compose::ComposeBox {
+            name: name.to_string(),
+            service: name.to_string(),
+            image: image.map(str::to_string),
+            expose: expose.iter().map(|p| (*p, false)).collect(),
+            ..Default::default()
+        };
+        let cache = svc("cache", Some(image), &[]);
+        // The service that declares nothing takes its image's EXPOSE.
+        assert_eq!(relay_ports(&cache), vec![(6379, false)]);
+        // A service that declares ports keeps exactly those: the relay cap is per stack, and the
+        // file has already said what this one listens on.
+        assert_eq!(
+            relay_ports(&svc("cache", Some(image), &[9000])),
+            vec![(9000, false)]
+        );
+        // A service on the same image that runs ITS OWN command (a worker, a `psql` client) is not
+        // the image's process and takes none of its ports: it collided with the server's relay.
+        let mut worker = svc("worker", Some(image), &[]);
+        worker.command = vec!["sh".into(), "/w/worker.sh".into()];
+        assert!(
+            relay_ports(&worker).is_empty(),
+            "a replaced command is not the image's server"
+        );
+        let mut wrapped = svc("wrapped", Some(image), &[]);
+        wrapped.entrypoint = Some(vec!["redis-cli".into()]);
+        assert!(
+            relay_ports(&wrapped).is_empty(),
+            "nor is a replaced entrypoint"
+        );
+        // An image kern cannot read contributes nothing, as before.
+        assert!(relay_ports(&svc("x", Some("kern-test.invalid/unknown:1"), &[])).is_empty());
+        assert!(relay_ports(&svc("x", None, &[])).is_empty());
+        // And the note no longer names a service its peers CAN reach.
+        let api = svc("api", None, &[8000]);
+        let stack = [api, cache];
+        let note = no_pod_undeclared_ports_note(&stack, true);
+        crate::unset_global_env("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            note.is_none(),
+            "cache is reachable on its image's 6379, so nothing is mute: {note:?}"
         );
     }
 
@@ -8493,4 +8664,114 @@ fn the_host_shm_mount_is_refused_and_a_single_object_or_another_path_is_not() {
             assert!(host_ipc_source_refusal("x", &via_link).is_some());
         }
     }
+}
+
+/// Which binds get docker's ownership: the caller's host paths, only as real root, never a named
+/// volume (kern's own storage, written under kern's map since it was made).
+#[test]
+fn idmapped_binds_are_the_callers_host_paths_and_only_as_real_root() {
+    let _g = crate::env_guard();
+    let named = crate::volume::volumes_dir().join("cache").join("data");
+    let vols = vec![
+        kern_isolation::Volume {
+            source: "/srv/config".into(),
+            target: "/config".into(),
+            read_only: false,
+        },
+        kern_isolation::Volume {
+            source: named.to_string_lossy().into_owned(),
+            target: "/cache".into(),
+            read_only: false,
+        },
+        kern_isolation::Volume {
+            source: "/srv/media".into(),
+            target: "/media".into(),
+            read_only: true,
+        },
+    ];
+    assert_eq!(
+        super::idmap_bind_candidates(&vols, true),
+        vec![
+            ("/srv/config".to_string(), "/config".to_string()),
+            ("/srv/media".to_string(), "/media".to_string()),
+        ]
+    );
+    assert!(super::idmap_bind_candidates(&vols, false).is_empty());
+}
+
+/// ⛔ THE HOME A WIDENED PROJECT ROOT MUST NOT HOLD IS NOT TAKEN FROM `$HOME` ALONE. With it unset there
+/// was nothing to compare and a dotfiles repository was adopted; under `sudo` (`HOME=/root`) the
+/// user's own home was not protected. FOUND BY AUDIT. The password database's home for this uid is
+/// in the list whatever `$HOME` says, and with no home known nothing is adopted.
+#[test]
+fn the_protected_homes_come_from_the_password_database_and_none_known_adopts_nothing() {
+    let _g = crate::env_guard();
+    let me =
+        super::passwd_home(unsafe { libc::getuid() }).and_then(|h| std::fs::canonicalize(h).ok());
+    let file = std::env::temp_dir();
+    let saved = crate::global_env_str("HOME").ok();
+    crate::unset_global_env("HOME");
+    let unset = super::homes_to_protect(&file);
+    crate::set_global_env("HOME", "/root");
+    let as_root = super::homes_to_protect(&file);
+    match saved {
+        Some(h) => crate::set_global_env("HOME", &h),
+        None => crate::unset_global_env("HOME"),
+    }
+    if let Some(me) = me {
+        assert!(
+            unset.contains(&me),
+            "HOME unset lost the real home: {unset:?}"
+        );
+        assert!(
+            as_root.contains(&me),
+            "HOME=/root lost the real home: {as_root:?}"
+        );
+    }
+    let repo = std::env::temp_dir().join(format!("kern-ut-gitroot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(repo.join(".git")).expect("dir");
+    std::fs::create_dir_all(repo.join("sub")).expect("dir");
+    let base = std::fs::canonicalize(repo.join("sub")).expect("canonical");
+    let elsewhere = vec![std::path::PathBuf::from("/nonexistent-home")];
+    let adopted = super::git_project_root(&base, &elsewhere);
+    let none_known = super::git_project_root(&base, &[]);
+    let holds_home = super::git_project_root(&base, &[base.join("me")]);
+    let _ = std::fs::remove_dir_all(&repo);
+    assert!(
+        adopted.is_some(),
+        "a repository away from every home was not adopted"
+    );
+    assert!(
+        none_known.is_none(),
+        "with no home known a repository was adopted"
+    );
+    assert!(
+        holds_home.is_none(),
+        "a repository holding a home was adopted"
+    );
+}
+
+/// The default route's gateway, read the way the kernel writes `/proc/net/route`: host-order hex of
+/// network-order bytes, the default route being destination 0 with the gateway flag. A table with no
+/// default route has no gateway. (Rows from this host and from a WSL2 guest.)
+#[test]
+fn the_default_gateway_is_read_from_the_route_table() {
+    let here =
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                wlp4s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                wlp4s0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n";
+    assert_eq!(
+        super::default_gateway_v4(here).as_deref(),
+        Some("192.168.1.1")
+    );
+    let wsl = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+               eth0\t00000000\t01A019AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
+    assert_eq!(
+        super::default_gateway_v4(wsl).as_deref(),
+        Some("172.25.160.1")
+    );
+    let none = "Iface\tDestination\tGateway\tFlags\n\
+                lo\t0000007F\t00000000\t0001\n";
+    assert_eq!(super::default_gateway_v4(none), None);
 }

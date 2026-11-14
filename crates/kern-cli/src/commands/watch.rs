@@ -544,6 +544,7 @@ mod tests {
                 dockerfile: None,
                 args: vec!["A=1".into()],
                 target: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -582,6 +583,7 @@ mod tests {
                 dockerfile: Some("Dockerfile.dev".into()),
                 args: Vec::new(),
                 target: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
