@@ -65,6 +65,10 @@ read-only once instead of remounting each file. On WSL2 the search of the Window
 is mounted over 9p, is remembered and re-checked instead of walked for every box. A box without a GPU
 is unchanged.
 
+**Two GPU examples.** `examples/compose/gpu-per-service.sh` runs a `docker-compose.yml` with one card
+per service behind nginx, and `examples/agents/gpu-sandbox.py` gives each sandbox its own card from the
+SDK. Both say what a grant does not give: a VRAM limit, or a boundary against the code on the card.
+
 **A compose stack is no longer left broken and called fine.** A service with a relative bind
 (`./app:/app`) is up to date on the next `up` instead of recreated every time; a pod whose holder died
 is named on `kern ps` and recreated by `up`/`start` instead of reported "already up to date"; a
