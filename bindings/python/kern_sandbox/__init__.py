@@ -8888,8 +8888,8 @@ _PATH_REFUSALS = {
         "two outright, because the descent there holds the parent descriptor and can look)"
     ),
     errno.ENXIO: (
-        "it is a FIFO with no reader. Opening one for writing would block until the box chose to read, "
-        "so the open is non-blocking and fails instead"
+        "not a regular file: it is a FIFO with no reader. Opening one for writing would block until "
+        "the box chose to read, so the open is non-blocking and fails instead"
     ),
 }
 

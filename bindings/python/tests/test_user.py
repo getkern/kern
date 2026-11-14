@@ -791,6 +791,8 @@ def test_a_snapshot_of_what_the_host_cannot_read_is_taken_through_the_helper(tmp
     box user's failure: measured 9 times out of 9 (a 0700 directory, a 0600 file, and both), each
     one reported as "the box user could not read ... exit -9" about a stream it had read in full.
     Node did it correctly, so this was also a Python/Node split on a documented API."""
+    if os.getuid() == 0:
+        pytest.skip("root reads what the box user closes, so the helper is never needed here")
     ws = tmp_path / "ws"
     ws.mkdir()
     arc = tmp_path / "ckpt.tar"
@@ -836,6 +838,8 @@ def test_an_image_that_declares_a_user_works_without_user_and_runs_as_it(tmp_pat
 
 
 def test_what_the_box_user_closes_to_the_host_is_still_read_listed_counted_snapshotted_and_removed(tmp_path, user_box):
+    if os.getuid() == 0:
+        pytest.skip("root reads what the box user closes, so the helper is never needed here")
     with Sandbox(image="python:3.12-alpine", user="nobody", pyc_cache=False, workspace_max_bytes=64 << 20) as s:
         r = s.run_code(
             "import os, tempfile\n"
@@ -1513,6 +1517,12 @@ def test_one_archive_restores_to_the_same_tree_in_both_bindings(tmp_path, user_b
     if not node or not js_path.exists():
         pytest.skip("needs node and the Node binding's source beside this one")
     mt = 1_600_000_000
+    # A directory's mode is NOT taken from the archive (see `_restore_host`): a restored directory
+    # is made with this process's umask, like any other `mkdir`. The expected mode is therefore the
+    # umask's, read here, and not a literal 775 that holds only for a umask of 002 (as root, 022).
+    um = os.umask(0o022)
+    os.umask(um)
+    dmode = f"{0o777 & ~um:o}"
 
     def make_tree(ws: pathlib.Path) -> None:
         (ws / "emptydir").mkdir()
@@ -1616,14 +1626,14 @@ def test_one_archive_restores_to_the_same_tree_in_both_bindings(tmp_path, user_b
     # The expected tree, spelled out: the facts this test is about, not just "the four agree".
     want = sorted(
         [
-            f"emptydir d 775 {mt}",
-            f"d d 775 {mt}",
+            f"emptydir d {dmode} {mt}",
+            f"d d {dmode} {mt}",
             f"d/a.txt f 600 {mt}",
             f"plain.txt f 600 {mt}",
             f"script.sh f 700 {mt}",
-            f"{'a' * 60} d 775 {mt}",
-            f"{'a' * 60}/{'b' * 60} d 775 {mt}",
-            f"{'a' * 60}/{'b' * 60}/{'c' * 60} d 775 {mt}",
+            f"{'a' * 60} d {dmode} {mt}",
+            f"{'a' * 60}/{'b' * 60} d {dmode} {mt}",
+            f"{'a' * 60}/{'b' * 60}/{'c' * 60} d {dmode} {mt}",
             f"{'a' * 60}/{'b' * 60}/{'c' * 60}/deep.txt f 600 {mt}",
         ]
     )

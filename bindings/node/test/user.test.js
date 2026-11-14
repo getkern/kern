@@ -958,6 +958,7 @@ test("an image that declares a user works without user and runs as it", integrat
 
 test("what the box user closes to the host is still read, listed, counted, snapshotted and removed", integration, async (tc) => {
   if (whyNoUserBox()) return tc.skip(whyNoUserBox());
+  if (process.getuid() === 0) return tc.skip("root reads what the box user closes, so the helper is never needed here");
   const prevSnap = process.env.KERN_SANDBOX_SNAPSHOT;
   process.env.KERN_SANDBOX_SNAPSHOT = "1";
   const t = tmpdir("closed");
@@ -1070,6 +1071,7 @@ test("the helper refuses what the host refuses", integration, async (tc) => {
 
 test("a restore into a directory the box user closed goes through the helper, empty directories included", integration, async (tc) => {
   if (whyNoUserBox()) return tc.skip(whyNoUserBox());
+  if (process.getuid() === 0) return tc.skip("root reads what the box user closes, so the helper is never needed here");
   const prev = process.env.KERN_SANDBOX_SNAPSHOT;
   process.env.KERN_SANDBOX_SNAPSHOT = "1";
   const t = tmpdir("hrestore");

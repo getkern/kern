@@ -831,7 +831,15 @@ echo RECYCLED
     // manager does not run cannot reach: MEASURED in a WSL2 guest as root, the run got to `RECYCLED`
     // and `exec` then answered "Failed to connect to bus" before any pid check. `kern exec` itself
     // works there (checked outside the scaffolding), so this is the harness's environment, said.
-    if text.contains("Failed to connect to bus") && !text.contains("ENTERED") {
+    //
+    // THE SAME WALL, ONE STEP FURTHER, AS A NON-ROOT USER WITH A RUNNING USER MANAGER. Inside
+    // `unshare -Ur` kern sees uid 0 and asks the SYSTEM manager for a transient scope, and polkit
+    // refuses the real uid behind the mapping: MEASURED in WSL2 as `kdev` with `user@1001` active,
+    // "Failed to start transient scope unit: Interactive authentication required." after `RECYCLED`,
+    // before any pid check. Outside the scaffolding `kern exec` as that user works.
+    let no_manager = text.contains("Failed to connect to bus")
+        || text.contains("Interactive authentication required");
+    if no_manager && !text.contains("ENTERED") {
         eprintln!(
             "skip: no systemd bus reachable from the nested user namespace: {}",
             text.trim()
@@ -7028,6 +7036,146 @@ fn a_base_without_true_still_builds_layered() {
         "a layered image must be inspectable: {}",
         String::from_utf8_lossy(&inspected.stderr)
     );
+}
+
+/// An image that entered the cache WITHOUT a pull (loaded, built, tagged) runs by its name, as root
+/// too.
+///
+/// MEASURED as root before the fix: only a pull wrote the entry's owner mark, so every loaded or
+/// built image read as "unpacked by an older kern whose file owners do not match the uid map a box
+/// gets when kern runs as root", was sent to the registry to be repaired, and failed there with
+/// "cannot access 'library/<tag>' on registry-1.docker.io": a local image does not exist anywhere
+/// else. As a non-root caller the mark is not consulted, so this passes there by construction and
+/// measures the root path where it runs as root.
+#[test]
+fn a_loaded_built_or_tagged_image_runs_by_its_name_as_root_too() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("kern-it-ownmark-{}", std::process::id()));
+    let cache = base.join("cache");
+    let data = base.join("data");
+    fs::create_dir_all(&cache).unwrap();
+    let archive = tiny_image_archive(&base, "ownbase:1", Some(&busybox));
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_DATA_HOME", &data)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let loaded = run(&["load", "-i", archive.to_str().unwrap()]);
+    assert!(
+        loaded.status.success(),
+        "load: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    let ctx = base.join("ctx");
+    fs::create_dir_all(&ctx).unwrap();
+    fs::write(
+        ctx.join("Dockerfile"),
+        "FROM ownbase:1\nRUN [\"/bin/busybox\", \"touch\", \"/ran\"]\n",
+    )
+    .unwrap();
+    let built = run(&["build", "-t", "ownbuilt:1", ctx.to_str().unwrap()]);
+    let berr = String::from_utf8_lossy(&built.stderr).to_string();
+    if !built.status.success() && berr.contains("user namespaces") {
+        let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+        let _ = fs::remove_dir_all(&base);
+        eprintln!("skip: no box can start here, so a RUN cannot build: {berr}");
+        return;
+    }
+    assert!(built.status.success(), "build: {berr}");
+    // A FLAT build too: a layered image is resolved through its layer list and never asks the
+    // owner question, so without this case the flat writer's mark had no test (measured: removing
+    // it left the three cases above green).
+    let flat = kern()
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_DATA_HOME", &data)
+        .env("KERN_BUILD_FLAT", "1")
+        .args(["build", "-t", "ownflat:1", ctx.to_str().unwrap_or_default()])
+        .output()
+        .expect("run kern");
+    assert!(
+        flat.status.success(),
+        "flat build: {}",
+        String::from_utf8_lossy(&flat.stderr)
+    );
+    // A COMMIT of a running box, the fifth way an image enters the cache without a pull.
+    let up = run(&[
+        "box",
+        "own-src",
+        "-d",
+        "--image",
+        "ownbase:1",
+        "--pull",
+        "never",
+        "--",
+        "/bin/busybox",
+        "sleep",
+        "30",
+    ]);
+    assert!(
+        up.status.success(),
+        "box to commit: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    let committed = run(&["commit", "own-src", "owncommit:1"]);
+    let _ = run(&["stop", "own-src"]);
+    assert!(
+        committed.status.success(),
+        "commit: {}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    // The TAG of the flat one: a tag shares its source's files, so it must carry the source's mark.
+    let tagged = run(&["tag", "ownflat:1", "owntagged:1"]);
+    assert!(
+        tagged.status.success(),
+        "tag: {}",
+        String::from_utf8_lossy(&tagged.stderr)
+    );
+    let mut seen = Vec::new();
+    for (name, img, probe) in [
+        ("own-l", "ownbase:1", "/bin/busybox"),
+        ("own-b", "ownbuilt:1", "/ran"),
+        ("own-t", "owntagged:1", "/ran"),
+        ("own-f", "ownflat:1", "/ran"),
+        ("own-c", "owncommit:1", "/bin/busybox"),
+    ] {
+        let out = run(&[
+            "box",
+            name,
+            "--image",
+            img,
+            "--pull",
+            "never",
+            "--",
+            "/bin/busybox",
+            "test",
+            "-e",
+            probe,
+        ]);
+        seen.push((
+            img,
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ));
+    }
+    let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
+    let _ = fs::remove_dir_all(&base);
+    for (img, code, err) in &seen {
+        assert!(
+            !err.contains("re-fetching") && !err.contains("registry"),
+            "{img} was sent to a registry: {err}"
+        );
+        assert_eq!(*code, Some(0), "{img} did not run: {err}");
+    }
 }
 
 #[test]
@@ -18141,4 +18289,158 @@ fn a_run_bind_mount_from_a_stage_and_from_an_image() {
         said.contains("ID=tiny"),
         "the image's file was not mounted: {said}"
     );
+}
+
+/// ONE HISTORY LINE PER BOX, AND IT SAYS WHAT ENDED IT.
+///
+/// MEASURED before the fix, on a resident sandbox ended by `kern stop`: two lines for one run,
+/// `exit-143` from the detached box's supervisor (which outlives the first signal) and `stopped` from
+/// the stop, and a detached box's line carried `-` for its image and whole seconds for its run time.
+/// Three boxes, each read back through `kern sandbox history --all --json`:
+///
+/// * a detached box that exits 3 after 0.3 s: one line, `exit-3`, a run time in milliseconds that is
+///   neither 0 nor a whole second;
+/// * a detached box ended by `kern stop`: one line, `stopped`;
+/// * a FOREGROUND box ended by `kern stop` from another process (the SDK deadline's shape): one line,
+///   `stopped`.
+#[test]
+fn a_finished_box_leaves_one_history_line_that_names_what_ended_it() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    let root = build_rootfs(&busybox, "hist-one");
+    let rootfs = root.to_str().unwrap_or_default().to_string();
+    let base = std::env::temp_dir().join(format!("kern-it-hist-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for d in ["run", "config", "data"] {
+        let _ = fs::create_dir_all(base.join(d));
+    }
+    let env = |c: &mut Command| {
+        c.env("XDG_RUNTIME_DIR", base.join("run"))
+            .env("XDG_CONFIG_HOME", base.join("config"))
+            .env("XDG_DATA_HOME", base.join("data"))
+            .env_remove("KERN_CONFIG");
+    };
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut c = kern();
+        env(&mut c);
+        c.args(args).output().expect("run kern")
+    };
+    let lines_of = |name: &str| -> Vec<String> {
+        let out = run(&["sandbox", "history", "--all", "--json", "-n", "1000"]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(&format!("\"name\":\"{name}\"")))
+            .map(str::to_string)
+            .collect()
+    };
+    let wait_for = |pred: &dyn Fn() -> bool| {
+        for _ in 0..100 {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    };
+    let running = |name: &str| {
+        String::from_utf8_lossy(&run(&["ps", "-q"]).stdout)
+            .lines()
+            .any(|l| l.trim() == name)
+    };
+
+    // 1. A detached box that ends by itself.
+    let out = run(&[
+        "box",
+        "hist-self",
+        "--rootfs",
+        &rootfs,
+        "-d",
+        "--",
+        "/bin/busybox",
+        "sh",
+        "-c",
+        "/bin/busybox sleep 0.3; exit 3",
+    ]);
+    if String::from_utf8_lossy(&out.stderr).contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&base);
+        return;
+    }
+    assert!(
+        wait_for(&|| !lines_of("hist-self").is_empty()),
+        "the detached box left no line: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let l = lines_of("hist-self");
+    assert_eq!(l.len(), 1, "{l:?}");
+    assert!(l[0].contains("\"outcome\":\"exit-3\""), "{l:?}");
+    let ran: u64 = l[0]
+        .split("\"ran_ms\":")
+        .nth(1)
+        .and_then(|r| r.split(',').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        (250..5000).contains(&ran) && ran % 1000 != 0,
+        "a 0.3 s box ran {ran} ms by its line: {l:?}"
+    );
+
+    // 2. A detached box ended by `kern stop`.
+    let _ = run(&[
+        "box",
+        "hist-stopd",
+        "--rootfs",
+        &rootfs,
+        "-d",
+        "--",
+        "/bin/busybox",
+        "sleep",
+        "30",
+    ]);
+    assert!(wait_for(&|| running("hist-stopd")), "hist-stopd never ran");
+    let _ = run(&["stop", "hist-stopd"]);
+    assert!(
+        wait_for(&|| !lines_of("hist-stopd").is_empty()),
+        "no line for hist-stopd"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let l = lines_of("hist-stopd");
+    assert_eq!(l.len(), 1, "one line per stopped box: {l:?}");
+    assert!(l[0].contains("\"outcome\":\"stopped\""), "{l:?}");
+
+    // 3. A foreground box ended by `kern stop` from another process.
+    let mut fg = kern();
+    env(&mut fg);
+    let mut child = fg
+        .args([
+            "box",
+            "hist-stopf",
+            "--rootfs",
+            &rootfs,
+            "--",
+            "/bin/busybox",
+            "sleep",
+            "30",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the foreground box");
+    assert!(wait_for(&|| running("hist-stopf")), "hist-stopf never ran");
+    let _ = run(&["stop", "hist-stopf"]);
+    let _ = child.wait();
+    assert!(
+        wait_for(&|| !lines_of("hist-stopf").is_empty()),
+        "no line for hist-stopf"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let l = lines_of("hist-stopf");
+    assert_eq!(l.len(), 1, "one line per stopped box: {l:?}");
+    assert!(l[0].contains("\"outcome\":\"stopped\""), "{l:?}");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&base);
 }

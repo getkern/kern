@@ -591,6 +591,27 @@ pub fn ended_and_ran(e: &Entry) -> (String, String) {
     (hms(e.ended_ms), dur(e.ran_ms))
 }
 
+/// How long ago a process started, in milliseconds, from its kernel start time in clock ticks since
+/// boot (`/proc/<pid>/stat` field 22) and `/proc/uptime`: to the tick (10 ms at the usual 100 Hz),
+/// where the recorded start second would round a 300 ms box to 0 or 1000. `None` for a zero start
+/// time (never recorded) or an unreadable clock.
+pub fn ran_ms_since_ticks(ticks: u64) -> Option<u64> {
+    if ticks == 0 {
+        return None;
+    }
+    // SAFETY: `sysconf` has no preconditions.
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+        .ok()
+        .filter(|h| *h > 0)?;
+    let up = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = up.split_whitespace().next()?.parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    let now_ms = (secs * 1000.0) as u64;
+    now_ms.checked_sub(ticks.checked_mul(1000)? / hz)
+}
+
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1182,6 +1203,20 @@ mod tests {
         );
         assert!(std::fs::metadata(b.join(CURRENT)).unwrap().len() <= MAX_BYTES);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A start time in ticks becomes a run time to the tick: this process started moments ago, so
+    /// its own start reads as a few seconds at most, and a zero start (never recorded) as nothing.
+    #[test]
+    fn a_start_in_clock_ticks_gives_the_run_time_to_the_tick() {
+        let me = i32::try_from(std::process::id()).unwrap_or(0);
+        let ticks = crate::registry::proc_starttime(me);
+        let ran = ran_ms_since_ticks(ticks);
+        assert!(
+            ran.is_some_and(|ms| ms < 600_000),
+            "this test process started {ran:?} ms ago"
+        );
+        assert_eq!(ran_ms_since_ticks(0), None);
     }
 
     /// An empty or relative XDG variable is unset, as the spec says and as both SDKs read it: the

@@ -2953,6 +2953,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             args.restart_max,
             args.def_hash,
             log_cap,
+            args.image.unwrap_or(""),
+            args.gpus.unwrap_or(""),
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -3024,6 +3026,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             seccomp_mode: spec.seccomp_mode,
             no_new_privs: spec.effective_no_new_privs(),
             keep_groups: spec.keep_groups,
+            image: args.image.unwrap_or("").to_string(),
+            gpus: args.gpus.unwrap_or("").to_string(),
+            timeout_s: args.timeout,
             apparmor: spec.apparmor.clone().unwrap_or_default(),
             cap_recorded: true,
             aa_recorded: true,
@@ -3230,13 +3235,19 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             image: args.image.unwrap_or("-").to_string(),
             ran_ms,
             code: *code,
-            outcome: crate::history::classify(
-                *code,
-                kern_isolation::box_workload_signal(),
-                kern_isolation::box_was_oom_killed(),
-                args.timeout,
-                ran_ms,
-            ),
+            // A `kern stop` that ended this box left a marker: the line says `stopped`, and it is
+            // the only line (see `registry::mark_stopping`).
+            outcome: if registry::take_stopping(name.as_str(), launcher_pid) {
+                crate::history::Outcome::Stopped
+            } else {
+                crate::history::classify(
+                    *code,
+                    kern_isolation::box_workload_signal(),
+                    kern_isolation::box_was_oom_killed(),
+                    args.timeout,
+                    ran_ms,
+                )
+            },
             gpu: args.gpus.unwrap_or("-").to_string(),
         });
     }
@@ -4779,6 +4790,12 @@ fn supervise_box(
     let mut gate_dropped = false;
     // The previous attempt's exit, `None` before the first. Only its equality with 125 is read.
     let mut last_code: Option<i32> = None;
+    // The last attempt's verdict (signal, OOM) from the runner, and how long it ran: what the box's
+    // line in the sandbox history is written from once no restart is left.
+    // Declared unassigned: every attempt assigns both before the loop can end, and the compiler
+    // holds that.
+    let mut last_verdict: (u8, bool);
+    let mut last_ran_ms: u64;
     let final_code = loop {
         let ready = if attempt == 0 {
             have_pipe.then_some(wr)
@@ -4793,6 +4810,14 @@ fn supervise_box(
         }
         // Wall-clock this attempt so a box that stayed up counts as recovered (see the reset below).
         let started = std::time::Instant::now();
+        // THE RUNNER'S VERDICT, CARRIED BACK. The signal that ended the workload and whether its own
+        // cgroup OOM-killed it are latched in the RUNNER (it reaps the box), and the exit status that
+        // reaches this supervisor carries neither: an OOM read `exit-137`, the same as a `kill -9`.
+        // Two bytes over a pipe, written just before the runner exits; a runner killed before it
+        // writes leaves the pipe empty and the code alone speaks, as before. CLOEXEC, so the box's
+        // own exec never inherits either end.
+        let mut latch = [-1i32; 2];
+        let have_latch = unsafe { libc::pipe2(latch.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
         let runner = unsafe { libc::fork() };
         if runner == 0 {
             // Filled by the callback below, which runs in THIS process: the supervisor never sees
@@ -4953,7 +4978,19 @@ fn supervise_box(
                     }
                 }
             }
+            if have_latch {
+                let verdict = [
+                    kern_isolation::box_workload_signal(),
+                    u8::from(kern_isolation::box_was_oom_killed()),
+                ];
+                // SAFETY: `latch[1]` is this process's own pipe end and `verdict` lives on this frame.
+                let _ = unsafe { libc::write(latch[1], verdict.as_ptr().cast(), verdict.len()) };
+            }
             unsafe { libc::_exit(code) };
+        }
+        if have_latch {
+            // SAFETY: the supervisor's copy of the write end; the runner holds its own.
+            unsafe { libc::close(latch[1]) };
         }
         // Supervisor: drop our readiness-pipe copy so the launcher sees EOF when the box exec()s.
         if attempt == 0 && have_pipe {
@@ -4995,6 +5032,18 @@ fn supervise_box(
         } else {
             1 // fork or waitpid failed - treat as a failure, don't spin
         };
+        // The runner has exited, so its end is closed and this read cannot block on it.
+        last_verdict = (0, false);
+        if have_latch {
+            let mut v = [0u8; 2];
+            // SAFETY: `latch[0]` is this process's read end, `v` lives on this frame.
+            let n = unsafe { libc::read(latch[0], v.as_mut_ptr().cast(), v.len()) };
+            if n == 2 {
+                last_verdict = (v[0], v[1] != 0);
+            }
+            unsafe { libc::close(latch[0]) };
+        }
+        last_ran_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // A box that stayed up past the stabilisation window counts as RECOVERED: clear the backoff
         // counter so a later, unrelated exit restarts promptly (1 s) instead of inheriting the escalated
         // 30 s from a crash loop that has long since healed - and, for `on-failure`, so the retry budget
@@ -5103,18 +5152,35 @@ fn supervise_box(
             &inst.command,
         );
     }
-    // A DETACHED BOX'S LINE IN THE HISTORY. Only the exit code reaches this supervisor, so the outcome
-    // is the code and nothing guessed from it (a `137` stays `exit-137`).
+    // A DETACHED BOX'S LINE IN THE HISTORY, from the last attempt: its run time measured here to the
+    // millisecond, its signal and OOM verdict from the runner (see `latch`), its image, GPUs and
+    // timeout from the record. A `kern stop` that ended it left a marker, and then the line says
+    // `stopped` and is the only one.
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "-".to_string()
+        } else {
+            s.to_string()
+        }
+    };
     crate::history::record(&crate::history::Entry {
         ended_ms: crate::history::now_ms(),
         name: inst.name.clone(),
-        image: "-".to_string(),
-        ran_ms: crate::registry::now_unix()
-            .saturating_sub(inst.started)
-            .saturating_mul(1000),
+        image: dash(&inst.image),
+        ran_ms: last_ran_ms,
         code: final_code,
-        outcome: crate::history::classify(final_code, 0, false, 0, 0),
-        gpu: "-".to_string(),
+        outcome: if registry::take_stopping(&inst.name, inst.pid) {
+            crate::history::Outcome::Stopped
+        } else {
+            crate::history::classify(
+                final_code,
+                last_verdict.0,
+                last_verdict.1,
+                inst.timeout_s,
+                last_ran_ms,
+            )
+        },
+        gpu: dash(&inst.gpus),
     });
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
@@ -5163,6 +5229,10 @@ fn run_detached(
     def_hash: &str,
     // `--log-max-size` / `--log-max-file`, resolved by the caller so both detach paths share one.
     log_cap: crate::commands::boxlog::LogCap,
+    // `--image` and `--gpus`, empty when absent: recorded in the registry so the box's line in the
+    // sandbox history names them, whoever writes it.
+    image: &str,
+    gpus: &str,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -5286,6 +5356,9 @@ fn run_detached(
         seccomp_mode: spec.seccomp_mode,
         no_new_privs: spec.effective_no_new_privs(),
         keep_groups: spec.keep_groups,
+        image: image.to_string(),
+        gpus: gpus.to_string(),
+        timeout_s: timeout,
         apparmor: spec.apparmor.clone().unwrap_or_default(),
         cap_recorded: true,
         aa_recorded: true,

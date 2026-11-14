@@ -879,6 +879,8 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
         // Place the assembled rootfs as the image's cache dir + write the sentinel and config sidecar,
         // the exact on-disk shape of a flat pulled image (so `box --image <tag>` / `images` see it).
         std::fs::rename(&img.rootfs, &dest).map_err(|e| Error::Oci(format!("load rootfs: {e}")))?;
+        // THE OWNER MARK BEFORE THE SENTINEL, as a pull writes it: see `imagecache::record_owner_map`.
+        super::imagecache::record_owner_map(&cache, &safe);
         std::fs::write(cache.join(format!("{safe}.ok")), primary.as_bytes())
             .map_err(|e| Error::Oci(format!("load sentinel: {e}")))?;
         write_image_config(&cache.join(format!("{safe}.image")), &img.config)
@@ -967,6 +969,17 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
         return Err(Error::Oci(format!(
             "image '{src}' is cached but has no rootfs form - try re-pulling"
         )));
+    }
+    // A TAG SHARES THE SOURCE'S FILES, so it carries the source's owner mark rather than this
+    // process's: the files were written under whatever map extracted them. A source without one
+    // gives a tag without one, which reads exactly as the source does.
+    match std::fs::read(cache.join(format!("{src_safe}.owners"))) {
+        Ok(mark) => {
+            let _ = std::fs::write(cache.join(format!("{dst_safe}.owners")), mark);
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(cache.join(format!("{dst_safe}.owners")));
+        }
     }
     // Write the `.ok` marker LAST (so an interrupted tag leaves no half-image that `images`/`push` sees),
     // storing the human `dst` ref as its content (what `kern images` displays).
@@ -1059,6 +1072,7 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     };
     write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg)
         .map_err(|e| Error::Oci(format!("commit image config: {e}")))?;
+    super::imagecache::record_owner_map(&cache, &dst_safe);
     std::fs::write(cache.join(format!("{dst_safe}.ok")), image.as_bytes())
         .map_err(|e| Error::Oci(format!("commit marker: {e}")))?;
     println!("committed box '{box_ref}' → image '{image}'  (run: kern box <name> --image {image})");

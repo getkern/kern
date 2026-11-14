@@ -2334,6 +2334,11 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
     // have already been signalled and, for the ones that exit, returns at once.
     // When the signal went out. Each box's own grace is measured from here, so a member that asked
     // for less is not held to the longest grace in the stack - see `remaining_grace_ms`.
+    // THE STOP MARKER GOES DOWN BEFORE THE FIRST SIGNAL, so an owner that sees its box die already
+    // knows a stop ended it and writes ONE history line saying so. See `registry::mark_stopping`.
+    for b in &targets {
+        registry::mark_stopping(&b.name, b.pid);
+    }
     let signalled_at = std::time::Instant::now();
     // Hold every target's reaper BEFORE a single signal goes out, so each box's exit status is still
     // readable when its wait returns. Kept alive to the end of the teardown loop and released by
@@ -3152,16 +3157,41 @@ mod driver_row_tests {
 
 /// A box ended by `kern stop` / `kern kill`, in the history: the SDKs' own deadline arrives this way,
 /// so this is the line that says a call was stopped rather than that it died. See `history.rs`.
+/// The stopped box's line in the sandbox history, written HERE only when its owner cannot write it.
+///
+/// The owner (the foreground launcher, or a detached box's supervisor) writes the line itself and,
+/// finding the `stopping` marker this command left, writes `stopped`. This writes it only when the
+/// owner is gone and the marker is still there: an orphaned box, or a supervisor the stop's SIGKILL
+/// took before it could write. The owner gets up to half a second to finish, which is longer than a
+/// supervisor or launcher takes between its box's death and its own.
 fn record_stopped(b: &registry::Instance, code: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while registry::owner_alive(b.pid, b.starttime) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if registry::owner_alive(b.pid, b.starttime) || !registry::take_stopping(&b.name, b.pid) {
+        return;
+    }
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "-".to_string()
+        } else {
+            s.to_string()
+        }
+    };
     crate::history::record(&crate::history::Entry {
         ended_ms: crate::history::now_ms(),
         name: b.name.clone(),
-        image: "-".to_string(),
-        ran_ms: registry::now_unix()
-            .saturating_sub(b.started)
-            .saturating_mul(1000),
+        image: dash(&b.image),
+        // From the kernel's start time of the box's init, to the tick, where the record has it;
+        // else from the recorded start second.
+        ran_ms: crate::history::ran_ms_since_ticks(b.pid1_starttime).unwrap_or_else(|| {
+            registry::now_unix()
+                .saturating_sub(b.started)
+                .saturating_mul(1000)
+        }),
         code,
         outcome: crate::history::Outcome::Stopped,
-        gpu: "-".to_string(),
+        gpu: dash(&b.gpus),
     });
 }

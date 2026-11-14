@@ -3339,7 +3339,7 @@ fn history_choice_line(p: &Palette, held: usize) -> String {
         .map(|f| format!(" in {}", f.display()))
         .unwrap_or_default();
     format!(
-        "{}   {d}{what} · {held} sandboxes{file} ·{z} {c}m{z}{d} to change{z}",
+        "{}   {d}{what} · {held} finished sandboxes recorded{file} ·{z} {c}m{z}{d} to change{z}",
         marks.join("  ")
     )
 }
@@ -3962,7 +3962,7 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
         ),
     ));
     s.push_str(&row(
-        "History",
+        "Sandbox history",
         history_choice_line(p, crate::history::sandboxes_newest_first().len()),
     ));
     // Fleet budget: the SUM cap across all boxes on `kern.slice` (KERN_FLEET_MEMORY_MAX / _PIDS_MAX),
@@ -4836,7 +4836,7 @@ mod tests {
                     // The Overview says where the sandbox history is kept, and how to change it.
                     if tab == TAB_OVERVIEW && term_rows >= 40 {
                         assert!(
-                            frame.lines().any(|l| l.contains("History")
+                            frame.lines().any(|l| l.contains("Sandbox history")
                                 && l.contains("○")
                                 && l.contains("m to change")),
                             "{frame}"
@@ -4914,7 +4914,7 @@ mod tests {
         assert!(
             marked == 1
                 && open == 2
-                && hist.contains("300 sandboxes")
+                && hist.contains("300 finished sandboxes recorded")
                 && hist.contains("m to change"),
             "{out}"
         );

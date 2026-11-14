@@ -122,6 +122,15 @@ pub struct Instance {
     /// open only through a group: `kern exec` and the health probe keep them too. A record without the
     /// line predates it: `false`, the stricter side. See `kern_isolation::SandboxSpec::keep_groups`.
     pub keep_groups: bool,
+    /// The image the box runs (`--image`), empty for a `--rootfs` box (`image=`). Read by whoever
+    /// writes the box's line in the sandbox history without having started it: the detached box's
+    /// supervisor and `kern stop`. An older record lacks the key and reads as empty.
+    pub image: String,
+    /// The `--gpus` selection, empty for none (`gpus=`), for the same line.
+    pub gpus: String,
+    /// `--timeout` in seconds, 0 for none (`timeout=`): what tells kern's own watchdog SIGKILL from
+    /// any other in that line's outcome.
+    pub timeout_s: u64,
     /// `--apparmor <profile>` the box entered on exec (empty = none). Part of the exec POSTURE, like
     /// `seccomp_mode`/`cap_*`: `kern exec` re-enters the RECORDED profile rather than deducing it from
     /// `/proc/<pid1>/attr/apparmor/current`, which reads UNCONFINED for an `--init` box (PID 1 is the
@@ -432,7 +441,7 @@ fn exit_dir() -> io::Result<PathBuf> {
 /// `every_registry_child_is_classified` fails the build on a registry child in neither this nor
 /// [`BOX_DATA_DIRS`] - so a dir added here is protected by construction, closing the parallel-list drift
 /// that let `waitexit/` ship mountable.
-const AUTHORITATIVE_DIRS: [&str; 12] = [
+const AUTHORITATIVE_DIRS: [&str; 13] = [
     "instances",
     "claims",
     "exit",
@@ -457,6 +466,10 @@ const AUTHORITATIVE_DIRS: [&str; 12] = [
     // gone. kern reads it and reports it as fact, so a box able to write a line there invents a run, or
     // hides one: the same forgery as `waitexit`, which is why it sits beside it. See `history.rs`.
     "history",
+    // `stopping/` holds one empty marker per box a `kern stop` is ending, so that the box's history
+    // line is written ONCE, by its owner, as `stopped`. AUTHORITATIVE for `history`'s reason: a box
+    // able to place a marker there relabels how a peer's run ended.
+    "stopping",
     // `mounts/` is where a network volume (sshfs/nfs/smb) is staged before it is bound into a box,
     // and it is AUTHORITATIVE for two reasons rather than one: what is mounted there is a PEER's
     // remote filesystem, and the path itself is a location kern acts on during that peer's start, so
@@ -1377,11 +1390,44 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// `kern stop` is ending the box `name` owned by `pid`: leave the marker that tells the owner (the
+/// foreground launcher, or a detached box's supervisor) to write its history line as `stopped`.
+///
+/// ONE LINE PER STOPPED BOX, AND THIS IS WHAT MAKES IT ONE. Both the stop and the owner used to write
+/// one: MEASURED, a resident sandbox ended by `kern stop` left `exit-143` (the supervisor, which
+/// outlives the first signal) and `stopped` (the stop) for the same run. Best-effort: a marker that
+/// could not be written costs the word `stopped`, never the line.
+pub fn mark_stopping(name: &str, pid: i32) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(d) = runtime_subdir("stopping") {
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(d.join(format!("{name}-{pid}")));
+    }
+}
+
+/// Consume the [`mark_stopping`] marker: `true` for exactly one caller, whichever removes it first.
+pub fn take_stopping(name: &str, pid: i32) -> bool {
+    runtime_subdir("stopping")
+        .map(|d| fs::remove_file(d.join(format!("{name}-{pid}"))).is_ok())
+        .unwrap_or(false)
+}
+
+/// Whether the process `pid` started at `starttime` is still running, for a caller outside this
+/// module that must not mistake a recycled pid for it.
+pub fn owner_alive(pid: i32, starttime: u64) -> bool {
+    is_alive(pid, starttime)
+}
+
 /// Encode an entry to its `key=value` wire format (paired with [`parse`]). Extracted so the format is
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\ngpus={}\ntimeout={}\n",
         inst.name,
         inst.pid,
         inst.pid1_recorded,
@@ -1422,6 +1468,9 @@ fn encode(inst: &Instance) -> String {
         inst.pid1_starttime,
         u8::from(inst.no_new_privs),
         u8::from(inst.keep_groups),
+        one_line(&inst.image),
+        one_line(&inst.gpus),
+        inst.timeout_s,
     )
 }
 
@@ -2696,6 +2745,9 @@ fn parse(body: &str) -> Option<Instance> {
     let mut seccomp_recorded = false;
     let mut no_new_privs = true;
     let mut keep_groups = false;
+    let mut image = String::new();
+    let mut gpus = String::new();
+    let mut timeout_s = 0u64;
     let mut posture_corrupt = false;
     // Completeness: `encode` writes `capdropall`, `capdrops`, `capadds` together (one feature, one era),
     // so a record that has `capdropall` but is MISSING either list is TRUNCATED, and exec must refuse it
@@ -2788,6 +2840,9 @@ fn parse(body: &str) -> Option<Instance> {
             // before this field: it stays the default Denylist, which is what that box actually ran.
             "nnp" => no_new_privs = v != "0",
             "keepgroups" => keep_groups = v == "1",
+            "image" => image = v.to_string(),
+            "gpus" => gpus = v.to_string(),
+            "timeout" => timeout_s = v.parse().unwrap_or(0),
             "seccompmode" => {
                 seccomp_recorded = true;
                 match kern_isolation::SeccompFilter::parse(v) {
@@ -2851,6 +2906,9 @@ fn parse(body: &str) -> Option<Instance> {
         seccomp_mode,
         no_new_privs,
         keep_groups,
+        image,
+        gpus,
+        timeout_s,
         apparmor,
         cap_recorded,
         aa_recorded,
@@ -3375,6 +3433,34 @@ mod tests {
         }
     }
 
+    /// The image, GPUs and timeout a box was started with survive the record, for the writers of its
+    /// history line that did not start it; an older record without them reads as empty.
+    #[test]
+    fn image_gpus_and_timeout_survive_the_record_and_an_old_one_reads_empty() {
+        let base =
+            "name=b\npid=1\npid1=2\ncapdropall=1\ncapdrops=\ncapadds=\nseccompmode=denylist\n";
+        let old = parse(base);
+        assert!(
+            old.as_ref()
+                .is_some_and(|i| i.image.is_empty() && i.gpus.is_empty() && i.timeout_s == 0),
+            "an old record reads as no image, no GPU, no timeout"
+        );
+        let rec = format!("{base}image=python:3.12-slim\ngpus=device=0,1\ntimeout=30\n");
+        let Some(inst) = parse(&rec) else {
+            panic!("the record did not parse");
+        };
+        assert_eq!(
+            (inst.image.as_str(), inst.gpus.as_str(), inst.timeout_s),
+            ("python:3.12-slim", "device=0,1", 30)
+        );
+        let again = parse(&encode(&inst));
+        assert_eq!(
+            again.map(|i| (i.image, i.gpus, i.timeout_s)),
+            Some(("python:3.12-slim".to_string(), "device=0,1".to_string(), 30)),
+            "round trip"
+        );
+    }
+
     #[test]
     fn apparmor_survives_the_record_round_trip_and_reaches_exec_posture() {
         // The `--apparmor` profile is part of the exec POSTURE: it must survive encode->parse and come
@@ -3568,6 +3654,9 @@ mod tests {
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
             no_new_privs: true,
             keep_groups: false,
+            image: String::new(),
+            gpus: String::new(),
+            timeout_s: 0,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -3840,6 +3929,9 @@ mod tests {
             seccomp_mode: kern_isolation::SeccompFilter::Allowlist,
             no_new_privs: true,
             keep_groups: false,
+            image: String::new(),
+            gpus: String::new(),
+            timeout_s: 0,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -3885,6 +3977,9 @@ mod tests {
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
             no_new_privs: true,
             keep_groups: false,
+            image: String::new(),
+            gpus: String::new(),
+            timeout_s: 0,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -4201,6 +4296,9 @@ mod tests {
                 seccomp_mode: kern_isolation::SeccompFilter::Denylist,
                 no_new_privs: true,
                 keep_groups: false,
+                image: String::new(),
+                gpus: String::new(),
+                timeout_s: 0,
                 apparmor: String::new(),
                 cap_recorded: true,
                 aa_recorded: true,
@@ -4280,6 +4378,9 @@ mod tests {
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
             no_new_privs: true,
             keep_groups: false,
+            image: String::new(),
+            gpus: String::new(),
+            timeout_s: 0,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,
@@ -4362,6 +4463,9 @@ mod tests {
             seccomp_mode: kern_isolation::SeccompFilter::Denylist,
             no_new_privs: true,
             keep_groups: false,
+            image: String::new(),
+            gpus: String::new(),
+            timeout_s: 0,
             apparmor: String::new(),
             cap_recorded: true,
             aa_recorded: true,

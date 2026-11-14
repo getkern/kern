@@ -6804,8 +6804,9 @@ function pathRefusal(verb, rel, e, writing, full = null) {
     );
   if (e && e.code === "ENXIO")
     return new SandboxError(
-      `refusing to ${verb} ${JSON.stringify(rel)}: it is a FIFO with no reader. Opening one for writing ` +
-        "would block until the box chose to read, so the open is non-blocking and fails instead",
+      `refusing to ${verb} ${JSON.stringify(rel)}: not a regular file: it is a FIFO with no reader. ` +
+        "Opening one for writing would block until the box chose to read, so the open is non-blocking " +
+        "and fails instead",
       cause,
     );
   return new SandboxError(`cannot ${verb} ${JSON.stringify(rel)}: ${e && e.message ? e.message : e}`, cause);
