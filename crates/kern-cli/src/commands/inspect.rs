@@ -2399,7 +2399,7 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
         if b.orphaned {
             let reaped = registry::reap_orphan(b);
             registry::set_box_exit(b.pid, b.starttime, 137, &b.name, &b.pod, &b.command);
-            record_stopped(b, 137);
+            crate::history::record_stopped(b, 137);
             registry::clear_health(&b.name, b.pid);
             // The environment sidecar has the same lifetime as the health one: cleared together so a
             // runtime dir cannot accumulate one and not the other.
@@ -2479,7 +2479,7 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
             &b.pod,
             &b.command,
         );
-        record_stopped(b, outcome.exit_code());
+        crate::history::record_stopped(b, outcome.exit_code());
         // AND THE KEPT RECORD, FOR THE SAME REASON, in the same place: the sentence above says the
         // supervisor never records its own code under a `stop`, and the kept record is the one that
         // OUTLIVES this runtime dir. The supervisor's own call covers a box that ended by itself;
@@ -3153,43 +3153,4 @@ mod driver_row_tests {
             None
         );
     }
-}
-
-/// A box ended by `kern stop` / `kern kill`, in the history: the SDKs' own deadline arrives this way,
-/// so this is the line that says a call was stopped rather than that it died. See `history.rs`.
-/// The stopped box's line in the sandbox history, written HERE unless its owner already wrote it.
-///
-/// One atomic claim decides between the two, with no waiting: see `registry::owner_stop_claim`. If
-/// the owner (the foreground launcher, or a detached box's supervisor) consumed the marker first,
-/// it wrote `stopped` and this writes nothing; otherwise this writes it now and leaves the owner a
-/// `.done` mark, which an owner that is already gone never reads, so it is removed here.
-fn record_stopped(b: &registry::Instance, code: i32) {
-    if !registry::claim_stop_record(&b.name, b.pid) {
-        return;
-    }
-    if !registry::owner_alive(b.pid, b.starttime) {
-        registry::forget_stop_record(&b.name, b.pid);
-    }
-    let dash = |s: &str| {
-        if s.is_empty() {
-            "-".to_string()
-        } else {
-            s.to_string()
-        }
-    };
-    crate::history::record(&crate::history::Entry {
-        ended_ms: crate::history::now_ms(),
-        name: b.name.clone(),
-        image: dash(&b.image),
-        // From the kernel's start time of the box's init, to the tick, where the record has it;
-        // else from the recorded start second.
-        ran_ms: crate::history::ran_ms_since_ticks(b.pid1_starttime).unwrap_or_else(|| {
-            registry::now_unix()
-                .saturating_sub(b.started)
-                .saturating_mul(1000)
-        }),
-        code,
-        outcome: crate::history::Outcome::Stopped,
-        gpu: dash(&b.gpus),
-    });
 }

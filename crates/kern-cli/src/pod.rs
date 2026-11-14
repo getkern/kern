@@ -960,11 +960,8 @@ pub fn create_with_range(
     // A BRIDGE POD, where each member keeps its own network namespace and loopback. Passed by
     // environment for the reason the uid range is: the holder is a forked process and this is the
     // channel that already exists for telling it what kind of pod it is holding.
-    if let Some((first, rest)) = bridges.split_first() {
-        cmd.env("KERN_POD_BRIDGE", first);
-        if !rest.is_empty() {
-            cmd.env("KERN_POD_BRIDGES", rest.join(","));
-        }
+    if !bridges.is_empty() {
+        cmd.env("KERN_POD_BRIDGE", bridges.join(","));
     }
     let mut child = cmd
         .spawn()

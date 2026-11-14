@@ -837,17 +837,17 @@ fn save_once(image: &str, out: Option<&str>) -> Result<(), Error> {
 /// `load`. They kept three: `commit` and `load` missed `.platforms`, so after a multi-platform build
 /// a committed or loaded image of the same name was pushed as the OLD variants (found by audit), and
 /// `load` cleared the directory alone, leaving a previous image's `.layers` and `.base` beside it.
+///
+/// THE SIDECARS ARE `CACHE_SIDECARS`, not a list of their own: this one had drifted to seven of the
+/// eleven, so a replaced entry kept a previous image's `.owners`, `.flatkey` and `.size`. `.lock` is
+/// the one left alone, because removing a lock file someone holds would let a second writer in.
 fn clear_for_replace(cache: &std::path::Path, stem: &str) {
     let _ = std::fs::remove_file(cache.join(format!("{stem}.ok")));
-    for suffix in [
-        "",
-        ".diff",
-        ".layers",
-        ".base",
-        ".image",
-        ".platforms",
-        ".setuid",
-    ] {
+    for suffix in ["", ".diff"].into_iter().chain(
+        super::imagecache::CACHE_SIDECARS
+            .into_iter()
+            .filter(|s| *s != ".lock" && *s != ".ok"),
+    ) {
         let p = cache.join(format!("{stem}{suffix}"));
         let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_file(&p);
@@ -879,14 +879,18 @@ pub fn load(input: Option<&str>) -> Result<(), Error> {
         // Place the assembled rootfs as the image's cache dir + write the sentinel and config sidecar,
         // the exact on-disk shape of a flat pulled image (so `box --image <tag>` / `images` see it).
         std::fs::rename(&img.rootfs, &dest).map_err(|e| Error::Oci(format!("load rootfs: {e}")))?;
-        // THE OWNER MARK BEFORE THE SENTINEL, as a pull writes it: see `imagecache::record_owner_map`.
-        super::imagecache::record_owner_map(&cache, &safe);
-        std::fs::write(cache.join(format!("{safe}.ok")), primary.as_bytes())
-            .map_err(|e| Error::Oci(format!("load sentinel: {e}")))?;
         write_image_config(&cache.join(format!("{safe}.image")), &img.config)
             .map_err(|e| Error::Oci(format!("load image config: {e}")))?;
-        // `load` keeps an image's setuid bits, as the pull into the cache does.
-        super::imagecache::record_setuid_kept(&cache, &safe);
+        // `load` keeps an image's setuid bits, as the pull into the cache does. The config is
+        // written first and the sentinel last, by the one writer every path uses.
+        super::imagecache::seal_entry(
+            &cache,
+            &safe,
+            primary,
+            super::imagecache::Owners::ThisProcess,
+            true,
+        )
+        .map_err(|e| Error::Oci(format!("load sentinel: {e}")))?;
         println!("loaded '{primary}'");
         // Extra RepoTags become aliases (content-shared where possible), like `docker load`.
         for t in img.repo_tags.iter().skip(1) {
@@ -970,21 +974,17 @@ pub fn tag(src: &str, dst: &str) -> Result<(), Error> {
             "image '{src}' is cached but has no rootfs form - try re-pulling"
         )));
     }
-    // A TAG SHARES THE SOURCE'S FILES, so it carries the source's owner mark rather than this
-    // process's: the files were written under whatever map extracted them. A source without one
-    // gives a tag without one, which reads exactly as the source does.
-    match std::fs::read(cache.join(format!("{src_safe}.owners"))) {
-        Ok(mark) => {
-            let _ = std::fs::write(cache.join(format!("{dst_safe}.owners")), mark);
-        }
-        Err(_) => {
-            let _ = std::fs::remove_file(cache.join(format!("{dst_safe}.owners")));
-        }
-    }
-    // Write the `.ok` marker LAST (so an interrupted tag leaves no half-image that `images`/`push` sees),
-    // storing the human `dst` ref as its content (what `kern images` displays).
-    std::fs::write(cache.join(format!("{dst_safe}.ok")), dst.as_bytes())
-        .map_err(|e| Error::Oci(format!("tag marker: {e}")))?;
+    // The `.ok` marker LAST (so an interrupted tag leaves no half-image that `images`/`push` sees),
+    // storing the human `dst` ref as its content (what `kern images` displays). A TAG SHARES THE
+    // SOURCE'S FILES, so it carries the source's owner mark rather than this process's.
+    super::imagecache::seal_entry(
+        &cache,
+        &dst_safe,
+        dst,
+        super::imagecache::Owners::CopyOf(&src_safe),
+        false,
+    )
+    .map_err(|e| Error::Oci(format!("tag marker: {e}")))?;
     println!("tagged '{src}' → '{dst}'");
     Ok(())
 }
@@ -1072,9 +1072,14 @@ pub fn commit(box_ref: &str, image: &str) -> Result<(), Error> {
     };
     write_image_config(&cache.join(format!("{dst_safe}.image")), &cfg)
         .map_err(|e| Error::Oci(format!("commit image config: {e}")))?;
-    super::imagecache::record_owner_map(&cache, &dst_safe);
-    std::fs::write(cache.join(format!("{dst_safe}.ok")), image.as_bytes())
-        .map_err(|e| Error::Oci(format!("commit marker: {e}")))?;
+    super::imagecache::seal_entry(
+        &cache,
+        &dst_safe,
+        image,
+        super::imagecache::Owners::ThisProcess,
+        false,
+    )
+    .map_err(|e| Error::Oci(format!("commit marker: {e}")))?;
     println!("committed box '{box_ref}' → image '{image}'  (run: kern box <name> --image {image})");
     Ok(())
 }

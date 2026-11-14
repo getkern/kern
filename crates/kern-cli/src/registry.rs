@@ -467,7 +467,7 @@ const AUTHORITATIVE_DIRS: [&str; 13] = [
     // hides one: the same forgery as `waitexit`, which is why it sits beside it. See `history.rs`.
     "history",
     // `stopping/` holds one empty marker per box a `kern stop` is ending, so that the box's history
-    // line is written ONCE, by its owner, as `stopped`. AUTHORITATIVE for `history`'s reason: a box
+    // line is written ONCE, as `stopped`, by whichever of the stop and the owner claims it first. AUTHORITATIVE for `history`'s reason: a box
     // able to place a marker there relabels how a peer's run ended.
     "stopping",
     // `mounts/` is where a network volume (sshfs/nfs/smb) is staged before it is bound into a box,
@@ -1065,8 +1065,8 @@ fn runtime_subdir_candidates(leaf: &str) -> Vec<PathBuf> {
     assert_registry_child(leaf);
     let uid = unsafe { libc::getuid() };
     let mut candidates = Vec::new();
-    if let Some(x) = crate::global_env("XDG_RUNTIME_DIR") {
-        candidates.push(PathBuf::from(x).join("kern").join(leaf));
+    if let Some(x) = crate::xdg_var("XDG_RUNTIME_DIR") {
+        candidates.push(x.join("kern").join(leaf));
     }
     candidates.push(PathBuf::from(format!("/run/user/{uid}/kern/{leaf}")));
     candidates.push(PathBuf::from(format!("/tmp/kern-{uid}/{leaf}")));
@@ -1390,13 +1390,13 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// `kern stop` is ending the box `name` owned by `pid`: leave the marker that tells the owner (the
-/// foreground launcher, or a detached box's supervisor) to write its history line as `stopped`.
+/// `kern stop` is ending the box `name` owned by `pid`: leave the marker that makes its history
+/// line say `stopped`, written ONCE by whichever of the stop and the owner claims it first (see
+/// [`owner_stop_claim`]).
 ///
-/// ONE LINE PER STOPPED BOX, AND THIS IS WHAT MAKES IT ONE. Both the stop and the owner used to write
-/// one: MEASURED, a resident sandbox ended by `kern stop` left `exit-143` (the supervisor, which
-/// outlives the first signal) and `stopped` (the stop) for the same run. Best-effort: a marker that
-/// could not be written costs the word `stopped`, never the line.
+/// MEASURED before the marker: a resident sandbox ended by `kern stop` left `exit-143` (the
+/// supervisor, which outlives the first signal) and `stopped` (the stop) for the same run.
+/// Best-effort: a marker that could not be written costs the word `stopped`, never the line.
 pub fn mark_stopping(name: &str, pid: i32) {
     use std::os::unix::fs::OpenOptionsExt;
     if let Ok(d) = runtime_subdir("stopping") {
@@ -1408,6 +1408,17 @@ pub fn mark_stopping(name: &str, pid: i32) {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(d.join(format!("{name}-{pid}")));
     }
+}
+
+/// The marker of `name`/`pid` and the `.done` mark a stop that wrote the line leaves, in
+/// `stopping/`. NOT CREATED: every box's end asks, and a stop that left a marker already made the
+/// directory, so a missing one simply means "not stopped".
+fn stop_marks(name: &str, pid: i32) -> Option<(PathBuf, PathBuf)> {
+    let d = dir().ok()?.parent()?.join("stopping");
+    Some((
+        d.join(format!("{name}-{pid}")),
+        d.join(format!("{name}-{pid}.done")),
+    ))
 }
 
 /// What the OWNER of a box finds when it is about to write that box's history line.
@@ -1431,12 +1442,12 @@ pub enum StopClaim {
 /// `kern stop` and then SIGKILLs the launcher's process group, so the owner died before writing and
 /// a box ended by its deadline had no line at all, three runs out of three on a Jetson.
 pub fn owner_stop_claim(name: &str, pid: i32) -> StopClaim {
-    let Ok(d) = runtime_subdir("stopping") else {
+    let Some((marker, done)) = stop_marks(name, pid) else {
         return StopClaim::NotStopped;
     };
-    if fs::remove_file(d.join(format!("{name}-{pid}"))).is_ok() {
+    if fs::remove_file(marker).is_ok() {
         StopClaim::OwnerWrites
-    } else if fs::remove_file(d.join(format!("{name}-{pid}.done"))).is_ok() {
+    } else if fs::remove_file(done).is_ok() {
         StopClaim::AlreadyWritten
     } else {
         StopClaim::NotStopped
@@ -1446,28 +1457,14 @@ pub fn owner_stop_claim(name: &str, pid: i32) -> StopClaim {
 /// The stop's claim on the marker: `true` when this stop is the one that writes the line (it
 /// renamed the marker before the owner removed it). See [`owner_stop_claim`].
 pub fn claim_stop_record(name: &str, pid: i32) -> bool {
-    runtime_subdir("stopping")
-        .map(|d| {
-            fs::rename(
-                d.join(format!("{name}-{pid}")),
-                d.join(format!("{name}-{pid}.done")),
-            )
-            .is_ok()
-        })
-        .unwrap_or(false)
+    stop_marks(name, pid).is_some_and(|(marker, done)| fs::rename(marker, done).is_ok())
 }
 
 /// Remove the `.done` mark a stop left for an owner that is gone and will never read it.
 pub fn forget_stop_record(name: &str, pid: i32) {
-    if let Ok(d) = runtime_subdir("stopping") {
-        let _ = fs::remove_file(d.join(format!("{name}-{pid}.done")));
+    if let Some((_, done)) = stop_marks(name, pid) {
+        let _ = fs::remove_file(done);
     }
-}
-
-/// Whether the process `pid` started at `starttime` is still running, for a caller outside this
-/// module that must not mistake a recycled pid for it.
-pub fn owner_alive(pid: i32, starttime: u64) -> bool {
-    is_alive(pid, starttime)
 }
 
 /// Encode an entry to its `key=value` wire format (paired with [`parse`]). Extracted so the format is

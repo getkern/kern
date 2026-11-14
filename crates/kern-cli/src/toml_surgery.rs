@@ -120,16 +120,7 @@ pub fn upsert_block(raw: &str, header: &str, name: &str, body_lines: &[String]) 
         with_trailing_newline(&out.join("\n"), raw)
     } else {
         // Append a fresh block, separated by a blank line from any existing content.
-        let mut s = raw.to_string();
-        if !s.is_empty() {
-            if !s.ends_with('\n') {
-                s.push('\n');
-            }
-            s.push('\n');
-        }
-        s.push_str(&block.join("\n"));
-        s.push('\n');
-        s
+        append_section(raw, &block.join("\n"))
     }
 }
 
@@ -214,13 +205,25 @@ fn is_table_header(trimmed: &str, table: &str) -> bool {
         && trimmed
             .strip_prefix('[')
             .and_then(|r| r.split_once(']'))
-            .map(|(name, rest)| {
-                name.trim() == table && {
-                    let rest = rest.trim();
-                    rest.is_empty() || rest.starts_with('#')
-                }
+            .is_some_and(|(name, rest)| {
+                let rest = rest.trim();
+                name.trim() == table && (rest.is_empty() || rest.starts_with('#'))
             })
-            == Some(true)
+}
+
+/// Append `text` (lines, no trailing newline) as a new section, separated from any existing content
+/// by a blank line: the rule `upsert_block` appends a block by too.
+fn append_section(raw: &str, text: &str) -> String {
+    let mut s = raw.to_string();
+    if !s.is_empty() {
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push('\n');
+    }
+    s.push_str(text);
+    s.push('\n');
+    s
 }
 
 /// Set `key` in the single table `[table]` to the whole line `line` (`key = value`), or remove it
@@ -229,28 +232,17 @@ fn is_table_header(trimmed: &str, table: &str) -> bool {
 pub fn set_table_key(raw: &str, table: &str, key: &str, line: Option<&str>) -> String {
     let lines: Vec<&str> = raw.lines().collect();
     let Some(start) = lines.iter().position(|l| is_table_header(l.trim(), table)) else {
-        let Some(line) = line else {
-            return raw.to_string();
+        return match line {
+            Some(line) => append_section(raw, &format!("[{table}]\n{line}")),
+            None => raw.to_string(),
         };
-        let mut s = raw.to_string();
-        if !s.is_empty() {
-            if !s.ends_with('\n') {
-                s.push('\n');
-            }
-            s.push('\n');
-        }
-        s.push_str(&format!("[{table}]\n{line}\n"));
-        return s;
     };
     let end = lines[start + 1..]
         .iter()
         .position(|l| starts_any_section(l.trim()))
         .map_or(lines.len(), |i| start + 1 + i);
     let mut out: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
-    match (0..end - start - 1)
-        .map(|i| start + 1 + i)
-        .find(|&i| line_key(lines[i].trim()) == Some(key))
-    {
+    match (start + 1..end).find(|&i| line_key(lines[i].trim()) == Some(key)) {
         Some(i) => match line {
             Some(l) => out[i] = l.to_string(),
             None => {
@@ -267,12 +259,7 @@ pub fn set_table_key(raw: &str, table: &str, key: &str, line: Option<&str>) -> S
             }
         }
     }
-    let joined = out.join("\n");
-    if raw.is_empty() || raw.ends_with('\n') {
-        format!("{joined}\n")
-    } else {
-        joined
-    }
+    with_trailing_newline(&out.join("\n"), raw)
 }
 
 /// Preserve the input's trailing-newline convention on the rebuilt text (`lines()` drops it).

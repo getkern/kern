@@ -416,8 +416,7 @@ pub fn spawn_proxy(allow: &[String]) -> Result<(std::process::Child, std::path::
         }
     }
     let uid = unsafe { libc::getuid() };
-    let sock_path = crate::global_env("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
+    let sock_path = crate::xdg_var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|| std::path::PathBuf::from(format!("/run/user/{uid}")))
         .join(format!("kern-egress-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock_path);

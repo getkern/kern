@@ -43,6 +43,24 @@ pub fn compose_verbs_help() -> String {
 /// exactly this descriptor and close the rest.
 const GATE_FD: libc::c_int = 900;
 
+/// The wiring every sentence about `networks:`, `network_mode: service:` and the shared loopback
+/// describes, decided ONCE: they were chosen in five places with three different rules, and a
+/// `start` on a stack running without a pod was told about a bridge while it ran on relays.
+/// `already_without_pod`: some service of this stack is up with no pod, which `start` keeps.
+fn stack_mode(
+    no_pod: bool,
+    want_bridge: bool,
+    already_without_pod: bool,
+) -> crate::compose::StackNet {
+    if no_pod || already_without_pod {
+        crate::compose::StackNet::PerService
+    } else if want_bridge {
+        crate::compose::StackNet::Bridged
+    } else {
+        crate::compose::StackNet::Pod
+    }
+}
+
 /// `(network, cidr)` for each bridge of a stack with one per network, in bridge order.
 type BridgeNets = Vec<(String, String)>;
 
@@ -78,12 +96,14 @@ fn stack_bridge_networks(
         let (gw, mask, prefix) = kern_isolation::pod_bridge_parts(cidr)?;
         Some((u32::from(gw) & u32::from(mask), prefix))
     };
-    let overlaps = |a: (u32, u8), b: (u32, u8)| {
-        let p = a.1.min(b.1);
-        let mask = u32::MAX.checked_shl(u32::from(32 - p)).unwrap_or(0);
-        a.0 & mask == b.0 & mask
-    };
     let mut placed: Vec<(u32, u8)> = Vec::new();
+    // Free: overlapping no network already placed, compared under the wider of the two masks.
+    let free = |placed: &[(u32, u8)], sp: (u32, u8)| {
+        placed.iter().all(|p| {
+            let mask = u32::from(kern_isolation::mask_of(p.1.min(sp.1)));
+            p.0 & mask != sp.0 & mask
+        })
+    };
     let mut out: Vec<(String, String)> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let mut next = 0u32;
@@ -91,10 +111,10 @@ fn stack_bridge_networks(
         let wanted = declared(&n);
         let usable = wanted
             .as_deref()
-            .and_then(|c| span(c).map(|sp| (c, sp)))
-            .filter(|(_, sp)| placed.iter().all(|p| !overlaps(*p, *sp)));
-        let cidr = match usable {
-            Some((c, _)) => c.to_string(),
+            .and_then(|c| span(c).map(|sp| (c.to_string(), sp)))
+            .filter(|(_, sp)| free(&placed, *sp));
+        let (cidr, sp) = match usable {
+            Some(found) => found,
             None => {
                 let generated = loop {
                     if next > 255 {
@@ -105,38 +125,41 @@ fn stack_bridge_networks(
                     }
                     let c = format!("10.89.{next}.0/24");
                     next += 1;
-                    if let Some(sp) = span(&c) {
-                        if placed.iter().all(|p| !overlaps(*p, sp)) {
-                            break c;
-                        }
+                    if let Some(sp) = span(&c).filter(|sp| free(&placed, *sp)) {
+                        break (c, sp);
                     }
                 };
                 if let Some(w) = wanted {
                     notes.push(format!(
                         "network '{n}' declares {w}, which kern cannot build a bridge on here \
                          (not an IPv4 network with a prefix between 8 and 30, or it overlaps \
-                         another network of this stack), so it is built on {generated} and an \
-                         `ipv4_address:` from {w} is not the address a peer reaches"
+                         another network of this stack), so it is built on {} and an \
+                         `ipv4_address:` from {w} is not the address a peer reaches",
+                        generated.0
                     ));
                 }
                 generated
             }
         };
-        if let Some(sp) = span(&cidr) {
-            placed.push(sp);
-        }
+        placed.push(sp);
         out.push((n, cidr));
     }
     Ok((out, notes))
 }
 
-/// The address plan of a stack with ONE BRIDGE PER NETWORK: every service gets an address on each
-/// network it joins, the file's `ipv4_address:` where it pinned one inside that network, the next
-/// free one otherwise. `alias`, which the code shared with the one-bridge plan reads, is the address
-/// on the service's FIRST network.
-fn multi_bridge_plan(
+/// The address plan of a BRIDGE stack, one bridge or one per network: every service gets an
+/// address on each bridge network it is on, the file's `ipv4_address:` where it pinned one inside
+/// that network, the next free one otherwise.
+///
+/// ONE ALLOCATOR FOR BOTH SHAPES. The single bridge is the per-network case with one network that
+/// every service is on (`one_bridge`); its address is the service's `alias` and nothing per network
+/// is recorded. Per network, each address goes into `net_addrs` in the service's own network order
+/// (`eth0` is its first network, as Docker numbers a container's interfaces) and `alias` is the
+/// first of them, which the code shared with the other wirings reads.
+fn bridge_plan(
     boxes: &[crate::compose::ComposeBox],
     nets: &[(String, String)],
+    one_bridge: bool,
 ) -> Result<(Vec<crate::nopod::Assigned>, Vec<String>), Error> {
     let services: Vec<crate::nopod::ServiceInput> = boxes
         .iter()
@@ -154,96 +177,74 @@ fn multi_bridge_plan(
         })
         .collect();
     let mut plan = crate::nopod::assign_aliases(&services).map_err(Error::Compose)?;
-    let pinned_of = |service: &str| -> Vec<u32> {
-        boxes
-            .iter()
-            .find(|b| b.service_name() == service)
-            .map(|b| {
-                b.net_ipv4
-                    .iter()
-                    .filter_map(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
-                    .map(u32::from)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    // Each service's pinned addresses, parsed once.
+    let pins: Vec<Vec<u32>> = plan
+        .iter()
+        .map(|a| {
+            boxes
+                .iter()
+                .find(|b| b.service_name() == a.service)
+                .map(|b| {
+                    b.net_ipv4
+                        .iter()
+                        .filter_map(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
+                        .map(u32::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
     for (idx, (net, cidr)) in nets.iter().enumerate() {
         let bridge = u8::try_from(idx).map_err(|_| {
             Error::Compose("more networks than a pod has bridges (256)".to_string())
         })?;
         let (gw, _, prefix) = kern_isolation::pod_bridge_parts(cidr)
             .ok_or_else(|| Error::Compose(format!("'{cidr}' is not a network kern can bridge")))?;
-        let first = u32::from(gw) + 1;
-        // The last address is the broadcast and is not handed out.
-        let last = u32::from(gw) | (!0u32 >> prefix);
-        let members: Vec<usize> = plan
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| crate::nopod::effective_networks(&a.networks).contains(net))
-            .map(|(i, _)| i)
-            .collect();
-        let mut taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        // Pinned first, so an allocated address can never take one a later service pinned.
-        for &i in &members {
-            if let Some(v) = pinned_of(&plan[i].service)
-                .into_iter()
-                .find(|v| *v >= first && *v < last)
-            {
-                if !taken.insert(v) {
-                    return Err(Error::Compose(format!(
-                        "two services are pinned to {} on network '{net}' with `ipv4_address:`; \
-                         only one of them can answer there",
-                        std::net::Ipv4Addr::from(v)
-                    )));
-                }
+        let members: Vec<usize> = if one_bridge {
+            (0..plan.len()).collect()
+        } else {
+            plan.iter()
+                .enumerate()
+                .filter(|(_, a)| crate::nopod::effective_networks(&a.networks).contains(net))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let label = if one_bridge {
+            format!("the bridge network {cidr}")
+        } else {
+            format!("network '{net}' ({cidr})")
+        };
+        for (i, addr) in allocate_on(&members, &pins, u32::from(gw), prefix, &label)? {
+            if one_bridge {
+                plan[i].alias = addr;
+            } else {
                 plan[i].net_addrs.push(crate::nopod::NetAddr {
                     network: net.clone(),
-                    addr: v,
+                    addr,
                     bridge,
                     prefix,
                 });
             }
         }
-        let mut next = first;
-        for &i in &members {
-            if plan[i].net_addrs.iter().any(|n| &n.network == net) {
-                continue;
-            }
-            while taken.contains(&next) && next < last {
-                next += 1;
-            }
-            if next >= last {
-                return Err(Error::Compose(format!(
-                    "network '{net}' ({cidr}) ran out of addresses for its {} services",
-                    members.len()
-                )));
-            }
-            taken.insert(next);
-            plan[i].net_addrs.push(crate::nopod::NetAddr {
-                network: net.clone(),
-                addr: next,
-                bridge,
-                prefix,
-            });
-            next += 1;
-        }
     }
     let mut outside: Vec<String> = Vec::new();
-    for a in &mut plan {
-        // `eth0` is the service's FIRST network, as Docker numbers a container's interfaces.
-        let order = crate::nopod::effective_networks(&a.networks);
-        a.net_addrs.sort_by_key(|n| {
-            order
-                .iter()
-                .position(|x| x == &n.network)
-                .unwrap_or(usize::MAX)
-        });
-        if let Some(n) = a.net_addrs.first() {
-            a.alias = n.addr;
+    for (a, pinned) in plan.iter_mut().zip(&pins) {
+        if !one_bridge {
+            let order = crate::nopod::effective_networks(&a.networks);
+            a.net_addrs.sort_by_key(|n| {
+                order
+                    .iter()
+                    .position(|x| x == &n.network)
+                    .unwrap_or(usize::MAX)
+            });
+            if let Some(n) = a.net_addrs.first() {
+                a.alias = n.addr;
+            }
         }
-        for v in pinned_of(&a.service) {
-            if !a.net_addrs.iter().any(|n| n.addr == v) {
-                outside.push(format!("{} at {}", a.service, std::net::Ipv4Addr::from(v)));
+        for v in pinned {
+            let taken = a.alias == *v || a.net_addrs.iter().any(|n| n.addr == *v);
+            if !taken {
+                outside.push(format!("{} at {}", a.service, std::net::Ipv4Addr::from(*v)));
             }
         }
     }
@@ -252,12 +253,65 @@ fn multi_bridge_plan(
         let shown: Vec<&str> = outside.iter().map(String::as_str).collect();
         notes.push(format!(
             "`ipv4_address:` outside every network the service is on is not taken ({}): the \
-             address would not be routable here, so the service answers on the addresses its \
-             networks give it",
+             address would not be routable here, so the service answers on the address its \
+             network gives it",
             crate::compose::name_list(&shown)
         ));
     }
     Ok((plan, notes))
+}
+
+/// The addresses on one bridge network for `members` (indices into the plan, with `pins` their
+/// pinned addresses): a pinned one inside the network first, so an allocated address can never
+/// take one a later service pinned, then the next free one. `gw` is the bridge's own address,
+/// which is never handed out, nor is the broadcast. Two services pinned to one address is the
+/// file's error and is refused: the second would silently take the first's traffic.
+fn allocate_on(
+    members: &[usize],
+    pins: &[Vec<u32>],
+    gw: u32,
+    prefix: u8,
+    label: &str,
+) -> Result<Vec<(usize, u32)>, Error> {
+    let first = gw + 1;
+    let last = gw | (!0u32 >> prefix);
+    let mut taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut out: Vec<(usize, u32)> = Vec::with_capacity(members.len());
+    for &i in members {
+        let pinned = pins
+            .get(i)
+            .and_then(|p| p.iter().copied().find(|v| *v >= first && *v < last));
+        if let Some(v) = pinned {
+            if !taken.insert(v) {
+                return Err(Error::Compose(format!(
+                    "two services are pinned to {} on {label} with `ipv4_address:`; only one of \
+                     them can answer there",
+                    std::net::Ipv4Addr::from(v)
+                )));
+            }
+            out.push((i, v));
+        }
+    }
+    let mut next = first;
+    for &i in members {
+        if out.iter().any(|(j, _)| *j == i) {
+            continue;
+        }
+        while taken.contains(&next) && next < last {
+            next += 1;
+        }
+        if next >= last {
+            return Err(Error::Compose(format!(
+                "{label} has room for {} services and this stack puts {} on it",
+                last - first,
+                members.len()
+            )));
+        }
+        taken.insert(next);
+        out.push((i, next));
+        next += 1;
+    }
+    Ok(out)
 }
 
 /// The network ONE bridge will carry, from the subnets the file declares. Pure: the notes about a
@@ -1594,6 +1648,15 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         );
     }
     let no_pod = no_pod || auto_no_pod;
+    // COMPUTED HERE, before the sentences about the wiring, because it decides the wiring too:
+    // `start` on a stack running without a pod keeps it without one (see `use_pod` below), and a
+    // sentence chosen without it described the bridge on a stack that ran on relays.
+    let running_without_pod: Vec<String> = boxes
+        .iter()
+        .filter(|b| registry::find(&b.name).is_some_and(|i| i.pod.is_empty() && !b.net))
+        .map(|b| b.service.clone())
+        .collect();
+    let mode = stack_mode(no_pod, want_bridge, !running_without_pod.is_empty());
     // The two sentences the parser no longer says, said once, now that the wiring is settled.
     //
     // ONLY WHEN THE MEMBERSHIPS SEPARATE SOMETHING. A file can name three networks and still put
@@ -1607,13 +1670,6 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // command's output, and on a stack brought up with `--no-pod` it described the bridge wiring
     // the `exec` would have chosen rather than the relays the stack actually had.
     if segregates && wiring_is_the_subject {
-        let mode = if no_pod {
-            crate::compose::StackNet::PerService
-        } else if want_bridge {
-            crate::compose::StackNet::Bridged
-        } else {
-            crate::compose::StackNet::Pod
-        };
         if let Some(note) = crate::compose::networks_note(mode) {
             eprintln!("kern: warning: compose: {note}");
         }
@@ -1652,14 +1708,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // `want_bridge` is read AFTER the automatic decision above has been folded into it, so this is
     // the wiring the stack will actually get and not the flag someone typed.
-    if let Some(note) = crate::compose::net_share_note(
-        if no_pod || want_bridge {
-            crate::compose::StackNet::PerService
-        } else {
-            crate::compose::StackNet::Pod
-        },
-        &net_share_pairs,
-    ) {
+    if let Some(note) = crate::compose::net_share_note(mode, &net_share_pairs) {
         eprintln!("kern: warning: compose: {note}");
     }
     // THE MEMORY CEILING EVERY SERVICE ACTUALLY GETS, RESOLVED ONCE FOR THE WHOLE STACK.
@@ -1709,14 +1758,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // reason the wiring exists. Keyed on `no_pod` alone it fired on every bridge stack and told the
     // reader the opposite of what was happening: MEASURED on the corpus, 17 files gained that
     // difference under `--bridge` instead of losing it.
-    if let Some(note) = crate::compose::wiring_note(
-        if no_pod || want_bridge {
-            crate::compose::StackNet::PerService
-        } else {
-            crate::compose::StackNet::Pod
-        },
-        boxes.len(),
-    ) {
+    if let Some(note) = crate::compose::wiring_note(mode, boxes.len()) {
         eprintln!("kern: note: compose: {note}");
     }
     // Verbs that answer a question about the stack rather than changing it return here.
@@ -1849,26 +1891,29 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                     .map(move |ip| (b.service.clone(), ip.clone()))
             })
             .collect();
-        let note = if want_bridge {
-            let mut declared: Vec<&str> = boxes
-                .iter()
-                .filter_map(|b| b.net_subnet.as_deref())
-                .collect();
-            declared.sort_unstable();
-            declared.dedup();
-            crate::compose::net_ipv4_bridge_note(bridge_cidr_for(&declared), &pairs)
+        // A BRIDGE PER NETWORK says what the bring-up says, from the same two functions: which
+        // subnets were replaced and which pinned addresses fall outside every network.
+        if want_bridge && segregates && !no_pod {
+            let (nets, mut notes) = stack_bridge_networks(&boxes)?;
+            notes.extend(bridge_plan(&boxes, &nets, false)?.1);
+            for n in notes {
+                eprintln!("kern: warning: compose: {n}");
+            }
         } else {
-            crate::compose::net_ipv4_note(
-                if no_pod {
-                    crate::compose::StackNet::PerService
-                } else {
-                    crate::compose::StackNet::Pod
-                },
-                &pairs,
-            )
-        };
-        if let Some(note) = note {
-            eprintln!("kern: warning: compose: {note}");
+            let note = if want_bridge {
+                let mut declared: Vec<&str> = boxes
+                    .iter()
+                    .filter_map(|b| b.net_subnet.as_deref())
+                    .collect();
+                declared.sort_unstable();
+                declared.dedup();
+                crate::compose::net_ipv4_bridge_note(bridge_cidr_for(&declared), &pairs)
+            } else {
+                crate::compose::net_ipv4_note(mode, &pairs)
+            };
+            if let Some(note) = note {
+                eprintln!("kern: warning: compose: {note}");
+            }
         }
     }
     if run_terminal_verb(
@@ -1911,11 +1956,6 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // The registry holds facts about processes that exist, and a no-pod box carries an EMPTY pod
     // field (measured), so "some box of this stack is up and is in no pod" is the same question asked
     // of something that cannot be stale.
-    let running_without_pod: Vec<String> = boxes
-        .iter()
-        .filter(|b| registry::find(&b.name).is_some_and(|i| i.pod.is_empty() && !b.net))
-        .map(|b| b.service.clone())
-        .collect();
 
     // `up` WITHOUT `--no-pod` ON SUCH A STACK IS AMBIGUOUS, so it is refused.
     //
@@ -2336,9 +2376,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // and `backend` each bind port 80 and neither declares it: in a shared namespace the second
     // cannot bind, and without a pod kern's own relay takes the port first.
     //
-    // ONE NETWORK FOR NOW, and a file whose `networks:` SEGREGATE keeps the relay wiring, because one
-    // bridge puts every service back on one network and would drop the separation the file asked
-    // for. A bridge per compose network is the next step and is not this one.
+    // A FILE WHOSE `networks:` SEPARATE SERVICES gets one bridge per network: see
+    // `stack_bridge_networks` and `bridge_plan`.
     // THE FILE'S OWN NETWORK IS USED WHEN IT DECLARES ONE, and that is what makes `ipv4_address:`
     // honoured rather than approximated: the address the file pinned IS the address the service
     // answers on, which is Docker's arrangement. Without it kern invents a network, the declared
@@ -2399,6 +2438,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     } else {
         None
     };
+    // ONE SHARED NETWORK NAMESPACE FOR THE WHOLE STACK: a pod with no bridge. NAMED ONCE, because
+    // "a pod" is not the question: a bridge stack is a pod too, and each of its members has its own
+    // loopback and needs its own NAT. Asked as `use_pod`, a `links:` alias on a bridge resolved to
+    // the service's own `127.0.0.1`.
+    let shared_ns = use_pod && bridge_cidr.is_none();
 
     // `ipv4_address:` ANSWERED HERE TOO, and for the same reason: the key is honoured in one wiring
     // and only half honoured in the other, so the parser cannot say which without knowing the
@@ -2420,11 +2464,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     let ipv4_note = match bridge_cidr {
         Some(_) if !bridge_nets.is_empty() => None,
         Some(cidr) => crate::compose::net_ipv4_bridge_note(cidr, &net_ipv4_pairs),
+        // `use_pod` and not `no_pod`: a stack running without a pod is started without one.
         None => crate::compose::net_ipv4_note(
-            if no_pod {
-                crate::compose::StackNet::PerService
-            } else {
+            if use_pod {
                 crate::compose::StackNet::Pod
+            } else {
+                crate::compose::StackNet::PerService
             },
             &net_ipv4_pairs,
         ),
@@ -2469,7 +2514,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // ON A BRIDGE EVERY MEMBER NEEDS ITS OWN NAT: the pod's single NAT lives in the holder's
     // namespace, which a bridge member is not in. The rule is about ONE SHARED NAMESPACE and not
     // about the word "pod", which is why the argument is the shared-namespace question.
-    let outbound_for = outbound_targets(&boxes, use_pod && bridge_cidr.is_none(), use_pod);
+    let outbound_for = outbound_targets(&boxes, shared_ns, use_pod);
     // Write ends, one per PREPARED box, held by `up` and keyed by box name so the release can be
     // ordered by dependency level.
     //
@@ -2724,117 +2769,17 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // duplicates), and only the ADDRESS is replaced afterwards: the alias field is a full 32-bit
     // address already, so a bridge address travels through `add_host_args` and `links` unchanged.
     let address_plan: Vec<crate::nopod::Assigned> = match bridge_cidr {
-        Some(_) if !bridge_nets.is_empty() => {
-            let (plan, notes) = multi_bridge_plan(&boxes, &bridge_nets)?;
-            for n in notes {
-                eprintln!("kern: warning: compose: {n}");
-            }
-            plan
-        }
         None => address_plan,
         Some(cidr) => {
-            let (gw, _, prefix) = kern_isolation::pod_bridge_parts(cidr).ok_or_else(|| {
-                Error::Compose(format!("'{cidr}' is not a network kern can bridge"))
-            })?;
-            let first = u32::from(gw) + 1;
-            let last = u32::from(gw) | (!0u32 >> prefix);
-            let services: Vec<crate::nopod::ServiceInput> = boxes
-                .iter()
-                .map(|b| {
-                    (
-                        b.service_name().to_string(),
-                        b.name.clone(),
-                        declared_container_ports(b)
-                            .iter()
-                            .map(|(p, _)| *p)
-                            .collect(),
-                        b.networks.clone(),
-                        b.net_aliases.clone(),
-                    )
-                })
-                .collect();
-            let mut plan = crate::nopod::assign_aliases(&services).map_err(Error::Compose)?;
-            // The last address of the network is its broadcast and is not usable, so the count is
-            // checked against what the network actually holds rather than against the plan's own cap.
-            let room = (last - first) as usize;
-            if plan.len() > room {
-                return Err(Error::Compose(format!(
-                    "a --bridge stack on {cidr} can address at most {room} services; this one has {}",
-                    plan.len()
-                )));
-            }
-            // THE ADDRESS THE FILE PINNED, WHERE IT PINNED ONE. `ipv4_address:` is the whole reason
-            // the bridge uses the file's own subnet: taking the declared address makes the key
-            // honoured exactly, and a peer that hard-codes it reaches the service.
-            //
-            // AN ADDRESS OUTSIDE THIS BRIDGE'S NETWORK IS NOT TAKEN, and the reader is told: it
-            // would not be routable here, and putting it on the interface anyway would produce a
-            // service that answers nowhere its peers can reach. A file with two subnets lands here.
-            //
-            // TWO SERVICES ON ONE ADDRESS is the file's own error and is refused: the second would
-            // silently take the first's traffic.
-            let mut taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            let mut outside: Vec<String> = Vec::new();
-            for (i, a) in plan.iter_mut().enumerate() {
-                let pinned = boxes
-                    .iter()
-                    .find(|b| b.service_name() == a.service)
-                    .and_then(|b| b.net_ipv4.first())
-                    .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
-                    .map(u32::from)
-                    .filter(|v| {
-                        let inside = *v >= first && *v < last;
-                        if !inside {
-                            outside.push(format!(
-                                "{} at {}",
-                                a.service,
-                                std::net::Ipv4Addr::from(*v)
-                            ));
-                        }
-                        inside
-                    });
-                if let Some(v) = pinned {
-                    if !taken.insert(v) {
-                        return Err(Error::Compose(format!(
-                            "two services are pinned to {} with `ipv4_address:`; only one of them \
-                             can answer there",
-                            std::net::Ipv4Addr::from(v)
-                        )));
-                    }
-                    a.alias = v;
-                } else {
-                    a.alias = first + i as u32;
-                }
-            }
-            // A SECOND PASS FOR THE UNPINNED ONES, because the first pass may have handed an
-            // allocated address to a service that a LATER service pinned. Without it two services
-            // share an address and the file said nothing wrong.
-            let mut next = first;
-            for a in plan.iter_mut() {
-                if taken.contains(&a.alias) {
-                    continue;
-                }
-                while taken.contains(&next) && next < last {
-                    next += 1;
-                }
-                if next >= last {
-                    return Err(Error::Compose(format!(
-                        "a --bridge stack on {cidr} ran out of addresses for {} services",
-                        plan.len()
-                    )));
-                }
-                a.alias = next;
-                taken.insert(next);
-                next += 1;
-            }
-            if !outside.is_empty() {
-                let shown: Vec<&str> = outside.iter().map(String::as_str).collect();
-                eprintln!(
-                    "kern: warning: compose: `ipv4_address:` outside the bridge's network {cidr} is \
-                     not taken ({}): the address would not be routable here, so the service gets one \
-                     from {cidr} and its peers reach it there",
-                    crate::compose::name_list(&shown)
-                );
+            let one = [(String::new(), cidr.to_string())];
+            let (nets, one_bridge) = if bridge_nets.is_empty() {
+                (&one[..], true)
+            } else {
+                (&bridge_nets[..], false)
+            };
+            let (plan, notes) = bridge_plan(&boxes, nets, one_bridge)?;
+            for n in notes {
+                eprintln!("kern: warning: compose: {n}");
             }
             plan
         }
@@ -3124,7 +3069,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                 for e in crate::nopod::link_host_args(
                                     &b.links,
                                     address_plan,
-                                    use_pod && bridge_cidr.is_none(),
+                                    shared_ns,
                                     &b.service,
                                 ) {
                                     cmd.arg("--add-host").arg(e);
@@ -4871,7 +4816,7 @@ networks:
     fn a_service_on_two_networks_answers_each_peer_on_the_network_they_share() {
         let b = boxes();
         let (nets, _) = stack_bridge_networks(&b).expect("networks");
-        let (plan, notes) = multi_bridge_plan(&b, &nets).expect("plan");
+        let (plan, notes) = bridge_plan(&b, &nets, false).expect("plan");
         assert!(notes.is_empty(), "{notes:?}");
         let get = |s: &str| plan.iter().find(|a| a.service == s).expect("in plan");
         let ip = |v: u32| std::net::Ipv4Addr::from(v).to_string();
@@ -4918,7 +4863,7 @@ networks:
         );
         let b = crate::compose::parse(&y).expect("fixture parses");
         let (nets, _) = stack_bridge_networks(&b).expect("networks");
-        let err = multi_bridge_plan(&b, &nets)
+        let err = bridge_plan(&b, &nets, false)
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();

@@ -1620,8 +1620,47 @@ pub(crate) fn owner_map_signature() -> &'static str {
     })
 }
 
+/// Whose uid map a cache entry's files were written under, for [`seal_entry`].
+pub(crate) enum Owners<'a> {
+    /// This process wrote them (a pull, a load, a build, a commit).
+    ThisProcess,
+    /// They are another entry's files, shared (a tag): that entry's mark travels with them.
+    CopyOf(&'a str),
+}
+
+/// Finish a cache entry: its marks first, then the `.ok` sentinel LAST, so no reader ever sees an
+/// entry complete without what describes it.
+///
+/// ONE WRITER FOR EVERY WAY AN IMAGE ENTERS THE CACHE, pull, load, build, tag and commit. Only a pull
+/// wrote the owner mark, so as root every other entry read as "unpacked by an older kern", was sent
+/// to the registry to be repaired and failed there: MEASURED, `kern box --image <built>` as root
+/// answered "cannot access 'library/<tag>' on registry-1.docker.io". The pull itself wrote its
+/// sentinel BEFORE its marks; here the order is one, for all of them.
+pub(crate) fn seal_entry(
+    cache: &std::path::Path,
+    safe: &str,
+    reference: &str,
+    owners: Owners,
+    setuid_kept: bool,
+) -> std::io::Result<()> {
+    match owners {
+        Owners::ThisProcess => record_owner_map(cache, safe),
+        // A source without a mark gives a tag without one, which reads exactly as the source does.
+        Owners::CopyOf(src) => match std::fs::read(cache.join(format!("{src}.owners"))) {
+            Ok(mark) => std::fs::write(cache.join(format!("{safe}.owners")), mark)?,
+            Err(_) => {
+                let _ = std::fs::remove_file(cache.join(format!("{safe}.owners")));
+            }
+        },
+    }
+    if setuid_kept {
+        record_setuid_kept(cache, safe);
+    }
+    std::fs::write(cache.join(format!("{safe}.ok")), reference.as_bytes())
+}
+
 /// Record the uid map this extraction used, beside the entry's sentinel.
-pub(crate) fn record_owner_map(cache: &std::path::Path, safe: &str) {
+fn record_owner_map(cache: &std::path::Path, safe: &str) {
     let _ = std::fs::write(
         cache.join(format!("{safe}.owners")),
         owner_map_signature().as_bytes(),
@@ -1918,9 +1957,7 @@ pub(crate) fn pull_to_cache(
         // of `--pull always` (don't re-pull a tag while concurrently starting it).
         write_image_config(&cfgfile, &config)
             .map_err(|e| Error::Oci(format!("image config for '{image}': {e}")))?;
-        let _ = std::fs::write(&sentinel, image.as_bytes());
-        record_owner_map(&cache, &safe);
-        record_setuid_kept(&cache, &safe);
+        let _ = seal_entry(&cache, &safe, image, Owners::ThisProcess, true);
         return Ok((dir.to_string_lossy().into_owned(), config));
     }
     // Reached when the entry is missing OR incomplete. Same predicate as the fast path above, so the
@@ -2062,9 +2099,7 @@ pub(crate) fn pull_to_cache(
         };
         write_image_config(&cfgfile, &config)
             .map_err(|e| Error::Oci(format!("image config for '{image}': {e}")))?;
-        let _ = std::fs::write(&sentinel, image.as_bytes());
-        record_owner_map(&cache, &safe);
-        record_setuid_kept(&cache, &safe);
+        let _ = seal_entry(&cache, &safe, image, Owners::ThisProcess, true);
     }
     // lock released when `lock` drops
     Ok((

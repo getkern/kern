@@ -700,13 +700,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             // The Sandboxes history picker: a letter is the choice, `c` asks before clearing, any
             // other key leaves everything as it was.
             Mode::PickHistory => {
-                use crate::history::Keep;
-                let pick = match key.first() {
-                    Some(b'm') => Some(Keep::Memory),
-                    Some(b'd') => Some(Keep::Disk),
-                    Some(b'o') => Some(Keep::Off),
-                    _ => None,
-                };
+                let pick = key.first().copied().and_then(crate::history::Keep::by_key);
                 if let Some(k) = pick {
                     mode = Mode::Overlay(choose_history(k));
                     dirty = true;
@@ -1213,11 +1207,9 @@ fn choose_history(k: crate::history::Keep) -> String {
             "sandbox history\n\n{}{}\n\nWritten to kern.toml as [kern] sandbox_history = \"{}\"; \
              `kern sandbox keep` reads and changes the same line.",
             crate::history::keep_line(),
-            match moved {
-                0 => String::new(),
-                1 => "\n1 row moved with it".to_string(),
-                n => format!("\n{n} rows moved with it"),
-            },
+            crate::history::moved_line(moved)
+                .map(|m| format!("\n{m}"))
+                .unwrap_or_default(),
             k.word()
         ),
         Err(e) => format!("sandbox history: not changed\n\n{e}"),
@@ -2113,7 +2105,7 @@ struct Snapshot {
     /// Cached images ON DISK, which is what the tab bar counts. See `builds_total`.
     images_total: usize,
     /// Finished sandboxes, newest first (cached by `history`, so cheap on every frame).
-    sbx: Vec<crate::history::Entry>,
+    sbx: std::sync::Arc<[crate::history::Entry]>,
 }
 
 impl Snapshot {
@@ -2908,8 +2900,17 @@ fn render(
         }
         Mode::PickHistory => {
             s.push_str(&history_pane(p, crate::history::keep()));
+            // The keys from the choices themselves (`Keep::key`), as the pane and the handler.
+            let keys: Vec<String> = crate::history::Keep::ALL
+                .into_iter()
+                .map(|k| {
+                    let w = k.word();
+                    format!("[{z}{}{d}]{}", &w[..1], &w[1..])
+                })
+                .collect();
             format!(
-                "{d}[{z}m{d}]emory  [{z}d{d}]isk  [{z}o{d}]ff  [{z}c{d}]lear   [{z}Esc{d}] cancel{z}"
+                "{d}{}  [{z}c{d}]lear   [{z}Esc{d}] cancel{z}",
+                keys.join("  ")
             )
         }
         Mode::Confirm { prompt, .. } => {
@@ -3310,7 +3311,6 @@ fn confirm_pane(p: &Palette, prompt: &str) -> String {
     format!("\n\n  {y}⚠{z}  {b}{prompt}{z}\n")
 }
 
-/// The Profiles "new" kind picker: vcpu / vgpio / vdisk, each attachable to a box by prefix.
 /// Where the sandbox history is kept, as one line: the three choices with the current one marked,
 /// what it means, how many sandboxes it holds and the file. The Sandboxes tab and the Overview both
 /// print it, so the choice is visible where the history is read and not only behind `m`.
@@ -3330,11 +3330,7 @@ fn history_choice_line(p: &Palette, held: usize) -> String {
             }
         })
         .collect();
-    let what = match now {
-        Keep::Memory => "kept until reboot",
-        Keep::Disk => "kept across reboots",
-        Keep::Off => "nothing new is recorded",
-    };
+    let what = now.meaning();
     let file = crate::history::current_file()
         .map(|f| format!(" in {}", f.display()))
         .unwrap_or_default();
@@ -3351,7 +3347,8 @@ fn history_pane(p: &Palette, now: crate::history::Keep) -> String {
     let mut s = format!(
         "\n  {b}sandbox history{z}  {d}- one line per finished sandbox (never its output): where to keep it{z}\n\n"
     );
-    for (key, k) in [("m", Keep::Memory), ("d", Keep::Disk), ("o", Keep::Off)] {
+    for k in Keep::ALL {
+        let key = char::from(k.key());
         let mark = if k == now {
             format!("{g}● now{z}")
         } else {
@@ -3370,6 +3367,7 @@ fn history_pane(p: &Palette, now: crate::history::Keep) -> String {
     s
 }
 
+/// The Profiles "new" kind picker: vcpu / vgpio / vdisk, each attachable to a box by prefix.
 fn pick_pane(p: &Palette) -> String {
     let (b, c, d, z) = (p.b, p.c, p.d, p.z);
     let row = |key: &str, name: &str, what: &str| {
@@ -3953,18 +3951,16 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     s.push_str(&row("Tasks", format!("{total_tasks}")));
     s.push_str(&row("Resource cap", format!("{d}{cap}{z}")));
     // SANDBOXES: the ones running, and the last hour of the ones that finished; the tab has the rest.
+    let done = crate::history::sandboxes_newest_first();
     s.push_str(&row(
         "Sandboxes",
         format!(
             "{} running   {d}{}{z}",
             live_sandboxes(rows).len(),
-            crate::history::last_hour_line(&crate::history::sandboxes_newest_first())
+            crate::history::last_hour_line(&done)
         ),
     ));
-    s.push_str(&row(
-        "Sandbox history",
-        history_choice_line(p, crate::history::sandboxes_newest_first().len()),
-    ));
+    s.push_str(&row("Sandbox history", history_choice_line(p, done.len())));
     // Fleet budget: the SUM cap across all boxes on `kern.slice` (KERN_FLEET_MEMORY_MAX / _PIDS_MAX),
     // the real-enforcement backstop to the cooperative KERN_MAX_CONCURRENT counter. Shown only when a
     // budget is actually set (otherwise the slice usually doesn't even exist).

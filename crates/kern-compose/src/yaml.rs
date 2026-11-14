@@ -499,14 +499,8 @@ fn parse_document(
                             dotenv,
                         },
                     )?;
-                    // The subnet of the FIRST network this service joins that declares one.
-                    b.net_subnet = b.networks.iter().find_map(|n| {
-                        network_subnets
-                            .iter()
-                            .find(|(name, _)| name == n)
-                            .map(|(_, cidr)| cidr.clone())
-                    });
-                    // And every one of them, for a stack that gets a bridge per network.
+                    // Every network this service joins that declares a subnet, in the service's
+                    // order; the first of them is the one bridge's network.
                     b.net_subnets = b
                         .networks
                         .iter()
@@ -517,6 +511,7 @@ fn parse_document(
                                 .map(|(name, cidr)| (name.clone(), cidr.clone()))
                         })
                         .collect();
+                    b.net_subnet = b.net_subnets.first().map(|(_, cidr)| cidr.clone());
                     // PROFILES ARE DECIDED AFTER THIS LOOP, by `split_inactive_profiles`, so a merge
                     // of several files can decide them on the MERGED stack instead. See that function.
                     boxes.push(b);

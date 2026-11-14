@@ -267,7 +267,7 @@ fn validate_net(host: &str, path: &str) -> Result<(), Error> {
 fn net_staging(idx: usize) -> String {
     crate::registry::assert_registry_child("mounts"); // classification chokepoint (see registry.rs)
     let uid = unsafe { libc::getuid() };
-    let base = crate::global_env("XDG_RUNTIME_DIR")
+    let base = crate::xdg_var("XDG_RUNTIME_DIR")
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_else(|| format!("/run/user/{uid}"));
     format!("{base}/kern/mounts/net-{}-{idx}", std::process::id())
@@ -428,7 +428,7 @@ pub fn setup_network(spec: &str, idx: usize) -> Result<(String, String, bool, Ne
 /// Locate a just-created GVFS mount for (scheme, host) under `$XDG_RUNTIME_DIR/gvfs`.
 fn find_gvfs_mount(scheme: NetScheme, host: &str) -> Option<String> {
     let uid = unsafe { libc::getuid() };
-    let base = crate::global_env("XDG_RUNTIME_DIR")
+    let base = crate::xdg_var("XDG_RUNTIME_DIR")
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_else(|| format!("/run/user/{uid}"));
     let (prefix, key) = match scheme {

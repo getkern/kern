@@ -632,9 +632,13 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
         "sandbox_history" => {
             let raw = value_string(v)?;
             k.sandbox_history = Some(crate::history::Keep::parse(raw.trim()).ok_or_else(|| {
+                let choices: Vec<String> = crate::history::Keep::ALL
+                    .into_iter()
+                    .map(|c| format!("\"{}\" ({})", c.word(), c.meaning()))
+                    .collect();
                 format!(
-                    "[kern] sandbox_history = '{raw}': expected \"memory\" (kept until reboot), \
-                     \"disk\" (kept across reboots) or \"off\" (nothing recorded)"
+                    "[kern] sandbox_history = '{raw}': expected {}",
+                    choices.join(", ")
                 )
             })?);
         }
@@ -888,14 +892,9 @@ fn value_u32_array(v: &str) -> Result<Vec<u32>, String> {
 /// Default config location: `$XDG_CONFIG_HOME/kern/kern.toml`, else `~/.config/kern/kern.toml`.
 /// The conventional XDG location.
 pub fn default_path() -> Option<std::path::PathBuf> {
-    // An empty `XDG_CONFIG_HOME` (exported but blank) must be treated as unset - otherwise it forms a
+    // An empty or relative `XDG_CONFIG_HOME` is unset (`crate::xdg_base`): otherwise it forms a
     // *relative* `kern/kern.toml` and the config lands in the current directory.
-    if let Some(x) = crate::global_env("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
-        return Some(std::path::PathBuf::from(x).join("kern").join("kern.toml"));
-    }
-    crate::global_env("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| std::path::PathBuf::from(h).join(".config/kern/kern.toml"))
+    crate::kern_xdg_root("XDG_CONFIG_HOME", ".config").map(|r| r.join("kern.toml"))
 }
 
 /// The config file **in effect** for this invocation: `KERN_CONFIG` when set and non-empty, else
@@ -2199,10 +2198,17 @@ pub(crate) fn read_kern_toml() -> Result<(std::path::PathBuf, String), String> {
 /// Atomic, private, symlink-safe write of `kern.toml`: a per-pid temp opened with `O_CREAT|O_EXCL`
 /// (never follows a planted symlink), mode `0600`, `fsync`ed before the rename so the swapped-in file
 /// is never a partial write.
+///
+/// Not only `kern.toml`: the sandbox history rewrites its files through it too. The temporary is
+/// `<file name>.tmp.<pid>` beside the target, which for `kern.toml` is the name it always had.
 pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.tmp.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp); // clear a temp left by our own crashed write
     let mut f = std::fs::OpenOptions::new()
         .write(true)

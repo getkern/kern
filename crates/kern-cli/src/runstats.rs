@@ -55,8 +55,8 @@ pub fn since_start_us() -> Option<u128> {
 /// agree on the file without a shared constant. `pub(crate)` so the volume guard can add this FILE's
 /// dev/ino to the non-mountable identity set (it is a runtime registry child, not a directory).
 pub(crate) fn path() -> std::path::PathBuf {
-    if let Some(x) = crate::global_env("XDG_RUNTIME_DIR") {
-        return std::path::PathBuf::from(x).join("kern/runstats");
+    if let Some(x) = crate::xdg_var("XDG_RUNTIME_DIR") {
+        return x.join("kern/runstats");
     }
     let uid = unsafe { libc::getuid() };
     let run = std::path::PathBuf::from(format!("/run/user/{uid}"));

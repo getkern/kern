@@ -338,7 +338,7 @@ pub use real::{
     ulimit_named, username, BridgeAttach, CapSpec, OverlayDirs, RealMounts, SandboxSpec,
     TmpfsMount, UidRange, Unplaceable, VdiskMount, Volume, ULIMITS,
 };
-pub use real::{iface_set_ipv4, iface_up, member_mac, pod_bridge_parts, POD_BRIDGE};
+pub use real::{iface_set_ipv4, iface_up, mask_of, member_mac, pod_bridge_name, pod_bridge_parts};
 pub use real::{mount_overlay_c, overlay_escape, overlay_lowerdir, OverlayMount, OverlayOpts};
 /// The embeddable fluent SDK: `Sandbox::builder()…build()?.run(cmd, args)?`. See [`sandbox`].
 pub use sandbox::{Sandbox, SandboxBuilder, SandboxError, SandboxResult, SeccompMode};

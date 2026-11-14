@@ -7443,11 +7443,9 @@ fn ipv4_is_local(_probe: libc::c_int, ip: std::net::Ipv4Addr) -> bool {
     }
 }
 
-/// The bridge interface a pod holder builds, and the one its members attach to.
-pub const POD_BRIDGE: &str = "kbr0";
-
-/// The name of the pod holder's bridge number `i`: `kbr0` for the first, which is [`POD_BRIDGE`],
-/// then `kbr1`, `kbr2`, one per compose network of a stack whose `networks:` separate services.
+/// The name of the pod holder's bridge number `i`, the interface its members attach to: `kbr0`
+/// for a pod with one network, then `kbr1`, `kbr2`, one per compose network of a stack whose
+/// `networks:` separate services.
 #[must_use]
 pub fn pod_bridge_name(i: u8) -> String {
     format!("kbr{i}")
@@ -7755,19 +7753,14 @@ pub fn run_pod_holder() -> ! {
     // not build one must not report itself ready: the alternative is a pod that starts, looks fine
     // and silently isolates every service in it.
     //
-    // `KERN_POD_BRIDGES=<cidr>,<cidr>`: the FURTHER bridges, `kbr1` onwards, one per compose network
-    // of a stack whose `networks:` separate services. Built the same way, and fail-closed the same
-    // way.
-    if let Ok(cidr) = std::env::var("KERN_POD_BRIDGE") {
-        let extra = std::env::var("KERN_POD_BRIDGES").unwrap_or_default();
-        let all: Vec<String> = std::iter::once(cidr.clone())
-            .chain(
-                extra
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|c| !c.is_empty())
-                    .map(str::to_string),
-            )
+    // A LIST, `<cidr>,<cidr>`: one bridge per compose network of a stack whose `networks:` separate
+    // services, `kbr0` onwards, built the same way and fail-closed the same way. One network has no
+    // comma, so a single-bridge pod reads exactly as before.
+    if let Ok(list) = std::env::var("KERN_POD_BRIDGE") {
+        let all: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
             .collect();
         if all.len() > 1 {
             // NO FORWARDING BETWEEN THE BRIDGES. Members never route through the holder (their way
@@ -7787,15 +7780,15 @@ pub fn run_pod_holder() -> ! {
                 unsafe { libc::_exit(1) };
             }
         }
-        if all.len() > usize::from(u8::MAX) {
-            eprintln!(
-                "kern: pod: {} networks is more than a pod can carry",
-                all.len()
-            );
-            unsafe { libc::_exit(1) };
-        }
         for (i, cidr) in all.iter().enumerate() {
-            let name = pod_bridge_name(u8::try_from(i).unwrap_or(u8::MAX));
+            let Ok(i) = u8::try_from(i) else {
+                eprintln!(
+                    "kern: pod: {} networks is more than a pod can carry",
+                    all.len()
+                );
+                unsafe { libc::_exit(1) };
+            };
+            let name = pod_bridge_name(i);
             match pod_bridge_parts(cidr) {
                 Some((gw, mask, _)) => {
                     if crate::netlink::add_bridge(&name).is_err()

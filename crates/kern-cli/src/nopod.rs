@@ -133,17 +133,14 @@ pub fn effective_networks(nets: &[String]) -> Vec<String> {
     }
 }
 
-/// The address `peer` answers on AS SEEN FROM `me`: on a stack with a bridge per network, its
-/// address on the first of `me`'s networks it is also on; otherwise its one address.
-pub fn peer_addr(plan: &[Assigned], me: &str, peer: &Assigned) -> u32 {
+/// The address `peer` answers on AS SEEN FROM a service on the networks `mine` (as
+/// [`effective_networks`] spells them): on a stack with a bridge per network, its address on the
+/// first of those it is also on; otherwise its one address. `mine` is resolved once by the caller,
+/// which asks for every peer.
+pub fn peer_addr(mine: &[String], peer: &Assigned) -> u32 {
     if peer.net_addrs.is_empty() {
         return peer.alias;
     }
-    let mine = plan
-        .iter()
-        .find(|a| a.service == me)
-        .map(|a| effective_networks(&a.networks))
-        .unwrap_or_default();
     mine.iter()
         .find_map(|n| {
             peer.net_addrs
@@ -287,6 +284,8 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
         .iter()
         .find(|a| a.service == me)
         .map_or(&[], |a| a.networks.as_slice());
+    // Resolved once for every peer below (see `peer_addr`).
+    let mine_eff = effective_networks(mine);
     let my_ports: &[u16] = plan
         .iter()
         .find(|a| a.service == me)
@@ -357,7 +356,7 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
         if via_relay && a.ports.iter().any(|p| my_ports.contains(p)) {
             continue;
         }
-        let addr = alias_to_dotted(peer_addr(plan, me, a), &mut buf).to_string();
+        let addr = alias_to_dotted(peer_addr(&mine_eff, a), &mut buf).to_string();
         out.push(format!("{}:{}", a.service, addr));
         // AND THE PEER'S BOX NAME, which is the name it ANNOUNCES rather than the name the file
         // calls it by.
@@ -399,7 +398,7 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
 ///
 /// A LINK TO A SERVICE THAT IS NOT IN THE PLAN IS SKIPPED, not guessed. Under `--no-pod` there is no
 /// address to give it, and inventing one would produce a name that resolves to the wrong box. In a
-/// pod the plan is empty by construction, so `use_pod` short-circuits before the lookup and every
+/// pod the plan is empty by construction, so `shared_ns` short-circuits before the lookup and every
 /// link resolves to the shared loopback; a link naming a service that does not exist is reported by
 /// the parser, which is the layer that can see the whole file.
 ///
@@ -415,7 +414,11 @@ pub fn link_host_args(
     shared_ns: bool,
     me: &str,
 ) -> Vec<String> {
-    let use_pod = shared_ns;
+    let mine = plan
+        .iter()
+        .find(|a| a.service == me)
+        .map(|a| effective_networks(&a.networks))
+        .unwrap_or_default();
     let mut out = Vec::with_capacity(links.len());
     let mut buf = [0u8; 15];
     for l in links {
@@ -427,14 +430,14 @@ pub fn link_host_args(
         if alias == service {
             continue;
         }
-        if use_pod {
+        if shared_ns {
             out.push(format!("{alias}:127.0.0.1"));
             continue;
         }
         if let Some(a) = plan.iter().find(|a| a.service == service) {
             out.push(format!(
                 "{alias}:{}",
-                alias_to_dotted(peer_addr(plan, me, a), &mut buf)
+                alias_to_dotted(peer_addr(&mine, a), &mut buf)
             ));
         }
     }

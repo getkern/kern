@@ -1033,7 +1033,7 @@ fn nesting_active(privileged: bool) -> bool {
 /// better to skip the logo than to reprint it every time. A lost race (two boxes at once) just
 /// prints the logo twice, which is harmless.
 fn first_box_of_session() -> bool {
-    let Some(dir) = crate::global_env("XDG_RUNTIME_DIR") else {
+    let Some(dir) = crate::xdg_var("XDG_RUNTIME_DIR") else {
         return false;
     };
     let marker = std::path::Path::new(&dir).join("kern").join(".greeted");
@@ -2542,17 +2542,9 @@ fn kern_state_refusal(
 
 /// The user's systemd unit directory (`$XDG_CONFIG_HOME/systemd/user`, else `~/.config/systemd/user`).
 fn user_systemd_dir() -> Result<PathBuf, Error> {
-    if let Some(x) = crate::global_env("XDG_CONFIG_HOME") {
-        if !x.is_empty() {
-            return Ok(PathBuf::from(x).join("systemd/user"));
-        }
-    }
-    let home = crate::global_env("HOME")
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| {
-            Error::Sandbox("HOME not set - cannot locate the systemd user dir".into())
-        })?;
-    Ok(PathBuf::from(home).join(".config/systemd/user"))
+    crate::xdg_base("XDG_CONFIG_HOME", ".config")
+        .map(|b| b.join("systemd/user"))
+        .ok_or_else(|| Error::Sandbox("HOME not set - cannot locate the systemd user dir".into()))
 }
 
 /// Run `systemctl --user <args>` quietly; `true` on success. Used for the persistent-box unit.

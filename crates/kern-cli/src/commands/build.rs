@@ -922,12 +922,14 @@ fn materialize_final_image(tag: &str) -> Result<(), Error> {
     let _ = std::fs::remove_file(cache.join(format!("{safe}.layers")));
     write_image_config(&cache.join(format!("{safe}.image")), &config)
         .map_err(|e| Error::Sandbox(format!("materialize '{tag}': image config: {e}")))?;
-    // THE OWNER MARK BEFORE THE SENTINEL. Only a pull wrote it, so as root every BUILT image read as
-    // "unpacked by an older kern" and was sent to the registry to be repaired, where a local image
-    // does not exist: MEASURED, `kern box --image <built>` as root failed with "cannot access
-    // 'library/<tag>' on registry-1.docker.io". The files were written under this process's map.
-    super::imagecache::record_owner_map(&cache, &safe);
-    let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
+    // Sealed like every other way into the cache: see `imagecache::seal_entry`.
+    let _ = super::imagecache::seal_entry(
+        &cache,
+        &safe,
+        tag,
+        super::imagecache::Owners::ThisProcess,
+        false,
+    );
     Ok(())
 }
 
@@ -1439,12 +1441,14 @@ fn build_run(
     let _ = std::fs::remove_file(cache.join(format!("{safe}.layers")));
     write_image_config(&cache.join(format!("{safe}.image")), &config)
         .map_err(|e| Error::Sandbox(format!("image config for '{tag}': {e}")))?;
-    // THE OWNER MARK BEFORE THE SENTINEL. Only a pull wrote it, so as root every BUILT image read as
-    // "unpacked by an older kern" and was sent to the registry to be repaired, where a local image
-    // does not exist: MEASURED, `kern box --image <built>` as root failed with "cannot access
-    // 'library/<tag>' on registry-1.docker.io". The files were written under this process's map.
-    super::imagecache::record_owner_map(&cache, &safe);
-    let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
+    // Sealed like every other way into the cache: see `imagecache::seal_entry`.
+    let _ = super::imagecache::seal_entry(
+        &cache,
+        &safe,
+        tag,
+        super::imagecache::Owners::ThisProcess,
+        false,
+    );
     // Record the content key so the NEXT identical build hits the flat cache above and skips the rebuild.
     write_flat_key(tag, &flat_key);
     announce_built(tag);
@@ -1889,12 +1893,14 @@ fn build_layered_cached(
         .map_err(|e| Error::Sandbox(format!("finalize image '{tag}': {e}")))?;
     write_image_config(&cache.join(format!("{safe}.image")), &config)
         .map_err(|e| Error::Sandbox(format!("image config for '{tag}': {e}")))?;
-    // THE OWNER MARK BEFORE THE SENTINEL. Only a pull wrote it, so as root every BUILT image read as
-    // "unpacked by an older kern" and was sent to the registry to be repaired, where a local image
-    // does not exist: MEASURED, `kern box --image <built>` as root failed with "cannot access
-    // 'library/<tag>' on registry-1.docker.io". The files were written under this process's map.
-    super::imagecache::record_owner_map(&cache, &safe);
-    let _ = std::fs::write(cache.join(format!("{safe}.ok")), tag.as_bytes());
+    // Sealed like every other way into the cache: see `imagecache::seal_entry`.
+    let _ = super::imagecache::seal_entry(
+        &cache,
+        &safe,
+        tag,
+        super::imagecache::Owners::ThisProcess,
+        false,
+    );
     announce_built(tag);
     Ok(())
 }

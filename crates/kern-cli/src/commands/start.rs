@@ -3226,34 +3226,25 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // THE BOX'S LINE IN THE HISTORY, from what kern observed outside it: see `history.rs`. Here,
     // after teardown and before the exit code is handed back, because this is the one place every
     // foreground box (every SDK and MCP call) passes on its way out with its outcome known.
-    // A STOP MAY HAVE WRITTEN THIS BOX'S LINE ALREADY, and then this writes none: see
-    // `registry::owner_stop_claim`.
-    let stop_claim = registry::owner_stop_claim(name.as_str(), launcher_pid);
-    if let (Ok(code), false) = (&result, stop_claim == registry::StopClaim::AlreadyWritten) {
-        let ran_ms = crate::runstats::since_start_us()
-            .map_or(0, |us| u64::try_from(us / 1000).unwrap_or(u64::MAX));
-        crate::history::record(&crate::history::Entry {
-            ended_ms: crate::history::now_ms(),
-            name: name.as_str().to_string(),
-            image: args.image.unwrap_or("-").to_string(),
+    // EVERY ENDING GETS ITS LINE, a box kern could not start included: it is the `not-started`
+    // outcome (kern's own 125). Writing only on success consumed a stop's claim and then wrote
+    // nothing, so a stopped box whose launcher failed afterwards left no line at all.
+    let code = *result.as_ref().unwrap_or(&125);
+    let ran_ms = crate::runstats::since_start_us()
+        .map_or(0, |us| u64::try_from(us / 1000).unwrap_or(u64::MAX));
+    crate::history::record_owner_end(
+        name.as_str(),
+        launcher_pid,
+        &crate::history::Observed {
+            code,
+            signal: kern_isolation::box_workload_signal(),
+            oom: kern_isolation::box_was_oom_killed(),
+            timeout_s: args.timeout,
             ran_ms,
-            code: *code,
-            // A `kern stop` that ended this box left a marker: the line says `stopped`, and it is
-            // the only line (see `registry::mark_stopping`).
-            outcome: if stop_claim == registry::StopClaim::OwnerWrites {
-                crate::history::Outcome::Stopped
-            } else {
-                crate::history::classify(
-                    *code,
-                    kern_isolation::box_workload_signal(),
-                    kern_isolation::box_was_oom_killed(),
-                    args.timeout,
-                    ran_ms,
-                )
-            },
-            gpu: args.gpus.unwrap_or("-").to_string(),
-        });
-    }
+            image: args.image.unwrap_or(""),
+            gpu: args.gpus.unwrap_or(""),
+        },
+    );
     match result {
         // Propagate the sandboxed command's exit code as kern's, like `docker run`. This is the
         // one place a non-0/1 exit code is produced - a deliberate terminal action.
@@ -5159,35 +5150,19 @@ fn supervise_box(
     // millisecond, its signal and OOM verdict from the runner (see `latch`), its image, GPUs and
     // timeout from the record. A `kern stop` that ended it left a marker, and then the line says
     // `stopped` and is the only one.
-    let dash = |s: &str| {
-        if s.is_empty() {
-            "-".to_string()
-        } else {
-            s.to_string()
-        }
-    };
-    let stop_claim = registry::owner_stop_claim(&inst.name, inst.pid);
-    if stop_claim != registry::StopClaim::AlreadyWritten {
-        crate::history::record(&crate::history::Entry {
-            ended_ms: crate::history::now_ms(),
-            name: inst.name.clone(),
-            image: dash(&inst.image),
-            ran_ms: last_ran_ms,
+    crate::history::record_owner_end(
+        &inst.name,
+        inst.pid,
+        &crate::history::Observed {
             code: final_code,
-            outcome: if stop_claim == registry::StopClaim::OwnerWrites {
-                crate::history::Outcome::Stopped
-            } else {
-                crate::history::classify(
-                    final_code,
-                    last_verdict.0,
-                    last_verdict.1,
-                    inst.timeout_s,
-                    last_ran_ms,
-                )
-            },
-            gpu: dash(&inst.gpus),
-        });
-    }
+            signal: last_verdict.0,
+            oom: last_verdict.1,
+            timeout_s: inst.timeout_s,
+            ran_ms: last_ran_ms,
+            image: &inst.image,
+            gpu: &inst.gpus,
+        },
+    );
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
     }

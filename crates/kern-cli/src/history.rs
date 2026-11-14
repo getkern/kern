@@ -234,13 +234,25 @@ impl Keep {
         Keep::ALL.into_iter().find(|k| k.word() == w)
     }
 
-    /// What the choice means, in the words every surface prints.
+    /// What the choice does, in the words every surface prints after [`Self::word`]: the CLI,
+    /// `kern info`, the config error and both lines of `kern top` read it from here, so the
+    /// sentence cannot be spelled four ways.
     pub fn meaning(self) -> &'static str {
         match self {
-            Keep::Memory => "in memory, cleared at reboot",
-            Keep::Disk => "on disk, kept across reboots",
-            Keep::Off => "off, nothing new is recorded",
+            Keep::Memory => "cleared at reboot",
+            Keep::Disk => "kept across reboots",
+            Keep::Off => "nothing new is recorded",
         }
+    }
+
+    /// The picker key for this choice in `kern top`: its word's first letter (`m`, `d`, `o`).
+    pub fn key(self) -> u8 {
+        self.word().as_bytes().first().copied().unwrap_or(b'?')
+    }
+
+    /// The choice a picker key names, if any.
+    pub fn by_key(k: u8) -> Option<Keep> {
+        Keep::ALL.into_iter().find(|x| x.key() == k)
     }
 }
 
@@ -249,9 +261,16 @@ impl Keep {
 /// `kern top` runs for hours and the choice is made from another process (`kern sandbox keep`) as
 /// often as from its own key. A missing or unreadable file is the default.
 pub fn keep() -> Keep {
+    keep_state().0
+}
+
+/// [`keep`] and, when `kern.toml` does not parse, why: the default is then in force and the
+/// sentences that name the place say so. One load answers both, memoised together.
+fn keep_state() -> (Keep, Option<String>) {
     use std::sync::Mutex;
     type Key = (Option<PathBuf>, u64, Option<std::time::SystemTime>);
-    static MEMO: Mutex<Option<(Key, Keep)>> = Mutex::new(None);
+    type State = (Keep, Option<String>);
+    static MEMO: Mutex<Option<(Key, State)>> = Mutex::new(None);
     let path = crate::config::active_path();
     let meta = path.as_ref().and_then(|p| std::fs::metadata(p).ok());
     let key: Key = (
@@ -262,15 +281,26 @@ pub fn keep() -> Keep {
     let mut guard = MEMO.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((k, v)) = guard.as_ref() {
         if *k == key {
-            return *v;
+            return v.clone();
         }
     }
-    let v = crate::config::load(None)
+    let v = match crate::config::load(None) {
+        Ok(c) => (c.kern.sandbox_history.unwrap_or(Keep::Memory), None),
+        Err(e) => (Keep::Memory, Some(e)),
+    };
+    *guard = Some((key, v.clone()));
+    v
+}
+
+/// [`keep`] for the one read a box's end makes: no memo key to `stat`, because a box process
+/// records once and the memo could never hit. NOT `load_cached`, whose answer is fixed for the
+/// process: a detached box's supervisor lives as long as its box and must write where the setting
+/// says NOW, and an SDK box loads no config before this anyway, so the cache saves no read.
+fn keep_for_record() -> Keep {
+    crate::config::load(None)
         .ok()
         .and_then(|c| c.kern.sandbox_history)
-        .unwrap_or(Keep::Memory);
-    *guard = Some((key, v));
-    v
+        .unwrap_or(Keep::Memory)
 }
 
 fn memory_dir() -> std::io::Result<PathBuf> {
@@ -290,17 +320,14 @@ pub(crate) fn disk_dir_path() -> Option<PathBuf> {
 /// [`disk_dir_path`], created private (`0700`) and checked to be a directory this user owns, so a
 /// symlink or another user's directory planted there is refused rather than written through.
 fn disk_dir() -> std::io::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::MetadataExt;
     let d = disk_dir_path().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "neither XDG_DATA_HOME nor HOME is set",
         )
     })?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&d)?;
+    crate::commands::own_only_dir(&d)?;
     let m = std::fs::symlink_metadata(&d)?;
     // SAFETY: `getuid` has no preconditions and cannot fail.
     if !m.is_dir() || m.uid() != unsafe { libc::getuid() } {
@@ -327,16 +354,21 @@ fn dir() -> std::io::Result<PathBuf> {
     dir_of(keep())
 }
 
-/// The file the history is written to now (for `off`, the one that holds what came before),
-/// without reading it: what `kern top` names on every frame.
+/// The file the history is written to now (for `off`, the one that holds what came before), for
+/// display: what `kern top` names on every frame, so the disk path is COMPUTED and nothing is made
+/// or checked on disk to name it.
 pub fn current_file() -> Option<PathBuf> {
-    dir().ok().map(|d| d.join(CURRENT))
+    match keep() {
+        Keep::Disk => disk_dir_path(),
+        Keep::Memory | Keep::Off => memory_dir().ok(),
+    }
+    .map(|d| d.join(CURRENT))
 }
 
 /// Append one entry, unless the history is `off`. Best-effort and silent: a box's result must
 /// never depend on its history.
-pub fn record(e: &Entry) {
-    let k = keep();
+fn record(e: &Entry) {
+    let k = keep_for_record();
     if k == Keep::Off {
         return;
     }
@@ -344,6 +376,73 @@ pub fn record(e: &Entry) {
         return;
     };
     record_in(&d, e);
+}
+
+/// What the OWNER of a box (its foreground launcher, or a detached box's supervisor) observed
+/// when the box ended: everything its history line is written from.
+pub struct Observed<'a> {
+    pub code: i32,
+    /// The signal that ended the workload, 0 if it exited.
+    pub signal: u8,
+    /// Whether its own cgroup OOM-killed it.
+    pub oom: bool,
+    /// `--timeout` in seconds, 0 for none.
+    pub timeout_s: u64,
+    pub ran_ms: u64,
+    /// The image, empty for a `--rootfs` box (written `-`).
+    pub image: &'a str,
+    /// The `--gpus` selection, empty for none (written `-`).
+    pub gpu: &'a str,
+}
+
+/// The owner's line for the box `name` it owned as `owner_pid`. THE ONE PLACE an owner writes one,
+/// so the stop claim, the outcome and the field rules cannot differ between the foreground and the
+/// detached path: if a `kern stop` already wrote the line this writes nothing, if a stop ended the
+/// box and left the line to its owner the outcome is `stopped`, otherwise it is what was observed.
+pub fn record_owner_end(name: &str, owner_pid: i32, o: &Observed) {
+    let outcome = match crate::registry::owner_stop_claim(name, owner_pid) {
+        crate::registry::StopClaim::AlreadyWritten => return,
+        crate::registry::StopClaim::OwnerWrites => Outcome::Stopped,
+        crate::registry::StopClaim::NotStopped => {
+            classify(o.code, o.signal, o.oom, o.timeout_s, o.ran_ms)
+        }
+    };
+    record(&Entry {
+        ended_ms: now_ms(),
+        name: name.to_string(),
+        image: o.image.to_string(),
+        ran_ms: o.ran_ms,
+        code: o.code,
+        outcome,
+        gpu: o.gpu.to_string(),
+    });
+}
+
+/// `kern stop`'s line for the box `b` it ended, written HERE unless the box's owner already wrote
+/// it: one atomic claim decides, with no waiting (see `registry::owner_stop_claim`). A stop that
+/// wins leaves the owner a `.done` mark, which an owner already gone never reads, so it is removed.
+pub fn record_stopped(b: &crate::registry::Instance, code: i32) {
+    if !crate::registry::claim_stop_record(&b.name, b.pid) {
+        return;
+    }
+    if !crate::registry::pid_is_still(b.pid, b.starttime) {
+        crate::registry::forget_stop_record(&b.name, b.pid);
+    }
+    record(&Entry {
+        ended_ms: now_ms(),
+        name: b.name.clone(),
+        image: b.image.clone(),
+        // From the kernel's start time of the box's init, to the tick, where the record has it;
+        // else from the recorded start second.
+        ran_ms: ran_ms_since_ticks(b.pid1_starttime).unwrap_or_else(|| {
+            crate::registry::now_unix()
+                .saturating_sub(b.started)
+                .saturating_mul(1000)
+        }),
+        code,
+        outcome: Outcome::Stopped,
+        gpu: b.gpus.clone(),
+    });
 }
 
 fn record_in(d: &std::path::Path, e: &Entry) {
@@ -385,12 +484,16 @@ fn read_in(d: &std::path::Path) -> Vec<Entry> {
 /// FOR `kern top`, which asks every second: the files hold up to about 12 000 lines and parsing them
 /// on every frame would be work for an answer that rarely changes. The key is each file's size and
 /// modification time, which an append always moves.
-pub fn sandboxes_newest_first() -> Vec<Entry> {
-    use std::sync::Mutex;
+///
+/// SHARED, NOT COPIED: an `Arc` over the cached list. `kern top` asks for it several times a frame
+/// (the tab bar's count, the Overview, the tab, Enter), and a copy of 12 000 entries with three
+/// strings each is about 36 000 allocations per call.
+pub fn sandboxes_newest_first() -> std::sync::Arc<[Entry]> {
+    use std::sync::{Arc, Mutex};
     type Key = (PathBuf, Vec<(u64, Option<std::time::SystemTime>)>);
-    static CACHE: Mutex<Option<(Key, Vec<Entry>)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<(Key, Arc<[Entry]>)>> = Mutex::new(None);
     let Ok(d) = dir() else {
-        return Vec::new();
+        return Arc::from(Vec::new());
     };
     // THE DIRECTORY IS PART OF THE KEY: a switch between memory and disk changes where the rows
     // are, and two files that happen to share a size and a second must not answer for each other.
@@ -408,12 +511,13 @@ pub fn sandboxes_newest_first() -> Vec<Entry> {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((k, v)) = guard.as_ref() {
         if *k == key {
-            return v.clone();
+            return Arc::clone(v);
         }
     }
     let mut v: Vec<Entry> = read_in(&d).into_iter().filter(Entry::is_sandbox).collect();
     v.reverse();
-    *guard = Some((key, v.clone()));
+    let v: Arc<[Entry]> = Arc::from(v);
+    *guard = Some((key, Arc::clone(&v)));
     v
 }
 
@@ -422,58 +526,65 @@ pub fn sandboxes_newest_first() -> Vec<Entry> {
 /// file is written to a private temporary and renamed over, so a reader sees the old file or the
 /// new one, never half of one.
 fn write_whole(d: &std::path::Path, entries: &[Entry]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let lines: Vec<String> = entries.iter().map(Entry::line).collect();
-    // Split from the newest end: `cur` takes lines while they fit, `prev` the ones before.
-    let mut split = lines.len();
-    let mut size = 0u64;
-    while split > 0 && size + lines[split - 1].len() as u64 <= MAX_BYTES {
-        size += lines[split - 1].len() as u64;
-        split -= 1;
-    }
-    let mut start = split;
-    let mut psize = 0u64;
-    while start > 0 && psize + lines[start - 1].len() as u64 <= MAX_BYTES {
-        psize += lines[start - 1].len() as u64;
-        start -= 1;
-    }
+    // From the newest end: the current file takes the lines that fit, the previous one the lines
+    // before them that fit, and older ones go.
+    let fit_before = |end: usize| -> usize {
+        let mut start = end;
+        let mut size = 0u64;
+        while start > 0 && size + lines[start - 1].len() as u64 <= MAX_BYTES {
+            size += lines[start - 1].len() as u64;
+            start -= 1;
+        }
+        start
+    };
+    let split = fit_before(lines.len());
+    let start = fit_before(split);
     for (name, body) in [
         (PREVIOUS, lines[start..split].concat()),
         (CURRENT, lines[split..].concat()),
     ] {
         let target = d.join(name);
         if body.is_empty() {
-            match std::fs::remove_file(&target) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => continue,
-            }
+            remove_if_present(&target)?;
+        } else {
+            crate::config::write_atomic(&target, &body)?;
         }
-        let tmp = d.join(format!(".{name}.{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&tmp)?;
-        if let Err(e) = f.write_all(body.as_bytes()).and_then(|()| f.sync_all()) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        std::fs::rename(&tmp, &target)?;
     }
     Ok(())
 }
 
-/// Remove both history files of `d`; a file that is not there is not an error.
+/// Remove `path`; one that is not there is already the state asked for.
+fn remove_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Remove both history files of `d`.
 fn remove_in(d: &std::path::Path) -> std::io::Result<()> {
     for f in [PREVIOUS, CURRENT] {
-        match std::fs::remove_file(d.join(f)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
+        remove_if_present(&d.join(f))?;
     }
     Ok(())
+}
+
+/// How many lines `d` holds, counted as bytes rather than parsed: the sentences that name the
+/// place say how many, and parsing up to 2 MiB to count it cost milliseconds per call.
+fn held_in(d: &std::path::Path) -> usize {
+    [PREVIOUS, CURRENT]
+        .iter()
+        .filter_map(|f| std::fs::read(d.join(f)).ok())
+        .map(|b| b.iter().filter(|c| **c == b'\n').count())
+        .sum()
+}
+
+/// Every place a history can be: memory, and the disk directory where it exists.
+fn places() -> impl Iterator<Item = PathBuf> {
+    [memory_dir().ok(), disk_dir_path().filter(|p| p.is_dir())]
+        .into_iter()
+        .flatten()
 }
 
 /// Move every row of `from` into `to`, merged by end time with what `to` already holds, and empty
@@ -503,21 +614,16 @@ fn move_rows(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<us
 /// where `new` keeps them (`off` keeps them in memory, readable until the next reboot). Returns how
 /// many rows moved.
 pub fn set_keep(new: Keep) -> Result<usize, String> {
-    let old = keep();
     crate::config::set_kern_key("sandbox_history", Some(&format!("\"{}\"", new.word())))?;
-    let (Ok(from), Ok(to)) = (dir_of(old), dir_of(new)) else {
+    let Ok(to) = dir_of(new) else {
         return Ok(0);
     };
-    // Rows can sit in the place that is NOT the old one too: a disk directory that could not be made
-    // fell back to memory. Both are swept, the old one first.
-    let mut moved = move_rows(&from, &to).map_err(|e| format!("moving the history: {e}"))?;
-    for other in [memory_dir().ok(), disk_dir_path().filter(|p| p.is_dir())]
-        .into_iter()
-        .flatten()
-    {
-        if other != from {
-            moved += move_rows(&other, &to).map_err(|e| format!("moving the history: {e}"))?;
-        }
+    // EVERY PLACE IS SWEPT, not only the previous setting's: a disk directory that could not be
+    // made fell back to memory, so rows can sit in either. `move_rows` merges by end time and is a
+    // no-op on the target itself, so the order does not matter.
+    let mut moved = 0;
+    for from in places() {
+        moved += move_rows(&from, &to).map_err(|e| format!("moving the history: {e}"))?;
     }
     Ok(moved)
 }
@@ -525,14 +631,20 @@ pub fn set_keep(new: Keep) -> Result<usize, String> {
 /// Remove every row held, in memory and on disk. Returns how many there were.
 pub fn clear() -> Result<usize, String> {
     let mut n = 0;
-    for d in [memory_dir().ok(), disk_dir_path().filter(|p| p.is_dir())]
-        .into_iter()
-        .flatten()
-    {
-        n += read_in(&d).len();
+    for d in places() {
+        n += held_in(&d);
         remove_in(&d).map_err(|e| format!("clearing {}: {e}", d.display()))?;
     }
     Ok(n)
+}
+
+/// "N rows moved with it", or nothing for none: the CLI and `kern top` say it the same way.
+pub fn moved_line(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some("1 row moved with it".to_string()),
+        n => Some(format!("{n} rows moved with it")),
+    }
 }
 
 /// Where the history is and how many rows it holds, the sentence `kern info` and the CLI print:
@@ -542,32 +654,39 @@ pub fn clear() -> Result<usize, String> {
 /// puts it, and a reader who wrote `disk` with a typo elsewhere in the file must not be told
 /// "memory" as if that were their choice.
 pub fn keep_line() -> String {
-    let line = keep_line_of_setting();
-    match crate::config::load(None) {
-        Err(e) => format!("{line} (the default: kern.toml does not parse, {e})"),
-        Ok(_) => line,
-    }
-}
-
-fn keep_line_of_setting() -> String {
-    let k = keep();
-    let Ok(d) = dir_of(k) else {
-        return format!("{}: {}, no directory to keep it in", k.word(), k.meaning());
+    let (k, broken) = keep_state();
+    let line = match dir_of(k) {
+        Err(_) => format!("{}: {}, no directory to keep it in", k.word(), k.meaning()),
+        Ok(d) => {
+            let held = held_in(&d);
+            let at = d.join(CURRENT);
+            let fell_back = k == Keep::Disk && disk_dir_path().is_some_and(|p| !d.starts_with(p));
+            match k {
+                Keep::Off if held == 0 => "off: nothing is recorded".to_string(),
+                Keep::Off => format!(
+                    "off: {}; {held} rows from before stay in {} until reboot",
+                    k.meaning(),
+                    at.display()
+                ),
+                Keep::Disk if fell_back => format!(
+                    "disk, but the disk directory could not be made: {held} rows in {}, {}",
+                    at.display(),
+                    Keep::Memory.meaning()
+                ),
+                Keep::Disk | Keep::Memory => {
+                    format!(
+                        "{}: {}, {held} rows in {}",
+                        k.word(),
+                        k.meaning(),
+                        at.display()
+                    )
+                }
+            }
+        }
     };
-    let held = read_in(&d).len();
-    let at = d.join(CURRENT);
-    match k {
-        Keep::Off if held == 0 => "off: nothing is recorded".to_string(),
-        Keep::Off => format!(
-            "off: nothing new is recorded; {held} rows from before stay in {} until reboot",
-            at.display()
-        ),
-        Keep::Disk if disk_dir().is_err() => format!(
-            "disk, but the disk directory could not be made: {held} rows in {}, cleared at reboot",
-            at.display()
-        ),
-        Keep::Disk => format!("disk: kept across reboots, {held} rows in {}", at.display()),
-        Keep::Memory => format!("memory: cleared at reboot, {held} rows in {}", at.display()),
+    match broken {
+        Some(e) => format!("{line} (the default: kern.toml does not parse, {e})"),
+        None => line,
     }
 }
 
@@ -724,10 +843,8 @@ pub fn sandbox_cmd(cmd: &SandboxCmd) -> Result<(), crate::error::Error> {
         SandboxCmd::Keep { to: Some(k) } => {
             let moved = set_keep(*k).map_err(crate::error::Error::Config)?;
             println!("{}", keep_line());
-            match moved {
-                0 => {}
-                1 => println!("1 row moved with it"),
-                n => println!("{n} rows moved with it"),
+            if let Some(m) = moved_line(moved) {
+                println!("{m}");
             }
             Ok(())
         }
@@ -747,9 +864,10 @@ fn config_name() -> String {
 /// The closing line of a human `history` or `stats`: where these rows live and how to change it,
 /// because the default clears them at reboot and a reader should not find that out from a reboot.
 fn where_line() {
+    let now = keep();
     let next: Vec<&str> = Keep::ALL
         .into_iter()
-        .filter(|k| *k != keep())
+        .filter(|k| *k != now)
         .map(Keep::word)
         .collect();
     println!(

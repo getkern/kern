@@ -231,18 +231,23 @@ pub(crate) fn global_env_str(name: &str) -> Result<String, std::env::VarError> {
 /// `XDG_DATA_HOME=` exported empty, a named volume landed in `./kern/volumes` under whatever
 /// directory kern was started from, while the SDKs' mount refusal guarded `~/.local/share/kern`.
 pub(crate) fn kern_xdg_root(var: &str, home_rel: &str) -> Option<std::path::PathBuf> {
-    let absolute = |v: std::ffi::OsString| {
-        let p = std::path::PathBuf::from(v);
-        p.is_absolute().then_some(p)
-    };
+    xdg_base(var, home_rel).map(|b| b.join("kern"))
+}
+
+/// An XDG base directory: the variable when it is set to an ABSOLUTE path, else `$HOME/<home_rel>`.
+/// The rule [`kern_xdg_root`] applies, for the callers whose directory is not kern's own (the
+/// systemd user units under `XDG_CONFIG_HOME`).
+pub(crate) fn xdg_base(var: &str, home_rel: &str) -> Option<std::path::PathBuf> {
+    xdg_var(var).or_else(|| xdg_var("HOME").map(|h| h.join(home_rel)))
+}
+
+/// An XDG variable as the spec reads it: its value when that is an absolute path, else unset. An
+/// exported-but-empty or relative value would otherwise put kern's state under whatever directory
+/// kern was started from. Also for `XDG_RUNTIME_DIR`, whose readers fall back to `/run/user/<uid>`.
+pub(crate) fn xdg_var(var: &str) -> Option<std::path::PathBuf> {
     global_env(var)
-        .and_then(absolute)
-        .or_else(|| {
-            global_env("HOME")
-                .and_then(absolute)
-                .map(|h| h.join(home_rel))
-        })
-        .map(|b| b.join("kern"))
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
 }
 
 #[allow(clippy::disallowed_methods)] // this IS the chokepoint
