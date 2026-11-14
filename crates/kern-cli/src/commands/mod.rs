@@ -9587,6 +9587,14 @@ fn run_terminal_verb(
         }
         // `restart` = stop everything, then fall through to the full bring-up below.
         ComposeAction::Restart => {
+            // ⛔ THE BRING-UP'S REFUSAL IS ASKED BEFORE ANYTHING IS STOPPED. It was asked after:
+            // MEASURED 2026-11-14 on a web stack with two GPU services, `restart api0 api1`
+            // without `--allow-device-grants` killed both (exit 137) and then refused to start
+            // them, leaving nginx answering 502. The same question, of the same boxes, as the
+            // bring-up below asks, so the two cannot disagree.
+            if let Some(msg) = device_grant_problem(boxes, allow_device_grants) {
+                return Err(Error::Compose(msg));
+            }
             // Same selection as `stop`; the bring-up below narrows to the same names, so
             // `restart b` stops and starts b and leaves its peers alone.
             // The same selection as before, and the ordering still read from the WHOLE graph: a

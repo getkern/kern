@@ -2032,6 +2032,30 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             level.retain(|n| wanted.contains(n));
         }
     }
+    // ⛔ A POD WHOSE HOLDER IS GONE HAS MEMBERS THAT RUN AND REACH NOTHING. Its namespaces, its
+    // bridge and its published ports went with the holder, and every member still running read as
+    // up to date, so `up` and `start` left the stack broken and said it was fine (see
+    // `pod::holder_lost`). Those members are stopped here, before either verb decides what is
+    // running, so the bring-up below creates the pod again and starts them in it.
+    if matches!(action, ComposeAction::Up | ComposeAction::Start) && crate::pod::holder_lost(&pod) {
+        let cut_off: Vec<String> = boxes
+            .iter()
+            .filter(|b| registry::find(&b.name).is_some_and(|i| i.pod == pod))
+            .map(|b| b.name.clone())
+            .collect();
+        if !cut_off.is_empty() {
+            let short: Vec<&str> = cut_off
+                .iter()
+                .map(|n| n.strip_prefix(&format!("{pod}-")).unwrap_or(n))
+                .collect();
+            println!(
+                "→ pod '{pod}' lost its holder, the process that owns its network: its services \
+                 run but reach neither each other nor their published ports. Recreating: {}",
+                short.join(", ")
+            );
+            let _ = stop(&cut_off, false);
+        }
+    }
     if action == ComposeAction::Start {
         for level in &mut levels {
             level.retain(|n| !is_box_alive(n));
@@ -2041,6 +2065,22 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             return Ok(());
         }
     }
+    // Docker resolves a RELATIVE bind source (`./certs:/dst`, `.:/app`) against the compose file's
+    // directory. kern's `-v` needs an absolute path or a named volume, so rewrite relative binds here
+    // to absolute (confined under the compose dir - traversal guard, like a build context). A `named:`
+    // source or an already-absolute `/host:/dst` passes through untouched.
+    //
+    // ⛔ BEFORE THE BUILDS AND THE PULLS, because it costs nothing and they cost minutes. MEASURED
+    // in the field: Kokoro-FastAPI's file, whose `../../web` bind kern refuses outside a repository,
+    // downloaded its multi-GB image for nine minutes and was refused after it.
+    //
+    // ⛔ AND BEFORE THE DRIFT DETECTION BELOW, which hashes the same flags the launch records. It ran
+    // after it: the launch recorded the hash of `/abs/x:/x` and the next `up` compared it with the
+    // hash of `./x:/x`, so a service with a relative bind was "changed" at every `up` and recreated
+    // with its connections dropped. MEASURED 2026-11-14 on a web stack (nginx with its config bound
+    // from `./nginx`, two APIs with `./app`): every `up -d` on the healthy stack recreated all three,
+    // and on a four-service file only the one with `./x:/x` was recreated; v0.33.0 the same.
+    resolve_relative_binds(&mut boxes, file, &crate::commands::compose_root(file)?)?;
     // DRIFT DETECTION. `up` on a running stack used to fail with "a box named 'x' is already
     // running", so an edit to the compose file was never applied and the user had to know to run
     // `down` first. Reconcile instead: a service whose definition still matches is LEFT ALONE (no
@@ -2231,15 +2271,6 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // command's own output under it. There is nothing after this call that exec consumes from a
     // build: it reads the service's name, its workdir and its user, and finds the box in the
     // registry.
-    // Docker resolves a RELATIVE bind source (`./certs:/dst`, `.:/app`) against the compose file's
-    // directory. kern's `-v` needs an absolute path or a named volume, so rewrite relative binds here
-    // to absolute (confined under the compose dir - traversal guard, like a build context). A `named:`
-    // source or an already-absolute `/host:/dst` passes through untouched.
-    //
-    // ⛔ BEFORE THE BUILDS AND THE PULLS, because it costs nothing and they cost minutes. MEASURED
-    // in the field: Kokoro-FastAPI's file, whose `../../web` bind kern refuses outside a repository,
-    // downloaded its multi-GB image for nine minutes and was refused after it.
-    resolve_relative_binds(&mut boxes, file, &crate::commands::compose_root(file)?)?;
     if action != ComposeAction::Exec {
         // ONLY WHAT WILL START IS BUILT, as docker does: `up <svc>` and `run <svc>` build that
         // service and its dependencies, `--no-deps` the service alone, and no selection the whole

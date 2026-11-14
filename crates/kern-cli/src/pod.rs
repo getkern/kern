@@ -204,6 +204,17 @@ pub fn holder_pid(name: &str) -> Option<i32> {
     }
 }
 
+/// Whether pod `name` exists and its holder does not: the process that owns the pod's namespaces,
+/// and with them its bridge, its published ports and the way its members reach each other, has
+/// exited, and the members still running are cut off.
+///
+/// MEASURED 2026-11-14, a web stack whose holder was killed: the published port answered nothing,
+/// `kern ps` listed every service `healthy`, and `compose up` answered "4 service(s) already up to
+/// date" with exit 0, because a running member read as an up-to-date one.
+pub fn holder_lost(name: &str) -> bool {
+    pod_dir(name).join("holder").exists() && holder_pid(name).is_none()
+}
+
 /// The argv token that makes a process kern's own pod holder. One definition: `create` spawns the
 /// holder with it and [`holder_to_reap`] recognises it, so the two cannot drift.
 const HOLDER_ARGV: &str = "__pod-holder";

@@ -7989,6 +7989,178 @@ fn restarting_one_service_of_a_no_pod_stack_keeps_its_peers_reachable() {
     );
 }
 
+/// A POD WHOSE HOLDER DIED IS SAID BY `ps` AND REPAIRED BY `up`.
+///
+/// MEASURED 2026-11-14 on a web stack: with the holder killed the published port answered nothing,
+/// `ps` listed every service healthy and `up` said "already up to date" with exit 0.
+#[test]
+fn a_pod_whose_holder_died_is_reported_and_recreated() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "holderlost");
+    let rootfs = root.to_str().unwrap();
+    let dir = std::env::temp_dir().join(format!("kern-it-holder-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let xdg = dir.join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let toml = dir.join("stack.toml");
+    fs::write(
+        &toml,
+        format!(
+            "[box.a]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"sleep\", \"30\"]\n\n\
+             [box.b]\nrootfs = \"{rootfs}\"\ncommand = [\"/bin/busybox\", \"sleep\", \"30\"]\n"
+        ),
+    )
+    .unwrap();
+    let pod = format!("xthl{}", std::process::id() % 100000);
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut a = vec!["compose", "-p", pod.as_str(), toml.to_str().unwrap()];
+        a.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+            .expect("run kern")
+    };
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+    };
+    let first = run(&["up", "-d"]);
+    let holder = fs::read_to_string(xdg.join("kern/pods").join(&pod).join("holder")).ok();
+    let Some(pid) = holder
+        .as_deref()
+        .and_then(|h| h.trim().split(':').next())
+        .and_then(|p| p.parse::<i32>().ok())
+        .filter(|p| *p > 1)
+    else {
+        eprintln!(
+            "skip: no pod was created here: {}",
+            String::from_utf8_lossy(&first.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+        run(&["down"]);
+        cleanup();
+        return;
+    };
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let ps = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .arg("ps")
+        .output()
+        .expect("kern ps");
+    let ps_out = String::from_utf8_lossy(&ps.stdout).to_string();
+    let again = run(&["up", "-d"]);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&again.stdout),
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let alive = fs::read_to_string(xdg.join("kern/pods").join(&pod).join("holder"))
+        .ok()
+        .and_then(|h| {
+            h.trim()
+                .split(':')
+                .next()
+                .and_then(|p| p.parse::<i32>().ok())
+        })
+        .is_some_and(|p| p != pid && unsafe { libc::kill(p, 0) } == 0);
+    run(&["down"]);
+    cleanup();
+    assert!(ps_out.contains("HOLDER GONE"), "ps said nothing: {ps_out}");
+    assert!(
+        out.contains("lost its holder") && !out.contains("already up to date"),
+        "up did not see the dead pod: {out}"
+    );
+    assert!(again.status.success(), "{out}");
+    assert!(alive, "no new holder after up: {out}");
+}
+
+/// A SERVICE WITH A RELATIVE BIND IS UP TO DATE ON THE NEXT `up`, like its neighbour without one.
+///
+/// The launch recorded the hash of the ABSOLUTE bind and the next `up` compared it with the hash of
+/// the relative one, so `./data:/data` read as a changed definition at every `up` and the service
+/// was recreated, connections and all. MEASURED 2026-11-14 on a web stack, and on v0.33.0.
+#[test]
+fn a_relative_bind_is_up_to_date_on_the_next_up() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "relbind");
+    let rootfs = root.to_str().unwrap();
+    let dir = std::env::temp_dir().join(format!("kern-it-relbind-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("data")).unwrap();
+    fs::write(dir.join("data/f"), b"x").unwrap();
+    let xdg = dir.join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let toml = dir.join("stack.toml");
+    fs::write(
+        &toml,
+        format!(
+            "[box.rel]\nrootfs = \"{rootfs}\"\nvolumes = [\"./data:/data:ro\"]\n\
+             command = [\"/bin/busybox\", \"sleep\", \"20\"]\n\n\
+             [box.plain]\nrootfs = \"{rootfs}\"\n\
+             command = [\"/bin/busybox\", \"sleep\", \"20\"]\n"
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut a = vec!["compose", toml.to_str().unwrap()];
+        a.extend_from_slice(args);
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+            .expect("run kern")
+    };
+    let first = run(&["up", "-d"]);
+    if !first.status.success() {
+        eprintln!(
+            "skip: the stack did not come up here: {}",
+            String::from_utf8_lossy(&first.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+        run(&["down"]);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    let second = run(&["up", "-d"]);
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    run(&["down"]);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        !out.contains("definition changed"),
+        "an unchanged service with a relative bind was recreated: {out}"
+    );
+    assert!(
+        out.contains("2 service(s) already up to date"),
+        "both services are up to date: {out}"
+    );
+}
+
 /// `up` WITHOUT `--no-pod` ON A STACK RUNNING WITHOUT ONE IS REFUSED, AND `start` IS NOT.
 ///
 /// The plan file on disk is how a stack remembers it is a no-pod stack. `start` means "put back what

@@ -917,8 +917,16 @@ pub fn ps(
             // group - the header is the "root" the user stops or removes.
             let n = members.len();
             let plural = if n == 1 { "box" } else { "boxes" };
+            // A HOLDER THAT IS GONE IS SAID ON THE HEADER: its members still run and their health
+            // checks still pass inside them, while nothing reaches them (see `pod::holder_lost`).
+            let lost = if crate::pod::holder_lost(pod) {
+                " · HOLDER GONE: these services are cut off from each other and their ports; \
+                 `kern compose up` recreates them"
+            } else {
+                ""
+            };
             println!(
-                "{b}{y}{pod}{z} {d}(pod · {n} {plural}){z}",
+                "{b}{y}{pod}{z} {d}(pod · {n} {plural}{lost}){z}",
                 b = p.b,
                 y = p.y,
                 d = p.d,

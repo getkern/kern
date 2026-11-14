@@ -5396,6 +5396,50 @@ mod port_collision_tests {
         assert!(device_grant_problem(&plain, false).is_none());
     }
 
+    /// `restart` OF A STACK WHOSE GPU IS NOT GRANTED STOPS NOTHING: the refusal comes back from the
+    /// terminal verb itself, before `stop_stack`. MEASURED 2026-11-14: it came after, so two GPU
+    /// services of a running web stack were killed and left down.
+    #[test]
+    fn a_restart_refused_for_a_gpu_grant_stops_nothing() {
+        let _g = crate::env_guard();
+        let mut boxes = vec![crate::compose::ComposeBox {
+            name: "xt-restart-gate-api".into(),
+            image: Some("alpine".into()),
+            gpus: Some("device=0".into()),
+            ..Default::default()
+        }];
+        let services: Vec<String> = Vec::new();
+        let o = super::super::TerminalOpts {
+            pod: "xt-restart-gate",
+            file: "compose.yml",
+            stop_timeout: None,
+            ignore_pull_failures: false,
+            build_args: &[],
+            rmi: None,
+            tail: None,
+            follow: false,
+            log_timestamps: false,
+            log_window: (None, None),
+            no_log_prefix: false,
+            all: false,
+            services: &services,
+            own_namespaces: false,
+            relay_wiring: false,
+            wiring_from_flag: false,
+            allow_device_grants: false,
+            remove_volumes: false,
+            remove_orphans: false,
+            ps_quiet: false,
+            ps_services: false,
+            ps_format: None,
+        };
+        match super::super::run_terminal_verb(super::super::ComposeAction::Restart, &mut boxes, &o)
+        {
+            Err(crate::error::Error::Compose(m)) => assert!(m.contains("asks for a GPU"), "{m}"),
+            other => panic!("restart went on to stop the stack: {other:?}"),
+        }
+    }
+
     /// SEVERAL SERVICES ASKING FOR A CARD: the refusal names each and carries its own remedy, so
     /// the generic "a stack is a docker-compose.yml" hint is not printed under it. MEASURED
     /// 2026-11-14 on a five-service file, four asking for cards: the hint described a malformed file
