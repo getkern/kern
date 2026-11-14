@@ -7651,20 +7651,63 @@ fn take_nul(b: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((b.get(..i)?, b.get(i + 1..)?))
 }
 
-/// Every library path a loader cache names, as (directory, file name), sorted.
+/// The magic of glibc's current loader-cache format, the only one a cache is read in.
+const LD_CACHE_NEW_MAGIC: &[u8] = b"glibc-ld.so.cache1.1";
+/// glibc's legacy header, which a combined cache puts before the current one.
+const LD_CACHE_OLD_MAGIC: &[u8] = b"ld.so-1.7.0";
+
+/// The native-endian `u32` at `off` in `b`.
+fn u32_at(b: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(
+        b.get(off..off.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+/// Every library path a loader cache names, in glibc's current format (`glibc-ld.so.cache1.1`,
+/// alone or after the legacy section of a combined file), or `None` for anything else.
 ///
-/// Read as the absolute strings in the file rather than through either of glibc's layouts: a
-/// library's path is the only string in a cache that starts with `/`, and a token that is not one
-/// (a run of header bytes) names nothing in the box and is skipped where it is looked up.
-fn ld_cache_paths(cache: &[u8]) -> Vec<(&[u8], &[u8])> {
-    let mut v: Vec<(&[u8], &[u8])> = cache
-        .split(|b| *b == 0)
-        .filter(|s| s.len() > 1 && s.len() < PATH_MAX_BYTES && s.starts_with(b"/"))
+/// The layout is glibc's `struct cache_file_new`: a 48-byte header holding the entry count at byte
+/// 20, then 24-byte entries whose third `u32` is the offset of the library's path, counted from the
+/// header. In a combined file the header follows the legacy one (16 bytes, then 12 per entry),
+/// aligned to 8. Every offset is bounds-checked; one that leaves the file, or a path that is not
+/// absolute, makes the whole cache unreadable.
+fn ld_cache_libs(cache: &[u8]) -> Option<Vec<&[u8]>> {
+    let start = if cache.starts_with(LD_CACHE_NEW_MAGIC) {
+        0
+    } else if cache.starts_with(LD_CACHE_OLD_MAGIC) {
+        let n = usize::try_from(u32_at(cache, 12)?).ok()?;
+        let end = n.checked_mul(12)?.checked_add(16)?;
+        end.checked_add(7)? & !7
+    } else {
+        return None;
+    };
+    let new = cache.get(start..)?;
+    if !new.starts_with(LD_CACHE_NEW_MAGIC) {
+        return None;
+    }
+    let n = usize::try_from(u32_at(new, 20)?).ok()?;
+    let mut out = Vec::with_capacity(n.min(1 << 16));
+    for i in 0..n {
+        let entry = i.checked_mul(24)?.checked_add(48)?;
+        let value = usize::try_from(u32_at(new, entry.checked_add(8)?)?).ok()?;
+        let (path, _) = take_nul(new.get(value..)?)?;
+        if !path.starts_with(b"/") || path.len() >= PATH_MAX_BYTES {
+            return None;
+        }
+        out.push(path);
+    }
+    Some(out)
+}
+
+/// [`ld_cache_libs`] as (directory, file name), sorted and deduplicated.
+fn ld_cache_paths(cache: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
+    let mut v: Vec<(&[u8], &[u8])> = ld_cache_libs(cache)?
+        .into_iter()
         .filter_map(split_box_path)
         .collect();
     v.sort_unstable();
     v.dedup();
-    v
+    Some(v)
 }
 
 /// An absolute path in the box as its directory and its last component, or `None` when the last is
@@ -7724,16 +7767,61 @@ fn readlink_at(dir: libc::c_int, name: &std::ffi::CStr) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// The kernel's coarse real-time clock, the one it stamps a new inode's times from: a link made
-/// after this reading has a change time at or after it.
-fn coarse_now() -> (libc::time_t, libc::c_long) {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
+/// One reading of the kernel's coarse clocks: real time, the one it stamps a new inode's times
+/// from, and monotonic time, which no one can set.
+#[derive(Clone, Copy)]
+struct CoarseNow {
+    real: (libc::time_t, libc::c_long),
+    mono: (libc::time_t, libc::c_long),
+}
+
+fn coarse_now() -> CoarseNow {
+    let read = |clock| {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a timespec on this frame.
+        unsafe { libc::clock_gettime(clock, &mut ts) };
+        (ts.tv_sec, ts.tv_nsec)
     };
-    // SAFETY: `ts` is a timespec on this frame.
-    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts) };
-    (ts.tv_sec, ts.tv_nsec)
+    CoarseNow {
+        real: read(libc::CLOCK_REALTIME_COARSE),
+        mono: read(libc::CLOCK_MONOTONIC_COARSE),
+    }
+}
+
+/// How far real time may fall behind monotonic time across a run, and how far before the run's
+/// start a link's change time may lie, and still be the run's. Slewing moves the two clocks apart
+/// by microseconds over a run of milliseconds; a step is what this catches.
+const CLOCK_STEP_MARGIN_NS: i128 = 1_000_000;
+
+fn ns(t: (libc::time_t, libc::c_long)) -> i128 {
+    i128::from(t.0) * 1_000_000_000 + i128::from(t.1)
+}
+
+/// Whether real time kept pace with monotonic time from `a` to `b`, within [`CLOCK_STEP_MARGIN_NS`].
+///
+/// ⛔ A LINK IS THE RUN'S BY ITS TIME, SO A CLOCK SET BACK DURING THE RUN WOULD HIDE ONE: made
+/// after the step, its change time falls before the reading taken at the start, the entry is kept
+/// without it, and every later box of that image loses the library it names (the `dlopen` failure
+/// the links are carried for, MEASURED on a Jetson with an entry stripped of them). A run across
+/// which real time fell behind is therefore not kept, and the next box runs `ldconfig` again.
+fn clock_held(a: CoarseNow, b: CoarseNow) -> bool {
+    ns(b.real) - ns(a.real) >= ns(b.mono) - ns(a.mono) - CLOCK_STEP_MARGIN_NS
+}
+
+/// The change time at or after which a link is the run that started at `a`'s: its start, less
+/// [`CLOCK_STEP_MARGIN_NS`], so a step smaller than the one [`clock_held`] catches hides nothing.
+fn made_since(a: CoarseNow) -> (libc::time_t, libc::c_long) {
+    let t = ns(a.real) - CLOCK_STEP_MARGIN_NS;
+    match (
+        libc::time_t::try_from(t.div_euclid(1_000_000_000)),
+        libc::c_long::try_from(t.rem_euclid(1_000_000_000)),
+    ) {
+        (Ok(s), Ok(n)) => (s, n),
+        _ => a.real,
+    }
 }
 
 /// The links among the cache's paths that were made at or after `started`, as (path, target); `None`
@@ -7753,7 +7841,7 @@ fn ld_new_links(
     };
     let mut out = Vec::new();
     let mut cur: Option<(&[u8], Option<std::os::fd::OwnedFd>)> = None;
-    for (dir, name) in ld_cache_paths(cache) {
+    for (dir, name) in ld_cache_paths(cache)? {
         let Ok(cname) = CString::new(name) else {
             continue;
         };
@@ -8076,8 +8164,8 @@ fn refresh_loader_cache(spec: &SandboxSpec, allow_nesting: bool, store: Option<&
             // KEPT ONLY WHEN THE RUN PRODUCED ONE: the cache changed and reads as a loader cache.
             // Captured here, before the workload exists, so nothing the workload does reaches it.
             if let (Some(st), Some(r)) = (store, root_fd) {
-                if ld_cache_identity(r) != before {
-                    st.keep(r, started);
+                if ld_cache_identity(r) != before && clock_held(started, coarse_now()) {
+                    st.keep(r, made_since(started));
                 }
             }
             return;
@@ -12005,9 +12093,97 @@ mod ro_stage_tests {
 #[cfg(test)]
 mod ldstore_tests {
     use super::{
-        coarse_now, ld_entry_decode, ld_entry_encode, ld_links_replay, ld_new_links, open_box_dir,
+        clock_held, coarse_now, ld_cache_libs, ld_entry_decode, ld_entry_encode, ld_links_replay,
+        ld_new_links, made_since, open_box_dir, CoarseNow,
     };
     use std::os::fd::AsRawFd;
+
+    /// A loader cache in glibc's current format naming `paths`, each under its file name as key.
+    fn fake_cache(paths: &[&str]) -> Vec<u8> {
+        let base = 48 + paths.len() * 24;
+        let mut strings = Vec::new();
+        let mut entries = Vec::new();
+        for p in paths {
+            let key = base + strings.len();
+            strings.extend_from_slice(p.rsplit('/').next().unwrap().as_bytes());
+            strings.push(0);
+            let value = base + strings.len();
+            strings.extend_from_slice(p.as_bytes());
+            strings.push(0);
+            entries.push((key as u32, value as u32));
+        }
+        let mut c = b"glibc-ld.so.cache1.1".to_vec();
+        c.extend_from_slice(&(paths.len() as u32).to_ne_bytes());
+        c.extend_from_slice(&(strings.len() as u32).to_ne_bytes());
+        c.extend_from_slice(&[0u8; 4]);
+        c.extend_from_slice(&[0u8; 16]);
+        assert_eq!(c.len(), 48);
+        for (k, v) in entries {
+            c.extend_from_slice(&1i32.to_ne_bytes());
+            c.extend_from_slice(&k.to_ne_bytes());
+            c.extend_from_slice(&v.to_ne_bytes());
+            c.extend_from_slice(&[0u8; 12]);
+        }
+        c.extend_from_slice(&strings);
+        c
+    }
+
+    /// The cache is read in glibc's layout, alone or after a legacy section, and anything that does
+    /// not fit it is not read at all.
+    #[test]
+    fn a_loader_cache_is_read_in_glibcs_layout_and_nothing_else() {
+        let c = fake_cache(&["/usr/lib/libx.so.1", "/lib/liby.so.2"]);
+        assert_eq!(
+            ld_cache_libs(&c).unwrap(),
+            vec![&b"/usr/lib/libx.so.1"[..], &b"/lib/liby.so.2"[..]]
+        );
+        // A combined file: the legacy header (16 bytes), one 12-byte legacy entry, padding to 8.
+        let mut combined = b"ld.so-1.7.0\0".to_vec();
+        combined.extend_from_slice(&1u32.to_ne_bytes());
+        combined.extend_from_slice(&[0u8; 12]);
+        combined.extend_from_slice(&[0u8; 4]);
+        combined.extend_from_slice(&c);
+        assert_eq!(ld_cache_libs(&combined).unwrap().len(), 2);
+        assert!(ld_cache_libs(b"ELF").is_none());
+        // An offset past the end, and a relative path, make the cache unreadable.
+        let mut past = c.clone();
+        past[48 + 8..48 + 12].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(ld_cache_libs(&past).is_none());
+        let relative = fake_cache(&["usr/lib/libx.so.1"]);
+        assert!(ld_cache_libs(&relative).is_none());
+        assert!(ld_cache_libs(&c[..60]).is_none());
+    }
+
+    /// A run across which real time fell behind monotonic time is not kept; slewing, a forward
+    /// step and a step inside the margin are.
+    #[test]
+    fn a_clock_set_back_during_the_run_keeps_nothing() {
+        let at = |real_ms: i64, mono_ms: i64| CoarseNow {
+            real: (1_000 + real_ms / 1000, (real_ms % 1000) * 1_000_000),
+            mono: (50 + mono_ms / 1000, (mono_ms % 1000) * 1_000_000),
+        };
+        let start = at(0, 0);
+        assert!(
+            clock_held(start, at(15, 15)),
+            "a run with the clocks in step"
+        );
+        assert!(
+            clock_held(start, at(2_015, 15)),
+            "real time stepped forward"
+        );
+        assert!(!clock_held(start, at(10, 15)), "real time set back 5 ms");
+        assert!(
+            !clock_held(start, at(-985, 15)),
+            "real time set back a second"
+        );
+        // Within the margin, and the links' threshold is moved back by the same margin.
+        let small = CoarseNow {
+            real: (1_000, 14_500_000),
+            mono: (50, 15_000_000),
+        };
+        assert!(clock_held(start, small));
+        assert_eq!(made_since(start), (999, 999_000_000));
+    }
 
     /// An entry reads back as it was written, and anything else is not an entry.
     #[test]
@@ -12046,11 +12222,17 @@ mod ldstore_tests {
         // `/lib64 -> /usr/lib`, absolute, as merged-usr images have: it must land in the box.
         std::os::unix::fs::symlink("/usr/lib", base.join("lib64")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(30));
-        let started = coarse_now();
+        let started = made_since(coarse_now());
         // The run's.
         std::os::unix::fs::symlink("libx.so", lib.join("libx.so.1")).unwrap();
-        let cache = b"glibc-ld.so.cache1.1\0\x01\x2f\x02\0libx.so.1\0/usr/lib/libx.so.1\0\
-            /lib64/libx.so.1\0/usr/lib/libold.so.1\0/usr/lib/libx.so\0/nowhere/liby.so.1\0";
+        let cache = fake_cache(&[
+            "/usr/lib/libx.so.1",
+            "/lib64/libx.so.1",
+            "/usr/lib/libold.so.1",
+            "/usr/lib/libx.so",
+            "/nowhere/liby.so.1",
+        ]);
+        let cache = cache.as_slice();
         let root = std::fs::File::open(&base).unwrap();
         let r = root.as_raw_fd();
         assert!(open_box_dir(r, b"/lib64").is_some());
