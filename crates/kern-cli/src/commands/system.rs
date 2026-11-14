@@ -147,7 +147,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}stop{z} <name>... | --all                                         Stop box(es), or all
 
   {d}Images{z}
-    {c}search{z} <query> [--json]                                        Search Docker Hub for images
+    {c}search{z} <query> [--json]                                        Search the public image registry
     {c}pull{z} <image> [-q|--quiet]                                      Fetch an image into the cache (`--image` uses it)
                                                                      -q prints the resolved reference and nothing else, for `ref=$(kern pull -q X)`
     {c}pull{z} <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
@@ -155,17 +155,17 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}tag{z} <src> <dst>                                                Give a cached image a second name
     {c}commit{z} <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
     {c}build{z} -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
-    {c}build{z} --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that Dockerfile, and build NOTHING
+    {c}build{z} --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that file, and build NOTHING
                                                                      Exit 0 if it builds here; the lines kern does not act on are marked `dropped`
                                                                      -t is repeatable: one build, every name applied (layers shared, not copied)
                                                                      --secret id=X,src=FILE|env=VAR and --ssh default|ID=KEY: what RUN --mount=type=secret|ssh read
                                                                      --platform A[,B]: build for those platforms (qemu-user for another arch); --no-cache: reuse nothing
     {c}images{z} [<repo>] [--json] [--filter K=V] [--format T]             List pulled (cached) images (<repo> = --filter reference=<repo>)
                                                                      --filter: reference=PAT (`*` allowed; no tag = any tag), dangling=BOOL, label=K or K=V, before=REF, since=REF
-    {c}image{z} ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs under Docker's noun-first grouping (one parser each, not a second)
+    {c}image{z} ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs grouped under `image` (one parser each, not a second)
     {c}rmi{z} <image>...                                                 Remove cached images (frees unshared layers)
-    {c}save{z} <image> [-o file]                                         Export an image to a tar (docker load-compatible)
-    {c}load{z} [-i file]                                                 Import an image from a tar (docker save format)
+    {c}save{z} <image> [-o file]                                         Export an image to a tar (the common image-archive format)
+    {c}load{z} [-i file]                                                 Import an image from a tar (the common image-archive format)
     {c}builds{z} [<tag>] [--status S] [-n N] [--json]                    List past builds; S is ok|warn|failed|running|interrupted
     {c}build{z} logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
@@ -175,7 +175,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}sandbox{z} ls|history|stats [-n N] [--failed] [--all] [--json]      The SDK and MCP sandboxes: running now, finished (metadata only), outcomes
     {c}sandbox{z} keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
     {c}inspect{z} <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
-                                                                     (`-f '{{{{.State.Status}}}}'`, `docker inspect`'s own paths)
+                                                                     (`-f '{{{{.State.Status}}}}'`, the common field paths)
     {c}port{z} <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has
     {c}attach{z} <name>                                                  Stream a box's output live (Ctrl-C detaches)
     {c}cp{z} <box>:<src> <dst> | <src> <box>:<dst>                       Copy a file host<->box
@@ -195,7 +195,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}history{z} [-n N]                                                 Recently-run boxes
 
   {d}Multi-box{z}
-    {c}compose{z} [<file>] [{cv}]  Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+    {c}compose{z} [<file>] [{cv}]  Run a stack (kern TOML or a compose file); [--profile P] selects optional services
                                                                      With no file the directory is searched for docker-compose.yml, docker-compose.yaml, compose.yml, compose.yaml, kern.toml
                                                                      up: [--force-recreate|--no-recreate] [-V|--renew-anon-volumes]; logs: [-t] [--since T] [--until T] [--no-log-prefix]
                                                                      wait/events/images/push/rm/top/version scope the box-level verb to this stack; kill is an alias of stop
@@ -280,19 +280,19 @@ fn help_text(p: &crate::ui::Palette) -> String {
     -e, --env K=V       Set an environment variable (repeatable)
     -w, --workdir <dir> Working directory inside the box
         --entrypoint <a> Replace the image's ENTRYPOINT (repeat for an exec-form list;
-                         `--entrypoint \"\"` clears it). Discards the image's CMD, as docker does
+                         `--entrypoint \"\"` clears it). Discards the image's CMD too
     -m, --memory <size> Hard memory cap (e.g. 512m, 1g; default 512m, the host's RAM with --gpus)
     --cpus <n>          CPU cap in cores (e.g. 1.5, 2; default uncapped)
     --cpuset-cpus <list>  Pin to specific CPUs (e.g. 0-3, 0,2,4; default no pinning)
     --memory-swap-max <size>  Swap allowance → cgroup-v2 memory.swap.max (default 0 = swap off)
     -it, -ti, -t        Allocate an interactive PTY (shells/REPLs); foreground only
-    -i, --interactive   Keep stdin attached WITHOUT a PTY, as docker's -i does. stdin is
+    -i, --interactive   Keep stdin attached WITHOUT a PTY. stdin is
                         inherited either way, so this asks for what already happens: it is
                         accepted so `-i < file.sql` runs here unchanged. A PTY would echo
                         that file back and never see its EOF
     -p, --publish H:B   Publish box port B on host port H ([ip:]H:B[/tcp|/udp]; a port RANGE
-                        like 8000-8010:8000-8010 works; binds 0.0.0.0 (all interfaces) like
-                        Docker, use 127.0.0.1:H:B for loopback only, or set
+                        like 8000-8010:8000-8010 works; binds 0.0.0.0 (all interfaces);
+                        use 127.0.0.1:H:B for loopback only, or set
                         `[kern] publish_bind` in kern.toml to make loopback the
                         host's policy; repeatable)
     --add-host N:IP     Add an /etc/hosts entry N → IP in the box; IP may be `host-gateway`
@@ -304,7 +304,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --log-max-size <sz> Rotate the box's captured log at this size (default 16m)
     --log-max-file <n>  How many log files to keep, the active one included (default 2)
     --memory-reservation <size>  Soft memory floor (cgroup memory.low): protected under pressure,
-                        never a cap and never an OOM kill. Docker's mem_reservation
+                        never a cap and never an OOM kill (compose mem_reservation)
     --cpu-weight <n>    Relative CPU share under contention (cgroup cpu.weight, 1-10000, 100 =
                         normal). Orthogonal to --cpus, which is an absolute ceiling
     --secret SPEC       Deliver a secret as /run/secrets/NAME: SRC[:NAME] (file), NAME=- (from
@@ -322,7 +322,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --restart           Restart a detached box if it exits non-zero (on-failure)
     --health-cmd <cmd>  Shell command probed in the box; sets ps HEALTH (exit 0 = healthy)
     --health-cmd-argv A The same check with NO shell: one argv element per flag, repeated
-                        (Docker's exec form). Use it when the image has no /bin/sh
+                        (the exec form). Use it when the image has no /bin/sh
     --health-interval N Seconds between health checks (default 30)
     --health-retries N  Consecutive failures before a box is unhealthy (default 3)
     --health-start-period N  Grace period where failures keep it starting (default 0)
@@ -332,13 +332,13 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --net [host|none]   Share the host network (bare/host); none = isolated (default)
     --network <mode>    host = share host net (= --net); none = isolated (default); or the NAME of
                         a running pod, which is what a `kern compose` stack is - so
-                        `--network <stack> -- <cmd>` is docker's `run --network <net>` for a one-off
+                        `--network <stack> -- <cmd>` runs a one-off box
                         that has to talk to a stack (`kern pod ls` names them)
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
     --egress-allow d,d  Restrict outbound to an allowlist of domains via a filtering proxy (foreground-only)
     --hostname <name>   Set the box's hostname (default: the box name)
     --tun               Expose /dev/net/tun in the box (WireGuard / userspace VPN)
-    --gpus <spec>       Hand the box NVIDIA cards, with docker's grammar: a bare number
+    --gpus <spec>       Hand the box NVIDIA cards. A bare number
                         is HOW MANY (--gpus 2), device=0 or device=0,1 names which, and
                         all takes every one. count=2 and count=all also work. The nodes
                         and the host's driver libraries are resolved from the driver's own
@@ -357,7 +357,7 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         alias over --gpus: the spec says which card the name means and the
                         mounts come from the driver's own layout. Several cards are asked
                         for with the other flag. Pass one of the two, not both. A host path,
-                        /dev/X[:/dev/Y[:rwm]], binds that node as docker does (read-only
+                        /dev/X[:/dev/Y[:rwm]], binds that node (read-only
                         without `w`), beside --gpus too; a missing node is refused
     --init              Run a built-in reaping init as PID 1 (no zombies; forwards SIGTERM)
     --pids-limit <N>    Cap the box's process count (pids.max), fork-bomb containment
@@ -372,8 +372,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --shm-size <size>   Cap /dev/shm (e.g. 64m; default: the --memory cap, so what the box is
                         told matches what its cgroup enforces)
     --runtime nvidia    The GPUs the box's own NVIDIA_VISIBLE_DEVICES names (the image's ENV or -e),
-                        as NVIDIA's runtime grants them under docker; any other runtime is refused
-    --ipc <mode>        Docker's IPC flag: every box has its own IPC namespace already (private);
+                        as NVIDIA's container runtime grants them; any other runtime is refused
+    --ipc <mode>        Every box has its own IPC namespace already (private);
                         `host` is accepted and NOT applied, said when the box starts. For a larger
                         /dev/shm, which is what `--ipc=host` buys most GPU examples, use --shm-size
     -u, --user <u[:g]>  Run the box command as this user[:group], numeric or named in the image's /etc/passwd
@@ -393,8 +393,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --sysctl <k=v>      Set a namespaced kernel knob (e.g. net.core.somaxconn=1024); repeatable
     --pod-bridge <ip>/<n> Join the pod through its BRIDGE with this address, instead of sharing the
                         pod's network namespace. The box then keeps its own 127.0.0.1, which no
-                        peer can reach, and meets its peers at their addresses: what a Docker
-                        container gets. Needs a pod made with `pod create --bridge <cidr>`
+                        peer can reach, and meets its peers at their addresses, each on its own
+                        network namespace. Needs a pod made with `pod create --bridge <cidr>`
     --ip <addr>         Extra IPv4 address the box's loopback answers on, as a /32; repeatable.
                         This is what a compose file's `ipv4_address:` becomes: the literal address
                         a peer hard-codes exists inside the box's network namespace instead of
@@ -410,8 +410,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         on a host with no /etc/subuid entry, or with --cap-drop ALL
     --bind-rootfs       Bind --rootfs directly instead of an overlay, faster on kernels with a
                         slow overlayfs, but the source is mutable & shared (no per-box isolation)
-    --privileged        Relax seccomp so a NESTED `kern box` (docker-in-docker style) can start,
-                        rootless-only; still blocks kexec/modules/bpf/io_uring (unlike Docker)
+    --privileged        Relax seccomp so a NESTED `kern box` (a runtime inside a box) can start,
+                        rootless-only; still blocks kexec/modules/bpf/io_uring
     --require-limits    Refuse to start unless the memory and pids caps (incl. their defaults) are
                         actually enforced (the OOM/fork-bomb backstop); cpu/cpuset stay best-effort,
                         as on the scope path. Default warns and runs uncapped
@@ -419,13 +419,13 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         mutually exclusive with --require-limits
     --security-profile <untrusted>  Opt-in hardening bundle (seccomp allowlist + cap-drop ALL +
                         read-only), applied as a base explicit flags override; prints its constituents
-    --apparmor <profile>  Enter a pre-loaded AppArmor profile on exec (Docker's --security-opt
-                        apparmor=), layered over seccomp; a missing/unloaded profile fails closed
+    --apparmor <profile>  Enter a pre-loaded AppArmor profile on exec (the
+                        `--security-opt apparmor=` form too), layered over seccomp; a missing/unloaded profile fails closed
     --plan              Preview the isolation sequence and any device grants, without running
 
 {b}OPTIONS for run:{z}
     -m, --memory <SIZE>     RAM ceiling for the process (e.g. 512m, 2g)
-    --memory-swap-max <S>   cgroup v2 swap allowance (NOT Docker's mem+swap total; 0 = no swap)
+    --memory-swap-max <S>   cgroup v2 swap allowance (NOT a mem+swap total; 0 = no swap)
     --cpus <N>              CPU quota, fractional allowed (0.5 = half a core)
     --cpuset-cpus <LIST>    Pin to these CPUs (e.g. 0-3,8); a CPU that does not exist is dropped
     --config <PATH>         kern.toml to resolve `vcpu:`/`vgpio:`/`vdisk:` profiles against

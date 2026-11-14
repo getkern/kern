@@ -80,7 +80,7 @@ pub fn banner() -> Result<(), Error> {
     {b}kern run{z} --memory 512m -- <cmd>         {d}govern a command's CPU/memory (no sandbox){z}
     {b}kern ps{z} {d}·{z} {b}logs{z} {d}·{z} {b}exec{z} {d}·{z} {b}stop{z}            {d}manage running boxes{z}
     {b}kern pull{z} {d}·{z} {b}build{z} {d}·{z} {b}push{z} {d}·{z} {b}images{z}       {d}work with OCI images{z}
-    {b}kern compose{z} stack.yml                  {d}bring up a stack (docker-compose.yml too){z}
+    {b}kern compose{z} stack.yml                  {d}bring up a stack (compose.yaml too){z}
     {b}kern box{z} g --image <img> --gpus all    {d}a box with the host's GPUs{z}
     {b}kern sandbox{z} ls {d}·{z} {b}history{z} {d}·{z} {b}stats{z}       {d}SDK and MCP sandboxes: running, finished, outcomes{z}
     {b}kern sandbox keep{z} disk                  {d}keep their history across reboots (default: until reboot){z}
@@ -5280,7 +5280,7 @@ fn build_wanted(policy: BuildPolicy, pull: Option<&str>, image: &str) -> Result<
     match resolve_image_depth(image, 0, pull_policy) {
         Ok(_) => {
             eprintln!(
-                "kern: note: using the published image '{image}', as docker does; `--build` builds \
+                "kern: note: using the published image '{image}'; `--build` builds \
                  it from the service's `build:` instead"
             );
             Ok(false)

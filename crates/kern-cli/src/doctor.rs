@@ -2327,7 +2327,7 @@ fn gpu_row(
                 "those nodes need gid {}: {}. A default box drops the caller's groups, so this is a \
                  refusal for it; a single-uid box (`--no-uid-range`, or a host with no range in \
                  /etc/subuid) keeps them and reaches the nodes, at the price of keeping EVERY \
-                 inherited group, which on a typical host also reaches the raw disk and the docker \
+                 inherited group, which on a typical host also reaches the raw disk and any container runtime's \
                  socket",
                 join_short(&gids.iter().map(u32::to_string).collect::<Vec<_>>()),
                 join_paths(&gated)

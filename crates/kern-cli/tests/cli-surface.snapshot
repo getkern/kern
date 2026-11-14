@@ -13,19 +13,19 @@ COMMANDS:
     stop <name>... | --all                                         Stop box(es), or all
 
   Images
-    search <query> [--json]                                        Search Docker Hub for images
+    search <query> [--json]                                        Search the public image registry
     pull <image> [-q|--quiet]                                      Fetch an image into the cache (`--image` uses it)
     pull <image> --dest <dir> [--platform os/arch]                 Extract a rootfs instead, for `--rootfs`
     push <local-ref> [as <remote-ref>]                             Publish a cached image to a registry
     tag <src> <dst>                                                Give a cached image a second name
     commit <box> <image>                                           Snapshot a running box's fs into a reusable image (warm start)
     build -t <name> [-t <name>…] [-f <file>] [--build-arg K=V] [--target S] [ctx]  Build a local image; without -f it reads a Containerfile, else a Dockerfile (--target: stop at that `FROM … AS S` stage)
-    build --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that Dockerfile, and build NOTHING
+    build --check [-f <file>] [--build-arg K=V] [ctx]              Say what kern does with every instruction of that file, and build NOTHING
     images [<repo>] [--json] [--filter K=V] [--format T]             List pulled (cached) images (<repo> = --filter reference=<repo>)
-    image ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs under Docker's noun-first grouping (one parser each, not a second)
+    image ls|inspect|rm|pull|push|tag|history|save|load|build     The same verbs grouped under `image` (one parser each, not a second)
     rmi <image>...                                                 Remove cached images (frees unshared layers)
-    save <image> [-o file]                                         Export an image to a tar (docker load-compatible)
-    load [-i file]                                                 Import an image from a tar (docker save format)
+    save <image> [-o file]                                         Export an image to a tar (the common image-archive format)
+    load [-i file]                                                 Import an image from a tar (the common image-archive format)
     builds [<tag>] [--status S] [-n N] [--json]                    List past builds; S is ok|warn|failed|running|interrupted
     build logs|inspect|rm|prune <id>                               Inspect/manage build-history records
 
@@ -54,7 +54,7 @@ COMMANDS:
     history [-n N]                                                 Recently-run boxes
 
   Multi-box
-    compose [<file>] [up|down|stop|start|restart|ps|logs|build|pull|config|watch|port|systemd|run|cp|exec|wait|events|images|push|rm|top|version|kill]  Run a stack (kern TOML or docker-compose.yml); [--profile P] selects optional services
+    compose [<file>] [up|down|stop|start|restart|ps|logs|build|pull|config|watch|port|systemd|run|cp|exec|wait|events|images|push|rm|top|version|kill]  Run a stack (kern TOML or a compose file); [--profile P] selects optional services
     up [--no-pod|--pod|--bridge] [-d] / down                        Bring up / tear down the stack (--no-pod: a namespace per service, peers through relays; --pod: one shared)
     compose <file> watch [service...]                              Rebuild + restart ONE service when its `build:` context changes
     compose <file> port <service> <container-port>                 Print the host address serving that box port (non-zero if none)
