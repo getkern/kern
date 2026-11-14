@@ -5396,6 +5396,33 @@ mod port_collision_tests {
         assert!(device_grant_problem(&plain, false).is_none());
     }
 
+    /// SEVERAL SERVICES ASKING FOR A CARD: the refusal names each and carries its own remedy, so
+    /// the generic "a stack is a docker-compose.yml" hint is not printed under it. MEASURED
+    /// 2026-11-14 on a five-service file, four asking for cards: the hint described a malformed file
+    /// under the refusal of a well-formed one.
+    #[test]
+    fn several_gpu_services_refused_get_no_file_format_hint() {
+        let _g = crate::env_guard();
+        let gpu = |name: &str, spec: &str| crate::compose::ComposeBox {
+            name: name.into(),
+            image: Some("alpine".into()),
+            gpus: Some(spec.into()),
+            ..Default::default()
+        };
+        let boxes = vec![gpu("a", "device=0"), gpu("b", "device=1")];
+        let msg = device_grant_problem(&boxes, false).expect("refused without the grant");
+        assert!(
+            msg.contains("'a' (device=0)") && msg.contains("'b' (device=1)"),
+            "{msg}"
+        );
+        assert!(msg.contains("`--allow-device-grants`"), "{msg}");
+        assert_eq!(
+            crate::error::Error::Compose(msg.clone()).hint(),
+            None,
+            "{msg}"
+        );
+    }
+
     /// THE SAME NODE UNDER `volumes:` IS THE SAME GRANT, AND THE GATE USED TO MISS IT ENTIRELY.
     ///
     /// The gate above is keyed on the `devices:` KEY being non-empty, so the identical string written

@@ -5396,7 +5396,10 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
     if runtime_nvidia {
         b.runtime_nvidia = true;
     }
-    if b.gpus.is_none() && b.device.is_none() {
+    // ⛔ NOT WITH `runtime: nvidia`, which IS the request this variable completes: the sentence
+    // below said the service would get no card, and MEASURED 2026-11-14 with `runtime: nvidia`,
+    // `NVIDIA_VISIBLE_DEVICES=1` and `--allow-device-grants` it got card 1, as under docker.
+    if b.gpus.is_none() && b.device.is_none() && !b.runtime_nvidia {
         if let Some(raw) = b
             .env
             .iter()
@@ -5670,6 +5673,43 @@ fn gpu_reservation_spec(
         if !mentions_gpu {
             continue;
         }
+        // THE CAPABILITIES BESIDE `gpu` TRAVEL TO `--gpus`, in docker's own spelling, so the box
+        // says what it says for the flag: a grant binds the driver's whole library set, and a list
+        // that would select a part of it in docker selects nothing here. MEASURED 2026-11-14, two
+        // cards, `count: 1, capabilities: [utility]`: docker gave the service no `libcuda`, kern
+        // gave it CUDA, and said nothing about the difference. `kern box` owns that sentence; this
+        // hands it the request it answers.
+        let extra_caps: Vec<String> = caps
+            .map(|c| {
+                let words: Vec<String> = if c.items.is_empty() {
+                    c.scalar
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim()
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .split(',')
+                        .map(|x| x.trim().trim_matches('"').trim_matches('\'').to_string())
+                        .collect()
+                } else {
+                    c.items
+                        .iter()
+                        .map(|x| x.trim().trim_matches('"').trim_matches('\'').to_string())
+                        .collect()
+                };
+                words
+                    .into_iter()
+                    .filter(|w| !w.is_empty() && !w.eq_ignore_ascii_case("gpu"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ask = |spec: String| {
+            if extra_caps.is_empty() {
+                GpuAsk::Gpus(spec)
+            } else {
+                GpuAsk::Gpus(format!("{spec},\"capabilities={}\"", extra_caps.join(",")))
+            }
+        };
         // ⛔ ANOTHER VENDOR'S DRIVER IS NOT AN NVIDIA CARD, and this granted one.
         //
         // MEASURED 2026-11-12: a reservation of `driver: amd` with `capabilities: [gpu]` handed the
@@ -5719,7 +5759,7 @@ fn gpu_reservation_spec(
                      count (count: 2)"
                 )));
             }
-            return Some(Ok(GpuAsk::Gpus(format!("device={}", listed.join(",")))));
+            return Some(Ok(ask(format!("device={}", listed.join(",")))));
         }
         if let Some(count) = entry.child("count") {
             let v = count
@@ -5759,7 +5799,7 @@ fn gpu_reservation_spec(
                      without one: write `count: 1`, `count: all` or `device_ids` to get a card"
                 )));
             }
-            return Some(Ok(GpuAsk::Gpus(v)));
+            return Some(Ok(ask(v)));
         }
         // NEITHER `count` NOR `device_ids` IS EVERY CARD. This read "Docker's own default here is
         // not something kern should reproduce from memory", and the entry was refused a card. It is
@@ -5769,7 +5809,7 @@ fn gpu_reservation_spec(
         // LLMSystems/vLLMux, whose `backend` and `dcgm-exporter` write exactly this block: docker gave
         // them every card, kern gave them none. The operator still decides: a grant needs
         // `--allow-device-grants`, and that gate names the selection, `(all)`.
-        return Some(Ok(GpuAsk::Gpus("all".to_string())));
+        return Some(Ok(ask("all".to_string())));
     }
     None
 }
@@ -10063,6 +10103,52 @@ mod tests {
             args.windows(2)
                 .any(|w| w[0] == "--runtime" && w[1] == "nvidia"),
             "{args:?}"
+        );
+    }
+
+    /// `runtime: nvidia` is the request `NVIDIA_VISIBLE_DEVICES` completes, so the file is not told
+    /// its service gets no card: it gets the card the variable names (MEASURED, card 1 of two).
+    #[test]
+    fn runtime_nvidia_with_the_variable_is_not_warned_as_no_request() {
+        let _ = take_warnings();
+        let b = parse(
+            "services:\n  s:\n    image: alpine\n    runtime: nvidia\n    environment:\n      - NVIDIA_VISIBLE_DEVICES=1\n",
+        )
+        .expect("parses");
+        let warns = take_warnings();
+        assert!(b[0].runtime_nvidia);
+        assert!(
+            !warns.iter().any(|w| w.contains("is NOT a GPU request")),
+            "{warns:?}"
+        );
+    }
+
+    /// The capabilities beside `gpu` reach `--gpus` in docker's spelling, where the box says that a
+    /// grant selects nothing by them; `gpu` alone, or the `gpus:` key, adds nothing.
+    #[test]
+    fn gpu_capabilities_beside_gpu_travel_to_the_gpus_flag() {
+        let spec = |entry: &str| {
+            let text = format!(
+                "services:\n  s:\n    image: alpine\n    deploy:\n      resources:\n        reservations:\n          devices: [{entry}]\n"
+            );
+            parse(&text).expect("parses")[0].gpus.clone()
+        };
+        assert_eq!(
+            spec("{driver: nvidia, count: 1, capabilities: [utility]}").as_deref(),
+            Some("1,\"capabilities=utility\"")
+        );
+        assert_eq!(
+            spec("{driver: nvidia, device_ids: [\"1\"], capabilities: [gpu, compute, utility]}")
+                .as_deref(),
+            Some("device=1,\"capabilities=compute,utility\"")
+        );
+        assert_eq!(
+            spec("{driver: nvidia, capabilities: [gpu]}").as_deref(),
+            Some("all")
+        );
+        assert_eq!(
+            spec("{driver: nvidia, device_ids: [\"0\"], capabilities: [gpu]}").as_deref(),
+            Some("device=0")
         );
     }
 

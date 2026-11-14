@@ -7133,9 +7133,9 @@ fn host_device_sources_under(specs: &[String], dev_root: &std::path::Path) -> Ve
 fn ungranted_gpu_message(askers: &[String]) -> String {
     format!(
         "{} services ask for a GPU and nothing granted them: {}. A GPU is a device grant, and \
-         --allow-device-grants (or allow_device_grants in YOUR OWN kern.toml) gives every one of \
-         them its card at once. A compose file cannot grant itself hardware, and a file that could \
-         would not be a policy",
+         `--allow-device-grants` (or `allow_device_grants` in YOUR OWN kern.toml) gives every one \
+         of them its card at once. A compose file cannot grant itself hardware, and a file that \
+         could would not be a policy",
         askers.len(),
         askers.join(", ")
     )
