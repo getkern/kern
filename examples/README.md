@@ -42,8 +42,8 @@ by folder:
 | folder | scripts | what is in it |
 |---|---:|---|
 | [`basics/`](basics/) | 19 | one box, mounts, logs, `ps`/`top`, pause, gc |
-| [`agents/`](agents/) | 12 | the code-execution tool an LLM calls, warm kernels, embedding this in Python/Node/Rust |
-| [`compose/`](compose/) | 13 | multi-box stacks, pods, named volumes, rolling and canary deploys |
+| [`agents/`](agents/) | 13 | the code-execution tool an LLM calls, warm kernels, embedding this in Python/Node/Rust |
+| [`compose/`](compose/) | 14 | multi-box stacks, pods, named volumes, rolling and canary deploys |
 | [`build/`](build/) | 11 | `kern build`, Dockerfiles, multi-stage, language toolchains, save/load, registries |
 | [`ci/`](ci/) | 8 | the same steps locally and in GitHub Actions, air-gapped, pre-commit |
 | [`edge/`](edge/) | 13 | services with a published port, data pipelines, a database box, a watchdog |
@@ -160,6 +160,7 @@ by folder:
 | [scheduled-job.sh](ci/scheduled-job.sh) | Daemonless cron-like pattern: a loop starting a fresh, capped, self-removing box each interval, honest that kern has no built-in scheduler (pair with host cron) |
 | [compose-webstack.sh](compose/compose-webstack.sh) + [compose-webstack.toml](compose/compose-webstack.toml) | A richer `kern compose` stack: a cache with a `--health-cmd` and a web front-end gated on `depends_healthy`, brought up in health order and torn down |
 | [docker-compose-file.sh](compose/docker-compose-file.sh) | **The file you already have**: a real `docker-compose.yml` with a health check, a `depends_on` that waits for it, a published port, a named volume and `extra_hosts: host.docker.internal`. Then the sequence a deploy script runs: `up -d --wait`, `ps --format json` (Docker's field names), `exec`, `cp`, `down -v` |
+| [gpu-per-service.sh](compose/gpu-per-service.sh) | **One GPU per service** from a `docker-compose.yml`: nginx in front of two APIs, each on its own card through `deploy.resources.reservations.devices`, the grant given on the command line with `--allow-device-grants`. Each API writes and reads back a buffer on its card; the host's `nvidia-smi` shows which process is on which card, and the service that asked for none has no `/dev/nvidia*`. No VRAM limit: separate cards are the separation |
 | [compose-declared-ports.sh](compose/compose-declared-ports.sh) | One stack is one pod, so two services cannot both listen on the same internal port; kern refuses that stack up front instead of letting the loser die with `EADDRINUSE` in its own log. Walks `ports:` / `port:` / `expose:`, ranges, and `--no-pod` |
 | [compose-systemd-unit.sh](compose/compose-systemd-unit.sh) | Start a stack at boot on a daemonless runtime: `kern compose <file> systemd` prints a unit and installs nothing. Honest that it brings the stack up and down but does **not** supervise it |
 | [stack-python-postgres/run.sh](stack-python-postgres/run.sh) | A two-service stack end to end: a Python API and the official `postgres` in one pod, the API reaching the DB on `localhost:5432`, a note written over HTTP and read back out of the database |
@@ -174,6 +175,7 @@ Call the `kern_sandbox` SDK to execute untrusted or LLM-generated code in a fres
 | [code-interpreter.py](agents/code-interpreter.py) | A stateful notebook-style session where **file** state persists turn to turn (write CSV → aggregate → format), a dep installed once via `setup=` |
 | [agent-code-interpreter.py](agents/agent-code-interpreter.py) | The same idea taken to its edges: a `pip install` under an **egress allowlist** (PyPI reachable, exfiltration not), stdout **streamed** as it runs, a matplotlib figure returned as a mime-typed result with no Jupyter kernel, timeout/OOM/blocked-syscall as data, snapshot-and-resume, and the same box running JavaScript |
 | [warm-kernel.py](agents/warm-kernel.py) | The **warm kernel** (`sbx.kernel()`): one persistent interpreter so **in-memory** state persists across cells and each cell is **sub-millisecond** (vs ~14 ms cold), with rich chart results, confined errors, network still off, and a per-cell timeout that tears it down |
+| [gpu-sandbox.py](agents/gpu-sandbox.py) | **A GPU for the code an agent writes**: `gpus="device=N"` per sandbox, two at once each on its own card (checked against the host's `nvidia-smi`), a CUDA buffer that survives between `kernel()` cells, and a missing card returned as a fault. `memory_mb` caps host RAM, not VRAM; for MCP the same knob is `KERN_MCP_GPUS` |
 | [kern-mcp setup](../bindings/python/README.md#works-with) | Wire **`kern-mcp`** into Claude Desktop / Cursor / Zed: a local, **network-off** code interpreter, with every knob in one table |
 | [per-request-workers.py](agents/per-request-workers.py) | A stdlib-only pool mapping N requests to N fresh throwaway boxes, so one request's timeout/crash is contained to its own box |
 | [sandboxed-eval.sh](agents/sandboxed-eval.sh) | The shell angle for agents that shell out: eval an untrusted snippet `--read-only --network none` + capped, using the exit code as the signal (benign / blocked / timeout-killed) |

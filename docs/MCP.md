@@ -69,7 +69,7 @@ Every knob is an environment variable in the client's `env` block. There is no c
 | `KERN_MCP_MEMORY_MB` | `1024` | hard RAM cap per box |
 | `KERN_MCP_TIMEOUT` | `60` | per-call wall-clock deadline |
 | `KERN_MCP_WORKSPACE` | a temp dir | persist file state at this path instead |
-| `KERN_MCP_PROFILES` | none | comma-separated `kern.toml` profiles, e.g. `vcpu:heavy,vgpio:sensors`. `vgpio:` is the only way to give an agent a hardware device |
+| `KERN_MCP_PROFILES` | none | comma-separated `kern.toml` profiles, e.g. `vcpu:heavy,vgpio:sensors`. `vgpio:` gives an agent a board's devices (i2c, serial, spi); a GPU comes through `KERN_MCP_GPUS` below |
 | `KERN_MCP_PREWARM` | `1` | how many boxes are kept started in advance. A call claims one instead of starting its own, dropping the per-call cost from ~38 ms to ~1.6 ms **without** changing what a call gets: each prewarmed box serves exactly one cell and is destroyed |
 | `KERN_MCP_KERNEL` | off | `1` routes Python through ONE warm interpreter. Unlike prewarming this DOES change the contract: state persists between calls |
 | `KERN_MCP_TMPFS_MB` | `64` | scratch at `/tmp`, charged to the box's own memory cap |

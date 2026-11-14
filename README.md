@@ -88,7 +88,7 @@ first: [docs/INSTALL.md](docs/INSTALL.md#linux).
 | What is running (`--json` too) | `kern ps` |
 
 `--security-profile untrusted` is the seccomp allowlist, `--cap-drop ALL` and `--read-only` in one
-flag. [examples/](examples/) holds 94 runnable scripts, one per thing kern does.
+flag. [examples/](examples/) holds 96 runnable scripts, one per thing kern does.
 
 ## Kern Sandbox: run an agent's code from Python or Node
 
