@@ -13,11 +13,19 @@
 //! arguments or its environment, which can carry a secret; the box's own stdout is not a channel this
 //! file is ever written from.
 //!
-//! WHERE. `$XDG_RUNTIME_DIR/kern/history/boxes.tsv`, beside the registry, and classified
-//! AUTHORITATIVE there: kern prints these lines as fact, so a box able to write the file would print
-//! rows of its choosing. One `O_APPEND` write per box (a line is far under `PIPE_BUF`, so concurrent
-//! boxes cannot interleave), and past [`MAX_BYTES`] the file is renamed to `boxes.1.tsv` and a new
-//! one started: the history is bounded at twice that, with no daemon to trim it.
+//! WHERE, AND THE OPERATOR CHOOSES. `[kern] sandbox_history` in `kern.toml` (see [`Keep`]):
+//!
+//! * `memory`, the default: `$XDG_RUNTIME_DIR/kern/history/boxes.tsv`, beside the registry, on the
+//!   runtime tmpfs, so a reboot clears it. Classified AUTHORITATIVE there: kern prints these lines as
+//!   fact, so a box able to write the file would print rows of its choosing.
+//! * `disk`: `$XDG_DATA_HOME/kern/history/boxes.tsv`, kept across reboots. Under the same root as the
+//!   kept-box store, which the CLI and both SDKs already refuse as a mount source, for the same
+//!   reason; a test holds that the location and the refusal agree.
+//! * `off`: nothing new is recorded.
+//!
+//! One `O_APPEND` write per box (a line is far under `PIPE_BUF`, so concurrent boxes cannot
+//! interleave), and past [`MAX_BYTES`] the file is renamed to `boxes.1.tsv` and a new one started:
+//! the history is bounded at twice that, with no daemon to trim it.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -199,13 +207,134 @@ impl Entry {
     }
 }
 
-fn dir() -> std::io::Result<PathBuf> {
+/// Where the history is kept: `[kern] sandbox_history`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keep {
+    /// The runtime tmpfs: kept until the machine reboots. The default.
+    Memory,
+    /// `$XDG_DATA_HOME/kern/history`: kept across reboots.
+    Disk,
+    /// Nothing new is recorded.
+    Off,
+}
+
+impl Keep {
+    pub const ALL: [Keep; 3] = [Keep::Memory, Keep::Disk, Keep::Off];
+
+    /// The value `kern.toml` and `kern sandbox keep` spell it with.
+    pub fn word(self) -> &'static str {
+        match self {
+            Keep::Memory => "memory",
+            Keep::Disk => "disk",
+            Keep::Off => "off",
+        }
+    }
+
+    pub fn parse(w: &str) -> Option<Keep> {
+        Keep::ALL.into_iter().find(|k| k.word() == w)
+    }
+
+    /// What the choice means, in the words every surface prints.
+    pub fn meaning(self) -> &'static str {
+        match self {
+            Keep::Memory => "in memory, cleared at reboot",
+            Keep::Disk => "on disk, kept across reboots",
+            Keep::Off => "off, nothing new is recorded",
+        }
+    }
+}
+
+/// The configured [`Keep`], read from the active `kern.toml` and re-read only when that file
+/// changed. NOT [`crate::config::load_cached`], which holds one answer for the life of a process:
+/// `kern top` runs for hours and the choice is made from another process (`kern sandbox keep`) as
+/// often as from its own key. A missing or unreadable file is the default.
+pub fn keep() -> Keep {
+    use std::sync::Mutex;
+    type Key = (Option<PathBuf>, u64, Option<std::time::SystemTime>);
+    static MEMO: Mutex<Option<(Key, Keep)>> = Mutex::new(None);
+    let path = crate::config::active_path();
+    let meta = path.as_ref().and_then(|p| std::fs::metadata(p).ok());
+    let key: Key = (
+        path,
+        meta.as_ref().map_or(0, std::fs::Metadata::len),
+        meta.and_then(|m| m.modified().ok()),
+    );
+    let mut guard = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, v)) = guard.as_ref() {
+        if *k == key {
+            return *v;
+        }
+    }
+    let v = crate::config::load(None)
+        .ok()
+        .and_then(|c| c.kern.sandbox_history)
+        .unwrap_or(Keep::Memory);
+    *guard = Some((key, v));
+    v
+}
+
+fn memory_dir() -> std::io::Result<PathBuf> {
     crate::registry::runtime_subdir("history")
 }
 
-/// Append one entry. Best-effort and silent: a box's result must never depend on its history.
+/// `$XDG_DATA_HOME/kern/history`, else `~/.local/share/kern/history`; `None` with neither set.
+///
+/// THE SAME ROOT AS THE KEPT-BOX STORE ([`crate::keepbox::data_root`], from the same resolver),
+/// and that is the reason for the place: the CLI refuses that root and its ancestors as a mount source, and both SDKs refuse
+/// `$XDG_DATA_HOME/kern`, so a box can neither read nor forge this history.
+/// `the_disk_history_is_refused_as_a_mount_source` holds the agreement.
+pub(crate) fn disk_dir_path() -> Option<PathBuf> {
+    crate::keepbox::data_root().map(|r| r.join("history"))
+}
+
+/// [`disk_dir_path`], created private (`0700`) and checked to be a directory this user owns, so a
+/// symlink or another user's directory planted there is refused rather than written through.
+fn disk_dir() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let d = disk_dir_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "neither XDG_DATA_HOME nor HOME is set",
+        )
+    })?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&d)?;
+    let m = std::fs::symlink_metadata(&d)?;
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    if !m.is_dir() || m.uid() != unsafe { libc::getuid() } {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory this user owns", d.display()),
+        ));
+    }
+    Ok(d)
+}
+
+/// The directory `k` writes to, and the one `kern sandbox history` reads: `off` reads the memory
+/// one, which holds what was recorded before (a switch to `off` moves the rows there, so they are
+/// still readable and go at the next reboot). A disk directory that cannot be made falls back to
+/// memory, so a box's line is kept somewhere rather than nowhere.
+fn dir_of(k: Keep) -> std::io::Result<PathBuf> {
+    match k {
+        Keep::Disk => disk_dir().or_else(|_| memory_dir()),
+        Keep::Memory | Keep::Off => memory_dir(),
+    }
+}
+
+fn dir() -> std::io::Result<PathBuf> {
+    dir_of(keep())
+}
+
+/// Append one entry, unless the history is `off`. Best-effort and silent: a box's result must
+/// never depend on its history.
 pub fn record(e: &Entry) {
-    let Ok(d) = dir() else {
+    let k = keep();
+    if k == Keep::Off {
+        return;
+    }
+    let Ok(d) = dir_of(k) else {
         return;
     };
     record_in(&d, e);
@@ -252,19 +381,24 @@ fn read_in(d: &std::path::Path) -> Vec<Entry> {
 /// modification time, which an append always moves.
 pub fn sandboxes_newest_first() -> Vec<Entry> {
     use std::sync::Mutex;
-    type Key = Vec<(u64, Option<std::time::SystemTime>)>;
+    type Key = (PathBuf, Vec<(u64, Option<std::time::SystemTime>)>);
     static CACHE: Mutex<Option<(Key, Vec<Entry>)>> = Mutex::new(None);
     let Ok(d) = dir() else {
         return Vec::new();
     };
-    let key: Key = [PREVIOUS, CURRENT]
-        .iter()
-        .map(|f| {
-            std::fs::metadata(d.join(f))
-                .map(|m| (m.len(), m.modified().ok()))
-                .unwrap_or((0, None))
-        })
-        .collect();
+    // THE DIRECTORY IS PART OF THE KEY: a switch between memory and disk changes where the rows
+    // are, and two files that happen to share a size and a second must not answer for each other.
+    let key: Key = (
+        d.clone(),
+        [PREVIOUS, CURRENT]
+            .iter()
+            .map(|f| {
+                std::fs::metadata(d.join(f))
+                    .map(|m| (m.len(), m.modified().ok()))
+                    .unwrap_or((0, None))
+            })
+            .collect(),
+    );
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((k, v)) = guard.as_ref() {
         if *k == key {
@@ -275,6 +409,160 @@ pub fn sandboxes_newest_first() -> Vec<Entry> {
     v.reverse();
     *guard = Some((key, v.clone()));
     v
+}
+
+/// Write `entries` (oldest first) as the whole history of `d`, newest [`MAX_BYTES`] in the current
+/// file and the [`MAX_BYTES`] before them in the previous one, the bound [`record_in`] keeps. Each
+/// file is written to a private temporary and renamed over, so a reader sees the old file or the
+/// new one, never half of one.
+fn write_whole(d: &std::path::Path, entries: &[Entry]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lines: Vec<String> = entries.iter().map(Entry::line).collect();
+    // Split from the newest end: `cur` takes lines while they fit, `prev` the ones before.
+    let mut split = lines.len();
+    let mut size = 0u64;
+    while split > 0 && size + lines[split - 1].len() as u64 <= MAX_BYTES {
+        size += lines[split - 1].len() as u64;
+        split -= 1;
+    }
+    let mut start = split;
+    let mut psize = 0u64;
+    while start > 0 && psize + lines[start - 1].len() as u64 <= MAX_BYTES {
+        psize += lines[start - 1].len() as u64;
+        start -= 1;
+    }
+    for (name, body) in [
+        (PREVIOUS, lines[start..split].concat()),
+        (CURRENT, lines[split..].concat()),
+    ] {
+        let target = d.join(name);
+        if body.is_empty() {
+            match std::fs::remove_file(&target) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => continue,
+            }
+        }
+        let tmp = d.join(format!(".{name}.{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)?;
+        if let Err(e) = f.write_all(body.as_bytes()).and_then(|()| f.sync_all()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        std::fs::rename(&tmp, &target)?;
+    }
+    Ok(())
+}
+
+/// Remove both history files of `d`; a file that is not there is not an error.
+fn remove_in(d: &std::path::Path) -> std::io::Result<()> {
+    for f in [PREVIOUS, CURRENT] {
+        match std::fs::remove_file(d.join(f)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Move every row of `from` into `to`, merged by end time with what `to` already holds, and empty
+/// `from`. Returns how many rows came across. The same directory is a no-op.
+///
+/// A box that ends DURING the move may append to `from` after it was read; that line stays there
+/// and is read again if the history ever points back at `from`. The window is one read and two
+/// renames long, and the alternative, a lock every box end would take, is a cost on the hot path
+/// for a switch that happens once.
+fn move_rows(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<usize> {
+    if from == to {
+        return Ok(0);
+    }
+    let moving = read_in(from);
+    if moving.is_empty() {
+        return Ok(0);
+    }
+    let mut all = read_in(to);
+    all.extend(moving.iter().cloned());
+    all.sort_by_key(|e| e.ended_ms);
+    write_whole(to, &all)?;
+    remove_in(from)?;
+    Ok(moving.len())
+}
+
+/// Make `new` the history's place: write `[kern] sandbox_history` and move the rows already held to
+/// where `new` keeps them (`off` keeps them in memory, readable until the next reboot). Returns how
+/// many rows moved.
+pub fn set_keep(new: Keep) -> Result<usize, String> {
+    let old = keep();
+    crate::config::set_kern_key("sandbox_history", Some(&format!("\"{}\"", new.word())))?;
+    let (Ok(from), Ok(to)) = (dir_of(old), dir_of(new)) else {
+        return Ok(0);
+    };
+    // Rows can sit in the place that is NOT the old one too: a disk directory that could not be made
+    // fell back to memory. Both are swept, the old one first.
+    let mut moved = move_rows(&from, &to).map_err(|e| format!("moving the history: {e}"))?;
+    for other in [memory_dir().ok(), disk_dir_path().filter(|p| p.is_dir())]
+        .into_iter()
+        .flatten()
+    {
+        if other != from {
+            moved += move_rows(&other, &to).map_err(|e| format!("moving the history: {e}"))?;
+        }
+    }
+    Ok(moved)
+}
+
+/// Remove every row held, in memory and on disk. Returns how many there were.
+pub fn clear() -> Result<usize, String> {
+    let mut n = 0;
+    for d in [memory_dir().ok(), disk_dir_path().filter(|p| p.is_dir())]
+        .into_iter()
+        .flatten()
+    {
+        n += read_in(&d).len();
+        remove_in(&d).map_err(|e| format!("clearing {}: {e}", d.display()))?;
+    }
+    Ok(n)
+}
+
+/// Where the history is and how many rows it holds, the sentence `kern info` and the CLI print:
+/// `memory: cleared at reboot, 139 rows in /run/user/1000/kern/history/boxes.tsv`.
+///
+/// A `kern.toml` that does not parse is SAID, not absorbed: the history then sits where the default
+/// puts it, and a reader who wrote `disk` with a typo elsewhere in the file must not be told
+/// "memory" as if that were their choice.
+pub fn keep_line() -> String {
+    let line = keep_line_of_setting();
+    match crate::config::load(None) {
+        Err(e) => format!("{line} (the default: kern.toml does not parse, {e})"),
+        Ok(_) => line,
+    }
+}
+
+fn keep_line_of_setting() -> String {
+    let k = keep();
+    let Ok(d) = dir_of(k) else {
+        return format!("{}: {}, no directory to keep it in", k.word(), k.meaning());
+    };
+    let held = read_in(&d).len();
+    let at = d.join(CURRENT);
+    match k {
+        Keep::Off if held == 0 => "off: nothing is recorded".to_string(),
+        Keep::Off => format!(
+            "off: nothing new is recorded; {held} rows from before stay in {} until reboot",
+            at.display()
+        ),
+        Keep::Disk if disk_dir().is_err() => format!(
+            "disk, but the disk directory could not be made: {held} rows in {}, cleared at reboot",
+            at.display()
+        ),
+        Keep::Disk => format!("disk: kept across reboots, {held} rows in {}", at.display()),
+        Keep::Memory => format!("memory: cleared at reboot, {held} rows in {}", at.display()),
+    }
 }
 
 /// The last hour of `rows` as one line: runs, the outcomes by count, and run-time p50/p99.
@@ -343,6 +631,10 @@ pub enum SandboxCmd {
     },
     /// Counts, outcomes and run time over the held history.
     Stats { json: bool, all: bool },
+    /// Where the history is kept; with a value, change it.
+    Keep { to: Option<Keep> },
+    /// Remove every row held.
+    Clear,
 }
 
 /// `kern sandbox ls|history|stats`.
@@ -371,6 +663,7 @@ pub fn sandbox_cmd(cmd: &SandboxCmd) -> Result<(), crate::error::Error> {
                 println!(
                     "no finished sandbox recorded yet (kern records one line per box that ends)"
                 );
+                where_line();
                 return Ok(());
             }
             println!(
@@ -389,10 +682,54 @@ pub fn sandbox_cmd(cmd: &SandboxCmd) -> Result<(), crate::error::Error> {
                     e.gpu
                 );
             }
+            where_line();
             Ok(())
         }
         SandboxCmd::Stats { json, all } => sandbox_stats(*json, *all),
+        SandboxCmd::Keep { to: None } => {
+            println!("{}", keep_line());
+            println!(
+                "change it with: kern sandbox keep memory | disk | off   ([kern] sandbox_history in {})",
+                config_name()
+            );
+            Ok(())
+        }
+        SandboxCmd::Keep { to: Some(k) } => {
+            let moved = set_keep(*k).map_err(crate::error::Error::Config)?;
+            println!("{}", keep_line());
+            match moved {
+                0 => {}
+                1 => println!("1 row moved with it"),
+                n => println!("{n} rows moved with it"),
+            }
+            Ok(())
+        }
+        SandboxCmd::Clear => {
+            let n = clear().map_err(crate::error::Error::Config)?;
+            println!("{n} rows removed; {}", keep_line());
+            Ok(())
+        }
     }
+}
+
+/// The `kern.toml` the setting is written to, for the sentence that names it.
+fn config_name() -> String {
+    crate::config::active_path().map_or_else(|| "kern.toml".into(), |p| p.display().to_string())
+}
+
+/// The closing line of a human `history` or `stats`: where these rows live and how to change it,
+/// because the default clears them at reboot and a reader should not find that out from a reboot.
+fn where_line() {
+    let next: Vec<&str> = Keep::ALL
+        .into_iter()
+        .filter(|k| *k != keep())
+        .map(Keep::word)
+        .collect();
+    println!(
+        "history {}   (kern sandbox keep {})",
+        keep_line(),
+        next.join(" | ")
+    );
 }
 
 fn cut(s: &str, n: usize) -> String {
@@ -525,6 +862,7 @@ fn sandbox_stats(json: bool, all: bool) -> Result<(), crate::error::Error> {
             dur(p99)
         );
     }
+    where_line();
     Ok(())
 }
 
@@ -619,5 +957,257 @@ mod tests {
         let names: Vec<String> = read_in(&d).into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["old", "new"]);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A temporary XDG world: runtime, data and config dirs of its own, `KERN_CONFIG` unset, all
+    /// restored on drop so a failing assertion leaves nothing pointing at a removed directory.
+    struct World {
+        base: PathBuf,
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    const VARS: [&str; 4] = [
+        "XDG_RUNTIME_DIR",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "KERN_CONFIG",
+    ];
+
+    impl World {
+        fn new(tag: &str) -> World {
+            let base = std::env::temp_dir().join(format!("kern-hist-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            for d in ["run", "data", "config"] {
+                std::fs::create_dir_all(base.join(d)).unwrap();
+            }
+            let prev = VARS.iter().map(|v| (*v, crate::global_env(v))).collect();
+            crate::set_global_env("XDG_RUNTIME_DIR", base.join("run"));
+            crate::set_global_env("XDG_DATA_HOME", base.join("data"));
+            crate::set_global_env("XDG_CONFIG_HOME", base.join("config"));
+            crate::unset_global_env("KERN_CONFIG");
+            World { base, prev }
+        }
+        fn toml(&self) -> String {
+            std::fs::read_to_string(self.base.join("config/kern/kern.toml")).unwrap_or_default()
+        }
+    }
+
+    impl Drop for World {
+        fn drop(&mut self) {
+            for (v, old) in &self.prev {
+                match old {
+                    Some(x) => crate::set_global_env(v, x),
+                    None => crate::unset_global_env(v),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn named(name: &str, ended_ms: u64) -> Entry {
+        Entry {
+            ended_ms,
+            ..entry(name, Outcome::Ok)
+        }
+    }
+
+    /// The key is validated where the file is read: the three words load, anything else is refused
+    /// with the three named, and an absent key is the default, memory.
+    #[test]
+    fn the_history_setting_parses_its_three_values_and_refuses_the_rest() {
+        for k in Keep::ALL {
+            let cfg =
+                crate::config::parse(&format!("[kern]\nsandbox_history = \"{}\"\n", k.word()))
+                    .unwrap();
+            assert_eq!(cfg.kern.sandbox_history, Some(k));
+            assert_eq!(Keep::parse(k.word()), Some(k));
+        }
+        let err = crate::config::parse("[kern]\nsandbox_history = \"tmpfs\"\n").unwrap_err();
+        assert!(
+            err.contains("\"memory\"") && err.contains("\"disk\"") && err.contains("\"off\""),
+            "{err}"
+        );
+        assert_eq!(
+            crate::config::parse("[kern]\n")
+                .unwrap()
+                .kern
+                .sandbox_history,
+            None
+        );
+    }
+
+    /// THE DISK HISTORY IS WHERE THE MOUNT REFUSAL ALREADY LOOKS. A box handed this directory could
+    /// read what ran on the host and print rows of its choosing; the refusal covers it because it is
+    /// derived from the same root, and this holds the two together.
+    #[test]
+    fn the_disk_history_is_refused_as_a_mount_source() {
+        let _g = crate::env_guard();
+        let w = World::new("mount");
+        let d = disk_dir().expect("the disk dir is made");
+        assert!(d.starts_with(w.base.join("data/kern")), "{}", d.display());
+        let canon = std::fs::canonicalize(&d).unwrap();
+        assert!(
+            crate::registry::trusted_state_overlap(&canon).is_some(),
+            "{} must be refused as a mount source",
+            canon.display()
+        );
+        // Refused on the CLI path, with the data root's own reason and the right relation.
+        let e = crate::commands::parse_volumes(&[format!("{}:/h", canon.display())])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            e.contains("is inside kern's own state") && e.contains("sandbox history"),
+            "{e}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    /// The whole switch, through the functions the CLI and `kern top` call: the default is memory;
+    /// `disk` writes the key, carries the rows across and makes the next box land on disk; `off`
+    /// records nothing and brings the rows back to memory, where they stay readable; `clear` empties
+    /// both places.
+    #[test]
+    fn switching_where_the_history_is_kept_moves_the_rows_and_the_next_line() {
+        let _g = crate::env_guard();
+        let w = World::new("switch");
+        assert_eq!(keep(), Keep::Memory, "no kern.toml is the default");
+        record(&named("pysbx-a", 1));
+        record(&named("pysbx-b", 3));
+        let mem = memory_dir().unwrap();
+        assert_eq!(read_in(&mem).len(), 2);
+
+        assert_eq!(set_keep(Keep::Disk), Ok(2));
+        assert!(
+            w.toml().contains("sandbox_history = \"disk\""),
+            "{}",
+            w.toml()
+        );
+        assert_eq!(keep(), Keep::Disk);
+        assert!(read_in(&mem).is_empty(), "the rows left memory");
+        record(&named("pysbx-c", 2));
+        let disk = disk_dir().unwrap();
+        let names: Vec<String> = read_all().into_iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            ["pysbx-a", "pysbx-b", "pysbx-c"],
+            "read from disk, in order"
+        );
+        assert!(read_in(&mem).is_empty(), "the new line went to disk");
+        assert!(keep_line().starts_with("disk: kept across reboots, 3 rows in "));
+
+        assert_eq!(set_keep(Keep::Off), Ok(3));
+        assert!(w.toml().contains("sandbox_history = \"off\""));
+        record(&named("pysbx-d", 9));
+        assert_eq!(read_all().len(), 3, "off records nothing");
+        assert!(read_in(&disk).is_empty(), "the rows left the disk");
+        assert!(keep_line().starts_with("off: nothing new is recorded; 3 rows from before"));
+
+        // The key is written in place, never twice.
+        assert_eq!(
+            w.toml().matches("sandbox_history").count(),
+            1,
+            "{}",
+            w.toml()
+        );
+
+        assert_eq!(clear(), Ok(3));
+        assert!(read_all().is_empty());
+        assert_eq!(keep_line(), "off: nothing is recorded");
+
+        // A file that does not parse leaves the default in force, and the line says why.
+        std::fs::write(
+            w.base.join("config/kern/kern.toml"),
+            "[kern]\nsandbox_history = \"tmpfs\"\n",
+        )
+        .unwrap();
+        assert_eq!(keep(), Keep::Memory);
+        let l = keep_line();
+        assert!(
+            l.starts_with("memory: cleared at reboot") && l.contains("kern.toml does not parse"),
+            "{l}"
+        );
+    }
+
+    /// A move merges by end time and holds the bound a single file holds: the newest
+    /// [`MAX_BYTES`] in the current file, the [`MAX_BYTES`] before them in the previous one.
+    #[test]
+    fn a_move_merges_by_time_and_keeps_the_bound() {
+        let base = std::env::temp_dir().join(format!("kern-hist-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        record_in(&a, &named("one", 1));
+        record_in(&a, &named("three", 3));
+        record_in(&b, &named("two", 2));
+        assert_eq!(move_rows(&a, &b).unwrap(), 2);
+        let names: Vec<String> = read_in(&b).into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["one", "two", "three"]);
+        assert!(read_in(&a).is_empty());
+        assert_eq!(
+            move_rows(&b, &b).unwrap(),
+            0,
+            "the same directory is a no-op"
+        );
+
+        // Past the bound: three files' worth of lines keep the newest two files' worth.
+        // A fixed-width time, so every line is the same length and a file's worth is a count.
+        let t0 = 1_000_000_000_000u64;
+        let line = named("n", t0).line().len() as u64;
+        let per_file = MAX_BYTES / line;
+        let many: Vec<Entry> = (0..per_file * 3).map(|i| named("n", t0 + i)).collect();
+        write_whole(&b, &many).unwrap();
+        let kept = read_in(&b);
+        assert_eq!(kept.len() as u64, per_file * 2);
+        assert_eq!(
+            kept.first().map(|e| e.ended_ms),
+            Some(t0 + per_file),
+            "the oldest third dropped"
+        );
+        assert_eq!(
+            kept.last().map(|e| e.ended_ms),
+            Some(t0 + per_file * 3 - 1),
+            "the newest kept"
+        );
+        assert!(std::fs::metadata(b.join(CURRENT)).unwrap().len() <= MAX_BYTES);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An empty or relative XDG variable is unset, as the spec says and as both SDKs read it: the
+    /// data root falls back to `$HOME/.local/share/kern` instead of a path relative to wherever kern
+    /// was started.
+    #[test]
+    fn an_empty_or_relative_xdg_variable_is_unset() {
+        let _g = crate::env_guard();
+        let prev = (
+            crate::global_env("XDG_DATA_HOME"),
+            crate::global_env("HOME"),
+        );
+        crate::set_global_env("HOME", "/home/someone");
+        for v in ["", "relative/dir"] {
+            crate::set_global_env("XDG_DATA_HOME", v);
+            assert_eq!(
+                crate::keepbox::data_root(),
+                Some(PathBuf::from("/home/someone/.local/share/kern")),
+                "XDG_DATA_HOME={v:?}"
+            );
+            assert!(
+                crate::volume::volumes_dir().is_absolute(),
+                "XDG_DATA_HOME={v:?}"
+            );
+        }
+        crate::set_global_env("XDG_DATA_HOME", "/x");
+        assert_eq!(disk_dir_path(), Some(PathBuf::from("/x/kern/history")));
+        for (k, v) in [("XDG_DATA_HOME", prev.0), ("HOME", prev.1)] {
+            match v {
+                Some(x) => crate::set_global_env(k, x),
+                None => crate::unset_global_env(k),
+            }
+        }
     }
 }

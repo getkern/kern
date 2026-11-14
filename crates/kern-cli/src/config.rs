@@ -134,6 +134,15 @@ pub struct KernSettings {
     /// one-off sandbox typed at a prompt; a compose service is a declared long-running workload
     /// whose file has a way to say what it needs.
     pub compose_memory_max: Option<String>,
+    /// `sandbox_history` - where the one-line record of every finished box is kept: `"memory"`
+    /// (the default: `$XDG_RUNTIME_DIR/kern/history`, a tmpfs, so a reboot clears it), `"disk"`
+    /// (`$XDG_DATA_HOME/kern/history`, kept across reboots) or `"off"` (nothing new is recorded).
+    ///
+    /// MEMORY IS THE DEFAULT because the lines name what ran on this machine, and a record nobody
+    /// asked to keep should not outlive the session that made it. The choice is the operator's, and
+    /// `kern sandbox keep`, `kern top` (Sandboxes, `m`) and this key are three ways of making it in
+    /// one place: the first two write this key.
+    pub sandbox_history: Option<crate::history::Keep>,
 }
 
 // ─────────────────────────────── CPU (implemented) ───────────────────────────────
@@ -617,6 +626,17 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
                 ));
             }
             k.compose_memory_max = Some(raw.trim().to_string());
+        }
+        // VALIDATED HERE for `publish_bind`'s reason: a typo must not leave the history somewhere
+        // the operator did not choose, which for "off" is the whole point of having written it.
+        "sandbox_history" => {
+            let raw = value_string(v)?;
+            k.sandbox_history = Some(crate::history::Keep::parse(raw.trim()).ok_or_else(|| {
+                format!(
+                    "[kern] sandbox_history = '{raw}': expected \"memory\" (kept until reboot), \
+                     \"disk\" (kept across reboots) or \"off\" (nothing recorded)"
+                )
+            })?);
         }
         _ => warn_unknown_key("kern", key),
     }
@@ -2533,6 +2553,22 @@ pub(crate) fn delete_named_block(section: &str, name: &str) -> Result<(), String
         return Err(format!("no {section} profile named '{name}'"));
     }
     let out = crate::toml_surgery::delete_block(&raw, section, name);
+    write_atomic(&path, &out).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Set (or, with `None`, remove) one key of the `[kern]` table, leaving every other byte of
+/// `kern.toml` as it was. `value` is the TOML value as written (`"\"disk\""`, `true`).
+///
+/// The same discipline as the profile writers: serialised by [`config_lock`], refused when the
+/// result would not parse, written atomically.
+pub(crate) fn set_kern_key(key: &str, value: Option<&str>) -> Result<(), String> {
+    let _lock = config_lock();
+    let (path, raw) = read_kern_toml()?;
+    let line = value.map(|v| format!("{key} = {v}"));
+    let out = crate::toml_surgery::set_table_key(&raw, "kern", key, line.as_deref());
+    parse(&out).map_err(|e| {
+        format!("refusing to write: the resulting kern.toml would not parse ({e}) - your existing config may be malformed; fix it first")
+    })?;
     write_atomic(&path, &out).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 

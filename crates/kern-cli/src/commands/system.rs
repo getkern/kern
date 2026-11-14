@@ -172,7 +172,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
   {d}Manage boxes{z}
     {c}top{z}                                                            Interactive task manager (TUI): host, every GPU, boxes, sandboxes (finished too)
     {c}stats{z} [--json] [--no-stream] [name...]                         Per-box memory + CPU (always a snapshot; --no-stream names that, `kern top` is the live view)
-    {c}sandbox{z} ls | history [-n N] [--failed] [--all] | stats [--all]  The SDK and MCP sandboxes: running now, finished (metadata only), outcomes
+    {c}sandbox{z} ls|history|stats [-n N] [--failed] [--all] [--json]      The SDK and MCP sandboxes: running now, finished (metadata only), outcomes
+    {c}sandbox{z} keep|clear [memory|disk|off]                             Where the finished ones are kept (default memory: until reboot), or remove them
     {c}inspect{z} <name> [--json] [-f|--format T]                        Full detail for one box; -f renders a Go-style template
                                                                      (`-f '{{{{.State.Status}}}}'`, `docker inspect`'s own paths)
     {c}port{z} <box> [<container-port>[/tcp|/udp]]                       Host address serving that box port, or every mapping it has

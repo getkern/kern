@@ -220,6 +220,31 @@ pub(crate) fn global_env_str(name: &str) -> Result<String, std::env::VarError> {
     std::env::var(name)
 }
 
+/// kern's directory under an XDG base: `$<var>/kern`, else `$HOME/<home_rel>/kern`, else `None`.
+/// The ONE resolver for `$XDG_DATA_HOME/kern` and `$XDG_CACHE_HOME/kern`, which the volumes, the
+/// builds, the kept boxes, the image cache, the sandbox history and the mount refusal all hang off.
+///
+/// AN EMPTY OR RELATIVE VALUE IS UNSET, which is what the XDG Base Directory spec says ("if
+/// `$XDG_DATA_HOME` is either not set or empty, a default equal to `$HOME/.local/share` should be
+/// used"; a relative path "is invalid and should be ignored") and what both SDKs already did
+/// (`configured or default`). Each site used to take the variable as it came: MEASURED, with
+/// `XDG_DATA_HOME=` exported empty, a named volume landed in `./kern/volumes` under whatever
+/// directory kern was started from, while the SDKs' mount refusal guarded `~/.local/share/kern`.
+pub(crate) fn kern_xdg_root(var: &str, home_rel: &str) -> Option<std::path::PathBuf> {
+    let absolute = |v: std::ffi::OsString| {
+        let p = std::path::PathBuf::from(v);
+        p.is_absolute().then_some(p)
+    };
+    global_env(var)
+        .and_then(absolute)
+        .or_else(|| {
+            global_env("HOME")
+                .and_then(absolute)
+                .map(|h| h.join(home_rel))
+        })
+        .map(|b| b.join("kern"))
+}
+
 #[allow(clippy::disallowed_methods)] // this IS the chokepoint
 pub(crate) fn global_env(name: &str) -> Option<std::ffi::OsString> {
     #[cfg(test)]

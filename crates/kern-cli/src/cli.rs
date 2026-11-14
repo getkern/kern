@@ -1571,9 +1571,20 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     reject_unknown_flags("sandbox stats", &rest[1..], &["--json", "--all"])?;
                     Command::Sandbox(SandboxCmd::Stats { json, all })
                 }
+                Some("keep") => match rest.get(2..).unwrap_or_default() {
+                    [] => Command::Sandbox(SandboxCmd::Keep { to: None }),
+                    [w] => Command::Sandbox(SandboxCmd::Keep {
+                        to: Some(
+                            crate::history::Keep::parse(w)
+                                .ok_or(Error::Usage("sandbox keep [memory | disk | off]"))?,
+                        ),
+                    }),
+                    _ => return Err(Error::Usage("sandbox keep [memory | disk | off]")),
+                },
+                Some("clear") if rest.len() == 2 => Command::Sandbox(SandboxCmd::Clear),
                 _ => {
                     return Err(Error::Usage(
-                        "sandbox ls | history [-n N] [--failed] [--all] | stats [--all]  (each takes --json)",
+                        "sandbox ls|history|stats [-n N] [--failed] [--all] [--json] | sandbox keep [memory|disk|off] | sandbox clear",
                     ))
                 }
             }

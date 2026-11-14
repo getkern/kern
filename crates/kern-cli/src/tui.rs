@@ -67,6 +67,8 @@ enum Mode {
     Form(Form),
     /// The "new profile" kind picker (Profiles tab `n`): choose vcpu / vgpio / vdisk / disk.
     PickKind,
+    /// Where the sandbox history is kept (Sandboxes tab `m`): memory / disk / off, or clear it.
+    PickHistory,
     /// A destructive action awaiting `y`/`n`.
     Confirm {
         prompt: String,
@@ -90,6 +92,7 @@ enum Pending {
     DeleteAllBuilds(Vec<String>),
     RemoveAllVolumes(Vec<String>),
     StopAllBoxes(Vec<String>),
+    ClearHistory, // every row of the sandbox history, in memory and on disk
 }
 
 /// A multi-field input form. `active` is the focused field; typing edits its value.
@@ -694,6 +697,27 @@ pub fn run() -> Result<(), crate::error::Error> {
                 Some(b'v') => mode = Mode::Form(new_profile_form("vdisk")),
                 _ => {}
             },
+            // The Sandboxes history picker: a letter is the choice, `c` asks before clearing, any
+            // other key leaves everything as it was.
+            Mode::PickHistory => {
+                use crate::history::Keep;
+                let pick = match key.first() {
+                    Some(b'm') => Some(Keep::Memory),
+                    Some(b'd') => Some(Keep::Disk),
+                    Some(b'o') => Some(Keep::Off),
+                    _ => None,
+                };
+                if let Some(k) = pick {
+                    mode = Mode::Overlay(choose_history(k));
+                    dirty = true;
+                } else if key.first() == Some(&b'c') {
+                    mode = Mode::Confirm {
+                        prompt: "remove every finished-sandbox row, in memory and on disk?  (y/n)"
+                            .into(),
+                        action: Pending::ClearHistory,
+                    };
+                }
+            }
             // A form: edit fields; Enter/Ctrl-S saves, Esc cancels.
             Mode::Form(form) => match handle_form_key(form, key) {
                 FormOutcome::Stay(f) => mode = Mode::Form(f),
@@ -1177,6 +1201,26 @@ fn perform_pending(action: Pending) -> Option<String> {
                     .map(|e| e.to_string())
             }),
         ),
+        Pending::ClearHistory => crate::history::clear().err(),
+    }
+}
+
+/// Apply a choice from the history picker, and say what it did: the place, the rows held, and
+/// how many moved with the switch. A failure (a `kern.toml` that would not parse) says why.
+fn choose_history(k: crate::history::Keep) -> String {
+    match crate::history::set_keep(k) {
+        Ok(moved) => format!(
+            "sandbox history\n\n{}{}\n\nWritten to kern.toml as [kern] sandbox_history = \"{}\"; \
+             `kern sandbox keep` reads and changes the same line.",
+            crate::history::keep_line(),
+            match moved {
+                0 => String::new(),
+                1 => "\n1 row moved with it".to_string(),
+                n => format!("\n{n} rows moved with it"),
+            },
+            k.word()
+        ),
+        Err(e) => format!("sandbox history: not changed\n\n{e}"),
     }
 }
 
@@ -2862,6 +2906,12 @@ fn render(
             s.push_str(&pick_pane(p));
             format!("{d}[{z}c{d}]vcpu  [{z}g{d}]vgpio  [{z}v{d}]vdisk   [{z}Esc{d}] cancel{z}")
         }
+        Mode::PickHistory => {
+            s.push_str(&history_pane(p, crate::history::keep()));
+            format!(
+                "{d}[{z}m{d}]emory  [{z}d{d}]isk  [{z}o{d}]ff  [{z}c{d}]lear   [{z}Esc{d}] cancel{z}"
+            )
+        }
         Mode::Confirm { prompt, .. } => {
             s.push_str(&confirm_pane(p, prompt));
             format!("{d}[{z}y{d}] yes   [{z}any other{d}] no{z}")
@@ -2923,6 +2973,10 @@ fn help_text() -> String {
        7 Storage    physical disks (read-only) and your named volumes\n\
        8 Sandboxes  SDK and MCP sandboxes: running now, and the ones that finished with how\n\
      \x20                they ended (metadata only, never the output); Enter shows one\n\
+     \n\
+     SANDBOXES tab\n\
+       m  where the history is kept: memory (the default, cleared at reboot), disk (kept\n\
+     \x20   across reboots) or off; c in the same menu clears it (asks first)\n\
      \n\
      BOXES tab - act on the selected box\n\
        s  stop (asks first)   S  stop ALL (asks first)\n\
@@ -2988,7 +3042,8 @@ fn nav_footer(
             )
         }
         TAB_SANDBOXES => format!(
-            "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}⏎{d}]detail   [{z}Tab{d}] next   [{z}q{d}] quit{help}"
+            "{d}[{z}↑↓ PgUp/PgDn{d}] select   [{z}⏎{d}]detail   [{z}m{d}] history: {z}{}{d}   [{z}Tab{d}] next   [{z}q{d}] quit{help}",
+            crate::history::keep().word()
         ),
         _ => format!(
             "{d}[{z}q{d}] quit   [{z}Tab{d}/{z}←→{d}] switch tab   [{z}1{d}-{z}8{d}] jump{help}"
@@ -3256,6 +3311,32 @@ fn confirm_pane(p: &Palette, prompt: &str) -> String {
 }
 
 /// The Profiles "new" kind picker: vcpu / vgpio / vdisk, each attachable to a box by prefix.
+/// The history picker: the three places, the current one marked, and what each means.
+fn history_pane(p: &Palette, now: crate::history::Keep) -> String {
+    use crate::history::Keep;
+    let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
+    let mut s = format!(
+        "\n  {b}sandbox history{z}  {d}- one line per finished sandbox (never its output): where to keep it{z}\n\n"
+    );
+    for (key, k) in [("m", Keep::Memory), ("d", Keep::Disk), ("o", Keep::Off)] {
+        let mark = if k == now {
+            format!("{g}● now{z}")
+        } else {
+            "     ".to_string()
+        };
+        s.push_str(&format!(
+            "    {b}[{c}{key}{b}]{z}  {b}{:<7}{z}{d}{:<32}{z} {mark}\n",
+            k.word(),
+            k.meaning()
+        ));
+    }
+    s.push_str(&format!(
+        "\n    {b}[{c}c{b}]{z}  {b}clear{z}  {d}remove every row held, in memory and on disk (asks first){z}\n\n  {d}{}{z}\n",
+        crate::history::keep_line()
+    ));
+    s
+}
+
 fn pick_pane(p: &Palette) -> String {
     let (b, c, d, z) = (p.b, p.c, p.d, p.z);
     let row = |key: &str, name: &str, what: &str| {
@@ -3437,8 +3518,17 @@ fn sandboxes_table_at(
 ) -> String {
     const LIVE_ROWS: usize = 3;
     let (b, c, d, g, r, y, z) = (p.b, p.c, p.d, p.g, p.r, p.y, p.z);
+    // THE CAPTION SAYS WHERE THE HISTORY IS, because the default clears it at reboot and a reader
+    // should learn that here rather than from a reboot; `m` is the way to change it.
+    let keep = crate::history::keep();
+    let kc = if keep == crate::history::Keep::Off {
+        y
+    } else {
+        c
+    };
     let mut s = format!(
-        "\n  {d}code an SDK or the MCP server ran, live and finished · {z}{c}kern sandbox history{z}{d} on the CLI{z}\n"
+        "\n  {d}code an SDK or the MCP server ran, live and finished · history {z}{kc}{}{z}{d} · {z}{c}m{z}{d} to change{z}\n",
+        keep.meaning()
     );
 
     // LIVE.
@@ -3523,8 +3613,13 @@ fn sandboxes_table_at(
     s
 }
 
-/// Sandboxes-tab keys: Enter shows the selected finished sandbox in full.
+/// Sandboxes-tab keys: Enter shows the selected finished sandbox in full, `m` where the history
+/// is kept.
 fn nav_sandboxes(k: u8, sel: usize, mode: &mut Mode) {
+    if k == b'm' {
+        *mode = Mode::PickHistory;
+        return;
+    }
     if !matches!(k, b'\r' | b'\n') {
         return;
     }

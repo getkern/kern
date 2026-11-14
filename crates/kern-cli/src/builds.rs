@@ -135,13 +135,10 @@ pub struct Record {
 /// data under `$XDG_DATA_HOME/kern/builds` (fallback `~/.local/share/kern/builds`, then a `/tmp`
 /// last resort), NOT the tmpfs runtime dir.
 pub fn builds_dir() -> PathBuf {
-    if let Some(x) = crate::global_env("XDG_DATA_HOME") {
-        return PathBuf::from(x).join("kern").join("builds");
-    }
-    if let Some(h) = crate::global_env("HOME") {
-        return PathBuf::from(h).join(".local/share/kern/builds");
-    }
-    PathBuf::from(format!("/tmp/kern-builds-{}", unsafe { libc::getuid() }))
+    crate::keepbox::data_root().map_or_else(
+        || PathBuf::from(format!("/tmp/kern-builds-{}", unsafe { libc::getuid() })),
+        |r| r.join("builds"),
+    )
 }
 
 /// A build id (`<name>` of a `builds/<name>` dir) that is a safe single path component. Reuses the

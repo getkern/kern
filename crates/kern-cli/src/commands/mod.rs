@@ -83,6 +83,7 @@ pub fn banner() -> Result<(), Error> {
     {b}kern compose{z} stack.yml                  {d}bring up a stack (docker-compose.yml too){z}
     {b}kern box{z} g --image <img> --gpus all    {d}a box with the host's GPUs{z}
     {b}kern sandbox{z} ls {d}·{z} {b}history{z} {d}·{z} {b}stats{z}       {d}SDK and MCP sandboxes: running, finished, outcomes{z}
+    {b}kern sandbox keep{z} disk                  {d}keep their history across reboots (default: until reboot){z}
     {b}kern top{z}                                {d}live: host, GPUs, boxes, sandboxes{z}
 
   {b}kern --help{z} {d}all commands{z} {d}·{z} {b}kern doctor{z} {d}check this host{z}
@@ -1823,7 +1824,7 @@ pub(crate) fn idmap_bind_candidates(
 /// Parse `-v src:dst[:opt,opt…]` specs into [`Volume`]s. The target must be absolute; the source is a
 /// volume name, an absolute path, or a `./`-style path relative to the current directory, and must
 /// exist on the host. The options are read by [`volume_option`].
-fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
+pub(crate) fn parse_volumes(specs: &[String]) -> Result<Vec<Volume>, Error> {
     let mut out = Vec::with_capacity(specs.len());
     for s in specs {
         let (source, target, read_only) = split_volume_spec(s)?;
@@ -2011,17 +2012,9 @@ pub(crate) fn resolve_volume(
                 // sent to look for a kern directory where their doc told them to find a display
                 // socket, and the two paths are now both in the sentence.
                 if let Some(state) = crate::registry::trusted_state_overlap(&canon) {
-                    let same = state == canon;
-                    return Err(Error::Sandbox(format!(
-                        "{s}: refusing it - {} kern's own state ({}), and a box able to write that \
-                         could forge another box's recorded capability/seccomp posture and elevate \
-                         its own `kern exec`. Bind a path that does not contain it",
-                        if same {
-                            format!("{} IS", canon.display())
-                        } else {
-                            format!("{} contains", canon.display())
-                        },
-                        state.display()
+                    let data_root = crate::keepbox::boxes_dir().parent() == Some(state.as_path());
+                    return Err(Error::Sandbox(kern_state_refusal(
+                        s, &canon, &state, data_root,
                     )));
                 }
                 if let Some(msg) = host_ipc_source_refusal(s, &canon) {
@@ -2509,6 +2502,44 @@ fn ports_summary(ports: &[kern_isolation::PortMap]) -> String {
         .join(", ")
 }
 
+/// The sentence a `-v` onto kern's own state is refused with: how the path relates to the state
+/// (it IS it, is INSIDE it, or CONTAINS it) and what a box able to write that state could do.
+///
+/// TWO ROOTS, TWO REASONS. Under the runtime registry a writer could forge another box's recorded
+/// capability and seccomp posture and elevate its own `kern exec`. Under the data root
+/// (`$XDG_DATA_HOME/kern`) it could choose the command line a later `kern start` replays, reach every
+/// named volume, and read or forge the sandbox history. One sentence used to give the registry's
+/// reason for both, and said "contains" for a path that is inside: MEASURED, `-v
+/// ~/.local/share/kern/history:/h` was refused as "contains kern's own state (~/.local/share/kern)
+/// ... elevate its own `kern exec`".
+fn kern_state_refusal(
+    spec: &str,
+    canon: &std::path::Path,
+    state: &std::path::Path,
+    data_root: bool,
+) -> String {
+    let relation = if canon == state {
+        "IS"
+    } else if canon.starts_with(state) {
+        "is inside"
+    } else {
+        "contains"
+    };
+    let why = if data_root {
+        "a box able to write that could choose the command line a later `kern start` replays, \
+         reach every named volume, and read or forge the sandbox history"
+    } else {
+        "a box able to write that could forge another box's recorded capability/seccomp posture \
+         and elevate its own `kern exec`"
+    };
+    format!(
+        "{spec}: refusing it - {} {relation} kern's own state ({}), and {why}. Bind a path that \
+         does not contain it",
+        canon.display(),
+        state.display()
+    )
+}
+
 /// The user's systemd unit directory (`$XDG_CONFIG_HOME/systemd/user`, else `~/.config/systemd/user`).
 fn user_systemd_dir() -> Result<PathBuf, Error> {
     if let Some(x) = crate::global_env("XDG_CONFIG_HOME") {
@@ -2571,15 +2602,14 @@ const SCOPE_TASKS_MAX: &str = "TasksMax=512";
 /// comes from the kernel command line. Mirrors [`crate::volume::volumes_dir`] and
 /// [`crate::builds::builds_dir`] rather than inventing a fourth location rule.
 fn uncapped_notice_path() -> PathBuf {
-    if let Some(x) = crate::global_env("XDG_DATA_HOME") {
-        return PathBuf::from(x).join("kern").join("uncapped-notice");
-    }
-    if let Some(h) = crate::global_env("HOME") {
-        return PathBuf::from(h).join(".local/share/kern/uncapped-notice");
-    }
-    PathBuf::from(format!("/tmp/kern-uncapped-notice-{}", unsafe {
-        libc::getuid()
-    }))
+    crate::keepbox::data_root().map_or_else(
+        || {
+            PathBuf::from(format!("/tmp/kern-uncapped-notice-{}", unsafe {
+                libc::getuid()
+            }))
+        },
+        |r| r.join("uncapped-notice"),
+    )
 }
 
 /// True the first time this host is told its resource caps are not enforceable, false afterwards.
@@ -7926,13 +7956,10 @@ pub(crate) fn image_expose_collisions(
 /// `kern box --image` would fail on a rootfs nobody extracted. Nothing here is ever mistaken for an
 /// image: the files hold port numbers and nothing else.
 fn expose_memo_dir() -> std::path::PathBuf {
-    if let Some(x) = crate::global_env("XDG_CACHE_HOME") {
-        return std::path::PathBuf::from(x).join("kern").join("expose");
-    }
-    if let Some(h) = crate::global_env("HOME") {
-        return std::path::PathBuf::from(h).join(".cache/kern/expose");
-    }
-    std::path::PathBuf::from(format!("/tmp/kern-expose-{}", unsafe { libc::getuid() }))
+    crate::kern_xdg_root("XDG_CACHE_HOME", ".cache").map_or_else(
+        || std::path::PathBuf::from(format!("/tmp/kern-expose-{}", unsafe { libc::getuid() })),
+        |r| r.join("expose"),
+    )
 }
 
 /// A filename for an image reference: every byte that is not a safe name character becomes `_`.

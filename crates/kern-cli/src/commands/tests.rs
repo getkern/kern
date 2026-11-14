@@ -1918,6 +1918,18 @@ mod net_resource_tests {
                 })
                 .unwrap_or(false)
         };
+        // The sentence says how the path relates to the state, in the three shapes there are.
+        let msg = |src: &str| {
+            parse_volumes(&[format!("{src}:/r")])
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        let tk = tmp.join("kern");
+        assert!(msg(&format!("{}", tk.display())).contains(" IS kern's own state"));
+        assert!(msg(&format!("{}/instances", tk.display())).contains(" is inside kern's own state"));
+        assert!(msg(&format!("{}", tmp.display())).contains(" contains kern's own state"));
+        assert!(msg(&format!("{}", tk.display())).contains("`kern exec`"));
         let t = tmp.to_string_lossy().into_owned();
         for form in [
             format!("{t}/kern"),              // the exact dir

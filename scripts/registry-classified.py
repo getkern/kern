@@ -49,7 +49,11 @@ CHOKEPOINT_CONSTRUCTORS = ["pods_root", "scratch_dir"]
 # cache and the profiles the same way). What `kern start` replays is checked on READ instead: the
 # record is size-bounded and must be a `kern box <name> ...` command line, or it is reported rather
 # than run.
-SIBLING_TREES = {"images", "volumes", "builds", "boxes", "uncapped-notice"}  # under $XDG_DATA_HOME/$XDG_CACHE_HOME
+# `expose` is the memo of the ports each image EXPOSEs ($XDG_CACHE_HOME/kern/expose), read by the
+# compose wiring decision before the registry is consulted: a SIBLING TREE beside `images` in the
+# same cache root, with the same exposure, and each file names the image it was written for, so a
+# memo for another image is discarded on read.
+SIBLING_TREES = {"images", "volumes", "builds", "boxes", "uncapped-notice", "expose"}  # under $XDG_DATA_HOME/$XDG_CACHE_HOME
 COSMETIC_FILES = {"runstats", ".greeted"}  # runtime FILES kern only DISPLAYS: run counter, greet marker
 NON_DIR_CHILDREN = SIBLING_TREES | COSMETIC_FILES
 

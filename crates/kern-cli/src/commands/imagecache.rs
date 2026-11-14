@@ -2076,14 +2076,13 @@ pub(crate) fn pull_to_cache(
 /// Image cache root: `$XDG_CACHE_HOME/kern/images` → `$HOME/.cache/kern/images` (both user-owned
 /// and persistent) → `/tmp/kern-cache-<uid>/images` (created mode 0700, last resort).
 pub(crate) fn cache_dir() -> PathBuf {
-    if let Some(x) = crate::global_env("XDG_CACHE_HOME") {
-        return PathBuf::from(x).join("kern/images");
-    }
-    if let Some(h) = crate::global_env("HOME") {
-        return PathBuf::from(h).join(".cache/kern/images");
-    }
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/kern-cache-{uid}/images"))
+    crate::kern_xdg_root("XDG_CACHE_HOME", ".cache").map_or_else(
+        || {
+            let uid = unsafe { libc::getuid() };
+            PathBuf::from(format!("/tmp/kern-cache-{uid}/images"))
+        },
+        |r| r.join("images"),
+    )
 }
 
 /// The content-addressed build **layer cache** (`<image cache>/L`): each `kern build` unit (a RUN

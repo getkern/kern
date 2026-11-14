@@ -52,13 +52,17 @@ use std::path::{Path, PathBuf};
 /// is a layer that is still there after a reboot; the fallbacks mirror [`crate::volume::volumes_dir`]
 /// so the two kinds of persistent state sit side by side.
 pub fn boxes_dir() -> PathBuf {
-    if let Some(x) = crate::global_env("XDG_DATA_HOME") {
-        return PathBuf::from(x).join("kern").join("boxes");
-    }
-    if let Some(h) = crate::global_env("HOME") {
-        return PathBuf::from(h).join(".local/share/kern/boxes");
-    }
-    PathBuf::from(format!("/tmp/kern-boxes-{}", unsafe { libc::getuid() }))
+    data_root().map_or_else(
+        || PathBuf::from(format!("/tmp/kern-boxes-{}", unsafe { libc::getuid() })),
+        |r| r.join("boxes"),
+    )
+}
+
+/// `$XDG_DATA_HOME/kern` (else `~/.local/share/kern`): the root of kern's persistent data, the
+/// volumes, the builds, the kept boxes and the sandbox history kept on disk. The mount refusal
+/// guards this root through [`boxes_dir`]'s parent, so everything under it shares the refusal.
+pub fn data_root() -> Option<PathBuf> {
+    crate::kern_xdg_root("XDG_DATA_HOME", ".local/share")
 }
 
 /// The directory of the kept box called `name`, or `None` when the name is not one kern would accept

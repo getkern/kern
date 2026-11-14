@@ -208,6 +208,73 @@ pub fn delete_block(raw: &str, header: &str, name: &str) -> String {
     with_trailing_newline(&joined, raw)
 }
 
+/// Is this trimmed line the header of the single table `[table]` (not an array of tables)?
+fn is_table_header(trimmed: &str, table: &str) -> bool {
+    !trimmed.starts_with("[[")
+        && trimmed
+            .strip_prefix('[')
+            .and_then(|r| r.split_once(']'))
+            .map(|(name, rest)| {
+                name.trim() == table && {
+                    let rest = rest.trim();
+                    rest.is_empty() || rest.starts_with('#')
+                }
+            })
+            == Some(true)
+}
+
+/// Set `key` in the single table `[table]` to the whole line `line` (`key = value`), or remove it
+/// with `None`. The key is replaced where it stands; a new key goes after the table's last key line,
+/// and a missing table is appended at the end. Every other line is kept byte for byte.
+pub fn set_table_key(raw: &str, table: &str, key: &str, line: Option<&str>) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let Some(start) = lines.iter().position(|l| is_table_header(l.trim(), table)) else {
+        let Some(line) = line else {
+            return raw.to_string();
+        };
+        let mut s = raw.to_string();
+        if !s.is_empty() {
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push('\n');
+        }
+        s.push_str(&format!("[{table}]\n{line}\n"));
+        return s;
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| starts_any_section(l.trim()))
+        .map_or(lines.len(), |i| start + 1 + i);
+    let mut out: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
+    match (0..end - start - 1)
+        .map(|i| start + 1 + i)
+        .find(|&i| line_key(lines[i].trim()) == Some(key))
+    {
+        Some(i) => match line {
+            Some(l) => out[i] = l.to_string(),
+            None => {
+                out.remove(i);
+            }
+        },
+        None => {
+            if let Some(l) = line {
+                let after = (start + 1..end)
+                    .rev()
+                    .find(|&i| line_key(lines[i].trim()).is_some())
+                    .unwrap_or(start);
+                out.insert(after + 1, l.to_string());
+            }
+        }
+    }
+    let joined = out.join("\n");
+    if raw.is_empty() || raw.ends_with('\n') {
+        format!("{joined}\n")
+    } else {
+        joined
+    }
+}
+
 /// Preserve the input's trailing-newline convention on the rebuilt text (`lines()` drops it).
 fn with_trailing_newline(s: &str, original: &str) -> String {
     if original.ends_with('\n') && !s.ends_with('\n') {
@@ -220,6 +287,53 @@ fn with_trailing_newline(s: &str, original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kern_key_is_set_in_place_added_after_the_last_key_and_removed() {
+        let raw = "# mine\n[kern]\nlog_level = \"info\"  \n\n[[vcpu]]\nname = \"a\"\n";
+        // Added after the table's last key, before the blank separator and the next block.
+        let added = set_table_key(
+            raw,
+            "kern",
+            "sandbox_history",
+            Some("sandbox_history = \"disk\""),
+        );
+        assert_eq!(
+            added,
+            "# mine\n[kern]\nlog_level = \"info\"  \nsandbox_history = \"disk\"\n\n[[vcpu]]\nname = \"a\"\n"
+        );
+        // Replaced where it stands.
+        let changed = set_table_key(
+            &added,
+            "kern",
+            "sandbox_history",
+            Some("sandbox_history = \"off\""),
+        );
+        assert_eq!(changed, added.replace("\"disk\"", "\"off\""));
+        // Removed, which gives the original back.
+        assert_eq!(
+            set_table_key(&changed, "kern", "sandbox_history", None),
+            raw
+        );
+        // A key of the same name in ANOTHER table is not touched.
+        let other = "[[vcpu]]\nsandbox_history = 1\n";
+        assert_eq!(
+            set_table_key(
+                other,
+                "kern",
+                "sandbox_history",
+                Some("sandbox_history = \"off\"")
+            ),
+            "[[vcpu]]\nsandbox_history = 1\n\n[kern]\nsandbox_history = \"off\"\n"
+        );
+        // No table and nothing to set: unchanged.
+        assert_eq!(set_table_key(other, "kern", "x", None), other);
+        // An empty file gets the table alone.
+        assert_eq!(
+            set_table_key("", "kern", "k", Some("k = 1")),
+            "[kern]\nk = 1\n"
+        );
+    }
 
     #[test]
     fn name_value_parses_both_quote_styles() {

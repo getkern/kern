@@ -13,13 +13,10 @@ use std::path::PathBuf;
 
 /// Root directory holding all named volumes.
 pub fn volumes_dir() -> PathBuf {
-    if let Some(x) = crate::global_env("XDG_DATA_HOME") {
-        return PathBuf::from(x).join("kern").join("volumes");
-    }
-    if let Some(h) = crate::global_env("HOME") {
-        return PathBuf::from(h).join(".local/share/kern/volumes");
-    }
-    PathBuf::from(format!("/tmp/kern-volumes-{}", unsafe { libc::getuid() }))
+    crate::keepbox::data_root().map_or_else(
+        || PathBuf::from(format!("/tmp/kern-volumes-{}", unsafe { libc::getuid() })),
+        |r| r.join("volumes"),
+    )
 }
 
 /// What a `-v` source names.

@@ -420,6 +420,7 @@ pub fn info() -> Result<(), Error> {
             row("runtime dir", &parent.to_string_lossy());
         }
     }
+    row("sandbox history", &crate::history::keep_line());
     row(
         "config",
         crate::config::active_path()
