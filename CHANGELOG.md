@@ -57,6 +57,16 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
+**A compose file whose `networks:` separate services gets a bridge per network.** Each network is its
+own bridge (on the subnet the file declares for it), each service is attached to the bridges of its
+networks only, and the pod does not forward between them, which is Docker's arrangement. Such files
+used to get the relay wiring, which reached a peer only on the ports it declared: a service on an
+image that EXPOSEs nothing was reached by name and answered by the CALLER's own listener. Peers are
+now reached on every port, with no `expose:`. `kern pod create --bridge` is repeatable and
+`kern box --pod-bridge <ip>/<n>@<b>` joins bridge `b`. A `links:` alias on a bridge named the
+service's own `127.0.0.1` instead of the peer; it names the peer. The `networks:` sentence is said by
+the verbs that choose the wiring, not by `exec`, `ps` or `logs`.
+
 **As root, an image that was loaded, built, tagged or committed did not run by its name.** Only a
 pull marked the cache entry with the uid map its files were written under, so as root every other
 entry was read as stale and sent to the registry to be repaired, where a local image does not exist:

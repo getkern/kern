@@ -119,24 +119,38 @@ kern picks the wiring from the file, and says which one it picked.
 each service keeps its own `127.0.0.1` and peers are reached by name. Measured against `--pod` on
 `up -d` with warm images: +17 ms for 2 services, +23 ms for 4, +27 ms for 8.
 
+**A bridge per network, when the file's `networks:` leave two services with nothing in common.** Each
+compose network gets its own bridge, on the subnet the file declares for it or on `10.89.<n>.0/24`;
+each service is attached to the bridges of its own networks (`eth0`, `eth1`, ... in the order it lists
+them) and to no other, and the pod does not forward between them. A peer is reached by name, on every
+port, at its address on the first network the two share; a service on no shared network has neither
+the name nor a route. Measured with three services on images that EXPOSE nothing (`web` on `front`,
+`db` on `back`, `app` on both), as root and as a user: `web` reached `app` and not `db`, by name or by
+address, and `app` had one interface per network. Two members given `NET_ADMIN` that each add a route
+through the pod did not reach each other; with forwarding turned on in the pod, they did.
+
 **One shared namespace (`--pod`).** Services reach each other by name on `127.0.0.1`: no bridge, no
 IPAM, no DNS server. Two services cannot both listen on the same container port, and kern refuses such
 a stack rather than running it with one of them dead. A port bound on the loopback is reachable by
 every peer.
 
-**A namespace per service with relays (`--no-pod`).** Chosen automatically when the file's `networks:`
-leave two services with nothing in common. Peers are reached through per-service loopback aliases
+**A namespace per service with relays (`--no-pod`).** Chosen automatically only for a file that both
+separates services with `networks:` and asks for a shared namespace (`network_mode: service:`).
+Peers are reached through per-service loopback aliases
 (`127.0.0.2` upward). The cost is a relay hop: -34% bulk throughput, -16% connection rate. A relay is
 built per known port: what the service declares (`port:`, `expose:`, `ports:`) or, when it declares
 none and runs the image's own command, what its image EXPOSEs, so a `redis` or an `nginx` is reachable
 as in Docker while a worker that runs `psql` from the `postgres` image does not claim 5432. A service on an
 image that EXPOSEs nothing and declares no port gets no relay, and `up` names it; Docker reaches any
-port a container listens on, and here that port has to be written as `expose:`.
+port a container listens on, and here that port has to be written as `expose:`. Measured on the
+three-service file above under `--no-pod`: with no port declared, a call to a peer by name reached the
+CALLER's own listener and returned its own answer.
 
-**`networks:` is enforced in that wiring and inert in a pod.** Two services with no network in common
-get no relay and no `/etc/hosts` entry, so the peer's name does not resolve. The boundary is the ABSENCE
-of a relay, not a filter, so no rule can be misconfigured into permissiveness. Over 240 real files, 52
-have a pair that loses an edge, so `up` names every cut pair first.
+**`networks:` is enforced on a bridge per network and under `--no-pod`, and inert in a pod.** Two
+services with no network in common share no bridge (or get no relay) and no `/etc/hosts` entry, so the
+peer's name does not resolve. The boundary is the ABSENCE of a path, not a filter, so no rule can be
+misconfigured into permissiveness. Over 240 real files, 52 have a pair that loses an edge, so `up`
+names every cut pair first.
 
 **A network shared BETWEEN projects (`external: true`).** `kern network create <name>` makes it, and
 services of different files on it reach each other by name. A file naming one that does not exist is
