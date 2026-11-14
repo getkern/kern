@@ -1200,16 +1200,25 @@ mod tests {
     fn the_host_port_is_bound_before_the_box_exists() {
         let _g = port_guard();
         use std::net::TcpListener;
-        let port = free_port();
-        let m = PortMap {
-            bind_ip: LOOPBACK,
-            host: port,
-            box_port: 9,
-            udp: false,
-        };
-        let fwd = match fork_forwarders(&[m]) {
-            Ok(f) => f,
-            Err((p, e)) => panic!("a free port {p} should publish: {e}"),
+        // A port found free is released before the forwarder binds it, and another test in this
+        // binary can take it in between (seen once in a full run: "Address already in use" on a
+        // port `free_port` had just returned). That one answer takes another port; any other fails.
+        let mut attempt = 0;
+        let (port, fwd) = loop {
+            let port = free_port();
+            let m = PortMap {
+                bind_ip: LOOPBACK,
+                host: port,
+                box_port: 9,
+                udp: false,
+            };
+            match fork_forwarders(&[m]) {
+                Ok(f) => break (port, f),
+                Err((_, e)) if e.contains("os error 98") && attempt < 5 => {
+                    attempt += 1;
+                }
+                Err((p, e)) => panic!("a free port {p} should publish: {e}"),
+            }
         };
         // No box has been forked and nothing was activated - yet the port is already taken.
         assert!(

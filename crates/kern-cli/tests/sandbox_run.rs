@@ -5995,6 +5995,84 @@ fn box_volume_roundtrips_data_and_ro_is_enforced() {
     let _ = fs::remove_dir_all(&host);
 }
 
+/// Read-only FILE volumes out of one directory, the shape of a GPU grant: each is readable and
+/// read-only in the box, whether it was bound out of a read-only staged directory (five out of
+/// `libs/`) or the ordinary way (four out of `mixed/`, which also holds a writable source and so is
+/// never staged: staging it would make that one read-only too). The writable one stays writable.
+#[test]
+fn read_only_file_volumes_from_one_directory_stay_read_only() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "rofiles");
+    let rootfs = root.to_str().unwrap();
+    let host = std::env::temp_dir().join(format!("kern-it-rofiles-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&host);
+    fs::create_dir_all(host.join("libs")).unwrap();
+    fs::create_dir_all(host.join("mixed")).unwrap();
+    let mut args: Vec<String> = ["box", "rofiles", "--rootfs", rootfs]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut script = String::new();
+    for (dir, n) in [("libs", 5), ("mixed", 4)] {
+        for i in 0..n {
+            let f = host.join(dir).join(format!("lib{i}.so"));
+            fs::write(&f, format!("{dir}{i}")).unwrap();
+            args.push("-v".into());
+            args.push(format!("{}:/{dir}/lib{i}.so:ro", f.display()));
+            script.push_str(&format!(
+                "cat /{dir}/lib{i}.so; echo; if echo x >> /{dir}/lib{i}.so; then echo WROTE-{dir}{i}; fi; "
+            ));
+        }
+    }
+    let rw = host.join("mixed/rw.txt");
+    fs::write(&rw, "").unwrap();
+    args.push("-v".into());
+    args.push(format!("{}:/mixed/rw.txt", rw.display()));
+    script.push_str("echo box-wrote >> /mixed/rw.txt && echo RW-OK");
+    args.extend(["--", "/bin/busybox", "sh", "-c", &script].map(String::from));
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = kern_out(&argv);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("user namespaces") {
+        eprintln!("skip: userns unavailable at runtime");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&host);
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for (dir, n) in [("libs", 5), ("mixed", 4)] {
+        for i in 0..n {
+            assert!(
+                stdout.contains(&format!("{dir}{i}")),
+                "{dir}/lib{i}.so must be readable: {stdout}\n{stderr}"
+            );
+            assert!(
+                !stdout.contains(&format!("WROTE-{dir}{i}")),
+                "{dir}/lib{i}.so is :ro and was written: {stdout}"
+            );
+            assert_eq!(
+                fs::read_to_string(host.join(dir).join(format!("lib{i}.so"))).unwrap(),
+                format!("{dir}{i}"),
+                "the host file behind a :ro volume changed"
+            );
+        }
+    }
+    assert!(
+        stdout.contains("RW-OK"),
+        "the writable volume must stay writable: {stdout}\n{stderr}"
+    );
+    assert!(fs::read_to_string(&rw).unwrap().contains("box-wrote"));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&host);
+}
+
 /// `--env` and `--workdir` reach the workload.
 #[test]
 fn box_env_and_workdir_apply() {

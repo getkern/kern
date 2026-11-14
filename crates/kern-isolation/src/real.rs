@@ -229,6 +229,10 @@ pub struct SandboxSpec {
     /// `/etc/ld.so.conf.d/00-kern-gpu.conf` in the box: a Jetson grant keeps NVIDIA's library paths,
     /// as docker's toolkit does with its `00-nvcr-*.conf`. Empty everywhere else.
     pub ldconfig_dirs: Vec<String>,
+    /// Where the loader caches a GPU box's `ldconfig` produced are kept for the next box of the same
+    /// image and grant (`$XDG_CACHE_HOME/kern/ldcache`), or `None` to run `ldconfig` every time. See
+    /// [`ldcache_key`].
+    pub ldcache_dir: Option<String>,
     /// `--security-opt no-new-privileges`: set `PR_SET_NO_NEW_PRIVS` and mount the box root `nosuid`,
     /// so no setuid program in the box can raise its user. Docker's default is OFF, and so is kern's
     /// for a box, a compose service and a build step; the SDK sandboxes ask for it. `--landlock-rw`
@@ -1766,6 +1770,13 @@ fn child_setup_and_exec(
     make_private()?;
     t.mark("unshare+private");
 
+    // THE LOADER CACHE'S KEY, BEFORE THE ROOT IS BUILT: it asks whether the box's writable layer is
+    // still empty, and from the overlay mount on kern itself writes into it (mount points).
+    let ld_key = if spec.refresh_ldcache {
+        ldcache_key(spec)
+    } else {
+        None
+    };
     let mut ops = RealMounts;
     // Build the new root (typestate). Overlay sets up the merge directly; bind/tmpfs go through
     // the recordable seam.
@@ -1864,6 +1875,9 @@ fn child_setup_and_exec(
     setup_extra_hosts(&spec.root, &spec.extra_hosts);
     // AFTER the hosts files, because the two are independent and this one only fires when asked.
     setup_resolv_conf(&spec.root, &spec.dns, &spec.dns_search, &spec.dns_options);
+    // The store is opened while host paths still resolve; after the pivot it is reached only through
+    // this descriptor.
+    let ld_store = ld_key.and_then(|k| LdStore::open(spec.ldcache_dir.as_deref()?, k));
     t.mark("volumes");
     // Self-pivot into the new root. The old root is left stacked at "/"; mount a fresh `proc`
     // (cwd-relative, while the old root still provides the visible proc instance the kernel
@@ -1936,9 +1950,10 @@ fn child_setup_and_exec(
     t.mark("cgroup-view");
     // THE LOADER CACHE, while the root is still writable (before the read-only remount below).
     if spec.refresh_ldcache {
-        refresh_loader_cache(spec, allow_nesting);
+        refresh_loader_cache(spec, allow_nesting, ld_store.as_ref());
         t.mark("ldcache");
     }
+    drop(ld_store);
     // Optional read-only remount LAST - the typestate makes any other order a compile error.
     // Overlay leaves the root writable (writes land in the upper layer). Volume submounts keep
     // their own flags, so a writable `-v` stays writable even under a read-only root. `MS_REMOUNT`
@@ -2799,26 +2814,45 @@ fn open_source_nofollow(src: &str) -> Result<libc::c_int, Error> {
 /// `path` opened as an `O_PATH` directory with no symlink anywhere on it, in ONE `openat2`, or
 /// `None` where the kernel has no `openat2` (before 5.6) and the caller walks instead.
 fn open_dir_no_symlinks(path: &CString) -> Option<Result<libc::c_int, std::io::Error>> {
-    /// `struct open_how` (`linux/openat2.h`), spelled here so no libc version has to carry it.
-    #[repr(C)]
-    struct OpenHow {
-        flags: u64,
-        mode: u64,
-        resolve: u64,
-    }
-    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    openat2(
+        libc::AT_FDCWD,
+        path,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+    )
+}
+
+/// `struct open_how` (`linux/openat2.h`), spelled here so no libc version has to carry it.
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+
+/// `openat2(dirfd, path)` with `flags` and the `resolve` restrictions, or `None` where the kernel has
+/// no `openat2` (before 5.6).
+fn openat2(
+    dirfd: libc::c_int,
+    path: &std::ffi::CStr,
+    flags: libc::c_int,
+    resolve: u64,
+) -> Option<Result<libc::c_int, std::io::Error>> {
     let how = OpenHow {
-        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        flags: flags as u64,
         mode: 0,
-        resolve: RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+        resolve,
     };
     // SAFETY: `path` is NUL-terminated and `how` lives on this frame for the call; the size passed
     // is the struct's own.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
-            libc::AT_FDCWD,
+            dirfd,
             path.as_ptr(),
             &raw const how,
             std::mem::size_of::<OpenHow>(),
@@ -3230,10 +3264,17 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
     }
     let mut result = Ok(());
     let mut parents = ParentCache(None);
+    let stage = RoStage::build(vols, root);
     for v in vols {
         // Resolve and PIN the source symlink-free (race-close the check->mount window, see
         // `open_source_nofollow`). `fstat` on the pinned fd gives the type without re-touching the path.
-        let src_fd = match open_source_nofollow(&v.source) {
+        // A read-only source in a staged directory is opened through it (see `RoStage`).
+        let staged = if v.read_only {
+            stage.open(&v.source)
+        } else {
+            None
+        };
+        let src_fd = match staged.map_or_else(|| open_source_nofollow(&v.source), Ok) {
             Ok(fd) => fd,
             Err(e) => {
                 result = Err(e);
@@ -3344,7 +3385,10 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
         // on, and the wrong one to put in the operator's error message.
         // A PREPARED IDMAPPED MOUNT IS ATTACHED INSTEAD OF BINDING THE SOURCE; see
         // `prepare_idmapped_binds`. The source checks above ran on it all the same.
-        let r = match idmapped_bind_for(v) {
+        let idmapped = idmapped_bind_for(v);
+        // Bound out of a read-only staged directory, the mount is read-only from the bind itself.
+        let born_read_only = staged.is_some() && idmapped.is_none();
+        let r = match idmapped {
             Some(mfd) => {
                 // SAFETY: `move_mount(2)` from the detached tree to the pinned target, both by fd.
                 let r = unsafe {
@@ -3406,7 +3450,7 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
             });
             break;
         }
-        if v.read_only {
+        if v.read_only && !born_read_only {
             // `:ro` is a per-mount flag, and a FIRST bind ignores it - it takes an `MS_REMOUNT` - so
             // without this pass a `:ro` volume is writable. No `nosuid`: a docker bind keeps the
             // setuid bit, and no-new-privileges, when asked for, is what makes it inert.
@@ -3459,8 +3503,156 @@ fn setup_volumes(root: &str, vols: &[Volume], socket_targets: &[String]) -> Resu
         }
     }
     drop(parents);
+    drop(stage);
     unsafe { libc::close(root_fd) };
     result
+}
+
+/// How many read-only sources one directory must hold before it is staged: staging costs a bind, a
+/// remount and an unmount, and saves one remount per source.
+const RO_STAGE_MIN: usize = 4;
+
+/// The source directories [`RoStage`] binds read-only for `vols`: each holds at least
+/// [`RO_STAGE_MIN`] read-only sources directly, and is none of: `/`, a directory holding the box's
+/// root, one holding a WRITABLE source (which a staged directory would make read-only).
+fn ro_stage_plan<'a>(vols: &'a [Volume], root: &str) -> Vec<&'a str> {
+    let under = |p: &str, d: &str| p == d || p.strip_prefix(d).is_some_and(|r| r.starts_with('/'));
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for v in vols.iter().filter(|v| v.read_only) {
+        if let Some((d, name)) = v.source.rsplit_once('/') {
+            if !d.is_empty() && !name.is_empty() {
+                *counts.entry(d).or_default() += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(d, n)| {
+            *n >= RO_STAGE_MIN
+                && !under(root, d)
+                && !vols.iter().any(|v| !v.read_only && under(&v.source, d))
+        })
+        .map(|(d, _)| d)
+        .collect()
+}
+
+/// Read-only binds of the directories in [`ro_stage_plan`], each made over the directory itself in
+/// this box's private mount namespace, so a file bound out of one is read-only from its first bind.
+///
+/// MEASURED BOTTLENECK, a Jetson's GPU grant: some 300 read-only file binds, and a first bind
+/// ignores `MS_RDONLY`, so each took a bind, a second walk to its target and a remount: 614 mounts,
+/// 18 ms of the box's setup. A bind copies its source mount's flags, `ro` included, so the remount
+/// is made once per directory instead. The binds are recursive, so every other path under the
+/// directory resolves as it did, and a source that still lands on a writable mount (a host mount
+/// below the directory) is opened the ordinary way. They are unmounted when the volumes are done,
+/// and the host's own mounts are never touched: this namespace is private.
+struct RoStage(Vec<(String, libc::c_int)>);
+
+impl RoStage {
+    fn build(vols: &[Volume], root: &str) -> RoStage {
+        RoStage(
+            ro_stage_plan(vols, root)
+                .into_iter()
+                .filter_map(|d| stage_ro_dir(d).map(|fd| (d.to_string(), fd)))
+                .collect(),
+        )
+    }
+
+    /// `source` opened through its staged directory (an `O_PATH`, no-follow descriptor, as
+    /// [`open_source_nofollow`] returns), when it has one and the open lands on a read-only mount.
+    fn open(&self, source: &str) -> Option<libc::c_int> {
+        let (d, name) = split_box_path(source.as_bytes())?;
+        let (_, dir) = self.0.iter().find(|(s, _)| s.as_bytes() == d)?;
+        let c = CString::new(name).ok()?;
+        // SAFETY: a NUL-terminated name under a directory descriptor this value owns.
+        let fd = unsafe {
+            libc::openat(
+                *dir,
+                c.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        if current_mount_flags(fd) & libc::MS_RDONLY as libc::c_ulong == 0 {
+            // SAFETY: the descriptor just opened.
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        Some(fd)
+    }
+}
+
+impl Drop for RoStage {
+    fn drop(&mut self) {
+        for (_, fd) in &self.0 {
+            unmount_and_close(*fd);
+        }
+    }
+}
+
+/// Detach the mount `fd` is the root of, and close `fd`.
+fn unmount_and_close(fd: libc::c_int) {
+    if let Ok(p) = cstr(&format!("/proc/self/fd/{fd}")) {
+        // SAFETY: a NUL-terminated path naming our own descriptor.
+        unsafe { libc::umount2(p.as_ptr(), libc::MNT_DETACH) };
+    }
+    // SAFETY: the descriptor the caller owns.
+    unsafe { libc::close(fd) };
+}
+
+/// Bind `dir` over itself, recursively, and remount the bind read-only. Returns an `O_PATH`
+/// descriptor of the read-only bind, or `None` with nothing left mounted.
+fn stage_ro_dir(dir: &str) -> Option<libc::c_int> {
+    let under = open_source_nofollow(dir).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fstat` into a buffer on this frame.
+    let is_dir =
+        unsafe { libc::fstat(under, &mut st) } == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    let path = cstr(&format!("/proc/self/fd/{under}")).ok();
+    let bound = is_dir
+        && path.as_ref().is_some_and(|p| {
+            // SAFETY: both ends name our own pinned descriptor.
+            let r = unsafe {
+                libc::mount(
+                    p.as_ptr(),
+                    p.as_ptr(),
+                    ptr::null(),
+                    (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+                    ptr::null(),
+                )
+            };
+            r == 0
+        });
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(under) };
+    if !bound {
+        return None;
+    }
+    // The path now resolves to the bind, the topmost mount on it. A remount through a descriptor that
+    // is not a mount's root fails, so one that reached anything else leaves nothing changed.
+    let top = match open_source_nofollow(dir) {
+        Ok(fd) => fd,
+        Err(_) => {
+            if let Ok(c) = cstr(dir) {
+                // SAFETY: a NUL-terminated path; detaching the bind made above.
+                unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+            }
+            return None;
+        }
+    };
+    let flags = current_mount_flags(top)
+        | (libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY) as libc::c_ulong;
+    let remounted = cstr(&format!("/proc/self/fd/{top}")).is_ok_and(|p| {
+        // SAFETY: a NUL-terminated path naming our own descriptor.
+        unsafe { libc::mount(ptr::null(), p.as_ptr(), ptr::null(), flags, ptr::null()) == 0 }
+    });
+    if !remounted || current_mount_flags(top) & libc::MS_RDONLY as libc::c_ulong == 0 {
+        unmount_and_close(top);
+        return None;
+    }
+    Some(top)
 }
 
 /// Resolve (creating as needed) `target` strictly *within* `root_fd`, refusing to traverse any
@@ -7132,6 +7324,593 @@ fn drop_caps_around_identity(
     clear_caps_from_sets(mask).map_err(|e| (CapDropStep::Sets, e))
 }
 
+/// The headers a real loader cache starts with (glibc's two formats).
+const LD_CACHE_MAGICS: [&[u8]; 2] = [b"ld.so-1.7.0", b"glibc-ld.so.cache"];
+/// The largest loader cache kept or installed. A real one is tens of kilobytes.
+const LD_CACHE_MAX: usize = 16 << 20;
+/// How many caches the store holds before the oldest goes.
+const LD_STORE_MAX: usize = 64;
+/// The first bytes of a store entry; see [`ld_entry_encode`]. An entry without them is dropped.
+const LD_STORE_MAGIC: &[u8; 8] = b"kernld2\n";
+/// The most links one entry carries. More than this and the box runs its own `ldconfig`.
+const LD_LINKS_MAX: usize = 4096;
+
+/// The longest path the kernel hands back, and so the longest link path or target an entry holds.
+const PATH_MAX_BYTES: usize = 4096;
+
+/// The identity of the box's `/etc/ld.so.cache` under `root`: (inode, size, mtime), or `None` when
+/// absent.
+fn ld_cache_identity(
+    root: libc::c_int,
+) -> Option<(libc::ino_t, libc::off_t, libc::time_t, libc::c_long)> {
+    use std::os::fd::AsRawFd;
+    let st = lstat_at(ld_etc(root)?.as_raw_fd(), c"ld.so.cache")?;
+    Some((st.st_ino, st.st_size, st.st_mtime, st.st_mtime_nsec))
+}
+
+/// 64-bit FNV-1a, for a key that must be the same in every kern process: `DefaultHasher` makes no
+/// promise across builds, and this needs none beyond the binary, which is in the key anyway.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        for x in b {
+            self.0 ^= u64::from(*x);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // A separator, so ("ab","c") and ("a","bc") differ.
+        self.0 ^= 0xff;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    fn num(&mut self, n: i128) {
+        self.bytes(&n.to_le_bytes());
+    }
+}
+
+/// The key of the loader cache a box's `ldconfig` would produce, or `None` when this box's must be
+/// built afresh.
+///
+/// THE INPUTS ARE EVERYTHING THE RESULT DEPENDS ON: the running binary (any rebuild of kern starts
+/// over), the image's layers by identity (a re-pulled image is a new directory), every bind's source
+/// by identity, size and modification time together with its target (the driver's libraries are
+/// binds, so a driver update moves the key), the directories the grant adds, the tmpfs mounts and
+/// the architecture. NOT CACHED: a box that is not built on image layers, and one whose writable
+/// layer already holds something (a `--keep` box run again can have changed its own libraries).
+fn ldcache_key(spec: &SandboxSpec) -> Option<u64> {
+    if spec.mode != MountMode::Overlay {
+        return None;
+    }
+    ldcache_key_of(
+        spec.overlay.as_ref()?,
+        &spec.volumes,
+        &spec.ldconfig_dirs,
+        &spec.tmpfs,
+    )
+}
+
+/// [`ldcache_key`] from its inputs alone.
+fn ldcache_key_of(
+    o: &OverlayDirs,
+    volumes: &[Volume],
+    ldconfig_dirs: &[String],
+    tmpfs: &[TmpfsMount],
+) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    if o.lower.is_empty() {
+        return None;
+    }
+    if std::fs::read_dir(&o.upper).is_ok_and(|mut d| d.next().is_some()) {
+        return None;
+    }
+    let mut h = Fnv::new();
+    let exe = std::fs::metadata("/proc/self/exe").ok()?;
+    h.num(i128::from(exe.dev()));
+    h.num(i128::from(exe.ino()));
+    h.num(i128::from(exe.mtime()));
+    h.num(i128::from(exe.mtime_nsec()));
+    h.bytes(std::env::consts::ARCH.as_bytes());
+    for l in &o.lower {
+        let m = std::fs::metadata(l).ok()?;
+        h.bytes(l.as_bytes());
+        h.num(i128::from(m.dev()));
+        h.num(i128::from(m.ino()));
+        h.num(i128::from(m.mtime()));
+    }
+    for v in volumes {
+        let m = std::fs::metadata(&v.source).ok()?;
+        h.bytes(v.source.as_bytes());
+        h.bytes(v.target.as_bytes());
+        // A FILE OR A DIRECTORY BY ITS CONTENT'S IDENTITY; A DEVICE BY WHICH DEVICE IT IS. A
+        // device node's modification time moves when the device is used: MEASURED, `/dev/dxg` in
+        // the key made two GPU boxes in a row miss, because the first box's use of the card moved
+        // it. What a device contributes to the loader's cache is nothing but its presence.
+        //
+        // NOT THE INODE, for a file or a directory: MEASURED on WSL2, `/usr/lib/wsl/lib` (an overlay
+        // over 9p) gives the same `libcuda.so` inode 9007199254790304 in one process and 11 in the
+        // next, so a key with it missed on the second box. Path, size and the nanosecond modification
+        // time are what a driver update changes.
+        if m.is_file() || m.is_dir() {
+            h.num(i128::from(m.size()));
+            h.num(i128::from(m.mtime()));
+            h.num(i128::from(m.mtime_nsec()));
+        } else {
+            h.num(i128::from(m.mode() & libc::S_IFMT));
+            h.num(i128::from(m.rdev()));
+        }
+    }
+    for d in ldconfig_dirs {
+        h.bytes(d.as_bytes());
+    }
+    for t in tmpfs {
+        h.bytes(t.path.as_bytes());
+    }
+    Some(h.0)
+}
+
+/// The loader-cache store, opened before the pivot so it is reachable after it through `dir` alone.
+///
+/// MEASURED BOTTLENECK, every platform with a GPU grant: the image's `ldconfig` runs in every box,
+/// confined, in its own PID namespace, and takes 12.6 ms of a GPU box on a Jetson and 2.3 ms on
+/// WSL2, for a result that is the same every time the image and the grant are. The store lives in
+/// kern's cache directory, which no box can mount, and an entry is written only from a box's own
+/// `ldconfig` run, captured before that box's workload exists.
+///
+/// ⛔ `ldconfig` WRITES MORE THAN THE CACHE: it also makes the soname links of the libraries it
+/// scans, and the cache names those links. MEASURED on a Jetson: the grant binds
+/// `/usr/lib/aarch64-linux-gnu/libcuda.so`, `ldconfig` made `libcuda.so.1 -> libcuda.so` beside it
+/// and the cache listed that path first, so a box given the stored cache alone failed
+/// `dlopen("libcuda.so.1")` with "No such file or directory", while `ldconfig -p` listed it. An
+/// entry therefore carries the links that run made (see [`ld_new_links`]) and a box gets them back
+/// before the cache, or runs `ldconfig` itself.
+struct LdStore {
+    dir: libc::c_int,
+    name: CString,
+}
+
+impl LdStore {
+    fn open(dir: &str, key: u64) -> Option<LdStore> {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir);
+        let c = CString::new(dir).ok()?;
+        // SAFETY: a NUL-terminated path; the descriptor is owned by the returned value.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        Some(LdStore {
+            dir: fd,
+            name: CString::new(format!("{key:016x}")).ok()?,
+        })
+    }
+
+    /// Put the stored cache, and the links it names, in place in the box under `root`, when there
+    /// is a good entry. `false` sends the box to its own `ldconfig`.
+    fn install(&self, root: libc::c_int) -> bool {
+        use std::io::Read;
+        // SAFETY: `dir` is this value's open directory and `name` NUL-terminated.
+        let fd = unsafe {
+            libc::openat(
+                self.dir,
+                self.name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: `fd` was just opened and is handed to the `File`, which closes it.
+        let mut f = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let mut body = Vec::new();
+        let read = (&mut f)
+            .take((LD_CACHE_MAX + LD_LINKS_MAX * 2 * PATH_MAX_BYTES) as u64)
+            .read_to_end(&mut body)
+            .is_ok();
+        let Some((links, cache)) = read.then(|| ld_entry_decode(&body)).flatten() else {
+            // Not an entry: dropped, so the next box does not meet it again.
+            // SAFETY: unlinking a name in our own store directory.
+            unsafe { libc::unlinkat(self.dir, self.name.as_ptr(), 0) };
+            return false;
+        };
+        ld_links_replay(root, &links) && ld_cache_put(root, cache)
+    }
+
+    /// Keep the cache this box's `ldconfig` just produced, with the links it made since `started`,
+    /// if it reads as one and every link is in the box's own layer; and hold the store to
+    /// [`LD_STORE_MAX`] entries.
+    fn keep(&self, root: libc::c_int, started: (libc::time_t, libc::c_long)) {
+        use std::io::Write;
+        let Some(cache) = ld_cache_get(root) else {
+            return;
+        };
+        let Some(links) = ld_new_links(root, &cache, started) else {
+            return;
+        };
+        let body = ld_entry_encode(&links, &cache);
+        let Ok(tmp) = CString::new(format!(".tmp.{}", std::process::id())) else {
+            return;
+        };
+        // SAFETY: a fresh name in our own store directory, created exclusively and not followed.
+        let fd = unsafe {
+            libc::openat(
+                self.dir,
+                tmp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return;
+        }
+        // SAFETY: `fd` was just opened and is handed to the `File`, which closes it.
+        let mut f = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let ok = f.write_all(&body).is_ok();
+        drop(f);
+        // SAFETY: names in our own store directory.
+        unsafe {
+            if !ok || libc::renameat(self.dir, tmp.as_ptr(), self.dir, self.name.as_ptr()) != 0 {
+                libc::unlinkat(self.dir, tmp.as_ptr(), 0);
+                return;
+            }
+        }
+        self.evict();
+    }
+
+    /// Hold the store to [`LD_STORE_MAX`] entries, the least recently written going first.
+    fn evict(&self) {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(rd) = std::fs::read_dir(format!("/proc/self/fd/{}", self.dir)) else {
+            return;
+        };
+        let mut entries: Vec<(i64, std::ffi::OsString)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                Some((m.mtime(), e.file_name()))
+            })
+            .collect();
+        if entries.len() <= LD_STORE_MAX {
+            return;
+        }
+        entries.sort();
+        for (_, name) in entries.iter().take(entries.len() - LD_STORE_MAX) {
+            if let Ok(c) = CString::new(name.as_encoded_bytes()) {
+                // SAFETY: a name read from our own store directory.
+                unsafe { libc::unlinkat(self.dir, c.as_ptr(), 0) };
+            }
+        }
+    }
+}
+
+impl Drop for LdStore {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor this value owns.
+        unsafe { libc::close(self.dir) };
+    }
+}
+
+/// The links of a store entry, as (path absolute in the box, target), borrowed from it.
+type LdLinks<'a> = Vec<(&'a [u8], &'a [u8])>;
+
+/// A store entry: [`LD_STORE_MAGIC`], the number of links as a little-endian `u32`, each link as
+/// `path NUL target NUL` (the path absolute in the box), then the loader cache itself.
+fn ld_entry_encode(links: &[(Vec<u8>, Vec<u8>)], cache: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LD_STORE_MAGIC.len() + 4 + cache.len());
+    out.extend_from_slice(LD_STORE_MAGIC);
+    out.extend_from_slice(&u32::try_from(links.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for (path, target) in links {
+        out.extend_from_slice(path);
+        out.push(0);
+        out.extend_from_slice(target);
+        out.push(0);
+    }
+    out.extend_from_slice(cache);
+    out
+}
+
+/// The links and the cache of a store entry, or `None` for anything [`ld_entry_encode`] would not
+/// have written: a link that is not absolute or has no target, too many links, a cache that does not
+/// start as one.
+fn ld_entry_decode(b: &[u8]) -> Option<(LdLinks<'_>, &[u8])> {
+    let rest = b.strip_prefix(LD_STORE_MAGIC.as_slice())?;
+    let n = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
+    let n = usize::try_from(n).ok()?;
+    if n > LD_LINKS_MAX {
+        return None;
+    }
+    let mut rest = rest.get(4..)?;
+    let mut links = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (path, r) = take_nul(rest)?;
+        let (target, r) = take_nul(r)?;
+        rest = r;
+        if !path.starts_with(b"/") || target.is_empty() {
+            return None;
+        }
+        links.push((path, target));
+    }
+    if rest.len() > LD_CACHE_MAX || !LD_CACHE_MAGICS.iter().any(|m| rest.starts_with(m)) {
+        return None;
+    }
+    Some((links, rest))
+}
+
+/// The bytes before the first NUL of `b`, and those after it.
+fn take_nul(b: &[u8]) -> Option<(&[u8], &[u8])> {
+    let i = b.iter().position(|x| *x == 0)?;
+    Some((b.get(..i)?, b.get(i + 1..)?))
+}
+
+/// Every library path a loader cache names, as (directory, file name), sorted.
+///
+/// Read as the absolute strings in the file rather than through either of glibc's layouts: a
+/// library's path is the only string in a cache that starts with `/`, and a token that is not one
+/// (a run of header bytes) names nothing in the box and is skipped where it is looked up.
+fn ld_cache_paths(cache: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut v: Vec<(&[u8], &[u8])> = cache
+        .split(|b| *b == 0)
+        .filter(|s| s.len() > 1 && s.len() < PATH_MAX_BYTES && s.starts_with(b"/"))
+        .filter_map(split_box_path)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// An absolute path in the box as its directory and its last component, or `None` when the last is
+/// empty, `.` or `..`.
+fn split_box_path(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    let i = path.iter().rposition(|b| *b == b'/')?;
+    let dir = path.get(..i)?;
+    let name = path.get(i + 1..)?;
+    if name.is_empty() || name == b"." || name == b".." {
+        return None;
+    }
+    Some((if dir.is_empty() { b"/" } else { dir }, name))
+}
+
+/// A directory of the box, `dir` absolute in it, opened under `root` (the box's `/`) with nothing
+/// that leaves the box's own root filesystem: no magic link, no other mount, nothing above `root`.
+/// `None` for any other answer, a kernel without `openat2` included.
+///
+/// ⛔ THE STORE NEVER WRITES OUTSIDE THE BOX'S OWN LAYER. A link `ldconfig` made in a bind mount, a
+/// volume or under `/proc` is not one this replays: the entry is not kept (see [`ld_new_links`]).
+fn open_box_dir(root: libc::c_int, dir: &[u8]) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let rel = match dir.iter().position(|b| *b != b'/') {
+        Some(i) => dir.get(i..)?,
+        None => b".",
+    };
+    let c = CString::new(rel).ok()?;
+    let fd = openat2(
+        root,
+        &c,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV,
+    )?
+    .ok()?;
+    // SAFETY: `fd` was just opened and is owned by the returned value alone.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`.
+fn lstat_at(dir: libc::c_int, name: &std::ffi::CStr) -> Option<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is NUL-terminated and `st` a stat buffer on this frame.
+    let r = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    (r == 0).then_some(st)
+}
+
+/// `readlinkat(dir, name)`, or `None` when it is not a link or its target does not fit `PATH_MAX`.
+fn readlink_at(dir: libc::c_int, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; PATH_MAX_BYTES];
+    // SAFETY: `name` is NUL-terminated and `buf` is writable for its length.
+    let n = unsafe { libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    let n = usize::try_from(n).ok()?;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// The kernel's coarse real-time clock, the one it stamps a new inode's times from: a link made
+/// after this reading has a change time at or after it.
+fn coarse_now() -> (libc::time_t, libc::c_long) {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a timespec on this frame.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts) };
+    (ts.tv_sec, ts.tv_nsec)
+}
+
+/// The links among the cache's paths that were made at or after `started`, as (path, target); `None`
+/// when one of them is outside the box's own layer, or there are more than [`LD_LINKS_MAX`].
+///
+/// "Made at or after `started`" is the link's change time against [`coarse_now`] taken before
+/// `ldconfig` ran: the image's own links were made when its layers were unpacked, before this box
+/// existed, and nothing but `ldconfig` runs in the box in between.
+fn ld_new_links(
+    root: libc::c_int,
+    cache: &[u8],
+    started: (libc::time_t, libc::c_long),
+) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    use std::os::fd::AsRawFd;
+    let is_new_link = |st: &libc::stat| {
+        st.st_mode & libc::S_IFMT == libc::S_IFLNK && (st.st_ctime, st.st_ctime_nsec) >= started
+    };
+    let mut out = Vec::new();
+    let mut cur: Option<(&[u8], Option<std::os::fd::OwnedFd>)> = None;
+    for (dir, name) in ld_cache_paths(cache) {
+        let Ok(cname) = CString::new(name) else {
+            continue;
+        };
+        if cur.as_ref().is_none_or(|(d, _)| *d != dir) {
+            cur = Some((dir, open_box_dir(root, dir)));
+        }
+        let mut path = dir.to_vec();
+        if dir != b"/" {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name);
+        match cur.as_ref().and_then(|(_, fd)| fd.as_ref()) {
+            Some(fd) => {
+                let Some(st) = lstat_at(fd.as_raw_fd(), &cname) else {
+                    continue;
+                };
+                if is_new_link(&st) {
+                    out.push((path, readlink_at(fd.as_raw_fd(), &cname)?));
+                    if out.len() > LD_LINKS_MAX {
+                        return None;
+                    }
+                }
+            }
+            None => {
+                // Not reachable inside the box's own layer. A link made there is one this cannot
+                // make again, so the run is not kept.
+                let rel = path.get(1..).unwrap_or_default();
+                let Ok(crel) = CString::new(rel) else {
+                    continue;
+                };
+                if lstat_at(root, &crel).is_some_and(|st| is_new_link(&st)) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Make each stored link in the box under `root` as `ldconfig` made it: created where absent,
+/// replaced where it points elsewhere. `false` when one cannot be, which leaves the box to its own
+/// `ldconfig`: a path that is now something other than a link, a directory outside the box's own
+/// layer.
+fn ld_links_replay(root: libc::c_int, links: &[(&[u8], &[u8])]) -> bool {
+    use std::os::fd::AsRawFd;
+    for (path, target) in links {
+        let Some((dir, name)) = split_box_path(path) else {
+            return false;
+        };
+        let (Some(fd), Ok(cname), Ok(ctarget)) = (
+            open_box_dir(root, dir),
+            CString::new(name),
+            CString::new(*target),
+        ) else {
+            return false;
+        };
+        let fd = fd.as_raw_fd();
+        match lstat_at(fd, &cname) {
+            None => {
+                // SAFETY: NUL-terminated strings, a directory descriptor this function holds.
+                if unsafe { libc::symlinkat(ctarget.as_ptr(), fd, cname.as_ptr()) } != 0 {
+                    return false;
+                }
+            }
+            Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
+                if readlink_at(fd, &cname).as_deref() == Some(*target) {
+                    continue;
+                }
+                let Ok(tmp) = CString::new(format!(".kern-ld.{}", std::process::id())) else {
+                    return false;
+                };
+                // SAFETY: as above; the temporary is renamed over the stale link or removed.
+                unsafe {
+                    if libc::symlinkat(ctarget.as_ptr(), fd, tmp.as_ptr()) != 0 {
+                        return false;
+                    }
+                    if libc::renameat(fd, tmp.as_ptr(), fd, cname.as_ptr()) != 0 {
+                        libc::unlinkat(fd, tmp.as_ptr(), 0);
+                        return false;
+                    }
+                }
+            }
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
+/// The box's `/etc`, opened as [`open_box_dir`] does.
+fn ld_etc(root: libc::c_int) -> Option<std::os::fd::OwnedFd> {
+    open_box_dir(root, b"/etc")
+}
+
+/// The box's loader cache, when it reads as one.
+fn ld_cache_get(root: libc::c_int) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let etc = ld_etc(root)?;
+    // SAFETY: a fixed NUL-terminated name under a directory descriptor this function holds.
+    let fd = unsafe {
+        libc::openat(
+            etc.as_raw_fd(),
+            c"ld.so.cache".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` was just opened and is handed to the `File`, which closes it.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut body = Vec::new();
+    f.take(LD_CACHE_MAX as u64 + 1)
+        .read_to_end(&mut body)
+        .ok()?;
+    (body.len() <= LD_CACHE_MAX && LD_CACHE_MAGICS.iter().any(|m| body.starts_with(m)))
+        .then_some(body)
+}
+
+/// Write `cache` as the box's loader cache, as `ldconfig` does: a temporary beside it, renamed over.
+fn ld_cache_put(root: libc::c_int, cache: &[u8]) -> bool {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let Some(etc) = ld_etc(root) else {
+        return false;
+    };
+    let etc = etc.as_raw_fd();
+    let tmp = c".ld.so.cache.kern";
+    // SAFETY: fixed NUL-terminated names under a directory descriptor this function holds.
+    unsafe { libc::unlinkat(etc, tmp.as_ptr(), 0) };
+    let fd = unsafe {
+        libc::openat(
+            etc,
+            tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: `fd` was just opened and is handed to the `File`, which closes it.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    // The mode is set on the descriptor, since the umask may have taken bits from the create's.
+    // SAFETY: `fchmod` on the descriptor `f` owns.
+    let wrote = f.write_all(cache).is_ok() && unsafe { libc::fchmod(f.as_raw_fd(), 0o644) } == 0;
+    drop(f);
+    // SAFETY: as above.
+    unsafe {
+        if !wrote || libc::renameat(etc, tmp.as_ptr(), etc, c"ld.so.cache".as_ptr()) != 0 {
+            libc::unlinkat(etc, tmp.as_ptr(), 0);
+            return false;
+        }
+    }
+    true
+}
+
 /// Where an image keeps `ldconfig`, in the order a root shell's `PATH` finds it.
 const LDCONFIG_PATHS: [&str; 2] = ["/sbin/ldconfig", "/usr/sbin/ldconfig"];
 /// How long the image's `ldconfig` may take before it is killed. A real one takes milliseconds.
@@ -7154,7 +7933,7 @@ const LDCONFIG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10
 /// alone, never the host's; killed after [`LDCONFIG_DEADLINE`]. Its output is discarded and its
 /// failure is not the box's: a cache that could not be rebuilt leaves the box as it was before this
 /// existed.
-fn refresh_loader_cache(spec: &SandboxSpec, allow_nesting: bool) {
+fn refresh_loader_cache(spec: &SandboxSpec, allow_nesting: bool, store: Option<&LdStore>) {
     use std::os::unix::fs::PermissionsExt;
     // THE GRANT'S LIBRARY DIRECTORIES, IN THE BOX'S OWN CONFIGURATION, before its loader runs: the
     // file lands in the box's writable layer (this runs after the pivot, before any read-only
@@ -7174,6 +7953,28 @@ fn refresh_loader_cache(spec: &SandboxSpec, allow_nesting: bool) {
     }) else {
         return;
     };
+    // The box's `/`, which the store reads and writes under (see `open_box_dir`).
+    // SAFETY: a fixed NUL-terminated path; the descriptor is owned by `root` below.
+    let root = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    // SAFETY: closed only when non-negative, and owned by nothing else.
+    let root = (root >= 0)
+        .then(|| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(root) });
+    let root_fd = root.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
+    // A CACHE THIS IMAGE AND GRANT ALREADY PRODUCED: no image code runs, the result is the same.
+    if let (Some(st), Some(r)) = (store, root_fd) {
+        if st.install(r) {
+            return;
+        }
+    }
+    // What the box's cache is before the run, so a run that changed nothing is not stored, and when
+    // it started, so the links it makes can be told from the image's.
+    let before = root_fd.and_then(ld_cache_identity);
+    let started = coarse_now();
     let Ok(path) = CString::new(*ldconfig) else {
         return;
     };
@@ -7271,9 +8072,17 @@ fn refresh_loader_cache(spec: &SandboxSpec, allow_nesting: bool) {
         let mut status = 0i32;
         // SAFETY: waiting on the one child forked above.
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if r == pid
-            || (r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR))
-        {
+        if r == pid {
+            // KEPT ONLY WHEN THE RUN PRODUCED ONE: the cache changed and reads as a loader cache.
+            // Captured here, before the workload exists, so nothing the workload does reaches it.
+            if let (Some(st), Some(r)) = (store, root_fd) {
+                if ld_cache_identity(r) != before {
+                    st.keep(r, started);
+                }
+            }
+            return;
+        }
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             return;
         }
         if std::time::Instant::now() >= deadline {
@@ -11072,6 +11881,208 @@ mod source_open_tests {
         assert_eq!(kind(fd), libc::S_IFLNK);
         // `..` is refused before anything is opened.
         assert!(open_source_nofollow(&path("real/dir/../dir/file")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod ldcache_key_tests {
+    use super::{ldcache_key_of, OverlayDirs, Volume};
+
+    /// The loader cache's key: the same inputs give the same key in two calls; a driver library that
+    /// changes size moves it; a device's state does not (its node's time moves with use); and a box
+    /// whose writable layer already holds something gets none, so it runs its own `ldconfig`.
+    #[test]
+    fn the_loader_cache_key_follows_what_the_cache_depends_on() {
+        let base = std::env::temp_dir().join(format!("kern-ldkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["lower", "upper", "work"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        std::fs::write(base.join("libcuda.so.1"), b"elf").unwrap();
+        let p = |x: &str| base.join(x).to_string_lossy().into_owned();
+        // A node that is neither a file nor a directory, standing in for a device: its times are
+        // moved below, as a device's are by use.
+        let node = std::ffi::CString::new(p("node")).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(node.as_ptr(), 0o600) }, 0);
+        let o = OverlayDirs {
+            lower: vec![p("lower")],
+            upper: p("upper"),
+            work: p("work"),
+        };
+        let vols = vec![
+            Volume {
+                source: p("libcuda.so.1"),
+                target: "/usr/lib/x86_64-linux-gnu/libcuda.so.1".into(),
+                read_only: true,
+            },
+            Volume {
+                source: p("node"),
+                target: "/dev/dxg".into(),
+                read_only: false,
+            },
+        ];
+        let k1 = ldcache_key_of(&o, &vols, &[], &[]);
+        assert!(k1.is_some());
+        assert_eq!(k1, ldcache_key_of(&o, &vols, &[], &[]), "stable");
+        // The node's times move, as a device's do when it is used; the key does not.
+        let later = [libc::timespec {
+            tv_sec: 2_000_000_000,
+            tv_nsec: 7,
+        }; 2];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, node.as_ptr(), later.as_ptr(), 0) },
+            0
+        );
+        assert_eq!(
+            k1,
+            ldcache_key_of(&o, &vols, &[], &[]),
+            "a device's use moved the key"
+        );
+        // The grant's directories are an input.
+        assert_ne!(k1, ldcache_key_of(&o, &vols, &["/opt/lib".into()], &[]));
+        // A changed library is a different key.
+        std::fs::write(base.join("libcuda.so.1"), b"elf, a newer driver").unwrap();
+        assert_ne!(
+            k1,
+            ldcache_key_of(&o, &vols, &[], &[]),
+            "a changed library kept the key"
+        );
+        // A writable layer that already holds something: no key.
+        std::fs::write(base.join("upper/kept"), b"x").unwrap();
+        assert_eq!(ldcache_key_of(&o, &vols, &[], &[]), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod ro_stage_tests {
+    use super::{ro_stage_plan, Volume};
+
+    fn v(source: &str, read_only: bool) -> Volume {
+        Volume {
+            source: source.into(),
+            target: format!("/box{source}"),
+            read_only,
+        }
+    }
+
+    /// A directory is staged for four read-only sources and not three; never when it, or anything
+    /// under it, is a writable source; never when it holds the box's root; never `/`.
+    #[test]
+    fn a_directory_is_staged_only_where_every_source_under_it_is_read_only() {
+        let lib = |n: usize, dir: &str| -> Vec<Volume> {
+            (0..n)
+                .map(|i| v(&format!("{dir}/lib{i}.so"), true))
+                .collect()
+        };
+        let root = "/run/user/1000/kern/instances/b/merged";
+        assert_eq!(
+            ro_stage_plan(&lib(4, "/usr/lib/x"), root),
+            vec!["/usr/lib/x"]
+        );
+        assert!(ro_stage_plan(&lib(3, "/usr/lib/x"), root).is_empty());
+        let mut writable_inside = lib(5, "/usr/lib/x");
+        writable_inside.push(v("/usr/lib/x/cache", false));
+        assert!(ro_stage_plan(&writable_inside, root).is_empty());
+        let mut writable_itself = lib(5, "/usr/lib/x");
+        writable_itself.push(v("/usr/lib/x", false));
+        assert!(ro_stage_plan(&writable_itself, root).is_empty());
+        // A writable source ABOVE it is bound non-recursively, so the staged bind is not in it.
+        let mut writable_above = lib(5, "/usr/lib/x");
+        writable_above.push(v("/usr/lib", false));
+        assert_eq!(ro_stage_plan(&writable_above, root), vec!["/usr/lib/x"]);
+        // A sibling sharing a prefix is not under it.
+        let mut sibling = lib(5, "/usr/lib/x");
+        sibling.push(v("/usr/lib/xy", false));
+        assert_eq!(ro_stage_plan(&sibling, root), vec!["/usr/lib/x"]);
+        assert!(ro_stage_plan(&lib(5, "/run/user/1000"), root).is_empty());
+        let top: Vec<Volume> = (0..5).map(|i| v(&format!("/f{i}"), true)).collect();
+        assert!(ro_stage_plan(&top, root).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ldstore_tests {
+    use super::{
+        coarse_now, ld_entry_decode, ld_entry_encode, ld_links_replay, ld_new_links, open_box_dir,
+    };
+    use std::os::fd::AsRawFd;
+
+    /// An entry reads back as it was written, and anything else is not an entry.
+    #[test]
+    fn a_store_entry_reads_back_and_nothing_else_does() {
+        let cache = b"glibc-ld.so.cache1.1\0rest".to_vec();
+        let links = vec![(b"/usr/lib/libx.so.1".to_vec(), b"libx.so".to_vec())];
+        let e = ld_entry_encode(&links, &cache);
+        let (l, c) = ld_entry_decode(&e).unwrap();
+        assert_eq!(l, vec![(&b"/usr/lib/libx.so.1"[..], &b"libx.so"[..])]);
+        assert_eq!(c, &cache[..]);
+        // The first binary's form, a bare cache, is not an entry: it is dropped and rebuilt.
+        assert!(ld_entry_decode(&cache).is_none());
+        let relative = ld_entry_encode(&[(b"usr/lib/x".to_vec(), b"y".to_vec())], &cache);
+        assert!(ld_entry_decode(&relative).is_none());
+        let no_target = ld_entry_encode(&[(b"/usr/lib/x".to_vec(), Vec::new())], &cache);
+        assert!(ld_entry_decode(&no_target).is_none());
+        let not_a_cache = ld_entry_encode(&links, b"ELF");
+        assert!(ld_entry_decode(&not_a_cache).is_none());
+        let truncated = &e[..e.len() - cache.len() - 3];
+        assert!(ld_entry_decode(truncated).is_none());
+    }
+
+    /// The links a run made are told from the image's by their time, and a box given them back gets
+    /// each as it was made: created where absent, re-aimed where stale, refused over a file. Paths
+    /// resolve under the box's `/` even through an absolute link.
+    #[test]
+    fn the_links_ldconfig_made_are_kept_and_made_again() {
+        let base = std::env::temp_dir().join(format!("kern-ldlinks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lib = base.join("usr/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("libx.so"), b"elf").unwrap();
+        std::fs::write(lib.join("libold.so"), b"elf").unwrap();
+        // The image's: made before the run.
+        std::os::unix::fs::symlink("libold.so", lib.join("libold.so.1")).unwrap();
+        // `/lib64 -> /usr/lib`, absolute, as merged-usr images have: it must land in the box.
+        std::os::unix::fs::symlink("/usr/lib", base.join("lib64")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let started = coarse_now();
+        // The run's.
+        std::os::unix::fs::symlink("libx.so", lib.join("libx.so.1")).unwrap();
+        let cache = b"glibc-ld.so.cache1.1\0\x01\x2f\x02\0libx.so.1\0/usr/lib/libx.so.1\0\
+            /lib64/libx.so.1\0/usr/lib/libold.so.1\0/usr/lib/libx.so\0/nowhere/liby.so.1\0";
+        let root = std::fs::File::open(&base).unwrap();
+        let r = root.as_raw_fd();
+        assert!(open_box_dir(r, b"/lib64").is_some());
+        let links = ld_new_links(r, cache, started).unwrap();
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"/lib64/libx.so.1".to_vec(), b"libx.so".to_vec()),
+            (b"/usr/lib/libx.so.1".to_vec(), b"libx.so".to_vec()),
+        ];
+        assert_eq!(links, expected, "only the run's links, through /lib64 too");
+        let as_refs: Vec<(&[u8], &[u8])> = links
+            .iter()
+            .map(|(p, t)| (p.as_slice(), t.as_slice()))
+            .collect();
+        // A fresh box: the link absent.
+        std::fs::remove_file(lib.join("libx.so.1")).unwrap();
+        assert!(ld_links_replay(r, &as_refs));
+        assert_eq!(
+            std::fs::read_link(lib.join("libx.so.1")).unwrap(),
+            std::path::Path::new("libx.so")
+        );
+        // A stale one: re-aimed.
+        std::fs::remove_file(lib.join("libx.so.1")).unwrap();
+        std::os::unix::fs::symlink("libold.so", lib.join("libx.so.1")).unwrap();
+        assert!(ld_links_replay(r, &as_refs));
+        assert_eq!(
+            std::fs::read_link(lib.join("libx.so.1")).unwrap(),
+            std::path::Path::new("libx.so")
+        );
+        // A file where the link was: the box runs its own `ldconfig`.
+        std::fs::remove_file(lib.join("libx.so.1")).unwrap();
+        std::fs::write(lib.join("libx.so.1"), b"elf").unwrap();
+        assert!(!ld_links_replay(r, &as_refs));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

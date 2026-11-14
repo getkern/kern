@@ -1744,15 +1744,6 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let mut wsl_pending: Option<crate::gpu::WslGrant> = None;
     // Nodes the grant reaches only through a group, decided once the box's uid map is known.
     let mut gpu_groups_needed: Option<(Vec<u32>, Vec<std::path::PathBuf>)> = None;
-    if let Some(selection) = gpu_selection {
-        let o = decide_gpu_grant(selection?, args.gpus)?;
-        gpu_enumeration = o.enumeration;
-        gpu_for_identity = o.for_identity;
-        gpu_visible = o.visible;
-        granted_tools = o.tools;
-        wsl_pending = o.wsl;
-        gpu_groups_needed = o.groups_needed;
-    }
     // `--mount`'s mounts, resolved from their FIELDS. They never pass through a `src:dst` string, so
     // a source containing a `:` (or, quoted, a `,`) arrives whole - which is the difference between
     // `--mount` and `-v` now, and the reason the cache under a `colon:cache` path can be mounted.
@@ -1826,6 +1817,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--show-config`: a dry run - print the resolved box configuration and exit BEFORE any host-side
     // mount or the systemd-scope re-exec, so nothing is created or torn down.
     if args.show_config {
+        // The dry run refuses what the launch would, the grant included.
+        if let Some(selection) = gpu_selection {
+            decide_gpu_grant(selection?, args.gpus)?;
+        }
         print_resolved_config(
             &args,
             name.as_str(),
@@ -1869,6 +1864,20 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             die_with_parent: !args.detached && !args.tty, // a foreground box dies with its launcher
             allow_uncapped: args.allow_uncapped || kern_common::env_flag("KERN_ALLOW_UNCAPPED"),
         });
+    }
+    // THE GPU GRANT IS DECIDED IN THE FINAL PROCESS, after the scope re-exec and still before the
+    // image is pulled, so a request this host cannot meet is refused before any download. Decided
+    // above the re-exec, it was decided twice: MEASURED on a Jetson, where an SSH session sits
+    // outside the user manager and every box takes the scope, the parent opened and read the header
+    // of each of the grant's libraries once before `systemd-run` and once after it.
+    if let Some(selection) = gpu_selection {
+        let o = decide_gpu_grant(selection?, args.gpus)?;
+        gpu_enumeration = o.enumeration;
+        gpu_for_identity = o.for_identity;
+        gpu_visible = o.visible;
+        granted_tools = o.tools;
+        wsl_pending = o.wsl;
+        gpu_groups_needed = o.groups_needed;
     }
     // Now in the FINAL process (the scope re-exec above, if taken, has already execve'd): mark the
     // started-fd CLOEXEC so the workload's execvp closes it. Fail-closed (a fd we cannot protect is

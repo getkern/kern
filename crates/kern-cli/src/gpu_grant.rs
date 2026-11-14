@@ -814,9 +814,52 @@ fn tegra_csv_under(root: &Path) -> Option<TegraCsv> {
 /// and a bind source with a `..` in it is refused by the box: MEASURED on a Jetson Orin Nano, "volume
 /// source must be canonical".
 fn canonical_under(root: &Path, path: &Path) -> Option<PathBuf> {
-    let real = std::fs::canonicalize(path).ok()?;
-    let real_root = std::fs::canonicalize(root).ok()?;
+    let real = canonical(path)?;
+    let real_root = canonical(root)?;
     real.starts_with(&real_root).then_some(real)
+}
+
+/// `std::fs::canonicalize`, with each DIRECTORY resolved once per process.
+///
+/// A GRANT RESOLVES HUNDREDS OF FILES IN A FEW DIRECTORIES, and `canonicalize` walks every component
+/// of every path with a `readlink`: MEASURED on a Jetson, 748 path syscalls under `/usr` for one
+/// grant, every library repeating the walk of `/usr/lib/aarch64-linux-gnu`, and the root resolved
+/// again for each one. The answer is the same: a file that is not itself a link is its directory's
+/// canonical path plus its name, and the directory's answer is remembered. A link, or anything
+/// that cannot be read as "not a link", takes the full walk as before, so the result is the one
+/// `canonicalize` gives. One invocation of kern lives milliseconds; a directory's canonical path
+/// does not change under it in a way the box's own no-follow bind would not refuse anyway.
+fn canonical(path: &Path) -> Option<PathBuf> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static DIRS: RefCell<HashMap<PathBuf, PathBuf>> = RefCell::new(HashMap::new());
+    }
+    let dir_of = |d: &Path| -> Option<PathBuf> {
+        if let Some(hit) = DIRS.with(|m| m.borrow().get(d).cloned()) {
+            return Some(hit);
+        }
+        let real = std::fs::canonicalize(d).ok()?;
+        DIRS.with(|m| m.borrow_mut().insert(d.to_path_buf(), real.clone()));
+        Some(real)
+    };
+    // A `.` or `..` anywhere, or a trailing `/`, takes the full walk: `Path` drops a trailing `.`
+    // from `file_name`, so `link/.` would read as the link's own name and not its target.
+    let plain = {
+        use std::os::unix::ffi::OsStrExt;
+        let b = path.as_os_str().as_bytes();
+        !b.ends_with(b"/") && !b.split(|c| *c == b'/').any(|s| s == b"." || s == b"..")
+    };
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name))
+            if plain
+                && !parent.as_os_str().is_empty()
+                && std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) =>
+        {
+            Some(dir_of(parent)?.join(name))
+        }
+        _ => std::fs::canonicalize(path).ok(),
+    }
 }
 
 /// The CSV's libraries that exist under `root`, resolved, of the wanted class, deduplicated by
@@ -931,7 +974,7 @@ pub fn driver_configs_under(root: &Path) -> Vec<(PathBuf, String)> {
         if out.iter().any(|(_, t)| t == target) {
             continue;
         }
-        let Ok(real) = std::fs::canonicalize(root.join(rel)) else {
+        let Some(real) = canonical(&root.join(rel)) else {
             continue;
         };
         if std::fs::metadata(&real)
@@ -992,7 +1035,7 @@ pub fn driver_tools_under(root: &Path) -> Vec<DriverTool> {
     let mut out: Vec<DriverTool> = Vec::new();
     for name in kern_isolation::driver_tools() {
         for dir in DRIVER_TOOL_DIRS_REL {
-            let Ok(real) = std::fs::canonicalize(root.join(dir).join(name)) else {
+            let Some(real) = canonical(&root.join(dir).join(name)) else {
                 continue;
             };
             if std::fs::metadata(&real)
@@ -3179,6 +3222,42 @@ pub fn render_plan_for(grant: &GpuGrant, selection: &GpuSelection, who: &Caller)
 
 #[cfg(test)]
 mod tests {
+    /// The memoised resolution answers what `canonicalize` answers: a file, a file through a linked
+    /// directory, a link, a missing name, and the `.`/`..` forms that must not take the short cut.
+    #[test]
+    fn the_memoised_resolution_answers_what_canonicalize_answers() {
+        let base = std::env::temp_dir().join(format!("kern-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/sub")).unwrap();
+        std::fs::write(base.join("real/lib.so"), b"elf").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("linkdir")).unwrap();
+        std::os::unix::fs::symlink("lib.so", base.join("real/link.so")).unwrap();
+        std::os::unix::fs::symlink("real/sub", base.join("subl")).unwrap();
+        for rel in [
+            "real/lib.so",
+            "linkdir/lib.so",
+            "linkdir/link.so",
+            "linkdir/missing.so",
+            "linkdir/.",
+            "subl/.",
+            "subl/..",
+            "linkdir/./lib.so",
+            "real/../linkdir/lib.so",
+            "linkdir/",
+        ] {
+            let p = PathBuf::from(format!("{}/{rel}", base.display()));
+            // Twice: the second call answers from the memo.
+            for _ in 0..2 {
+                assert_eq!(
+                    super::canonical(&p),
+                    std::fs::canonicalize(&p).ok(),
+                    "{rel}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     use super::*;
 
     /// Put a stand-in DEVICE NODE at `path`, the way an unprivileged test can.

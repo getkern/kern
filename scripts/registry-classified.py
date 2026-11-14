@@ -53,7 +53,12 @@ CHOKEPOINT_CONSTRUCTORS = ["pods_root", "scratch_dir"]
 # compose wiring decision before the registry is consulted: a SIBLING TREE beside `images` in the
 # same cache root, with the same exposure, and each file names the image it was written for, so a
 # memo for another image is discarded on read.
-SIBLING_TREES = {"images", "volumes", "builds", "boxes", "uncapped-notice", "expose"}  # under $XDG_DATA_HOME/$XDG_CACHE_HOME
+# `ldcache` is the loader caches a GPU box's `ldconfig` produced ($XDG_CACHE_HOME/kern/ldcache, 0700),
+# each with the links that run made: a SIBLING TREE beside `images` with the same exposure (write it
+# and a later box of that image gets your loader cache, as writing `images` gets it your rootfs). What
+# a box gets back is checked on READ: an entry must parse, its links are absolute and made only on the
+# box's own root filesystem, never through another mount or a magic link.
+SIBLING_TREES = {"images", "volumes", "builds", "boxes", "uncapped-notice", "expose", "ldcache"}  # under $XDG_DATA_HOME/$XDG_CACHE_HOME
 COSMETIC_FILES = {"runstats", ".greeted"}  # runtime FILES kern only DISPLAYS: run counter, greet marker
 NON_DIR_CHILDREN = SIBLING_TREES | COSMETIC_FILES
 

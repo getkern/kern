@@ -1704,6 +1704,14 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         vgpio_devs: b.vgpio_devs,
         vgpio_sysfs: b.vgpio_sysfs,
         gpu_enumeration: b.gpu_enumeration,
+        // The loader caches a GPU box's `ldconfig` produced, kept beside the image cache for the
+        // next box of the same image and grant: see `kern_isolation`'s `ldcache_key`.
+        ldcache_dir: if b.refresh_ldcache {
+            crate::kern_xdg_root("XDG_CACHE_HOME", ".cache")
+                .map(|r| r.join("ldcache").to_string_lossy().into_owned())
+        } else {
+            None
+        },
         refresh_ldcache: b.refresh_ldcache,
         ldconfig_dirs: b.ldconfig_dirs,
         idmap_binds: b.idmap_binds,
