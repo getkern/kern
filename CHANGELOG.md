@@ -57,6 +57,17 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
+**As root, an image that was loaded, built, tagged or committed did not run by its name.** Only a
+pull marked the cache entry with the uid map its files were written under, so as root every other
+entry was read as stale and sent to the registry to be repaired, where a local image does not exist:
+`cannot access 'library/<tag>' on registry-1.docker.io`. Every writer marks it now; a tag carries its
+source's mark.
+
+**One line per box in the sandbox history, and it says what ended it.** A box ended by `kern stop`
+was recorded twice (`exit-143` and `stopped` for one run); it is recorded once, as `stopped`, by the
+process that owned it. A detached box's line now has its image, GPUs, a run time to the millisecond,
+and `oom` or `timeout` where those ended it, as a foreground box's line already had.
+
 **An exported but empty `XDG_DATA_HOME` or `XDG_CACHE_HOME` put kern's data under the current
 directory.** Named volumes, build records, kept boxes and the image cache were written to
 `./kern/...` relative to wherever kern was started, while both SDKs, reading the empty variable as
