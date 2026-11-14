@@ -65,6 +65,11 @@ read-only once instead of remounting each file. On WSL2 the search of the Window
 is mounted over 9p, is remembered and re-checked instead of walked for every box. A box without a GPU
 is unchanged.
 
+**Compose GPU messages say what happens.** A service with `runtime: nvidia` and
+`NVIDIA_VISIBLE_DEVICES` is no longer told it gets no card (it gets the one named); `capabilities:`
+beside `gpu` reach `--gpus` and get its note that a grant binds the driver's whole library set; a
+refusal of several GPU services no longer ends with the file-format hint.
+
 **A compose file whose `networks:` separate services gets a bridge per network.** Each network is its
 own bridge (on the subnet the file declares for it), each service is attached to the bridges of its
 networks only, and the pod does not forward between them, which is Docker's arrangement. Such files
