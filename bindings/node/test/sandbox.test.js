@@ -3679,11 +3679,14 @@ test(
 // The same five tests as the Python binding's, in the same order.
 
 /** A kern double that logs `<verb> <arg>` per call and, on `pull`, can be slow, fail, or store the image
- * the way kern does: by writing its `.ok` sentinel last. */
+ * the way kern does: its setuid mark, then its `.ok` sentinel last. */
 function recordingKern(dir, { okFile = null, pullExit = 0, pullSleep = 0 } = {}) {
   const log = path.join(dir, "kern.log");
   const fake = path.join(dir, "kern-rec");
-  const store = okFile ? `mkdir -p "${path.dirname(okFile)}" && : > "${okFile}"` : ":";
+  const mark = okFile ? okFile.replace(/\.ok$/, ".setuid") : "";
+  const store = okFile
+    ? `mkdir -p "${path.dirname(okFile)}" && echo "kept v2" > "${mark}" && : > "${okFile}"`
+    : ":";
   fs.writeFileSync(
     fake,
     "#!/bin/sh\n" +
@@ -3804,13 +3807,14 @@ test("a pull that outlives its budget is killed", async () => {
 });
 
 test("the cache check finds every image kern lists", exec, (t) => {
-  // `imageIsCached` reads kern's `.ok` sentinel by a name this package computes, so it is checked
-  // against kern itself. A rule that missed EVERY image would add a process to every session unseen.
+  // The NAME this package computes is what is checked, so by the `.ok` sentinel alone: `imageIsCached`
+  // also wants the setuid mark, which an entry an older kern stored does not have. A rule that missed
+  // EVERY image would add a process to every session unseen.
   const r = spawnSync(KERN_PATH, ["images", "--json"], { encoding: "utf8", timeout: 60000 });
   assert.strictEqual(r.status, 0, r.stderr);
   const refs = JSON.parse(r.stdout || "[]").map((x) => x.image);
   if (refs.length === 0) return t.skip("kern's cache is empty here, so there is nothing to compare against");
-  const missed = refs.filter((ref) => !kern._imageIsCached(ref));
+  const missed = refs.filter((ref) => !fs.existsSync(kern._kernImageFile(ref, ".ok")));
   assert.deepStrictEqual(missed, [], `${missed.length} of ${refs.length} cached images not found`);
 });
 
@@ -4276,4 +4280,25 @@ test("gpus reaches the argv verbatim and the default adds no flag", () => {
   assert.ok(
     !new Sandbox({ gpus: null })._baseArgv("n", { network: false, timeoutS: 30 }).includes("--gpus"),
   );
+});
+
+// An entry an older kern stored (sentinel, no `.setuid` mark) is NOT cached for the fetch, so the
+// `kern pull` that re-extracts it runs at the session's start and not inside a call's deadline.
+test("an entry without the setuid mark is fetched before the first call", () => {
+  const was = process.env.XDG_CACHE_HOME;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kern-setuid-mark-"));
+  process.env.XDG_CACHE_HOME = tmp;
+  try {
+    const image = "example.org/older:1";
+    const ok = kern._kernImageFile(image, ".ok");
+    fs.mkdirSync(path.dirname(ok), { recursive: true });
+    fs.writeFileSync(ok, "");
+    assert.strictEqual(kern._imageIsCached(image), false, "a sentinel alone is an entry an older kern left");
+    fs.writeFileSync(kern._kernImageFile(image, ".setuid"), "kept v2\n");
+    assert.strictEqual(kern._imageIsCached(image), true);
+  } finally {
+    if (was === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = was;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

@@ -1128,13 +1128,24 @@ _IMAGE_FETCH_GUARD = threading.Lock()
 
 
 def _image_is_cached(image: str) -> bool:
-    """True when kern has finished storing `image`: its `.ok` sentinel, which kern writes LAST.
+    """True when kern has finished storing `image` as THIS kern stores it: its `.ok` sentinel, which kern
+    writes last, and its `.setuid` mark.
+
+    ⛔ THE MARK TOO. kern re-extracts, with a download, an entry an older kern stored without its
+    setuid bits, and it does so where the image is next used. Here that is a box start, inside a call's
+    deadline: MEASURED 2026-11-14 with `ghcr.io/getkern/kern-sandbox:0.2.44` cached in October, the
+    first `kernel()` cell died as a timeout at 30 s and the next took 17.7 s, both downloading the image
+    again. Without the mark this is not cached, so the fetch below runs `kern pull`, which does the
+    re-extraction there, under the fetch's own budget; on an entry with nothing to re-extract it returns
+    at once.
 
     A local stat, no box and no network. "Cannot tell" (a moved cache, a kern that names its files
-    differently) reads as NOT cached, which costs one `kern pull` that finds the image and returns: 2 ms,
+    differently) reads as NOT cached, which costs one `kern pull` that finds the image and returns: 1 ms,
     measured, with or without a network."""
     try:
-        return os.path.exists(_kern_image_file(image, ".ok"))
+        return os.path.exists(_kern_image_file(image, ".ok")) and os.path.exists(
+            _kern_image_file(image, ".setuid")
+        )
     except Exception:  # noqa: BLE001 - "never raises" is the contract `_fetch_image` states
         return False
 

@@ -1067,11 +1067,15 @@ const IMAGE_FETCH_BUDGET_S = 900;
 /** One download per image at a time in this process; a second caller waits for it, then looks again. */
 const IMAGE_FETCHES = new Map();
 
-/** True when kern has finished storing `image`: its `.ok` sentinel, which kern writes LAST. A local
- * stat; "cannot tell" reads as not cached, which costs one `kern pull` that finds the image (2 ms). */
+/** True when kern has finished storing `image` as THIS kern stores it: its `.ok` sentinel, which kern
+ * writes LAST, and its `.setuid` mark. Without the mark kern re-extracts the entry, with a download,
+ * where the image is next used, which is a box start inside a call's deadline: measured, a first
+ * `kernel()` cell timed out at 30 s on an entry cached in October. Not cached here, the fetch runs
+ * `kern pull`, which does it under the fetch's own budget. A local stat; "cannot tell" reads as not
+ * cached, which costs one `kern pull` that finds the image (1 ms). Mirrors `_image_is_cached`. */
 function imageIsCached(image) {
   try {
-    return fs.existsSync(kernImageFile(image, ".ok"));
+    return fs.existsSync(kernImageFile(image, ".ok")) && fs.existsSync(kernImageFile(image, ".setuid"));
   } catch {
     return false;
   }
@@ -7869,6 +7873,7 @@ module.exports = {
   _PYC_SOURCE_ID: PYC_SOURCE_ID,
   _sanitizeRef: sanitizeRef,
   _imageIsCached: imageIsCached,
+  _kernImageFile: kernImageFile,
   _fetchImage: fetchImage,
   // The snapshot reader, exported for its tests only: what it accepts decides where a member of a
   // hostile or foreign archive lands, and the `prefix` field it used to ignore was a silent rename.

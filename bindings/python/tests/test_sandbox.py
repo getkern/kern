@@ -5452,10 +5452,15 @@ def test_pyc_identity_is_the_same_in_both_bindings(tmp_path, monkeypatch):
 
 def _recording_kern(tmp_path, ok_file=None, pull_exit=0, pull_sleep=0.0):
     """A kern double that logs `<verb> <arg>` per call and, on `pull`, can be slow, fail, or store the
-    image the way kern does: by writing its `.ok` sentinel last."""
+    image the way kern does: its setuid mark, then its `.ok` sentinel last."""
     log = tmp_path / "kern.log"
     fake = tmp_path / "kern-rec"
-    store = f'mkdir -p "{os.path.dirname(ok_file)}" && : > "{ok_file}"' if ok_file else ":"
+    mark = ok_file[: -len(".ok")] + ".setuid" if ok_file else ""
+    store = (
+        f'mkdir -p "{os.path.dirname(ok_file)}" && echo "kept v2" > "{mark}" && : > "{ok_file}"'
+        if ok_file
+        else ":"
+    )
     fake.write_text(
         "#!/bin/sh\n"
         'case "$1" in --version) echo "kern v0.0.0-test-double"; exit 0 ;; esac\n'
@@ -5552,8 +5557,23 @@ def test_the_cache_check_finds_every_image_kern_lists():
     refs = [x["image"] for x in json.loads(out.stdout or "[]")]
     if not refs:
         pytest.skip("kern's cache is empty here, so there is nothing to compare against")
-    missed = [r for r in refs if not kern._image_is_cached(r)]
+    # THE NAME is what this checks, so by the sentinel alone: `_image_is_cached` also wants the setuid
+    # mark, which an entry an older kern stored does not have (see the test below).
+    missed = [r for r in refs if not os.path.exists(kern._kern_image_file(r, ".ok"))]
     assert not missed, f"{len(missed)} of {len(refs)} cached images not found: {missed[:5]}"
+
+
+def test_an_entry_without_the_setuid_mark_is_fetched_before_the_first_call(tmp_path, monkeypatch):
+    """An entry an older kern stored (sentinel, no `.setuid` mark) is NOT cached for the fetch, so the
+    `kern pull` that re-extracts it runs at the session's start and not inside a call's deadline."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    image = "example.org/older:1"
+    ok = kern._kern_image_file(image, ".ok")
+    os.makedirs(os.path.dirname(ok), exist_ok=True)
+    open(ok, "w").close()
+    assert not kern._image_is_cached(image), "a sentinel alone is an entry an older kern left"
+    open(kern._kern_image_file(image, ".setuid"), "w").write("kept v2\n")
+    assert kern._image_is_cached(image)
 
 
 # ---------------------------------------------------------------------------
