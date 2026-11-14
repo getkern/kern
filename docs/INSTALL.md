@@ -79,7 +79,7 @@ across the WSL boundary and says so.
 from the Linux side to Windows. Measured on a Windows 10 host (WSL2 kernel 6.18), on one project of
 2000 small files:
 
-```
+```text
                                             in the distro     under /mnt/c
 kern build, COPY of the 2000 files          0.18 - 0.19 s     17.2 - 19.1 s
 the same build again, nothing changed       0.04 - 0.05 s     7.8 - 9.0 s

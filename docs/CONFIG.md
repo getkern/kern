@@ -90,12 +90,28 @@ will get, without starting it.
 publish_bind        = "127.0.0.1"  # a port with no address binds here
 compose_memory_max  = "512m"       # memory ceiling per compose service
 allow_device_grants = true         # compose stacks may use device profiles
+sandbox_history     = "disk"       # keep the finished-sandbox lines across reboots
 ```
 
 Without them, a port binds every interface, a compose service with no `mem_limit` gets the host's
 RAM, and a stack that names a device profile is refused. They are read only from your own config,
 never from a file a stack names, so a downloaded stack cannot grant itself anything. The first two are
 ceilings: a stack cannot ask for more.
+
+`sandbox_history` is where kern keeps one line per finished box (time, name, image, run time, exit
+code, outcome, GPU; never the output), which `kern sandbox history` and the Sandboxes tab of
+`kern top` read:
+
+| value | where | kept |
+|---|---|---|
+| `"memory"` (the default) | `$XDG_RUNTIME_DIR/kern/history/` | until reboot |
+| `"disk"` | `$XDG_DATA_HOME/kern/history/` | across reboots |
+| `"off"` | nothing new is written | |
+
+`kern sandbox keep disk` (or `m` in the Sandboxes tab) writes this key and moves the lines already
+kept to the new place; `kern sandbox keep` and `kern info` say where they are and how many there are,
+and `kern sandbox clear` removes them. Each place holds about 33,000 lines, after which the oldest go.
+Neither directory can be mounted into a box.
 
 ## Values
 

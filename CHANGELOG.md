@@ -31,7 +31,11 @@ answers `[N/A]`, so the load and temperature come from `/sys`, and its memory is
 Profiles tabs no longer push their footer off the screen when a list is long. `kern sandbox ls|history|stats`
 lists the SDK and MCP sandboxes running now and the ones that finished: one line of metadata per box
 (time, name, image, run time, exit code, GPU and how it ended: `ok`, `exit-N`, `oom`, `timeout`,
-`stopped`, `signal-N`), never its output; `--failed`, `--all`, `--json`, and p50/p99 in `stats`. `kern top` has the same as an eighth tab, **Sandboxes** (key `8`): the last hour, the ones running, the finished ones with Enter for one in full, and a line in the Overview. `kern compose --help` names the flags every verb
+`stopped`, `signal-N`), never its output; `--failed`, `--all`, `--json`, and p50/p99 in `stats`. `kern top` has the same as an eighth tab, **Sandboxes** (key `8`): the last hour, the ones running, the finished ones with Enter for one in full, and a line in the Overview. Where those lines are kept is a setting, `[kern] sandbox_history`:
+`memory` (the default, cleared at reboot), `disk` (`$XDG_DATA_HOME/kern/history`, kept across reboots)
+or `off`. `kern sandbox keep [memory|disk|off]` and the tab's `m` key change it and move the lines
+already kept; the tab's caption, `kern sandbox history`, `stats` and `kern info` say where they are;
+`kern sandbox clear` removes them. `kern compose --help` names the flags every verb
 takes (`--allow-device-grants`, `--allow-privileged`, `--project-root`, `--pod`/`--no-pod`/`--bridge`).
 
 **A box could hand the host kernel checksum metadata of its own choosing, and two socket families
@@ -52,6 +56,12 @@ defect, and `docs/CVE-POSTURE.md` carries the counts behind that sentence, inclu
 differs in one bit: a box with checksum offload on took 97,608 arrivals at the software-completion
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
+
+**An exported but empty `XDG_DATA_HOME` or `XDG_CACHE_HOME` put kern's data under the current
+directory.** Named volumes, build records, kept boxes and the image cache were written to
+`./kern/...` relative to wherever kern was started, while both SDKs, reading the empty variable as
+unset as the XDG spec says, refused `~/.local/share/kern` as a mount source and not that directory.
+An empty or relative value now means unset everywhere, through one resolver.
 
 ## v0.33.0 - 2026-10-17
 
