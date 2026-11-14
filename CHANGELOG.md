@@ -65,6 +65,14 @@ read-only once instead of remounting each file. On WSL2 the search of the Window
 is mounted over 9p, is remembered and re-checked instead of walked for every box. A box without a GPU
 is unchanged.
 
+**A large layer downloads over eight connections at once.** A layer of 256 MiB or more is fetched in
+byte ranges in parallel, joined and checked against its digest; `ollama/ollama` (one 3.25 GB layer)
+pulled cold in 610-795 s instead of 23 minutes on the same link. `KERN_NO_RANGED_PULL=1` turns it off.
+
+**Compose asks for the GPU grant only for what it starts.** `up -d agent` or `run agent` on a file
+whose other service takes a card no longer needs `--allow-device-grants`, and `compose cp <local file>
+<service>:<path>` no longer reads the local file as the compose file.
+
 **Two GPU examples.** `examples/compose/gpu-per-service.sh` runs a `docker-compose.yml` with one card
 per service behind nginx, and `examples/agents/gpu-sandbox.py` gives each sandbox its own card from the
 SDK. Both say what a grant does not give: a VRAM limit, or a boundary against the code on the card.
