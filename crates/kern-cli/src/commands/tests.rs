@@ -3033,6 +3033,7 @@ stopsignal	SIGTERM
             host,
             box_port: 80,
             udp: false,
+            host_pool: None,
         };
         const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         const ANY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
@@ -7749,6 +7750,7 @@ fn a_privileged_port_moves_to_the_conventional_alternative_and_never_onto_a_take
         host,
         box_port,
         udp,
+        host_pool: None,
     };
 
     let mut ports = vec![map(80, 80, false), map(443, 443, false)];

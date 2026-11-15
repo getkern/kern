@@ -4010,14 +4010,28 @@ fn assign_picked_ports(ports: &mut [kern_isolation::PortMap]) -> Result<(), Erro
             .iter()
             .filter_map(|&j| ports.get(j).map(|t| t.bind))
             .collect();
-        let picked = kern_isolation::pick_free_port(p.bind, &also, p.udp).ok_or_else(|| {
-            Error::Sandbox(format!(
-                "cannot publish box port {}: no free host port could be picked on {}",
-                p.box_port,
-                crate::ports::host_side(&kern_isolation::PortMap { host: 0, ..p })
-                    .trim_end_matches(":0")
-            ))
-        })?;
+        let picked = match p.host_pool {
+            // A RANGE: its first free port, as Docker picks one, refused in Docker's words when the
+            // whole range is taken.
+            Some((start, end)) => kern_isolation::pick_port_in(p.bind, &also, p.udp, start, end)
+                .ok_or_else(|| {
+                    Error::Sandbox(format!(
+                        "cannot publish box port {}: Bind for {}:{start}-{end} failed: port is \
+                         already allocated (every port of the range is in use)",
+                        p.box_port,
+                        crate::ports::host_side(&kern_isolation::PortMap { host: 0, ..p })
+                            .trim_end_matches(":0")
+                    ))
+                })?,
+            None => kern_isolation::pick_free_port(p.bind, &also, p.udp).ok_or_else(|| {
+                Error::Sandbox(format!(
+                    "cannot publish box port {}: no free host port could be picked on {}",
+                    p.box_port,
+                    crate::ports::host_side(&kern_isolation::PortMap { host: 0, ..p })
+                        .trim_end_matches(":0")
+                ))
+            })?,
+        };
         for j in std::iter::once(i).chain(twins) {
             if let Some(m) = ports.get_mut(j) {
                 m.host = picked;
@@ -4299,6 +4313,7 @@ fn prepare_ssh(
         host: port,
         box_port: 22,
         udp: false,
+        host_pool: None,
     }); // 127.0.0.1:<port> -> box :22
     let id = hint_key
         .map(|k| format!(" -i {}", super::shell_quote_single(&k)))

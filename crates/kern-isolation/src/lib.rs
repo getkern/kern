@@ -320,7 +320,8 @@ pub fn setup_failure_hint(msg: &str) -> &'static str {
 pub const OVERLAY_VANISHED_HINT: &str =
     "a directory this mount needs was removed while the box was being built: one of the image's layers, or the box's own scratch under the runtime directory. That is something else on this machine deleting it at the same moment (an image removal, a cleanup of $XDG_RUNTIME_DIR), not a host capability, and starting the box again normally succeeds.";
 pub use ports::{
-    address_is_bindable, host_has_ipv6, pick_free_port, preflight as preflight_ports, PortMap,
+    address_is_bindable, host_has_ipv6, pick_free_port, pick_port_in, preflight as preflight_ports,
+    PortMap,
 };
 /// While kern waits for a box, treat a fatal signal as "end the BOX", not "end kern": forward it to
 /// the box and keep reaping, so kern exits with (and records) the box's own status. See

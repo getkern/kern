@@ -4877,6 +4877,89 @@ fn ipc_service_shares_a_shareable_donors_namespace_and_shm() {
     assert_eq!(left, 0, "the shared memory directory goes with the stack");
 }
 
+/// A HOST PORT RANGE ONTO ONE BOX PORT GIVES EACH BOX A FREE PORT OF IT, AS DOCKER DOES.
+///
+/// MEASURED against Docker Compose v5: `ports: ["8080-8095:80"]` under `--scale web=15` gave each
+/// replica a different port of the range. kern refused the spec as malformed. Asserted with the
+/// first port of the range held by this test: the first box takes the second port, the next box the
+/// third, and a box finding the whole range taken is refused in Docker's words.
+#[test]
+fn a_host_port_range_onto_one_box_port_picks_a_free_port_of_it() {
+    let xdg = std::env::temp_dir().join(format!("kern-it-range-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let Ok(held) = std::net::TcpListener::bind("0.0.0.0:18320") else {
+        eprintln!("SKIP: port 18320 is not free on this host");
+        return;
+    };
+    let run = |args: &[&str]| -> (Option<i32>, String) {
+        match kern().env("XDG_RUNTIME_DIR", &xdg).args(args).output() {
+            Ok(o) => (
+                o.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (None, e.to_string()),
+        }
+    };
+    let id = std::process::id();
+    let names: Vec<String> = (1..=3).map(|n| format!("range-{n}-{id}")).collect();
+    let mut started = Vec::new();
+    for n in &names {
+        started.push(run(&[
+            "box",
+            "--image",
+            "alpine",
+            "-d",
+            "--name",
+            n,
+            "-p",
+            "18320-18322:80",
+            "--",
+            "sleep",
+            "30",
+        ]));
+    }
+    let (_, ps) = run(&["ps"]);
+    for n in &names {
+        let _ = run(&["stop", n]);
+        let _ = run(&["rm", n]);
+    }
+    drop(held);
+    let _ = std::fs::remove_dir_all(&xdg);
+    // A refusal of the SPEC is the defect this test is about, never a reason to skip.
+    assert!(
+        !started[0].1.contains("port"),
+        "the range spec is accepted: {:?}",
+        started[0]
+    );
+    if !ps.contains(&names[0]) {
+        eprintln!("SKIP: this host did not run the box:\n{ps}");
+        return;
+    }
+    let row = |n: &str| {
+        ps.lines()
+            .find(|l| l.contains(n))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        row(&names[0]).contains(":18321->80"),
+        "the first free port of the range:\n{ps}"
+    );
+    assert!(
+        row(&names[1]).contains(":18322->80"),
+        "the next one for the next box:\n{ps}"
+    );
+    assert!(
+        started[2].1.contains("port is already allocated"),
+        "a box finding the range taken is refused in Docker's words: {:?}",
+        started[2]
+    );
+}
+
 /// FIVE THINGS A SECOND MODEL'S CASES FOUND, EACH MEASURED AGAINST DOCKER ON THE SAME FILE.
 ///
 /// `run --entrypoint "sh -c 'exit 42'"` exited 42 under Docker and 127 under kern; `COMPOSE_FILE`

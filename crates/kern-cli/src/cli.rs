@@ -4298,7 +4298,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         }
                         None => {
                             return Err(Error::Usage(
-                                "-p [ip:]<hostport>:<boxport>[/tcp|/udp] (e.g. 8080:80 or 8000-8010:8000-8010)",
+                                "-p [ip:]<hostport>:<boxport>[/tcp|/udp] (e.g. 8080:80, 8000-8010:8000-8010, or 8080-8095:80 for a free port of the range)",
                             ))
                         }
                     }
@@ -7773,6 +7773,7 @@ mod tests {
             host,
             box_port,
             udp,
+            host_pool: None,
         };
         assert_eq!(
             ports,

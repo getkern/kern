@@ -292,7 +292,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         accepted so `-i < file.sql` runs here unchanged. A PTY would echo
                         that file back and never see its EOF
     -p, --publish H:B   Publish box port B on host port H ([ip:]H:B[/tcp|/udp]; a port RANGE
-                        like 8000-8010:8000-8010 works; binds 0.0.0.0 (all interfaces);
+                        like 8000-8010:8000-8010 works, and 8080-8095:80 takes a
+                        free port of the range; binds 0.0.0.0 (all interfaces);
                         use 127.0.0.1:H:B for loopback only, or set
                         `[kern] publish_bind` in kern.toml to make loopback the
                         host's policy; repeatable)

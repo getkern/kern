@@ -129,13 +129,20 @@ pub fn parse_with_default(spec: &str, default_ip: IpAddr) -> Option<Vec<kern_iso
     } else {
         parse_port_or_range(h)?
     };
-    // A host range must map onto a box range of the SAME length (like Docker); a single box port with a
-    // host range is ambiguous and rejected.
-    if he - hs != be - bs {
+    // A HOST RANGE FOR ONE BOX PORT IS A POOL: the box gets any free port of it, picked at start, as
+    // Docker gives it (MEASURED: `8080-8095:80` under `--scale web=15` gave each replica a different
+    // port of the range; the comment here said Docker rejected it). A host range onto a box range
+    // must still be the same length.
+    let pool = (he > hs && be == bs).then_some((hs, he));
+    if pool.is_none() && he - hs != be - bs {
         return None;
     }
-    let count = (he - hs) as usize + 1;
-    let random = h.is_empty() || h == "0";
+    let count = if pool.is_some() {
+        1
+    } else {
+        (he - hs) as usize + 1
+    };
+    let random = h.is_empty() || h == "0" || pool.is_some();
     if count > MAX_RANGE {
         return None;
     }
@@ -155,6 +162,7 @@ pub fn parse_with_default(spec: &str, default_ip: IpAddr) -> Option<Vec<kern_iso
                     host: if random { 0 } else { hs + k },
                     box_port: bs + k,
                     udp,
+                    host_pool: pool,
                 })
             })
             .collect(),
@@ -232,6 +240,7 @@ pub fn parse_display(s: &str) -> Option<kern_isolation::PortMap> {
         host,
         box_port,
         udp,
+        host_pool: None,
     })
 }
 
@@ -272,6 +281,7 @@ mod tests {
             host,
             box_port,
             udp,
+            host_pool: None,
         }
     }
     /// The IPv6 twin a default bind adds.
@@ -499,8 +509,15 @@ mod tests {
             parse("0.0.0.0:80-81:80-81"),
             Some(vec![pm(ANY, 80, 80, false), pm(ANY, 81, 81, false)])
         );
-        // a range mapping onto a single box port is ambiguous → rejected (like Docker)
-        assert_eq!(parse("8000-8010:80"), None);
+        // a host range onto ONE box port is a pool the box picks a free port from at start, as
+        // Docker does: host 0 until then, one mapping per family
+        let pool = parse("8000-8010:80").unwrap_or_default();
+        assert!(!pool.is_empty(), "a host range onto one box port parses");
+        assert!(
+            pool.iter()
+                .all(|m| m.host == 0 && m.box_port == 80 && m.host_pool == Some((8000, 8010))),
+            "{pool:?}"
+        );
         // mismatched range lengths → rejected
         assert_eq!(parse("8000-8002:9000-9005"), None);
         // reversed range → rejected

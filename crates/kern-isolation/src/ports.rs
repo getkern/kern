@@ -53,6 +53,10 @@ pub struct PortMap {
     pub box_port: u16,
     /// UDP when true, else TCP.
     pub udp: bool,
+    /// A host port RANGE for one box port (`8080-8095:80`): the port is any free one in it, picked at
+    /// start, as Docker picks it (MEASURED: fifteen replicas of `8080-8095:80` each got a different
+    /// port of the range). `host` is 0 until then. `None` for every other spec.
+    pub host_pool: Option<(u16, u16)>,
 }
 
 /// How a forwarder worker reaches the box's port. Decided ONCE, from the box's PID 1, right after
@@ -1278,6 +1282,52 @@ pub fn pick_free_port(
     None
 }
 
+/// The first port of `start..=end` that binds on `primary` and on every address in `also` (one number
+/// for a default bind's two families), for a host port RANGE published onto one box port. `None` when
+/// every port of the range is taken. The sockets are closed again: the forwarder binds for real.
+#[must_use]
+pub fn pick_port_in(
+    primary: std::net::IpAddr,
+    also: &[std::net::IpAddr],
+    udp: bool,
+    start: u16,
+    end: u16,
+) -> Option<u16> {
+    let ty = if udp {
+        libc::SOCK_DGRAM
+    } else {
+        libc::SOCK_STREAM
+    };
+    let binds = |ip: std::net::IpAddr, port: u16| -> Option<i32> {
+        let s = host_socket(ip, ty);
+        if s < 0 {
+            return None;
+        }
+        let (a, len) = sockaddr_of(ip, port);
+        if unsafe { libc::bind(s, (&a as *const libc::sockaddr_storage).cast(), len) } != 0 {
+            unsafe { libc::close(s) };
+            return None;
+        }
+        Some(s)
+    };
+    (start..=end).find(|&port| {
+        let mut held = Vec::new();
+        let ok = std::iter::once(primary)
+            .chain(also.iter().copied())
+            .all(|ip| match binds(ip, port) {
+                Some(s) => {
+                    held.push(s);
+                    true
+                }
+                None => false,
+            });
+        for s in held {
+            unsafe { libc::close(s) };
+        }
+        ok
+    })
+}
+
 /// Can a TCP socket be bound to `ip` (on an ephemeral port) on this host? This is what decides the
 /// IPv6 half of a default bind, PER ADDRESS: a host can have IPv6 and still not have `::1`.
 /// MEASURED on a VPS with IPv6 on `eth0` and `disable_ipv6 = 1` on `lo`: `[::]` binds and `[::1]`
@@ -1544,6 +1594,7 @@ mod tests {
                 host: port,
                 box_port: 9,
                 udp: false,
+                host_pool: None,
             };
             match fork_forwarders(&[m]) {
                 Ok(f) => break (port, f),
@@ -1582,6 +1633,7 @@ mod tests {
             host: taken,
             box_port: 9,
             udp: false,
+            host_pool: None,
         };
         match fork_forwarders(&[m]) {
             Err((p, why)) => {
@@ -1615,6 +1667,7 @@ mod tests {
                 host: good,
                 box_port: 9,
                 udp: false,
+                host_pool: None,
             },
             PortMap {
                 bind: std::net::IpAddr::V4(std::net::Ipv4Addr::from(LOOPBACK)),
@@ -1622,6 +1675,7 @@ mod tests {
                 host: taken,
                 box_port: 9,
                 udp: false,
+                host_pool: None,
             },
         ];
         assert!(
@@ -1659,6 +1713,7 @@ mod tests {
             host,
             box_port: 80,
             udp: false,
+            host_pool: None,
         };
         match preflight(&[pm(taken)]) {
             Err((p, _)) => assert_eq!(p, taken, "reported the conflicting port"),
