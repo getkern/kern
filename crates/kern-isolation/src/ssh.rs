@@ -12,7 +12,7 @@
 //!     a no-op anyway).
 //!
 //! Keys never touch the image: the host key + `authorized_keys` + config live on the `/run` tmpfs.
-//! sshd binds `127.0.0.1:22` inside the box's own network namespace; the caller wires the host port
+//! sshd binds the box's own address (`BOX_ADDR`, or its bridge address) on port 22; the caller wires the host port
 //! to it with the ordinary `-p HOST:22` rootless forwarder. sshd is `fork`ed as a child just before
 //! the box execs its PID 1, so it dies with the box's PID namespace.
 //!
@@ -45,13 +45,39 @@ const PASSWD: &str = "/run/kern-ssh/passwd";
 const SHADOW: &str = "/run/kern-ssh/shadow";
 const SHIM: &str = "/run/kern-ssh/nogroups.so";
 
+/// The in-box `sshd_config`: pubkey-only, no PAM/password, one cipher suite, no DNS, and LISTENING
+/// ON `listen`, the address the `--ssh` forwarder connects to (the box's own, see `BOX_ADDR`).
+///
+/// ⛔ THE TWO MUST BE THE SAME ADDRESS, and they were not: sshd listened on `127.0.0.1` while the
+/// forwarder moved to the box's address, so every `--ssh` connection was reset. MEASURED on a VPS,
+/// as root, with an image built there: `Connection reset by 127.0.0.1 port 2299` on three launches,
+/// and kern's own note "port 22 listens on its 127.0.0.1 only". The caller passes the address the
+/// forwarder is activated with, from the same function.
+fn sshd_config(listen: std::net::Ipv4Addr, sftp: &str) -> String {
+    let mut cfg = format!(
+        "Port 22\nListenAddress {listen}\nHostKey /run/kern-ssh/hostkey\n\
+         AuthorizedKeysFile /run/kern-ssh/authorized_keys\nPermitRootLogin yes\n\
+         PasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\n\
+         PermitEmptyPasswords no\nX11Forwarding no\nAllowAgentForwarding no\nPrintMotd no\n\
+         AllowTcpForwarding no\nPermitTunnel no\nGatewayPorts no\n\
+         StrictModes no\nUseDNS no\nLogLevel ERROR\nPidFile none\n\
+         Ciphers chacha20-poly1305@openssh.com\nKexAlgorithms curve25519-sha256\n\
+         MACs hmac-sha2-256-etm@openssh.com\n"
+    );
+    // Only advertise sftp if the server binary exists and its path is metacharacter-free.
+    if !sftp.is_empty() && !sftp.contains([' ', '\t', '\n', '"', '\'', '\\']) {
+        cfg.push_str(&format!("Subsystem sftp {sftp}\n"));
+    }
+    cfg
+}
+
 fn cs(s: &str) -> Option<CString> {
     CString::new(s).ok()
 }
 
 /// Stand up sshd inside the box. Best-effort: any failure warns and leaves the box running without
 /// SSH rather than aborting it. Must run after the loopback is up and before seccomp is installed.
-pub fn setup(ssh: &SshSetup) {
+pub fn setup(ssh: &SshSetup, listen: std::net::Ipv4Addr) {
     // The box-owned tmpfs over `/run` is already mounted by the caller (before pivot), so `/run/sshd`
     // is namespace-root-owned (sshd's privsep ownership check) and our key material lives off the
     // image. Here we just create the dirs and files on it.
@@ -119,20 +145,7 @@ pub fn setup(ssh: &SshSetup) {
     .into_iter()
     .find(|p| Path::new(p).exists())
     .unwrap_or("");
-    let mut cfg = String::from(
-        "Port 22\nListenAddress 127.0.0.1\nHostKey /run/kern-ssh/hostkey\n\
-         AuthorizedKeysFile /run/kern-ssh/authorized_keys\nPermitRootLogin yes\n\
-         PasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\n\
-         PermitEmptyPasswords no\nX11Forwarding no\nAllowAgentForwarding no\nPrintMotd no\n\
-         AllowTcpForwarding no\nPermitTunnel no\nGatewayPorts no\n\
-         StrictModes no\nUseDNS no\nLogLevel ERROR\nPidFile none\n\
-         Ciphers chacha20-poly1305@openssh.com\nKexAlgorithms curve25519-sha256\n\
-         MACs hmac-sha2-256-etm@openssh.com\n",
-    );
-    // Only advertise sftp if the server binary exists and its path is metacharacter-free.
-    if !sftp.is_empty() && !sftp.contains([' ', '\t', '\n', '"', '\'', '\\']) {
-        cfg.push_str(&format!("Subsystem sftp {sftp}\n"));
-    }
+    let cfg = sshd_config(listen, sftp);
     if write_mode(CONFIG, cfg.as_bytes(), 0o600).is_err() {
         warn("cannot write sshd_config - SSH not started");
         return;
@@ -247,4 +260,21 @@ fn bind_over(src: &str, dst: &str) {
 
 fn warn(msg: &str) {
     eprintln!("kern: warning: --ssh: {msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    /// sshd listens exactly where the forwarder connects, and nowhere else.
+    #[test]
+    fn sshd_listens_on_the_address_it_is_given() {
+        let a = std::net::Ipv4Addr::new(192, 0, 0, 8);
+        let cfg = super::sshd_config(a, "/usr/lib/ssh/sftp-server");
+        let listens: Vec<&str> = cfg
+            .lines()
+            .filter(|l| l.starts_with("ListenAddress"))
+            .collect();
+        assert_eq!(listens, vec!["ListenAddress 192.0.0.8"], "{cfg}");
+        assert!(cfg.contains("Subsystem sftp /usr/lib/ssh/sftp-server"));
+        assert!(!super::sshd_config(a, "/bad path").contains("Subsystem"));
+    }
 }

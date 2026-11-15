@@ -1209,15 +1209,87 @@ fn host_socket(ip: std::net::IpAddr, ty: libc::c_int) -> i32 {
 }
 
 /// Can this host bind an IPv6 socket at all? `false` where the kernel has no IPv6 (`ipv6.disable=1`,
-/// a CI runner built without it), which is where the CLI drops the IPv6 half of a default bind.
+/// a CI runner built without it).
 #[must_use]
 pub fn host_has_ipv6() -> bool {
-    let any = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
-    let s = host_socket(any, libc::SOCK_STREAM);
+    address_is_bindable(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
+}
+
+/// A host port the kernel picked for `primary`, free on every address in `also` too, for the
+/// protocol given: one number for both families of a default bind, as Docker gives
+/// (`0.0.0.0:32768` and `[::]:32768`). `None` after a bounded number of attempts.
+///
+/// The port is released before the box binds it, as Docker's allocator does before its proxy binds:
+/// a process that takes it in that window makes the box's own bind fail, by name, rather than the
+/// box being published somewhere else.
+#[must_use]
+pub fn pick_free_port(
+    primary: std::net::IpAddr,
+    also: &[std::net::IpAddr],
+    udp: bool,
+) -> Option<u16> {
+    let ty = if udp {
+        libc::SOCK_DGRAM
+    } else {
+        libc::SOCK_STREAM
+    };
+    let bound_port = |ip: std::net::IpAddr, port: u16| -> Option<(i32, u16)> {
+        let s = host_socket(ip, ty);
+        if s < 0 {
+            return None;
+        }
+        let (a, len) = sockaddr_of(ip, port);
+        if unsafe { libc::bind(s, (&a as *const libc::sockaddr_storage).cast(), len) } != 0 {
+            unsafe { libc::close(s) };
+            return None;
+        }
+        let mut st: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut sl = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let r = unsafe {
+            libc::getsockname(s, (&mut st as *mut libc::sockaddr_storage).cast(), &mut sl)
+        };
+        if r != 0 {
+            unsafe { libc::close(s) };
+            return None;
+        }
+        // Both families keep the port at the same offset of their sockaddr.
+        let got = u16::from_be(unsafe {
+            (*(&st as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>()).sin_port
+        });
+        Some((s, got))
+    };
+    for _ in 0..32 {
+        let (first, port) = bound_port(primary, 0)?;
+        let mut held = vec![first];
+        let all = also.iter().all(|ip| match bound_port(*ip, port) {
+            Some((s, _)) => {
+                held.push(s);
+                true
+            }
+            None => false,
+        });
+        for s in held {
+            unsafe { libc::close(s) };
+        }
+        if all {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Can a TCP socket be bound to `ip` (on an ephemeral port) on this host? This is what decides the
+/// IPv6 half of a default bind, PER ADDRESS: a host can have IPv6 and still not have `::1`.
+/// MEASURED on a VPS with IPv6 on `eth0` and `disable_ipv6 = 1` on `lo`: `[::]` binds and `[::1]`
+/// answers `EADDRNOTAVAIL`, so a `publish_bind = "127.0.0.1"` policy (whose IPv6 twin is `::1`)
+/// refused every `-p` while "does this host have IPv6" said yes.
+#[must_use]
+pub fn address_is_bindable(ip: std::net::IpAddr) -> bool {
+    let s = host_socket(ip, libc::SOCK_STREAM);
     if s < 0 {
         return false;
     }
-    let (a, len) = sockaddr_of(any, 0);
+    let (a, len) = sockaddr_of(ip, 0);
     let ok = unsafe { libc::bind(s, (&a as *const libc::sockaddr_storage).cast(), len) } == 0;
     unsafe { libc::close(s) };
     ok

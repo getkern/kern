@@ -6154,7 +6154,7 @@ pub(crate) fn declared_host_ports(b: &crate::compose::ComposeBox) -> Vec<u16> {
     let mut out: Vec<u16> = Vec::new();
     for spec in &b.ports {
         for pm in crate::ports::parse(spec).unwrap_or_default() {
-            if !out.contains(&pm.host) {
+            if pm.host != 0 && !out.contains(&pm.host) {
                 out.push(pm.host);
             }
         }
@@ -6306,7 +6306,15 @@ pub fn port(name: &str, want: Option<&str>) -> Result<(), Error> {
             have.join(", ")
         )));
     };
-    println!("{}", published_address(m));
+    // EVERY BINDING OF THAT PORT, one per line, as `docker port <c> 80` prints them (measured:
+    // `0.0.0.0:32768` then `[::]:32768`). A default bind is two of them now, and printing one hid
+    // the IPv6 half from a script that reads both.
+    for b in published
+        .iter()
+        .filter(|b| b.box_port == m.box_port && b.udp == m.udp)
+    {
+        println!("{}", published_address(b));
+    }
     Ok(())
 }
 
@@ -6527,10 +6535,11 @@ pub(crate) fn shift_privileged_ports(
     ports: &mut [kern_isolation::PortMap],
     floor: u16,
 ) -> Vec<(u16, u16)> {
+    // Host port 0 is "the kernel picks", always an unprivileged one: never moved.
     let mut low: Vec<u16> = ports
         .iter()
         .map(|p| p.host)
-        .filter(|h| *h < floor)
+        .filter(|h| *h != 0 && *h < floor)
         .collect();
     low.sort_unstable();
     low.dedup();
@@ -8599,7 +8608,8 @@ fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Err
             let Some(pms) = crate::ports::parse(spec) else {
                 continue;
             };
-            for pm in pms {
+            // A port the kernel picks at start (`80`, `ip::80`) claims no number here.
+            for pm in pms.into_iter().filter(|p| p.host != 0) {
                 let slot = slots
                     .entry((pm.host, pm.udp, pm.bind.is_ipv6()))
                     .or_default();

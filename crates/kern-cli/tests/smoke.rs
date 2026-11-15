@@ -3864,3 +3864,166 @@ fn an_ssh_box_on_a_taken_port_prints_no_command_and_leaves_no_keys() {
     );
     assert!(!keys_left, "the refused box's keys must be removed");
 }
+
+/// A PORT WITH NO HOST NUMBER IS PUBLISHED ON ONE THE KERNEL PICKS, as Docker publishes it.
+///
+/// MEASURED against `docker run -p`: `80`, `ip::80` and `0:80` publish on a host port Docker picks,
+/// the same number for `0.0.0.0` and `[::]`, and `docker port` lists every binding. kern refused all
+/// three with its usage line, and compose turned `ports: ["80"]` into a port that was not published,
+/// which is how one file runs as several stacks at once (one per pull request). Asserted here: the
+/// box answers on the port `kern port` reports, every line carries the same number, and two compose
+/// projects of one file get two different ports.
+#[test]
+fn a_port_with_no_host_number_is_published_on_a_picked_one() {
+    use std::io::Read;
+    let xdg = std::env::temp_dir().join(format!("kern-it-rport-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let dir = std::env::temp_dir().join(format!("kern-it-rport-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let run = |args: &[&str]| -> (String, String) {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+        {
+            Ok(o) => (
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            ),
+            Err(e) => (String::new(), e.to_string()),
+        }
+    };
+    let serve = "while true; do echo PICKED | nc -l -p 80 >/dev/null 2>&1; done";
+    let (_, started) = run(&[
+        "box", "rport", "-d", "-p", "80", "--image", "alpine", "--", "sh", "-c", serve,
+    ]);
+    let (lines, _) = run(&["port", "rport", "80"]);
+    let ports: Vec<u16> = lines
+        .lines()
+        .filter_map(|l| l.rsplit(':').next())
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
+    let mut answer = String::new();
+    if let Some(p) = ports.first() {
+        for _ in 0..20 {
+            if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", *p)) {
+                let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                let _ = c.read_to_string(&mut answer);
+                if !answer.is_empty() {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    let _ = run(&["stop", "rport"]);
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  web:\n    image: alpine\n    command: [\"sleep\", \"30\"]\n    ports: [\"80\"]\n",
+    );
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "rpa", "up", "-d"]);
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "rpb", "up", "-d"]);
+    let (a, _) = run(&[
+        "compose",
+        "-f",
+        "compose.yml",
+        "-p",
+        "rpa",
+        "port",
+        "web",
+        "80",
+    ]);
+    let (b, _) = run(&[
+        "compose",
+        "-f",
+        "compose.yml",
+        "-p",
+        "rpb",
+        "port",
+        "web",
+        "80",
+    ]);
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "rpa", "down"]);
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "rpb", "down"]);
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::remove_dir_all(&dir);
+    if started.contains("error") && !started.contains("publish") {
+        eprintln!("SKIP: this host could not start the box:\n{started}");
+        return;
+    }
+    assert!(
+        !ports.is_empty(),
+        "`kern port` must name the picked port:\n{lines}\n{started}"
+    );
+    assert!(
+        ports.iter().all(|p| *p == ports[0] && *p != 0),
+        "one number, never 0: {lines}"
+    );
+    assert!(
+        answer.contains("PICKED"),
+        "the box must answer on the picked port: {lines}"
+    );
+    assert!(
+        !a.trim().is_empty() && !b.trim().is_empty() && a.trim() != b.trim(),
+        "two projects of one file get two ports: {a:?} {b:?}"
+    );
+}
+
+/// A stack whose LATER service is refused leaves neither its pod nor its earlier services behind.
+///
+/// MEASURED with a GPU service asking for a card the host lacks, after a cache and a web service had
+/// been prepared: nothing kept running, and the pod stayed `0 up` with its holder alive, one per
+/// failed CI job. Two causes, both measured: the guard that removes an empty pod ran BEFORE the gate
+/// write ends closed (locals drop in reverse order), so it was itself holding the boxes it waited
+/// on; and once that order is right the prepared boxes still leave a few milliseconds after the
+/// gates close. The refusal here is a `mem_limit:` below what a box needs, which needs no GPU.
+#[test]
+fn a_later_refused_service_leaves_no_pod_behind() {
+    let dir = std::env::temp_dir().join(format!("kern-it-laterref-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-laterref-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> String {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+        {
+            Ok(o) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => e.to_string(),
+        }
+    };
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        concat!(
+            "services:\n",
+            "  first:\n    image: alpine\n    command: [\"sleep\", \"60\"]\n",
+            "  second:\n    image: alpine\n    depends_on: [first]\n    mem_limit: 64\n",
+            "    command: [\"sleep\", \"60\"]\n",
+        ),
+    );
+    let up = run(&["compose", "-f", "compose.yml", "-p", "laterref", "up", "-d"]);
+    let pods = run(&["pod", "ls"]);
+    let ps = run(&["ps"]);
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "laterref", "down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if !up.contains("BARE NUMBER IS BYTES") {
+        eprintln!("SKIP: the refusal this test is about did not happen here:\n{up}");
+        return;
+    }
+    assert!(
+        !pods.contains("laterref"),
+        "the pod outlived the failed bring-up:\n{pods}\n{up}"
+    );
+    assert!(
+        !ps.contains("first"),
+        "an earlier service outlived the failed bring-up:\n{ps}"
+    );
+}

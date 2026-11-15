@@ -112,19 +112,30 @@ pub fn parse_with_default(spec: &str, default_ip: IpAddr) -> Option<Vec<kern_iso
     }
     let parts: Vec<&str> = head.split(':').collect();
     let n = parts.len();
-    if n < 2 {
-        return None;
-    }
-    let (h, b) = (*parts.get(n - 2)?, *parts.get(n - 1)?);
+    // `80` alone is a box port with NO host port: Docker picks one (measured: `docker run -p 80`
+    // answers `0.0.0.0:32768` and `[::]:32768`).
+    let (h, b) = if n == 1 {
+        ("", *parts.first()?)
+    } else {
+        (*parts.get(n - 2)?, *parts.get(n - 1)?)
+    };
     let written = written_address(head).ok()?;
-    let (hs, he) = parse_port_or_range(h)?;
     let (bs, be) = parse_port_or_range(b)?;
+    // AN ABSENT OR ZERO HOST PORT IS "THE KERNEL PICKS ONE", per box port, as Docker reads `80`,
+    // `ip::80` and `0:80` (all three measured). Carried as host `0` and replaced by a real number
+    // at start, before anything is recorded, so no registry entry ever holds a 0.
+    let (hs, he) = if h.is_empty() || h == "0" {
+        (0, be - bs)
+    } else {
+        parse_port_or_range(h)?
+    };
     // A host range must map onto a box range of the SAME length (like Docker); a single box port with a
     // host range is ambiguous and rejected.
     if he - hs != be - bs {
         return None;
     }
     let count = (he - hs) as usize + 1;
+    let random = h.is_empty() || h == "0";
     if count > MAX_RANGE {
         return None;
     }
@@ -141,7 +152,7 @@ pub fn parse_with_default(spec: &str, default_ip: IpAddr) -> Option<Vec<kern_iso
                 (0..count as u16).map(move |k| kern_isolation::PortMap {
                     bind,
                     implicit,
-                    host: hs + k,
+                    host: if random { 0 } else { hs + k },
                     box_port: bs + k,
                     udp,
                 })
@@ -388,6 +399,28 @@ mod tests {
         assert_eq!(fmt(&pm(LO, 8080, 80, false)), "127.0.0.1:8080->80");
     }
 
+    /// NO HOST PORT, OR 0, IS "THE KERNEL PICKS ONE", as Docker reads `80`, `ip::80` and `0:80` (all
+    /// three measured against `docker run -p`): host port 0 here, and the box start puts a real number
+    /// there before anything is recorded. A default bind keeps its IPv6 twin, on the same 0.
+    #[test]
+    fn an_absent_or_zero_host_port_is_picked_at_start() {
+        let both = |b, udp| Some(vec![pm(ANY, 0, b, udp), twin(ANY6, 0, b, udp)]);
+        assert_eq!(parse("80"), both(80, false));
+        assert_eq!(parse("0:80"), both(80, false));
+        assert_eq!(parse("53/udp"), both(53, true));
+        assert_eq!(parse("127.0.0.1::80"), Some(vec![pm(LO, 0, 80, false)]));
+        assert_eq!(parse("[::1]::80"), Some(vec![pm(LO6, 0, 80, false)]));
+        assert_eq!(
+            parse("9000-9001"),
+            Some(vec![
+                pm(ANY, 0, 9000, false),
+                pm(ANY, 0, 9001, false),
+                twin(ANY6, 0, 9000, false),
+                twin(ANY6, 0, 9001, false),
+            ])
+        );
+    }
+
     /// IPv6 is read the way Docker reads it, every form measured against `docker run -p`: the last two
     /// fields are the ports and everything before them is the address, brackets optional.
     #[test]
@@ -481,8 +514,7 @@ mod tests {
         assert_eq!(parse("8080:80/sctp"), None); // unknown proto → not silent tcp
         assert_eq!(parse("8080:80/"), None);
         assert_eq!(parse("abc"), None);
-        assert_eq!(parse("80"), None);
-        assert_eq!(parse("0:80"), None); // port 0 rejected
+        assert_eq!(parse("80:0"), None); // a BOX port 0 is still nothing to publish
         assert_eq!(parse("8080:99999"), None); // out of range
         assert_eq!(parse("8080:80/udp/extra"), None); // trailing token "extra" is not a known proto
         assert_eq!(parse("999.0.0.1:8080:80"), None);

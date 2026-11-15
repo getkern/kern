@@ -2032,10 +2032,14 @@ fn child_setup_and_exec(
     }
 
     // `--ssh`: stand up the in-box sshd (mounts /run tmpfs, writes keys/config, forks sshd). Done
-    // here - after loopback (sshd binds 127.0.0.1) and pivot (privileged mounts), before seccomp
+    // here - after the box address (sshd binds it) and pivot (privileged mounts), before seccomp
     // (the filter would block the mounts, and the forked sshd must predate the filter).
     if let Some(ssh) = &spec.ssh {
-        crate::ssh::setup(ssh);
+        // WHERE THE FORWARDER CONNECTS, from the same function that activates it (see `sshd_config`).
+        crate::ssh::setup(
+            ssh,
+            box_own_ip(spec).unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+        );
     }
 
     // `-it`: adopt the PTY slave as the controlling terminal (done before seccomp - these are setup

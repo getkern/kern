@@ -7707,7 +7707,7 @@ mod tests {
             ]
         );
         // Malformed mappings are usage errors, never silently dropped.
-        for bad in ["0:80", "abc", "80", "80:0", "999.0.0.1:8080:80"] {
+        for bad in ["abc", "80:0", "999.0.0.1:8080:80"] {
             assert!(
                 matches!(
                     parse(&["box".into(), "x".into(), "-p".into(), bad.to_string()]),

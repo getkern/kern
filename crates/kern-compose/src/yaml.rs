@@ -4541,13 +4541,7 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             }
             "environment" => b.env = kv_pairs_from(node, Some(dotenv)),
             "env_file" => b.env_file = env_file_value(node, name, dir),
-            "ports" => {
-                // A container-only entry joins the DECLARED space (what `expose:`/`port:` feed)
-                // instead of being refused: same statement, one space, as everywhere else here.
-                let mut declared = Vec::new();
-                b.ports = ports_value(node, name, &mut declared);
-                b.expose.extend(declared);
-            }
+            "ports" => b.ports = ports_value(node, name),
             // `expose:` is Compose's spelling of "I listen here": the same pod port space as
             // `ports:` and `port:`, so it enters the same preflight. It injects nothing, since in
             // Docker the key only documents. The syntax is read by `parse_expose_entry`, shared with
@@ -6575,7 +6569,7 @@ fn interpolate_expr(expr: &str, dotenv: &crate::DotEnv) -> String {
 /// their service "doesn't answer from outside".
 /// Published port specs, plus (out-param) the container-only ones, which are DECLARED rather than
 /// published: see the comment at the detection site.
-fn ports_value(node: &Node, svc: &str, declared: &mut Vec<(u16, bool)>) -> Vec<String> {
+fn ports_value(node: &Node, svc: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut push_spec = |spec: String| {
         let (host_port, proto) = match spec.rsplit_once('/') {
@@ -6601,35 +6595,26 @@ fn ports_value(node: &Node, svc: &str, declared: &mut Vec<(u16, bool)>) -> Vec<S
         }
         // host:box with no host-IP → kern binds loopback (secure default, unlike Docker's 0.0.0.0).
         let colons = host_port.matches(':').count();
-        // CONTAINER-ONLY forms: `"8000"` and `":8000"`. Docker treats them identically (`config`
-        // normalises both to `target: 8000` with no `published:`) and picks an EPHEMERAL host port at
-        // `up`. kern has no ephemeral allocator, and inventing one would be worse than saying so: it
-        // would publish a port the file never named, on a number nobody could predict.
-        //
-        // So the entry becomes a DECLARED port instead of a published one - the same space `expose:`
-        // and `port:` feed - which is exactly what it means inside the pod: the service listens here.
-        // Refusing it was the alternative, and it cost four real files (Supabase, Budibase, Jitsi,
-        // OpenCTI) that reach this form through an unset `${VAR}` and that Docker accepts. Measured
-        // against `docker compose config`, not assumed.
+        // CONTAINER-ONLY forms: `"8000"` and `":8000"`. Docker publishes them on a host port it picks
+        // (measured: `docker run -p 80` answers `0.0.0.0:32768` and `[::]:32768`), which is how one
+        // file runs as several stacks at once (one per pull request) without two of them fighting for
+        // a number. kern does the same now: the spec becomes `0:<port>`, the box start picks the
+        // number, and `compose port` reads it back. It used to become a DECLARED port only, with a
+        // note that kern had no ephemeral allocator.
         let bare = host_port.strip_prefix(':').unwrap_or(&host_port);
         if colons == 0 || (colons == 1 && host_port.starts_with(':')) {
-            match bare.parse::<u16>() {
-                Ok(n) if n > 0 => {
-                    declared.push((n, keep_proto == "/udp"));
-                    // NAME THE PORT THAT IS IN THE FILE. This used to be a fixed sentence quoting
-                    // `8000` whatever the file said, so a stack declaring only `9090` was told about
-                    // a port that appears nowhere in it. A field test on `dev` had to go and prove
-                    // that kern was not reading stale state from another file before it could be
-                    // dismissed, which is the cost of an example that looks like an observation.
-                    //
-                    // Still `warn_once`, so the dedup is now per DISTINCT PORT rather than per file:
-                    // a stack with one such port says it once, and each extra line names a different
-                    // number and is therefore worth its own line.
-                    warn_once(&container_only_port_note(n));
+            let ok = match bare.split_once('-') {
+                Some((x, y)) => {
+                    x.parse::<u16>().is_ok_and(|n| n > 0) && y.parse::<u16>().is_ok_and(|n| n > 0)
                 }
-                _ => warn(&format!(
+                None => bare.parse::<u16>().is_ok_and(|n| n > 0),
+            };
+            if ok {
+                out.push(format!("0:{bare}{keep_proto}"));
+            } else {
+                warn(&format!(
                     "service '{svc}': port '{spec}' is not a port in 1..=65535, entry SKIPPED"
-                )),
+                ));
             }
             return;
         }
@@ -8005,21 +7990,6 @@ fn stdin_open_note(service: &str) -> String {
 /// For facts that belong to the FILE rather than to a service: `networks:` is dropped for the whole
 /// stack, so a seven-service file was getting eight lines saying it. Repeating one fact per service
 /// trains the reader to skim past warnings, which is how the one that mattered gets missed.
-/// The note for a compose entry that names a container port with no host port.
-///
-/// A function rather than a fixed sentence because the number in the message has to be the number in
-/// the FILE. It used to read `a container-only port (\`8000\` / \`:8000\`) ...` whatever the file
-/// said, so a stack declaring only `9090` was told about a port that appears nowhere in it. A field
-/// test on the `dev` branch had to isolate the case and prove kern was not carrying stale state from
-/// another file before it could dismiss it: that is the cost of an example that reads like an
-/// observation.
-fn container_only_port_note(port: u16) -> String {
-    format!(
-        "a container-only port (`{port}` / `:{port}`) is DECLARED, not published: kern assigns no \
-         random host port. Write `HOST:{port}` to publish one"
-    )
-}
-
 /// What to say about an `x-kern-…` key this build does not read.
 ///
 /// TWO PROBLEMS, TWO SENTENCES. `x-kern-vgpi` is a typo: the fix is to correct the key, so the note
@@ -10458,28 +10428,26 @@ mod tests {
         );
     }
 
-    /// THE WARNING MAY NOT NAME A PORT THAT IS NOT IN THE FILE.
-    ///
-    /// The sentence used to quote `8000` as an example regardless of the entry that triggered it, so
-    /// a file declaring only `9090` produced a line about port 8000. Reported from a field test on
-    /// `dev`, which had to isolate the case to establish that kern was not reading stale state from
-    /// a previous file. An example that reads like an observation costs the reader that
-    /// investigation, every time.
+    /// A CONTAINER-ONLY PORT IS PUBLISHED ON A HOST PORT THE KERNEL PICKS, as Docker publishes it.
+    /// `"8000"`, `":8000"` and a range become `0:<port>`; anything that is not a port is skipped by
+    /// name. It used to become a declared port only, with a note that kern assigned no random port.
     #[test]
-    fn the_container_only_port_note_names_the_port_the_file_declared() {
-        let note = container_only_port_note(9090);
-        assert!(
-            note.contains("`9090`") && note.contains("HOST:9090"),
-            "the note must quote the port that triggered it, in both places: {note}"
+    fn a_container_only_port_is_published_on_a_picked_host_port() {
+        let src = "services:\n  web:\n    image: alpine\n    ports: [\"8000\", \":9000\", \"7000-7001\", \"53/udp\"]\n";
+        let boxes = parse(src).expect("parses");
+        let web = boxes
+            .iter()
+            .find(|b| b.service_name() == "web")
+            .expect("web");
+        assert_eq!(
+            web.ports,
+            vec![
+                "0:8000".to_string(),
+                "0:9000".to_string(),
+                "0:7000-7001".to_string(),
+                "0:53/udp".to_string()
+            ]
         );
-        assert!(
-            !note.contains("8000"),
-            "and it must not mention a port the file never named: {note}"
-        );
-        // Positive control: 8000 is not banned, it is simply no longer hardcoded.
-        assert!(container_only_port_note(8000).contains("`8000`"));
-        // The two are different sentences, which is the property the old literal could not have.
-        assert_ne!(container_only_port_note(1), container_only_port_note(2));
     }
 
     /// A NUL BYTE IS REFUSED BY THE FILE, NOT BY WHATEVER SYSCALL TRIPS OVER IT LATER.

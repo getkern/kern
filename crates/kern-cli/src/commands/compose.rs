@@ -916,7 +916,25 @@ impl Drop for EmptyPodGuard<'_> {
     fn drop(&mut self) {
         // The registry is the authority on membership, and it is what `pod::teardown` counts too, so
         // the two cannot disagree about whether this pod holds anything.
-        if crate::registry::list().iter().any(|i| i.pod == self.pod) {
+        let holds = || crate::registry::list().iter().any(|i| i.pod == self.pod);
+        // A BRING-UP THAT FAILED IS STILL EMPTYING THE POD WHEN THIS RUNS. The gates closed just
+        // before (see where `_pod_guard` is declared), and every box that was prepared and not yet
+        // released has read EOF and is exiting. MEASURED with a GPU service asking for a card the
+        // host lacks, under `--abort-on-container-exit`: this check still listed `gpr9-web` and
+        // `gpr9-cache`, and the pod stayed `0 up`, its holder alive, after every such CI job. This
+        // guard is armed only for a pod THIS invocation created, so every member is this
+        // bring-up's: when it never reached its "started" line they get a bounded moment to leave.
+        // One that was released and keeps running does not leave, and the pod is kept, as before.
+        // BOTH HALVES MEASURED: with the declaration order fixed and no wait, the pod stayed 3 of 3
+        // times (the boxes leave milliseconds after the gates close); with both, it was removed 2
+        // of 2 times, the whole failed `up` taking 145 ms.
+        if self.started.get() == 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while holds() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        if holds() {
             return;
         }
         let (removed, _) = crate::pod::teardown(self.pod);
@@ -2591,6 +2609,17 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .into_iter()
             .filter(|n| !joins.contains_key(n))
             .collect();
+    // Armed only in the branch that CREATES the pod, so an `up` onto a pod that already existed can
+    // never remove it. Declared out here because the guard has to outlive that branch: it is the whole
+    // bring-up that can fail. See `EmptyPodGuard`.
+    //
+    // ⛔ DECLARED BEFORE `gates`, SO IT IS DROPPED AFTER THEM. Locals drop in reverse order, and the
+    // guard used to be declared after: it ran while the write ends were still open, so the boxes
+    // prepared for a failed bring-up were still held at their gate, still registered, and the guard
+    // kept the pod. They read EOF only when `up` exited, and the pod stayed `0 up` with its holder
+    // alive. MEASURED: waiting 5 s inside the guard changed nothing, because the guard itself was
+    // what held them.
+    let mut _pod_guard: Option<EmptyPodGuard> = None;
     // Write ends, one per PREPARED box, held by `up` and keyed by box name so the release can be
     // ordered by dependency level.
     //
@@ -2600,10 +2629,6 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // from the type system rather than from remembering to clean up on eleven error paths.
     let gates: std::sync::Mutex<Vec<(String, std::os::fd::OwnedFd)>> =
         std::sync::Mutex::new(Vec::new());
-    // Armed only in the branch that CREATES the pod, so an `up` onto a pod that already existed can
-    // never remove it. Declared out here because the guard has to outlive that branch: it is the whole
-    // bring-up that can fail. See `EmptyPodGuard`.
-    let mut _pod_guard: Option<EmptyPodGuard> = None;
     if use_pod && crate::pod::holder_pid(&pod).is_none() {
         // Map a uid RANGE into the pod's shared user ns when ANY member needs it (`wants_uid_range`,
         // the single statement of that rule). A pod member setns's into the holder's user ns and writes

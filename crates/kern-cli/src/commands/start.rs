@@ -2332,13 +2332,14 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             "kern: warning: {e}; a privileged port is moved rather than refused, which is the default"
         ),
     }
-    // THE IPv6 TWIN OF A DEFAULT BIND IS DROPPED WHERE THE HOST HAS NO IPv6, as Docker drops it: a
-    // CI runner or a kernel booted with `ipv6.disable=1` would otherwise refuse every `-p 8080:80`.
-    // An IPv6 address the spec WROTE is kept, so that host refuses it by name. Probed only when there
-    // is a twin to decide about.
-    if eff_ports.iter().any(|p| p.implicit) && !kern_isolation::host_has_ipv6() {
-        eff_ports.retain(|p| !p.implicit);
-    }
+    // THE IPv6 TWIN OF A DEFAULT BIND IS DROPPED WHERE ITS ADDRESS CANNOT BE BOUND, as Docker drops
+    // it: a CI runner or a kernel booted with `ipv6.disable=1` would otherwise refuse every `-p
+    // 8080:80`. Decided PER ADDRESS, because a host can have IPv6 and not `::1` (see
+    // `address_is_bindable`), which is the twin a loopback policy asks for. An IPv6 address the spec
+    // WROTE is kept, so that host refuses it by name. One probe per distinct address, and none when
+    // there is no twin.
+    drop_unbindable_twins(&mut eff_ports, kern_isolation::address_is_bindable);
+    assign_picked_ports(&mut eff_ports)?;
     let ports: &[kern_isolation::PortMap] = &eff_ports;
     // Fail fast if a `-p` host port is already taken (by another box or any process): otherwise the
     // forwarder fails inside its fork - whose stderr a detached box swallows - and the box would
@@ -2385,6 +2386,23 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                 .filter_map(|a| a.rsplit(':').next())
                 .any(|p| p.trim().parse::<u16>() == Ok(hp))
         });
+        // NOT A TAKEN PORT AT ALL: the host has no such address. Said as what it is, because "held by
+        // something else, `ss -ltnp` names it" sent the reader after a process that does not exist.
+        // MEASURED on a VPS whose loopback has IPv6 disabled: `-p [::1]:18202:80` answered exactly
+        // that. Docker refuses the same spec there ("cannot assign requested address").
+        if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) {
+            let asked: Vec<String> = ports
+                .iter()
+                .filter(|p| p.host == hp)
+                .map(crate::ports::host_side)
+                .collect();
+            return Err(Error::Sandbox(format!(
+                "cannot publish {}: {e} - this host has no such address to listen on (an IPv6 \
+                 address where IPv6 is disabled on that interface, or an address of another \
+                 machine); publish it on an address the host has, or without an address",
+                asked.join(", ")
+            )));
+        }
         return Err(Error::AlreadyRunning(match holder {
             Some(b) if b.pod.is_empty() => format!(
                 "cannot publish host port {hp}: {e} - box '{}' is already publishing it. \
@@ -3956,6 +3974,70 @@ pub fn run(
     eprintln!("kern: cannot run '{}': {err}", command[0]);
     eprintln!("hint: the command must exist and be executable (an absolute path, or on $PATH)");
     std::process::exit(127);
+}
+
+/// Give every mapping whose host port is 0 (`-p 80`, `-p ip::80`, `-p 0:80`, compose `"80"`) a port
+/// the kernel picked, ONE NUMBER FOR A DEFAULT BIND'S TWO FAMILIES (the IPv4 map and its implicit
+/// IPv6 twin with the same box port and protocol), as Docker does. Done before the preflight and the
+/// registry, so `kern ps`, `kern port` and `compose port` read the real number.
+fn assign_picked_ports(ports: &mut [kern_isolation::PortMap]) -> Result<(), Error> {
+    for i in 0..ports.len() {
+        let Some(p) = ports.get(i).copied() else {
+            continue;
+        };
+        if p.host != 0 || p.implicit {
+            continue;
+        }
+        let twins: Vec<usize> = (0..ports.len())
+            .filter(|&j| {
+                ports.get(j).is_some_and(|t| {
+                    t.implicit && t.host == 0 && t.box_port == p.box_port && t.udp == p.udp
+                })
+            })
+            .collect();
+        let also: Vec<std::net::IpAddr> = twins
+            .iter()
+            .filter_map(|&j| ports.get(j).map(|t| t.bind))
+            .collect();
+        let picked = kern_isolation::pick_free_port(p.bind, &also, p.udp).ok_or_else(|| {
+            Error::Sandbox(format!(
+                "cannot publish box port {}: no free host port could be picked on {}",
+                p.box_port,
+                crate::ports::host_side(&kern_isolation::PortMap { host: 0, ..p })
+                    .trim_end_matches(":0")
+            ))
+        })?;
+        for j in std::iter::once(i).chain(twins) {
+            if let Some(m) = ports.get_mut(j) {
+                m.host = picked;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop every IMPLICIT mapping (the IPv6 twin of a default bind) whose address `bindable` refuses,
+/// asking once per distinct address and not at all when there is no twin. A written mapping is
+/// always kept, so a host that cannot bind it refuses it by name.
+fn drop_unbindable_twins(
+    ports: &mut Vec<kern_isolation::PortMap>,
+    bindable: impl Fn(std::net::IpAddr) -> bool,
+) {
+    if !ports.iter().any(|p| p.implicit) {
+        return;
+    }
+    let mut probed: Vec<(std::net::IpAddr, bool)> = Vec::new();
+    ports.retain(|p| {
+        if !p.implicit {
+            return true;
+        }
+        if let Some(&(_, ok)) = probed.iter().find(|(ip, _)| *ip == p.bind) {
+            return ok;
+        }
+        let ok = bindable(p.bind);
+        probed.push((p.bind, ok));
+        ok
+    });
 }
 
 /// What a box that joins another's network namespace takes from it.
@@ -7003,5 +7085,45 @@ mod ssh_hint_tests {
         );
         assert_eq!(super::known_hosts_line(2222, "ssh-ed25519\n"), None);
         assert_eq!(super::known_hosts_line(2222, ""), None);
+    }
+}
+
+#[cfg(test)]
+mod twin_tests {
+    /// THE TWIN IS DECIDED BY ITS OWN ADDRESS. The shape of a VPS measured with IPv6 on `eth0` and
+    /// none on `lo`: `::` binds and `::1` does not. A loopback policy's twin (`::1`) must go and the
+    /// box must still start; the default's twin (`::`) must stay; a WRITTEN `[::1]` is never dropped
+    /// (it is refused by name at the bind); and each address is asked about once.
+    #[test]
+    fn a_twin_goes_only_when_its_own_address_cannot_be_bound() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let lo6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let any6 = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let vps = |ip: IpAddr| {
+            asked.borrow_mut().push(ip);
+            ip != lo6
+        };
+        let mut policy =
+            crate::ports::parse_with_default("8000-8002:80-82", crate::ports::LOOPBACK_IP)
+                .unwrap_or_default();
+        policy.extend(crate::ports::parse("[::1]:9000:90").unwrap_or_default());
+        super::drop_unbindable_twins(&mut policy, vps);
+        assert!(
+            policy.iter().all(|p| !p.implicit),
+            "the ::1 twins must go on a host without ::1: {policy:?}"
+        );
+        assert!(
+            policy.iter().any(|p| p.bind == lo6 && p.host == 9000),
+            "a written [::1] is kept, for the bind to refuse by name: {policy:?}"
+        );
+        assert_eq!(asked.borrow().len(), 1, "one probe per distinct address");
+
+        let mut default = crate::ports::parse("8080:80").unwrap_or_default();
+        super::drop_unbindable_twins(&mut default, |ip| ip != lo6);
+        assert!(
+            default.iter().any(|p| p.bind == any6),
+            "the [::] twin stays: {default:?}"
+        );
     }
 }
