@@ -6896,9 +6896,15 @@ mod ranged_tests {
     }
 
     /// The digest the way the crate itself computes it, with `sha256sum`.
+    ///
+    /// ONE FILE PER CALL: the name used to be `<pid>-<len>`, so two tests hashing blobs of the same
+    /// length in parallel shared it, one removed it under the other's `sha256sum`, and the empty
+    /// output panicked (seen once in a full run as the unprivileged user, never alone).
     fn digest_of(b: &[u8]) -> String {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let f = std::env::temp_dir().join(format!(
-            "kern-ranged-digest-{}-{}",
+            "kern-ranged-digest-{}-{}-{k}",
             std::process::id(),
             b.len()
         ));
