@@ -420,26 +420,25 @@ pub struct BoxRunArgs<'a> {
 }
 
 /// Resolve `--add-host` entries: the `host-gateway` keyword becomes the host's reachable address -
-/// `127.0.0.1` when the box shares the host network, else the host's DEFAULT GATEWAY. Other values
+/// `127.0.0.1` when the box shares the host network, else the host's PRIMARY address. Other values
 /// pass through verbatim.
 ///
-/// ⛔ THE GATEWAY, NOT THE HOST'S OWN ADDRESS. A box's egress is pasta, which answers for the gateway
-/// address inside the namespace and maps it to the host's loopback, so `<gateway>:<port>` reaches a
-/// port the host serves on `127.0.0.1`, which is where kern publishes `-p` and `ports:` by default.
-/// The host's primary address reaches only what listens on every interface. MEASURED: valiantlynx's
-/// open-webui, configured for `http://host.docker.internal:7869` (ollama's published port), got
-/// `connection refused` on a WSL2 guest; a service here reached a published port through the gateway
-/// (200) and was refused through the host's own address. Docker reaches it through its bridge.
+/// THE HOST'S OWN ADDRESS, as Docker's `host-gateway` is the host's bridge address: the box reaches
+/// what the host serves on its interfaces (a published `-p`/`ports:`, which binds every interface by
+/// default) and not what it keeps on `127.0.0.1`. This used to be the default GATEWAY, which pasta
+/// mapped to the host's loopback, so `host.docker.internal` reached loopback-only services too; that
+/// mapping is gone (see `pasta_args` in `pod.rs`), and the gateway is now a real router.
+///
+/// MEASURED before: valiantlynx's open-webui, configured for `http://host.docker.internal:7869`
+/// (ollama's published port), got `connection refused` through the host's address on a WSL2 guest.
+/// That was the copied address: the box held the host's address itself, so the connection went
+/// to the box. With an address of its own the host's address is the host.
 fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, String)> {
     let gateway = || -> String {
         if share_net {
             return "127.0.0.1".to_string();
         }
-        std::fs::read_to_string("/proc/net/route")
-            .ok()
-            .and_then(|t| default_gateway_v4(&t))
-            .or_else(host_primary_ipv4)
-            .unwrap_or_else(|| "127.0.0.1".to_string())
+        host_primary_ipv4().unwrap_or_else(|| "127.0.0.1".to_string())
     };
     raw.iter()
         .map(|(name, ip)| {
@@ -451,23 +450,6 @@ fn resolve_add_hosts(raw: &[(String, String)], share_net: bool) -> Vec<(String, 
             (name.clone(), ip)
         })
         .collect()
-}
-
-/// The IPv4 gateway of the default route in a `/proc/net/route` table, or `None`. The table writes
-/// addresses as host-order hex of the network-order bytes, so `0101A8C0` is 192.168.1.1; the default
-/// route is destination `00000000` with the gateway flag (`0x2`) set.
-fn default_gateway_v4(table: &str) -> Option<String> {
-    table.lines().skip(1).find_map(|line| {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        let (dest, gw, flags) = (f.get(1)?, f.get(2)?, f.get(3)?);
-        let flags = u32::from_str_radix(flags, 16).ok()?;
-        if *dest != "00000000" || flags & 0x2 == 0 {
-            return None;
-        }
-        let raw = u32::from_str_radix(gw, 16).ok()?;
-        let ip = std::net::Ipv4Addr::from(raw.to_le_bytes());
-        (!ip.is_unspecified()).then(|| ip.to_string())
-    })
 }
 
 /// The host's primary IPv4 (the source address the default route would use), found by `connect()`ing a

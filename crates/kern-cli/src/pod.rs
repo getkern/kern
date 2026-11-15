@@ -1149,23 +1149,30 @@ const PASTA_NO_PORT_MAP: [&str; 8] = ["-t", "none", "-u", "none", "-T", "none", 
 const PASTA_IF_ALONE: &str = "eth0";
 const PASTA_IF_ON_BRIDGE: &str = "kern0";
 
-/// The host's first non-loopback nameserver, which is the address pasta must be told to answer.
+/// The /24s pasta may put a box on, in order of preference. The first is slirp's own convention
+/// (`10.0.2.15`, gateway `10.0.2.2`), so a reader who has met rootless networking recognises it.
+const PASTA_GUEST_NETS: [[u8; 3]; 4] = [[10, 0, 2], [10, 177, 2], [172, 31, 254], [192, 168, 254]];
+
+/// The box's OWN network on pasta's tap: the first of [`PASTA_GUEST_NETS`] that no route in any of
+/// `tables` (`/proc/net/route` text: the host's, and the namespace's own, which holds a bridge
+/// member's subnets) overlaps. A /24 the host already routes would hide that slice of the host's
+/// network from the box, and on a host that is itself a slirp guest (`10.0.2.15`) it would make the
+/// box's address the host's.
 ///
-/// `None` when the host resolves through a loopback stub (systemd-resolved and friends): pasta cannot
-/// copy that address into a namespace where it would mean the box's own loopback, so it substitutes a
-/// public resolver, and a box on such a host resolves today. This is only about the OTHER shape, where
-/// the copied address is a real one the box cannot reach.
-fn host_resolver_to_forward() -> Option<String> {
-    let text = std::fs::read_to_string("/etc/resolv.conf").ok()?;
-    text.lines()
-        .filter_map(|l| {
-            l.split_whitespace()
-                .next()
-                .filter(|k| *k == "nameserver")
-                .and(l.split_whitespace().nth(1))
+/// When every candidate overlaps, the first is used anyway: the box then misses one slice of the
+/// host's network, which is a reachability cost; going back to the host's address would be the
+/// loopback exposure [`pasta_args`] exists to close.
+fn pasta_guest_net(tables: &[String]) -> [u8; 3] {
+    PASTA_GUEST_NETS
+        .iter()
+        .copied()
+        .find(|n| {
+            let bits = u32::from_be_bytes([n[0], n[1], n[2], 0]);
+            tables
+                .iter()
+                .all(|t| route_overlapping(t, bits, 24).is_none())
         })
-        .find(|a| !a.starts_with("127.") && *a != "::1" && a.parse::<std::net::Ipv4Addr>().is_ok())
-        .map(str::to_string)
+        .unwrap_or(PASTA_GUEST_NETS[0])
 }
 
 /// The exact argv passed to `pasta` for a pod, as a pure function of the pod dir + holder PID, so the
@@ -1208,12 +1215,22 @@ fn pasta_args(
     watch_netns: bool,
     ns_ifname: &str,
 ) -> Vec<std::ffi::OsString> {
+    // Both route tables, read once per pasta: the host's, and the namespace's (a bridge member has its
+    // bridge subnets there already). One that cannot be read constrains nothing.
+    let tables: Vec<String> = [
+        "/proc/net/route".to_string(),
+        format!("/proc/{holder}/net/route"),
+    ]
+    .iter()
+    .filter_map(|p| std::fs::read_to_string(p).ok())
+    .collect();
     pasta_args_for(
         dir,
         holder,
         watch_netns,
         ns_ifname,
         unsafe { libc::geteuid() } == 0,
+        pasta_guest_net(&tables),
     )
 }
 
@@ -1224,8 +1241,9 @@ fn pasta_args_for(
     watch_netns: bool,
     ns_ifname: &str,
     as_root: bool,
+    guest: [u8; 3],
 ) -> Vec<std::ffi::OsString> {
-    let mut a: Vec<std::ffi::OsString> = Vec::with_capacity(16);
+    let mut a: Vec<std::ffi::OsString> = Vec::with_capacity(24);
     a.push("--config-net".into());
     a.push("-q".into());
     a.push("-P".into());
@@ -1244,20 +1262,31 @@ fn pasta_args_for(
     // (shared namespace, no veth, no collision) - a REGRESSION of the bridge default on that platform.
     a.push("-I".into());
     a.push(ns_ifname.into());
-    // TELL PASTA TO ANSWER THE RESOLVER IT ADVERTISES. `--config-net` copies the host's nameserver
-    // into the box, and on a home or edge network that address IS the default gateway, which pasta
-    // impersonates inside the namespace. pasta does not forward DNS queries by default, so they land
-    // on pasta and die: MEASURED on a Raspberry Pi 5, a box with `nameserver 192.168.1.1` and a
-    // working route (`nc 1.1.1.1:443` connects) that could not resolve a single name, with no warning
-    // from anything. `--dns-forward` is pasta's own answer for exactly this.
+    // ⛔ THE BOX GETS ITS OWN ADDRESS AND GATEWAY, AND THE GATEWAY IS NOT THE HOST'S LOOPBACK.
+    // `--config-net` alone copies the host's address and gateway into the box, and pasta answers for
+    // that gateway by mapping it to the host's `127.0.0.1`. So every box in a pod reached every
+    // service the host keeps on loopback only: MEASURED on this desktop, a canary bound to
+    // `127.0.0.1` answered a box connecting to `192.168.1.1`. Those are exactly the services a host
+    // keeps there because they must not be reachable: `kubectl port-forward`, a kind API server, a
+    // docker TCP socket, a dev database. Docker refuses the same connection.
     //
-    // ONLY FOR A NON-LOOPBACK RESOLVER, and the distinction is the host's, not ours: where the host
-    // runs a stub on `127.0.0.53` (systemd-resolved) pasta already substitutes a public resolver that
-    // works, which is why this was invisible on a laptop and not on a board.
-    if let Some(ns) = host_resolver_to_forward() {
-        a.push("--dns-forward".into());
-        a.push(ns.into());
-    }
+    // `--no-map-gw` ends the mapping, and needs the address with it: with the host's address copied,
+    // the host's LAN address is the box's own, so the host stays unreachable even where it listens on
+    // every interface, and on a host whose resolver is its gateway (a home router, WSL2) DNS dies.
+    // On its own /24 the box reaches the host at the host's address, the resolver at its real
+    // address, and the host's loopback not at all, which is Docker's answer.
+    //
+    // This also retires `--dns-forward`: it existed because the copied resolver address WAS the
+    // gateway pasta impersonated (measured on a Raspberry Pi 5), and that gateway is now `.2` of a
+    // network the host's resolver is never on.
+    let [n0, n1, n2] = guest;
+    a.push("-a".into());
+    a.push(format!("{n0}.{n1}.{n2}.15").into());
+    a.push("-n".into());
+    a.push("24".into());
+    a.push("-g".into());
+    a.push(format!("{n0}.{n1}.{n2}.2").into());
+    a.push("--no-map-gw".into());
     // ⛔ STARTED BY ROOT, PASTA TURNS ITSELF INTO `nobody` FIRST, and `nobody` cannot open the
     // namespaces of a holder root owns. MEASURED in the field on a WSL2 Ubuntu guest, where one works
     // as root: every box came up with "no outbound", pasta saying "Don't run as root. Changing to
@@ -1580,10 +1609,15 @@ fn setup_outbound_in(dir: &std::path::Path, holder: i32, ns_ifname: &str) -> Out
 /// The nameservers a NAT'd namespace should use, derived from the host.
 ///
 /// The host's REAL (non-loopback) nameservers, which are reachable through the NAT, so split-horizon
-/// and LAN DNS keep working. A host that has only a local stub (systemd-resolved's `127.0.0.53`)
-/// offers nothing usable from inside a namespace, and the fallback is a public resolver rather than
-/// an empty file: an empty `resolv.conf` makes glibc try `127.0.0.1`, which is the box's own
-/// loopback and answers nothing.
+/// and LAN DNS keep working. A host that resolves through systemd-resolved's stub (`127.0.0.53`)
+/// lists its real upstreams in [`RESOLVED_UPSTREAMS`], and those are used next, which is where
+/// Docker looks too. MEASURED on this desktop: the stub's upstream `192.168.1.1` answered 20 of 20
+/// AAAA queries, while the public fallback `1.1.1.1` this used to jump to answered 8 of 20 from the
+/// same host; a network that blocks outside DNS, or a VPN whose names only its resolver knows, gets
+/// no names at all from a public resolver.
+///
+/// Only a host with neither gets a public resolver rather than an empty file: an empty
+/// `resolv.conf` makes glibc try `127.0.0.1`, which is the box's own loopback and answers nothing.
 ///
 /// SHARED BY THE POD AND THE PER-BOX PATH, because a stack must not resolve names differently
 /// depending on which wiring it was started with. The pod writes these into a file it binds; a
@@ -1592,28 +1626,39 @@ fn setup_outbound_in(dir: &std::path::Path, holder: i32, ns_ifname: &str) -> Out
 /// Never empty: the caller can rely on getting at least one resolver.
 #[must_use]
 pub fn host_nameservers() -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if let Ok(host) = std::fs::read_to_string("/etc/resolv.conf") {
-        for l in host.lines() {
-            if let Some(ns) = l.strip_prefix("nameserver ") {
-                // A resolv.conf value is a single token; take it and drop any trailing comment.
-                let ns = ns.split_whitespace().next().unwrap_or("");
-                // A LITERAL, because it travels into a `--dns` argument and then into a file glibc
-                // parses: a value carrying whitespace or anything but an address would be dropped
-                // silently by the resolver, which is the failure mode this whole path exists to
-                // avoid.
-                if !ns.starts_with("127.")
-                    && !ns.is_empty()
-                    && ns.parse::<std::net::IpAddr>().is_ok()
-                    && !out.iter().any(|o| o == ns)
-                {
-                    out.push(ns.to_string());
-                }
-            }
-        }
+    let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let mut out = nameservers_in(&read("/etc/resolv.conf"));
+    if out.is_empty() {
+        out = nameservers_in(&read(RESOLVED_UPSTREAMS));
     }
     if out.is_empty() {
-        out.push("1.1.1.1".to_string()); // host has only a local stub -> public fallback
+        out.push("1.1.1.1".to_string()); // no usable resolver anywhere -> public fallback
+    }
+    out
+}
+
+/// systemd-resolved's list of the upstream servers behind its `127.0.0.53` stub.
+const RESOLVED_UPSTREAMS: &str = "/run/systemd/resolve/resolv.conf";
+
+/// The `nameserver` addresses in a `resolv.conf` text a namespace can use: literal addresses, not on
+/// the loopback, each once. PURE, so a test can hand it any host's file.
+fn nameservers_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in text.lines() {
+        let Some(ns) = l.strip_prefix("nameserver ") else {
+            continue;
+        };
+        // A resolv.conf value is a single token; take it and drop any trailing comment.
+        let ns = ns.split_whitespace().next().unwrap_or("");
+        // A LITERAL, because it travels into a `--dns` argument and then into a file glibc parses:
+        // a value carrying whitespace, or a scoped `fe80::1%eth0`, would be dropped silently by the
+        // resolver, which is the failure mode this whole path exists to avoid.
+        let Ok(ip) = ns.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if !ip.is_loopback() && !out.iter().any(|o| o == ns) {
+            out.push(ns.to_string());
+        }
     }
     out
 }
@@ -3008,47 +3053,84 @@ mod tests {
     /// as well with both names set to the same value, which is the defect; and pinning only the bridge
     /// case would let the OTHER namespace go back to whatever the host's NIC is called, which is the
     /// lottery this replaced.
-    /// pasta is told to ANSWER the resolver it advertises, and only when that address is a real one.
-    ///
-    /// MEASURED on a Raspberry Pi 5, which is the shape a laptop hides: the host resolves through the
-    /// LAN router, pasta copies that address into the box, and it is the same address pasta
-    /// impersonates as the gateway - so queries land on pasta, which does not forward by default. The
-    /// box had a working route (`nc 1.1.1.1:443` connected) and could not resolve a single name, with
-    /// no warning from anything. With `--dns-forward` the same box, same nameserver, resolves.
-    ///
-    /// The laptop control is the other half: there the host's resolver is a loopback stub, pasta
-    /// substitutes a public one, the box resolves today, and this must not change it.
+    /// A host on systemd-resolved's stub gives the box the stub's REAL upstreams, not a public
+    /// resolver: the stub file has nothing a namespace can use, the upstream file does.
     #[test]
-    fn pasta_is_told_to_forward_dns_only_for_a_reachable_resolver() {
-        let pick = |conf: &str| -> Option<String> {
-            conf.lines()
-                .filter_map(|l| {
-                    l.split_whitespace()
-                        .next()
-                        .filter(|k| *k == "nameserver")
-                        .and(l.split_whitespace().nth(1))
-                })
-                .find(|a| {
-                    !a.starts_with("127.") && *a != "::1" && a.parse::<std::net::Ipv4Addr>().is_ok()
-                })
-                .map(str::to_string)
-        };
-        assert_eq!(pick("nameserver 192.168.1.1\n"), Some("192.168.1.1".into()));
+    fn a_stub_hosts_upstreams_are_the_boxs_resolvers() {
+        let stub = "# This is /run/systemd/resolve/stub-resolv.conf\nnameserver 127.0.0.53\noptions edns0 trust-ad\nsearch lan\n";
+        assert!(nameservers_in(stub).is_empty());
+        let upstream = "# This is /run/systemd/resolve/resolv.conf\nnameserver 192.168.1.1\nnameserver fe80::1%wlp4s0\nnameserver 2001:4860:4860::8888\nnameserver 192.168.1.1\nsearch lan\n";
+        // Scoped link-local dropped (glibc would drop it silently), duplicates once, order kept.
         assert_eq!(
-            pick("search lan\nnameserver 10.0.0.1\n"),
-            Some("10.0.0.1".into())
+            nameservers_in(upstream),
+            vec![
+                "192.168.1.1".to_string(),
+                "2001:4860:4860::8888".to_string()
+            ]
         );
-        // A loopback stub is NOT forwarded: inside a namespace that address is the box's own
-        // loopback, and pasta already substitutes something that works.
-        assert_eq!(pick("nameserver 127.0.0.53\n"), None);
-        assert_eq!(pick("nameserver ::1\n"), None);
-        // Neither is a file with nothing usable in it.
-        assert_eq!(pick("# nothing here\noptions ndots:2\n"), None);
-        // The FIRST usable one wins, and a loopback stub before it does not stop the search.
+        // Loopback in either family is the box's own, never the host's.
+        assert!(nameservers_in("nameserver ::1\nnameserver 127.0.0.1\n").is_empty());
         assert_eq!(
-            pick("nameserver 127.0.0.53\nnameserver 9.9.9.9\n"),
-            Some("9.9.9.9".into())
+            nameservers_in("nameserver 172.25.160.1 # wsl\n"),
+            vec!["172.25.160.1".to_string()]
         );
+    }
+
+    /// ⛔ A box in a pod must not reach the host's loopback through pasta's gateway.
+    ///
+    /// MEASURED on this desktop before the fix: a canary bound to `127.0.0.1` on the host answered a
+    /// box connecting to the gateway `192.168.1.1`, because `--config-net` copied the host's gateway
+    /// and pasta mapped it to the host's loopback. The argv must turn the mapping off AND give the
+    /// box its own network, since `--no-map-gw` on the copied address leaves the host unreachable and
+    /// a gateway resolver dead (measured too).
+    #[test]
+    fn pasta_never_maps_the_gateway_to_the_hosts_loopback() {
+        let dir = std::path::Path::new("/run/user/1000/kern/pods/demo");
+        for as_root in [false, true] {
+            let a: Vec<String> =
+                pasta_args_for(dir, 4242, true, PASTA_IF_ALONE, as_root, [10, 0, 2])
+                    .iter()
+                    .map(|x| x.to_string_lossy().into_owned())
+                    .collect();
+            assert!(a.iter().any(|x| x == "--no-map-gw"), "{a:?}");
+            let val = |flag: &str| {
+                let i = a.iter().position(|x| x == flag)?;
+                a.get(i + 1).cloned()
+            };
+            assert_eq!(val("-a").as_deref(), Some("10.0.2.15"), "{a:?}");
+            assert_eq!(val("-n").as_deref(), Some("24"), "{a:?}");
+            assert_eq!(val("-g").as_deref(), Some("10.0.2.2"), "{a:?}");
+            // The forward existed for a gateway that was the host's resolver; that gateway is gone.
+            assert!(!a.iter().any(|x| x == "--dns-forward"), "{a:?}");
+        }
+    }
+
+    /// The box's network is one no route of the host's OR of the namespace's own overlaps. A host
+    /// that is itself a slirp guest routes `10.0.2.0/24`, and a bridge member may sit on a compose
+    /// subnet; either would hide that slice of the network from the box.
+    #[test]
+    fn the_boxs_network_avoids_every_route_it_would_shadow() {
+        let head =
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+        // 192.168.1.0/24 plus a default route, which overlaps everything and must not count.
+        let desktop = format!(
+            "{head}wlp4s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+             wlp4s0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n"
+        );
+        assert_eq!(pasta_guest_net(std::slice::from_ref(&desktop)), [10, 0, 2]);
+        assert_eq!(pasta_guest_net(&[]), [10, 0, 2]);
+        // A VirtualBox guest: 10.0.2.0/24 is the host's own LAN.
+        let slirp = format!("{head}eth0\t0002000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n");
+        assert_eq!(pasta_guest_net(std::slice::from_ref(&slirp)), [10, 177, 2]);
+        // ... and the namespace's own table holds a bridge on 10.0.0.0/8: both 10.x candidates go.
+        let bridge = format!("{head}eth0\t0000000A\t00000000\t0001\t0\t0\t0\t000000FF\t0\t0\t0\n");
+        assert_eq!(pasta_guest_net(&[slirp, bridge]), [172, 31, 254]);
+        // Every candidate taken: the first, never the host's address back.
+        let all = format!(
+            "{head}eth0\t00000000\t00000000\t0001\t0\t0\t0\t00000080\t0\t0\t0\n\
+             eth1\t00000080\t00000000\t0001\t0\t0\t0\t00000080\t0\t0\t0\n"
+        );
+        assert_eq!(pasta_guest_net(&[all]), [10, 0, 2]);
     }
 
     /// ⛔ STARTED BY ROOT, pasta must be told to stay root or it becomes `nobody` and cannot enter
@@ -3058,13 +3140,13 @@ mod tests {
     fn pasta_stays_root_only_when_kern_runs_as_root() {
         let dir = std::path::Path::new("/tmp/kern-pasta-runas");
         let has_runas = |as_root: bool| {
-            let a = pasta_args_for(dir, 4242, true, PASTA_IF_ALONE, as_root);
+            let a = pasta_args_for(dir, 4242, true, PASTA_IF_ALONE, as_root, [10, 0, 2]);
             a.windows(2).any(|w| w[0] == "--runas" && w[1] == "0")
         };
         assert!(has_runas(true));
         assert!(!has_runas(false));
         // And before the namespaces it must open, which are the last arguments.
-        let a = pasta_args_for(dir, 4242, true, PASTA_IF_ALONE, true);
+        let a = pasta_args_for(dir, 4242, true, PASTA_IF_ALONE, true, [10, 0, 2]);
         let runas = a.iter().position(|x| x == "--runas").expect("runas");
         let userns = a.iter().position(|x| x == "--userns").expect("userns");
         assert!(runas < userns);

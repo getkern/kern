@@ -8884,27 +8884,3 @@ fn the_protected_homes_come_from_the_password_database_and_none_known_adopts_not
         "a repository holding a home was adopted"
     );
 }
-
-/// The default route's gateway, read the way the kernel writes `/proc/net/route`: host-order hex of
-/// network-order bytes, the default route being destination 0 with the gateway flag. A table with no
-/// default route has no gateway. (Rows from this host and from a WSL2 guest.)
-#[test]
-fn the_default_gateway_is_read_from_the_route_table() {
-    let here =
-        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
-                wlp4s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
-                wlp4s0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n";
-    assert_eq!(
-        super::default_gateway_v4(here).as_deref(),
-        Some("192.168.1.1")
-    );
-    let wsl = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
-               eth0\t00000000\t01A019AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
-    assert_eq!(
-        super::default_gateway_v4(wsl).as_deref(),
-        Some("172.25.160.1")
-    );
-    let none = "Iface\tDestination\tGateway\tFlags\n\
-                lo\t0000007F\t00000000\t0001\n";
-    assert_eq!(super::default_gateway_v4(none), None);
-}
