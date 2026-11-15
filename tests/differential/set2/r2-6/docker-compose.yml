@@ -1,0 +1,9 @@
+services:
+  stable:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+  moving:
+    image: alpine:3.20
+    environment:
+      MARK: one
+    command: ["sh", "-c", "echo START:$$MARK; sleep infinity"]

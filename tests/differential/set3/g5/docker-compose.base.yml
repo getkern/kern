@@ -1,0 +1,5 @@
+services:
+  web:
+    image: nginx:alpine
+    command: nginx -g "daemon off;"
+    restart: "no"

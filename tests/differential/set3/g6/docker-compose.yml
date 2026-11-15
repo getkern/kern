@@ -1,0 +1,8 @@
+services:
+  worker:
+    image: python:3.12-slim
+    command: python3 -c "import time; time.sleep(30)"
+    stop_signal: SIGINT
+    stop_grace_period: 5s
+    init: true
+    restart: "no"

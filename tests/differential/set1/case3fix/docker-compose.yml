@@ -1,0 +1,10 @@
+services:
+  ssh:
+    build: ./sshd
+    ports:
+      - "2222:22"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep sshd >/dev/null"]
+      interval: 1s
+      timeout: 2s
+      retries: 30

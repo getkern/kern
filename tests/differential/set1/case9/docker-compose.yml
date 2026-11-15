@@ -1,0 +1,28 @@
+services:
+  graceful:
+    image: alpine:3.20
+    stop_grace_period: 3s
+    volumes:
+      - ./data:/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+        trap 'echo BYE > /data/graceful_bye; exit 0' TERM
+        echo STARTED > /data/graceful_started
+        while true; do sleep 0.2; done
+  stubborn:
+    image: alpine:3.20
+    stop_grace_period: 2s
+    volumes:
+      - ./data:/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+        trap '' TERM
+        echo STUBBORN_STARTED > /data/stubborn_started
+        while true; do sleep 0.2; done
+  slow-start:
+    image: alpine:3.20
+    command: ["sh", "-c", "echo SLOW_BOOT; sleep 20; echo SLOW_DONE"]

@@ -1,0 +1,16 @@
+services:
+  ml-trainer:
+    image: kern-torch:test
+    command: python3 -c "import torch; print('CUDA_AVAILABLE:', torch.cuda.is_available()); print('DEVICE_COUNT:', torch.cuda.device_count())"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: "no"
+  cpu-worker:
+    image: alpine:3.18
+    command: echo "CPU only"
+    restart: "no"

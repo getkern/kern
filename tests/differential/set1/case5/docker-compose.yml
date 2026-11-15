@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: test
+      POSTGRES_USER: test
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d app"]
+      interval: 1s
+      timeout: 3s
+      retries: 40
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  test:
+    image: python:3.12-slim
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: test
+      PGPASSWORD: test
+      PGDATABASE: app
+      REDIS: cache
+    command:
+      - python
+      - -c
+      - |
+        import os, socket, struct, sys
+        # redis PING
+        s = socket.create_connection((os.environ["REDIS"], 6379), 5)
+        s.sendall(b"PING\r\n"); assert s.recv(16).startswith(b"+PONG"); s.close()
+        # postgres startup packet minimal: use TCP + wait for ready via simple connect loop
+        import time
+        import subprocess, textwrap, tempfile, pathlib
+        # psycopg not guaranteed - use pure TCP check that port accepts + redis already ok
+        for i in range(30):
+            try:
+                c = socket.create_connection((os.environ["PGHOST"], 5432), 2)
+                c.close()
+                break
+            except OSError:
+                time.sleep(0.2)
+        else:
+            raise SystemExit("pg unreachable")
+        print("CI_OK")
+        sys.exit(0)

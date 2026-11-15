@@ -1,0 +1,29 @@
+services:
+  io:
+    image: alpine:3.20
+    mem_limit: 128m
+    pids_limit: 20
+    tmpfs:
+      - /tmp:size=1048576
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set +e
+        # binary stdout
+        printf 'BIN\x00\x01END\n'
+        # ~1 MiB single write to stdout (long "line")
+        dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\0' 'B'
+        echo
+        # fill tmpfs (1 MiB) - must fail
+        dd if=/dev/zero of=/tmp/fill bs=1024 count=2048 2>/tmp/dd.err
+        if [ $? -eq 0 ]; then echo TMPFS_NOT_ENFORCED; exit 11; else echo TMPFS_FULL_OK; fi
+        # exhaust pids
+        i=0
+        while [ $i -lt 50 ]; do
+          sleep 30 &
+          i=$((i+1))
+        done
+        wait 2>/tmp/wait.err
+        echo PIDS_DONE
+        exit 0

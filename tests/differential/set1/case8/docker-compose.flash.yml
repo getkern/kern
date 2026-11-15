@@ -1,0 +1,9 @@
+services:
+  flash:
+    image: alpine:3.20
+    command: ["sh", "-c", "echo FLASH_OK; exit 0"]
+  watcher:
+    image: alpine:3.20
+    depends_on:
+      - flash
+    command: ["sh", "-c", "echo WATCHER_OK"]

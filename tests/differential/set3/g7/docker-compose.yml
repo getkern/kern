@@ -1,0 +1,11 @@
+services:
+  tuner:
+    image: alpine:3.18
+    command: sh -c "sysctl net.core.somaxconn && ulimit -n"
+    ulimits:
+      nofile:
+        soft: 2048
+        hard: 4096
+    sysctls:
+      net.core.somaxconn: "1024"
+    restart: "no"

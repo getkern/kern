@@ -1,0 +1,16 @@
+services:
+  migration:
+    image: alpine:3.18
+    command: sh -c "echo 'Running DB migrations...'; exit 3"
+    restart: "no"
+  test-runner:
+    image: alpine:3.18
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+    command: sh -c "echo 'Should not reach here'; exit 0"
+    restart: "no"
+  helper:
+    image: alpine:3.18
+    command: sleep 60
+    restart: "no"

@@ -1,0 +1,16 @@
+services:
+  app.v1:
+    image: alpine:3.20
+    user: "12345:12345"
+    volumes:
+      - ./link-out:/data:ro
+      - ./inside.txt:/inside.txt:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        grep -q OUTSIDE /data/outside.txt && echo SYMLINK_BIND_OK
+        grep -q INSIDE /inside.txt && echo OTHER_UID_READ_OK
+        id -u | grep -q 12345 && echo RUN_AS_OK
+        exit 0

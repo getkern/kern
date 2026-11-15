@@ -1,0 +1,16 @@
+services:
+  never-healthy:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD", "false"]
+      interval: 1s
+      timeout: 1s
+      retries: 3
+      start_period: 0s
+  dependent:
+    image: alpine:3.20
+    depends_on:
+      never-healthy:
+        condition: service_healthy
+    command: ["echo", "SHOULD_NOT_RUN"]

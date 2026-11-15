@@ -1,0 +1,13 @@
+services:
+  svc-1:
+    image: alpine:3.18
+    command: sleep 10
+    restart: "no"
+  svc-2:
+    image: alpine:3.18
+    command: sleep 10
+    restart: "no"
+  my.service-app_v1:
+    image: alpine:3.18
+    command: sleep 10
+    restart: "no"

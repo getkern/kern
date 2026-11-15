@@ -1,0 +1,4 @@
+services:
+  bad:
+    image: alpine:3.20
+    command: ["this-binary-does-not-exist-xyz"]

@@ -1,0 +1,64 @@
+services:
+  front:
+    image: nginx:alpine
+    ports:
+      - "18081:80"
+    networks: [public]
+    volumes:
+      - ./front.conf:/etc/nginx/conf.d/default.conf:ro
+  back:
+    image: python:3.12-slim
+    networks: [public, private]
+    command:
+      - python
+      - -c
+      - |
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = b"BACK_OK"
+                self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+        HTTPServer(("0.0.0.0", 9000), H).serve_forever()
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/')"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  sidecar:
+    image: alpine:3.20
+    network_mode: "service:back"
+    depends_on:
+      back:
+        condition: service_healthy
+    command: ["sleep", "infinity"]
+  locked:
+    image: alpine:3.20
+    networks: [private]
+    command: ["sleep", "infinity"]
+  probe:
+    image: alpine:3.20
+    networks: [public]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      back:
+        condition: service_healthy
+      front:
+        condition: service_started
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        wget -q -O - http://back:9000/ | grep -q BACK_OK && echo REACH_BACK_OK
+        wget -q -O - http://front:80/ | grep -q FRONT_OK && echo REACH_FRONT_OK
+        # private-only service name must NOT resolve on public net
+        if wget -q -O - http://locked:1/ 2>/dev/null; then echo LOCKED_REACHABLE; exit 1; else echo LOCKED_ISOLATED; fi
+        # host-gateway entry exists
+        getent hosts host.docker.internal && echo HOST_GATEWAY_OK
+        exit 0
+networks:
+  public:
+  private:
+    internal: true

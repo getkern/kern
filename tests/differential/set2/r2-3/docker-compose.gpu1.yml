@@ -1,0 +1,21 @@
+services:
+  torch:
+    image: kern-torch:test
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    command:
+      - python3
+      - -c
+      - |
+        import torch, sys
+        assert torch.cuda.is_available()
+        assert torch.cuda.device_count() >= 1
+        print("GPU_OK", torch.cuda.current_device(), torch.cuda.get_device_name(0))
+        sys.stdout.flush()

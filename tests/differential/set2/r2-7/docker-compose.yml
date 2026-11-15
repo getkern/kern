@@ -1,0 +1,10 @@
+services:
+  web.api:
+    image: nginx:alpine
+    ports:
+      - "18088:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

@@ -1,0 +1,34 @@
+services:
+  proxy:
+    image: nginx:alpine
+    networks:
+      - public-net
+    extra_hosts:
+      - "custom.internal:127.0.0.1"
+    restart: "no"
+  app:
+    image: alpine:3.18
+    command: sh -c "while true; do sleep 1; done"
+    networks:
+      - public-net
+      - private-net
+    hostname: app-node-1
+    networks_advanced:
+      aliases:
+        - backend-alias
+    restart: "no"
+  db:
+    image: redis:7-alpine
+    networks:
+      - private-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 2s
+    restart: "no"
+networks:
+  public-net:
+  private-net:
+    internal: true

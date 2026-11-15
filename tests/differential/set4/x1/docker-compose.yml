@@ -1,0 +1,18 @@
+services:
+  writer:
+    image: alpine:3.18
+    user: "1000:1000"
+    command: sh -c "echo 'hello from user 1000' > /shared/test.txt"
+    volumes:
+      - ./shared_data:/shared
+    restart: "no"
+  reader:
+    image: alpine:3.18
+    user: "2000:2000"
+    command: cat /shared/test.txt
+    volumes:
+      - ./shared_data:/shared
+    depends_on:
+      writer:
+        condition: service_completed_successfully
+    restart: "no"

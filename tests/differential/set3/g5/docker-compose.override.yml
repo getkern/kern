@@ -1,0 +1,6 @@
+services:
+  web:
+    profiles:
+      - frontend
+    environment:
+      - APP_ENV=${APP_ENV:-production}

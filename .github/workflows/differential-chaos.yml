@@ -1,0 +1,48 @@
+name: Kern Differential Chaos CI
+
+# Every case of the differential suite, run 1:1 with Docker and with kern on one machine.
+#
+# workflow_dispatch only: the job needs a self-hosted runner with a GPU, Docker and the NVIDIA
+# container toolkit. On push or pull_request a job for a runner that is not registered waits in
+# the queue indefinitely, on every commit.
+on:
+  workflow_dispatch:
+
+jobs:
+  chaos-tests:
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build and install kern
+        run: |
+          cargo build --release -p getkern --bin kern
+          mkdir -p "$HOME/.local/bin"
+          install -m 755 target/release/kern "$HOME/.local/bin/kern"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # kern reads a GPU grant only from the operator's own config or its command line, never from
+      # an environment variable. A config scoped to this job grants GPUs and nothing else.
+      - name: Grant GPUs to compose files for this job
+        run: |
+          mkdir -p "$RUNNER_TEMP/kern-config/kern"
+          printf '[kern]\nallow_gpu_grants = true\n' > "$RUNNER_TEMP/kern-config/kern/kern.toml"
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/kern-config" >> "$GITHUB_ENV"
+
+      - name: Run Differential Chaos Suite
+        env:
+          CHAOS_ROOT: ${{ github.workspace }}/tests/differential
+          CHAOS_WORK: ${{ runner.temp }}/chaos-work
+          KERN_GPU_GRANT: config
+        run: |
+          chmod +x tests/differential/run-chaos.sh
+          tests/differential/run-chaos.sh
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-report
+          path: ${{ runner.temp }}/chaos-work/report.txt

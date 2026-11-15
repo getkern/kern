@@ -1,0 +1,38 @@
+services:
+  dbdata:
+    image: alpine:3.20
+    volumes:
+      - pgdata:/data
+      - "./bind dir:/bind:ro"
+    secrets:
+      - app_secret
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo vol > /data/marker
+        cat /run/secrets/app_secret | grep -q 'sekrit' && echo SECRET_OK
+        cat "/bind/hello.txt" | grep -q 'BIND_OK' && echo BIND_OK
+        # listen only on loopback inside container
+        nc -l -p 9999 -s 127.0.0.1 >/tmp/nc.log 2>&1 &
+        sleep 2
+        echo loopback-open > /data/ready
+        sleep infinity
+  loopback-publish-attempt:
+    # binds container port that exists only on 127.0.0.1 inside peer - should not be reachable via published host port from outside the namespace
+    image: alpine:3.20
+    network_mode: "service:dbdata"
+    command: ["sleep", "infinity"]
+  writer:
+    image: alpine:3.20
+    volumes:
+      - pgdata:/data
+    depends_on:
+      - dbdata
+    command: ["sh", "-c", "while [ ! -f /data/ready ]; do sleep 0.2; done; echo WRITER_SEES_MARKER $$(cat /data/marker)"]
+volumes:
+  pgdata:
+secrets:
+  app_secret:
+    file: ./app_secret.txt

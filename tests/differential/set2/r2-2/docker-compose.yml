@@ -1,0 +1,27 @@
+services:
+  seed:
+    image: alpine:3.20
+    volumes:
+      - pgdata:/data
+      - "./bind dir:/bind:ro"
+    secrets:
+      - app_secret
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo vol-marker > /data/marker
+        grep -q sekrit /run/secrets/app_secret && echo SECRET_OK
+        grep -q BIND_OK /bind/hello.txt && echo BIND_OK
+        sleep infinity
+  inspector:
+    image: alpine:3.20
+    volumes:
+      - pgdata:/data
+    entrypoint: ["cat", "/data/marker"]
+volumes:
+  pgdata:
+secrets:
+  app_secret:
+    file: ./app_secret.txt

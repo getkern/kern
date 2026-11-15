@@ -1,0 +1,15 @@
+services:
+  sandbox:
+    image: python:3.11-alpine
+    command: python3 -c "import os; print('EUID:', os.geteuid()); print('CHECK_COMPLETE')"
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+    mem_limit: 128m
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"

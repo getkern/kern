@@ -1,0 +1,15 @@
+services:
+  loop:
+    image: python:3.12-slim
+    ports:
+      - "18099:8099"
+    command:
+      - python
+      - -c
+      - |
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers(); self.wfile.write(b"LOOP_OK")
+            def log_message(self, *a): pass
+        HTTPServer(("127.0.0.1", 8099), H).serve_forever()

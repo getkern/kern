@@ -1,0 +1,17 @@
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - target: 80
+        published: 18086
+        host_ip: "::"
+        protocol: tcp
+      - target: 80
+        published: 18087
+        host_ip: "::1"
+        protocol: tcp
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

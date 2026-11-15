@@ -1,0 +1,11 @@
+services:
+  sandbox:
+    image: python:3.12-slim
+    network_mode: "none"
+    mem_limit: 64m
+    pids_limit: 64
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    working_dir: /tmp
+    user: "65534:65534"

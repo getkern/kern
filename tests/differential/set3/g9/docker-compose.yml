@@ -1,0 +1,5 @@
+services:
+  ops:
+    image: alpine:3.18
+    command: sh -c "echo 'initial' > /tmp/test.txt && while true; do sleep 1; done"
+    restart: "no"

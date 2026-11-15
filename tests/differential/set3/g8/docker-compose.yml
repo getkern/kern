@@ -1,0 +1,5 @@
+services:
+  flaky:
+    image: alpine:3.18
+    command: sh -c "echo 'failing'; exit 1"
+    restart: "on-failure:3"

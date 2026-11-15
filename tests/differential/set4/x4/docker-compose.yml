@@ -1,0 +1,6 @@
+services:
+  memory-hog:
+    image: alpine:3.18
+    mem_limit: 32m
+    command: sh -c "awk 'BEGIN { while(1) { a[i++] = \"OOM_BOMB_STRING_ALLOCATION_\" } }'"
+    restart: "no"
