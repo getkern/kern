@@ -192,6 +192,16 @@ IPC". `kern box --ipc shareable` and `--ipc container:<box>` do the same for two
 port of the range that is free on every address it binds, picked at start, and a box finding the whole
 range taken is refused with Docker's "port is already allocated".
 
+**`up --scale SERVICE=N`, `scale:` and `deploy.replicas` run one box per replica.** kern refused
+`--scale` and warned that it ran one box per service. Replica 1 keeps the service's box name and
+replica N is `<project>-<service>-N`, each with its own network namespace, address and ports (a host
+port range gives each a port of it, a `"80"` each a random one, one fixed host port is refused with
+Docker's "port is already allocated"); the replicas start one after another. `ps`, `logs`, `stop` and
+`down` naming the service reach every replica, `port --index N` and `exec --index N` reach one, and an
+`up` without `--scale` brings the service back to the file's count, stopping the replicas above it, as
+Docker's does. A replicated service's name resolves to replica 1 (Docker's DNS answers any of them),
+and `container_name` cannot be scaled.
+
 **`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
 before anything runs, where `""` first built a bytecode cache for an empty reference. An empty

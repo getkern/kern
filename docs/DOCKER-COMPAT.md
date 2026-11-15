@@ -471,6 +471,12 @@ IPC namespace, and kern says so when the box starts. What those examples want fr
 `/dev/shm` (docker gives 64 MB by default and the host's with `--ipc=host`); a box's is sized to its
 `--memory` cap, and `--shm-size` sets it.
 
+**Replicas** (`up --scale web=3`, `scale:`, `deploy.replicas`) are one box each: `<project>-web`,
+`<project>-web-2`, `<project>-web-3`, with their own addresses and ports, a host port range handing
+each a port of it. A command naming the service reaches every replica, `port --index` and `exec
+--index` one. The difference from Docker is the name: the service's name resolves to replica 1, where
+Docker's DNS answers with any of them, so a client wanting to spread its connections names the replicas.
+
 **Shared IPC between services** works as Docker's: `ipc: shareable` on one service and `ipc:
 "service:<it>"` on another put the second in the first's IPC namespace with the same `/dev/shm`
 (`kern box --ipc shareable` and `--ipc container:<box>`). As under Docker, the donor must be
