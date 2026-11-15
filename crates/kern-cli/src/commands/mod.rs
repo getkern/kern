@@ -255,6 +255,8 @@ pub struct BoxRunArgs<'a> {
     pub share_net: bool,
     /// `--pod <name>`: join this pod's shared network (created by `kern pod create`).
     pub pod: Option<&'a str>,
+    /// `--network container:<box>`: live in that running box's network namespace.
+    pub net_container: Option<&'a str>,
     pub uid_range: bool,
     /// `--no-uid-range`: opt OUT of the range mapping an `--image` box gets by default.
     pub no_uid_range: bool,
@@ -1332,6 +1334,8 @@ struct BuildSpec<'a> {
     read_only: bool,
     landlock_rw: Vec<String>,
     net_ips: Vec<std::net::Ipv4Addr>,
+    /// See [`kern_isolation::SandboxSpec::box_addr`].
+    box_addr: bool,
     pod_bridges: Vec<kern_isolation::BridgeAttach>,
     apparmor: Option<String>,
     volumes: Vec<Volume>,
@@ -1657,6 +1661,7 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         read_only: b.read_only,
         landlock_rw: b.landlock_rw,
         net_ips: b.net_ips,
+        box_addr: b.box_addr,
         pod_bridges: b.pod_bridges,
         apparmor: b.apparmor,
         command: b.cmd,
@@ -6097,6 +6102,8 @@ fn declared_container_ports(b: &crate::compose::ComposeBox) -> Vec<(u16, bool)> 
             crate::ports::parse(spec)
                 .unwrap_or_default()
                 .into_iter()
+                // One entry per box port: the IPv6 twin of a default bind is the same box port.
+                .filter(|m| !m.implicit)
                 .map(|m| (m.box_port, m.udp))
         }))
         .collect()
@@ -6196,17 +6203,10 @@ enum Reconcile {
     Recreate,
 }
 
-/// `a.b.c.d:port` from a published mapping's host side, which is the shape `docker port` prints and
-/// the shape a caller substitutes straight into a URL.
+/// `a.b.c.d:port` or `[v6]:port` from a published mapping's host side, which is the shape `docker
+/// port` prints and the shape a caller substitutes straight into a URL.
 fn published_address(m: &kern_isolation::PortMap) -> String {
-    format!(
-        "{}.{}.{}.{}:{}",
-        m.bind_ip >> 24 & 0xff,
-        m.bind_ip >> 16 & 0xff,
-        m.bind_ip >> 8 & 0xff,
-        m.bind_ip & 0xff,
-        m.host
-    )
+    crate::ports::host_side(m)
 }
 
 /// The one mapping a caller means by a bare container port.
@@ -6455,7 +6455,7 @@ const DRY_RUN_REFUSAL_EXCEPTIONS: [&str; 1] = ["device grants (config reports, b
 /// and bound `0.0.0.0` without a word. An absent config is not this case and never was: `load`
 /// returns the defaults for a file that does not exist, so an `Err` here is always a file the
 /// operator wrote and kern could not read.
-pub(crate) fn publish_policy() -> Result<Option<u32>, String> {
+pub(crate) fn publish_policy() -> Result<Option<std::net::IpAddr>, String> {
     let cfg = crate::config::load_cached(None)?;
     Ok(match cfg.kern.publish_bind.as_deref() {
         Some("127.0.0.1") => Some(crate::ports::LOOPBACK_IP),
@@ -6470,18 +6470,31 @@ pub(crate) fn publish_policy() -> Result<Option<u32>, String> {
 ///
 /// SEPARATED FROM THE POLICY LOOKUP so the decision can be asserted without a `kern.toml` on disk:
 /// a function that both reads the filesystem and rewrites its argument can be checked by nothing.
+///
+/// BOTH FAMILIES ARE HELD TO IT: an IPv4 map takes the policy address and an IPv6 one takes its twin
+/// (`127.0.0.1` -> `::1`, `0.0.0.0` -> `::`), so a loopback policy cannot be walked around through
+/// `[::]:8080:80`. The count is of the specs the operator could have written, so a default bind's
+/// IPv6 twin moving with its IPv4 half is not counted twice.
 pub(crate) fn apply_publish_policy(
     ports: &mut [kern_isolation::PortMap],
-    policy: Option<u32>,
+    policy: Option<std::net::IpAddr>,
 ) -> usize {
     let Some(ip) = policy else {
         return 0;
     };
+    let v6 = crate::ports::ipv6_twin(ip);
     let mut moved = 0;
     for p in ports.iter_mut() {
-        if p.bind_ip != ip {
-            p.bind_ip = ip;
-            moved += 1;
+        let want = if p.bind.is_ipv6() {
+            v6.unwrap_or(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        } else {
+            ip
+        };
+        if p.bind != want {
+            p.bind = want;
+            if !p.implicit {
+                moved += 1;
+            }
         }
     }
     moved
@@ -6571,15 +6584,19 @@ fn respell_port_spec(spec: &str, hosts: &[u16]) -> Option<Vec<String>> {
         }
         _ => (spec, String::new()),
     };
-    // Three parts means an explicit `ip:`; two means the caller's policy decides, and it must keep
+    // Everything before the last two fields is the address as written (`[::1]`, `0.0.0.0`, or
+    // nothing), copied as text; no address means the caller's policy decides, and it must keep
     // deciding.
-    let ip = match head.split(':').collect::<Vec<_>>().as_slice() {
-        [ip, _, _] => format!("{ip}:"),
-        _ => String::new(),
+    let ip = match head.rsplitn(3, ':').nth(2) {
+        Some(ip) => format!("{ip}:"),
+        None => String::new(),
     };
+    // One respelled spec per WRITTEN mapping: the IPv6 twin of a default bind is re-created by the
+    // parser from the respelled spec, so emitting it too would publish it twice.
     Some(
         pms.iter()
             .zip(hosts)
+            .filter(|(pm, _)| !pm.implicit)
             .map(|(pm, host)| format!("{ip}{host}:{}{proto}", pm.box_port))
             .collect(),
     )
@@ -8513,15 +8530,47 @@ pub(crate) fn tear_down_stack_keeping(
 struct PortSlot<'a> {
     wildcard: Option<&'a str>,
     first_specific: Option<&'a str>,
-    specific: std::collections::HashMap<u32, &'a str>,
+    specific: std::collections::HashMap<std::net::IpAddr, &'a str>,
+}
+
+/// Every published spec that does not parse, named with its service, ALL of them in one refusal
+/// (fixing them one error per run is a poor loop), with the same parser the box uses.
+///
+/// RUN BY `up` AS WELL AS `config`. It was `config`'s alone, so `up` left a bad spec to the box that
+/// carried it: the pod was created, the box was refused with `kern -p`'s usage line, and the pod was
+/// removed again. Docker refuses the file before creating anything (measured: `ports: ["::443:443"]`
+/// answers `invalid IP address: :`), and so does this.
+fn port_spec_problems(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error> {
+    let bad: Vec<String> = boxes
+        .iter()
+        .flat_map(|b| {
+            b.ports
+                .iter()
+                .filter(|spec| crate::ports::parse(spec).is_none())
+                // NAME THE REASON WHEN IT IS KNOWN: an address that is not one is refused in
+                // Docker's words, so the reader looks at the address and not at the ports.
+                .map(move |spec| match crate::ports::written_address(spec) {
+                    Err(ip) => format!("  {}: port '{spec}' - invalid IP address: {ip}", b.name),
+                    Ok(_) => format!("  {}: invalid port '{spec}'", b.name),
+                })
+        })
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Compose(format!(
+        "{} invalid port spec(s) - expected [ip:]host:box[/tcp|/udp], ports 1-65535:\n{}",
+        bad.len(),
+        bad.join("\n")
+    )))
 }
 
 /// Pre-flight for `compose up`: reject two published mappings that would fight for the SAME host port.
 ///
 /// Reuses the verified spec parser ([`crate::ports::parse`]) so range/`ip:host:box`/`/udp` forms are
 /// interpreted exactly as at box-start. Two mappings conflict when they share protocol and host port
-/// AND their bind addresses overlap - identical, or either bound to `0.0.0.0` (`bind_ip == 0`), which
-/// subsumes any specific address.
+/// AND their bind addresses overlap - identical, or either bound to the family's wildcard (`0.0.0.0`,
+/// `::`), which subsumes any specific address of that family.
 ///
 /// LINEAR in the number of published mappings, by bucketing on `(host, udp)` and hashing the bind
 /// address inside each bucket. The obvious pairwise form is quadratic, and that is NOT academic here:
@@ -8530,15 +8579,18 @@ struct PortSlot<'a> {
 /// a single box started (10/20/40 services = 0.7/2.7/10.5 s, textbook x4-per-doubling). Bucketing
 /// makes the same file ~40 ms.
 ///
-/// Panic-free (`Result` throughout); an unparseable spec is left for the per-box path to report, not
-/// silently treated as a conflict.
+/// Panic-free (`Result` throughout). An unparseable spec is refused first, by
+/// [`port_spec_problems`], so it is never silently treated as a conflict or as no conflict.
 ///
 /// On the protocol dimension: the compose parser (`ports_value`) already STRIPS the `/tcp` suffix and
 /// drops non-TCP entries with a warning, so specs arriving here are always TCP today. Bucketing on
 /// `(host, udp)` anyway keeps this faithful to `ports::parse`'s contract - the day kern publishes UDP,
 /// a `udp/8080` and a `tcp/8080` won't be conflated into a bogus conflict.
 fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Error> {
-    let mut slots: std::collections::HashMap<(u16, bool), PortSlot> =
+    port_spec_problems(boxes)?;
+    // KEYED BY FAMILY TOO: an IPv6 listener is IPv6 only, so `0.0.0.0:8080` and `[::]:8080` are two
+    // binds that never collide, and a default bind's pair is one claim per family.
+    let mut slots: std::collections::HashMap<(u16, bool, bool), PortSlot> =
         std::collections::HashMap::new();
     for b in boxes {
         // The name the file uses, for the same reason as in `check_pod_global_conflicts`.
@@ -8548,12 +8600,14 @@ fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Err
                 continue;
             };
             for pm in pms {
-                let slot = slots.entry((pm.host, pm.udp)).or_default();
+                let slot = slots
+                    .entry((pm.host, pm.udp, pm.bind.is_ipv6()))
+                    .or_default();
                 // Who (if anyone) already holds an address overlapping this one on this port+proto.
                 let prior = match slot.wildcard {
                     Some(w) => Some(w), // 0.0.0.0 is already taken: everything here conflicts
-                    None if pm.bind_ip == 0 => slot.first_specific, // we ARE the wildcard
-                    None => slot.specific.get(&pm.bind_ip).copied(), // exact same address
+                    None if pm.bind.is_unspecified() => slot.first_specific, // we ARE the wildcard
+                    None => slot.specific.get(&pm.bind).copied(), // exact same address
                 };
                 if let Some(other) = prior {
                     let proto = if pm.udp { "udp" } else { "tcp" };
@@ -8572,10 +8626,10 @@ fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Err
                         "{who}. Only one process can bind a host port; give each a distinct one."
                     )));
                 }
-                if pm.bind_ip == 0 {
+                if pm.bind.is_unspecified() {
                     slot.wildcard = Some(name);
                 } else {
-                    slot.specific.insert(pm.bind_ip, name);
+                    slot.specific.insert(pm.bind, name);
                     slot.first_specific.get_or_insert(name);
                 }
             }
@@ -8771,43 +8825,8 @@ fn run_terminal_verb(
                     return Err(Error::Compose(msg));
                 }
             }
-            // Validate every published spec HERE, with the same parser the box uses. `config` is the
-            // verb people run to check a file, so a typo must surface without starting anything (as
-            // `docker compose config` does) instead of failing one box at bring-up. ALL bad specs are
-            // reported together: fixing them one error per run is a poor loop.
-            let bad: Vec<String> = boxes
-                .iter()
-                .flat_map(|b| {
-                    b.ports
-                        .iter()
-                        .filter(|spec| crate::ports::parse(spec).is_none())
-                        // NAME THE REASON WHEN IT IS KNOWN. An IPv6 or empty bind address is not a
-                        // typo, it is a feature kern does not have, and "invalid port spec" sends the
-                        // reader hunting for a mistake that is not in the line. Measured on a
-                        // 240-file corpus: mailcow's `${HTTPS_BIND:-:}:443:443` expands to
-                        // `::443:443` and cost an author a spec-by-spec bisection of fourteen ports.
-                        .map(move |spec| {
-                            if crate::ports::names_ipv6_or_empty_bind(spec) {
-                                format!(
-                                    "  {}: port '{spec}' - kern publishes on IPv4 only, so an IPv6 \
-                                     or empty bind address cannot be expressed; use \
-                                     `0.0.0.0:HOST:BOX` for every interface or `127.0.0.1:HOST:BOX` \
-                                     for loopback",
-                                    b.name
-                                )
-                            } else {
-                                format!("  {}: invalid port '{spec}'", b.name)
-                            }
-                        })
-                })
-                .collect();
-            if !bad.is_empty() {
-                return Err(Error::Compose(format!(
-                    "{} invalid port spec(s) - expected [ip:]host:box[/tcp|/udp], ports 1-65535:\n{}",
-                    bad.len(),
-                    bad.join("\n")
-                )));
-            }
+            // Every published spec was validated by `check_port_collisions` above, which `up` runs
+            // too, so a typo is refused by name before anything starts in either verb.
             // `tmpfs:` GOES THROUGH THE SAME PARSER, for the same reason as `ports:` above and with
             // the same words in front of it: `config` exists so a file can be checked without
             // starting anything. It was not checked, and the gap has a name.

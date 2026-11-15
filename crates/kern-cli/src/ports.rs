@@ -1,12 +1,14 @@
 //! `-p [ip:]host:box` parsing. The forwarder itself lives in `kern_isolation` (it must fork before
 //! the sandbox `unshare`, where only the isolation crate has the host-namespace context).
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 /// Longest port range a single `-p` may expand to - a guard so `-p 1-65535:…` can't fork tens of
 /// thousands of forwarder processes.
 const MAX_RANGE: usize = 1024;
 
 /// The host address a spec with no explicit `ip:` binds: **`0.0.0.0`**, every interface, which is what
-/// Docker does.
+/// Docker does. Its IPv6 twin `::` is bound beside it (see [`ipv6_twin`]), as Docker binds both.
 ///
 /// IT USED TO BE `127.0.0.1`, and that was the single largest source of behavioural difference from
 /// Docker in this project. MEASURED on a NEUTRAL corpus of 259 compose files, one per repository,
@@ -22,18 +24,73 @@ const MAX_RANGE: usize = 1024;
 /// also how the same wish is written under Docker. What changed is which of the two a file gets when
 /// it says nothing, and "what it says under Docker" is the answer that cannot surprise anyone
 /// reading the file.
-pub const PUBLISH_DEFAULT_IP: u32 = 0x0000_0000;
+pub const PUBLISH_DEFAULT_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
 /// The loopback address, for a caller that configures the narrower policy.
-pub const LOOPBACK_IP: u32 = 0x7f00_0001;
+pub const LOOPBACK_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// The IPv6 address bound beside an IPv4 DEFAULT: `::` beside `0.0.0.0`, `::1` beside `127.0.0.1`.
+/// `None` for any other address, which has no IPv6 meaning of its own.
+///
+/// MEASURED on Docker 29 on this repository's development machine: `docker run -p 18448:80` and
+/// `-p :18444:80` both answer `docker port` with `0.0.0.0:<port>` AND `[::]:<port>`, while
+/// `-p 0.0.0.0:18447:80` answers with the IPv4 line only. So the twin belongs to a spec that names
+/// no address, and never to one that names `0.0.0.0`.
+#[must_use]
+pub fn ipv6_twin(v4: IpAddr) -> Option<IpAddr> {
+    match v4 {
+        IpAddr::V4(a) if a.is_unspecified() => Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        IpAddr::V4(a) if a.is_loopback() => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        _ => None,
+    }
+}
 
 /// Parse a `-p` spec: `[ip:]hostport:boxport[/tcp|/udp]`, where either port may be a `START-END` RANGE
-/// (e.g. `8000-8010:9000-9010`). Ports are 1..=65535. The optional leading IPv4 is the host bind
-/// address; without one it is [`PUBLISH_DEFAULT_IP`]. A trailing `/tcp` (default) or `/udp` selects the
-/// protocol. Returns the EXPANDED list of [`PortMap`]s (one for a single port, N for a range); `None`
+/// (e.g. `8000-8010:9000-9010`). Ports are 1..=65535. The optional leading address is the host bind
+/// address, either family; without one it is [`PUBLISH_DEFAULT_IP`] plus its IPv6 twin. A trailing
+/// `/tcp` (default) or `/udp` selects the protocol. Returns the EXPANDED list of [`PortMap`]s; `None`
 /// if malformed, if the host/box ranges differ in length, or if the range exceeds [`MAX_RANGE`].
+///
+/// [`PortMap`]: kern_isolation::PortMap
 pub fn parse(spec: &str) -> Option<Vec<kern_isolation::PortMap>> {
     parse_with_default(spec, PUBLISH_DEFAULT_IP)
+}
+
+/// The address a spec WROTE, as Docker's parser reads it: the last `:` field is the box port, the one
+/// before it the host port, and EVERYTHING before those is the address, with brackets optional
+/// (`[::1]`, `::1`). `Ok(None)` when no address was written (`8080:80`) or it is empty (`:8080:80`),
+/// both of which Docker treats as "no address" (measured: both bind `0.0.0.0` and `[::]`).
+/// `Err(text)` names an address that is not one: Docker refuses `::8080:80` with
+/// `invalid IP address: :`, and so does this.
+pub fn written_address(spec: &str) -> Result<Option<IpAddr>, String> {
+    let head = strip_proto(spec).map_or(spec, |(h, _)| h);
+    let parts: Vec<&str> = head.split(':').collect();
+    if parts.len() < 3 {
+        return Ok(None);
+    }
+    let ip = parts
+        .get(..parts.len() - 2)
+        .map(|p| p.join(":"))
+        .unwrap_or_default();
+    let bare = ip
+        .strip_prefix('[')
+        .and_then(|i| i.strip_suffix(']'))
+        .unwrap_or(&ip);
+    if bare.is_empty() {
+        return Ok(None);
+    }
+    bare.parse::<IpAddr>().map(Some).map_err(|_| ip.clone())
+}
+
+/// The protocol suffix: `Some((head, udp))` for `…/tcp` or `…/udp`, `None` when there is none, and a
+/// head of `""` for any other suffix, which no spec can parse.
+fn strip_proto(spec: &str) -> Option<(&str, bool)> {
+    match spec.rsplit_once('/') {
+        Some((head, p)) if p.eq_ignore_ascii_case("udp") => Some((head, true)),
+        Some((head, p)) if p.eq_ignore_ascii_case("tcp") => Some((head, false)),
+        Some(_) => Some(("", false)),
+        None => None,
+    }
 }
 
 /// [`parse`], with the bind address a spec without an explicit `ip:` should get.
@@ -44,20 +101,22 @@ pub fn parse(spec: &str) -> Option<Vec<kern_isolation::PortMap>> {
 /// is refused on the same grounds whatever the local configuration is. A process-global would make
 /// the answer depend on an assignment invisible from the call site, which is the defect class this
 /// codebase keeps paying for.
-pub fn parse_with_default(spec: &str, default_ip: u32) -> Option<Vec<kern_isolation::PortMap>> {
-    // Optional trailing protocol: `…/udp` or `…/tcp` (anything else is a malformed spec, not silent tcp).
-    let (spec, udp) = match spec.rsplit_once('/') {
-        Some((head, p)) if p.eq_ignore_ascii_case("udp") => (head, true),
-        Some((head, p)) if p.eq_ignore_ascii_case("tcp") => (head, false),
-        Some(_) => return None,
-        None => (spec, false),
-    };
-    let parts: Vec<&str> = spec.split(':').collect();
-    let (ip, h, b) = match parts.as_slice() {
-        [h, b] => (default_ip, *h, *b), // no `ip:` written: the caller's policy decides
-        [ip, h, b] => (parse_ipv4(ip)?, *h, *b),
-        _ => return None,
-    };
+///
+/// An unwritten address expands to the default AND its IPv6 twin, the twin marked
+/// [`implicit`](kern_isolation::PortMap::implicit) so a host without IPv6 can drop it (Docker
+/// does). A written one is exactly that address.
+pub fn parse_with_default(spec: &str, default_ip: IpAddr) -> Option<Vec<kern_isolation::PortMap>> {
+    let (head, udp) = strip_proto(spec).unwrap_or((spec, false));
+    if head.is_empty() {
+        return None; // a protocol other than tcp/udp: malformed, never silent tcp
+    }
+    let parts: Vec<&str> = head.split(':').collect();
+    let n = parts.len();
+    if n < 2 {
+        return None;
+    }
+    let (h, b) = (*parts.get(n - 2)?, *parts.get(n - 1)?);
+    let written = written_address(head).ok()?;
     let (hs, he) = parse_port_or_range(h)?;
     let (bs, be) = parse_port_or_range(b)?;
     // A host range must map onto a box range of the SAME length (like Docker); a single box port with a
@@ -69,68 +128,26 @@ pub fn parse_with_default(spec: &str, default_ip: u32) -> Option<Vec<kern_isolat
     if count > MAX_RANGE {
         return None;
     }
+    let binds: Vec<(IpAddr, bool)> = match written {
+        Some(ip) => vec![(ip, false)],
+        None => std::iter::once((default_ip, false))
+            .chain(ipv6_twin(default_ip).map(|v6| (v6, true)))
+            .collect(),
+    };
     Some(
-        (0..count as u16)
-            .map(|k| kern_isolation::PortMap {
-                bind_ip: ip,
-                host: hs + k,
-                box_port: bs + k,
-                udp,
+        binds
+            .iter()
+            .flat_map(|&(bind, implicit)| {
+                (0..count as u16).map(move |k| kern_isolation::PortMap {
+                    bind,
+                    implicit,
+                    host: hs + k,
+                    box_port: bs + k,
+                    udp,
+                })
             })
             .collect(),
     )
-}
-
-/// Does this spec name an IPv6 bind address, in any of the forms a compose file actually uses?
-///
-/// # Why a predicate and not support
-///
-/// [`PortMap::bind_ip`] is a `u32` and every socket in the forwarder is `AF_INET`, so IPv6 is not a
-/// gap in this parser: it is a feature spanning two crates, 48 uses of `bind_ip`, seven `AF_INET`
-/// call sites, the UDP path, the `fmt`/`parse_display` round trip that `kern ps` and `inspect --json`
-/// read back, and the conflict detection in `cli.rs`. It also decides WHAT GETS EXPOSED, so guessing
-/// a semantic for a form nobody has specified is the wrong direction of error.
-///
-/// What this predicate buys is the difference between a user who thinks they made a typo and a user
-/// who knows they hit a missing feature. FOUND ON A 240-FILE COMPOSE CORPUS: mailcow publishes
-/// `${HTTPS_BIND:-:}:${HTTPS_PORT:-443}:443`, which expands to `::443:443`, and kern answered
-/// `invalid port spec` - so the reader looks for a typo in a line that has none.
-///
-/// The forms, all of which this must catch:
-///
-/// * `[::]:443:443` and `[::1]:443:443` - the bracketed form Docker documents.
-/// * `::443:443` - what mailcow's default expands to.
-/// * `:443:443` - an EMPTY bind address. Deliberately included: it is equally unsupported.
-///
-/// # Why refusing, and not mapping onto the nearest IPv4
-///
-/// TWO DIFFERENT REASONS, and citing only one of them was the first version of this comment. A wrong
-/// explanation outlives a wrong line, because the next reader inherits it:
-///
-/// * `[::1]` and `::1` are IPv6 LOOPBACK. Reading them as `0.0.0.0` would WIDEN the exposure from one
-///   interface to every interface, which is a vulnerability produced by a convenience.
-/// * `[::]` and `::` are already "all interfaces". Reading them as `0.0.0.0` does not widen anything:
-///   it silently changes the ADDRESS FAMILY, so a service the author published for IPv6 clients
-///   answers only IPv4 ones and the failure appears in the client, far from the file.
-///
-/// The empty address is the third case and has no defined meaning in compose's short syntax at all,
-/// so any reading of it is invention.
-#[must_use]
-pub fn names_ipv6_or_empty_bind(spec: &str) -> bool {
-    // Strip the protocol suffix the same way `parse` does, so `[::]:443:443/udp` is recognised too.
-    let head = match spec.rsplit_once('/') {
-        Some((h, p)) if p.eq_ignore_ascii_case("udp") || p.eq_ignore_ascii_case("tcp") => h,
-        _ => spec,
-    };
-    // A bracketed address is unambiguous: `[` opens it and `]:` closes it before the ports.
-    if head.starts_with('[') && head.contains("]:") {
-        return true;
-    }
-    // Unbracketed: `parse` splits on every `:`, so anything with more than the two separators of
-    // `ip:host:box` is either an IPv6 literal or the empty-address form. `:443:443` has exactly two
-    // and an empty first field, which is the same case for the reader and is named the same way.
-    let fields: Vec<&str> = head.split(':').collect();
-    fields.len() > 3 || (fields.len() == 3 && fields[0].is_empty())
 }
 
 /// Parse a `PORT` or a `START-END` range (each 1..=65535, `START <= END`). Returns `(start, end)`
@@ -150,23 +167,30 @@ fn parse_port_or_range(s: &str) -> Option<(u16, u16)> {
     }
 }
 
-/// Format a [`PortMap`] for display (the inverse of [`parse`], e.g. `127.0.0.1:8080->80` or
-/// `…->53/udp`) - always showing the bind address so the exposure is visible.
+/// The host side of a mapping as `docker port` prints it: `0.0.0.0:8080`, `[::]:8080`.
+#[must_use]
+pub fn host_side(m: &kern_isolation::PortMap) -> String {
+    match m.bind {
+        IpAddr::V4(a) => format!("{a}:{}", m.host),
+        IpAddr::V6(a) => format!("[{a}]:{}", m.host),
+    }
+}
+
+/// Format a [`PortMap`] for display (the inverse of [`parse`], e.g. `127.0.0.1:8080->80`,
+/// `[::]:8080->80` or `…->53/udp`) - always showing the bind address so the exposure is visible.
+///
+/// [`PortMap`]: kern_isolation::PortMap
 pub fn fmt(m: &kern_isolation::PortMap) -> String {
     format!(
-        "{}.{}.{}.{}:{}->{}{}",
-        m.bind_ip >> 24 & 0xff,
-        m.bind_ip >> 16 & 0xff,
-        m.bind_ip >> 8 & 0xff,
-        m.bind_ip & 0xff,
-        m.host,
+        "{}->{}{}",
+        host_side(m),
         m.box_port,
         if m.udp { "/udp" } else { "" }
     )
 }
 
 /// The INVERSE of [`fmt`], defined next to it so the two cannot drift: read one rendered mapping
-/// (`IP:HOST->BOX` or `IP:HOST->BOX/udp`) back into a [`kern_isolation::PortMap`].
+/// (`IP:HOST->BOX`, `[IP6]:HOST->BOX`, either with `/udp`) back into a [`kern_isolation::PortMap`].
 ///
 /// WHY THIS EXISTS AS A FUNCTION rather than as a `split` at the call site: the published mapping is
 /// stored in the registry as the string [`fmt`] produced, so anything that answers "which host
@@ -174,28 +198,26 @@ pub fn fmt(m: &kern_isolation::PortMap) -> String {
 /// site is how one of them ends up disagreeing with the writer. `fmt_parse_round_trips` pins the
 /// pair, so a change to either without the other fails the build.
 ///
-/// Total and allocation-free on the parse path: every malformed shape returns `None` rather than
-/// panicking, including a missing arrow, a non-IPv4 left side, a port outside 1..=65535 and a
-/// protocol suffix that is neither `tcp` nor `udp`.
+/// Total on the parse path: every malformed shape returns `None` rather than panicking, including a
+/// missing arrow, an address that is not a literal, an unbracketed IPv6 address (`fmt` always
+/// brackets one, so a bare one is not something it wrote), a port outside 1..=65535 and a protocol
+/// suffix that is neither `tcp` nor `udp`. What it reads back is never `implicit`: that mark is the
+/// parser's, for a decision taken before anything is recorded.
 pub fn parse_display(s: &str) -> Option<kern_isolation::PortMap> {
     let s = s.trim();
-    // Protocol suffix first: `…/udp`, `…/tcp`, or nothing. Anything else is malformed rather than
-    // silently TCP, matching `parse`'s rule for the same suffix.
-    let (s, udp) = match s.rsplit_once('/') {
-        Some((head, p)) if p.eq_ignore_ascii_case("udp") => (head, true),
-        Some((head, p)) if p.eq_ignore_ascii_case("tcp") => (head, false),
-        Some(_) => return None,
-        None => (s, false),
-    };
+    let (s, udp) = strip_proto(s).unwrap_or((s, false));
     let (left, box_s) = s.split_once("->")?;
-    // `rsplit_once(':')`: the address is IPv4 here (`fmt` writes four octets), so the LAST colon
-    // separates the host port. Splitting on the first would take `127` as the address.
+    // `rsplit_once(':')`: the LAST colon separates the host port, whatever the address holds.
     let (ip_s, host_s) = left.rsplit_once(':')?;
-    let bind_ip = parse_ipv4(ip_s)?;
+    let bind = match ip_s.strip_prefix('[').and_then(|i| i.strip_suffix(']')) {
+        Some(v6) => IpAddr::V6(v6.parse::<Ipv6Addr>().ok()?),
+        None => IpAddr::V4(parse_ipv4_strict(ip_s)?),
+    };
     let host: u16 = host_s.parse().ok().filter(|p| *p > 0)?;
     let box_port: u16 = box_s.trim().parse().ok().filter(|p| *p > 0)?;
     Some(kern_isolation::PortMap {
-        bind_ip,
+        bind,
+        implicit: false,
         host,
         box_port,
         udp,
@@ -209,71 +231,77 @@ pub fn parse_display_list(s: &str) -> Vec<kern_isolation::PortMap> {
     s.split(',').filter_map(parse_display).collect()
 }
 
-/// `a.b.c.d` → a `u32` in host byte order. `None` if not four 0..=255 octets.
-fn parse_ipv4(s: &str) -> Option<u32> {
+/// `a.b.c.d`, exactly four decimal octets. Stricter than `Ipv4Addr::from_str` on nothing that `fmt`
+/// writes, and kept so the registry grammar does not widen with the standard library's.
+fn parse_ipv4_strict(s: &str) -> Option<Ipv4Addr> {
     let octets: Vec<&str> = s.split('.').collect();
     if octets.len() != 4 {
         return None;
     }
-    let mut v = 0u32;
-    for o in octets {
-        v = (v << 8) | o.parse::<u8>().ok()? as u32;
+    let mut v = [0u8; 4];
+    for (slot, o) in v.iter_mut().zip(octets) {
+        *slot = o.parse::<u8>().ok()?;
     }
-    Some(v)
+    Some(Ipv4Addr::from(v))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use kern_isolation::PortMap;
+    const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const ANY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    const ANY6: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+    const LO6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+    fn pm(bind: IpAddr, host: u16, box_port: u16, udp: bool) -> PortMap {
+        PortMap {
+            bind,
+            implicit: false,
+            host,
+            box_port,
+            udp,
+        }
+    }
+    /// The IPv6 twin a default bind adds.
+    fn twin(bind: IpAddr, host: u16, box_port: u16, udp: bool) -> PortMap {
+        PortMap {
+            implicit: true,
+            ..pm(bind, host, box_port, udp)
+        }
+    }
 
     /// `fmt` AND `parse_display` ARE ONE PAIR, and this is the only thing that keeps them one.
     ///
     /// The registry stores a mapping as the string `fmt` produced; every reader of that field has to
-    /// invert it. Exhaustive over the axes that can differ (bind address, either port at its
-    /// boundary, protocol) rather than over a sample, because the failure mode of a broken inverse is
-    /// a silently wrong answer, not a crash.
+    /// invert it. Exhaustive over the axes that can differ (bind address of either family, either
+    /// port at its boundary, protocol) rather than over a sample, because the failure mode of a broken
+    /// inverse is a silently wrong answer, not a crash.
     #[test]
     fn fmt_parse_round_trips() {
         let cases = [
-            kern_isolation::PortMap {
-                bind_ip: 0x7f00_0001,
-                host: 8080,
-                box_port: 80,
-                udp: false,
-            },
-            kern_isolation::PortMap {
-                bind_ip: 0,
-                host: 443,
-                box_port: 8443,
-                udp: false,
-            },
-            kern_isolation::PortMap {
-                bind_ip: 0x7f00_0001,
-                host: 53,
-                box_port: 53,
-                udp: true,
-            },
-            kern_isolation::PortMap {
-                bind_ip: 0xc0a8_0101,
-                host: 1,
-                box_port: 65535,
-                udp: false,
-            },
-            kern_isolation::PortMap {
-                bind_ip: 0xffff_ffff,
-                host: 65535,
-                box_port: 1,
-                udp: true,
-            },
+            pm(LO, 8080, 80, false),
+            pm(ANY, 443, 8443, false),
+            pm(LO, 53, 53, true),
+            pm(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 1, 65535, false),
+            pm(IpAddr::V4(Ipv4Addr::BROADCAST), 65535, 1, true),
+            pm(ANY6, 8080, 80, false),
+            pm(LO6, 53, 53, true),
+            pm(
+                IpAddr::V6("fe80::1".parse().unwrap_or(Ipv6Addr::LOCALHOST)),
+                9,
+                9,
+                false,
+            ),
         ];
         for want in cases {
             let rendered = fmt(&want);
             let got = parse_display(&rendered)
                 .unwrap_or_else(|| panic!("parse_display rejected what fmt wrote: {rendered}"));
-            assert_eq!(got.bind_ip, want.bind_ip, "bind_ip lost in {rendered}");
-            assert_eq!(got.host, want.host, "host port lost in {rendered}");
-            assert_eq!(got.box_port, want.box_port, "box port lost in {rendered}");
-            assert_eq!(got.udp, want.udp, "protocol lost in {rendered}");
+            assert_eq!(got, want, "a field was lost in {rendered}");
         }
+        assert_eq!(fmt(&pm(ANY6, 8080, 80, false)), "[::]:8080->80");
+        assert_eq!(fmt(&pm(LO6, 5353, 53, true)), "[::1]:5353->53/udp");
     }
 
     /// Every malformed shape answers `None`. A parser for a field read out of a file on disk is an
@@ -293,10 +321,13 @@ mod tests {
             "127.0.0.1.5:8080->80",    // five octets
             "127.0.0:8080->80",        // three octets
             "256.0.0.1:8080->80",      // octet out of range
-            "localhost:8080->80",      // not an IPv4 literal
+            "localhost:8080->80",      // not an address literal
             "8080->80",                // no address at all
             "127.0.0.1:8080->80/sctp", // unknown protocol
             "127.0.0.1:80 80->80",     // space inside the address side
+            ":::8080->80",             // an unbracketed IPv6 address: fmt never writes one
+            "[::g]:8080->80",          // not an IPv6 literal
+            "[127.0.0.1]:8080->80",    // brackets around IPv4
         ] {
             assert!(
                 parse_display(bad).is_none(),
@@ -310,44 +341,44 @@ mod tests {
     /// port", and losing every answer because of a neighbour is the wrong failure.
     #[test]
     fn parse_display_list_keeps_what_it_can_read() {
-        let got = parse_display_list("127.0.0.1:18081->8000, garbage, 0.0.0.0:443->8443/udp");
-        assert_eq!(got.len(), 2, "expected the two readable mappings: {got:?}");
+        let got = parse_display_list(
+            "127.0.0.1:18081->8000, garbage, 0.0.0.0:443->8443/udp, [::]:443->8443/udp",
+        );
+        assert_eq!(
+            got.len(),
+            3,
+            "expected the three readable mappings: {got:?}"
+        );
         assert_eq!(got[0].host, 18081);
         assert_eq!(got[0].box_port, 8000);
-        assert_eq!(got[1].bind_ip, 0);
+        assert_eq!(got[1].bind, ANY);
         assert_eq!(got[1].box_port, 8443);
         assert!(got[1].udp);
+        assert_eq!(got[2].bind, ANY6);
         assert!(
             parse_display_list("").is_empty(),
             "an empty field is no mappings"
         );
     }
-    use super::*;
-    use kern_isolation::PortMap;
-    const LO: u32 = 0x7f00_0001;
 
-    fn pm(bind_ip: u32, host: u16, box_port: u16, udp: bool) -> PortMap {
-        PortMap {
-            bind_ip,
-            host,
-            box_port,
-            udp,
-        }
-    }
-
-    /// THE DEFAULT BIND IS DOCKER'S, and that is the single largest compatibility fact in this
-    /// project: measured on a neutral 259-file corpus, 203 files (78%) published a port and were
-    /// therefore behaving differently from what they say. A spec without an `ip:` binds every
-    /// interface, exactly as `docker run -p 8080:80` does.
+    /// THE DEFAULT BIND IS DOCKER'S, BOTH FAMILIES, and that is the single largest compatibility
+    /// fact in this project: measured on a neutral 259-file corpus, 203 files (78%) published a port.
+    /// A spec without an `ip:` binds every interface, IPv4 and IPv6, exactly as `docker run -p
+    /// 8080:80` does (measured: `docker port` lists `0.0.0.0:<p>` and `[::]:<p>`).
     #[test]
     fn parses_tcp_udp_and_ip() {
-        // default proto is tcp, default bind is 0.0.0.0; a single port → a one-element list
-        assert_eq!(parse("8080:80"), Some(vec![pm(0, 8080, 80, false)]));
-        assert_eq!(parse("8080:80/tcp"), Some(vec![pm(0, 8080, 80, false)]));
-        assert_eq!(parse("5353:53/udp"), Some(vec![pm(0, 5353, 53, true)]));
-        assert_eq!(parse("53:53/UDP"), Some(vec![pm(0, 53, 53, true)])); // case-insensitive
-        assert_eq!(parse("0.0.0.0:53:53/udp"), Some(vec![pm(0, 53, 53, true)]));
-        // An explicit loopback still means loopback: the default moved, the grammar did not.
+        let both = |h, b, udp| Some(vec![pm(ANY, h, b, udp), twin(ANY6, h, b, udp)]);
+        assert_eq!(parse("8080:80"), both(8080, 80, false));
+        assert_eq!(parse("8080:80/tcp"), both(8080, 80, false));
+        assert_eq!(parse("5353:53/udp"), both(5353, 53, true));
+        assert_eq!(parse("53:53/UDP"), both(53, 53, true)); // case-insensitive
+                                                            // An EMPTY address is no address, as in Docker (`-p :18444:80` measured as both families).
+        assert_eq!(parse(":8080:80"), both(8080, 80, false));
+        // A written address is exactly that address, and no twin: `0.0.0.0` is IPv4 only in Docker.
+        assert_eq!(
+            parse("0.0.0.0:53:53/udp"),
+            Some(vec![pm(ANY, 53, 53, true)])
+        );
         assert_eq!(
             parse("127.0.0.1:8080:80"),
             Some(vec![pm(LO, 8080, 80, false)])
@@ -355,6 +386,31 @@ mod tests {
         // round-trips through fmt (shows /udp only for udp)
         assert_eq!(fmt(&pm(LO, 5353, 53, true)), "127.0.0.1:5353->53/udp");
         assert_eq!(fmt(&pm(LO, 8080, 80, false)), "127.0.0.1:8080->80");
+    }
+
+    /// IPv6 is read the way Docker reads it, every form measured against `docker run -p`: the last two
+    /// fields are the ports and everything before them is the address, brackets optional.
+    #[test]
+    fn ipv6_bind_addresses_are_read_as_docker_reads_them() {
+        assert_eq!(parse("[::]:443:443"), Some(vec![pm(ANY6, 443, 443, false)]));
+        assert_eq!(parse("[::1]:443:443"), Some(vec![pm(LO6, 443, 443, false)]));
+        assert_eq!(parse("::1:443:443"), Some(vec![pm(LO6, 443, 443, false)]));
+        assert_eq!(parse("[::]:53:53/udp"), Some(vec![pm(ANY6, 53, 53, true)]));
+        assert_eq!(
+            parse("[::1]:8000-8001:9000-9001"),
+            Some(vec![pm(LO6, 8000, 9000, false), pm(LO6, 8001, 9001, false)])
+        );
+        // Docker REFUSES `::443:443` (`invalid IP address: :`, measured in both `run` and compose):
+        // the address field is `:`. So does this, and the reason names the field.
+        assert_eq!(parse("::443:443"), None);
+        assert_eq!(written_address("::443:443"), Err(":".to_string()));
+        assert_eq!(written_address("[::1]:443:443"), Ok(Some(LO6)));
+        assert_eq!(written_address(":443:443"), Ok(None));
+        assert_eq!(written_address("443:443"), Ok(None));
+        assert_eq!(
+            written_address("nothere:443:443"),
+            Err("nothere".to_string())
+        );
     }
 
     /// THE DEFAULT IS A PARAMETER, and the parameter must not touch an explicit address.
@@ -367,18 +423,14 @@ mod tests {
     fn the_default_bind_is_a_parameter_and_never_overrides_a_written_address() {
         assert_eq!(
             parse_with_default("8080:80", LO),
-            Some(vec![pm(LO, 8080, 80, false)]),
-            "a spec with no ip: takes the caller's default"
-        );
-        assert_eq!(
-            parse_with_default("8080:80", PUBLISH_DEFAULT_IP),
-            Some(vec![pm(0, 8080, 80, false)])
+            Some(vec![pm(LO, 8080, 80, false), twin(LO6, 8080, 80, false)]),
+            "a spec with no ip: takes the caller's default, with its IPv6 twin"
         );
         // Written addresses survive both defaults, unchanged.
         for d in [LO, PUBLISH_DEFAULT_IP] {
             assert_eq!(
                 parse_with_default("0.0.0.0:8080:80", d),
-                Some(vec![pm(0, 8080, 80, false)])
+                Some(vec![pm(ANY, 8080, 80, false)])
             );
             assert_eq!(
                 parse_with_default("127.0.0.1:8080:80", d),
@@ -390,25 +442,29 @@ mod tests {
             parse("8080:80"),
             parse_with_default("8080:80", PUBLISH_DEFAULT_IP)
         );
-        assert_eq!(PUBLISH_DEFAULT_IP, 0);
+        assert_eq!(PUBLISH_DEFAULT_IP, ANY);
         assert_eq!(LOOPBACK_IP, LO);
+        assert_eq!(ipv6_twin(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))), None);
     }
 
     #[test]
     fn expands_port_ranges() {
-        // equal-length host/box ranges expand to one mapping per port
+        // equal-length host/box ranges expand to one mapping per port, per family
         assert_eq!(
             parse("8000-8002:9000-9002/udp"),
             Some(vec![
-                pm(0, 8000, 9000, true),
-                pm(0, 8001, 9001, true),
-                pm(0, 8002, 9002, true),
+                pm(ANY, 8000, 9000, true),
+                pm(ANY, 8001, 9001, true),
+                pm(ANY, 8002, 9002, true),
+                twin(ANY6, 8000, 9000, true),
+                twin(ANY6, 8001, 9001, true),
+                twin(ANY6, 8002, 9002, true),
             ])
         );
         // an ip applies to the whole range
         assert_eq!(
             parse("0.0.0.0:80-81:80-81"),
-            Some(vec![pm(0, 80, 80, false), pm(0, 81, 81, false)])
+            Some(vec![pm(ANY, 80, 80, false), pm(ANY, 81, 81, false)])
         );
         // a range mapping onto a single box port is ambiguous → rejected (like Docker)
         assert_eq!(parse("8000-8010:80"), None);
@@ -425,9 +481,11 @@ mod tests {
         assert_eq!(parse("8080:80/sctp"), None); // unknown proto → not silent tcp
         assert_eq!(parse("8080:80/"), None);
         assert_eq!(parse("abc"), None);
+        assert_eq!(parse("80"), None);
         assert_eq!(parse("0:80"), None); // port 0 rejected
         assert_eq!(parse("8080:99999"), None); // out of range
         assert_eq!(parse("8080:80/udp/extra"), None); // trailing token "extra" is not a known proto
+        assert_eq!(parse("999.0.0.1:8080:80"), None);
     }
 
     /// THE ROUND TRIP HOLDS OVER THE WHOLE SPACE, not over a handful of chosen cases.
@@ -437,49 +495,36 @@ mod tests {
     /// readings of one field and therefore a drift surface: a change to how a mapping is rendered
     /// that the parser cannot read back would make `compose port` answer for a box that publishes.
     ///
-    /// The alternative a later pass proposed was to store the structured value and format at display
-    /// time, deleting the parser. It is not available: `fmt`'s output IS the only wire format there
-    /// is, so a decoder for it is `parse_display` under another name, and adding a SECOND structured
-    /// field would duplicate state rather than remove a parser, while changing the existing field's
-    /// encoding would make a running kern read nothing for boxes a previous kern started.
-    ///
     /// So the drift is closed by exhausting the space instead: every bind address shape that `fmt`
-    /// can emit, the full range of both ports at their boundaries, and both protocols. 4 x 9 x 9 x 2
-    /// combinations, each asserted to survive `fmt` then `parse_display` unchanged, and each asserted
-    /// to survive the list form too, because `compose port` reads a comma-joined list and a separator
-    /// that appears inside an element would break only there.
+    /// can emit (both families), the full range of both ports at their boundaries, and both
+    /// protocols. 6 x 9 x 9 x 2 combinations, each asserted to survive `fmt` then `parse_display`
+    /// unchanged, and each asserted to survive the list form too, because `compose port` reads a
+    /// comma-joined list and a separator that appears inside an element would break only there.
     #[test]
     fn fmt_and_parse_display_round_trip_over_the_whole_space() {
-        let ips = [0u32, 0x7f00_0001, 0xc0a8_0001, 0xffff_ffff];
-        // PORT 0 IS DELIBERATELY ABSENT, and the first version of this test included it and failed.
-        // `parse_display` refuses it, because `0` means "any port" to `bind` and a published mapping
-        // on it addresses nothing; it is one of the malformed shapes that function exists to reject.
-        // The inverse is defined over VALID mappings, so a `PortMap` with port 0 is outside the space
-        // rather than a lost round trip. A registry entry cannot contain one: a forwarder that bound
-        // port 0 would have recorded the port the kernel chose.
+        let ips = [
+            ANY,
+            LO,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            ANY6,
+            LO6,
+        ];
+        // PORT 0 IS DELIBERATELY ABSENT: `parse_display` refuses it, because `0` means "any port" to
+        // `bind` and a published mapping on it addresses nothing.
         let ports = [1u16, 80, 443, 1024, 8080, 65534, 65535, 32768, 49152];
         let mut checked = 0usize;
         for ip in ips {
             for host in ports {
                 for box_port in ports {
                     for udp in [false, true] {
-                        let m = kern_isolation::PortMap {
-                            bind_ip: ip,
-                            host,
-                            box_port,
-                            udp,
-                        };
+                        let m = pm(ip, host, box_port, udp);
                         let rendered = fmt(&m);
-                        let back = parse_display(&rendered);
                         assert_eq!(
-                            back.as_ref()
-                                .map(|b| (b.bind_ip, b.host, b.box_port, b.udp)),
-                            Some((m.bind_ip, m.host, m.box_port, m.udp)),
+                            parse_display(&rendered),
+                            Some(m),
                             "round trip lost {m:?} through {rendered:?}"
                         );
-                        // AND THROUGH THE LIST, which is how the registry actually stores it. A
-                        // rendering that contained the separator would pass the single-element check
-                        // and fail here, which is the failure `compose port` would see.
                         let list = format!("{rendered}, {rendered}");
                         assert_eq!(
                             parse_display_list(&list).len(),
@@ -491,50 +536,6 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 4 * 9 * 9 * 2, "the whole space must be walked");
-    }
-
-    /// The IPv6 and empty-bind forms are RECOGNISED, so the refusal names the missing feature.
-    ///
-    /// They are still refused - `PortMap::bind_ip` is a `u32` and every forwarder socket is
-    /// `AF_INET` - and this test pins the recognition, not support. It exists because the generic
-    /// "invalid port spec" sent an author bisecting fourteen of mailcow's ports one at a time
-    /// looking for a typo in a line that had none.
-    #[test]
-    fn ipv6_and_empty_bind_addresses_are_named_rather_than_called_typos() {
-        for spec in [
-            "[::]:443:443",     // the bracketed form Docker documents
-            "[::1]:443:443",    // IPv6 loopback
-            "::443:443",        // what mailcow's ${HTTPS_BIND:-:} expands to
-            "::1:443:443",      // unbracketed loopback
-            ":443:443",         // empty bind address
-            "[::]:443:443/udp", // the protocol suffix must not hide it
-        ] {
-            assert!(
-                names_ipv6_or_empty_bind(spec),
-                "{spec} must be recognised as an IPv6/empty bind address"
-            );
-            assert!(
-                parse(spec).is_none(),
-                "{spec} must still be refused: the forwarder is AF_INET"
-            );
-        }
-
-        // AND THE OTHER DIRECTION, which is the half that matters: a real IPv4 spec must NOT be
-        // mislabelled. If this ever fires, a working publish is being reported as an unsupported
-        // feature, which is worse than the message it replaced.
-        for spec in [
-            "8080:80",
-            "0.0.0.0:443:443",
-            "127.0.0.1:443:443",
-            "8000-8010:9000-9010",
-            "0.0.0.0:53:53/udp",
-        ] {
-            assert!(
-                !names_ipv6_or_empty_bind(spec),
-                "{spec} is IPv4 and must not be reported as IPv6"
-            );
-            assert!(parse(spec).is_some(), "{spec} must still parse");
-        }
+        assert_eq!(checked, 6 * 9 * 9 * 2, "the whole space must be walked");
     }
 }

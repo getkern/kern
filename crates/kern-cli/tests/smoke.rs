@@ -3515,3 +3515,232 @@ fn abort_on_container_exit_returns_the_tests_own_status() {
     let _ = std::fs::remove_dir_all(&xdg);
     assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
 }
+
+/// A PUBLISHED PORT REACHES THE BOX'S ADDRESS, AND THE BOX'S NAME IS THAT ADDRESS, as under Docker.
+///
+/// MEASURED before: `-p` forwarded to the box's `127.0.0.1`, from `127.0.0.1`. A listener bound to
+/// loopback only answered 200 to a LAN client, a Redis in protected mode answered `+PONG` to one, and
+/// a box's own name resolved to `127.0.0.1` (or, on an image shipping `/etc/hosts`, not at all).
+///
+/// Two boxes on alpine's `nc`, one bound to `127.0.0.1`, one to every interface: the second is the
+/// CONTROL, so a host where nothing can be published at all skips instead of passing. Then the name,
+/// standalone and in a pod.
+#[test]
+fn a_published_port_reaches_the_box_address_and_the_name_is_that_address() {
+    let xdg = std::env::temp_dir().join(format!("kern-it-boxaddr-xdg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> (String, Option<i32>) {
+        match kern().env("XDG_RUNTIME_DIR", &xdg).args(args).output() {
+            Ok(o) => (
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                o.status.code(),
+            ),
+            Err(e) => (e.to_string(), None),
+        }
+    };
+    let free = || {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .unwrap_or(0)
+    };
+    let fetch = |port: u16| -> String {
+        use std::io::Read;
+        for _ in 0..30 {
+            if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                let mut s = String::new();
+                let _ = c.read_to_string(&mut s);
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        String::new()
+    };
+    let serve = |bind: &str, word: &str| {
+        format!("while true; do echo {word} | nc -l -s {bind} -p 81 >/dev/null 2>&1; done")
+    };
+    let (lo_port, any_port) = (free(), free());
+    let lo_map = format!("{lo_port}:81");
+    let any_map = format!("{any_port}:81");
+    let lo_cmd = serve("127.0.0.1", "LO-ONLY");
+    let any_cmd = serve("0.0.0.0", "ANY-IF");
+    let _ = run(&[
+        "box", "smlo", "-d", "-p", &lo_map, "--image", "alpine", "--", "sh", "-c", &lo_cmd,
+    ]);
+    let _ = run(&[
+        "box", "smany", "-d", "-p", &any_map, "--image", "alpine", "--", "sh", "-c", &any_cmd,
+    ]);
+    let any = fetch(any_port);
+    // Only a few tries for the loopback one: the control above already waited for the box to be up.
+    let lo = {
+        use std::io::Read;
+        let mut s = String::new();
+        if let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", lo_port)) {
+            let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+            let _ = c.read_to_string(&mut s);
+        }
+        s
+    };
+    // A box that PUBLISHES has the address and its name resolves to it; one with nothing to reach
+    // it skips the address, and its name stays on loopback (that is what spares the SDK's cells).
+    let name_port = format!("{}:81", free());
+    let (name_alone, _) = run(&[
+        "box",
+        "--rm",
+        "-p",
+        &name_port,
+        "--image",
+        "alpine",
+        "--",
+        "sh",
+        "-c",
+        "getent hosts $(hostname)",
+    ]);
+    let (name_plain, _) = run(&[
+        "box",
+        "--rm",
+        "--image",
+        "alpine",
+        "--",
+        "sh",
+        "-c",
+        "getent hosts $(hostname); ip -4 addr",
+    ]);
+    let _ = run(&["pod", "create", "smaddr"]);
+    let (name_pod, _) = run(&[
+        "box", "smmember", "--rm", "--pod", "smaddr", "--image", "alpine", "--", "getent", "hosts",
+        "smmember",
+    ]);
+    let _ = run(&["stop", "smlo"]);
+    let _ = run(&["stop", "smany"]);
+    let _ = run(&["pod", "rm", "smaddr"]);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if !any.contains("ANY-IF") {
+        eprintln!(
+            "SKIP: this host did not publish the control box's port, so it cannot show the rule"
+        );
+        return;
+    }
+    assert!(
+        !lo.contains("LO-ONLY"),
+        "a listener on the box's 127.0.0.1 only was published: {lo:?}"
+    );
+    assert!(
+        name_alone.contains("192.0.0.8"),
+        "a box's own name must resolve to its address: {name_alone:?}"
+    );
+    assert!(
+        name_plain.contains("127.0.0.1") && !name_plain.contains("192.0.0.8"),
+        "a box with nothing to reach it must not pay for an address: {name_plain:?}"
+    );
+    assert!(
+        name_pod.contains("192.0.0.8"),
+        "a pod member's name must resolve to the pod's address: {name_pod:?}"
+    );
+}
+
+/// `network_mode: service:X` JOINS X's NETWORK NAMESPACE in a stack with a namespace per service, as
+/// under Docker.
+///
+/// MEASURED before: on a bridge stack the key was not honoured at all (kern said so), so a client put
+/// behind a VPN container got a namespace, an address and a route of its own and reached the network
+/// directly. Docker, same file: one namespace inode for both, the client sees the VPN's loopback, a
+/// peer reaches the client's port at the VPN's name and does not resolve the client's.
+///
+/// Three services (a third makes the stack a bridge by default). The control is the target's own
+/// line: if it never prints, the host cannot run the stack and this skips. Then the refusal Docker
+/// makes for `ports:` on a joining service, in Docker's words.
+#[test]
+fn network_mode_service_joins_the_named_services_namespace() {
+    let dir = std::env::temp_dir().join(format!("kern-it-join-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("SKIP: could not create a temp project dir");
+        return;
+    }
+    let xdg = std::env::temp_dir().join(format!("kern-it-join-xdg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> String {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+        {
+            Ok(o) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => e.to_string(),
+        }
+    };
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        concat!(
+            "services:\n",
+            "  vpn:\n    image: alpine\n",
+            "    command: [\"sh\", \"-c\", \"echo VPN=$$(readlink /proc/self/ns/net); ",
+            "while true; do echo CTL | nc -l -s 127.0.0.1 -p 9000; done\"]\n",
+            "  client:\n    image: alpine\n    network_mode: \"service:vpn\"\n",
+            "    command: [\"sh\", \"-c\", \"sleep 1; echo CLIENT=$$(readlink /proc/self/ns/net) ",
+            "LO=$$(nc -w 2 127.0.0.1 9000 </dev/null); sleep 30\"]\n",
+            "  peer:\n    image: alpine\n",
+            "    command: [\"sh\", \"-c\", \"sleep 2; getent hosts client || echo PEER=unresolved; sleep 30\"]\n",
+        ),
+    );
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "joinit", "up", "-d"]);
+    let mut logs = String::new();
+    for _ in 0..40 {
+        logs = run(&["compose", "-f", "compose.yml", "-p", "joinit", "logs"]);
+        if logs.contains("CLIENT=") && logs.contains("PEER=") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "joinit", "down"]);
+    let _ = std::fs::write(
+        dir.join("ports.yml"),
+        "services:\n  vpn:\n    image: alpine\n    command: [\"sleep\", \"5\"]\n  client:\n    \
+         image: alpine\n    network_mode: \"service:vpn\"\n    ports: [\"18402:80\"]\n",
+    );
+    let refused = run(&["compose", "-f", "ports.yml", "-p", "joinpt", "up", "-d"]);
+    let _ = run(&["compose", "-f", "ports.yml", "-p", "joinpt", "down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    let field = |key: &str| {
+        logs.split_whitespace()
+            .find_map(|w| w.strip_prefix(key))
+            .unwrap_or("")
+            .to_string()
+    };
+    let (vpn, client) = (field("VPN="), field("CLIENT="));
+    if vpn.is_empty() {
+        eprintln!(
+            "SKIP: this host did not bring the stack up, so it cannot show the join:\n{logs}"
+        );
+        return;
+    }
+    assert_eq!(
+        client, vpn,
+        "the client must be in the vpn's network namespace:\n{logs}"
+    );
+    assert_eq!(field("LO="), "CTL", "and see the vpn's loopback:\n{logs}");
+    assert!(
+        logs.contains("PEER=unresolved"),
+        "a peer does not resolve a joining service:\n{logs}"
+    );
+    assert!(
+        refused.contains("conflicting options: port publishing"),
+        "ports on a joining service are refused as Docker refuses them:\n{refused}"
+    );
+}

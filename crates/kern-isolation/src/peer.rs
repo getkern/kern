@@ -496,7 +496,7 @@ fn listener_main(status: i32, pair: i32, a: BoxRef, alias_ip: u32, port: u16, pa
         write_status(status, if errno() != 0 { errno() } else { libc::EPERM });
         unsafe { libc::_exit(1) };
     }
-    let listener = match bind_host_socket(alias_ip, port, false) {
+    let listener = match bind_host_socket(std::net::IpAddr::V4(alias_ip.into()), port, false) {
         Ok(fd) => fd,
         Err(e) => {
             write_status(status, e);
@@ -1066,7 +1066,22 @@ mod tests {
                     unsafe { libc::pause() };
                 }
             }
-            let srv = match bind_host_socket(0x7f00_0001, serve_port, false) {
+            // B's own address, as every box a relay serves has one (`BOX_ADDR`): the relay reaches a
+            // peer there and not on its loopback. `iface_set_ipv4` with a literal label, because this
+            // child may not allocate (see above) and `add_loopback_alias` formats the label.
+            if !crate::real::iface_set_ipv4(
+                "lo:c0000008",
+                crate::real::BOX_ADDR,
+                std::net::Ipv4Addr::BROADCAST,
+            ) {
+                write_status(ready, 2400 + errno());
+                unsafe { libc::_exit(1) };
+            }
+            let srv = match bind_host_socket(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                serve_port,
+                false,
+            ) {
                 Ok(fd) => fd,
                 Err(e) => {
                     write_status(ready, 3000 + e);
@@ -1098,7 +1113,8 @@ mod tests {
 
     /// THE GATE FOR THIS MODULE: a byte crosses two network namespaces that share nothing.
     ///
-    /// Box B listens on its own `127.0.0.1:PORT`; box A holds a namespace with only loopback. The
+    /// Box B listens on every interface of its own namespace, which holds its address (`BOX_ADDR`);
+    /// box A holds a namespace with only loopback. The
     /// relay makes B's port answer at `127.0.0.2:PORT` INSIDE A. The assertion is made from inside A,
     /// by a process that entered A's namespaces, so it is the same reachability a service would have
     /// - not a host-side approximation of it.

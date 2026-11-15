@@ -660,6 +660,13 @@ fn parse_document(
     for (i, nets) in shared.inherit {
         if let Some(b) = boxes.get_mut(i) {
             b.networks = nets;
+            // THE SERVICE IT NAMES STARTS FIRST, as Docker compose orders it: a box joins a network
+            // namespace that has to exist, so the named service is an implicit `depends_on`.
+            if let Some(t) = b.net_share.clone() {
+                if !b.depends_on.contains(&t) {
+                    b.depends_on.push(t);
+                }
+            }
         }
     }
     // AFTER the `volumes_from` inheritance above: an inherited mount of an external volume is still a
@@ -3559,13 +3566,11 @@ pub fn net_share_note(net: crate::StackNet, pairs: &[(String, String)]) -> Optio
              leaves through the same route"
         )),
         crate::StackNet::PerService | crate::StackNet::Bridged => Some(format!(
-            "'network_mode: service:' is NOT given a shared namespace here ({list}), because this \
-             stack is wired with one namespace per service. Each of these services inherits the \
-             `networks:` of the one it names, so it resolves it by name and reaches it through a \
-             relay. What one namespace would also give it does not have: 127.0.0.1 is not shared, \
-             and its outbound traffic does NOT pass through the service it names, so a service put \
-             behind a VPN or a proxy container this way reaches the network directly. `--pod` wires \
-             the whole stack as one namespace, which does satisfy the key"
+            "'network_mode: service:' is satisfied here ({list}): each of these services JOINS the \
+             network namespace of the one it names, as under Docker, so it shares that service's \
+             127.0.0.1 and leaves through its route (a service put behind a VPN or a proxy \
+             container stays behind it), and has no address or name of its own on the stack's \
+             networks"
         )),
         crate::StackNet::Undecided => None,
     }
@@ -8406,6 +8411,13 @@ mod tests {
             Some("db"),
             "and must keep the record of why, so the driver can say what the wiring gives"
         );
+        // And it starts AFTER the service it names, as Docker compose orders it: a box joins a
+        // namespace that has to exist.
+        assert!(
+            by("sidecar").depends_on.contains(&"db".to_string()),
+            "the named service is an implicit dependency: {:?}",
+            by("sidecar").depends_on
+        );
         // THE CONTROL, and it is what makes the assertion above mean anything: the inheritance is
         // targeted, not a blanket "put everyone together". `web` named no share and must be left
         // exactly where the file put it.
@@ -8694,37 +8706,28 @@ mod tests {
         assert_eq!(net_ipv4_note(crate::StackNet::Undecided, &pairs), None);
     }
 
-    /// THE SENTENCE MUST SAY OPPOSITE THINGS IN THE TWO WIRINGS, because the two wirings make
-    /// opposite things true, and the one it used to say was picked before the wiring was known.
+    /// THE SENTENCE SAYS WHAT EACH WIRING GIVES, and both now give the key.
     ///
-    /// The old sentence claimed the key was satisfied and named `--no-pod` as the case to worry
-    /// about. MEASURED on the corpus: 75 files use the key and kern selects the per-service wiring
-    /// for 20 of them on its own, so the reassurance was false for one file in four that read it,
-    /// and the flag it told the reader to avoid was one they never passed.
+    /// It used to say opposite things, because a per-service wiring did not honour the key: the
+    /// client of a VPN container got a namespace and a route of its own. A box now JOINS the named
+    /// service's namespace in every wiring, so the per-service sentence must say the traffic DOES go
+    /// through the service it names, and must not keep the old warning that it does not.
     #[test]
-    fn the_net_share_sentence_says_opposite_things_in_the_two_wirings() {
+    fn the_net_share_sentence_says_what_each_wiring_gives() {
         let pairs = vec![("client".to_string(), "vpn".to_string())];
         let pod = net_share_note(crate::StackNet::Pod, &pairs).expect("a pod stack is owed one");
         let per = net_share_note(crate::StackNet::PerService, &pairs)
             .expect("a per-service stack is owed one");
+        for s in [&pod, &per] {
+            assert!(s.contains("is satisfied here"), "the key is honoured: {s}");
+            assert!(
+                !s.contains("does NOT pass through"),
+                "the old warning is gone: {s}"
+            );
+        }
         assert!(
-            pod.contains("is satisfied here"),
-            "in one namespace the key IS satisfied: {pod}"
-        );
-        assert!(
-            per.contains("is NOT given a shared namespace here"),
-            "with a namespace per service it is not: {per}"
-        );
-        // THE HALF THAT MATTERS. People write this key to put a service behind a VPN or a proxy
-        // container. A sentence that says "not shared" without saying where the traffic goes
-        // instead leaves the reader with the safer of the two readings, which is the wrong one.
-        assert!(
-            per.contains("does NOT pass through the service it names"),
-            "the per-service sentence must say where the traffic goes: {per}"
-        );
-        assert!(
-            !pod.contains("does NOT pass through"),
-            "and the pod sentence must not, because there it does: {pod}"
+            per.contains("JOINS the network namespace") && per.contains("stays behind it"),
+            "the per-service sentence says the service joins, and where the traffic goes: {per}"
         );
         // Both name the pair, so a reader knows which services the sentence is about.
         for s in [&pod, &per] {

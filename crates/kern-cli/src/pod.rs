@@ -1892,13 +1892,21 @@ fn which_pasta() -> Option<PathBuf> {
 
 /// Append a member to a pod's shared `/etc/hosts` (name → `127.0.0.1`) if not already present, so
 /// every member box can resolve it. Idempotent.
+///
+/// THE MEMBER'S NAME RESOLVES TO THE POD'S ADDRESS ([`kern_isolation::BOX_ADDR`]), NOT TO LOOPBACK,
+/// for the reason a container's name is its address under Docker: a published port reaches that
+/// address, and a service that binds its own hostname must be the one it reaches. Peers reach a
+/// member by name on every port it serves on its interfaces; what a member keeps on `127.0.0.1` is
+/// reached through `localhost` by the other members of the SAME namespace, which is what sharing one
+/// namespace means, and not by name.
 pub fn add_member(name: &str, member: &str) -> Result<(), Error> {
     let hp = hosts_path(name);
     let body = std::fs::read_to_string(&hp).unwrap_or_default();
-    let line = format!("127.0.0.1\t{member}\n");
+    let addr = kern_isolation::BOX_ADDR.to_string();
+    let line = format!("{addr}\t{member}\n");
     if body.lines().any(|l| {
         let mut it = l.split_whitespace();
-        it.next() == Some("127.0.0.1") && it.next() == Some(member)
+        it.next() == Some(addr.as_str()) && it.next() == Some(member)
     }) {
         return Ok(());
     }

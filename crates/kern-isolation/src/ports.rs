@@ -39,8 +39,14 @@ use std::ptr;
 /// (host / box port) made the tuple swap-prone at every call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortMap {
-    /// Host bind address in host byte order (`0` = `0.0.0.0`, all interfaces; default `127.0.0.1`).
-    pub bind_ip: u32,
+    /// Host bind address, either family: `0.0.0.0` or `::` is every interface of that family. An IPv6
+    /// listener is IPv6 ONLY (`IPV6_V6ONLY`), so `0.0.0.0` and `::` are two listeners, as Docker
+    /// binds them for a spec that names no address.
+    pub bind: std::net::IpAddr,
+    /// The IPv6 half of a spec that named NO address, added by the parser beside the IPv4 one. The
+    /// one mapping the CLI drops on a host without IPv6 (Docker does the same); an IPv6 address the
+    /// spec WROTE is never dropped, and a host that cannot bind it refuses the box.
+    pub implicit: bool,
     /// Host-side port.
     pub host: u16,
     /// Box-side (in-namespace) port.
@@ -86,13 +92,16 @@ struct PortForwarder {
 }
 
 impl PortForwarder {
-    /// Send the box's PID 1 so the forwarder can reach the box's namespaces, then close our end.
-    fn activate(&self, pid1: i32) {
+    /// Send the box's PID 1 and the address to reach inside it, then close our end.
+    fn activate(&self, pid1: i32, target: u32) {
         let fd = self.sock.replace(-1);
         if fd < 0 {
             return; // already activated or stopped - never write to a recycled fd
         }
-        write_all(fd, &pid1.to_ne_bytes());
+        let mut msg = [0u8; 8];
+        msg[..4].copy_from_slice(&pid1.to_ne_bytes());
+        msg[4..].copy_from_slice(&target.to_ne_bytes());
+        write_all(fd, &msg);
         unsafe { libc::close(fd) };
     }
 
@@ -120,10 +129,11 @@ impl PortForwarder {
 pub struct Forwarders(Vec<PortForwarder>);
 
 impl Forwarders {
-    /// Hand every forwarder the box's PID 1, which is what actually starts forwarding.
-    pub fn activate(&self, pid1: i32) {
+    /// Hand every forwarder the box's PID 1 and the box address its connections go to (host byte
+    /// order; the box's own address, see `BOX_ADDR`), which is what actually starts forwarding.
+    pub fn activate(&self, pid1: i32, target: u32) {
         for f in &self.0 {
-            f.activate(pid1);
+            f.activate(pid1, target);
         }
     }
 }
@@ -155,14 +165,14 @@ pub fn preflight(ports: &[PortMap]) -> Result<(), (u16, std::io::Error)> {
         } else {
             libc::SOCK_STREAM
         };
-        let s = unsafe { libc::socket(libc::AF_INET, ty, 0) };
+        let s = host_socket(p.bind, ty);
         if s < 0 {
             continue;
         }
         set_sock_flag(s, libc::SO_REUSEADDR); // NOT REUSEPORT - see the doc: a REUSEPORT probe here
                                               // would falsely pass alongside another REUSEPORT holder.
-        let addr = addr_in(p.bind_ip, p.host);
-        let r = unsafe { libc::bind(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) };
+        let (addr, len) = sockaddr_of(p.bind, p.host);
+        let r = unsafe { libc::bind(s, (&addr as *const libc::sockaddr_storage).cast(), len) };
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(s) };
         if r != 0 {
@@ -284,19 +294,20 @@ pub fn fork_forwarders(ports: &[PortMap]) -> Result<Forwarders, (u16, String)> {
 
 /// Tell the user what is now listening - AFTER the bind succeeded, never before.
 fn announce(m: &PortMap) {
-    let (ip, hp, bp) = (m.bind_ip, m.host, m.box_port);
+    let (hp, bp) = (m.host, m.box_port);
+    let ip = match m.bind {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
     crate::progress!(
-        "→ publishing {}.{}.{}.{}:{hp} → box :{bp}{}",
-        ip >> 24 & 0xff,
-        ip >> 16 & 0xff,
-        ip >> 8 & 0xff,
-        ip & 0xff,
+        "→ publishing {ip}:{hp} → box :{bp}{}",
         if m.udp { "/udp" } else { "" }
     );
-    if ip == 0 {
+    // Said once for the pair a default bind makes: its IPv6 twin is the same exposure.
+    if m.bind.is_unspecified() && !m.implicit {
         // `kern: warning:` and not a bare `warning:`, for the reason the images.rs note carries: the
         // SDK tells kern's lines from the workload's by that prefix and nothing else.
-        eprintln!("kern: warning: bound 0.0.0.0 - box port {bp} is reachable from the network");
+        eprintln!("kern: warning: bound {ip} - box port {bp} is reachable from the network");
     }
 }
 
@@ -305,7 +316,7 @@ fn announce(m: &PortMap) {
 /// PID 1, decides how to reach the box's network ([`BoxNet`]), and forwards forever. Never returns.
 fn forwarder_child(sock: i32, m: PortMap) -> ! {
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) }; // auto-reap per-connection/-client children
-    let listener = match bind_host_socket(m.bind_ip, m.host, m.udp) {
+    let listener = match bind_host_socket(m.bind, m.host, m.udp) {
         Ok(fd) => {
             write_all(sock, &0i32.to_ne_bytes());
             fd
@@ -315,12 +326,13 @@ fn forwarder_child(sock: i32, m: PortMap) -> ! {
             unsafe { libc::_exit(1) };
         }
     };
-    let mut buf = [0u8; 4];
+    let mut buf = [0u8; 8];
     if !read_exact_fd(sock, &mut buf) {
         unsafe { libc::_exit(0) }; // parent gave up (EOF) before the box started
     }
     unsafe { libc::close(sock) };
-    let box_pid1 = i32::from_ne_bytes(buf);
+    let box_pid1 = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let target = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
     // Decide the reach ONCE, here, where we still hold the host privileges the check needs. Say it
     // out loud on the refusing branch: the CLI is supposed to have rejected this combination, so
     // reaching it means something got past that check, and a silently dead port would be the same
@@ -336,21 +348,25 @@ fn forwarder_child(sock: i32, m: PortMap) -> ! {
         BoxNet::Enter
     };
     if m.udp {
-        udp_forwarder(listener, box_pid1, m.bind_ip, m.host, m.box_port, net); // -> !
+        udp_forwarder(listener, box_pid1, m, net, target); // -> !
     }
-    tcp_forwarder(listener, box_pid1, m.box_port, net) // -> !
+    tcp_forwarder(listener, box_pid1, m, net, target) // -> !
 }
 
 /// Create and bind the HOST-side socket for one mapping (and `listen` it, for TCP), in the host net
 /// ns this process was forked into. Returns the fd, or the `errno` that stopped us - an `errno`
 /// rather than a message so the child stays allocation-free and the parent formats it.
-pub(crate) fn bind_host_socket(bind_ip: u32, host_port: u16, udp: bool) -> Result<i32, i32> {
+pub(crate) fn bind_host_socket(
+    bind: std::net::IpAddr,
+    host_port: u16,
+    udp: bool,
+) -> Result<i32, i32> {
     let ty = if udp {
         libc::SOCK_DGRAM
     } else {
         libc::SOCK_STREAM
     };
-    let s = unsafe { libc::socket(libc::AF_INET, ty, 0) };
+    let s = host_socket(bind, ty);
     if s < 0 {
         return Err(errno());
     }
@@ -360,8 +376,8 @@ pub(crate) fn bind_host_socket(bind_ip: u32, host_port: u16, udp: bool) -> Resul
     } else {
         set_sock_flag(s, libc::SO_REUSEADDR);
     }
-    let addr = addr_in(bind_ip, host_port);
-    if unsafe { libc::bind(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) } != 0 {
+    let (addr, len) = sockaddr_of(bind, host_port);
+    if unsafe { libc::bind(s, (&addr as *const libc::sockaddr_storage).cast(), len) } != 0 {
         let e = errno();
         unsafe { libc::close(s) };
         return Err(e);
@@ -432,7 +448,12 @@ fn read_exact_fd(fd: i32, buf: &mut [u8]) -> bool {
 /// accepted connection (fork, not threads, because `setns(CLONE_NEWUSER)` is refused in a
 /// multithreaded process). The bind/listen happened in [`forwarder_child`], before the box was
 /// declared started.
-fn tcp_forwarder(listener: i32, box_pid1: i32, box_port: u16, net: BoxNet) -> ! {
+fn tcp_forwarder(listener: i32, box_pid1: i32, m: PortMap, net: BoxNet, target: u32) -> ! {
+    // ONE FLAG SHARED BY EVERY CONNECTOR this forwarder forks, so the "listening on loopback only"
+    // note is said once per mapping rather than once per refused connection. An anonymous SHARED page
+    // is the only memory a forked child writes and its parent then reads; null when the kernel
+    // refuses the page, and then the note is simply never printed.
+    let told = shared_flag();
     loop {
         let conn = unsafe { libc::accept(listener, ptr::null_mut(), ptr::null_mut()) };
         if conn < 0 {
@@ -444,7 +465,7 @@ fn tcp_forwarder(listener: i32, box_pid1: i32, box_port: u16, net: BoxNet) -> ! 
         let c = unsafe { libc::fork() }; // single-threaded child → setns(USER) allowed
         if c == 0 {
             unsafe { libc::close(listener) };
-            connector_main(box_pid1, box_port, conn, net);
+            connector_main(box_pid1, m, conn, net, target, told);
             unsafe { libc::_exit(0) };
         }
         unsafe { libc::close(conn) };
@@ -747,22 +768,109 @@ pub(crate) fn restrict_capabilities(mask: u64) -> bool {
     }
 }
 
-/// Reach the box's network, connect to its loopback `box_port`, and pump bytes against the accepted
-/// host connection `conn`. With [`BoxNet::NotTheBoxs`] there is no box port to reach, so the
-/// connection is closed rather than pointed at a host service.
-fn connector_main(box_pid1: i32, box_port: u16, conn: i32, net: BoxNet) {
+/// Reach the box's network, connect to its own address at `box_port`, and pump bytes against the
+/// accepted host connection `conn`. With [`BoxNet::NotTheBoxs`] there is no box port to reach, so
+/// the connection is closed rather than pointed at a host service.
+///
+/// When the box's address refuses and its `127.0.0.1` would have answered, the listener is bound to
+/// loopback only: Docker does not publish that either, and says nothing about it. kern says so, once
+/// per mapping (`told`), because "connection refused" from a port `kern ps` lists names nothing.
+fn connector_main(
+    box_pid1: i32,
+    m: PortMap,
+    conn: i32,
+    net: BoxNet,
+    target: u32,
+    told: *const std::sync::atomic::AtomicU32,
+) {
     if net != BoxNet::Enter || !enter_box_ns(box_pid1) {
         return;
     }
-    let bs = connect_box_loopback(box_port, libc::SOCK_STREAM);
-    if bs < 0 {
-        return;
-    }
+    let bs = match connect_box_addr(target, m.box_port, libc::SOCK_STREAM) {
+        Ok(fd) => fd,
+        Err(e) => {
+            if e == libc::ECONNREFUSED {
+                note_loopback_only(m, told);
+            }
+            return;
+        }
+    };
     // TCP only, and before a single byte moves: see `set_nodelay`.
     set_nodelay(conn);
     set_nodelay(bs);
     pump_bidir(conn, bs);
     unsafe { libc::close(bs) };
+}
+
+/// Say, once per mapping, that the box's port answers on its loopback only. Probes `127.0.0.1` (a
+/// connect that is closed at once) and stays silent when nothing is there either: a service that is
+/// not up yet is not this.
+fn note_loopback_only(m: PortMap, told: *const std::sync::atomic::AtomicU32) {
+    use std::sync::atomic::Ordering;
+    let probe = connect_box_loopback(m.box_port, libc::SOCK_STREAM);
+    if probe < 0 {
+        return;
+    }
+    unsafe { libc::close(probe) };
+    // SAFETY: `told` is null or the start of a live MAP_SHARED page this process inherited.
+    let Some(flag) = (unsafe { told.as_ref() }) else {
+        return;
+    };
+    if flag.swap(1, Ordering::AcqRel) == 0 {
+        eprintln!(
+            "kern: -p {}->{}: the box's port {} listens on its 127.0.0.1 only, so it is not \
+             published (a published port reaches the box's address, as under Docker); bind the \
+             service to 0.0.0.0",
+            m.host, m.box_port, m.box_port
+        );
+    }
+}
+
+/// An `AtomicU32` in an anonymous SHARED page: written by forked children, read by their siblings.
+/// Null when the kernel refuses the mapping.
+fn shared_flag() -> *const std::sync::atomic::AtomicU32 {
+    // SAFETY: an anonymous mapping, owned by this process for its lifetime; zero-filled by the
+    // kernel, which is the valid bit pattern of an `AtomicU32` holding 0.
+    let p = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return ptr::null();
+    }
+    p.cast::<std::sync::atomic::AtomicU32>()
+}
+
+/// Connect to the box's own address `ip:box_port`, FROM that address, in the CURRENT net ns (the
+/// caller is already in the box's namespaces). The source is the box's address too, so the server
+/// sees a client that is not loopback, as under Docker where it sees the bridge gateway. Returns the
+/// fd, or the `errno` that stopped it (`ECONNREFUSED` is what the loopback note keys on).
+pub(crate) fn connect_box_addr(ip: u32, box_port: u16, ty: libc::c_int) -> Result<i32, i32> {
+    unsafe {
+        let s = libc::socket(libc::AF_INET, ty, 0);
+        if s < 0 {
+            return Err(errno());
+        }
+        let src = addr_in(ip, 0);
+        if libc::bind(s, &src as *const _ as *const libc::sockaddr, ADDR_LEN) != 0 {
+            let e = errno();
+            libc::close(s);
+            return Err(e);
+        }
+        let addr = addr_in(ip, box_port);
+        if libc::connect(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) != 0 {
+            let e = errno();
+            libc::close(s);
+            return Err(e);
+        }
+        Ok(s)
+    }
 }
 
 /// Create an `AF_INET` socket of type `ty` (`SOCK_STREAM`/`SOCK_DGRAM`) in the CURRENT net ns and
@@ -783,7 +891,8 @@ pub(crate) fn connect_box_loopback(box_port: u16, ty: libc::c_int) -> i32 {
     }
 }
 
-/// [`connect_box_loopback`], but with the SOURCE address pinned to `src_ip`.
+/// Connect to the box's own address ([`crate::real::BOX_ADDR`]) at `box_port`, with the SOURCE pinned
+/// to `src_ip`.
 ///
 /// WHY THE SOURCE IS SET AT ALL. A peer relay connects from inside box B to `127.0.0.1:<port>`, so
 /// without this B sees every peer as loopback, indistinguishable from a connection made by B itself.
@@ -813,7 +922,10 @@ pub(crate) fn connect_box_loopback_from(src_ip: u32, box_port: u16, ty: libc::c_
             libc::close(s);
             return -1;
         }
-        let addr = addr_in(0x7f00_0001, box_port); // 127.0.0.1:box_port (box net ns)
+        // THE BOX'S ADDRESS, NOT ITS LOOPBACK: a peer reaches what the service serves on its
+        // interfaces and not what it keeps on `127.0.0.1`, which is Docker's rule between two
+        // containers and the bridge's rule here. See `BOX_ADDR`.
+        let addr = addr_in(u32::from(crate::real::BOX_ADDR), box_port);
         if libc::connect(s, &addr as *const _ as *const libc::sockaddr, ADDR_LEN) != 0 {
             libc::close(s);
             return -1;
@@ -892,14 +1004,7 @@ fn reuse_addr_port(s: i32) {
 /// (see `pump_dgram`) so a request/response client's process/sockets are freed, and the parent's
 /// recent-client table is TIME-bounded (not a lifetime blacklist), so a long-lived resolver never hits
 /// a cumulative ceiling and a client can reconnect after its relay dies. The group dies with the box.
-fn udp_forwarder(
-    sock: i32,
-    box_pid1: i32,
-    bind_ip: u32,
-    host_port: u16,
-    box_port: u16,
-    net: BoxNet,
-) -> ! {
+fn udp_forwarder(sock: i32, box_pid1: i32, m: PortMap, net: BoxNet, target: u32) -> ! {
     // Recently-forked clients (ip:port → when). Its ONLY job is to dedupe the ~ms race window between
     // us reading a client's first datagram and its child binding the connected socket that steals the
     // client's later datagrams. It is TIME-BOUNDED (pruned to `DEDUP_TTL`), NOT a lifetime blacklist -
@@ -907,12 +1012,12 @@ fn udp_forwarder(
     // reconnect once its stale entry ages out. The size cap is a secondary flood guard on RECENT peers.
     const DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(5);
     const MAX_RECENT: usize = 1024;
-    let mut seen: std::collections::HashMap<u64, std::time::Instant> =
+    let mut seen: std::collections::HashMap<(u128, u16), std::time::Instant> =
         std::collections::HashMap::new();
     let mut buf = [0u8; 65535];
     loop {
-        let mut caddr: libc::sockaddr_in = unsafe { mem::zeroed() };
-        let mut clen = ADDR_LEN;
+        let mut caddr: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut clen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         let n = unsafe {
             libc::recvfrom(
                 sock,
@@ -934,7 +1039,7 @@ fn udp_forwarder(
         // key = client (ip:port). A datagram from a client we forked a relay for in the last DEDUP_TTL
         // only reaches us in the race window before its child took over → drop it (UDP is lossy; the
         // client retransmits to the child). A brand-new (or aged-out) client forks a fresh relay.
-        let key = ((caddr.sin_addr.s_addr as u64) << 16) | caddr.sin_port as u64;
+        let key = client_key(&caddr);
         if seen.contains_key(&key) || seen.len() >= MAX_RECENT {
             continue;
         }
@@ -942,19 +1047,24 @@ fn udp_forwarder(
         let c = unsafe { libc::fork() };
         if c == 0 {
             unsafe { libc::close(sock) };
-            udp_relay_child(
-                box_pid1,
-                bind_ip,
-                host_port,
-                box_port,
-                caddr,
-                &buf[..n as usize],
-                net,
-            );
+            udp_relay_child(box_pid1, m, (caddr, clen), &buf[..n as usize], net, target);
             unsafe { libc::_exit(0) };
         }
     }
     unsafe { libc::_exit(0) }
+}
+
+/// A UDP client's identity (address bytes, port) from a `recvfrom` address of either family.
+fn client_key(a: &libc::sockaddr_storage) -> (u128, u16) {
+    if i32::from(a.ss_family) == libc::AF_INET6 {
+        // SAFETY: the family says the storage holds a `sockaddr_in6`.
+        let v6 = unsafe { &*(a as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
+        (u128::from_be_bytes(v6.sin6_addr.s6_addr), v6.sin6_port)
+    } else {
+        // SAFETY: anything else this socket receives is a `sockaddr_in` (it is bound IPv4).
+        let v4 = unsafe { &*(a as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+        (u128::from(v4.sin_addr.s_addr), v4.sin_port)
+    }
 }
 
 /// One client's UDP relay: a host socket connected to the client (so it sends replies back to exactly
@@ -962,22 +1072,22 @@ fn udp_forwarder(
 /// `first` is the initial datagram already read by the parent. Runs until either socket errors.
 fn udp_relay_child(
     box_pid1: i32,
-    bind_ip: u32,
-    host_port: u16,
-    box_port: u16,
-    client: libc::sockaddr_in,
+    m: PortMap,
+    client: (libc::sockaddr_storage, libc::socklen_t),
     first: &[u8],
     net: BoxNet,
+    target: u32,
 ) {
     unsafe {
-        let hs = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        let hs = host_socket(m.bind, libc::SOCK_DGRAM);
         if hs < 0 {
             return;
         }
         reuse_addr_port(hs);
-        let ha = addr_in(bind_ip, host_port);
-        if libc::bind(hs, &ha as *const _ as *const libc::sockaddr, ADDR_LEN) != 0
-            || libc::connect(hs, &client as *const _ as *const libc::sockaddr, ADDR_LEN) != 0
+        let (ha, hlen) = sockaddr_of(m.bind, m.host);
+        let (caddr, clen) = client;
+        if libc::bind(hs, (&ha as *const libc::sockaddr_storage).cast(), hlen) != 0
+            || libc::connect(hs, (&caddr as *const libc::sockaddr_storage).cast(), clen) != 0
         {
             return; // a racing sibling already owns this client's 4-tuple
         }
@@ -986,10 +1096,9 @@ fn udp_relay_child(
         if net != BoxNet::Enter || !enter_box_ns(box_pid1) {
             return;
         }
-        let bs = connect_box_loopback(box_port, libc::SOCK_DGRAM);
-        if bs < 0 {
+        let Ok(bs) = connect_box_addr(target, m.box_port, libc::SOCK_DGRAM) else {
             return;
-        }
+        };
         // Forward the datagram that got us here, then relay both ways.
         let _ = libc::send(bs, first.as_ptr().cast(), first.len(), 0);
         pump_dgram(hs, bs);
@@ -1045,6 +1154,73 @@ fn pump_dgram(a: i32, b: i32) {
             }
         }
     }
+}
+
+/// A host-side socket address of either family, as `sockaddr_storage` and its length.
+pub(crate) fn sockaddr_of(
+    ip: std::net::IpAddr,
+    port: u16,
+) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: an all-zero `sockaddr_storage` is a valid value; each arm writes a complete address of
+    // its family into the front of it.
+    let mut st: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let a = addr_in(u32::from(v4), port);
+            // SAFETY: `sockaddr_in` fits in `sockaddr_storage` by definition.
+            unsafe { ptr::write((&mut st as *mut libc::sockaddr_storage).cast(), a) };
+            (st, ADDR_LEN)
+        }
+        std::net::IpAddr::V6(v6) => {
+            // SAFETY: an all-zero `sockaddr_in6` is a valid value.
+            let mut a: libc::sockaddr_in6 = unsafe { mem::zeroed() };
+            a.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            a.sin6_port = port.to_be();
+            a.sin6_addr.s6_addr = v6.octets();
+            // SAFETY: `sockaddr_in6` fits in `sockaddr_storage` by definition.
+            unsafe { ptr::write((&mut st as *mut libc::sockaddr_storage).cast(), a) };
+            (st, mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    }
+}
+
+/// A socket of `ty` for `ip`'s family; an IPv6 one is set IPv6-ONLY, so `::` never also takes the
+/// IPv4 port its `0.0.0.0` twin binds. `-1` on failure, with `errno` set.
+fn host_socket(ip: std::net::IpAddr, ty: libc::c_int) -> i32 {
+    let fam = if ip.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let s = unsafe { libc::socket(fam, ty, 0) };
+    if s >= 0 && ip.is_ipv6() {
+        let one: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                s,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &one as *const _ as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    s
+}
+
+/// Can this host bind an IPv6 socket at all? `false` where the kernel has no IPv6 (`ipv6.disable=1`,
+/// a CI runner built without it), which is where the CLI drops the IPv6 half of a default bind.
+#[must_use]
+pub fn host_has_ipv6() -> bool {
+    let any = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+    let s = host_socket(any, libc::SOCK_STREAM);
+    if s < 0 {
+        return false;
+    }
+    let (a, len) = sockaddr_of(any, 0);
+    let ok = unsafe { libc::bind(s, (&a as *const libc::sockaddr_storage).cast(), len) } == 0;
+    unsafe { libc::close(s) };
+    ok
 }
 
 const ADDR_LEN: libc::socklen_t = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
@@ -1192,6 +1368,90 @@ mod tests {
         }
     }
 
+    /// `0.0.0.0` AND `::` ON ONE PORT, as Docker binds them for `-p 8080:80`: the IPv6 listener is
+    /// IPv6 only, so it neither takes the IPv4 port from its twin nor answers IPv4 clients, and an
+    /// IPv6 client reaches it. Skipped where the host has no IPv6, which is the case the CLI drops
+    /// the twin for.
+    #[test]
+    fn an_ipv6_listener_is_ipv6_only_so_both_families_share_one_port() {
+        let _g = port_guard();
+        if !host_has_ipv6() {
+            eprintln!("skip: this host has no IPv6");
+            return;
+        }
+        let any4 = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let any6 = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        let port = free_port();
+        let v4 = bind_host_socket(any4, port, false);
+        let v6 = bind_host_socket(any6, port, false);
+        let both = matches!((v4, v6), (Ok(_), Ok(_)));
+        let reached = v6.ok().is_some_and(|_| {
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+                std::time::Duration::from_secs(2),
+            )
+            .is_ok()
+        });
+        for fd in [v4, v6].into_iter().flatten() {
+            unsafe { libc::close(fd) };
+        }
+        assert!(
+            both,
+            "0.0.0.0 and :: must both bind port {port}: {v4:?} {v6:?}"
+        );
+        assert!(reached, "an IPv6 client must reach the :: listener");
+    }
+
+    /// A published connection reaches the box's OWN ADDRESS, from that address, and never its
+    /// loopback: a listener on `127.0.0.1` only is refused (Docker does not publish it either), one
+    /// on every interface is reached, and the server sees a client that is not `127.0.0.1`.
+    ///
+    /// `127.0.0.2` stands in for `BOX_ADDR` because a test cannot add an address to `lo`; it is
+    /// local on `lo` by the `127.0.0.0/8` route and is not `127.0.0.1`, which is the one property
+    /// the rule turns on. MEASURED before this function: a `-p` listener bound to `127.0.0.1` in a
+    /// box answered 200 from the LAN, and a Redis in protected mode answered `+PONG` to a LAN client.
+    #[test]
+    fn a_published_connection_reaches_the_box_address_and_not_its_loopback() {
+        let _g = port_guard();
+        use std::io::Read;
+        use std::net::TcpListener;
+        let stand_in = u32::from(std::net::Ipv4Addr::new(127, 0, 0, 2));
+        // Loopback only: refused, with the errno the note keys on.
+        let lo = match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) => panic!("bind loopback: {e}"),
+        };
+        let lo_port = lo.local_addr().map(|a| a.port()).unwrap_or(0);
+        assert_eq!(
+            connect_box_addr(stand_in, lo_port, libc::SOCK_STREAM)
+                .map(|fd| unsafe { libc::close(fd) }),
+            Err(libc::ECONNREFUSED),
+            "a listener on 127.0.0.1 only must not be reached"
+        );
+        // Every interface: reached, and the accepted peer is the box address, not loopback.
+        let any = match TcpListener::bind(("0.0.0.0", 0)) {
+            Ok(l) => l,
+            Err(e) => panic!("bind any: {e}"),
+        };
+        let any_port = any.local_addr().map(|a| a.port()).unwrap_or(0);
+        let fd = match connect_box_addr(stand_in, any_port, libc::SOCK_STREAM) {
+            Ok(fd) => fd,
+            Err(e) => panic!("a listener on every interface must be reached (errno {e})"),
+        };
+        let peer = any.accept().map(|(mut c, a)| {
+            let mut b = [0u8; 1];
+            let _ = c.set_nonblocking(true);
+            let _ = c.read(&mut b);
+            a.ip()
+        });
+        unsafe { libc::close(fd) };
+        assert_eq!(
+            peer.ok(),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2))),
+            "the server must see the box address as the client, never 127.0.0.1"
+        );
+    }
+
     /// THE invariant this module was rewritten for: the host port is bound by the time
     /// `fork_forwarders` RETURNS - before the box is unshared, forked, or declared started. Proven
     /// the only way that isn't a restatement of the code: by racing it. A second `bind` of the same
@@ -1207,7 +1467,8 @@ mod tests {
         let (port, fwd) = loop {
             let port = free_port();
             let m = PortMap {
-                bind_ip: LOOPBACK,
+                bind: std::net::IpAddr::V4(std::net::Ipv4Addr::from(LOOPBACK)),
+                implicit: false,
                 host: port,
                 box_port: 9,
                 udp: false,
@@ -1244,7 +1505,8 @@ mod tests {
             Err(e) => panic!("local_addr: {e}"),
         };
         let m = PortMap {
-            bind_ip: LOOPBACK,
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::from(LOOPBACK)),
+            implicit: false,
             host: taken,
             box_port: 9,
             udp: false,
@@ -1276,13 +1538,15 @@ mod tests {
         };
         let maps = [
             PortMap {
-                bind_ip: LOOPBACK,
+                bind: std::net::IpAddr::V4(std::net::Ipv4Addr::from(LOOPBACK)),
+                implicit: false,
                 host: good,
                 box_port: 9,
                 udp: false,
             },
             PortMap {
-                bind_ip: LOOPBACK,
+                bind: std::net::IpAddr::V4(std::net::Ipv4Addr::from(LOOPBACK)),
+                implicit: false,
                 host: taken,
                 box_port: 9,
                 udp: false,
@@ -1318,7 +1582,8 @@ mod tests {
         let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let taken = l.local_addr().unwrap().port();
         let pm = |host| PortMap {
-            bind_ip: LOOPBACK,
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::from(LOOPBACK)),
+            implicit: false,
             host,
             box_port: 80,
             udp: false,

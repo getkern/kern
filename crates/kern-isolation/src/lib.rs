@@ -150,6 +150,7 @@ pub use real::with_id_mapped_userns;
 /// Which of the host's NVIDIA cards a box may see in the driver's own `/proc` enumeration.
 pub use real::GpuEnumeration;
 pub use real::Secret;
+pub use real::BOX_ADDR;
 /// Bring `lo` UP in the CURRENT net namespace. Exported for the egress pump, which joins a box's
 /// net ns from outside and must not assume the box's init has already got there. See `real`.
 /// The readiness-pipe byte a gated box writes when it is set up and waiting on its pre-exec gate.
@@ -318,7 +319,7 @@ pub fn setup_failure_hint(msg: &str) -> &'static str {
 /// See [`setup_failure_hint`]. One physical line, for the reason given on [`SETUP_FAILURE_HINT`].
 pub const OVERLAY_VANISHED_HINT: &str =
     "a directory this mount needs was removed while the box was being built: one of the image's layers, or the box's own scratch under the runtime directory. That is something else on this machine deleting it at the same moment (an image removal, a cleanup of $XDG_RUNTIME_DIR), not a host capability, and starting the box again normally succeeds.";
-pub use ports::{preflight as preflight_ports, PortMap};
+pub use ports::{host_has_ipv6, preflight as preflight_ports, PortMap};
 /// While kern waits for a box, treat a fatal signal as "end the BOX", not "end kern": forward it to
 /// the box and keep reaping, so kern exits with (and records) the box's own status. See
 /// [`real::forward_signals_to_the_box`].

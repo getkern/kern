@@ -103,6 +103,9 @@ pub enum Command {
         share_net: bool,
         /// `--pod <name>`: join a pod's shared loopback network (reach peers by name).
         pod: Option<String>,
+        /// `--network container:<box>`: live in that running box's network namespace (Docker's
+        /// spelling, and compose `network_mode: service:`).
+        net_container: Option<String>,
         /// `--uid-range`: map a sub-uid/gid range (apt/dpkg, www-data). Default maps only the caller.
         uid_range: bool,
         /// `--no-uid-range`: opt OUT of the range mapping an `--image` box gets by default.
@@ -3353,6 +3356,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut read_only = false;
     let mut share_net = false;
     let mut pod: Option<String> = None;
+    let mut net_container: Option<String> = None;
     let mut pod_bridges: Vec<kern_isolation::BridgeAttach> = Vec::new();
     let mut uid_range = false;
     let mut no_uid_range = false;
@@ -3536,6 +3540,17 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     match rest.get(i).copied() {
                         Some("host") => share_net = true,
                         Some("none") => share_net = false,
+                        // `container:<box>`: Docker's way to put a container in another's network
+                        // namespace, and what compose's `network_mode: service:` becomes. The name is
+                        // recorded like a pod's, and resolved at start.
+                        Some(v) if v.starts_with("container:") => {
+                            match v.strip_prefix("container:").filter(|n| !n.is_empty()) {
+                                Some(n) => net_container = Some(n.to_string()),
+                                None => {
+                                    return Err(Error::Usage("--network container:<box name>"))
+                                }
+                            }
+                        }
                         // THE NAME IS RECORDED, NOT RESOLVED. Whether it names a running pod, a
                         // `kern network` or nothing is a question about runtime state, and a parser
                         // that answers it is a parser whose result depends on which boxes happen to
@@ -3545,7 +3560,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         Some(name) if !name.starts_with('-') => pod = Some(name.to_string()),
                         _ => {
                             return Err(Error::Usage(
-                                "--network <host|none|pod-name> (host = share host net; none = isolated)",
+                                "--network <host|none|container:BOX|pod-name> (host = share host net; none = isolated; container:BOX = BOX's network)",
                             ))
                         }
                     }
@@ -4230,14 +4245,15 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         Some(p) => ports.extend(p), // one mapping, or many for a port range
                         // The reason compose already names: an IPv6 or empty bind address is a
                         // feature kern lacks, not a typo, and the generic usage line said typo.
+                        // Docker's reason, in Docker's words: an address that is not one (`::8080:80`
+                        // has the address `:`) is not a typo in the ports.
                         None if rest
                             .get(i)
-                            .is_some_and(|v| crate::ports::names_ipv6_or_empty_bind(v)) =>
+                            .is_some_and(|v| crate::ports::written_address(v).is_err()) =>
                         {
                             return Err(Error::Usage(
-                                "-p with an IPv6 or empty bind address: kern publishes on IPv4 \
-                                 only; use 0.0.0.0:HOST:BOX for every interface or \
-                                 127.0.0.1:HOST:BOX for loopback",
+                                "-p with an invalid IP address: write it as [ip:]host:box, an IPv6 \
+                                 address in brackets ([::1]:8080:80)",
                             ))
                         }
                         None => {
@@ -4540,7 +4556,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             // Keyed on protocol too: TCP and UDP are SEPARATE host ports, so `-p 53:53/tcp -p 53:53/udp`
             // (the common DNS shape) is NOT a duplicate - only two mappings of the SAME proto+addr+port
             // collide on one bind.
-            if ports[a].bind_ip == ports[b].bind_ip
+            if ports[a].bind == ports[b].bind
                 && ports[a].host == ports[b].host
                 && ports[a].udp == ports[b].udp
             {
@@ -4632,6 +4648,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             workdir,
             share_net,
             pod,
+            net_container,
             uid_range,
             no_uid_range,
             bind_rootfs,
@@ -5669,6 +5686,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             workdir,
             share_net,
             pod,
+            net_container,
             uid_range,
             no_uid_range,
             bind_rootfs,
@@ -5760,6 +5778,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             workdir: workdir.as_deref(),
             share_net,
             pod: pod.as_deref(),
+            net_container: net_container.as_deref(),
             uid_range,
             no_uid_range,
             bind_rootfs,
@@ -7657,7 +7676,7 @@ mod tests {
             "box".into(),
             "x".into(),
             "-p".into(),
-            "8080:80".into(), // default → 127.0.0.1 (loopback only), tcp
+            "8080:80".into(), // default → 0.0.0.0 and its IPv6 twin, tcp
             "-p".into(),
             "0.0.0.0:443:443".into(), // explicit all-interfaces
             "-p".into(),
@@ -7667,8 +7686,12 @@ mod tests {
         let Command::BoxRun { ports, .. } = cmd else {
             panic!("expected BoxRun")
         };
-        let pm = |bind_ip, host, box_port, udp| kern_isolation::PortMap {
-            bind_ip,
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        const ANY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        const ANY6: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        let pm = |bind, implicit, host, box_port, udp| kern_isolation::PortMap {
+            bind,
+            implicit,
             host,
             box_port,
             udp,
@@ -7676,9 +7699,11 @@ mod tests {
         assert_eq!(
             ports,
             vec![
-                pm(0, 8080, 80, false),
-                pm(0, 443, 443, false),
-                pm(0, 53, 53, true),
+                pm(ANY, false, 8080, 80, false),
+                pm(ANY6, true, 8080, 80, false),
+                pm(ANY, false, 443, 443, false),
+                pm(ANY, false, 53, 53, true),
+                pm(ANY6, true, 53, 53, true),
             ]
         );
         // Malformed mappings are usage errors, never silently dropped.
@@ -7691,19 +7716,26 @@ mod tests {
                 "-p {bad}"
             );
         }
-        // An IPv6 or empty bind address names the missing feature, as compose does; a typo does not.
-        for v6 in ["[::1]:8080:80", "[::]:443:443/udp", "::443:443", ":8080:80"] {
+        // IPv6 addresses are accepted as Docker accepts them, and the one Docker refuses (`::H:B`,
+        // address `:`) is refused as an invalid address rather than as a typo in the ports.
+        for v6 in [
+            "[::1]:8080:80",
+            "[::]:443:443/udp",
+            "::1:8080:80",
+            ":8080:80",
+        ] {
             assert!(
-                matches!(
-                    parse(&["box".into(), "x".into(), "-p".into(), v6.to_string()]),
-                    Err(Error::Usage(m)) if m.contains("IPv4")
-                ),
+                parse(&["box".into(), "x".into(), "-p".into(), v6.to_string()]).is_ok(),
                 "-p {v6}"
             );
         }
         assert!(matches!(
+            parse(&["box".into(), "x".into(), "-p".into(), "::443:443".into()]),
+            Err(Error::Usage(m)) if m.contains("invalid IP address")
+        ));
+        assert!(matches!(
             parse(&["box".into(), "x".into(), "-p".into(), "abc".into()]),
-            Err(Error::Usage(m)) if !m.contains("IPv4")
+            Err(Error::Usage(m)) if !m.contains("invalid IP address")
         ));
         // The same host address+port can't map to two box ports (would silently fail to bind twice).
         assert!(matches!(
@@ -7811,6 +7843,21 @@ mod tests {
             }
             other => panic!("expected BoxRun, got {other:?}"),
         }
+        // `container:<box>` is Docker's other meaning of the flag: that box's network, never a pod.
+        let (_, cmd) = p(&[
+            "box",
+            "x",
+            "--image",
+            "alpine",
+            "--network",
+            "container:vpn",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Command::BoxRun { ref net_container, pod: None, .. } if net_container.as_deref() == Some("vpn")
+        ));
+        assert!(p(&["box", "x", "--image", "alpine", "--network", "container:"]).is_err());
         // `--pod` is the same slot, so the two spellings cannot diverge.
         let (_, cmd) = p(&["box", "x", "--image", "alpine", "--pod", "mystack"]).unwrap();
         assert!(matches!(cmd, Command::BoxRun { pod: Some(ref n), .. } if n == "mystack"));

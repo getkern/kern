@@ -1545,16 +1545,15 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // So the order is: honour the key when the wiring that honours it can be built, and otherwise
     // keep the bridge and SAY the key is not given, which the note's other arm does. Refusing the
     // file is the one answer that is worse than both, because it is the one Docker does not give.
-    let wants_shared_netns = boxes.iter().any(|b| b.net_share.is_some());
-    let shared_netns_is_possible = wants_shared_netns && !collides && !hosts_collide;
-    let auto_bridge = !no_pod
-        && !force_pod
-        && !shared_netns_is_possible
-        && (segregates || collides || hosts_collide || boxes.len() >= 2);
+    // `network_mode: service:` NO LONGER CHOOSES THE WIRING. It used to force one namespace for the
+    // whole stack (coarser than Docker, which puts only the naming service in the named one), or the
+    // relays when the file also separated services, and on a bridge it was not honoured at all: the
+    // traffic a file put behind a VPN container went out directly. A box now JOINS the named
+    // service's network namespace in every wiring (`--network container:`), which is Docker's
+    // arrangement exactly, so the stack takes the wiring its other properties call for.
+    let auto_bridge =
+        !no_pod && !force_pod && (segregates || collides || hosts_collide || boxes.len() >= 2);
     let want_bridge = want_bridge || auto_bridge;
-    // The one shape still sent to the relays: a file that both separates services AND asks for a
-    // shared namespace (`network_mode: service:`), where neither a pod nor a bridge holds both.
-    let auto_no_pod = !no_pod && !force_pod && segregates && shared_netns_is_possible;
     // THE DEFAULT ARM SPEAKS FOR ITSELF, and does not borrow the sentence below.
     //
     // That sentence is built for a file that ASKS for something one namespace cannot give, and its
@@ -1598,7 +1597,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // `logs`, `port` - where no wiring is being decided and the reader cannot act on it. A field
     // report named it: the note "came out on every command". A standing note on a correct stack is
     // what teaches a reader to skim past kern's output, which costs more than the line buys.
-    if wiring_is_the_subject && (auto_no_pod || (auto_bridge && !default_bridge)) {
+    if wiring_is_the_subject && auto_bridge && !default_bridge {
         // NAMED, because an unactionable note is a note nobody acts on. The collision is identified
         // by service and by port when it comes from the FILE; when it comes from two images' EXPOSE
         // the names live in `image_expose_collisions`, so the generic wording stands for that case
@@ -1630,16 +1629,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // network is `internal: true`, which gets no NAT at all (measured: 9 pasta processes for 8
         // members with outbound, 0 without, 1 for the whole pod), come up in 305 ms. So one NAT per
         // bridge instead of one per member would buy back 12 ms a service and not the other 17.
-        let how = if auto_bridge && segregates {
+        let how = if segregates {
             "so kern gives each compose network its own bridge and each service its own network \
              namespace, attached to the bridges of its networks and no other, which is Docker's \
              arrangement. That costs about 20 ms for the stack"
-        } else if auto_bridge {
+        } else {
             "so kern gives each service its own network namespace on a bridge, which is Docker's \
              arrangement. That costs about 20 ms for the stack"
-        } else {
-            "so kern gives each service its own network namespace (as `--no-pod` does). That costs \
-             a relay hop between peers"
         };
         eprintln!(
             "kern: note: this file {why}, which ONE shared namespace cannot do, {how}; pass `--pod` \
@@ -1647,7 +1643,6 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
              it with the separation dropped"
         );
     }
-    let no_pod = no_pod || auto_no_pod;
     // COMPUTED HERE, before the sentences about the wiring, because it decides the wiring too:
     // `start` on a stack running without a pod keeps it without one (see `use_pod` below), and a
     // sentence chosen without it described the bridge on a stack that ran on relays.
@@ -1708,8 +1703,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // `want_bridge` is read AFTER the automatic decision above has been folded into it, so this is
     // the wiring the stack will actually get and not the flag someone typed.
-    if let Some(note) = crate::compose::net_share_note(mode, &net_share_pairs) {
-        eprintln!("kern: warning: compose: {note}");
+    // A NOTE AND NOT A WARNING: the key is satisfied in every wiring now. And only where the wiring
+    // is the subject, like the other wiring notes, so `ps` and `logs` do not repeat it.
+    if wiring_is_the_subject {
+        if let Some(note) = crate::compose::net_share_note(mode, &net_share_pairs) {
+            eprintln!("kern: note: compose: {note}");
+        }
     }
     // THE MEMORY CEILING EVERY SERVICE ACTUALLY GETS, RESOLVED ONCE FOR THE WHOLE STACK.
     //
@@ -2473,6 +2472,49 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // loopback and needs its own NAT. Asked as `use_pod`, a `links:` alias on a bridge resolved to
     // the service's own `127.0.0.1`.
     let shared_ns = use_pod && bridge_cidr.is_none();
+    // `network_mode: service:X` IN A STACK WITH A NAMESPACE PER SERVICE: the box joins X's network
+    // namespace (`--network container:<X's box>`), so it has no address, no NAT, no relay and no name
+    // of its own on the stack's networks, and every plan below is built without it. In ONE shared
+    // namespace there is nothing to join: the key is satisfied by the wiring itself.
+    //
+    // A TARGET ON THE HOST NETWORK IS NOT JOINED: it has no namespace of its own to enter, and the
+    // parser already said the posture is not carried across.
+    let joins: std::collections::HashMap<String, String> = if shared_ns {
+        std::collections::HashMap::new()
+    } else {
+        boxes
+            .iter()
+            .filter(|b| !b.net && !b.net_none)
+            .filter_map(|b| {
+                let t = b.net_share.as_deref()?;
+                let target = boxes.iter().find(|o| o.service == t || o.name == t)?;
+                (!target.net).then(|| (b.name.clone(), target.name.clone()))
+            })
+            .collect()
+    };
+    // DOCKER'S TWO REFUSALS, in Docker's words (measured with `docker compose up`): a published port
+    // would be the target's port under this service's name, and the hostname belongs to the
+    // namespace being joined.
+    for name in joins.keys() {
+        if let Some(b) = boxes.iter().find(|b| &b.name == name) {
+            if !b.ports.is_empty() {
+                return Err(Error::Compose(format!(
+                    "service '{}': conflicting options: port publishing and the container type \
+                     network mode (`network_mode: service:` shares another service's network, so \
+                     publish the port on that service), as Docker refuses it",
+                    b.service_name()
+                )));
+            }
+            if b.hostname.is_some() {
+                return Err(Error::Compose(format!(
+                    "service '{}': conflicting options: hostname and the network mode (the name \
+                     belongs to the network namespace it joins), as Docker refuses it",
+                    b.service_name()
+                )));
+            }
+        }
+    }
+    let joins = &joins;
 
     // `ipv4_address:` ANSWERED HERE TOO, and for the same reason: the key is honoured in one wiring
     // and only half honoured in the other, so the parser cannot say which without knowing the
@@ -2544,7 +2586,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // ON A BRIDGE EVERY MEMBER NEEDS ITS OWN NAT: the pod's single NAT lives in the holder's
     // namespace, which a bridge member is not in. The rule is about ONE SHARED NAMESPACE and not
     // about the word "pod", which is why the argument is the shared-namespace question.
-    let outbound_for = outbound_targets(&boxes, shared_ns, use_pod);
+    let outbound_for: std::collections::HashSet<String> =
+        outbound_targets(&boxes, shared_ns, use_pod)
+            .into_iter()
+            .filter(|n| !joins.contains_key(n))
+            .collect();
     // Write ends, one per PREPARED box, held by `up` and keyed by box name so the release can be
     // ordered by dependency level.
     //
@@ -2703,8 +2749,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         let mut udp_ports: Vec<String> = Vec::new();
         let services: Vec<crate::nopod::ServiceInput> = boxes
             .iter()
+            // A box that joins another's namespace has no alias of its own (see `joins`).
+            .filter(|b| !joins.contains_key(&b.name))
             .map(|b| {
-                let declared = relay_ports(b);
+                // ITS JOINERS' PORTS ARE ITS PORTS: a box that joined this one listens in this
+                // namespace, so a peer reaches it at this service's name, as under Docker.
+                let mut declared = relay_ports(b);
+                for j in boxes.iter().filter(|j| joins.get(&j.name) == Some(&b.name)) {
+                    for p in relay_ports(j) {
+                        if !declared.contains(&p) {
+                            declared.push(p);
+                        }
+                    }
+                }
                 let tcp: Vec<u16> = declared
                     .iter()
                     .filter(|(_, udp)| !*udp)
@@ -2807,7 +2864,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             } else {
                 (&bridge_nets[..], false)
             };
-            let (plan, notes) = bridge_plan(&boxes, nets, one_bridge)?;
+            let (mut plan, notes) = bridge_plan(&boxes, nets, one_bridge)?;
+            // A box that joins another's namespace takes no bridge address (see `joins`): its entry
+            // is dropped after the assignment, which leaves only a gap in the numbering.
+            plan.retain(|a| {
+                !boxes
+                    .iter()
+                    .any(|b| b.service == a.service && joins.contains_key(&b.name))
+            });
             for n in notes {
                 eprintln!("kern: warning: compose: {n}");
             }
@@ -2921,7 +2985,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         if !external_nets.is_empty() {
             let peers = crate::network::peers_of(&external_nets, &pod);
             for b in &boxes {
-                if b.external_networks.is_empty() || b.net {
+                // A joining box reads its hosts file from the box it joins (see `joins`).
+                if b.external_networks.is_empty() || b.net || joins.contains_key(&b.name) {
                     // A service on the HOST network resolves what the host resolves; pointing its
                     // peers at a loopback alias would break that, which is the same reason the
                     // intra-stack hosts entries skip it.
@@ -3057,7 +3122,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // `network_mode: none` STAYS OUT TOO, for the opposite reason to `host`:
                             // that one already has the host's network, this one asked for none at
                             // all, and a pod would hand it both peers and egress.
-                            if use_pod && !b.net && !b.net_none {
+                            // A BOX THAT JOINS ANOTHER'S NAMESPACE is in no pod and on no bridge of
+                            // its own: it enters the namespace of the box it names, and takes that
+                            // box's name, hosts file and resolvers with it (see `joins`).
+                            let joining = joins.get(&b.name);
+                            if let Some(target) = joining {
+                                cmd.arg("--network").arg(format!("container:{target}"));
+                            }
+                            if use_pod && !b.net && !b.net_none && joining.is_none() {
                                 cmd.arg("--pod").arg(pod);
                                 // ON A BRIDGE the box joins the pod's USER namespace and keeps its
                                 // OWN network one, taking its address on the bridge. That is what
@@ -3080,7 +3152,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // alias, this box at its own loopback. A box on the host net is skipped -
                             // it already resolves whatever the host resolves, and pointing its name
                             // at a loopback alias would break that.
-                            if !b.net {
+                            if !b.net && joining.is_none() {
                                 if let Some(entries) = crate::nopod::add_host_args(
                                     address_plan,
                                     &b.service,
@@ -3110,7 +3182,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             // allocated when they joined it, so they are known before this box
                             // exists; the relay that makes each one answer is built below, while
                             // every box is still held at its gate.
-                            if !b.net {
+                            if !b.net && joining.is_none() {
                                 for e in cross_hosts.get(&b.name).into_iter().flatten() {
                                     cmd.arg("--add-host").arg(e);
                                 }
@@ -3322,6 +3394,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         let mine: Vec<crate::network::Joining> = boxes
             .iter()
             .filter(|b| !b.external_networks.is_empty() && !b.net)
+            // Not a member in its own right: it lives in the namespace of the box it joins.
+            .filter(|b| !joins.contains_key(&b.name))
             .filter(|b| registry::find(&b.name).is_some())
             .map(|b| crate::network::Joining {
                 box_name: b.name.clone(),
@@ -3850,6 +3924,13 @@ fn compose_run(
             bm.entrypoint = Some(vec![e.to_string()]);
         }
     }
+    // `network_mode: service:X` HOLDS FOR THE ONE-OFF TOO, as under Docker: it runs in X's network
+    // namespace (X is a dependency, so it was started above), and is in no pod and on no bridge.
+    let join_target: Option<String> = boxes.get(idx).and_then(|b| {
+        let t = b.net_share.as_deref()?;
+        let host = boxes.iter().find(|o| o.service == t || o.name == t)?;
+        (!host.net && !b.net && !b.net_none).then(|| host.name.clone())
+    });
     let Some(b) = boxes.get_mut(idx) else {
         return Err(Error::Compose(format!("run: service '{target}' vanished")));
     };
@@ -3866,7 +3947,15 @@ fn compose_run(
     // Join the stack's pod when there IS one, so the one-off reaches `db` by name exactly as the
     // service would. There is none when the stack was never started and the target has no
     // dependencies, and then a one-off with no peers needs no network of its own.
-    if crate::pod::holder_pid(pod).is_some() {
+    if let Some(t) = &join_target {
+        if !crate::commands::is_box_alive(t) {
+            return Err(Error::Compose(format!(
+                "run: service '{target_service}' lives in the network namespace of '{t}' \
+                 (`network_mode: service:`), and that box is not running; start it first"
+            )));
+        }
+        c.arg("--network").arg(format!("container:{t}"));
+    } else if crate::pod::holder_pid(pod).is_some() {
         c.arg("--pod").arg(pod);
         // ON A BRIDGE, JOINING THE POD IS NOT ENOUGH. A member keeps its own network namespace and
         // takes an address on the bridge; a one-off that only joined the pod's USER namespace had no
@@ -3890,7 +3979,10 @@ fn compose_run(
     }
     // THE PEERS, AT THE ADDRESSES THEY ACTUALLY HOLD. `add_host_args` is the same function every
     // member is wired with, asked for this service's view: peers at their aliases, itself at its own.
-    if let Some(entries) = crate::nopod::add_host_args(address_plan, &target_service, false) {
+    if let (Some(entries), None) = (
+        crate::nopod::add_host_args(address_plan, &target_service, false),
+        &join_target,
+    ) {
         for e in entries {
             c.arg("--add-host").arg(e);
         }

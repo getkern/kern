@@ -8710,6 +8710,10 @@ fn a_shared_port_costs_only_the_service_that_binds_the_wildcard() {
 /// `db` and `cache` behind an `api` behind a `web`, with `depends_on` between them, two services
 /// binding a specific address and two binding the wildcard, and four distinct ports. Twelve relays.
 ///
+/// The specific address is the box's OWN (`192.0.0.8`, what its name resolves to), not its
+/// loopback: a peer reaches what a service serves on its interfaces and not what it keeps on
+/// `127.0.0.1`, which is Docker's rule and, since the relays target the box address, kern's.
+///
 /// IT EXISTS BECAUSE IT FOUND A DEFECT THE UNIT TESTS COULD NOT. The holder decides each relay by
 /// measuring what the hosting box bound, and "nothing is listening on that port" was read as the racy
 /// case for every pair. That is only true when the host DECLARES the port and has not bound it yet; a
@@ -8739,7 +8743,7 @@ fn a_four_service_stack_reaches_itself_without_a_pod() {
     // and a quoting mistake in the probe reads exactly like a broken relay.
     fs::write(
         root.join("api.sh"),
-        "#!/bin/busybox sh\nhttpd -p 127.0.0.1:3000 -h /www\nsleep 5\nwhile :; do\n  \
+        "#!/bin/busybox sh\nhttpd -p 192.0.0.8:3000 -h /www\nsleep 5\nwhile :; do\n  \
          D=$(wget -qO- http://db:5432/d 2>/dev/null)\n  \
          C=$(wget -qO- http://cache:6379/c 2>/dev/null)\n  \
          echo \"api: db=${D:-NO} cache=${C:-NO}\"\n  sleep 2\ndone\n",
@@ -8760,7 +8764,7 @@ fn a_four_service_stack_reaches_itself_without_a_pod() {
         &toml,
         format!(
             "[box.db]\nrootfs = \"{rootfs}\"\nport = 5432\n\
-             command = [\"/bin/busybox\", \"sh\", \"-c\", \"httpd -p 127.0.0.1:5432 -h /www; sleep 3600\"]\n\n\
+             command = [\"/bin/busybox\", \"sh\", \"-c\", \"httpd -p 192.0.0.8:5432 -h /www; sleep 3600\"]\n\n\
              [box.cache]\nrootfs = \"{rootfs}\"\nport = 6379\n\
              command = [\"/bin/busybox\", \"httpd\", \"-f\", \"-p\", \"6379\", \"-h\", \"/www\"]\n\n\
              [box.api]\nrootfs = \"{rootfs}\"\nport = 3000\ndepends_on = [\"db\", \"cache\"]\n\
@@ -13818,12 +13822,10 @@ fn the_ps_table_stays_aligned_when_a_box_name_is_long() {
 /// `wiring: bridge`. Two independent defects in one output - a dropped key, and a sentence asserting
 /// the opposite of what happened.
 ///
-/// TWO THINGS ARE ASSERTED, and the second is why the first cannot be faked:
-///   1. by DEFAULT the key is honoured: the client reaches the peer's listener on its OWN 127.0.0.1,
-///      which is only possible if the two share a namespace;
-///   2. under an explicit `--bridge` the note switches to the arm that says the key is NOT given,
-///      because there the namespaces really are separate. A single-armed message would pass the
-///      first assertion and lie in exactly the configuration this defect appeared in.
+/// THE KEY IS NOW HONOURED BY JOINING, in every wiring: the client enters the named service's network
+/// namespace (`--network container:`), as under Docker, so the stack keeps the bridge its three
+/// services call for and the note says the key is satisfied on it. Asserted from inside: the client
+/// reaches the peer's listener on its OWN 127.0.0.1, which only a shared namespace makes possible.
 #[test]
 fn network_mode_service_gets_a_shared_namespace_and_the_note_says_which() {
     let Some(busybox) = static_busybox() else {
@@ -13941,9 +13943,9 @@ fn network_mode_service_gets_a_shared_namespace_and_the_note_says_which() {
         return;
     }
     assert!(
-        default_cfg.contains("wiring: pod"),
-        "a file asking for a shared namespace must be wired as one, whatever the default is for \
-         files that do not ask:\n{default_cfg}"
+        default_cfg.contains("wiring: bridge"),
+        "the key no longer forces one namespace for the whole stack: the joining service enters \
+         the named one's, and the stack takes the wiring its other properties call for:\n{default_cfg}"
     );
     assert!(
         reach.contains("VPN-SIDE"),
@@ -13956,19 +13958,18 @@ fn network_mode_service_gets_a_shared_namespace_and_the_note_says_which() {
     );
     assert!(
         bridged_cfg.contains("wiring: bridge")
-            && bridged_cfg.contains("is NOT given a shared namespace"),
-        "the CONTROL failed: under an explicit `--bridge` the namespaces really are separate, so \
-         the note must say the key is NOT given. A message with one arm would pass every assertion \
-         above and lie here, which is the configuration this defect appeared in:\n{bridged_cfg}"
+            && bridged_cfg.contains("JOINS the network namespace"),
+        "under an explicit `--bridge` the joining service still enters the named one's namespace, \
+         and the note says so:\n{bridged_cfg}"
     );
     assert!(
         collide_cfg.contains("wiring: bridge")
-            && collide_cfg.contains("is NOT given a shared namespace")
+            && collide_cfg.contains("is satisfied here")
             && !collide_cfg.contains("error:"),
         "a stack that asks for a shared namespace AND collides on a container port cannot be a pod, \
          and must not be REFUSED for it: Docker accepts such a file and lets the second bind fail \
-         at run time. It gets the bridge and is told the key is not given. The first version of \
-         this fix forced the pod unconditionally and turned five real corpus files into \
+         at run time. It gets the bridge, on which the key is honoured by joining. An earlier \
+         version forced the pod unconditionally and turned five real corpus files into \
          refusals:\n{collide_cfg}"
     );
 }

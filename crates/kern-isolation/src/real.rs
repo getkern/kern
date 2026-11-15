@@ -157,6 +157,13 @@ pub struct SandboxSpec {
     /// NOT A SUBNET AND NOT A ROUTE. Each address is claimed as a `/32` on the loopback, so it
     /// answers inside the namespace and changes nothing about how the box reaches the world.
     pub net_ips: Vec<std::net::Ipv4Addr>,
+    /// Give this box its own address ([`BOX_ADDR`]) and resolve its name to it. Set by the CLI for a
+    /// box that publishes ports, joins a pod, or is a compose service: the boxes something reaches
+    /// from outside. A box with none of those (an SDK cell, an MCP call) has nothing to reach it, and
+    /// skips the cost: MEASURED on WSL2 in the child phase that holds the add (`KERN_TIMING=1`, the
+    /// `seccomp` mark), about 210 us with the address against 175 us without, 8 starts each. A
+    /// whole-start A/B could not see it: its A/A control came out "distinguishable" that session.
+    pub box_addr: bool,
     /// `--pod <name>`: JOIN this pod holder's user + net namespace instead of creating a fresh one,
     /// so every box in the pod shares one loopback network (they reach each other on `127.0.0.1`,
     /// resolved by name via a shared `/etc/hosts`). The value is the holder process's PID; the box
@@ -1871,7 +1878,15 @@ fn child_setup_and_exec(
         make_box_tmpfs(&spec.root, "run")?;
     }
     setup_secrets(&spec.root, &spec.secrets, run_tmpfs)?;
-    setup_etc_identity(&spec.root, &spec.hostname);
+    // A pod member in the SHARED namespace has the pod's hosts file bound over its own, and its
+    // entry there is written by the CLI; writing it here would race the other members on one file.
+    let shared_hosts = spec.pod_holder.is_some() && spec.pod_bridges.is_empty();
+    setup_etc_identity(
+        &spec.root,
+        &spec.hostname,
+        box_own_ip(spec).unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+        shared_hosts,
+    );
     setup_extra_hosts(&spec.root, &spec.extra_hosts);
     // AFTER the hosts files, because the two are independent and this one only fires when asked.
     setup_resolv_conf(&spec.root, &spec.dns, &spec.dns_search, &spec.dns_options);
@@ -2007,6 +2022,13 @@ fn child_setup_and_exec(
     // share. Best-effort and per address, so one that cannot be claimed does not cost the others.
     for ip in &spec.net_ips {
         add_loopback_alias(*ip);
+    }
+    // THE BOX'S OWN ADDRESS, in every box with a network namespace of its own. A bridge member
+    // publishes on its bridge address, but a peer relay (`--no-pod`, an external network) reaches
+    // whichever box it serves at this one, so every private namespace carries it. A pod member adds
+    // it to the namespace it shares, idempotent and verified like the `--ip` aliases above.
+    if !spec.share_net && spec.box_addr {
+        add_loopback_alias(BOX_ADDR);
     }
 
     // `--ssh`: stand up the in-box sshd (mounts /run tmpfs, writes keys/config, forks sshd). Done
@@ -4861,6 +4883,18 @@ fn cpu_dir_name(buf: &mut [u8; 16], id: u32) -> usize {
     total
 }
 
+/// Does this `/etc/hosts` text name `host` on some entry? Fields after the address, comments
+/// skipped, compared byte for byte (a hostname is ASCII), with no allocation.
+fn hosts_text_names(text: &[u8], host: &[u8]) -> bool {
+    text.split(|&b| b == b'\n').any(|line| {
+        let line = line.split(|&b| b == b'#').next().unwrap_or(&[]);
+        line.split(|b| b.is_ascii_whitespace())
+            .filter(|f| !f.is_empty())
+            .skip(1)
+            .any(|f| f.eq_ignore_ascii_case(host))
+    })
+}
+
 /// Write the two `/etc` files a container runtime owns: `/etc/hosts` and `/etc/hostname`.
 ///
 /// WHY BOTH IN ONE FUNCTION, AND WHY NOT `open_in_root`
@@ -4894,7 +4928,7 @@ fn cpu_dir_name(buf: &mut [u8; 16], id: u32) -> usize {
 ///
 /// Best-effort in every branch: no failure here fails the box, and `setup_extra_hosts` appends
 /// `--add-host` entries after this, so they land under the seeds instead of into an empty file.
-fn setup_etc_identity(root: &str, hostname: &str) {
+fn setup_etc_identity(root: &str, hostname: &str, self_ip: std::net::Ipv4Addr, shared_hosts: bool) {
     /// The two lines every runtime seeds, byte-identical to what the pod's shared file carries so a
     /// standalone box and a pod member cannot disagree about `localhost`.
     ///
@@ -4920,8 +4954,6 @@ fn setup_etc_identity(root: &str, hostname: &str) {
     /// `::1`, and kern does the same. The IPv6 loopback keeps its own names, which is what anything
     /// asking for IPv6 by name uses.
     const LOCALHOST_SEED: &[u8] = b"127.0.0.1\tlocalhost\n::1\tip6-localhost ip6-loopback\n";
-    /// Prefix of the box's own entry. Split from the name so neither has to be copied to be written.
-    const SELF_PREFIX: &[u8] = b"127.0.0.1\t";
     /// What an `/etc/hosts` must already contain for kern to leave it alone.
     const LOCALHOST: &[u8] = b"localhost";
 
@@ -4980,7 +5012,14 @@ fn setup_etc_identity(root: &str, hostname: &str) {
     // also what makes this safe against the pod bind. That shared file always carries `localhost`,
     // so it is matched and skipped; if it somehow did not, appending would still not destroy the
     // peer names it exists to carry.
-    if let Ok(f) = cstr("hosts") {
+    // THE BOX'S OWN NAME resolves to the box's own address (`self_ip`: [`BOX_ADDR`], or its bridge
+    // address), as a container's name resolves to its address under Docker. It used to be written as
+    // `127.0.0.1`, and only into a file that lacked `localhost`, so on an image that ships one
+    // (alpine does) the name did not resolve at all. A service that binds its hostname (Cassandra,
+    // Kafka, Elasticsearch read `hostname -i`) then bound loopback or nothing, and a published port,
+    // which reaches the box's address, would not reach it. The line is appended unless the file
+    // already names the host; the shared pod file is left alone (its entries are the CLI's).
+    if let (Ok(f), false) = (cstr("hosts"), shared_hosts) {
         let fd = unsafe {
             libc::openat(
                 dir_fd,
@@ -4990,8 +5029,7 @@ fn setup_etc_identity(root: &str, hostname: &str) {
             )
         };
         if fd >= 0 {
-            // A bounded read: an /etc/hosts that answers for `localhost` states it in the first few
-            // lines, and a box must not be able to make kern read an unbounded file at setup.
+            // A bounded read: a box must not be able to make kern read an unbounded file at setup.
             let mut buf = [0u8; 4096];
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             let head = if n > 0 {
@@ -5003,30 +5041,40 @@ fn setup_etc_identity(root: &str, hostname: &str) {
             let resolves_localhost = head
                 .windows(LOCALHOST.len())
                 .any(|w| w.eq_ignore_ascii_case(LOCALHOST));
-            if !resolves_localhost {
-                // `writev` over borrowed slices: the two constant halves are `'static` and the name
-                // is borrowed from the caller, so the file is written with ZERO heap allocation and
-                // ONE syscall. The earlier shape built a `String` per box to concatenate three
-                // fragments that never needed to be contiguous.
-                let mut iov = [libc::iovec {
-                    iov_base: ptr::null_mut(),
-                    iov_len: 0,
-                }; 4];
-                let mut n = 0usize;
-                let mut push = |b: &[u8]| {
-                    iov[n] = libc::iovec {
+            let names_host = name_ok && hosts_text_names(head, h.as_bytes());
+            // The address as text, in a stack buffer: at most `255.255.255.255`, 15 bytes.
+            let mut ip_buf = [0u8; 16];
+            let ip_len = {
+                use std::io::Write as _;
+                let mut cur = std::io::Cursor::new(&mut ip_buf[..]);
+                let _ = write!(cur, "{self_ip}\t");
+                usize::try_from(cur.position()).unwrap_or(0)
+            };
+            // `writev` over borrowed slices: zero heap allocation, one syscall.
+            let mut iov = [libc::iovec {
+                iov_base: ptr::null_mut(),
+                iov_len: 0,
+            }; 4];
+            let mut k = 0usize;
+            let mut push = |b: &[u8]| {
+                if let Some(slot) = iov.get_mut(k) {
+                    *slot = libc::iovec {
                         iov_base: b.as_ptr() as *mut libc::c_void,
                         iov_len: b.len(),
                     };
-                    n += 1;
-                };
-                push(LOCALHOST_SEED);
-                if name_ok {
-                    push(SELF_PREFIX);
-                    push(h.as_bytes());
-                    push(b"\n");
+                    k += 1;
                 }
-                unsafe { libc::writev(fd, iov.as_ptr(), n as libc::c_int) };
+            };
+            if !resolves_localhost {
+                push(LOCALHOST_SEED);
+            }
+            if name_ok && !names_host && ip_len > 0 {
+                push(ip_buf.get(..ip_len).unwrap_or(&[]));
+                push(h.as_bytes());
+                push(b"\n");
+            }
+            if k > 0 {
+                unsafe { libc::writev(fd, iov.as_ptr(), k as libc::c_int) };
             }
             unsafe { libc::close(fd) };
         }
@@ -6533,7 +6581,12 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     }
     // Report PID 1 (for `kern exec`) and start the `-p` forwarders now that the box's net ns exists.
     let box_master = on_started(pid);
-    forwarders.activate(pid);
+    // The address a published port reaches: the box's own, never its loopback (see [`BOX_ADDR`]).
+    // A box on the host network has none, and its forwarders refuse every connection anyway.
+    forwarders.activate(
+        pid,
+        box_own_ip(spec).map_or(u32::from(std::net::Ipv4Addr::LOCALHOST), u32::from),
+    );
     // `-it`: hand the terminal to the box. Drop our copy of the slave so the master sees EOF when
     // the box exits, then pump host stdio <-> master until then. Single-threaded by design - the
     // fork above must run in a single-threaded process (the child does non-async-signal-safe setup),
@@ -8421,6 +8474,45 @@ pub fn iface_rename(old: &str, new: &str) -> bool {
         libc::close(sock);
         ok
     }
+}
+
+/// THE BOX'S OWN ADDRESS when it has no network interface of its own: `192.0.0.8`, the "IPv4 dummy
+/// address" of RFC 7600, reserved for exactly this (a host with no IPv4 of its own that still needs
+/// a source and a destination). Added as a `/32` on the box's `lo`; never routed anywhere.
+///
+/// WHY A BOX NEEDS ONE. A published port used to be forwarded to `127.0.0.1:<port>` inside the box,
+/// FROM `127.0.0.1`. Two Docker differences came out of that, both measured:
+///
+/// * a service listening on the box's `127.0.0.1` only was published anyway (`-p 18084:80` on a
+///   listener bound to `127.0.0.1` answered from the LAN), where Docker forwards to the container's
+///   address and such a listener is not reached;
+/// * every client from the network arrived as LOOPBACK, which is the most trusted source a server
+///   has: Redis' protected mode, an admin endpoint that trusts `127.0.0.0/8`, a database's `trust`
+///   rule for local connections. Under Docker the client is the bridge gateway.
+///
+/// Forwarding to and from this address gives Docker's answer for both: a listener on every interface
+/// is reached, one on `127.0.0.1` is not, and the server sees a client that is not loopback. The
+/// box's own name resolves to it too (see [`setup_etc_identity`]), as a container's name resolves to
+/// its address, so a service that binds its hostname is still the one a published port reaches.
+pub const BOX_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 0, 8);
+
+/// The address a box answers on inside its own network namespace: its address on the pod bridge when
+/// it is a bridge member (the one its peers use), [`BOX_ADDR`] when it has one ([`SandboxSpec::box_addr`]),
+/// `127.0.0.1` otherwise. `None` for a box that shares the HOST network, which has no address of its
+/// own to publish.
+#[must_use]
+pub fn box_own_ip(spec: &SandboxSpec) -> Option<std::net::Ipv4Addr> {
+    if spec.share_net {
+        return None;
+    }
+    if let Some(b) = spec.pod_bridges.first() {
+        return Some(b.ip);
+    }
+    Some(if spec.box_addr {
+        BOX_ADDR
+    } else {
+        std::net::Ipv4Addr::LOCALHOST
+    })
 }
 
 pub fn add_loopback_alias(ip: std::net::Ipv4Addr) -> bool {
@@ -10352,7 +10444,7 @@ mod add_host_tests {
         let _ = std::fs::write(tmp.join("etc/hostname"), "debuerreotype\n");
         let root = tmp.to_string_lossy().into_owned();
 
-        setup_etc_identity(&root, "boxname");
+        setup_etc_identity(&root, "boxname", BOX_ADDR, false);
 
         let hosts = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert!(
@@ -10367,9 +10459,11 @@ mod add_host_tests {
             hosts.contains("::1\tip6-localhost") && !hosts.contains("::1\tlocalhost"),
             "the IPv6 line must not claim the name `localhost`: {hosts:?}"
         );
+        // Its OWN ADDRESS, not loopback: a published port reaches that address, so a service that
+        // binds its hostname must land there (as a container's name is its address under Docker).
         assert!(
-            hosts.contains("127.0.0.1\tboxname"),
-            "the box resolves its own name: {hosts:?}"
+            hosts.contains("192.0.0.8\tboxname") && !hosts.contains("127.0.0.1\tboxname"),
+            "the box resolves its own name to its own address: {hosts:?}"
         );
         let hn = std::fs::read_to_string(tmp.join("etc/hostname")).unwrap_or_default();
         assert_eq!(
@@ -10380,25 +10474,59 @@ mod add_host_tests {
     }
 
     #[test]
-    fn etc_identity_leaves_a_populated_hosts_alone() {
+    fn etc_identity_keeps_a_shipped_hosts_and_adds_only_the_own_name() {
         let tmp = std::env::temp_dir().join(format!("kern-etcid-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let Ok(()) = std::fs::create_dir_all(tmp.join("etc")) else {
             return;
         };
-        // Alpine ships one; so does the pod bind, which arrives as a non-empty file over this path.
+        // Alpine ships one with `localhost` and no entry for the box: the name did not resolve at
+        // all in an alpine box, and `hostname -i` failed.
         let shipped = "127.0.0.1\tlocalhost localhost.localdomain\n";
         let _ = std::fs::write(tmp.join("etc/hosts"), shipped);
         let root = tmp.to_string_lossy().into_owned();
+        let bridge = std::net::Ipv4Addr::new(10, 89, 0, 3);
 
-        setup_etc_identity(&root, "boxname");
-
-        let hosts = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
+        setup_etc_identity(&root, "boxname", bridge, false);
+        let once = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert_eq!(
-            hosts, shipped,
-            "a non-empty hosts file is never rewritten, so a pod's shared file is not duplicated"
+            once,
+            format!("{shipped}10.89.0.3\tboxname\n"),
+            "the image's lines are kept and only the box's own name is added, at its address"
         );
+        // A second setup over the same file (a restart on a kept rootfs) adds nothing.
+        setup_etc_identity(&root, "boxname", bridge, false);
+        let twice = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
+        assert_eq!(
+            twice, once,
+            "an entry that names the host is not duplicated"
+        );
+
+        // THE POD'S SHARED FILE is never written here: the CLI owns its entries, and every member
+        // writing its own would race the others on one file.
+        let _ = std::fs::write(tmp.join("etc/hosts"), shipped);
+        setup_etc_identity(&root, "boxname", BOX_ADDR, true);
+        let shared = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
+        assert_eq!(shared, shipped, "a shared pod hosts file is left alone");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn hosts_text_names_matches_whole_names_after_the_address_only() {
+        let t = b"# boxname in a comment\n127.0.0.1 localhost\n10.0.0.5 db boxname.lan\n";
+        assert!(
+            !hosts_text_names(t, b"boxname"),
+            "a comment or a longer name is not the name"
+        );
+        assert!(hosts_text_names(t, b"db"));
+        assert!(
+            !hosts_text_names(t, b"10.0.0.5"),
+            "the address field is not a name"
+        );
+        assert!(
+            hosts_text_names(b"192.0.0.8\tBoxName", b"boxname"),
+            "names are case-blind"
+        );
     }
 
     #[test]
@@ -10415,7 +10543,7 @@ mod add_host_tests {
         let comments = "# written by the build\n# do not edit\n";
         let _ = std::fs::write(tmp.join("etc/hosts"), comments);
 
-        setup_etc_identity(&tmp.to_string_lossy(), "boxname");
+        setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false);
 
         let out = std::fs::read_to_string(tmp.join("etc/hosts")).unwrap_or_default();
         assert!(
@@ -10423,7 +10551,7 @@ mod add_host_tests {
             "what the image wrote is kept, the seeds go under it: {out:?}"
         );
         assert!(
-            out.contains("127.0.0.1\tlocalhost") && out.contains("127.0.0.1\tboxname"),
+            out.contains("127.0.0.1\tlocalhost") && out.contains("192.0.0.8\tboxname"),
             "a file that resolved nothing is seeded: {out:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -10444,7 +10572,7 @@ mod add_host_tests {
 
         // 1. `/etc` itself is a symlink out of the root: the descent must refuse it.
         if std::os::unix::fs::symlink(&out, tmp.join("etc")).is_ok() {
-            setup_etc_identity(&tmp.to_string_lossy(), "boxname");
+            setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false);
             assert!(
                 !out.join("hosts").exists() && !out.join("hostname").exists(),
                 "a symlinked /etc must not be followed out of the box root"
@@ -10457,7 +10585,7 @@ mod add_host_tests {
             return;
         };
         if std::os::unix::fs::symlink(out.join("pwned"), tmp.join("etc/hosts")).is_ok() {
-            setup_etc_identity(&tmp.to_string_lossy(), "boxname");
+            setup_etc_identity(&tmp.to_string_lossy(), "boxname", BOX_ADDR, false);
             assert!(
                 !out.join("pwned").exists(),
                 "a symlinked /etc/hosts must not be followed out of the box root"

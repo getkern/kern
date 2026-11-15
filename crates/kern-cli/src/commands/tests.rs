@@ -3008,16 +3008,19 @@ stopsignal	SIGTERM
     /// is no `kern.toml`, which is most hosts.
     #[test]
     fn the_publish_policy_overrides_even_a_written_address_and_counts_what_it_moved() {
-        let pm = |ip, host| kern_isolation::PortMap {
-            bind_ip: ip,
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let pm = |bind, host| kern_isolation::PortMap {
+            bind,
+            implicit: false,
             host,
             box_port: 80,
             udp: false,
         };
-        const LO: u32 = 0x7f00_0001;
+        const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        const ANY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
         // No policy: nothing moves, nothing is reported.
-        let mut ports = vec![pm(0, 8080), pm(LO, 8081)];
+        let mut ports = vec![pm(ANY, 8080), pm(LO, 8081)];
         let before = ports.clone();
         assert_eq!(apply_publish_policy(&mut ports, None), 0);
         assert_eq!(ports, before, "the shipped behaviour must be a no-op");
@@ -3025,19 +3028,32 @@ stopsignal	SIGTERM
         // Loopback policy: the wildcard moves, the one already on loopback does not, and only the
         // moves are counted - a count that included the no-ops would report a change that did not
         // happen.
-        let mut ports = vec![pm(0, 8080), pm(LO, 8081), pm(0, 8082)];
+        let mut ports = vec![pm(ANY, 8080), pm(LO, 8081), pm(ANY, 8082)];
         assert_eq!(apply_publish_policy(&mut ports, Some(LO)), 2);
-        assert!(ports.iter().all(|p| p.bind_ip == LO));
+        assert!(ports.iter().all(|p| p.bind == LO));
 
         // A WRITTEN `0.0.0.0` is overridden too: that is what makes it a ceiling.
-        let mut ports = vec![pm(0, 9090)];
+        let mut ports = vec![pm(ANY, 9090)];
         assert_eq!(apply_publish_policy(&mut ports, Some(LO)), 1);
-        assert_eq!(ports[0].bind_ip, LO);
+        assert_eq!(ports[0].bind, LO);
 
         // And the policy can also be the wide one, which moves an explicit loopback the other way.
         let mut ports = vec![pm(LO, 9091)];
-        assert_eq!(apply_publish_policy(&mut ports, Some(0)), 1);
-        assert_eq!(ports[0].bind_ip, 0);
+        assert_eq!(apply_publish_policy(&mut ports, Some(ANY)), 1);
+        assert_eq!(ports[0].bind, ANY);
+
+        // IPv6 IS HELD TO THE SAME CEILING: a loopback policy moves `[::]` to `[::1]`, so the policy
+        // cannot be walked around through an IPv6 spec. A default bind's twin moves with its IPv4
+        // half and is not counted a second time.
+        let mut ports = crate::ports::parse("8080:80").unwrap_or_default();
+        ports.extend(crate::ports::parse("[::]:8081:80").unwrap_or_default());
+        assert_eq!(apply_publish_policy(&mut ports, Some(LO)), 2);
+        let v6: Vec<IpAddr> = ports
+            .iter()
+            .filter(|p| p.bind.is_ipv6())
+            .map(|p| p.bind)
+            .collect();
+        assert_eq!(v6, vec![IpAddr::V6(Ipv6Addr::LOCALHOST); 2], "{ports:?}");
     }
 
     /// THE OPTIONS KERN CAN APPLY MUST BE APPLIED, AND THE HARDENING FLOOR MUST NOT BE REACHABLE.
@@ -6038,11 +6054,17 @@ mod port_collision_tests {
     }
 
     #[test]
-    fn unparseable_spec_is_left_for_the_per_box_path() {
-        // A spec `ports::parse` rejects must NOT be treated as a collision here (that would mask the
-        // real "invalid port" error the per-box start reports). No panic, no false positive.
+    fn an_unparseable_spec_is_refused_as_invalid_and_never_as_a_collision() {
+        // REFUSED BEFORE ANY BOX, as Docker refuses the file. It used to be left for the per-box start,
+        // so `up` created the pod, the box died on `kern -p`'s usage line and the pod was removed
+        // again. It must still never read as a collision with a well-formed neighbour.
         let boxes = [svc("bad", &["not-a-port"]), svc("ok", &["8080:80"])];
-        assert!(check_port_collisions(&boxes).is_ok());
+        let m = check_port_collisions(&boxes)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(m.contains("bad: invalid port 'not-a-port'"), "{m}");
+        assert!(!m.contains("both publish"), "{m}");
     }
 
     // ---- extreme / adversarial edge cases ----------------------------------------------------
@@ -6079,12 +6101,19 @@ mod port_collision_tests {
     #[test]
     fn max_range_boundary() {
         // `ports::parse` caps a single spec at MAX_RANGE (1024). At the cap the spec expands and a peer
-        // inside it collides; one PAST the cap is rejected by the parser, so we must stay silent and let
-        // the per-box path report it - NOT invent a collision from a spec that will never bind.
+        // inside it collides; one PAST the cap is rejected by the parser, so it is refused as an invalid
+        // spec - NOT reported as a collision from a spec that will never bind.
         let at_cap = [svc("big", &["1-1024:1-1024"]), svc("peer", &["512:80"])];
         assert_collides(&at_cap, &["'big'", "'peer'", "512/tcp"]);
         let past_cap = [svc("huge", &["1-1025:1-1025"]), svc("peer", &["512:80"])];
-        assert!(check_port_collisions(&past_cap).is_ok());
+        let m = check_port_collisions(&past_cap)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            m.contains("huge: invalid port '1-1025:1-1025'") && !m.contains("both publish"),
+            "{m}"
+        );
     }
 
     #[test]
@@ -6100,6 +6129,25 @@ mod port_collision_tests {
         );
         // Adjacent extremes don't collide.
         assert!(check_port_collisions(&[svc("a", &["65534:1"]), svc("b", &["65535:1"])]).is_ok());
+    }
+
+    #[test]
+    fn ipv6_binds_collide_within_their_family_only() {
+        // A default bind is BOTH families (Docker's), so it collides with an explicit `[::]`; an
+        // explicit `0.0.0.0` and an explicit `[::]` are two listeners that never meet (IPv6-only).
+        assert_collides(
+            &[svc("a", &["8090:80"]), svc("b", &["[::]:8090:81"])],
+            &["8090/tcp", "'a'", "'b'"],
+        );
+        assert!(check_port_collisions(&[
+            svc("a", &["0.0.0.0:8091:80"]),
+            svc("b", &["[::]:8091:81"])
+        ])
+        .is_ok());
+        assert_collides(
+            &[svc("a", &["[::1]:8092:80"]), svc("b", &["[::]:8092:81"])],
+            &["8092/tcp"],
+        );
     }
 
     #[test]
@@ -6268,14 +6316,24 @@ mod port_collision_tests {
     }
 
     #[test]
-    fn a_malformed_spec_does_not_stop_the_scan() {
-        // The `continue` on an unparseable spec must skip only THAT spec: a real collision after it is
-        // still caught (a `return` there would silently disable the whole check).
+    fn every_malformed_spec_is_refused_together_and_by_name() {
+        // A malformed spec is refused BEFORE anything starts, in `up` as in `config`, and every one of
+        // them in the same refusal: fixing them one error per run is a poor loop. An address that is
+        // not one is named in Docker's words (`invalid IP address: ...`).
         let boxes = [
             svc("a", &["bogus:spec:here:too", "7200:80"]),
-            svc("b", &["7200:81"]),
+            svc("b", &["7200:81", "nope"]),
         ];
-        assert_collides(&boxes, &["'a'", "'b'", "7200/tcp"]);
+        let Err(e) = check_port_collisions(&boxes) else {
+            panic!("malformed specs must be refused");
+        };
+        let m = e.to_string();
+        assert!(
+            m.contains("2 invalid port spec(s)")
+                && m.contains("a: port 'bogus:spec:here:too' - invalid IP address: bogus:spec")
+                && m.contains("b: invalid port 'nope'"),
+            "{m}"
+        );
     }
 }
 
@@ -7660,7 +7718,8 @@ fn a_bind_source_inside_the_registry_is_never_created_and_one_beside_it_is() {
 fn a_privileged_port_moves_to_the_conventional_alternative_and_never_onto_a_taken_one() {
     use crate::commands::shift_privileged_ports;
     let map = |host: u16, box_port: u16, udp: bool| kern_isolation::PortMap {
-        bind_ip: 0,
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        implicit: false,
         host,
         box_port,
         udp,

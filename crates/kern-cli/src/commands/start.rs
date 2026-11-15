@@ -1760,14 +1760,29 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let dns_requested =
         !args.dns.is_empty() || !args.dns_search.is_empty() || !args.dns_options.is_empty();
     let mut inherited_nameservers: Vec<String> = Vec::new();
-    let pod_holder = join_pod_and_bind_its_files(
-        args.pod,
-        name.as_str(),
-        &mut volumes,
-        dns_requested,
-        &mut inherited_nameservers,
-        !args.pod_bridges.is_empty(),
-    )?;
+    // `--network container:<box>` joins THAT box's network namespace through the pod path (a pod
+    // holder is "a process whose user and network namespaces a box enters"), and takes its name, its
+    // hosts file and its resolvers, which is what a container in another's namespace has under Docker.
+    let joined = match args.net_container {
+        Some(target) => Some(join_box_network(target, &args)?),
+        None => None,
+    };
+    let pod_holder = match &joined {
+        Some(j) => {
+            if !dns_requested {
+                inherited_nameservers.extend(j.nameservers.iter().cloned());
+            }
+            Some(j.pid1)
+        }
+        None => join_pod_and_bind_its_files(
+            args.pod,
+            name.as_str(),
+            &mut volumes,
+            dns_requested,
+            &mut inherited_nameservers,
+            !args.pod_bridges.is_empty(),
+        )?,
+    };
     // `--env-file` first (K=V lines from a file), then `--env` on top (explicit wins).
     let mut env = parse_env_files(args.env_file)?;
     env.extend(parse_envs(args.env)?);
@@ -2289,7 +2304,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     let moved = crate::commands::apply_publish_policy(&mut eff_ports, policy);
     if moved > 0 {
         eprintln!(
-            "kern: note: {moved} published port(s) bound to 127.0.0.1 by the host's \
+            "kern: note: {moved} published port(s) bound to loopback (127.0.0.1, ::1) by the host's \
              `[kern] publish_bind` policy, overriding what the spec asked for"
         );
     }
@@ -2315,6 +2330,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         Err(e) => eprintln!(
             "kern: warning: {e}; a privileged port is moved rather than refused, which is the default"
         ),
+    }
+    // THE IPv6 TWIN OF A DEFAULT BIND IS DROPPED WHERE THE HOST HAS NO IPv6, as Docker drops it: a
+    // CI runner or a kernel booted with `ipv6.disable=1` would otherwise refuse every `-p 8080:80`.
+    // An IPv6 address the spec WROTE is kept, so that host refuses it by name. Probed only when there
+    // is a twin to decide about.
+    if eff_ports.iter().any(|p| p.implicit) && !kern_isolation::host_has_ipv6() {
+        eff_ports.retain(|p| !p.implicit);
     }
     let ports: &[kern_isolation::PortMap] = &eff_ports;
     // Fail fast if a `-p` host port is already taken (by another box or any process): otherwise the
@@ -2371,7 +2393,12 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     }
     // `--hostname`: validate before it reaches `sethostname`. `--tmpfs`: parse the Docker-style
     // specs (blocking a tmpfs over the hardened mounts). `--user`: parse UID[:GID].
-    let hostname = validate_hostname(args.hostname)?;
+    let hostname = match &joined {
+        // The joined box's own name, as Docker gives it: a container in another's network namespace
+        // answers to that namespace's hostname.
+        Some(j) if !j.hostname.is_empty() => Some(j.hostname.clone()),
+        _ => validate_hostname(args.hostname)?,
+    };
     let tmpfs = parse_tmpfs(args.tmpfs)?;
     // `--user` wins; otherwise the image's `config.User`. Either can be NUMERIC (parses directly) or a
     // NAME - `--user memcache`, compose `user:`, or the image's own `USER memcache` - resolved against the
@@ -2700,6 +2727,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         seccomp_mode, // resolved above (explicit KERN_SECCOMP > profile > default), not from env here
         landlock_rw: args.landlock_rw.to_vec(),
         net_ips: args.net_ips.to_vec(),
+        // THE BOXES SOMETHING REACHES FROM OUTSIDE get an address of their own: a published port, a
+        // pod's peers, a compose service's peers (every service carries `--def-hash`, and only compose
+        // writes it). An SDK cell or an MCP call has none of them and does not pay for one.
+        box_addr: !args.share_net
+            && (!ports.is_empty() || pod_holder.is_some() || !args.def_hash.is_empty()),
         pod_bridges: args.pod_bridges.clone(),
         apparmor: args.apparmor.map(|s| s.to_string()),
         volumes,
@@ -2769,7 +2801,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         caps,
         io_max: vdisk_io_max,
         io_weight: args.io_weight,
-        extra_hosts: resolve_add_hosts(args.add_hosts, args.share_net),
+        extra_hosts: {
+            let mut h = joined.as_ref().map(|j| j.hosts.clone()).unwrap_or_default();
+            h.extend(resolve_add_hosts(args.add_hosts, args.share_net));
+            h
+        },
         // The box's own servers win; the pod's are the FALLBACK for a box that only added a search
         // domain or an option. An empty result means neither existed, and the box then gets no
         // nameserver line at all, which is the same as it had before it asked.
@@ -3909,6 +3945,86 @@ pub fn run(
     std::process::exit(127);
 }
 
+/// What a box that joins another's network namespace takes from it.
+struct JoinedNet {
+    /// The target's PID 1, whose user and network namespaces the box enters.
+    pid1: i32,
+    /// The target's hostname, its `/etc/hosts` entries (`localhost` lines left to the box) and its
+    /// resolvers: all three belong to the namespace, as under Docker.
+    hostname: String,
+    hosts: Vec<(String, String)>,
+    nameservers: Vec<String>,
+}
+
+/// Resolve `--network container:<target>` to a running box and read what the joining box inherits.
+///
+/// REFUSED with what Docker refuses with it, because each is a contradiction rather than an option:
+/// `-p` (a published port would be the TARGET's port under this box's name; Docker: "conflicting
+/// options: port publishing and the container sharing the network namespace"), `--hostname` (the
+/// name is the namespace's), `--pod` and `--net` (a second network), `--egress-allow` (the filter
+/// owns a namespace this box does not).
+///
+/// The target's files are read through `/proc/<pid1>/root`, which is the target's own view and needs
+/// no mount; one that cannot be read leaves that part empty rather than failing the box, because the
+/// namespace itself is what was asked for.
+fn join_box_network(target: &str, args: &BoxRunArgs) -> Result<JoinedNet, Error> {
+    let conflict = if !args.ports.is_empty() || args.ssh_port.is_some() {
+        Some("-p/--ssh: a published port would be the other box's, under this box's name")
+    } else if args.hostname.is_some() {
+        Some("--hostname: the name belongs to the network namespace being joined")
+    } else if args.pod.is_some() || args.share_net {
+        Some("--pod/--net: a box has one network")
+    } else if !args.egress_allow.is_empty() {
+        Some("--egress-allow: the filter needs a network namespace of the box's own")
+    } else {
+        None
+    };
+    if let Some(why) = conflict {
+        return Err(Error::Sandbox(format!(
+            "--network container:{target} cannot combine with {why} (Docker refuses the same pair)"
+        )));
+    }
+    let pid1 = registry::find_ref(target)
+        .and_then(|i| i.live_pid1())
+        .ok_or_else(|| {
+            Error::Sandbox(format!(
+                "--network container:{target}: no running box '{target}' (`kern ps` lists them); \
+                 the box whose network this one joins must be up first"
+            ))
+        })?;
+    let read =
+        |f: &str| std::fs::read_to_string(format!("/proc/{pid1}/root/etc/{f}")).unwrap_or_default();
+    let hostname = read("hostname").trim().to_string();
+    let hosts: Vec<(String, String)> = read("hosts")
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let ip = f.next()?;
+            ip.parse::<std::net::IpAddr>()
+                .ok()
+                .filter(|a| !a.is_loopback())?;
+            Some(
+                f.map(|n| (n.to_string(), ip.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect();
+    let nameservers: Vec<String> = read("resolv.conf")
+        .lines()
+        .filter_map(|l| l.strip_prefix("nameserver"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
+        .collect();
+    Ok(JoinedNet {
+        pid1,
+        hostname,
+        hosts,
+        nameservers,
+    })
+}
+
 /// Prepare `--ssh`: authorize a public key (from `--ssh-key`, or a freshly generated throwaway
 /// ed25519 keypair kept in the runtime dir) and add the `host_port → box:22` mapping to the port set.
 /// Prints the ready-to-paste `ssh` command. Returns `(None, ports.to_vec())` when `--ssh` is unset.
@@ -3987,7 +4103,8 @@ fn prepare_ssh(
 
     let mut eff = ports.to_vec();
     eff.push(kern_isolation::PortMap {
-        bind_ip: 0x7f00_0001,
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        implicit: false,
         host: port,
         box_port: 22,
         udp: false,
