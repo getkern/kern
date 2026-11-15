@@ -3558,6 +3558,15 @@ class Sandbox {
    */
   constructor(opts = {}) {
     this.image = opts.image ?? DEFAULT_IMAGE;
+    // An image that is not a non-empty string is refused HERE, by name. A number died as
+    // `TypeError: image.indexOf is not a function`, and "" first built a bytecode cache for an empty
+    // reference (with a warning about it) and then failed to start. `null` is the default, as in Python.
+    if (typeof this.image !== "string" || this.image.trim() === "")
+      throw new SandboxError(
+        `image must be an image reference STRING such as "python:3.12-slim", not ${
+          typeof this.image === "string" ? "an empty string" : typeof this.image
+        }; leave it out (or pass null) for the default`,
+      );
     this.setup = opts.setup ?? null;
     // `setup` is ONE SHELL COMMAND, and a list of package names is the natural first guess. Without this
     // it reaches `_runSetup` and dies as `TypeError: cmd.trim is not a function`, an internal error where

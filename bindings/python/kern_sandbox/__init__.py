@@ -4185,6 +4185,18 @@ class Sandbox:
         # `Did you mean tmpfs={'/tmp': '256m'}`. A generic "must be a dict" placed here ran FIRST and
         # replaced all of them with something worse. A guard is only an improvement where there is no
         # better one already; nine tests said so.
+        # The IMAGE, first of all: `None` is the default (as `null` is in Node), and anything that is
+        # not a non-empty string is refused by name. `None` died as `TypeError: expected str, bytes or
+        # os.PathLike object, not NoneType` out of `subprocess`, and `""` first built a bytecode cache
+        # for an empty reference (with a warning about it) and then failed to start.
+        if self.image is None:
+            self.image = _DEFAULT_IMAGE
+        if not isinstance(self.image, str) or not self.image.strip():
+            _what = "an empty string" if isinstance(self.image, str) else type(self.image).__name__
+            raise SandboxError(
+                f"image must be an image reference string such as {_DEFAULT_IMAGE!r}, not {_what}; "
+                "leave it out (or pass None) for the default"
+            )
         for _name, _value in (
             ("mounts", self.mounts),
             ("env", self.env),

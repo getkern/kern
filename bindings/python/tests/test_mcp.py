@@ -2071,3 +2071,12 @@ def test_kern_mcp_user_reaches_the_sandbox_as_user_and_unset_means_the_images_ow
             monkeypatch.setenv("KERN_MCP_USER", raw)
         M._Server()._session()
         assert seen[-1]["user"] == want, (raw, seen[-1])
+
+
+def test_an_empty_image_variable_is_unset():
+    """`KERN_MCP_IMAGE=` in a client config is the operator leaving it out, as every other
+    KERN_MCP_* knob reads an empty value. It answered every call with an error about an empty image
+    reference instead."""
+    for blank in ("", "  "):
+        assert _server(KERN_MCP_IMAGE=blank)._image == M._DEFAULT_MCP_IMAGE
+    assert _server(KERN_MCP_IMAGE="node:20-slim")._image == "node:20-slim"

@@ -407,7 +407,9 @@ class _Server:
         # Read ONCE, like _use_kernel, because two readers is one too many: `_tools_view` tells the
         # model which image this is and `_session` starts it, and those two must not be able to
         # disagree about which image "this server" means.
-        self._image = os.environ.get("KERN_MCP_IMAGE", _DEFAULT_MCP_IMAGE)
+        # Empty is UNSET, as every other KERN_MCP_* knob reads it: `KERN_MCP_IMAGE=` in a client
+        # config answered every call with an error about an empty image reference.
+        self._image = os.environ.get("KERN_MCP_IMAGE", "").strip() or _DEFAULT_MCP_IMAGE
 
     # -- lifecycle ---------------------------------------------------------------------------------
     def _session(self) -> Sandbox:

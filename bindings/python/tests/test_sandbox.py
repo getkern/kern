@@ -6188,3 +6188,12 @@ def test_gpus_reaches_the_argv_verbatim_and_the_default_adds_no_flag():
         assert argv[argv.index("--gpus") + 1] == spec, spec
     assert "--gpus" not in _cfg()._base_argv("n", network=False, timeout_s=30)
     assert "--gpus" not in _cfg(gpus=None)._base_argv("n", network=False, timeout_s=30)
+
+
+def test_image_none_is_the_default_and_a_bad_image_is_refused_by_name():
+    # `None` is the default, as `null` is in Node. It used to die as a raw TypeError out of
+    # `subprocess`, and "" first built a bytecode cache for an empty reference, then failed to start.
+    assert Sandbox(image=None).image == Sandbox().image
+    for bad in ("", "   ", 42, ["python:3.12-slim"]):
+        with pytest.raises(SandboxError, match="image must be an image reference string"):
+            Sandbox(image=bad)

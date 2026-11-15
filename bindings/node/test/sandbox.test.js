@@ -148,6 +148,14 @@ test("capabilities are dropped by default and the opt-out is explicit", () => {
   assert.throws(() => new Sandbox({ capDrop: "ALL" }), SandboxError);
 });
 
+test("image: null is the default and a bad image is refused by name", () => {
+  // It used to die as `TypeError: image.indexOf is not a function` for a number, and "" first built
+  // a bytecode cache for an empty reference, then failed to start.
+  assert.equal(new Sandbox({ image: null }).image, new Sandbox().image);
+  for (const bad of ["", "   ", 42, ["python:3.12-slim"]])
+    assert.throws(() => new Sandbox({ image: bad }), /image must be an image reference STRING/, `should reject ${JSON.stringify(bad)}`);
+});
+
 test("apparmor profile reaches the argv and bad names are refused", () => {
   const prev = process.env.KERN_BIN;
   process.env.KERN_BIN = FAKE_KERN;
