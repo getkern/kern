@@ -3821,3 +3821,46 @@ fn a_pod_box_never_reaches_the_hosts_loopback() {
         "a pod box reached a listener the host keeps on 127.0.0.1:\n{out}"
     );
 }
+
+/// `--ssh` ON A TAKEN PORT PRINTS NO `ssh` COMMAND AND LEAVES NO KEYS.
+///
+/// MEASURED before: a second box asking for an `--ssh` port another box held printed a ready-to-paste
+/// `kern: ssh: ssh -p ...` line for a box that never ran, then the refusal, and its key directory
+/// stayed in the runtime dir. The port is held here by the test itself, so no sshd is needed: the
+/// refusal comes before anything starts.
+#[test]
+fn an_ssh_box_on_a_taken_port_prints_no_command_and_leaves_no_keys() {
+    let Ok(held) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
+        eprintln!("SKIP: could not hold a port");
+        return;
+    };
+    let port = held.local_addr().map(|a| a.port()).unwrap_or(0).to_string();
+    let xdg = std::env::temp_dir().join(format!("kern-it-sshport-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let out = match kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "box", "sshtaken", "--ssh", &port, "--image", "alpine", "--", "true",
+        ])
+        .output()
+    {
+        Ok(o) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => e.to_string(),
+    };
+    let keys_left = xdg.join("kern/ssh/sshtaken").exists();
+    let _ = std::fs::remove_dir_all(&xdg);
+    drop(held);
+    if !out.contains("cannot publish host port") {
+        eprintln!("SKIP: the refusal this test is about did not happen here:\n{out}");
+        return;
+    }
+    assert!(
+        !out.contains("kern: ssh: ssh -p"),
+        "no ssh command for a box that never ran:\n{out}"
+    );
+    assert!(!keys_left, "the refused box's keys must be removed");
+}

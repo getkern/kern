@@ -2268,7 +2268,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // `--ssh`: authorize a key (generate a throwaway keypair, or use `--ssh-key`) and publish the
     // in-box sshd on the host port (→ box `:22`) via the ordinary rootless forwarder. `eff_ports`
     // is the user's `-p` maps plus that SSH mapping.
-    let (ssh, mut eff_ports) = prepare_ssh(&name, args.ssh_port, args.ssh_key, args.ports)?;
+    let (ssh, mut eff_ports, ssh_hint) =
+        prepare_ssh(&name, args.ssh_port, args.ssh_key, args.ports)?;
     // THE HOST'S PUBLISH POLICY, APPLIED AT THE ONE CHOKE POINT. Everything downstream - the
     // preflight, the forwarders, the registry entry, `kern ps` - reads this list, so narrowing it
     // here means there is no second place where a port could still be bound wider than the operator
@@ -2342,7 +2343,19 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // Fail fast if a `-p` host port is already taken (by another box or any process): otherwise the
     // forwarder fails inside its fork - whose stderr a detached box swallows - and the box would
     // print "started" while nothing actually listens.
-    if let Err((hp, e)) = kern_isolation::preflight_ports(ports) {
+    // THE `ssh` LINE IS PRINTED ONLY ONCE THE PORTS ARE KNOWN FREE, and the keys made for a box that
+    // cannot start are removed. It used to be printed first, so a taken port produced a ready-to-paste
+    // command for a box that never ran, followed by the refusal, and left the keys behind.
+    let preflight = kern_isolation::preflight_ports(ports);
+    if preflight.is_err() && args.ssh_port.is_some() {
+        forget_ssh_keys(&name);
+    }
+    if preflight.is_ok() {
+        if let Some(h) = &ssh_hint {
+            eprintln!("{h}");
+        }
+    }
+    if let Err((hp, e)) = preflight {
         // Tell the two failures apart. `EACCES` on a port <1024 is NOT "in use": rootless kern lacks
         // CAP_NET_BIND_SERVICE, so the fix is a higher port - sending the user to `kern ps`/`kern stop`
         // would chase a phantom holder (the old message did). `EADDRINUSE` (or any other errno) IS the
@@ -4038,11 +4051,12 @@ fn prepare_ssh(
     (
         Option<kern_isolation::SshSetup>,
         Vec<kern_isolation::PortMap>,
+        Option<String>,
     ),
     Error,
 > {
     let Some(port) = ssh_port else {
-        return Ok((None, ports.to_vec()));
+        return Ok((None, ports.to_vec(), None));
     };
     // Don't silently shadow a user `-p` on the same host port, or a second box-side :22.
     if ports.iter().any(|m| m.host == port) {
@@ -4122,7 +4136,7 @@ fn prepare_ssh(
     // launch, refuses any other key, and never writes to the user's file.
     match host_key_for(name, port) {
         Some((private, known_hosts)) => {
-            eprintln!(
+            let hint = format!(
                 "kern: ssh: ssh -p {port}{id} -o UserKnownHostsFile={} \
                  -o StrictHostKeyChecking=yes root@127.0.0.1",
                 super::shell_quote_single(&known_hosts.to_string_lossy())
@@ -4133,6 +4147,7 @@ fn prepare_ssh(
                     host_key: Some(private),
                 }),
                 eff,
+                Some(hint),
             ))
         }
         // No `ssh-keygen` on the host (only reachable with `--ssh-key`): the box makes its own key,
@@ -4143,7 +4158,7 @@ fn prepare_ssh(
         // (measured: `Host key verification failed`), and turning checking off wholesale teaches
         // the wrong habit. `accept-new` still refuses a CHANGED key; it needs OpenSSH 7.6 (2017).
         None => {
-            eprintln!(
+            let hint = format!(
                 "kern: ssh: ssh -p {port}{id} -o StrictHostKeyChecking=accept-new root@127.0.0.1"
             );
             Ok((
@@ -4152,7 +4167,22 @@ fn prepare_ssh(
                     host_key: None,
                 }),
                 eff,
+                Some(hint),
             ))
+        }
+    }
+}
+
+/// Remove the `--ssh` keys made for `name`, when its box could not start. Only kern's own files are
+/// in that directory, and the name is a validated box name, so the path is never empty or `..`.
+fn forget_ssh_keys(name: &BoxName) {
+    if name.as_str().is_empty() {
+        return;
+    }
+    if let Ok(dir) = registry::ssh_dir() {
+        let mine = dir.join(name.as_str());
+        if mine.starts_with(&dir) && mine != dir {
+            let _ = std::fs::remove_dir_all(mine);
         }
     }
 }
