@@ -57,6 +57,12 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
+**The `ssh` command `--ssh` prints works on every launch.** The box made a new host key each time,
+and the printed `accept-new` pinned the first one in `~/.ssh/known_hosts`, so the second box on the
+same port was refused with `Host key verification failed`. kern now makes the box's host key and a
+`known_hosts` naming it, and the printed command checks strictly against that file: no prompt, any
+other key refused, and `~/.ssh/known_hosts` is not written.
+
 **A box with outbound could reach what the host keeps on `127.0.0.1`.** pasta gave the box the
 host's address and gateway and mapped that gateway to the host's loopback, so a compose service or a
 `kern box --pod` box connecting to the gateway reached every loopback-only service: a `kubectl
