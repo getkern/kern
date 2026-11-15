@@ -57,6 +57,20 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
+**`compose up --abort-on-container-exit --exit-code-from tests` returns when the tests do.** A test
+service that exited before kern began following the logs was skipped, so its output was never shown
+and `up` waited on a database that never exits, until the job's own timeout. A test that exited
+inside the 150 ms start window was reported as "died", exited 1 whatever the test returned, and left
+the stack running. Both now end the wait, the stack is torn down, and the status is the test's.
+
+**`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
+raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
+before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
+`KERN_MCP_IMAGE` is unset, as every other `KERN_MCP_*` variable reads it.
+
+**`kern box -p` with an IPv6 or empty bind address names the reason**: kern publishes on IPv4 only.
+It printed the generic usage line, which reads as a typo; compose already said why.
+
 **The `ssh` command `--ssh` prints works on every launch.** The box made a new host key each time,
 and the printed `accept-new` pinned the first one in `~/.ssh/known_hosts`, so the second box on the
 same port was refused with `Host key verification failed`. kern now makes the box's host key and a
