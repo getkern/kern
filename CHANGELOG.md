@@ -111,6 +111,28 @@ and `up` waited on a database that never exits, until the job's own timeout. A t
 inside the 150 ms start window was reported as "died", exited 1 whatever the test returned, and left
 the stack running. Both now end the wait, the stack is torn down, and the status is the test's.
 
+**A code sandbox written as a compose one-off runs as written.** `compose run --rm -v SRC:DST[:ro]`
+mounts the file: `-v` was taken for the service name. A bind inside a `tmpfs:` (the script mounted
+into `/tmp`) is mounted after the tmpfs, so it is no longer hidden under it. A one-off of a
+`network_mode: none` or `host` service no longer joins the stack's pod, where it had outbound. Measured
+against Docker on one file: the script runs, with `lo` as its only interface.
+
+**A YAML block scalar in a list is text, even with `: ` inside.** `command: [sh, -c]` followed by a
+`- |` item holding `echo "a: b"` was read as a mapping, so the script the service ran was not the one
+in the file, with no message. The block's lines now reach the command unchanged.
+
+**A service's `compose logs` spans its restarts, and `down` removes them.** After two `restart`s the
+log held one run's lines, so the output of a run that crashed was gone once it was restarted; it holds
+all three now, oldest first, and `--tail N` counts across them. `down`, and a recreate by `up`, remove
+the old runs, and `logs` and `up` accept `--no-color`.
+
+**A stack leaves no exited row in `kern ps -a` after `down`, and a restarted service is one row.** A
+`network_mode: service:X` box was recorded with no pod, so `down` never removed its row (one per run).
+A service that exits on its stop signal, as sshd does, had its record written after `down` had cleared
+the stack's, one run in three; `kern stop` now returns once the box's supervisor has finished (5 ms
+for such a box on WSL2). `compose restart` and a recreate by `up` no longer
+leave the stopped run's row beside the new box.
+
 **`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
 before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
