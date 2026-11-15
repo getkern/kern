@@ -5176,6 +5176,18 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                     .to_string();
                 let head = v.split(':').next().unwrap_or("").to_ascii_lowercase();
                 let ns = if key == "ipc" { "IPC" } else { "PID" };
+                // `ipc:` SHARING IS APPLIED (see `kern box --ipc`): a `shareable` service's IPC
+                // namespace and `/dev/shm` can be joined by `service:<it>` in the same stack, which
+                // starts after it, as Docker orders it. MEASURED against Docker on one file.
+                if key == "ipc" && matches!(head.as_str(), "shareable" | "service" | "container") {
+                    if let Some(t) = v.strip_prefix("service:").filter(|t| !t.is_empty()) {
+                        if !b.depends_on.iter().any(|d| d == t) {
+                            b.depends_on.push(t.to_string());
+                        }
+                    }
+                    b.ipc = Some(v.clone());
+                    continue;
+                }
                 match head.as_str() {
                     "private" | "" => warn(&format!(
                         "service '{name}': '{key}: {v}' is ALREADY ENFORCED - every kern box gets \
@@ -10232,19 +10244,35 @@ mod tests {
     /// else", which stopped being so when each service got its own on a bridge.
     #[test]
     fn a_shared_ipc_or_pid_request_names_the_reason_that_holds() {
-        for key in ["ipc", "pid"] {
-            let _ = take_warnings();
-            let _ = parse(&format!(
-                "services:\n  a:\n    image: alpine\n    {key}: \"service:b\"\n  b:\n    image: alpine\n"
-            ));
-            let warns = take_warnings();
-            let w = warns
-                .iter()
-                .find(|w| w.contains(&format!("'{key}: service:b' is NOT applied")))
-                .unwrap_or_else(|| panic!("{key}: no warning in {warns:?}"));
-            assert!(w.contains("has its own"), "{w}");
-            assert!(!w.contains("network namespace"), "{w}");
-        }
+        // `pid: service:b` is not applied, and says why.
+        let _ = take_warnings();
+        let _ = parse(
+            "services:\n  a:\n    image: alpine\n    pid: \"service:b\"\n  b:\n    image: alpine\n",
+        );
+        let warns = take_warnings();
+        let w = warns
+            .iter()
+            .find(|w| w.contains("'pid: service:b' is NOT applied"))
+            .unwrap_or_else(|| panic!("pid: no warning in {warns:?}"));
+        assert!(w.contains("has its own"), "{w}");
+        assert!(!w.contains("network namespace"), "{w}");
+        // `ipc: service:b` IS applied now: carried to the box, and `b` starts first, as Docker
+        // orders it.
+        let _ = take_warnings();
+        let boxes = parse(
+            "services:\n  a:\n    image: alpine\n    ipc: \"service:b\"\n  b:\n    image: alpine\n    ipc: shareable\n",
+        )
+        .expect("parses");
+        let warns = take_warnings();
+        assert!(
+            !warns.iter().any(|w| w.contains("ipc")),
+            "a shared IPC request is applied, not warned about: {warns:?}"
+        );
+        let a = boxes.iter().find(|b| b.name == "a").expect("a");
+        let b = boxes.iter().find(|b| b.name == "b").expect("b");
+        assert_eq!(a.ipc.as_deref(), Some("service:b"));
+        assert!(a.depends_on.iter().any(|d| d == "b"), "{:?}", a.depends_on);
+        assert_eq!(b.ipc.as_deref(), Some("shareable"));
     }
 
     /// `runtime: nvidia` is the request `NVIDIA_VISIBLE_DEVICES` completes, so the file is not told

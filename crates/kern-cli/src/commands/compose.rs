@@ -3100,6 +3100,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         // is not there simply has nothing to start, and the level barrier below
                         // still waits for the ones that are.
                         let b = boxes.iter().find(|b| &b.name == name)?;
+                        // `ipc:` resolved here, where every service is in view: the worker below
+                        // is a `move` closure and takes only this box's answer.
+                        let ipc_arg = ipc_flag(b, &boxes[..]);
                         // `boxes` is no longer captured: it was here only to ask whether some peer
                         // waited on this box's completion, and every box gets the exit key now.
                         // REBOUND AS REFERENCES so the `move` closure borrows instead of taking
@@ -3196,6 +3199,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                             let joining = joins.get(&b.name);
                             if let Some(target) = joining {
                                 cmd.arg("--network").arg(format!("container:{target}"));
+                            }
+                            if let Some(f) = &ipc_arg {
+                                cmd.arg("--ipc").arg(f);
                             }
                             if use_pod && !b.net && !b.net_none && joining.is_none() {
                                 cmd.arg("--pod").arg(pod);
@@ -3840,6 +3846,22 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// The `kern box --ipc` value for a service's `ipc:`, with `service:<name>` resolved to that
+/// service's box; `None` when the service keeps its own IPC namespace.
+fn ipc_flag(
+    b: &crate::compose::ComposeBox,
+    boxes: &[crate::compose::ComposeBox],
+) -> Option<String> {
+    let v = b.ipc.as_deref()?;
+    match v.strip_prefix("service:") {
+        Some(t) => boxes
+            .iter()
+            .find(|o| o.service == t || o.name == t)
+            .map(|o| format!("container:{}", o.name)),
+        None => Some(v.to_string()),
+    }
+}
+
 /// `compose run [--rm] [--no-deps] <service> [command…]`: a one-off box from a service definition.
 ///
 /// THE VERB THAT COMES FIRST IN EVERY DOCKER WORKFLOW. It is step 2 of nearly every project README
@@ -4006,6 +4028,8 @@ fn compose_run(
         let host = boxes.iter().find(|o| o.service == t || o.name == t)?;
         (!host.net && !b.net && !b.net_none).then(|| host.name.clone())
     });
+    // `ipc:` for the one-off, resolved before the service is borrowed mutably below.
+    let ipc_value: Option<String> = boxes.get(idx).and_then(|b| ipc_flag(b, boxes));
     let Some(b) = boxes.get_mut(idx) else {
         return Err(Error::Compose(format!("run: service '{target}' vanished")));
     };
@@ -4055,6 +4079,9 @@ fn compose_run(
                 }
             }
         }
+    }
+    if let Some(f) = &ipc_value {
+        c.arg("--ipc").arg(f);
     }
     // THE PEERS, AT THE ADDRESSES THEY ACTUALLY HOLD. `add_host_args` is the same function every
     // member is wired with, asked for this service's view: peers at their aliases, itself at its own.

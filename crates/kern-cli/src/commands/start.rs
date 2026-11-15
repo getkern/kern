@@ -1790,6 +1790,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             !args.pod_bridges.is_empty(),
         )?,
     };
+    let (ipc_from, shm_dir) = share_ipc(&args, &name, pod_holder, &pod_label)?;
     // `--env-file` first (K=V lines from a file), then `--env` on top (explicit wins).
     let mut env = parse_env_files(args.env_file)?;
     env.extend(parse_envs(args.env)?);
@@ -2781,6 +2782,8 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             .or_else(|| image_config.workdir.clone()),
         share_net: args.share_net,
         pod_holder,
+        ipc_from,
+        shm_dir,
         // `--ssh` and a non-root `--user` imply the uid/gid *range* mapping: sshd's privsep needs a
         // working `setgroups` (a single-uid map forbids it via `/proc/self/setgroups=deny`), and a
         // non-zero target uid must be mapped in. With the range (via `newgidmap`/`newuidmap`) both
@@ -3294,6 +3297,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     if let Some((_, Some(_))) = &reg_state {
         registry::clear_box_env(name.as_str(), launcher_pid);
     }
+    registry::clear_box_shm(name.as_str());
     pt.mark("parent:teardown");
     // CLOSE THE PROFILE, naming what the marks above do NOT cover. Every phase here is a delta
     // between two marks, so the sum describes only the span from the first mark onwards: the
@@ -4061,6 +4065,84 @@ struct JoinedNet {
     /// stack: recorded with no pod, `compose down` could not find its exit record and left it in
     /// `kern ps -a` (MEASURED: one `exit 137` row per run of a VPN-sidecar file, four after four runs).
     pod: String,
+}
+
+/// `--ipc shareable` / `--ipc container:<box>`: the IPC namespace to enter and the host directory to
+/// bind at `/dev/shm`, as `(ipc_from, shm_dir)`; `(None, None)` for a box that keeps its own.
+///
+/// DOCKER'S RULES, MEASURED against Docker Compose v5 on one file: `ipc: "service:producer"` let the
+/// consumer read what the producer wrote to `/dev/shm` when the producer was `ipc: shareable`, and
+/// was refused with `non-shareable IPC (hint: use IpcMode:shareable for the donor container)` when it
+/// was not. kern refused both by never applying `ipc:` at all.
+///
+/// ONE POD, BECAUSE ONE USER NAMESPACE. The donor's IPC namespace is owned by the user namespace it
+/// was created in, and only a process with CAP_SYS_ADMIN there may enter it: the members of one pod
+/// share the pod's (measured, in pod and bridge wiring), standalone boxes each have their own.
+fn share_ipc(
+    args: &BoxRunArgs,
+    name: &BoxName,
+    pod_holder: Option<i32>,
+    pod_label: &str,
+) -> Result<(Option<i32>, Option<String>), Error> {
+    if !args
+        .ipc
+        .is_some_and(|m| m.eq_ignore_ascii_case("shareable"))
+    {
+        registry::clear_box_shm(name.as_str());
+    }
+    let Some(mode) = args.ipc else {
+        return Ok((None, None));
+    };
+    if mode.eq_ignore_ascii_case("shareable") {
+        let dir = registry::shm_dir_of(name.as_str()).map_err(|e| {
+            Error::Sandbox(format!("--ipc shareable: shared memory directory: {e}"))
+        })?;
+        // A directory left by a box of this name that is gone (a live box holds its name alone) is
+        // stale: the new box starts with an empty store, as a new container does.
+        registry::clear_box_shm(name.as_str());
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| Error::Sandbox(format!("--ipc shareable: {}: {e}", dir.display())))?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777));
+        return Ok((None, Some(dir.to_string_lossy().into_owned())));
+    }
+    let Some(target) = mode.strip_prefix("container:") else {
+        return Ok((None, None));
+    };
+    if pod_holder.is_none() {
+        return Err(Error::Sandbox(format!(
+            "--ipc container:{target} needs this box in the same pod as '{target}' (`--pod`, or \
+             one compose stack): an IPC namespace can only be entered from the user namespace that \
+             owns it, and a pod's members share one"
+        )));
+    }
+    let donor = registry::find_ref(target).ok_or_else(|| {
+        Error::Sandbox(format!(
+            "--ipc container:{target}: no running box '{target}' (`kern ps` lists them); the box \
+             whose IPC namespace this one joins must be up first"
+        ))
+    })?;
+    if donor.pod != pod_label {
+        return Err(Error::Sandbox(format!(
+            "--ipc container:{target}: '{target}' is in pod '{}' and this box in '{pod_label}': an \
+             IPC namespace is shared inside one pod",
+            donor.pod
+        )));
+    }
+    let pid1 = donor.live_pid1().ok_or_else(|| {
+        Error::Sandbox(format!(
+            "--ipc container:{target}: '{target}' has no running init"
+        ))
+    })?;
+    let dir = registry::shm_dir_of(&donor.name)
+        .map_err(|e| Error::Sandbox(format!("--ipc container:{target}: {e}")))?;
+    if !dir.is_dir() {
+        return Err(Error::Sandbox(format!(
+            "--ipc container:{target}: non-shareable IPC (hint: start '{target}' with --ipc \
+             shareable, compose `ipc: shareable`), as Docker answers the same file"
+        )));
+    }
+    Ok((Some(pid1), Some(dir.to_string_lossy().into_owned())))
 }
 
 /// Resolve `--network container:<target>` to a running box and read what the joining box inherits.
@@ -5737,6 +5819,7 @@ fn run_detached(
     if let Some(p) = path {
         registry::unregister(&p);
     }
+    registry::clear_box_shm(name.as_str());
     cleanup_scratch(scratch.as_deref());
     unsafe { libc::_exit(0) };
 }

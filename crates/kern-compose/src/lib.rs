@@ -269,6 +269,11 @@ pub struct ComposeBox {
     /// express - one namespace, one loopback, one route out - is named at the wiring decision,
     /// where the wiring is finally known.
     pub net_share: Option<String>,
+    /// Compose `ipc:` when it shares: `shareable` (this service's `/dev/shm` and IPC namespace may be
+    /// joined), `service:<name>` (join that service's) or `container:<box>`, carried as written and
+    /// resolved to `kern box --ipc` at launch. `private` and `host` are not carried (the parser says
+    /// what each means here).
+    pub ipc: Option<String>,
     /// Compose `networks.<net>.ipv4_address` - the literal addresses this service is pinned to.
     ///
     /// A LIST BECAUSE A SERVICE MAY SIT ON SEVERAL NETWORKS, one address per network, and picking
@@ -1559,6 +1564,7 @@ impl ComposeBox {
             secret_mode,
             config,
             net_share,
+            ipc,
             // DERIVED from the DOCUMENT's top-level `networks:` rather than written on the service,
             // so an override's value is computed against the override's declarations. The scalar
             // and list rules are an approximation of a recompute over the merged stack, and a
@@ -4827,6 +4833,11 @@ mod contract_tests {
         // command line's shape, not a flag; the rest name a real call site.
         const READERS: &[(&str, &str)] = &[
             ("name", "the `kern box <name>` argument itself"),
+            (
+                "ipc",
+                "compose's `ipc_flag`, which resolves `service:<name>` to that box and passes \
+                 `kern box --ipc`",
+            ),
             (
                 "container_name",
                 "compose() names the box this exactly instead of <project>-<service>",

@@ -106,6 +106,9 @@ pub enum Command {
         /// `--network container:<box>`: live in that running box's network namespace (Docker's
         /// spelling, and compose `network_mode: service:`).
         net_container: Option<String>,
+        /// `--ipc shareable` / `--ipc container:<box>`: a /dev/shm another box can join, or join
+        /// that box's IPC namespace and /dev/shm (Docker's `ipc:`); `private`/`host` only note.
+        ipc: Option<String>,
         /// `--uid-range`: map a sub-uid/gid range (apt/dpkg, www-data). Default maps only the caller.
         uid_range: bool,
         /// `--no-uid-range`: opt OUT of the range mapping an `--image` box gets by default.
@@ -3167,18 +3170,24 @@ fn parse_mount_spec(spec: &str) -> Result<MountSpec, Error> {
 
 /// What `kern box --ipc <mode>` does, as one sentence: a box always has its own IPC namespace.
 pub(crate) fn ipc_flag_note(mode: &str) -> String {
-    match mode.split(':').next().unwrap_or("").to_ascii_lowercase().as_str() {
-        "private" | "shareable" | "" => format!(
-            "--ipc {mode} is what every box already has: its own IPC namespace"
-        ),
+    match mode
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "private" | "" => {
+            format!("--ipc {mode} is what every box already has: its own IPC namespace")
+        }
         "host" => format!(
             "--ipc {mode} is NOT applied: the box keeps its own IPC namespace, a kernel boundary \
              kern does not hand back. If the point was a large /dev/shm (docker's --ipc=host gives \
              the host's), the box has its own, sized to its --memory cap; --shm-size sets it"
         ),
         _ => format!(
-            "--ipc {mode} is NOT applied: there is no way to put two boxes in one IPC namespace, so \
-             this box keeps its own"
+            "--ipc {mode} is NOT applied: the modes are private, shareable, container:<box> and \
+             host, so this box keeps its own IPC namespace"
         ),
     }
 }
@@ -3383,6 +3392,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut share_net = false;
     let mut pod: Option<String> = None;
     let mut net_container: Option<String> = None;
+    let mut ipc: Option<String> = None;
     let mut pod_bridges: Vec<kern_isolation::BridgeAttach> = Vec::new();
     let mut uid_range = false;
     let mut no_uid_range = false;
@@ -3819,9 +3829,13 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                 "--ipc" => {
                     i += 1;
                     let Some(v) = rest.get(i) else {
-                        return Err(Error::Usage("--ipc <private|shareable|host>"));
+                        return Err(Error::Usage("--ipc <private|shareable|container:BOX|host>"));
                     };
-                    eprintln!("kern: note: {}", ipc_flag_note(v));
+                    let head = v.split(':').next().unwrap_or("").to_ascii_lowercase();
+                    match head.as_str() {
+                        "shareable" | "container" => ipc = Some((*v).to_string()),
+                        _ => eprintln!("kern: note: {}", ipc_flag_note(v)),
+                    }
                 }
                 "--tmpfs" => {
                     i += 1;
@@ -4675,6 +4689,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             share_net,
             pod,
             net_container,
+            ipc,
             uid_range,
             no_uid_range,
             bind_rootfs,
@@ -5737,6 +5752,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             share_net,
             pod,
             net_container,
+            ipc,
             uid_range,
             no_uid_range,
             bind_rootfs,
@@ -5829,6 +5845,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             share_net,
             pod: pod.as_deref(),
             net_container: net_container.as_deref(),
+            ipc: ipc.as_deref(),
             uid_range,
             no_uid_range,
             bind_rootfs,
@@ -7029,13 +7046,20 @@ mod tests {
         );
         assert!(parsed.is_ok(), "{parsed:?}");
         assert!(ipc_flag_note("private").contains("already has"));
-        assert!(ipc_flag_note("shareable").contains("already has"));
         let host = ipc_flag_note("host");
         assert!(
             host.contains("NOT applied") && host.contains("--shm-size"),
             "{host}"
         );
-        assert!(ipc_flag_note("container:db").contains("NOT applied"));
+        assert!(ipc_flag_note("bogus").contains("NOT applied"));
+        // `shareable` and `container:<box>` are modes the box takes, not notes.
+        for mode in ["shareable", "container:db"] {
+            let a = ["box", "x", "--image", "alpine", "--ipc", mode, "--", "true"];
+            match parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()) {
+                Ok((_, Command::BoxRun { ipc, .. })) => assert_eq!(ipc.as_deref(), Some(mode)),
+                other => panic!("--ipc {mode} must be carried to the box: {other:?}"),
+            }
+        }
     }
 
     #[test]

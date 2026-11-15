@@ -4776,6 +4776,107 @@ fn a_missing_bind_source_is_created_without_group_write() {
     );
 }
 
+/// `ipc: "service:X"` SHARES X'S IPC NAMESPACE AND /dev/shm WHEN X IS `shareable`, AND IS REFUSED
+/// WHEN IT IS NOT, AS DOCKER DOES BOTH.
+///
+/// MEASURED against Docker Compose v5 on one file: the consumer read what the producer wrote to
+/// `/dev/shm` with the producer `ipc: shareable`, and Docker refused the file with "non-shareable
+/// IPC" without it. kern applied neither: every service kept its own IPC namespace and `/dev/shm`,
+/// with a warning. Asserted: the data, the SAME IPC namespace inode on both sides, and the refusal.
+#[test]
+fn ipc_service_shares_a_shareable_donors_namespace_and_shm() {
+    let dir = std::env::temp_dir().join(format!("kern-it-ipc-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-ipc-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let producer_cmd =
+        r#"readlink /proc/self/ns/ipc > /dev/shm/ns; echo data-sync > /dev/shm/p; sleep 30"#;
+    // `$$` because Compose interpolates `$` in the file, as Docker does.
+    let consumer_cmd = r#"sleep 1; cat /dev/shm/p; [ "$$(readlink /proc/self/ns/ipc)" = "$$(cat /dev/shm/ns)" ] && echo SAME_IPC_NS"#;
+    let file = |shareable: bool| {
+        let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "services:\n  producer:\n    image: alpine\n{}    command: [\"sh\", \"-c\", \"{}\"]\n  consumer:\n    image: alpine\n    ipc: \"service:producer\"\n    command: [\"sh\", \"-c\", \"{}\"]\n",
+            if shareable { "    ipc: shareable\n" } else { "" },
+            quote(producer_cmd),
+            quote(consumer_cmd),
+        )
+    };
+    let up = |f: &str| -> (Option<i32>, String) {
+        let _ = std::fs::write(dir.join("compose.yml"), f);
+        let out = kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "compose",
+                "-f",
+                "compose.yml",
+                "-p",
+                "ipcs",
+                "up",
+                "--abort-on-container-exit",
+                "--exit-code-from",
+                "consumer",
+            ])
+            .output();
+        let _ = kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "compose",
+                "-f",
+                "compose.yml",
+                "-p",
+                "ipcs",
+                "down",
+                "-t",
+                "0",
+            ])
+            .output();
+        match out {
+            Ok(o) => (
+                o.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (None, e.to_string()),
+        }
+    };
+    let (rc, shared) = up(&file(true));
+    // Read right after the shareable stack's `down`: the next start of a box of that name clears a
+    // stale directory too, so reading at the end would not see a teardown that forgot it.
+    let left = std::fs::read_dir(xdg.join("kern").join("shm"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    // A STALE DIRECTORY, as a box killed before its teardown leaves one: a donor started without
+    // `shareable` must not be joinable because of it.
+    let _ = std::fs::create_dir_all(xdg.join("kern").join("shm").join("ipcs-producer"));
+    let (_, refused) = up(&file(false));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if !shared.contains("consumer") {
+        eprintln!("SKIP: this host did not run the stack:\n{shared}");
+        return;
+    }
+    assert!(
+        shared.contains("data-sync"),
+        "the consumer reads the producer's /dev/shm:\n{shared}"
+    );
+    assert!(
+        shared.contains("SAME_IPC_NS"),
+        "and is in its IPC namespace:\n{shared}"
+    );
+    assert_eq!(rc, Some(0), "the consumer's own status:\n{shared}");
+    assert!(
+        refused.contains("non-shareable IPC"),
+        "a donor that is not shareable is refused:\n{refused}"
+    );
+    assert_eq!(left, 0, "the shared memory directory goes with the stack");
+}
+
 /// FIVE THINGS A SECOND MODEL'S CASES FOUND, EACH MEASURED AGAINST DOCKER ON THE SAME FILE.
 ///
 /// `run --entrypoint "sh -c 'exit 42'"` exited 42 under Docker and 127 under kern; `COMPOSE_FILE`

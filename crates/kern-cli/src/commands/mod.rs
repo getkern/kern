@@ -257,6 +257,8 @@ pub struct BoxRunArgs<'a> {
     pub pod: Option<&'a str>,
     /// `--network container:<box>`: live in that running box's network namespace.
     pub net_container: Option<&'a str>,
+    /// `--ipc shareable` / `--ipc container:<box>`: see `share_ipc` in `start.rs`.
+    pub ipc: Option<&'a str>,
     pub uid_range: bool,
     /// `--no-uid-range`: opt OUT of the range mapping an `--image` box gets by default.
     pub no_uid_range: bool,
@@ -1344,6 +1346,10 @@ struct BuildSpec<'a> {
     share_net: bool,
     /// `--pod`: the pod holder PID whose user+net ns this box joins (`None` = its own).
     pod_holder: Option<i32>,
+    /// `--ipc container:<box>`: that box's PID 1, whose IPC namespace this box enters.
+    ipc_from: Option<i32>,
+    /// The host directory bound at `/dev/shm` (`--ipc shareable`, or the one joined).
+    shm_dir: Option<String>,
     uid_range: UidRange,
     bind_rootfs: bool,
     /// `--privileged`: relax seccomp for a nested `kern box` (rootless-only).
@@ -1671,6 +1677,8 @@ fn build_spec(b: BuildSpec) -> Result<(SandboxSpec, Option<PathBuf>), Error> {
         workdir: b.workdir,
         share_net: b.share_net,
         pod_holder: b.pod_holder,
+        ipc_from: b.ipc_from,
+        shm_dir: b.shm_dir,
         uid_range: b.uid_range,
         memory_max: b.memory,
         // `--shm-size` when given, else the cap that is ACTUALLY in force: `--memory` when the operator

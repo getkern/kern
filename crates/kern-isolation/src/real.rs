@@ -170,6 +170,17 @@ pub struct SandboxSpec {
     /// still gets its own mount/pid/uts/ipc namespaces. Pod members are co-trusted (they share the
     /// pod's user+net ns) - the pod is the network trust unit, like a Kubernetes pod.
     pub pod_holder: Option<i32>,
+    /// `--ipc container:<box>`: the PID 1 of a box in the SAME pod whose IPC namespace this box
+    /// enters instead of creating its own (Docker's `ipc: service:X`). Only on the pod path: the
+    /// target's IPC namespace is owned by the pod's user namespace, which is the one this box joins,
+    /// and `setns` into it needs CAP_SYS_ADMIN there (MEASURED: two services of one stack, in pod and
+    /// in bridge wiring, share one user namespace and have distinct IPC namespaces).
+    pub ipc_from: Option<i32>,
+    /// A host directory bound at `/dev/shm` instead of a fresh tmpfs, which is how two boxes see one
+    /// POSIX shared-memory store: `--ipc shareable` gets one under the runtime dir, and a box joining
+    /// it with `--ipc container:<box>` binds the same one. Docker keeps a container's shm on the host
+    /// for the same reason: a mount cannot be bound from another mount namespace.
+    pub shm_dir: Option<String>,
     /// `--pod-bridge <ip>/<prefix>`: join the pod through its BRIDGE instead of sharing its network
     /// namespace, taking this address on it.
     ///
@@ -1839,6 +1850,7 @@ fn child_setup_and_exec(
         spec.tty_slave,
         shm_size_for(spec.shm_max, spec.memory_max),
         spec.pty_sock,
+        spec.shm_dir.as_deref(),
     )?;
     // The host slave is now dead weight in this process: the workload is about to get the box's
     // one. Closing it here rather than leaking it into the exec keeps the box from holding an fd on
@@ -3967,6 +3979,7 @@ fn setup_dev(
     tty_slave: Option<i32>,
     shm_size: Option<u64>,
     pty_sock: Option<i32>,
+    shm_dir: Option<&str>,
 ) -> Result<Option<i32>, Error> {
     let mut box_slave: Option<i32> = None;
     let dev_path = format!("{root}/dev");
@@ -4078,7 +4091,39 @@ fn setup_dev(
                 Some(n) => format!("mode=1777,size={n}"),
                 None => "mode=1777".to_string(),
             };
-            if let (Ok(ty), Ok(o)) = (cstr("tmpfs"), cstr(&opts)) {
+            // A SHARED /dev/shm IS THE HOST DIRECTORY, bound in place of the tmpfs (see
+            // `SandboxSpec::shm_dir`). Not best-effort: a box that asked to share memory and got a
+            // private store would run with no error and see nothing its peer wrote.
+            if let Some(dir) = shm_dir {
+                let src = cstr(dir)?;
+                let bound = unsafe {
+                    libc::mount(
+                        src.as_ptr(),
+                        sd.as_ptr(),
+                        std::ptr::null(),
+                        (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+                        std::ptr::null(),
+                    )
+                };
+                if bound != 0 {
+                    return Err(Error::Syscall(
+                        "bind the shared /dev/shm",
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+                // The same nosuid/nodev the private tmpfs has; best-effort, the source's own flags
+                // already carry them on a runtime dir.
+                unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        sd.as_ptr(),
+                        std::ptr::null(),
+                        (libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV)
+                            as libc::c_ulong,
+                        std::ptr::null(),
+                    )
+                };
+            } else if let (Ok(ty), Ok(o)) = (cstr("tmpfs"), cstr(&opts)) {
                 unsafe {
                     libc::mount(
                         ty.as_ptr(),
@@ -6348,6 +6393,26 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
                 "pod holder is gone (create the pod first with `kern pod create`)",
             ));
         }
+        // The IPC namespace to join, opened from the host side beside the pod's, and entered once
+        // this process is in the pod's user namespace, which owns it.
+        let ipc_join = match spec.ipc_from {
+            Some(donor) => {
+                let p = format!("/proc/{donor}/ns/ipc\0");
+                let fd = unsafe {
+                    libc::open(
+                        p.as_ptr() as *const libc::c_char,
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(Error::Unsupported(
+                        "--ipc container: the box whose IPC namespace this one joins is gone",
+                    ));
+                }
+                Some(fd)
+            }
+            None => None,
+        };
         // STILL IN THE HOST USER NAMESPACE, holding the pod's: the one moment an idmapped mount
         // against that namespace can be made. See `prepare_idmapped_binds`.
         if !spec.idmap_binds.is_empty() && is_initial_root() {
@@ -6383,7 +6448,16 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
             libc::close(user);
             libc::close(net);
         }
-        let rest = libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        let mut rest = libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        if let Some(fd) = ipc_join {
+            let joined = unsafe { libc::setns(fd, libc::CLONE_NEWIPC) };
+            unsafe { libc::close(fd) };
+            if joined != 0 {
+                let e = std::io::Error::last_os_error();
+                return Err(Error::Syscall("setns(ipc of the box joined)", e));
+            }
+            rest &= !libc::CLONE_NEWIPC;
+        }
         if unsafe { libc::unshare(rest) } != 0 {
             return Err(Error::Syscall(
                 "unshare(pid+uts+ipc)",

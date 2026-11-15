@@ -340,6 +340,32 @@ pub fn clear_box_env(name: &str, pid: i32) {
     }
 }
 
+/// The host directory holding the `/dev/shm` of the box `name` when it was started `--ipc shareable`.
+/// Keyed by the name, which a live box holds alone, so a box joining it finds it by that name.
+pub fn shm_dir_of(name: &str) -> io::Result<PathBuf> {
+    let valid = kern_common::BoxName::parse(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "not a box name"))?;
+    Ok(runtime_subdir("shm")?.join(valid.as_str()))
+}
+
+/// Remove the shared `/dev/shm` directory of the box `name`, if it has one: called wherever the box's
+/// other sidecars go, so its shared memory ends with it, and when a box of that name starts WITHOUT
+/// `--ipc shareable`, so a directory a dead box left cannot make it look shareable (a live box holds
+/// its name alone, so any directory found then is stale). LOOKED UP, NEVER CREATED: every box start
+/// and end passes here, and most boxes have no `shm/` at all. The path is the validated name under
+/// kern's own `shm/` directory and nothing else.
+pub fn clear_box_shm(name: &str) {
+    let Ok(valid) = kern_common::BoxName::parse(name) else {
+        return;
+    };
+    for base in runtime_subdir_candidates("shm") {
+        let dir = base.join(valid.as_str());
+        if dir.is_dir() && dir.starts_with(&base) && dir != base {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+}
+
 /// Record a box's latest health (`healthy`/`unhealthy`/`starting`); written by the health-checker.
 pub fn set_health(name: &str, pid: i32, status: &str) {
     if let Ok(d) = health_dir() {
@@ -510,7 +536,9 @@ const AUTHORITATIVE_DIRS: [&str; 14] = [
 /// mounts a peer's `scratch/` writable into another box AND `kern commit`s that peer while it runs lands
 /// the mounted box's bytes in the PUBLISHED image. It stays a foot-gun (an operator `-v`, never in-box
 /// code), but the effect leaves the box - a published artefact - so it is documented, not silent.
-const BOX_DATA_DIRS: [&str; 2] = ["logs", "scratch"];
+/// `shm` holds the POSIX shared memory of a box started `--ipc shareable`, bound at its `/dev/shm`
+/// and at the `/dev/shm` of every box that joins it (`--ipc container:<box>`): a box's own bytes.
+const BOX_DATA_DIRS: [&str; 3] = ["logs", "scratch", "shm"];
 
 /// The classification CHOKEPOINT: every function that builds a `<runtime>/kern/<name>` path calls this,
 /// so a registry-root child cannot be created without being in a class. A new unclassified `name` would
@@ -1924,6 +1952,7 @@ fn load_live(path: &Path) -> Option<Instance> {
             unregister(path);
             clear_box_env(&inst.name, inst.pid);
             clear_health(&inst.name, inst.pid);
+            clear_box_shm(&inst.name);
             None
         }
     }
