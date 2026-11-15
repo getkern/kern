@@ -187,6 +187,11 @@ directory, starting after it; a donor that is not `shareable` is refused with Do
 IPC". `kern box --ipc shareable` and `--ipc container:<box>` do the same for two boxes of one pod
 (an IPC namespace is entered from the user namespace that owns it, which a pod's members share).
 
+**A host port range onto one box port takes a free port of the range, as Docker does.** `-p
+8080-8095:80` (compose `ports: ["8080-8095:80"]`) was refused as malformed; the box now gets the first
+port of the range that is free on every address it binds, picked at start, and a box finding the whole
+range taken is refused with Docker's "port is already allocated".
+
 **`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
 before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
