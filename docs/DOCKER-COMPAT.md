@@ -166,6 +166,11 @@ namespace that owns the target, and a sibling has neither (both measured as EPER
 comes up loopback-only and says so. Outside a pod each service gets its own NAT, attached while it is
 held at its pre-exec gate, so no workload sees a half-built network.
 
+A box behind pasta has an address of its own (`10.0.2.15`) and reaches the host at the host's address,
+never the host's loopback: a service bound to `127.0.0.1` on the host is out of reach from every box.
+Its resolvers are the host's; on a host that resolves through systemd-resolved's `127.0.0.53` stub,
+the stub's upstreams.
+
 `internal: true` is a real boundary without a pod: such a service is given no NAT, so there is no
 route out of its namespace. Two exceptions are named rather than hidden: a service on the host network
 already has the host's connectivity, and one with `restart:` becomes a systemd unit `up` never holds.
@@ -484,10 +489,11 @@ kern box app --image python:3.12-slim --add-host host.docker.internal:host-gatew
 ```
 
 `host-gateway` is the keyword; the NAME beside it is yours, so `host.docker.internal`, `dockerhost` and
-`gateway` all work. It resolves to the host's default gateway, which pasta answers for inside the box
-and maps to the host's loopback, so a port kern publishes (on `127.0.0.1` by default) is reachable
-through it: an open-webui configured for `http://host.docker.internal:7869` reaches the ollama port
-the same stack publishes, measured on a WSL2 guest. Three spellings are accepted (`extra_hosts`, `--add-host`, and `add_host = [...]`
+`gateway` all work. It resolves to the host's own address, so a port the host serves on its
+interfaces is reachable through it, a port kern publishes included (every interface by default): an
+open-webui configured for `http://host.docker.internal:7869` reaches the ollama port the same stack
+publishes. What the host keeps on `127.0.0.1` is not reachable, through this name or any other
+address. Three spellings are accepted (`extra_hosts`, `--add-host`, and `add_host = [...]`
 in a `kern.toml`), and [examples/edge/add-host.sh](../examples/edge/add-host.sh) runs it.
 
 **A box is on its own network namespace by default**, so nothing reaches the host until you say so.

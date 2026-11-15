@@ -57,6 +57,19 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
+**A box with outbound could reach what the host keeps on `127.0.0.1`.** pasta gave the box the
+host's address and gateway and mapped that gateway to the host's loopback, so a compose service or a
+`kern box --pod` box connecting to the gateway reached every loopback-only service: a `kubectl
+port-forward`, a kind API server, a docker TCP socket, a dev database. Measured before this: a
+canary bound to `127.0.0.1` answered a box connecting to `192.168.1.1`. A box now has an address of
+its own (`10.0.2.15`, gateway `10.0.2.2`, another /24 when the host or the box already routes that
+one) and the gateway maps to nothing. It reaches the host at the host's address, what the host
+serves on its interfaces and not its loopback, measured closed on every path probed on a desktop and
+on WSL2 as root and as a user. `host-gateway` (`host.docker.internal`) is the host's address now,
+and a published port answers through it from a compose service. On a host that resolves through
+systemd-resolved's stub, a box's resolvers are the stub's upstreams instead of `1.1.1.1`, so a
+network that blocks outside DNS, or a VPN's own names, resolve in a box too.
+
 **A GPU box starts faster: 31.3 to 13.9 ms on WSL2, 82.0 to 44.2 ms on a Jetson** (`python:3.12-slim`).
 The image's `ldconfig` runs for the first box of an image and grant, and the next ones get its cache
 and the soname links it made back from kern's cache directory. The grant is decided once per box
