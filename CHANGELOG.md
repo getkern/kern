@@ -100,7 +100,8 @@ before anything runs, where `""` first built a bytecode cache for an empty refer
 and the printed `accept-new` pinned the first one in `~/.ssh/known_hosts`, so the second box on the
 same port was refused with `Host key verification failed`. kern now makes the box's host key and a
 `known_hosts` naming it, and the printed command checks strictly against that file: no prompt, any
-other key refused, and `~/.ssh/known_hosts` is not written.
+other key refused, and `~/.ssh/known_hosts` is not written. A box refused for a taken `--ssh` port
+prints no `ssh` command and leaves no keys behind.
 
 **A box with outbound could reach what the host keeps on `127.0.0.1`.** pasta gave the box the
 host's address and gateway and mapped that gateway to the host's loopback, so a compose service or a
