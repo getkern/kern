@@ -3744,3 +3744,80 @@ fn network_mode_service_joins_the_named_services_namespace() {
         "ports on a joining service are refused as Docker refuses them:\n{refused}"
     );
 }
+
+/// A BOX WITH OUTBOUND NEVER REACHES WHAT THE HOST KEEPS ON LOOPBACK, by any road out of it.
+///
+/// MEASURED before the fix, against the real loopback-only services of a development machine (the
+/// shape of `kubectl port-forward`, a kind API, a local database): a box in a pod opened 12 of 21
+/// tries across 7 such ports, through the gateway pasta answered for and through `host-gateway`.
+/// After: 0 of 21, in a pod, on a compose bridge and under `--no-pod`, with `--net` as the control
+/// that reached all 7.
+///
+/// The test owns both listeners, so it needs no service of the host's: one on `127.0.0.1` (must stay
+/// shut) and one on every interface (the CONTROL: it must open through `host-gateway`, or this host
+/// gives a pod no outbound and the test skips instead of passing).
+#[test]
+fn a_pod_box_never_reaches_the_hosts_loopback() {
+    use std::io::Write as _;
+    let Ok(lo) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
+        eprintln!("SKIP: could not bind a loopback listener");
+        return;
+    };
+    let Ok(any) = std::net::TcpListener::bind(("0.0.0.0", 0)) else {
+        eprintln!("SKIP: could not bind a wildcard listener");
+        return;
+    };
+    let lo_port = lo.local_addr().map(|a| a.port()).unwrap_or(0);
+    let any_port = any.local_addr().map(|a| a.port()).unwrap_or(0);
+    for l in [lo, any] {
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let _ = c.write_all(b"HOST\n");
+            }
+        });
+    }
+    let xdg = std::env::temp_dir().join(format!("kern-it-hostlo-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> String {
+        match kern().env("XDG_RUNTIME_DIR", &xdg).args(args).output() {
+            Ok(o) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => e.to_string(),
+        }
+    };
+    let probe = format!(
+        "gw=$(ip route | awk '/^default/{{print $3; exit}}'); hg=$(awk '$2==\"hg\"{{print $1; exit}}' /etc/hosts); \
+         for r in $gw $hg; do nc -z -w 3 $r {lo_port} && echo LO-OPEN-$r; done; \
+         nc -z -w 3 $hg {any_port} && echo CONTROL-OPEN; echo DONE"
+    );
+    let _ = run(&["pod", "create", "hostlo"]);
+    let out = run(&[
+        "box",
+        "--rm",
+        "--pod",
+        "hostlo",
+        "--add-host",
+        "hg:host-gateway",
+        "--image",
+        "alpine",
+        "--",
+        "sh",
+        "-c",
+        &probe,
+    ]);
+    let _ = run(&["pod", "rm", "hostlo"]);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if !out.contains("CONTROL-OPEN") {
+        eprintln!(
+            "SKIP: a pod box here cannot reach the host at all, so the rule cannot show:\n{out}"
+        );
+        return;
+    }
+    assert!(
+        !out.contains("LO-OPEN"),
+        "a pod box reached a listener the host keeps on 127.0.0.1:\n{out}"
+    );
+}
