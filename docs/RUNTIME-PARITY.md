@@ -42,7 +42,7 @@ identity, environment and mount rules, decided by runc and the daemon rather tha
 | 24 | `up --wait`, four cases | 0 / 0 / 1 / 1 | not measured | same | agree |
 | 25 | `up --build` after editing the Dockerfile | the OLD image without the flag | not measured | `build:` alone: rebuilds either way; with `image:`, as Docker | kern deviates for `build:` alone: always current |
 | 26 | `--exit-code-from db` while `tests` exits 3 | **137** (the abort ended db) | not measured | same | agree |
-| 27 | `compose ps --format json` | NDJSON since Compose 2.21 | not measured | `kern ps --json`'s shape, own field names | differs in the FIELD NAMES |
+| 27 | `compose ps --format json` | NDJSON since Compose 2.21 | not measured | NDJSON, kern's fields plus nine of Docker's (`ID`, `Name`, `Service`, `State`, `Publishers`, ...) | five of Docker's fields missing (see 29) |
 
 ---
 
@@ -412,10 +412,12 @@ already shares, so a column cannot differ between the two views.
 `--services` answers from the FILE under both runtimes: the list is the same whether the stack is up
 or down, which is what makes it usable in a deploy script.
 
-The field NAMES differ from Docker's (`Command`, `CreatedAt`, `ExitCode`, `Health`, `ID`, `Image`,
-`Labels`, `Name`, `Project`, `Publishers`, `RunningFor`, `Service`, `State`, `Status`): kern's
-`--json` is kern's own shape and is documented with `kern ps --help`. A script that reads
-`.Service` or `.Name` ports; one that reads `.Publishers` does not.
+Each line carries kern's own fields (documented with `kern ps --help`) and, beside them, Docker's
+`ID`, `Name`, `Service`, `Project`, `State`, `Health`, `ExitCode`, `Command` and `Publishers`. Five of
+Docker's are not there: `CreatedAt`, `Image`, `Labels` (kern's is the lowercase `labels`),
+`RunningFor` and `Status`. `ps -q` prints the same `ID`, which is the box's supervisor pid: `kern
+stop`, `exec` and `logs` take it, and a recreate changes it, as a container ID changes. `ps SERVICE...`
+lists those services alone.
 
 ## 30. The THIRD number: what the shared loopback actually changes
 

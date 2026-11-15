@@ -146,6 +146,13 @@ toolkit. A `devices:` node, a CDI name of any other class and a device profile s
 `--allow-device-grants` or `allow_device_grants`, which open every device. Read only from your own
 config, as `allow_device_grants` is.
 
+**`compose ps SERVICE...` lists those services, and `compose ps -q` prints IDs.** The services named
+were ignored, so `ps -q stable` printed the whole stack. `-q` printed each box's name, which a
+recreate does not change, so a script comparing `ps -q` before and after `up -d` could not see what
+was recreated; it prints the box's ID now, its supervisor pid, which `kern stop`/`exec`/`logs` and
+`--filter id=` already take and which a recreate changes. `ps --format json` carries the same `ID`.
+`kern ps -q` still prints names.
+
 **`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
 before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
