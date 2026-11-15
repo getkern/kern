@@ -85,6 +85,14 @@ pub struct Assigned {
     /// share ([`peer_addr`]): the same name is a different address depending on who asks, which is
     /// what a container on two networks has under Docker.
     pub net_addrs: Vec<NetAddr>,
+    /// The service this box is a REPLICA of (`--scale`, `deploy.replicas`), for replicas 2..N.
+    ///
+    /// A replica answers to its service's name and to its box name, never to its plan key
+    /// (`web-2`), which is what Docker's DNS does. MEASURED on Docker Compose 2.40.3 with
+    /// `--scale web=3`: `getent ahosts web` listed the three addresses from an Alpine and from a
+    /// Debian client, `dnsd-web-2` resolved, and `web-2` did not. The service's name comes through
+    /// [`Self::aliases`], where the driver puts it, so this only stops the key being published.
+    pub replica_of: Option<String>,
 }
 
 /// A service's place on one network of a stack with a bridge per network.
@@ -208,9 +216,17 @@ pub fn hosts_name_is_safe(name: &str) -> bool {
 /// A message naming the offending service when a name is unusable in a hosts file, when two services
 /// share a name, or when the stack has more services than there are addresses.
 /// One service as the address plan needs it: `(service name, box name, declared container ports,
-/// networks, aliases)`. Named because the tuple travels from the compose driver to here and a
-/// five-element type spelled out at every site is a type nobody can read.
-pub type ServiceInput = (String, String, Vec<u16>, Vec<String>, Vec<String>);
+/// networks, aliases, the service it is a replica of)`. Named because the tuple travels from the
+/// compose driver to here and a six-element type spelled out at every site is a type nobody can
+/// read.
+pub type ServiceInput = (
+    String,
+    String,
+    Vec<u16>,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+);
 
 pub fn assign_aliases(services: &[ServiceInput]) -> Result<Vec<Assigned>, String> {
     if services.len() > MAX_PEER_INDEX {
@@ -221,7 +237,9 @@ pub fn assign_aliases(services: &[ServiceInput]) -> Result<Vec<Assigned>, String
         ));
     }
     let mut out: Vec<Assigned> = Vec::with_capacity(services.len());
-    for (i, (service, box_name, ports, networks, aliases)) in services.iter().enumerate() {
+    for (i, (service, box_name, ports, networks, aliases, replica_of)) in
+        services.iter().enumerate()
+    {
         if !hosts_name_is_safe(service) {
             return Err(format!(
                 "service '{service}' cannot be written into a hosts file: a name may hold only \
@@ -258,6 +276,7 @@ pub fn assign_aliases(services: &[ServiceInput]) -> Result<Vec<Assigned>, String
             networks: networks.clone(),
             aliases: aliases.clone(),
             net_addrs: Vec::new(),
+            replica_of: replica_of.clone(),
         });
     }
     Ok(out)
@@ -290,8 +309,13 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
         .iter()
         .find(|a| a.service == me)
         .map_or(&[], |a| a.ports.as_slice());
+    let my_index = plan.iter().position(|a| a.service == me).unwrap_or(0);
+    let i_am_a_replica = plan.get(my_index).is_some_and(|a| a.replica_of.is_some());
     let mut out = Vec::with_capacity(plan.len());
-    out.push(format!("{me}:127.0.0.1"));
+    // A REPLICA'S PLAN KEY (`web-2`) IS NOT A NAME: see `Assigned::replica_of`.
+    if !i_am_a_replica {
+        out.push(format!("{me}:127.0.0.1"));
+    }
     // MY OWN BOX NAME TOO, because that is what `hostname` answers inside the box and what a
     // clustered service ANNOUNCES to its peers. See the peer loop below for what it cost.
     if let Some(bn) = plan
@@ -357,7 +381,9 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
             continue;
         }
         let addr = alias_to_dotted(peer_addr(&mine_eff, a), &mut buf).to_string();
-        out.push(format!("{}:{}", a.service, addr));
+        if a.replica_of.is_none() {
+            out.push(format!("{}:{}", a.service, addr));
+        }
         // AND THE PEER'S BOX NAME, which is the name it ANNOUNCES rather than the name the file
         // calls it by.
         //
@@ -385,7 +411,50 @@ pub fn add_host_args(plan: &[Assigned], me: &str, via_relay: bool) -> Option<Vec
             }
         }
     }
+    rotate_shared_names(&mut out, my_index);
     Some(out)
+}
+
+/// A NAME SEVERAL BOXES ANSWER TO (a replicated service) lists their addresses starting at a
+/// different one in each box, rotated by `offset` (the box's place in the plan).
+///
+/// A resolver reading `/etc/hosts` returns every line that names the host, in file order, and a
+/// client connects to the first. Docker's DNS shuffles the answer on every query, so its clients
+/// spread over the replicas: MEASURED on Docker Compose 2.40.3 with `--scale web=3`, the first
+/// address of 20 `getent hosts web` was 6/7/7 across the three, and 20 `wget http://web/` reached
+/// them 4/6/10 times. A hosts file cannot change between two queries, so the spread is made between
+/// CLIENTS instead: each starts its list at a different replica. Every address is still listed, in
+/// every box, so a client that tries the next one on a refusal reaches the others too.
+///
+/// Rotated IN PLACE, among the positions the name already holds, so no other line moves.
+fn rotate_shared_names(entries: &mut [String], offset: usize) {
+    let mut by_name: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let Some((name, _)) = e.split_once(':') else {
+            continue;
+        };
+        match by_name.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, at)) => at.push(i),
+            None => by_name.push((name, vec![i])),
+        }
+    }
+    let groups: Vec<Vec<usize>> = by_name
+        .into_iter()
+        .filter(|(_, at)| at.len() > 1)
+        .map(|(_, at)| at)
+        .collect();
+    for at in groups {
+        let values: Vec<String> = at.iter().filter_map(|&i| entries.get(i).cloned()).collect();
+        if values.is_empty() {
+            continue;
+        }
+        let k = offset % values.len();
+        for (&i, v) in at.iter().zip(values.iter().cycle().skip(k)) {
+            if let Some(slot) = entries.get_mut(i) {
+                slot.clone_from(v);
+            }
+        }
+    }
 }
 
 /// The `--add-host ALIAS:IP` values a service's `links:` need, in EITHER stack mode.
@@ -587,6 +656,7 @@ mod tests {
             ports.to_vec(),
             Vec::new(),
             Vec::new(),
+            None,
         )
     }
 
@@ -598,6 +668,7 @@ mod tests {
             ports.to_vec(),
             nets.iter().map(|n| (*n).to_string()).collect(),
             Vec::new(),
+            None,
         )
     }
 
@@ -609,7 +680,83 @@ mod tests {
             ports.to_vec(),
             Vec::new(),
             aliases.iter().map(|a| (*a).to_string()).collect(),
+            None,
         )
+    }
+
+    /// A REPLICATED SERVICE'S NAME LISTS EVERY REPLICA, its key `web-2` lists none, and two clients
+    /// start the list at different replicas.
+    ///
+    /// MEASURED on Docker Compose 2.40.3 with `--scale web=3`: `getent ahosts web` gave the three
+    /// addresses, `<project>-web-2` resolved and `web-2` did not; kern resolved `web` to replica 1
+    /// alone and published `web-2`.
+    #[test]
+    fn a_replicated_name_lists_every_replica_and_its_keys_are_not_names() {
+        let replica = |k: u8| -> Svc {
+            (
+                format!("web-{k}"),
+                format!("p-web-{k}"),
+                vec![80],
+                Vec::new(),
+                vec!["web".to_string()],
+                Some("web".to_string()),
+            )
+        };
+        let mut plan = assign_aliases(&[
+            svc_aka("web", &[80], &["web"]),
+            replica(2),
+            replica(3),
+            svc("cm", &[]),
+            svc("cg", &[]),
+        ])
+        .expect("plan");
+        // A bridge: every service on its own address, as `bridge_plan` sets them.
+        for (i, a) in plan.iter_mut().enumerate() {
+            a.alias = u32::from(std::net::Ipv4Addr::new(10, 89, 0, 2)) + i as u32;
+        }
+        let web_of = |me: &str| -> Vec<String> {
+            add_host_args(&plan, me, false)
+                .expect("in the plan")
+                .into_iter()
+                .filter_map(|e| e.strip_prefix("web:").map(str::to_string))
+                .collect()
+        };
+        let from_cm = web_of("cm");
+        let mut sorted = from_cm.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            ["10.89.0.2", "10.89.0.3", "10.89.0.4"],
+            "{from_cm:?}"
+        );
+        let all = add_host_args(&plan, "cm", false).expect("cm");
+        assert!(
+            !all.iter()
+                .any(|e| e.starts_with("web-2:") || e.starts_with("web-3:")),
+            "a replica's key is not a name: {all:?}"
+        );
+        assert!(
+            all.iter().any(|e| e == "p-web-2:10.89.0.3"),
+            "its box name is: {all:?}"
+        );
+        let from_cg = web_of("cg");
+        assert_ne!(
+            from_cm.first(),
+            from_cg.first(),
+            "two clients start at different replicas: {from_cm:?} {from_cg:?}"
+        );
+        // Inside a replica the name is itself and its siblings, the key still not a name.
+        let from_2 = add_host_args(&plan, "web-2", false).expect("web-2");
+        assert!(
+            !from_2.iter().any(|e| e.starts_with("web-2:")),
+            "{from_2:?}"
+        );
+        assert_eq!(
+            from_2.iter().filter(|e| e.starts_with("web:")).count(),
+            3,
+            "{from_2:?}"
+        );
+        assert!(from_2.iter().any(|e| e == "web:127.0.0.1"), "{from_2:?}");
     }
 
     /// A `networks.<net>.aliases` NAME RESOLVES IN EVERY WIRING, not only in the pod.
@@ -673,6 +820,7 @@ mod tests {
                 vec![5432],
                 vec!["back".into()],
                 vec!["db".into()],
+                None,
             ),
             (
                 "web".into(),
@@ -680,6 +828,7 @@ mod tests {
                 vec![80],
                 vec!["front".into()],
                 Vec::new(),
+                None,
             ),
         ])
         .expect("plan");
@@ -1179,6 +1328,7 @@ mod tests {
                     vec![9000 + i as u16],
                     Vec::new(),
                     Vec::new(),
+                    None,
                 )
             })
             .collect();
@@ -1199,6 +1349,7 @@ mod tests {
                     vec![9000 + i as u16],
                     Vec::new(),
                     Vec::new(),
+                    None,
                 )
             })
             .collect();

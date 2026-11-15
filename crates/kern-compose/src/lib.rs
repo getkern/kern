@@ -1839,6 +1839,14 @@ impl DotEnv {
         self.0
     }
 
+    /// `self` with `over`'s bindings after its own, so a key both bind reads `over`'s value: lookups
+    /// take the LAST definition (see [`DotEnv::get`]). The working directory's `.env` over the
+    /// project's, for a run that named no file, is the one caller.
+    pub fn overlaid_by(mut self, over: DotEnv) -> DotEnv {
+        self.0.extend(over.0);
+        self
+    }
+
     /// Number of bindings (0 when there is no `.env`).
     pub fn len(&self) -> usize {
         self.0.len()

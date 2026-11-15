@@ -719,6 +719,60 @@ pub fn drop_foreign_hosts(box_name: &str, project: &str) {
     let _ = drop_marked_lines(&file, &current, &foreign_marker(project));
 }
 
+/// Make the names in `names` map to exactly what `want` returns, in a RUNNING box's hosts file.
+///
+/// `want` is handed the `(name, address)` pairs the file holds now for those names, in file order,
+/// and returns the pairs the file should hold; every other line is kept as it is. Lines are matched
+/// by NAME, so a line naming one of `names` beside another name is replaced whole. The new lines go
+/// at the end, where kern's `--add-host` block is, written as that block writes them.
+///
+/// WHY A RUNNING BOX NEEDS IT: a replicated service's name lists every replica (see
+/// `nopod::rotate_shared_names`), and a box left running by `up` keeps the file it started with.
+/// MEASURED on WSL2 before this existed: after `up --scale web=2` and then `up --scale web=3`, the
+/// running `cm` still listed `web-2` and not the third replica. Opened as [`add_foreign_host`] opens
+/// a file (inside the box's root, regular files only), written over the start and then cut, so it is
+/// never empty in between. Nothing is written when nothing changes.
+pub fn set_box_names(
+    box_name: &str,
+    names: &std::collections::HashSet<String>,
+    want: impl FnOnce(Vec<(String, String)>) -> Vec<(String, String)>,
+) -> Result<(), Error> {
+    use std::os::unix::fs::FileExt;
+    let Some(pid1) = crate::registry::find(box_name).and_then(|i| i.live_pid1()) else {
+        return Ok(()); // gone meanwhile: nothing of it to keep current
+    };
+    let (file, current) = open_foreign_hosts(pid1)
+        .map_err(|e| Error::Sandbox(format!("{box_name}: cannot read its hosts file: {e}")))?;
+    let names_a_line = |l: &str| {
+        let body = l.split('#').next().unwrap_or("");
+        body.split_whitespace().skip(1).any(|n| names.contains(n))
+    };
+    let mut held: Vec<(String, String)> = Vec::new();
+    for l in current.lines().filter(|l| names_a_line(l)) {
+        let mut it = l.split('#').next().unwrap_or("").split_whitespace();
+        if let Some(addr) = it.next() {
+            for n in it.filter(|n| names.contains(*n)) {
+                held.push((n.to_string(), addr.to_string()));
+            }
+        }
+    }
+    let wanted = want(held.clone());
+    if wanted == held {
+        return Ok(());
+    }
+    let mut next: String = current
+        .lines()
+        .filter(|l| !names_a_line(l))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    for (name, addr) in &wanted {
+        next.push_str(&format!("{addr}\t{name}\n"));
+    }
+    file.write_all_at(next.as_bytes(), 0)
+        .and_then(|()| file.set_len(next.len() as u64))
+        .map_err(|e| Error::Sandbox(format!("{box_name}: cannot write its hosts file: {e}")))
+}
+
 /// Rewrite an already-read hosts file without the lines carrying `marker`: the kept text over the
 /// start, then the file cut to it, so it is never empty in between. Nothing to do when none match.
 fn drop_marked_lines(file: &std::fs::File, current: &str, marker: &str) -> std::io::Result<()> {

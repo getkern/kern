@@ -3978,6 +3978,11 @@ fn a_port_with_no_host_number_is_published_on_a_picked_one() {
 /// write ends closed (locals drop in reverse order), so it was itself holding the boxes it waited
 /// on; and once that order is right the prepared boxes still leave a few milliseconds after the
 /// gates close. The refusal here is a `mem_limit:` below what a box needs, which needs no GPU.
+///
+/// AS DOCKER'S CREATE PHASE, the refusal now comes before any box is prepared: Docker refused this
+/// file's `second` with `Minimum memory limit allowed is 6MB` and `first` was created and not
+/// running (measured on Docker Compose 2.40.3). A failure at START is the other case, where the
+/// services that started keep running: see `a_service_that_fails_to_start_stops_only_its_dependents`.
 #[test]
 fn a_later_refused_service_leaves_no_pod_behind() {
     let dir = std::env::temp_dir().join(format!("kern-it-laterref-{}", std::process::id()));
@@ -4025,6 +4030,10 @@ fn a_later_refused_service_leaves_no_pod_behind() {
     assert!(
         !ps.contains("first"),
         "an earlier service outlived the failed bring-up:\n{ps}"
+    );
+    assert!(
+        up.contains("service 'second'") && up.contains("no service was started"),
+        "refused before any start, naming the service:\n{up}"
     );
 }
 
@@ -5122,6 +5131,409 @@ fn scale_and_deploy_replicas_run_one_box_per_replica() {
         fixed.contains("port is already allocated"),
         "in Docker's words:\n{fixed}"
     );
+}
+
+/// A SERVICE THAT FAILS TO START STOPS ITS DEPENDENTS AND NOTHING ELSE, as Docker's partial bring-up.
+///
+/// MEASURED on Docker Compose 2.40.3, with the host port range of `b` held by another process:
+/// `up -d` exited 1 naming `b`; `a`, the replicas of `d` and `f` (which depends on `a`) were running
+/// and `e` (which depends on `b`) was not. kern closed every pre-exec gate at the first failure and
+/// ran none of them.
+#[test]
+fn a_service_that_fails_to_start_stops_only_its_dependents() {
+    // The two ports of `b`'s range, held here so its start finds none free.
+    let held: Vec<std::net::TcpListener> = [18571u16, 18572]
+        .iter()
+        .filter_map(|p| std::net::TcpListener::bind(("0.0.0.0", *p)).ok())
+        .collect();
+    if held.len() != 2 {
+        eprintln!("SKIP: ports 18571-18572 are not free on this host");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kern-it-partial-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-partial-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  a:\n    image: alpine\n    command: [\"sleep\", \"60\"]\n  b:\n    image: alpine\n    command: [\"sleep\", \"60\"]\n    ports: [\"18571-18572:80\"]\n  d:\n    image: alpine\n    command: [\"sleep\", \"60\"]\n    deploy:\n      replicas: 2\n  e:\n    image: alpine\n    command: [\"sleep\", \"60\"]\n    depends_on: [b]\n  f:\n    image: alpine\n    command: [\"sleep\", \"60\"]\n    depends_on: [a]\n",
+    );
+    let run = |args: &[&str]| -> (Option<i32>, String) {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+        {
+            Ok(o) => (
+                o.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (None, e.to_string()),
+        }
+    };
+    let (up_rc, up) = run(&["compose", "-p", "part", "up", "-d"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (_, ps) = run(&["compose", "-p", "part", "ps", "--format", "json"]);
+    let running: Vec<String> = ps
+        .lines()
+        .filter_map(|l| l.split("\"Name\":\"").nth(1))
+        .filter_map(|r| r.split('"').next())
+        .map(str::to_string)
+        .collect();
+    let _ = run(&["compose", "-p", "part", "down", "-t", "0"]);
+    let (_, after) = run(&["ps", "-q"]);
+    drop(held);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+
+    assert_ne!(up_rc, Some(0), "the bring-up failed for `b`:\n{up}");
+    assert!(up.contains("service 'b'"), "and says which:\n{up}");
+    assert!(
+        up.contains("dependency failed to start: e"),
+        "and which service it held back:\n{up}"
+    );
+    let mut got = running.clone();
+    got.sort();
+    assert_eq!(
+        got,
+        ["part-a", "part-d", "part-d-2", "part-f"],
+        "every service that does not depend on `b` runs:\n{ps}\n{up}"
+    );
+    assert_eq!(
+        after.lines().count(),
+        0,
+        "nothing left after down:\n{after}"
+    );
+}
+
+/// A REPLICATED SERVICE'S NAME ANSWERS WITH EVERY REPLICA, AND A RUNNING STACK CAN BE RESCALED.
+///
+/// MEASURED on Docker Compose 2.40.3 with `--scale web=3`: `getent ahosts web` listed the three
+/// replicas from an Alpine and from a Debian client, the first address moved between lookups,
+/// `<project>-web-2` resolved and `web-2` did not. kern resolved `web` to replica 1 alone and
+/// published `web-2`; and rescaling a running stack (`--scale web=2`, then `--scale web=3`) gave the
+/// new replica the address a running client still held, so the client could not reach it.
+#[test]
+fn replicas_share_the_service_name_and_a_running_stack_rescales_cleanly() {
+    let dir = std::env::temp_dir().join(format!("kern-it-repdns-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-repdns-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    // Each replica answers one line, its hostname, on port 80; the clients only sleep.
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  web:\n    image: alpine\n    command: [\"sh\", \"-c\", \"while true; do hostname | nc -l -p 80; done\"]\n  cm:\n    image: alpine\n    command: [\"sleep\", \"120\"]\n  cg:\n    image: alpine\n    command: [\"sleep\", \"120\"]\n",
+    );
+    let run = |args: &[&str]| -> (Option<i32>, String, String) {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            // What is asserted is names and addresses, not caps: a host without cgroup delegation
+            // refuses a capped exec (see the replica test above).
+            .env("KERN_ALLOW_UNCAPPED", "1")
+            .args(args)
+            .output()
+        {
+            Ok(o) => (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            ),
+            Err(e) => (None, String::new(), e.to_string()),
+        }
+    };
+    let c = |verb: &[&str]| {
+        let mut a = vec!["compose", "-f", "compose.yml", "-p", "rdns"];
+        a.extend_from_slice(verb);
+        run(&a)
+    };
+    let sh = |svc: &str, index: &str, script: &str| -> (Option<i32>, String) {
+        let mut a = vec!["exec", "-T"];
+        if !index.is_empty() {
+            a.extend_from_slice(&["--index", index]);
+        }
+        a.extend_from_slice(&[svc, "sh", "-c", script]);
+        let (rc, out, _) = c(&a);
+        (rc, out)
+    };
+    let web_addrs = |client: &str| -> Vec<String> {
+        let (_, out) = sh(client, "", "getent ahosts web | awk '{print $1}'");
+        let mut v: Vec<String> = out.lines().map(str::trim).map(str::to_string).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let first_web = |client: &str| sh(client, "", "getent hosts web | awk 'NR==1 {print $1}'").1;
+    let own_addr = |svc: &str, index: &str| {
+        sh(
+            svc,
+            index,
+            "ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1",
+        )
+        .1
+        .trim()
+        .to_string()
+    };
+    let answers = |client: &str, addrs: &[String]| -> Vec<String> {
+        let mut v: Vec<String> = addrs
+            .iter()
+            .map(|a| {
+                sh(client, "", &format!("nc -w 2 {a} 80 </dev/null"))
+                    .1
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    let (up3_rc, _, up3_err) = c(&["up", "-d", "--scale", "web=3"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let three = web_addrs("cm");
+    let (key_rc, key_out) = sh("cm", "", "getent hosts web-2");
+    let (box_rc, _) = sh("cm", "", "getent hosts rdns-web-2");
+    let (cm_first, cg_first) = (first_web("cm"), first_web("cg"));
+    let three_answers = answers("cm", &three);
+
+    let (up4_rc, _, up4_err) = c(&["up", "-d", "--scale", "web=4"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let four = web_addrs("cm");
+    let mut every: Vec<String> = (1..=4)
+        .map(|i| own_addr("web", &i.to_string()))
+        .chain([own_addr("cm", ""), own_addr("cg", "")])
+        .collect();
+    every.sort();
+    every.dedup();
+    let four_answers = answers("cm", &four);
+
+    let (up1_rc, _, up1_err) = c(&["up", "-d"]);
+    let one = web_addrs("cm");
+    let (gone_rc, gone_out) = sh("cm", "", "getent hosts rdns-web-2");
+    let _ = c(&["down", "-t", "0"]);
+    let (_, after, _) = run(&["ps", "-q"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+
+    assert_eq!(up3_rc, Some(0), "up --scale web=3:\n{up3_err}");
+    assert_eq!(three.len(), 3, "`web` lists the three replicas: {three:?}");
+    assert_ne!(
+        key_rc,
+        Some(0),
+        "`web-2` is not a name, as under Docker: {key_out}"
+    );
+    assert_eq!(box_rc, Some(0), "the replica's box name is");
+    assert_ne!(
+        cm_first, cg_first,
+        "two clients start at different replicas"
+    );
+    assert_eq!(
+        three_answers.len(),
+        3,
+        "each address is its own replica: {three_answers:?}"
+    );
+    assert_eq!(
+        up4_rc,
+        Some(0),
+        "up --scale web=4 on the running stack:\n{up4_err}"
+    );
+    assert_eq!(
+        four.len(),
+        4,
+        "the client left running learns the fourth: {four:?}"
+    );
+    assert_eq!(every.len(), 6, "six boxes, six addresses: {every:?}");
+    assert_eq!(
+        four_answers.len(),
+        4,
+        "and the client reaches all four: {four_answers:?}"
+    );
+    assert_eq!(
+        up1_rc,
+        Some(0),
+        "up without --scale goes back to one:\n{up1_err}"
+    );
+    assert_eq!(one.len(), 1, "the name is one address again: {one:?}");
+    assert_ne!(
+        gone_rc,
+        Some(0),
+        "a stopped replica no longer resolves: {gone_out}"
+    );
+    assert_eq!(
+        after.lines().count(),
+        0,
+        "nothing left after down:\n{after}"
+    );
+}
+
+/// `COMPOSE_FILE` FROM THE WORKING DIRECTORY'S `.env`, AND DISCOVERY IN PARENT DIRECTORIES, AS DOCKER.
+///
+/// MEASURED on Docker Compose 2.40.3 with the same tree: the working directory's `.env` holding
+/// `COMPOSE_FILE` ran those files (the shell's value won over it, `--env-file` replaced it, its
+/// `COMPOSE_PATH_SEPARATOR` was honoured); from three levels below a `compose.yml` Docker ran that
+/// file; the working directory's `.env` won over the project's for interpolation when no file was
+/// named, and did not apply under `-f`; and `COMPOSE_FILE` set by the `.env` kept the default override
+/// out, as the variable does from the shell. kern read none of the `.env` cases and looked only in
+/// the working directory.
+#[test]
+fn compose_file_from_the_dotenv_and_discovery_in_parent_directories() {
+    let root = std::env::temp_dir().join(format!("kern-it-cfenv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["w", "s", "x/y/z", "o", "f/sub"] {
+        let _ = std::fs::create_dir_all(root.join(d));
+    }
+    let w = |f: &str, t: &str| {
+        let _ = std::fs::write(root.join(f), t);
+    };
+    w("a.yml", "services:\n  one:\n    image: alpine\n");
+    w("b.yml", "services:\n  two:\n    image: alpine\n");
+    w("c.yml", "services:\n  three:\n    image: alpine\n");
+    w(
+        "compose.yml",
+        // `image:` carries the interpolated value because it is what `compose config` prints.
+        "services:\n  d:\n    image: \"${X:-unset}\"\n",
+    );
+    w(".env", "X=from-parent-env\n");
+    w("w/.env", "COMPOSE_FILE=../a.yml:../b.yml\n");
+    w("w/other.env", "COMPOSE_FILE=../c.yml\n");
+    w(
+        "s/.env",
+        "COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=\"../a.yml;../c.yml\"\n",
+    );
+    w("x/y/.env", "X=from-cwd-env\n");
+    w("o/compose.yml", "services:\n  base:\n    image: alpine\n");
+    w(
+        "o/compose.override.yml",
+        "services:\n  extra:\n    image: alpine\n",
+    );
+    let xdg = root.join("xdg");
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |cwd: &str, env: &[(&str, &str)], args: &[&str]| -> (Option<i32>, String) {
+        let mut c = kern();
+        c.current_dir(root.join(cwd))
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env_remove("COMPOSE_FILE")
+            .env_remove("COMPOSE_PATH_SEPARATOR")
+            .env_remove("X");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        match c.args(args).output() {
+            Ok(o) => (
+                o.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (None, e.to_string()),
+        }
+    };
+    let services = &["compose", "config", "--services"];
+    let (_, dotenv_list) = run("w", &[], services);
+    let (_, shell_wins) = run("w", &[("COMPOSE_FILE", "../c.yml")], services);
+    let (_, env_file) = run(
+        "w",
+        &[],
+        &["compose", "--env-file", "other.env", "config", "--services"],
+    );
+    let (_, separator) = run("s", &[], services);
+    let (up_rc, up_three) = run("x/y/z", &[], &["compose", "config"]);
+    let (_, cwd_env_wins) = run("x/y", &[], &["compose", "config"]);
+    let (_, named_ignores_cwd_env) = run(
+        "x/y",
+        &[],
+        &["compose", "-f", "../../compose.yml", "config"],
+    );
+    let (_, override_control) = run("o", &[], services);
+    w("o/.env", "COMPOSE_FILE=compose.yml\n");
+    let (_, override_kept_out) = run("o", &[], services);
+    // A PARENT'S FILE THAT IS NOT THE USER'S IS NOT RUN. Only root can make a file another uid's.
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let foreign = if unsafe { libc::geteuid() } == 0 {
+        w(
+            "f/compose.yml",
+            "services:\n  planted:\n    image: alpine\n",
+        );
+        let owned = std::os::unix::fs::chown(root.join("f/compose.yml"), Some(65534), Some(65534));
+        owned.ok().map(|()| run("f/sub", &[], services))
+    } else {
+        None
+    };
+    let _ = std::fs::remove_dir_all(&root);
+
+    let names = |out: &str| -> Vec<String> {
+        out.lines()
+            .map(str::trim)
+            .filter(|l| ["one", "two", "three", "base", "extra", "planted"].contains(l))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        names(&dotenv_list),
+        ["one", "two"],
+        "the `.env`'s COMPOSE_FILE:\n{dotenv_list}"
+    );
+    assert_eq!(
+        names(&shell_wins),
+        ["three"],
+        "the shell's COMPOSE_FILE wins:\n{shell_wins}"
+    );
+    assert_eq!(
+        names(&env_file),
+        ["three"],
+        "`--env-file` replaces the `.env`:\n{env_file}"
+    );
+    assert_eq!(
+        names(&separator),
+        ["one", "three"],
+        "the `.env`'s COMPOSE_PATH_SEPARATOR, quotes removed:\n{separator}"
+    );
+    assert_eq!(
+        up_rc,
+        Some(0),
+        "a compose.yml three levels up is found:\n{up_three}"
+    );
+    assert!(
+        up_three.contains("from-parent-env"),
+        "and interpolated from its own `.env`:\n{up_three}"
+    );
+    assert!(
+        cwd_env_wins.contains("from-cwd-env") && !cwd_env_wins.contains("from-parent-env"),
+        "with no file named, the working directory's `.env` wins:\n{cwd_env_wins}"
+    );
+    assert!(
+        named_ignores_cwd_env.contains("from-parent-env"),
+        "under `-f` the project's `.env` is the one read:\n{named_ignores_cwd_env}"
+    );
+    assert_eq!(
+        names(&override_control),
+        ["base", "extra"],
+        "control: the override is loaded beside a discovered file:\n{override_control}"
+    );
+    assert_eq!(
+        names(&override_kept_out),
+        ["base"],
+        "a COMPOSE_FILE from the `.env` keeps the override out:\n{override_kept_out}"
+    );
+    if let Some((rc, out)) = foreign {
+        assert_ne!(
+            rc,
+            Some(0),
+            "another uid's file in a parent is not run:\n{out}"
+        );
+        assert!(
+            out.contains("not using") && !names(&out).contains(&"planted".to_string()),
+            "and the note names it:\n{out}"
+        );
+    }
 }
 
 /// FIVE THINGS A SECOND MODEL'S CASES FOUND, EACH MEASURED AGAINST DOCKER ON THE SAME FILE.

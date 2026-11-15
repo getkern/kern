@@ -76,6 +76,15 @@ pub struct Instance {
     /// The `--egress-allow` domain allowlist (comma-joined) governing this box's outbound traffic;
     /// empty when the box is fully isolated or shares the host network. Absent in older entries.
     pub egress: String,
+    /// The box's places on its pod's bridges, comma-joined in the `--pod-bridge` spelling
+    /// (`<ip>/<prefix>@<bridge>`); empty off a bridge and in older entries.
+    ///
+    /// RECORDED SO THE NEXT `up` OF THE STACK CAN KEEP THEM. Addresses are handed out by position in
+    /// the file, so a running stack whose composition changes (a replica added, a service added
+    /// above another) gave a NEW box the address a RUNNING one still held. MEASURED on WSL2: after
+    /// `up --scale web=2` put `cm` on 10.89.0.4, `up --scale web=3` started `web-3` on 10.89.0.4
+    /// too, and `cm` could not reach it. The plan now pins a running box to what this field says.
+    pub bridges: String,
     /// The `--landlock-rw` write-allowlist paths (comma-joined) confining the box's writes via the
     /// Landlock LSM; empty when no Landlock policy applies. Absent in older entries.
     pub landlock_rw: String,
@@ -1503,7 +1512,7 @@ pub fn forget_stop_record(name: &str, pid: i32) {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\ngpus={}\ntimeout={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\ngpus={}\ntimeout={}\nbridges={}\n",
         inst.name,
         inst.pid,
         inst.pid1_recorded,
@@ -1547,6 +1556,7 @@ fn encode(inst: &Instance) -> String {
         one_line(&inst.image),
         one_line(&inst.gpus),
         inst.timeout_s,
+        one_line(&inst.bridges),
     )
 }
 
@@ -2595,6 +2605,26 @@ pub fn proc_starttime(pid: i32) -> u64 {
     stat_field(&s, 22).and_then(|t| t.parse().ok()).unwrap_or(0)
 }
 
+/// [`Instance::bridges`] from the box's attachments, in the `--pod-bridge` spelling, so the field
+/// reads like the flag that gave it.
+pub(crate) fn encode_bridges(attached: &[kern_isolation::BridgeAttach]) -> String {
+    attached
+        .iter()
+        .map(|a| format!("{}/{}@{}", a.ip, a.prefix, a.bridge))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The addresses an [`Instance::bridges`] field records. An item that does not read as an address
+/// is skipped: the field only steers the next plan, and a pin that cannot be read costs the
+/// stability it would have given, never a box.
+pub(crate) fn recorded_bridge_addrs(field: &str) -> Vec<std::net::Ipv4Addr> {
+    field
+        .split(',')
+        .filter_map(|item| item.split('/').next()?.trim().parse().ok())
+        .collect()
+}
+
 /// Collapse newlines so one entry stays on its own lines.
 /// Join `--label k=v` pairs into the registry's ONE label field, escaping the separator.
 ///
@@ -2806,6 +2836,7 @@ fn parse(body: &str) -> Option<Instance> {
     let mut pid1_starttime = 0u64;
     let (mut volumes, mut pod) = (String::new(), String::new());
     let (mut egress, mut landlock_rw) = (String::new(), String::new());
+    let mut bridges = String::new();
     let (mut memory_max, mut pids_max) = (None, None);
     let mut labels = String::new();
     let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
@@ -2873,6 +2904,7 @@ fn parse(body: &str) -> Option<Instance> {
             "volumes" => volumes = v.to_string(),
             "pod" => pod = v.to_string(),
             "egress" => egress = v.to_string(),
+            "bridges" => bridges = v.to_string(),
             "landlock" => landlock_rw = v.to_string(),
             // empty string (uncapped) parses to None; a bad value is ignored, not fatal
             "memory_max" => memory_max = v.parse().ok(),
@@ -2979,6 +3011,7 @@ fn parse(body: &str) -> Option<Instance> {
         run_as,
         extra_gids,
         egress,
+        bridges,
         landlock_rw,
         labels,
         stop_signal,
@@ -3763,6 +3796,7 @@ mod tests {
             run_as: None,
             extra_gids: Vec::new(),
             egress: String::new(),
+            bridges: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
             pids_max: None,
@@ -4038,6 +4072,7 @@ mod tests {
             run_as: None,
             extra_gids: Vec::new(),
             egress: "pypi.org,files.pythonhosted.org".into(),
+            bridges: "10.89.0.3/24@0,10.89.1.2/24@1".into(),
             landlock_rw: "/tmp,/data".into(),
             memory_max: Some(134_217_728),
             pids_max: Some(64),
@@ -4066,6 +4101,7 @@ mod tests {
         let got = parse(&encode(&inst)).expect("parse a well-formed entry");
         assert_eq!(got.pod, "stack");
         assert_eq!(got.egress, "pypi.org,files.pythonhosted.org");
+        assert_eq!(got.bridges, "10.89.0.3/24@0,10.89.1.2/24@1");
         assert_eq!(got.landlock_rw, "/tmp,/data");
         assert_eq!(got.memory_max, Some(134_217_728));
         assert_eq!(got.pids_max, Some(64));
@@ -4441,6 +4477,7 @@ mod tests {
                 run_as: None,
                 extra_gids: Vec::new(),
                 egress: String::new(),
+                bridges: String::new(),
                 landlock_rw: String::new(),
                 memory_max: None,
                 pids_max: None,
@@ -4523,6 +4560,7 @@ mod tests {
             run_as: None,
             extra_gids: Vec::new(),
             egress: String::new(),
+            bridges: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
             pids_max: None,
@@ -4608,6 +4646,7 @@ mod tests {
             run_as: None,
             extra_gids: Vec::new(),
             egress: String::new(),
+            bridges: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
             pids_max: None,

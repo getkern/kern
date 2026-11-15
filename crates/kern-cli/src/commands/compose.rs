@@ -147,6 +147,21 @@ fn stack_bridge_networks(
     Ok((out, notes))
 }
 
+/// The bridge addresses every running box holds, by box name (see `registry::Instance::bridges`).
+fn live_bridge_addrs() -> std::collections::HashMap<String, Vec<u32>> {
+    crate::registry::list()
+        .into_iter()
+        .filter(|i| !i.bridges.is_empty())
+        .map(|i| {
+            let addrs = crate::registry::recorded_bridge_addrs(&i.bridges)
+                .into_iter()
+                .map(u32::from)
+                .collect();
+            (i.name, addrs)
+        })
+        .collect()
+}
+
 /// The address plan of a BRIDGE stack, one bridge or one per network: every service gets an
 /// address on each bridge network it is on, the file's `ipv4_address:` where it pinned one inside
 /// that network, the next free one otherwise.
@@ -156,10 +171,14 @@ fn stack_bridge_networks(
 /// is recorded. Per network, each address goes into `net_addrs` in the service's own network order
 /// (`eth0` is its first network, as Docker numbers a container's interfaces) and `alias` is the
 /// first of them, which the code shared with the other wirings reads.
+///
+/// `live` is what [`live_bridge_addrs`] read: the addresses running boxes hold, which they keep.
+/// Passed in so this stays a function of its arguments.
 fn bridge_plan(
     boxes: &[crate::compose::ComposeBox],
     nets: &[(String, String)],
     one_bridge: bool,
+    live: &std::collections::HashMap<String, Vec<u32>>,
 ) -> Result<(Vec<crate::nopod::Assigned>, Vec<String>), Error> {
     let services: Vec<crate::nopod::ServiceInput> = boxes
         .iter()
@@ -173,6 +192,7 @@ fn bridge_plan(
                     .collect(),
                 b.networks.clone(),
                 b.net_aliases.clone(),
+                b.replica_of.clone(),
             )
         })
         .collect();
@@ -192,6 +212,26 @@ fn bridge_plan(
                         .collect()
                 })
                 .unwrap_or_default()
+        })
+        .collect();
+    // THE ADDRESSES RUNNING BOXES HOLD, pinned BEHIND the file's own pins (see
+    // `registry::Instance::bridges` for the duplicate address this closes). A running box keeps its
+    // address while the stack around it changes; a recorded address another service pins in the
+    // file, or one a second running box also claims (the state the defect left behind), is not
+    // pinned, so the plan stays decidable instead of refusing the `up`.
+    let file_pinned: std::collections::HashSet<u32> = pins.iter().flatten().copied().collect();
+    let mut live_taken: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let alloc_pins: Vec<Vec<u32>> = plan
+        .iter()
+        .zip(&pins)
+        .map(|(a, file)| {
+            let mut all = file.clone();
+            for v in live.get(&a.box_name).into_iter().flatten() {
+                if !file_pinned.contains(v) && live_taken.insert(*v) {
+                    all.push(*v);
+                }
+            }
+            all
         })
         .collect();
     for (idx, (net, cidr)) in nets.iter().enumerate() {
@@ -214,7 +254,7 @@ fn bridge_plan(
         } else {
             format!("network '{net}' ({cidr})")
         };
-        for (i, addr) in allocate_on(&members, &pins, u32::from(gw), prefix, &label)? {
+        for (i, addr) in allocate_on(&members, &alloc_pins, u32::from(gw), prefix, &label)? {
             if one_bridge {
                 plan[i].alias = addr;
             } else {
@@ -719,6 +759,105 @@ fn expand_replicas(
     Ok(surplus)
 }
 
+/// The names a change of replica count touches: each replicated service's name and every replica's
+/// box name, those of the replicas `surplus` stops included. Empty for a stack without replicas,
+/// which is what keeps the hosts-file upkeep for them off every other stack.
+fn replica_names(
+    boxes: &[crate::compose::ComposeBox],
+    surplus: &[String],
+    pod: &str,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for b in boxes {
+        if let Some(base) = &b.replica_of {
+            names.insert(base.clone());
+            names.insert(b.name.clone());
+        }
+    }
+    let scope = format!("{pod}-");
+    for n in surplus {
+        names.insert(n.clone());
+        if let Some((base, _)) = n.strip_prefix(&scope).and_then(|r| r.rsplit_once('-')) {
+            names.insert(base.to_string());
+        }
+    }
+    names
+}
+
+/// DOCKER'S CREATE PHASE: what the file asks of every box this `up` starts, read by the parser that
+/// reads it at launch, before ANY box starts.
+///
+/// Docker creates every container before it starts one, so a service whose configuration the
+/// daemon refuses stops the whole `up` with nothing running, while a failure at START (a port
+/// another process holds) leaves the services that started. MEASURED on Docker Compose 2.40.3:
+/// `second` (depends on `first`) with `mem_limit: 64` gave `Minimum memory limit allowed is 6MB`,
+/// exit 1, and `first` was created and NOT running; with a held port range, the other services ran.
+/// kern's bring-up prepares boxes one by one, so without this the refusal arrived after `first`
+/// was prepared, and with the partial bring-up `first` would run. The flags are the ones
+/// `push_box_flags` writes, which are exactly the file's; what the bring-up adds (addresses,
+/// gates, DNS) is kern's own and cannot be the file's mistake.
+fn refuse_what_docker_would_not_create(
+    boxes: &[crate::compose::ComposeBox],
+    levels: &[Vec<String>],
+) -> Result<(), Error> {
+    for name in levels.iter().flatten() {
+        let Some(b) = boxes.iter().find(|b| &b.name == name) else {
+            continue;
+        };
+        let mut cmd = std::process::Command::new("kern");
+        cmd.arg("box").arg(&b.name);
+        b.push_box_flags(&mut cmd);
+        // Detached, as every service is launched: `--restart` is refused without it.
+        cmd.arg("-d");
+        if !b.command.is_empty() {
+            cmd.arg("--").args(&b.command);
+        }
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if let Err(e) = crate::cli::parse(&args) {
+            return Err(Error::Compose(format!(
+                "service '{}': {e}\n  no service was started",
+                b.service_name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Take the replicas a scale-down stopped out of the hosts files of the boxes it left running.
+///
+/// A stopped replica's BOX NAME goes, and so does every line of the service's name at an address
+/// that box name held, since that address now answers nothing. An address a pod member shares with
+/// every other ([`kern_isolation::BOX_ADDR`]) is never one of them: in a pod the service's name
+/// stays where it is.
+fn forget_stopped_replicas(
+    kept: &[String],
+    names: &std::collections::HashSet<String>,
+    stopped: &[String],
+) {
+    if stopped.is_empty() {
+        return;
+    }
+    let shared = kern_isolation::BOX_ADDR.to_string();
+    for k in kept {
+        let r = crate::network::set_box_names(k, names, |held| {
+            let gone: std::collections::HashSet<String> = held
+                .iter()
+                .filter(|(n, a)| stopped.contains(n) && *a != shared)
+                .map(|(_, a)| a.clone())
+                .collect();
+            held.into_iter()
+                .filter(|(n, a)| !stopped.contains(n) && !gone.contains(a))
+                .collect()
+        });
+        if let Err(e) = r {
+            eprintln!("kern: warning: {e}: it may still resolve a replica that was stopped");
+        }
+    }
+}
+
 fn resolve_box_names(
     boxes: &mut [crate::compose::ComposeBox],
     pod: &str,
@@ -743,8 +882,11 @@ fn resolve_box_names(
         // Kept before the rewrite below destroys it: `config` reports the FILE, and the file calls
         // this service `svc` whatever the box ends up being named.
         b.service = svc.clone();
-        if !b.net_aliases.contains(&svc) {
-            b.net_aliases.push(svc.clone());
+        // A REPLICA ANSWERS TO ITS SERVICE'S NAME, not to its own key (`web-2`): see
+        // `nopod::Assigned::replica_of` for the measurement.
+        let answers_to = b.replica_of.clone().unwrap_or_else(|| svc.clone());
+        if !b.net_aliases.contains(&answers_to) {
+            b.net_aliases.push(answers_to);
         }
         // EVERY EDGE THAT NAMES A SERVICE, and `degraded_health` is one. It was added later and
         // missed here once: the parser records SERVICE names, this rewrite makes everything else
@@ -809,12 +951,14 @@ const DEFAULT_OVERRIDE_NAMES: [&str; 4] = [
 ///  * `COMPOSE_FILE` is unset - setting it declares the exact list, and Docker suppresses the
 ///    auto-override when it is set (measured: `COMPOSE_FILE=docker-compose.yml docker compose
 ///    config` printed `B: base`, the un-overridden value). That is also the escape hatch here, and
-///    it needs no flag kern does not already have.
-fn default_override_for(files: &[String]) -> Option<String> {
+///    it needs no flag kern does not already have. A list that CAME from `COMPOSE_FILE` is the
+///    same declaration when the working directory's `.env` set it, which the environment does not
+///    show, so `from` carries it.
+fn default_override_for(files: &[String], from: ComposeFilesFrom) -> Option<String> {
     let [only] = files else {
         return None;
     };
-    if crate::global_env("COMPOSE_FILE").is_some() {
+    if from == ComposeFilesFrom::ComposeFileVar || crate::global_env("COMPOSE_FILE").is_some() {
         return None;
     }
     let path = std::path::Path::new(only);
@@ -1105,6 +1249,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         env_file,
         project_root,
         profiles,
+        files_from,
         recreate,
         renew_anon_volumes,
         log_timestamps,
@@ -1162,7 +1307,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // The override `docker compose` would have loaded, appended so it merges LAST (see
     // `default_override_for` for the three conditions and what each one was measured against).
     let with_override: Vec<String>;
-    let files: &[String] = match default_override_for(files) {
+    let files: &[String] = match default_override_for(files, files_from) {
         Some(extra) => {
             eprintln!(
                 "kern: note: also loading {extra} (docker compose loads it too; set COMPOSE_FILE \
@@ -1195,9 +1340,26 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             &std::fs::read_to_string(p)
                 .map_err(|e| Error::Compose(format!("--env-file {p}: {e}")))?,
         ),
-        None => std::fs::read_to_string(compose_dir(file).join(".env"))
-            .map(|t| crate::compose::parse_dotenv(&t))
-            .unwrap_or_default(),
+        None => {
+            let read = |p: &std::path::Path| {
+                std::fs::read_to_string(p)
+                    .map(|t| crate::compose::parse_dotenv(&t))
+                    .unwrap_or_default()
+            };
+            let project_env = compose_dir(file).join(".env");
+            let project = read(&project_env);
+            // A RUN THAT NAMED NO FILE IS CONFIGURED BY THE WORKING DIRECTORY'S `.env` TOO, and its
+            // values win: see `ComposeFilesFrom` for the measurement. Read once when the two are
+            // the same file, which is the ordinary case of `kern compose up` beside the file.
+            let cwd_env = std::path::Path::new(".env");
+            let same =
+                std::fs::canonicalize(cwd_env).ok() == std::fs::canonicalize(&project_env).ok();
+            if files_from == ComposeFilesFrom::Named || same {
+                project
+            } else {
+                project.overlaid_by(read(cwd_env))
+            }
+        }
     };
     // COMPOSE'S OWN VARIABLES COME FROM THE `.env` TOO, which is what Docker means by loading that
     // file "both for self-configuration and interpolation". kern read `COMPOSE_PROFILES` from the
@@ -1372,6 +1534,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     }
     let service_names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
     let box_name_of = resolve_box_names(&mut boxes, &pod);
+    let replica_names = replica_names(&boxes, &surplus, &pod);
     let box_name = |svc: &str| {
         box_name_of
             .get(svc)
@@ -2084,7 +2247,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // subnets were replaced and which pinned addresses fall outside every network.
         if want_bridge && segregates && !no_pod {
             let (nets, mut notes) = stack_bridge_networks(&boxes)?;
-            notes.extend(bridge_plan(&boxes, &nets, false)?.1);
+            notes.extend(bridge_plan(&boxes, &nets, false, &live_bridge_addrs())?.1);
             for n in notes {
                 eprintln!("kern: warning: compose: {n}");
             }
@@ -2283,6 +2446,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     //
     // This is only safe because `up` now verifies the stack after bring-up: without that check a
     // service that dies immediately would be recreated on every invocation, silently, forever.
+    // The boxes this `up` leaves running as they are: the ones whose hosts file a change of replica
+    // count has to reach (see `network::set_box_names`).
+    let mut kept_boxes: Vec<String> = Vec::new();
     if action == ComposeAction::Up {
         let mut kept = 0usize;
         let mut stale: Vec<String> = Vec::new();
@@ -2296,6 +2462,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                     Some(inst) => match reconcile_decision(&inst, &definition_hash(b), recreate) {
                         Reconcile::UpToDate => {
                             kept += 1;
+                            kept_boxes.push(n.clone());
                             false
                         }
                         Reconcile::Recreate => {
@@ -2363,6 +2530,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             }
         }
         if kept > 0 && levels.iter().all(|l| l.is_empty()) {
+            // A SCALE-DOWN STARTS NOTHING, so the plan below is never reached: the replicas it
+            // stopped are taken out of the running boxes' hosts files here.
+            forget_stopped_replicas(&kept_boxes, &replica_names, &surplus);
             println!("compose up: {kept} service(s) already up to date");
             return Ok(());
         }
@@ -3004,6 +3174,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                     tcp,
                     b.networks.clone(),
                     b.net_aliases.clone(),
+                    b.replica_of.clone(),
                 )
             })
             .collect();
@@ -3078,7 +3249,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             } else {
                 (&bridge_nets[..], false)
             };
-            let (mut plan, notes) = bridge_plan(&boxes, nets, one_bridge)?;
+            let (mut plan, notes) = bridge_plan(&boxes, nets, one_bridge, &live_bridge_addrs())?;
             // A box that joins another's namespace takes no bridge address (see `joins`): its entry
             // is dropped after the assignment, which leaves only a gap in the numbering.
             plan.retain(|a| {
@@ -3233,11 +3404,42 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         .unwrap_or(4)
         .saturating_mul(4)
         .clamp(8, 32);
+    // THE SERVICES THAT FAILED TO START, and the ones not started because one they depend on did.
+    //
+    // A FAILURE STOPS ITS DEPENDENTS AND NOTHING ELSE, as under Docker. The first failure used to
+    // end the bring-up with `?`, which under the pre-exec gate closed every gate: no service of the
+    // stack ran, though the comment here promised Docker's partial bring-up. MEASURED on Docker
+    // Compose 2.40.3, with the one host port range of `b` held by another process: `up -d` exited 1
+    // naming `b`, and `a`, `c`, three replicas of `d` and `f` (which depends on `a`) were running,
+    // `e` (which depends on `b`) was not. kern ran none of them. The `up` still exits with the
+    // failure, after the rest is released.
+    refuse_what_docker_would_not_create(&boxes, &levels)?;
+    let mut failed: Vec<(String, Error)> = Vec::new();
+    let mut not_started: Vec<String> = Vec::new();
     for level in &levels {
-        for chunk in level.chunks(start_cap) {
+        let runnable: Vec<String> = level
+            .iter()
+            .filter(|n| {
+                let Some(b) = boxes.iter().find(|b| &b.name == *n) else {
+                    return true;
+                };
+                let blocked = b
+                    .depends_on
+                    .iter()
+                    .chain(&b.depends_healthy)
+                    .chain(&b.depends_completed)
+                    .any(|d| failed.iter().any(|(f, _)| f == d) || not_started.contains(d));
+                if blocked {
+                    not_started.push((*n).clone());
+                }
+                !blocked
+            })
+            .cloned()
+            .collect();
+        for chunk in runnable.chunks(start_cap) {
             // One worker per service in this chunk; `thread::scope` joins them ALL (the barrier) before
             // we advance. Each worker runs the exact same start sequence the old serial loop did.
-            let results: Vec<Result<(), Error>> = std::thread::scope(|scope| {
+            let results: Vec<(String, Result<(), Error>)> = std::thread::scope(|scope| {
                 let handles: Vec<_> = chunk
                     .iter()
                     .filter_map(|name| -> Option<_> {
@@ -3277,226 +3479,229 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         );
                         // `Some(...)`: `filter_map` wants an `Option`, and the `?` above is the
                         // miss. The spawn itself always succeeds.
-                        Some(scope.spawn(move || -> Result<(), Error> {
-                            // Conditional deps (healthy/completed) live in an earlier, already-started
-                            // level; plain `depends_on` is honored by the level barrier itself.
-                            //
-                            // UNDER THE GATE THIS MOVES TO RELEASE. `service_healthy` asks about a
-                            // workload, and under the gate no workload has run yet: waiting here would
-                            // block forever on a health that cannot exist, which is the same deadlock
-                            // the gate was added to remove, arriving through the other door. The wait
-                            // is performed in the release loop, in dependency order, which is where
-                            // "start only after the dependency is healthy" actually means something.
-                            if !gate_active {
-                                wait_for_conditions(
-                                    b,
-                                    pod,
-                                    up_token,
-                                    wait_timeout,
-                                    no_deps,
-                                    will_start_plan,
-                                )?;
-                            }
-                            let n = started.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            let dep = if b.depends_on.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" (after {})", b.depends_on.join(", "))
-                            };
-                            let src = b
-                                .image
-                                .as_deref()
-                                .or(b.rootfs.as_deref())
-                                .unwrap_or("(no source)");
-                            kern_common::progress!(
-                                "→ [{n}/{total}] starting '{}'  {src}{dep}",
-                                b.name
-                            );
-                            let mut cmd = std::process::Command::new(self_exe);
-                            // Anchor the box's relative paths (env_file/-v/rootfs) to the project dir.
-                            cmd.current_dir(project_dir);
-                            cmd.arg("box").arg(&b.name);
-                            // Record the fingerprint WITH the box, so the next `up` can compare.
-                            cmd.arg("--def-hash").arg(definition_hash(b));
-                            b.push_box_flags(&mut cmd);
-                            // DNS FOR A SERVICE THAT WILL GET A NAT, handed over as `--dns` at
-                            // launch rather than as a file bound later.
-                            //
-                            // The pod binds a `resolv.conf` it wrote; a box outside a pod writes its
-                            // own from these arguments, which is the mechanism `dns:` already uses.
-                            // The CONTENT is the same function in both wirings, so a stack cannot
-                            // resolve names differently depending on how it was started.
-                            //
-                            // Only when the file named none: an explicit `dns:` is the service's
-                            // decision and must not be appended to, or a service that pinned one
-                            // resolver would quietly get three.
-                            if outbound_for.contains(&b.name) && b.dns.is_empty() {
-                                for ns in crate::pod::host_nameservers() {
-                                    cmd.arg("--dns").arg(ns);
+                        Some((
+                            name.clone(),
+                            scope.spawn(move || -> Result<(), Error> {
+                                // Conditional deps (healthy/completed) live in an earlier, already-started
+                                // level; plain `depends_on` is honored by the level barrier itself.
+                                //
+                                // UNDER THE GATE THIS MOVES TO RELEASE. `service_healthy` asks about a
+                                // workload, and under the gate no workload has run yet: waiting here would
+                                // block forever on a health that cannot exist, which is the same deadlock
+                                // the gate was added to remove, arriving through the other door. The wait
+                                // is performed in the release loop, in dependency order, which is where
+                                // "start only after the dependency is healthy" actually means something.
+                                if !gate_active {
+                                    wait_for_conditions(
+                                        b,
+                                        pod,
+                                        up_token,
+                                        wait_timeout,
+                                        no_deps,
+                                        will_start_plan,
+                                    )?;
                                 }
-                            }
-                            // A box not on the host net joins the stack pod → reachable by name from peers.
-                            //
-                            // `network_mode: none` STAYS OUT TOO, for the opposite reason to `host`:
-                            // that one already has the host's network, this one asked for none at
-                            // all, and a pod would hand it both peers and egress.
-                            // A BOX THAT JOINS ANOTHER'S NAMESPACE is in no pod and on no bridge of
-                            // its own: it enters the namespace of the box it names, and takes that
-                            // box's name, hosts file and resolvers with it (see `joins`).
-                            let joining = joins.get(&b.name);
-                            if let Some(target) = joining {
-                                cmd.arg("--network").arg(format!("container:{target}"));
-                            }
-                            if let Some(f) = &ipc_arg {
-                                cmd.arg("--ipc").arg(f);
-                            }
-                            if use_pod && !b.net && !b.net_none && joining.is_none() {
-                                cmd.arg("--pod").arg(pod);
-                                // ON A BRIDGE the box joins the pod's USER namespace and keeps its
-                                // OWN network one, taking its address on the bridge. That is what
-                                // gives it a `127.0.0.1` no peer can reach.
-                                // One `--pod-bridge` per network on a stack with a bridge
-                                // per network: see `nopod::pod_bridge_flags`.
-                                if let Some(cidr) = bridge_cidr {
-                                    if let Some(a) =
-                                        address_plan.iter().find(|a| a.service == b.service)
-                                    {
-                                        let single = kern_isolation::pod_bridge_parts(cidr)
-                                            .map(|(_, _, prefix)| prefix);
-                                        for f in crate::nopod::pod_bridge_flags(a, single) {
-                                            cmd.arg("--pod-bridge").arg(f);
+                                let n =
+                                    started.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                let dep = if b.depends_on.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (after {})", b.depends_on.join(", "))
+                                };
+                                let src = b
+                                    .image
+                                    .as_deref()
+                                    .or(b.rootfs.as_deref())
+                                    .unwrap_or("(no source)");
+                                kern_common::progress!(
+                                    "→ [{n}/{total}] starting '{}'  {src}{dep}",
+                                    b.name
+                                );
+                                let mut cmd = std::process::Command::new(self_exe);
+                                // Anchor the box's relative paths (env_file/-v/rootfs) to the project dir.
+                                cmd.current_dir(project_dir);
+                                cmd.arg("box").arg(&b.name);
+                                // Record the fingerprint WITH the box, so the next `up` can compare.
+                                cmd.arg("--def-hash").arg(definition_hash(b));
+                                b.push_box_flags(&mut cmd);
+                                // DNS FOR A SERVICE THAT WILL GET A NAT, handed over as `--dns` at
+                                // launch rather than as a file bound later.
+                                //
+                                // The pod binds a `resolv.conf` it wrote; a box outside a pod writes its
+                                // own from these arguments, which is the mechanism `dns:` already uses.
+                                // The CONTENT is the same function in both wirings, so a stack cannot
+                                // resolve names differently depending on how it was started.
+                                //
+                                // Only when the file named none: an explicit `dns:` is the service's
+                                // decision and must not be appended to, or a service that pinned one
+                                // resolver would quietly get three.
+                                if outbound_for.contains(&b.name) && b.dns.is_empty() {
+                                    for ns in crate::pod::host_nameservers() {
+                                        cmd.arg("--dns").arg(ns);
+                                    }
+                                }
+                                // A box not on the host net joins the stack pod → reachable by name from peers.
+                                //
+                                // `network_mode: none` STAYS OUT TOO, for the opposite reason to `host`:
+                                // that one already has the host's network, this one asked for none at
+                                // all, and a pod would hand it both peers and egress.
+                                // A BOX THAT JOINS ANOTHER'S NAMESPACE is in no pod and on no bridge of
+                                // its own: it enters the namespace of the box it names, and takes that
+                                // box's name, hosts file and resolvers with it (see `joins`).
+                                let joining = joins.get(&b.name);
+                                if let Some(target) = joining {
+                                    cmd.arg("--network").arg(format!("container:{target}"));
+                                }
+                                if let Some(f) = &ipc_arg {
+                                    cmd.arg("--ipc").arg(f);
+                                }
+                                if use_pod && !b.net && !b.net_none && joining.is_none() {
+                                    cmd.arg("--pod").arg(pod);
+                                    // ON A BRIDGE the box joins the pod's USER namespace and keeps its
+                                    // OWN network one, taking its address on the bridge. That is what
+                                    // gives it a `127.0.0.1` no peer can reach.
+                                    // One `--pod-bridge` per network on a stack with a bridge
+                                    // per network: see `nopod::pod_bridge_flags`.
+                                    if let Some(cidr) = bridge_cidr {
+                                        if let Some(a) =
+                                            address_plan.iter().find(|a| a.service == b.service)
+                                        {
+                                            let single = kern_isolation::pod_bridge_parts(cidr)
+                                                .map(|(_, _, prefix)| prefix);
+                                            for f in crate::nopod::pod_bridge_flags(a, single) {
+                                                cmd.arg("--pod-bridge").arg(f);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            // Without a pod, the same reachability is spelled out: every peer at its
-                            // alias, this box at its own loopback. A box on the host net is skipped -
-                            // it already resolves whatever the host resolves, and pointing its name
-                            // at a loopback alias would break that.
-                            if !b.net && joining.is_none() {
-                                if let Some(entries) = crate::nopod::add_host_args(
-                                    address_plan,
-                                    &b.service,
-                                    bridge_cidr.is_none(),
-                                ) {
-                                    for e in entries {
+                                // Without a pod, the same reachability is spelled out: every peer at its
+                                // alias, this box at its own loopback. A box on the host net is skipped -
+                                // it already resolves whatever the host resolves, and pointing its name
+                                // at a loopback alias would break that.
+                                if !b.net && joining.is_none() {
+                                    if let Some(entries) = crate::nopod::add_host_args(
+                                        address_plan,
+                                        &b.service,
+                                        bridge_cidr.is_none(),
+                                    ) {
+                                        for e in entries {
+                                            cmd.arg("--add-host").arg(e);
+                                        }
+                                    }
+                                    // `links:` ALIASES, IN EITHER MODE. A box on the host net is skipped
+                                    // for the same reason as above: it resolves what the host resolves,
+                                    // and a stack alias pointing at a loopback would break that.
+                                    // ONE NAMESPACE FOR THE STACK, not "a pod": on a bridge each
+                                    // member has its own loopback, so a link alias must name the
+                                    // peer's address and not `127.0.0.1`.
+                                    for e in crate::nopod::link_host_args(
+                                        &b.links,
+                                        address_plan,
+                                        shared_ns,
+                                        &b.service,
+                                    ) {
                                         cmd.arg("--add-host").arg(e);
                                     }
                                 }
-                                // `links:` ALIASES, IN EITHER MODE. A box on the host net is skipped
-                                // for the same reason as above: it resolves what the host resolves,
-                                // and a stack alias pointing at a loopback would break that.
-                                // ONE NAMESPACE FOR THE STACK, not "a pod": on a bridge each
-                                // member has its own loopback, so a link alias must name the
-                                // peer's address and not `127.0.0.1`.
-                                for e in crate::nopod::link_host_args(
-                                    &b.links,
-                                    address_plan,
-                                    shared_ns,
-                                    &b.service,
-                                ) {
-                                    cmd.arg("--add-host").arg(e);
+                                // AND THE PEERS ON AN `external:` NETWORK, which are services of OTHER
+                                // projects. Their addresses are their identity on that network and were
+                                // allocated when they joined it, so they are known before this box
+                                // exists; the relay that makes each one answer is built below, while
+                                // every box is still held at its gate.
+                                if !b.net && joining.is_none() {
+                                    for e in cross_hosts.get(&b.name).into_iter().flatten() {
+                                        cmd.arg("--add-host").arg(e);
+                                    }
                                 }
-                            }
-                            // AND THE PEERS ON AN `external:` NETWORK, which are services of OTHER
-                            // projects. Their addresses are their identity on that network and were
-                            // allocated when they joined it, so they are known before this box
-                            // exists; the relay that makes each one answer is built below, while
-                            // every box is still held at its gate.
-                            if !b.net && joining.is_none() {
-                                for e in cross_hosts.get(&b.name).into_iter().flatten() {
-                                    cmd.arg("--add-host").arg(e);
-                                }
-                            }
-                            // EVERY box gets the stack+run-scoped exit KEY, and that key is CLEARED
-                            // before the spawn. Each box owns a unique one (it carries this `up`'s
-                            // token), so concurrent workers never touch each other's.
-                            //
-                            // IT USED TO BE HANDED OUT ONLY TO A `depends_completed` TARGET, and that
-                            // made the settle check below unable to tell success from failure. It asks
-                            // `exit_of(key) != Some(0)` to spare a service that finished CLEANLY inside
-                            // the window; with no key there is no file, `exit_of` answers `None`, and
-                            // the carve-out could never fire for any service that was not some peer's
-                            // completion target. MEASURED from a field report on 0.8.5: a one-shot
-                            // service running `/bin/echo` and exiting 0 was reported as
-                            // "died within 150ms of starting" and `up` exited 1, so a stack with a
-                            // migration or a build step failed its CI run by succeeding. The exit code
-                            // was already being recorded for `kern wait` under a different key the
-                            // whole time; only compose's own key was withheld.
-                            let key = exit_key(pod, up_token, &b.name);
-                            registry::clear_exit(&key);
-                            cmd.env("KERN_EXIT_KEY", &key);
-                            // THE GATE PIPE. Both ends are created `CLOEXEC` so no other child of
-                            // `up` (a health checker, a relay half, the timeout watchdog) can inherit
-                            // the write end and keep the gate from closing when `up` dies. The READ
-                            // end has its `CLOEXEC` cleared in the child, between fork and exec, so
-                            // it survives into the box and nowhere else - which is why this is done
-                            // in `pre_exec` rather than by creating the pipe without `CLOEXEC`: with
-                            // concurrent workers a non-`CLOEXEC` read end would leak into every box
-                            // started at the same moment.
-                            let mut gate_rd: Option<std::os::fd::OwnedFd> = None;
-                            // A BOX THAT WILL BE RUN BY SYSTEMD CANNOT BE GATED, AND MUST NOT BE
-                            // GIVEN A GATE IT WILL NEVER READ.
-                            //
-                            // Outside a pod, a service that sets `restart:` is installed as a systemd
-                            // unit: this launcher writes the unit and exits, and the box is started
-                            // later by the manager, in a process that inherits nothing from here. A
-                            // descriptor does not cross that boundary, so the gate's read end dies
-                            // with the launcher while `up` still holds the write end and later writes
-                            // to it. MEASURED, three runs of three: `EXIT=141` - SIGPIPE, because
-                            // `main` sets `SIGPIPE` to `SIG_DFL` on purpose so `kern … | head`
-                            // behaves like a Unix tool - and no peer payload delivered.
-                            //
-                            // The box is therefore left ungated. It starts when the manager starts
-                            // it, which is also when it would have started without any of this, so
-                            // nothing regresses for it; what it does not get is the guarantee that
-                            // its peers' relays exist first. That limit is the manager's, not the
-                            // gate's, and it is stated in the note below rather than papered over.
-                            //
-                            // A POD MEMBER IS NOT THAT CASE. `persistent_supervision` puts every pod
-                            // member on the in-process supervisor whatever systemd offers (it needs
-                            // the holder's namespace), so the descriptor does cross into the box and
-                            // the gate works exactly as it does for any other member. Asking the
-                            // question as "does it write `restart:`" instead of "will systemd start
-                            // it" is what left every `restart:` service on a bridge with no NAT.
-                            let gate_this = gate_active && (use_pod || !b.restart_always);
-                            if gate_this {
-                                let (rd, wr) = gate_pipe()?;
-                                let raw = std::os::fd::AsRawFd::as_raw_fd(&rd);
-                                // A RESERVED NUMBER, NOT WHATEVER `pipe2` HANDED OUT. The gate is
-                                // read by the box's PID 1, hundreds of setup steps after the fork:
-                                // mounts, the pivot, the uid map and the loopback all open and close
-                                // descriptors, so the low number `pipe2` returned is long since
-                                // recycled by the time it is read. MEASURED: the launcher passed
-                                // `fd=3`, PID 1 resolved `gate=Some(3)` correctly, read one byte
-                                // from whatever now sat on 3, and released itself instantly - the
-                                // workload ran while the relays were still being built, and the
-                                // number was right the whole time. `dup2` in the child pins it above
-                                // everything kern opens; `shed_inherited_fds_keeping` covers the
-                                // range and keeps exactly this one.
-                                cmd.env("KERN_GATE_FD", GATE_FD.to_string());
-                                // SAFETY: `pre_exec` runs between fork and exec in the child. The
-                                // closure calls one async-signal-safe syscall on a descriptor the
-                                // child inherited, allocates nothing and takes no lock.
-                                unsafe {
-                                    std::os::unix::process::CommandExt::pre_exec(
-                                        &mut cmd,
-                                        move || {
-                                            // Pin to the reserved number, then clear CLOEXEC on the
-                                            // pinned copy: `dup2` already returns a descriptor
-                                            // WITHOUT `FD_CLOEXEC`, but the clear is kept explicit so
-                                            // the invariant does not depend on that detail of dup2.
-                                            if libc::dup2(raw, GATE_FD) < 0 {
-                                                return Err(std::io::Error::last_os_error());
-                                            }
-                                            if libc::fcntl(GATE_FD, libc::F_SETFD, 0) < 0 {
-                                                return Err(std::io::Error::last_os_error());
-                                            }
-                                            Ok(())
-                                        },
-                                    )
-                                };
-                                match gates.lock() {
+                                // EVERY box gets the stack+run-scoped exit KEY, and that key is CLEARED
+                                // before the spawn. Each box owns a unique one (it carries this `up`'s
+                                // token), so concurrent workers never touch each other's.
+                                //
+                                // IT USED TO BE HANDED OUT ONLY TO A `depends_completed` TARGET, and that
+                                // made the settle check below unable to tell success from failure. It asks
+                                // `exit_of(key) != Some(0)` to spare a service that finished CLEANLY inside
+                                // the window; with no key there is no file, `exit_of` answers `None`, and
+                                // the carve-out could never fire for any service that was not some peer's
+                                // completion target. MEASURED from a field report on 0.8.5: a one-shot
+                                // service running `/bin/echo` and exiting 0 was reported as
+                                // "died within 150ms of starting" and `up` exited 1, so a stack with a
+                                // migration or a build step failed its CI run by succeeding. The exit code
+                                // was already being recorded for `kern wait` under a different key the
+                                // whole time; only compose's own key was withheld.
+                                let key = exit_key(pod, up_token, &b.name);
+                                registry::clear_exit(&key);
+                                cmd.env("KERN_EXIT_KEY", &key);
+                                // THE GATE PIPE. Both ends are created `CLOEXEC` so no other child of
+                                // `up` (a health checker, a relay half, the timeout watchdog) can inherit
+                                // the write end and keep the gate from closing when `up` dies. The READ
+                                // end has its `CLOEXEC` cleared in the child, between fork and exec, so
+                                // it survives into the box and nowhere else - which is why this is done
+                                // in `pre_exec` rather than by creating the pipe without `CLOEXEC`: with
+                                // concurrent workers a non-`CLOEXEC` read end would leak into every box
+                                // started at the same moment.
+                                let mut gate_rd: Option<std::os::fd::OwnedFd> = None;
+                                // A BOX THAT WILL BE RUN BY SYSTEMD CANNOT BE GATED, AND MUST NOT BE
+                                // GIVEN A GATE IT WILL NEVER READ.
+                                //
+                                // Outside a pod, a service that sets `restart:` is installed as a systemd
+                                // unit: this launcher writes the unit and exits, and the box is started
+                                // later by the manager, in a process that inherits nothing from here. A
+                                // descriptor does not cross that boundary, so the gate's read end dies
+                                // with the launcher while `up` still holds the write end and later writes
+                                // to it. MEASURED, three runs of three: `EXIT=141` - SIGPIPE, because
+                                // `main` sets `SIGPIPE` to `SIG_DFL` on purpose so `kern … | head`
+                                // behaves like a Unix tool - and no peer payload delivered.
+                                //
+                                // The box is therefore left ungated. It starts when the manager starts
+                                // it, which is also when it would have started without any of this, so
+                                // nothing regresses for it; what it does not get is the guarantee that
+                                // its peers' relays exist first. That limit is the manager's, not the
+                                // gate's, and it is stated in the note below rather than papered over.
+                                //
+                                // A POD MEMBER IS NOT THAT CASE. `persistent_supervision` puts every pod
+                                // member on the in-process supervisor whatever systemd offers (it needs
+                                // the holder's namespace), so the descriptor does cross into the box and
+                                // the gate works exactly as it does for any other member. Asking the
+                                // question as "does it write `restart:`" instead of "will systemd start
+                                // it" is what left every `restart:` service on a bridge with no NAT.
+                                let gate_this = gate_active && (use_pod || !b.restart_always);
+                                if gate_this {
+                                    let (rd, wr) = gate_pipe()?;
+                                    let raw = std::os::fd::AsRawFd::as_raw_fd(&rd);
+                                    // A RESERVED NUMBER, NOT WHATEVER `pipe2` HANDED OUT. The gate is
+                                    // read by the box's PID 1, hundreds of setup steps after the fork:
+                                    // mounts, the pivot, the uid map and the loopback all open and close
+                                    // descriptors, so the low number `pipe2` returned is long since
+                                    // recycled by the time it is read. MEASURED: the launcher passed
+                                    // `fd=3`, PID 1 resolved `gate=Some(3)` correctly, read one byte
+                                    // from whatever now sat on 3, and released itself instantly - the
+                                    // workload ran while the relays were still being built, and the
+                                    // number was right the whole time. `dup2` in the child pins it above
+                                    // everything kern opens; `shed_inherited_fds_keeping` covers the
+                                    // range and keeps exactly this one.
+                                    cmd.env("KERN_GATE_FD", GATE_FD.to_string());
+                                    // SAFETY: `pre_exec` runs between fork and exec in the child. The
+                                    // closure calls one async-signal-safe syscall on a descriptor the
+                                    // child inherited, allocates nothing and takes no lock.
+                                    unsafe {
+                                        std::os::unix::process::CommandExt::pre_exec(
+                                            &mut cmd,
+                                            move || {
+                                                // Pin to the reserved number, then clear CLOEXEC on the
+                                                // pinned copy: `dup2` already returns a descriptor
+                                                // WITHOUT `FD_CLOEXEC`, but the clear is kept explicit so
+                                                // the invariant does not depend on that detail of dup2.
+                                                if libc::dup2(raw, GATE_FD) < 0 {
+                                                    return Err(std::io::Error::last_os_error());
+                                                }
+                                                if libc::fcntl(GATE_FD, libc::F_SETFD, 0) < 0 {
+                                                    return Err(std::io::Error::last_os_error());
+                                                }
+                                                Ok(())
+                                            },
+                                        )
+                                    };
+                                    match gates.lock() {
                                     Ok(mut g) => g.push((b.name.clone(), wr)),
                                     // A poisoned lock means another worker panicked while holding it.
                                     // Dropping `wr` here closes it, the box reads EOF and refuses to
@@ -3507,56 +3712,61 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                                             .to_string(),
                                     )),
                                 }
-                                // THE READ END STAYS OPEN UNTIL AFTER THE SPAWN. Closing it here
-                                // closed the number the child was told to read, and every box failed
-                                // with `Bad file descriptor (os error 9)`: `Command` does not
-                                // duplicate the descriptor at configuration time, it inherits
-                                // whatever is open at fork. It is dropped below, once the child has
-                                // it, so the parent does not hold a pipe open for a box that is gone.
-                                gate_rd = Some(rd);
-                            }
-                            cmd.arg("-d");
-                            if !b.command.is_empty() {
-                                cmd.arg("--").args(&b.command);
-                            }
-                            let status = cmd
-                                .status()
-                                .map_err(|e| Error::Compose(format!("starting '{}': {e}", b.name)));
-                            // The child has the read end now (or the spawn failed and nobody will).
-                            // Either way the parent must not keep it: a live read end in `up` means
-                            // the pipe never reaches EOF, so a box whose launcher died would wait
-                            // forever instead of refusing.
-                            drop(gate_rd);
-                            let status = status?;
-                            if !status.success() {
-                                return Err(Error::Compose(format!(
-                                    "box '{}' failed to start",
-                                    b.name
-                                )));
-                            }
-                            Ok(())
-                        }))
+                                    // THE READ END STAYS OPEN UNTIL AFTER THE SPAWN. Closing it here
+                                    // closed the number the child was told to read, and every box failed
+                                    // with `Bad file descriptor (os error 9)`: `Command` does not
+                                    // duplicate the descriptor at configuration time, it inherits
+                                    // whatever is open at fork. It is dropped below, once the child has
+                                    // it, so the parent does not hold a pipe open for a box that is gone.
+                                    gate_rd = Some(rd);
+                                }
+                                cmd.arg("-d");
+                                if !b.command.is_empty() {
+                                    cmd.arg("--").args(&b.command);
+                                }
+                                let status = cmd.status().map_err(|e| {
+                                    Error::Compose(format!("starting '{}': {e}", b.name))
+                                });
+                                // The child has the read end now (or the spawn failed and nobody will).
+                                // Either way the parent must not keep it: a live read end in `up` means
+                                // the pipe never reaches EOF, so a box whose launcher died would wait
+                                // forever instead of refusing.
+                                drop(gate_rd);
+                                let status = status?;
+                                if !status.success() {
+                                    return Err(Error::Compose(format!(
+                                        "box '{}' failed to start",
+                                        b.name
+                                    )));
+                                }
+                                Ok(())
+                            }),
+                        ))
                     })
                     .collect();
                 handles
                     .into_iter()
-                    .map(|h| {
-                        h.join().unwrap_or_else(|_| {
+                    .map(|(n, h)| {
+                        let r = h.join().unwrap_or_else(|_| {
                             Err(Error::Compose("compose worker panicked".into()))
-                        })
+                        });
+                        (n, r)
                     })
                     .collect()
             });
-            // Abort the whole `up` on the first failure in this chunk (peers already started stay up,
-            // like Docker's partial bring-up).
-            for r in results {
-                r?;
+            for (n, r) in results {
+                if let Err(e) = r {
+                    failed.push((n, e));
+                }
             }
         }
         // Register this level's pod aliases AFTER the barrier - serial, so the racy /etc/hosts
         // read-modify-write in `add_member` never runs concurrently, and the NEXT level resolves them.
         if use_pod {
-            for name in level {
+            for name in runnable
+                .iter()
+                .filter(|n| !failed.iter().any(|(f, _)| f == *n))
+            {
                 // Same as above: the level was built from `boxes`, so a miss cannot happen and
                 // aborting on it would be the only way it ever could.
                 let Some(b) = boxes.iter().find(|b| &b.name == name) else {
@@ -3567,6 +3777,41 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                         crate::pod::add_member(&pod, alias)?;
                     }
                 }
+            }
+        }
+    }
+    // A FAILED BOX'S GATE GOES NOW, so the release below neither writes to a box that is gone nor
+    // stops at it: closing the write end is the refusal the box already acted on.
+    if !failed.is_empty() {
+        if let Ok(mut g) = gates.lock() {
+            g.retain(|(n, _)| !failed.iter().any(|(f, _)| f == n));
+        }
+    }
+    // THE BOXES LEFT RUNNING LEARN THE REPLICAS THIS `up` STARTED OR STOPPED, from the same
+    // `add_host_args` a box is started with, so a running box and a new one cannot disagree about
+    // what `web` means. ON A BRIDGE ONLY: in a pod every member answers at one address the shared
+    // file already holds, and under `--no-pod` a name is only reachable through a relay built inside
+    // the box when it starts, so a line added to a running box would name an address nothing binds.
+    if action == ComposeAction::Up && bridge_cidr.is_some() && !replica_names.is_empty() {
+        for k in &kept_boxes {
+            let Some(b) = boxes.iter().find(|b| &b.name == k) else {
+                continue;
+            };
+            if b.net || joins.contains_key(&b.name) {
+                continue;
+            }
+            let Some(entries) = crate::nopod::add_host_args(&address_plan, &b.service, false)
+            else {
+                continue;
+            };
+            let want: Vec<(String, String)> = entries
+                .iter()
+                .filter_map(|e| e.split_once(':'))
+                .filter(|(n, _)| replica_names.contains(*n))
+                .map(|(n, a)| (n.to_string(), a.to_string()))
+                .collect();
+            if let Err(e) = crate::network::set_box_names(k, &replica_names, |_| want) {
+                eprintln!("kern: warning: {e}: it may not resolve every replica");
             }
         }
     }
@@ -3871,8 +4116,14 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     }
     // ONLY WHAT THIS INVOCATION STARTED. `boxes` is the whole file; `levels` is what was launched,
     // after `up web` narrowed it to web and its dependencies. See `settle_and_collect_dead`.
-    let started: std::collections::HashSet<&str> =
-        levels.iter().flatten().map(String::as_str).collect();
+    // A box that failed to start, or was not started for a dependency that did, did not start: it
+    // is reported below as what it is, not as a service that died after starting.
+    let started: std::collections::HashSet<&str> = levels
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|n| !failed.iter().any(|(f, _)| f == n) && !not_started.iter().any(|x| x == n))
+        .collect();
     let mine: Vec<&crate::compose::ComposeBox> = boxes
         .iter()
         .filter(|b| started.contains(b.name.as_str()))
@@ -3908,7 +4159,30 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // whole stack has exited by the time the guard runs, its message says how many services this
     // invocation started rather than claiming none did.
     if let Some(g) = _pod_guard.as_ref() {
-        g.started.set(total);
+        g.started.set(started.len());
+    }
+    // THE BRING-UP FAILED FOR SOME SERVICES, AND THE REST RUNS: said as Docker says it, with exit 1.
+    if let Some((first, e)) = failed.first() {
+        let short = |n: &str| n.strip_prefix(&format!("{pod}-")).unwrap_or(n).to_string();
+        let mut msg = format!("service '{}': {e}", short(first));
+        for (n, e) in failed.iter().skip(1) {
+            msg.push_str(&format!("\n  service '{}': {e}", short(n)));
+        }
+        if !not_started.is_empty() {
+            let names: Vec<String> = not_started.iter().map(|n| short(n)).collect();
+            msg.push_str(&format!(
+                "\n  not started, dependency failed to start: {}",
+                names.join(", ")
+            ));
+        }
+        if !started.is_empty() {
+            msg.push_str(&format!(
+                "\n  the {} other box(es) started and are running; `kern compose {file} down` \
+                 stops them",
+                started.len()
+            ));
+        }
+        return Err(Error::Compose(msg));
     }
     println!("compose up: {total} box(es) started. track with `kern ps`.");
     if use_pod {
@@ -4714,24 +4988,39 @@ mod tests {
         let base = write("docker-compose.yml");
         let over = write("docker-compose.override.yml");
 
+        for from in [ComposeFilesFrom::Named, ComposeFilesFrom::Discovered] {
+            assert_eq!(
+                default_override_for(std::slice::from_ref(&base), from).as_deref(),
+                Some(over.as_str()),
+                "a default-named file must pick up its sibling override, as `docker compose` does"
+            );
+        }
+        // A list that came from `COMPOSE_FILE` is exact, also when the `.env` set it and the
+        // environment does not show it. MEASURED on Docker Compose 2.40.3.
         assert_eq!(
-            default_override_for(std::slice::from_ref(&base)).as_deref(),
-            Some(over.as_str()),
-            "a default-named file must pick up its sibling override, as `docker compose` does"
+            default_override_for(
+                std::slice::from_ref(&base),
+                ComposeFilesFrom::ComposeFileVar
+            ),
+            None,
+            "`COMPOSE_FILE` declares the exact list"
         );
 
         // Two files are already an explicit list; Docker adds nothing to one.
-        assert_eq!(default_override_for(&[base.clone(), over]), None);
+        assert_eq!(
+            default_override_for(&[base.clone(), over], ComposeFilesFrom::Named),
+            None
+        );
 
         // A file Docker would not have found without `-f` gets no override either.
         let odd = write("ci.yml");
-        assert_eq!(default_override_for(&[odd]), None);
+        assert_eq!(default_override_for(&[odd], ComposeFilesFrom::Named), None);
 
         // POSITIVE CONTROL: with the override removed, the same base file discovers nothing. Without
         // this the first assertion could pass on a function that returns a path it never checked.
         std::fs::remove_file(root.join("docker-compose.override.yml")).expect("removable");
         assert_eq!(
-            default_override_for(std::slice::from_ref(&base)),
+            default_override_for(std::slice::from_ref(&base), ComposeFilesFrom::Named),
             None,
             "no override file, no override"
         );
@@ -4751,8 +5040,22 @@ mod tests {
     fn a_service_that_died_on_a_port_is_told_which_port_and_which_wiring_took_it() {
         let _g = crate::env_guard();
         let plan = crate::nopod::assign_aliases(&[
-            ("proxy".into(), "p-proxy".into(), vec![80], vec![], vec![]),
-            ("backend".into(), "p-backend".into(), vec![], vec![], vec![]),
+            (
+                "proxy".into(),
+                "p-proxy".into(),
+                vec![80],
+                vec![],
+                vec![],
+                None,
+            ),
+            (
+                "backend".into(),
+                "p-backend".into(),
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ),
         ])
         .expect("a two-service plan");
         let mut boxes = crate::compose::parse(
@@ -5284,7 +5587,8 @@ networks:
     fn a_service_on_two_networks_answers_each_peer_on_the_network_they_share() {
         let b = boxes();
         let (nets, _) = stack_bridge_networks(&b).expect("networks");
-        let (plan, notes) = bridge_plan(&b, &nets, false).expect("plan");
+        let none = std::collections::HashMap::new();
+        let (plan, notes) = bridge_plan(&b, &nets, false, &none).expect("plan");
         assert!(notes.is_empty(), "{notes:?}");
         let get = |s: &str| plan.iter().find(|a| a.service == s).expect("in plan");
         let ip = |v: u32| std::net::Ipv4Addr::from(v).to_string();
@@ -5322,6 +5626,57 @@ networks:
         assert_eq!(links, vec![format!("backend:{app_back}")]);
     }
 
+    /// A RUNNING BOX KEEPS ITS ADDRESS WHEN THE STACK AROUND IT CHANGES, and a recorded address
+    /// that collides is dropped rather than refusing the plan.
+    ///
+    /// MEASURED on WSL2: `up --scale web=2` put `cm` on 10.89.0.4, and `up --scale web=3` then
+    /// started `web-3` on 10.89.0.4 as well, because addresses followed positions in the file.
+    #[test]
+    fn a_running_box_keeps_its_bridge_address_when_a_replica_is_added() {
+        let y = "services:\n  web:\n    image: alpine\n  web-2:\n    image: alpine\n  web-3:\n    image: alpine\n  cm:\n    image: alpine\n";
+        let mut b = crate::compose::parse(y).expect("fixture parses");
+        // As `resolve_box_names` leaves them: the service keeps its name, the box is scoped.
+        for x in &mut b {
+            x.service = x.name.clone();
+            x.name = format!("p-{}", x.name);
+        }
+        let nets = [(String::new(), "10.89.0.0/24".to_string())];
+        let addr = |plan: &[crate::nopod::Assigned], svc: &str| {
+            plan.iter()
+                .find(|a| a.service == svc)
+                .map(|a| std::net::Ipv4Addr::from(a.alias).to_string())
+                .unwrap_or_default()
+        };
+        // Control: with nothing running, positions decide, and `web-3` takes .4.
+        let none = std::collections::HashMap::new();
+        let (plan, _) = bridge_plan(&b, &nets, true, &none).expect("plan");
+        assert_eq!(addr(&plan, "web-3"), "10.89.0.4");
+        assert_eq!(addr(&plan, "cm"), "10.89.0.5");
+        // `cm` running at .4 keeps it, and `web-3` goes to the next free address.
+        let four = u32::from(std::net::Ipv4Addr::new(10, 89, 0, 4));
+        let live: std::collections::HashMap<String, Vec<u32>> =
+            [("p-cm".to_string(), vec![four])].into_iter().collect();
+        let (plan, _) = bridge_plan(&b, &nets, true, &live).expect("plan");
+        assert_eq!(addr(&plan, "cm"), "10.89.0.4");
+        assert_eq!(addr(&plan, "web-3"), "10.89.0.5");
+        // Two running boxes recorded at one address (the state the defect left): the first keeps
+        // it, the second is given a free one, and the plan is not refused.
+        let live: std::collections::HashMap<String, Vec<u32>> = [
+            ("p-web-3".to_string(), vec![four]),
+            ("p-cm".to_string(), vec![four]),
+        ]
+        .into_iter()
+        .collect();
+        let (plan, _) = bridge_plan(&b, &nets, true, &live).expect("not refused");
+        let mut all: Vec<String> = plan
+            .iter()
+            .map(|a| std::net::Ipv4Addr::from(a.alias).to_string())
+            .collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 4, "four distinct addresses: {all:?}");
+    }
+
     /// Two services pinned to one address on one network is the file's error, refused.
     #[test]
     fn two_services_pinned_to_one_address_on_a_network_are_refused() {
@@ -5331,7 +5686,7 @@ networks:
         );
         let b = crate::compose::parse(&y).expect("fixture parses");
         let (nets, _) = stack_bridge_networks(&b).expect("networks");
-        let err = bridge_plan(&b, &nets, false)
+        let err = bridge_plan(&b, &nets, false, &std::collections::HashMap::new())
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();

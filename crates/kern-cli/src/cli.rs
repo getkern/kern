@@ -813,6 +813,8 @@ pub enum Command {
         project_root: Option<String>,
         /// `--profile` (repeatable).
         profiles: Vec<String>,
+        /// Where `files` came from (see [`commands::ComposeFilesFrom`]).
+        files_from: commands::ComposeFilesFrom,
     },
     /// `kern config [edit|setup|probe|clear]`: manage `kern.toml` (default: list its profiles).
     Config {
@@ -2486,13 +2488,16 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             // A BARE `kern compose` STILL PRINTS USAGE. Discovery answers "which file", not "which
             // verb", and a lone `kern compose` has named neither: guessing `up` there would start a
             // stack on a keystroke, which is the one outcome nobody would have wanted.
+            let mut files_from = commands::ComposeFilesFrom::Named;
             if files.is_empty() {
                 if action.is_none() {
                     return Err(Error::Usage(usage));
                 }
-                let found = compose_files_for_no_file().ok_or_else(no_compose_file_here)?;
+                let (found, from) = compose_files_for_no_file(env_file.as_deref())
+                    .ok_or_else(no_compose_file_here)?;
                 file = found.first().cloned();
                 files.extend(found);
+                files_from = from;
             }
             // `--` AFTER THE SERVICE IS A SEPARATOR, NOT THE PROGRAM TO RUN. The loop above sends
             // everything after the service name into the command, flags and all, which is what makes
@@ -2569,6 +2574,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 env_file,
                 project_root,
                 profiles,
+                files_from,
             }
         }
         // `up [--no-pod]` / `down`: Docker-familiar shorthands that DISCOVER a compose file in the CWD
@@ -2585,7 +2591,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let force_pod = rest.contains(&"--pod");
             let allow_device_grants = rest.contains(&"--allow-device-grants");
             let allow_privileged = rest.contains(&"--allow-privileged");
-            let files = compose_files_for_no_file().ok_or_else(no_compose_file_here)?;
+            let (files, files_from) =
+                compose_files_for_no_file(None).ok_or_else(no_compose_file_here)?;
             Command::Compose {
                 files,
                 action,
@@ -2656,6 +2663,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 env_file: None,
                 project_root: None,
                 profiles: Vec::new(),
+                files_from,
             }
         }
         // `config`: list resource profiles from kern.toml.
@@ -5502,36 +5510,112 @@ const COMPOSE_FILE_NAMES: [&str; 5] = [
     "kern.toml",
 ];
 
-/// Discover a compose file in the current directory for `kern up`/`down` and for a `kern compose`
-/// invocation that named a verb but no file. Returns the first of [`COMPOSE_FILE_NAMES`] that exists.
+/// Discover a compose file for `kern up`/`down` and for a `kern compose` invocation that named a verb
+/// but no file: the first of [`COMPOSE_FILE_NAMES`] in the working directory, else the first of
+/// Docker's four names in the nearest parent directory holding one, as Docker looks. MEASURED on
+/// Docker Compose 2.40.3: from three levels below a `compose.yml` it ran that file under the project
+/// named after its directory, and a nearer `docker-compose.yml` one level up won over it.
+///
+/// ⛔ A PARENT'S FILE MUST BE THE INVOKING USER'S, and so must the link when the name is a symlink.
+/// This is where kern does less than Docker, on purpose: `kern up` typed in `/tmp/work`, where the
+/// user forgot to create the file, would otherwise run whatever `compose.yml` another user left in
+/// `/tmp`, with the invoking user's rights. A file in the working directory is the one the user is
+/// looking at and is taken as it is, as before. A foreign file in a parent ends the search with a
+/// note naming it and its owner, so the refusal that follows is not a mystery.
 fn discover_compose_file() -> Option<String> {
-    COMPOSE_FILE_NAMES
+    if let Some(name) = COMPOSE_FILE_NAMES
         .iter()
         .find(|name| std::path::Path::new(name).is_file())
-        .map(|name| (*name).to_string())
+    {
+        return Some((*name).to_string());
+    }
+    use std::os::unix::fs::MetadataExt;
+    let cwd = std::env::current_dir().ok()?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    for dir in cwd.ancestors().skip(1) {
+        // DOCKER'S FOUR NAMES ONLY: Docker's search is what is being matched, and `kern.toml` is
+        // kern's own name, which a parent (a home directory) may hold for another reason.
+        for name in COMPOSE_FILE_NAMES.iter().filter(|n| !n.ends_with(".toml")) {
+            let path = dir.join(name);
+            let Ok(link) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !path.is_file() {
+                continue;
+            }
+            let target_uid = std::fs::metadata(&path).map(|m| m.uid()).ok();
+            // The link's owner first: a foreign symlink to the user's own file is still foreign.
+            let foreign = [Some(link.uid()), target_uid]
+                .into_iter()
+                .find(|uid| *uid != Some(me));
+            if let Some(owner) = foreign {
+                let owner = owner.map_or_else(
+                    || "an owner kern could not read".to_string(),
+                    |uid| format!("uid {uid}"),
+                );
+                eprintln!(
+                    "kern: note: not using {}: it belongs to {owner}, not to you (uid {me}); a \
+                     compose file found in a parent directory must be yours. Name it with \
+                     `kern compose <file> <verb>` to run it anyway",
+                    path.display(),
+                );
+                return None;
+            }
+            return path.to_str().map(str::to_string);
+        }
+    }
+    None
 }
 
-/// The files an invocation that named none means: `COMPOSE_FILE` when it is set, as Docker reads it
-/// (a list split on `COMPOSE_PATH_SEPARATOR`, `:` when that is unset, merged in order like repeated
-/// `-f`), else the one [`discover_compose_file`] finds. MEASURED against Docker:
-/// `COMPOSE_FILE=base.yml:override.yml docker compose --profile frontend up -d` started the merged
-/// service, and kern ignored the variable and answered "no compose file in this directory".
-/// `COMPOSE_FILE` written in the project's `.env`, which Docker also reads, is not read here.
-fn compose_files_for_no_file() -> Option<Vec<String>> {
-    let from_env = crate::global_env_str("COMPOSE_FILE").ok().and_then(|v| {
-        let sep = crate::global_env_str("COMPOSE_PATH_SEPARATOR")
+/// The working directory's `.env` as Docker reads it BEFORE it knows which file it runs, for its own
+/// variables: `COMPOSE_FILE` and `COMPOSE_PATH_SEPARATOR`. `--env-file` replaces it, as it replaces
+/// the project's. MEASURED on Docker Compose 2.40.3: `.env` holding `COMPOSE_FILE=a.yml:b.yml` ran
+/// both files merged, `--env-file other.env` holding `COMPOSE_FILE=c.yml` ran `c.yml`, a quoted
+/// value had its quotes removed and `${X}` was interpolated from an earlier line. Absent or
+/// unreadable: an empty table, so discovery runs as it did.
+fn working_dir_dotenv(env_file: Option<&str>) -> crate::compose::DotEnv {
+    std::fs::read_to_string(env_file.unwrap_or(".env"))
+        .map(|t| crate::compose::parse_dotenv(&t))
+        .unwrap_or_default()
+}
+
+/// The files an invocation that named none means, and where they came from: `COMPOSE_FILE` when it
+/// is set, from the environment or else from the working directory's `.env` (see
+/// [`working_dir_dotenv`]), split on `COMPOSE_PATH_SEPARATOR` from the same two places (`:` when
+/// neither sets it) and merged in order like repeated `-f`; else the one [`discover_compose_file`]
+/// finds. MEASURED against Docker: `COMPOSE_FILE=base.yml:override.yml docker compose --profile
+/// frontend up -d` started the merged service, the shell's value won over the `.env`'s, and `-f`
+/// won over both; kern ignored the `.env`'s value.
+///
+/// An EMPTY value counts as unset, in either place, and discovery runs: Docker answered an empty
+/// `COMPOSE_FILE=` in the `.env` with `read <dir>: is a directory`, which names no file to fix.
+fn compose_files_for_no_file(
+    env_file: Option<&str>,
+) -> Option<(Vec<String>, commands::ComposeFilesFrom)> {
+    let dotenv = working_dir_dotenv(env_file);
+    // The shell first, then the `.env`; `set` says what counts as a value for that variable.
+    let var = |key: &str, set: fn(&str) -> bool| -> Option<String> {
+        crate::global_env_str(key)
             .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| ":".to_string());
+            .filter(|v| set(v))
+            .or_else(|| dotenv.get(key).filter(|v| set(v)).map(str::to_string))
+    };
+    let from_var = var("COMPOSE_FILE", |v| !v.trim().is_empty()).and_then(|v| {
+        // A separator is any non-empty string, a space included, so it is not trimmed.
+        let sep =
+            var("COMPOSE_PATH_SEPARATOR", |v| !v.is_empty()).unwrap_or_else(|| ":".to_string());
         let files: Vec<String> = v
             .split(sep.as_str())
             .map(str::trim)
             .filter(|f| !f.is_empty())
             .map(str::to_string)
             .collect();
-        (!files.is_empty()).then_some(files)
+        (!files.is_empty()).then_some((files, commands::ComposeFilesFrom::ComposeFileVar))
     });
-    from_env.or_else(|| discover_compose_file().map(|f| vec![f]))
+    from_var.or_else(|| {
+        discover_compose_file().map(|f| (vec![f], commands::ComposeFilesFrom::Discovered))
+    })
 }
 
 /// The refusal when discovery found nothing, naming every name it tried and both ways to say it
@@ -6224,6 +6308,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env_file,
             project_root,
             profiles,
+            files_from,
         } => commands::compose(commands::ComposeOpts {
             files: &files,
             action,
@@ -6271,6 +6356,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             env_file: env_file.as_deref(),
             project_root: project_root.as_deref(),
             profiles: &profiles,
+            files_from,
         }),
         Command::Config { sub, force, json } => commands::config_cmd(&sub, force, json),
         Command::ConfigAdd { args } => commands::config_add(&args),

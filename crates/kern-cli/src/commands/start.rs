@@ -3096,6 +3096,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             run_as: spec.run_as,
             extra_gids: spec.extra_gids.clone(),
             egress: args.egress_allow.join(","),
+            bridges: registry::encode_bridges(&spec.pod_bridges),
             landlock_rw: spec.landlock_rw.join(","),
             labels: registry::encode_labels(args.labels),
             stop_signal,
@@ -5763,6 +5764,7 @@ fn run_detached(
         run_as: spec.run_as,
         extra_gids: spec.extra_gids.clone(),
         egress: String::new(), // --egress-allow is foreground-only; a detached box never carries it
+        bridges: registry::encode_bridges(&spec.pod_bridges),
         landlock_rw: spec.landlock_rw.join(","),
         labels: labels.to_string(),
         stop_signal,

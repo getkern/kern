@@ -6336,6 +6336,28 @@ pub fn port(name: &str, want: Option<&str>) -> Result<(), Error> {
     Ok(())
 }
 
+/// WHERE A COMPOSE INVOCATION'S FILE LIST CAME FROM, decided once by the CLI.
+///
+/// Two behaviours of Docker's depend on it, and reading it from one value keeps them from being
+/// derived twice from different evidence. MEASURED on Docker Compose 2.40.3:
+///
+///  * The working directory's `.env` configures a run that NAMED NO FILE, and its values win over
+///    the project `.env` for interpolation: from a directory holding `.env` with `X=from-cwd-env`,
+///    a file two levels up whose own `.env` says `X=from-parent-env` interpolated `from-cwd-env`
+///    (discovered, and through `COMPOSE_FILE`), and `from-parent-env` under `-f`.
+///  * The default override is not loaded when the list came from `COMPOSE_FILE`, whether the shell or
+///    the `.env` set it: setting it declares the exact list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComposeFilesFrom {
+    /// Named on the command line (`kern compose <file>`, `-f` through the shim).
+    #[default]
+    Named,
+    /// `COMPOSE_FILE`, from the environment or from the working directory's `.env`.
+    ComposeFileVar,
+    /// Found by looking in the working directory and its parents.
+    Discovered,
+}
+
 /// `up --force-recreate` / `up --no-recreate`: the two ways a caller overrides the comparison.
 ///
 /// THE COMPARISON IS THE DEFAULT AND IS USUALLY RIGHT, so both of these exist for the cases where the
@@ -10367,6 +10389,8 @@ pub struct ComposeOpts<'a> {
     pub project_root: Option<&'a str>,
     /// `--profile` (repeatable): profiles to activate, like `COMPOSE_PROFILES`.
     pub profiles: &'a [String],
+    /// Where `files` came from, which decides two things Docker ties to it (see [`ComposeFilesFrom`]).
+    pub files_from: ComposeFilesFrom,
     /// `logs -t/--timestamps`: prefix each line with the time the index recorded for it.
     pub log_timestamps: bool,
     /// `logs --since` / `--until` as unix nanoseconds. See `boxlog::Stamper::window` for why a line
