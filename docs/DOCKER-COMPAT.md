@@ -490,6 +490,12 @@ GPU and kern used to give none. `NVIDIA_VISIBLE_DEVICES` on its own, with no `ru
 not a request: whether docker honours it depends on the daemon's default runtime, which a file
 cannot show, so kern names it with the line to write instead.
 
+`allow_gpu_grants = true` under `[kern]` in your own [`kern.toml`](CONFIG.md) grants four of the
+five with no flag: `gpus:`, the `deploy` reservation, `nvidia.com/gpu` CDI names and `runtime:
+nvidia`. It is the decision docker's users make once by installing the NVIDIA container toolkit.
+The host nodes under `devices:`, a CDI name of any other class and every other device still need
+`--allow-device-grants`, and a config a compose file names cannot set the key.
+
 ONE MORE SHAPE CHANGES ITS ANSWER HERE, and it is the one every guide prints:
 
 ```yaml

@@ -133,6 +133,19 @@ the stack's, one run in three; `kern stop` now returns once the box's supervisor
 for such a box on WSL2). `compose restart` and a recreate by `up` no longer
 leave the stopped run's row beside the new box.
 
+**`kern stop` and `compose down` no longer wait out the grace on a box that has already exited.** On
+a host without cgroup delegation, a box whose workload exited on the stop signal before the teardown
+reached it was waited on for its whole remaining grace: `down` of a service that traps SIGTERM beside a
+`sleep` took 10.3-11.5 s in 5 runs of 12, and takes 274-347 ms in 12 of 12. The box keeps the exit code
+it chose.
+
+**`allow_gpu_grants = true` in your own `kern.toml` lets a compose file take the GPUs it asks for, and
+no other device.** `gpus:`, a `deploy` reservation, `runtime: nvidia` and `nvidia.com/gpu` CDI names
+pass with no flag, which is the decision docker's users make once by installing the NVIDIA container
+toolkit. A `devices:` node, a CDI name of any other class and a device profile still need
+`--allow-device-grants` or `allow_device_grants`, which open every device. Read only from your own
+config, as `allow_device_grants` is.
+
 **`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
 before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
