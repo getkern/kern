@@ -4324,6 +4324,91 @@ fn allow_gpu_grants_is_read_from_the_operators_config_and_grants_the_gpu_only() 
     );
 }
 
+/// `compose ps -q SERVICE` NAMES THAT SERVICE, BY AN ID THAT A RECREATE CHANGES.
+///
+/// MEASURED against Docker on a selective-recreate check (change one service, `up -d`, compare
+/// `ps -q` of each before and after): kern recreated only the changed service, as Docker did, and the
+/// check still failed, for two reasons. `ps -q stable` printed every service of the stack, and it
+/// printed names, which a recreate does not change. Asserted: one line per named service; the
+/// unchanged service keeps its id and the changed one gets a new one; the JSON `ID` is the same id.
+#[test]
+fn compose_ps_q_names_the_service_by_an_id_a_recreate_changes() {
+    let dir = std::env::temp_dir().join(format!("kern-it-psq-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-psq-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let file = |mark: &str| {
+        let _ = std::fs::write(
+            dir.join("compose.yml"),
+            format!(
+                "services:\n  stable:\n    image: alpine\n    command: [\"sleep\", \"600\"]\n  moving:\n    \
+                 image: alpine\n    environment:\n      MARK: {mark}\n    command: [\"sleep\", \"600\"]\n"
+            ),
+        );
+    };
+    let c = |verb: &[&str]| -> String {
+        let mut a = vec!["compose", "-f", "compose.yml", "-p", "psq"];
+        a.extend_from_slice(verb);
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Err(_) => String::new(),
+        }
+    };
+    file("one");
+    let _ = c(&["up", "-d"]);
+    let (s1, m1, all) = (
+        c(&["ps", "-q", "stable"]),
+        c(&["ps", "-q", "moving"]),
+        c(&["ps", "-q"]),
+    );
+    let json = c(&["ps", "--format", "json", "stable"]);
+    file("two");
+    let _ = c(&["up", "-d"]);
+    let (s2, m2) = (c(&["ps", "-q", "stable"]), c(&["ps", "-q", "moving"]));
+    let _ = c(&["down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if all.is_empty() {
+        eprintln!("SKIP: this host did not run the stack");
+        return;
+    }
+    assert_eq!(
+        all.lines().count(),
+        2,
+        "`ps -q` lists both services: {all:?}"
+    );
+    assert_eq!(
+        s1.lines().count(),
+        1,
+        "`ps -q stable` lists that service alone: {s1:?}"
+    );
+    assert!(
+        s1.parse::<u32>().is_ok() && m1.parse::<u32>().is_ok(),
+        "`ps -q` prints an id: {s1:?} {m1:?}"
+    );
+    assert!(
+        json.contains(&format!("\"ID\":\"{s1}\"")),
+        "the JSON carries the same id: {json}"
+    );
+    assert!(
+        !json.contains("psq-moving"),
+        "`ps --format json stable` is that service alone: {json}"
+    );
+    assert_eq!(
+        s1, s2,
+        "the unchanged service was not recreated, so its id is the same"
+    );
+    assert_ne!(
+        m1, m2,
+        "the changed service was recreated, so its id is new"
+    );
+}
+
 /// THE SHAPE OF A CODE SANDBOX, RUN AS A ONE-OFF: `network_mode: none`, `read_only`, a `/tmp` tmpfs,
 /// and the script mounted INTO that tmpfs with `run -v`. MEASURED against Docker on a case written
 /// for both: kern took the `-v` spec for the service name, then (with `-v` read) mounted the tmpfs

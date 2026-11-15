@@ -243,13 +243,21 @@ pub(crate) fn label_value(field: &str, key: &str) -> Option<String> {
 /// false, None)` says nothing about which `false` is which - the same reason [`JsonShape`] is an
 /// enum rather than a second boolean beside `quiet`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PsView {
+pub struct PsView<'a> {
     /// `--no-trunc`: print the whole COMMAND even on a terminal, where it is truncated by default so
     /// a long line never wraps.
     pub no_trunc: bool,
     /// `--last N` / `-n N`: keep only the N most recent boxes, newest first, across live and exited.
     /// `Some(0)` lists nothing, which is what `docker ps -n 0` does.
     pub last: Option<usize>,
+    /// `compose ps SERVICE...`: only these box names, matched EXACTLY. A `name=` filter is a
+    /// substring and would let `web` select `web2`; Docker lists the services named and no other.
+    pub only: Option<&'a [String]>,
+    /// `compose ps -q`: print each live box's ID, its supervisor pid, instead of its name. It is
+    /// the id `kern stop`/`exec`/`logs` resolve and `--filter id=` matches, and it changes when a
+    /// service is recreated, which is what a script comparing `ps -q` before and after `up` reads
+    /// (as Docker's container ID). The name does not change, so a recreate was invisible.
+    pub ids: bool,
 }
 
 /// How `ps` renders a machine-readable listing.
@@ -275,8 +283,9 @@ pub fn ps(
     all: bool,
     filters: &[(String, String)],
     format: Option<&str>,
-    view: PsView,
+    view: PsView<'_>,
 ) -> Result<(), Error> {
+    let named = |n: &str| view.only.is_none_or(|only| only.iter().any(|o| o == n));
     // Validate every filter once, fail-fast on an unsupported key or status value.
     for (k, v) in filters {
         match k.as_str() {
@@ -329,7 +338,7 @@ pub fn ps(
         live.iter().map(|b| b.name.clone()).collect();
     let boxes: Vec<registry::Instance> = live
         .into_iter()
-        .filter(|b| ps_matches(b, filters))
+        .filter(|b| ps_matches(b, filters) && named(&b.name))
         .collect();
     // ASK THE KERNEL TOO, because the registry is the one source that can be erased while the boxes it
     // describes keep running. `$XDG_RUNTIME_DIR/kern/instances` is swept by `systemd-tmpfiles`, cleared
@@ -464,7 +473,7 @@ pub fn ps(
         crate::keepbox::list_matching(|n| name_want.is_none_or(|w| n.contains(w)))
             .into_iter()
             .filter(|k| !live_names.contains(&k.name))
-            .filter(|k| kept_matches(k, filters))
+            .filter(|k| kept_matches(k, filters) && named(&k.name))
             .collect()
     } else {
         Vec::new()
@@ -485,7 +494,11 @@ pub fn ps(
             boxes.iter().map(|b| (b.pid, b.starttime)).collect();
         registry::list_exited()
             .into_iter()
-            .filter(|e| !live.contains(&(e.pid, e.starttime)) && exited_matches(e, filters))
+            .filter(|e| {
+                !live.contains(&(e.pid, e.starttime))
+                    && exited_matches(e, filters)
+                    && named(&e.name)
+            })
             // ONE BOX, ONE ROW, for a name that has a kept layer. The exit record is transient (an
             // hour, or `kern gc`) and the kept record is durable and now carries the same code (the
             // supervisor records it), so printing both put one box in two sections of one `ps -a`
@@ -577,7 +590,11 @@ pub fn ps(
     // box's name is already scrubbed at the source (`list_exited`), so it is safe to print raw here.
     if quiet {
         for b in &boxes {
-            println!("{}", b.name);
+            if view.ids {
+                println!("{}", b.pid);
+            } else {
+                println!("{}", b.name);
+            }
         }
         for e in &exited {
             println!("{}", e.name);
@@ -728,7 +745,8 @@ pub fn ps(
                             "running"
                         };
                         format!(
-                            ",\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":0,\"Command\":{},\"Publishers\":{}",
+                            ",\"ID\":{},\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":0,\"Command\":{},\"Publishers\":{}",
+                            json_str(&b.pid.to_string()),
                             json_str(&b.name),
                             json_str(service),
                             json_str(&b.pod),
@@ -745,7 +763,8 @@ pub fn ps(
                                 .strip_prefix(&format!("{}-", e.pod))
                                 .unwrap_or(&e.name);
                             format!(
-                                ",\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":{},\"Command\":{}",
+                                ",\"ID\":{},\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":{},\"Command\":{}",
+                                json_str(&e.pid.to_string()),
                                 json_str(&e.name),
                                 json_str(service),
                                 json_str(&e.pod),

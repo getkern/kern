@@ -551,7 +551,7 @@ pub enum Command {
         format: Option<String>,
         /// `--no-trunc` and `--last N`: how the listing is PRESENTED, as opposed to which boxes it
         /// holds. See [`commands::PsView`].
-        view: commands::PsView,
+        view: commands::PsView<'static>,
     },
     /// `kern sandbox ls|history|stats`: the SDK and MCP sandboxes, live and finished.
     Sandbox(crate::history::SandboxCmd),
@@ -1534,7 +1534,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 all,
                 filters,
                 format,
-                view: commands::PsView { no_trunc, last },
+                view: commands::PsView {
+                    no_trunc,
+                    last,
+                    ..Default::default()
+                },
             }
         }
         // `sandbox ls|history|stats`: the SDK and MCP sandboxes, live and finished (see `history.rs`).

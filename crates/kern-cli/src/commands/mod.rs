@@ -9356,16 +9356,29 @@ fn run_terminal_verb(
                 None => (JsonShape::No, None),
             };
             let as_json = shape != JsonShape::No;
+            // `compose ps SERVICE...` LISTS THOSE SERVICES. The names were parsed and dropped, so
+            // `ps -q stable` printed every service of the stack (MEASURED against Docker on a
+            // recreate check, where it made the answer depend on the order of two lines).
+            let only: Option<Vec<String>> = (!services.is_empty()).then(|| {
+                boxes
+                    .iter()
+                    .filter(|b| selected(b))
+                    .map(|b| b.name.clone())
+                    .collect()
+            });
             let rc = ps(
                 shape,
                 o.ps_quiet,
                 all,
                 std::slice::from_ref(&filter),
                 template,
-                // The compose view has no presentation flags of its own yet: `--no-trunc`/`--last`
-                // are `kern ps`'s, and threading a default here keeps the ONE renderer rather than
-                // growing a second entry point that could drift from it.
-                PsView::default(),
+                // `--no-trunc`/`--last` are `kern ps`'s; the compose view adds the service selection
+                // and Docker's `-q` answer, an ID, through the ONE renderer.
+                PsView {
+                    only: only.as_deref(),
+                    ids: true,
+                    ..PsView::default()
+                },
             );
             // The lines below explain a DEGRADED stack to a person. A machine-readable form has no
             // room for prose, and a script parsing NDJSON must not be handed a sentence.
