@@ -607,6 +607,30 @@ pub(crate) fn proc_state(pid: i32) -> Option<char> {
     registry::stat_field(&stat, 3)?.chars().next()
 }
 
+/// How long `stop` waits for a box's supervisor once the workload has exited. The supervisor's own
+/// teardown after its init exits is milliseconds; the bound only keeps a wedged one from holding
+/// `stop` for ever.
+const SUPERVISOR_TAIL_MS: u64 = 2000;
+
+/// Wait, bounded, until the supervisor `(pid, starttime)` has finished: gone, or a zombie, which
+/// has run its last line and only waits to be reaped.
+///
+/// ⛔ A STOP IS DONE WHEN THE SUPERVISOR IS, NOT WHEN THE WORKLOAD IS. A workload that exits on its
+/// stop signal ends the graceful phase, and its supervisor, which was not killed, then writes the
+/// box's exit record as its last act. Returning before that let the caller clean up first: MEASURED,
+/// after `compose down` of an sshd service the stopped box's record was still in `kern ps -a` with
+/// the stack gone, written at 13:39:09.728 by a `down` that had returned by 09.729 (one run in three
+/// on the desktop).
+pub(crate) fn wait_supervisor_done(pid: i32, starttime: u64) {
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(SUPERVISOR_TAIL_MS);
+    while registry::is_alive(pid, starttime)
+        && proc_state(pid) != Some('Z')
+        && std::time::Instant::now() < until
+    {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// A pid's parent, or `None` when it cannot be read (already reaped, or a process we may not look
 /// at).
 pub(crate) fn parent_of(pid: i32) -> Option<i32> {

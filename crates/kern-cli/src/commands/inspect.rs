@@ -2350,8 +2350,9 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
     let signalled_at = std::time::Instant::now();
     // Hold every target's reaper BEFORE a single signal goes out, so each box's exit status is still
     // readable when its wait returns. Kept alive to the end of the teardown loop and released by
-    // `Drop`; a box with no grace has nothing to observe and holds nothing. See `ReaperHold`.
-    let _holds: Vec<ReaperHold> = targets
+    // the `drop` after it; a box with no grace has nothing to observe and holds nothing. See
+    // `ReaperHold`.
+    let holds: Vec<ReaperHold> = targets
         .iter()
         .map(|b| {
             // Only where an interrupted `stop` is RECOVERABLE. A held reaper is resumed by `Drop`,
@@ -2370,6 +2371,8 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
             }
         })
         .collect();
+    // The supervisors whose workload this stop saw exit: waited for once their reapers are released.
+    let mut finished: Vec<(i32, u64)> = Vec::new();
     for b in &targets {
         if grace.unwrap_or(b.stop_grace) > 0 {
             let sig = if b.stop_signal > 0 {
@@ -2474,6 +2477,9 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
                 crate::commands::GraceSignal::AlreadySent,
             )
         };
+        if outcome.confirmed() {
+            finished.push((b.pid, b.starttime));
+        }
         // A `stop` signals the supervisor's group, so the supervisor never records its own exit code.
         // We record it here - BEFORE removing the instance file - so `kern wait` on a stopped box
         // answers like Docker instead of "no exit code recorded". The code is the box's REAL one when
@@ -2532,6 +2538,14 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
                 b.name, b.pid
             ));
         }
+    }
+    // The supervisor of a workload that exited on its signal is still tearing down, and writes the
+    // box's exit record as its last act: wait for it, so nothing the caller does next races that
+    // write. AFTER the reapers are released, because a held supervisor cannot finish (MEASURED: the
+    // wait placed inside the loop always ran to its 2 s bound).
+    drop(holds);
+    for (pid, starttime) in finished {
+        crate::commands::wait_supervisor_done(pid, starttime);
     }
     for n in &managed_only {
         stop_managed_unit(n);

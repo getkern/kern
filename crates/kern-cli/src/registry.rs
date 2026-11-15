@@ -2350,7 +2350,7 @@ pub fn pid_is_still(pid: i32, starttime: u64) -> bool {
 /// real recycle through `ns_last_pid`: the first attempt produced a decoy with the SAME start-time as
 /// the process it replaced, which made the test inconclusive rather than red. Narrow, but it is a
 /// property of the mechanism and not of the test, so it belongs here.
-fn is_alive(pid: i32, starttime: u64) -> bool {
+pub(crate) fn is_alive(pid: i32, starttime: u64) -> bool {
     // A NON-POSITIVE PID IS NOT A LIVE PROCESS, and `kill` cannot say so: `kill(0, 0)` probes the
     // caller's own process group and `kill(-1, 0)` probes every process the user owns, so BOTH
     // succeed and read as "that recorded pid is alive". The starttime comparison below does not

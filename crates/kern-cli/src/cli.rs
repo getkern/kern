@@ -705,6 +705,8 @@ pub enum Command {
         run_entrypoint: Option<String>,
         /// `run -e KEY=VALUE`, repeatable: environment for this one-off, over the service's own.
         run_env: Vec<String>,
+        /// `run -v SRC:DST[:ro]`, repeatable: a mount for this one-off, beside the service's own.
+        run_volumes: Vec<String>,
         /// `run --user <uid[:gid]>`: the identity this one-off runs as.
         run_user: Option<String>,
         /// `down --rmi <local|all>`: `Some(false)` removes the images this file BUILDS, `Some(true)`
@@ -2037,6 +2039,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut run_name: Option<String> = None;
             let mut run_entrypoint: Option<String> = None;
             let mut run_env: Vec<String> = Vec::new();
+            let mut run_volumes: Vec<String> = Vec::new();
             let mut run_user: Option<String> = None;
             // `Some(false)` = `--rmi local`, `Some(true)` = `--rmi all`.
             let mut rmi: Option<bool> = None;
@@ -2162,6 +2165,18 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                         inline_or_next(inline, &mut it)
                             .ok_or(Error::Usage("compose run -e KEY=VALUE"))?,
                     ),
+                    // `run -v SRC:DST[:ro]`, repeatable: Docker's per-run mount. MEASURED on a
+                    // sandbox case written for both runtimes: `run --rm -v "$PWD/x.py:/tmp/x.py:ro"
+                    // sandbox python /tmp/x.py` ran under Docker, and kern took the mount spec for
+                    // the SERVICE name ("no service '/home/...:ro'").
+                    // ONLY FOR `run`: `-v` on `down` is "remove the volumes", and the verb decides,
+                    // as it does for `-t`.
+                    "-v" | "--volume" if action == Some(commands::ComposeAction::Run) => {
+                        run_volumes.push(
+                            inline_or_next(inline, &mut it)
+                                .ok_or(Error::Usage("compose run -v SRC:DST[:ro]"))?,
+                        )
+                    }
                     // `run --user <uid[:gid]>`: Docker's per-invocation identity, which kern's box
                     // already takes as `--user`. Sentry's installer fixes a directory's ownership
                     // with `run --user 0 ... chown`.
@@ -2312,6 +2327,11 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // this `up` starts, instead of carrying the previous run's contents into them.
                     "-V" | "--renew-anon-volumes" => renew_anon_volumes = true,
                     "--no-log-prefix" => no_log_prefix = true,
+                    // `logs --no-color` / `up --no-color`: kern never colours its output, so the flag
+                    // asks for what already happens. It was refused as unknown, which stopped the CI
+                    // scripts that pass it to get clean logs (measured on a day-2 case run against
+                    // Docker, which accepts it).
+                    "--no-color" => {}
                     "--since" | "--until" => {
                         let v = inline_or_next(inline, &mut it).ok_or(Error::Usage(
                             "compose logs --since/--until <10m|1h30m|1789730443|2026-09-18T12:00:00Z>",
@@ -2485,6 +2505,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_name,
                 run_entrypoint,
                 run_env,
+                run_volumes,
                 run_user,
                 rmi,
                 recreate,
@@ -2548,6 +2569,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_name: None,
                 run_entrypoint: None,
                 run_env: Vec::new(),
+                run_volumes: Vec::new(),
                 run_user: None,
                 rmi: None,
                 // The shorthand carries the recreate overrides too: `kern up --force-recreate` in a
@@ -5360,7 +5382,8 @@ fn unknown_compose_flag(flag: &str) -> String {
          --allow-device-grants, -d/--detach, -v/--volumes (on `down`), --tail N, -f/--follow, \
          -a/--all, --build, --no-deps, --force-recreate, --no-recreate, -V/--renew-anon-volumes, \
          --wait, --wait-timeout, --exit-code-from, --abort-on-container-exit, --remove-orphans, \
-         --pull, -t/--timeout, --rmi, --format, --services, -q/--quiet, -T, --rm"
+         --pull, -t/--timeout, --rmi, --format, --services, -q/--quiet, -T, --rm, --no-color, \
+         -v/--volume (on `run`)"
     )
 }
 
@@ -6097,6 +6120,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             run_name,
             run_entrypoint,
             run_env,
+            run_volumes,
             run_user,
             rmi,
             recreate,
@@ -6146,6 +6170,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             log_window,
             no_log_prefix,
             run_env: &run_env,
+            run_volumes: &run_volumes,
             run_user: run_user.as_deref(),
             rmi,
             no_pod,
@@ -7832,6 +7857,15 @@ mod tests {
     /// stack brought up by `kern compose` IS a pod, so the name joins it; whether the name exists is
     /// decided at bring-up, where the registry is already being read, and is measured against a live
     /// pod rather than asserted here.
+    /// `logs --no-color` and `up --no-color` are accepted, as Docker accepts them: kern never colours
+    /// its output, and refusing the flag stopped CI scripts that pass it.
+    #[test]
+    fn compose_accepts_no_color() {
+        let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert!(p(&["compose", "f.yml", "logs", "--no-color"]).is_ok());
+        assert!(p(&["compose", "f.yml", "up", "-d", "--no-color"]).is_ok());
+    }
+
     #[test]
     fn a_network_name_is_carried_as_a_pod_join() {
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());

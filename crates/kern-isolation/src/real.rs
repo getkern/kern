@@ -1866,9 +1866,16 @@ fn child_setup_and_exec(
         spec.cpuset.as_deref(),
         !spec.vgpio_sysfs.is_empty(),
     );
+    // PARENT BEFORE CHILD, as Docker orders mounts by destination. A tmpfs that CONTAINS a volume's
+    // target goes first, so the bind lands inside it; one inside a volume goes after, as before.
+    // MEASURED with the shape of a code sandbox (`read_only`, a `/tmp` tmpfs, a script bound to
+    // `/tmp/job.py`): the tmpfs was mounted over the bind, `ls /tmp` was empty while `mount` listed
+    // both, and `python /tmp/job.py` failed with ENOENT where Docker ran it.
+    let (outer, inner) = split_tmpfs_around_volumes(&spec.tmpfs, &spec.volumes);
+    setup_tmpfs(&spec.root, &outer)?;
     setup_volumes(&spec.root, &spec.volumes, &spec.socket_binds)?;
     setup_vdisk(&spec.root, &spec.vdisks)?;
-    setup_tmpfs(&spec.root, &spec.tmpfs)?;
+    setup_tmpfs(&spec.root, &inner)?;
     // `--ssh` needs a box-owned tmpfs over ALL of `/run` (so `/run/sshd` is namespace-root-owned for
     // sshd's privsep check). Mount it once here, up front, so secrets write `/run/secrets` INTO it
     // rather than under a `/run` that sshd will later shadow. Without `--ssh`, secrets mount their own
@@ -4519,6 +4526,26 @@ fn setup_vdisk(root: &str, vdisks: &[VdiskMount]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// The tmpfs mounts that must go BEFORE the volumes (a volume's target is at or under them) and the
+/// rest, in their given order. A path is "under" another only at a component boundary: `/tmpx` is
+/// not under `/tmp`.
+fn split_tmpfs_around_volumes(
+    tmpfs: &[TmpfsMount],
+    volumes: &[Volume],
+) -> (Vec<TmpfsMount>, Vec<TmpfsMount>) {
+    let under = |child: &str, parent: &str| {
+        let parent = parent.trim_end_matches('/');
+        child == parent
+            || child
+                .strip_prefix(parent)
+                .is_some_and(|r| r.starts_with('/'))
+    };
+    tmpfs
+        .iter()
+        .cloned()
+        .partition(|t| volumes.iter().any(|v| under(&v.target, &t.path)))
 }
 
 /// Mount each `--tmpfs PATH[:size]` as a fresh tmpfs inside the box (pre-pivot, `<root>/PATH`).
@@ -12398,5 +12425,37 @@ mod ldstore_tests {
         std::fs::write(lib.join("libx.so.1"), b"elf").unwrap();
         assert!(!ld_links_replay(r, &as_refs));
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod mount_order_tests {
+    /// A tmpfs that contains a volume's target is mounted first; one inside a volume, or beside it,
+    /// keeps its place after the volumes. Component boundaries count: `/tmpx` is not under `/tmp`.
+    #[test]
+    fn a_tmpfs_holding_a_bind_is_mounted_before_it() {
+        let t = |p: &str| super::TmpfsMount {
+            path: p.to_string(),
+            ..Default::default()
+        };
+        let v = |dst: &str| super::Volume {
+            source: "/x".into(),
+            target: dst.to_string(),
+            read_only: true,
+        };
+        let (outer, inner) = super::split_tmpfs_around_volumes(
+            &[t("/tmp"), t("/data/cache"), t("/run"), t("/tmpx")],
+            &[v("/tmp/job.py"), v("/data")],
+        );
+        let names = |m: &[super::TmpfsMount]| m.iter().map(|x| x.path.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&outer), vec!["/tmp".to_string()]);
+        assert_eq!(
+            names(&inner),
+            vec![
+                "/data/cache".to_string(),
+                "/run".to_string(),
+                "/tmpx".to_string()
+            ]
+        );
     }
 }

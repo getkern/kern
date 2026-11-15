@@ -1767,6 +1767,13 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         Some(target) => Some(join_box_network(target, &args)?),
         None => None,
     };
+    // The pod this box is RECORDED under: its own `--pod`, or the pod of the box whose network it
+    // joined (see `JoinedNet::pod`). A label only: `args.pod` still decides what the box enters.
+    let pod_label: String = args
+        .pod
+        .map(str::to_string)
+        .or_else(|| joined.as_ref().map(|j| j.pod.clone()))
+        .unwrap_or_default();
     let pod_holder = match &joined {
         Some(j) => {
             if !dns_requested {
@@ -3018,7 +3025,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             scratch,
             ports,
             &mounted_vols,
-            args.pod.unwrap_or(""),
+            &pod_label,
             restart,
             restart_always,
             health_cfg,
@@ -3081,7 +3088,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             starttime: registry::proc_starttime(pid),
             ports: ports_summary(ports),
             volumes: mounted_vols.clone(),
-            pod: args.pod.unwrap_or("").to_string(),
+            pod: pod_label.clone(),
             workdir: spec.workdir.clone().unwrap_or_default(),
             run_as: spec.run_as,
             extra_gids: spec.extra_gids.clone(),
@@ -3424,7 +3431,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // this box's pod AND its name, so a foreign record is never touched.
             if args.rm {
                 registry::clear_waitexit_pod(
-                    args.pod.unwrap_or(""),
+                    &pod_label,
                     std::slice::from_ref(&args.name.to_string()),
                 );
             }
@@ -4049,6 +4056,11 @@ struct JoinedNet {
     hostname: String,
     hosts: Vec<(String, String)>,
     nameservers: Vec<String>,
+    /// The target's pod, which the joining box is RECORDED under (it does not enter the pod's
+    /// namespace, it enters the target's). A `network_mode: service:X` service is a member of X's
+    /// stack: recorded with no pod, `compose down` could not find its exit record and left it in
+    /// `kern ps -a` (MEASURED: one `exit 137` row per run of a VPN-sidecar file, four after four runs).
+    pod: String,
 }
 
 /// Resolve `--network container:<target>` to a running box and read what the joining box inherits.
@@ -4079,14 +4091,14 @@ fn join_box_network(target: &str, args: &BoxRunArgs) -> Result<JoinedNet, Error>
             "--network container:{target} cannot combine with {why} (Docker refuses the same pair)"
         )));
     }
-    let pid1 = registry::find_ref(target)
-        .and_then(|i| i.live_pid1())
-        .ok_or_else(|| {
-            Error::Sandbox(format!(
-                "--network container:{target}: no running box '{target}' (`kern ps` lists them); \
+    let found = registry::find_ref(target);
+    let pod = found.as_ref().map(|i| i.pod.clone()).unwrap_or_default();
+    let pid1 = found.and_then(|i| i.live_pid1()).ok_or_else(|| {
+        Error::Sandbox(format!(
+            "--network container:{target}: no running box '{target}' (`kern ps` lists them); \
                  the box whose network this one joins must be up first"
-            ))
-        })?;
+        ))
+    })?;
     let read =
         |f: &str| std::fs::read_to_string(format!("/proc/{pid1}/root/etc/{f}")).unwrap_or_default();
     let hostname = read("hostname").trim().to_string();
@@ -4117,6 +4129,7 @@ fn join_box_network(target: &str, args: &BoxRunArgs) -> Result<JoinedNet, Error>
         hostname,
         hosts,
         nameservers,
+        pod,
     })
 }
 

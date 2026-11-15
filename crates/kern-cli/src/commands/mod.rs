@@ -9410,6 +9410,16 @@ fn run_terminal_verb(
                     }
                     println!("=== {name} ===");
                 }
+                // THE SERVICE'S EARLIER RUNS FIRST, as Docker's log of a container spans its
+                // restarts (see `Followed::open`). Not with `--timestamps` or a time window: those
+                // read the newest run's time index, and the earlier runs have none to read.
+                if !o.log_timestamps && o.log_window == (None, None) {
+                    let earlier = earlier_runs(name, tail);
+                    if !earlier.is_empty() {
+                        use std::io::Write as _;
+                        let _ = std::io::stdout().write_all(&earlier);
+                    }
+                }
                 // A service that never started (or already exited) has no log: report it and keep
                 // going, so one missing service can't hide the others' output.
                 if let Err(e) = logs(name, tail, follow, o.log_timestamps, o.log_window) {
@@ -9492,6 +9502,13 @@ fn run_terminal_verb(
             };
             let all: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
             let (stopped, pod_existed) = tear_down_stack(boxes, &all, pod);
+            // THE LOGS GO WITH THE SERVICES, as Docker removes a container's log with it: the next
+            // `up` starts each service with an empty history, and a stack brought up and down in a
+            // loop no longer leaves one log file per run behind (measured: five runs of one service
+            // survived its `down`).
+            for n in &all {
+                remove_logs_of(n);
+            }
             print_down_summary(stopped, pod_existed, pod);
             if !orphans.is_empty() {
                 println!(
@@ -9623,6 +9640,10 @@ fn run_terminal_verb(
                 .map(|b| b.name.clone())
                 .collect();
             let names = stop_stack(boxes, &chosen, pod, o.stop_timeout).stopped;
+            // A restarted service is ONE service in `ps -a`, as a restarted container is one
+            // container: the run that was stopped leaves no exited row beside the new one. Its log
+            // is kept, which is what `logs` across a restart reads.
+            registry::clear_waitexit_pod(pod, &names);
             println!(
                 "compose restart: {} box(es) stopped, restarting",
                 names.len()
@@ -10066,6 +10087,8 @@ pub struct ComposeOpts<'a> {
     pub run_entrypoint: Option<&'a str>,
     /// `run -e KEY=VALUE`, repeatable: environment for this one-off, applied OVER the service's own.
     pub run_env: &'a [String],
+    /// `run -v SRC:DST[:ro]`, repeatable: a mount for this one-off, beside the service's own.
+    pub run_volumes: &'a [String],
     /// `run --user <uid[:gid]>`: the identity this one-off runs as, over the service's own.
     pub run_user: Option<&'a str>,
     /// `down --rmi <local|all>`: `Some(false)` removes the images this file BUILDS, `Some(true)`

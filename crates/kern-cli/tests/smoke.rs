@@ -4027,3 +4027,222 @@ fn a_later_refused_service_leaves_no_pod_behind() {
         "an earlier service outlived the failed bring-up:\n{ps}"
     );
 }
+
+/// A SERVICE'S LOG SPANS ITS RESTARTS AND ENDS AT `down`, as a container's does under Docker.
+///
+/// MEASURED against Docker on one file: after two `compose restart`s Docker's `logs` held three runs'
+/// lines and kern's one, so the output of a run that crashed was gone once it was restarted; and
+/// kern kept every run's log file after `down`. Asserted: three runs after two restarts, `--tail k`
+/// the last k lines of that history for every k, one run after `down` + `up`.
+#[test]
+fn a_services_log_spans_its_restarts_and_ends_at_down() {
+    let dir = std::env::temp_dir().join(format!("kern-it-logs-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-logs-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> String {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(_) => String::new(),
+        }
+    };
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  s:\n    image: alpine\n    command: [\"sh\", \"-c\", \"echo RUN-$$$$; sleep 60\"]\n",
+    );
+    let c = |verb: &[&str]| {
+        let mut a = vec!["compose", "-f", "compose.yml", "-p", "logspan"];
+        a.extend_from_slice(verb);
+        run(&a)
+    };
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(800));
+    let _ = c(&["up", "-d"]);
+    pause();
+    let _ = c(&["restart"]);
+    pause();
+    let _ = c(&["restart"]);
+    pause();
+    let count = |s: &str| s.lines().filter(|l| l.contains("RUN-")).count();
+    let full = c(&["logs"]);
+    let all = count(&full);
+    // `--tail k` is the last k lines of the whole history, for every k, so some k crosses from the
+    // newest run into the one before it. Compared as text, not by counting `RUN-` lines: a run's log
+    // can also hold kern's own start-up notes (a non-root host without cgroup delegation writes two),
+    // so the lines per run are not known in advance.
+    let lines: Vec<&str> = full.lines().collect();
+    let tails: Vec<(usize, bool)> = (1..=lines.len())
+        .map(|k| {
+            let got = c(&["logs", "--tail", &k.to_string()]);
+            (
+                k,
+                got.lines().collect::<Vec<_>>() == lines[lines.len() - k..],
+            )
+        })
+        .collect();
+    let _ = c(&["down"]);
+    let _ = c(&["up", "-d"]);
+    pause();
+    let fresh = count(&c(&["logs"]));
+    let _ = c(&["down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if all == 0 {
+        eprintln!("SKIP: this host did not run the service");
+        return;
+    }
+    assert_eq!(all, 3, "three runs after two restarts");
+    let wrong: Vec<usize> = tails
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(k, _)| *k)
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "--tail k is not the last k lines for k in {wrong:?}:\n{full}"
+    );
+    assert_eq!(fresh, 1, "after down + up the history starts over");
+}
+
+/// A STACK LEAVES NO EXITED ROW IN `ps -a`: not after `down`, and not beside a restarted service.
+///
+/// MEASURED against Docker on a 1:1 run of the same files, three ways kern left one. A
+/// `network_mode: service:X` sidecar was recorded with no pod, so `down` never found its record (one
+/// `exit 137` row per run, four after four runs). A service that exits on its stop signal (sshd) had
+/// its supervisor write the record AFTER `down` had cleared them, one run in three. And `restart`
+/// left the stopped run's row beside the new box, where Docker restarts one container.
+#[test]
+fn a_stack_leaves_no_exited_row_after_down_or_a_restart() {
+    let dir = std::env::temp_dir().join(format!("kern-it-psa-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-psa-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> String {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(_) => String::new(),
+        }
+    };
+    let trap = "[\"sh\", \"-c\", \"trap 'exit 0' TERM; while :; do sleep 1; done\"]";
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        format!(
+            "services:\n  s:\n    image: alpine\n    command: {trap}\n  back:\n    image: alpine\n    \
+             command: {trap}\n  sidecar:\n    image: alpine\n    network_mode: \"service:back\"\n    \
+             command: [\"sleep\", \"600\"]\n"
+        ),
+    );
+    let c = |verb: &[&str]| {
+        let mut a = vec!["compose", "-f", "compose.yml", "-p", "psa"];
+        a.extend_from_slice(verb);
+        run(&a)
+    };
+    let exited = || -> Vec<String> {
+        run(&["ps", "-a"])
+            .lines()
+            .filter(|l| l.contains("psa-") && l.contains(" exit "))
+            .map(str::to_string)
+            .collect()
+    };
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(600));
+    let _ = c(&["up", "-d"]);
+    pause();
+    let ran = run(&["ps"]).contains("sidecar");
+    let _ = c(&["restart", "s"]);
+    pause();
+    let after_restart = exited();
+    let mut after_down = Vec::new();
+    for _ in 0..3 {
+        let _ = c(&["down"]);
+        after_down.extend(exited());
+        let _ = c(&["up", "-d"]);
+        pause();
+    }
+    let _ = c(&["down"]);
+    after_down.extend(exited());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if !ran {
+        eprintln!("SKIP: this host did not run the stack");
+        return;
+    }
+    assert!(
+        after_restart.is_empty(),
+        "a restarted service left an exited row: {after_restart:?}"
+    );
+    assert!(
+        after_down.is_empty(),
+        "`down` left exited rows: {after_down:?}"
+    );
+}
+
+/// THE SHAPE OF A CODE SANDBOX, RUN AS A ONE-OFF: `network_mode: none`, `read_only`, a `/tmp` tmpfs,
+/// and the script mounted INTO that tmpfs with `run -v`. MEASURED against Docker on a case written
+/// for both: kern took the `-v` spec for the service name, then (with `-v` read) mounted the tmpfs
+/// over the bind so the script was not there, and the one-off joined the stack's pod with outbound.
+/// Docker ran the script with no network.
+#[test]
+fn a_sandbox_one_off_mounts_its_script_inside_its_tmpfs_with_no_network() {
+    let dir = std::env::temp_dir().join(format!("kern-it-sandbox1-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-sandbox1-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  sandbox:\n    image: alpine\n    network_mode: \"none\"\n    read_only: true\n    \
+         tmpfs:\n      - /tmp:size=8m,mode=1777\n",
+    );
+    let _ = std::fs::write(
+        dir.join("job.sh"),
+        "echo SCRIPT-RAN; ip -o link | grep -vc ': lo:' ; echo IFACES-DONE\n",
+    );
+    let spec = format!("{}:/tmp/job.sh:ro", dir.join("job.sh").display());
+    let out = match kern()
+        .current_dir(&dir)
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args([
+            "compose",
+            "-f",
+            "compose.yml",
+            "-p",
+            "sbx1",
+            "run",
+            "--rm",
+            "-v",
+            &spec,
+            "sandbox",
+            "sh",
+            "/tmp/job.sh",
+        ])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => e.to_string(),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    assert!(
+        out.contains("SCRIPT-RAN"),
+        "the script mounted inside the tmpfs must run:\n{out}"
+    );
+    let ifaces: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.contains("SCRIPT-RAN"))
+        .skip(1)
+        .take(1)
+        .collect();
+    assert_eq!(
+        ifaces,
+        vec!["0"],
+        "a `network_mode: none` one-off has no interface but lo:\n{out}"
+    );
+}

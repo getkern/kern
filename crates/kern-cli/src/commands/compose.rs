@@ -976,6 +976,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         run_name,
         run_entrypoint,
         run_env,
+        run_volumes,
         run_user,
         bridge: want_bridge,
         allow_privileged,
@@ -2145,6 +2146,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             }
             // Stopped BEFORE the launch loop so the name is free when it is recreated.
             let _ = stop(&stale, false);
+            // A RECREATED service starts a new history, as a new container does under Docker: its
+            // logs and its exit record go with the old box.
+            for n in &stale {
+                crate::commands::remove_logs_of(n);
+            }
+            crate::registry::clear_waitexit_pod(&pod, &stale);
         }
         // `-V/--renew-anon-volumes`: AFTER the stop and BEFORE the launch loop, which is the only
         // window where the volume is neither held by the old box nor yet needed by the new one. A
@@ -2936,6 +2943,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             run_name,
             run_entrypoint,
             run_env,
+            run_volumes,
             run_user,
             detach,
             _pod_guard.as_ref().map(|g| &g.started),
@@ -3836,6 +3844,8 @@ fn compose_run(
     entrypoint: Option<&str>,
     // `-e KEY=VALUE`: environment for this one-off, applied over the service's own.
     env: &[String],
+    // `-v SRC:DST[:ro]`: mounts for this one-off, beside the service's own.
+    volumes: &[String],
     // `--user <uid[:gid]>`: the identity this one-off runs as, over the service's own.
     user: Option<&str>,
     // `-d`: start the one-off and return, instead of waiting for it.
@@ -3980,7 +3990,11 @@ fn compose_run(
             )));
         }
         c.arg("--network").arg(format!("container:{t}"));
-    } else if crate::pod::holder_pid(pod).is_some() {
+    // `network_mode: none` AND `host` STAY OUT OF THE POD FOR A ONE-OFF TOO, as they do at `up`: a
+    // pod would hand a `none` service peers and egress. MEASURED with a sandbox service declaring
+    // `network_mode: none`: `compose run` joined the stack's pod and announced outbound through
+    // pasta, where Docker's one-off had no network at all.
+    } else if !b.net && !b.net_none && crate::pod::holder_pid(pod).is_some() {
         c.arg("--pod").arg(pod);
         // ON A BRIDGE, JOINING THE POD IS NOT ENOUGH. A member keeps its own network namespace and
         // takes an address on the bridge; a one-off that only joined the pod's USER namespace had no
@@ -4029,6 +4043,10 @@ fn compose_run(
     // caller's answer for this one run.
     for e in env {
         c.arg("--env").arg(e);
+    }
+    // The one-off's own mounts, beside the service's: `kern box -v` takes the same spec Docker does.
+    for v in volumes {
+        c.arg("-v").arg(v);
     }
     // AFTER the service's own `user:`, for the same reason: the flag is the caller's answer for this
     // one run, and `kern box` lets the later `--user` win.

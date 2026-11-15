@@ -885,26 +885,31 @@ impl Followed {
         pid: i32,
         tail: Option<usize>,
     ) -> Result<Option<Self>, Error> {
-        use std::io::{Read, Seek, SeekFrom};
-        let Some(path) = newest_log(&box_name)? else {
+        use std::io::Read;
+        // EVERY RUN OF THE SERVICE, OLDEST FIRST, as a container's log spans its restarts under
+        // Docker. MEASURED: after two `compose restart`s Docker's `logs` held three runs' lines and
+        // kern's one, so the output of the run that crashed was gone the moment it was restarted.
+        // The runs are the ones since `up` created the service: `down` and a recreation remove a
+        // service's old logs (see `remove_logs_of`), as Docker removes the container with its log.
+        let runs = logs_oldest_first(&box_name)?;
+        let Some(path) = runs.last().cloned() else {
             return Ok(None);
         };
+        let mut all = Vec::new();
+        for older in runs.iter().take(runs.len() - 1) {
+            if let Ok(mut f) = std::fs::File::open(older) {
+                let _ = f.read_to_end(&mut all);
+            }
+        }
         let mut file =
             std::fs::File::open(&path).map_err(|e| Error::Sandbox(format!("opening log: {e}")))?;
+        // Reading the newest run to its end also leaves the cursor at EOF, so the follow streams
+        // only NEW appends.
+        file.read_to_end(&mut all)
+            .map_err(|e| Error::Sandbox(format!("reading log: {e}")))?;
         let pending = match tail {
-            Some(n) => {
-                let window = tail_file(&mut file, n)?;
-                // Leave the cursor at EOF so the follow streams only NEW appends.
-                file.seek(SeekFrom::End(0))
-                    .map_err(|e| Error::Sandbox(format!("seeking log: {e}")))?;
-                window
-            }
-            None => {
-                let mut all = Vec::new();
-                file.read_to_end(&mut all)
-                    .map_err(|e| Error::Sandbox(format!("reading log: {e}")))?;
-                all
-            }
+            Some(n) => last_lines(&all, n).to_vec(),
+            None => all,
         };
         Ok(Some(Self {
             label,
@@ -1048,6 +1053,89 @@ pub(crate) fn follow_many(
             return Ok(());
         }
         unsafe { libc::usleep(200_000) }; // 200 ms - the cadence `follow_log` already uses
+    }
+}
+
+/// The last `n` lines of `bytes` (a trailing partial line counts as one).
+fn last_lines(bytes: &[u8], n: usize) -> &[u8] {
+    if n == 0 {
+        return &bytes[bytes.len()..];
+    }
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let mut seen = 0usize;
+    for (i, b) in body.iter().enumerate().rev() {
+        if *b == b'\n' {
+            seen += 1;
+            if seen == n {
+                return &bytes[i + 1..];
+            }
+        }
+    }
+    bytes
+}
+
+/// Is `file` one of `name`'s run logs, `<name>-<digits>.log`? Exactly that shape, so box `foo` never
+/// matches `foo-bar`'s logs (box names may contain `-`).
+fn is_run_log_of(file: &str, name: &str) -> bool {
+    file.strip_prefix(name)
+        .and_then(|r| r.strip_prefix('-'))
+        .and_then(|rest| rest.strip_suffix(".log"))
+        .is_some_and(|mid| !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Every run log of `name`, oldest first (by modification time).
+pub(crate) fn logs_oldest_first(name: &str) -> Result<Vec<PathBuf>, Error> {
+    let dir = registry::logs_dir().map_err(|e| Error::Sandbox(format!("logs dir: {e}")))?;
+    let mut runs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if is_run_log_of(&e.file_name().to_string_lossy(), name) {
+                if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                    runs.push((t, e.path()));
+                }
+            }
+        }
+    }
+    runs.sort();
+    Ok(runs.into_iter().map(|(_, p)| p).collect())
+}
+
+/// What the runs BEFORE the newest wrote, oldest first, bounded to the last `want` lines when given,
+/// and how many lines the newest run holds: what `compose logs` prints ahead of the newest run so a
+/// service's history spans its restarts, as a container's does under Docker. Empty with one run.
+pub(crate) fn earlier_runs(name: &str, tail: Option<usize>) -> Vec<u8> {
+    use std::io::Read;
+    let runs = logs_oldest_first(name).unwrap_or_default();
+    let Some((newest, older)) = runs.split_last() else {
+        return Vec::new();
+    };
+    let mut text = Vec::new();
+    for p in older {
+        if let Ok(mut f) = std::fs::File::open(p) {
+            let _ = f.read_to_end(&mut text);
+        }
+    }
+    let Some(n) = tail else {
+        return text;
+    };
+    let newest_lines = std::fs::read(newest)
+        .map(|b| b.iter().filter(|c| **c == b'\n').count())
+        .unwrap_or(0);
+    if n <= newest_lines {
+        return Vec::new();
+    }
+    last_lines(&text, n - newest_lines).to_vec()
+}
+
+/// Remove every run log of `name` and its index, as Docker removes a container's log with the
+/// container: called by `compose down` and by a recreation, so the next life of the service starts
+/// with an empty history. Best effort: a file that is gone already is the wanted state.
+pub(crate) fn remove_logs_of(name: &str) {
+    for p in logs_oldest_first(name).unwrap_or_default() {
+        let mut idx = p.clone().into_os_string();
+        idx.push(".idx");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(PathBuf::from(idx));
     }
 }
 
@@ -2098,5 +2186,22 @@ mod log_time_totality {
         assert_eq!(parse_log_time("99999999d", 0), None);
         // And the one value that must survive all of it: a stamp this crate prints.
         assert!(parse_log_time("2026-09-18T11:20:43.731Z", now).is_some());
+    }
+}
+
+#[cfg(test)]
+mod run_log_tests {
+    /// A run log is exactly `<name>-<digits>.log`, so `foo` never takes `foo-bar`'s history, and the
+    /// last-lines window counts a trailing partial line as a line.
+    #[test]
+    fn run_logs_match_exactly_and_the_tail_window_counts_lines() {
+        assert!(super::is_run_log_of("web-123.log", "web"));
+        assert!(!super::is_run_log_of("web-bar-123.log", "web"));
+        assert!(!super::is_run_log_of("web-123.log.idx", "web"));
+        assert!(!super::is_run_log_of("web-.log", "web"));
+        assert_eq!(super::last_lines(b"a\nb\nc\n", 2), b"b\nc\n");
+        assert_eq!(super::last_lines(b"a\nb\nc", 2), b"b\nc");
+        assert_eq!(super::last_lines(b"a\nb\n", 5), b"a\nb\n");
+        assert_eq!(super::last_lines(b"a\n", 0), b"");
     }
 }

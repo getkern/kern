@@ -826,6 +826,17 @@ const BLOCK_NL: char = '\u{1}';
 /// `value[0]` with `IndexError: string index out of range`.
 const UNSET_MARK: char = '\u{2}';
 
+/// Leads every value that came from a block scalar (`|`, `>`), and is erased by [`scalar_str`]: the
+/// value is OPAQUE text, so nothing may read YAML structure out of it.
+///
+/// ⛔ A BLOCK OPENING A LIST ITEM WAS READ AS A MAPPING when its text held a `: `. The body is folded
+/// onto the `- ` line, and the item reader then took the first `: ` in the SCRIPT for a key. MEASURED
+/// against Docker Compose: `- |` with `echo A` and `echo key: value` ran only `echo key: value` (and
+/// a comment line `# note: x` dropped the lines above it); a Python `-c` block with
+/// `# ... minimal: use TCP` reached the interpreter as `{import os, ...` and died on `SyntaxError`,
+/// where Docker ran it. [`BLOCK_NL`] could not be the mark: a one-line `|-` block has no line break.
+const BLOCK_OPAQUE: char = '\u{3}';
+
 /// Fold the multi-line YAML the line scanner can't span, before prescreen/lex:
 ///  * BLOCK SCALARS - `key: |`/`>` and the list form `- |`/`- >` (with `-`/`+`/indent indicators): the
 ///    indented body becomes ONE value; `|` (literal) keeps line breaks as [`BLOCK_NL`], `>` (folded)
@@ -837,6 +848,9 @@ const UNSET_MARK: char = '\u{2}';
 fn fold_multiline(text: &str) -> Result<String, String> {
     if text.contains(BLOCK_NL) {
         return Err("control character U+0001 is not allowed in a compose file".into());
+    }
+    if text.contains(BLOCK_OPAQUE) {
+        return Err("control character U+0003 is not allowed in a compose file".into());
     }
     // U+0000 is refused for a different reason than U+0001, which is only barred because it is the
     // sentinel above. Every consumer of a compose value downstream is a C string or a path, so a NUL
@@ -925,7 +939,7 @@ fn fold_multiline(text: &str) -> Result<String, String> {
             for _ in 0..tail {
                 value.push(BLOCK_NL);
             }
-            out.push(format!("{prefix}{value}"));
+            out.push(format!("{prefix}{BLOCK_OPAQUE}{value}"));
             for _ in (i + 1)..j {
                 out.push(String::new());
             }
@@ -1277,7 +1291,7 @@ fn prescreen(text: &str) -> Result<(), String> {
         seen_content = true;
         // A folded block scalar (`fold_multiline` marked it with U+0001) is an OPAQUE value - its bytes
         // are shell-script text, not YAML structure. Skip every value-scanning check for it.
-        if line.contains(BLOCK_NL) {
+        if line.contains(BLOCK_NL) || line.contains(BLOCK_OPAQUE) {
             continue;
         }
         // Block-level anchors (`key: &c`), aliases (`key: *c`) and merge keys (`<<: *c` / `<<: [*a,*b]`)
@@ -1609,7 +1623,7 @@ fn lex(text: &str) -> Result<Vec<Line>, String> {
         }
         // A folded block scalar carries literal `#`s (shell comments) inside its U+0001-joined body -
         // do NOT run the comment scanner over it, or the body would be truncated at the first `#`.
-        let stripped = if raw.contains(BLOCK_NL) {
+        let stripped = if raw.contains(BLOCK_NL) || raw.contains(BLOCK_OPAQUE) {
             raw.to_string()
         } else {
             strip_comment_precise(raw)
@@ -1776,7 +1790,8 @@ fn build_tree(lines: &[Line]) -> Result<Node, String> {
             // block-key colon (see `colon_index`) and is pushed as it is, the shape the readers parse.
             // MEASURED on a Jetson before that rule: it was wrapped a second time, `{{...}}`, its keys
             // were lost, and a GPU reservation written that way ran WITHOUT the GPU.
-            if colon_index(item).is_some() {
+            // A block scalar's text is never a mapping, whatever it contains (see `BLOCK_OPAQUE`).
+            if !item.starts_with(BLOCK_OPAQUE) && colon_index(item).is_some() {
                 // A placeholder, overwritten with the rendered item when it closes.
                 cur.items.push(format!("{{{item}}}"));
                 item_map = Some(ItemMap {
@@ -2628,15 +2643,16 @@ fn scalar_str(s: &str) -> String {
     if dq {
         decode_double_quoted(&t[1..t.len() - 1])
             .replace(BLOCK_NL, "\n")
-            .replace(UNSET_MARK, "")
+            .replace([UNSET_MARK, BLOCK_OPAQUE], "")
     } else if sq {
         // Single quotes take no backslash escapes at all; `''` is the only one, and it means `'`.
         t[1..t.len() - 1]
             .replace("''", "'")
             .replace(BLOCK_NL, "\n")
-            .replace(UNSET_MARK, "")
+            .replace([UNSET_MARK, BLOCK_OPAQUE], "")
     } else {
-        t.replace(BLOCK_NL, "\n").replace(UNSET_MARK, "")
+        t.replace(BLOCK_NL, "\n")
+            .replace([UNSET_MARK, BLOCK_OPAQUE], "")
     }
 }
 
@@ -10425,6 +10441,37 @@ mod tests {
             b.volumes.is_empty(),
             "a tmpfs volume is not a bind: {:?}",
             b.volumes
+        );
+    }
+
+    /// A BLOCK SCALAR OPENING A LIST ITEM IS TEXT, whatever `: ` it holds. The three shapes measured
+    /// against Docker Compose: a later line with `key: value`, a comment line with a colon (both used
+    /// to drop the lines above them), and a one-line `|-` (no line break for a mark to sit on).
+    #[test]
+    fn a_block_scalar_list_item_is_text_even_with_a_colon_inside() {
+        let src = "services:\n  t:\n    image: alpine\n    command:\n      - sh\n      - -c\n      - |\n        echo A\n        # note: with a colon\n        echo key: value\n  u:\n    image: alpine\n    command:\n      - sh\n      - -c\n      - |-\n        echo only: one\n";
+        let boxes = parse(src).expect("parses");
+        let by = |n: &str| {
+            boxes
+                .iter()
+                .find(|b| b.service_name() == n)
+                .expect("service")
+        };
+        assert_eq!(
+            by("t").command,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo A\n# note: with a colon\necho key: value\n".to_string()
+            ]
+        );
+        assert_eq!(
+            by("u").command,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo only: one".to_string()
+            ]
         );
     }
 
