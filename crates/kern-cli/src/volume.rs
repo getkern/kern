@@ -111,7 +111,7 @@ fn validate(name: &str) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::Volume(format!(
-            "invalid volume name '{name}' (letters/digits/_/./- only, no leading '-' or '.', ≤64)"
+            "invalid volume name '{name}' (letters/digits/_/./- only, no leading '-' or '.', ≤200)"
         )))
     }
 }
@@ -1400,8 +1400,12 @@ mod tests {
         ] {
             assert!(validate(bad).is_err(), "'{bad}' must be rejected");
         }
-        // a 65-char name is too long.
-        assert!(validate(&"a".repeat(65)).is_err());
+        // one byte over the shared bound is too long.
+        assert!(validate(&"a".repeat(kern_common::RESOURCE_NAME_MAX + 1)).is_err());
+        assert!(
+            validate(&"a".repeat(72)).is_ok(),
+            "a 72-byte compose project name is valid"
+        );
     }
 
     #[test]

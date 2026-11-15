@@ -607,6 +607,38 @@ pub(crate) fn proc_state(pid: i32) -> Option<char> {
     registry::stat_field(&stat, 3)?.chars().next()
 }
 
+/// Wait, at most `budget`, until the box `name` (supervisor `pid`) runs its WORKLOAD, and return its
+/// record as it is then: a recorded init whose `comm` is not kern's own. `None` when the box is gone.
+///
+/// A COMPOSE STOP REACHES A BOX THAT HAS STARTED, as Docker's does, whose init is the workload from
+/// the first instant. A box stopped while kern is still setting it up has no init in the record the
+/// caller read, so the init would get no signal, its reaper no hold, and the graceful wait no pidfd.
+/// The record is refreshed here once the workload runs.
+pub(crate) fn wait_for_workload(
+    name: &str,
+    pid: i32,
+    budget: std::time::Duration,
+) -> Option<registry::Instance> {
+    let own = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
+    let until = std::time::Instant::now() + budget;
+    loop {
+        let inst = registry::find(name).filter(|i| i.pid == pid)?;
+        let running = inst.live_pid1().is_some_and(|p1| {
+            std::fs::read_to_string(format!("/proc/{p1}/comm")).is_ok_and(|c| c != own)
+        });
+        // A RUN THAT HAS ENDED IS NOT WAITED ON: its init is gone, or the supervisor recorded its
+        // code before a restart backoff. Waiting for "the workload" then waits for the NEXT run,
+        // which is the restart the stop is there to prevent (MEASURED: an `on-failure:3` service
+        // stopped in its backoff ran twice).
+        let between_runs = (inst.pid1_recorded > 0 && inst.live_pid1().is_none())
+            || registry::box_exit(inst.pid, inst.starttime).is_some();
+        if running || between_runs || std::time::Instant::now() >= until {
+            return Some(inst);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// How long `stop` waits for a box's supervisor once the workload has exited. The supervisor's own
 /// teardown after its init exits is milliseconds; the bound only keeps a wedged one from holding
 /// `stop` for ever.
@@ -841,12 +873,30 @@ pub(crate) enum GraceSignal {
 /// and 4007 ms across three runs, against 2006 ms once the second send was removed, with the box's
 /// own log showing the trap entered TWICE. It is not only latency: a shutdown handler that flushes,
 /// deregisters or writes a final record ran twice for every `kern stop`.
+/// What a stop does with an init that cannot receive its stop signal (default disposition: the kernel
+/// discards it for a PID-namespace init, so the signal is never heard).
+///
+/// AN ENUM AND NOT A `bool`, for the reason [`GraceSignal`] is one: two callers with two obligations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeafInit {
+    /// Kill it at once: waiting is a guaranteed delay. `kern stop` and the sandbox SDKs, whose
+    /// teardown is on a deadline (the Node SDK gives `kern stop` 5 s).
+    Kill,
+    /// Wait out the grace anyway, returning as soon as it exits, as Docker does. The workload keeps
+    /// running for the grace and can finish what it was doing: MEASURED against Docker, a compose
+    /// file whose `ml-trainer` (Python as PID 1, no SIGTERM handler) was still importing torch when
+    /// `--abort-on-container-exit` stopped the stack printed its result under Docker and nothing
+    /// under kern, which killed it on the spot. Every `kern compose` teardown uses this.
+    WaitGrace,
+}
+
 pub(crate) fn kill_box_graceful(
     pid: i32,
     pid1: i32,
     stop_signal: i32,
     grace_ms: u64,
     pre: GraceSignal,
+    deaf: DeafInit,
 ) -> Teardown {
     // The init may ALREADY be gone: `stop` signals the supervisor's process group before it reaches
     // here, and a box init that sits in that group takes that signal too, so it can be an unreaped
@@ -866,7 +916,9 @@ pub(crate) fn kill_box_graceful(
         // kernel discards it for a PID-namespace init, so waiting on it is a guaranteed delay.
         let graceful = grace_ms > 0
             && already.is_none()
-            && (init_catches_signal(pid1, stop_signal) || init_ignores_signal(pid1, stop_signal));
+            && (deaf == DeafInit::WaitGrace
+                || init_catches_signal(pid1, stop_signal)
+                || init_ignores_signal(pid1, stop_signal));
         if graceful {
             // Graceful phase: the configured signal to the box init, and to the supervisor's group so
             // a foreground box's helpers hear it too. SKIPPED ENTIRELY when the caller has already

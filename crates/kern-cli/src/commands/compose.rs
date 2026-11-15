@@ -1034,6 +1034,30 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         all.extend(profiles.iter().cloned());
         crate::set_global_env("COMPOSE_PROFILES", all.join(","));
     }
+    // A VERB THAT ACTS ON WHAT IS RUNNING SEES EVERY SERVICE, whatever profile is active, because
+    // Docker finds those containers by project and not by profile. MEASURED against Docker on a file
+    // whose only service is behind `profiles: [frontend]`, started with `--profile frontend up -d`:
+    // a plain `ps` listed it under Docker and was refused by kern ("every service is behind an
+    // inactive profile"), and so was `down`, which left the service running. `down` here stops it
+    // (Docker's `down` without the profile leaves it running and exits 0, which is the one place
+    // kern does more). Starting verbs keep the profile rule.
+    if matches!(
+        action,
+        ComposeAction::Down
+            | ComposeAction::Stop
+            | ComposeAction::Ps
+            | ComposeAction::Logs
+            | ComposeAction::Port
+            | ComposeAction::Wait
+            | ComposeAction::Events
+            | ComposeAction::Rm
+            | ComposeAction::Top
+            | ComposeAction::Exec
+            | ComposeAction::Cp
+            | ComposeAction::Images
+    ) {
+        crate::set_global_env("COMPOSE_PROFILES", "*");
+    }
     // The override `docker compose` would have loaded, appended so it merges LAST (see
     // `default_override_for` for the three conditions and what each one was measured against).
     let with_override: Vec<String>;
@@ -2071,7 +2095,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                  run but reach neither each other nor their published ports. Recreating: {}",
                 short.join(", ")
             );
-            let _ = stop(&cut_off, false);
+            let _ = crate::commands::inspect::stop_with_grace(
+                &cut_off,
+                false,
+                None,
+                crate::commands::DeafInit::WaitGrace,
+            );
         }
     }
     if action == ComposeAction::Start {
@@ -2145,7 +2174,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 _ => println!("→ definition changed, recreating: {}", short.join(", ")),
             }
             // Stopped BEFORE the launch loop so the name is free when it is recreated.
-            let _ = stop(&stale, false);
+            // Docker's grace, as every compose teardown: see `DeafInit::WaitGrace`.
+            let _ = crate::commands::inspect::stop_with_grace(
+                &stale,
+                false,
+                None,
+                crate::commands::DeafInit::WaitGrace,
+            );
             // A RECREATED service starts a new history, as a new container does under Docker: its
             // logs and its exit record go with the old box.
             for n in &stale {
@@ -3953,10 +3988,15 @@ fn compose_run(
     // `entrypoint:`.
     if let Some(e) = entrypoint {
         if let Some(bm) = boxes.get_mut(idx) {
-            // Docker takes a STRING here and splits it as a shell would; the file's own
-            // `entrypoint:` may be a list. One element is the faithful reading of the flag: the
-            // whole value is the program, and anything after it on the command line is its argv.
-            bm.entrypoint = Some(vec![e.to_string()]);
+            // DOCKER TAKES A STRING HERE AND SPLITS IT AS A SHELL WOULD, through the same splitter
+            // a string `command:` goes through. MEASURED against Docker: `run --entrypoint "sh -c
+            // 'exit 42'" svc` exited 42 under Docker and 127 under kern, which looked for a program
+            // named `sh -c 'exit 42'`. An empty value keeps its meaning, clearing the entrypoint.
+            bm.entrypoint = Some(if e.is_empty() {
+                vec![String::new()]
+            } else {
+                crate::compose::split_argv(e)
+            });
         }
     }
     // `network_mode: service:X` HOLDS FOR THE ONE-OFF TOO, as under Docker: it runs in X's network
@@ -4137,6 +4177,8 @@ fn watch_and_abort(
     // --abort-on-container-exit --exit-code-from tests` on a `redis-cli ping` test hung until the
     // job's own timeout. A gone box is opened with pid 0, which no live entry has, so the follow
     // drains its log once and reads it as ended.
+    // The service whose run ended first, as the watcher below saw it.
+    let ended_first: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let mut who = Vec::with_capacity(mine.len());
     for b in mine {
         let pid = registry::find_ref(&b.name).map_or(0, |ins| ins.pid);
@@ -4151,7 +4193,16 @@ fn watch_and_abort(
             Err(e) => eprintln!("kern: warning: {}: {e}", b.service_name()),
         }
     }
-    if who.is_empty() {
+    // The teardown, run once by whichever side sees the stack end first.
+    let tear_down = || {
+        println!("compose up: a service exited, stopping the stack");
+        let selected: Vec<String> = mine.iter().map(|b| b.name.clone()).collect();
+        // KEEPING THE EXIT RECORDS, because the status being adopted may be one this very teardown
+        // is about to produce: `--exit-code-from db`, where `db` never exits on its own, reports
+        // the 137 the stop leaves behind. Reaping inside the teardown made every one of these exit 0.
+        crate::commands::tear_down_stack_keeping(all, &selected, pod, false, None)
+    };
+    let torn_down = if who.is_empty() {
         // NO LOG TO FOLLOW IS NOT A REASON TO ABORT AT ONCE. Every box could have been launched in
         // a way that left no log file, and tearing the stack down on the first pass would report a
         // status for a service that had not run. Poll the registry instead, which is the same
@@ -4162,48 +4213,90 @@ fn watch_and_abort(
         {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
+        None
     } else {
-        // A SERVICE WITH NO LOG FILE STILL ENDS THE WAIT. `follow_many` stops when a service IT
-        // follows ends, and one whose log file did not exist yet when the loop above ran (the case
-        // `Followed::open` answers `None` for, and the branch above polls for) is not in `who`, so
-        // its exit went unseen while the follow waited on the others. A watcher on the registry
-        // stops the follow when ANY of them is gone; the pass that sees the flag still drains what
-        // the others wrote. NOT what the smoke test exercises: a box that prints nothing still has
-        // an empty log file and is followed (measured: removing this watcher keeps that test
-        // green). Together with the skipped-gone-box bug it was the hang; on its own it is the
-        // second line for the same shape.
-        let ended = std::sync::atomic::AtomicBool::new(false);
+        // A SERVICE WITH NO LOG FILE STILL ENDS THE WAIT: a watcher on the registry sees ANY of
+        // them go, including one whose log did not exist yet when the follow opened.
+        //
+        // THE LOGS KEEP STREAMING WHILE THE STACK STOPS, as Docker's do. The watcher that sees the
+        // first exit runs the teardown itself, and the follow goes on until every box is gone.
+        // MEASURED against Docker: with `cpu-worker` exiting at once beside an `ml-trainer` still
+        // importing torch, Docker's `up --abort-on-container-exit` printed the trainer's two result
+        // lines while it stopped the stack, and kern, which ended the follow at the first exit,
+        // printed neither.
+        let teardown_done = std::sync::atomic::AtomicBool::new(false);
         let finished = std::sync::atomic::AtomicBool::new(false);
+        let torn = std::sync::Mutex::new(None);
         std::thread::scope(|sc| {
             sc.spawn(|| {
                 use std::sync::atomic::Ordering;
+                // A RUN THAT ENDS IS AN EXIT, even when the service's restart policy is about to
+                // start the next one, which is what Docker's flag reads ("stops all containers if
+                // any container was stopped"). The box outlives its runs, so its init is watched:
+                // gone, or replaced by a new one, means the run ended. MEASURED against Docker on
+                // an `on-failure:3` service that always fails: Docker stopped the stack after the
+                // first exit, kern after the third restart.
+                let mut inits: Vec<Option<(i32, u64)>> = vec![None; mine.len()];
                 while !finished.load(Ordering::Acquire) {
-                    if mine.iter().any(|b| registry::find_ref(&b.name).is_none()) {
-                        ended.store(true, Ordering::Release);
+                    let mut gone: Option<String> = None;
+                    for (i, b) in mine.iter().enumerate() {
+                        let Some(ins) = registry::find_ref(&b.name) else {
+                            gone = Some(b.name.clone());
+                            break;
+                        };
+                        // THE RUN'S OWN EXIT RECORD, which the supervisor writes before its restart
+                        // backoff and which stays there for the whole backoff: a run of a few ms is
+                        // seen here even when it began and ended between two polls of its init.
+                        // MEASURED: an `echo; exit 1` service ran four times before the stack
+                        // stopped, the init check alone having missed every run.
+                        if registry::box_exit(ins.pid, ins.starttime).is_some() {
+                            gone = Some(b.name.clone());
+                            break;
+                        }
+                        if ins.pid1_recorded <= 0 {
+                            continue;
+                        }
+                        let now = (ins.pid1_recorded, ins.pid1_starttime);
+                        let seen = *inits[i].get_or_insert(now);
+                        if seen != now || ins.live_pid1().is_none() {
+                            gone = Some(b.name.clone());
+                            break;
+                        }
+                    }
+                    if let Some(g) = gone {
+                        // Who ended it is read BEFORE the teardown, or every service looks exited.
+                        if let Ok(mut w) = ended_first.lock() {
+                            w.get_or_insert(g);
+                        }
+                        let result = tear_down();
+                        if let Ok(mut t) = torn.lock() {
+                            *t = Some(result);
+                        }
+                        teardown_done.store(true, Ordering::Release);
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             });
-            let r = crate::commands::follow_many(who, &ended, true);
+            let r = crate::commands::follow_many(who, &teardown_done, false);
             finished.store(true, std::sync::atomic::Ordering::Release);
             r
         })?;
-    }
+        torn.into_inner().ok().flatten()
+    };
 
-    // Whoever is gone now is who ended it. Read BEFORE the teardown, or every service looks exited.
-    let first_gone: Option<String> = mine
-        .iter()
-        .find(|b| registry::find_ref(&b.name).is_none())
-        .map(|b| b.name.clone());
-
-    println!("compose up: a service exited, stopping the stack");
-    let selected: Vec<String> = mine.iter().map(|b| b.name.clone()).collect();
-    // KEEPING THE EXIT RECORDS, because the status being adopted may be one this very teardown is
-    // about to produce: `--exit-code-from db`, where `db` never exits on its own, reports the 137
-    // the stop leaves behind. Reaping inside the teardown made every one of these exit 0.
-    let ((stopped, pod_existed), names) =
-        crate::commands::tear_down_stack_keeping(all, &selected, pod, false, None);
+    // Whoever is gone now is who ended it, or the service whose run ended first (a restart policy
+    // keeps its box). Read BEFORE a teardown this side still has to run.
+    let first_gone: Option<String> =
+        ended_first.lock().ok().and_then(|w| w.clone()).or_else(|| {
+            mine.iter()
+                .find(|b| registry::find_ref(&b.name).is_none())
+                .map(|b| b.name.clone())
+        });
+    let ((stopped, pod_existed), names) = match torn_down {
+        Some(done) => done,
+        None => tear_down(),
+    };
     crate::commands::print_down_summary(stopped, pod_existed, pod);
 
     // The status: the NAMED service's if one was named (137 when the teardown is what ended it),

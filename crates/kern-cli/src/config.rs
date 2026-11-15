@@ -3412,8 +3412,11 @@ mod tests {
         assert_eq!(field_state("name", "-lead"), Invalid); // leading '-' is unfixable
         assert_eq!(field_state("name", ".hidden"), Invalid); // leading '.'
         assert_eq!(field_state("name", "a..b"), Invalid); // traversal
-        assert_eq!(field_state("name", &"x".repeat(65)), Invalid); // too long
-                                                                   // And the same anti-dead-end invariant for names: field_state Valid ⇒ validate accepts.
+        assert_eq!(
+            field_state("name", &"x".repeat(kern_common::RESOURCE_NAME_MAX + 1)),
+            Invalid
+        ); // too long
+           // And the same anti-dead-end invariant for names: field_state Valid ⇒ validate accepts.
         for v in ["a", "web-1", "a.b", "MyBox_2", "-x", ".x", "a/b", "a:b", ""] {
             if field_state("name", v) == Valid {
                 assert!(
@@ -3485,7 +3488,7 @@ mod tests {
         assert!(validate_profile_name("../x").is_err());
         assert!(validate_profile_name("..").is_err()); // no lying "created ok" for a path-escape name
         assert!(validate_profile_name("a..b").is_err());
-        assert!(validate_profile_name(&"a".repeat(65)).is_err());
+        assert!(validate_profile_name(&"a".repeat(kern_common::RESOURCE_NAME_MAX + 1)).is_err());
     }
 
     #[test]

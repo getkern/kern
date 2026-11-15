@@ -2466,9 +2466,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 if action.is_none() {
                     return Err(Error::Usage(usage));
                 }
-                let found = discover_compose_file().ok_or_else(no_compose_file_here)?;
-                file = Some(found.clone());
-                files.push(found);
+                let found = compose_files_for_no_file().ok_or_else(no_compose_file_here)?;
+                file = found.first().cloned();
+                files.extend(found);
             }
             // `--` AFTER THE SERVICE IS A SEPARATOR, NOT THE PROGRAM TO RUN. The loop above sends
             // everything after the service name into the command, flags and all, which is what makes
@@ -2559,9 +2559,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let force_pod = rest.contains(&"--pod");
             let allow_device_grants = rest.contains(&"--allow-device-grants");
             let allow_privileged = rest.contains(&"--allow-privileged");
-            let file = discover_compose_file().ok_or_else(no_compose_file_here)?;
+            let files = compose_files_for_no_file().ok_or_else(no_compose_file_here)?;
             Command::Compose {
-                files: vec![file],
+                files,
                 action,
                 // The shorthand takes no `--pull`: it is `kern up` in a directory, and a policy
                 // override belongs to the explicit form.
@@ -5472,6 +5472,29 @@ fn discover_compose_file() -> Option<String> {
         .map(|name| (*name).to_string())
 }
 
+/// The files an invocation that named none means: `COMPOSE_FILE` when it is set, as Docker reads it
+/// (a list split on `COMPOSE_PATH_SEPARATOR`, `:` when that is unset, merged in order like repeated
+/// `-f`), else the one [`discover_compose_file`] finds. MEASURED against Docker:
+/// `COMPOSE_FILE=base.yml:override.yml docker compose --profile frontend up -d` started the merged
+/// service, and kern ignored the variable and answered "no compose file in this directory".
+/// `COMPOSE_FILE` written in the project's `.env`, which Docker also reads, is not read here.
+fn compose_files_for_no_file() -> Option<Vec<String>> {
+    let from_env = crate::global_env_str("COMPOSE_FILE").ok().and_then(|v| {
+        let sep = crate::global_env_str("COMPOSE_PATH_SEPARATOR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ":".to_string());
+        let files: Vec<String> = v
+            .split(sep.as_str())
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect();
+        (!files.is_empty()).then_some(files)
+    });
+    from_env.or_else(|| discover_compose_file().map(|f| vec![f]))
+}
+
 /// The refusal when discovery found nothing, naming every name it tried and both ways to say it
 /// explicitly.
 fn no_compose_file_here() -> Error {
@@ -6436,6 +6459,8 @@ mod tests {
     /// from the directory holding both read `ask.py` as the stack.
     #[test]
     fn a_local_file_after_cp_is_a_path_not_the_compose_file() {
+        // A verb with no file reads `COMPOSE_FILE`, process-global state.
+        let _g = crate::env_guard();
         let p = |a: &[&str]| parse(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
         let local = std::env::temp_dir().join(format!("kern-cp-arg-{}.py", std::process::id()));
         std::fs::write(&local, b"print(1)\n").unwrap();

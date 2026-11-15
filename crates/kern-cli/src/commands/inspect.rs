@@ -2275,7 +2275,7 @@ pub fn top() -> Result<(), Error> {
 }
 
 pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
-    stop_with_grace(names, all, None)
+    stop_with_grace(names, all, None, crate::commands::DeafInit::Kill)
 }
 
 /// [`stop`], with the per-invocation grace `docker compose down -t <secs>` sets.
@@ -2288,7 +2288,12 @@ pub fn stop(names: &[String], all: bool) -> Result<(), Error> {
 ///
 /// `Some(0)` IS A REAL VALUE, not "unset": Docker reads `-t 0` as "do not wait, kill now", and the
 /// `> 0` tests below are what implement that, unchanged.
-pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Result<(), Error> {
+pub fn stop_with_grace(
+    names: &[String],
+    all: bool,
+    grace: Option<u64>,
+    deaf: crate::commands::DeafInit,
+) -> Result<(), Error> {
     let dir = registry::dir().map_err(|e| Error::Sandbox(format!("registry: {e}")))?;
     let running = registry::list();
     let mut targets: Vec<_> = if all {
@@ -2363,6 +2368,16 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
     // for less is not held to the longest grace in the stack - see `remaining_grace_ms`.
     // THE STOP MARKER GOES DOWN BEFORE THE FIRST SIGNAL, so an owner that sees its box die already
     // knows a stop ended it and writes ONE history line saying so. See `registry::mark_stopping`.
+    // A COMPOSE STOP WAITS FOR A BOX STILL BEING SET UP TO RUN ITS WORKLOAD, before any signal and
+    // before the reapers are held, so everything below sees its real init. See `wait_for_workload`.
+    if deaf == crate::commands::DeafInit::WaitGrace {
+        for b in targets.iter_mut() {
+            let budget = std::time::Duration::from_secs(grace.unwrap_or(b.stop_grace));
+            if let Some(fresh) = crate::commands::wait_for_workload(&b.name, b.pid, budget) {
+                *b = fresh;
+            }
+        }
+    }
     for b in &targets {
         registry::mark_stopping(&b.name, b.pid);
     }
@@ -2414,7 +2429,20 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
             // instead of when its child happens to finish. MEASURED: dropping this turned a 3 ms
             // stop into 65 ms for exactly that shape of workload. The box's own runner is in that
             // group too and would die here - which is why `stop` holds it first, see `ReaperHold`.
-            if b.pid > 1 {
+            //
+            // ⛔ NOT FOR A COMPOSE TEARDOWN, which signals the init alone as Docker does: neither
+            // the group nor the supervisor hears it. MEASURED against Docker on
+            // `sh -c 'sleep 3; date > /out/done'` stopped at 1 s: Docker's `down` took 2.2 s and the
+            // file was written 1.95 s in, when the `sleep` finished, because the shell (PID 1, deaf)
+            // never heard the signal and its child never received one; kern's group signal killed
+            // the `sleep` at once and the script ran its next command at stop time.
+            //
+            // ⛔ A COMPOSE STOP DOES NOT SIGNAL THE SUPERVISOR EITHER. MEASURED on the desktop, a GPU
+            // service stopped by `--abort-on-container-exit` while it started exited 143 in 4 runs
+            // of 60 with the supervisor signalled, and 0 of 120 with only the init signalled. The
+            // supervisor is ended once the workload has (below), so a restart policy cannot bring
+            // the service back.
+            if b.pid > 1 && deaf == crate::commands::DeafInit::Kill {
                 unsafe { libc::kill(-b.pid, sig) };
             }
         }
@@ -2481,15 +2509,24 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
             // others, depending on whether the trap had fired before the loop got there. The
             // supervisor is let finish (its record carries the real code), then its group is swept
             // with no grace, and the code it recorded is the one reported.
-            crate::commands::wait_supervisor_done(b.pid, b.starttime);
+            // A RUN THAT ALREADY RECORDED ITS CODE is not waited on: a supervisor in its restart
+            // backoff does not finish, it restarts (MEASURED: an `on-failure:3` service stopped in
+            // its one-second backoff ran a second time while this waited two seconds for it).
+            let recorded = registry::box_exit(b.pid, b.starttime);
+            if recorded.is_none() {
+                crate::commands::wait_supervisor_done(b.pid, b.starttime);
+            }
             match kill_box_graceful(
                 b.pid,
                 0,
                 libc::SIGKILL,
                 0,
                 crate::commands::GraceSignal::AlreadySent,
+                deaf,
             ) {
-                Teardown::Gone(None) => Teardown::Gone(registry::box_exit(b.pid, b.starttime)),
+                Teardown::Gone(None) => {
+                    Teardown::Gone(recorded.or_else(|| registry::box_exit(b.pid, b.starttime)))
+                }
                 other => other,
             }
         } else {
@@ -2515,10 +2552,21 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
                 // exactly the boxes with `stop_grace > 0`, and for the rest `remaining_grace_ms` is
                 // 0 and the graceful phase is skipped, so this is true in both arms.
                 crate::commands::GraceSignal::AlreadySent,
+                deaf,
             )
         };
         if outcome.confirmed() {
-            finished.push((b.pid, b.starttime));
+            match deaf {
+                crate::commands::DeafInit::Kill => finished.push((b.pid, b.starttime)),
+                // The workload is gone and the supervisor was never signalled: end it now, before
+                // its restart policy (whose first backoff is a second) can start the next run. The
+                // teardown below is the one a SIGKILLed supervisor already gets.
+                crate::commands::DeafInit::WaitGrace => {
+                    if b.pid > 1 && registry::is_alive(b.pid, b.starttime) {
+                        unsafe { libc::kill(-b.pid, libc::SIGKILL) };
+                    }
+                }
+            }
         }
         // A `stop` signals the supervisor's group, so the supervisor never records its own exit code.
         // We record it here - BEFORE removing the instance file - so `kern wait` on a stopped box

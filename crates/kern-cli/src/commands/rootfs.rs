@@ -1089,7 +1089,10 @@ pub(crate) fn resolve_relative_binds(
                 ))
             })?;
             if !target.exists() {
-                std::fs::create_dir_all(&target).map_err(|e| {
+                // 0755, the mode Docker's daemon creates a missing bind source with (MEASURED:
+                // `root:root 755` under Docker, `775` here with the user's umask 002).
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new().recursive(true).mode(0o755).create(&target).map_err(|e| {
                     Error::Compose(format!(
                         "service '{}': bind source '{src}' does not exist and could not be created: {e}",
                         b.name

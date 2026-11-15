@@ -2321,7 +2321,8 @@ fn validate_name(name: &str) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::Sandbox(format!(
-            "invalid pod name '{name}' (use letters, digits, '_', '-', '.'; no leading '-'/'.' or '..'; max 64)"
+            "invalid pod name '{name}' (use letters, digits, '_', '-', '.'; no leading '-'/'.' or '..'; max {})",
+            kern_common::RESOURCE_NAME_MAX
         )))
     }
 }
@@ -2401,7 +2402,7 @@ mod tests {
             "a/b",
             ".hidden",
             "has space",
-            &"x".repeat(65),
+            &"x".repeat(kern_common::RESOURCE_NAME_MAX + 1),
         ] {
             assert!(validate_name(bad).is_err(), "{bad} should be rejected");
         }

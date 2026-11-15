@@ -1978,7 +1978,14 @@ pub(crate) fn resolve_volume(
                     }
                     if let Some(planned) = planned_bind_source(source) {
                         if !crate::registry::path_overlaps_trusted_state(&planned) {
-                            let _ = std::fs::create_dir_all(source);
+                            // 0755, the mode Docker's daemon creates a missing bind source with
+                            // (MEASURED: `root:root 755` under Docker, `775` under kern with the
+                            // user's umask 002); the umask still applies on top.
+                            use std::os::unix::fs::DirBuilderExt;
+                            let _ = std::fs::DirBuilder::new()
+                                .recursive(true)
+                                .mode(0o755)
+                                .create(source);
                         }
                     }
                 }
@@ -6038,7 +6045,10 @@ fn stop_stack(
     // what was alive when it began.
     let was_alive: Vec<String> = names.iter().filter(|n| is_box_alive(n)).cloned().collect();
     for batch in stop_batches(boxes, &names) {
-        let _ = crate::commands::inspect::stop_with_grace(&batch, false, grace);
+        // A compose teardown waits the grace even for an init that cannot hear the signal, as
+        // Docker does: see `DeafInit::WaitGrace`.
+        let _ =
+            crate::commands::inspect::stop_with_grace(&batch, false, grace, DeafInit::WaitGrace);
     }
     for n in &names {
         if !is_box_alive(n) {
@@ -9988,30 +9998,65 @@ fn run_terminal_verb(
             // running" is hardest to answer any other way. A host that cannot delegate a cgroup has
             // no list to give, and says so per service instead of printing an empty table that reads
             // as "no processes".
+            // DOCKER'S TABLE: one for the stack, a row per process, the columns `ps -ef` gives
+            // (SERVICE # UID PID PPID C STIME TTY TIME CMD). MEASURED against Docker Compose v5: a
+            // script reading `compose top` by column got Docker's ten and kern's two (PID, COMMAND),
+            // under a header per service. `#` is the replica, always 1 here.
             let mut any = false;
+            let mut rows: Vec<[String; 10]> = Vec::new();
+            let mut unreadable: Vec<&str> = Vec::new();
             for b in boxes.iter().filter(|b| selected(b)) {
                 let Some(inst) = registry::find(&b.name) else {
                     continue;
                 };
                 any = true;
-                let p = crate::ui::Palette::detect();
-                println!("{}{}{}{}", p.b, p.c, b.service_name(), p.z);
                 match box_processes(inst.pid1_recorded) {
-                    Some(procs) if !procs.is_empty() => {
-                        println!("{d}{:>8}  COMMAND{z}", "PID", d = p.d, z = p.z);
+                    Some(procs) => {
                         for (pid, cmd) in procs {
-                            println!("{pid:>8}  {}", crate::ui::scrub(&cmd));
+                            if let Some(r) = top_row(b.service_name(), pid, &cmd) {
+                                rows.push(r);
+                            }
                         }
                     }
-                    Some(_) => println!("  (no processes)"),
-                    None => println!(
-                        "  (no delegated cgroup on this host, so the process list cannot be read - \
-                         `kern doctor` says which host you are on)"
-                    ),
+                    None => unreadable.push(b.service_name()),
                 }
             }
             if !any {
                 println!("compose top: no service of this stack is running");
+                return Ok(true);
+            }
+            if !rows.is_empty() {
+                let header = [
+                    "SERVICE", "#", "UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD",
+                ];
+                let mut width = header.map(str::len);
+                for r in &rows {
+                    for (w, cell) in width.iter_mut().zip(r.iter()) {
+                        *w = (*w).max(cell.chars().count());
+                    }
+                }
+                let line = |cells: &[&str]| {
+                    let mut out = String::new();
+                    for (i, c) in cells.iter().enumerate() {
+                        if i + 1 == cells.len() {
+                            out.push_str(c);
+                        } else {
+                            out.push_str(&format!("{c:<w$}  ", w = width[i]));
+                        }
+                    }
+                    out
+                };
+                println!("{}", line(&header));
+                for r in &rows {
+                    let cells: Vec<&str> = r.iter().map(String::as_str).collect();
+                    println!("{}", line(&cells));
+                }
+            }
+            for s in unreadable {
+                println!(
+                    "{s}: no delegated cgroup on this host, so the process list cannot be read - \
+                     `kern doctor` says which host you are on"
+                );
             }
             return Ok(true);
         }
@@ -10054,6 +10099,92 @@ fn short_service_name(box_name: &str, pod: &str) -> String {
 /// `/proc/<pid>/comm` for a kernel thread or a process whose argv has been cleared. Every read is
 /// best-effort: a process that exits between the listing and the read is skipped rather than
 /// failing the whole table.
+/// One `compose top` row, read from `/proc` the way `ps -ef` reads it: the user name on the host (as
+/// Docker shows it), the parent, the lifetime CPU percentage, the start time (HH:MM today, else the
+/// date), the terminal (`?` for none), the CPU time used and the command. `None` when the process is
+/// gone between the listing and the read.
+fn top_row(service: &str, pid: i32, cmd: &str) -> Option<[String; 10]> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let field = |n: usize| registry::stat_field(&stat, n).and_then(|v| v.parse::<u64>().ok());
+    let ppid = field(4)?;
+    let tty_nr = field(7).unwrap_or(0);
+    let utime = field(14).unwrap_or(0);
+    let stime = field(15).unwrap_or(0);
+    let start = field(22).unwrap_or(0);
+    // SAFETY: sysconf has no preconditions; a failure answers -1, folded to Linux's usual 100.
+    let tick = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+        .ok()
+        .filter(|t| *t > 0)
+        .unwrap_or(100);
+    let boot = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("btime "))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })?;
+    let started = boot + start / tick;
+    let now = registry::now_unix();
+    let cpu_secs = (utime + stime) / tick;
+    let alive = now.saturating_sub(started).max(1);
+    let c = (utime + stime) * 100 / tick / alive;
+    let uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Uid:"))
+                .and_then(|v| v.split_whitespace().next().map(str::to_string))
+        })?;
+    let user = std::fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|pw| {
+            pw.lines().find_map(|l| {
+                let mut f = l.split(':');
+                let name = f.next()?;
+                (f.nth(1)? == uid).then(|| name.to_string())
+            })
+        })
+        .unwrap_or(uid);
+    let stime_text = {
+        // 64-bit seconds, `time_t` on every target kern builds for; the alias is deprecated in
+        // `libc` for musl, so it is not named (as in `history::hms`).
+        let t = i64::try_from(started).unwrap_or(0);
+        // SAFETY: `localtime_r` reads `t` and writes only into `tm`, which lives on this stack frame.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r((&raw const t).cast(), &mut tm) }.is_null() {
+            "?".to_string()
+        } else if now.saturating_sub(started) < 86_400 {
+            format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+        } else {
+            format!("{:02}-{:02}", tm.tm_mon + 1, tm.tm_mday)
+        }
+    };
+    let tty = if tty_nr == 0 {
+        "?".to_string()
+    } else {
+        format!(
+            "{}:{}",
+            (tty_nr >> 8) & 0xfff,
+            (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00)
+        )
+    };
+    Some([
+        service.to_string(),
+        "1".to_string(),
+        user,
+        pid.to_string(),
+        ppid.to_string(),
+        c.to_string(),
+        stime_text,
+        tty,
+        format!(
+            "{:02}:{:02}:{:02}",
+            cpu_secs / 3600,
+            (cpu_secs / 60) % 60,
+            cpu_secs % 60
+        ),
+        crate::ui::scrub(cmd),
+    ])
+}
+
 fn box_processes(pid1: i32) -> Option<Vec<(i32, String)>> {
     let dir = kern_isolation::box_cgroup_dir(pid1)?;
     let procs = std::fs::read_to_string(dir.join("cgroup.procs")).ok()?;

@@ -535,7 +535,10 @@ fn parse_document(
             // READ AFTER THIS LOOP, once every own service is known, so a name an included model
             // also defines is refused rather than silently shadowed.
             "include" => include_node = Some(node.clone()),
-            other => warn(&format!("top-level '{other}:' ignored (unsupported)")),
+            other if COMPOSE_SPEC_TOP_KEYS.contains(&other) => {
+                warn(&format!("top-level '{other}:' ignored (unsupported)"))
+            }
+            other => return Err(not_a_compose_key("top level", other)),
         }
     }
     // A FILE THAT ONLY INCLUDES IS A FILE: the Specification allows a top-level document whose
@@ -5294,18 +5297,22 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             // dead-end "unsupported": a dropped health/ordering directive is not cosmetic, so a user
             // who mixed the two syntaxes would otherwise bring a stack up with no health gate and only
             // a vague warning to explain why.
+            // REFUSED, as Docker refuses them (they are not compose keys), with the line to write.
             "health_cmd" | "health_interval" | "health_retries" | "health_timeout"
-            | "health_start_period" | "health_action" => warn(&format!(
-                "service '{name}': '{key}:' is kern's TOML spelling - in a docker-compose.yml declare \
-                 a `healthcheck:` block (test / interval / retries / timeout / start_period)"
+            | "health_start_period" | "health_action" => return Err(format!(
+                "service '{name}': '{key}:' is kern's TOML spelling, not a compose key (Docker \
+                 refuses it too) - in a docker-compose.yml declare a `healthcheck:` block (test / \
+                 interval / retries / timeout / start_period)"
             )),
-            "depends_healthy" => warn(&format!(
-                "service '{name}': 'depends_healthy:' is kern's TOML spelling - in a docker-compose.yml \
-                 use `depends_on: {{ SERVICE: {{ condition: service_healthy }} }}`"
+            "depends_healthy" => return Err(format!(
+                "service '{name}': 'depends_healthy:' is kern's TOML spelling, not a compose key \
+                 (Docker refuses it too) - in a docker-compose.yml use `depends_on: {{ SERVICE: {{ \
+                 condition: service_healthy }} }}`"
             )),
-            "depends_completed" => warn(&format!(
-                "service '{name}': 'depends_completed:' is kern's TOML spelling - in a docker-compose.yml \
-                 use `depends_on: {{ SERVICE: {{ condition: service_completed_successfully }} }}`"
+            "depends_completed" => return Err(format!(
+                "service '{name}': 'depends_completed:' is kern's TOML spelling, not a compose key \
+                 (Docker refuses it too) - in a docker-compose.yml use `depends_on: {{ SERVICE: {{ \
+                 condition: service_completed_successfully }} }}`"
             )),
             // THREE EXTENSION FIELDS ARE READ, and the rest of the namespace is not.
             //
@@ -5384,7 +5391,10 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             // ignoring them is not a difference from Docker and reporting one is a false alarm. On
             // the corpus, `cpu_count` was the ONLY difference two files had.
             "cpu_count" | "cpu_percent" | "cpus_shares" | "isolation" => {}
-            other => warn(&unknown_service_key_note(name, other)),
+            other if COMPOSE_SPEC_SERVICE_KEYS.contains(&other) => {
+                warn(&unknown_service_key_note(name, other))
+            }
+            other => return Err(not_a_compose_key(&format!("service '{name}'"), other)),
         }
     }
     // `NVIDIA_VISIBLE_DEVICES` IS A GPU REQUEST, and it was the one spelling this parser said
@@ -6071,7 +6081,7 @@ fn command_value(node: &Node) -> Vec<String> {
 ///
 /// An unterminated quote yields what it has rather than an error: the file is malformed, and the
 /// workload's own argument parser gives a better message about it than this function could.
-fn split_argv(s: &str) -> Vec<String> {
+pub fn split_argv(s: &str) -> Vec<String> {
     // ONE scratch buffer, sized from the input and REUSED across arguments: an argument never holds
     // more bytes than the whole string, so the buffer never grows again after this. Each finished
     // argument is cloned out at its exact length (`clone` allocates `len`, not `capacity`), which is
@@ -7777,6 +7787,128 @@ fn edit_distance_at_most_one(a: &str, b: &str) -> bool {
     edits + (long.len() - i) + (short.len() - j) <= 1
 }
 
+/// EVERY SERVICE KEY DOCKER COMPOSE ACCEPTS, MEASURED rather than copied from a page: each candidate
+/// was written alone under a service and given to `docker compose config` (Compose v5.0.2), which
+/// answered either with a type error (the key exists) or with `additional properties '<key>' not
+/// allowed` (it does not). 92 keys exist; every misspelling tried was refused. `x-*` extension
+/// fields are accepted too and are handled before this list is asked.
+///
+/// A key OUTSIDE this list is refused, as Docker refuses it, and no longer run with a warning: a
+/// typo like `enviroment:` or an invented key like `networks_advanced:` started a stack under kern
+/// that Docker would not start at all (MEASURED on a file written for both). A key IN the list that
+/// kern does not act on still warns, because the file is valid and runs under Docker.
+const COMPOSE_SPEC_SERVICE_KEYS: [&str; 92] = [
+    "annotations",
+    "attach",
+    "blkio_config",
+    "build",
+    "cap_add",
+    "cap_drop",
+    "cgroup",
+    "cgroup_parent",
+    "command",
+    "configs",
+    "container_name",
+    "cpu_count",
+    "cpu_percent",
+    "cpu_period",
+    "cpu_quota",
+    "cpu_rt_period",
+    "cpu_rt_runtime",
+    "cpu_shares",
+    "cpus",
+    "cpuset",
+    "credential_spec",
+    "depends_on",
+    "deploy",
+    "develop",
+    "device_cgroup_rules",
+    "devices",
+    "dns",
+    "dns_opt",
+    "dns_search",
+    "domainname",
+    "entrypoint",
+    "env_file",
+    "environment",
+    "expose",
+    "extends",
+    "external_links",
+    "extra_hosts",
+    "gpus",
+    "group_add",
+    "healthcheck",
+    "hostname",
+    "image",
+    "init",
+    "ipc",
+    "isolation",
+    "label_file",
+    "labels",
+    "links",
+    "logging",
+    "mac_address",
+    "mem_limit",
+    "mem_reservation",
+    "mem_swappiness",
+    "memswap_limit",
+    "models",
+    "network_mode",
+    "networks",
+    "oom_kill_disable",
+    "oom_score_adj",
+    "pid",
+    "pids_limit",
+    "platform",
+    "ports",
+    "post_start",
+    "pre_stop",
+    "privileged",
+    "profiles",
+    "provider",
+    "pull_policy",
+    "pull_refresh_after",
+    "read_only",
+    "restart",
+    "runtime",
+    "scale",
+    "secrets",
+    "security_opt",
+    "shm_size",
+    "stdin_open",
+    "stop_grace_period",
+    "stop_signal",
+    "storage_opt",
+    "sysctls",
+    "tmpfs",
+    "tty",
+    "ulimits",
+    "use_api_socket",
+    "user",
+    "userns_mode",
+    "uts",
+    "volumes",
+    "volumes_from",
+    "working_dir",
+];
+
+/// The top-level keys Docker Compose accepts, measured the same way (v5.0.2), besides `x-*`.
+const COMPOSE_SPEC_TOP_KEYS: [&str; 9] = [
+    "version", "name", "services", "networks", "volumes", "secrets", "configs", "include", "models",
+];
+
+/// The refusal for a key Docker's schema does not have, in Docker's words, with kern's suggestion
+/// when one known key is a single edit away.
+fn not_a_compose_key(at: &str, key: &str) -> String {
+    let hint = nearest_service_key(key)
+        .map(|near| format!(" - did you mean `{near}:`?"))
+        .unwrap_or_default();
+    format!(
+        "{at}: '{key}:' is not a compose key, and Docker refuses this file too (`additional \
+         properties '{key}' not allowed`){hint}"
+    )
+}
+
 /// The service keys a near miss is measured against: every key this parser acts on, plus the ones it
 /// deliberately ignores, because a typo for an ignored key is still a typo worth naming.
 const KNOWN_SERVICE_KEYS: [&str; 47] = [
@@ -8516,7 +8648,7 @@ mod tests {
         // anchors as a whole.
         // An alias as a whole flow item IS expanded now, as docker compose v5 expands it.
         let expanded =
-            parse("x: &a alpine\nservices:\n  s:\n    image: alpine\n    command: [*a]\n")
+            parse("x-a: &a alpine\nservices:\n  s:\n    image: alpine\n    command: [*a]\n")
                 .expect("a whole-item alias in a flow list expands");
         assert_eq!(expanded[0].command, vec!["alpine".to_string()]);
         // An ANCHOR inside a flow collection is still the refused form.
@@ -11093,15 +11225,19 @@ mod tests {
             "    depends_healthy: [\"cache\"]\n",
             "    depends_completed: [\"cache\"]\n",
         );
-        let bs = boxes(y);
-        let cache = bs.iter().find(|b| b.name == "cache").expect("cache box");
-        let web = bs.iter().find(|b| b.name == "web").expect("web box");
-        // The kern-TOML health keys did NOT populate the box (docker `healthcheck:` is the way in YAML):
-        assert_eq!(cache.health_cmd, None);
-        assert_eq!(cache.health_interval, None);
-        // The kern-TOML dependency conditions created NO ordering/health edge:
-        assert!(web.depends_healthy.is_empty());
-        assert!(web.depends_completed.is_empty());
+        // REFUSED NOW, as Docker refuses them (they are not compose keys), so the file cannot start
+        // a stack whose health gate or ordering edge silently is not there. The refusal is the
+        // guidance: it names the YAML spelling to use.
+        match parse(y) {
+            Err(e) => assert!(
+                e.contains("TOML spelling") && e.contains("healthcheck:"),
+                "the refusal names what to write: {e}"
+            ),
+            Ok(bs) => panic!(
+                "kern's TOML keys in a docker-compose.yml must be refused: {} boxes",
+                bs.len()
+            ),
+        }
     }
 
     #[test]
@@ -13535,17 +13671,39 @@ mod surface_tests {
     fn every_key_kern_does_not_apply_says_so() {
         // (key, the document, the word the warning must carry beyond the key itself)
         let cases: &[(&str, &str)] = &[
-            ("configs", "services:\n  s:\n    image: alpine\n    configs:\n      - c\n"),
-            ("domainname", "services:\n  s:\n    image: alpine\n    domainname: d\n"),
+            (
+                "configs",
+                "services:\n  s:\n    image: alpine\n    configs:\n      - c\n",
+            ),
+            (
+                "domainname",
+                "services:\n  s:\n    image: alpine\n    domainname: d\n",
+            ),
             // `runtime: nvidia` is APPLIED now (NVIDIA's meaning, `kern box --runtime nvidia`), so
             // the not-applied case is another runtime, which kern cannot be.
-            ("runtime", "services:\n  s:\n    image: alpine\n    runtime: runc\n"),
+            (
+                "runtime",
+                "services:\n  s:\n    image: alpine\n    runtime: runc\n",
+            ),
             ("ipc", "services:\n  s:\n    image: alpine\n    ipc: host\n"),
             ("pid", "services:\n  s:\n    image: alpine\n    pid: host\n"),
+        ];
+        // kern's TOML spellings are not compose keys: refused, as Docker refuses them, with the
+        // YAML to write instead.
+        for (key, doc) in [
             ("health_cmd", "services:\n  s:\n    image: alpine\n    health_cmd: true\n"),
             ("depends_healthy", "services:\n  s:\n    image: alpine\n    depends_healthy:\n      - other\n  other:\n    image: alpine\n"),
             ("depends_completed", "services:\n  s:\n    image: alpine\n    depends_completed:\n      - other\n  other:\n    image: alpine\n"),
-        ];
+        ] {
+            match parse(doc) {
+                Err(e) => assert!(
+                    e.contains(key) && e.contains("TOML spelling") && e.contains("depends_on")
+                        || e.contains(key) && e.contains("healthcheck:"),
+                    "'{key}:' is refused with what to write: {e}"
+                ),
+                Ok(_) => panic!("'{key}:' is not a compose key and must be refused"),
+            }
+        }
         for (key, doc) in cases {
             let _ = take_warnings();
             let parsed = parse(doc);
@@ -13570,7 +13728,9 @@ mod surface_tests {
         }
     }
 
-    /// A key nobody has heard of is named, at both levels, and the extension mechanism is not.
+    /// A key nobody has heard of is REFUSED and named, at both levels, as Docker refuses it; a key
+    /// Docker accepts and kern does not apply still parses with a warning; the extension mechanism is
+    /// silent.
     #[test]
     fn an_unknown_key_is_named_and_an_extension_field_is_not() {
         for (doc, needle) in [
@@ -13584,12 +13744,27 @@ mod surface_tests {
             ),
         ] {
             let _ = take_warnings();
-            parse(doc).expect("an unknown key is a warning, not a parse error");
-            let said = take_warnings();
-            assert!(
-                said.iter().any(|w| w.contains(needle)),
-                "an unknown key must be named: {said:?}"
-            );
+            match parse(doc) {
+                Err(e) => assert!(
+                    e.contains(needle) && e.contains("not a compose key"),
+                    "an unknown key is refused by name: {e}"
+                ),
+                Ok(_) => panic!("a key Docker's schema does not have must be refused: {doc}"),
+            }
+        }
+        // `enviroment:` is one edit from `environment:`, and the refusal says so.
+        match parse("services:\n  s:\n    image: alpine\n    enviroment:\n      A: b\n") {
+            Err(e) => assert!(e.contains("`environment:`"), "the near key is named: {e}"),
+            Ok(_) => panic!("a misspelt key must be refused"),
+        }
+        // A key Docker accepts and kern does not act on is still a warning, not a refusal.
+        for doc in [
+            "services:\n  s:\n    image: alpine\n    blkio_config:\n      weight: 300\n",
+            "models:\n  m:\n    model: x\nservices:\n  s:\n    image: alpine\n",
+        ] {
+            let _ = take_warnings();
+            parse(doc).expect("a compose key kern does not apply parses");
+            assert!(!take_warnings().is_empty(), "and is reported: {doc}");
         }
         // `x-…` is the Compose Specification's extension mechanism: the `x-common:` + anchors idiom
         // is the commonest pattern in the ecosystem, so warning about it is a false alarm on every

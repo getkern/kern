@@ -187,14 +187,25 @@ pub fn parse_binary_size(s: &str) -> Option<u64> {
     Some(bytes as u64)
 }
 
+/// The longest pod, volume, network, secret or profile name, in bytes: the same bound and the same
+/// derivation as [`BoxName::MAX_LEN`]. Each becomes a directory or a cgroup leaf with a short prefix,
+/// inside `NAME_MAX` (255); no unix socket path and no interface name is built from it (bridges are
+/// `kbr<N>`).
+///
+/// IT WAS 64, and a compose project name becomes the pod's name: MEASURED against Docker, a
+/// 72-character `COMPOSE_PROJECT_NAME` that Docker Compose accepted was refused by kern with
+/// "invalid pod name ... max 64", before a single service started.
+pub const RESOURCE_NAME_MAX: usize = 200;
+
 /// The shared rule for a kern resource name - volume, secret, pod, profile/vdisk. Each becomes a
-/// filesystem path component and/or a `kind:name` attach token, so: non-empty, ≤64 bytes, charset
+/// filesystem path component and/or a `kind:name` attach token, so: non-empty, at most
+/// [`RESOURCE_NAME_MAX`] bytes, charset
 /// `[A-Za-z0-9_.-]`, no `..` substring (path escape), no leading `-` (argument injection) or `.`
 /// (dotfiles / `.`/`..`). One definition so the four callers can't drift into subtly different rules
 /// (a name valid for a pod but not a volume, etc.). Callers layer their own error message / type.
 pub fn valid_resource_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= RESOURCE_NAME_MAX
         && !name.contains("..")
         && !name.starts_with('-')
         && !name.starts_with('.')

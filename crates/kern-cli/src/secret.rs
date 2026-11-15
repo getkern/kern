@@ -25,7 +25,7 @@ fn valid_name(name: &str) -> bool {
 
 fn name_err(name: &str) -> Error {
     Error::Sandbox(format!(
-        "--secret name '{name}' is invalid (letters/digits/_/./- only, no '/'/'..', ≤64)"
+        "--secret name '{name}' is invalid (letters/digits/_/./- only, no '/'/'..', ≤200)"
     ))
 }
 

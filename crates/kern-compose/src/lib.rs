@@ -28,6 +28,8 @@ mod yaml;
 /// second implementation for the shim is how `/dev/net/tun` would come to mean `--tun` in one place
 /// and a plain bind in another.
 pub use yaml::normalise_devices;
+// The one shell-word splitter, for `compose run --entrypoint "<string>"` as for `command: <string>`.
+pub use yaml::split_argv;
 /// The two sentences the DRIVER owes a reader once it has chosen the wiring.
 ///
 /// Exported because the choice moved: a driver that auto-selects the wiring from the file cannot

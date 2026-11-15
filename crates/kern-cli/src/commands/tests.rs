@@ -4267,7 +4267,15 @@ mod image_rm_tests {
 
         // The fix: `kill_box` signals pid1 directly and confirms the exit before returning.
         assert!(
-            kill_box_graceful(child, child, libc::SIGTERM, 0, GraceSignal::Send).confirmed(),
+            kill_box_graceful(
+                child,
+                child,
+                libc::SIGTERM,
+                0,
+                GraceSignal::Send,
+                DeafInit::Kill
+            )
+            .confirmed(),
             "kill_box must confirm the foreground box is gone"
         );
         // Reap the zombie (kill_box confirms via the pidfd BEFORE the process is reaped).

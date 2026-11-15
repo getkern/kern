@@ -4409,6 +4409,554 @@ fn compose_ps_q_names_the_service_by_an_id_a_recreate_changes() {
     );
 }
 
+/// A COMPOSE TEARDOWN LETS AN INIT THAT CANNOT HEAR SIGTERM FINISH INSIDE ITS GRACE, AS DOCKER DOES;
+/// `kern stop` STILL KILLS IT AT ONCE.
+///
+/// MEASURED against Docker: a service whose PID 1 is Python with no SIGTERM handler (it catches only
+/// SIGINT, `SigCgt 0x2`, so the kernel discards a SIGTERM to a namespace's init) printed its result
+/// under Docker, which waits the grace before SIGKILL, and nothing under kern, which killed it on the
+/// spot. The same init here, finishing a 2 s job in-process (no child the stop signal could reach):
+/// `compose down` at 1 s must let it write its file and return well inside the 10 s grace, while
+/// `kern stop` of the same box keeps its immediate kill (the SDKs stop their boxes on a deadline).
+#[test]
+fn compose_down_lets_a_deaf_init_finish_and_kern_stop_still_kills_it() {
+    let dir = std::env::temp_dir().join(format!("kern-it-deaf-{}", std::process::id()));
+    let out = dir.join("out");
+    let _ = std::fs::create_dir_all(&out);
+    let xdg = std::env::temp_dir().join(format!("kern-it-deaf-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let job = "import time; time.sleep(2); open('/out/done', 'w').write('DONE')";
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        format!(
+            "services:\n  job:\n    image: python:3.12-slim\n    volumes:\n      - ./out:/out\n    command: [\"python3\", \"-c\", \"{job}\"]\n"
+        ),
+    );
+    let run = |args: &[&str]| {
+        kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(1000));
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "deaf", "up", "-d"]);
+    pause();
+    let ran = run(&["ps"]).contains("job");
+    let t = std::time::Instant::now();
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "deaf", "down"]);
+    let down = t.elapsed();
+    let finished = std::fs::read_to_string(out.join("done")).unwrap_or_default();
+    let _ = std::fs::remove_file(out.join("done"));
+    let spec = format!("{}:/out", out.display());
+    let name = format!("deaf-stop-{}", std::process::id());
+    let _ = run(&[
+        "box",
+        "--image",
+        "python:3.12-slim",
+        "-d",
+        "--name",
+        &name,
+        "-v",
+        &spec,
+        "--",
+        "python3",
+        "-c",
+        job,
+    ]);
+    pause();
+    let t = std::time::Instant::now();
+    let _ = run(&["stop", &name]);
+    let stop = t.elapsed();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let after_stop = out.join("done").exists();
+    let _ = run(&["rm", &name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if !ran {
+        eprintln!("SKIP: this host did not run the stack");
+        return;
+    }
+    assert_eq!(
+        finished.trim(),
+        "DONE",
+        "compose down let the job finish inside its grace"
+    );
+    assert!(
+        down > std::time::Duration::from_millis(500),
+        "it waited for the job: {down:?}"
+    );
+    assert!(
+        down < std::time::Duration::from_secs(6),
+        "and returned when it ended: {down:?}"
+    );
+    assert!(
+        stop < std::time::Duration::from_secs(1),
+        "kern stop still kills at once: {stop:?}"
+    );
+    assert!(
+        !after_stop,
+        "so the job that kern stop ended never wrote its file"
+    );
+}
+
+/// A COMPOSE TEARDOWN SIGNALS THE INIT, NOT ITS CHILDREN, AS DOCKER DOES.
+///
+/// MEASURED against Docker on `sh -c 'sleep 3; date > /out/done'` stopped at 1 s: the shell is PID 1
+/// and cannot hear SIGTERM, Docker signals only it, so the `sleep` ran to its end and the file was
+/// written 1.95 s into a 2.2 s `down`. kern signalled the whole process group, which killed the
+/// `sleep` at once and ran the script's next command at stop time. Asserted: the file is written
+/// when the `sleep` ends, not when `down` begins.
+#[test]
+fn compose_down_signals_the_init_and_not_its_children() {
+    let dir = std::env::temp_dir().join(format!("kern-it-grp-{}", std::process::id()));
+    let out = dir.join("out");
+    let _ = std::fs::create_dir_all(&out);
+    let xdg = std::env::temp_dir().join(format!("kern-it-grp-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  job:\n    image: alpine\n    volumes:\n      - ./out:/out\n    \
+         command: [\"sh\", \"-c\", \"sleep 2; echo DONE > /out/done\"]\n",
+    );
+    let c = |verb: &[&str]| {
+        let mut a = vec!["compose", "-f", "compose.yml", "-p", "grp"];
+        a.extend_from_slice(verb);
+        kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(&a)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let _ = c(&["up", "-d"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let ran = c(&["ps"]).contains("job");
+    let began = std::time::Instant::now();
+    let watch = std::thread::spawn({
+        let done = out.join("done");
+        move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while std::time::Instant::now() < until {
+                if done.exists() {
+                    return Some(std::time::Instant::now());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            None
+        }
+    });
+    let _ = c(&["down"]);
+    let written = watch.join().ok().flatten();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if !ran {
+        eprintln!("SKIP: this host did not run the stack");
+        return;
+    }
+    let at = written.map(|w| w.duration_since(began));
+    assert!(
+        at.is_some_and(|a| a > std::time::Duration::from_millis(900)),
+        "the file is written when the `sleep` ends (about 1.5 s in), not at the stop signal: {at:?}"
+    );
+}
+
+/// `compose top` IS DOCKER'S TABLE, AND `--abort-on-container-exit` KEEPS STREAMING WHILE IT STOPS.
+///
+/// MEASURED against Docker Compose v5: `top` printed one table with SERVICE # UID PID PPID C STIME
+/// TTY TIME CMD where kern printed PID and COMMAND under a header per service; and with one service
+/// exiting at once beside one still working, Docker's `up --abort-on-container-exit` printed the
+/// working service's last lines while the stack stopped, which kern, ending the follow at the first
+/// exit, did not.
+#[test]
+fn compose_top_is_dockers_table_and_abort_streams_while_it_stops() {
+    let dir = std::env::temp_dir().join(format!("kern-it-top-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-top-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> String {
+        kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let _ = std::fs::write(
+        dir.join("top.yml"),
+        "services:\n  ops:\n    image: alpine\n    command: [\"sleep\", \"600\"]\n",
+    );
+    let _ = run(&["compose", "-f", "top.yml", "-p", "toptab", "up", "-d"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let top = run(&["compose", "-f", "top.yml", "-p", "toptab", "top"]);
+    let _ = run(&[
+        "compose", "-f", "top.yml", "-p", "toptab", "down", "-t", "0",
+    ]);
+    let _ = std::fs::write(
+        dir.join("abort.yml"),
+        "services:\n  quick:\n    image: alpine\n    command: [\"true\"]\n  slow:\n    image: alpine\n    \
+         command: [\"sh\", \"-c\", \"echo SLOW-START; sleep 2; echo SLOW-DONE\"]\n",
+    );
+    let abort = run(&[
+        "compose",
+        "-f",
+        "abort.yml",
+        "-p",
+        "abortlog",
+        "up",
+        "--abort-on-container-exit",
+    ]);
+    let _ = run(&["compose", "-f", "abort.yml", "-p", "abortlog", "down"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if !top.contains("ops") {
+        eprintln!("SKIP: this host did not run the stack:\n{top}");
+        return;
+    }
+    // A host with no delegated cgroup cannot list a box's processes, and `top` says so; the table
+    // is then not asserted, the abort below still is.
+    if !top.contains("no delegated cgroup") {
+        let mut lines = top.lines();
+        let header: Vec<&str> = lines
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            header,
+            ["SERVICE", "#", "UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"],
+            "Docker's columns:\n{top}"
+        );
+        let row: Vec<&str> = lines
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        assert!(
+            row.first() == Some(&"ops") && row.get(3).is_some_and(|p| p.parse::<u32>().is_ok()),
+            "a row per process, service first and a numeric pid:\n{top}"
+        );
+    }
+    assert!(
+        abort.contains("SLOW-START") && abort.contains("SLOW-DONE"),
+        "the working service's lines are streamed while the stack stops:\n{abort}"
+    );
+}
+
+/// A COMPOSE STOP OF A `restart: always` SERVICE THAT EXITS ON ITS SIGNAL DOES NOT BRING IT BACK.
+///
+/// A compose stop signals the init alone, as Docker does, so the supervisor never hears it and would
+/// restart a workload that exited on SIGTERM; it is ended once the workload has. Asserted against the
+/// shape Docker was measured on (a `trap 'exit 0' TERM` loop under `restart: always`): nothing of the
+/// stack is running three seconds after `down`, past the restart policy's first one-second backoff.
+#[test]
+fn compose_down_of_a_restart_always_service_does_not_bring_it_back() {
+    let dir = std::env::temp_dir().join(format!("kern-it-rchk-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-rchk-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    // A marker in the workload's own command line: a box restarted after `down` removed its record is
+    // invisible to `kern ps`, so the host's process table is what is read.
+    let marker = format!("rchk-marker-{}", std::process::id());
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        format!(
+            "services:\n  svc:\n    image: alpine\n    restart: always\n    \
+             command: [\"sh\", \"-c\", \"trap 'exit 0' TERM; while :; do sleep 1; done\", \"{marker}\"]\n"
+        ),
+    );
+    let run = |args: &[&str]| -> String {
+        kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let running = || -> usize {
+        std::fs::read_dir("/proc")
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| {
+                        std::fs::read(e.path().join("cmdline"))
+                            .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "rchk", "up", "-d"]);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let ran = running();
+    let _ = run(&["compose", "-f", "compose.yml", "-p", "rchk", "down"]);
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let after = running();
+    let _ = run(&[
+        "compose",
+        "-f",
+        "compose.yml",
+        "-p",
+        "rchk",
+        "down",
+        "-t",
+        "0",
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    if ran == 0 {
+        eprintln!("SKIP: this host did not run the stack");
+        return;
+    }
+    assert_eq!(
+        after, 0,
+        "no process of the service runs after `down`, restart policy or not"
+    );
+}
+
+/// A MISSING BIND SOURCE IS CREATED 0755, THE MODE DOCKER'S DAEMON GIVES IT.
+///
+/// MEASURED on one file under both: Docker created `./shared_data` as `root:root 755`, kern as the
+/// user with the user's umask (`775` under umask 002), so the group could write a directory Docker
+/// keeps closed. Asserted: no group or other write bit (the umask may only take bits away).
+#[test]
+fn a_missing_bind_source_is_created_without_group_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("kern-it-mode-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-mode-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  s:\n    image: alpine\n    command: [\"true\"]\n    volumes:\n      - ./made_here:/data\n",
+    );
+    // UMASK 002, the common user default, under which the difference shows: with 022 the user's
+    // umask alone already gives 755.
+    let mut up = kern();
+    up.current_dir(&dir).env("XDG_RUNTIME_DIR", &xdg).args([
+        "compose",
+        "-f",
+        "compose.yml",
+        "-p",
+        "mode",
+        "up",
+        "--abort-on-container-exit",
+    ]);
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `umask` is async-signal-safe and touches only the child's own process state.
+        unsafe {
+            up.pre_exec(|| {
+                libc::umask(0o002);
+                Ok(())
+            });
+        }
+    }
+    let _ = up.output();
+    let mode = std::fs::metadata(dir.join("made_here")).map(|m| m.permissions().mode() & 0o777);
+    let _ = kern()
+        .current_dir(&dir)
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", "-f", "compose.yml", "-p", "mode", "down"])
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    let Ok(mode) = mode else {
+        eprintln!("SKIP: the bind source was not created on this host");
+        return;
+    };
+    assert_eq!(
+        mode & 0o022,
+        0,
+        "created {mode:o}: no group or other write, as Docker's 755"
+    );
+}
+
+/// FIVE THINGS A SECOND MODEL'S CASES FOUND, EACH MEASURED AGAINST DOCKER ON THE SAME FILE.
+///
+/// `run --entrypoint "sh -c 'exit 42'"` exited 42 under Docker and 127 under kern; `COMPOSE_FILE`
+/// was ignored; a key that is not a compose key (`networks_advanced:`) started a stack Docker refuses
+/// to start; an `on-failure:3` service under `--abort-on-container-exit` stopped the stack after its
+/// third restart instead of its first exit; and a 72-character project name was refused.
+#[test]
+fn compose_entrypoint_compose_file_unknown_keys_first_exit_and_long_projects() {
+    let dir = std::env::temp_dir().join(format!("kern-it-gem-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-gem-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let w = |f: &str, t: &str| {
+        let _ = std::fs::write(dir.join(f), t);
+    };
+    let run = |env: &[(&str, &str)], args: &[&str]| -> (Option<i32>, String) {
+        let mut c = kern();
+        c.current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env_remove("COMPOSE_FILE");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        match c.args(args).output() {
+            Ok(o) => (
+                o.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (None, e.to_string()),
+        }
+    };
+    // COMPOSE_FILE, split on `:` and merged in order, with no `-f`.
+    w("a.yml", "services:\n  one:\n    image: alpine\n");
+    w("b.yml", "services:\n  two:\n    image: alpine\n");
+    let (_, merged) = run(
+        &[("COMPOSE_FILE", "a.yml:b.yml")],
+        &["compose", "config", "--services"],
+    );
+    // A key that is not a compose key, and a one-letter typo of one.
+    w(
+        "bad.yml",
+        "services:\n  app:\n    image: alpine\n    networks_advanced:\n      aliases: [x]\n",
+    );
+    let (bad_rc, bad) = run(&[], &["compose", "-f", "bad.yml", "config"]);
+    w(
+        "typo.yml",
+        "services:\n  app:\n    image: alpine\n    enviroment:\n      A: b\n",
+    );
+    let (_, typo) = run(&[], &["compose", "-f", "typo.yml", "config"]);
+    // `--entrypoint` as a string.
+    w("ep.yml", "services:\n  s:\n    image: alpine\n");
+    let (ep_rc, ep) = run(
+        &[],
+        &[
+            "compose",
+            "-f",
+            "ep.yml",
+            "-p",
+            "gemep",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh -c 'exit 42'",
+            "s",
+        ],
+    );
+    // A run that ends is an exit, restart policy or not.
+    w(
+        "flaky.yml",
+        "services:\n  flaky:\n    image: alpine\n    restart: \"on-failure:3\"\n    command: [\"sh\", \"-c\", \"echo FLAKY-RUN; exit 1\"]\n",
+    );
+    let (flaky_rc, flaky) = run(
+        &[],
+        &[
+            "compose",
+            "-f",
+            "flaky.yml",
+            "-p",
+            "gemflaky",
+            "up",
+            "--abort-on-container-exit",
+            "--exit-code-from",
+            "flaky",
+        ],
+    );
+    let _ = run(
+        &[],
+        &["compose", "-f", "flaky.yml", "-p", "gemflaky", "down"],
+    );
+    // A project name Docker accepts and the old 64-byte bound refused.
+    let long = "verylongprojectnamethatextendsovermanycharactersforboundarytesting123456";
+    w(
+        "long.yml",
+        "services:\n  s:\n    image: alpine\n    command: [\"sleep\", \"30\"]\n",
+    );
+    let (long_rc, long_out) = run(&[], &["compose", "-f", "long.yml", "-p", long, "up", "-d"]);
+    let (_, ps) = run(&[], &["ps"]);
+    let _ = run(&[], &["compose", "-f", "long.yml", "-p", long, "down"]);
+    // A service behind a profile, started with it: `ps` and `down` without it still reach it.
+    w(
+        "prof.yml",
+        "services:\n  gated:\n    image: alpine\n    profiles: [front]\n    command: [\"sleep\", \"31\"]\n",
+    );
+    let _ = run(
+        &[],
+        &[
+            "compose",
+            "-f",
+            "prof.yml",
+            "-p",
+            "gemprof",
+            "--profile",
+            "front",
+            "up",
+            "-d",
+        ],
+    );
+    let (_, prof_ps) = run(&[], &["compose", "-f", "prof.yml", "-p", "gemprof", "ps"]);
+    let (prof_down_rc, prof_down) =
+        run(&[], &["compose", "-f", "prof.yml", "-p", "gemprof", "down"]);
+    let (_, after_prof) = run(&[], &["ps"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+
+    assert!(
+        merged.contains("one") && merged.contains("two"),
+        "COMPOSE_FILE merges a.yml and b.yml:\n{merged}"
+    );
+    assert_ne!(
+        bad_rc,
+        Some(0),
+        "a key Docker's schema does not have is refused:\n{bad}"
+    );
+    assert!(
+        bad.contains("not a compose key") && bad.contains("networks_advanced"),
+        "{bad}"
+    );
+    assert!(
+        typo.contains("not a compose key") && typo.contains("`environment:`"),
+        "the typo names the key it is one edit from:\n{typo}"
+    );
+    if !ps.contains("NAME") {
+        eprintln!("SKIP (runtime half): this host lists no boxes");
+        return;
+    }
+    assert_eq!(
+        ep_rc,
+        Some(42),
+        "the entrypoint string is split as a shell would:\n{ep}"
+    );
+    assert_eq!(flaky_rc, Some(1), "the service's own status:\n{flaky}");
+    let runs = flaky.matches("FLAKY-RUN").count();
+    assert!(
+        runs == 1,
+        "stopped at the first exit, not after three restarts ({runs} runs):\n{flaky}"
+    );
+    assert_eq!(
+        long_rc,
+        Some(0),
+        "a 72-byte project name starts:\n{long_out}"
+    );
+    assert!(ps.contains("sleep 30"), "and its service runs:\n{ps}");
+    assert!(
+        prof_ps.contains("sleep 31") && !prof_ps.contains("inactive profile"),
+        "`ps` without the profile lists the running service:\n{prof_ps}"
+    );
+    assert_eq!(
+        prof_down_rc,
+        Some(0),
+        "`down` without the profile succeeds:\n{prof_down}"
+    );
+    assert!(
+        !after_prof.contains("sleep 31"),
+        "and stops it:\n{after_prof}"
+    );
+}
+
 /// THE SHAPE OF A CODE SANDBOX, RUN AS A ONE-OFF: `network_mode: none`, `read_only`, a `/tmp` tmpfs,
 /// and the script mounted INTO that tmpfs with `run -v`. MEASURED against Docker on a case written
 /// for both: kern took the `-v` spec for the service name, then (with `-v` read) mounted the tmpfs

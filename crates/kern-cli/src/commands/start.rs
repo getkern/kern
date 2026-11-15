@@ -5446,6 +5446,22 @@ fn supervise_box(
             // this is the same log-fill class already guarded elsewhere). Matches Docker's back-off
             // shape. `attempt` is >= 1 here (incremented above): 1, 2, 4, 8, 16, then 30 s thereafter.
             let backoff = (1u32 << attempt.saturating_sub(1).min(5)).min(30);
+            // THE RUN THAT JUST ENDED IS RECORDED BEFORE THE BACKOFF, overwritten by the next one and
+            // by the final one below. While this supervisor is alive no reader shows it (`ps -a`
+            // skips a live record); it is what a stop arriving between two runs reports, where
+            // before it found no record and the service read as exit 0. MEASURED against Docker:
+            // `up --abort-on-container-exit` on an `on-failure:3` service that exits 1 stops the
+            // stack at the first exit, and the service's status is 1.
+            if !rm && !never_started {
+                registry::set_box_exit(
+                    std::process::id() as i32,
+                    inst.starttime,
+                    code,
+                    &inst.name,
+                    &inst.pod,
+                    &inst.command,
+                );
+            }
             unsafe { libc::sleep(backoff) };
             // Read at the top of the next iteration to decide whether the pre-exec gate may be
             // dropped. See the block above the loop: dropping it after a box that NEVER STARTED
