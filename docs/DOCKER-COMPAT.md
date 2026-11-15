@@ -474,8 +474,12 @@ IPC namespace, and kern says so when the box starts. What those examples want fr
 **Replicas** (`up --scale web=3`, `scale:`, `deploy.replicas`) are one box each: `<project>-web`,
 `<project>-web-2`, `<project>-web-3`, with their own addresses and ports, a host port range handing
 each a port of it. A command naming the service reaches every replica, `port --index` and `exec
---index` one. The difference from Docker is the name: the service's name resolves to replica 1, where
-Docker's DNS answers with any of them, so a client wanting to spread its connections names the replicas.
+--index` one. The service's name lists every replica and a replica's box name resolves, while
+`web-2` does not, as under Docker. The order differs: Docker's DNS shuffles the list at every query,
+and a hosts file cannot change between two, so each box starts its list at a different replica and
+the spread is between clients rather than between one client's connections. A stack that is up can be
+rescaled: running boxes keep their addresses and learn the replicas added or stopped, except under
+`--no-pod`, where a replica added later is not reached from a box that was already running.
 
 **Shared IPC between services** works as Docker's: `ipc: shareable` on one service and `ipc:
 "service:<it>"` on another put the second in the first's IPC namespace with the same `/dev/shm`

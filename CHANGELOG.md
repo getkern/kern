@@ -199,8 +199,36 @@ port range gives each a port of it, a `"80"` each a random one, one fixed host p
 Docker's "port is already allocated"); the replicas start one after another. `ps`, `logs`, `stop` and
 `down` naming the service reach every replica, `port --index N` and `exec --index N` reach one, and an
 `up` without `--scale` brings the service back to the file's count, stopping the replicas above it, as
-Docker's does. A replicated service's name resolves to replica 1 (Docker's DNS answers any of them),
-and `container_name` cannot be scaled.
+Docker's does. `container_name` cannot be scaled.
+
+**A replicated service's name lists every replica, and a running stack can be rescaled.** `web`
+resolved to replica 1 alone and a replica's key `web-2` resolved too; under Docker `getent ahosts web`
+lists every replica and `web-2` is not a name, only `<project>-web-2` is. kern's hosts files now say
+the same, each box starting the list at a different replica so clients spread over them (Docker
+shuffles at every query; a hosts file cannot, so the spread is between clients). Rescaling a stack
+that is up gave the new replica the bridge address a running service still held (measured: `web-3`
+and `cm` both on 10.89.0.4, `cm` unable to reach it): a running box now keeps its address, recorded
+in the registry, whatever is added around it, and the boxes left running learn the replicas an `up`
+started or stopped. Under `--no-pod` a running box does not learn a replica added later, because the
+relay that would reach it is built when the box starts.
+
+**A service that fails to start stops its dependents and nothing else.** The first service to fail
+ended the bring-up, and with every box held at its pre-exec gate that meant no service ran at all.
+Measured on Docker with one service's host port range held by another process: `up -d` exits 1 naming
+it, and every service that does not depend on it, replicas included, is running. kern does the same
+now, names the services held back (`not started, dependency failed to start: e`) and how many are
+running, and still exits 1. A configuration Docker refuses when it creates the containers (a
+`mem_limit:` below what a box can start with) still starts nothing, as under Docker, which creates
+every container before it starts one: every service's flags are read by the box parser before the
+first box is prepared.
+
+**`COMPOSE_FILE` in the `.env`, and a compose file in a parent directory, as Docker reads them.** With
+no file named, the working directory's `.env` (or `--env-file`) gives `COMPOSE_FILE` and
+`COMPOSE_PATH_SEPARATOR` when the shell does not, and its values win over the project's `.env` for
+interpolation; under `-f` it is not read, and a list from `COMPOSE_FILE` loads no default override, as
+under Docker. With no file in the working directory, the nearest parent holding one of Docker's four
+names is used. A parent's file that belongs to another user, or is a link that does, is not run: a
+note names it and its owner, and `kern compose <file>` runs it.
 
 **`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
