@@ -180,6 +180,13 @@ service's log while the stack stops, as Docker's does, so the last lines of a se
 when another exited are no longer cut off. A missing bind source is created `0755`, as Docker's
 daemon creates it (it took the user's umask, `775` under umask 002).
 
+**`ipc: shareable` and `ipc: "service:X"` share an IPC namespace and `/dev/shm`, as Docker does.**
+kern gave every service its own and said so. A service that is `shareable` keeps its `/dev/shm` in a
+directory under the runtime dir, and a service naming it joins its IPC namespace and binds that
+directory, starting after it; a donor that is not `shareable` is refused with Docker's "non-shareable
+IPC". `kern box --ipc shareable` and `--ipc container:<box>` do the same for two boxes of one pod
+(an IPC namespace is entered from the user namespace that owns it, which a pod's members share).
+
 **`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
 before anything runs, where `""` first built a bytecode cache for an empty reference. An empty

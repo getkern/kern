@@ -1,0 +1,13 @@
+services:
+  producer:
+    image: python:3.11-alpine
+    ipc: shareable
+    command: python3 -c "import time; open('/dev/shm/shared_pipe', 'w').write('data-sync'); time.sleep(10)"
+    restart: "no"
+  consumer:
+    image: python:3.11-alpine
+    ipc: "service:producer"
+    command: python3 -c "print('READING:', open('/dev/shm/shared_pipe').read())"
+    depends_on:
+      - producer
+    restart: "no"

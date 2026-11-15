@@ -33,7 +33,8 @@ listed. What a case leaves running on either engine is counted before it is clea
 - `set3`: ten covering CI exit codes, GPU, a sandbox, networks, merged files and profiles, stop
   signals, `ulimits`/`sysctls`, restart policies, `cp`/`top`, long names.
 - `set4`: four aimed at the kernel side: two UIDs on one bind mount, `--scale` with a host port range,
-  shared IPC, and an out-of-memory kill.
+  shared IPC, and an out-of-memory kill. `x3b` is `x3` with `ipc: "service:producer"`, the form
+  Docker accepts.
 
 Several cases contain mistakes of their own (a certificate without the IP it is checked against, a
 `$` that Compose interpolates, a check printed unconditionally). They are kept: a mistake that fails

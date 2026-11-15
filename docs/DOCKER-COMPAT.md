@@ -471,6 +471,14 @@ IPC namespace, and kern says so when the box starts. What those examples want fr
 `/dev/shm` (docker gives 64 MB by default and the host's with `--ipc=host`); a box's is sized to its
 `--memory` cap, and `--shm-size` sets it.
 
+**Shared IPC between services** works as Docker's: `ipc: shareable` on one service and `ipc:
+"service:<it>"` on another put the second in the first's IPC namespace with the same `/dev/shm`
+(`kern box --ipc shareable` and `--ipc container:<box>`). As under Docker, the donor must be
+`shareable` (otherwise "non-shareable IPC"), and the two must be in one stack or pod: an IPC
+namespace is entered from the user namespace that owns it, and a pod's members share one. A shared
+`/dev/shm` is a directory under the runtime dir, as Docker keeps a container's on the host, so its
+size is bounded by the runtime dir's tmpfs rather than by `--shm-size`.
+
 Docker's default capability list is `compute,utility`, so it selects a subset of the driver's
 libraries, adds the driver's command-line tools, and hands over no DRM node. kern binds the
 driver's whole library set and the same tools, and the three extra nodes are `nvidia-modeset` and

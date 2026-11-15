@@ -40,7 +40,7 @@ expected() {
     set3/g1) echo "a failed migration under --exit-code-from: Docker exits 0, kern exits 1 (deliberate, owner decision)" ;;
     set3/g8) echo "Docker itself sometimes hangs on --abort-on-container-exit with a restart policy (measured: 600 s timeout)" ;;
     set4/x2) echo "OPEN: kern has no --scale / replicas and no host port ranges" ;;
-    set4/x3) echo "Docker refuses 'ipc: container:producer' (no such container); OPEN: kern has no shared IPC between services" ;;
+    set4/x3b) echo "a race in the file: the consumer depends on the producer having STARTED, not written; Docker's slower container start wins it (5/5), kern's sometimes loses (3/5); with the consumer 1 s later both read 3/3" ;;
     *) return 1 ;;
   esac
 }
