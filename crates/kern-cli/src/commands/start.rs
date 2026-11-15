@@ -3992,18 +3992,95 @@ fn prepare_ssh(
         box_port: 22,
         udp: false,
     }); // 127.0.0.1:<port> -> box :22
-    let id = hint_key.map(|k| format!(" -i {k}")).unwrap_or_default();
-    // `accept-new`, and no known-hosts override at all. The line used to read
-    // `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`, which is two problems in one
-    // hint. It is not portable: a box started inside kern's WSL distro is most often reached with
-    // Windows' own ssh.exe, where the null device is `NUL` and `/dev/null` is a path that does not
-    // exist, so the printed command fails verbatim on the platform kern ships a bridge for
-    // (measured: `Host key verification failed`, then it worked with `NUL`). And it teaches the
-    // reader to switch host-key checking off wholesale to silence one first-connection prompt.
-    // `accept-new` pins the key on first sight and still refuses a CHANGED one, which is the part
-    // worth keeping; it needs OpenSSH 7.6 (2017), older than any Windows that ships ssh.exe.
-    eprintln!("kern: ssh: ssh -p {port}{id} -o StrictHostKeyChecking=accept-new root@127.0.0.1");
-    Ok((Some(kern_isolation::SshSetup { authorized_key }), eff))
+    let id = hint_key
+        .map(|k| format!(" -i {}", super::shell_quote_single(&k)))
+        .unwrap_or_default();
+    // THE HOST KEY IS KERN'S, AND SO IS THE `known_hosts` THAT NAMES IT. The box used to generate a
+    // fresh host key every launch while the hint said `StrictHostKeyChecking=accept-new`, which pins
+    // the FIRST key it sees for `[127.0.0.1]:<port>` in the user's own `~/.ssh/known_hosts`. So the
+    // printed command worked once: MEASURED, the second box on the same port answered `Host key for
+    // [127.0.0.1]:2222 has changed ... Host key verification failed`, which is every rerun of a CI
+    // job or a dev loop that relaunches its box. Generated here, the key is known before the box
+    // starts: the hint points at a file holding exactly it and checks strictly, so it works on every
+    // launch, refuses any other key, and never writes to the user's file.
+    match host_key_for(name, port) {
+        Some((private, known_hosts)) => {
+            eprintln!(
+                "kern: ssh: ssh -p {port}{id} -o UserKnownHostsFile={} \
+                 -o StrictHostKeyChecking=yes root@127.0.0.1",
+                super::shell_quote_single(&known_hosts.to_string_lossy())
+            );
+            Ok((
+                Some(kern_isolation::SshSetup {
+                    authorized_key,
+                    host_key: Some(private),
+                }),
+                eff,
+            ))
+        }
+        // No `ssh-keygen` on the host (only reachable with `--ssh-key`): the box makes its own key,
+        // which no client can know in advance, so the hint can only pin it on first sight.
+        //
+        // `accept-new` and not `UserKnownHostsFile=/dev/null`: a box started inside kern's WSL
+        // distro is often reached with Windows' own ssh.exe, where `/dev/null` does not exist
+        // (measured: `Host key verification failed`), and turning checking off wholesale teaches
+        // the wrong habit. `accept-new` still refuses a CHANGED key; it needs OpenSSH 7.6 (2017).
+        None => {
+            eprintln!(
+                "kern: ssh: ssh -p {port}{id} -o StrictHostKeyChecking=accept-new root@127.0.0.1"
+            );
+            Ok((
+                Some(kern_isolation::SshSetup {
+                    authorized_key,
+                    host_key: None,
+                }),
+                eff,
+            ))
+        }
+    }
+}
+
+/// Generate the box's ed25519 host key on the host and write the `known_hosts` that names it, in the
+/// box's ssh dir. Returns the PRIVATE key (it goes to the box, in memory; the file is removed) and
+/// the `known_hosts` path. `None` when anything fails, which falls back to a key the box makes.
+fn host_key_for(name: &BoxName, port: u16) -> Option<(String, std::path::PathBuf)> {
+    let dir = registry::ssh_dir().ok()?.join(name.as_str());
+    std::fs::create_dir_all(&dir).ok()?;
+    let key = dir.join("hostkey");
+    let _ = std::fs::remove_file(&key);
+    let _ = std::fs::remove_file(dir.join("hostkey.pub"));
+    let ok = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-C", "", "-f"])
+        .arg(&key)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    let private = ok.then(|| std::fs::read_to_string(&key).ok()).flatten();
+    let public = ok
+        .then(|| std::fs::read_to_string(dir.join("hostkey.pub")).ok())
+        .flatten();
+    let _ = std::fs::remove_file(&key);
+    let _ = std::fs::remove_file(dir.join("hostkey.pub"));
+    let (private, public) = (private?, public?);
+    let known_hosts = dir.join("known_hosts");
+    std::fs::write(&known_hosts, known_hosts_line(port, &public)?).ok()?;
+    Some((private, known_hosts))
+}
+
+/// The `known_hosts` line for a server on `127.0.0.1:<port>` with this public key (`<type> <base64>
+/// [comment]`). OpenSSH writes a non-default port as `[host]:port` and port 22 as the bare host;
+/// a line in the other form never matches. `None` for a key with no type and body.
+fn known_hosts_line(port: u16, public: &str) -> Option<String> {
+    let mut f = public.split_whitespace();
+    let (kind, body) = (f.next()?, f.next()?);
+    let host = if port == 22 {
+        "127.0.0.1".to_string()
+    } else {
+        format!("[127.0.0.1]:{port}")
+    };
+    Some(format!("{host} {kind} {body}\n"))
 }
 
 /// WHOSE identity a `kern exec` command runs under.
@@ -6758,5 +6835,26 @@ mod image_defaults_tests {
         assert_eq!(crate::cli::parse_signal_name("SIGWINCH"), None);
         assert_eq!(crate::cli::parse_signal_name(""), None);
         assert_eq!(crate::cli::parse_signal_name("999"), None);
+    }
+}
+
+#[cfg(test)]
+mod ssh_hint_tests {
+    /// The `known_hosts` line kern writes must be the form OpenSSH LOOKS UP, or the strict hint
+    /// refuses the very key kern handed the box: `[127.0.0.1]:<port>` for a non-default port, the
+    /// bare address for 22, and the key's type and body without its comment.
+    #[test]
+    fn the_known_hosts_line_is_the_form_ssh_looks_up() {
+        let public = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKern alex@desk\n";
+        assert_eq!(
+            super::known_hosts_line(2222, public).as_deref(),
+            Some("[127.0.0.1]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKern\n")
+        );
+        assert_eq!(
+            super::known_hosts_line(22, public).as_deref(),
+            Some("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKern\n")
+        );
+        assert_eq!(super::known_hosts_line(2222, "ssh-ed25519\n"), None);
+        assert_eq!(super::known_hosts_line(2222, ""), None);
     }
 }
