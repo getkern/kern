@@ -2452,6 +2452,27 @@ pub fn stop_with_grace(names: &[String], all: bool, grace: Option<u64>) -> Resul
             // systemd owns the lifecycle and has torn the unit down: gone, but its exit code went to
             // the journal, not to us, so it records like any teardown we did not observe.
             Teardown::Gone(None)
+        } else if b.pid1_recorded > 0 && b.live_pid1().is_none() {
+            // ⛔ THE WORKLOAD IS ALREADY GONE: phase 1's signal ended it before this loop reached
+            // the box. With no reaper hold (a box without a dedicated cgroup has none) the
+            // supervisor reaps its init at once, so there is no init left to poll, and the graceful
+            // call below, handed pid1 = 0, slept the whole remaining grace on a box that had exited.
+            // MEASURED on WSL2 as an unprivileged user without delegation: `down` of a stack whose
+            // service traps SIGTERM beside a `sleep` took 10.3-11.5 s in 5 runs of 12 and 0.3 s in the
+            // others, depending on whether the trap had fired before the loop got there. The
+            // supervisor is let finish (its record carries the real code), then its group is swept
+            // with no grace, and the code it recorded is the one reported.
+            crate::commands::wait_supervisor_done(b.pid, b.starttime);
+            match kill_box_graceful(
+                b.pid,
+                0,
+                libc::SIGKILL,
+                0,
+                crate::commands::GraceSignal::AlreadySent,
+            ) {
+                Teardown::Gone(None) => Teardown::Gone(registry::box_exit(b.pid, b.starttime)),
+                other => other,
+            }
         } else {
             // Honour the shutdown contract the box was STARTED with: the registry carries it, so a
             // later `kern stop` (a different process) sends the same signal and waits the same grace.

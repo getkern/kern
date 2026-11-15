@@ -4185,6 +4185,145 @@ fn a_stack_leaves_no_exited_row_after_down_or_a_restart() {
     );
 }
 
+/// A BOX WHOSE WORKLOAD HAS ALREADY EXITED IS NOT WAITED ON FOR ITS GRACE, and keeps its own code.
+///
+/// MEASURED on WSL2 as an unprivileged user without cgroup delegation: `compose down` of a service
+/// that traps SIGTERM beside a `sleep` took 10.3-11.5 s in 5 runs of 12, 0.3 s in the others. The
+/// stop signal ended the trapping box before the teardown loop reached it; with no reaper hold its
+/// init was already reaped, and the graceful wait, given no init, slept the whole remaining grace.
+/// Here `slow` holds the loop for 1 s inside its grace while `fast` exits at once, in both orders.
+/// Where a reaper hold exists (a dedicated cgroup) the init stays a zombie and this passes anyway.
+#[test]
+fn stop_does_not_wait_the_grace_on_a_box_that_already_exited() {
+    let xdg = std::env::temp_dir().join(format!("kern-it-stopgone-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let run = |args: &[&str]| -> String {
+        match kern().env("XDG_RUNTIME_DIR", &xdg).args(args).output() {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(_) => String::new(),
+        }
+    };
+    let id = std::process::id();
+    let (slow, fast) = (format!("stopgone-slow-{id}"), format!("stopgone-fast-{id}"));
+    let start = |name: &str, on_term: &str| {
+        let script = format!("trap '{on_term}' TERM; while :; do sleep 0.1; done");
+        let _ = run(&[
+            "box", "--image", "alpine", "-d", "--name", name, "--", "sh", "-c", &script,
+        ]);
+    };
+    let mut timings = Vec::new();
+    let mut codes = Vec::new();
+    for order in [
+        [slow.as_str(), fast.as_str()],
+        [fast.as_str(), slow.as_str()],
+    ] {
+        start(&slow, "sleep 1; exit 0");
+        start(&fast, "exit 0");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if !run(&["ps"]).contains(&fast) {
+            let _ = run(&["stop", &slow, &fast]);
+            let _ = std::fs::remove_dir_all(&xdg);
+            eprintln!("SKIP: this host did not run the boxes");
+            return;
+        }
+        let t = std::time::Instant::now();
+        let _ = run(&["stop", order[0], order[1]]);
+        timings.push(t.elapsed());
+        codes.extend(
+            run(&["ps", "-a"])
+                .lines()
+                .filter(|l| l.contains(&fast))
+                .map(str::to_string),
+        );
+        let _ = run(&["rm", &slow]);
+        let _ = run(&["rm", &fast]);
+    }
+    let _ = std::fs::remove_dir_all(&xdg);
+    for (i, t) in timings.iter().enumerate() {
+        assert!(
+            *t < std::time::Duration::from_secs(5),
+            "stop order {i} took {t:?}: the grace was waited on a box that had already exited"
+        );
+    }
+    assert!(
+        codes.iter().all(|l| l.contains("exit 0")),
+        "the box that exited on its signal must keep its code 0: {codes:?}"
+    );
+}
+
+/// `allow_gpu_grants` IS READ FROM THE OPERATOR'S OWN `kern.toml`, AND GRANTS THE GPU ONLY.
+///
+/// Through the real config reader, not the decision function: with the key in the operator's config a
+/// `gpus: all` service gets past the gate with no flag, while a `devices:` node in the same config is
+/// still refused; without it the GPU is refused and the refusal names the key. Whether a card is then
+/// found is the host's business, so the assertion is on the gate's sentence alone.
+#[test]
+fn allow_gpu_grants_is_read_from_the_operators_config_and_grants_the_gpu_only() {
+    let base = std::env::temp_dir().join(format!("kern-it-gpugrant-{}", std::process::id()));
+    let (dir, cfg_on, cfg_off, xdg) = (
+        base.join("p"),
+        base.join("on"),
+        base.join("off"),
+        base.join("xdg"),
+    );
+    for d in [&dir, &cfg_on.join("kern"), &cfg_off.join("kern"), &xdg] {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(
+        cfg_on.join("kern/kern.toml"),
+        "[kern]\nallow_gpu_grants = true\n",
+    );
+    let _ = std::fs::write(cfg_off.join("kern/kern.toml"), "[kern]\n");
+    let _ = std::fs::write(
+        dir.join("gpu.yml"),
+        "services:\n  g:\n    image: alpine\n    command: [\"true\"]\n    gpus: all\n",
+    );
+    let _ = std::fs::write(
+        dir.join("dev.yml"),
+        "services:\n  d:\n    image: alpine\n    command: [\"true\"]\n    devices:\n      - \"/dev/null:/dev/null\"\n",
+    );
+    let up = |file: &str, cfg: &std::path::Path| -> String {
+        let out = kern()
+            .current_dir(&dir)
+            .env("XDG_CONFIG_HOME", cfg)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env_remove("KERN_CONFIG")
+            .args(["compose", "-f", file, "-p", "gpugrant", "up", "-d"])
+            .output();
+        let _ = kern()
+            .current_dir(&dir)
+            .env("XDG_CONFIG_HOME", cfg)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env_remove("KERN_CONFIG")
+            .args(["compose", "-f", file, "-p", "gpugrant", "down"])
+            .output();
+        match out {
+            Ok(o) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => e.to_string(),
+        }
+    };
+    let gpu_on = up("gpu.yml", &cfg_on);
+    let gpu_off = up("gpu.yml", &cfg_off);
+    let dev_on = up("dev.yml", &cfg_on);
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        !gpu_on.contains("nothing granted it"),
+        "allow_gpu_grants in the operator's config grants the GPU with no flag:\n{gpu_on}"
+    );
+    assert!(
+        gpu_off.contains("nothing granted it") && gpu_off.contains("allow_gpu_grants (GPUs only)"),
+        "without the key the GPU is refused and the refusal names it:\n{gpu_off}"
+    );
+    assert!(
+        dev_on.contains("--allow-device-grants") && dev_on.contains("/dev/null"),
+        "allow_gpu_grants does not grant a `devices:` node:\n{dev_on}"
+    );
+}
+
 /// THE SHAPE OF A CODE SANDBOX, RUN AS A ONE-OFF: `network_mode: none`, `read_only`, a `/tmp` tmpfs,
 /// and the script mounted INTO that tmpfs with `run -v`. MEASURED against Docker on a case written
 /// for both: kern took the `-v` spec for the service name, then (with `-v` read) mounted the tmpfs

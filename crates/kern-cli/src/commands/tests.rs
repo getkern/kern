@@ -2930,23 +2930,41 @@ stopsignal	SIGTERM
             "both the pidfd path and the group-only fallback must skip the send when the caller              already signalled"
         );
 
-        // And `stop`, which DOES signal in phase 1, must say so at the call site.
+        // And `stop`, which DOES signal in phase 1, must say so at EVERY call site: the graceful
+        // teardown, and the sweep of a box whose workload had already exited.
         let insp = include_str!("inspect.rs");
         let call = "kill_box_graceful(";
+        let sites: Vec<&str> = insp
+            .match_indices(call)
+            .map(|(at, _)| {
+                // The call's own arguments: up to the parenthesis that closes it.
+                let after = &insp[at + call.len()..];
+                let mut depth = 1usize;
+                let end = after
+                    .char_indices()
+                    .find(|&(_, c)| {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        depth == 0
+                    })
+                    .map_or(after.len(), |(i, _)| i);
+                &after[..end]
+            })
+            .collect();
         assert_eq!(
-            insp.matches(call).count(),
-            1,
-            "one call site in `stop`, or this test is checking the wrong one"
+            sites.len(),
+            2,
+            "the two call sites in `stop`, or this test is checking the wrong ones"
         );
-        let after = &insp[insp.find(call).unwrap_or(0) + call.len()..];
-        let args = match after.find("\n            )") {
-            Some(end) => &after[..end],
-            None => after,
-        };
-        assert!(
-            args.contains("GraceSignal::AlreadySent"),
-            "`stop` signals every box in phase 1, so phase 2 must not send it again; got: {args}"
-        );
+        for args in sites {
+            assert!(
+                args.contains("GraceSignal::AlreadySent"),
+                "`stop` signals every box in phase 1, so phase 2 must not send it again; got: {args}"
+            );
+        }
     }
 
     #[test]
@@ -8762,10 +8780,10 @@ fn the_gpu_gate_names_every_service_that_asks_and_one_asker_keeps_its_sentence()
     use super::device_grant_problem;
     // The gate reads the operator's config through `KERN_CONFIG`, which other tests set.
     let _g = crate::env_guard();
-    if super::device_grants_allowed_by_config() {
+    if super::device_grants_allowed_by_config() || super::gpu_grants_allowed_by_config() {
         eprintln!(
-            "skip: this user's own kern.toml already allows device grants, so the gate is open \
-             and there is no sentence to read"
+            "skip: this user's own kern.toml already allows device or GPU grants, so the gate is \
+             open and there is no sentence to read"
         );
         return;
     }
@@ -8807,6 +8825,87 @@ fn the_gpu_gate_names_every_service_that_asks_and_one_asker_keeps_its_sentence()
         device_grant_problem(&stack(&[("base", true), ("jupyter", true)]), true),
         None
     );
+}
+
+/// `allow_gpu_grants` GRANTS THE GPU AND NOTHING ELSE.
+///
+/// The key is the operator's one-time decision Docker's users make by installing the NVIDIA
+/// container toolkit. Under it every GPU spelling a file can write passes (`gpus:`, which a `deploy`
+/// reservation lands in, `runtime: nvidia`, a `nvidia.com/gpu` CDI name), and every other device is
+/// still refused: a `devices:` node, a CDI name of another class, one mixed into a GPU list. Without
+/// it the GPU is refused and the sentence names the key; `allow_device_grants` still opens all.
+#[test]
+fn allow_gpu_grants_grants_the_gpu_and_nothing_else() {
+    use super::{device_grant_problem_under, Grants};
+    let svc = |f: &dyn Fn(&mut crate::compose::ComposeBox)| {
+        let mut b = crate::compose::ComposeBox {
+            name: "p-train".into(),
+            image: Some("alpine".into()),
+            ..Default::default()
+        };
+        f(&mut b);
+        vec![b]
+    };
+    let gpus_only = Grants {
+        all: false,
+        gpus: true,
+    };
+    let none = Grants::default();
+    let all = Grants {
+        all: true,
+        gpus: false,
+    };
+    let gpu_spellings = [
+        svc(&|b| b.gpus = Some("all".into())),
+        svc(&|b| b.gpus = Some("device=1".into())),
+        svc(&|b| b.runtime_nvidia = true),
+        svc(&|b| b.device = Some("nvidia.com/gpu=0".into())),
+        svc(&|b| b.device = Some("nvidia.com/gpu=0,nvidia.com/gpu=1".into())),
+    ];
+    for boxes in &gpu_spellings {
+        assert_eq!(
+            device_grant_problem_under(boxes, gpus_only),
+            None,
+            "a GPU under allow_gpu_grants: {:?}",
+            (&boxes[0].gpus, boxes[0].runtime_nvidia, &boxes[0].device)
+        );
+        let refused = device_grant_problem_under(boxes, none).unwrap_or_default();
+        assert!(
+            refused.contains("allow_gpu_grants (GPUs only)"),
+            "without a grant the GPU is refused, naming the narrow key: {refused}"
+        );
+        assert_eq!(device_grant_problem_under(boxes, all), None);
+    }
+    let not_gpus = [
+        svc(&|b| b.devices = vec!["/dev/kvm:/dev/kvm".into()]),
+        svc(&|b| b.device = Some("vendor.com/fpga=0".into())),
+        svc(&|b| b.device = Some("nvidia.com/gpu=0,vendor.com/fpga=0".into())),
+        svc(&|b| b.device = Some("nvidia.com/gpu=".into())),
+        svc(&|b| {
+            b.gpus = Some("all".into());
+            b.devices = vec!["/dev/kvm:/dev/kvm".into()];
+        }),
+    ];
+    for boxes in &not_gpus {
+        assert!(
+            device_grant_problem_under(boxes, gpus_only).is_some(),
+            "not a GPU, so allow_gpu_grants does not cover it: {:?}",
+            (&boxes[0].devices, &boxes[0].device)
+        );
+        assert_eq!(device_grant_problem_under(boxes, all), None);
+    }
+    // A file asking for a GPU twice is malformed whatever was granted.
+    let twice = svc(&|b| {
+        b.gpus = Some("all".into());
+        b.device = Some("nvidia.com/gpu=0".into());
+    });
+    assert!(device_grant_problem_under(&twice, gpus_only).is_some());
+    // And the key parses from `[kern]`, off by default.
+    let on =
+        crate::config::parse("[kern]\nallow_gpu_grants = true\n").map(|c| c.kern.allow_gpu_grants);
+    assert_eq!(on, Ok(true));
+    let off = crate::config::parse("[kern]\n").map(|c| c.kern.allow_gpu_grants);
+    assert_eq!(off, Ok(false));
 }
 
 /// ⛔ THE HOST'S /dev/shm IS REFUSED AS A BIND SOURCE, ONE OBJECT IN IT IS NOT.

@@ -6868,6 +6868,36 @@ fn device_grants_allowed_by_config() -> bool {
     }
 }
 
+/// `allow_gpu_grants` from the operator's own config: the same reader and the same rule as
+/// [`device_grants_allowed_by_config`] (the default config only, fail-closed when it does not
+/// parse), for the narrower key.
+fn gpu_grants_allowed_by_config() -> bool {
+    match crate::config::load_cached(None) {
+        Ok(cfg) => cfg.kern.allow_gpu_grants,
+        Err(_) => false,
+    }
+}
+
+/// What the operator has granted compose files: every host device, or GPUs only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Grants {
+    /// `--allow-device-grants` or `allow_device_grants`: every device a file asks for.
+    pub(crate) all: bool,
+    /// `allow_gpu_grants`: the GPU requests only (`gpus:`, a `deploy` reservation, `runtime:
+    /// nvidia`, CDI names of the `nvidia.com/gpu` class), never `devices:` nodes or profiles.
+    pub(crate) gpus: bool,
+}
+
+/// Is every CDI name in a service's `--device` list a GPU (`nvidia.com/gpu=...`)? The list is the
+/// comma-joined one `add_cdi_names` builds. A name of any other class (`vendor.com/fpga=0`) is not
+/// what `allow_gpu_grants` covers.
+fn cdi_names_are_all_gpus(names: &str) -> bool {
+    names.split(',').map(str::trim).all(|n| {
+        n.strip_prefix("nvidia.com/gpu=")
+            .is_some_and(|rest| !rest.is_empty())
+    })
+}
+
 /// Has the OPERATOR granted `privileged: true` to compose files, on the command line or in their
 /// own config?
 ///
@@ -7141,8 +7171,8 @@ fn host_device_sources_under(specs: &[String], dev_root: &std::path::Path) -> Ve
 fn ungranted_gpu_message(askers: &[String]) -> String {
     format!(
         "{} services ask for a GPU and nothing granted them: {}. A GPU is a device grant, and \
-         `--allow-device-grants` (or `allow_device_grants` in YOUR OWN kern.toml) gives every one \
-         of them its card at once. A compose file cannot grant itself hardware, and a file that \
+         `--allow-device-grants` (or `allow_gpu_grants`, GPUs only, or `allow_device_grants` in YOUR \
+         OWN kern.toml) gives every one of them its card at once. A compose file cannot grant itself hardware, and a file that \
          could would not be a policy",
         askers.len(),
         askers.join(", ")
@@ -7155,7 +7185,24 @@ where
 {
     // The command line, or the operator's own config. Never the compose file, and never a config the
     // compose file named: see `device_grants_allowed_by_config`.
-    if allow || device_grants_allowed_by_config() {
+    let all = allow || device_grants_allowed_by_config();
+    let gpus = !all && gpu_grants_allowed_by_config();
+    device_grant_problem_under(boxes, Grants { all, gpus })
+}
+
+/// [`device_grant_problem`] with the operator's grants already read, so the decision is a function of
+/// the file and the grants alone.
+///
+/// `allow_gpu_grants` IS THE TOOLKIT'S HALF, NOT THE FILE'S. Docker gives a compose file a GPU with
+/// no flag only on a host where the administrator installed and configured the NVIDIA container
+/// toolkit, once; this key is that one decision written in the operator's config. It covers the GPU
+/// and nothing else: `allow_device_grants` also hands a file `/dev/kvm` and every other node, which
+/// is more than the toolkit concedes.
+pub(crate) fn device_grant_problem_under<'a, I>(boxes: I, grants: Grants) -> Option<String>
+where
+    I: IntoIterator<Item = &'a crate::compose::ComposeBox> + Clone,
+{
+    if grants.all {
         return None;
     }
     // ⛔ EVERY SERVICE THAT ASKS, NOT THE FIRST ONE. MEASURED 2026-11-12 on NVIDIA's own
@@ -7166,6 +7213,7 @@ where
     let askers: Vec<String> = boxes
         .clone()
         .into_iter()
+        .filter(|_| !grants.gpus)
         .filter_map(|b| match (&b.device, &b.gpus) {
             (Some(name), None) => Some(format!("'{}' (CDI name {name})", b.service_name())),
             (None, Some(spec)) => Some(format!("'{}' ({spec})", b.service_name())),
@@ -7191,32 +7239,44 @@ where
                     b.service_name()
                 ));
             }
-            if askers.len() > 1 {
-                return Some(ungranted_gpu_message(&askers));
+            if grants.gpus && !cdi_names_are_all_gpus(name) {
+                return Some(format!(
+                    "service '{}' asks for the CDI device(s) {name}, and not every one is a GPU. \
+                     allow_gpu_grants covers GPUs (`nvidia.com/gpu=...`) only: pass \
+                     --allow-device-grants to `kern compose`, or set allow_device_grants in YOUR \
+                     OWN kern.toml",
+                    b.service_name()
+                ));
             }
-            return Some(format!(
-                "service '{}' asks for a GPU by its CDI name ({name}) and nothing granted it. A \
-                 GPU is a device grant: pass --allow-device-grants to `kern compose`, or set \
-                 allow_device_grants in YOUR OWN kern.toml. A compose file cannot grant itself \
-                 hardware, and a file that could would not be a policy",
-                b.service_name()
-            ));
+            if !grants.gpus {
+                if askers.len() > 1 {
+                    return Some(ungranted_gpu_message(&askers));
+                }
+                return Some(format!(
+                    "service '{}' asks for a GPU by its CDI name ({name}) and nothing granted it. \
+                     A GPU is a device grant: pass --allow-device-grants to `kern compose`, or set \
+                     allow_gpu_grants (GPUs only) or allow_device_grants in YOUR OWN kern.toml. A \
+                     compose file cannot grant itself hardware, and a file that could would not be \
+                     a policy",
+                    b.service_name()
+                ));
+            }
         }
-        if let Some(spec) = &b.gpus {
+        if let Some(spec) = b.gpus.as_ref().filter(|_| !grants.gpus) {
             if askers.len() > 1 {
                 return Some(ungranted_gpu_message(&askers));
             }
             return Some(format!(
                 "service '{}' asks for a GPU ({spec}) and nothing granted it. A GPU is a device \
-                 grant: pass --allow-device-grants to `kern compose`, or set \
-                 allow_device_grants in YOUR OWN kern.toml. A compose file cannot grant itself \
-                 hardware, and a file that could would not be a policy",
+                 grant: pass --allow-device-grants to `kern compose`, or set allow_gpu_grants \
+                 (GPUs only) or allow_device_grants in YOUR OWN kern.toml. A compose file cannot \
+                 grant itself hardware, and a file that could would not be a policy",
                 b.service_name()
             ));
         }
         // `runtime: nvidia` WITHOUT AN EXPLICIT REQUEST IS ONE TOO: it grants what the image's
         // NVIDIA_VISIBLE_DEVICES names, which in a CUDA image is every card.
-        if b.runtime_nvidia {
+        if b.runtime_nvidia && !grants.gpus {
             if askers.len() > 1 {
                 return Some(ungranted_gpu_message(&askers));
             }
@@ -7224,8 +7284,9 @@ where
                 "service '{}' has `runtime: nvidia`, which hands it the GPUs its image's \
                  NVIDIA_VISIBLE_DEVICES names (every card, in a CUDA image), and nothing granted \
                  it. A GPU is a device grant: pass --allow-device-grants to `kern compose`, or set \
-                 allow_device_grants in YOUR OWN kern.toml. A compose file cannot grant itself \
-                 hardware, and a file that could would not be a policy",
+                 allow_gpu_grants (GPUs only) or allow_device_grants in YOUR OWN kern.toml. A \
+                 compose file cannot grant itself hardware, and a file that could would not be a \
+                 policy",
                 b.service_name()
             ));
         }

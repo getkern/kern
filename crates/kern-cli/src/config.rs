@@ -59,6 +59,15 @@ pub struct KernSettings {
     /// or the generated unit carries the flag itself, which is the self-perpetuating grant on an
     /// unattended machine that the gate exists to prevent.
     pub allow_device_grants: bool,
+    /// `allow_gpu_grants` - let a compose stack take the GPUs it asks for (`gpus:`, a `deploy`
+    /// reservation, `runtime: nvidia`, CDI names of the `nvidia.com/gpu` class) without
+    /// `--allow-device-grants`, and NOTHING ELSE: a `devices:` node, a device bind under `volumes:`
+    /// or a device profile still needs `allow_device_grants`. Default `false`.
+    ///
+    /// The one-time decision Docker's users make by installing the NVIDIA container toolkit, made
+    /// here in the operator's own config. Read by the same rule as `allow_device_grants`: the default
+    /// config only, never a config a compose file names (`gpu_grants_allowed_by_config`).
+    pub allow_gpu_grants: bool,
     /// `publish_bind` - the host address a `-p`/`ports:` spec binds when it names none.
     ///
     /// Absent means [`crate::ports::PUBLISH_DEFAULT_IP`] (`0.0.0.0`), which is what Docker does and
@@ -582,6 +591,7 @@ fn apply_kern(k: &mut KernSettings, key: &str, v: &str) -> Result<(), String> {
         "log_level" => k.log_level = Some(value_string(v)?),
         "crash_recovery" => k.crash_recovery = value_bool(v)?,
         "allow_device_grants" => k.allow_device_grants = value_bool(v)?,
+        "allow_gpu_grants" => k.allow_gpu_grants = value_bool(v)?,
         "compose_privileged" => k.compose_privileged = value_bool(v)?,
         // VALIDATED HERE, where the file is read, so a typo cannot silently leave every box on a
         // policy the operator did not choose. The value decides where services LISTEN, so a value
