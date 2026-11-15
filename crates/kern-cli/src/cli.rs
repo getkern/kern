@@ -4228,6 +4228,18 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                     i += 1;
                     match rest.get(i).and_then(|v| crate::ports::parse(v)) {
                         Some(p) => ports.extend(p), // one mapping, or many for a port range
+                        // The reason compose already names: an IPv6 or empty bind address is a
+                        // feature kern lacks, not a typo, and the generic usage line said typo.
+                        None if rest
+                            .get(i)
+                            .is_some_and(|v| crate::ports::names_ipv6_or_empty_bind(v)) =>
+                        {
+                            return Err(Error::Usage(
+                                "-p with an IPv6 or empty bind address: kern publishes on IPv4 \
+                                 only; use 0.0.0.0:HOST:BOX for every interface or \
+                                 127.0.0.1:HOST:BOX for loopback",
+                            ))
+                        }
                         None => {
                             return Err(Error::Usage(
                                 "-p [ip:]<hostport>:<boxport>[/tcp|/udp] (e.g. 8080:80 or 8000-8010:8000-8010)",
@@ -7679,6 +7691,20 @@ mod tests {
                 "-p {bad}"
             );
         }
+        // An IPv6 or empty bind address names the missing feature, as compose does; a typo does not.
+        for v6 in ["[::1]:8080:80", "[::]:443:443/udp", "::443:443", ":8080:80"] {
+            assert!(
+                matches!(
+                    parse(&["box".into(), "x".into(), "-p".into(), v6.to_string()]),
+                    Err(Error::Usage(m)) if m.contains("IPv4")
+                ),
+                "-p {v6}"
+            );
+        }
+        assert!(matches!(
+            parse(&["box".into(), "x".into(), "-p".into(), "abc".into()]),
+            Err(Error::Usage(m)) if !m.contains("IPv4")
+        ));
         // The same host address+port can't map to two box ports (would silently fail to bind twice).
         assert!(matches!(
             parse(&[
