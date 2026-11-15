@@ -178,7 +178,12 @@ comes up loopback-only and says so. Outside a pod each service gets its own NAT,
 held at its pre-exec gate, so no workload sees a half-built network.
 
 A box behind pasta has an address of its own (`10.0.2.15`) and reaches the host at the host's address,
-never the host's loopback: a service bound to `127.0.0.1` on the host is out of reach from every box.
+never the host's loopback, in either family: a service bound to `127.0.0.1` or `[::1]` on the host is
+out of reach from every box. Measured against the 7 loopback-only services of a development machine,
+0 opened from a pod, a compose bridge or `--no-pod`, and with an IPv6 default route on the host,
+`[::1]` through the IPv6 gateway answered nothing (the previous build reached it). Where the host has
+IPv6, a box reaches the IPv6 internet and resolves AAAA (measured on a VPS); Docker gives a container
+no IPv6 unless the daemon is configured for it.
 Its resolvers are the host's; on a host that resolves through systemd-resolved's `127.0.0.53` stub,
 the stub's upstreams.
 
