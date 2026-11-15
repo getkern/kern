@@ -41,6 +41,9 @@ from accepted to refused, all eight for this reason and no other, and Docker acc
 change leads that release's [CHANGELOG](../CHANGELOG.md) entry, naming the key.
 
 **A key kern does not read is never silent.** It is refused, or reported with what kern does instead.
+A key that is not in Docker's compose schema at all (a typo like `enviroment:`) is refused, as Docker
+refuses it, naming the key it is one edit from; the schema is the 92 service keys and 9 top-level
+keys Docker Compose v5.0.2 accepts, measured one by one.
 Two silences are deliberate: `x-*` extension fields, and the four keys Docker itself does not act on
 under Linux (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`).
 

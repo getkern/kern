@@ -153,6 +153,33 @@ was recreated; it prints the box's ID now, its supervisor pid, which `kern stop`
 `--filter id=` already take and which a recreate changes. `ps --format json` carries the same `ID`.
 `kern ps -q` still prints names.
 
+**A compose teardown stops a service as Docker does.** `down`, `stop`, `restart`, a recreate and
+`--abort-on-container-exit` now wait the grace for an init that cannot hear SIGTERM (a Python or
+`sleep` PID 1 with no handler), returning as soon as it exits, where kern killed it on the spot: a
+job that was finishing lost its result. The stop signal goes to the init alone, as Docker sends it,
+not to the box's whole process group, so a shell script's running child is not killed under it. A
+`down` of a stack whose services are a `sleep` therefore takes their grace, 10 s by default, as it
+does under Docker; `stop_grace_period: 0s` or `down -t 0` kills at once. `kern stop` and the sandbox
+SDKs keep the immediate stop.
+
+**Compose surface, measured against Docker.** `compose run --entrypoint "sh -c 'exit 42'"` splits the
+string as a shell would (it looked for a program named `sh -c 'exit 42'`). `COMPOSE_FILE` (split on
+`COMPOSE_PATH_SEPARATOR`, `:` by default) names the files when none is given. A key that is not in
+Docker's compose schema is refused, as Docker refuses it, instead of starting the stack with a
+warning: the 92 service keys and 9 top-level keys Docker Compose v5.0.2 accepts were measured one by
+one, a key among them that kern does not act on still warns, and a typo names the key it is one edit
+from. kern's TOML spellings (`health_cmd:`, `depends_healthy:`) in a docker-compose.yml are refused
+the same way, with the YAML to write. `--abort-on-container-exit` stops the stack when a run ends even
+if a restart policy would start the next one, and the service's status is that run's code. A project,
+pod, volume, network or secret name may be 200 bytes long (it was 64, and Docker accepts a 72-byte
+project name). `ps`, `down`, `stop`, `logs`, `exec` and the other verbs that act on what is running
+reach a service behind a profile that is not active, as Docker's `ps` does; `down` stops it, where
+Docker's leaves it running. `compose top` prints Docker's table (SERVICE # UID PID PPID C STIME TTY TIME CMD, one for the
+stack) instead of PID and COMMAND per service. `up --abort-on-container-exit` keeps streaming every
+service's log while the stack stops, as Docker's does, so the last lines of a service still working
+when another exited are no longer cut off. A missing bind source is created `0755`, as Docker's
+daemon creates it (it took the user's umask, `775` under umask 002).
+
 **`image=None` in the Python SDK is the default image**, as `image: null` already was in Node. It
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
 before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
