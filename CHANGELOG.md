@@ -57,6 +57,26 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
+**`-p 80`, `-p ip::80`, `-p 0:80` and compose `ports: ["80"]` publish on a host port the kernel
+picks**, as Docker does: one number for `0.0.0.0` and `[::]`, recorded before anything else, so
+`kern ps`, `kern port` and `compose port` read it. kern refused the three `-p` forms and turned a
+compose container-only port into one that was not published, which is how one file runs as several
+stacks at once (one per pull request). `kern port <box> <port>` lists every binding of the port, as
+`docker port` does.
+
+**`--ssh` works again with the box-address change above**: the in-box sshd listened on `127.0.0.1`
+while the forwarder moved to the box's address, so every connection was reset. sshd now listens
+where the forwarder connects.
+
+**A loopback `publish_bind` policy works on a host with IPv6 but no `::1`**, which is a common VPS
+shape: the policy's IPv6 half is dropped when its own address cannot be bound, where every `-p` was
+refused before. `Address not available` is said as what it is (the host has no such address) instead
+of "held by something else".
+
+**A compose stack whose later service is refused leaves no pod behind.** The guard that removes an
+empty pod ran before the gates of the prepared services closed, so it held them and kept the pod
+with its holder process, after every such failed CI job.
+
 **A published port no longer reaches a box's loopback, and its clients no longer arrive as
 loopback.** `-p` forwarded to the box's `127.0.0.1` from `127.0.0.1`, so a service listening on its
 loopback only was published anyway, and every client from the network looked local to the server:
