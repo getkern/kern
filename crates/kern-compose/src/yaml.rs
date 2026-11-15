@@ -5310,6 +5310,19 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
             // who mixed the two syntaxes would otherwise bring a stack up with no health gate and only
             // a vague warning to explain why.
             // REFUSED, as Docker refuses them (they are not compose keys), with the line to write.
+            // `scale:` runs that many boxes, as `deploy.replicas` does (see `ComposeBox::replicas`).
+            "scale" => match node
+                .scalar
+                .as_deref()
+                .and_then(|v| scalar_str(v).trim().parse::<u32>().ok())
+            {
+                Some(n) => b.replicas = Some(n),
+                None => {
+                    return Err(format!(
+                        "service '{name}': `scale:` must be a number of replicas"
+                    ))
+                }
+            },
             "health_cmd" | "health_interval" | "health_retries" | "health_timeout"
             | "health_start_period" | "health_action" => return Err(format!(
                 "service '{name}': '{key}:' is kern's TOML spelling, not a compose key (Docker \
@@ -5576,7 +5589,7 @@ fn parse_binary_size_str(s: &str) -> Option<u64> {
 /// `deploy.resources.reservations.devices: [{capabilities: [gpu]}]` came up with **no output at all** and
 /// ran without the device. [`apply_deploy`] returns early when `resources.limits` is absent, so the whole
 /// `reservations` subtree was never looked at. Every neighbour in that function names what it drops
-/// (`replicas`, `mode`, `placement`, ...) for the same reason: a stack that looks scaled and is not, or
+/// (`mode`, `placement`, ...) for the same reason: a stack that looks scaled and is not, or
 /// looks accelerated and is not, is the "runs but lies" shape this parser exists to refuse.
 ///
 /// The device half gets its own sentence because the remedy is different in kind: a device is granted by
@@ -5876,7 +5889,7 @@ fn deploy_reservation_note(service: &str, key: &str) -> String {
     }
     format!(
         "service '{service}': deploy.resources.reservations.{key} ignored - it is a scheduling request \
-         to an orchestrator, and kern runs one box per service with no scheduler. Write a CAP instead \
+         to an orchestrator, and kern has no scheduler. Write a CAP instead \
          (`mem_limit:`/`cpus:`, or deploy.resources.limits), which kern does enforce"
     )
 }
@@ -5902,11 +5915,17 @@ const DEPLOY_KEYS_MAPPED: [&str; 2] = ["resources", "restart_policy"];
 /// orchestration keys keep their own sentence, and the catch-all arm names anything left, so the NEXT key
 /// a Compose release adds is a warning rather than another silence.
 fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
-    // `deploy.replicas` / `deploy.mode`: kern runs ONE box per service. Docker would start N, so
-    // ignoring this in silence means a stack that looks scaled and is not - the exact "runs but lies"
-    // this parser refuses. Named, so the operator decides.
+    // `deploy.replicas` IS APPLIED: compose runs that many boxes (see `ComposeBox::replicas`).
+    // `deploy.mode` and the other orchestration keys are named below, so a stack does not look
+    // scheduled the way Docker would schedule it while kern runs it otherwise.
+    if let Some(n) = node
+        .child("replicas")
+        .and_then(|r| r.scalar.as_deref())
+        .and_then(|v| scalar_str(v).trim().parse::<u32>().ok())
+    {
+        b.replicas = Some(n);
+    }
     for k in [
-        "replicas",
         "mode",
         "placement",
         "update_config",
@@ -5915,7 +5934,7 @@ fn apply_deploy(b: &mut ComposeBox, node: &Node, name: &str) {
     ] {
         if node.child(k).is_some() {
             warn(&format!(
-                "service '{name}': deploy.{k} ignored - kern runs one box per service (no orchestrator)"
+                "service '{name}': deploy.{k} ignored - kern has no orchestrator"
             ));
         }
     }

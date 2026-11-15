@@ -133,7 +133,7 @@ pub fn pull_policy_word(v: &str) -> Option<&'static str> {
 /// `user`→`--user`, `volumes`→`-v`, `env`→`-e`, `ports`→`-p`, `secrets`→`--secret`; the rest share
 /// the flag's long name (`pids_limit`, `io_weight`, `nice`, `timeout`, `hostname`, `tun`, `tmpfs`,
 /// `cap_add`, `cap_drop`, `env_file`, `health_retries`/`_start_period`/`_timeout`/`_action`).
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct ComposeBox {
     pub name: String,
     /// Docker's `container_name:`. When set, `kern compose` names the box this EXACTLY (not
@@ -274,6 +274,13 @@ pub struct ComposeBox {
     /// resolved to `kern box --ipc` at launch. `private` and `host` are not carried (the parser says
     /// what each means here).
     pub ipc: Option<String>,
+    /// Compose `scale:` / `deploy.replicas`: how many boxes this service runs. `None` is one.
+    /// Expanded by compose before the names are scoped: replica 1 keeps the service's name, replica
+    /// N is the service `<name>-N`, each a box with its own namespace, address and ports.
+    pub replicas: Option<u32>,
+    /// Set on a replica made by that expansion: the service it is a replica of, so a command that
+    /// names the service (`logs web`, `stop web`) reaches every replica.
+    pub replica_of: Option<String>,
     /// Compose `networks.<net>.ipv4_address` - the literal addresses this service is pinned to.
     ///
     /// A LIST BECAUSE A SERVICE MAY SIT ON SEVERAL NETWORKS, one address per network, and picking
@@ -1565,6 +1572,7 @@ impl ComposeBox {
             config,
             net_share,
             ipc,
+            replicas,
             // DERIVED from the DOCUMENT's top-level `networks:` rather than written on the service,
             // so an override's value is computed against the override's declarations. The scalar
             // and list rules are an approximation of a recompute over the merged stack, and a
@@ -3947,7 +3955,8 @@ mod dotenv_tests {
     #[test]
     fn every_compose_box_field_is_handled_by_merge_from_or_exempted_by_name() {
         // Identity, not data: a merge only ever runs on two boxes that already share these.
-        const EXEMPT: [&str; 2] = ["name", "service"];
+        // `replica_of` is never written in a file: compose sets it when it expands replicas.
+        const EXEMPT: [&str; 3] = ["name", "service", "replica_of"];
         let src = include_str!("lib.rs");
         let start = src
             .find("pub struct ComposeBox {")
@@ -4837,6 +4846,14 @@ mod contract_tests {
                 "ipc",
                 "compose's `ipc_flag`, which resolves `service:<name>` to that box and passes \
                  `kern box --ipc`",
+            ),
+            (
+                "replicas",
+                "compose's `expand_replicas`, which makes one box per replica",
+            ),
+            (
+                "replica_of",
+                "compose's service selection, so naming a service reaches its replicas",
             ),
             (
                 "container_name",

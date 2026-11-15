@@ -620,6 +620,105 @@ fn gate_release(fd: &std::os::fd::OwnedFd) -> bool {
     }
 }
 
+/// Expand every service with more than one replica (`scale:`, `deploy.replicas`, `--scale
+/// svc=N`, the flag winning) into one box per replica, BEFORE the names are scoped: replica 1 keeps
+/// the service's name, replica N becomes the service `<name>-N`, a box of its own with its own
+/// namespace, address and ports, and each replica starts after the one before it, so replicas
+/// sharing a host port range pick their ports one at a time (MEASURED: three replicas of
+/// `18410-18413:80` took three different ports in each of four runs). A replica count of 0 runs
+/// none, as Docker's does.
+///
+/// MEASURED against Docker Compose v5: `up -d --scale web=3` started `<project>-web-1..3`, each with
+/// its own port of an `8080-8095:80` range and `compose port --index N` answering each; a fixed
+/// host port under `--scale 2` started one replica and refused the other with "port is already
+/// allocated"; `deploy.replicas: 2` started two. kern refused `--scale` and warned that it ran one
+/// box per service. `container_name` cannot be shared by replicas, as under Docker.
+fn expand_replicas(
+    boxes: &mut Vec<crate::compose::ComposeBox>,
+    scale: &[String],
+    pod: &str,
+    starting: bool,
+) -> Result<Vec<String>, Error> {
+    let mut wanted: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for spec in scale {
+        let (svc, n) = spec
+            .split_once('=')
+            .and_then(|(s, n)| n.trim().parse::<u32>().ok().map(|n| (s.trim(), n)))
+            .ok_or(Error::Usage("compose up --scale SERVICE=NUM"))?;
+        if !boxes.iter().any(|b| b.name == svc) {
+            return Err(Error::Compose(format!(
+                "--scale {spec}: no such service: {svc}"
+            )));
+        }
+        wanted.insert(svc.to_string(), n);
+    }
+    // THE REPLICAS RUNNING NOW, by name (`<pod>-<service>-<N>`): `--scale` is a flag of one `up`, and
+    // a `ps`, `logs` or `down` after it must still see every replica it started, as Docker finds
+    // them by project. MEASURED: `down` after `up --scale web=3` stopped `web` alone and left two
+    // replicas running with their pod gone.
+    let live: Vec<String> = crate::registry::list()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    let running = |svc: &str| -> u32 {
+        let prefix = format!("{pod}-{svc}-");
+        live.iter()
+            .filter_map(|n| n.strip_prefix(&prefix)?.parse::<u32>().ok())
+            .filter(|k| *k >= 2)
+            .max()
+            .unwrap_or(1)
+    };
+    let mut surplus: Vec<String> = Vec::new();
+    let mut out: Vec<crate::compose::ComposeBox> = Vec::with_capacity(boxes.len());
+    for b in boxes.drain(..) {
+        let desired = wanted.get(&b.name).copied().or(b.replicas).unwrap_or(1);
+        let up_to = running(&b.name);
+        // `up` brings the service to the count asked for and stops the replicas above it, as
+        // Docker's does; every other verb sees every replica that is running.
+        let n = if starting {
+            for k in (desired + 1).max(2)..=up_to {
+                surplus.push(format!("{pod}-{}-{k}", b.name));
+            }
+            desired
+        } else {
+            desired.max(up_to)
+        };
+        if n == 0 {
+            continue;
+        }
+        if n > 1 && b.container_name.is_some() {
+            return Err(Error::Compose(format!(
+                "service '{}': `container_name` is one name and the service runs {n} replicas; \
+                 remove the custom name to scale the service, as Docker requires",
+                b.name
+            )));
+        }
+        let base = b.name.clone();
+        for k in 2..=n {
+            let mut r = b.clone();
+            r.name = format!("{base}-{k}");
+            r.replica_of = Some(base.clone());
+            r.replicas = None;
+            let previous = if k == 2 {
+                base.clone()
+            } else {
+                format!("{base}-{}", k - 1)
+            };
+            if !r.depends_on.contains(&previous) {
+                r.depends_on.push(previous);
+            }
+            out.push(r);
+        }
+        let mut first = b;
+        first.replicas = None;
+        // The first replica sits where the service did, so peers named in the file keep their order.
+        let at = out.len() - (n as usize - 1);
+        out.insert(at, first);
+    }
+    *boxes = out;
+    Ok(surplus)
+}
+
 fn resolve_box_names(
     boxes: &mut [crate::compose::ComposeBox],
     pod: &str,
@@ -977,6 +1076,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         run_entrypoint,
         run_env,
         run_volumes,
+        scale,
+        index,
         run_user,
         bridge: want_bridge,
         allow_privileged,
@@ -1253,6 +1354,22 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // liveness) keeps working on one consistent set of names without knowing about projects at all.
     // The bare service name is registered as a pod ALIAS below, so peers still reach each other as
     // `db` inside the stack - the name that appears in the compose file is the name that resolves.
+    let starting = matches!(action, ComposeAction::Up | ComposeAction::Start);
+    let surplus = expand_replicas(&mut boxes, scale, &pod, starting)?;
+    // Replicas above the count this `up` asks for: stopped as a compose teardown stops a service.
+    if !surplus.is_empty() {
+        println!("→ scaling down, stopping: {}", surplus.join(", "));
+        let _ = crate::commands::inspect::stop_with_grace(
+            &surplus,
+            false,
+            None,
+            crate::commands::DeafInit::WaitGrace,
+        );
+        for n in &surplus {
+            crate::commands::remove_logs_of(n);
+        }
+        crate::registry::clear_waitexit_pod(&pod, &surplus);
+    }
     let service_names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
     let box_name_of = resolve_box_names(&mut boxes, &pod);
     let box_name = |svc: &str| {
@@ -1262,14 +1379,44 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .unwrap_or_else(|| format!("{pod}-{svc}"))
     };
     // Selectors from the command line name SERVICES; map them onto the boxes they now identify.
-    let services: Vec<String> = services
+    // `--index N` names replica N of the first service: the service `<name>-N` (1 is the service).
+    let indexed: Vec<String> = services
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| match index {
+            Some(n) if i == 0 && n > 1 => format!("{s}-{n}"),
+            _ => s.clone(),
+        })
+        .collect();
+    // A SERVICE NAMED ON THE COMMAND LINE IS ALL OF ITS REPLICAS, as `logs web` and `stop web` are
+    // under Docker, unless `--index` picked one.
+    let services: Vec<String> = indexed
+        .iter()
+        .flat_map(|s| {
+            let mut v: Vec<String> = Vec::new();
             if service_names.iter().any(|n| n == s) {
-                box_name(s)
+                v.push(box_name(s));
+                // `port`, `exec`, `cp` and `run` address ONE box, replica 1 unless `--index`
+                // says otherwise, as Docker's do.
+                let one_box = matches!(
+                    action,
+                    ComposeAction::Port
+                        | ComposeAction::Exec
+                        | ComposeAction::Cp
+                        | ComposeAction::Run
+                );
+                if index.is_none() && !one_box {
+                    for b in boxes
+                        .iter()
+                        .filter(|b| b.replica_of.as_deref() == Some(s.as_str()))
+                    {
+                        v.push(b.name.clone());
+                    }
+                }
             } else {
-                s.clone()
+                v.push(s.clone());
             }
+            v
         })
         .collect();
     let services = &services[..];

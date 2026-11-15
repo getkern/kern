@@ -8700,6 +8700,23 @@ fn check_port_collisions(boxes: &[crate::compose::ComposeBox]) -> Result<(), Err
                 };
                 if let Some(other) = prior {
                     let proto = if pm.udp { "udp" } else { "tcp" };
+                    // REPLICAS OF ONE SERVICE ON ONE FIXED HOST PORT, in Docker's words: Docker
+                    // starts the first and refuses the next with "port is already allocated".
+                    if b.replica_of.is_some() {
+                        let base = b.replica_of.as_deref().unwrap_or(other);
+                        return Err(Error::Compose(format!(
+                            "service '{base}' runs more than one replica on host port {}/{proto}: \
+                             Bind for {}:{} failed: port is already allocated. Give the \
+                             replicas a range (`\"{}-{}:{}\"`) or a random port (`\"{}\"`)",
+                            pm.host,
+                            pm.bind,
+                            pm.host,
+                            pm.host,
+                            pm.host.saturating_add(9),
+                            pm.box_port,
+                            pm.box_port
+                        )));
+                    }
                     let who = if other == name {
                         format!(
                             "service '{name}' publishes host port {}/{proto} more than once",
@@ -10302,6 +10319,10 @@ pub struct ComposeOpts<'a> {
     pub run_env: &'a [String],
     /// `run -v SRC:DST[:ro]`, repeatable: a mount for this one-off, beside the service's own.
     pub run_volumes: &'a [String],
+    /// `up --scale SERVICE=NUM`: see `expand_replicas`.
+    pub scale: &'a [String],
+    /// `port --index N` / `exec --index N`: the replica N of the first service named.
+    pub index: Option<u32>,
     /// `run --user <uid[:gid]>`: the identity this one-off runs as, over the service's own.
     pub run_user: Option<&'a str>,
     /// `down --rmi <local|all>`: `Some(false)` removes the images this file BUILDS, `Some(true)`

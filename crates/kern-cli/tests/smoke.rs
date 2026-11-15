@@ -4960,6 +4960,170 @@ fn a_host_port_range_onto_one_box_port_picks_a_free_port_of_it() {
     );
 }
 
+/// `--scale` AND `deploy.replicas` RUN ONE BOX PER REPLICA, AS DOCKER DOES.
+///
+/// MEASURED against Docker Compose v5: `up -d --scale web=3` on `ports: ["18180-18183:80"]` gave
+/// three containers, each on its own port of the range, with `compose port --index N` answering each;
+/// `deploy.replicas: 2` started two; a fixed host port under `--scale 2` was refused for the second
+/// replica with "port is already allocated". kern refused `--scale` and ran one box per service.
+#[test]
+fn scale_and_deploy_replicas_run_one_box_per_replica() {
+    let dir = std::env::temp_dir().join(format!("kern-it-scale-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-scale-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  web:\n    image: alpine\n    command: [\"sleep\", \"60\"]\n    ports:\n      - \"18410-18413:80\"\n  rep:\n    image: alpine\n    command: [\"sh\", \"-c\", \"echo REP-RUN; sleep 60\"]\n    deploy:\n      replicas: 2\n",
+    );
+    let _ = std::fs::write(
+        dir.join("fixed.yml"),
+        "services:\n  fixed:\n    image: alpine\n    command: [\"sleep\", \"60\"]\n    ports:\n      - \"18419:80\"\n",
+    );
+    let run = |args: &[&str]| -> (Option<i32>, String) {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+        {
+            Ok(o) => (
+                o.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (None, e.to_string()),
+        }
+    };
+    let c = |verb: &[&str]| {
+        let mut a = vec!["compose", "-f", "compose.yml", "-p", "scl"];
+        a.extend_from_slice(verb);
+        run(&a)
+    };
+    let (up_rc, up) = c(&["up", "-d", "--scale", "web=3"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let (_, web_ids) = c(&["ps", "-q", "web"]);
+    let ports: Vec<String> = (1..=3)
+        .map(|i| {
+            c(&["port", "--index", &i.to_string(), "web", "80"])
+                .1
+                .trim()
+                .to_string()
+        })
+        .collect();
+    let (_, logs) = c(&["logs", "rep"]);
+    // What is asserted is WHICH replica `--index` reaches, not the caps: a host without cgroup
+    // delegation refuses a capped exec (measured as kdev on WSL2), so the exec runs uncapped, and
+    // only its stdout is compared so a host note on stderr cannot make the two answers differ.
+    let hostname_of = |index: &str| -> String {
+        let mut a = vec!["compose", "-f", "compose.yml", "-p", "scl", "exec", "-T"];
+        if !index.is_empty() {
+            a.extend_from_slice(&["--index", index]);
+        }
+        a.extend_from_slice(&["web", "hostname"]);
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env("KERN_ALLOW_UNCAPPED", "1")
+            .args(&a)
+            .output()
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(e) => e.to_string(),
+        }
+    };
+    let host_1 = hostname_of("");
+    let host_2 = hostname_of("2");
+    // `up` without `--scale` brings web back to the file's one replica, as Docker's does.
+    let _ = c(&["up", "-d"]);
+    let (_, scaled_down) = c(&["ps", "-q", "web"]);
+    let _ = c(&["down", "-t", "0"]);
+    let (_, after) = run(&["ps", "-q"]);
+    let (fixed_rc, fixed) = run(&[
+        "compose",
+        "-f",
+        "fixed.yml",
+        "-p",
+        "sclf",
+        "up",
+        "-d",
+        "--scale",
+        "fixed=2",
+    ]);
+    let _ = run(&[
+        "compose",
+        "-f",
+        "fixed.yml",
+        "-p",
+        "sclf",
+        "down",
+        "-t",
+        "0",
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    assert!(
+        !up.contains("--scale") && !up.contains("one box per service"),
+        "`--scale` and `deploy.replicas` are applied:\n{up}"
+    );
+    // A REFUSED `up` IS A FAILURE, NOT A HOST WITHOUT A RUNTIME, when kern itself said why: a
+    // replica refused its port is the defect this test is about.
+    assert!(
+        !up.contains("port is already allocated") && !up.contains("failed to start"),
+        "the scaled stack starts:\n{up}"
+    );
+    if up_rc != Some(0) {
+        eprintln!("SKIP: this host did not run the stack:\n{up}");
+        return;
+    }
+    assert_eq!(
+        web_ids.lines().count(),
+        3,
+        "three replicas of web:\n{web_ids}"
+    );
+    let mut seen: Vec<&str> = ports.iter().map(String::as_str).collect();
+    assert!(
+        seen.iter().all(|p| ["18410", "18411", "18412", "18413"]
+            .iter()
+            .any(|r| p.ends_with(&format!(":{r}")))),
+        "each replica on a port of the range: {ports:?}"
+    );
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 3, "and each on its own: {ports:?}");
+    assert_eq!(
+        logs.matches("REP-RUN").count(),
+        2,
+        "two replicas of rep:\n{logs}"
+    );
+    assert!(
+        !host_2.trim().is_empty() && host_1.trim() != host_2.trim(),
+        "`exec --index 2` runs in the second replica: {host_1:?} {host_2:?}"
+    );
+    assert_eq!(
+        after.lines().count(),
+        0,
+        "nothing left after down:\n{after}"
+    );
+    assert_eq!(
+        scaled_down.lines().count(),
+        1,
+        "`up` without --scale scales back to one:\n{scaled_down}"
+    );
+    assert_ne!(
+        fixed_rc,
+        Some(0),
+        "two replicas on one fixed host port are refused:\n{fixed}"
+    );
+    assert!(
+        fixed.contains("port is already allocated"),
+        "in Docker's words:\n{fixed}"
+    );
+}
+
 /// FIVE THINGS A SECOND MODEL'S CASES FOUND, EACH MEASURED AGAINST DOCKER ON THE SAME FILE.
 ///
 /// `run --entrypoint "sh -c 'exit 42'"` exited 42 under Docker and 127 under kern; `COMPOSE_FILE`

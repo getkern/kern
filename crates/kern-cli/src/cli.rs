@@ -710,6 +710,10 @@ pub enum Command {
         run_env: Vec<String>,
         /// `run -v SRC:DST[:ro]`, repeatable: a mount for this one-off, beside the service's own.
         run_volumes: Vec<String>,
+        /// `up --scale SERVICE=NUM` (repeatable): that many replicas of the service.
+        scale: Vec<String>,
+        /// `port --index N` / `exec --index N`: the replica N of the service named.
+        index: Option<u32>,
         /// `run --user <uid[:gid]>`: the identity this one-off runs as.
         run_user: Option<String>,
         /// `down --rmi <local|all>`: `Some(false)` removes the images this file BUILDS, `Some(true)`
@@ -2047,6 +2051,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut run_entrypoint: Option<String> = None;
             let mut run_env: Vec<String> = Vec::new();
             let mut run_volumes: Vec<String> = Vec::new();
+            let mut scale: Vec<String> = Vec::new();
+            let mut index: Option<u32> = None;
             let mut run_user: Option<String> = None;
             // `Some(false)` = `--rmi local`, `Some(true)` = `--rmi all`.
             let mut rmi: Option<bool> = None;
@@ -2178,6 +2184,21 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // the SERVICE name ("no service '/home/...:ro'").
                     // ONLY FOR `run`: `-v` on `down` is "remove the volumes", and the verb decides,
                     // as it does for `-t`.
+                    // `port --index N` / `exec --index N`: which replica, as Docker counts them (1 is
+                    // the first).
+                    "--index" => {
+                        index = Some(
+                            inline_or_next(inline, &mut it)
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .filter(|n| *n >= 1)
+                                .ok_or(Error::Usage("compose port|exec --index N (1 or more)"))?,
+                        )
+                    }
+                    // `up --scale SERVICE=NUM`: Docker's replica count, repeatable.
+                    "--scale" => scale.push(
+                        inline_or_next(inline, &mut it)
+                            .ok_or(Error::Usage("compose up --scale SERVICE=NUM"))?,
+                    ),
                     "-v" | "--volume" if action == Some(commands::ComposeAction::Run) => {
                         run_volumes.push(
                             inline_or_next(inline, &mut it)
@@ -2513,6 +2534,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_entrypoint,
                 run_env,
                 run_volumes,
+                scale,
+                index,
                 run_user,
                 rmi,
                 recreate,
@@ -2577,6 +2600,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 run_entrypoint: None,
                 run_env: Vec::new(),
                 run_volumes: Vec::new(),
+                scale: Vec::new(),
+                index: None,
                 run_user: None,
                 rmi: None,
                 // The shorthand carries the recreate overrides too: `kern up --force-recreate` in a
@@ -5372,7 +5397,6 @@ fn unknown_compose_flag(flag: &str) -> String {
     // what makes a stale entry dangerous: it cannot fail a test, and it is read only by a person
     // who has just hit the error, at the moment they are most likely to believe it.
     let known: &[(&str, &str)] = &[
-        ("--scale", "kern has no replica count; a service is one box"),
         (
             "--compatibility",
             "kern has no v1 naming to fall back to; boxes are named <project>-<service>",
@@ -6165,6 +6189,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             run_entrypoint,
             run_env,
             run_volumes,
+            scale,
+            index,
             run_user,
             rmi,
             recreate,
@@ -6215,6 +6241,8 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             no_log_prefix,
             run_env: &run_env,
             run_volumes: &run_volumes,
+            scale: &scale,
+            index,
             run_user: run_user.as_deref(),
             rmi,
             no_pod,
