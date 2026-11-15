@@ -129,14 +129,16 @@ the name nor a route. Measured with three services on images that EXPOSE nothing
 address, and `app` had one interface per network. Two members given `NET_ADMIN` that each add a route
 through the pod did not reach each other; with forwarding turned on in the pod, they did.
 
-**One shared namespace (`--pod`).** Services reach each other by name on `127.0.0.1`: no bridge, no
-IPAM, no DNS server. Two services cannot both listen on the same container port, and kern refuses such
-a stack rather than running it with one of them dead. A port bound on the loopback is reachable by
-every peer.
+**One shared namespace (`--pod`).** Services reach each other by name at the pod's address
+(`192.0.0.8`): no bridge, no IPAM, no DNS server. Two services cannot both listen on the same container
+port, and kern refuses such a stack rather than running it with one of them dead. A port bound on the
+loopback is reached through `localhost` by every member, which is what one namespace means, and not by
+a service's name: measured with a listener on `127.0.0.1` and one on `0.0.0.0`, a peer's
+`wget loonly:81` was refused and `wget anyif:81` answered, in all three wirings and under Docker.
 
-**A namespace per service with relays (`--no-pod`).** Chosen automatically only for a file that both
-separates services with `networks:` and asks for a shared namespace (`network_mode: service:`).
-Peers are reached through per-service loopback aliases
+**A namespace per service with relays (`--no-pod`).** Only when asked for. A relay reaches the
+service at its own address and not at its loopback, so a service bound to `127.0.0.1` is not reached
+by a peer, as under Docker. Peers are reached through per-service loopback aliases
 (`127.0.0.2` upward). The cost is a relay hop: -34% bulk throughput, -16% connection rate. A relay is
 built per known port: what the service declares (`port:`, `expose:`, `ports:`) or, when it declares
 none and runs the image's own command, what its image EXPOSEs, so a `redis` or an `nginx` is reachable
@@ -145,6 +147,15 @@ image that EXPOSEs nothing and declares no port gets no relay, and `up` names it
 port a container listens on, and here that port has to be written as `expose:`. Measured on the
 three-service file above under `--no-pod`: with no port declared, a call to a peer by name reached the
 CALLER's own listener and returned its own answer.
+
+**`network_mode: service:X` joins X's network namespace, in every wiring.** The service shares X's
+`127.0.0.1` and X's route out, so a client put behind a VPN container stays behind it; it has no
+address and no name of its own on the stack's networks, and a peer reaches its ports at X's name.
+X starts first. `ports:` or `hostname:` on such a service are refused with Docker's words
+(`conflicting options: ...`). Measured on a `vpn` + `client` + `web` file, against Docker on the
+same file: one namespace inode for `vpn` and `client`, `client` read `vpn`'s loopback-only port,
+`client` reached the internet through `vpn`, `web` got `client`'s answer from `vpn:8080` and did not
+resolve `client`. On the command line the same is `kern box --network container:<box>`.
 
 **`networks:` is enforced on a bridge per network and under `--no-pod`, and inert in a pod.** Two
 services with no network in common share no bridge (or get no relay) and no `/etc/hosts` entry, so the
@@ -182,12 +193,27 @@ Pasta costs about **3.6 ms per round trip** and about 9% less download throughpu
 ## Differences that bite
 
 **In one shared namespace the services share `127.0.0.1`.** A port bound on the loopback is reachable
-from every peer: admin endpoints, `/metrics`, pprof, anything trusting `127.0.0.0/8` without
-authentication. `--no-pod` gives each service its own loopback.
+from every member through `localhost`: admin endpoints, `/metrics`, pprof, anything trusting
+`127.0.0.0/8` without authentication. The default bridge gives each service its own loopback.
 
-**A published port binds `0.0.0.0`, like Docker.** On the corpus, 203 of 259 files (78%) publish at
-least one port. The narrower posture is a CEILING rather than a default, so a downloaded file cannot
-defeat it by writing an address:
+**A published port binds `0.0.0.0` and `[::]`, like Docker.** On the corpus, 203 of 259 files (78%)
+publish at least one port. Every form is read as Docker reads it, measured against `docker port`:
+`8080:80` and `:8080:80` bind both families, `0.0.0.0:8080:80` IPv4 only, `[::]:8080:80` and
+`[::1]:8080:80` (or `::1:8080:80`) that IPv6 address only, and `::8080:80` is refused as Docker refuses
+it, `invalid IP address: :`. On a host without IPv6 the `[::]` half of a default bind is dropped, as
+Docker drops it. `kern ps` lists both halves, `0.0.0.0:8080->80, [::]:8080->80`. `compose port` prints
+an IPv6 address in brackets (`[::1]:18207`), as `docker port` does; `docker compose port` prints it
+without (`::1:18207`), which is not a usable URL.
+
+**A published port reaches the box's address, not its loopback, as under Docker.** A service listening
+on the box's `127.0.0.1` only is not published, and kern says so once in the box's log; a client
+arrives from the box's address and not from loopback, so a server's "trust local connections" rule
+does not admit it. Measured against Docker, same images: a listener bound to `127.0.0.1` answered
+nothing on either, and Redis in protected mode answered `-DENIED` to a published client on both. Before
+this, under kern, the first answered 200 to a LAN client and the second `+PONG`.
+
+The narrower posture is a CEILING rather than a default, for both families, so a downloaded file
+cannot defeat it by writing an address:
 
 ```toml
 [kern]

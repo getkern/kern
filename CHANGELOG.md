@@ -57,6 +57,34 @@ differs in one bit: a box with checksum offload on took 97,608 arrivals at the s
 predicate and entered it 0 times, and the same shape with the box turning offload off on its own
 `eth0` took 42,721 and entered it 4,282.
 
+**A published port no longer reaches a box's loopback, and its clients no longer arrive as
+loopback.** `-p` forwarded to the box's `127.0.0.1` from `127.0.0.1`, so a service listening on its
+loopback only was published anyway, and every client from the network looked local to the server:
+measured from a LAN address, a listener bound to `127.0.0.1` answered 200, and Redis in protected
+mode with no password answered `+PONG`. Docker answers nothing and `-DENIED`, and so does kern now.
+A box that publishes, joins a pod or is a compose service has an address of its own (`192.0.0.8`,
+RFC 7600's dummy address, on its `lo`), its name resolves to it, and a published port and a peer
+relay reach the box there, from there. A service bound to `127.0.0.1` is therefore not reached by a
+peer by name either, in a pod, on a bridge or through `--no-pod` relays, which is Docker's rule;
+members of one pod still share `localhost`. When a published port finds only a loopback listener,
+the box's log says so once. A box with nothing to reach it (an SDK cell, an MCP call) gets no
+address and pays nothing.
+
+**`-p` publishes on IPv6 too, read the way Docker reads it.** `8080:80` binds `0.0.0.0` and `[::]`,
+`[::1]:8080:80` and `[::]:8080:80` bind that address only, `::8080:80` is refused with Docker's
+`invalid IP address: :`, and a host without IPv6 drops the `[::]` half. UDP works over both.
+`publish_bind = "127.0.0.1"` holds both families to loopback. `compose up` refuses a malformed port
+spec before creating anything, naming the service, as `config` did.
+
+**`network_mode: service:X` joins X's network namespace, on every wiring, and `kern box --network
+container:<box>` does the same.** On a bridge the key was not honoured, so a client put behind a VPN
+container reached the network directly; a file that also used `networks:` was sent to the relays,
+and one without was run as a single namespace for the whole stack. The joining service now shares
+X's loopback and route, takes X's hostname, hosts and resolvers, has no address or name of its own,
+starts after X, and its `ports:` or `hostname:` are refused with Docker's words. Measured against
+Docker on one file: the same namespace for both, the VPN's loopback port read, the internet reached
+through the VPN, a peer answered by the client at the VPN's name.
+
 **`compose up --abort-on-container-exit --exit-code-from tests` returns when the tests do.** A test
 service that exited before kern began following the logs was skipped, so its output was never shown
 and `up` waited on a database that never exits, until the job's own timeout. A test that exited
@@ -67,9 +95,6 @@ the stack running. Both now end the wait, the stack is torn down, and the status
 raised a `TypeError` from `subprocess`; an empty or non-string image is refused by name in both SDKs
 before anything runs, where `""` first built a bytecode cache for an empty reference. An empty
 `KERN_MCP_IMAGE` is unset, as every other `KERN_MCP_*` variable reads it.
-
-**`kern box -p` with an IPv6 or empty bind address names the reason**: kern publishes on IPv4 only.
-It printed the generic usage line, which reads as a typo; compose already said why.
 
 **The `ssh` command `--ssh` prints works on every launch.** The box made a new host key each time,
 and the printed `accept-new` pinned the first one in `~/.ssh/known_hosts`, so the second box on the
