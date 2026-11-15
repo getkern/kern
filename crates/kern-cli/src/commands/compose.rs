@@ -3583,7 +3583,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         .filter(|b| started.contains(b.name.as_str()))
         .collect();
     let dead = settle_and_collect_dead(&mine, &pod, &up_token);
-    if !dead.is_empty() {
+    // UNDER `--abort-on-container-exit` AN EARLY EXIT IS THE RESULT, NOT A FAILED START. A test
+    // service that pings its database and exits does so well inside the settle window, and this
+    // reported it as "died within 150ms", exited 1 whatever the test returned, and left the rest of
+    // the stack running for the next CI job to find "up to date". MEASURED with a two-service file
+    // (`redis` + a `redis-cli ping` test). [`watch_and_abort`] already reads who ended first, tears
+    // the stack down and returns that service's own status, which is Docker's contract.
+    if !dead.is_empty() && !abort_on_exit {
         // WHY IT DIED, WHEN KERN CAN SEE WHY. A service that binds a port another service in the same
         // network namespace already holds fails with `Address already in use` in its OWN logs, and
         // kern reported only that it "died within 150ms". The reader is then looking at nginx's
@@ -3989,15 +3995,20 @@ fn watch_and_abort(
 
     // Stream until the first service ends. A service that has already gone contributes its log and
     // ends the follow on the first pass.
+    //
+    // ⛔ "ALREADY GONE" MUST BE FOLLOWED TOO, and it was skipped: the loop took only services still
+    // in the registry, so a test service that exited before this point was left out, its output was
+    // never shown, and the follow waited on a database that never exits. MEASURED: `up
+    // --abort-on-container-exit --exit-code-from tests` on a `redis-cli ping` test hung until the
+    // job's own timeout. A gone box is opened with pid 0, which no live entry has, so the follow
+    // drains its log once and reads it as ended.
     let mut who = Vec::with_capacity(mine.len());
     for b in mine {
-        let Some(ins) = registry::find_ref(&b.name) else {
-            continue;
-        };
+        let pid = registry::find_ref(&b.name).map_or(0, |ins| ins.pid);
         match crate::commands::Followed::open(
             b.service_name().to_string(),
             b.name.clone(),
-            ins.pid,
+            pid,
             None,
         ) {
             Ok(Some(f)) => who.push(f),
@@ -4017,7 +4028,32 @@ fn watch_and_abort(
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     } else {
-        crate::commands::follow_many(who, &crate::commands::FOLLOW_FOREVER, true)?;
+        // A SERVICE WITH NO LOG FILE STILL ENDS THE WAIT. `follow_many` stops when a service IT
+        // follows ends, and one whose log file did not exist yet when the loop above ran (the case
+        // `Followed::open` answers `None` for, and the branch above polls for) is not in `who`, so
+        // its exit went unseen while the follow waited on the others. A watcher on the registry
+        // stops the follow when ANY of them is gone; the pass that sees the flag still drains what
+        // the others wrote. NOT what the smoke test exercises: a box that prints nothing still has
+        // an empty log file and is followed (measured: removing this watcher keeps that test
+        // green). Together with the skipped-gone-box bug it was the hang; on its own it is the
+        // second line for the same shape.
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                use std::sync::atomic::Ordering;
+                while !finished.load(Ordering::Acquire) {
+                    if mine.iter().any(|b| registry::find_ref(&b.name).is_none()) {
+                        ended.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+            let r = crate::commands::follow_many(who, &ended, true);
+            finished.store(true, std::sync::atomic::Ordering::Release);
+            r
+        })?;
     }
 
     // Whoever is gone now is who ended it. Read BEFORE the teardown, or every service looks exited.

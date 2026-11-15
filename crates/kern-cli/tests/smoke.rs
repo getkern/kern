@@ -3393,3 +3393,125 @@ fn a_missing_env_file_stops_config_and_up_before_any_fetch() {
         "`required: false` was refused:\n{optional}"
     );
 }
+
+/// `up --abort-on-container-exit --exit-code-from tests` ENDS WHEN THE TEST DOES, with its status.
+///
+/// MEASURED before the fix with `redis` and a `redis-cli ping` test: a test that exited before `up`
+/// began following the logs was skipped, its output never shown, and `up` waited on the database
+/// until the CI job's own timeout. One that exited inside the 150 ms start window was reported as
+/// "died", exited 1 whatever it returned, and left the database running.
+///
+/// Three tests, each against a `db` that never exits on its own: a fast one that prints and exits 3,
+/// a SILENT one that exits 4 (no log file to follow), and a slow one that exits 0. Each `up` is
+/// given a deadline and killed past it, so a hang fails here instead of hanging the suite.
+#[test]
+fn abort_on_container_exit_returns_the_tests_own_status() {
+    let dir = std::env::temp_dir().join(format!("kern-it-abort-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("SKIP: could not create a temp project dir");
+        return;
+    }
+    let xdg = std::env::temp_dir().join(format!("kern-it-abort-xdg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::create_dir_all(&xdg);
+    let run_within = |args: &[&str], secs: u64| -> (String, Option<i32>, bool) {
+        let mut child = match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return (e.to_string(), None, false),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let mut hung = false;
+        while matches!(child.try_wait(), Ok(None)) {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                hung = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        match child.wait_with_output() {
+            Ok(out) => (
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                out.status.code(),
+                hung,
+            ),
+            Err(e) => (e.to_string(), None, hung),
+        }
+    };
+    let stack = |test_cmd: &str| {
+        format!(
+            "services:\n  db:\n    image: alpine\n    command: [\"sleep\", \"300\"]\n  tests:\n    \
+             image: alpine\n    command: [\"sh\", \"-c\", \"{test_cmd}\"]\n"
+        )
+    };
+    // THE CONTROL: the stack must come up at all on this host, or nothing below can be measured.
+    if std::fs::write(dir.join("compose.yml"), stack("sleep 1")).is_err() {
+        eprintln!("SKIP: could not write the compose file");
+        return;
+    }
+    let (out, _, _) = run_within(
+        &["compose", "-f", "compose.yml", "-p", "abortctl", "up", "-d"],
+        60,
+    );
+    let _ = run_within(
+        &["compose", "-f", "compose.yml", "-p", "abortctl", "down"],
+        60,
+    );
+    if !out.contains("box(es) started") {
+        eprintln!("SKIP: this host did not bring the control stack up ({out})");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&xdg);
+        return;
+    }
+    let mut failures = Vec::new();
+    for (cmd, want, marker) in [
+        ("echo T-FAST; exit 3", 3, Some("T-FAST")),
+        ("exit 4", 4, None),
+        ("sleep 2; echo T-SLOW", 0, Some("T-SLOW")),
+    ] {
+        let _ = std::fs::write(dir.join("compose.yml"), stack(cmd));
+        let args = [
+            "compose",
+            "-f",
+            "compose.yml",
+            "-p",
+            "abortit",
+            "up",
+            "--abort-on-container-exit",
+            "--exit-code-from",
+            "tests",
+        ];
+        let (out, code, hung) = run_within(&args, 60);
+        let (ps, _, _) = run_within(&["ps"], 30);
+        let _ = run_within(
+            &["compose", "-f", "compose.yml", "-p", "abortit", "down"],
+            60,
+        );
+        if hung {
+            failures.push(format!("`{cmd}`: up did not return within 60 s:\n{out}"));
+        } else if code != Some(want) {
+            failures.push(format!("`{cmd}`: exit {code:?}, want {want}:\n{out}"));
+        }
+        if marker.is_some_and(|m| !out.contains(m)) {
+            failures.push(format!("`{cmd}`: the test's output was not shown:\n{out}"));
+        }
+        if ps.contains("abortit-db") {
+            failures.push(format!("`{cmd}`: the stack was left running:\n{ps}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
+}
