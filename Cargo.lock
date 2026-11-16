@@ -16,6 +16,9 @@ dependencies = [
 [[package]]
 name = "kern-common"
 version = "0.0.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "kern-compose"
@@ -28,6 +31,7 @@ dependencies = [
 name = "kern-isolation"
 version = "0.0.0"
 dependencies = [
+ "kern-common",
  "libc",
 ]
 

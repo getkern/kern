@@ -37,13 +37,8 @@ const DEFAULT_REGISTRY: &str = "registry-1.docker.io";
 /// cache). Simple images (alpine/busybox) still extract on 9p, so this warns rather than refuses.
 /// Linux-only and a no-op on every native filesystem (9p never matches there).
 fn warn_if_windows_mount(dest: &Path) {
-    use std::os::unix::ffi::OsStrExt;
     const V9FS_MAGIC: i64 = 0x0102_1997; // WSL2 drvfs / `\\wsl$` is a 9p mount
-    let Ok(c) = std::ffi::CString::new(dest.as_os_str().as_bytes()) else {
-        return;
-    };
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 && st.f_type as i64 == V9FS_MAGIC {
+    if kern_common::fs_magic(dest) == Some(V9FS_MAGIC) {
         eprintln!(
             "kern: warning: pulling into a Windows-mounted path (WSL2 9p/drvfs) - slow, and it fails \
              for images carrying Linux ownership/permissions (e.g. debian). Pull into a Linux \
@@ -6685,8 +6680,18 @@ mod setuid_bits_tests {
             )
             .expect("chmod");
         }
+        // `--format=gnu`: the first member must be the file. A `tar` whose default is POSIX puts a
+        // pax header first (mode 0644), and this test then read that header's mode: MEASURED on
+        // openSUSE Leap 16, `kept` came back 0o644. The filter passes pax headers through; the
+        // fixture is what had to be pinned.
         let made = Command::new("tar")
-            .args(["--owner=0", "--group=0", "--numeric-owner", "-C"])
+            .args([
+                "--format=gnu",
+                "--owner=0",
+                "--group=0",
+                "--numeric-owner",
+                "-C",
+            ])
             .arg(dir.join("root"))
             .arg("-cf")
             .arg(dir.join("layer.tar"))

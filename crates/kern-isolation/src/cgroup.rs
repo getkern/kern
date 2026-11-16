@@ -52,6 +52,133 @@ impl CgroupGuard {
     }
 }
 
+/// The limit files a box's leaf carries, the set [`hold_caps_across_reloads`] puts back. Every file
+/// `apply_limits` may write; one the host does not offer is simply absent from the snapshot.
+const LEAF_LIMIT_FILES: [&str; 12] = [
+    "memory.max",
+    "memory.swap.max",
+    "memory.high",
+    "memory.low",
+    "memory.oom.group",
+    "pids.max",
+    "cpu.max",
+    "cpu.weight",
+    "cpuset.cpus",
+    "cpuset.mems",
+    "io.max",
+    "io.weight",
+];
+
+/// Keep the box's caps in force across a `systemctl --user daemon-reload`, on the paths where kern
+/// built its leaves inside a systemd unit that is not delegated to it.
+///
+/// A RELOAD TAKES THE CONTROLLERS AWAY FROM A NON-DELEGATED SCOPE'S CHILDREN. A box started from
+/// outside the user manager (an SSH session, cron, a system service) runs in its own transient scope,
+/// `kern-box-<pid>.scope`, made without `Delegate=yes` because delegation measured 8 ms to 846 ms per
+/// scope on systemd 249; kern builds the box's leaf and the supervisor's `kern-sup` inside it. systemd
+/// treats the scope's subtree as its own, and a reload rewrites the scope's `cgroup.subtree_control`
+/// to empty. MEASURED on a Jetson (systemd 249, over SSH): after a reload the leaf had no
+/// `memory.max` and no `memory.oom.group`, only the scope's own `MemoryMax` (68 MiB for `--memory
+/// 64m`) still bound, and an over-allocation killed the one process while the box lived on, where
+/// before the reload it took the whole box.
+///
+/// systemd's rewrite is a `write()` on that file, and every write raises `IN_MODIFY`, cgroupfs
+/// included (measured): a thread of the supervisor waits on it and puts back the controllers that
+/// were enabled and the leaf's limit files as `apply_limits` left them (re-enabling a controller
+/// brings its files back at their defaults). Measured: the box was again group-killed at its own cap
+/// after the repair. One thread per box on these paths only, asleep in `read` until a reload; none on
+/// the delegated `kern-boxes.service` path, which systemd leaves alone.
+///
+/// Called by the SUPERVISOR after the fork: a thread before it would make the fork a multi-threaded
+/// one, which the box's start path does not allow.
+pub fn hold_caps_across_reloads(guard: &CgroupGuard) {
+    if !(env_flag("KERN_SCOPE") || env_flag("KERN_MANAGED")) {
+        return;
+    }
+    let leaf = guard.dir.clone();
+    let Some(unit) = leaf.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let subtree = unit.join("cgroup.subtree_control");
+    let enabled: Vec<String> = fs::read_to_string(&subtree)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if enabled.is_empty() {
+        return;
+    }
+    let snapshot: Vec<(PathBuf, String)> = LEAF_LIMIT_FILES
+        .iter()
+        .filter_map(|f| {
+            let p = leaf.join(f);
+            fs::read_to_string(&p).ok().map(|v| (p, v))
+        })
+        .collect();
+    // SAFETY: plain syscalls; the descriptor is owned by the thread below from here on.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return;
+    }
+    let Ok(c_subtree) = std::ffi::CString::new(subtree.as_os_str().as_encoded_bytes()) else {
+        unsafe { libc::close(fd) };
+        return;
+    };
+    // SAFETY: a valid descriptor and a NUL-terminated path.
+    if unsafe { libc::inotify_add_watch(fd, c_subtree.as_ptr(), libc::IN_MODIFY) } < 0 {
+        unsafe { libc::close(fd) };
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("kern-capwatch".to_string())
+        .spawn(move || {
+            let mut buf = [0u8; 512];
+            loop {
+                // SAFETY: a valid descriptor and a buffer of the length passed.
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                if n <= 0 {
+                    return;
+                }
+                if !leaf.is_dir() {
+                    return; // the box is gone and its leaf with it
+                }
+                restore_leaf_caps(&subtree, &enabled, &snapshot);
+            }
+        });
+    if spawned.is_err() {
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// Put back what a reload took: the controllers `enabled` in the unit's `subtree`, then each limit
+/// file of the leaf whose content no longer matches the snapshot. Pure file I/O, separated so the
+/// repair is testable on plain files.
+fn restore_leaf_caps(subtree: &Path, enabled: &[String], snapshot: &[(PathBuf, String)]) {
+    let now = fs::read_to_string(subtree).unwrap_or_default();
+    let missing: Vec<String> = enabled
+        .iter()
+        .filter(|c| !now.split_whitespace().any(|t| t == c.as_str()))
+        .map(|c| format!("+{c}"))
+        .collect();
+    if !missing.is_empty() {
+        let _ = fs::write(subtree, missing.join(" "));
+    }
+    for (path, want) in snapshot {
+        if fs::read_to_string(path).is_ok_and(|cur| cur == *want) {
+            continue;
+        }
+        // `io.max` lists one device per line and takes one per write.
+        for line in want.lines().filter(|l| !l.trim().is_empty()) {
+            let _ = fs::write(path, line);
+        }
+    }
+}
+
 /// Whether the box's own cgroup recorded an OOM kill, latched at the one moment it can be read.
 ///
 /// 0 = not looked at or nothing there, 1 = the box's cgroup counted at least one OOM kill. Latched
@@ -457,13 +584,39 @@ fn open_cgroup_dir_fd(dir: &Path) -> Option<libc::c_int> {
 /// A caller that passes `None` gets a plain `fork`, which is what the layouts that keep the
 /// supervisor INSIDE the capped cgroup need: there the workload inherits the cgroup and must not be
 /// placed anywhere.
+///
+/// # `new_pid_ns`: the child is PID 1 of a pid namespace made FOR THIS FORK
+///
+/// THE NAMESPACE IS CREATED BY THE CLONE THAT USES IT, NOT BY AN `unshare` BEFORE IT, because a
+/// refused first fork CLOSES a pid namespace for good. The kernel allocates the child's pid before
+/// it asks the cgroup whether the child may be born there (`alloc_pid`, then `cgroup_can_fork`, in
+/// `copy_process`), and when the FIRST pid of a namespace is freed by a failed fork, `free_pid`
+/// clears `PIDNS_ADDING`: from then on every fork into that namespace answers `ENOMEM`. So after an
+/// `unshare(CLONE_NEWPID)`, a `clone3(CLONE_INTO_CGROUP)` the cgroup refuses (`EACCES`, `ENOENT`,
+/// `EOPNOTSUPP` for a "domain invalid" cgroup, `EBUSY`) leaves the fallback `fork` below nothing to
+/// fork into. MEASURED in an openSUSE Leap 16 VM (kernel 6.12): `clone3({flags=CLONE_INTO_CGROUP,
+/// cgroup=6}) = -1 EOPNOTSUPP`, then `fork() = -1 ENOMEM`, and every box under that layout died
+/// "fork failed: Cannot allocate memory", the binary from before 16/11 included. With the flag in the
+/// clone, a refusal takes its own namespace with it. The fallback makes its namespace with `unshare`
+/// IMMEDIATELY before the libc `fork`, with no attempt in between that could spend its PID 1, so it
+/// keeps everything a libc `fork` does for the child (its thread id, the atfork handlers).
+///
+/// The refusals that come BEFORE the pid exists (`ENOSYS` from a seccomp filter, `EINVAL` from a
+/// kernel without `CLONE_INTO_CGROUP`) never closed anything. The other hosts were green because their
+/// `clone3` was never refused at all: the cgroup Leap refused was made invalid by kern itself (see
+/// [`holds_processes`]). The closing is not Leap's kernel: the test below measures it on 7.0 too.
 #[must_use]
-pub fn fork_into_cgroup(cg: Option<&CgroupRef>) -> (libc::pid_t, bool) {
+pub fn fork_into_cgroup(cg: Option<&CgroupRef>, new_pid_ns: bool) -> (libc::pid_t, bool) {
+    let pid_ns = if new_pid_ns {
+        libc::CLONE_NEWPID as u64
+    } else {
+        0
+    };
     if let Some(c) = cg {
         let fd = c.raw();
         if fd >= 0 {
             let mut args = CloneArgs {
-                flags: CLONE_INTO_CGROUP,
+                flags: CLONE_INTO_CGROUP | pid_ns,
                 // Without this the parent gets NO signal on exit and `waitpid` still works, but every
                 // existing SIGCHLD-based path in kern would silently stop seeing the box. `fork(2)`
                 // implies SIGCHLD; `clone3` does not, so it is stated.
@@ -492,6 +645,11 @@ pub fn fork_into_cgroup(cg: Option<&CgroupRef>) -> (libc::pid_t, bool) {
             // Any error at all: fall through. `errno` is overwritten by the `fork` below, which is
             // correct - the caller reports the failure that actually stopped it, not this one.
         }
+    }
+    // SAFETY: `unshare` takes no pointers; on failure `errno` is set and the `-1` is the fork
+    // convention's failure, which the caller reports.
+    if new_pid_ns && unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+        return (-1, false);
     }
     (unsafe { libc::fork() }, false)
 }
@@ -532,7 +690,7 @@ pub fn fork_workload_into_leaf(guard: &CgroupGuard) -> (libc::pid_t, bool) {
         // anyway and report the truth; refusing here would be a policy decision (see the doc above).
         return report(unsafe { libc::fork() }, false);
     };
-    let (pid, born) = fork_into_cgroup(Some(&cg));
+    let (pid, born) = fork_into_cgroup(Some(&cg), false);
     if pid != 0 {
         // Parent (or a failed fork). `placed` describes the CHILD, which reports its own below.
         return report(pid, true);
@@ -661,14 +819,27 @@ pub fn oom_kill_dir_for_pid(pid: i32) -> Option<PathBuf> {
         .find_map(|l| l.strip_prefix("0::"))
         .map(str::trim)
         .filter(|p| p.starts_with('/'))?;
-    let mut dir = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
-    // The nearest ancestor that HAS the file, resolved now: the scope itself is `--collect` and will
-    // be gone, its parent slice will not.
+    let mount = Path::new("/sys/fs/cgroup");
+    surviving_ancestor_with_events(&mount.join(rel.trim_start_matches('/')), mount)
+}
+
+/// The nearest ancestor of `dir` that HAS `memory.events` and is not one of the box's own cgroups.
+///
+/// PAST EVERY `kern-box-*` LEVEL, NOT ONE. The box's cgroups go when the box does: its leaf, and on
+/// the per-box scope path the `kern-box-<pid>.scope` that holds the leaf, which systemd collects. A
+/// counter read through a descriptor on either answers nothing after the box is gone (the file is
+/// removed with the cgroup). MEASURED on a Jetson over SSH: the walk stopped one level up, at that
+/// scope, and a `kern exec` killed with its box by the group OOM exited 137 with nothing said.
+fn surviving_ancestor_with_events(dir: &Path, mount: &Path) -> Option<PathBuf> {
+    let mut dir = dir.to_path_buf();
     while dir.pop() {
-        if !dir.starts_with("/sys/fs/cgroup") || dir == Path::new("/sys/fs/cgroup") {
+        if !dir.starts_with(mount) || dir == mount {
             return None;
         }
-        if dir.join("memory.events").is_file() {
+        let is_the_box_s = dir
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(BOX_LEAF_PREFIX));
+        if !is_the_box_s && dir.join("memory.events").is_file() {
             return Some(dir);
         }
     }
@@ -794,10 +965,18 @@ pub fn open_oom_events_fd(dir: &Path) -> Option<libc::c_int> {
 ///
 /// The read rewinds first, so the same descriptor can be read repeatedly. Nothing here allocates, so
 /// it is usable after a `fork`.
+///
+/// A KERNEL BEFORE 5.16 HAS NO `oom_group_kill`, and there `oom_kill` is the counter read. MEASURED on
+/// a Jetson Orin Nano (Linux 5.15): `memory.events` held `oom` and `oom_kill` only, so this answered
+/// `None`, the caller never had a baseline, and a `kern exec` killed with its box exited 137 with
+/// nothing said. `oom_kill` also counts a single task reaped in a box that survives, which is why the
+/// callers pair the rise with the death of the box's PID 1: a group kill takes PID 1, a neighbour's
+/// OOM and a lone reaped task do not.
 #[must_use]
 pub fn oom_group_kill_from_fd(fd: libc::c_int) -> Option<u64> {
     let mut buf = [0u8; 512];
-    parse_flat_key(read_fd_raw(fd, &mut buf)?, b"oom_group_kill")
+    let text = read_fd_raw(fd, &mut buf)?;
+    parse_flat_key(text, b"oom_group_kill").or_else(|| parse_flat_key(text, b"oom_kill"))
 }
 
 /// `oom_kill` from the nearest ancestor of `dir` that exposes `memory.events`, `dir` itself excluded.
@@ -1717,7 +1896,27 @@ pub fn env_claims_enforcer_but_none_real() -> bool {
 /// file existence): the root of a cgroup namespace lists its controllers but carries no limit
 /// files, and a limit set by privileged systemd counts even where the user has no delegation.
 fn controller_available_in_tree(child: &std::path::Path, ctrl: &str) -> bool {
-    in_tree(child, |dir| has_controller(dir, ctrl))
+    let mount = std::path::Path::new("/sys/fs/cgroup");
+    in_tree(child, |dir| controller_usable_at(dir, mount, ctrl))
+}
+
+/// Whether `ctrl` at `dir` could carry a cap for what is below it.
+///
+/// THE TRUE ROOT IS READ FOR WHAT IT GIVES, NOT FOR WHAT IT HAS. The root of the cgroup hierarchy
+/// lists in `cgroup.controllers` every controller the kernel has, whether or not it ever enables one
+/// for a child, and it can hold no limit of its own; what can bind below it is what its
+/// `cgroup.subtree_control` enables. Counting its list made `memory` "available" on a host whose
+/// root enables only `pids` for everything under it: MEASURED on openSUSE Leap 16, every detached
+/// box then printed that an outer-enforcer variable was set with no cap in force and that "a caller
+/// may be bypassing the resource limits", when no memory cap could exist anywhere. The true root is
+/// the one cgroup without a `cgroup.type` file; a cgroup namespace's root (inside a container) has
+/// one, and is read as any other level.
+fn controller_usable_at(dir: &std::path::Path, mount: &std::path::Path, ctrl: &str) -> bool {
+    if is_true_root(dir, mount) {
+        return fs::read_to_string(dir.join("cgroup.subtree_control"))
+            .is_ok_and(|c| c.split_whitespace().any(|t| t == ctrl));
+    }
+    has_controller(dir, ctrl)
 }
 
 /// Walk from `child` up to the cgroup root (inclusive), returning true at the first level where
@@ -1814,7 +2013,111 @@ fn kern_slice_path() -> Option<PathBuf> {
     // and every `kern run` there took the per-invocation systemd scope: 11.5 ms against the 1.0 ms
     // the same host reaches with `KERN_NO_SCOPE=1`. The delegated tree was there the whole time,
     // one directory away, and kern could not name it because it was looking UP instead of AT it.
-    Some(user_delegation_root()?.join(KERN_SLICE_NAME))
+    Some(
+        user_delegation_root()?
+            .join(KERN_SLICE_NAME)
+            .join(KERN_ANCHOR_UNIT),
+    )
+}
+
+/// The DELEGATED unit rootless boxes live under, inside `kern.slice`.
+///
+/// ⛔ NOT `kern.slice` ITSELF. A slice is a systemd unit, and systemd owns its `subtree_control`:
+/// it recomputes it from its member UNITS at every re-realization, and a box's cgroup is a plain
+/// directory, not a unit. MEASURED on a desktop (systemd 255): one second after kern created
+/// `kern.slice` through a `systemd-run` scope, and at any `systemctl --user daemon-reload`, the
+/// slice's controllers went off and every running box's `memory.max` and `pids.max` disappeared,
+/// with nothing said; the start of a box landing in that window was refused ("caps could not be
+/// enforced on the direct cgroup path"). A `Delegate=yes` unit is the one subtree systemd never
+/// touches, and the controllers it needs are the slice's to keep on.
+const KERN_ANCHOR_UNIT: &str = "kern-boxes.service";
+
+/// The leaf the anchor's own process moves into: a cgroup with processes of its own cannot hand
+/// controllers to children (cgroup v2), and the boxes are its children.
+const KERN_ANCHOR_HOLDER: &str = "holder";
+
+/// Start the anchor unit (`kern-boxes.service`, `Delegate=yes`, in `kern.slice`) and make its
+/// subtree cap-able: its process moved into [`KERN_ANCHOR_HOLDER`], then the controllers enabled
+/// for its children. Once per boot, at the first box: every later start finds it and reads two
+/// files. Two kern processes starting it at once end up with the one unit: systemd refuses the
+/// second `--unit`, and the second waits for the first's holder like the first does.
+fn start_kern_anchor(anchor: &std::path::Path) -> bool {
+    let systemd_run =
+        crate::trusted_helper("systemd-run").unwrap_or_else(|| PathBuf::from("systemd-run"));
+    // The holder moves itself out of the unit's cgroup into the leaf, then waits forever: a plain
+    // shell loop, so nothing but `sh`, `sed` and `sleep` has to exist on the host. It writes `0`
+    // (the writer itself) and not `$$`: systemd expands `ExecStart`, and `$$` reached the shell as a
+    // literal `$`, which `cgroup.procs` refused with EIO (MEASURED, systemd 255).
+    let script = "cg=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup) && \
+                  mkdir -p \"$cg/holder\" && echo 0 > \"$cg/holder/cgroup.procs\" && \
+                  while :; do sleep 86400; done";
+    let unit = format!("--unit={}", KERN_ANCHOR_UNIT.trim_end_matches(".service"));
+    let _ = Command::new(systemd_run)
+        .args([
+            systemd_scope_mode(),
+            unit.as_str(),
+            "--slice=kern.slice",
+            "-p",
+            "Delegate=yes",
+            "--quiet",
+            "--collect",
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        // THIS IS A PROBE, so its output has no reader and must not have one. The verdict is the exit
+        // status, read below; the two streams only carry systemd's opinion of the question we asked.
+        //
+        // Inherited, they were kern's stderr, and kern's stderr is the box's stderr as far as the SDK
+        // is concerned. On a host with the systemd tools installed but not booted (a container, a WSL
+        // session, the plain-root machine a later pass ran on), this probe answers "no" and prints
+        //
+        //   System has not been booted with systemd as init system (PID 1). Can't operate.
+        //   Failed to connect to bus: Host is down
+        //
+        // which travelled all the way into a LangChain tool result, where a model read a line about
+        // dbus as though its own code had produced it. `--quiet` does not cover this: it suppresses
+        // systemd-run's info messages, not the bus error.
+        //
+        // The other three systemd-run call sites already null both. This one did not.
+        //
+        // THE RULE IS A JUDGEMENT AND THERE IS NO MECHANICAL FORM OF IT. Worth writing down, because
+        // two candidates were tried and both are wrong. "A probe, versus a command whose failure a
+        // user reads" is circular. "Whether the exit status is the whole answer" sounds checkable and
+        // is not: 30 call sites in this workspace read only `.status()` while inheriting stderr, and
+        // `tar`, `curl`, `mkfs.ext4` and `ssh-keygen` are all among them and all correct, because a
+        // user who cannot see why tar failed cannot fix it.
+        //
+        // What actually separates this one: its failure is an EXPECTED, HANDLED outcome. "No delegated
+        // slice here" is a normal answer that the caller acts on by taking another path, so there is
+        // nothing for a human to do about the message. Every one of those 30 reports an ABNORMAL
+        // outcome that ends the operation, where the message is the only thing that explains it.
+        //
+        // Since the rule cannot be checked, the exposure is bounded instead:
+        // `scripts/progress-is-tty-gated.py` enforces the shape of what kern writes in the modules an
+        // SDK caller's stderr is actually made of.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // Polled, with the backoff of kern's other waits: the unit's cgroup appears, its process moves
+    // into the leaf, and only then can the children's controllers be turned on.
+    let holder_in_leaf = || {
+        fs::read_to_string(anchor.join(KERN_ANCHOR_HOLDER).join("cgroup.procs"))
+            .is_ok_and(|p| !p.trim().is_empty())
+            && fs::read_to_string(anchor.join("cgroup.procs")).is_ok_and(|p| p.trim().is_empty())
+    };
+    let (mut waited, mut step) = (0u64, 1u64);
+    while !holder_in_leaf() {
+        if waited >= 2000 {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        waited += step;
+        step = (step * 2).min(8);
+    }
+    enable_subtree_controllers(anchor);
+    slice_can_cap(anchor)
 }
 
 /// The delegated tree kern caps in when it is not root: the `user@<n>.service` AT or above our own
@@ -2175,9 +2478,15 @@ const SWEEP_LIMIT: usize = 128;
 pub fn live_box_cgroups() -> Vec<(String, u32)> {
     let mut out: Vec<(String, u32)> = Vec::new();
     let mut done: Vec<PathBuf> = Vec::new();
+    // AND EVERY PER-BOX SCOPE, where a box started from outside the user manager lives: an SSH
+    // session, cron or a system service cannot move a process into `kern-boxes.service`, so the box
+    // takes its own `kern-box-<pid>.scope` under the manager's `app.slice`, with its leaf inside.
+    // MEASURED on a Jetson over SSH: with the registry record gone, `ps` named nothing, because
+    // neither of the two directories above holds that leaf.
     for dir in [kern_slice_path(), current_v2_cgroup()]
         .into_iter()
         .flatten()
+        .chain(box_scope_dirs())
     {
         if !dir.is_dir() || done.contains(&dir) {
             continue;
@@ -2215,6 +2524,40 @@ pub fn live_box_cgroups() -> Vec<(String, u32)> {
     out.sort();
     out.dedup();
     out
+}
+
+/// The parent pid in a `/proc/<pid>/stat` line: the second field after the command, which is in
+/// parentheses and may itself hold spaces and parentheses, hence the LAST `)`.
+fn ppid_from_stat(stat: &str) -> Option<String> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let ppid = rest.split_whitespace().nth(1)?;
+    ppid.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| ppid.to_string())
+}
+
+/// The per-box transient scopes (`kern-box-<pid>.scope`) under the user manager's `app.slice`.
+fn box_scope_dirs() -> Vec<PathBuf> {
+    box_scope_dirs_in(&user_delegation_root().map(|r| r.join("app.slice")))
+}
+
+/// [`box_scope_dirs`] under a given `app.slice`, so the selection is testable on plain directories.
+fn box_scope_dirs_in(app: &Option<PathBuf>) -> Vec<PathBuf> {
+    let Some(app) = app else {
+        return Vec::new();
+    };
+    fs::read_dir(app)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.starts_with(BOX_LEAF_PREFIX) && n.ends_with(".scope")
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The same question as [`live_box_cgroups`], asked of `/proc` instead, for a host that has no
@@ -2298,14 +2641,40 @@ pub fn live_box_supervisors_via_proc() -> Vec<(String, u32)> {
     // on `kern ps` with no boxes, which is the most common invocation there is. `task/<tid>/children`
     // is one small file per KERN process, and there are three of those against five hundred pids.
     //
-    // It needs `CONFIG_PROC_CHILDREN`, which is not universal, so a kernel without it reads an empty
-    // list and this finds nothing - a miss, never a wrong answer.
+    // It needs `CONFIG_PROC_CHILDREN`, which is not universal: where the file is absent, the parent
+    // map is read from every process's `stat` instead, the first version's 6.6 ms, paid only there.
+    // MEASURED: the Jetson Orin Nano's Tegra kernel is built without it, and this channel found no
+    // box at all on it.
+    let mut no_children_file = false;
     for k in &kern_pids {
         let Ok(children) = fs::read_to_string(format!("/proc/{k}/task/{k}/children")) else {
+            no_children_file = true;
             continue;
         };
         for c in children.split_whitespace() {
             parents.push((c.to_string(), k.clone()));
+        }
+    }
+    if no_children_file {
+        if let Ok(rd) = fs::read_dir("/proc") {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let Some(pid) = name
+                    .to_str()
+                    .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                else {
+                    continue;
+                };
+                let Some(ppid) = fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|st| ppid_from_stat(&st))
+                else {
+                    continue;
+                };
+                if kern_pids.contains(&ppid) && !parents.iter().any(|(c, _)| c == pid) {
+                    parents.push((pid.to_string(), ppid));
+                }
+            }
         }
     }
     let mut out: Vec<(String, u32)> = Vec::new();
@@ -2351,7 +2720,39 @@ pub fn gc_orphan_box_cgroups() -> usize {
     // "nothing to prune" while they sat there. Normal boxes were unaffected (their RAII Drop removes the
     // dir); it is the SIGKILLed ones, whose Drop never runs, that accumulated. So sweep both places the
     // creator can choose, deduped when they are the same directory.
-    gc_orphan_box_cgroups_in(&[kern_slice_path(), current_v2_cgroup()])
+    gc_orphan_box_cgroups_in(&orphan_dirs())
+}
+
+/// Every directory a box leaf can have been built in, for both reapers: the delegated anchor, the
+/// legacy `kern.slice` around it, and the caller's own cgroup, the last left out where it is the same
+/// directory as the first.
+///
+/// ONE LIST FOR `kern gc` AND FOR THE SWEEP AT BOX START. The sweep used to take the anchor from
+/// `ensure_kern_slice`, which answers `None` where the slice cannot cap a box, while `kern gc` took it
+/// from `kern_slice_path`, which answers where it is. MEASURED on openSUSE Leap 16 (`pids` delegated
+/// alone, so the slice cannot cap memory): an orphan in the anchor was never reaped by a box start,
+/// and only `kern gc` saw it. Whether this host can cap there now has no bearing on what an earlier
+/// box left there.
+fn orphan_dirs() -> [Option<PathBuf>; 3] {
+    let slice = kern_slice_path();
+    let legacy = legacy_slice_of(slice.as_deref());
+    let own = current_v2_cgroup().filter(|o| slice.as_ref() != Some(o));
+    [slice, legacy, own]
+}
+
+/// `kern.slice` itself, when boxes now live in the delegated unit inside it: where a kern from
+/// before that unit built them, and where its orphans still are.
+///
+/// SWEPT, BECAUSE NOTHING ELSE WOULD. The sweep and `kern gc` followed the boxes into
+/// `kern-boxes.service` and stopped looking at the slice, so a box SIGKILLed under the previous
+/// layout left a leaf there for good. Found by the suite on a rootless desktop: an orphan planted in
+/// `kern.slice` survived a box start and the test that plants it went red.
+fn legacy_slice_of(slice: Option<&Path>) -> Option<PathBuf> {
+    let s = slice?;
+    if s.file_name()? != KERN_ANCHOR_UNIT {
+        return None;
+    }
+    s.parent().map(Path::to_path_buf)
 }
 
 /// Testable core of [`gc_orphan_box_cgroups`]: sweep every directory a box can be created in, skipping
@@ -2594,15 +2995,8 @@ pub fn sweep_orphans_off_hot_path() {
     // Deduplicated because on a host that caps through `kern.slice` the two are different directories
     // and on one that does not they can be the same: sweeping it twice would double the cost of the
     // one thing this function exists to keep cheap.
-    let slice = ensure_kern_slice();
-    let own = current_v2_cgroup();
-    if let Some(s) = slice.as_ref() {
-        sweep_orphan_boxes(s, SWEEP_LIMIT);
-    }
-    if let Some(o) = own.as_ref() {
-        if slice.as_ref() != Some(o) {
-            sweep_orphan_boxes(o, SWEEP_LIMIT);
-        }
+    for dir in orphan_dirs().iter().flatten() {
+        sweep_orphan_boxes(dir, SWEEP_LIMIT);
     }
 }
 
@@ -2736,56 +3130,16 @@ fn locate_or_create_kern_slice() -> Option<PathBuf> {
     // best-effort - a failure (no systemd-run, policy) returns None → the caller uses the per-box scope /
     // best-effort path, never uncapped-silently. Resolve `systemd-run` by trusted ABSOLUTE path (not
     // `$PATH`), same policy as the reexec scope spawn, so a `~/.local/bin/systemd-run` can't shadow it.
-    let systemd_run =
-        crate::trusted_helper("systemd-run").unwrap_or_else(|| PathBuf::from("systemd-run"));
-    let created = Command::new(systemd_run)
-        .args([
-            systemd_scope_mode(),
-            "-p",
-            "Delegate=yes",
-            "--slice=kern.slice",
-            "--scope",
-            "--quiet",
-            "--",
-            "true",
-        ])
-        // THIS IS A PROBE, so its output has no reader and must not have one. The verdict is the exit
-        // status, read below; the two streams only carry systemd's opinion of the question we asked.
-        //
-        // Inherited, they were kern's stderr, and kern's stderr is the box's stderr as far as the SDK
-        // is concerned. On a host with the systemd tools installed but not booted (a container, a WSL
-        // session, the plain-root machine a later pass ran on), this probe answers "no" and prints
-        //
-        //   System has not been booted with systemd as init system (PID 1). Can't operate.
-        //   Failed to connect to bus: Host is down
-        //
-        // which travelled all the way into a LangChain tool result, where a model read a line about
-        // dbus as though its own code had produced it. `--quiet` does not cover this: it suppresses
-        // systemd-run's info messages, not the bus error.
-        //
-        // The other three systemd-run call sites already null both. This one did not.
-        //
-        // THE RULE IS A JUDGEMENT AND THERE IS NO MECHANICAL FORM OF IT. Worth writing down, because
-        // two candidates were tried and both are wrong. "A probe, versus a command whose failure a
-        // user reads" is circular. "Whether the exit status is the whole answer" sounds checkable and
-        // is not: 30 call sites in this workspace read only `.status()` while inheriting stderr, and
-        // `tar`, `curl`, `mkfs.ext4` and `ssh-keygen` are all among them and all correct, because a
-        // user who cannot see why tar failed cannot fix it.
-        //
-        // What actually separates this one: its failure is an EXPECTED, HANDLED outcome. "No delegated
-        // slice here" is a normal answer that the caller acts on by taking another path, so there is
-        // nothing for a human to do about the message. Every one of those 30 reports an ABNORMAL
-        // outcome that ends the operation, where the message is the only thing that explains it.
-        //
-        // Since the rule cannot be checked, the exposure is bounded instead:
-        // `scripts/progress-is-tty-gated.py` enforces the shape of what kern writes in the modules an
-        // SDK caller's stderr is actually made of.
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    (created && slice_can_cap(&slice)).then_some(slice)
+    // Rootless: the delegated anchor unit, started once (see `KERN_ANCHOR_UNIT`).
+    (start_kern_anchor(&slice) && children_ready(&slice)).then_some(slice)
+}
+
+/// The anchor hands memory and pids to its children: what a box needs to be capped.
+fn children_ready(anchor: &std::path::Path) -> bool {
+    fs::read_to_string(anchor.join("cgroup.subtree_control")).is_ok_and(|c| {
+        let on: Vec<&str> = c.split_whitespace().collect();
+        on.contains(&"memory") && on.contains(&"pids")
+    })
 }
 
 /// Make the controllers available to `parent`'s children. A cgroup-v2 `subtree_control` write is
@@ -2845,6 +3199,29 @@ fn subtree_all_enabled(available: &str, current: &str) -> bool {
     })
 }
 
+/// The root of the whole hierarchy: `mount` itself, and the one cgroup with no `cgroup.type` file. A
+/// cgroup namespace's root (inside a container) has one, and is an ordinary cgroup to the kernel.
+fn is_true_root(dir: &std::path::Path, mount: &std::path::Path) -> bool {
+    dir == mount && !dir.join("cgroup.type").exists()
+}
+
+/// Whether `dir` holds processes of its own, in which case no controller may be enabled below it.
+///
+/// ENABLING A THREADED CONTROLLER ON A POPULATED CGROUP INVALIDATES EVERY DOMAIN CHILD IT HAS. A
+/// domain controller (`memory`, `io`) is refused there with `EBUSY` (no internal processes), and the
+/// write is atomic, so a batch that holds one changes nothing. A batch of threaded controllers alone
+/// (`pids`, `cpuset`, `perf_event`) is ACCEPTED, and the kernel then reads the cgroup as a thread
+/// root (`cgroup_is_thread_root`: tasks plus a threaded controller in `subtree_control`), so each of
+/// its domain children becomes "domain invalid" and refuses every process: `clone3(CLONE_INTO_CGROUP)`
+/// and a `cgroup.procs` write both answer `EOPNOTSUPP`. MEASURED in an openSUSE Leap 16 VM, whose
+/// user manager delegates `pids` alone: kern, unable to reach the manager, made its box's cgroup under
+/// its own scope, wrote `+pids` there, and every box was refused. The true root is exempt: it may
+/// hold processes and enable anything.
+fn holds_processes(dir: &std::path::Path) -> bool {
+    !is_true_root(dir, std::path::Path::new("/sys/fs/cgroup"))
+        && fs::read_to_string(dir.join("cgroup.procs")).is_ok_and(|p| !p.trim().is_empty())
+}
+
 fn enable_subtree_controllers(parent: &std::path::Path) {
     let subtree = parent.join("cgroup.subtree_control");
     match fs::read_to_string(parent.join("cgroup.controllers")) {
@@ -2859,13 +3236,14 @@ fn enable_subtree_controllers(parent: &std::path::Path) {
                 let already_on = fs::read_to_string(&subtree)
                     .map(|current| subtree_all_enabled(&avail, &current))
                     .unwrap_or(false);
-                if !already_on {
+                if !already_on && !holds_processes(parent) {
                     let _ = fs::write(&subtree, batch);
                 }
             }
         }
         // Available set unreadable: fall back to the old best-effort probe (try each controller
         // individually) so an unusual host still gets whatever it will accept.
+        Err(_) if holds_processes(parent) => {}
         Err(_) => {
             for ctrl in ["+memory", "+pids", "+cpu", "+cpuset", "+io"] {
                 let _ = fs::write(&subtree, ctrl);
@@ -5065,11 +5443,23 @@ mod tests {
             eprintln!("SKIP: this process and pid 1 share a cgroup ({mine}), so nothing distinguishes them");
             return;
         }
+        // NO ANSWER FOR EITHER is a host where neither branch carries the memory controller, so there
+        // is no OOM directory to find for anyone: MEASURED on openSUSE Leap 16, whose user manager is
+        // delegated `pids` alone. Two `None`s there are correct and say nothing about the walk.
+        let (me, one) = (
+            oom_kill_dir_for_pid(std::process::id() as i32),
+            oom_kill_dir_for_pid(1),
+        );
+        if me.is_none() && one.is_none() {
+            eprintln!(
+                "SKIP: no memory controller on either branch, so neither has an OOM directory"
+            );
+            return;
+        }
         // Two pids in two branches must not resolve to one directory. Under the old walk they would:
         // it never looked at the pid at all.
         assert_ne!(
-            oom_kill_dir_for_pid(std::process::id() as i32),
-            oom_kill_dir_for_pid(1),
+            me, one,
             "pid 1 is in {init} and we are in {mine}, yet both resolved to the same directory: \
              the answer is not being read from the pid"
         );
@@ -5395,6 +5785,176 @@ mod tests {
             controller_available_in_tree(&d, "memory"),
             "memory listed = the host can cap, even with no memory.max file here"
         );
+    }
+
+    /// THE TRUE ROOT COUNTS ONLY WHAT IT ENABLES BELOW IT. Its `cgroup.controllers` lists every
+    /// controller the kernel has; openSUSE Leap 16's root enables `pids` alone for its children, and
+    /// reading the list made a `memory` cap look possible where none can exist.
+    #[test]
+    fn the_true_root_is_read_for_what_it_enables_and_a_namespace_root_as_any_level() {
+        let m = std::env::temp_dir().join(format!("kern-cgroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&m);
+        std::fs::create_dir_all(&m).unwrap();
+        std::fs::write(m.join("cgroup.controllers"), "cpuset cpu io memory pids\n").unwrap();
+        std::fs::write(m.join("cgroup.subtree_control"), "pids\n").unwrap();
+        assert!(
+            !controller_usable_at(&m, &m, "memory"),
+            "a true root that enables only pids gives no memory cap to anything below it"
+        );
+        assert!(controller_usable_at(&m, &m, "pids"));
+        std::fs::write(m.join("cgroup.subtree_control"), "memory pids\n").unwrap();
+        assert!(
+            controller_usable_at(&m, &m, "memory"),
+            "enabled below the root: usable"
+        );
+        // A cgroup namespace's root has `cgroup.type`, and its list IS what its parent enabled.
+        std::fs::write(m.join("cgroup.type"), "domain\n").unwrap();
+        std::fs::write(m.join("cgroup.subtree_control"), "\n").unwrap();
+        assert!(
+            controller_usable_at(&m, &m, "memory"),
+            "a namespace root is read by its own controllers"
+        );
+        let _ = std::fs::remove_dir_all(&m);
+    }
+
+    /// A POPULATED CGROUP GETS NO CONTROLLER ENABLED BELOW IT. `+pids` alone is accepted there and
+    /// turns it into a thread root whose domain children refuse every process (openSUSE Leap 16, whose
+    /// user manager delegates `pids` alone). An empty one still gets its batch.
+    #[test]
+    fn controllers_are_enabled_below_an_empty_cgroup_and_never_below_a_populated_one() {
+        let d = std::env::temp_dir().join(format!("kern-populated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("cgroup.controllers"), "pids\n").unwrap();
+        std::fs::write(d.join("cgroup.subtree_control"), "").unwrap();
+        std::fs::write(d.join("cgroup.procs"), "4242\n").unwrap();
+        enable_subtree_controllers(&d);
+        assert_eq!(
+            std::fs::read_to_string(d.join("cgroup.subtree_control")).unwrap(),
+            "",
+            "a cgroup holding a process must not get +pids: its domain children would be invalid"
+        );
+        std::fs::write(d.join("cgroup.procs"), "").unwrap();
+        enable_subtree_controllers(&d);
+        assert_eq!(
+            std::fs::read_to_string(d.join("cgroup.subtree_control")).unwrap(),
+            "+pids",
+            "an empty cgroup gets the controllers it offers"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// WHAT A RELOAD TOOK IS PUT BACK, AND ONLY THAT: the controllers missing from the unit's
+    /// `subtree_control`, and each leaf file whose content differs from the snapshot (a file that
+    /// still matches is not rewritten). Plain files stand in for cgroupfs, as in the tests above.
+    #[test]
+    fn a_reload_s_stripped_controllers_and_caps_are_put_back() {
+        let d = std::env::temp_dir().join(format!("kern-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let leaf = d.join("kern-box-x-1");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let subtree = d.join("cgroup.subtree_control");
+        std::fs::write(&subtree, "").unwrap();
+        std::fs::write(leaf.join("memory.max"), "max\n").unwrap();
+        std::fs::write(leaf.join("pids.max"), "512\n").unwrap();
+        let enabled = vec!["memory".to_string(), "pids".to_string()];
+        let snapshot = vec![
+            (leaf.join("memory.max"), "67108864\n".to_string()),
+            (leaf.join("pids.max"), "512\n".to_string()),
+        ];
+        restore_leaf_caps(&subtree, &enabled, &snapshot);
+        assert_eq!(std::fs::read_to_string(&subtree).unwrap(), "+memory +pids");
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("memory.max")).unwrap(),
+            "67108864",
+            "the cap the reload reset is written back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("pids.max")).unwrap(),
+            "512\n",
+            "untouched"
+        );
+        // Nothing missing: nothing written to the unit.
+        std::fs::write(&subtree, "memory pids\n").unwrap();
+        restore_leaf_caps(&subtree, &enabled, &snapshot);
+        assert_eq!(std::fs::read_to_string(&subtree).unwrap(), "memory pids\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The OOM counter is read from the first ancestor that outlives the box: past the leaf AND past
+    /// the per-box scope, stopping at the slice; never the mount root.
+    #[test]
+    fn the_oom_counter_is_read_above_every_cgroup_the_box_owns() {
+        let m = std::env::temp_dir().join(format!("kern-oomanc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&m);
+        let leaf = m.join("user.slice/app.slice/kern-box-77.scope/kern-box-web-78");
+        std::fs::create_dir_all(&leaf).unwrap();
+        for d in [
+            "user.slice/app.slice",
+            "user.slice/app.slice/kern-box-77.scope",
+            "user.slice/app.slice/kern-box-77.scope/kern-box-web-78",
+        ] {
+            std::fs::write(m.join(d).join("memory.events"), "oom_kill 0\n").unwrap();
+        }
+        assert_eq!(
+            surviving_ancestor_with_events(&leaf.join("x"), &m),
+            Some(m.join("user.slice/app.slice")),
+            "the scope is the box's own and goes with it"
+        );
+        // A box directly in a delegated unit: the unit is the answer.
+        let anchored = m.join("kern.slice/kern-boxes.service/kern-box-db-9");
+        std::fs::create_dir_all(&anchored).unwrap();
+        std::fs::write(m.join("kern.slice/kern-boxes.service/memory.events"), "").unwrap();
+        assert_eq!(
+            surviving_ancestor_with_events(&anchored.join("x"), &m),
+            Some(m.join("kern.slice/kern-boxes.service"))
+        );
+        assert_eq!(
+            surviving_ancestor_with_events(&m.join("a"), &m),
+            None,
+            "never the root"
+        );
+        let _ = std::fs::remove_dir_all(&m);
+    }
+
+    /// The parent pid is read past the LAST `)`, so a command holding `) (` cannot shift it.
+    #[test]
+    fn the_parent_pid_is_read_past_the_command() {
+        assert_eq!(
+            ppid_from_stat("4242 (kern) S 1717 4242 4242 0").as_deref(),
+            Some("1717")
+        );
+        assert_eq!(
+            ppid_from_stat("9 (a) b (c) R 33 9 9").as_deref(),
+            Some("33")
+        );
+        assert_eq!(ppid_from_stat("garbage"), None);
+        assert_eq!(ppid_from_stat("1 (x) S notapid").as_deref(), None);
+    }
+
+    /// Only kern's per-box scopes are searched under `app.slice`: not another unit's scope, not a
+    /// stray directory that merely starts like one.
+    #[test]
+    fn the_box_scopes_are_found_under_app_slice_and_nothing_else_is() {
+        let app = std::env::temp_dir().join(format!("kern-appslice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&app);
+        for d in [
+            "kern-box-4242.scope",
+            "kern-box-77.scope",
+            "run-p999-i1.scope",
+            "kern-box-notascope",
+            "app-gnome-x.scope",
+        ] {
+            std::fs::create_dir_all(app.join(d)).unwrap();
+        }
+        let mut got: Vec<String> = box_scope_dirs_in(&Some(app.clone()))
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["kern-box-4242.scope", "kern-box-77.scope"]);
+        assert!(box_scope_dirs_in(&None).is_empty());
+        let _ = std::fs::remove_dir_all(&app);
     }
 
     #[test]
@@ -7358,7 +7918,7 @@ mod tests {
     /// write. A `true` here would ship a box that never enters its own cgroup.
     #[test]
     fn a_fork_with_no_target_reports_that_it_placed_nothing() {
-        let (pid, born) = fork_into_cgroup(None);
+        let (pid, born) = fork_into_cgroup(None, false);
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
             unsafe { libc::_exit(0) };
@@ -7371,6 +7931,104 @@ mod tests {
         let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
         assert_eq!(waited, pid);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
+
+    /// A FIRST FORK THE CGROUP REFUSES MUST NOT CLOSE THE BOX'S PID NAMESPACE.
+    ///
+    /// A directory outside cgroupfs is refused by the kernel where `EOPNOTSUPP` from a "domain
+    /// invalid" cgroup is, in `cgroup_can_fork`, after the child's pid exists. Each half runs in a
+    /// child of its own with a user namespace, because a pid namespace is made once per process.
+    /// The CONTROL is the old shape (unshare, refused `clone3`, `fork`) and is reported, not asserted:
+    /// whether this kernel closes the namespace there is the kernel's business (openSUSE Leap 16's 6.12
+    /// and this desktop's 7.0 both do: `fork() = -1 ENOMEM`). The ASSERTION is that `fork_into_cgroup`
+    /// gets a PID 1 either way.
+    #[test]
+    fn a_refused_first_fork_leaves_the_box_a_pid_namespace_to_fork_into() {
+        let Some(not_a_cgroup) = CgroupRef::open(&std::env::temp_dir()) else {
+            eprintln!("SKIP: the temporary directory does not open");
+            return;
+        };
+        // Forked children of a threaded test process: syscalls and `_exit` only, no allocation.
+        let run = |body: &dyn Fn() -> i32| -> i32 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                    unsafe { libc::_exit(77) };
+                }
+                let code = body();
+                unsafe { libc::_exit(code) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            }
+        };
+        let reap_one = |pid: libc::pid_t| -> i32 {
+            if pid == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            if pid < 0 {
+                return 1;
+            }
+            let mut st = 0;
+            unsafe { libc::waitpid(pid, &mut st, 0) };
+            0
+        };
+        let control = run(&|| {
+            if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+                return 77;
+            }
+            let mut args = CloneArgs {
+                flags: CLONE_INTO_CGROUP,
+                exit_signal: libc::SIGCHLD as u64,
+                cgroup: not_a_cgroup.raw() as u64,
+                ..CloneArgs::default()
+            };
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_clone3,
+                    std::ptr::addr_of_mut!(args),
+                    std::mem::size_of::<CloneArgs>(),
+                )
+            };
+            if rc >= 0 {
+                return 78; // not refused: this kernel did not exercise the case
+            }
+            let pid = unsafe { libc::fork() };
+            if pid < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+                return 10; // the namespace was closed by the refused fork
+            }
+            reap_one(pid) + 11
+        });
+        if control == 77 {
+            eprintln!("SKIP: no user namespace for an unprivileged process here");
+            return;
+        }
+        eprintln!(
+            "control (unshare, refused clone3, fork) on this kernel: {}",
+            match control {
+                10 => "the namespace was CLOSED (fork answered ENOMEM)",
+                11 => "the namespace stayed usable",
+                78 => "clone3 into a non-cgroup directory was not refused",
+                _ => "unexpected",
+            }
+        );
+        let fixed = run(&|| {
+            let (pid, born) = fork_into_cgroup(Some(&not_a_cgroup), true);
+            if born {
+                return 2;
+            }
+            reap_one(pid)
+        });
+        assert_eq!(
+            fixed, 0,
+            "fork_into_cgroup found no pid namespace to fork into after a refused clone3 \
+             (1 = the fork failed, 2 = it claimed a placement)"
+        );
     }
 
     /// The teardown vacate must fire exactly when the supervisor left `origin`, and never otherwise.
@@ -7433,7 +8091,7 @@ mod tests {
             let _ = fs::remove_dir(&dir);
             return;
         };
-        let (pid, born) = fork_into_cgroup(Some(&cgref));
+        let (pid, born) = fork_into_cgroup(Some(&cgref), false);
         if pid == 0 {
             // NOTHING HERE MAY ALLOCATE. This is the child of a `fork` in cargo's MULTITHREADED test
             // harness: another thread can hold the allocator's lock at the instant of the fork, and

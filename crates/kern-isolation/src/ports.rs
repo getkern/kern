@@ -1501,11 +1501,33 @@ mod tests {
             eprintln!("skip: this host has no IPv6");
             return;
         }
+        // The client half needs `::1`, which a host can lack while `::` still binds: MEASURED on the
+        // VPS, `net.ipv6.conf.all.disable_ipv6 = 1` left the stack able to bind `::` and nothing to
+        // connect from. The bind half is still the product's (`host_has_ipv6`); only this test's
+        // client depends on the loopback.
+        if std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_err() {
+            eprintln!("skip: this host binds :: but has no IPv6 loopback to connect from");
+            return;
+        }
         let any4 = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
         let any6 = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
-        let port = free_port();
-        let v4 = bind_host_socket(any4, port, false);
-        let v6 = bind_host_socket(any6, port, false);
+        // ANOTHER PORT WHEN A THIRD PARTY HOLDS THIS ONE. `free_port` asks `127.0.0.1` only, and any
+        // other IPv4 socket on the port refuses `0.0.0.0`: MEASURED once in a VM, "Err(98) Ok(6)". The
+        // defect this test exists for, a `::` that is not IPv6-only, refuses the twin on EVERY port,
+        // so retrying on `EADDRINUSE` absorbs the collision and never the defect.
+        let (mut port, mut v4, mut v6) = (0, Err(0), Err(0));
+        for _ in 0..20 {
+            port = free_port();
+            v4 = bind_host_socket(any4, port, false);
+            v6 = bind_host_socket(any6, port, false);
+            // Only the IPv4 bind is retried: a refused `::` after a bound `0.0.0.0` IS the defect.
+            if v4 != Err(libc::EADDRINUSE) {
+                break;
+            }
+            for fd in [v4, v6].into_iter().flatten() {
+                unsafe { libc::close(fd) };
+            }
+        }
         let both = matches!((v4, v6), (Ok(_), Ok(_)));
         let reached = v6.ok().is_some_and(|_| {
             std::net::TcpStream::connect_timeout(

@@ -7,3 +7,6 @@ license.workspace = true
 repository.workspace = true
 description = "Shared types and utilities for kern (internal)."
 publish = false
+
+[dependencies]
+libc = "0.2"

@@ -917,19 +917,7 @@ fn mount_overlay(
 /// kernel refuses as an overlay UPPER layer. Used only to turn a bare `EINVAL` into a clear error.
 fn fs_is_overlayfs(path: &str) -> bool {
     const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
-    let mut p = std::path::Path::new(path);
-    loop {
-        if let Ok(c) = cstr(&p.to_string_lossy()) {
-            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-            if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 {
-                return st.f_type as i64 == OVERLAYFS_SUPER_MAGIC;
-            }
-        }
-        match p.parent() {
-            Some(parent) => p = parent,
-            None => return false,
-        }
-    }
+    kern_common::fs_magic(std::path::Path::new(path)) == Some(OVERLAYFS_SUPER_MAGIC)
 }
 
 /// Mount a fresh procfs for the new PID namespace (so `ps` etc. see only sandbox processes).
@@ -1061,6 +1049,40 @@ pub enum GpuEnumeration {
 /// unmasked one, because the card it was actually given would be missing from the driver's own
 /// listing and nothing in the box asked for that. The masks in `mask_proc_paths` carry a boundary
 /// and fail closed; this one carries cosmetics and says so.
+/// A box granted no card sees no NVIDIA enumeration at all: ONE empty tmpfs over
+/// `/proc/driver/nvidia` (cards, capabilities, version), the same tmpfs bound over
+/// `/proc/driver/nvidia-uvm`. It hides more than the per-directory masks a granted box needs, and it
+/// is one superblock instead of three. MEASURED on a desktop with two NVIDIA cards: the `proc-mask`
+/// phase of every box went 65 -> 127 us when the three per-directory tmpfs masks arrived, for boxes
+/// that use no GPU at all.
+fn mask_nvidia_for_a_box_with_no_card() -> Result<(), Error> {
+    let present: Vec<&str> = ["/proc/driver/nvidia", "/proc/driver/nvidia-uvm"]
+        .into_iter()
+        .filter(|d| std::path::Path::new(d).is_dir())
+        .collect();
+    let Some((first, rest)) = present.split_first() else {
+        return Ok(());
+    };
+    mask_proc_dir_keeping(first, &[])?;
+    let src = cstr(first)?;
+    for other in rest {
+        let dst = cstr(other)?;
+        if unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND as libc::c_ulong,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(Error::last("mount(bind nvidia mask)"));
+        }
+    }
+    Ok(())
+}
+
 fn mask_proc_dir_keeping(dir: &str, keep: &[String]) -> Result<(), Error> {
     // NOTHING TO KEEP IS A MASK THAT KEEPS NOTHING, and reading it as "leave the directory alone"
     // is the defect this function shipped with: see [`GpuEnumeration`] for the measurement. The
@@ -1240,7 +1262,7 @@ fn mask_nvidia_enumeration(what: &GpuEnumeration) -> Result<(), Error> {
         // The one state where masking would hide a card the box WAS given. Left whole on purpose,
         // and the caller says so out loud.
         GpuEnumeration::Unnameable => return Ok(()),
-        GpuEnumeration::NoneGranted => &[],
+        GpuEnumeration::NoneGranted => return mask_nvidia_for_a_box_with_no_card(),
         GpuEnumeration::Only(addresses) => addresses,
     };
 
@@ -6448,7 +6470,10 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
             libc::close(user);
             libc::close(net);
         }
-        let mut rest = libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        // No `CLONE_NEWPID` here: the box's pid namespace is made by the fork of its PID 1 (see
+        // `fork_into_cgroup`), because one made here is closed for good by a first fork the cgroup
+        // refuses.
+        let mut rest = libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
         if let Some(fd) = ipc_join {
             let joined = unsafe { libc::setns(fd, libc::CLONE_NEWIPC) };
             unsafe { libc::close(fd) };
@@ -6458,19 +6483,19 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
             }
             rest &= !libc::CLONE_NEWIPC;
         }
-        if unsafe { libc::unshare(rest) } != 0 {
+        if rest != 0 && unsafe { libc::unshare(rest) } != 0 {
             return Err(Error::Syscall(
-                "unshare(pid+uts+ipc)",
+                "unshare(uts+ipc)",
                 std::io::Error::last_os_error(),
             ));
         }
     } else {
-        // Full namespace set: user + PID + UTS (hostname) + IPC, and - unless `--net` shares the host
+        // Full namespace set: user + UTS (hostname) + IPC, and - unless `--net` shares the host
         // network - an isolated (loopback-only) network namespace. The mount namespace is unshared in
-        // the child (so its pivot doesn't touch the parent). With CLONE_NEWPID the *next* fork
-        // becomes PID 1.
-        let mut ns_flags =
-            libc::CLONE_NEWUSER | libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        // the child (so its pivot doesn't touch the parent). The PID namespace is made by the fork of
+        // the box's PID 1 itself (see `fork_into_cgroup`): one unshared here would be closed for good
+        // by a first fork the cgroup refuses.
+        let mut ns_flags = libc::CLONE_NEWUSER | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
         if !spec.share_net {
             ns_flags |= libc::CLONE_NEWNET;
         }
@@ -6576,7 +6601,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
             ))
         }
     };
-    let (pid, born_in_cgroup) = crate::cgroup::fork_into_cgroup(cg_ref.as_ref());
+    let (pid, born_in_cgroup) = crate::cgroup::fork_into_cgroup(cg_ref.as_ref(), true);
     if pid < 0 {
         return Err(Error::last("fork"));
     }
@@ -6643,7 +6668,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
         // entrypoint clears it on execve - that only drops the anti-orphan guarantee back to the
         // `--timeout` backstop (an availability property, not an isolation boundary). (b) Unlike the
         // supervisor leg we do NOT re-check `getppid()` after arming: this child is already PID 1 of
-        // its new pid namespace (CLONE_NEWPID was unshared above), so `getppid()` reads 0 regardless of
+        // its new pid namespace (made by the fork that created it), so `getppid()` reads 0 regardless of
         // the host-side supervisor's fate - a supervisor death in the fork→prctl microsecond window
         // simply falls through to the `--timeout` backstop, exactly as before this fix.
         if die_with_parent {
@@ -6683,6 +6708,11 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
     // exec()s (or the failure byte if the box's own setup fails), not before.
     if let Some(fd) = ready.disarm() {
         unsafe { libc::close(fd) };
+    }
+    // A reload of a non-delegated unit strips the box's leaf of its caps: keep them in force (see
+    // `hold_caps_across_reloads`). After the fork, so no thread exists while it happens.
+    if let Some(g) = cg.as_ref() {
+        crate::cgroup::hold_caps_across_reloads(g);
     }
     // Report PID 1 (for `kern exec`) and start the `-p` forwarders now that the box's net ns exists.
     let box_master = on_started(pid);
@@ -7496,11 +7526,18 @@ const LD_LINKS_MAX: usize = 4096;
 /// The longest path the kernel hands back, and so the longest link path or target an entry holds.
 const PATH_MAX_BYTES: usize = 4096;
 
+/// Seconds as the kernel's `time_t` holds them on every target kern ships (x86_64 and aarch64, glibc
+/// and musl: 64 bits). Named here rather than as `libc::time_t`, which the `libc` crate deprecates on
+/// musl because its width changed in musl 1.2, so the musl lint refused it. Checked by the compiler at
+/// every use: `st_mtime` and `tv_sec` are assigned to it, and a target whose `time_t` were not `i64`
+/// would not build rather than truncate.
+type TimeSecs = i64;
+
 /// The identity of the box's `/etc/ld.so.cache` under `root`: (inode, size, mtime), or `None` when
 /// absent.
 fn ld_cache_identity(
     root: libc::c_int,
-) -> Option<(libc::ino_t, libc::off_t, libc::time_t, libc::c_long)> {
+) -> Option<(libc::ino_t, libc::off_t, TimeSecs, libc::c_long)> {
     use std::os::fd::AsRawFd;
     let st = lstat_at(ld_etc(root)?.as_raw_fd(), c"ld.so.cache")?;
     Some((st.st_ino, st.st_size, st.st_mtime, st.st_mtime_nsec))
@@ -7686,7 +7723,7 @@ impl LdStore {
     /// Keep the cache this box's `ldconfig` just produced, with the links it made since `started`,
     /// if it reads as one and every link is in the box's own layer; and hold the store to
     /// [`LD_STORE_MAX`] entries.
-    fn keep(&self, root: libc::c_int, started: (libc::time_t, libc::c_long)) {
+    fn keep(&self, root: libc::c_int, started: (TimeSecs, libc::c_long)) {
         use std::io::Write;
         let Some(cache) = ld_cache_get(root) else {
             return;
@@ -7929,8 +7966,8 @@ fn readlink_at(dir: libc::c_int, name: &std::ffi::CStr) -> Option<Vec<u8>> {
 /// from, and monotonic time, which no one can set.
 #[derive(Clone, Copy)]
 struct CoarseNow {
-    real: (libc::time_t, libc::c_long),
-    mono: (libc::time_t, libc::c_long),
+    real: (TimeSecs, libc::c_long),
+    mono: (TimeSecs, libc::c_long),
 }
 
 fn coarse_now() -> CoarseNow {
@@ -7954,7 +7991,7 @@ fn coarse_now() -> CoarseNow {
 /// by microseconds over a run of milliseconds; a step is what this catches.
 const CLOCK_STEP_MARGIN_NS: i128 = 1_000_000;
 
-fn ns(t: (libc::time_t, libc::c_long)) -> i128 {
+fn ns(t: (TimeSecs, libc::c_long)) -> i128 {
     i128::from(t.0) * 1_000_000_000 + i128::from(t.1)
 }
 
@@ -7971,10 +8008,10 @@ fn clock_held(a: CoarseNow, b: CoarseNow) -> bool {
 
 /// The change time at or after which a link is the run that started at `a`'s: its start, less
 /// [`CLOCK_STEP_MARGIN_NS`], so a step smaller than the one [`clock_held`] catches hides nothing.
-fn made_since(a: CoarseNow) -> (libc::time_t, libc::c_long) {
+fn made_since(a: CoarseNow) -> (TimeSecs, libc::c_long) {
     let t = ns(a.real) - CLOCK_STEP_MARGIN_NS;
     match (
-        libc::time_t::try_from(t.div_euclid(1_000_000_000)),
+        TimeSecs::try_from(t.div_euclid(1_000_000_000)),
         libc::c_long::try_from(t.rem_euclid(1_000_000_000)),
     ) {
         (Ok(s), Ok(n)) => (s, n),
@@ -7991,7 +8028,7 @@ fn made_since(a: CoarseNow) -> (libc::time_t, libc::c_long) {
 fn ld_new_links(
     root: libc::c_int,
     cache: &[u8],
-    started: (libc::time_t, libc::c_long),
+    started: (TimeSecs, libc::c_long),
 ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     use std::os::fd::AsRawFd;
     let is_new_link = |st: &libc::stat| {
@@ -9754,7 +9791,7 @@ pub fn exec_in_box(
         refusal = [-1, -1];
     }
     EXEC_REFUSAL_FD.store(refusal[1], std::sync::atomic::Ordering::Relaxed);
-    let (pid, born) = crate::cgroup::fork_into_cgroup(box_cg.as_ref());
+    let (pid, born) = crate::cgroup::fork_into_cgroup(box_cg.as_ref(), false);
     if pid != 0 {
         // The parent (or a failed fork): the child has its own copy of the write end, or there is no
         // child. Ours goes, so the read below sees only what the child wrote.

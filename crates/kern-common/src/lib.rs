@@ -31,6 +31,31 @@ pub const TAGLINE: &str = "a fast, rootless container runtime and sandbox, no da
 /// Registry credentials shared by `kern login`/`logout` and the OCI pull path.
 pub mod registry_auth;
 
+/// The filesystem magic (`statfs.f_type`) of `path`'s deepest EXISTING ancestor, `path` itself
+/// included: the path a caller asks about often does not exist yet. `None` only when nothing up to
+/// `/` can be stat'd.
+///
+/// ONE READER FOR EVERY CRATE. The same `statfs` and cast lived in four places (the overlay-upper
+/// check, the WSL 9p warning on pull, the build scratch, the log store's tmpfs row), and `f_type` is
+/// `i64` on x86_64 glibc and another width elsewhere, so the cast is needed on some targets and
+/// redundant on others: clippy 1.93 refused the redundant one in each crate in turn (measured on the
+/// VPS). Silenced here, once, with the reason.
+#[allow(clippy::unnecessary_cast)]
+#[must_use]
+pub fn fs_magic(path: &std::path::Path) -> Option<i64> {
+    let mut cur = path;
+    loop {
+        if let Ok(c) = std::ffi::CString::new(cur.as_os_str().as_encoded_bytes()) {
+            // SAFETY: a zeroed `statfs` the kernel writes, and a NUL-terminated path.
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 {
+                return Some(st.f_type as i64);
+            }
+        }
+        cur = cur.parent()?;
+    }
+}
+
 /// The tiny TOML-ish value readers (quoted string / bool / `[...]` array / `#` comment) shared by the
 /// `kern.toml` profile loader and the `kern-compose` file parser.
 pub mod toml_lite;
