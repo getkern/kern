@@ -22,6 +22,8 @@
 #![allow(clippy::disallowed_methods)]
 use std::collections::{HashMap, HashSet, VecDeque};
 
+pub mod canon;
+pub mod schema;
 mod yaml;
 /// The `devices:` normaliser, exported because THREE surfaces must agree on what a device entry
 /// means: a `docker-compose.yml`, a `kern.toml` compose file, and `kern docker run --device`. A
@@ -627,6 +629,12 @@ pub struct ComposeBox {
     /// A network marked internal that NO service joins sets neither, and nothing is said about it:
     /// it confines nothing, so there is nothing to report.
     pub on_internal_network: bool,
+    /// The networks of this service the file marks `internal: true`, by name.
+    ///
+    /// Per NETWORK, where the two flags above are per service: a box that joins a stack later on
+    /// one of its networks (`kern box --network <project>_<network>`) is given egress or not by
+    /// that network alone, as Docker gives a container on an internal network none.
+    pub internal_networks: Vec<String>,
 }
 
 impl ComposeBox {
@@ -711,7 +719,7 @@ impl ComposeBox {
     /// stable order. The detached `-d` and the trailing `-- command` are added by the caller.
     /// The name this service has IN THE FILE.
     ///
-    /// `name` is the BOX name once `resolve_box_names` has run - `<project>-<service>`, or a
+    /// `name` is the BOX name once `resolve_box_names` has run - `<project>-<service>-1`, or a
     /// `container_name` verbatim - and that is the right name for the runtime and the wrong one for
     /// anything a reader compares against their own file. Every message that quotes a service, and
     /// `compose … config`, goes through here.
@@ -1167,6 +1175,31 @@ pub const POD_SHARED_LOOPBACK: &str =
      loopback, meeting on a bridge as Docker does, for about 20 ms for the whole stack (measured: \
      +17 ms for two services, +27 ms for eight); `--no-pod` also separates them but reaches peers \
      through a relay per ordered pair per port";
+
+/// A compose file as a YAML value, after the same front end the parser runs (interpolation,
+/// anchors, `extends:`, `!reset`), for `config` to print through [`canon::project`].
+///
+/// # Errors
+///
+/// What the front end refuses.
+/// The top-level `name:` of a compose YAML, interpolated; `None` for a TOML stack or no `name:`.
+pub fn top_level_name(text: &str, dotenv: &DotEnv) -> Option<String> {
+    let t = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if is_yaml(t) {
+        yaml::top_level_name(t, dotenv)
+    } else {
+        None
+    }
+}
+
+pub fn config_document(
+    text: &str,
+    dotenv: &DotEnv,
+    dir: Option<&std::path::Path>,
+    interpolate: bool,
+) -> Result<canon::Val, String> {
+    yaml::document_val(text, dotenv, dir, interpolate)
+}
 
 pub fn parse(text: &str) -> Result<Vec<ComposeBox>, String> {
     parse_with_env(text, &DotEnv::default(), StackNet::Pod)
@@ -1643,6 +1676,7 @@ impl ComposeBox {
             net_subnets,
             degraded_health,
             tmpfs_from_volumes,
+            internal_networks,
         );
         // AN OVERRIDE THAT RESTATES A LINE MUST NOT DOUBLE IT. The lists above that
         // `collapse_repeated_mappings` does not know were appended blindly, so a GPU override
@@ -1662,6 +1696,7 @@ impl ComposeBox {
             &mut self.networks,
             &mut self.external_networks,
             &mut self.degraded_health,
+            &mut self.internal_networks,
         ] {
             dedup_keep_first(v);
         }
@@ -2227,12 +2262,12 @@ pub fn topo_order(boxes: &[ComposeBox]) -> Result<Vec<String>, String> {
 /// The services still inside a `depends_on` cycle, named AS THE FILE NAMES THEM.
 ///
 /// THE BOX NAME IS NOT THE SERVICE NAME, and printing it here was the defect. By the time the graph
-/// is walked, `resolve_box_names` has rewritten `name` to `<project>-<hash>-<service>`, so a file
+/// is walked, `resolve_box_names` has rewritten `name` to `<project>-<service>-1`, so a file
 /// with `a` depending on `b` depending on `a` reported `dependency cycle detected among:
 /// fuzzc-06f7c969-a, fuzzc-06f7c969-b`. The reader wrote `a`. They now have to find their own file
 /// inside a hash they did not choose, to be told something they could have been told in their own
 /// words - the same defect this tree already fixed for `compose exec`, where the answer was that the
-/// reader knows `web` and not `<project>-<hash>-web`.
+/// reader knows `web` and not `<project>-web-1`.
 ///
 /// ONE FUNCTION FOR BOTH WALKS. The flat topological sort and the levelled one each built this
 /// string, which is two places for the next correction to be applied to one of.
@@ -4955,6 +4990,12 @@ mod contract_tests {
                  service may be defined below the one that shares it), so the relay graph and the \
                  hosts file are built from it; the compose driver reads the field again once the \
                  wiring is settled, to say what a namespace per service cannot give",
+            ),
+            (
+                "internal_networks",
+                "the compose driver records it with each bridge network, so a box joining the stack \
+                 later with `kern box --network <project>_<network>` gets egress only on a network \
+                 the file does not mark internal",
             ),
             (
                 "on_internal_network",

@@ -2,3 +2,7 @@ kern
 Copyright 2026 Alex (github.com/realexhub)
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes crates/kern-compose/src/compose-spec.json, the Compose Specification JSON
+schema as shipped in compose-go v2.13.0 (https://github.com/compose-spec/compose-go), unmodified.
+Copyright 2020 The Compose Specification Authors. Licensed under the Apache License, Version 2.0.

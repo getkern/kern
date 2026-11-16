@@ -339,18 +339,35 @@ pub(crate) fn parse_with_env_rooted(
     )
 }
 
-/// [`parse_with_env`] with the `include:` chain it is being read under; the top-level document
-/// starts one, and every included model is read through here with the chain extended.
-#[allow(clippy::too_many_arguments)]
-fn parse_document(
+/// The refusal for `${VAR:?...}` references that have no value, named once for every reader of a
+/// file (the parse and `config`).
+fn required_unset_error(missing: &[String]) -> String {
+    format!(
+            "{} required by this file with `${{VAR:?...}}` {} no value: {}. That form exists to STOP \
+             the file being rendered without it - it is what a compose file writes for a password or \
+             a token - so kern refuses rather than substituting an empty string. Set {} in your \
+             shell or in the project `.env`.",
+            if missing.len() == 1 {
+                "a variable"
+            } else {
+                "variables"
+            },
+            if missing.len() == 1 { "has" } else { "have" },
+            missing.join(", "),
+            if missing.len() == 1 { "it" } else { "them" },
+        )
+}
+
+/// THE FRONT END EVERY READER OF A FILE GOES THROUGH: multi-line folding, the structural
+/// prescreen, document-level interpolation, the line parse, anchors, `extends:` and `!reset`. One
+/// function, so `parse_document` (which builds the boxes) and [`document_val`] (which `config`
+/// prints) read the same tree and cannot drift apart.
+fn front_end(
     text: &str,
     dotenv: &crate::DotEnv,
-    require_runnable: bool,
-    net: crate::StackNet,
     dir: Option<&std::path::Path>,
-    defer_profiles: bool,
-    chain: &IncludeChain,
-) -> Result<Vec<ComposeBox>, String> {
+    interpolate: bool,
+) -> Result<Node, String> {
     // Fold multi-line block scalars (`|`/`>`) and multi-line flow collections onto single logical lines
     // first, so the rest of the pipeline stays line-at-a-time (block-scalar bodies become opaque values).
     let folded = fold_multiline(text)?;
@@ -364,7 +381,12 @@ fn parse_document(
     // per-field pass would miss `ports: ["${PORT}:80"]`; Docker substitutes over the whole file before
     // parsing, and so do we. Unset with no default → empty + warn (Docker semantics), never a literal
     // `${VAR}` left to confuse a downstream tool.
-    let interpolated = interpolate_document(&folded, dotenv);
+    // `config --no-interpolate` reads the file with its `${...}` as written.
+    let interpolated = if interpolate {
+        interpolate_document(&folded, dotenv)
+    } else {
+        folded.clone()
+    };
     // TAKEN, not read: draining here is what stops one document's missing variables being reported
     // against the next one parsed in this process. A mutation replacing the take with a clone leaves
     // the second parse refusing a variable its file never mentions, which the test pins.
@@ -374,20 +396,7 @@ fn parse_document(
     // control flow makes impossible. Defensive code whose justification is false is worse than none.
     let missing = one_entry_per_variable(take_required_unset());
     if !missing.is_empty() {
-        return Err(format!(
-            "{} required by this file with `${{VAR:?...}}` {} no value: {}. That form exists to STOP \
-             the file being rendered without it - it is what a compose file writes for a password or \
-             a token - so kern refuses rather than substituting an empty string. Set {} in your \
-             shell or in the project `.env`.",
-            if missing.len() == 1 {
-                "a variable"
-            } else {
-                "variables"
-            },
-            if missing.len() == 1 { "has" } else { "have" },
-            missing.join(", "),
-            if missing.len() == 1 { "it" } else { "them" },
-        ));
+        return Err(required_unset_error(&missing));
     }
     let text = interpolated.as_str();
 
@@ -403,6 +412,157 @@ fn parse_document(
     resolve_extends(&mut root, dir, dotenv)?;
     // `!reset` in THIS file, and the keys a LATER `-f` resets or overrides: see `merge_tag_keys`.
     drop_reset_keys(&mut root);
+    Ok(root)
+}
+
+/// The file as a YAML value, after [`front_end`], for `config` to print (see `crate::canon`).
+///
+/// # Errors
+///
+/// What the front end refuses.
+pub(crate) fn document_val(
+    text: &str,
+    dotenv: &crate::DotEnv,
+    dir: Option<&std::path::Path>,
+    interpolate: bool,
+) -> Result<crate::canon::Val, String> {
+    // A byte-order mark is not part of the first key: read as one, `\u{feff}name:` lost the
+    // project's `name:`, as the other entry points already strip it.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // ONE READING PER FILE PER PROCESS: `config` asks Docker's check and its own rendering for the
+    // same tree of the same file, and each reading cost ~12 us per line (MEASURED on the VPS).
+    type Key = (
+        String,
+        Option<std::path::PathBuf>,
+        bool,
+        Vec<(String, String)>,
+    );
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<(Key, Result<crate::canon::Val, String>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key: Key = (
+        text.to_string(),
+        dir.map(std::path::Path::to_path_buf),
+        interpolate,
+        dotenv.0.clone(),
+    );
+    // The interpolation also reads the process environment, which kern sets once before any file
+    // is read; the crate's own tests change it between readings, so they read afresh.
+    if let Some(hit) = READ.with(|r| {
+        r.borrow()
+            .iter()
+            .find(|(k, _)| *k == key && !cfg!(test))
+            .map(|(_, v)| v.clone())
+    }) {
+        return hit;
+    }
+    let read = document_val_uncached(text, dotenv, dir, interpolate);
+    READ.with(|r| r.borrow_mut().push((key, read.clone())));
+    read
+}
+
+fn document_val_uncached(
+    text: &str,
+    dotenv: &crate::DotEnv,
+    dir: Option<&std::path::Path>,
+    interpolate: bool,
+) -> Result<crate::canon::Val, String> {
+    // The front end's notes are the parse's to give, and the parse of the same file has given them;
+    // `config` takes the tree only, so they are not printed twice.
+    //
+    // INTERPOLATED VALUE BY VALUE, AFTER THE PARSE, as compose-go does it, and not on the text:
+    // a value an interpolation produced is a STRING whatever it reads as. MEASURED on Docker
+    // Compose 5.3.1: `C: ${ALT:+alt}` with ALT unset is `C: ""`, where the text-level pass leaves
+    // `C: ` and reads it as null; and the service hash (`config --hash`) follows the string.
+    SILENT_WARNINGS.with(|s| s.set(true));
+    let root = front_end(text, dotenv, dir, false);
+    let val = root.map(|r| node_val(&r, interpolate.then_some(dotenv)));
+    SILENT_WARNINGS.with(|s| s.set(false));
+    let val = val?;
+    if interpolate {
+        let missing = one_entry_per_variable(take_required_unset());
+        if !missing.is_empty() {
+            return Err(required_unset_error(&missing));
+        }
+    }
+    Ok(val)
+}
+
+/// One parsed node as a [`crate::canon::Val`]: children are a mapping, items a sequence (each item a
+/// scalar or the flow form `build_tree` renders a block item to), a scalar decoded by
+/// [`scalar_str`] and marked quoted when it was quoted or a block scalar.
+fn node_val(n: &Node, dotenv: Option<&crate::DotEnv>) -> crate::canon::Val {
+    use crate::canon::Val;
+    if !n.children.is_empty() {
+        return Val::Map(
+            n.children
+                .iter()
+                .map(|(k, v)| (k.clone(), node_val(v, dotenv)))
+                .collect(),
+        );
+    }
+    if !n.items.is_empty() {
+        return Val::Seq(
+            n.items
+                .iter()
+                .map(|i| interpolated_val(i, dotenv))
+                .collect(),
+        );
+    }
+    match &n.scalar {
+        None => Val::Null,
+        Some(s) => interpolated_val(s, dotenv),
+    }
+}
+
+/// A raw value, interpolated when `dotenv` is given: a scalar the interpolation changed is a
+/// string (see [`document_val`]).
+fn interpolated_val(raw: &str, dotenv: Option<&crate::DotEnv>) -> crate::canon::Val {
+    use crate::canon::Val;
+    let Some(env) = dotenv.filter(|_| raw.contains('$')) else {
+        return raw_val(raw);
+    };
+    let out = interpolate_fragment(raw, env);
+    if out == raw {
+        return raw_val(raw);
+    }
+    let t = out.trim();
+    if t.starts_with('[') || t.starts_with('{') {
+        return Val::from_flow(&strip_unset_mark(t));
+    }
+    Val::Scalar(scalar_str(t), true)
+}
+
+/// A raw scalar or flow collection as kern's line parser keeps it.
+fn raw_val(raw: &str) -> crate::canon::Val {
+    use crate::canon::Val;
+    let t = raw.trim();
+    let block = t.contains(BLOCK_OPAQUE) || t.contains(BLOCK_NL);
+    let t = t.strip_prefix("!!str").map_or(t, str::trim);
+    let quoted = block || t.starts_with('"') || t.starts_with('\'');
+    if !quoted && (t.starts_with('[') || t.starts_with('{')) {
+        return Val::from_flow(&strip_unset_mark(t));
+    }
+    if !quoted && matches!(t, "" | "~" | "null" | "Null" | "NULL") {
+        return Val::Null;
+    }
+    Val::Scalar(scalar_str(t), quoted)
+}
+
+/// [`parse_with_env`] with the `include:` chain it is being read under; the top-level document
+/// starts one, and every included model is read through here with the chain extended.
+#[allow(clippy::too_many_arguments)]
+fn parse_document(
+    text: &str,
+    dotenv: &crate::DotEnv,
+    require_runnable: bool,
+    net: crate::StackNet,
+    dir: Option<&std::path::Path>,
+    defer_profiles: bool,
+    chain: &IncludeChain,
+) -> Result<Vec<ComposeBox>, String> {
+    let root = front_end(text, dotenv, dir, true)?;
 
     // Top level must have `services:`. `volumes:`/`networks:`/`version:`/`name:` are recognized;
     // everything else at the top is warned and ignored.
@@ -4108,8 +4268,20 @@ fn load_includes(
             inner.files.push(f.clone());
             let text = std::fs::read_to_string(f)
                 .map_err(|err| format!("`include:` reads {}: {err}", f.display()))?;
-            let layer = parse_document(&text, &dotenv, false, net, f.parent(), true, &inner)
-                .map_err(|err| format!("`include:` {}: {err}", f.display()))?;
+            // Docker checks an included file as it checks a top-level one, and names it in the
+            // message (MEASURED: `validating <abs>/inc/bad.yml: services.b.cap_add must be a
+            // array`, with nothing about the including file).
+            let refusal = crate::schema::docker_refusal(
+                &text,
+                &dotenv,
+                f.parent(),
+                &f.display().to_string(),
+                true,
+            );
+            let layer = crate::schema::refused_or(refusal, || {
+                parse_document(&text, &dotenv, false, net, f.parent(), true, &inner)
+                    .map_err(|err| format!("`include:` {}: {err}", f.display()))
+            })?;
             inner.files.pop();
             model = Some(match model {
                 None => layer,
@@ -4806,6 +4978,11 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                 b.only_internal_networks =
                     !names.is_empty() && names.iter().all(|n| internal_networks.contains(n));
                 b.on_internal_network = names.iter().any(|n| internal_networks.contains(n));
+                b.internal_networks = names
+                    .iter()
+                    .filter(|n| internal_networks.contains(*n))
+                    .cloned()
+                    .collect();
                 // Only RECORDED here, announced once for the whole document. A per-service
                 // `networks:` used to pass in total silence when the file declared no top-level
                 // block (Docker rejects such a file; kern accepted it and said nothing about the
@@ -8119,9 +8296,61 @@ pub(crate) fn take_warnings() -> Vec<String> {
     WARNINGS.with(|w| w.borrow_mut().drain(..).collect())
 }
 
+/// The service keys kern reads that Docker's Compose schema does not have: kern's own (`rootfs`,
+/// `bind_rootfs`, `port`), the spellings it takes beside Docker's (`memory` for `mem_limit`,
+/// `workdir` for `working_dir`, ...), and `cpus_shares`, which it ignores. Docker's schema check
+/// leaves them to kern's parser (see `schema`), so a file using them is not refused for them.
+/// `depends_healthy`/`depends_completed` are not here: kern refuses those itself, with the spelling
+/// to use instead.
+pub(crate) const KERN_SERVICE_KEYS: &[&str] = &[
+    "rootfs",
+    "bind_rootfs",
+    "port",
+    "memory",
+    "mem_swap_limit",
+    "memory_reservation",
+    "workdir",
+    "dns_options",
+    "cpus_shares",
+];
+
+/// The top-level `name:` of a compose YAML, interpolated, read by a scan of its lines and not by a
+/// parse: the project name is asked by every verb, and a whole parse for one key cost the read-only
+/// verbs ~12 us per line of the file (MEASURED on the VPS). Only a `name:` at column 0 with a scalar
+/// on the same line counts, which is how a top-level key is written.
+pub(crate) fn top_level_name(text: &str, dotenv: &crate::DotEnv) -> Option<String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("name:") else {
+            continue;
+        };
+        let raw = split_at_comment(rest).0.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let value = scalar_str(&interpolate_fragment(raw, dotenv));
+        let value = strip_unset_mark(&value);
+        return Some(value).filter(|v| !v.trim().is_empty());
+    }
+    None
+}
+
+thread_local! {
+    /// Set while [`document_val`] reads a file the parse has already read (and warned about).
+    ///
+    /// PER THREAD, because the read it silences is on this thread and no other. A process-wide flag
+    /// let one thread's `document_val` swallow another thread's warning: MEASURED in the crate's own
+    /// tests, where the schema tests read documents in parallel with a test asserting that a parse
+    /// warns.
+    static SILENT_WARNINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Emit a compat warning to stderr. Prefixed so it's clearly kern's compose-import voice, and so the
 /// user sees exactly which part of their compose didn't map 1:1.
 fn warn(msg: &str) {
+    if SILENT_WARNINGS.with(std::cell::Cell::get) {
+        return;
+    }
     #[cfg(test)]
     WARNINGS.with(|w| w.borrow_mut().push(msg.to_string()));
     eprintln!("kern: warning: compose: {}", sanitize_for_terminal(msg));
