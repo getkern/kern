@@ -21,6 +21,220 @@ both halves of that rule, so removing one from the parser fails the build by nam
 
 ## Unreleased
 
+**Minor bump: `--cpus` and `--cpuset-cpus` beyond the host are refused, as Docker refuses them.**
+They were clamped to what the host has, with a warning: `--cpus 64` on 28 CPUs ran with 28, and
+`--cpuset-cpus 0,2,4-6` on 6 CPUs ran pinned to `0,2,4,5`, a set nobody named. Both now stop before
+the box starts, with Docker's sentence ("range of CPUs is from 0.01 to 28.00, as there are only 28
+CPUs available"; "requested CPUs are not available - requested 0,2,4-6, available: 0-5"), and so does
+a `vcpu:` profile's value, named as the profile's. A compose file whose `cpus:` exceeds the machine
+is refused at that service's start, as `docker compose up` refuses it. To keep a file or a profile
+portable across machine sizes, ask for at most the smallest machine's CPUs. The available CPUs are
+the kernel's online list, so a CPU offline in the middle of the range counts as missing.
+
+**A rootless box keeps its memory and pids caps for its whole life.** The boxes were plain cgroups
+directly in `kern.slice`, a systemd unit whose controllers systemd recomputes from its member units:
+one second after kern created the slice (the first box after a boot), and at every `systemctl --user
+daemon-reload`, systemd turned them off and every running box lost `memory.max` and `pids.max`, with
+nothing said; a start landing in that second was refused. Boxes now live in `kern-boxes.service`, a
+`Delegate=yes` unit in `kern.slice` that systemd does not touch, started once at the first box
+(measured: ~35 ms, once); a box start is unchanged (4.41 ms against 4.41, indistinguishable). `kern
+stop` takes `-t/--timeout N`, as `docker stop` does. As root nothing changes: that `kern.slice` is
+not a systemd unit, and a system `daemon-reload` leaves its boxes capped (measured).
+
+**A `--gpus` box starts in half the time.** Every start read every link in the loader's directories
+to find the ones ending at the driver's libraries: about 9 syscalls per link, 12,000 on a desktop
+with 1291 links in `/usr/lib/x86_64-linux-gnu`. A chain is now walked once per target, without the
+`realpath` that could only answer yes under `/`, and the result is kept in kern's runtime
+directory and reused while every directory it was read from is unchanged; a library or link added,
+removed or re-pointed, or an `ld.so.conf` edit, makes it scan again. The box gets the same files.
+Measured on that desktop, medians of 50 to 60: `--gpus device=0` 19.9 to 9.7 ms on `alpine:3.20`,
+17.6 to 7.7 ms on `ubuntu:24.04`.
+
+**A box started over SSH keeps its caps through a `daemon-reload`, and `ps` and `exec` still see it.**
+From outside the user manager (an SSH session, cron, a system service) a box runs in its own
+transient scope, made without `Delegate=yes`, and kern builds the box's cgroup inside it. Measured
+on a Jetson Orin Nano (systemd 249, Linux 5.15) over SSH, four defects on that path. A `systemctl
+--user daemon-reload` emptied the scope's `cgroup.subtree_control`, so the box lost its own
+`memory.max` and `memory.oom.group`: only the scope's ceiling still bound, and an over-allocation
+killed one process while the box lived on. The supervisor now watches that file (inotify, no
+polling) and puts back the controllers and the limits it had applied; after a reload the box is
+again killed whole at its own cap. `kern ps` did not name a running box whose registry record was
+gone, because it never looked in per-box scopes; it does now. A `kern exec` killed with its box by
+the OOM killer exited 137 with nothing said, for two reasons: the counter was read from the box's
+own scope, which goes with the box, and Linux before 5.16 has no `oom_group_kill`, where `oom_kill`
+(paired with the box's PID 1 dying, as before) is now read. And the `/proc` fallback that finds
+boxes the registry lost now works on kernels built without `CONFIG_PROC_CHILDREN`, the Jetson's
+included. On that board `kern doctor`'s GPU row also fits a terminal again.
+
+**A box starts on a host that delegates only `pids`, where kern places it in a cgroup of its own.**
+On openSUSE Leap 16, whose user manager delegates `pids` alone, every box kern could not hand to
+the user manager (an `XDG_RUNTIME_DIR` without its socket) died "fork failed: Cannot allocate
+memory". Two defects in series. kern enabled `+pids` on its own
+cgroup while it was in it, which the kernel accepts and which makes every cgroup below it refuse
+processes. And the box's pid namespace was made before the fork that cgroup refused: a pid
+namespace whose first fork fails is closed for good, so the fallback fork had nowhere to go.
+kern no longer enables a controller on a cgroup that holds processes, and the box's PID 1 is
+created together with its pid namespace, so a refused fork leaves the fallback a namespace to fork
+into (the closing measured on kernel 6.12 and 7.0). On that host `kern box` also stopped warning
+that "a caller may be bypassing the resource limits": the root cgroup lists `memory` among its
+controllers and enables only `pids` below it, and the check now reads what the root enables.
+
+**Where SELinux refuses pasta, the installer labels kern so stacks reach the internet.** On openSUSE
+Leap 16 (enforcing, passt-selinux 2025-04) pasta is refused every namespace of an unconfined process,
+so no stack service and no one-off box reached the internet, with pasta's "Couldn't open user
+namespace … Permission denied" as the only explanation. Making `pasta_t` permissive does not change
+it; kern labelled as a container runtime, the type rootless podman runs as, does. The installer now
+probes pasta on an enforcing host and, only where SELinux is what refused it, labels kern
+`container_runtime_exec_t`, keeps the label only if the probe then succeeds, and otherwise puts the
+old one back; where the type is missing it says to install container-selinux. Run as root it also
+adds a file-context rule, so a relabel leaves the label in place (a plain `chcon` is undone by any
+`restorecon`, measured); run as a user it prints that root command. `kern uninstall` lists the rule
+and removes it as root. `kern doctor` runs the same probe on an enforcing host and warns only on that
+refusal, and the refusal itself names the command.
+
+**`kern box --network <project>_<network>` reaches the internet, as `docker run --network` does.**
+A box joining a running stack's network reached its services by name and had no default route and
+no `resolv.conf`. It now gets its own NAT, attached while it waits at its pre-exec gate exactly as a
+service's is, and the host's resolvers; on a network the file marks `internal: true` it gets none,
+as the services on it get none. The stack's pod no longer starts a NAT of its own when the stack is
+on bridges, since no process is in its namespace: `compose up -d` of three services 44.2 to 31.0 ms
+(medians of 30 alternated runs, one desktop).
+
+**`kern top` never blocks a key on a long list, and the sandbox history has dates.** The Builds tab read
+every build record on every 1 s refresh and Storage walked every volume, on the thread that reads
+keys: on a desktop with 11961 builds and 556 volumes, the first visit took 51 and 60 ms and each
+tab cost over 5 % of a core while shown. Builds now reads the newest 512 records and more as the
+selection scrolls toward them, and keeps a finished record instead of reading it again; volume
+sizes are measured by a child process and shown as they arrive. First visit 5.4 and 0.2 ms, idle
+0.5 % of a core on every tab. `kern sandbox history` and the Sandboxes tab print the date with the
+time, since the history outlives the day.
+
+**`kern top` has a Logs tab: every box's output in one stream, live.** Each line carries its time mark,
+its box and a level read from its text (a stack trace's lines take the level of the line they
+continue); `/` searches (`a|b` for either, case ignored), `e` filters by level, `s` by the selected
+line's box, `⏎` shows the whole line, `x` writes what is shown as CSV (`timestamp,object,message`,
+the file readable by you only, a cell starting with `= + - @` prefixed so a spreadsheet does not run
+it). It reads only while shown and only what was appended, woken by inotify; escape sequences a box
+prints are removed whole. A box writing faster than a screen can show is skipped to its newest lines,
+and the tab says so: measured with a box printing 290k lines a second, `kern top` used 0.7 % of a core
+and answered a key in 0.3 ms (99 % and 3 ms before the skip). Esc on the tab clears its filters
+before it quits.
+
+**`kern logs --all`: every box's output in one stream, ordered by time.** Each line carries its box
+(`web  | ...`, as `compose logs` prefixes a service); `-f` follows boxes started later too, `-t`,
+`--since`, `--until` and `--tail` (per box) work as for one box. It is the Logs tab of `kern top`
+for a script, and reads every line: nothing is skipped however fast a box writes. Docker has no
+command for this.
+
+**`kern doctor` says how full the disk and the log store are.** Two rows: the disk under kern's data
+(volumes, builds, kept boxes) and the log store, each turning into a warning from 85 % with what fails
+when it is full and the command that frees room. Percentages are `df`'s (used over used plus
+available, rounded up), in `kern top` too, since the space root reserves is not writable by anyone
+else: on one desktop 77 % of the total was the 82 % that predicts the error.
+
+**A full log store is said, and a `--rm` box takes its logs with it.** Box logs live in
+`$XDG_RUNTIME_DIR/kern/logs`, a tmpfs in RAM on a desktop, at most 32 MiB a box by default. When the
+store was full the pump dropped output (never the box) and nothing said so; the log now carries
+`kern: warning: N byte(s) of this box's output were dropped here` at the gap, so `kern logs`, `compose
+logs` and the Logs tab show it. `kern top` colours the disk figure yellow from 85 % and red from 95 %,
+shows the log store in the header when it is that full, and its Overview lists what fails and the
+command that frees room (`kern gc`, `kern prune`); the Logs tab states where the logs are, how much
+they take and how much of it is from boxes that ended. A detached `--rm` box that ran now removes its
+logs at exit, as Docker does (one that never started keeps them: its launcher quotes them as the
+reason). Measured on a desktop before: 142 MiB in the store, all of it from boxes that had ended.
+The orphan sweep (every box start and `kern gc`) also covers `kern.slice` itself again, where a kern
+from before `kern-boxes.service` built its boxes: since that unit, orphans left there by an upgrade
+were never reaped.
+
+**`compose down -t N` takes the grace it is given, and `up -d` and `down` lose their fixed waits.**
+`down -t 0` waited each service's full default grace (10.27 s for three `sleep` services) because the
+flag never reached the teardown. `down` then slept a flat 250 ms after stopping the stack's outbound
+NATs, which leave in about 20 ms; it now polls and returns when they are gone. `up -d` no longer
+waits 150 ms to see whether a service dies, since it exits 0 either way (`--wait` and an `up` that
+stays keep the window). Measured on one desktop, medians of 15 runs of a three-service stack: `up
+-d` 190 to 48 ms, `down -t 0` 10.27 s to 40 ms.
+
+**A stack has Docker's names.** The project is Docker's: `-p`, then `COMPOSE_PROJECT_NAME`, then the
+file's `name:` (which kern ignored), then the directory's name in lower case without what Docker
+drops (`My.App_X` is `myapp_x`). kern named it `<directory>-<hash of the file>`, so every compose
+file in one directory was a project of its own and a second directory of the same name was another.
+Service boxes are `<project>-<service>-1` as Docker's containers are (a replica `-2`, `-3`, a
+`container_name:` as written), so `kern exec usbim-assets-api-server-1` and `kern box --network
+usbim-assets_usbim -v usbim-assets_data:/d` name what `docker exec` and `docker run` name. A `-p`
+Docker refuses is refused with its words. Nothing is lost on the way: a stack still running under the
+old name keeps it until its `down`, and says so; at the next `up` a volume named after the old project
+is renamed to the new one, with its data.
+
+**A one-off box reaches the stack it joins.** `kern box --network <project>_<network>` (or the
+project's name) on a stack whose services sit on a bridge was put in the bridge's own namespace with
+every name pointing at its own loopback, so the services refused it and a `container_name:` did not
+resolve. It now takes a free address on that network, reserved against a second one-off started at
+the same moment, and resolves every service, alias and box name of that network and of no other, as a
+container on a Docker network does.
+
+**`compose up`, `down`, `stop`, `start`, `restart`, `pull` and `cp` narrate on stderr**, as Docker
+Compose does (measured: zero bytes on its stdout), so `out=$(kern compose up -d)` is empty; an attached
+`up` still streams the services' output on stdout. `up -d` exits 0 when a service dies at once, as
+Docker's does, and says so on stderr; `up --wait` still exits 1. `compose ps` prints Docker's table
+(`NAME IMAGE COMMAND SERVICE CREATED STATUS PORTS`), with the image by its name and the command as
+Docker writes it (`"sh -c 'echo a; …"`); its notes on degraded edges and stopped services moved to
+stderr.
+
+**`compose restart` and `compose start` return, as Docker's do.** On a terminal both followed the
+stack's logs like an attached `up`, and Ctrl-C then stopped the service: `kern compose restart rest`
+did not return, and interrupted it left `rest` stopped. Only `up` follows now.
+
+**`ps --format` speaks Docker's fields.** `.Status` is Docker's sentence (`Up 4 seconds (healthy)`,
+`Up 4 seconds (Paused)`, `Exited (3) 4 seconds ago`, `Created`) where it was the state word, which is
+now `.State` (`running`, `paused`, `exited`); `.Health`, `.ExitCode` are new and `.RunningFor` is `5
+seconds ago`. `--format "table ..."` prints Docker's header and aligns the columns as Docker does,
+where kern printed the word `table` on every row. `compose ps --format` lists the services by name.
+A script that read `{{.Status}}` for `running` reads `{{.State}}`.
+
+**`compose logs` prefixes every line as Docker does**, `api-server-1  | a1`, with and without `-f`
+and for one service too, where kern printed `=== name ===` headings; `--no-log-prefix` leaves the lines
+bare. A service that had died and is brought back with `up --force-recreate` starts a new log, as a
+new container does; its dead run's output was still shown.
+
+**A compose file Docker refuses is refused, with Docker's message.** kern ran `command: [echo, 1,
+true]`, `cap_add: SYS_ADMIN`, `version: 3` and `oom_score_adj: -2000`; Docker Compose 5.3.1 refuses
+all four. Each file, and each `include:`d file, now goes through compose-go's own checks before kern
+reads a service, on the verbs that build from the file (`up`, `start`, `restart`, `run`, `build`,
+`pull`, `push`, `config`, `watch`, `systemd`); the read-only verbs (`ps`, `logs`, `exec`, `port`,
+`stop`, `down`, ...) do not repeat it, and measure as before. The check reads the file a second
+time, about 20 us per line (measured: +22 ms for a 1081-line file): the type conversions of its interpolation (`replicas: x` is `strconv.Atoi: parsing
+"x": invalid syntax`), its list deduplication (`cap_add: [A, B, A]` is accepted, `cap_add: [A, 5]`
+is not), and the Compose schema, vendored unmodified from compose-go v2.13.0. The message is
+Docker's, word for word on the 37 files compared (32 refused, 5 accepted), with the file's absolute path: `validating
+/srv/app/compose.yaml: services.a.command.1 must be a string`. An unknown key keeps kern's message,
+which names the closest key.
+
+**`compose config` prints the project as Docker Compose prints it.** kern answered with a summary of
+its own; stdout is now the resolved file, byte for byte as `docker compose config` writes it on Docker
+Compose 5.3.1 (51 files compared, including the differential suite): short forms expanded in
+compose-go's field order, paths absolute, sizes and durations normalised, `env_file` read into
+`environment`, overrides and `include:` merged, unused networks and volumes left out, and the YAML
+emitter's quoting and folding at 80 columns. `--format json`, `--services`, `--images`, `--volumes`,
+`--networks`, `--profiles`, `--variables`, `--hash` (the same digests), `--no-interpolate`, `-q` and
+`-o` answer as Docker's do; `--format json` and `--volumes` used to print the summary instead, with
+nothing said. kern's summary (the `wiring:` fields and the per-service lines) is on stderr. A value
+an interpolation produced is a string, as compose-go reads it (`${UNSET:+x}` is `""`, not null).
+Volumes, networks and variables are listed sorted, where Docker lists them in a different order on
+each run.
+
+**The container verbs of Docker's tutorials.** `kern create [OPTIONS] IMAGE [CMD...]` records a kept
+box without starting it and prints its name; `kern start` runs it, `kern start -a` follows its output
+and exits with its code, `kern restart [-t N]` stops a kept box and starts it again, `kern export <box>
+[-o file]` writes a running box's filesystem as a tar (relative names, the box's own owners, without
+what is mounted over it), and `kern container <verb>` groups the box verbs (`container ls` is `ps`;
+`run`, `top` and `prune` are refused by name, because kern's verbs of those names do something else).
+`kern run` is unchanged. Fixed on the way: `rename` of a kept box moved its registry entry and not
+its layer, so `kern start <new>` found nothing; a box kept with `--name` could never start again;
+`diff` refused a kept box and now answers for one running or stopped; `update --cpus 0.5 web` (flags
+first) took `0.5` for the box; `update` of a kept box is kept for its next start; a raised cap stayed
+under the systemd scope's old ceiling and now moves it; and a box started without `--cpus` says it
+has no cpu controller to update rather than "permission denied".
+
 **CLI surface, additive.** `kern rm -f` stops and removes a running box, and a missing name exits 0,
 as `docker rm -f` does. `kern box --group-add <name|gid>` (compose `group_add:`) adds a supplementary
 group, a name resolved in the image's `/etc/group`. `kern box --device /dev/X[:/dev/Y[:rwm]]` binds a
@@ -209,8 +423,9 @@ shuffles at every query; a hosts file cannot, so the spread is between clients).
 that is up gave the new replica the bridge address a running service still held (measured: `web-3`
 and `cm` both on 10.89.0.4, `cm` unable to reach it): a running box now keeps its address, recorded
 in the registry, whatever is added around it, and the boxes left running learn the replicas an `up`
-started or stopped. Under `--no-pod` a running box does not learn a replica added later, because the
-relay that would reach it is built when the box starts.
+started or stopped. Under `--no-pod` the same holds for the loopback aliases (recorded per stack): an
+alias moved by position used to hand a running box's name for `api` to the new `web-3` relay, and a
+running client did not learn the new replica.
 
 **A service that fails to start stops its dependents and nothing else.** The first service to fail
 ended the bring-up, and with every box held at its pre-exec gate that meant no service ran at all.

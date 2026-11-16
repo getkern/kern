@@ -80,8 +80,8 @@ Every key is its flag's long name, with `_` for `-`. Where the flag differs, it 
 | images and logs | `pull` or `pull_policy`, `log_max_size`, `log_max_file` |
 
 `port` and `expose` have no flag: they say what a service listens on inside the shared pod, so a port
-collision is refused before anything starts. `kern compose stack.toml config` prints what each service
-will get, without starting it.
+collision is refused before anything starts. `kern compose stack.toml config` says what each service
+will get, without starting it, in the summary it prints on stderr.
 
 ## `[kern]` settings
 

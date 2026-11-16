@@ -44,6 +44,13 @@ change leads that release's [CHANGELOG](../CHANGELOG.md) entry, naming the key.
 A key that is not in Docker's compose schema at all (a typo like `enviroment:`) is refused, as Docker
 refuses it, naming the key it is one edit from; the schema is the 92 service keys and 9 top-level
 keys Docker Compose v5.0.2 accepts, measured one by one.
+A value of the wrong shape is refused as Docker refuses it, before any service is read, by the verbs
+that build from the file (`up`, `run`, `config`, `build`, `pull` and the like; not `ps`, `logs` or
+`down`): kern checks each file (and each `include:`d file) against Docker's own Compose schema, after the same type
+conversions and list deduplication, and prints Docker's message with the file's absolute path, such
+as `validating /srv/app/compose.yaml: services.web.command.1 must be a string` for
+`command: [echo, 1]`. Where two failures are equally deep Docker names either one from run to run;
+kern names the first in the file.
 Two silences are deliberate: `x-*` extension fields, and the four keys Docker itself does not act on
 under Linux (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`).
 
@@ -165,6 +172,14 @@ services with no network in common share no bridge (or get no relay) and no `/et
 peer's name does not resolve. The boundary is the ABSENCE of a path, not a filter, so no rule can be
 misconfigured into permissiveness. Over 240 real files, 52 have a pair that loses an edge, so `up`
 names every cut pair first.
+
+**The project and its names are Docker's.** The project is `-p`, `COMPOSE_PROJECT_NAME`, the file's
+`name:`, or the directory's name normalized as Docker normalizes it; every file in one directory is
+one project. A service's box is `<project>-<service>-1` and a network is `<project>_<network>`:
+`kern box --network <project>_<network>` joins that network of a running stack, with an address of its
+own on a stack on a bridge and every name of that network resolving, and the internet through its own
+NAT with the host's resolvers unless the file marks that network `internal: true`, as `docker run
+--network` does.
 
 **A network shared BETWEEN projects (`external: true`).** `kern network create <name>` makes it, and
 services of different files on it reach each other by name. A file naming one that does not exist is
@@ -311,8 +326,8 @@ profile to a service. `x-` is the specification's extension mechanism, so the fi
 
 A profile buys only what compose cannot already say: `cpus`, `cpuset` and `mem_limit` are compose's
 own and are used directly. `vgpio` is gated, because a profile name means different hardware on
-different hosts: `compose config` prints what each resolves to here, and `--allow-device-grants` is
-required.
+different hosts: `compose config` says what each resolves to here (in its summary, on stderr), and
+`--allow-device-grants` is required.
 
 A kind this build does not have is named as ABSENT (`x-kern-vgpu:`); a MISSPELLED key gets a different
 sentence, naming the keys kern does read. Both are warnings, because the specification requires every
@@ -329,28 +344,30 @@ manual on purpose.
 
 | `docker …` | `kern …` | Notes |
 |---|---|---|
-| `run` / `create` | `box` | one verb. `-d`, `-t`/`-it`, `--entrypoint` replaces ENTRYPOINT and discards CMD, `--network <name>` joins a running pod |
+| `run` | `box` | `-d`, `-t`/`-it`, `--entrypoint` replaces ENTRYPOINT and discards CMD, `--network <name>` joins a running pod, a stack, or a stack's `<project>_<network>` |
+| `create` | `create` | a kept box recorded and not started; `start` runs it |
 | `exec` | `exec` | joins the box's namespaces; `-t` allocates a PTY, `-i` does not |
 | `ps` / `inspect` / `stats` | same | `--filter`, `--format`, `--json`, `--no-trunc`; `inspect -f` takes docker's own paths; `kern top` is the live view |
-| `logs` | `logs` | `--tail`, `-f`, `-t`, `--since`/`--until`; the follow is a bounded read |
+| `logs` | `logs` | `--tail`, `-f`, `-t`, `--since`/`--until`; the follow is a bounded read. Every box's output in one stream, ordered by time: `kern logs --all` (Docker has no CLI equivalent), and live in `kern top`, Logs tab, as Docker Desktop's Logs view (search, level and source filters, CSV export) |
 | `stop` / `kill` | `stop` / `kill` | `stop` signals, waits 10 s, then SIGKILLs. `kill` is immediate |
 | `pause` / `unpause` / `attach` | same | cgroup v2 freezer; Ctrl-C detaches and the box keeps running |
 | `cp` | `cp` | host↔box; symlinks cannot escape the box root |
-| `images` / `rename` / `wait` | same | rename is in place, pid unchanged; `wait` blocks and prints the status |
+| `images` / `rename` / `wait` | same | rename is in place, pid unchanged, and a kept box's layer moves with it; `wait` blocks and prints the status |
 | `top` (box processes) | `exec <box> ps` | plus `kern top` |
-| `update` / `diff` / `events` | same | live cgroup caps with no restart; overlay-upper `C`/`D`; a poll-based, best-effort event stream |
+| `update` / `diff` / `events` | same | live cgroup caps with no restart, and a kept box's record for its next start; overlay-upper `C`/`D`, a kept box's too; a poll-based, best-effort event stream |
 | `commit` | `commit` | box → reusable image |
 | `start` / `rm` | `start` / `rm` | a plain box is a process and its writable layer goes with it. `--keep` keeps that layer, `start` runs the same command on it, `rm` removes both. `rm` takes an exited box out of `ps -a`; `rm -f` stops a running one first and, on a name that is not there, says so and exits 0, as docker does |
+| `restart` / `export` / `container <verb>` | same | `restart [-t N]` stops a kept box and starts it again; `export` writes a running box's filesystem as a tar; `container` groups the box verbs, except `run`, `top` and `prune`, which are kern's own words |
 | `login` / `logout` / `port` | same | registry credentials; `port` is read from the running box, not from the file |
 
 ### Every `docker compose` verb and flag kern accepts
 
 | | |
 |---|---|
-| **Verbs** | `up`, `down`, `stop`, `start`, `restart`, `ps`, `logs`, `build`, `pull`, `config`, `watch`, `port`, `systemd`, `run`, `cp`, `exec`, `wait`, `events`, `images`, `push`, `rm`, `top`, `version`, `kill`. `create` and `scale` are refused by name: no created-but-not-started state, no replica count |
+| **Verbs** | `up`, `down`, `stop`, `start`, `restart`, `ps`, `logs`, `build`, `pull`, `config`, `watch`, `port`, `systemd`, `run`, `cp`, `exec`, `wait`, `events`, `images`, `push`, `rm`, `top`, `version`, `kill`. `create` (a stack is created by `up`; `kern create` makes one box) and `scale` (`up --scale`) are refused by name |
 | **`up`** | `-d`, `--wait`, `--wait-timeout`, `--exit-code-from`, `--abort-on-container-exit`, `--no-deps`, `--build`, `--no-build` (both as Docker for a service with `image:` and `build:`; see below), `--quiet-pull`, `--force-recreate`, `--no-recreate`, `-V` |
 | **`down` / `run`** | `-v`, `--remove-orphans`, `-t`, `--rmi local\|all` · `-d`, `--rm`, `-T`, `--name`, `--entrypoint`, `-e`, `--user`, `--pull`, `--no-deps` |
-| **`logs` / `ps`** | `--tail`, `-f`, `-t`, `--since`, `--until`, `--no-log-prefix` · `-q`, `--services`, `--format json` (Docker's field names plus `Publishers`) |
+| **`logs` / `ps`** | `--tail`, `-f`, `-t`, `--since`, `--until`, `--no-log-prefix` · `-q`, `--services`, `--format json` (Docker's field names plus `Publishers`), a template, or `table ...`; Docker's table by default |
 | **`wait` / `push`** | `wait` exits with the status of the first service to stop, as Docker's does; `kern wait <box>` PRINTS the code and exits 0, an older frozen contract. `push` publishes only the services the file BUILDS, skipping by name one that merely names an upstream image |
 | **Everywhere** | `-p`, `--env-file`, `--profile`, `--build-arg`, and `--flag=value` wherever `--flag value` works |
 | **The file** | positional, behind `-f`, or OMITTED: the directory is searched for `docker-compose.yml`, `compose.yml`, their `.yaml` spellings, and `kern.toml` |
@@ -471,15 +488,15 @@ IPC namespace, and kern says so when the box starts. What those examples want fr
 `/dev/shm` (docker gives 64 MB by default and the host's with `--ipc=host`); a box's is sized to its
 `--memory` cap, and `--shm-size` sets it.
 
-**Replicas** (`up --scale web=3`, `scale:`, `deploy.replicas`) are one box each: `<project>-web`,
-`<project>-web-2`, `<project>-web-3`, with their own addresses and ports, a host port range handing
+**Replicas** (`up --scale web=3`, `scale:`, `deploy.replicas`) are one box each: `<project>-web-1`,
+`<project>-web-2`, `<project>-web-3` (Docker's container names), with their own addresses and ports, a host port range handing
 each a port of it. A command naming the service reaches every replica, `port --index` and `exec
 --index` one. The service's name lists every replica and a replica's box name resolves, while
 `web-2` does not, as under Docker. The order differs: Docker's DNS shuffles the list at every query,
 and a hosts file cannot change between two, so each box starts its list at a different replica and
 the spread is between clients rather than between one client's connections. A stack that is up can be
-rescaled: running boxes keep their addresses and learn the replicas added or stopped, except under
-`--no-pod`, where a replica added later is not reached from a box that was already running.
+rescaled: running boxes keep their addresses (their loopback aliases under `--no-pod`) and learn the
+replicas added or stopped.
 
 **Shared IPC between services** works as Docker's: `ipc: shareable` on one service and `ipc:
 "service:<it>"` on another put the second in the first's IPC namespace with the same `/dev/shm`

@@ -240,17 +240,17 @@ volume with that name and reads it.
 ```
 Docker 29.6.2   b-1 | EMPTY        volumes: pa_shared, pb_shared
 kern (before)   B   | FROM_PROJECT_A   one directory, shared by every stack that used the name
-kern (now)      B   | EMPTY        volumes: pA-<hash>_shared, pB-<hash>_shared
+kern (now)      B   | EMPTY        volumes: pa_shared, pb_shared
 ```
 
 The names that collide are the ordinary ones - `data`, `db_data`, `pgdata`, `redis-data` - so two
 Postgres stacks were sharing one data directory.
 
-The scope key differs from Docker's and the difference cuts both ways. Docker keys on the
-directory's basename, so `/a/myapp` and `/b/myapp` ARE one project and share volumes; kern's project
-name carries a hash of the file's path, so those two do not collide, and the mirror case is that
-moving a project directory leaves its volumes behind under the old name. `-p NAME` pins the project
-name under either runtime and is the answer to both.
+The scope key is Docker's: the directory's name, normalized as compose-go normalizes it (`pA` is
+`pa`), so `/a/myapp` and `/b/myapp` are one project and share volumes under either runtime, and a
+moved project directory keeps its volumes. `-p NAME` pins the project name under either runtime. A
+volume named under kern's earlier key (`<dir>-<hash>_<volume>`) is renamed to the new one by the
+next `up`, with its data.
 
 A volume declared `external: true` is never renamed and never removed: the key means it exists
 independently of this project.
@@ -506,7 +506,7 @@ Docker has no equivalent question: every container there has its own namespace, 
 exposing one port never collide and nothing has to be read to know it.
 
 The behaviour stays, because the alternative is a `config` that downloads images to answer a
-question about a file. What changed is that it is stated: `config` prints
+question about a file. What changed is that it is stated: `config`'s summary on stderr carries
 `wiring-images-unread: N (service (image), …)` and a note. On the neutral corpus 96 files of 259 are
 in that state, which is the bound on how reproducible the compatibility rate is across machines.
 

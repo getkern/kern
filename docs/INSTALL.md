@@ -24,6 +24,23 @@ kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null
 sudo apparmor_parser -r /etc/apparmor.d/kern
 ```
 
+**SELinux hosts whose policy refuses pasta (openSUSE Leap 16):** stacks and one-off boxes get no
+internet until kern is labelled as a container runtime, the type rootless podman runs as. The script
+does it where a probe shows it is needed. Installed any other way (pip, npm, by hand), `kern doctor`
+says whether this host needs it, and the command is:
+
+```sh
+chcon -t container_runtime_exec_t "$(command -v kern)"   # the type comes with container-selinux
+```
+
+A `restorecon` undoes a `chcon`. To keep the label across one, as root (for a binary under
+`/usr/local`, name its `/usr` equivalent, e.g. `/usr/bin/kern`, as semanage requires):
+
+```sh
+sudo semanage fcontext -a -t container_runtime_exec_t "$(command -v kern)"
+sudo restorecon -F "$(command -v kern)"
+```
+
 **Without the script:**
 
 ```sh
@@ -117,6 +134,9 @@ venv, it brings kern with it. An MCP client on the Mac needs the `ssh` line in
 kern uninstall          # shows what it would remove
 kern uninstall --yes    # removes it
 ```
+
+An SELinux file-context rule the installer added as root is listed too; `--yes` removes it when run
+as root, and otherwise prints the `semanage` command that does.
 
 On Windows, in PowerShell. It shows what it would remove, and the command that removes it:
 
