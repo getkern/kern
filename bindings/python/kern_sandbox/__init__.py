@@ -2422,6 +2422,18 @@ _REFUSED_MOUNT_COMPONENTS = {
     ".boto",
     ".s3cfg",
     ".rclone.conf",
+    # SHELL AND CLIENT HISTORIES: what was typed, and that is where a password passed on a command
+    # line, an `export TOKEN=...` or a `psql` connection string ends up. Not a credential store by
+    # design and one in practice; mounting one has no ordinary use.
+    ".bash_history",
+    ".zsh_history",
+    ".histfile",
+    ".python_history",
+    ".psql_history",
+    ".mysql_history",
+    ".sqlite_history",
+    ".node_repl_history",
+    ".rediscli_history",
 }
 
 # `(parent, child)` pairs, refused when they appear CONSECUTIVELY in the source. For tools whose

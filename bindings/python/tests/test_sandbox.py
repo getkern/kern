@@ -562,6 +562,21 @@ def test_the_host_credential_files_under_etc_are_refused_and_the_rest_of_etc_is_
             assert target == "/x"
 
 
+def test_shell_and_client_histories_are_refused_as_mount_sources(tmp_path):
+    """What was typed holds the passwords passed on command lines. Each history file is refused; a
+    file merely NAMED like one inside its own directory is still a history, refused too; an ordinary
+    dotfile next to them stays mountable (the positive control)."""
+    for name in (".bash_history", ".zsh_history", ".psql_history", ".python_history"):
+        f = tmp_path / name
+        f.write_text("export TOKEN=x\n")
+        with pytest.raises(MountRefused):
+            kern._validate_mount(str(f), "/x")
+    rc = tmp_path / ".bashrc"
+    rc.write_text("alias ll='ls -l'\n")
+    real, target = kern._validate_mount(str(rc), "/x")
+    assert target == "/x"
+
+
 def test_a_link_to_a_host_credential_file_is_refused(tmp_path):
     if not os.path.lexists("/etc/shadow"):
         pytest.skip("this host has no /etc/shadow")

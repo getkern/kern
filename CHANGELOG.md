@@ -57,7 +57,9 @@ bindings, with everything below them and through symlinks: `/etc/shadow`, `/etc/
 `-` backups, `/etc/sudoers` and `sudoers.d`, `/etc/ssh`, `/etc/ssl/private`,
 `/etc/security/opasswd`, `/etc/krb5.keytab`, `/etc/wireguard`,
 `/etc/NetworkManager/system-connections`. The rest of `/etc` (`resolv.conf`, `hosts`, `localtime`)
-stays mountable.
+stays mountable. Shell and database-client histories (`.bash_history`, `.zsh_history`,
+`.psql_history` and the like) join the refused credential names: what was typed is where a password
+passed on a command line ends up.
 
 **`kern stop <name>` stops a running box whose registry record is gone.** `kern ps` already named
 such a box, found by its cgroup or its processes, and `kern stop` still answered "no running box

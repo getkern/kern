@@ -2376,6 +2376,16 @@ const REFUSED_MOUNT_COMPONENTS = new Set([
   ".boto",
   ".s3cfg",
   ".rclone.conf",
+  // Shell and client histories (see the Python binding).
+  ".bash_history",
+  ".zsh_history",
+  ".histfile",
+  ".python_history",
+  ".psql_history",
+  ".mysql_history",
+  ".sqlite_history",
+  ".node_repl_history",
+  ".rediscli_history",
 ]);
 
 // `parent/child` pairs, refused when they appear CONSECUTIVELY in the source.
