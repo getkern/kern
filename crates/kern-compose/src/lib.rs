@@ -412,6 +412,9 @@ pub struct ComposeBox {
     pub links: Vec<String>,
     /// Compose `logging.options.max-file:` → `--log-max-file` (counts the active file, as Docker does).
     pub log_max_file: Option<String>,
+    /// Compose `logging: {driver: none}` → `--log-driver none`: the service's output is not kept,
+    /// as Docker keeps none for that driver.
+    pub log_driver_none: bool,
     /// Compose `mem_reservation:` → `--memory-reservation` (cgroup `memory.low`, a soft floor).
     pub memory_reservation: Option<String>,
     /// Compose `pull_policy:` → `--pull` (`always` / `never` / `missing`).
@@ -940,6 +943,9 @@ impl ComposeBox {
         }
         if let Some(v) = &self.log_max_file {
             cmd.arg("--log-max-file").arg(v);
+        }
+        if self.log_driver_none {
+            cmd.arg("--log-driver").arg("none");
         }
         if let Some(v) = &self.memory_reservation {
             cmd.arg("--memory-reservation").arg(v);
@@ -1634,6 +1640,7 @@ impl ComposeBox {
             on_internal_network,
             runtime_nvidia,
             no_new_privs,
+            log_driver_none,
         );
         if o.uid_range_explicit_false {
             self.uid_range_explicit_false = true;
@@ -2105,6 +2112,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<ComposeBox>, String> {
             }
             "log_max_size" => b.log_max_size = Some(val.trim().trim_matches('"').to_string()),
             "log_max_file" => b.log_max_file = Some(val.trim().trim_matches('"').to_string()),
+            "log_driver" => b.log_driver_none = val.trim().trim_matches('"') == "none",
             "dns" => b.dns = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "dns_search" => b.dns_search = parse_string_array(val).map_err(|e| line_err(i, &e))?,
             "dns_opt" | "dns_options" => {

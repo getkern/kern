@@ -169,6 +169,8 @@ pub enum Command {
         /// `--log-max-file <n>`: how many log files are kept IN TOTAL, active one included (Docker's
         /// `max-file` counting). `None` leaves kern's default (2: active plus one generation).
         log_max_file: Option<u32>,
+        /// `--log-driver none`: the box's output is not kept (Docker's driver of that name).
+        log_none: bool,
         /// `--memory-reservation <size>` → cgroup `memory.low`: a soft floor, never a cap.
         memory_reservation: Option<u64>,
         /// `--cpu-weight <n>` (1..=10000) → cgroup `cpu.weight`: relative CPU share under contention.
@@ -3556,6 +3558,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--ipc",
     "--label",
     "--landlock-rw",
+    "--log-driver",
     "--log-max-file",
     "--log-max-size",
     "--memory",
@@ -3748,6 +3751,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
     let mut dns_options: Vec<String> = Vec::new();
     let mut log_max_size: Option<u64> = None;
     let mut log_max_file: Option<u32> = None;
+    let mut log_none = false;
     let mut memory_reservation: Option<u64> = None;
     let mut cpu_weight: Option<u64> = None;
     let mut secrets: Vec<String> = Vec::new();
@@ -4717,6 +4721,26 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
                         }
                     }
                 }
+                // DOCKER'S DRIVERS, THE ONES WITH A LOCAL MEANING. `json-file` and `local` write the
+                // output to a file on the host, which is what kern always does; `none` keeps nothing,
+                // and `kern logs` then says so as `docker logs` does. Every other driver ships the
+                // output elsewhere (syslog, journald, fluentd, a cloud service), which kern does not
+                // do: refused by name rather than accepted and ignored.
+                "--log-driver" => {
+                    i += 1;
+                    match rest.get(i).map(|v| v.to_string()).as_deref() {
+                        Some("none") => log_none = true,
+                        Some("json-file" | "local") => log_none = false,
+                        Some(other) => {
+                            return Err(Error::Cli(format!(
+                                "--log-driver {other}: kern keeps a box's output in a local file \
+                                 (`kern logs`) or, with `none`, keeps nothing; it does not ship it \
+                                 to another place. Accepted: json-file, local, none"
+                            )))
+                        }
+                        None => return Err(Error::Usage("--log-driver <json-file|local|none>")),
+                    }
+                }
                 // A SIZE, AND NOT ZERO. `memory.low = 0` is the kernel's default (no protection), so
                 // accepting a `0` would let a file ask for something and get nothing, which reads as
                 // applied and is not.
@@ -5031,6 +5055,7 @@ fn parse_box(rest: &[&str]) -> Result<Command, Error> {
             dns_options,
             log_max_size,
             log_max_file,
+            log_none,
             memory_reservation,
             cpu_weight,
             secrets,
@@ -6181,6 +6206,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             dns_options,
             log_max_size,
             log_max_file,
+            log_none,
             memory_reservation,
             cpu_weight,
             secrets,
@@ -6332,6 +6358,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
                 dns_options: &dns_options,
                 log_max_size,
                 log_max_file,
+                log_none,
                 memory_reservation,
                 cpu_weight,
             })

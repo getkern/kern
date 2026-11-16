@@ -85,6 +85,9 @@ pub struct Instance {
     /// `up --scale web=2` put `cm` on 10.89.0.4, `up --scale web=3` started `web-3` on 10.89.0.4
     /// too, and `cm` could not reach it. The plan now pins a running box to what this field says.
     pub bridges: String,
+    /// `none` when the box was started with `--log-driver none` (Docker's flag: its output is not
+    /// kept, and `kern logs` says so), empty otherwise. Absent in older entries.
+    pub log_driver: String,
     /// The `--landlock-rw` write-allowlist paths (comma-joined) confining the box's writes via the
     /// Landlock LSM; empty when no Landlock policy applies. Absent in older entries.
     pub landlock_rw: String,
@@ -1517,7 +1520,7 @@ pub fn forget_stop_record(name: &str, pid: i32) {
 /// round-trip unit-tested without touching the filesystem.
 fn encode(inst: &Instance) -> String {
     format!(
-        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\ngpus={}\ntimeout={}\nbridges={}\n",
+        "name={}\npid={}\npid1={}\nrootfs={}\ncommand={}\nstarted={}\nstarttime={}\nports={}\nvolumes={}\npod={}\negress={}\nlandlock={}\nmemory_max={}\npids_max={}\nlabels={}\nstopsig={}\nstopgrace={}\ndefhash={}\nworkdir={}\nrunas={}\nsgids={}\ncapdropall={}\ncapdrops={}\ncapadds={}\nseccompmode={}\napparmor={}\ncgroup={}\ncgroupid={}\npid1starttime={}\nnnp={}\nkeepgroups={}\nimage={}\ngpus={}\ntimeout={}\nbridges={}\nlogdriver={}\n",
         inst.name,
         inst.pid,
         inst.pid1_recorded,
@@ -1562,6 +1565,7 @@ fn encode(inst: &Instance) -> String {
         one_line(&inst.gpus),
         inst.timeout_s,
         one_line(&inst.bridges),
+        one_line(&inst.log_driver),
     )
 }
 
@@ -2891,6 +2895,7 @@ fn parse(body: &str) -> Option<Instance> {
     let (mut volumes, mut pod) = (String::new(), String::new());
     let (mut egress, mut landlock_rw) = (String::new(), String::new());
     let mut bridges = String::new();
+    let mut log_driver = String::new();
     let (mut memory_max, mut pids_max) = (None, None);
     let mut labels = String::new();
     let (mut stop_signal, mut stop_grace) = (0i32, 0u64);
@@ -2959,6 +2964,7 @@ fn parse(body: &str) -> Option<Instance> {
             "pod" => pod = v.to_string(),
             "egress" => egress = v.to_string(),
             "bridges" => bridges = v.to_string(),
+            "logdriver" => log_driver = v.to_string(),
             "landlock" => landlock_rw = v.to_string(),
             // empty string (uncapped) parses to None; a bad value is ignored, not fatal
             "memory_max" => memory_max = v.parse().ok(),
@@ -3066,6 +3072,7 @@ fn parse(body: &str) -> Option<Instance> {
         extra_gids,
         egress,
         bridges,
+        log_driver,
         landlock_rw,
         labels,
         stop_signal,
@@ -3872,6 +3879,7 @@ mod tests {
             extra_gids: Vec::new(),
             egress: String::new(),
             bridges: String::new(),
+            log_driver: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
             pids_max: None,
@@ -4148,6 +4156,7 @@ mod tests {
             extra_gids: Vec::new(),
             egress: "pypi.org,files.pythonhosted.org".into(),
             bridges: "10.89.0.3/24@0,10.89.1.2/24@1".into(),
+            log_driver: String::new(),
             landlock_rw: "/tmp,/data".into(),
             memory_max: Some(134_217_728),
             pids_max: Some(64),
@@ -4553,6 +4562,7 @@ mod tests {
                 extra_gids: Vec::new(),
                 egress: String::new(),
                 bridges: String::new(),
+                log_driver: String::new(),
                 landlock_rw: String::new(),
                 memory_max: None,
                 pids_max: None,
@@ -4636,6 +4646,7 @@ mod tests {
             extra_gids: Vec::new(),
             egress: String::new(),
             bridges: String::new(),
+            log_driver: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
             pids_max: None,
@@ -4722,6 +4733,7 @@ mod tests {
             extra_gids: Vec::new(),
             egress: String::new(),
             bridges: String::new(),
+            log_driver: String::new(),
             landlock_rw: String::new(),
             memory_max: None,
             pids_max: None,

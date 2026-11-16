@@ -194,6 +194,8 @@ pub(crate) const MARK_LEN: usize = 16;
 pub(crate) struct LogCap {
     pub(crate) max_bytes: u64,
     pub(crate) files: u32,
+    /// `false` for `--log-driver none`: the output goes to `/dev/null` and no log file is made.
+    pub(crate) keep: bool,
 }
 
 impl Default for LogCap {
@@ -204,6 +206,7 @@ impl Default for LogCap {
         Self {
             max_bytes: BOX_LOG_MAX_BYTES,
             files: 2,
+            keep: true,
         }
     }
 }
@@ -677,7 +680,10 @@ pub(crate) fn detach_stdio(log: Option<&std::path::Path>, cap: LogCap) {
         if null >= 0 {
             libc::dup2(null, 0);
         }
+        // `--log-driver none`: nothing is captured and no file is made, as Docker keeps nothing for
+        // that driver.
         let sink = log
+            .filter(|_| cap.keep)
             .and_then(|p| start_log_pump(p, cap).or_else(|| open_log_direct(p)))
             .unwrap_or(null);
         if sink >= 0 {
@@ -1365,6 +1371,7 @@ mod rotation_tests {
                 LogCap {
                     max_bytes: 16,
                     files,
+                    keep: true,
                 },
             )
             .expect("the log opens");
@@ -1433,7 +1440,8 @@ mod rotation_tests {
             LogCap::default(),
             LogCap {
                 max_bytes: BOX_LOG_MAX_BYTES,
-                files: 2
+                files: 2,
+                keep: true,
             }
         );
     }
@@ -1914,6 +1922,7 @@ mod compaction_tests {
             LogCap {
                 max_bytes: 1 << 20,
                 files: 2,
+                keep: true,
             },
         )
         .expect("the log opens");
@@ -1947,6 +1956,7 @@ mod compaction_tests {
             LogCap {
                 max_bytes: 1 << 20,
                 files: 2,
+                keep: true,
             },
         )
         .expect("the log opens");
@@ -2044,6 +2054,7 @@ mod compaction_tests {
             LogCap {
                 max_bytes: 65_536,
                 files: 2,
+                keep: true,
             },
         )
         .expect("the log opens");

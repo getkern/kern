@@ -315,6 +315,8 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --dns-option OPT    Add a resolv.conf option, e.g. ndots:2 or timeout:2 (repeatable)
     --log-max-size <sz> Rotate the box's captured log at this size (default 16m)
     --log-max-file <n>  How many log files to keep, the active one included (default 2)
+    --log-driver <d>    json-file or local (default: output kept for `kern logs`), or none (kept
+                        nowhere, as Docker's none); drivers that ship output elsewhere are refused
     --memory-reservation <size>  Soft memory floor (cgroup memory.low): protected under pressure,
                         never a cap and never an OOM kill (compose mem_reservation)
     --cpu-weight <n>    Relative CPU share under contention (cgroup cpu.weight, 1-10000, 100 =

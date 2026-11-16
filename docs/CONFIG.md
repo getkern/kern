@@ -77,7 +77,7 @@ Every key is its flag's long name, with `_` for `-`. Where the flag differs, it 
 | security | `security_profile`, `cap_add`, `cap_drop`, `devices`, `init`, `labels`, `sysctls`, `ulimits` |
 | environment | `env`, `env_file`, `secrets` |
 | supervision | `restart`, `restart_max`, `stop_signal`, `stop_grace_period` (`--stop-timeout`), `timeout`, `health_cmd`, `health_interval`, `health_retries`, `health_timeout`, `health_start_period`, `health_start_interval`, `health_action` |
-| images and logs | `pull` or `pull_policy`, `log_max_size`, `log_max_file` |
+| images and logs | `pull` or `pull_policy`, `log_max_size`, `log_max_file`, `log_driver` (`none` keeps no log, as `--log-driver none`) |
 
 `port` and `expose` have no flag: they say what a service listens on inside the shared pod, so a port
 collision is refused before anything starts. `kern compose stack.toml config` says what each service

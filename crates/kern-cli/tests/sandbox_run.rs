@@ -19241,3 +19241,100 @@ fn a_running_box_keeps_its_caps_through_a_systemd_reload() {
         "the box's pids.max must survive a reload (cgroup {cg})"
     );
 }
+
+/// `--log-driver none` KEEPS NOTHING, AS DOCKER'S DOES: no log file is made for the box, `kern logs`
+/// refuses with the reason instead of printing an empty screen, and the default keeps the output (the
+/// positive control). A driver that ships output elsewhere is refused by name.
+#[test]
+fn a_box_with_the_none_log_driver_keeps_no_output_and_logs_says_so() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces unavailable");
+        return;
+    }
+    let root = build_rootfs(&busybox, "nologdrv");
+    let r = root.to_str().unwrap_or(".");
+    let start = |name: &str, extra: &[&str]| {
+        let mut args = vec!["box", name, "--rootfs", r, "-d"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "/bin/busybox", "sh", "-c", "echo SEEN-$$; sleep 20"]);
+        kern().args(&args).output().expect("start box")
+    };
+    // ONLY THE FILES THIS RUN MAKES: a box of an earlier run (or of a sabotaged build) may have left
+    // one with the same prefix, and counting it would blame this box for it.
+    let log_files = || -> Vec<String> {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .and_then(|x| fs::read_dir(x.join("kern/logs")).ok())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("nologdrv-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let before = log_files();
+    let none = start("nologdrv", &["--log-driver", "none"]);
+    let kept = start("keptlogdrv", &[]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let none_logs = kern().args(["logs", "nologdrv"]).output().expect("logs");
+    let kept_logs = kern().args(["logs", "keptlogdrv"]).output().expect("logs");
+    let files: Vec<String> = log_files()
+        .into_iter()
+        .filter(|f| !before.contains(f))
+        .collect();
+    let _ = kern()
+        .args(["stop", "-t", "0", "nologdrv", "keptlogdrv"])
+        .output();
+    let _ = fs::remove_dir_all(&root);
+    if host_cannot_build_a_box(&said(&none)) || !none.status.success() {
+        eprintln!(
+            "skip: this host cannot start a detached box: {}",
+            said(&none)
+        );
+        return;
+    }
+    assert!(
+        kept.status.success(),
+        "the control box must start: {}",
+        said(&kept)
+    );
+    assert!(
+        files.is_empty(),
+        "no log file may exist for a --log-driver none box: {files:?}"
+    );
+    assert!(
+        !none_logs.status.success()
+            && String::from_utf8_lossy(&none_logs.stderr).contains("--log-driver none"),
+        "kern logs must refuse and name the driver: {:?}",
+        String::from_utf8_lossy(&none_logs.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&kept_logs.stdout).contains("SEEN-"),
+        "the default driver keeps the output: {:?}",
+        String::from_utf8_lossy(&kept_logs.stdout)
+    );
+    let shipped = kern()
+        .args([
+            "box",
+            "--rootfs",
+            r,
+            "--log-driver",
+            "syslog",
+            "--",
+            "/bin/busybox",
+            "true",
+        ])
+        .output()
+        .expect("run kern");
+    assert!(
+        !shipped.status.success()
+            && String::from_utf8_lossy(&shipped.stderr).contains("--log-driver syslog"),
+        "a shipping driver must be refused by name: {:?}",
+        String::from_utf8_lossy(&shipped.stderr)
+    );
+}

@@ -5322,6 +5322,10 @@ fn service_to_box(name: &str, svc: &Node, cx: &ServiceCtx) -> Result<ComposeBox,
                             ));
                         }
                     }
+                    // `none` IS DOCKER'S "KEEP NOTHING", and kern has it: the box's output goes
+                    // nowhere and `kern logs` says so. It used to be one of the warnings below,
+                    // with the output captured anyway, which is the opposite of what was asked.
+                    "none" => b.log_driver_none = true,
                     other_drv => warn(&format!(
                         "service '{name}': 'logging: {other_drv}' has no kern equivalent - output is \
                          captured locally and read with `kern logs`, never shipped to a log server"
@@ -10816,6 +10820,20 @@ mod tests {
         let net =
             svc("    logging:\n      driver: gelf\n      options:\n        max-size: \"10m\"\n");
         assert_eq!(net.log_max_size, None);
+    }
+
+    /// `logging: {driver: none}` IS DOCKER'S "KEEP NOTHING", and it reaches the box as
+    /// `--log-driver none`. It used to fall under the "no kern equivalent" warning with the output
+    /// captured anyway, the opposite of what the file asked.
+    #[test]
+    fn a_none_logging_driver_keeps_nothing_and_a_file_driver_keeps_the_log() {
+        let svc = |body: &str| {
+            let src = format!("services:\n  a:\n    image: alpine\n{body}");
+            parse(&src).expect("parses").remove(0)
+        };
+        assert!(svc("    logging:\n      driver: none\n").log_driver_none);
+        assert!(!svc("    logging:\n      driver: json-file\n").log_driver_none);
+        assert!(!svc("").log_driver_none);
     }
 
     /// A LONG-FORM `type: tmpfs` VOLUME IS A MOUNT, NOT A DROPPED ENTRY.

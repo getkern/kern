@@ -348,7 +348,7 @@ manual on purpose.
 | `create` | `create` | a kept box recorded and not started; `start` runs it |
 | `exec` | `exec` | joins the box's namespaces; `-t` allocates a PTY, `-i` does not |
 | `ps` / `inspect` / `stats` | same | `--filter`, `--format`, `--json`, `--no-trunc`; `inspect -f` takes docker's own paths; `kern top` is the live view |
-| `logs` | `logs` | `--tail`, `-f`, `-t`, `--since`/`--until`; the follow is a bounded read. Every box's output in one stream, ordered by time: `kern logs --all` (Docker has no CLI equivalent), and live in `kern top`, Logs tab, as Docker Desktop's Logs view (search, level and source filters, CSV export) |
+| `logs` | `logs` | `--tail`, `-f`, `-t`, `--since`/`--until`; the follow is a bounded read. Every box's output in one stream, ordered by time: `kern logs --all` (Docker has no CLI equivalent), and live in `kern top`, Logs tab, as Docker Desktop's Logs view (search, level and source filters, CSV export). `--log-driver none` (compose `logging: driver: none`) keeps nothing and `kern logs` says so, as Docker does; `json-file` and `local` are the default, and drivers that ship output elsewhere are refused |
 | `stop` / `kill` | `stop` / `kill` | `stop` signals, waits 10 s, then SIGKILLs. `kill` is immediate |
 | `pause` / `unpause` / `attach` | same | cgroup v2 freezer; Ctrl-C detaches and the box keeps running |
 | `cp` | `cp` | host↔box; symlinks cannot escape the box root |

@@ -2985,6 +2985,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             .log_max_size
             .unwrap_or(crate::commands::boxlog::BOX_LOG_MAX_BYTES),
         files: args.log_max_file.unwrap_or(2),
+        keep: !args.log_none,
     };
     // THE RECORD IS WRITTEN HERE: past every argument-coherence refusal and immediately before the
     // box is launched.
@@ -3096,6 +3097,11 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             extra_gids: spec.extra_gids.clone(),
             egress: args.egress_allow.join(","),
             bridges: registry::encode_bridges(&spec.pod_bridges),
+            log_driver: if log_cap.keep {
+                String::new()
+            } else {
+                "none".to_string()
+            },
             landlock_rw: spec.landlock_rw.join(","),
             labels: registry::encode_labels(args.labels),
             stop_signal,
@@ -4887,6 +4893,8 @@ fn await_box_started(
     // way to the exec and not the end of the start: the read goes on to the EOF or failure byte,
     // and the start is reported as any other box's.
     self_gated: bool,
+    // `--log-driver none`: the box keeps no log, so the next steps do not offer `kern logs`.
+    keeps_log: bool,
 ) -> Result<(), Error> {
     // Assembled below, on whichever path resolves the start, and printed with the start line so the
     // launcher still makes ONE write per box (see that comment).
@@ -5016,9 +5024,14 @@ fn await_box_started(
     // The cap notices go FIRST and in the same write: they are the condition under which this box is
     // running, so a reader scanning for the tick has already passed them, and a reader who only sees
     // the tick is the defect this channel exists to close.
+    let logs_step = if keeps_log {
+        format!("kern logs {n} {} ", gl.dot)
+    } else {
+        String::new()
+    };
     let msg = format!(
-        "{notices}{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n  {}next: kern ps {} kern logs {n} {} kern stop {n}{}\n",
-        p.g, gl.ok, p.z, p.b, p.z, p.d, p.z, p.d, gl.dot, gl.dot, p.z
+        "{notices}{}{} started{} {}'{n}'{} {}[pid {child}, detached]{}\n  {}next: kern ps {} {logs_step}kern stop {n}{}\n",
+        p.g, gl.ok, p.z, p.b, p.z, p.d, p.z, p.d, gl.dot, p.z
     );
     let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
     Ok(())
@@ -5764,6 +5777,7 @@ fn run_detached(
             restart || restart_always,
             have_notice.then_some(notice_rd),
             outbound_pod.is_some(),
+            log_cap.keep,
         );
     }
     // ── Supervisor ──
@@ -5812,6 +5826,11 @@ fn run_detached(
         extra_gids: spec.extra_gids.clone(),
         egress: String::new(), // --egress-allow is foreground-only; a detached box never carries it
         bridges: registry::encode_bridges(&spec.pod_bridges),
+        log_driver: if log_cap.keep {
+            String::new()
+        } else {
+            "none".to_string()
+        },
         landlock_rw: spec.landlock_rw.join(","),
         labels: labels.to_string(),
         stop_signal,

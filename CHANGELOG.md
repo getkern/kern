@@ -50,6 +50,13 @@ removed or re-pointed, or an `ld.so.conf` edit, makes it scan again. The box get
 Measured on that desktop, medians of 50 to 60: `--gpus device=0` 19.9 to 9.7 ms on `alpine:3.20`,
 17.6 to 7.7 ms on `ubuntu:24.04`.
 
+**`--log-driver none` keeps no log, as Docker's does.** `kern box --log-driver none` (and compose
+`logging: driver: none`, which used to warn "no kern equivalent" and capture anyway) sends the box's
+output nowhere: no log file is made, and `kern logs` answers that the box keeps none instead of an
+empty screen. `json-file` and `local` are the default capture; a driver that ships output elsewhere
+(`syslog`, `journald`, `fluentd`...) is refused by name. Sandbox calls through the SDKs or MCP never
+wrote a log file; their history (one line per box, no output) is set with `kern sandbox keep off`.
+
 **kern-sandbox refuses the host's credential files as mount sources, not only `/etc` whole.** A
 mount of `/etc/shadow` (or a link to it) was accepted while `/etc` itself was refused, and a box
 started by root printed the password hashes (found by an external test). Refused now in both

@@ -420,6 +420,8 @@ pub struct BoxRunArgs<'a> {
     pub log_max_size: Option<u64>,
     /// `--log-max-file`: how many log files to keep, active one included; `None` = kern's default.
     pub log_max_file: Option<u32>,
+    /// `--log-driver none`: keep no log of the box's output.
+    pub log_none: bool,
     /// `--memory-reservation`: cgroup `memory.low`, a soft floor.
     pub memory_reservation: Option<u64>,
     /// `--cpu-weight`: cgroup `cpu.weight`, a relative share.

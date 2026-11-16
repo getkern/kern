@@ -2233,6 +2233,20 @@ struct LogHead {
 
 /// Write what a box's newest log holds now to `w`, as `kern logs` shows it (`--tail`, timestamps,
 /// a time window), and hand back what a follow continues from.
+/// A box started with `--log-driver none` keeps no output, and saying so is Docker's answer for that
+/// driver ("configured logging driver does not support reading"): an empty screen would read as a
+/// box that printed nothing.
+fn refuse_unlogged(name: &str) -> Result<(), Error> {
+    match registry::find_ref(name) {
+        Some(b) if b.log_driver == "none" => Err(Error::Sandbox(format!(
+            "box '{}' was started with --log-driver none: its output is not kept, so there is \
+             nothing to read",
+            b.name
+        ))),
+        _ => Ok(()),
+    }
+}
+
 fn log_head<W: std::io::Write>(
     name: &str,
     tail: Option<usize>,
@@ -2242,6 +2256,7 @@ fn log_head<W: std::io::Write>(
     w: &mut W,
 ) -> Result<LogHead, Error> {
     use std::io::{Read, Seek, SeekFrom};
+    refuse_unlogged(name)?;
     // Accept a `kern ps` PID too: a live box's pid resolves to its name; a name (incl. a stopped box,
     // whose log file persists) is used as-is.
     let by_pid = registry::find_ref(name).map(|i| i.name);
@@ -2382,6 +2397,7 @@ pub fn logs(
 /// output-only). Prints the log so far, then follows appends by polling the file, and stops when the
 /// box leaves the registry.
 pub fn attach(name: &str) -> Result<(), Error> {
+    refuse_unlogged(name)?;
     let bx = registry::find_ref(name);
     let Some(bx) = bx else {
         return Err(Error::NotRunning(format!("no running box named '{name}'")));
