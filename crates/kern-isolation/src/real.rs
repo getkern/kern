@@ -6094,6 +6094,47 @@ impl Drop for ReadyGuard {
     }
 }
 
+/// Is the box's pid namespace made by the fork of its PID 1, rather than by the `unshare` that makes
+/// its user namespace?
+///
+/// AT THE FORK WHERE IT CAN BE, because a pid namespace made earlier is closed for good by a first
+/// fork the cgroup refuses (see `fork_into_cgroup`, measured on openSUSE Leap 16).
+///
+/// IN THE SAME `unshare` AS THE USER NAMESPACE WHERE AppArmor RESTRICTS UNPRIVILEGED ONES
+/// (`kernel.apparmor_restrict_unprivileged_userns = 1`, Ubuntu 23.10 and later): there a process
+/// loses its capabilities in the new namespace once it is made, so a pid namespace asked for at the
+/// fork is refused (`EPERM`), while one made in the same call exists before the restriction bites.
+/// MEASURED on GitHub's Ubuntu runner: with the namespace made at the fork, every box start there
+/// failed "fork failed: Operation not permitted", with a hint about `ulimit` and `pids.max` instead
+/// of the AppArmor cause the same host reported before. Read once per process.
+fn pid_ns_at_fork() -> bool {
+    static AT_FORK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AT_FORK.get_or_init(|| {
+        pid_ns_at_fork_given(
+            std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`pid_ns_at_fork`] as a function of the sysctl's text (`None`: no such file, no AppArmor).
+fn pid_ns_at_fork_given(restrict: Option<&str>) -> bool {
+    restrict.is_none_or(|v| v.trim() != "1")
+}
+
+#[cfg(test)]
+mod pid_ns_placement_tests {
+    /// Restricted AppArmor hosts make the pid namespace with the user namespace; every other host
+    /// makes it at the fork.
+    #[test]
+    fn the_pid_namespace_waits_for_the_fork_except_under_the_apparmor_restriction() {
+        assert!(!super::pid_ns_at_fork_given(Some("1\n")));
+        assert!(super::pid_ns_at_fork_given(Some("0\n")));
+        assert!(super::pid_ns_at_fork_given(None));
+    }
+}
+
 /// Like [`run_in_sandbox`], but invokes `on_started` in the parent with the box's PID-1 pid (in
 /// the host pid namespace) right after the fork - so a supervisor can record it for `kern exec`
 /// to join the box's namespaces later.
@@ -6470,10 +6511,14 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
             libc::close(user);
             libc::close(net);
         }
-        // No `CLONE_NEWPID` here: the box's pid namespace is made by the fork of its PID 1 (see
-        // `fork_into_cgroup`), because one made here is closed for good by a first fork the cgroup
-        // refuses.
-        let mut rest = libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        // The pid namespace is made by the fork of PID 1 where it can be (see `pid_ns_at_fork`).
+        let mut rest = libc::CLONE_NEWUTS
+            | libc::CLONE_NEWIPC
+            | if pid_ns_at_fork() {
+                0
+            } else {
+                libc::CLONE_NEWPID
+            };
         if let Some(fd) = ipc_join {
             let joined = unsafe { libc::setns(fd, libc::CLONE_NEWIPC) };
             unsafe { libc::close(fd) };
@@ -6493,9 +6538,15 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
         // Full namespace set: user + UTS (hostname) + IPC, and - unless `--net` shares the host
         // network - an isolated (loopback-only) network namespace. The mount namespace is unshared in
         // the child (so its pivot doesn't touch the parent). The PID namespace is made by the fork of
-        // the box's PID 1 itself (see `fork_into_cgroup`): one unshared here would be closed for good
-        // by a first fork the cgroup refuses.
-        let mut ns_flags = libc::CLONE_NEWUSER | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+        // the box's PID 1 itself where it can be (see `pid_ns_at_fork`), and here otherwise.
+        let mut ns_flags = libc::CLONE_NEWUSER
+            | libc::CLONE_NEWUTS
+            | libc::CLONE_NEWIPC
+            | if pid_ns_at_fork() {
+                0
+            } else {
+                libc::CLONE_NEWPID
+            };
         if !spec.share_net {
             ns_flags |= libc::CLONE_NEWNET;
         }
@@ -6601,7 +6652,7 @@ pub fn run_in_sandbox_with<F: FnOnce(i32) -> Option<i32>>(
             ))
         }
     };
-    let (pid, born_in_cgroup) = crate::cgroup::fork_into_cgroup(cg_ref.as_ref(), true);
+    let (pid, born_in_cgroup) = crate::cgroup::fork_into_cgroup(cg_ref.as_ref(), pid_ns_at_fork());
     if pid < 0 {
         return Err(Error::last("fork"));
     }
