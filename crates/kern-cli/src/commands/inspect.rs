@@ -434,12 +434,11 @@ pub fn ps(
             // in is now part of the message, because it is what makes the second cause checkable.
             let dir = crate::registry::instances_dir_for_display();
             eprintln!(
-                "kern: warning: {} box(es) are RUNNING and have no record in {dir}, so `kern stop` \
-                 cannot reach them from here. EITHER that runtime dir was cleared under them, OR they \
-                 were started with a different XDG_RUNTIME_DIR - a systemd unit written by \
-                 `kern compose systemd` sets one, and `systemctl show <unit> -p Environment` says \
-                 which. Check there before killing anything; if the record really is gone, kill by pid \
-                 or `kern gc` once they exit:",
+                "kern: warning: {} box(es) are RUNNING and have no record in {dir}. EITHER that \
+                 runtime dir was cleared under them, OR they were started with a different \
+                 XDG_RUNTIME_DIR - a systemd unit written by `kern compose systemd` sets one, and \
+                 `systemctl show <unit> -p Environment` says which. Check there before stopping \
+                 anything; if the record really is gone, `kern stop <name>` still stops the box:",
                 lost.len()
             );
             for (tag, pid) in &lost {
@@ -2489,6 +2488,41 @@ pub fn stop_with_grace(
             .cloned()
             .collect()
     };
+    // A NAME WITH NO RECORD HERE CAN STILL BE A RUNNING BOX: `kern ps` names such boxes from their
+    // cgroups and processes, and they used to stay unstoppable through kern. MEASURED in an external
+    // test: after the registry was wiped, `ps` named the box and its supervisor pid while
+    // `kern stop <name>` answered "no running box named". Only for a name that matches nothing
+    // recorded, so a recorded box is never stopped this way.
+    let mut stopped_unrecorded: Vec<String> = Vec::new();
+    if !all {
+        let live_names = live_name_set(&running);
+        for n in names {
+            let recorded = targets.iter().any(|b| ref_matches(b, n, &live_names));
+            if recorded || managed_only.contains(n) {
+                continue;
+            }
+            if let Some(msg) = stop_unrecorded(n, grace.unwrap_or(DEFAULT_UNRECORDED_GRACE_S))? {
+                println!("{msg}");
+                stopped_unrecorded.push(n.clone());
+            }
+        }
+    }
+    if targets.is_empty() && managed_only.is_empty() && !stopped_unrecorded.is_empty() {
+        let rest: Vec<&String> = names
+            .iter()
+            .filter(|n| !stopped_unrecorded.contains(n))
+            .collect();
+        if rest.is_empty() {
+            return Ok(());
+        }
+        return Err(Error::NotRunning(format!(
+            "no running box named {}",
+            rest.iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     if targets.is_empty() && managed_only.is_empty() {
         return Err(Error::NotRunning(if all {
             "no running boxes to stop".to_string()
@@ -2846,7 +2880,7 @@ pub fn stop_with_grace(
         let live_names = live_name_set(&running);
         for n in names {
             let matched = targets.iter().any(|b| ref_matches(b, n, &live_names));
-            if !matched && !managed_only.contains(n) {
+            if !matched && !managed_only.contains(n) && !stopped_unrecorded.contains(n) {
                 failures.push(format!("no running box '{n}'"));
             }
         }
@@ -2858,6 +2892,83 @@ pub fn stop_with_grace(
         )));
     }
     Ok(())
+}
+
+/// The grace an unrecorded box gets: its own `--stop-timeout` was in the record that is gone, so
+/// Docker's default, 10 s.
+const DEFAULT_UNRECORDED_GRACE_S: u64 = 10;
+
+/// Stop the running box called `name` that has NO record here, found the way `kern ps` finds it
+/// (its `kern-box-<name>-<pid>` cgroup, else its `kern box <name>` supervisor in `/proc`).
+///
+/// `Ok(None)` when there is none, an error when two live boxes carry the name (which one is meant
+/// cannot be told), and the line to print when one was stopped. Docker's stop: `SIGTERM` to the
+/// box's init, `grace_s` to exit, then `SIGKILL`, which takes its whole pid namespace; then the
+/// supervisor, if it is still there. Every signal goes to a pid whose start time is the one read
+/// when it was found, so a recycled pid is never signalled.
+fn stop_unrecorded(name: &str, grace_s: u64) -> Result<Option<String>, Error> {
+    let recorded: std::collections::HashSet<String> =
+        registry::list().into_iter().map(|i| i.name).collect();
+    let pick = |found: Vec<(String, u32)>| -> Vec<u32> {
+        found
+            .into_iter()
+            .filter(|(tag, _)| tag == name && !recorded.contains(tag))
+            .map(|(_, pid)| pid)
+            .collect()
+    };
+    let mut sups = pick(kern_isolation::live_box_cgroups());
+    if sups.is_empty() {
+        sups = pick(kern_isolation::live_box_supervisors_via_proc());
+    }
+    sups.sort_unstable();
+    sups.dedup();
+    let sup = match sups.as_slice() {
+        [] => return Ok(None),
+        [one] => *one,
+        many => {
+            return Err(Error::Sandbox(format!(
+                "two or more running boxes are called '{name}' and none has a record here \
+                 (supervisor pids {}); stop one by pid with `kill`",
+                many.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        }
+    };
+    let Ok(sup) = i32::try_from(sup) else {
+        return Ok(None);
+    };
+    let sup_start = registry::proc_starttime(sup);
+    if sup_start == 0 {
+        return Ok(None); // gone between the scan and now
+    }
+    let init = registry::box_init_under(sup);
+    let target = init.unwrap_or(sup);
+    let target_start = registry::proc_starttime(target);
+    let alive = |pid: i32, start: u64| start != 0 && registry::proc_starttime(pid) == start;
+    let signal = |pid: i32, start: u64, sig: libc::c_int| {
+        if alive(pid, start) {
+            // SAFETY: a positive pid whose start time was just re-read, never 0 or -1.
+            unsafe { libc::kill(pid, sig) };
+        }
+    };
+    signal(target, target_start, libc::SIGTERM);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(grace_s);
+    while alive(target, target_start) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    signal(target, target_start, libc::SIGKILL);
+    let sup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while alive(sup, sup_start) && std::time::Instant::now() < sup_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    signal(sup, sup_start, libc::SIGKILL);
+    let dir = crate::registry::instances_dir_for_display();
+    Ok(Some(format!(
+        "stopped '{name}' (supervisor pid {sup}): it had no record in {dir}, and was found by its \
+         cgroup and processes"
+    )))
 }
 
 /// `kern pause <name>...` / `kern unpause <name>...` - freeze / thaw a running box via the cgroup v2

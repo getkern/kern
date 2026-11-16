@@ -9648,10 +9648,17 @@ fn a_box_whose_registry_record_vanished_is_still_reported_by_ps() {
     let out = kern().args(["ps"]).output().expect("run kern ps");
     let err = String::from_utf8_lossy(&out.stderr).to_string();
 
-    // Stop by name cannot work any more - that is the defect, not a bug in this test - so the
-    // supervisor is killed through the pid `ps` just reported. Cleaning up BEFORE asserting, so a
-    // failure never leaves a box nobody can reach.
-    let _ = kern().args(["stop", tag]).output();
+    // STOP BY NAME STILL REACHES IT. It used to answer "no running box named", found by an external
+    // test after this test had recorded the gap as expected. The pid `ps` reported is checked gone.
+    let sup_pid: Option<i32> = err
+        .lines()
+        .filter(|l| l.split_whitespace().any(|w| w == tag))
+        .find_map(|l| l.split("supervisor pid ").nth(1))
+        .and_then(|p| p.trim_end_matches(')').trim().parse().ok());
+    let stopped = kern().args(["stop", tag]).output().expect("run kern stop");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let sup_gone = sup_pid.is_some_and(|p| !PathBuf::from(format!("/proc/{p}")).exists());
+    // Cleanup that cannot be skipped, then the assertions.
     // ONLY THIS TEST'S BOX, and the filter is not caution, it is a defect this test HAD. The warning
     // lists every running box with no registry record, and in a full `cargo test` that set can hold
     // boxes belonging to OTHER test binaries running at the same moment. Killing every pid it
@@ -9677,9 +9684,16 @@ fn a_box_whose_registry_record_vanished_is_still_reported_by_ps() {
         // on the getkern.dev VPS the other cause was the true one: nginx started by a systemd unit that
         // sets its own XDG_RUNTIME_DIR. What this test is about is that the box is NAMED and the reader
         // is told `kern stop` cannot reach it, so it asserts those two and not the sentence around them.
-        err.contains(tag) && err.contains("no record in") && err.contains("cannot reach them"),
+        err.contains(tag) && err.contains("no record in") && err.contains("kern stop <name>"),
         "a running box with no registry record must be named on stderr, or it is invisible AND \
          unstoppable; got {err:?}"
+    );
+    assert!(
+        stopped.status.success() && sup_gone,
+        "`kern stop {tag}` must stop a box that has no record here: rc {:?}, supervisor {sup_pid:?} \
+         gone={sup_gone}, said {:?}",
+        stopped.status.code(),
+        String::from_utf8_lossy(&stopped.stderr)
     );
 }
 

@@ -50,6 +50,12 @@ removed or re-pointed, or an `ld.so.conf` edit, makes it scan again. The box get
 Measured on that desktop, medians of 50 to 60: `--gpus device=0` 19.9 to 9.7 ms on `alpine:3.20`,
 17.6 to 7.7 ms on `ubuntu:24.04`.
 
+**`kern stop <name>` stops a running box whose registry record is gone.** `kern ps` already named
+such a box, found by its cgroup or its processes, and `kern stop` still answered "no running box
+named" (found by an external test). It now stops it as Docker does, SIGTERM to the box's init, the
+grace, then SIGKILL, and says the box had no record in that directory; a name two unrecorded boxes
+share is refused with both pids, and a recorded box is never stopped this way.
+
 **A box started over SSH keeps its caps through a `daemon-reload`, and `ps` and `exec` still see it.**
 From outside the user manager (an SSH session, cron, a system service) a box runs in its own
 transient scope, made without `Delegate=yes`, and kern builds the box's cgroup inside it. Measured
