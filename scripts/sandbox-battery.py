@@ -87,7 +87,42 @@ CASES = [
 ]
 
 
+# THE DANGEROUS CASES NEED A CAP TO HIT, or they hit the host. Without a memory and a pids ceiling
+# (root in a container, no systemd, no delegated controller) the 400 MiB allocation and the fork bomb
+# run against the machine itself: an external run on a 1.2 GiB container stalled the whole host. The
+# box is asked what it is capped at, from its own cgroup, before either runs.
+def caps_in_force():
+    probe = (
+        "import os\n"
+        "def v(f):\n"
+        "    try: return open('/sys/fs/cgroup/' + f).read().strip()\n"
+        "    except OSError: return 'absent'\n"
+        "print('MEM', v('memory.max'), 'PIDS', v('pids.max'))"
+    )
+    try:
+        r = kern.run_code(probe, timeout_s=60, memory_mb=128)
+    except Exception as e:
+        return False, f"probe raised {type(e).__name__}"
+    words = (r.stdout or "").split()
+    mem = words[words.index("MEM") + 1] if "MEM" in words else "absent"
+    pids = words[words.index("PIDS") + 1] if "PIDS" in words else "absent"
+    # EXACTLY the cap asked for, not merely some number: inside a container the box can see the
+    # container's own ceiling (1.2 GiB, say), which bounds nothing this battery needs. 128 MiB was
+    # asked; 256 is the SDK's default pids ceiling.
+    capped = mem == str(128 << 20) and pids == "256"
+    return capped, f"memory.max={mem} pids.max={pids}"
+
+
+CAPPED, CAPS_SEEN = caps_in_force()
+print(f"caps in the box: {CAPS_SEEN} -> {'in force' if CAPPED else 'NOT in force: oom and fork bomb are skipped (HOST)'}",
+      flush=True)
+DANGEROUS = {"oom", "fork bomb"}
+
+
 def run_case(path, name, code, kw, tmo, check):
+    if name in DANGEROUS and not CAPPED:
+        row(path, name, "skipped: no cap to hit, it would hit the host", None, CAPS_SEEN)
+        return
     kw = dict(kw)
     run_t = kw.pop("timeout_s", None)
     try:
