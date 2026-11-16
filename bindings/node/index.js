@@ -2341,6 +2341,23 @@ function kernStateDirs() {
 //
 // KEPT IDENTICAL TO THE PYTHON BINDING on purpose: two spellings of one rule drift, and a caller who
 // moved between the two SDKs would meet a different boundary in each.
+// HOST CREDENTIAL PATHS, refused with everything below them (see `_REFUSED_MOUNT_TREES` in the Python
+// binding for the measurement). Kept the same set as Python by a test there.
+const REFUSED_MOUNT_TREES = new Set([
+  "/etc/shadow",
+  "/etc/shadow-",
+  "/etc/gshadow",
+  "/etc/gshadow-",
+  "/etc/sudoers",
+  "/etc/sudoers.d",
+  "/etc/ssh",
+  "/etc/ssl/private",
+  "/etc/security/opasswd",
+  "/etc/krb5.keytab",
+  "/etc/wireguard",
+  "/etc/NetworkManager/system-connections",
+]);
+
 const REFUSED_MOUNT_COMPONENTS = new Set([
   ".ssh",
   ".aws",
@@ -2819,6 +2836,14 @@ function validateMount(source, target) {
           "docker socket is refused",
       );
   }
+  const tree = [...REFUSED_MOUNT_TREES]
+    .sort()
+    .find((t) => real === t || real.startsWith(t + path.sep));
+  if (tree !== undefined)
+    throw new MountRefused(
+      `refusing to mount ${JSON.stringify(real)}: ${JSON.stringify(tree)} holds the host's credentials, ` +
+        "and code in the box would read them",
+    );
   const parts = real.split(path.sep);
   let hit = parts.find((p) => REFUSED_MOUNT_COMPONENTS.has(p));
   if (hit === undefined)

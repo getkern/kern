@@ -2356,6 +2356,28 @@ _REFUSED_MOUNT_SOURCES = {
 }
 
 
+# HOST CREDENTIAL PATHS, REFUSED WITH EVERYTHING BELOW THEM. `/etc` is refused whole, and that left its
+# most sensitive children mountable one by one, the same wrong way round the credential components
+# below were written to end: MEASURED by an external test running as root, `mounts={"/etc/shadow": "/s"}`
+# printed the password hashes. Absolute, because these live at fixed places on every host; matched
+# after the symlinks are resolved, so a link to one is refused too. `/etc/resolv.conf`, `/etc/hosts`,
+# `/etc/localtime` and the rest of `/etc` stay mountable: they are what jobs legitimately borrow.
+_REFUSED_MOUNT_TREES = {
+    "/etc/shadow",
+    "/etc/shadow-",
+    "/etc/gshadow",
+    "/etc/gshadow-",
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+    "/etc/ssh",
+    "/etc/ssl/private",
+    "/etc/security/opasswd",
+    "/etc/krb5.keytab",
+    "/etc/wireguard",
+    "/etc/NetworkManager/system-connections",
+}
+
+
 # CREDENTIAL DIRECTORIES, REFUSED AS A COMPONENT ANYWHERE IN THE SOURCE. The set above is absolute
 # paths, so it refused `$HOME` and accepted `$HOME/.ssh`: MEASURED, a box mounted with
 # `mounts={"~/.ssh": "/x"}` listed `id_ed25519` and `authorized_keys`. Refusing the parent and allowing
@@ -3566,6 +3588,12 @@ def _validate_mount_lexical(source: str, target: str) -> tuple[str, str]:
                 f"started gives the code inside the sandbox's control plane, which is the same reason "
                 f"the docker socket is refused"
             )
+    tree = next((t for t in sorted(_REFUSED_MOUNT_TREES) if _is_inside(real, t)), None)
+    if tree is not None:
+        raise MountRefused(
+            f"refusing to mount {real!r}: {tree!r} holds the host's credentials, and code in the box "
+            f"would read them"
+        )
     parts = real.split(os.sep)
     hit = next((p for p in parts if p in _REFUSED_MOUNT_COMPONENTS), None)
     if hit is None:

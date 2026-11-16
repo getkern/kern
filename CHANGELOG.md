@@ -50,6 +50,15 @@ removed or re-pointed, or an `ld.so.conf` edit, makes it scan again. The box get
 Measured on that desktop, medians of 50 to 60: `--gpus device=0` 19.9 to 9.7 ms on `alpine:3.20`,
 17.6 to 7.7 ms on `ubuntu:24.04`.
 
+**kern-sandbox refuses the host's credential files as mount sources, not only `/etc` whole.** A
+mount of `/etc/shadow` (or a link to it) was accepted while `/etc` itself was refused, and a box
+started by root printed the password hashes (found by an external test). Refused now in both
+bindings, with everything below them and through symlinks: `/etc/shadow`, `/etc/gshadow` and their
+`-` backups, `/etc/sudoers` and `sudoers.d`, `/etc/ssh`, `/etc/ssl/private`,
+`/etc/security/opasswd`, `/etc/krb5.keytab`, `/etc/wireguard`,
+`/etc/NetworkManager/system-connections`. The rest of `/etc` (`resolv.conf`, `hosts`, `localtime`)
+stays mountable.
+
 **`kern stop <name>` stops a running box whose registry record is gone.** `kern ps` already named
 such a box, found by its cgroup or its processes, and `kern stop` still answered "no running box
 named" (found by an external test). It now stops it as Docker does, SIGTERM to the box's init, the

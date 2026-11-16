@@ -541,6 +541,36 @@ def test_a_mount_path_with_a_nul_or_a_newline_is_refused_as_a_sandbox_error(sour
         _cfg(mounts={source: target})
 
 
+def test_the_host_credential_files_under_etc_are_refused_and_the_rest_of_etc_is_not():
+    """`/etc` is refused whole; its credential files were mountable one by one. MEASURED by an
+    external test as root: `mounts={"/etc/shadow": "/s"}` printed the hashes. Each path this host has
+    is refused, also below a directory in the set and through a symlink; the files jobs borrow from
+    `/etc` stay mountable (the positive control)."""
+    present = [p for p in sorted(kern._REFUSED_MOUNT_TREES) if os.path.lexists(p)]
+    assert present, "this host has none of the refused credential paths, so nothing was checked"
+    for p in present:
+        with pytest.raises(MountRefused):
+            kern._validate_mount(p, "/x")
+    if os.path.isdir("/etc/ssh"):
+        inside = next((str(q) for q in Path("/etc/ssh").iterdir()), None)
+        if inside:
+            with pytest.raises(MountRefused):
+                kern._validate_mount(inside, "/x")
+    for ok in ("/etc/resolv.conf", "/etc/hostname", "/etc/localtime", "/etc/hosts"):
+        if os.path.exists(ok):
+            real, target = kern._validate_mount(ok, "/x")
+            assert target == "/x"
+
+
+def test_a_link_to_a_host_credential_file_is_refused(tmp_path):
+    if not os.path.lexists("/etc/shadow"):
+        pytest.skip("this host has no /etc/shadow")
+    link = tmp_path / "innocent"
+    link.symlink_to("/etc/shadow")
+    with pytest.raises(MountRefused):
+        kern._validate_mount(str(link), "/x")
+
+
 def test_home_mount_refused():
     with pytest.raises(MountRefused):
         _cfg(mounts={os.path.expanduser("~"): "/home-x"})
@@ -5050,6 +5080,7 @@ def test_the_two_bindings_refuse_the_same_credential_names():
         return set(re.findall(r'"([^"]+)"', body.group(1)))
 
     assert js_set("REFUSED_MOUNT_COMPONENTS") == kern._REFUSED_MOUNT_COMPONENTS
+    assert js_set("REFUSED_MOUNT_TREES") == kern._REFUSED_MOUNT_TREES
     assert js_set("REFUSED_MOUNT_PAIRS") == {
         f"{a}/{b}" for a, b in kern._REFUSED_MOUNT_PAIRS
     }

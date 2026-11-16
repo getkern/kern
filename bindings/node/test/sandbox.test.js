@@ -4310,3 +4310,27 @@ test("an entry without the setuid mark is fetched before the first call", () => 
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// `/etc` was refused whole and its credential files were mountable one by one: MEASURED by an
+// external test as root, a box given /etc/shadow printed the hashes. The same paths as the Python
+// binding (a test there keeps the two sets equal); the files jobs borrow from /etc stay mountable.
+test("the host's credential files under /etc are refused, the rest of /etc is not", () => {
+  const refused = ["/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/ssh"].filter((p) => {
+    try { fs.lstatSync(p); return true; } catch { return false; }
+  });
+  assert.ok(refused.length > 0, "this host has none of the refused credential paths");
+  for (const p of refused)
+    assert.throws(() => new kern.Sandbox({ mounts: { [p]: "/x" } }), (e) => e.name === "MountRefused", p);
+  if (fs.existsSync("/etc/shadow")) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kern-etclink-"));
+    const link = path.join(dir, "innocent");
+    fs.symlinkSync("/etc/shadow", link);
+    try {
+      assert.throws(() => new kern.Sandbox({ mounts: { [link]: "/x" } }), (e) => e.name === "MountRefused");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  for (const ok of ["/etc/resolv.conf", "/etc/hostname"].filter((p) => fs.existsSync(p)))
+    assert.doesNotThrow(() => new kern.Sandbox({ mounts: { [ok]: "/x" } }), ok);
+});
