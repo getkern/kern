@@ -79,7 +79,7 @@ def wiring_of(kern, f, extra):
         [kern, "compose", "-f", str(f), "config", *extra],
         capture_output=True, text=True, timeout=120,
     )
-    for line in p.stdout.splitlines():
+    for line in p.stderr.splitlines():
         if line.startswith("  wiring: "):
             return line.split(": ", 1)[1].strip()
     return "?"

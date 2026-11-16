@@ -147,6 +147,234 @@ fn stack_bridge_networks(
     Ok((out, notes))
 }
 
+/// What `config` prints, as `docker compose config` prints it: every file through the parser's
+/// front end, merged, normalised and emitted by `kern_compose::canon`, or one of the views its
+/// flags ask for. The project name is the one this run uses; the directory is the first file's,
+/// absolute as Go's `filepath.Abs` makes it (no link is resolved). `services` narrows the project
+/// to those and what they depend on, as `config SERVICE...` does.
+fn render_config(
+    files: &[String],
+    dotenv: &crate::compose::DotEnv,
+    pod: &str,
+    flags: &crate::commands::ConfigFlags,
+    format: Option<&str>,
+    volumes_view: bool,
+    services: &[String],
+) -> Result<String, Error> {
+    use crate::compose::canon;
+    let json = match format {
+        None | Some("yaml") => false,
+        Some("json") => true,
+        Some(other) => {
+            return Err(Error::Compose(format!("unsupported format {other:?}")));
+        }
+    };
+    let interpolate = !flags.no_interpolate;
+    let mut vals = Vec::with_capacity(files.len());
+    let mut texts = Vec::with_capacity(files.len());
+    for f in files {
+        load_config_file(
+            std::path::Path::new(f),
+            dotenv,
+            0,
+            interpolate,
+            &mut vals,
+            &mut texts,
+        )?;
+    }
+    let lines = |v: Vec<String>| -> String { v.into_iter().map(|l| format!("{l}\n")).collect() };
+    if flags.variables {
+        return Ok(canon::variables_table(&canon::extract_variables(&texts)));
+    }
+    if flags.profiles {
+        return Ok(lines(canon::view_profiles(&vals)));
+    }
+    if flags.environment {
+        // The environment interpolation reads: the process's, the `.env` under it, and the project
+        // name compose-go adds. Docker's CLI also has its own plugin variables in its environment,
+        // which kern does not.
+        let mut env: Vec<(String, String)> = crate::global_env_all()
+            .into_iter()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        for (k, v) in dotenv.clone().into_pairs() {
+            if !env.iter().any(|(ek, _)| *ek == k) {
+                env.push((k, v));
+            }
+        }
+        if !env.iter().any(|(k, _)| k == "COMPOSE_PROJECT_NAME") {
+            env.push(("COMPOSE_PROJECT_NAME".into(), pod.to_string()));
+        }
+        env.sort();
+        return Ok(lines(
+            env.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        ));
+    }
+    let first = files.first().map(String::as_str).unwrap_or(".");
+    let dir = std::path::absolute(compose_dir(first))
+        .map_err(|e| Error::Compose(format!("the project directory: {e}")))?;
+    // `--no-interpolate` prints the model before profiles apply, as Docker does (measured: a
+    // service behind an inactive profile is in that output and in no other).
+    let profiles: Vec<String> = if flags.no_interpolate {
+        vec!["*".to_string()]
+    } else {
+        crate::global_env_str("COMPOSE_PROFILES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let env = |k: &str| crate::global_env_str(k).ok();
+    let env_file = |p: &std::path::Path| -> Result<Vec<(String, Option<String>)>, String> {
+        let text = std::fs::read_to_string(p)
+            .map_err(|e| format!("env file {} not found: {e}", p.display()))?;
+        Ok(crate::compose::parse_dotenv(&text)
+            .into_pairs()
+            .into_iter()
+            .map(|(k, v)| (k, Some(v)))
+            .collect())
+    };
+    let input = canon::ProjectInput {
+        name: pod,
+        dir: &dir,
+        profiles: &profiles,
+        env: &env,
+        env_file: &env_file,
+        json: json || flags.hash.is_some(),
+        prune: !flags.no_interpolate,
+    };
+    let mut project = canon::project(&vals, &input).map_err(Error::Compose)?;
+    if !services.is_empty() {
+        project = canon::select_services(project, services).map_err(Error::Compose)?;
+    }
+    if flags.images {
+        return Ok(lines(canon::view_images(&project, pod)));
+    }
+    if volumes_view {
+        return Ok(lines(canon::view_volumes(&project)));
+    }
+    if flags.networks {
+        return Ok(lines(canon::view_networks(&project)));
+    }
+    if let Some(h) = &flags.hash {
+        let mut names: Vec<String> = if h == "*" {
+            canon::service_names(&project)
+        } else {
+            h.split(',').map(|n| n.trim().to_string()).collect()
+        };
+        names.sort();
+        let mut out = String::new();
+        for n in names {
+            let Some(input) = canon::hash_input(&project, &n) else {
+                return Err(Error::Compose(format!("no such service: {n}")));
+            };
+            out.push_str(&format!("{n} {}\n", sha256_hex(input.as_bytes())?));
+        }
+        return Ok(out);
+    }
+    if flags.no_interpolate {
+        let sorted = canon::sort_all(project);
+        return Ok(if json {
+            canon::emit_json(&sorted)
+        } else {
+            canon::emit(&sorted)
+        });
+    }
+    let escaped = canon::escape_dollars(project);
+    Ok(if json {
+        canon::emit_json(&escaped)
+    } else {
+        canon::emit(&escaped)
+    })
+}
+
+/// The SHA-256 of `bytes` as hex, through coreutils' `sha256sum` as kern-oci computes its digests.
+fn sha256_hex(bytes: &[u8]) -> Result<String, Error> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sha256sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Compose(format!("sha256sum: {e}")))?;
+    if let Some(mut si) = child.stdin.take() {
+        si.write_all(bytes)
+            .map_err(|e| Error::Compose(format!("sha256sum: {e}")))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Error::Compose(format!("sha256sum: {e}")))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .next()
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string)
+        .ok_or_else(|| Error::Compose("sha256sum gave no digest".to_string()))
+}
+
+/// One compose file for `config`, with what it `include:`s before it: each file's paths resolved
+/// against its own directory (`canon::absolutize`), the `include` key itself dropped, as Docker
+/// prints a project whose includes are merged in. Bounded in depth, as the parser bounds it.
+fn load_config_file(
+    path: &std::path::Path,
+    dotenv: &crate::compose::DotEnv,
+    depth: usize,
+    interpolate: bool,
+    out: &mut Vec<crate::compose::canon::Val>,
+    texts: &mut Vec<String>,
+) -> Result<(), Error> {
+    use crate::compose::canon::Val;
+    if depth > 16 {
+        return Err(Error::Compose(format!(
+            "include: {} is nested more than 16 files deep",
+            path.display()
+        )));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Error::Compose(format!("reading {}: {e}", path.display())))?;
+    let dir = std::path::absolute(compose_dir(&path.to_string_lossy()))
+        .map_err(|e| Error::Compose(format!("{}: {e}", path.display())))?;
+    let val = crate::compose::config_document(&text, dotenv, Some(&dir), interpolate)
+        .map_err(Error::Compose)?;
+    texts.push(text);
+    let val = crate::compose::canon::absolutize(val, &dir);
+    let Val::Map(mut top) = val else {
+        out.push(val);
+        return Ok(());
+    };
+    if let Some(pos) = top.iter().position(|(k, _)| k == "include") {
+        let (_, inc) = top.remove(pos);
+        let entries = match inc {
+            Val::Seq(items) => items,
+            other => vec![other],
+        };
+        for e in entries {
+            let paths: Vec<String> = match &e {
+                Val::Map(_) => match e.get("path") {
+                    Some(Val::Seq(ps)) => ps
+                        .iter()
+                        .filter_map(|p| p.text().map(str::to_string))
+                        .collect(),
+                    Some(p) => p.text().map(str::to_string).into_iter().collect(),
+                    None => Vec::new(),
+                },
+                other => other.text().map(str::to_string).into_iter().collect(),
+            };
+            for p in paths {
+                let inc_path = if p.starts_with('/') {
+                    std::path::PathBuf::from(&p)
+                } else {
+                    dir.join(&p)
+                };
+                load_config_file(&inc_path, dotenv, depth + 1, interpolate, out, texts)?;
+            }
+        }
+    }
+    out.push(Val::Map(top));
+    Ok(())
+}
+
 /// The bridge addresses every running box holds, by box name (see `registry::Instance::bridges`).
 fn live_bridge_addrs() -> std::collections::HashMap<String, Vec<u32>> {
     crate::registry::list()
@@ -858,11 +1086,30 @@ fn forget_stopped_replicas(
     }
 }
 
+/// A service's box name, the ONE rule: Docker's `<project>-<service>-1` when `numbered`, kern's
+/// earlier `<project>-<service>` for a stack still running under it (and for a replica, whose key
+/// is already `<service>-<k>`).
+fn scoped_box_name(pod: &str, svc: &str, numbered: bool) -> String {
+    if numbered {
+        format!("{pod}-{svc}-1")
+    } else {
+        format!("{pod}-{svc}")
+    }
+}
+
 fn resolve_box_names(
     boxes: &mut [crate::compose::ComposeBox],
     pod: &str,
+    numbered: bool,
 ) -> std::collections::HashMap<String, String> {
-    let scoped = |svc: &str| format!("{pod}-{svc}");
+    // `<project>-<service>-1`, Docker's name, when `numbered`; a replica's key is already
+    // `<service>-<k>` (see `expand_replicas`), so it takes no second number.
+    let replica_keys: std::collections::HashSet<String> = boxes
+        .iter()
+        .filter(|b| b.replica_of.is_some())
+        .map(|b| b.name.clone())
+        .collect();
+    let scoped = |svc: &str| scoped_box_name(pod, svc, numbered && !replica_keys.contains(svc));
     // Each service's BOX name, built ONCE so the box's own name and every `depends_on` edge that
     // names a service map to the SAME box name.
     let box_name_of: std::collections::HashMap<String, String> = boxes
@@ -978,11 +1225,20 @@ fn default_override_for(files: &[String], from: ComposeFilesFrom) -> Option<Stri
 ///
 /// `on_box` is the scoped box name the NEXT word refers to, when it names a service, so the
 /// suggested command can be copied and run rather than adapted. kern's own verbs take a BOX name
-/// (`<project>-<service>`), which is exactly the thing a reader of a compose file does not know.
+/// (`<project>-<service>-1`), which is exactly the thing a reader of a compose file does not know.
 ///
 /// Every target named here is a verb kern actually has: `kern --help` lists cp, events, exec,
 /// images, inspect, kill, logs, ps, run, stats, stop, top, wait.
 fn docker_only_verb_hint(word: &str, on_box: Option<&str>) -> Option<String> {
+    // A word that IS one of kern compose's verbs, standing where a service goes (`compose f.yml logs
+    // top`), is not a verb kern lacks: it is a name that matches no service, and the generic answer
+    // says that, as Docker's `no such service` does.
+    if crate::commands::COMPOSE_VERBS
+        .iter()
+        .any(|(name, _)| *name == word)
+    {
+        return None;
+    }
     let target = on_box.unwrap_or("<box>");
     let what = match word {
         "kill" => format!("`kern kill {target}`"),
@@ -993,7 +1249,9 @@ fn docker_only_verb_hint(word: &str, on_box: Option<&str>) -> Option<String> {
         "events" => "`kern events`".to_string(),
         "ls" => "`kern ps`".to_string(),
         "rm" => format!("`kern stop {target}`, or `compose down` for the whole stack"),
-        "create" => "`compose up` (kern has no create/start split)".to_string(),
+        "create" => {
+            "`compose up` (`kern create` makes a single box without starting it)".to_string()
+        }
         "version" => "`kern --version`".to_string(),
         _ => return None,
     };
@@ -1207,6 +1465,23 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     if o.action == ComposeAction::Run {
         crate::pod::narrate_to_stderr_from_now_on();
     }
+    // THE VERBS THAT ONLY NARRATE SAY IT ON STDERR, as Docker Compose does: see
+    // `ui::narration_to_stderr`. MEASURED on Docker Compose 5.3.1, bytes on stdout: `up -d`,
+    // `stop`, `start`, `restart`, `down`, `pull`, `cp` print 0, while `build` (723) and `rm -sf`
+    // (24) print on stdout, so those two keep it, as do the verbs whose stdout is an answer (`ps`,
+    // `config`, `logs`, `images`, ...) or the workload's (`exec`, `run`).
+    if matches!(
+        o.action,
+        ComposeAction::Up
+            | ComposeAction::Down
+            | ComposeAction::Stop
+            | ComposeAction::Start
+            | ComposeAction::Restart
+            | ComposeAction::Pull
+            | ComposeAction::Cp
+    ) {
+        crate::ui::narration_to_stderr();
+    }
     let ComposeOpts {
         files,
         action,
@@ -1250,6 +1525,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         project_root,
         profiles,
         files_from,
+        config_flags,
         recreate,
         renew_anon_volumes,
         log_timestamps,
@@ -1432,6 +1708,54 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     };
+    // DOCKER'S REFUSAL FIRST, in its words: compose-go converts, deduplicates and checks every file
+    // against the Compose schema before it reads a service (see `kern_compose::schema`), and names
+    // the file by its absolute path. `config --no-interpolate` checks the text as written, as
+    // compose-go's `SkipInterpolation` does.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let interpolate = !(action == ComposeAction::Config && config_flags.no_interpolate);
+    // EVERY FILE READ ONCE, and checked once: the check's tree also carries the file's `name:`,
+    // which the project name below reads instead of parsing each file a third time.
+    let mut texts: Vec<String> = vec![text.clone()];
+    for extra in files.iter().skip(1) {
+        texts.push(
+            std::fs::read_to_string(extra)
+                .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?,
+        );
+    }
+    // DOCKER'S CHECK ON THE VERBS THAT BUILD FROM THE FILE. Docker validates on every verb; kern
+    // does it where the file is about to create or describe something, and not on the read-only
+    // verbs (`ps`, `logs`, `exec`, `port`, `stop`, `down`, ...), where a file `up` refuses cannot
+    // have started anything. MEASURED on the VPS (ab-measure, 40 paired runs): the check cost
+    // `compose ps` +5.2 ms on a 181-line file and +19.4 ms on a 1081-line one, against HEAD.
+    let validating = matches!(
+        action,
+        ComposeAction::Up
+            | ComposeAction::Start
+            | ComposeAction::Restart
+            | ComposeAction::Run
+            | ComposeAction::Build
+            | ComposeAction::Pull
+            | ComposeAction::Push
+            | ComposeAction::Config
+            | ComposeAction::Watch
+            | ComposeAction::Systemd
+    );
+    let checks: Vec<crate::compose::schema::DockerCheck> = files
+        .iter()
+        .zip(&texts)
+        .filter(|_| validating)
+        .map(|(f, t)| {
+            crate::compose::schema::docker_check(
+                t,
+                &dotenv,
+                Some(dir_of(f).as_path()),
+                &crate::compose::schema::file_label(f, &cwd),
+                interpolate,
+            )
+        })
+        .collect();
+    let refusal_of = |i: usize| checks.get(i).and_then(|c| c.refusal.clone());
     // ONE FILE: profiles are decided inside the parse, as they always were. SEVERAL: every file is
     // read with its profiles left open, merged left to right, and the decision is taken ONCE on the
     // result, which is Docker's order. MEASURED 2026-11-12: deciding them per file refused
@@ -1444,50 +1768,49 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // EVERY TEXT FIRST, because a `!reset` or `!override` in file N removes its key from what files
         // 0..N built, which is Docker's merge; kern merges interpreted services, so the key is
         // dropped from each earlier file's tree before it is read. See `merge_tag_keys`.
-        let mut texts: Vec<String> = vec![text.clone()];
-        for extra in &files[1..] {
-            texts.push(
-                std::fs::read_to_string(extra)
-                    .map_err(|e| Error::Compose(format!("reading {extra}: {e}")))?,
-            );
-        }
         let tagged: Vec<Vec<(String, String)>> = texts
             .iter()
             .map(|t| crate::compose::merge_tag_keys(t))
             .collect::<Result<_, _>>()
             .map_err(Error::Compose)?;
         let later = |i: usize| -> Vec<(String, String)> { tagged[i + 1..].concat() };
-        let mut merged = crate::compose::parse_stack_file_in_dropping(
-            &texts[0],
-            &dotenv,
-            stack_net,
-            Some(dir_of(&files[0]).as_path()),
-            include_root.as_deref(),
-            &later(0),
-        )
+        let mut merged = crate::compose::schema::refused_or(refusal_of(0), || {
+            crate::compose::parse_stack_file_in_dropping(
+                &texts[0],
+                &dotenv,
+                stack_net,
+                Some(dir_of(&files[0]).as_path()),
+                include_root.as_deref(),
+                &later(0),
+            )
+        })
         .map_err(Error::Compose)?;
         // Merge every additional `-f`, left to right (see `merge_stacks` for the exact rules).
         for (i, extra) in files.iter().enumerate().skip(1) {
-            let over = crate::compose::parse_stack_file_in_dropping(
-                &texts[i],
-                &dotenv,
-                stack_net,
-                Some(dir_of(extra).as_path()),
-                include_root.as_deref(),
-                &later(i),
-            )
+            let over = crate::compose::schema::refused_or(refusal_of(i), || {
+                crate::compose::parse_stack_file_in_dropping(
+                    &texts[i],
+                    &dotenv,
+                    stack_net,
+                    Some(dir_of(extra).as_path()),
+                    include_root.as_deref(),
+                    &later(i),
+                )
+            })
             .map_err(Error::Compose)?;
             merged = crate::compose::merge_stacks(merged, over);
         }
         crate::compose::apply_profiles(merged).map_err(Error::Compose)?
     } else {
-        crate::compose::parse_with_env_in(
-            &text,
-            &dotenv,
-            stack_net,
-            Some(dir_of(&files[0]).as_path()),
-            include_root.as_deref(),
-        )
+        crate::compose::schema::refused_or(refusal_of(0), || {
+            crate::compose::parse_with_env_in(
+                &text,
+                &dotenv,
+                stack_net,
+                Some(dir_of(&files[0]).as_path()),
+                include_root.as_deref(),
+            )
+        })
         .map_err(Error::Compose)?
     };
     // Per-service validation, on the MERGED stack and UNCONDITIONALLY. Merged, because an override
@@ -1497,14 +1820,76 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // unchecked (the TOML parser refuses "nothing to run" itself, the YAML front end defers it here)
     // and let a `port:`/`PORT=` contradiction through in the common one-file case.
     crate::compose::validate_runnable(&boxes).map_err(Error::Compose)?;
-    // The stack's pod is named after the compose file (Docker's project-name idea) - one shared
-    // network so services reach each other by name.
+    // THE PROJECT NAME IS DOCKER'S, in Docker's order: `-p`, then `COMPOSE_PROJECT_NAME`, then the
+    // `name:` of the files (the last one that sets it), then the directory of the first file,
+    // normalized. MEASURED on Docker Compose 5.3.1: a directory `usbim-assets` is the project
+    // `usbim-assets` whatever file in it is read, its network `usbim-assets_usbim`, its containers
+    // `usbim-assets-<service>-1`. kern named it `usbim-assets-<hash of the file>`, so `docker run
+    // --network usbim-assets_usbim` and `docker exec usbim-assets-api-server-1` named nothing, and
+    // `-f docker-compose.dev.yml` in the same directory was a different project.
+    let declared_name: Option<String> = texts
+        .iter()
+        .rev()
+        .find_map(|t| crate::compose::top_level_name(t, &dotenv));
+    let defaulted = project.is_none() && project_from_env.is_none() && declared_name.is_none();
     let pod = match project {
-        Some(p) => p.to_string(),
-        None => project_from_env
-            .clone()
-            .unwrap_or_else(|| compose_pod_name(file)),
+        Some(p) => {
+            if crate::commands::normalize_project_name(p) != p || p.is_empty() {
+                return Err(Error::Compose(format!(
+                    "invalid project name {}: must consist only of lowercase alphanumeric \
+                     characters, hyphens, and underscores as well as start with a letter or number",
+                    crate::compose::schema::go_quote(p)
+                )));
+            }
+            p.to_string()
+        }
+        None => match project_from_env.clone() {
+            // ⛔ VALIDATED AS `-p` IS. The variable comes from the environment or from the
+            // project's own `.env`, which a cloned repository writes: unchecked, `../../tmp/x`
+            // became the stack's name and `down` worked on the directory it named, killing the pid
+            // recorded there and deleting its files.
+            Some(n) if crate::commands::normalize_project_name(&n) != n => {
+                return Err(Error::Compose(format!(
+                    "invalid project name {}: must consist only of lowercase alphanumeric \
+                     characters, hyphens, and underscores as well as start with a letter or number",
+                    crate::compose::schema::go_quote(&n)
+                )));
+            }
+            Some(n) => n,
+            None => {
+                let n = match &declared_name {
+                    Some(d) => crate::commands::normalize_project_name(d),
+                    None => compose_pod_name(file),
+                };
+                if n.is_empty() {
+                    return Err(Error::Compose("project name must not be empty".to_string()));
+                }
+                n
+            }
+        },
     };
+    // A STACK STILL RUNNING UNDER THE NAME KERN USED BEFORE keeps it until it is taken down: its
+    // boxes, its pod and its relays carry that name, and a `down` or `ps` under the new one would
+    // find nothing of it. Said once; `down` then `up` moves it.
+    let legacy = crate::commands::legacy_pod_name(file);
+    let running_as_legacy = defaulted
+        && legacy != pod
+        && (crate::pod::holder_pid(&legacy).is_some()
+            || crate::registry::list()
+                .iter()
+                .any(|i| i.pod == legacy || i.name.starts_with(&format!("{legacy}-"))));
+    let pod = if running_as_legacy {
+        eprintln!(
+            "kern: note: this stack is running under the name kern gave it before, '{legacy}'; \
+             `down` and `up` move it to '{pod}', the name Docker gives it"
+        );
+        legacy.clone()
+    } else {
+        pod
+    };
+    // Docker's container names carry the replica number (`<project>-<service>-1`); a stack still
+    // running under the old name keeps the old ones (`<project>-<service>`).
+    let numbered = !running_as_legacy;
 
     // PROJECT-SCOPED BOX NAMES. Docker names a container `<project>-<service>`; kern used the bare
     // service name, and box names are global, so two projects that both have a `db` (or `web`, or
@@ -1533,13 +1918,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         crate::registry::clear_waitexit_pod(&pod, &surplus);
     }
     let service_names: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
-    let box_name_of = resolve_box_names(&mut boxes, &pod);
+    let box_name_of = resolve_box_names(&mut boxes, &pod, numbered);
     let replica_names = replica_names(&boxes, &surplus, &pod);
     let box_name = |svc: &str| {
         box_name_of
             .get(svc)
             .cloned()
-            .unwrap_or_else(|| format!("{pod}-{svc}"))
+            .unwrap_or_else(|| scoped_box_name(&pod, svc, numbered))
     };
     // Selectors from the command line name SERVICES; map them onto the boxes they now identify.
     // `--index N` names replica N of the first service: the service `<name>-N` (1 is the service).
@@ -1650,6 +2035,33 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // split, so `config` prints the name that will be mounted and `down -v` removes the name that
     // was. See `scope_named_volumes` for the measurement that made this necessary.
     let owned_volumes = scope_named_volumes(&mut boxes, &pod);
+    // THE OLD NAME'S VOLUMES ARE MOVED TO THE NEW ONE, so taking Docker's project name loses no
+    // data: `<old>_<volume>` becomes `<project>_<volume>` when the new name does not exist yet and
+    // nothing has the old one mounted. Only by a bring-up, which is about to mount them.
+    if defaulted
+        && !running_as_legacy
+        && legacy != pod
+        && matches!(
+            action,
+            ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart
+        )
+    {
+        let scope = format!("{pod}_");
+        for v in &owned_volumes {
+            let Some(bare) = v.strip_prefix(&scope) else {
+                continue;
+            };
+            let old = format!("{legacy}_{bare}");
+            match crate::volume::rename_if_absent(&old, v) {
+                Ok(true) => eprintln!(
+                    "kern: note: volume '{old}' is now '{v}', the stack's name under Docker's \
+                     naming; its data is unchanged"
+                ),
+                Ok(false) => {}
+                Err(e) => eprintln!("kern: warning: compose: volume '{old}' kept its name: {e}"),
+            }
+        }
+    }
     // THE MIGRATION NOTE BELONGS TO A BRING-UP, NOT TO A READING OF THE FILE. It reports what is on
     // this machine's disk, so emitting it from `config` made a STATIC answer depend on local state:
     // MEASURED on the neutral corpus, where leftover volumes from unrelated stacks made 15 files
@@ -2268,6 +2680,34 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             }
         }
     }
+    // `config`'s answer, as Docker Compose prints it, from the same files and the same `.env`.
+    // `-q` VALIDATES AND PRINTS NOTHING, as Docker's does, and the validation is done by then (the
+    // parse and Docker's check above): rendering the project only to drop it cost `config -q` the
+    // whole emitter (MEASURED on the VPS, +6.0 ms on 181 lines, +31 ms on 1081).
+    let config_yaml = if action == ComposeAction::Config && !ps_services && !ps_quiet {
+        let answer = render_config(
+            files,
+            &dotenv,
+            &pod,
+            config_flags,
+            ps_format,
+            remove_volumes,
+            services,
+        )?;
+        // `-o FILE`: the answer goes there, as Docker writes it (only when there is one).
+        match config_flags.output.as_deref() {
+            Some(path) if !ps_quiet => {
+                if !answer.is_empty() {
+                    std::fs::write(path, &answer)
+                        .map_err(|e| Error::Compose(format!("writing {path}: {e}")))?;
+                }
+                Some(String::new())
+            }
+            _ => Some(answer),
+        }
+    } else {
+        None
+    };
     if run_terminal_verb(
         action,
         &mut boxes,
@@ -2295,6 +2735,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             ps_quiet,
             ps_services,
             ps_format,
+            config_yaml,
         },
     )? {
         return Ok(());
@@ -2396,9 +2837,9 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             .map(|b| b.name.clone())
             .collect();
         if !cut_off.is_empty() {
-            let short: Vec<&str> = cut_off
+            let short: Vec<String> = cut_off
                 .iter()
-                .map(|n| n.strip_prefix(&format!("{pod}-")).unwrap_or(n))
+                .map(|n| short_service_name(&boxes, n, &pod))
                 .collect();
             println!(
                 "→ pod '{pod}' lost its holder, the process that owns its network: its services \
@@ -2449,16 +2890,28 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     // The boxes this `up` leaves running as they are: the ones whose hosts file a change of replica
     // count has to reach (see `network::set_box_names`).
     let mut kept_boxes: Vec<String> = Vec::new();
+    // The services the reconcile below recreates: stopped AFTER the builds (see there).
+    let mut stale_to_stop: Vec<String> = Vec::new();
     if action == ComposeAction::Up {
         let mut kept = 0usize;
         let mut stale: Vec<String> = Vec::new();
+        // Services that are NOT running and that `--force-recreate` makes anew: their old runs'
+        // logs go too. MEASURED on Docker Compose 5.3.1: a service that had died, brought back with
+        // `up -d --force-recreate`, logs only its new run; kern's `logs` still began with the dead
+        // run's `httpd: applet not found`.
+        let mut fresh: Vec<String> = Vec::new();
         for level in &mut levels {
             level.retain(|n| {
                 let Some(b) = boxes.iter().find(|b| &b.name == n) else {
                     return true;
                 };
                 match registry::find(n) {
-                    None => true, // not running: launch it
+                    None => {
+                        if matches!(recreate, RecreatePolicy::Always) {
+                            fresh.push(n.clone());
+                        }
+                        true // not running: launch it
+                    }
                     Some(inst) => match reconcile_decision(&inst, &definition_hash(b), recreate) {
                         Reconcile::UpToDate => {
                             kept += 1;
@@ -2473,10 +2926,16 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 }
             });
         }
+        for n in &fresh {
+            crate::commands::remove_logs_of(n);
+        }
+        if !fresh.is_empty() {
+            crate::registry::clear_waitexit_pod(&pod, &fresh);
+        }
         if !stale.is_empty() {
-            let short: Vec<&str> = stale
+            let short: Vec<String> = stale
                 .iter()
-                .map(|n| n.strip_prefix(&format!("{pod}-")).unwrap_or(n))
+                .map(|n| short_service_name(&boxes, n, &pod))
                 .collect();
             // SAY WHICH REASON, because the two are not the same news. "The file changed" invites a
             // reader to go and look at what changed; under `--force-recreate` nothing changed and
@@ -2487,47 +2946,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 }
                 _ => println!("→ definition changed, recreating: {}", short.join(", ")),
             }
-            // Stopped BEFORE the launch loop so the name is free when it is recreated.
-            // Docker's grace, as every compose teardown: see `DeafInit::WaitGrace`.
-            let _ = crate::commands::inspect::stop_with_grace(
-                &stale,
-                false,
-                None,
-                crate::commands::DeafInit::WaitGrace,
-            );
-            // A RECREATED service starts a new history, as a new container does under Docker: its
-            // logs and its exit record go with the old box.
-            for n in &stale {
-                crate::commands::remove_logs_of(n);
-            }
-            crate::registry::clear_waitexit_pod(&pod, &stale);
-        }
-        // `-V/--renew-anon-volumes`: AFTER the stop and BEFORE the launch loop, which is the only
-        // window where the volume is neither held by the old box nor yet needed by the new one. A
-        // volume still mounted by a running box cannot be removed from under it, and one removed
-        // after the launch would come back empty under a service already reading it.
-        //
-        // SCOPED TO THE SERVICES THIS `up` IS ABOUT TO START, which after the stop above is exactly
-        // what `levels` still holds. Docker's `-V` renews the volumes of the containers it
-        // recreates, not of the ones it leaves running, and the difference is not cosmetic: the
-        // wider reading deletes storage out from under a service nobody asked to touch.
-        if renew_anon_volumes {
-            let launching: std::collections::HashSet<&str> =
-                levels.iter().flatten().map(String::as_str).collect();
-            let scope = format!("{pod}_");
-            let renew: std::collections::HashSet<String> = boxes
-                .iter()
-                .filter(|b| launching.contains(b.name.as_str()))
-                .flat_map(|b| b.volumes.iter())
-                .filter_map(|v| v.split_once(':').map(|(src, _)| src))
-                .filter_map(|src| src.strip_prefix(&scope))
-                .filter(|bare| bare.starts_with("anon-"))
-                .map(str::to_string)
-                .collect();
-            let n = remove_project_volumes_matching(&boxes, &pod, |bare| renew.contains(bare))?;
-            if n > 0 {
-                println!("→ --renew-anon-volumes: {n} anonymous volume(s) discarded");
-            }
+            stale_to_stop = stale.clone();
         }
         if kept > 0 && levels.iter().all(|l| l.is_empty()) {
             // A SCALE-DOWN STARTS NOTHING, so the plan below is never reached: the replicas it
@@ -2671,6 +3090,57 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             build_args,
             build_policy,
         )?;
+    }
+
+    // ⛔ THE RECREATED SERVICES STOP AFTER THE BUILDS, as Docker builds and then recreates. MEASURED
+    // on Docker Compose 5.3.1 with `up -d --build --force-recreate --no-deps api-server`: the old
+    // container served while the image built; kern stopped it first and the service was down for
+    // the whole build, and stayed down when the build failed.
+    if !stale_to_stop.is_empty() {
+        let stale = &stale_to_stop;
+        // Before the launch loop so the name is free when it is recreated. Docker's grace, as
+        // every compose teardown: see `DeafInit::WaitGrace`.
+        let _ = crate::commands::inspect::stop_with_grace(
+            stale,
+            false,
+            None,
+            crate::commands::DeafInit::WaitGrace,
+        );
+        // A RECREATED service starts a new history, as a new container does under Docker: its
+        // logs and its exit record go with the old box.
+        for n in stale {
+            crate::commands::remove_logs_of(n);
+        }
+        crate::registry::clear_waitexit_pod(&pod, stale);
+    }
+    if action == ComposeAction::Up {
+        // `-V/--renew-anon-volumes`: AFTER the stop and BEFORE the launch loop, which is the only
+        // window where the volume is neither held by the old box nor yet needed by the new one. A
+        // volume still mounted by a running box cannot be removed from under it, and one removed
+        // after the launch would come back empty under a service already reading it.
+        //
+        // SCOPED TO THE SERVICES THIS `up` IS ABOUT TO START, which after the stop above is exactly
+        // what `levels` still holds. Docker's `-V` renews the volumes of the containers it
+        // recreates, not of the ones it leaves running, and the difference is not cosmetic: the
+        // wider reading deletes storage out from under a service nobody asked to touch.
+        if renew_anon_volumes {
+            let launching: std::collections::HashSet<&str> =
+                levels.iter().flatten().map(String::as_str).collect();
+            let scope = format!("{pod}_");
+            let renew: std::collections::HashSet<String> = boxes
+                .iter()
+                .filter(|b| launching.contains(b.name.as_str()))
+                .flat_map(|b| b.volumes.iter())
+                .filter_map(|v| v.split_once(':').map(|(src, _)| src))
+                .filter_map(|src| src.strip_prefix(&scope))
+                .filter(|bare| bare.starts_with("anon-"))
+                .map(str::to_string)
+                .collect();
+            let n = remove_project_volumes_matching(&boxes, &pod, |bare| renew.contains(bare))?;
+            if n > 0 {
+                println!("→ --renew-anon-volumes: {n} anonymous volume(s) discarded");
+            }
+        }
     }
 
     // `run` DIVERGES HERE, after the builds and the bind resolution and before the bring-up: it
@@ -3048,13 +3518,13 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             let opted_out: Vec<&str> = boxes
                 .iter()
                 .filter(|b| b.uid_range_explicit_false)
-                .map(|b| b.name.strip_prefix(&format!("{pod}-")).unwrap_or(&b.name))
+                .map(|b| b.service_name())
                 .collect();
             if !opted_out.is_empty() {
                 let because: Vec<&str> = boxes
                     .iter()
                     .filter(|b| b.wants_uid_range())
-                    .map(|b| b.name.strip_prefix(&format!("{pod}-")).unwrap_or(&b.name))
+                    .map(|b| b.service_name())
                     .collect();
                 eprintln!(
                     "kern: note: {} asked for the single-uid map (`uid_range = false`), but a pod shares \
@@ -3189,7 +3659,12 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
                 "kern: note: {who} keeps its TCP ports reachable, but its UDP ports are not relayed."
             );
         }
-        let plan = crate::nopod::assign_aliases(&services).map_err(Error::Compose)?;
+        let mut plan = crate::nopod::assign_aliases(&services).map_err(Error::Compose)?;
+        // The aliases running boxes hold stay theirs: see `nopod::keep_live_aliases`.
+        let live = crate::relayhold::stack_dir(&pod)
+            .map(|d| crate::relayhold::live_aliases(&d))
+            .unwrap_or_default();
+        crate::nopod::keep_live_aliases(&mut plan, &live).map_err(Error::Compose)?;
         // THE PAIRS THE FILE ASKED TO SEPARATE, NAMED BEFORE ANYTHING STARTS. A removed edge shows
         // up as `bad address '<peer>'` in a service log, which is the same symptom as a typo or a
         // dead peer; saying it here is what makes it readable as enforcement. Printed before the
@@ -3263,6 +3738,38 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             plan
         }
     };
+
+    // A STACK ON A BRIDGE RECORDS ITS NETWORKS, so a box started later with `kern box --network
+    // <project>_<network>` (Docker's `docker run --network <project>_<network>` one-off) gets an
+    // address on that bridge and the names on it. MEASURED: such a box was put in the bridge's
+    // holder namespace with the pod's hosts file, where every name was `192.0.0.8`, its own
+    // loopback: `wget api-server:3100` was refused and `ev-api` (a `container_name:`) did not
+    // resolve, where Docker's one-off reached both.
+    if let Some(cidr) = bridge_cidr {
+        if matches!(
+            action,
+            ComposeAction::Up | ComposeAction::Start | ComposeAction::Restart | ComposeAction::Run
+        ) {
+            let single = bridge_nets
+                .is_empty()
+                .then(|| kern_isolation::pod_bridge_parts(cidr).map(|(_, _, prefix)| prefix))
+                .flatten();
+            let mut nets = crate::nopod::bridge_networks(&address_plan, single);
+            // WHICH OF THEM THE FILE MARKS INTERNAL, from the services on it: a network no service
+            // joins is not recorded at all, so the services are the whole of what can be said.
+            for n in &mut nets {
+                n.internal = boxes
+                    .iter()
+                    .any(|b| b.internal_networks.contains(&n.network));
+            }
+            if let Err(e) = crate::pod::write_bridge_networks(&pod, &nets) {
+                eprintln!(
+                    "kern: warning: compose: recording the stack's networks for `kern box \
+                     --network`: {e}"
+                );
+            }
+        }
+    }
 
     // `run` IS DISPATCHED HERE, AFTER THE ADDRESS PLAN, and that position is the fix rather than a
     // tidy-up. It used to run before the wiring was decided, so the one-off joined the pod's USER
@@ -3789,10 +4296,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     }
     // THE BOXES LEFT RUNNING LEARN THE REPLICAS THIS `up` STARTED OR STOPPED, from the same
     // `add_host_args` a box is started with, so a running box and a new one cannot disagree about
-    // what `web` means. ON A BRIDGE ONLY: in a pod every member answers at one address the shared
-    // file already holds, and under `--no-pod` a name is only reachable through a relay built inside
-    // the box when it starts, so a line added to a running box would name an address nothing binds.
-    if action == ComposeAction::Up && bridge_cidr.is_some() && !replica_names.is_empty() {
+    // what `web` means. On a bridge, and under `--no-pod`, where the relay holder is respawned below
+    // with the whole plan and so builds the new replica's relay inside the running boxes too. Not in
+    // a pod: every member answers at one address the shared file already holds.
+    let own_addresses = bridge_cidr.is_some() || (!use_pod && !address_plan.is_empty());
+    if action == ComposeAction::Up && own_addresses && !replica_names.is_empty() {
         for k in &kept_boxes {
             let Some(b) = boxes.iter().find(|b| &b.name == k) else {
                 continue;
@@ -3800,7 +4308,8 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             if b.net || joins.contains_key(&b.name) {
                 continue;
             }
-            let Some(entries) = crate::nopod::add_host_args(&address_plan, &b.service, false)
+            let Some(entries) =
+                crate::nopod::add_host_args(&address_plan, &b.service, bridge_cidr.is_none())
             else {
                 continue;
             };
@@ -3951,6 +4460,19 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
             for line in &report.blocked {
                 eprintln!("kern: unreachable: {line}");
             }
+        }
+    }
+    // THE ALIASES THIS `up` GAVE, for the next one to keep (see `nopod::keep_live_aliases`). After
+    // the holder, whose spawn clears the directory.
+    if !use_pod && bridge_cidr.is_none() && !address_plan.is_empty() {
+        if let Err(e) = crate::relayhold::stack_dir(&pod)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+            .and_then(|d| crate::relayhold::record_aliases(&d, &address_plan))
+        {
+            eprintln!(
+                "kern: warning: compose: the services' aliases were not recorded ({e}); the next \
+                 `up` of this stack may move them"
+            );
         }
     }
     // RELEASE, IN DEPENDENCY ORDER, AFTER EVERY EDGE EXISTS.
@@ -4128,7 +4650,16 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         .iter()
         .filter(|b| started.contains(b.name.as_str()))
         .collect();
-    let dead = settle_and_collect_dead(&mine, &pod, &up_token);
+    // `up -d` DOES NOT WAIT TO SEE WHO DIES, as Docker's does not: it exits 0 whatever happens
+    // next (measured), so the window only delayed a warning. MEASURED on this desktop: a
+    // three-service `up -d` took ~190 ms, ~150 of them this window. The services already gone are
+    // still reported; `--wait`, and an `up` that stays to show the stack, keep the window.
+    let window = if detach && !wait_ready {
+        0
+    } else {
+        BRING_UP_SETTLE_MS
+    };
+    let dead = settle_and_collect_dead(&mine, &pod, &up_token, window);
     // UNDER `--abort-on-container-exit` AN EARLY EXIT IS THE RESULT, NOT A FAILED START. A test
     // service that pings its database and exits does so well inside the settle window, and this
     // reported it as "died within 150ms", exited 1 whatever the test returned, and left the rest of
@@ -4147,13 +4678,27 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         for note in dead_service_port_notes(&dead, &boxes, use_pod, &address_plan) {
             eprintln!("kern: note: {note}");
         }
-        return Err(Error::Compose(format!(
-            "{} service(s) died within {BRING_UP_SETTLE_MS}ms of starting: {}\n  the rest of the \
+        let when = if window == 0 {
+            "the bring-up".to_string()
+        } else {
+            format!("{window}ms of starting")
+        };
+        let msg = format!(
+            "{} service(s) died within {when}: {}\n  the rest of the \
              stack is still running; inspect with `kern compose {file} logs <service>`\n  (`up` \
              reports deaths at STARTUP; a service that dies later is not detected yet)",
             dead.len(),
             dead.join(", ")
-        )));
+        );
+        // ⛔ DOCKER'S EXIT CODE: `up` started what it was asked to start, and a container that then
+        // exits is a fact about the container, not a failed `up`. MEASURED on Docker Compose
+        // 5.3.1: `up -d` with a service that dies at once exits 0, and `up -d --wait` exits 1. kern
+        // exited 1 for both. The sentence is still printed, on stderr, where Docker prints its
+        // progress; `--wait` still fails, as it asked for running services.
+        if wait_ready {
+            return Err(Error::Compose(msg));
+        }
+        eprintln!("kern: warning: compose: {msg}");
     }
     // Told to the guard BEFORE the line is printed, so the two numbers come from one place: if the
     // whole stack has exited by the time the guard runs, its message says how many services this
@@ -4163,7 +4708,7 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     }
     // THE BRING-UP FAILED FOR SOME SERVICES, AND THE REST RUNS: said as Docker says it, with exit 1.
     if let Some((first, e)) = failed.first() {
-        let short = |n: &str| n.strip_prefix(&format!("{pod}-")).unwrap_or(n).to_string();
+        let short = |n: &str| short_service_name(&boxes, n, &pod);
         let mut msg = format!("service '{}': {e}", short(first));
         for (n, e) in failed.iter().skip(1) {
             msg.push_str(&format!("\n  service '{}': {e}", short(n)));
@@ -4235,7 +4780,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
     if abort_on_exit {
         return watch_and_abort(&mine, &boxes, &pod, exit_code_from);
     }
-    if !detach {
+    // ⛔ ONLY `up` FOLLOWS THE STACK. `start` and `restart` reach this line too, and they followed
+    // the logs on a terminal and stopped the stack on Ctrl-C: MEASURED on Docker Compose 5.3.1,
+    // `docker compose restart rest` and `docker compose start rest` return at once with exit 0 on a
+    // terminal, and kern's `restart rest` did not return, and interrupted it left `rest` STOPPED.
+    if !detach && action == ComposeAction::Up {
         if should_attach(detach, unsafe { libc::isatty(1) } == 1) {
             return attach_to_stack(&mine, &boxes, &pod, file);
         }
@@ -4245,24 +4794,11 @@ pub fn compose(o: ComposeOpts<'_>) -> Result<(), Error> {
         // 124, and so does a plain redirect and a run with stdin closed; only `-d` exits 0), so
         // this line is where kern says it did something else and why the reader may not have
         // noticed.
-        //
-        // ⛔ IT NAMES THE VERB THAT RAN, and before this it always said `up`. Three verbs reach this
-        // line - `up`, `start` and `restart` - and the two that are not `up` were handed a sentence
-        // about a command they did not type, pointing at a `-d` flag they cannot pass and claiming
-        // parity with `docker compose up`, which is not what they are. The mechanism the note
-        // describes is the same for all three; the words around it were only ever true for one.
-        match action {
-            ComposeAction::Up => eprintln!(
-                "kern: note: stdout is not a terminal, so `up` returned instead of streaming the \
-                 stack. `-d` says so explicitly; on a terminal it follows the logs and Ctrl-C stops \
-                 the stack, as `docker compose up` does."
-            ),
-            other => eprintln!(
-                "kern: note: stdout is not a terminal, so `{}` returned instead of streaming the \
-                 stack. On a terminal it follows the logs and Ctrl-C stops the stack.",
-                other.name()
-            ),
-        }
+        eprintln!(
+            "kern: note: stdout is not a terminal, so `up` returned instead of streaming the \
+             stack. `-d` says so explicitly; on a terminal it follows the logs and Ctrl-C stops \
+             the stack, as `docker compose up` does."
+        );
     }
     Ok(())
 }
@@ -4630,12 +5166,7 @@ fn watch_and_abort(
     let mut who = Vec::with_capacity(mine.len());
     for b in mine {
         let pid = registry::find_ref(&b.name).map_or(0, |ins| ins.pid);
-        match crate::commands::Followed::open(
-            b.service_name().to_string(),
-            b.name.clone(),
-            pid,
-            None,
-        ) {
+        match crate::commands::Followed::open(docker_log_label(b, pod), b.name.clone(), pid, None) {
             Ok(Some(f)) => who.push(f),
             Ok(None) => {}
             Err(e) => eprintln!("kern: warning: {}: {e}", b.service_name()),
@@ -4884,7 +5415,7 @@ fn attach_to_stack(
         // `None` replays the log from its start: the box was launched seconds ago, so this is
         // everything it has printed, which is what an attached `up` shows under Docker.
         match crate::commands::Followed::open(
-            b.service_name().to_string(),
+            docker_log_label(b, pod),
             b.name.clone(),
             ins.pid,
             None,
@@ -5353,10 +5884,25 @@ mod tests {
     /// printed the box name while claiming to print service names.
     ///
     /// This asserts the three things that were confused for one another, on one input.
+    /// Docker's container names: `<project>-<service>-1`, a replica `<project>-<service>-<k>`, a
+    /// `container_name:` as written; `depends_on` follows the box names.
+    #[test]
+    fn a_service_box_is_named_as_docker_names_its_container() {
+        let mut boxes = vec![svc("db", None), svc("web", None), svc("x", Some("ev-x"))];
+        let mut r = svc("web-2", None);
+        r.replica_of = Some("web".to_string());
+        r.depends_on = vec!["web".to_string(), "db".to_string()];
+        boxes.push(r);
+        resolve_box_names(&mut boxes, "proj", true);
+        let names: Vec<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["proj-db-1", "proj-web-1", "ev-x", "proj-web-2"]);
+        assert_eq!(boxes[3].depends_on, ["proj-web-1", "proj-db-1"]);
+    }
+
     #[test]
     fn a_container_name_renames_the_box_and_leaves_the_service_name_resolving() {
         let mut boxes = vec![svc("keycloak", Some("myapp-keycloak")), svc("db", None)];
-        let map = resolve_box_names(&mut boxes, "proj");
+        let map = resolve_box_names(&mut boxes, "proj", false);
 
         // 1. The BOX takes the container_name; without one it is the project-scoped form.
         assert_eq!(boxes[0].name, "myapp-keycloak");
@@ -5401,7 +5947,7 @@ mod tests {
             svc("migrate", Some("myapp-migrate")),
             api,
         ];
-        resolve_box_names(&mut boxes, "proj");
+        resolve_box_names(&mut boxes, "proj", false);
 
         let api = &boxes[3];
         assert_eq!(api.depends_on, vec!["proj-db".to_string()]);
@@ -5417,7 +5963,7 @@ mod tests {
         let mut orphan = svc("x", None);
         orphan.depends_on = vec!["nowhere".into()];
         let mut boxes = vec![orphan];
-        resolve_box_names(&mut boxes, "proj");
+        resolve_box_names(&mut boxes, "proj", false);
         assert_eq!(boxes[0].depends_on, vec!["proj-nowhere".to_string()]);
     }
 
@@ -5430,7 +5976,7 @@ mod tests {
         let mut b = svc("db", None);
         b.net_aliases = vec!["db".into(), "database".into()];
         let mut boxes = vec![b];
-        resolve_box_names(&mut boxes, "proj");
+        resolve_box_names(&mut boxes, "proj", false);
         assert_eq!(
             boxes[0].net_aliases,
             vec!["db".to_string(), "database".to_string()],

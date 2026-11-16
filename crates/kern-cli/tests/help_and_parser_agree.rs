@@ -523,21 +523,22 @@ fn start_and_rm_complete_from_kept_boxes_not_running_ones() {
     // be in the script and wired to nothing.
     let bash = script_of("bash");
     assert!(
-        bash.contains("        start|rm)"),
-        "bash: `start` and `rm` are not wired to the kept source:\n{bash}"
+        bash.contains("        start|rm|restart)"),
+        "bash: `start`, `rm` and `restart` are not wired to the kept source:\n{bash}"
     );
     let zsh = script_of("zsh");
     assert!(
-        zsh.contains("kept_verbs=(start rm)"),
-        "zsh: `start` and `rm` are not wired to the kept source:\n{zsh}"
+        zsh.contains("kept_verbs=(start rm restart)"),
+        "zsh: `start`, `rm` and `restart` are not wired to the kept source:\n{zsh}"
     );
     let fish = script_of("fish");
     assert!(
         fish.lines()
             .any(|l| l.contains("__fish_seen_subcommand_from start")
                 && l.contains("__fish_seen_subcommand_from rm")
+                && l.contains("__fish_seen_subcommand_from restart")
                 && l.contains(src)),
-        "fish: `start` and `rm` are not wired to the kept source:\n{fish}"
+        "fish: `start`, `rm` and `restart` are not wired to the kept source:\n{fish}"
     );
 }
 

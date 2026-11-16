@@ -705,9 +705,9 @@ pub fn last_hour_line(rows: &[Entry]) -> String {
     )
 }
 
-/// `HH:MM:SS` and a duration, for the TUI, which prints the same columns.
+/// The end as a local date and time, and a duration, for the TUI, which prints the same columns.
 pub fn ended_and_ran(e: &Entry) -> (String, String) {
-    (hms(e.ended_ms), dur(e.ran_ms))
+    (local_datetime(e.ended_ms), dur(e.ran_ms))
 }
 
 /// How long ago a process started, in milliseconds, from its kernel start time in clock ticks since
@@ -739,17 +739,30 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// `HH:MM:SS` of a Unix time in milliseconds, in the local zone.
-fn hms(ms: u64) -> String {
+/// `YYYY-MM-DD HH:MM:SS` of a Unix time in milliseconds, in the local zone: the shape Docker
+/// Desktop's log list uses.
+///
+/// THE DATE IS PART OF IT because the history outlives the day: kept on disk it spans reboots, and
+/// a column of bare `08:37:16` could not say which morning. Owner report 16/11, on a list of 1464
+/// sandboxes going back days.
+fn local_datetime(ms: u64) -> String {
     // 64-bit seconds, which is `time_t` on every target kern builds for (glibc and musl, x86_64 and
     // aarch64); the alias itself is deprecated in `libc` for musl, so it is not named here.
     let t = i64::try_from(ms / 1000).unwrap_or(0);
     // SAFETY: `localtime_r` reads `t` and writes only into `tm`, which lives on this stack frame.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r((&raw const t).cast(), &mut tm) }.is_null() {
-        return "--:--:--".into();
+        return "---------- --:--:--".into();
     }
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        i64::from(tm.tm_year) + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 /// `1.2s`, `340ms`, `3m05s`.
@@ -813,13 +826,13 @@ pub fn sandbox_cmd(cmd: &SandboxCmd) -> Result<(), crate::error::Error> {
                 return Ok(());
             }
             println!(
-                "{:<9} {:<24} {:<17} {:<26} {:>8}  {:<12} GPU",
+                "{:<19} {:<24} {:<17} {:<26} {:>8}  {:<12} GPU",
                 "ENDED", "NAME", "KIND", "IMAGE", "RAN", "OUTCOME"
             );
             for e in rows {
                 println!(
-                    "{:<9} {:<24} {:<17} {:<26} {:>8}  {:<12} {}",
-                    hms(e.ended_ms),
+                    "{:<19} {:<24} {:<17} {:<26} {:>8}  {:<12} {}",
+                    local_datetime(e.ended_ms),
                     cut(&e.name, 24),
                     e.kind(),
                     cut(&e.image, 26),

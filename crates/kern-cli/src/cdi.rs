@@ -1556,18 +1556,28 @@ containerEdits:
     #[test]
     fn the_spec_and_the_discovery_name_the_same_nodes_for_the_same_card() {
         let root = Path::new("/");
-        let specs = find_specs(root, None);
-        let Some(spec_path) = specs.first() else {
-            eprintln!("skip: no CDI spec in /etc/cdi or /var/run/cdi on this host");
+        // THE GPU'S SPEC, NOT THE FIRST ONE: a host can carry specs for other devices, and comparing
+        // one of those with the GPU's discovery compares two different things. MEASURED on a Jetson
+        // Orin Nano, whose only spec is `nvidia.com/pva` (its vision accelerator): device "0" of that
+        // spec names no node, and this failed as if the GPU's spec and discovery disagreed.
+        let mut gpu_spec = None;
+        for spec_path in find_specs(root, None) {
+            let Ok(text) = std::fs::read_to_string(&spec_path) else {
+                eprintln!("skip: {} is not readable", spec_path.display());
+                continue;
+            };
+            let spec = match parse_spec(&text) {
+                Ok(s) => s,
+                Err(e) => panic!("the host's spec must parse: {}", e.describe()),
+            };
+            if spec.kind == "nvidia.com/gpu" {
+                gpu_spec = Some(spec);
+                break;
+            }
+        }
+        let Some(spec) = gpu_spec else {
+            eprintln!("skip: no nvidia.com/gpu CDI spec in /etc/cdi or /var/run/cdi on this host");
             return;
-        };
-        let Ok(text) = std::fs::read_to_string(spec_path) else {
-            eprintln!("skip: {} is not readable", spec_path.display());
-            return;
-        };
-        let spec = match parse_spec(&text) {
-            Ok(s) => s,
-            Err(e) => panic!("the host's spec must parse: {}", e.describe()),
         };
 
         let native = match crate::gpu_grant::resolve() {

@@ -1064,7 +1064,15 @@ pub fn create_with_range(
     // `None` means "not attempted" (`--no-outbound`), and each `Some` is a real outcome. The
     // alternative was a dummy `Outbound` value standing in for "not consulted", which is a lie the
     // type would then carry to every reader of the match below.
-    let outbound = want_outbound.then(|| setup_outbound(name, pid));
+    //
+    // A COMPOSE STACK ON BRIDGES GETS NO NAT ON ITS HOLDER, because nothing is in the holder's
+    // namespace: every service is on a bridge with its own NAT and its own resolvers, and so is a
+    // box that joins the stack later (`stack_network_join`). The holder's pasta was spawned and
+    // waited for before any service could start, about 13 ms on a desktop (pasta alone, medians of
+    // 8), for a route no process used. An operator's `pod create --bridge` keeps it: its members may
+    // share the holder's namespace.
+    let members_carry_their_own = origin == PodOrigin::Derived && !bridges.is_empty();
+    let outbound = (want_outbound && !members_carry_their_own).then(|| setup_outbound(name, pid));
     // WHICH STREAM THIS NARRATION GOES TO IS THE CALLER'S BUSINESS, and `compose run` is why: that
     // verb's stdout belongs to the WORKLOAD. A caller doing
     // `state=$(docker compose run --rm -T svc sh -c 'printf skipped')` got these three lines ahead of
@@ -1082,6 +1090,9 @@ pub fn create_with_range(
     // One line per CAUSE. This was one line for five different states, and the one it printed told
     // a user with pasta installed to install pasta.
     match outbound {
+        None if want_outbound && members_carry_their_own => {
+            say!("  network: a bridge per network; each service gets its own NAT (pasta)")
+        }
         None => {
             say!("  network: loopback-only (--no-outbound) - services reach each other; no egress")
         }
@@ -1364,6 +1375,195 @@ fn pasta_reason(stderr: &[u8]) -> String {
     .collect::<String>()
 }
 
+/// What to do when SELinux is why pasta could not enter a namespace, or `None` when it is not.
+///
+/// MEASURED in an openSUSE Leap 16 VM (SELinux enforcing, passt-selinux 2025-04): pasta is refused
+/// every namespace of an `unconfined_t` process ("Couldn't open user namespace /proc/<pid>/ns/user:
+/// Permission denied"), with `/proc` paths and with bind mounts alike, so on that host no stack and no
+/// one-off ever reached the internet. Making `pasta_t` permissive did not change it, and running pasta
+/// in the caller's own domain did not either: the refusal follows the domain of the process whose
+/// namespace is opened. Rootless podman works there because its processes run as
+/// `container_runtime_t`, and kern relabelled to that type's entry point got its NAT
+/// (`SVC-NET=ok`). A relabel of a binary is the administrator's decision, so kern says it and does not
+/// do it. Said only where all three hold: enforcing, kern unconfined, and pasta's own refusal.
+fn selinux_pasta_hint(why: &str, enforcing: bool, label: &str) -> Option<String> {
+    if !selinux_blocks_pasta(why, enforcing, label) {
+        return None;
+    }
+    let me = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "kern".to_string());
+    Some(format!(
+        "SELinux refuses pasta the namespaces of an unconfined process here; labelled as a container \
+         runtime, as podman is, kern gets through: `chcon -t container_runtime_exec_t {me}` (the type \
+         comes with container-selinux, which podman installs; the installer applies it where needed)"
+    ))
+}
+
+/// THE ONE DEFINITION of "SELinux is why pasta was refused", for the failure message, the probe that
+/// `kern doctor` and the installer read, and nothing else: pasta's own namespace-open refusal, on an
+/// enforcing host, with kern in the unconfined domain (relabelled, it is `container_runtime_t`).
+fn selinux_blocks_pasta(why: &str, enforcing: bool, label: &str) -> bool {
+    let refused = (why.contains("Couldn't open user namespace")
+        || why.contains("Couldn't open network namespace"))
+        && why.contains("Permission denied");
+    refused && enforcing && label.contains(":unconfined_t:")
+}
+
+/// This process's SELinux facts: whether the host enforces, and kern's own label (empty without
+/// SELinux).
+fn selinux_state() -> (bool, String) {
+    (
+        std::fs::read_to_string("/sys/fs/selinux/enforce").is_ok_and(|e| e.trim() == "1"),
+        std::fs::read_to_string("/proc/self/attr/current")
+            .map(|l| l.trim_end_matches(['\0', '\n']).to_string())
+            .unwrap_or_default(),
+    )
+}
+
+/// What [`pasta_probe`] found.
+#[derive(Debug)]
+pub enum PastaProbe {
+    /// pasta attached its NAT to a box-shaped namespace.
+    Up,
+    /// No `pasta` on `PATH`.
+    NotInstalled,
+    /// SELinux refused it (see [`selinux_blocks_pasta`]), with pasta's words.
+    SelinuxRefused(String),
+    /// Anything else, with the reason.
+    Failed(String),
+}
+
+/// Attach pasta, through the SAME path a stack service takes (`setup_outbound_in`), to a throwaway
+/// process holding its own user and network namespace, and say what happened. The process and its
+/// pasta are gone when this returns, and so is the stack directory the NAT's state was kept in.
+///
+/// EXERCISED, NOT INSPECTED, because the refusal it exists for cannot be read off the host: on
+/// openSUSE Leap 16 the policy refuses pasta every namespace of an unconfined process and logs no AVC
+/// (a `dontaudit`), while Fedora 45, also enforcing, lets the same call through. Only the attempt
+/// tells them apart.
+pub fn pasta_probe() -> PastaProbe {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if which_pasta().is_none() {
+        return PastaProbe::NotInstalled;
+    }
+    let stack = match crate::relayhold::stack_dir(&format!("pasta-probe-{}", std::process::id())) {
+        Ok(d) => d,
+        Err(e) => return PastaProbe::Failed(format!("no directory for the probe's NAT: {e}")),
+    };
+    let pipe = || -> Option<(OwnedFd, OwnedFd)> {
+        let mut fds = [-1i32; 2];
+        // SAFETY: `fds` is a two-element array, which is what `pipe2` writes.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return None;
+        }
+        // SAFETY: both descriptors were just returned by `pipe2` and are owned by nothing else.
+        Some(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    };
+    let (Some((ready_r, ready_w)), Some((hold_r, hold_w))) = (pipe(), pipe()) else {
+        return PastaProbe::Failed(format!("no pipe ({})", std::io::Error::last_os_error()));
+    };
+    // SAFETY: the child below makes only async-signal-safe system calls and `_exit`s, so it is
+    // sound whatever threads this process has.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return PastaProbe::Failed(format!("fork: {}", std::io::Error::last_os_error()));
+    }
+    if child == 0 {
+        // CHILD: its own user and network namespace, a byte when they exist, then wait for EOF.
+        // The parent's ends are closed FIRST: a child holding its own copy of the hold pipe's write
+        // end never reads EOF on it (MEASURED: the first version waited ten minutes).
+        // SAFETY: plain system calls on descriptors this process owns, and `_exit`.
+        unsafe {
+            libc::close(ready_r.as_raw_fd());
+            libc::close(hold_w.as_raw_fd());
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
+                libc::_exit(1);
+            }
+            let one = [1u8];
+            libc::write(ready_w.as_raw_fd(), one.as_ptr().cast(), 1);
+            let mut b = [0u8; 1];
+            while libc::read(hold_r.as_raw_fd(), b.as_mut_ptr().cast(), 1) < 0
+                && *libc::__errno_location() == libc::EINTR
+            {}
+            libc::_exit(0);
+        }
+    }
+    drop(ready_w);
+    drop(hold_r);
+    let mut b = [0u8; 1];
+    let ready = loop {
+        // SAFETY: a valid descriptor and a one-byte buffer.
+        let n = unsafe { libc::read(ready_r.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break n == 1;
+    };
+    let outcome = if ready {
+        // The map is written from OUTSIDE, as the owner: uid 0 inside is the caller, the shape every
+        // rootless box has.
+        let (uid, gid) = (unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+        let mapped = std::fs::write(format!("/proc/{child}/setgroups"), "deny")
+            .and_then(|()| std::fs::write(format!("/proc/{child}/uid_map"), format!("0 {uid} 1")))
+            .and_then(|()| std::fs::write(format!("/proc/{child}/gid_map"), format!("0 {gid} 1")));
+        match mapped {
+            Err(e) => Outbound::Failed(format!("the probe's namespace could not be mapped: {e}")),
+            Ok(()) => {
+                let dir = stack.join("outbound").join("probe");
+                match std::fs::create_dir_all(&dir) {
+                    Ok(()) => setup_outbound_in(&dir, child, PASTA_IF_ALONE),
+                    Err(e) => Outbound::Failed(format!("could not create {}: {e}", dir.display())),
+                }
+            }
+        }
+    } else {
+        Outbound::Failed("this host refused the probe a user and network namespace".to_string())
+    };
+    // The namespace goes first, so a watching pasta leaves by itself; the stop is the backstop. The
+    // kill makes the reap unconditional: the child has nothing left to do but wait.
+    drop(hold_w);
+    // SAFETY: `child` is this process's own unreaped child, so the pid cannot have been recycled.
+    unsafe { libc::kill(child, libc::SIGKILL) };
+    crate::eintr::reap(child);
+    stop_stack_outbound_nats(&stack);
+    let _ = std::fs::remove_dir_all(&stack);
+    match outcome {
+        Outbound::Up | Outbound::NoDns => PastaProbe::Up,
+        Outbound::NotInstalled => PastaProbe::NotInstalled,
+        Outbound::Failed(why) => {
+            let (enforcing, label) = selinux_state();
+            if selinux_blocks_pasta(&why, enforcing, &label) {
+                // pasta's words alone: the failure path appended the hint, and the readers of this
+                // probe (`kern doctor`, the installer) say the remedy themselves.
+                let words = selinux_pasta_hint(&why, enforcing, &label)
+                    .and_then(|h| why.strip_suffix(&format!(". {h}")).map(str::to_string))
+                    .unwrap_or(why);
+                PastaProbe::SelinuxRefused(words)
+            } else {
+                PastaProbe::Failed(why)
+            }
+        }
+    }
+}
+
+/// `kern __pasta-probe`, for the installer: exit 0 attached, 2 no pasta, 3 refused by SELinux, 4
+/// anything else, the reason on stderr for the last two.
+pub fn pasta_probe_verb() -> i32 {
+    match pasta_probe() {
+        PastaProbe::Up => 0,
+        PastaProbe::NotInstalled => 2,
+        PastaProbe::SelinuxRefused(why) => {
+            eprintln!("{why}");
+            3
+        }
+        PastaProbe::Failed(why) => {
+            eprintln!("{why}");
+            4
+        }
+    }
+}
+
 /// Why a pod did or did not get outbound. One `bool` used to cover all of these, and `create`
 /// printed the same "install `passt`/`pasta` for egress" line for every one of them - including to
 /// someone who had `pasta` installed and whose real problem was that it refused to start. Measured
@@ -1582,7 +1782,15 @@ fn setup_outbound_in(dir: &std::path::Path, holder: i32, ns_ifname: &str) -> Out
                 }
             }
         }
-        Ok(o) => return Outbound::Failed(pasta_reason(&o.stderr)),
+        Ok(o) => {
+            let why = pasta_reason(&o.stderr);
+            let (enforcing, label) = selinux_state();
+            let hint = selinux_pasta_hint(&why, enforcing, &label);
+            return Outbound::Failed(match hint {
+                Some(h) => format!("{why}. {h}"),
+                None => why,
+            });
+        }
         Err(e) => return Outbound::Failed(e.to_string()),
     }
     // Seed the pod resolv.conf with the host's real (non-loopback) nameservers - reachable through
@@ -1717,8 +1925,19 @@ pub fn stop_stack_outbound_nats(stack_dir: &std::path::Path) -> usize {
         signalled.push(pid);
     }
     if !signalled.is_empty() {
-        // The same budget `stop_pasta` uses: pasta was measured leaving about 30 ms after SIGTERM.
-        std::thread::sleep(std::time::Duration::from_millis(PASTA_STOP_BUDGET_MS));
+        // The same budget `stop_pasta` uses (pasta was measured leaving about 30 ms after SIGTERM),
+        // POLLED with its backoff and NOT SLEPT whole: the flat sleep made every `down` of a stack
+        // with outbound NATs cost the full quarter second. MEASURED on this project's desktop:
+        // `compose down -t 0` of three services took 258 ms, 250 of them this sleep.
+        let gone = |pid: &i32| unsafe { libc::kill(*pid, 0) } != 0 || proc_is_zombie(*pid);
+        let (mut waited, mut step) = (0u64, 1u64);
+        // Steps capped at 8 ms: pasta leaves ~20 ms after SIGTERM (MEASURED here), and doubling to
+        // 32 ms overshot it by up to 30 ms, which `down` paid on every other run.
+        while waited < PASTA_STOP_BUDGET_MS && !signalled.iter().all(gone) {
+            std::thread::sleep(std::time::Duration::from_millis(step));
+            waited += step;
+            step = (step * 2).min(8);
+        }
         for pid in &signalled {
             // SAFETY: same argument; `kill(pid, 0)` only asks whether it is still there.
             unsafe {
@@ -2327,9 +2546,184 @@ fn validate_name(name: &str) -> Result<(), Error> {
     }
 }
 
+/// One network of a compose stack on a bridge, as the stack's `up` recorded it for a box that
+/// joins later (`kern box --network <project>_<network>`): which of the pod's bridges carries it,
+/// its prefix, and every name on it with the address it answers on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeNetwork {
+    pub network: String,
+    pub bridge: u8,
+    pub prefix: u8,
+    pub hosts: Vec<(std::net::Ipv4Addr, String)>,
+    /// The file marks this network `internal: true`: a box joining it later gets no NAT, as its
+    /// services got none. Recorded as a fourth word on the header line, `internal`.
+    pub internal: bool,
+}
+
+/// The directory of a pod's recorded networks.
+fn networks_dir(pod: &str) -> PathBuf {
+    pod_dir(pod).join("networks")
+}
+
+/// A network name that can be a file name: the compose charset, no leading `.`.
+fn network_file_name_ok(n: &str) -> bool {
+    !n.is_empty()
+        && !n.starts_with('.')
+        && n.len() <= 128
+        && n.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// Record the networks of a stack on a bridge, replacing what an earlier `up` recorded. A network
+/// whose name cannot be a file name is not recorded, which only means a later box cannot name it.
+pub fn write_bridge_networks(pod: &str, nets: &[BridgeNetwork]) -> std::io::Result<()> {
+    let dir = networks_dir(pod);
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    for n in nets.iter().filter(|n| network_file_name_ok(&n.network)) {
+        let mut text = format!(
+            "bridge {} {}{}\n",
+            n.bridge,
+            n.prefix,
+            if n.internal { " internal" } else { "" }
+        );
+        for (ip, name) in &n.hosts {
+            text.push_str(&format!("{ip} {name}\n"));
+        }
+        let tmp = dir.join(format!(".{}.tmp", n.network));
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, dir.join(&n.network))?;
+    }
+    Ok(())
+}
+
+/// The networks [`write_bridge_networks`] recorded for `pod`, sorted by name; empty for a pod whose
+/// stack is not on a bridge. A file that does not read is skipped.
+pub fn bridge_networks(pod: &str) -> Vec<BridgeNetwork> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(networks_dir(pod)) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let network = e.file_name().to_string_lossy().into_owned();
+        if !network_file_name_ok(&network) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        let mut lines = text.lines();
+        let Some(head) = lines.next() else {
+            continue;
+        };
+        let mut w = head.split_whitespace();
+        let (Some("bridge"), Some(b), Some(p)) = (w.next(), w.next(), w.next()) else {
+            continue;
+        };
+        let (Ok(bridge), Ok(prefix)) = (b.parse::<u8>(), p.parse::<u8>()) else {
+            continue;
+        };
+        // A fourth word other than `internal` is not a record this wrote: skipped, as an unreadable
+        // file is, rather than read as a network with egress.
+        let internal = match (w.next(), w.next()) {
+            (None, _) => false,
+            (Some("internal"), None) => true,
+            _ => continue,
+        };
+        let hosts = lines
+            .filter_map(|l| {
+                let (ip, name) = l.split_once(' ')?;
+                Some((ip.parse().ok()?, name.to_string()))
+            })
+            .collect();
+        out.push(BridgeNetwork {
+            network,
+            bridge,
+            prefix,
+            hosts,
+            internal,
+        });
+    }
+    out.sort_by(|a, b| a.network.cmp(&b.network));
+    out
+}
+
+/// Reserve `ip` on bridge `bridge` of `pod` for this process: a lease file created exclusively,
+/// so two boxes joining at once cannot take one address. A lease whose process is gone is taken
+/// over; one this process already holds (the scope re-exec runs the same pid) is kept.
+pub fn lease_bridge_addr(pod: &str, bridge: u8, ip: std::net::Ipv4Addr) -> bool {
+    let dir = pod_dir(pod).join("leases");
+    if std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .is_err()
+    {
+        return false;
+    }
+    // ⛔ UNDER ONE LOCK, the create, the read of a holder and its takeover. Without it a joiner
+    // could read a lease another had created and not yet written, take the empty file for a stale
+    // one and both kept the address; or two joiners took over one stale lease, the second deleting
+    // the first's fresh one. The kernel drops the lock with the process.
+    use std::os::fd::AsRawFd;
+    let Ok(lock) = std::fs::File::create(dir.join(".lock")) else {
+        return false;
+    };
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+    let path = dir.join(format!("{bridge}-{ip}"));
+    let me = std::process::id();
+    let holder = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| t.trim().parse::<i32>().ok());
+    match holder {
+        Some(pid) if pid as u32 == me => true,
+        Some(pid) if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 => false,
+        // Absent, unreadable, or its process gone: written whole, then put in place.
+        _ => {
+            let tmp = dir.join(format!(".{bridge}-{ip}.{me}"));
+            std::fs::write(&tmp, me.to_string()).is_ok() && std::fs::rename(&tmp, &path).is_ok()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SELinux hint appears for pasta's namespace refusal on an enforcing host with kern
+    /// unconfined, and for nothing else: a permissive host, a kern already relabelled, a host with
+    /// no label, or another pasta failure each get pasta's own words alone.
+    #[test]
+    fn the_selinux_hint_names_the_relabel_only_for_that_refusal() {
+        let refusal = "Couldn't open user namespace /proc/2543/ns/user: Permission denied";
+        let me = "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023";
+        assert!(selinux_pasta_hint(refusal, true, me)
+            .is_some_and(|h| h.contains("chcon -t container_runtime_exec_t")));
+        let net = "Couldn't open network namespace /x: Permission denied";
+        assert!(selinux_pasta_hint(net, true, me).is_some());
+        assert!(
+            selinux_pasta_hint(refusal, false, me).is_none(),
+            "permissive"
+        );
+        let relabelled = "unconfined_u:unconfined_r:container_runtime_t:s0";
+        assert!(selinux_pasta_hint(refusal, true, relabelled).is_none());
+        assert!(selinux_pasta_hint(refusal, true, "").is_none(), "no label");
+        let other = "TUNSETIFF failed: Invalid argument";
+        assert!(selinux_pasta_hint(other, true, me).is_none());
+        let gone = "Couldn't open user namespace /proc/1/ns/user: No such file or directory";
+        assert!(selinux_pasta_hint(gone, true, me).is_none());
+    }
 
     /// PODS RESOLVE THEIR DIRECTORY THE WAY EVERY OTHER RUNTIME CHILD DOES, and the regression this
     /// pins is a SECOND resolution existing at all.

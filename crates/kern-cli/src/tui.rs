@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::time::Instant;
 
-const TABS: [&str; 8] = [
+const TABS: [&str; 9] = [
     "Overview",
     "Boxes",
     "Runs",
@@ -37,6 +37,7 @@ const TABS: [&str; 8] = [
     "Profiles",
     "Storage",
     "Sandboxes",
+    "Logs",
 ];
 /// How long the FIRST poll waits before the first periodic refresh, in milliseconds.
 ///
@@ -57,6 +58,8 @@ const TAB_PROFILES: usize = 5;
 const TAB_STORAGE: usize = 6;
 /// The SDK and MCP sandboxes: the ones running and the ones that finished (see `history.rs`).
 const TAB_SANDBOXES: usize = 7;
+/// Every box's output in one stream: see [`crate::logview`].
+const TAB_LOGS: usize = 8;
 
 /// What the TUI is doing right now: plain navigation, or a modal layered over it.
 enum Mode {
@@ -512,6 +515,18 @@ pub fn run() -> Result<(), crate::error::Error> {
     // `q` never quit. They are queued here and dispatched one per turn instead.
     let mut keyq: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
 
+    // Measured once at the start, off this thread, so the first visit to Storage normally finds the
+    // sizes already there; after that only while the tab is on screen.
+    let mut sizer = VolumeSizer::default();
+    sizer.kick();
+    // The Logs tab: inert (no watch, no read) until the tab is shown.
+    let mut logs = crate::logview::LogView::default();
+    // When the last periodic refresh ran. The refresh is owed every `STEADY_WAIT_MS` whatever else
+    // wakes the loop: the Logs tab wakes it up to twenty times a second, and a refresh that waited
+    // for a quiet second would then never come.
+    let mut last_refresh = Instant::now();
+    // Set by a wake that has nothing new for the screen; the next turn skips the paint once.
+    let mut skip_paint = false;
     let mut snap = refresh_full(
         &mut prev,
         &mut prev_cpu,
@@ -529,6 +544,7 @@ pub fn run() -> Result<(), crate::error::Error> {
             &snap.profs,
             &snap.vols,
             &snap.builds,
+            snap.builds_total,
             &snap.images,
             &snap.sbx,
         );
@@ -544,46 +560,71 @@ pub fn run() -> Result<(), crate::error::Error> {
         //
         // It costs one `is_none()` scan of a list that is at most a few dozen long on every other
         // frame, and it cannot loop: after the walk every entry is `Some`.
-        if tab == TAB_STORAGE && snap.vols.iter().any(|v| v.size.is_none()) {
-            snap.vols = crate::volume::entries_with(crate::volume::Sizes::Measure);
+        //
+        // THE SIZES COME FROM A CHILD, NOT FROM THIS THREAD. Measuring is a recursive walk of every
+        // volume: MEASURED on a desktop with 556 volumes, 60 ms on the first visit and again on
+        // every 1 s refresh while the tab was shown (5.8 % of a core), on the thread that reads
+        // keys. A child (`kern __volume-sizes`) measures now, its output is read when `poll` says
+        // so, and every frame shows the latest sizes it has. Not a thread: this process runs
+        // lifecycle actions in-process, and kern's fork paths assume one thread.
+        if tab == TAB_STORAGE {
+            sizer.want_fresh();
         }
+        sizer.fill(&mut snap.vols);
+        logs.set_active(tab == TAB_LOGS);
         // The same repair for the two count-only lists, and the condition is `total > 0` rather
         // than `!is_empty()`: an empty store leaves the vec legitimately empty, and testing the vec
         // alone would re-read the directory on every single frame of an empty tab.
-        if tab == TAB_BUILDS && snap.builds.is_empty() && snap.builds_total > 0 {
-            snap.set_builds(crate::builds::list_with(crate::listing::Detail::Read));
+        if tab == TAB_BUILDS
+            && (snap.builds.is_empty()
+                || builds_reach(
+                    sel,
+                    snap.builds.len(),
+                    snap.builds_total,
+                    term_rows.saturating_sub(17).max(1),
+                ))
+            && snap.builds_total > 0
+        {
+            snap.set_builds(builds_listing(crate::listing::Detail::Read));
         }
         if tab == TAB_IMAGES && snap.images.is_empty() && snap.images_total > 0 {
             snap.set_images(crate::commands::image_entries_with(
                 crate::listing::Detail::Read,
             ));
         }
-        let frame = render(
-            &p,
-            tab,
-            &snap.rows,
-            &snap.host,
-            &snap.profs,
-            &snap.vols,
-            &snap.builds,
-            snap.builds_total,
-            &snap.images,
-            snap.images_total,
-            cols,
-            term_rows,
-            sel,
-            &mode,
-        );
-        // The frame is already capped to `term_rows` by `render` itself - one place decides the
-        // height, so this loop cannot disagree with it.
-        // Clear each line to end-of-line (`\x1b[K`) so a shorter/blank line in the new frame wipes
-        // any leftover text from the previous one (no residue, no flicker), then erase everything
-        // below the frame (`\x1b[J`) in case the new frame has fewer lines.
-        let painted = frame.replace('\n', "\x1b[K\n");
-        let _ = out.write_all(b"\x1b[H"); // cursor home
-        let _ = out.write_all(painted.as_bytes());
-        let _ = out.write_all(b"\x1b[J");
-        let _ = out.flush();
+        // A wake that brought nothing to show (a log event whose read is still paced) draws no
+        // frame: under a writing box those were most of the wakes.
+        if std::mem::take(&mut skip_paint) {
+            // Straight to the wait below.
+        } else {
+            let frame = render(
+                &p,
+                tab,
+                &snap.rows,
+                &snap.host,
+                &snap.profs,
+                &snap.vols,
+                &snap.builds,
+                snap.builds_total,
+                &snap.images,
+                snap.images_total,
+                cols,
+                term_rows,
+                sel,
+                &mode,
+                &logs,
+            );
+            // The frame is already capped to `term_rows` by `render` itself - one place decides the
+            // height, so this loop cannot disagree with it.
+            // Clear each line to end-of-line (`\x1b[K`) so a shorter/blank line in the new frame wipes
+            // any leftover text from the previous one (no residue, no flicker), then erase everything
+            // below the frame (`\x1b[J`) in case the new frame has fewer lines.
+            let painted = frame.replace('\n', "\x1b[K\n");
+            let _ = out.write_all(b"\x1b[H"); // cursor home
+            let _ = out.write_all(painted.as_bytes());
+            let _ = out.write_all(b"\x1b[J");
+            let _ = out.flush();
+        }
 
         // Wait for a key, a registry change (inotify), or ~1 s (the CPU%/stats window). A registry
         // change wakes us instantly (no poll lag); the timer keeps stats fresh even when idle.
@@ -601,10 +642,22 @@ pub fn run() -> Result<(), crate::error::Error> {
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                // The volume sizer's output while a measurement runs (see `VolumeSizer`).
+                libc::pollfd {
+                    fd: sizer.fd().unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                // The Logs tab's watch on the logs directory, while the tab is shown.
+                libc::pollfd {
+                    fd: logs.fd().unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
-            // Only the first slot is guaranteed valid: the inotify fd is absent when the watch could
-            // not be opened. Polling the whole array would hand `poll` a stale descriptor.
-            let nfds = (if ino_fd >= 0 { 2 } else { 1 }).min(pfds.len());
+            // An absent descriptor (no inotify watch, no measurement running) is `-1`, which `poll`
+            // ignores by definition: the slot reports nothing rather than a stale descriptor.
+            let nfds = pfds.len();
             // THE FIRST WAIT IS SHORT, AND ONLY THE FIRST. Host CPU% is a DELTA: the opening
             // frame has no previous sample, so it necessarily reads 0% and stays wrong until the
             // second refresh. With a flat 1000 ms that is a full second of a screen showing zeros,
@@ -616,13 +669,25 @@ pub fn run() -> Result<(), crate::error::Error> {
             // It is not kept short: a 120 ms cadence would re-walk `/proc` eight times a second
             // for a number that does not move that fast. After the first timeout this returns to
             // 1000 ms for the rest of the session.
-            let timeout_ms = if first_wait {
+            let period = if first_wait {
                 FIRST_WAIT_MS
             } else {
                 STEADY_WAIT_MS
             };
+            let since = i32::try_from(last_refresh.elapsed().as_millis()).unwrap_or(i32::MAX);
+            let refresh_in = period.saturating_sub(since).max(0);
+            let timeout_ms = logs.wait_ms().map_or(refresh_in, |w| {
+                refresh_in.min(i32::try_from(w).unwrap_or(i32::MAX))
+            });
             if crate::eintr::poll(&mut pfds[..nfds], timeout_ms) <= 0 {
+                let fresh_lines = logs.due() && logs.pump();
+                if last_refresh.elapsed().as_millis() < u128::try_from(period).unwrap_or(0) {
+                    // Nothing for the frame unless lines were read: no repaint for nothing.
+                    skip_paint = !fresh_lines;
+                    continue;
+                }
                 first_wait = false;
+                last_refresh = Instant::now();
                 snap = refresh_full(
                     &mut prev,
                     &mut prev_cpu,
@@ -633,6 +698,25 @@ pub fn run() -> Result<(), crate::error::Error> {
                     tab,
                 ); // timeout → periodic refresh (CPU% window)
                 continue;
+            }
+            // A MEASUREMENT LANDED: the sizes reach the frame drawn next, without a key, and the
+            // walk that produced them ran in another process.
+            if pfds[2].revents != 0 {
+                sizer.on_readable();
+                if pfds[0].revents & libc::POLLIN == 0 && pfds[1].revents & libc::POLLIN == 0 {
+                    continue;
+                }
+            }
+            // LOG FILES GREW: note which, and read them when the pacing allows. A frame is drawn
+            // only when lines were actually read, so a burst of writes costs one frame per
+            // `PUMP_EVERY_MS`, not one per write.
+            if pfds[3].revents != 0 {
+                logs.on_readable();
+                let fresh_lines = logs.due() && logs.pump();
+                if pfds[0].revents & libc::POLLIN == 0 && pfds[1].revents & libc::POLLIN == 0 {
+                    skip_paint = !fresh_lines;
+                    continue;
+                }
             }
             // A registry change woke us: drain the inotify queue and refresh NOW. If no key is also
             // pending, re-render and wait again - no 1 s lag on box appear/disappear.
@@ -728,6 +812,20 @@ pub fn run() -> Result<(), crate::error::Error> {
             },
             // Normal navigation.
             Mode::Nav => {
+                // THE LOGS TAB SEES THE KEY FIRST: while a search is typed it takes every key,
+                // `q` included, and its own keys (`/ e s f x c`, the arrows) are not the other
+                // tabs' (`s` stops a box on Boxes). What it does not use goes on as usual.
+                if tab == TAB_LOGS {
+                    let page = term_size().1.saturating_sub(16).max(1);
+                    match logs.handle_key(key, page) {
+                        crate::logview::KeyOutcome::Consumed => continue,
+                        crate::logview::KeyOutcome::Overlay(text) => {
+                            mode = Mode::Overlay(text);
+                            continue;
+                        }
+                        crate::logview::KeyOutcome::Ignored => {}
+                    }
+                }
                 if is_quit(key) {
                     break;
                 }
@@ -754,11 +852,13 @@ pub fn run() -> Result<(), crate::error::Error> {
             snap.rows = rows;
             snap.cfg = crate::config::load(None).unwrap_or_default();
             snap.profs = profile_rows(&snap.cfg);
-            snap.vols = crate::volume::entries_with(size_policy(tab));
+            snap.vols = crate::volume::entries_with(crate::volume::Sizes::Skip);
+            // A volume created or removed changes what there is to measure.
+            sizer.stale();
             // Also re-read the lists whose tabs now mutate (Images `d`/`p`, Builds `d`) so a deleted row
             // disappears on the very next frame, not on the ≤1 s periodic refresh (inotify watches the
             // box registry, not the image cache / build history).
-            snap.set_builds(crate::builds::list_with(detail_policy(tab, TAB_BUILDS)));
+            snap.set_builds(builds_listing(detail_policy(tab, TAB_BUILDS)));
             snap.set_images(crate::commands::image_entries_with(detail_policy(
                 tab, TAB_IMAGES,
             )));
@@ -780,6 +880,9 @@ fn tab_list_len(
     profs: &[ProfRow],
     vols: &[crate::volume::VolInfo],
     builds: &[crate::builds::Record],
+    // The Builds tab selects over the whole store, of which `builds` is the part read so far: the
+    // rest is read as the selection reaches it (`builds_reach`), so `End` lands on the oldest build.
+    builds_total: usize,
     images: &[crate::commands::ImageEntry],
     sbx: &[crate::history::Entry],
 ) -> usize {
@@ -787,7 +890,7 @@ fn tab_list_len(
         TAB_SANDBOXES => sbx.len(),
         TAB_BOXES => rows.len(),
         TAB_IMAGES => images.len(),
-        TAB_BUILDS => builds.len(),
+        TAB_BUILDS => builds_total.max(builds.len()),
         TAB_PROFILES => profs.len(),
         TAB_STORAGE => vols.len(),
         _ => 0,
@@ -850,6 +953,7 @@ fn handle_nav(
         b'6' => switch(tab, sel, TAB_PROFILES),
         b'7' => switch(tab, sel, TAB_STORAGE),
         b'8' => switch(tab, sel, TAB_SANDBOXES),
+        b'9' => switch(tab, sel, TAB_LOGS),
         b'j' => down(sel),
         // `k` IS UP. It was not bound here at all, so it fell through to the per-tab arms below,
         // where the Boxes tab read it as a lifecycle key and STOPPED the selected box. The help
@@ -2015,8 +2119,8 @@ fn volume_detail(v: &crate::volume::VolInfo) -> String {
     format!(
         "volume '{}'\n\n  data used   {}\n  quota       {}\n  mount with  -v {}:/path[:ro]",
         v.name,
-        // UNREACHABLE ON THIS TAB and still written out: the Storage tab measures before it draws.
-        // `-` rather than `0`, because an unmeasured volume and an empty one are different facts.
+        // `-` until the sizer has measured this volume (a volume made a moment ago): an unmeasured
+        // volume and an empty one are different facts, so never `0`.
         v.size.map_or_else(|| "-".to_string(), human_bytes),
         quota,
         v.name
@@ -2161,17 +2265,175 @@ fn sample_rate(
 // directions: a tab that shows `-` forever, or every other tab paying a recursive walk once a
 // second.
 
-/// Does the frame about to be drawn print a volume SIZE? Measuring is a recursive tree walk.
+/// Volume sizes, measured by a child process (`kern __volume-sizes`) so the recursive walk never
+/// runs on the thread that draws and reads keys.
 ///
-/// Volumes have no count-only mode, and the reason is worth keeping: reading a directory's
-/// `meta.json` is what identifies it AS a volume, so skipping the read would change the count.
-/// Only the walk is optional. [`crate::volume::Sizes`] says the same at its definition.
-fn size_policy(tab: usize) -> crate::volume::Sizes {
-    if tab == TAB_STORAGE {
-        crate::volume::Sizes::Measure
-    } else {
-        crate::volume::Sizes::Skip
+/// The latest measurement is kept and applied to every frame's list ([`VolumeSizer::fill`]); a
+/// volume it has not seen yet shows `-`, which is "not measured", never `0`. A new measurement is
+/// started at most every [`VolumeSizer::FRESH`] while the Storage tab is on screen, and at once
+/// after a volume is created or removed.
+#[derive(Default)]
+struct VolumeSizer {
+    child: Option<std::process::Child>,
+    out: Vec<u8>,
+    sizes: HashMap<String, u64>,
+    measured: Option<Instant>,
+}
+
+impl VolumeSizer {
+    /// How old a measurement may be while the Storage tab is shown. The walk is the expensive half
+    /// of the tab, and a volume's size does not move in the second it took to look.
+    const FRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Start a measurement, unless one is running.
+    fn kick(&mut self) {
+        use std::os::fd::AsRawFd;
+        if self.child.is_some() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let child = std::process::Command::new(exe)
+            .arg("__volume-sizes")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(child) = child else {
+            return;
+        };
+        if let Some(o) = child.stdout.as_ref() {
+            let fd = o.as_raw_fd();
+            // SAFETY: a descriptor this process owns through `child`; only its flags change.
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                if fl >= 0 {
+                    libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                }
+            }
+        }
+        self.out.clear();
+        self.child = Some(child);
     }
+
+    /// Start one if the last is older than [`Self::FRESH`] or there is none.
+    fn want_fresh(&mut self) {
+        if self.measured.is_none_or(|t| t.elapsed() >= Self::FRESH) {
+            self.kick();
+        }
+    }
+
+    /// The last measurement no longer describes the volumes: measure again now.
+    fn stale(&mut self) {
+        self.measured = None;
+        self.kick();
+    }
+
+    /// The running measurement's output, for `poll`.
+    fn fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        self.child
+            .as_ref()
+            .and_then(|c| c.stdout.as_ref())
+            .map(AsRawFd::as_raw_fd)
+    }
+
+    /// Read what the child has written; at its end, take the sizes and reap it.
+    fn on_readable(&mut self) {
+        use std::io::Read as _;
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let Some(stdout) = child.stdout.as_mut() else {
+            return;
+        };
+        let mut buf = [0u8; 65536];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => self.out.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => break,
+            }
+        }
+        let ok = child.wait().is_ok_and(|st| st.success());
+        self.child = None;
+        if !ok {
+            return;
+        }
+        let mut sizes = HashMap::new();
+        let mut fields = self.out.split(|b| *b == 0);
+        while let (Some(raw), Some(bytes)) = (fields.next(), fields.next()) {
+            let (Ok(raw), Some(bytes)) = (
+                std::str::from_utf8(raw),
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|b| b.parse::<u64>().ok()),
+            ) else {
+                continue;
+            };
+            sizes.insert(raw.to_string(), bytes);
+        }
+        self.sizes = sizes;
+        self.measured = Some(Instant::now());
+    }
+
+    /// Put the latest sizes on a freshly read list.
+    fn fill(&self, vols: &mut [crate::volume::VolInfo]) {
+        for v in vols {
+            if v.size.is_none() {
+                v.size = self.sizes.get(&v.raw).copied();
+            }
+        }
+    }
+}
+
+impl Drop for VolumeSizer {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// The build records, from [`crate::builds::list_cached`] with this process's cache: a finished
+/// record is read once per `kern top` session, not once a second.
+fn builds_listing(
+    detail: crate::listing::Detail,
+) -> crate::listing::Listing<crate::builds::Record> {
+    BUILD_RECORDS.with(|c| {
+        crate::builds::list_cached(&mut c.borrow_mut(), detail, BUILDS_SHOWN.with(|n| n.get()))
+    })
+}
+
+/// How many build records the session reads: one chunk to start, a chunk more each time the
+/// selection comes within a page of the end of what is read ([`builds_reach`]).
+const BUILDS_CHUNK: usize = 512;
+
+thread_local! {
+    static BUILD_RECORDS: std::cell::RefCell<crate::builds::RecordCache> =
+        std::cell::RefCell::new(crate::builds::RecordCache::default());
+    static BUILDS_SHOWN: std::cell::Cell<usize> = const { std::cell::Cell::new(BUILDS_CHUNK) };
+}
+
+/// The selection is near the end of the build records read so far and the store has more: read
+/// the next chunk. `true` when it grew, so the caller re-reads the list.
+fn builds_reach(sel: usize, read: usize, total: usize, page: usize) -> bool {
+    let reach = sel.saturating_add(page.saturating_mul(2));
+    if read >= total || reach < read {
+        return false;
+    }
+    // Up to where the selection is plus two pages, in whole chunks, in ONE step: `End` on a long
+    // history reads to the end at once rather than a chunk per frame.
+    let want = reach
+        .saturating_add(1)
+        .div_ceil(BUILDS_CHUNK)
+        .saturating_mul(BUILDS_CHUNK);
+    BUILDS_SHOWN.with(|n| n.set(n.get().saturating_add(BUILDS_CHUNK).max(want)));
+    true
 }
 
 /// Does the frame about to be drawn print the RECORDS of the list that `owner` owns?
@@ -2235,8 +2497,9 @@ fn refresh_full(
     host.box_starts_total = bt;
     let cfg = crate::config::load(None).unwrap_or_default();
     let profs = profile_rows(&cfg);
-    let vols = crate::volume::entries_with(size_policy(tab));
-    let builds = crate::builds::list_with(detail_policy(tab, TAB_BUILDS));
+    // Never measured here: see `VolumeSizer`.
+    let vols = crate::volume::entries_with(crate::volume::Sizes::Skip);
+    let builds = builds_listing(detail_policy(tab, TAB_BUILDS));
     let images = crate::commands::image_entries_with(detail_policy(tab, TAB_IMAGES));
     Snapshot {
         rows,
@@ -2389,6 +2652,13 @@ struct HostStats {
     mem_total: u64,
     disk_used: u64,
     disk_total: u64,
+    /// The filesystem the box logs are on (`$XDG_RUNTIME_DIR`, a tmpfs in RAM on a desktop): a box's
+    /// output is dropped when it is full, so its fill is watched like the disk's.
+    logs_used: u64,
+    logs_total: u64,
+    /// Percent full as `df` counts it, which is what predicts ENOSPC (`commands::fs_fill`).
+    disk_fill: u64,
+    logs_fill: u64,
     cpu_pct: f64,
     cores: usize,
     load1: f64,
@@ -2737,6 +3007,16 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
     };
     let (mem_used, mem_total) = host_mem().unwrap_or((0, 0));
     let (disk_used, disk_total) = host_disk().unwrap_or((0, 0));
+    let logs_dir = crate::registry::logs_dir().ok();
+    let (logs_used, logs_total) = logs_dir
+        .as_ref()
+        .and_then(|d| crate::commands::fs_usage(&d.to_string_lossy()))
+        .unwrap_or((0, 0));
+    let logs_fill = logs_dir
+        .as_ref()
+        .and_then(|d| crate::commands::fs_fill(&d.to_string_lossy()))
+        .map_or(0, |(pct, _)| pct);
+    let disk_fill = crate::commands::fs_fill("/").map_or(0, |(pct, _)| pct);
     let (load1, cores) = host_load_cores();
     (
         HostStats {
@@ -2744,6 +3024,10 @@ fn read_host(prev_cpu: Option<(u64, u64)>) -> (HostStats, Option<(u64, u64)>) {
             mem_total,
             disk_used,
             disk_total,
+            logs_used,
+            logs_total,
+            disk_fill,
+            logs_fill,
             cpu_pct,
             cores,
             load1,
@@ -2781,6 +3065,7 @@ fn render(
     term_rows: usize,
     sel: usize,
     mode: &Mode,
+    logs: &crate::logview::LogView,
 ) -> String {
     let (b, c, d, g, z) = (p.b, p.c, p.d, p.g, p.z);
     let width = cols.clamp(40, 120);
@@ -2798,13 +3083,26 @@ fn render(
     // Title bar - a live host header, always visible on every tab (CPU · RAM · Disk · Boxes),
     // refreshed each frame. The green figures are the "now"; the dim ones the total/context.
     s.push_str(&format!(
-        "{b}{c} kern top{z}   {d}CPU{z} {g}{:>3.0}%{z} {d}/ {} cores{z}   {d}RAM{z} {g}{}{z}{d} / {}{z}   {d}Disk{z} {g}{}{z}{d} / {}{z}   {d}Boxes{z} {g}{}{z}   {}\n\n",
+        "{b}{c} kern top{z}   {d}CPU{z} {g}{:>3.0}%{z} {d}/ {} cores{z}   {d}RAM{z} {g}{}{z}{d} / {}{z}   {d}Disk{z} {}{}{z}{d} / {}{z}{}   {d}Boxes{z} {g}{}{z}   {}\n\n",
         host.cpu_pct,
         host.cores,
         human_bytes(host.mem_used),
         human_bytes(host.mem_total),
+        fill_colour(p, host.disk_fill),
         human_bytes(host.disk_used),
         human_bytes(host.disk_total),
+        // THE LOG STORE ONLY WHEN IT IS FILLING: it is in RAM and small, and a full one drops box
+        // output, so it earns a place in the header exactly when that is close.
+        if host.logs_fill >= crate::logview::FILL_WARN_PCT {
+            format!(
+                "   {d}Logs{z} {}{}{z}{d} / {}{z}",
+                fill_colour(p, host.logs_fill),
+                human_bytes(host.logs_used),
+                human_bytes(host.logs_total)
+            )
+        } else {
+            String::new()
+        },
         rows.len(),
         gpu_header(p, &host.gpus),
     ));
@@ -2814,19 +3112,29 @@ fn render(
     // Each tab carries a live count - but 7 counted tabs (~87 cols) overflow a narrow/80-col
     // terminal: the bar wraps and shoves the later tabs (Images/Builds/…) off screen. If the full
     // bar won't fit `width`, drop the counts and render just the names so every tab stays visible.
-    let label = |i: usize, compact: bool| -> String {
+    // `short`: a count of a thousand or more as `1.5k`. The step between every count in full and
+    // none at all: with nine tabs a history of 1464 sandboxes and 11961 builds pushed a 100-column
+    // bar over its width, and every count went for the sake of four digits.
+    let label = |i: usize, compact: bool, short: bool| -> String {
         if compact {
             return TABS[i].to_string();
         }
+        let n = |v: usize| -> String {
+            if short {
+                short_count(v)
+            } else {
+                v.to_string()
+            }
+        };
         match i {
-            TAB_BOXES => format!("{} ({})", TABS[i], rows.len()),
+            TAB_BOXES => format!("{} ({})", TABS[i], n(rows.len())),
             // The `_total`s, NOT `.len()`: these records are only read on their own tab, so the
             // vec is empty everywhere else while the store is not. The count is a property of the
             // store and must not change when the reader looks somewhere else.
-            TAB_IMAGES => format!("{} ({})", TABS[i], images_total),
-            TAB_BUILDS => format!("{} ({})", TABS[i], builds_total),
-            TAB_PROFILES => format!("{} ({})", TABS[i], profs.len()),
-            TAB_STORAGE => format!("{} ({})", TABS[i], vols.len()),
+            TAB_IMAGES => format!("{} ({})", TABS[i], n(images_total)),
+            TAB_BUILDS => format!("{} ({})", TABS[i], n(builds_total)),
+            TAB_PROFILES => format!("{} ({})", TABS[i], n(profs.len())),
+            TAB_STORAGE => format!("{} ({})", TABS[i], n(vols.len())),
             // RUNNING sandboxes, as Boxes counts running boxes: the finished ones are a history,
             // and a count that only grows says nothing at a glance.
             // THE LIST'S LENGTH, the rule every other tab follows (Boxes its boxes, Storage its
@@ -2835,7 +3143,7 @@ fn render(
             TAB_SANDBOXES => format!(
                 "{} ({})",
                 TABS[i],
-                crate::history::sandboxes_newest_first().len()
+                n(crate::history::sandboxes_newest_first().len())
             ),
             // Runs are fire-and-forget (~1 ms) - there's no "current items" set like the other tabs,
             // so a cumulative count would mislead (it'd only grow). Show the LIVE rate while streaming
@@ -2854,16 +3162,17 @@ fn render(
     // A rendered tab takes `label.len() + 3` visible cols (a space each side + a trailing separator);
     // the leading space adds one. Compact the whole bar if the full version won't fit.
     //
-    // THREE STEPS, NOT TWO. Every count, then only the counts that are not `(0)`, then none. With
-    // eight tabs the full bar is wider than 100 columns, and an all-or-nothing rule took every count
-    // away there to make room for an `(0)` that says nothing; a `(0)` is the first thing to give up.
+    // FOUR STEPS. Every count, then only the counts that are not `(0)`, then those with a large
+    // number written short (`12.0k`), then none. With eight tabs the full bar is wider than 100
+    // columns, and an all-or-nothing rule took every count away there to make room for an `(0)` that
+    // says nothing; a `(0)` is the first thing to give up, four digits of a large count the second.
     let zero = |l: &str| l.ends_with(" (0)");
     let shown = |i: usize, step: usize| -> String {
-        let full = label(i, false);
+        let full = label(i, false, step >= 2);
         match step {
             0 => full,
-            1 if !zero(&full) => full,
-            _ => label(i, true),
+            1 | 2 if !zero(&full) => full,
+            _ => label(i, true, false),
         }
     };
     let bar_w = |step: usize| {
@@ -2871,7 +3180,7 @@ fn render(
             .map(|i| shown(i, step).chars().count() + 3)
             .sum::<usize>()
     };
-    let step = (0..2).find(|st| bar_w(*st) <= width).unwrap_or(2);
+    let step = (0..3).find(|st| bar_w(*st) <= width).unwrap_or(3);
     s.push(' ');
     for i in 0..TABS.len() {
         let l = shown(i, step);
@@ -2922,7 +3231,7 @@ fn render(
                 TAB_BOXES => s.push_str(&boxes_table(p, rows, body_rows, sel, host)),
                 TAB_RUNS => s.push_str(&runs_table(p, host)),
                 TAB_IMAGES => s.push_str(&images_table(p, images, body_rows, sel)),
-                TAB_BUILDS => s.push_str(&builds_table(p, builds, body_rows, sel)),
+                TAB_BUILDS => s.push_str(&builds_table(p, builds, builds_total, body_rows, sel)),
                 TAB_PROFILES => s.push_str(&profiles_table(p, profs, body_rows, sel)),
                 TAB_STORAGE => s.push_str(&storage_table(p, vols, body_rows, sel)),
                 TAB_SANDBOXES => s.push_str(&sandboxes_table(
@@ -2932,9 +3241,14 @@ fn render(
                     body_rows,
                     sel,
                 )),
+                TAB_LOGS => s.push_str(&logs.render(p, width, body_rows)),
                 _ => s.push_str(&overview(p, rows, host)),
             }
-            nav_footer(p, tab, rows, profs, vols, builds, images)
+            if tab == TAB_LOGS {
+                logs.footer(p)
+            } else {
+                nav_footer(p, tab, rows, profs, vols, builds, images)
+            }
         }
     };
     s.push_str(&format!("\n{d}{}{z}\n  {keys}\n", "─".repeat(width)));
@@ -2958,7 +3272,7 @@ fn help_text() -> String {
      \n\
      MOVE\n\
        Tab / → / l      next tab            ← / h      previous tab\n\
-       1 2 3 4 5 6 7 8  jump to a tab       ↑ ↓ / j k  select a row\n\
+       1 2 3 4 5 6 7 8 9  jump to a tab    ↑ ↓ / j k  select a row\n\
        PgUp / PgDn      a page up / down    Home / End the first / last row\n\
        q  or  Ctrl-C    quit\n\
      \n\
@@ -2974,6 +3288,14 @@ fn help_text() -> String {
        7 Storage    physical disks (read-only) and your named volumes\n\
        8 Sandboxes  SDK and MCP sandboxes: running now, and the ones that finished with how\n\
      \x20                they ended (metadata only, never the output); Enter shows one\n\
+       9 Logs       every box's output in one stream, newest at the bottom, live\n\
+     \n\
+     LOGS tab\n\
+       /  search (a|b matches either, case ignored; Esc clears)   e  level: all, warn+, error\n\
+       s  only the selected line's box (s again: all)             f  follow / pause\n\
+       Enter  the whole line     x  export what is shown as CSV     c  clear the view\n\
+     \x20  a line's level is read from its text; a stack trace's lines take the level of the\n\
+     \x20  line they continue. Read only while the tab is shown, and only what was appended.\n\
      \n\
      SANDBOXES tab\n\
        m  where the history is kept: memory (the default, cleared at reboot), disk (kept\n\
@@ -3601,7 +3923,7 @@ fn sandboxes_table_at(
     ));
     s.push_str(&format!(
         // Four columns in, where a row's time starts: the selection marker and the fresh dot.
-        "  {b}    {:<9} {:<26} {:<17} {:>8}  {:<12} {:<5}{z}\n",
+        "  {b}    {:<19} {:<26} {:<17} {:>8}  {:<12} {:<5}{z}\n",
         "ENDED", "NAME", "KIND", "RAN", "OUTCOME", "GPU"
     ));
     if done.is_empty() {
@@ -3633,7 +3955,7 @@ fn sandboxes_table_at(
             " ".to_string()
         };
         s.push_str(&format!(
-            "  {lead}{fresh} {col}{ended:<9}{z} {col}{:<26}{z} {d}{:<17}{z} {ran:>8}  {oc}{word:<12}{z} {d}{}{z}\n",
+            "  {lead}{fresh} {col}{ended:<19}{z} {col}{:<26}{z} {d}{:<17}{z} {ran:>8}  {oc}{word:<12}{z} {d}{}{z}\n",
             trunc(&e.name, 26),
             e.kind(),
             e.gpu
@@ -3741,6 +4063,59 @@ fn storage_table(
 }
 
 /// Compact large counts (`1.2k`, `3.4M`) for the runs metric - thousands of runs shouldn't sprawl.
+/// A count in the fewest characters, for a tab bar short of room: `1k`, `12k`, `2M`, rounded.
+/// `human_count`'s `1.5k` is as long as the `1464` it replaces.
+fn short_count(n: usize) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 999_500 {
+        format!("{}k", n.saturating_add(500) / 1_000)
+    } else {
+        format!("{}M", n.saturating_add(500_000) / 1_000_000)
+    }
+}
+
+/// Green, yellow from [`crate::logview::FILL_WARN_PCT`], red from
+/// [`crate::logview::FILL_CRIT_PCT`]: how a store's fill is coloured everywhere in `kern top`.
+fn fill_colour(p: &Palette, pct: u64) -> &'static str {
+    if pct >= crate::logview::FILL_CRIT_PCT {
+        p.r
+    } else if pct >= crate::logview::FILL_WARN_PCT {
+        p.y
+    } else {
+        p.g
+    }
+}
+
+/// The ALERTS block of the Overview: a store close to full, what fails when it is, and the command
+/// that gives room back. Empty when nothing is close.
+fn alerts(p: &Palette, host: &HostStats) -> String {
+    let (b, z) = (p.b, p.z);
+    let mut out = String::new();
+    let disk = host.disk_fill;
+    if disk >= crate::logview::FILL_WARN_PCT {
+        let c = fill_colour(p, disk);
+        out.push_str(&format!(
+            "  {c}Disk {disk} % full{z}: images, volumes, builds and the sandbox history live here, \
+             and a write that finds it full fails (a pull, a build, a volume write). \
+             `kern gc` frees build layers and leftovers; `kern gc --images` the image cache\n"
+        ));
+    }
+    let logs = host.logs_fill;
+    if logs >= crate::logview::FILL_WARN_PCT {
+        let c = fill_colour(p, logs);
+        out.push_str(&format!(
+            "  {c}Log store {logs} % full{z} ($XDG_RUNTIME_DIR, in RAM): when it is full a box's \
+             output is DROPPED, never the box, and its log says how much was lost. `kern prune` \
+             frees the logs of boxes that ended\n"
+        ));
+    }
+    if out.is_empty() {
+        return out;
+    }
+    format!("\n  {b}ALERTS{z}\n{out}")
+}
+
 fn human_count(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
@@ -3944,6 +4319,8 @@ fn overview(p: &Palette, rows: &[Row], host: &HostStats) -> String {
     } else {
         "no dedicated cgroup"
     };
+    // A store close to full is said before anything else on the screen that is not the host.
+    s.push_str(&alerts(p, host));
     s.push_str(&format!("\n  {b}BOXES{z}\n"));
     s.push_str(&row("Running", format!("{}", rows.len())));
     s.push_str(&row("Memory", human_bytes(total_mem)));
@@ -4205,6 +4582,9 @@ fn images_table(
 fn builds_table(
     p: &Palette,
     builds: &[crate::builds::Record],
+    // The whole store: `builds` is only the newest part read so far (see `builds_reach`), and the
+    // marker below counts what is below on disk, not what happens to be in memory.
+    total: usize,
     max_rows: usize,
     sel: usize,
 ) -> String {
@@ -4255,7 +4635,7 @@ fn builds_table(
     }
     // Unconditional: the marker is empty when the whole list fits, so the caller has one code path
     // and cannot forget the guard.
-    s.push_str(&list_marker(p, builds.len(), wstart, wend));
+    s.push_str(&list_marker(p, total.max(builds.len()), wstart, wend));
     s
 }
 
@@ -4756,6 +5136,7 @@ mod tests {
                     term_rows,
                     0,
                     &Mode::Nav,
+                    &crate::logview::LogView::default(),
                 );
                 let h = frame.lines().count();
                 assert!(
@@ -4823,6 +5204,7 @@ mod tests {
                         term_rows,
                         sel,
                         &Mode::Nav,
+                        &crate::logview::LogView::default(),
                     );
                     let last = frame.lines().last().unwrap_or("");
                     assert!(
@@ -5114,10 +5496,74 @@ mod tests {
         assert!(dbrow.contains('-'), "no-health/no-ports row shows a dash");
     }
 
+    /// A STORE CLOSE TO FULL IS SAID, with what fails and the command that gives room back; under
+    /// the threshold nothing is said at all.
+    #[test]
+    fn the_overview_alerts_on_a_disk_or_a_log_store_close_to_full() {
+        let at = |disk: u64, logs: u64| HostStats {
+            disk_fill: disk,
+            logs_fill: logs,
+            ..HostStats::default()
+        };
+        assert!(
+            alerts(&plain(), &at(84, 84)).is_empty(),
+            "under 85 % nothing is said"
+        );
+        let a = alerts(&plain(), &at(90, 10));
+        assert!(a.contains("ALERTS") && a.contains("Disk 90 % full") && a.contains("kern gc"));
+        assert!(!a.contains("Log store"));
+        let a = alerts(&plain(), &at(10, 96));
+        assert!(
+            a.contains("Log store 96 % full") && a.contains("DROPPED") && a.contains("kern prune")
+        );
+        assert!(!a.contains("Disk "));
+    }
+
     #[test]
     fn tab_bar_shows_live_counts() {
-        // `render` reads the sandbox history, which lives under `XDG_RUNTIME_DIR`.
+        // `render` reads the sandbox history, which lives under `XDG_RUNTIME_DIR` (or, kept on
+        // disk, under `XDG_DATA_HOME`), so the test gets its own, EMPTY one. Reading the host's made
+        // the outcome the host's: a desktop with 1464 finished sandboxes pushed the bar past 100
+        // columns once a ninth tab was added, and the counts this test asserts went with it.
         let _g = crate::env_guard();
+        struct World(
+            Vec<(&'static str, Option<std::ffi::OsString>)>,
+            std::path::PathBuf,
+        );
+        impl Drop for World {
+            fn drop(&mut self) {
+                for (v, old) in &self.0 {
+                    match old {
+                        Some(x) => crate::set_global_env(v, x),
+                        None => crate::unset_global_env(v),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let base = std::env::temp_dir().join(format!("kern-tui-tabbar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _world = World(
+            [
+                "XDG_RUNTIME_DIR",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "KERN_CONFIG",
+            ]
+            .iter()
+            .map(|v| (*v, crate::global_env(v)))
+            .collect(),
+            base.clone(),
+        );
+        for (v, d) in [
+            ("XDG_RUNTIME_DIR", "run"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CONFIG_HOME", "config"),
+        ] {
+            let _ = std::fs::create_dir_all(base.join(d));
+            crate::set_global_env(v, base.join(d));
+        }
+        crate::unset_global_env("KERN_CONFIG");
         // The tab bar shows a live count per data tab (Boxes/Profiles/Storage) so you see how many
         // items exist without entering - Overview (an aggregate) has no count.
         let host = HostStats {
@@ -5125,6 +5571,10 @@ mod tests {
             mem_total: 1,
             disk_used: 0,
             disk_total: 1,
+            logs_used: 0,
+            logs_total: 1,
+            disk_fill: 0,
+            logs_fill: 0,
             cpu_pct: 0.0,
             cores: 1,
             load1: 0.0,
@@ -5140,7 +5590,8 @@ mod tests {
             gpus: Vec::new(),
         };
         let boxes = [row("a", false), row("b", false), row("c", false)];
-        // A wide terminal (≥ the ~87-col full bar) shows the live counts.
+        // A wide terminal (100 columns, about the 97 the counted bar takes with its zeros dropped)
+        // shows the live counts.
         let out = render(
             &plain(),
             TAB_BOXES,
@@ -5162,6 +5613,7 @@ mod tests {
             24,
             0,
             &Mode::Nav,
+            &crate::logview::LogView::default(),
         );
         assert!(
             out.contains("Builds (7)"),
@@ -5176,7 +5628,7 @@ mod tests {
             out.contains("Boxes (3)"),
             "Boxes tab shows its count: {out}"
         );
-        // AT 100 COLUMNS EIGHT COUNTED TABS DO NOT FIT, and the bar gives up the `(0)`s first,
+        // AT 100 COLUMNS NINE COUNTED TABS DO NOT FIT, and the bar gives up the `(0)`s first,
         // keeping every count that says something: the three above.
         assert!(
             !out.contains("Profiles (0)"),
@@ -5204,6 +5656,7 @@ mod tests {
             24,
             0,
             &Mode::Nav,
+            &crate::logview::LogView::default(),
         );
         assert!(
             wide.contains("Profiles (0)"),
@@ -5219,6 +5672,34 @@ mod tests {
             !out.contains("Overview ("),
             "Overview must NOT carry a count"
         );
+
+        // LARGE COUNTS ARE WRITTEN SHORT BEFORE THEY ARE DROPPED: 11961 builds and 1464 images
+        // do not fit 100 columns in full, and `12k` and `1k` do.
+        let large = render(
+            &plain(),
+            TAB_BOXES,
+            &boxes,
+            &host,
+            &[],
+            &[],
+            &[],
+            11_961,
+            &[],
+            1_464,
+            100,
+            24,
+            0,
+            &Mode::Nav,
+            &crate::logview::LogView::default(),
+        );
+        assert!(
+            large.contains("Builds (12k)") && large.contains("Images (1k)"),
+            "a large count is shortened, not dropped: {large}"
+        );
+        assert_eq!(short_count(999), "999");
+        assert_eq!(short_count(1_464), "1k");
+        assert_eq!(short_count(999_499), "999k");
+        assert_eq!(short_count(999_500), "1M");
 
         // A narrow terminal drops the counts but keeps EVERY tab visible (the overflow bug: at 80
         // cols the counted bar would wrap and shove Images/Builds/… off screen).
@@ -5237,6 +5718,7 @@ mod tests {
             24,
             0,
             &Mode::Nav,
+            &crate::logview::LogView::default(),
         );
         assert!(!narrow.contains("Boxes (3)"), "narrow bar drops counts");
         for t in [

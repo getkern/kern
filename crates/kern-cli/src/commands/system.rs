@@ -138,13 +138,16 @@ fn help_text(p: &crate::ui::Palette) -> String {
                                                                      health= is healthy|unhealthy|starting|none; --last N keeps the N newest across live and exited (implies -a), newest first
                                                                      a row is an INSTANCE, not a name: a name reused after a box exited appears once per instance, identified by PID
                                                                      the exited rows are DETACHED boxes: the exit note is written by the supervisor, which a foreground box has none of
-                                                                     -a also lists `box --keep` boxes, which are state on disk and NOT transient: status=kept selects exactly those, and `kern start` runs one
+                                                                     -a also lists `box --keep` and `kern create` boxes, which are state on disk and NOT transient: status=kept selects exactly those, and `kern start` runs one
                                                                      --last N is about boxes that RAN, so it does not list the kept ones (they outlive the boot and share no clock with a run)
-    {c}logs{z} <name> [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
+                                                                     --format fields: .Names .ID .Image .Command .Ports .Pod .Service .Status .State .Health .ExitCode .RunningFor .Labels .Label \"k\"
+                                                                     .Status is Docker's (Up 4 seconds (healthy), Exited (3) 4 seconds ago, Created), .State the word (running, exited); `table ...` prints headers
+    {c}logs{z} <name>|--all [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
+                                                                     --all: every box's, one stream ordered by time, each line `box  | `; --tail is per box
                                                                      --since/--until take 10m, 1h30m, unix seconds, or RFC3339 UTC; a line the index cannot place in time is kept
                                                                      -t: the recorded time per line, bucketed from 100 ms; `-` where none was recorded
                                                                      -f is a diagnostic stream, not an audit log: under load it may drop a line, never reorder time
-    {c}stop{z} <name>... | --all                                         Stop box(es), or all
+    {c}stop{z} [-t N] <name>... | --all                                  Stop box(es), or all; -t: seconds before the kill
 
   {d}Images{z}
     {c}search{z} <query> [--json]                                        Search the public image registry
@@ -182,12 +185,16 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}pause{z} <name>... | --all                                        Freeze box(es) (cgroup freezer)
     {c}unpause{z} <name>... | --all                                      Thaw frozen box(es)
     {c}kill{z} <name>... | killall                                       Stop box(es) (alias of stop)
-    {c}start{z} <name>...                                                Run a `box --keep` box again, on the layer it left behind (its recorded command line)
+    {c}create{z} [OPTIONS] IMAGE [CMD...]                                A kept box recorded and not started (box's options, --name N); prints its name
+    {c}start{z} [-a] <name>...                                           Run a `box --keep`/`create` box again, on the layer it left behind; -a follows its output
+    {c}restart{z} [-t N] <name>...                                       Stop a kept box and start it again, or start it if stopped (N: seconds before the kill)
     {c}rm{z} [-f] <name>...                                              Remove a stopped or exited box and its record (`--keep`: its layer too); -f stops a running one first
-    {c}rename{z} <old> <new>                                             Give a running box a new name
-    {c}update{z} <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
+    {c}rename{z} <old> <new>                                             Give a box (running or kept) a new name
+    {c}update{z} [--memory M] [--cpus N] [--pids-limit P] <box>          Change a box's caps: live when running (needs delegated cgroup), and a kept box's record
     {c}wait{z} <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
-    {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D)
+    {c}diff{z} <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
+    {c}export{z} <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
+    {c}container{z} <verb> ...                                           The box verbs under one name (container ls = ps; not run/top/prune)
     {c}events{z}                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     {c}prune{z}                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     {c}gc{z} [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
@@ -197,10 +204,11 @@ fn help_text(p: &crate::ui::Palette) -> String {
   {d}Multi-box{z}
     {c}compose{z} [<file>] [{cv}]  Run a stack (kern TOML or a compose file); [--profile P] selects optional services
                                                                      With no file the directory is searched for docker-compose.yml, docker-compose.yaml, compose.yml, compose.yaml, kern.toml
-                                                                     up: [--force-recreate|--no-recreate] [-V|--renew-anon-volumes]; logs: [-t] [--since T] [--until T] [--no-log-prefix]
+                                                                     up: [--force-recreate|--no-recreate] [-V|--renew-anon-volumes]; logs: [-t] [--since T] [--until T] [--no-log-prefix] (each line is `service-1  | text`)
                                                                      wait/events/images/push/rm/top/version scope the box-level verb to this stack; kill is an alias of stop
                                                                      images takes --format json, as ps does; wait exits with the status of the first service to stop
                                                                      -f FILE repeats (merged left to right, `!reset`/`!override` honoured); -p NAME; --profile P; --env-file F
+                                                                     the project is -p, COMPOSE_PROJECT_NAME, the file's `name:`, else the directory's name; boxes are <project>-<service>-1
                                                                      --allow-device-grants: give the file's GPUs and `devices:` (a file cannot grant itself hardware)
                                                                      --allow-privileged: honour `privileged: true`; --project-root DIR: let paths reach anywhere under DIR
                                                                      --pod | --no-pod | --bridge: one namespace, one per service with relays, or a bridge (default: from the file)
@@ -218,8 +226,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
     {c}compose{z} <file> {c}run{z} [--rm] [--no-deps] <service> [cmd...]       One-off box from a service definition, in the foreground; its exit code is kern's
     {c}compose{z} <file> {c}cp{z} <service>:<path> <dst> | <src> <service>:<path>  Copy a file in or out, naming the SERVICE rather than the box
     {c}compose{z} <file> {c}exec{z} [-T] <service> <cmd...>                     Run a command in a RUNNING service; its exit code is kern's
-    {c}compose{z} <file> {c}ps{z} [-q] [--services] [--format json]            Ids only, service names from the file, or NDJSON for a script
-    {c}up{z} [-d] [--wait [--wait-timeout N]] / {c}down{z} [-v] [--remove-orphans]  --wait holds until every service is ready; down -v deletes this project's named volumes
+    {c}compose{z} <file> {c}ps{z} [-q] [--services] [--format json|T]          Docker's table (NAME IMAGE COMMAND SERVICE CREATED STATUS PORTS); -q ids, json NDJSON
+    {c}compose{z} <file> {c}config{z} [service...] [--format yaml|json] [--services|--images|--volumes|--networks|--profiles|--environment|--variables|--hash S] [--no-interpolate] [-q] [-o F]  The project as Docker Compose prints it; kern's summary on stderr
+    {c}up{z} [-d] [--wait [--wait-timeout N]] / {c}down{z} [-v] [--remove-orphans]  --wait holds until every service is ready (-d alone exits 0 if one dies at once); down -v deletes this project's named volumes
     {c}up{z} [--abort-on-container-exit] [--exit-code-from <service>]        Stop the stack when a service exits, and adopt that service's status
     {c}pod{z} create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>]...  Shared-network pod: peers reach each other by name.
                                                                         Members share the user and network namespaces; a sub-uid
@@ -271,8 +280,9 @@ fn help_text(p: &crate::ui::Palette) -> String {
                         hour-long breadcrumb too
     --keep              Keep this box's writable layer after it exits, under
                         $XDG_DATA_HOME/kern/boxes/<name>, and record its command line: `kern start
-                        <name>` runs it again on the same files, `kern rm <name>` removes it, and
-                        `kern ps -a` lists it. Without this a box leaves nothing behind, which is
+                        <name>` runs it again on the same files, `kern restart` stops and starts
+                        it, `kern rm <name>` removes it, `rename`, `diff` and `update` act on it,
+                        and `kern ps -a` lists it. Without this a box leaves nothing behind, which is
                         the default; the layer is yours to delete and `gc` will not touch it.
                         `--rm` does NOT undo it: that flag drops the hour-long exit breadcrumb, and
                         the layer is the thing `--keep` asked to survive. One image per layer: the
@@ -332,10 +342,11 @@ fn help_text(p: &crate::ui::Palette) -> String {
     --health-timeout N  Kill a single check that exceeds N seconds (default 0 = none)
     --health-action A   On unhealthy: restart | stop | none (default none)
     --net [host|none]   Share the host network (bare/host); none = isolated (default)
-    --network <mode>    host = share host net (= --net); none = isolated (default); or the NAME of
-                        a running pod, which is what a `kern compose` stack is - so
-                        `--network <stack> -- <cmd>` runs a one-off box
-                        that has to talk to a stack (`kern pod ls` names them)
+    --network <mode>    host = share host net (= --net); none = isolated (default); the NAME of
+                        a running pod; or a running `kern compose` stack, by its project name or
+                        as <project>_<network>: the box joins that network, with an address of
+                        its own on a bridge stack and every name of that network in its
+                        /etc/hosts (`kern pod ls` names the stacks)
     --pod <name>        Join a shared-network pod (reach peers by name; see `kern pod`)
     --egress-allow d,d  Restrict outbound to an allowlist of domains via a filtering proxy (foreground-only)
     --hostname <name>   Set the box's hostname (default: the box name)
@@ -927,6 +938,54 @@ pub fn bench(
 /// systemd-managed box (a standalone `--restart always`/`unless-stopped`) is instead rebuilt from its
 /// original spec by the unit's re-exec, and its OUTER scope also caps it: RAISING a cap above the outer
 /// one takes effect only after that rebuild, LOWERING always bites.
+/// The systemd scope kern made for a box (`kern-box-<pid>.scope`, its cgroup's parent), by unit name.
+fn box_scope_unit(cg: &std::path::Path) -> Option<&str> {
+    cg.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| n.starts_with("kern-box-") && n.ends_with(".scope"))
+}
+
+/// THE SCOPE FOLLOWS THE UPDATE, to the ceilings a start with these caps would have given it.
+///
+/// A box on the scope path is capped twice: by its own cgroup, at what was asked for, and by the
+/// scope kern created for it, a little above (`scope_memory_max`, `CPUQuota=`). An update wrote only
+/// the box's own, so raising a cap changed nothing. MEASURED on a Jetson: a box started with `--cpus
+/// 0.5 --memory 64m`, then `update --cpus 2 --memory 256m`: the box's `cpu.max` read 200000 and the
+/// scope's still 50000, the box's `memory.max` 256 MiB and the scope's 68 MiB, so the old caps held.
+///
+/// ⛔ WRITTEN TO THE SCOPE'S OWN FILES, NEVER THROUGH `systemctl set-property`. That was tried and
+/// measured: systemd realised the scope again and rewrote its `cgroup.subtree_control` to what it
+/// knew, so the box's cgroup lost its `memory` and `pids` controllers and with them every cap (the
+/// files were gone). The scope's directory is the user's, so the write needs nothing. A controller
+/// the scope does not have is skipped here; the box's own write then says so.
+fn scope_follow(cg: &std::path::Path, memory: Option<u64>, cpus: Option<f64>, pids: Option<u64>) {
+    let Some(scope_dir) = cg.parent().filter(|_| box_scope_unit(cg).is_some()) else {
+        return;
+    };
+    if let Some(m) = memory {
+        let _ = std::fs::write(
+            scope_dir.join("memory.max"),
+            super::scope_memory_max(Some(m)).to_string(),
+        );
+    }
+    if let Some(c) = cpus {
+        let quota = (c * CPU_PERIOD_US as f64).round().max(1.0) as u64;
+        let _ = std::fs::write(
+            scope_dir.join("cpu.max"),
+            format!("{quota} {CPU_PERIOD_US}"),
+        );
+    }
+    if let Some(p) = pids {
+        let v = if p == 0 {
+            "max".to_string()
+        } else {
+            p.to_string()
+        };
+        let _ = std::fs::write(scope_dir.join("pids.max"), v);
+    }
+}
+
 pub fn update(
     name: &str,
     memory: Option<u64>,
@@ -938,8 +997,35 @@ pub fn update(
             "update <box> [--memory M] [--cpus N] [--pids-limit P] (at least one)",
         ));
     }
+    // THE KNOBS AS `kern box` SPELLS THEM, for a kept box's record (see `keepbox::set_flags`): what
+    // Docker's `update` does to a container's configuration, which the next start keeps.
+    let as_flags = |mem: Option<u64>, cpu: Option<f64>, pid: Option<u64>| -> Vec<(&str, String)> {
+        let mut f = Vec::new();
+        if let Some(m) = mem {
+            f.push(("--memory", m.to_string()));
+        }
+        if let Some(c) = cpu {
+            f.push(("--cpus", c.to_string()));
+        }
+        if let Some(p) = pid {
+            f.push(("--pids-limit", p.to_string()));
+        }
+        f
+    };
     let Some(inst) = registry::find_ref(name) else {
-        return Err(Error::NotRunning(format!("no running box named '{name}'")));
+        // A KEPT BOX THAT IS NOT RUNNING takes the caps into its record, as Docker's `update` on a
+        // created or stopped container does; the tutorial's `create`, `update --cpus`, `start`.
+        if let Some(dir) = crate::keepbox::dir_of(name) {
+            if crate::keepbox::set_flags(&dir, &as_flags(memory, cpus, pids))
+                .map_err(|e| Error::Sandbox(format!("update {name}: {e}")))?
+            {
+                println!("{name}");
+                return Ok(());
+            }
+        }
+        return Err(Error::NotRunning(format!(
+            "no running box named '{name}' and no kept box by that name"
+        )));
     };
     let Some(cg) = registry::box_cgroup(inst.cgroup_pid()) else {
         return Err(Error::Sandbox(format!(
@@ -947,6 +1033,7 @@ pub fn update(
             inst.name
         )));
     };
+    scope_follow(&cg, memory, cpus, pids);
     // Best-effort PER KNOB: apply each independently so one controller that isn't delegated doesn't
     // discard the knobs that DID take effect. Collect what applied vs what failed, and record back
     // ONLY the caps that actually stuck (so `ps`/`inspect` never show a cap that silently failed).
@@ -965,7 +1052,24 @@ pub fn update(
     if let Some(c) = cpus {
         // cores → quota µs (clamped to ≥1); period fixed. Matches the box-start rendering.
         let quota = (c * CPU_PERIOD_US as f64).round().max(1.0) as u64;
-        match write_cgroup(&cg, "cpu.max", &format!("{quota} {CPU_PERIOD_US}")) {
+        let line = format!("{quota} {CPU_PERIOD_US}");
+        // A BOX STARTED WITHOUT `--cpus` HAS NO CPU CONTROLLER to write: kern asks the systemd scope
+        // for one only when a cap is given at start (`CPUQuota=`), and adding it later goes through
+        // systemd, which drops the box's other controllers (see `scope_follow`). Said, with the way
+        // that works: a kept box takes the cap into its record below, and its next start has it.
+        let wrote = write_cgroup(&cg, "cpu.max", &line).map_err(|first| {
+            if cg.join("cpu.max").exists() {
+                first
+            } else {
+                format!(
+                    "{first}; this box was started without --cpus, so it has no cpu controller to \
+                     update live: start it with --cpus (a kept box: this update is recorded, and \
+                     `kern restart {}` applies it)",
+                    inst.name
+                )
+            }
+        });
+        match wrote {
             Ok(()) => applied.push(format!("cpus={c}")),
             Err(why) => failed.push(why),
         }
@@ -990,6 +1094,17 @@ pub fn update(
     }
     if mem_ok.is_some() || pids_ok.is_some() {
         registry::update_caps(&inst.name, inst.pid, mem_ok, pids_ok);
+    }
+    // A RUNNING KEPT BOX keeps the caps for its next start too, as Docker's `update` keeps them in
+    // the container's configuration: what was asked, since the start validates it again and a cap
+    // that could not be applied live (no cpu controller, see above) is applied there.
+    if let Some(dir) = crate::keepbox::dir_of(&inst.name) {
+        if let Err(e) = crate::keepbox::set_flags(&dir, &as_flags(memory, cpus, pids)) {
+            eprintln!(
+                "kern: update {}: the kept record was not updated: {e}",
+                inst.name
+            );
+        }
     }
     if !applied.is_empty() {
         let pal = crate::ui::Palette::detect();
@@ -1187,7 +1302,12 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
         }
     }
 
-    if items.is_empty() {
+    // The SELinux file-context rules the installer adds for kern as root (see `install.sh`). Not a
+    // file this process can remove: a rule in the policy store, which `semanage` changes and only root
+    // may. Listed with everything else, removed by `--yes` as root, and named with its command as
+    // anyone else, so "nothing else is left" stays true.
+    let selinux_rules = installer_selinux_rules();
+    if items.is_empty() && selinux_rules.is_empty() {
         println!("nothing to remove - kern has created no state on this host.");
         return Ok(());
     }
@@ -1199,8 +1319,13 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
         .map(|i| i.bytes)
         .sum();
     println!(
-        "{b}{}{z} would be removed:",
-        if yes { "removing" } else { "this" },
+        "{b}{}{z}",
+        // MEASURED: the `--yes` header read "removing would be removed:".
+        if yes {
+            "removing:"
+        } else {
+            "this would be removed:"
+        },
         b = p.b,
         z = p.z
     );
@@ -1248,6 +1373,14 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
             "  {y}{kept_count} `box --keep` layer(s) will be destroyed - `kern ps -a --filter \
              status=kept` lists them{z}",
             y = p.y,
+            z = p.z
+        );
+    }
+    for spec in &selinux_rules {
+        println!(
+            "  {mark:>9}  {spec}  {d}SELinux file-context rule (container_runtime_exec_t){z}",
+            mark = "rule",
+            d = p.d,
             z = p.z
         );
     }
@@ -1325,12 +1458,115 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
             println!("  {f}");
         }
     }
-    println!(
-        "{d}the transient kern.slice cgroup disappears on its own; nothing else is left.{z}",
-        d = p.d,
-        z = p.z
-    );
+    // THE BOXES' DELEGATED UNIT (`kern-boxes.service`, see `kern_isolation::cgroup`) holds one
+    // waiting process for as long as the user manager runs: stopped here when no box is running,
+    // since stopping it ends whatever it contains.
+    // ROOT HAS NO `kern-boxes.service`: its `kern.slice` is a transient system slice, not a user
+    // unit (see the CHANGELOG entry on `kern-boxes.service`). MEASURED: root's `--yes` with no box
+    // running said "a box is still running", because being root fell through to that branch.
+    let anchor_note = if kern_isolation::is_initial_root() {
+        "the transient kern.slice cgroup disappears on its own"
+    } else if registry::list().is_empty() {
+        let stopped = std::process::Command::new("systemctl")
+            .args(["--user", "stop", "kern-boxes.service"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|st| st.success());
+        if stopped {
+            "the boxes' unit kern-boxes.service is stopped, and the transient kern.slice goes with it"
+        } else {
+            "the transient kern.slice cgroup disappears on its own"
+        }
+    } else {
+        "a box is still running, so its unit kern-boxes.service is left running; `kern stop --all` \
+         then `systemctl --user stop kern-boxes.service` ends it"
+    };
+    let mut rules_left: Vec<&str> = Vec::new();
+    for spec in &selinux_rules {
+        if kern_isolation::is_initial_root() && remove_selinux_rule(spec) {
+            println!(
+                "{d}SELinux file-context rule for {spec} removed{z}",
+                d = p.d,
+                z = p.z
+            );
+        } else {
+            rules_left.push(spec);
+        }
+    }
+    if rules_left.is_empty() {
+        println!(
+            "{d}{anchor_note}; nothing else is left.{z}",
+            d = p.d,
+            z = p.z
+        );
+    } else {
+        println!("{d}{anchor_note}.{z}", d = p.d, z = p.z);
+        for spec in rules_left {
+            println!(
+                "{y}left: the SELinux file-context rule for {spec}, which only root can remove: \
+                 sudo semanage fcontext -d '{spec}'{z}",
+                y = p.y,
+                z = p.z
+            );
+        }
+    }
     Ok(())
+}
+
+/// The SELinux file-context rules naming a file called `kern` as `container_runtime_exec_t`, from
+/// the active policy's local customizations: what `install.sh` adds as root. Empty without SELinux.
+fn installer_selinux_rules() -> Vec<String> {
+    let policy = std::fs::read_to_string("/etc/selinux/config")
+        .ok()
+        .and_then(|c| {
+            c.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("SELINUXTYPE=")
+                    .map(|v| v.trim().to_string())
+            })
+        })
+        .filter(|v| !v.is_empty() && !v.contains('/'))
+        .unwrap_or_else(|| "targeted".to_string());
+    std::fs::read_to_string(format!(
+        "/etc/selinux/{policy}/contexts/files/file_contexts.local"
+    ))
+    .map(|t| kern_rules_in(&t))
+    .unwrap_or_default()
+}
+
+/// [`installer_selinux_rules`]'s parse, pure: a line is `<spec> [<file type>] <context>`.
+fn kern_rules_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            let spec = words.next()?;
+            if spec.starts_with('#') {
+                return None;
+            }
+            let context = words.last()?;
+            (context.contains(":container_runtime_exec_t:")
+                && std::path::Path::new(spec)
+                    .file_name()
+                    .is_some_and(|n| n == "kern"))
+            .then(|| spec.to_string())
+        })
+        .collect()
+}
+
+/// `semanage fcontext -d <spec>`, found on PATH or where the SELinux tools live.
+fn remove_selinux_rule(spec: &str) -> bool {
+    let bin = ["/usr/sbin/semanage", "/sbin/semanage"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from("semanage"));
+    std::process::Command::new(bin)
+        .args(["fcontext", "-d", spec])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|st| st.success())
 }
 
 /// `kern examples` - print a commented example `kern.toml` to stdout (redirect it into
@@ -1343,6 +1579,27 @@ pub fn examples() -> Result<(), Error> {
 #[cfg(test)]
 mod help_filter_tests {
     use super::*;
+
+    /// The installer's rule is found in `file_contexts.local` in both forms semanage writes (with and
+    /// without a file-type column), and nothing else is: another type, another file name, a comment.
+    #[test]
+    fn uninstall_finds_the_installers_selinux_rule_and_only_it() {
+        let text = "# This file is auto-generated by libsemanage\n\
+                    # Do not edit directly.\n\
+                    /usr/bin/kern    system_u:object_r:container_runtime_exec_t:s0\n\
+                    /home/alex/.local/bin/kern -- system_u:object_r:container_runtime_exec_t:s0\n\
+                    /usr/bin/kernel-tool    system_u:object_r:container_runtime_exec_t:s0\n\
+                    /opt/kern    system_u:object_r:bin_t:s0\n\
+                    #/usr/bin/kern    system_u:object_r:container_runtime_exec_t:s0\n";
+        assert_eq!(
+            kern_rules_in(text),
+            vec![
+                "/usr/bin/kern".to_string(),
+                "/home/alex/.local/bin/kern".to_string()
+            ]
+        );
+        assert!(kern_rules_in("").is_empty());
+    }
 
     /// NO LINE OF THE REFERENCE MAY DECLARE A VERB FROM ITS DESCRIPTION.
     ///

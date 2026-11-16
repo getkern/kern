@@ -904,6 +904,28 @@ pub(crate) fn entries_with(sizes: Sizes) -> Vec<VolInfo> {
     out
 }
 
+/// `kern __volume-sizes`: every volume's raw directory name and size in bytes, NUL-separated
+/// (`<raw>\0<bytes>\0` each), for `kern top`'s Storage tab.
+///
+/// NUL, because a raw name is a directory name and NUL is the one byte it cannot hold: a tab or a
+/// newline in a planted name would otherwise split a record. The same scanner as `volume ls`, so
+/// the two cannot disagree on what a volume is.
+pub(crate) fn print_sizes() -> Result<(), Error> {
+    use std::io::Write as _;
+    let mut out = Vec::new();
+    for v in entries_with(Sizes::Measure) {
+        out.extend_from_slice(v.raw.as_bytes());
+        out.push(0);
+        out.extend_from_slice(v.size.unwrap_or(0).to_string().as_bytes());
+        out.push(0);
+    }
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&out)
+        .and_then(|()| stdout.flush())
+        .map_err(|e| Error::Volume(format!("volume sizes: {e}")))
+}
+
 /// `kern volume ls --json`: the same scan `list()` prints, as one array on one line.
 ///
 /// `quota` is `null` and not a string when no ceiling is set. The human table writes `∞` and the
@@ -1200,6 +1222,29 @@ fn dir_size(path: &std::path::Path) -> u64 {
 /// Human-readable byte size - the shared [`kern_common::fmt_bytes`] convention (one for the whole CLI).
 fn human_bytes(b: u64) -> String {
     kern_common::fmt_bytes(b)
+}
+
+/// Rename volume `old` to `new` when `old` exists, `new` does not, and no running box mounts `old`:
+/// `Ok(true)` when it was renamed, `Ok(false)` when there was nothing to do.
+pub fn rename_if_absent(old: &str, new: &str) -> Result<bool, Error> {
+    validate(old)?;
+    validate(new)?;
+    let dir = volumes_dir();
+    if !dir.join(old).join("data").is_dir() || dir.join(new).exists() {
+        return Ok(false);
+    }
+    if let Some(b) = crate::registry::list()
+        .iter()
+        .find(|b| b.volume_names().any(|v| v == old))
+    {
+        return Err(Error::AlreadyRunning(format!(
+            "volume '{old}' is in use by box '{}'",
+            b.name
+        )));
+    }
+    std::fs::rename(dir.join(old), dir.join(new))
+        .map_err(|e| Error::Volume(format!("cannot rename volume '{old}': {e}")))?;
+    Ok(true)
 }
 
 #[cfg(test)]

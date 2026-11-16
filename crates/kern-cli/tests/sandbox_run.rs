@@ -13,6 +13,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A compose file in a directory of its own. The directory names the project, as under Docker
+/// (`<dir>` normalized), so a file written straight into the temp dir made every such test the
+/// project `tmp`, and tests running at once stopped each other's boxes.
+fn stack_file(stem: &str, ext: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("{stem}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{stem}.{ext}"))
+}
+
 fn kern() -> Command {
     Command::new(env!("CARGO_BIN_EXE_kern"))
 }
@@ -65,7 +74,10 @@ fn find_kern_slice() -> Option<std::path::PathBuf> {
                 continue;
             }
             if e.file_name() == "kern.slice" {
-                return Some(p);
+                // WHERE BOXES ARE BUILT: the delegated unit inside the slice when it exists (see
+                // `KERN_ANCHOR_UNIT` in kern-isolation), the slice itself otherwise.
+                let anchor = p.join("kern-boxes.service");
+                return Some(if anchor.is_dir() { anchor } else { p });
             }
             stack.push((p, depth + 1));
         }
@@ -103,8 +115,21 @@ fn wait_for_leaf_of(slice: &Path, pid: u32) -> Option<String> {
 /// Does `pid` have at least one child yet? The portable "the fork has happened" signal, true on both
 /// the direct path (where kern forks the workload) and the scope path (where it forks a proxy).
 fn has_forked(pid: u32) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .is_ok_and(|c| !c.trim().is_empty())
+    match fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+        Ok(c) => !c.trim().is_empty(),
+        // NO `children` FILE (`CONFIG_PROC_CHILDREN=n`, the Jetson's Tegra kernel): a process whose
+        // parent is `pid`, read from `/proc/*/stat`. MEASURED there: this read false for a proxy
+        // that had forked and relayed, so the test expected a signal death and got the relay's 130.
+        Err(_) => fs::read_dir("/proc").is_ok_and(|rd| {
+            rd.flatten().any(|e| {
+                fs::read_to_string(e.path().join("stat")).is_ok_and(|st| {
+                    st.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                        .is_some_and(|ppid| ppid == pid.to_string())
+                })
+            })
+        }),
+    }
 }
 
 /// Does `pid` CATCH `SIGINT`, read from `SigCgt` in `/proc/<pid>/status`?
@@ -2719,7 +2744,7 @@ fn ps_json_carries_the_same_state_the_table_and_the_format_template_show() {
     let fmt_status = || -> String {
         let out = kern()
             .env("XDG_RUNTIME_DIR", &xdg)
-            .args(["ps", "--format", "{{.Status}}"])
+            .args(["ps", "--format", "{{.State}}"])
             .output()
             .expect("run kern");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -3058,11 +3083,16 @@ fn box_ps_dash_a_shows_an_exited_box_with_its_exit_code() {
     // The same exited row renders through `--format`, proving the exit code survived the round-trip.
     let fmt = kern()
         .env("XDG_RUNTIME_DIR", &xdg)
-        .args(["ps", "-a", "--format", "{{.Names}} {{.Status}}"])
+        .args([
+            "ps",
+            "-a",
+            "--format",
+            "{{.Names}} {{.State}} {{.ExitCode}} {{.Status}}",
+        ])
         .output()
         .expect("run kern");
     assert!(
-        String::from_utf8_lossy(&fmt.stdout).contains("psadead exited (7)"),
+        String::from_utf8_lossy(&fmt.stdout).contains("psadead exited 7 Exited (7) "),
         "ps -a --format should render the exited status: {}",
         String::from_utf8_lossy(&fmt.stdout)
     );
@@ -7334,7 +7364,7 @@ fn compose_port_prints_the_published_address_and_fails_when_there_is_none() {
     let xdg = std::env::temp_dir().join(format!("kern-it-cport-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-cport-{}.toml", std::process::id()));
+    let toml = stack_file("kern-cport", "toml");
     fs::write(
         &toml,
         format!(
@@ -7463,7 +7493,7 @@ fn the_default_wiring_separates_loopbacks_a_pod_shares_them_and_neither_reaches_
     let xdg = std::env::temp_dir().join(format!("kern-it-podnet-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-podnet-{}.toml", std::process::id()));
+    let toml = stack_file("kern-podnet", "toml");
     // `quiet` listens on 9999 and publishes NOTHING. `nosy` reports what it can reach.
     let probe = format!(
         // THIS busybox `nc` HAS NO `-z`: its usage is `nc [-iN] [-wN] [-l] [-p PORT] ...`, so a
@@ -7576,6 +7606,235 @@ fn the_default_wiring_separates_loopbacks_a_pod_shares_them_and_neither_reaches_
 /// The peer on the public network is the positive control, and it is what makes this an assertion
 /// rather than a coincidence: if kern had simply stopped attaching NATs, both services would show
 /// zero routes and this test would pass while proving nothing.
+/// A BOX THAT JOINS A STACK'S NETWORK LATER GETS THAT NETWORK'S EGRESS, AND ONLY THAT.
+///
+/// Docker's one-off, `docker run --network <project>_<network>`, reaches the stack's services and
+/// the internet. MEASURED before this: kern's `kern box --network <project>_default` reached the
+/// services by name and had no default route and no `/etc/resolv.conf`, because every service on a
+/// bridge gets its own NAT and a box joining later got none. A network the file marks
+/// `internal: true` must still give it none, as it gave its service none.
+///
+/// The positive control is the stack's own service on the public network: if it has no default
+/// route this host attaches no NAT at all (pasta absent or refused), and nothing here can be told
+/// from that.
+#[test]
+fn a_box_joining_a_stack_network_gets_its_egress_and_an_internal_one_gets_none() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "oneoffnat");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-oneoffnat-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let yml = stack_file("kern-oneoffnat", "yml");
+    let project = yml
+        .parent()
+        .and_then(|d| d.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap();
+    // No quotes in the probe: it travels inside a YAML flow string.
+    let probe =
+        "echo DEFAULT=$(tail -n +2 /proc/net/route | cut -f2 | grep -cx 00000000); sleep 30";
+    let doc = [
+        "networks:".to_string(),
+        "  pub: {}".to_string(),
+        "  priv:".to_string(),
+        "    internal: true".to_string(),
+        "services:".to_string(),
+        "  open:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    networks: [pub]".to_string(),
+        format!("    command: [\"/bin/busybox\", \"sh\", \"-c\", \"{probe}\"]"),
+        "  shut:".to_string(),
+        format!("    rootfs: \"{rootfs}\""),
+        "    networks: [priv]".to_string(),
+        format!("    command: [\"/bin/busybox\", \"sh\", \"-c\", \"{probe}\"]"),
+        String::new(),
+    ]
+    .join("\n");
+    fs::write(&yml, doc).unwrap();
+    let cleanup = || {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["compose", yml.to_str().unwrap(), "down", "-t", "0"])
+            .output()
+            .ok();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        let _ = fs::remove_file(&yml);
+    };
+
+    let up = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", yml.to_str().unwrap(), "up", "-d"])
+        .output()
+        .expect("run kern");
+    let up_err = String::from_utf8_lossy(&up.stderr).to_string();
+    if !up.status.success() {
+        eprintln!("skip: the stack could not start here: {up_err}");
+        cleanup();
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let logs = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["compose", yml.to_str().unwrap(), "logs", "open"])
+        .output()
+        .expect("run kern");
+    let open = String::from_utf8_lossy(&logs.stdout).to_string();
+    if !open.contains("DEFAULT=") {
+        eprintln!("skip: the public service printed nothing, so the stack did not run: {up_err}");
+        cleanup();
+        return;
+    }
+    if open.contains("DEFAULT=0") {
+        eprintln!(
+            "skip: the stack's own service has no default route, so this host attaches no NAT \
+             (pasta absent or refused): {open}"
+        );
+        cleanup();
+        return;
+    }
+    let one_off = |network: &str| -> (String, String) {
+        let o = kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args([
+                "box",
+                "--rm",
+                "--rootfs",
+                rootfs,
+                "--network",
+                &format!("{project}_{network}"),
+                "--",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "echo DEFAULT=$(tail -n +2 /proc/net/route | cut -f2 | grep -cx 00000000); \
+                 echo RESOLV=$(grep -c nameserver /etc/resolv.conf 2>/dev/null)",
+            ])
+            .output()
+            .expect("run kern");
+        (
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        )
+    };
+    let (public, public_err) = one_off("pub");
+    let (internal, internal_err) = one_off("priv");
+    cleanup();
+
+    assert!(
+        public.contains("DEFAULT=1"),
+        "a box joining the public network must get its default route, as the service did: \
+         stdout {public:?} stderr {public_err:?}"
+    );
+    assert!(
+        !public.contains("RESOLV=0") && public.contains("RESOLV="),
+        "a box given the network's NAT must be given resolvers with it: stdout {public:?}"
+    );
+    assert!(
+        internal.contains("DEFAULT=0"),
+        "a box joining a network marked internal must have no way out: stdout {internal:?} \
+         stderr {internal_err:?}"
+    );
+}
+
+/// `--rm` TAKES A DETACHED BOX'S LOGS WITH IT, as Docker removes a container's log with it, and
+/// KEEPS them for a box that never started, whose launcher quotes the log as the reason.
+///
+/// MEASURED before: a desktop's log store (a tmpfs, in RAM) held 142 MiB, all of boxes that had
+/// ended, among them a `--rm` one. The second half is the regression the first version of the fix
+/// had: an `exec` that fails exits 127, not 125, and its reason vanished with the log.
+#[test]
+fn rm_takes_a_detached_boxs_logs_but_not_the_reason_it_failed_to_start() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let root = build_rootfs(&busybox, "rmlogs");
+    let rootfs = root.to_str().unwrap();
+    let xdg = std::env::temp_dir().join(format!("kern-it-rmlogs-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&xdg);
+    let _ = fs::create_dir_all(&xdg);
+    let logs = xdg.join("kern").join("logs");
+    let run = |args: &[&str]| {
+        kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(args)
+            .output()
+            .expect("run kern")
+    };
+    let started = run(&[
+        "box",
+        "rmgone",
+        "-d",
+        "--rm",
+        "--rootfs",
+        rootfs,
+        "--",
+        "/bin/busybox",
+        "echo",
+        "hello",
+    ]);
+    let err = String::from_utf8_lossy(&started.stderr).to_string();
+    if !started.status.success() {
+        eprintln!("skip: a detached box could not start here: {err}");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&xdg);
+        return;
+    }
+    let leftover = || -> Vec<String> {
+        fs::read_dir(&logs)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("rmgone-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !leftover().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let left = leftover();
+    let failed = run(&[
+        "box",
+        "rmfail",
+        "-d",
+        "--rm",
+        "--rootfs",
+        rootfs,
+        "--",
+        "/no-such-binary",
+    ]);
+    let ferr = String::from_utf8_lossy(&failed.stderr).to_string();
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&xdg);
+    assert!(
+        left.is_empty(),
+        "a `--rm` box that ran and ended left its logs: {left:?}"
+    );
+    assert!(
+        !failed.status.success(),
+        "a box whose command does not exist must not start"
+    );
+    assert!(
+        ferr.contains("no-such-binary") || ferr.contains("No such file"),
+        "the reason a `--rm` box failed to start must still be quoted from its log: {ferr}"
+    );
+}
+
 #[test]
 fn an_internal_network_leaves_a_service_with_no_route_at_all() {
     let Some(busybox) = static_busybox() else {
@@ -7591,7 +7850,7 @@ fn an_internal_network_leaves_a_service_with_no_route_at_all() {
     let xdg = std::env::temp_dir().join(format!("kern-it-intnet-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let yml = std::env::temp_dir().join(format!("kern-intnet-{}.yml", std::process::id()));
+    let yml = stack_file("kern-intnet", "yml");
     // WRITTEN LINE BY LINE, not as one interpolated blob: the first version built the whole
     // document with a single `format!` and its `\n  ` continuations produced a file whose second
     // key sat at column 0, which the parser correctly read as a second service called `rootfs`. A
@@ -7699,7 +7958,7 @@ fn no_pod_leaves_a_service_with_loopback_and_nothing_else() {
     let xdg = std::env::temp_dir().join(format!("kern-it-nopod-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-nopod-{}.toml", std::process::id()));
+    let toml = stack_file("kern-nopod", "toml");
     // `peera` reports what its namespace holds; `peerb` exists only to be a peer worth naming.
     let probe =
         "cat /etc/hosts; echo IFACE_START; cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d ' '; \
@@ -7728,7 +7987,13 @@ fn no_pod_leaves_a_service_with_loopback_and_nothing_else() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let logs = kern()
             .env("XDG_RUNTIME_DIR", &xdg)
-            .args(["compose", toml.to_str().unwrap(), "logs", "peera"])
+            .args([
+                "compose",
+                toml.to_str().unwrap(),
+                "logs",
+                "--no-log-prefix",
+                "peera",
+            ])
             .output()
             .expect("run kern");
         kern()
@@ -7843,7 +8108,7 @@ fn restarting_one_service_of_a_no_pod_stack_keeps_its_peers_reachable() {
     let xdg = std::env::temp_dir().join(format!("kern-it-npr-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-npr-{}.toml", std::process::id()));
+    let toml = stack_file("kern-npr", "toml");
 
     // `cli` fetches a real body from `srv` in a loop, so the log records whether DATA crossed rather
     // than whether a socket opened.
@@ -8033,7 +8298,20 @@ fn a_pod_whose_holder_died_is_reported_and_recreated() {
         let _ = fs::remove_dir_all(&dir);
     };
     let first = run(&["up", "-d"]);
-    let holder = fs::read_to_string(xdg.join("kern/pods").join(&pod).join("holder")).ok();
+    // A service that dies at once is said on stderr and `up -d` still exits 0, as Docker's does:
+    // on such a host the stack never came up.
+    // ...or before the check could see it: `up -d` no longer waits, so ask the registry too.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let died = String::from_utf8_lossy(&first.stderr).contains("died within")
+        || kern()
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .args(["ps", "-q"])
+            .output()
+            .map(|o| o.stdout.is_empty())
+            .unwrap_or(true);
+    let holder = fs::read_to_string(xdg.join("kern/pods").join(&pod).join("holder"))
+        .ok()
+        .filter(|_| !died);
     let Some(pid) = holder
         .as_deref()
         .and_then(|h| h.trim().split(':').next())
@@ -8129,7 +8407,9 @@ fn a_relative_bind_is_up_to_date_on_the_next_up() {
             .expect("run kern")
     };
     let first = run(&["up", "-d"]);
-    if !first.status.success() {
+    // `up -d` exits 0 when a service dies at once, as Docker's does, and says so on stderr: that is
+    // a stack that did not come up here either.
+    if !first.status.success() || String::from_utf8_lossy(&first.stderr).contains("died within") {
         eprintln!(
             "skip: the stack did not come up here: {}",
             String::from_utf8_lossy(&first.stderr)
@@ -8189,7 +8469,7 @@ fn up_without_no_pod_on_a_no_pod_stack_is_refused_and_names_the_plan() {
     let xdg = std::env::temp_dir().join(format!("kern-it-npm-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-npm-{}.toml", std::process::id()));
+    let toml = stack_file("kern-npm", "toml");
     fs::write(
         &toml,
         format!(
@@ -8218,7 +8498,7 @@ fn up_without_no_pod_on_a_no_pod_stack_is_refused_and_names_the_plan() {
 
     let up = run(&["up", "--no-pod"]);
     let up_err = String::from_utf8_lossy(&up.stderr).to_string();
-    if !up.status.success() || !up_err.contains("peer relay") {
+    if !up.status.success() || !up_err.contains("peer relay") || up_err.contains("died within") {
         eprintln!(
             "skip: no relay plan was produced on this host: {}",
             up_err.lines().next().unwrap_or("")
@@ -8314,7 +8594,7 @@ fn killing_the_relay_holder_leaves_no_pump_behind() {
     // Declared after `xdg` exists: the scope IS that directory, which is what every relay
     // process of this stack carries on its command line.
     let scope = xdg.to_string_lossy().to_string();
-    let toml = std::env::temp_dir().join(format!("kern-pump-{}.toml", std::process::id()));
+    let toml = stack_file("kern-pump", "toml");
     fs::write(
         &toml,
         format!(
@@ -8443,7 +8723,7 @@ fn killing_one_relay_half_rebuilds_that_edge_and_leaves_the_stack_up() {
     let xdg = std::env::temp_dir().join(format!("kern-it-heal-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-heal-{}.toml", std::process::id()));
+    let toml = stack_file("kern-heal", "toml");
     let probe = "while :; do sleep 1; R=$(printf 'GET /hello HTTP/1.0\\r\\n\\r\\n' | nc -w 2 srv \
                  7351 2>/dev/null); case \"$R\" in *PAYLOAD_OK*) echo DATA_OK ;; *) echo DATA_FAIL \
                  ;; esac; done";
@@ -8589,7 +8869,7 @@ fn a_shared_port_costs_only_the_service_that_binds_the_wildcard() {
     let xdg = std::env::temp_dir().join(format!("kern-it-sp-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-sp-{}.toml", std::process::id()));
+    let toml = stack_file("kern-sp", "toml");
 
     // BOTH declare 7361. `a` binds it on 127.0.0.1 only; `b` binds the wildcard.
     let a_cmd = "httpd -p 127.0.0.1:7361 -h /tmp; sleep 2; while :; do sleep 1; R=$(printf 'GET \
@@ -8759,7 +9039,7 @@ fn a_four_service_stack_reaches_itself_without_a_pod() {
     let xdg = std::env::temp_dir().join(format!("kern-it-four-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-four-{}.toml", std::process::id()));
+    let toml = stack_file("kern-four", "toml");
     fs::write(
         &toml,
         format!(
@@ -8837,8 +9117,11 @@ fn a_four_service_stack_reaches_itself_without_a_pod() {
         up_err.contains("12 peer relay(s) up"),
         "a four-service stack with one port each needs twelve relays: {up_err}"
     );
+    // The relay planner's own refusal, `'<from>' cannot reach '<to>' on <port>`, and nothing looser:
+    // MEASURED on a Jetson without pasta, "cannot reach" alone matched the no-outbound warning ("it
+    // cannot reach the internet"), which says nothing about the relays this test is about.
     assert!(
-        !up_err.contains("cannot reach"),
+        !up_err.contains("' cannot reach '"),
         "and none of them is blocked: no two services here share a port: {up_err}"
     );
     assert!(
@@ -8949,11 +9232,26 @@ fn a_box_start_still_reaps_an_orphan_cgroup() {
         return;
     }
 
+    // AND ONE WHERE A KERN FROM BEFORE THE DELEGATED UNIT BUILT ITS BOXES: `kern.slice` itself. An
+    // upgrade leaves those orphans there, and the sweep must still find them.
+    let legacy = (slice.file_name() == Some(std::ffi::OsStr::new("kern-boxes.service")))
+        .then(|| slice.parent().map(|p| p.join("kern-box-sweeptest-4194402")))
+        .flatten()
+        .filter(|l| fs::create_dir(l).is_ok());
+
     let out = run_one("sweepbox");
     // The sweep runs after the spawn, so give the launcher a moment to reach it.
     std::thread::sleep(std::time::Duration::from_millis(400));
     let still_there = orphan.is_dir();
+    let legacy_still_there = legacy.as_ref().is_some_and(|l| l.is_dir());
     let _ = fs::remove_dir(&orphan);
+    if let Some(l) = legacy.as_ref() {
+        let _ = fs::remove_dir(l);
+    }
+    assert!(
+        !legacy_still_there,
+        "an orphan in kern.slice itself, left by a kern from before kern-boxes.service, must be reaped"
+    );
     let _ = fs::remove_dir_all(&root);
 
     assert!(
@@ -9097,8 +9395,7 @@ fn a_one_shot_service_that_exits_zero_does_not_fail_the_stack() {
     let _ = fs::create_dir_all(&xdg);
 
     let run = |tag: &str, code: &str| -> std::process::Output {
-        let toml =
-            std::env::temp_dir().join(format!("kern-1shot-{tag}-{}.toml", std::process::id()));
+        let toml = stack_file(&format!("kern-1shot-{tag}"), "toml");
         fs::write(
             &toml,
             format!(
@@ -9136,9 +9433,12 @@ fn a_one_shot_service_that_exits_zero_does_not_fail_the_stack() {
 
     let bad = run("bad", "3");
     let bad_err = String::from_utf8_lossy(&bad.stderr).to_string();
+    // REPORTED, AND THE COMMAND EXITS 0: `up` on a pipe returns as `up -d` does, and Docker Compose
+    // 5.3.1's `up -d` exits 0 for a service that exits at once (measured: `up -d` 0, `up -d --wait`
+    // 1). The report is the warning on stderr.
     assert!(
-        !bad.status.success() && bad_err.contains("died within"),
-        "a service that exited 3 must still be reported and must still fail the command: \
+        bad.status.success() && bad_err.contains("died within"),
+        "a service that exited 3 must still be reported, and `up -d` exits 0 as Docker's does: \
          status {:?}, stderr {bad_err}",
         bad.status.code()
     );
@@ -9162,7 +9462,7 @@ fn compose_full_schema_brings_box_up() {
     let rootfs = root.to_str().unwrap();
     let xdg = std::env::temp_dir().join(format!("kern-it-cmp-{}", std::process::id()));
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-cmp-{}.toml", std::process::id()));
+    let toml = stack_file("kern-cmp", "toml");
     fs::write(
         &toml,
         format!(
@@ -9735,7 +10035,7 @@ fn kern_procs_matching(tag: &str) -> usize {
 
 #[test]
 fn stopping_a_box_leaves_no_timeout_watchdog_behind() {
-    // `--timeout N` forks a watchdog in the HOST namespace, before the box's `unshare(CLONE_NEWPID)`,
+    // `--timeout N` forks a watchdog in the HOST namespace, before the box's pid namespace is made,
     // so that it can signal the box's ns-init. It used to `sleep(N)` outright, and the only thing
     // that stopped it early was the supervisor's own `cancel_foreground_timeout`. Kill the
     // supervisor before it reaches that line and the watchdog was orphaned, sleeping out the rest of
@@ -10399,7 +10699,14 @@ fn box_oom_group_kills_the_whole_box_atomically() {
         .output()
         .expect("run kern");
     let read_out = String::from_utf8_lossy(&read.stdout);
-    if read_out.contains("MAX=max") || !read_out.contains("MAX=") {
+    // NOT DELEGATED READS TWO WAYS: `max` where the file exists with no ceiling, and NOTHING where the
+    // controller is absent from the box's cgroup, so there is no `memory.max` at all. MEASURED on
+    // openSUSE Leap 16 (`pids` delegated alone): "GRP= MAX=", which the first form missed.
+    let max = read_out
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("MAX="))
+        .unwrap_or("");
+    if max.is_empty() || max == "max" {
         let _ = fs::remove_dir_all(&root);
         eprintln!(
             "skip: memory controller not delegated here ({})",
@@ -10944,7 +11251,7 @@ fn run_landlock_commitment_aborts_when_the_flag_did_not_survive_the_reexec() {
         };
         let so = String::from_utf8_lossy(&o.stdout).to_string();
         let se = String::from_utf8_lossy(&o.stderr).to_string();
-        if !kern_isolation::landlock_abi().is_some() && envs.len() == 2 {
+        if kern_isolation::landlock_abi().is_none() && envs.len() == 2 {
             // The third case legitimately refuses on a kernel with no Landlock, for a different reason.
             continue;
         }
@@ -11008,7 +11315,7 @@ fn compose_down_counts_what_it_actually_stopped() {
     let xdg = std::env::temp_dir().join(format!("kern-it-dcount-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-dcount-{}.toml", std::process::id()));
+    let toml = stack_file("kern-dcount", "toml");
     fs::write(
         &toml,
         format!(
@@ -11102,7 +11409,7 @@ fn a_service_selector_narrows_stop_start_and_restart() {
     let xdg = std::env::temp_dir().join(format!("kern-it-sel-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-sel-{}.toml", std::process::id()));
+    let toml = stack_file("kern-sel", "toml");
     let svc = |n: &str, dep: &str| {
         format!(
             "[box.{n}]\nrootfs = \"{rootfs}\"\n{dep}command = [\"/bin/busybox\", \"sleep\", \"300\"]\n\n"
@@ -11240,7 +11547,7 @@ fn compose_stop_names_a_pod_only_when_there_is_one() {
     let xdg = std::env::temp_dir().join(format!("kern-it-sm-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-sm-{}.toml", std::process::id()));
+    let toml = stack_file("kern-sm", "toml");
     fs::write(
         &toml,
         format!(
@@ -11270,7 +11577,7 @@ fn compose_stop_names_a_pod_only_when_there_is_one() {
     };
 
     let up = run(&["up", "--no-pod"]);
-    if !up.contains("box(es) started") {
+    if !up.contains("box(es) started") || up.contains("died within") {
         run(&["down"]);
         cleanup();
         eprintln!("skip: the no-pod stack did not come up here: {}", up.trim());
@@ -11338,7 +11645,7 @@ fn compose_down_removes_the_relay_directory_it_created() {
     let xdg = std::env::temp_dir().join(format!("kern-it-dc-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::create_dir_all(&xdg);
-    let toml = std::env::temp_dir().join(format!("kern-dc-{}.toml", std::process::id()));
+    let toml = stack_file("kern-dc", "toml");
     fs::write(
         &toml,
         format!(
@@ -13669,6 +13976,14 @@ fn compose_down_stops_the_stack_s_nats_and_does_not_merely_delete_their_pidfiles
         let _ = fs::remove_dir_all(&dir);
         return;
     }
+    // No pasta, no NAT to stop: kern says so itself, and then the control below cannot hold.
+    // MEASURED on a Jetson (Ubuntu 22.04 ships no passt).
+    if up.contains("pasta (passt) is not installed") {
+        eprintln!("skip: pasta is not installed here, so the stack has no NAT to stop");
+        let _ = compose(&["down"]);
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
     std::thread::sleep(std::time::Duration::from_millis(800));
     // The stack's own runtime tree is what a NAT's pidfile path carries; the temp XDG dir's name is
     // unique to this process, so it cannot match another run's.
@@ -14328,7 +14643,20 @@ fn a_restart_service_restarts_after_its_first_exit() {
         )
     };
     let up = run(&["up", "-d"]);
-    if !up.contains("started") {
+    // `up -d` does not wait for an early death: on a host whose rootfs cannot run, `b` (a plain
+    // `sleep 60`) is gone a moment later, and that is a stack that did not come up here.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let b_alive = kern()
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .args(["ps", "--format", "{{.Names}}"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.ends_with("-b-1"))
+        })
+        .unwrap_or(false);
+    if !up.contains("started") || up.contains("died within") || !b_alive {
         eprintln!("skip: the stack did not come up here: {up}");
         let _ = run(&["down"]);
         let _ = fs::remove_dir_all(&dir);
@@ -14942,6 +15270,12 @@ fn a_cpuset_list_produces_exactly_those_cpu_directories() {
         eprintln!("skip: no static busybox");
         return;
     };
+    // The list names CPU 6. On a host with fewer, the contract is Docker's refusal, asserted below
+    // instead of the listing: MEASURED on a 6-CPU VM, the clamp kern had then listed
+    // "cpu0 cpu2 cpu4 cpu5", a confinement nobody asked for.
+    let cpus = fs::read_to_string("/proc/cpuinfo")
+        .map(|c| c.lines().filter(|l| l.starts_with("processor")).count())
+        .unwrap_or(0);
     let rootfs = build_rootfs(&bb, "cpulist");
     let xdg = std::env::temp_dir().join(format!("kern-it-cpulist-{}", std::process::id()));
     let _ = fs::remove_dir_all(&xdg);
@@ -14968,6 +15302,13 @@ fn a_cpuset_list_produces_exactly_those_cpu_directories() {
     let said = said(&out);
     let _ = fs::remove_dir_all(&xdg);
     let _ = fs::remove_dir_all(&rootfs);
+    if cpus < 7 {
+        assert!(
+            !out.status.success() && said.contains("requested CPUs are not available"),
+            "a list naming CPU 6 on a {cpus}-CPU host must be refused as Docker refuses it: {said}"
+        );
+        return;
+    }
     if host_cannot_build_a_box(&said) {
         eprintln!("skip: this host cannot build a box: {said}");
         return;
@@ -17861,7 +18202,14 @@ fn build_for_another_platform_runs_its_own_binaries_and_keeps_the_hosts() {
         &["build", "-t", "plat:1", "--platform", "linux/arm64", c],
         &[],
     );
-    if !one_ok && (one.contains("resolve") || one.contains("curl failed")) {
+    // The registry's anonymous quota is the same kind of outside condition: kern names it ("is
+    // rate-limiting this pull"), and MEASURED, several VMs behind one address used it up and this
+    // test failed on Fedora for a pull nobody could make, docker included.
+    if !one_ok
+        && (one.contains("resolve")
+            || one.contains("curl failed")
+            || one.contains("is rate-limiting this pull"))
+    {
         eprintln!("skip: alpine for arm64 could not be fetched: {one}");
         let _ = as_mapped_root(&format!("rm -rf '{}'", base.display()));
         let _ = fs::remove_dir_all(&base);
@@ -18792,5 +19140,90 @@ fn a_file_bound_after_a_directory_over_its_parent_is_visible() {
     assert!(
         stdout.contains("COVER") && stdout.contains("TWO"),
         "the directory and the file bound after it must both be visible: {stdout} {stderr}"
+    );
+}
+
+/// ⛔ A RUNNING BOX KEEPS ITS CAPS THROUGH A `systemctl --user daemon-reload`.
+///
+/// MEASURED on a desktop (systemd 255): with the boxes as plain cgroups directly in `kern.slice`,
+/// a reload recomputed the slice's controllers from its member UNITS, found none, turned them off,
+/// and every running box lost `memory.max` and `pids.max` with nothing said. The boxes now live in
+/// a `Delegate=yes` unit, whose subtree systemd does not touch. Skipped where there is no user
+/// systemd, or where the box has no cap file of its own to begin with (a path that caps elsewhere).
+#[test]
+fn a_running_box_keeps_its_caps_through_a_systemd_reload() {
+    let Some(busybox) = static_busybox() else {
+        eprintln!("skip: no busybox available");
+        return;
+    };
+    if !userns_plausible() {
+        eprintln!("skip: unprivileged user namespaces disabled");
+        return;
+    }
+    let has_user_systemd = std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_user_systemd {
+        eprintln!("skip: no user systemd here");
+        return;
+    }
+    let rootfs = build_rootfs(&busybox, "capsreload");
+    let name = format!("capsreload-{}", std::process::id());
+    let up = kern()
+        .args(["box", "-d", "--name", &name, "--rootfs"])
+        .arg(&rootfs)
+        .args(["--", "/bin/busybox", "sleep", "30"])
+        .output()
+        .expect("run kern");
+    let stop = || {
+        let _ = kern().args(["stop", "-t", "0", &name]).output();
+    };
+    if !up.status.success() {
+        eprintln!(
+            "skip: the box did not start here: {}",
+            String::from_utf8_lossy(&up.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+        return;
+    }
+    // The box's own cgroup, from its init's `/proc/<pid>/cgroup`.
+    let pid = kern()
+        .args(["inspect", "-f", "{{.State.Pid}}", &name])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let cg = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|c| {
+            c.lines()
+                .find_map(|l| l.strip_prefix("0::").map(|p| format!("/sys/fs/cgroup{p}")))
+        })
+        .unwrap_or_default();
+    let mem_max = || fs::read_to_string(format!("{cg}/memory.max")).ok();
+    let before = mem_max();
+    if cg.is_empty() || before.is_none() {
+        stop();
+        eprintln!("skip: the box has no memory.max of its own here (cgroup {cg:?})");
+        return;
+    }
+    let reload = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let after = mem_max();
+    let pids_after = fs::read_to_string(format!("{cg}/pids.max")).ok();
+    stop();
+    assert!(reload.is_ok_and(|s| s.success()), "daemon-reload failed");
+    assert_eq!(
+        after, before,
+        "the box's memory.max must survive a reload (cgroup {cg})"
+    );
+    assert!(
+        pids_after.is_some(),
+        "the box's pids.max must survive a reload (cgroup {cg})"
     );
 }

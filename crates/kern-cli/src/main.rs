@@ -280,6 +280,7 @@ mod gpu_grant;
 mod history;
 mod keepbox;
 mod listing;
+mod logview;
 /// Peer addressing and hosts files for a `--no-pod` stack.
 mod network;
 mod nopod;

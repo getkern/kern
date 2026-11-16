@@ -42,7 +42,7 @@ echo "    live boxes (ps -q | grep | wc): $(count) / $N"
 
 echo
 echo "==> sample a slice with ps --filter + --format (first 3):"
-"$kern" ps --filter "name=$pfx" --format '{{.Names}}\t{{.Status}}\tup {{.RunningFor}}' \
+"$kern" ps --filter "name=$pfx" --format '{{.Names}}\t{{.Status}}' \
   | grep "$pfx" | sort -V | head -3 | sed 's/^/    /'
 
 echo

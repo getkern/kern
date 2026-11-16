@@ -9,8 +9,8 @@ COMMANDS:
     run --landlock-rw <path> [--] CMD...                           Confine CMD's writes to <path> (kernel LSM, no sandbox)
     exec <name> [-i|-t|-it] [-u <user>] [--env K=V] [-w <dir>] [--] [CMD...]  Run CMD in a running box
     ps [-a] [--json] [-q] [--filter name=|status=|id=|label=|pod=|health=] [--format T] [--no-trunc] [--last N|-n N]  List boxes (-a also lists recently-exited: transient, gc-reaped, no name hold)
-    logs <name> [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
-    stop <name>... | --all                                         Stop box(es), or all
+    logs <name>|--all [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]  Show a box's output
+    stop [-t N] <name>... | --all                                  Stop box(es), or all; -t: seconds before the kill
 
   Images
     search <query> [--json]                                        Search the public image registry
@@ -41,12 +41,16 @@ COMMANDS:
     pause <name>... | --all                                        Freeze box(es) (cgroup freezer)
     unpause <name>... | --all                                      Thaw frozen box(es)
     kill <name>... | killall                                       Stop box(es) (alias of stop)
-    start <name>...                                                Run a `box --keep` box again, on the layer it left behind (its recorded command line)
+    create [OPTIONS] IMAGE [CMD...]                                A kept box recorded and not started (box's options, --name N); prints its name
+    start [-a] <name>...                                           Run a `box --keep`/`create` box again, on the layer it left behind; -a follows its output
+    restart [-t N] <name>...                                       Stop a kept box and start it again, or start it if stopped (N: seconds before the kill)
     rm [-f] <name>...                                              Remove a stopped or exited box and its record (`--keep`: its layer too); -f stops a running one first
-    rename <old> <new>                                             Give a running box a new name
-    update <box> [--memory M] [--cpus N] [--pids-limit P]          Change a running box's caps live (needs delegated cgroup)
+    rename <old> <new>                                             Give a box (running or kept) a new name
+    update [--memory M] [--cpus N] [--pids-limit P] <box>          Change a box's caps: live when running (needs delegated cgroup), and a kept box's record
     wait <box>...                                                  Wait for box(es) to exit and print the code; one that already exited answers at once
-    diff <box> [--json]                                            List filesystem changes vs the image (C/D)
+    diff <box> [--json]                                            List filesystem changes vs the image (C/D); a kept box's too, running or not
+    export <box> [-o file]                                         A running box's filesystem as a tar (stdout without -o)
+    container <verb> ...                                           The box verbs under one name (container ls = ps; not run/top/prune)
     events                                                         Stream box start/die/rename events (Ctrl-C; best-effort)
     prune                                                          Remove a stopped box's leftovers: logs, health, environment, and the recorded exit code
     gc [--images]                                                  Cleanup: prune + scratch + build layers. --images DELETES every cached image
@@ -61,8 +65,9 @@ COMMANDS:
     compose <file> run [--rm] [--no-deps] <service> [cmd...]       One-off box from a service definition, in the foreground; its exit code is kern's
     compose <file> cp <service>:<path> <dst> | <src> <service>:<path>  Copy a file in or out, naming the SERVICE rather than the box
     compose <file> exec [-T] <service> <cmd...>                     Run a command in a RUNNING service; its exit code is kern's
-    compose <file> ps [-q] [--services] [--format json]            Ids only, service names from the file, or NDJSON for a script
-    up [-d] [--wait [--wait-timeout N]] / down [-v] [--remove-orphans]  --wait holds until every service is ready; down -v deletes this project's named volumes
+    compose <file> ps [-q] [--services] [--format json|T]          Docker's table (NAME IMAGE COMMAND SERVICE CREATED STATUS PORTS); -q ids, json NDJSON
+    compose <file> config [service...] [--format yaml|json] [--services|--images|--volumes|--networks|--profiles|--environment|--variables|--hash S] [--no-interpolate] [-q] [-o F]  The project as Docker Compose prints it; kern's summary on stderr
+    up [-d] [--wait [--wait-timeout N]] / down [-v] [--remove-orphans]  --wait holds until every service is ready (-d alone exits 0 if one dies at once); down -v deletes this project's named volumes
     up [--abort-on-container-exit] [--exit-code-from <service>]        Stop the stack when a service exits, and adopt that service's status
     pod create <name> [--no-outbound] [--no-uid-range] [--bridge <cidr>]...  Shared-network pod: peers reach each other by name.
     pod ls [--json] | pod rm <name>                                List pods, or remove one

@@ -222,7 +222,7 @@ impl Caller {
     /// form. A count that grows between the two calls is handled by trusting the second return
     /// value rather than the first, so a race widens nothing.
     pub fn current() -> Self {
-        let uid = unsafe { libc::getuid() } as u32;
+        let uid = unsafe { libc::getuid() };
         let mut gids: Vec<u32> = Vec::new();
 
         let needed = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
@@ -234,7 +234,7 @@ impl Caller {
                 gids.extend(buffer[..got].iter().copied());
             }
         }
-        let primary = unsafe { libc::getgid() } as u32;
+        let primary = unsafe { libc::getgid() };
         if !gids.contains(&primary) {
             gids.push(primary);
         }
@@ -1361,7 +1361,7 @@ pub fn driver_version_from(contents: &str) -> Option<String> {
 /// ONE SPELLING for the two callers that need it, and the reason they both needed fixing is that
 /// they disagreed about the same question. An ABSOLUTE target used to stop the walk in
 /// [`canonical_dir_under`], which left THE SYMLINK in the result, the exact shape that function
-/// exists to remove; and [`libraries_under`] followed one with `std::fs::metadata` and recorded the
+/// exists to remove; and [`libraries_from`] followed one with `std::fs::metadata` and recorded the
 /// LINK as the path to mount, which breaks the invariant [`symlinks_for`] enforces (the resolved
 /// file is bound at the link's own path).
 ///
@@ -1375,43 +1375,104 @@ pub fn driver_version_from(contents: &str) -> Option<String> {
 /// treats `false` as a skip never mounts a half-resolved path. A loop is a thing a filesystem
 /// permits and an unbounded walk is a hang.
 fn follow_links_under(root: &Path, path: &mut PathBuf) -> bool {
-    for _ in 0..MAX_LINK_HOPS {
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+    !matches!(
+        walk_links_under(root, path, MAX_LINK_HOPS),
+        LinkWalk::Refused
+    )
+}
+
+/// Where a chain walked by [`walk_links_under`] stopped.
+enum LinkWalk {
+    /// At a non-symlink, with its `lstat`, which for a non-symlink IS its `stat`: the caller that
+    /// needs the file's identity has it without asking the filesystem a second time.
+    Reached(std::fs::Metadata),
+    /// At a path with nothing there. Not a link, so as resolved as it gets.
+    Missing,
+    /// Out of hops, an unreadable link, or a target that climbed out of the root.
+    Refused,
+}
+
+/// [`follow_links_under`] with the final metadata kept and the hop budget the caller's: a caller
+/// that has already taken the first hop itself passes one hop fewer, so the bound on the WHOLE
+/// chain is the same [`MAX_LINK_HOPS`] either way.
+fn walk_links_under(root: &Path, path: &mut PathBuf, hops: u8) -> LinkWalk {
+    walk_links_noting(root, path, hops, &mut |_| {})
+}
+
+/// [`walk_links_under`], telling `note` every path a hop lands on, whether or not the hop is then
+/// accepted: the record of a scan ([`remember_scan`]) needs every directory whose contents the
+/// answer depended on, and a refused hop depended on its directory as much as a followed one.
+fn walk_links_noting(
+    root: &Path,
+    path: &mut PathBuf,
+    hops: u8,
+    note: &mut dyn FnMut(&Path),
+) -> LinkWalk {
+    for _ in 0..hops {
+        let Ok(meta) = std::fs::symlink_metadata(&*path) else {
             // Nothing there: not a symlink, so the chain is as resolved as it gets. A caller that
             // needs the path to EXIST checks that itself; this answers about links only.
-            return true;
+            return LinkWalk::Missing;
         };
         if !meta.file_type().is_symlink() {
-            return true;
+            return LinkWalk::Reached(meta);
         }
-        let Ok(target) = std::fs::read_link(&path) else {
-            return false;
+        let Ok(target) = std::fs::read_link(&*path) else {
+            return LinkWalk::Refused;
         };
-        let next = if target.is_absolute() {
-            root.join(target.strip_prefix("/").unwrap_or(&target))
-        } else {
-            let Some(parent) = path.parent() else {
-                return false;
-            };
-            parent.join(target)
+        let Some(next) = link_hop_target(root, path, &target) else {
+            return LinkWalk::Refused;
         };
-        // `..` IN A TARGET CAN STILL CLIMB OUT, and joining it does not normalise, so the check is
-        // on what the filesystem says the path really is. An unresolvable path cannot be shown to
-        // stay inside, so it does not.
-        match std::fs::canonicalize(&next) {
-            Ok(real) if real.starts_with(root) => {}
-            Ok(_) => return false,
-            // A dangling link is not an escape; the loop above stops on the next turn because
-            // `symlink_metadata` fails.
-            Err(_)
-                if !next
-                    .components()
-                    .any(|c| c == std::path::Component::ParentDir) => {}
-            Err(_) => return false,
+        note(&next);
+        if !hop_stays_under(root, &next) {
+            return LinkWalk::Refused;
         }
         *path = next;
     }
-    false
+    LinkWalk::Refused
+}
+
+/// One hop of a chain: where `target`, read from the link at `link`, points under `root`, or
+/// `None` when it climbs out. [`link_hop_target`], then [`hop_stays_under`].
+fn link_hop_under(root: &Path, link: &Path, target: &Path) -> Option<PathBuf> {
+    let next = link_hop_target(root, link, target)?;
+    hop_stays_under(root, &next).then_some(next)
+}
+
+/// Where `target`, read from the link at `link`, points. AN ABSOLUTE TARGET IS TAKEN AGAINST THE
+/// ROOT (see [`follow_links_under`]). `None` only for a link with no parent, which no path read out
+/// of a directory is.
+fn link_hop_target(root: &Path, link: &Path, target: &Path) -> Option<PathBuf> {
+    if target.is_absolute() {
+        Some(root.join(target.strip_prefix("/").unwrap_or(target)))
+    } else {
+        Some(link.parent()?.join(target))
+    }
+}
+
+/// Whether a hop's destination stays under `root`.
+///
+/// `..` IN A TARGET CAN STILL CLIMB OUT, and joining it does not normalise, so the check is on what
+/// the filesystem says the path really is. An unresolvable path cannot be shown to stay inside, so
+/// it does not, unless it has no `..` at all: a dangling link is not an escape, and the walk stops
+/// on the next turn because `symlink_metadata` fails.
+///
+/// UNDER THE REAL ROOT A PLAIN TARGET IS ACCEPTED WITHOUT ASKING. With `root` = `/` every resolved
+/// path starts with `/`, and a path with no `..` is accepted whether it resolves or not, so the
+/// `canonicalize` could only ever answer "accepted". It was still asked, and on a musl build it is
+/// a `readlink` per component: MEASURED on a desktop with 2805 entries in `/usr/lib/x86_64-linux-gnu`
+/// (1291 links), 7041 `readlink`s for one `--gpus` start, most of them this question.
+fn hop_stays_under(root: &Path, next: &Path) -> bool {
+    let climbs = next
+        .components()
+        .any(|c| c == std::path::Component::ParentDir);
+    if !climbs && root == Path::new("/") {
+        return true;
+    }
+    match std::fs::canonicalize(next) {
+        Ok(real) => real.starts_with(root),
+        Err(_) => !climbs,
+    }
 }
 
 fn canonical_dir_under(root: &Path, dir: &Path) -> PathBuf {
@@ -1576,62 +1637,74 @@ fn elf_class_of(path: &Path) -> Option<ElfClass> {
 }
 
 /// Every library carrying the driver's exact version suffix, deduplicated by identity.
-///
-/// The suffix is `.so.<version>` and the match is on the whole ending, not on a substring, so
-/// `libfoo.so.580.173.021` cannot join a `580.173.02` grant.
+#[cfg(test)]
 fn libraries_under(root: &Path, version: &str, want: ElfClass) -> Vec<Library> {
-    let suffix = format!(".so.{version}");
-    let mut out: Vec<Library> = Vec::new();
-    let mut identities: BTreeSet<(u64, u64)> = BTreeSet::new();
+    libraries_from(root, want, &library_candidates(&linker_dirs(root), version))
+}
 
-    for dir in linker_dirs(root) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+/// The directory entries a grant's libraries can come from: every name in the linker's directories
+/// that ends with `.so.<version>`, in the order the directories are read.
+///
+/// The match is on the whole ending, not on a substring, so `libfoo.so.580.173.021` cannot join a
+/// `580.173.02` grant.
+fn library_candidates(dirs: &[PathBuf], version: &str) -> Vec<PathBuf> {
+    let suffix = format!(".so.{version}");
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !name.ends_with(&suffix) {
-                continue;
+            if name.ends_with(&suffix) {
+                out.push(entry.path());
             }
-            // THE RESOLVED FILE, AND IT MUST STAY UNDER THE ROOT. This used to take
-            // `entry.path()` and `std::fs::metadata`, which follows a symlink wherever it points,
-            // including out of the root, and then recorded THE LINK as the path to mount. That
-            // breaks the invariant `symlinks_for` enforces, where the resolved file is bound at the
-            // link's own path, and under a synthetic root it names a file the bind would fail on
-            // with O_NOFOLLOW. A chain that leaves the root is skipped: a library kern cannot name
-            // inside the root is not a library it can hand over.
-            let mut path = entry.path();
-            if !follow_links_under(root, &mut path) {
-                continue;
-            }
-            // `metadata` and not `symlink_metadata`: the chain above is already resolved, and the
-            // identity that matters is the file's, because that is what two paths share.
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            if elf_class_of(&path) != Some(want) {
-                continue;
-            }
-            let identity = (meta.dev(), meta.ino());
-            if !identities.insert(identity) {
-                continue;
-            }
-            out.push(Library {
-                path,
-                dev: identity.0,
-                ino: identity.1,
-            });
         }
+    }
+    out
+}
+
+/// The libraries `candidates` resolve to: regular files of the wanted class, deduplicated by
+/// identity, sorted by path.
+fn libraries_from(root: &Path, want: ElfClass, candidates: &[PathBuf]) -> Vec<Library> {
+    let mut out: Vec<Library> = Vec::new();
+    let mut identities: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for candidate in candidates {
+        // THE RESOLVED FILE, AND IT MUST STAY UNDER THE ROOT. This used to take `entry.path()` and
+        // `std::fs::metadata`, which follows a symlink wherever it points, including out of the
+        // root, and then recorded THE LINK as the path to mount. That breaks the invariant
+        // `symlinks_for` enforces, where the resolved file is bound at the link's own path, and
+        // under a synthetic root it names a file the bind would fail on with O_NOFOLLOW. A chain
+        // that leaves the root is skipped: a library kern cannot name inside the root is not a
+        // library it can hand over.
+        let mut path = candidate.clone();
+        // The walk's last `lstat` is the resolved file's own metadata (it is not a link), and the
+        // identity that matters is the file's, because that is what two paths share.
+        let LinkWalk::Reached(meta) = walk_links_under(root, &mut path, MAX_LINK_HOPS) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if elf_class_of(&path) != Some(want) {
+            continue;
+        }
+        let identity = (meta.dev(), meta.ino());
+        if !identities.insert(identity) {
+            continue;
+        }
+        out.push(Library {
+            path,
+            dev: identity.0,
+            ino: identity.1,
+        });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-/// Every symlink in the linker's directories whose chain ends at one of the granted libraries.
+/// Every symlink in the linker's directories `dirs` whose chain ends at one of the granted libraries.
 ///
 /// The chain is followed by hand rather than with `std::fs::canonicalize`, for one reason that a
 /// grant cannot afford to get wrong: `canonicalize` resolves against the REAL filesystem root, so
@@ -1640,8 +1713,14 @@ fn libraries_under(root: &Path, version: &str, want: ElfClass) -> Vec<Library> {
 /// link lives in, which is where a library's SONAME link always points.
 ///
 /// `MAX_LINK_HOPS` bounds it. A symlink loop is a thing a filesystem permits, and an unbounded
-/// resolver meeting one would not return.
-fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
+/// resolver meeting one would not return. `note` is told every path a hop lands on
+/// ([`walk_links_noting`]).
+fn symlinks_for(
+    root: &Path,
+    dirs: &[PathBuf],
+    granted: &[Library],
+    note: &mut dyn FnMut(&Path),
+) -> Vec<Symlink> {
     let identities: BTreeSet<(u64, u64)> = granted.iter().map(|l| (l.dev, l.ino)).collect();
     let mut out: Vec<Symlink> = Vec::new();
     // DEDUPLICATED BY THE LINK'S OWN IDENTITY, not by its path, for exactly the reason the library
@@ -1650,9 +1729,12 @@ fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
     // the same mistake was made in this file, once for the files and once for the links, which is
     // why both now use the same key.
     let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // First hop -> the granted file its chain ends at, or `None` when it ends anywhere else.
+    let mut chains: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
 
-    for dir in linker_dirs(root) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -1669,10 +1751,7 @@ fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
             if !kind.is_symlink() {
                 continue;
             }
-            // The link's OWN target. It is read once here and then used as the first hop of the
-            // walk below, which used to re-read it: the loop started by asking again what kind
-            // `link` was, when the branch above had just established it, and then read the same
-            // target a second time.
+            // The link's OWN target, read once: it is the first hop of the walk below.
             let Ok(target) = std::fs::read_link(&link) else {
                 continue;
             };
@@ -1682,14 +1761,43 @@ fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
             // inside the root had no symlink recorded and the box got the file with no SONAME
             // pointing at it. A derived condition evaluated in three places is this project's
             // recurring defect, and this one took three fixes to notice.
-            let mut resolved = link.clone();
-            let ends_in_grant = if follow_links_under(root, &mut resolved) {
-                std::fs::metadata(&resolved)
-                    .ok()
-                    .filter(|meta| identities.contains(&(meta.dev(), meta.ino())))
-                    .map(|_| resolved)
-            } else {
-                None
+            //
+            // THE FIRST HOP IS TAKEN FROM THE TARGET JUST READ, and the walk goes on from there with
+            // one hop fewer, so the bound on the whole chain is unchanged. The walk used to start
+            // again at the link: an `lstat` to learn it was a link and a second `readlink` of it.
+            //
+            // AND A CHAIN IS WALKED ONCE PER STARTING POINT. `libz.so` and `libz.so.1` both point
+            // at `libz.so.1.3`; what that path resolves to does not depend on which link led
+            // there. MEASURED on this host (2805 entries, 1291 links in `/usr/lib/x86_64-linux-gnu`):
+            // about 9 syscalls per link before, 1 `readlink` plus at most 1 `lstat` now, and the
+            // final `stat` is the walk's own last `lstat`, which for a non-link is the same answer.
+            let Some(first) = link_hop_target(root, &link, &target) else {
+                continue;
+            };
+            note(&first);
+            if !hop_stays_under(root, &first) {
+                continue;
+            }
+            let ends_in_grant = match chains.get(&first) {
+                Some(known) => known.clone(),
+                None => {
+                    let mut resolved = first.clone();
+                    let answer = match walk_links_noting(
+                        root,
+                        &mut resolved,
+                        MAX_LINK_HOPS.saturating_sub(1),
+                        note,
+                    ) {
+                        LinkWalk::Reached(meta)
+                            if identities.contains(&(meta.dev(), meta.ino())) =>
+                        {
+                            Some(resolved)
+                        }
+                        _ => None,
+                    };
+                    chains.insert(first, answer.clone());
+                    answer
+                }
             };
             if let Some(resolved) = ends_in_grant {
                 // THE LINK'S OWN IDENTITY, ASKED ONLY FOR A LINK THAT IS ACTUALLY GRANTED. This is
@@ -1710,6 +1818,356 @@ fn symlinks_for(root: &Path, granted: &[Library]) -> Vec<Symlink> {
     }
     out.sort_by(|a, b| a.link.cmp(&b.link));
     out
+}
+
+/// The grant's libraries and links under `root`: from the record of an earlier scan when it still
+/// holds ([`recall_scan`]), otherwise from a scan, which is then recorded ([`remember_scan`]).
+///
+/// THE SCAN WAS MOST OF A `--gpus` START. MEASURED on a desktop (2x RTX 5060 Ti, 2805 entries and
+/// 1291 links in `/usr/lib/x86_64-linux-gnu`), medians of 15: 7.5 ms of the parent's 8.7 ms
+/// `config+volumes`, 5.5 ms of it reading every link in the linker's directories, on every box,
+/// to find the 29 that end at the driver's libraries. The answer changes only when those
+/// directories do.
+fn libraries_and_links(
+    root: &Path,
+    version: &str,
+    want: ElfClass,
+    record: Option<&Path>,
+) -> (Vec<Library>, Vec<Symlink>) {
+    // Recomputed every time, not recorded: it is the configuration the loader reads, cheap to
+    // parse, and a record compared against it cannot miss an `ld.so.conf` edit.
+    let dirs = linker_dirs(root);
+    if let Some(found) = record.and_then(|r| recall_scan(r, root, version, want, &dirs)) {
+        return found;
+    }
+    let started = std::time::SystemTime::now();
+    let candidates = library_candidates(&dirs, version);
+    let libraries = libraries_from(root, want, &candidates);
+    let mut touched: BTreeSet<PathBuf> = BTreeSet::new();
+    let symlinks = symlinks_for(root, &dirs, &libraries, &mut |hop: &Path| {
+        if let Some(parent) = hop.parent() {
+            if !touched.contains(parent) {
+                touched.insert(parent.to_path_buf());
+            }
+        }
+    });
+    if let Some(r) = record {
+        let scan = ScanRecord {
+            root,
+            version,
+            want,
+            dirs: &dirs,
+            touched: &touched,
+            candidates: &candidates,
+            libraries: &libraries,
+            symlinks: &symlinks,
+        };
+        if let Some(cutoff) = settled_before(started) {
+            remember_scan(r, &scan, cutoff);
+        }
+    }
+    (libraries, symlinks)
+}
+
+/// Format tag of the scan record. A record written by another version of the format is a miss.
+const SCAN_RECORD_MAGIC: &[u8] = b"kern-gpu-scan-1";
+
+/// How recently a watched directory may have changed for a scan to be recorded, in seconds.
+///
+/// A directory's timestamps have a granularity (the kernel's coarse clock), so a change made in the
+/// same tick as one the scan already saw leaves them EQUAL, and a record keyed on them would hold a
+/// stale answer. A scan that saw a directory change this recently is used and not recorded; the
+/// next one records it.
+const SCAN_RECORD_SETTLE_SECS: u64 = 2;
+
+/// Everything a scan's answer was derived from, for [`remember_scan`].
+struct ScanRecord<'a> {
+    root: &'a Path,
+    version: &'a str,
+    want: ElfClass,
+    dirs: &'a [PathBuf],
+    touched: &'a BTreeSet<PathBuf>,
+    candidates: &'a [PathBuf],
+    libraries: &'a [Library],
+    symlinks: &'a [Symlink],
+}
+
+fn class_tag(want: ElfClass) -> &'static [u8] {
+    match want {
+        ElfClass::Bits32 => b"32",
+        ElfClass::Bits64 => b"64",
+    }
+}
+
+fn push_field(out: &mut Vec<u8>, field: &[u8]) {
+    out.extend_from_slice(field);
+    out.push(0);
+}
+
+fn push_number(out: &mut Vec<u8>, n: impl std::fmt::Display) {
+    push_field(out, n.to_string().as_bytes());
+}
+
+/// A directory's identity and both of its timestamps: what changes when an entry is added, removed,
+/// renamed or replaced (`mtime`), and what no caller can set back (`ctime`, which `utime` itself
+/// moves forward).
+fn dir_stamp(meta: &std::fs::Metadata) -> [i64; 6] {
+    // `dev` and `ino` are `u64`; they are compared, never computed with, so the bit pattern is the
+    // value and the cast cannot lose one.
+    [
+        meta.dev() as i64,
+        meta.ino() as i64,
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    ]
+}
+
+/// The newest timestamp, in seconds since the epoch, a watched directory may carry for a scan that
+/// started at `started` to be recorded ([`SCAN_RECORD_SETTLE_SECS`]).
+fn settled_before(started: std::time::SystemTime) -> Option<i64> {
+    let since_epoch = started.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(
+        since_epoch
+            .as_secs()
+            .saturating_sub(SCAN_RECORD_SETTLE_SECS),
+    )
+    .ok()
+}
+
+/// Record a scan at `record`, unless one of the directories it depended on carries a timestamp at or
+/// after `cutoff` ([`settled_before`]) or can no longer be read.
+///
+/// WHAT IS WATCHED: every linker directory (its entries are the candidates and the links), and the
+/// directory of every path any chain's hop landed on, followed or refused. A link anywhere in those
+/// directories cannot be added, removed or re-pointed without changing that directory's `mtime`
+/// and `ctime`, and a directory reached through a re-pointed directory link is a different `ino`.
+/// What is NOT watched, because it is re-derived on every recall: the libraries (each candidate is
+/// walked and its ELF header read again) and the granted links (each is read and walked again).
+fn remember_scan(record: &Path, scan: &ScanRecord<'_>, cutoff: i64) {
+    let mut watched: BTreeSet<&Path> = scan.dirs.iter().map(PathBuf::as_path).collect();
+    watched.extend(scan.touched.iter().map(PathBuf::as_path));
+
+    let mut out: Vec<u8> = Vec::new();
+    push_field(&mut out, SCAN_RECORD_MAGIC);
+    push_field(&mut out, scan.root.as_os_str().as_bytes());
+    push_field(&mut out, scan.version.as_bytes());
+    push_field(&mut out, class_tag(scan.want));
+    push_field(&mut out, b"L");
+    push_number(&mut out, scan.dirs.len());
+    for dir in scan.dirs {
+        push_field(&mut out, dir.as_os_str().as_bytes());
+    }
+    push_field(&mut out, b"D");
+    push_number(&mut out, watched.len());
+    for dir in &watched {
+        // A DIRECTORY THAT IS NOT THERE IS RECORDED AS ABSENT, and a recall needs it still absent.
+        // That is the whole of what the scan depended on: a missing directory has no entries, and
+        // the answer changes only when it appears, however it appears (created, or reached through
+        // a link that stopped dangling). Giving up instead left the record unwritten on any host
+        // without one of the loader's default directories.
+        let Ok(meta) = std::fs::metadata(dir) else {
+            push_field(&mut out, b"-");
+            push_field(&mut out, dir.as_os_str().as_bytes());
+            continue;
+        };
+        if meta.mtime() >= cutoff || meta.ctime() >= cutoff {
+            return;
+        }
+        push_field(&mut out, b"+");
+        push_field(&mut out, dir.as_os_str().as_bytes());
+        for n in dir_stamp(&meta) {
+            push_number(&mut out, n);
+        }
+    }
+    push_field(&mut out, b"C");
+    push_number(&mut out, scan.candidates.len());
+    for candidate in scan.candidates {
+        push_field(&mut out, candidate.as_os_str().as_bytes());
+    }
+    push_field(&mut out, b"G");
+    push_number(&mut out, scan.libraries.len());
+    for library in scan.libraries {
+        push_field(&mut out, library.path.as_os_str().as_bytes());
+        push_number(&mut out, library.dev);
+        push_number(&mut out, library.ino);
+    }
+    push_field(&mut out, b"S");
+    push_number(&mut out, scan.symlinks.len());
+    for symlink in scan.symlinks {
+        push_field(&mut out, symlink.link.as_os_str().as_bytes());
+        push_field(&mut out, symlink.target.as_os_str().as_bytes());
+        push_field(&mut out, symlink.resolved.as_os_str().as_bytes());
+    }
+    push_field(&mut out, b"E");
+    // A record that cannot be written is a scan next time, which is what there was before.
+    let _ = crate::config::write_atomic_bytes(record, &out);
+}
+
+/// The NUL-separated fields of a scan record, read in order.
+struct RecordFields<'a> {
+    fields: std::slice::Split<'a, u8, fn(&u8) -> bool>,
+}
+
+impl<'a> RecordFields<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let is_nul: fn(&u8) -> bool = |b| *b == 0;
+        RecordFields {
+            fields: data.split(is_nul),
+        }
+    }
+
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        self.fields.next()
+    }
+
+    fn tag(&mut self, tag: &[u8]) -> Option<()> {
+        (self.bytes()? == tag).then_some(())
+    }
+
+    fn path(&mut self) -> Option<PathBuf> {
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(self.bytes()?)))
+    }
+
+    fn number<T: std::str::FromStr>(&mut self) -> Option<T> {
+        std::str::from_utf8(self.bytes()?).ok()?.parse().ok()
+    }
+}
+
+/// The answer of a recorded scan, when every directory it depended on is as it was and every part
+/// of it re-derives to the same thing; `None` otherwise, which is a scan.
+///
+/// BELIEVED ONLY AS FAR AS IT IS CHECKED, as the WSL store's record is ([`crate::gpu`]). The record
+/// lives in kern's runtime directory, which no box can mount, and still nothing in it is taken on
+/// its word: a candidate must sit in a linker directory and carry the version suffix, the libraries
+/// are re-derived from the candidates (walk, regular file, ELF class, identity) and must equal the
+/// recorded ones, and each granted link is read and walked again to the same library. A forged
+/// record can therefore only OMIT something, never add a file the scan would not have chosen. What
+/// the directory stamps add is the one thing re-derivation cannot: that no link was added.
+fn recall_scan(
+    record: &Path,
+    root: &Path,
+    version: &str,
+    want: ElfClass,
+    dirs: &[PathBuf],
+) -> Option<(Vec<Library>, Vec<Symlink>)> {
+    let data = std::fs::read(record).ok()?;
+    let mut f = RecordFields::new(&data);
+    f.tag(SCAN_RECORD_MAGIC)?;
+    f.tag(root.as_os_str().as_bytes())?;
+    f.tag(version.as_bytes())?;
+    f.tag(class_tag(want))?;
+
+    f.tag(b"L")?;
+    let count: usize = f.number()?;
+    if count != dirs.len() {
+        return None;
+    }
+    for dir in dirs {
+        if f.path()? != *dir {
+            return None;
+        }
+    }
+
+    f.tag(b"D")?;
+    let count: usize = f.number()?;
+    for _ in 0..count {
+        let present = match f.bytes()? {
+            b"+" => true,
+            b"-" => false,
+            _ => return None,
+        };
+        let dir = f.path()?;
+        let now = std::fs::metadata(&dir);
+        if !present {
+            if now.is_ok() {
+                return None;
+            }
+            continue;
+        }
+        let mut stamp = [0i64; 6];
+        for n in &mut stamp {
+            *n = f.number()?;
+        }
+        if dir_stamp(&now.ok()?) != stamp {
+            return None;
+        }
+    }
+
+    let suffix = format!(".so.{version}");
+    let in_dirs = |p: &Path| {
+        p.parent()
+            .is_some_and(|parent| dirs.iter().any(|d| d.as_path() == parent))
+    };
+    f.tag(b"C")?;
+    let count: usize = f.number()?;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for _ in 0..count {
+        let candidate = f.path()?;
+        let named = candidate
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(&suffix));
+        if !named || !in_dirs(&candidate) {
+            return None;
+        }
+        candidates.push(candidate);
+    }
+    let libraries = libraries_from(root, want, &candidates);
+
+    f.tag(b"G")?;
+    let count: usize = f.number()?;
+    if count != libraries.len() {
+        return None;
+    }
+    for library in &libraries {
+        let path = f.path()?;
+        let dev: u64 = f.number()?;
+        let ino: u64 = f.number()?;
+        if path != library.path || dev != library.dev || ino != library.ino {
+            return None;
+        }
+    }
+
+    let identities: BTreeSet<(u64, u64)> = libraries.iter().map(|l| (l.dev, l.ino)).collect();
+    let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+    f.tag(b"S")?;
+    let count: usize = f.number()?;
+    let mut symlinks: Vec<Symlink> = Vec::new();
+    for _ in 0..count {
+        let link = f.path()?;
+        let target = f.path()?;
+        let resolved = f.path()?;
+        if !in_dirs(&link) || std::fs::read_link(&link).ok()? != target {
+            return None;
+        }
+        let mut walked = link_hop_under(root, &link, &target)?;
+        let LinkWalk::Reached(meta) =
+            walk_links_under(root, &mut walked, MAX_LINK_HOPS.saturating_sub(1))
+        else {
+            return None;
+        };
+        if walked != resolved || !identities.contains(&(meta.dev(), meta.ino())) {
+            return None;
+        }
+        let link_meta = std::fs::symlink_metadata(&link).ok()?;
+        if !seen.insert((link_meta.dev(), link_meta.ino())) {
+            return None;
+        }
+        symlinks.push(Symlink {
+            link,
+            target,
+            resolved,
+        });
+    }
+    f.tag(b"E")?;
+    // The last NUL ends the record; anything after it is not a record this wrote.
+    if !f.bytes()?.is_empty() || f.bytes().is_some() {
+        return None;
+    }
+    symlinks.sort_by(|a, b| a.link.cmp(&b.link));
+    Some((libraries, symlinks))
 }
 
 /// Read the POSIX access ACL of `path` and reduce it to the fields [`NodeFacts`] carries.
@@ -2001,7 +2459,7 @@ pub fn group_policy(nodes: &[(PathBuf, NodeFacts)], who: &Caller) -> GroupPolicy
 /// what the HOST has, and who may reach it is a question about a SELECTION. `mount_plan` asks it
 /// over the nodes it is about to bind, which is the only set the answer can be right about.
 pub fn resolve() -> Result<GpuGrant, ResolveError> {
-    resolve_under(Path::new("/"), ElfClass::native())
+    resolve_recorded(Path::new("/"), ElfClass::native(), ScanRecordAt::RuntimeDir)
 }
 
 /// [`resolve`] with the root and the target class as parameters, so a test can build a tree.
@@ -2009,6 +2467,44 @@ pub fn resolve() -> Result<GpuGrant, ResolveError> {
 /// Nothing below reads a path the caller did not derive from `root`, which is the property that
 /// makes the whole module testable without hardware and the one a sabotage test removes first.
 pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveError> {
+    resolve_recorded(root, want, ScanRecordAt::Nowhere)
+}
+
+/// Where a resolve keeps the record of its library scan ([`libraries_and_links`]).
+#[derive(Clone, Copy)]
+enum ScanRecordAt {
+    /// Not recorded: a synthetic root, whose scan describes no host.
+    Nowhere,
+    /// `<runtime>/kern/gpu/scan`, beside the WSL store's record, for the real root.
+    RuntimeDir,
+}
+
+impl ScanRecordAt {
+    /// The path, resolved only when a scan is actually reached: a host whose grant comes from the
+    /// WSL store or a Jetson's list never asks, so it never creates the directory.
+    ///
+    /// NONE IN THIS CRATE'S UNIT TESTS. The runtime directory is the process-wide
+    /// `XDG_RUNTIME_DIR`, which a test may only read under the environment lock, and a test that
+    /// calls [`resolve`] to compare it with another surface is not about the record. The record has
+    /// its own test, with explicit paths:
+    /// `a_recorded_library_scan_is_recalled_only_while_its_directories_are_unchanged`.
+    fn path(self) -> Option<PathBuf> {
+        match self {
+            ScanRecordAt::Nowhere => None,
+            ScanRecordAt::RuntimeDir if cfg!(test) => None,
+            ScanRecordAt::RuntimeDir => crate::registry::runtime_subdir_public("gpu")
+                .ok()
+                .map(|d| d.join("scan")),
+        }
+    }
+}
+
+/// [`resolve_under`], with the library scan recorded where `record` says and recalled from it.
+fn resolve_recorded(
+    root: &Path,
+    want: ElfClass,
+    record: ScanRecordAt,
+) -> Result<GpuGrant, ResolveError> {
     let version_path = root.join(DRIVER_VERSION_REL);
     let Ok(contents) = std::fs::read_to_string(&version_path) else {
         return Err(ResolveError::NoDriverVersionFile {
@@ -2069,11 +2565,7 @@ pub fn resolve_under(root: &Path, want: ElfClass) -> Result<GpuGrant, ResolveErr
 
     let (libraries, symlinks) = match &csv {
         Some(c) => (csv_libraries(root, c, want), csv_symlinks(root, c)),
-        None => {
-            let libraries = libraries_under(root, &driver_version, want);
-            let symlinks = symlinks_for(root, &libraries);
-            (libraries, symlinks)
-        }
+        None => libraries_and_links(root, &driver_version, want, record.path().as_deref()),
     };
 
     // The loader's directories are DERIVED from where the libraries are, not copied from the host's
@@ -6709,5 +7201,244 @@ mod tests {
             assert!(binds.contains(&want), "{want:?} not in {binds:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Set a directory's `mtime` to an hour ago, so the next change to it is visible whatever the
+    /// granularity of the clock: a change made in the same tick as the fixture's own creation would
+    /// otherwise leave the stamp equal, which is the case [`SCAN_RECORD_SETTLE_SECS`] exists for and
+    /// not the one these tests are about.
+    fn age(dir: &Path) {
+        let Ok(c) = CString::new(dir.as_os_str().as_bytes()) else {
+            panic!("path with a NUL: {}", dir.display());
+        };
+        let hour_ago = libc::timespec {
+            tv_sec: unsafe { libc::time(std::ptr::null_mut()) } - 3600,
+            tv_nsec: 0,
+        };
+        let times = [hour_ago, hour_ago];
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "utimensat {}", dir.display());
+    }
+
+    /// THE RECORD OF A SCAN ANSWERS WHAT THE SCAN ANSWERS, AND STOPS ANSWERING WHEN IT WOULD NOT.
+    ///
+    /// The scan of the linker's directories was most of a `--gpus` start, so it is recorded and
+    /// recalled. What a recall must never do is hand a box the answer for a directory that has
+    /// changed since: a link added or re-pointed, a library replaced, `ld.so.conf` edited. Each is
+    /// made here and each must turn the recall into a miss; the positive control first, so a recall
+    /// that never hits cannot pass the misses.
+    #[test]
+    fn a_recorded_library_scan_is_recalled_only_while_its_directories_are_unchanged() {
+        let root =
+            std::env::temp_dir().join(format!("kern-gpu-scan-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lib = root.join("usr/lib/x86_64-linux-gnu");
+        let other = root.join("opt/vendor");
+        std::fs::create_dir_all(&lib).expect("lib dir");
+        std::fs::create_dir_all(&other).expect("vendor dir");
+        std::fs::create_dir_all(root.join("etc")).expect("etc");
+        std::fs::write(root.join("etc/ld.so.conf"), b"/usr/lib/x86_64-linux-gnu\n").expect("conf");
+        let mut elf = Vec::with_capacity(64);
+        elf.extend_from_slice(&ELF_MAGIC);
+        elf.push(ELF_CLASS_64);
+        elf.extend_from_slice(&[0u8; 59]);
+        std::fs::write(lib.join("libnv.so.1.2.3"), &elf).expect("lib");
+        std::fs::write(other.join("libnv-alt.so.1.2.3"), &elf).expect("alt lib");
+        std::fs::write(lib.join("libz.so.1"), b"not elf").expect("other file");
+        std::os::unix::fs::symlink("libnv.so.1.2.3", lib.join("libnv.so.1")).expect("soname link");
+        std::os::unix::fs::symlink("libz.so.1", lib.join("libz.so")).expect("other link");
+        // A chain through ANOTHER directory, which the record has to watch as well.
+        std::os::unix::fs::symlink(
+            "../../../opt/vendor/libnv-alt.so.1.2.3",
+            lib.join("libalt.so"),
+        )
+        .expect("cross-directory link");
+        for d in [
+            &lib,
+            &other,
+            &root.join("opt"),
+            &root.join("usr/lib"),
+            &root.join("usr"),
+            &root,
+        ] {
+            age(d);
+        }
+        let record = root.join("scan-record");
+        let want = ElfClass::Bits64;
+
+        let scan = |root: &Path| {
+            let dirs = linker_dirs(root);
+            let candidates = library_candidates(&dirs, "1.2.3");
+            let libraries = libraries_from(root, want, &candidates);
+            let mut touched: BTreeSet<PathBuf> = BTreeSet::new();
+            let symlinks = symlinks_for(root, &dirs, &libraries, &mut |hop: &Path| {
+                if let Some(parent) = hop.parent() {
+                    touched.insert(parent.to_path_buf());
+                }
+            });
+            (dirs, touched, candidates, libraries, symlinks)
+        };
+        let remember = |root: &Path| {
+            let (dirs, touched, candidates, libraries, symlinks) = scan(root);
+            let rec = ScanRecord {
+                root,
+                version: "1.2.3",
+                want,
+                dirs: &dirs,
+                touched: &touched,
+                candidates: &candidates,
+                libraries: &libraries,
+                symlinks: &symlinks,
+            };
+            // Every stamp is older than this, so the record is written.
+            remember_scan(&record, &rec, i64::MAX);
+            (libraries, symlinks)
+        };
+        let recall = |root: &Path| recall_scan(&record, root, "1.2.3", want, &linker_dirs(root));
+
+        // THE POSITIVE CONTROL: the record is written and recalled, and the recall IS the scan.
+        let fresh = remember(&root);
+        assert!(record.is_file(), "the record was not written");
+        assert_eq!(
+            fresh.1.len(),
+            1,
+            "one link ends at the granted library: {:?}",
+            fresh.1
+        );
+        assert_eq!(
+            recall(&root),
+            Some(fresh.clone()),
+            "the recall must equal the scan"
+        );
+
+        // A DIRECTORY CHANGED TOO RECENTLY IS NOT RECORDED: the cutoff is the scan's own start.
+        let _ = std::fs::remove_file(&record);
+        let (dirs, touched, candidates, libraries, symlinks) = scan(&root);
+        let rec = ScanRecord {
+            root: &root,
+            version: "1.2.3",
+            want,
+            dirs: &dirs,
+            touched: &touched,
+            candidates: &candidates,
+            libraries: &libraries,
+            symlinks: &symlinks,
+        };
+        // `ctime` cannot be aged, so every directory here changed "now": the cutoff of a scan started
+        // now refuses all of them.
+        let cutoff = settled_before(std::time::SystemTime::now()).expect("cutoff");
+        remember_scan(&record, &rec, cutoff);
+        assert!(
+            !record.exists(),
+            "a scan of directories that just changed was recorded"
+        );
+
+        // A LINK ADDED to a linker directory: nothing re-derived can see it, only the stamp.
+        remember(&root);
+        std::os::unix::fs::symlink("libnv.so.1", lib.join("libnv.so")).expect("new link");
+        assert_eq!(
+            recall(&root),
+            None,
+            "a link added since the record was recalled past"
+        );
+        age(&lib);
+        let with_new = remember(&root);
+        assert_eq!(
+            with_new.1.len(),
+            2,
+            "the new link is found by the scan: {:?}",
+            with_new.1
+        );
+        assert_eq!(recall(&root), Some(with_new), "the new record recalls");
+
+        // A CHAIN'S OTHER DIRECTORY CHANGED: the cross-directory link now ends at a granted file.
+        std::fs::remove_file(other.join("libnv-alt.so.1.2.3")).expect("remove alt");
+        std::os::unix::fs::symlink(
+            "../../usr/lib/x86_64-linux-gnu/libnv.so.1.2.3",
+            other.join("libnv-alt.so.1.2.3"),
+        )
+        .expect("alt now a link to the granted library");
+        assert_eq!(
+            recall(&root),
+            None,
+            "a change in a directory a chain passed through was recalled past"
+        );
+        age(&other);
+        let through = remember(&root);
+        assert!(
+            through.1.iter().any(|l| l.link == lib.join("libalt.so")),
+            "the scan follows the chain through the other directory: {:?}",
+            through.1
+        );
+        assert_eq!(recall(&root), Some(through), "the new record recalls");
+
+        // THE LOADER'S CONFIGURATION EDITED: a different directory list is a miss.
+        std::fs::write(
+            root.join("etc/ld.so.conf"),
+            b"/usr/lib/x86_64-linux-gnu\n/opt/vendor\n",
+        )
+        .expect("conf");
+        assert_eq!(recall(&root), None, "an ld.so.conf edit was recalled past");
+        std::fs::write(root.join("etc/ld.so.conf"), b"/usr/lib/x86_64-linux-gnu\n").expect("conf");
+        assert!(
+            recall(&root).is_some(),
+            "the original configuration recalls again"
+        );
+
+        // A DIRECTORY THAT WAS ABSENT AND APPEARS: the loader's defaults include directories this
+        // root does not have, and a library placed in one of them must not be recalled past.
+        let absent = linker_dirs(&root)
+            .into_iter()
+            .find(|d| !d.exists())
+            .expect("a default linker directory this root lacks, or this case proves nothing");
+        remember(&root);
+        std::fs::create_dir_all(&absent).expect("create the absent directory");
+        std::fs::write(absent.join("libnv-late.so.1.2.3"), &elf).expect("late lib");
+        assert_eq!(
+            recall(&root),
+            None,
+            "a directory that appeared was recalled past"
+        );
+        std::fs::remove_dir_all(&absent).expect("remove it again");
+
+        // A FORGED RECORD CAN ONLY OMIT. A consistent forgery: a real ELF file with the version
+        // suffix OUTSIDE the linker's directories, listed as a candidate, with the library list
+        // re-derived from the forged candidates so it agrees with them. Only the check that a
+        // candidate sits in a linker directory stands between it and a box. (The first version of
+        // this case forged `ld.so.conf`, which the suffix check refused before the directory
+        // check ran: a sabotage of the directory check went unnoticed.)
+        let outside = root.join("etc/libsecret.so.1.2.3");
+        std::fs::write(&outside, &elf).expect("outside lib");
+        let (dirs, touched, mut candidates, _, symlinks) = scan(&root);
+        candidates.push(outside.clone());
+        let forged_libraries = libraries_from(&root, want, &candidates);
+        assert!(
+            forged_libraries.iter().any(|l| l.path == outside),
+            "the forged candidate must resolve to a library, or this case proves nothing"
+        );
+        let forged = ScanRecord {
+            root: &root,
+            version: "1.2.3",
+            want,
+            dirs: &dirs,
+            touched: &touched,
+            candidates: &candidates,
+            libraries: &forged_libraries,
+            symlinks: &symlinks,
+        };
+        remember_scan(&record, &forged, i64::MAX);
+        assert_eq!(
+            recall(&root),
+            None,
+            "a candidate outside the linker's directories was believed"
+        );
+
+        // AND A TRUNCATED ONE IS A MISS, not a partial answer.
+        remember(&root);
+        let bytes = std::fs::read(&record).expect("record");
+        std::fs::write(&record, &bytes[..bytes.len() / 2]).expect("truncate");
+        assert_eq!(recall(&root), None, "a truncated record was believed");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

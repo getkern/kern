@@ -134,7 +134,7 @@ pub(crate) fn range_buys_nothing_for(
 /// lives next to the GPU resolver because that is where the question was first asked; it is not a
 /// GPU fact, and a second reader here is exactly the duplication that produced this defect.
 fn caller_inherits_groups() -> bool {
-    let primary = unsafe { libc::getgid() } as u32;
+    let primary = unsafe { libc::getgid() };
     crate::gpu_grant::Caller::current()
         .gids
         .iter()

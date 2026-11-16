@@ -1257,6 +1257,11 @@ pub(crate) fn state_dir_is_private() -> Result<(), String> {
 /// [`runtime_subdir`]. The identity check ([`guarded_identities`]) only STATs these dirs to fingerprint
 /// them; it must not mkdir a dir that never existed (e.g. `ssh/` when no box used `--ssh`) merely to read
 /// its dev/ino. A dir that does not exist cannot be a `mount --bind` alias source, so skipping it is safe.
+/// The logs directory if it exists, WITHOUT creating it: for a read-only reporter (`kern doctor`).
+pub(crate) fn existing_logs_dir() -> Option<PathBuf> {
+    existing_runtime_subdir("logs")
+}
+
 fn existing_runtime_subdir(leaf: &str) -> Option<PathBuf> {
     runtime_subdir_candidates(leaf)
         .into_iter()
@@ -2048,7 +2053,7 @@ fn kill_recorded_cgroup(inst: &Instance) -> ReapOutcome {
         unsafe { libc::close(dirfd) };
         return ReapOutcome::Unknown; // couldn't confirm identity ⇒ don't kill
     }
-    let outcome = if (st.st_dev as u64, st.st_ino as u64) == want {
+    let outcome = if (st.st_dev, st.st_ino) == want {
         // Relative to the pinned dir - never re-resolves `inst.cgroup`.
         let kfd = unsafe { libc::openat(dirfd, c"cgroup.kill".as_ptr(), libc::O_WRONLY) };
         if kfd >= 0 {
@@ -2149,7 +2154,7 @@ pub fn find_ref(x: &str) -> Option<Instance> {
 }
 
 /// Resolve the SHORT service name a pod box is displayed under. A compose box is named
-/// `<pod>-<token>-<service>`, and `kern ps` renders it in the pod's tree as just `<service>` - so the
+/// `<project>-<service>-1` (kern's earlier `<pod>-<token>-<service>`), and `kern ps` renders it in the pod's tree as just `<service>` - so the
 /// name a person reads was not a name any verb accepted: `kern exec api` answered "no running box
 /// named 'api'" while the box was right there on screen. `docker compose exec api` works, and the
 /// display had already promised the short form.
@@ -2186,9 +2191,24 @@ fn find_service(service: &str) -> Option<Instance> {
     hit
 }
 
-/// Does `name` have the compose shape `<stack>-<token>-<service>`, for this `-<service>` suffix, with
-/// `<token>` a hex hash? The token is what separates a generated stack box from a hand-named one.
+/// Does `name` have a compose shape for this `-<service>` suffix? Docker's `<project>-<service>-1`,
+/// when `<project>` is a running stack (its pod, or the relays of a `--no-pod` one): what separates a
+/// stack's box from a hand-named `my-api-1`. Or the shape kern used before, `<stack>-<token>-<service>`
+/// with `<token>` a hex hash, for a stack still running under it.
 fn is_compose_service(name: &str, suffix: &str) -> bool {
+    if let Some(stack) = name
+        .strip_suffix("-1")
+        .and_then(|n| n.strip_suffix(suffix))
+        .filter(|s| !s.is_empty())
+    {
+        if crate::pod::holder_pid(stack).is_some()
+            || crate::relayhold::stack_dir(stack)
+                .ok()
+                .is_some_and(|d| crate::relayhold::holder_pid(&d).is_some())
+        {
+            return true;
+        }
+    }
     let Some(prefix) = name.strip_suffix(suffix) else {
         return false;
     };
@@ -2702,6 +2722,40 @@ fn one_line(s: &str) -> String {
 /// sidecars outlive it - those accumulate. This removes any log/health file whose `<name>-<pid>`
 /// key doesn't match a currently-live box, and returns `(files_removed, bytes_freed)` so the caller
 /// can report it honestly. Live boxes are never touched.
+/// What the logs directory holds: `(files, bytes, bytes of boxes that ended)`. The last is what
+/// [`prune`] would free, by the same rule ([`log_key`] against the live boxes), so `kern top` can say
+/// how much one command gives back before the store fills.
+pub fn logs_store() -> (usize, u64, u64) {
+    let live: std::collections::HashSet<String> = list()
+        .iter()
+        .map(|i| format!("{}-{}", i.name, i.pid))
+        .collect();
+    let Ok(dir) = logs_dir() else {
+        return (0, 0, 0);
+    };
+    let Ok(rd) = fs::read_dir(&dir) else {
+        return (0, 0, 0);
+    };
+    let (mut files, mut bytes, mut ended) = (0usize, 0u64, 0u64);
+    for e in rd.flatten() {
+        let Ok(meta) = e.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        files += 1;
+        bytes = bytes.saturating_add(meta.len());
+        let name = e.file_name();
+        if let Some(key) = name.to_str().and_then(log_key) {
+            if !live.contains(key) {
+                ended = ended.saturating_add(meta.len());
+            }
+        }
+    }
+    (files, bytes, ended)
+}
+
 pub fn prune() -> (usize, u64) {
     // `list()` also prunes dead/unparseable instance files as a side effect.
     let live: std::collections::HashSet<String> = list()
@@ -3152,6 +3206,27 @@ impl Instance {
                 .collect(),
         ))
     }
+}
+
+/// A box's command as one line, as Docker's daemon writes a container's: an argument holding a
+/// space wrapped in single quotes (`sh -c 'echo a; sleep 1'`), the rest as written. MEASURED on
+/// Docker Compose 5.3.1: `docker compose ps` shows `"sh -c 'echo hello-w…"` for `command: sh -c
+/// "echo hello-web; sleep 300"`; kern joined with spaces, which loses where an argument ends.
+pub(crate) fn command_line(argv: &[String]) -> String {
+    let mut out = String::new();
+    for (i, a) in argv.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if i > 0 && a.contains(' ') {
+            out.push('\'');
+            out.push_str(a);
+            out.push('\'');
+        } else {
+            out.push_str(a);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

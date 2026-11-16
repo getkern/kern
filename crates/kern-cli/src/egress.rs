@@ -444,8 +444,9 @@ pub fn spawn_proxy(allow: &[String]) -> Result<(std::process::Child, std::path::
 }
 
 /// Spawn BOTH egress helpers, to be called from box_run in the HOST pid namespace **before**
-/// `run_in_sandbox_with` (i.e. before box_run's `unshare(CLONE_NEWPID)`). This placement is
-/// load-bearing, not cosmetic: after box_run unshares CLONE_NEWPID its `pid_for_children` is the BOX pid
+/// `run_in_sandbox_with` (i.e. before box_run makes the box's pid namespace). This placement is
+/// load-bearing, not cosmetic: where box_run unshares CLONE_NEWPID before the fork (`fork_into_cgroup`'s
+/// fallback), its `pid_for_children` is the BOX pid
 /// namespace, so a helper forked from the `on_started` callback lands INSIDE the box pidns. On box exit
 /// that helper is SIGKILL'd but lingers as a zombie box_run never reaps (box_run `wait4`s the box init
 /// specifically), and the box init's own exit blocks in `zap_pid_ns_processes` waiting for that zombie to

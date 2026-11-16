@@ -208,6 +208,78 @@ pub fn write(dir: &Path, argv: &[std::ffi::OsString], meta: &Meta) -> io::Result
     std::fs::rename(&tmp, dir.join(REC))
 }
 
+/// Give the kept box `old` the name `new`: its directory moves and its record's `box <name>` is
+/// rewritten, so `kern start <new>` replays this box. `Ok(false)` when `old` keeps nothing.
+///
+/// WHY THE LAYER MOVES WITH THE NAME. A kept box is addressed by name in two places, the registry
+/// and this store, and `kern rename` moved only the first: MEASURED, `kern box w1 --keep -d`, `kern
+/// rename w1 w2`, `kern stop w2`, then `kern start w2` answered "no kept box 'w2'", and the layer
+/// sat under `w1`. A running box's overlay keeps working across the move, because a mount holds the
+/// directory and not its path.
+pub fn rename(old: &str, new: &str) -> Result<bool, crate::error::Error> {
+    let (Some(from), Some(to)) = (dir_of(old), dir_of(new)) else {
+        return Ok(false);
+    };
+    let Some((mut argv, meta)) = read(&from) else {
+        return Ok(false);
+    };
+    if std::fs::symlink_metadata(&to).is_ok() {
+        return Err(crate::error::Error::Sandbox(format!(
+            "a kept box named '{new}' already exists: `kern rm {new}` removes it first"
+        )));
+    }
+    if let Some(slot) = argv.get_mut(1) {
+        *slot = std::ffi::OsString::from(new);
+    }
+    std::fs::rename(&from, &to).map_err(|e| {
+        crate::error::Error::Sandbox(format!("moving kept box '{old}' to '{new}': {e}"))
+    })?;
+    write(&to, &argv, &meta).map_err(|e| {
+        crate::error::Error::Sandbox(format!("rewriting kept box '{new}''s record: {e}"))
+    })?;
+    Ok(true)
+}
+
+/// Set `flag value` in the recorded command line of the kept box at `dir`, replacing the flag where
+/// the record already has it (`--cpus 1` or `--cpus=1`) and adding it before the workload's `--`
+/// otherwise, so the next `kern start` runs with it. `Ok(false)` when there is no record.
+///
+/// What Docker's `update` does to a container's configuration: it outlives the run.
+pub fn set_flags(dir: &Path, flags: &[(&str, String)]) -> io::Result<bool> {
+    let Some((argv, meta)) = read(dir) else {
+        return Ok(false);
+    };
+    let end = argv
+        .iter()
+        .position(|a| a.as_os_str() == "--")
+        .unwrap_or(argv.len());
+    let (opts, tail) = argv.split_at(end);
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len() + 2 * flags.len());
+    let mut i = 0;
+    while i < opts.len() {
+        let text = opts.get(i).and_then(|a| a.to_str()).unwrap_or("");
+        let named = flags
+            .iter()
+            .any(|(f, _)| text == *f || text.strip_prefix(*f).is_some_and(|r| r.starts_with('=')));
+        if named {
+            // `--flag value` takes two elements, `--flag=value` one.
+            i += if text.contains('=') { 1 } else { 2 };
+            continue;
+        }
+        if let Some(a) = opts.get(i) {
+            out.push(a.clone());
+        }
+        i += 1;
+    }
+    for (f, v) in flags {
+        out.push(std::ffi::OsString::from(*f));
+        out.push(std::ffi::OsString::from(v));
+    }
+    out.extend(tail.iter().cloned());
+    write(dir, &out, &meta)?;
+    Ok(true)
+}
+
 /// `\n`/`\r` out of a value, so one field cannot forge another. Same rule as the build records.
 fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")

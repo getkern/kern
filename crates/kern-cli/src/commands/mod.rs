@@ -409,6 +409,9 @@ pub struct BoxRunArgs<'a> {
     pub add_hosts: &'a [(String, String)],
     /// `--dns IP`: the box's `nameserver` lines (already validated as IP literals by the CLI).
     pub dns: &'a [String],
+    /// A box joining a compose stack's bridge network gets its own NAT, attached while it waits
+    /// at its pre-exec gate, as each of the stack's services does. See `stack_network_join`.
+    pub stack_outbound: bool,
     /// `--dns-search DOMAIN`: the `search` line of the box's `/etc/resolv.conf`.
     pub dns_search: &'a [String],
     /// `--dns-option OPT`: the `options` line of the box's `/etc/resolv.conf`.
@@ -486,118 +489,144 @@ fn host_cpu_count() -> usize {
     })
 }
 
-/// Clamp a `--cpus` request to the host's physical CPU count (from `/proc/cpuinfo`), so the cap
-/// is consistent across the systemd scope AND the in-namespace cgroup. The warning fires once - in
-/// the original process, before the scope re-exec (which sets `KERN_SCOPE`) runs the parse again.
+/// Where a CPU value came from, for the refusal to name it: the flag, or a `vcpu:` profile (a flag
+/// wins over a profile, so a value is one or the other).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CpuSource {
+    Flag,
+    Profile,
+}
+
 /// Is a `--cpus` request above what the machine has?
 ///
-/// Extracted so the boundary can be asserted. Inside `clamp_cpus` it could not be: at `c == host`
-/// the clamped result and the unclamped one are the SAME NUMBER, so a mutation from `>` to `>=`
-/// leaves the return value untouched and changes only the warning - which then tells the operator
-/// that 28 CPUs "exceeds the 28 available". A false message is the whole observable difference, and
-/// a test on the return value cannot see it.
-///
-/// Equality is NOT above: asking for exactly the machine is asking for the machine.
+/// Extracted so the boundary can be asserted on its own: equality is NOT above, asking for exactly
+/// the machine is asking for the machine, and a `>=` here refuses `--cpus 28` on a 28-CPU host.
 fn cpus_exceed_host(requested: f64, host: f64) -> bool {
     requested > host
 }
 
-fn clamp_cpus(cpus: Option<f64>) -> Option<f64> {
-    let c = cpus?;
-    let host = host_cpu_count() as f64;
-    if cpus_exceed_host(c, host) {
-        if crate::global_env("KERN_SCOPE").is_none() {
-            eprintln!(
-                "kern: --cpus {c} exceeds the {host:.0} available CPUs - clamping to {host:.0}"
-            );
-        }
-        return Some(host);
-    }
-    Some(c)
-}
-
-/// Clamp a `--cpuset-cpus` list to the host's CPU range (`0..host`), so an over-wide pin (`0-9999` on
-/// a 4-CPU box) becomes the valid subset (`0-3`) instead of a raw `systemd`/kernel "Failed to parse
-/// AllowedCPUs" that aborts the box start. Each range/single is intersected with `[0, host-1]`;
-/// out-of-range items are dropped. Warns once, like `clamp_cpus`.
+/// `--cpus` above the host is REFUSED, as Docker refuses it, with Docker's words.
 ///
-/// A list in which NOTHING exists on this host is REFUSED rather than passed through. It used to be
-/// passed through, on the reasoning that "the backend rejects an all-invalid pin loudly rather than
-/// us silently running unpinned". Measured on a 28-CPU machine, that reasoning was false for the
-/// values people actually mistype: `--cpuset-cpus 28` (one past the end) reached systemd, which
-/// accepted it, applied nothing, printed nothing, and exited 0 with the process free to use all 28
-/// CPUs. Only absurd values (`999999`) overflow systemd's parser and fail loudly, so the fallback
-/// worked precisely where it was not needed and failed on the off-by-one. A resource cap that cannot
-/// be applied must not silently become no cap, the same fail-closed rule `--user` follows.
-///
-/// Refusing rather than clamping is deliberate here and differs from [`clamp_cpus`]. Clamping
-/// `--cpus 999` to 28 moves TOWARD the request (you wanted a lot, you get the most there is), while
-/// clamping `--cpuset-cpus 28` to `0-27` INVERTS it: the caller asked to be confined to one CPU and
-/// would be handed the whole machine. There is no safe subset to pick, so the caller is told.
-fn clamp_cpuset(set: Option<String>) -> Result<Option<String>, Error> {
-    let Some(s) = set else {
+/// IT USED TO BE CLAMPED to the host count with a warning. That is a different contract on a flag
+/// Docker defines, and kern's rule for its Docker surface is the same flag with the same semantics:
+/// `docker run --cpus 64` on a 28-CPU host answers "Range of CPUs is from 0.01 to 28.00, as there are
+/// only 28 CPUs available" and starts nothing. A compose file or a script written against Docker
+/// that relies on that refusal gets it here too.
+pub(crate) fn check_cpus(cpus: Option<f64>, from: CpuSource) -> Result<Option<f64>, Error> {
+    let Some(c) = cpus else {
         return Ok(None);
     };
-    let host = host_cpu_count(); // >= 1 by construction, so `host - 1` cannot underflow
-    let max = host - 1;
-    let mut out: Vec<String> = Vec::new();
-    // Distinguishes "every item parsed and every item was out of range" (refuse) from "an item did
-    // not parse at all" (leave it to the backend, since the CLI validator already vetted the form
-    // and a parser disagreement here is our bug, not the caller's).
-    let mut parsed_any = false;
-    for part in s.split(',') {
+    let host = host_cpu_count();
+    if cpus_exceed_host(c, host as f64) {
+        let what = match from {
+            CpuSource::Flag => format!("--cpus {c}"),
+            CpuSource::Profile => format!("the profile's cpus = {c}"),
+        };
+        return Err(Error::Cli(format!(
+            "{what}: range of CPUs is from 0.01 to {host}.00, as there are only {host} CPUs available"
+        )));
+    }
+    Ok(Some(c))
+}
+
+/// A kernel CPU list (`0-3,6`, `5`) as inclusive ranges, MERGED and sorted, or `None` when an item
+/// is not a CPU number or a range of them. A reversed range (`6-4`) is read as the same range, as
+/// the CLI's own validator reads it.
+fn cpu_list_ranges(list: &str) -> Option<Vec<(u32, u32)>> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for part in list.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        match part.split_once('-') {
+        let (lo, hi) = match part.split_once('-') {
             Some((a, b)) => {
-                let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else {
-                    return Ok(Some(s)); // unparseable - leave it (the CLI boundary vetted the form)
-                };
-                parsed_any = true;
-                let (lo, hi) = (a.min(b), a.max(b));
-                if lo > max {
-                    continue; // wholly above the host range → drop
-                }
-                let hi = hi.min(max);
-                out.push(if lo == hi {
-                    lo.to_string()
-                } else {
-                    format!("{lo}-{hi}")
-                });
+                let (a, b) = (a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?);
+                (a.min(b), a.max(b))
             }
-            None => match part.parse::<usize>() {
-                Ok(n) if n <= max => {
-                    parsed_any = true;
-                    out.push(n.to_string());
-                }
-                Ok(_) => parsed_any = true, // single CPU out of range → drop
-                Err(_) => return Ok(Some(s)),
-            },
+            None => {
+                let n = part.parse::<u32>().ok()?;
+                (n, n)
+            }
+        };
+        out.push((lo, hi));
+    }
+    out.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(out.len());
+    for (lo, hi) in out {
+        match merged.last_mut() {
+            // Overlapping or adjacent (`0-3` then `4-5`): one range.
+            Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
         }
     }
-    if out.is_empty() {
-        if parsed_any {
-            let range = if max == 0 {
-                "0".to_string()
-            } else {
-                format!("0-{max}")
+    Some(merged)
+}
+
+/// Is every CPU of `requested` in `available`? Both are kernel CPU lists. `None` when `requested`
+/// does not parse, which the caller leaves to the backend: the CLI boundary vetted the form, so a
+/// disagreement here is a parser of ours, not the caller's input.
+///
+/// Interval containment on the merged lists, never a walk over the ids: `0-4294967295` costs what
+/// `0` costs.
+fn cpus_all_available(requested: &str, available: &str) -> Option<bool> {
+    let want = cpu_list_ranges(requested)?;
+    let have = cpu_list_ranges(available).unwrap_or_default();
+    Some(want.iter().all(|&(lo, hi)| {
+        // The merged ranges are disjoint and not adjacent, so ONE of them must hold the whole span.
+        have.iter().any(|&(a, b)| a <= lo && hi <= b)
+    }))
+}
+
+/// The CPUs this host has online, as the kernel lists them (`/sys/devices/system/cpu/online`, e.g.
+/// `0-27`, or `0-3,6` with CPUs 4 and 5 offline). Read, not derived from a count: a count numbers
+/// the CPUs `0..n` and is wrong wherever one in the middle is offline. Where the file cannot be
+/// read, the count is the fallback.
+fn online_cpu_list() -> String {
+    match std::fs::read_to_string("/sys/devices/system/cpu/online") {
+        Ok(t) if cpu_list_ranges(t.trim()).is_some_and(|r| !r.is_empty()) => t.trim().to_string(),
+        _ => match host_cpu_count() {
+            1 => "0".to_string(),
+            n => format!("0-{}", n - 1),
+        },
+    }
+}
+
+/// Which [`CpuSource`] a value has: the flag when the flag was given, a profile otherwise.
+pub(crate) fn cpu_source(flag_given: bool) -> CpuSource {
+    if flag_given {
+        CpuSource::Flag
+    } else {
+        CpuSource::Profile
+    }
+}
+
+/// `--cpuset-cpus` naming any CPU this host does not have online is REFUSED, as Docker refuses it,
+/// with Docker's words: "Requested CPUs are not available - requested 0,2,4-6, available: 0-5".
+///
+/// IT USED TO BE CLAMPED to the CPUs that exist, with a warning, and refused only when NONE existed.
+/// That kept the box confined to a subset the caller never named, on a flag Docker defines with a
+/// refusal; kern's Docker surface takes the same flag with the same semantics. The case that made the
+/// all-missing refusal necessary still holds and is covered: measured on a 28-CPU machine,
+/// `--cpuset-cpus 28` reached systemd, which accepted it, applied nothing, printed nothing and exited
+/// 0 with the process free to use every CPU. A cap that cannot be applied is never handed on.
+pub(crate) fn check_cpuset(set: Option<String>, from: CpuSource) -> Result<Option<String>, Error> {
+    let Some(s) = set else {
+        return Ok(None);
+    };
+    let available = online_cpu_list();
+    match cpus_all_available(&s, &available) {
+        Some(false) => {
+            let what = match from {
+                CpuSource::Flag => format!("--cpuset-cpus {s}"),
+                CpuSource::Profile => format!("the profile's cpuset = {s}"),
             };
-            return Err(Error::Cli(format!(
-                "--cpuset-cpus {s}: this machine has {host} CPU(s), numbered {range}, so none of \
-                 the CPUs you asked for exist. Refusing rather than starting with no pin at all."
-            )));
+            Err(Error::Cli(format!(
+                "{what}: requested CPUs are not available - requested {s}, available: {available}"
+            )))
         }
-        return Ok(Some(s));
+        Some(true) | None => Ok(Some(s)),
     }
-    let clamped = out.join(",");
-    if clamped != s && crate::global_env("KERN_SCOPE").is_none() {
-        eprintln!(
-            "kern: --cpuset-cpus {s} exceeds the {host} available CPUs - clamping to {clamped}"
-        );
-    }
-    Ok(Some(clamped))
 }
 
 /// `kern box <name> (--rootfs <dir> | --image <ref>) [-d] [-v ...] [--env ...] [-- cmd...]` - run
@@ -3031,11 +3060,22 @@ fn box_lifecycle_status(b: &registry::Instance) -> &'static str {
 
 /// One box's display status: `paused` (frozen by `kern pause`), else its health-check verdict, else
 /// `empty` when no health check is configured. The single source of truth for `ps`'s HEALTH column,
-/// `ps --format {{.Status}}`, and `--filter status=` - so they never drift on what "paused" means.
+/// `ps --json`'s `status`, and `--filter status=` - so they never drift on what "paused" means.
 ///
 /// Built ON [`box_lifecycle_status`] rather than beside it: this column MERGES two questions (what
 /// is it doing, and is it well), which is right for a table with one column for both, and every
 /// other surface needs them apart.
+/// A running box's Docker `State`, the ONE answer for `{{.State}}` and `--format json`: `paused`
+/// when frozen, else `running`. Docker has no word for kern's `orphaned` (the workload runs, its
+/// supervisor is gone), so that box is `running` here and says `(orphaned)` in `.Status`.
+fn docker_state(b: &registry::Instance) -> &'static str {
+    if box_lifecycle_status(b) == "paused" {
+        "paused"
+    } else {
+        "running"
+    }
+}
+
 fn box_status(b: &registry::Instance, empty: &str) -> String {
     match box_lifecycle_status(b) {
         "running" => {
@@ -3086,8 +3126,17 @@ trait PsRow {
     fn ps_command(&self) -> String;
     fn ps_ports(&self) -> &str;
     fn ps_pod(&self) -> &str;
+    /// Docker's `.RunningFor`: how long ago the box was created, `5 seconds ago`.
     fn ps_running_for(&self, now: u64) -> String;
-    fn ps_status(&self) -> String;
+    /// Docker's `.State`: `running`, `paused`, `exited`, `created`, and kern's `orphaned`.
+    fn ps_state(&self) -> String;
+    /// Docker's `.Status`, moby's `State.String()`: `Up 4 seconds (healthy)`, `Up 4 seconds
+    /// (Paused)`, `Exited (3) 4 seconds ago`, `Created`.
+    fn ps_status(&self, now: u64) -> String;
+    /// Docker's `.Health`: `healthy`, `unhealthy`, `starting`, or empty with no health check.
+    fn ps_health(&self) -> String;
+    /// Docker's `.ExitCode`: the last exit, `0` for a box that has not exited.
+    fn ps_exit_code(&self) -> i32;
     /// The registry's comma-joined `k=v` label field, EMPTY for an exited box.
     ///
     /// Empty there is a fact and not a placeholder: the labels lived in the instance record, which
@@ -3107,8 +3156,14 @@ impl PsRow for registry::Instance {
     fn ps_pid(&self) -> Option<i32> {
         Some(self.pid)
     }
+    /// The image the box was started from, as named (`alpine`), as Docker's IMAGE column shows it;
+    /// the rootfs for a box started from a directory.
     fn ps_image(&self) -> String {
-        crate::ui::scrub(&self.rootfs)
+        if self.image.is_empty() {
+            crate::ui::scrub(&self.rootfs)
+        } else {
+            crate::ui::scrub(&self.image)
+        }
     }
     fn ps_command(&self) -> String {
         crate::ui::scrub(&self.command)
@@ -3120,10 +3175,33 @@ impl PsRow for registry::Instance {
         &self.pod
     }
     fn ps_running_for(&self, now: u64) -> String {
-        fmt_uptime(now.saturating_sub(self.started))
+        format!("{} ago", human_duration(now.saturating_sub(self.started)))
     }
-    fn ps_status(&self) -> String {
-        box_status(self, "running")
+    fn ps_state(&self) -> String {
+        docker_state(self).to_string()
+    }
+    fn ps_status(&self, now: u64) -> String {
+        let up = format!("Up {}", human_duration(now.saturating_sub(self.started)));
+        match box_lifecycle_status(self) {
+            "paused" => format!("{up} (Paused)"),
+            "orphaned" => format!("{up} (orphaned)"),
+            _ => match self.ps_health().as_str() {
+                "" => up,
+                "starting" => format!("{up} (health: starting)"),
+                h => format!("{up} ({h})"),
+            },
+        }
+    }
+    fn ps_health(&self) -> String {
+        let h = registry::health_of(&self.name, self.pid);
+        if h == "none" {
+            String::new()
+        } else {
+            h
+        }
+    }
+    fn ps_exit_code(&self) -> i32 {
+        0
     }
 }
 
@@ -3149,11 +3227,27 @@ impl PsRow for registry::ExitedBox {
     fn ps_pod(&self) -> &str {
         &self.pod
     }
-    fn ps_running_for(&self, _now: u64) -> String {
-        format!("{} ago", fmt_uptime(self.exited_ago))
+    /// From the pid's start time, which is when the box was created; a box whose start time cannot
+    /// be read says how long ago it EXITED instead, which is the clock it still has.
+    fn ps_running_for(&self, now: u64) -> String {
+        let since = started_unix(self.starttime).map_or(self.exited_ago, |s| now.saturating_sub(s));
+        format!("{} ago", human_duration(since))
     }
-    fn ps_status(&self) -> String {
-        format!("exited ({})", self.code)
+    fn ps_state(&self) -> String {
+        "exited".to_string()
+    }
+    fn ps_status(&self, _now: u64) -> String {
+        format!(
+            "Exited ({}) {} ago",
+            self.code,
+            human_duration(self.exited_ago)
+        )
+    }
+    fn ps_health(&self) -> String {
+        String::new()
+    }
+    fn ps_exit_code(&self) -> i32 {
+        self.code
     }
 }
 
@@ -3164,7 +3258,7 @@ impl PsRow for registry::ExitedBox {
 ///
 /// `--json` DOES NOT COME THROUGH HERE, and neither does the table: each has its own register, the
 /// same way an exited row does. `--json` says the token (`exited`, `kept`) with the code in its own
-/// `exit_code` field, `--format` says the human string (`exited (0)`, `kept (exit 0)`), and the
+/// `exit_code` field, `--format` says Docker's (`Exited (0) 2 minutes ago`, `Created`), and the
 /// table says `exit 0` under a section header that already carries the row kind. Three registers of
 /// one fact is not the drift the note in `ps` is about: that one was `--json` saying NOTHING while
 /// the table said `paused`.
@@ -3191,14 +3285,211 @@ impl PsRow for crate::keepbox::KeptBox {
         ""
     }
     fn ps_running_for(&self, now: u64) -> String {
-        format!("{} ago", fmt_uptime(now.saturating_sub(self.meta.created)))
+        format!(
+            "{} ago",
+            human_duration(now.saturating_sub(self.meta.created))
+        )
     }
-    fn ps_status(&self) -> String {
+    fn ps_state(&self) -> String {
         match self.meta.last_exit {
-            Some(c) => format!("kept (exit {c})"),
-            None => "kept".to_string(),
+            Some(_) => "exited",
+            None => "created",
+        }
+        .to_string()
+    }
+    /// A kept box that has run is a stopped container (`Exited (0) 2 minutes ago`), one never
+    /// started is `Created`. The time is the record's: it is rewritten when a run ends, and also by
+    /// `update`, so after an `update` it is the time of the update.
+    fn ps_status(&self, now: u64) -> String {
+        match self.meta.last_exit {
+            Some(c) => {
+                let written = crate::keepbox::dir_of(&self.name)
+                    .and_then(|d| std::fs::metadata(d.join("box.rec")).ok())
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(self.meta.created, |d| d.as_secs());
+                format!(
+                    "Exited ({c}) {} ago",
+                    human_duration(now.saturating_sub(written))
+                )
+            }
+            None => "Created".to_string(),
         }
     }
+    fn ps_health(&self) -> String {
+        String::new()
+    }
+    fn ps_exit_code(&self) -> i32 {
+        self.meta.last_exit.unwrap_or(0)
+    }
+}
+
+/// The name `docker compose logs` prefixes a service's lines with: its container's name without the
+/// project, `<service>-<n>`, or the `container_name:` itself.
+///
+/// READ FROM THE BOX'S NAME, the one place it is decided (`resolve_box_names`), as Docker reads it
+/// from the container's: a stack still running under kern's earlier names gets `web` for its
+/// `<project>-web`, and nothing here restates the numbering rule.
+fn docker_log_label(b: &crate::compose::ComposeBox, pod: &str) -> String {
+    b.name
+        .strip_prefix(&format!("{pod}-"))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(&b.name)
+        .to_string()
+}
+
+/// A box's service when only its name is known: the name less `<project>-` and, for Docker's
+/// `<project>-<service>-<n>`, less `-<n>`. The ONE string fallback, for `{{.Service}}` and for
+/// `--format json`; a listing that has the file asks it instead.
+pub(crate) fn service_of_box_name(name: &str, pod: &str) -> String {
+    let short = if pod.is_empty() {
+        name
+    } else {
+        name.strip_prefix(&format!("{pod}-")).unwrap_or(name)
+    };
+    match short.rsplit_once('-') {
+        Some((svc, n))
+            if !svc.is_empty() && !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) =>
+        {
+            svc.to_string()
+        }
+        _ => short.to_string(),
+    }
+}
+
+/// go-units' `HumanDuration`, the words of Docker's `Up 4 seconds` and `5 seconds ago`.
+pub(crate) fn human_duration(secs: u64) -> String {
+    let minutes = secs / 60;
+    // `int(d.Hours() + 0.5)`.
+    let hours = (secs + 1800) / 3600;
+    match secs {
+        0 => "Less than a second".to_string(),
+        1 => "1 second".to_string(),
+        2..=59 => format!("{secs} seconds"),
+        _ if minutes == 1 => "About a minute".to_string(),
+        _ if minutes < 60 => format!("{minutes} minutes"),
+        _ if hours == 1 => "About an hour".to_string(),
+        _ if hours < 48 => format!("{hours} hours"),
+        _ if hours < 24 * 7 * 2 => format!("{} days", hours / 24),
+        _ if hours < 24 * 30 * 2 => format!("{} weeks", hours / 24 / 7),
+        _ if hours < 24 * 365 * 2 => format!("{} months", hours / 24 / 30),
+        _ => format!("{} years", secs / 3600 / 24 / 365),
+    }
+}
+
+/// The Unix time a process started, from its `/proc/<pid>/stat` start time in clock ticks.
+///
+/// The boot time and the tick are read ONCE per process: `/proc/stat` is regenerated across every
+/// CPU at each read, and `ps -a` asks for every exited row.
+fn started_unix(start_ticks: u64) -> Option<u64> {
+    static CLOCK: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    let (boot, tick) = (*CLOCK.get_or_init(|| {
+        // SAFETY: sysconf has no preconditions; a failure answers -1, folded to Linux's usual 100.
+        let tick = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+            .ok()
+            .filter(|t| *t > 0)
+            .unwrap_or(100);
+        let boot = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("btime "))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })?;
+        Some((boot, tick))
+    }))?;
+    Some(boot + start_ticks / tick)
+}
+
+/// The header `ps --format 'table ...'` prints for one field, as Docker prints it: `docker ps`'s
+/// words, or `docker compose ps`'s when `compose` (which has no header for `.Names`, `.Health` and
+/// `.ExitCode` and prints `<no value>` there: MEASURED on Docker Compose 5.3.1). A label's header is
+/// its key. `.Pid`, `.Pod` and `.Rootfs` are kern's.
+fn ps_header(field: &str, compose: bool) -> String {
+    if let Some(key) = field
+        .strip_prefix(".Label ")
+        .map(str::trim)
+        .and_then(|a| a.strip_prefix('"'))
+        .and_then(|a| a.strip_suffix('"'))
+    {
+        return key.to_string();
+    }
+    match field {
+        ".Names" | ".Health" | ".ExitCode" if compose => "<no value>",
+        ".Names" => "NAMES",
+        ".Name" => "NAME",
+        ".ID" => "CONTAINER ID",
+        ".Pid" => "PID",
+        ".Image" => "IMAGE",
+        ".Service" => "SERVICE",
+        ".Rootfs" => "ROOTFS",
+        ".Command" => "COMMAND",
+        ".Ports" => "PORTS",
+        ".Pod" => "POD",
+        ".RunningFor" => "CREATED",
+        ".Status" => "STATUS",
+        ".State" => "STATE",
+        ".Health" => "HEALTH",
+        ".ExitCode" => "EXIT CODE",
+        ".Labels" => "LABELS",
+        _ => "",
+    }
+    .to_string()
+}
+
+/// A `table` template's header line: the template with each field replaced by its header.
+fn render_ps_header(tmpl: &str, compose: bool) -> Result<String, Error> {
+    let mut out = String::with_capacity(tmpl.len());
+    let mut rest = tmpl;
+    while let Some(open) = rest.find("{{") {
+        push_unescaped(&mut out, &rest[..open]);
+        let after = &rest[open + 2..];
+        let close = after
+            .find("}}")
+            .ok_or(Error::Usage("ps --format: unterminated `{{`"))?;
+        out.push_str(&ps_header(after[..close].trim(), compose));
+        rest = &after[close + 2..];
+    }
+    push_unescaped(&mut out, rest);
+    Ok(out)
+}
+
+/// Go's `text/tabwriter` as Docker's formatter builds it (`NewWriter(out, 10, 1, 3, ' ', 0)`): every
+/// tab-terminated cell padded to its column's widest cell plus 3, and to at least 10; the last cell
+/// of a line is not aligned. Widths count characters.
+fn tabwrite(lines: &[String]) -> String {
+    let rows: Vec<Vec<&str>> = lines
+        .iter()
+        .flat_map(|l| l.split('\n'))
+        .map(|l| l.split('\t').collect())
+        .collect();
+    let mut widths: Vec<usize> = Vec::new();
+    for r in &rows {
+        for (i, cell) in r.iter().enumerate().take(r.len().saturating_sub(1)) {
+            let w = cell.chars().count();
+            match widths.get_mut(i) {
+                Some(m) => *m = (*m).max(w),
+                None => widths.push(w),
+            }
+        }
+    }
+    let mut out = String::new();
+    for r in &rows {
+        let last = r.len().saturating_sub(1);
+        for (i, cell) in r.iter().enumerate() {
+            out.push_str(cell);
+            if i < last {
+                let col = widths
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(3)
+                    .max(10);
+                let pad = col.saturating_sub(cell.chars().count());
+                out.extend(std::iter::repeat_n(' ', pad));
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Render one box through a `ps --format` template: the `{{.Field}}` placeholders below, plus `\t`/`\n`
@@ -3207,7 +3498,72 @@ impl PsRow for crate::keepbox::KeptBox {
 /// fields (name/pod/ports/status) are borrowed straight in; the UNTRUSTED command/rootfs are
 /// control-scrubbed first so a crafted box argv or `--rootfs` can't inject ANSI escapes into the
 /// terminal (the same guard the `ps` table, `images`, and `--json` already apply).
+#[cfg(test)]
 fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Error> {
+    render_ps_format_ctx(
+        tmpl,
+        b,
+        &PsCtx {
+            now,
+            service: None,
+            image: None,
+            docker_command: None,
+        },
+    )
+}
+
+/// A lookup by box name, given by the listing that knows the answer.
+type NameLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// What a `--format` row needs beyond the row itself.
+struct PsCtx<'a> {
+    now: u64,
+    /// `{{.Service}}`: the compose service of a box, when the listing knows it (`compose ps`); the
+    /// box name less its `<pod>-` otherwise.
+    service: Option<NameLookup<'a>>,
+    /// `{{.Image}}` for a row that records none (an exited box), when the listing knows it.
+    image: Option<NameLookup<'a>>,
+    /// `{{.Command}}` as Docker prints it, quoted (`"sleep 60"`), and cut to 20 characters with `…`
+    /// when `Some(true)` (no `--no-trunc`). `None` prints kern's command as it is.
+    docker_command: Option<bool>,
+}
+
+/// Docker's COMMAND cell: `strconv.Quote` of the command, cut to 20 characters (19 and `…`) unless
+/// `--no-trunc`. MEASURED on Docker Compose 5.3.1: `"sh -c 'echo hello-w…"`.
+fn docker_command_cell(command: &str, trunc: bool) -> String {
+    let shown = if trunc && command.chars().count() > 20 {
+        let mut s: String = command.chars().take(19).collect();
+        s.push('…');
+        s
+    } else {
+        command.to_string()
+    };
+    crate::compose::schema::go_quote(&shown)
+}
+
+/// Docker's PORTS cell from kern's published-port field: `0.0.0.0:8080->80/tcp`, comma-joined.
+fn docker_ports_cell(ports: &str) -> String {
+    crate::ports::parse_display_list(ports)
+        .iter()
+        .map(|p| {
+            let ip = match p.bind {
+                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                std::net::IpAddr::V4(v4) => v4.to_string(),
+            };
+            format!(
+                "{ip}:{}->{}/{}",
+                p.host,
+                p.box_port,
+                if p.udp { "udp" } else { "tcp" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// [`render_ps_format`] with a [`PsCtx`].
+fn render_ps_format_ctx<R: PsRow>(tmpl: &str, b: &R, ctx: &PsCtx<'_>) -> Result<String, Error> {
+    let now = ctx.now;
     let mut out = String::with_capacity(tmpl.len());
     let mut rest = tmpl;
     while let Some(open) = rest.find("{{") {
@@ -3222,12 +3578,38 @@ fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Err
                 Some(pid) => out.push_str(&pid.to_string()),
                 None => out.push('-'),
             },
-            ".Image" | ".Rootfs" => out.push_str(&b.ps_image()),
-            ".Command" => out.push_str(&b.ps_command()),
-            ".Ports" => out.push_str(b.ps_ports()),
+            ".Image" | ".Rootfs" => {
+                let own = b.ps_image();
+                match ctx
+                    .image
+                    .and_then(|f| f(b.ps_name()))
+                    .filter(|_| own.is_empty())
+                {
+                    Some(i) => out.push_str(&crate::ui::scrub(&i)),
+                    None => out.push_str(&own),
+                }
+            }
+            ".Command" => match ctx.docker_command {
+                Some(trunc) => out.push_str(&docker_command_cell(&b.ps_command(), trunc)),
+                None => out.push_str(&b.ps_command()),
+            },
+            ".Ports" => match ctx.docker_command {
+                Some(_) => out.push_str(&docker_ports_cell(b.ps_ports())),
+                None => out.push_str(b.ps_ports()),
+            },
+            ".Service" => {
+                let svc = ctx
+                    .service
+                    .and_then(|f| f(b.ps_name()))
+                    .unwrap_or_else(|| service_of_box_name(b.ps_name(), b.ps_pod()));
+                out.push_str(&svc);
+            }
             ".Pod" => out.push_str(b.ps_pod()),
             ".RunningFor" => out.push_str(&b.ps_running_for(now)),
-            ".Status" => out.push_str(&b.ps_status()),
+            ".Status" => out.push_str(&b.ps_status(now)),
+            ".State" => out.push_str(&b.ps_state()),
+            ".Health" => out.push_str(&b.ps_health()),
+            ".ExitCode" => out.push_str(&b.ps_exit_code().to_string()),
             // `{{.Labels}}`: every label, Docker's comma-joined `k=v` rendering, which is what the
             // registry already holds. Scrubbed like the other untrusted columns: a label value is
             // caller-supplied text heading for a terminal.
@@ -3266,8 +3648,9 @@ fn render_ps_format<R: PsRow>(tmpl: &str, b: &R, now: u64) -> Result<String, Err
             _ => {
                 return Err(Error::Usage(
                     "ps --format: unsupported token (supported: {{.Names}} {{.Pid}} {{.Image}} \
-                     {{.Command}} {{.Ports}} {{.Pod}} {{.Status}} {{.RunningFor}} {{.Labels}} \
-                     {{.Label \"key\"}}; use --json for more)",
+                     {{.Command}} {{.Ports}} {{.Pod}} {{.Status}} {{.State}} {{.Health}} \
+                     {{.ExitCode}} {{.Service}} {{.RunningFor}} {{.Labels}} \
+                     {{.Label \"key\"}}; prefix `table ` for a header row; use --json for more)",
                 ))
             }
         }
@@ -3502,7 +3885,7 @@ fn strip_scaffolding(out: Vec<(char, String)>) -> Vec<(char, String)> {
             let prefix = format!("{p}/");
             let had_dropped_child = dropped.iter().any(|d| d.starts_with(&prefix));
             let has_kept_child = kept.iter().any(|(_, k)| k.starts_with(&prefix));
-            !(had_dropped_child && !has_kept_child)
+            !had_dropped_child || has_kept_child
         })
         .cloned()
         .collect()
@@ -4901,16 +5284,7 @@ fn display_run(argv: &[String]) -> String {
 /// Filesystem magic (`statfs.f_type`) of `p`'s deepest EXISTING ancestor - the path itself usually
 /// doesn't exist yet (the scratch is created later). `None` only if nothing up to `/` can be stat'd.
 fn fs_magic_of(p: &std::path::Path) -> Option<i64> {
-    let mut cur = p;
-    loop {
-        if let Ok(c) = std::ffi::CString::new(cur.as_os_str().as_encoded_bytes()) {
-            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-            if unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 {
-                return Some(st.f_type as i64);
-            }
-        }
-        cur = cur.parent()?;
-    }
+    kern_common::fs_magic(p)
 }
 
 /// `kern stop <name>... | --all` - stop running box(es): SIGKILL each target supervisor's process
@@ -5044,7 +5418,7 @@ const COMPOSE_CONDITION_TIMEOUT_SECS: u64 = 120;
 /// with a `db` don't collide - pass 1b); `<token>` namespaces by this `up`'s RUN (two concurrent
 /// `up`s of the SAME stack own separate files, so one's clear/write can't clobber the other's real
 /// completion - an audit pass, the round-1 "token only inside the file" left the filename shared).
-/// `compose_pod_name(file)` is stable per compose file even for a `--no-pod` stack (no live pod), so
+/// The project name is stable for a stack (its directory, `-p` or `name:`), even for a `--no-pod` stack (no live pod), so
 /// the prefix is well-defined in both modes. `compose down` doesn't know the `up`'s token, so it reaps
 /// each box's sidecar by `exit_key_prefix(pod)` ++ `-<name>` (pod-prefix AND name-suffix) - NOT a
 /// blind pod prefix, which would wipe a concurrent same-stack run's in-flight files.
@@ -5843,14 +6217,14 @@ pub enum ComposeAction {
     ///
     /// It used to be read as a service name, then as "a docker verb kern does not have, run
     /// `kern exec <box> …` instead". Both were wrong answers to the same question: the reader knows
-    /// `web`, not `<project>-<hash>-web`, and looking the box up by hand is the step that sends
+    /// `web`, not `<project>-web-1`, and looking the box up by hand is the step that sends
     /// people back to Docker. The command's exit status is kern's, as it is under Docker.
     Exec,
     /// `cp <service>:<path> <dst>` / `cp <src> <service>:<path>`: copy a file in or out.
     ///
     /// The same copier `kern cp` uses, with the SERVICE name resolved to the box name it now has.
     /// That resolution is the whole point: a reader of a compose file knows `web`, not
-    /// `<project>-<hash>-web`, and looking it up by hand is the step that makes people reach for
+    /// `<project>-web-1`, and looking it up by hand is the step that makes people reach for
     /// `exec … | tar` instead.
     Cp,
     /// `run <service> [command…]`: one-off box from a service's definition, in the foreground.
@@ -5946,24 +6320,6 @@ pub const COMPOSE_VERBS: &[(&str, ComposeAction)] = &[
 ];
 
 impl ComposeAction {
-    /// The word that selects this verb on the command line, read from the ONE table that defines
-    /// them.
-    ///
-    /// DERIVED, NEVER RE-LISTED, which is the rule the table above states about itself after the
-    /// same list was written out three times by hand and `systemd` shipped working but undocumented.
-    /// The one place this is read is a note printed TO the user, and naming a verb they did not type
-    /// is exactly the defect it exists to prevent: that note said `up` for every verb that reached
-    /// it, including `start` and `restart`.
-    ///
-    /// `kill` and `stop` are one action and the table's order decides which word comes back: `stop`
-    /// is listed first, and it is the documented spelling.
-    pub fn name(self) -> &'static str {
-        COMPOSE_VERBS
-            .iter()
-            .find(|(_, a)| *a == self)
-            .map_or("up", |(n, _)| *n)
-    }
-
     /// Parse a compose sub-verb. `None` for an unknown word, so the caller can report it with the
     /// full list rather than guessing.
     pub fn from_verb(v: &str) -> Option<Self> {
@@ -6334,6 +6690,23 @@ pub fn port(name: &str, want: Option<&str>) -> Result<(), Error> {
         println!("{}", published_address(b));
     }
     Ok(())
+}
+
+/// `compose config`'s views and output, Docker's flags of that verb (`docker compose config
+/// --help`). `--services`, `-q` and `--format` travel in the fields `ps` shares; `--volumes` is
+/// `remove_volumes`, which is the same spelling `down -v` takes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigFlags {
+    pub images: bool,
+    pub networks: bool,
+    pub profiles: bool,
+    pub environment: bool,
+    pub variables: bool,
+    pub no_interpolate: bool,
+    /// `--hash <services>`: `*` or a comma-separated list.
+    pub hash: Option<String>,
+    /// `-o/--output <file>`: write the answer there instead of stdout.
+    pub output: Option<String>,
 }
 
 /// WHERE A COMPOSE INVOCATION'S FILE LIST CAME FROM, decided once by the CLI.
@@ -8385,13 +8758,14 @@ fn settle_and_collect_dead(
     boxes: &[&crate::compose::ComposeBox],
     pod: &str,
     token: &str,
+    window_ms: u64,
 ) -> Vec<String> {
     // BY REFERENCE, because the caller passes a SUBSET: `up web` starts web and its dependencies,
     // and the services the caller deliberately left out must not be examined. They were reported as
     // "died within 150ms of starting" - a death for a box that was never started - and turned a
     // bring-up that did exactly what was asked into a non-zero exit. MEASURED on a two-service file:
     // `up -d uno` printed `1 service(s) died: due`.
-    watch_for_early_death(boxes, BRING_UP_SETTLE_MS);
+    watch_for_early_death(boxes, window_ms);
     boxes
         .iter()
         .filter(|b| {
@@ -8401,12 +8775,7 @@ fn settle_and_collect_dead(
             // Gone: legitimate only if it recorded a clean completion.
             registry::exit_of(&exit_key(pod, token, &b.name)) != Some(0)
         })
-        .map(|b| {
-            b.name
-                .strip_prefix(&format!("{pod}-"))
-                .unwrap_or(&b.name)
-                .to_string()
-        })
+        .map(|b| b.service_name().to_string())
         .collect()
 }
 
@@ -8823,6 +9192,8 @@ struct TerminalOpts<'a> {
     ps_quiet: bool,
     ps_services: bool,
     ps_format: Option<&'a str>,
+    /// `config`'s output: the project as Docker Compose prints it (see `kern_compose::canon`).
+    config_yaml: Option<String>,
 }
 
 /// Run the compose verbs that never launch a box, and report whether one ran.
@@ -9071,7 +9442,11 @@ fn run_terminal_verb(
                     }
                 }
             }
-            println!("compose config: {} service(s) in {file}", boxes.len());
+            // THE SUMMARY IS KERN'S, ON STDERR; STDOUT IS DOCKER'S `config`. A script reading
+            // `config` reads the resolved file (`| yq`, a CI diff), which is what Docker prints
+            // there; kern's summary (the wiring fields a census counts, the per-service lines) is
+            // for the reader and goes beside the other notes.
+            eprintln!("compose config: {} service(s) in {file}", boxes.len());
             // ONE FIELD, FOR WHATEVER COUNTS. The wiring is announced on stderr in prose that says
             // what it costs and what the alternatives are, which is right for a reader and wrong for
             // a tool: a census that matched `"on a bridge"` counted every POD stack as a bridge,
@@ -9083,7 +9458,7 @@ fn run_terminal_verb(
             // printed as a token that says nothing else: `wiring: pod|bridge|relay`. Prose for the
             // reader, a field for whoever counts, and never one read as the other. It is derived
             // from the SAME two flags the bring-up carries, not re-derived from the file.
-            println!(
+            eprintln!(
                 "  wiring: {}",
                 match (own_namespaces, relay_wiring) {
                     (_, true) => "relay",
@@ -9095,7 +9470,7 @@ fn run_terminal_verb(
             // key pins the wiring today. It is in the vocabulary because the census that will have
             // to separate "kern chose this" from "the file asked for this" is written against this
             // field, and adding the value later must not change what `auto` and `flag` mean.
-            println!(
+            eprintln!(
                 "  wiring-source: {}",
                 if o.wiring_from_flag { "flag" } else { "auto" }
             );
@@ -9108,7 +9483,7 @@ fn run_terminal_verb(
             if !o.wiring_from_flag {
                 let unread = images_not_read(boxes);
                 if !unread.is_empty() {
-                    println!(
+                    eprintln!(
                         "  wiring-images-unread: {} ({})",
                         unread.len(),
                         unread.join(", ")
@@ -9134,7 +9509,7 @@ fn run_terminal_verb(
             // `container_name` keys from a working file over it. Peers resolve by service name
             // either way - the alias is registered at bring-up - so the output was the entire
             // defect. `short` remains for a box that never went through the rewrite.
-            let short = |n: &str| n.strip_prefix(&format!("{pod}-")).unwrap_or(n).to_string();
+            let short = |n: &str| short_service_name(boxes, n, pod);
             // BOX NAME BACK TO THE FILE'S NAME, for the dependency edges. Those are rewritten onto
             // box names at parse time so everything downstream agrees on one set of names, which is
             // right for the runtime and wrong for this view: `config` reports the FILE, and the file
@@ -9156,14 +9531,14 @@ fn run_terminal_verb(
                 // is exactly when a `container_name` set it. Printing `box=<project>-<service>` on
                 // every line would be noise, and noise is how a reader stops reading the line that
                 // matters.
-                let boxed = if b.name == svc || b.name == format!("{pod}-{svc}") {
+                let boxed = if b.container_name.is_none() {
                     String::new()
                 } else {
                     format!("  box={}", b.name)
                 };
-                println!("  {svc}  image={src}{boxed}");
+                eprintln!("  {svc}  image={src}{boxed}");
                 if !b.ports.is_empty() {
-                    println!("    ports: {}", b.ports.join(", "));
+                    eprintln!("    ports: {}", b.ports.join(", "));
                 }
                 // The v-profiles, because `config` answers "what did kern understand" and a profile
                 // changes every cap the box runs under. Shown as the TOKENS the box will receive, so
@@ -9172,9 +9547,9 @@ fn run_terminal_verb(
                 // this preview can warn about before anything starts.
                 let tokens = b.profile_tokens();
                 if !tokens.is_empty() {
-                    println!("    profiles: {}", tokens.join(" "));
+                    eprintln!("    profiles: {}", tokens.join(" "));
                     if let Some(c) = &b.config {
-                        println!("      defined in: {c}");
+                        eprintln!("      defined in: {c}");
                     }
                     // WHAT THE NAME RESOLVED TO ON THIS HOST, not just the name.
                     //
@@ -9201,13 +9576,13 @@ fn run_terminal_verb(
                             // same as a profile whose output this command simply does not show. It
                             // is also exactly what a MISTYPED key produces (`cores` where the key is
                             // `cpus`), which is the case this whole pairing exists to make visible.
-                            println!(
+                            eprintln!(
                                 "      resolves to: nothing (this build reads no cap from it - \
                                  check the [[...]] block for keys it does not have)"
                             );
                         }
                         for line in lines {
-                            println!("      {line}");
+                            eprintln!("      {line}");
                         }
                     }
                 }
@@ -9216,7 +9591,7 @@ fn run_terminal_verb(
                 // the command that exists to explain the file, and a hardening bundle that is silent
                 // here is a security posture the operator has to take on trust.
                 if let Some(sp) = &b.security_profile {
-                    println!(
+                    eprintln!(
                         "    security-profile: {sp} (seccomp allowlist + --cap-drop ALL + \
                          --read-only; kern only, Docker ignores it)"
                     );
@@ -9229,7 +9604,7 @@ fn run_terminal_verb(
                     // WHERE IT IS RESERVED DEPENDS ON THE WIRING, and this line said "in the
                     // pod" under every one of them. Measured on a `--no-pod` stack: `config`
                     // announced a reservation in a pod the stack does not have.
-                    println!(
+                    eprintln!(
                         "    port: {p} (reserved {}, passed as PORT={p})",
                         if own_namespaces {
                             "for this service"
@@ -9244,7 +9619,7 @@ fn run_terminal_verb(
                         .iter()
                         .map(|(n, udp)| format!("{n}/{}", if *udp { "udp" } else { "tcp" }))
                         .collect();
-                    println!(
+                    eprintln!(
                         "    expose: {} (reserved {})",
                         list.join(", "),
                         if own_namespaces {
@@ -9268,7 +9643,12 @@ fn run_terminal_verb(
                     })
                     .collect();
                 if !deps.is_empty() {
-                    println!("    depends_on: {}", deps.join(", "));
+                    eprintln!("    depends_on: {}", deps.join(", "));
+                }
+            }
+            if !o.ps_quiet {
+                if let Some(y) = o.config_yaml.as_deref() {
+                    print!("{y}");
                 }
             }
             return Ok(true);
@@ -9423,6 +9803,20 @@ fn run_terminal_verb(
                     .map(|b| b.name.clone())
                     .collect()
             });
+            // Each box's SERVICE as the file names it: a replica's is the replicated service's, a
+            // `container_name:`'s is still its service's, as Docker's SERVICE column shows them.
+            let service_of_box: Vec<(String, String, String)> = boxes
+                .iter()
+                .map(|b| {
+                    (
+                        b.name.clone(),
+                        b.replica_of
+                            .clone()
+                            .unwrap_or_else(|| b.service_name().to_string()),
+                        b.image.clone().unwrap_or_default(),
+                    )
+                })
+                .collect();
             let rc = ps(
                 shape,
                 o.ps_quiet,
@@ -9434,6 +9828,8 @@ fn run_terminal_verb(
                 PsView {
                     only: only.as_deref(),
                     ids: true,
+                    compose: true,
+                    services: Some(&service_of_box),
                     ..PsView::default()
                 },
             );
@@ -9463,7 +9859,7 @@ fn run_terminal_verb(
                     {
                         for e in edges.lines().filter(|l| !l.is_empty()) {
                             let p = crate::ui::Palette::detect();
-                            println!("{}peer edge DOWN: {e}{}", p.r, p.z);
+                            eprintln!("{}peer edge DOWN: {e}{}", p.r, p.z);
                         }
                     }
                 }
@@ -9486,7 +9882,7 @@ fn run_terminal_verb(
                     .count();
                 if running < defined {
                     let p = crate::ui::Palette::detect();
-                    println!(
+                    eprintln!(
                         "{d}{running}/{defined} services running - exited: kern compose … ps -a{z}",
                         d = p.d,
                         z = p.z
@@ -9496,66 +9892,81 @@ fn run_terminal_verb(
             return rc.map(|()| true);
         }
         ComposeAction::Logs => {
-            let wanted: Vec<&str> = boxes
+            // EVERY LINE CARRIES DOCKER'S PREFIX, `api-1   | a1`: the container's name without the
+            // project (`<service>-<n>`, or `container_name:`), padded to the longest, then `  | `.
+            // MEASURED on Docker Compose 5.3.1, with and without `-f` and for one service too; kern
+            // printed `=== name ===` headings without `-f` and nothing for one service.
+            // `--no-log-prefix` leaves the lines bare.
+            // In the order of the service names, as Docker Compose 5.3.1 printed them (measured:
+            // `api-server-1`, `done-1`, `ev-rest` for a file listing `rest` first).
+            let mut chosen: Vec<&crate::compose::ComposeBox> =
+                boxes.iter().filter(|b| selected(b)).collect();
+            chosen.sort_by(|a, b| a.service_name().cmp(b.service_name()));
+            let labels: Vec<String> = chosen
                 .iter()
-                .filter(|b| selected(b))
-                .map(|b| b.name.as_str())
+                .map(|b| {
+                    if o.no_log_prefix {
+                        String::new()
+                    } else {
+                        docker_log_label(b, pod)
+                    }
+                })
                 .collect();
-            // `-f` over the WHOLE stack, interleaved and prefixed, which is what `docker compose
-            // logs -f` does and what an attached `up` needs. It used to be refused ("follows ONE
-            // service at a time"), on the belief that it needed a blocking reader per service; a log
-            // file never blocks, so one poll pass reads them all (see `follow_many`).
-            if follow && wanted.len() > 1 {
-                let mut who = Vec::with_capacity(wanted.len());
-                for b in boxes.iter().filter(|b| selected(b)) {
-                    let Some(ins) = registry::find_ref(&b.name) else {
-                        continue; // never started, or already exited: nothing to follow
-                    };
-                    match Followed::open(
-                        b.service_name().to_string(),
-                        b.name.clone(),
-                        ins.pid,
-                        tail,
-                    ) {
+            let width = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+            // Padded here to the width of ALL the services named, as Docker aligns them, so the
+            // follow below (which aligns only the ones still running) keeps the same column.
+            let padded: Vec<String> = labels
+                .iter()
+                .map(|l| {
+                    if l.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{l:<width$}")
+                    }
+                })
+                .collect();
+            let mut who = Vec::new();
+            for (b, label) in chosen.iter().zip(&padded) {
+                let running = if follow {
+                    registry::find_ref(&b.name)
+                } else {
+                    None
+                };
+                if let Some(ins) = running {
+                    // `-f`: what it wrote so far and what it writes next, through the follow.
+                    match Followed::open(label.clone(), b.name.clone(), ins.pid, tail) {
                         Ok(Some(f)) => who.push(f),
                         Ok(None) => {}
                         Err(e) => eprintln!("compose logs: {}: {e}", b.service_name()),
                     }
-                }
-                if who.is_empty() {
-                    return Err(Error::Compose(
-                        "compose logs -f: none of the selected services is running".to_string(),
-                    ));
-                }
-                follow_many(who, &FOLLOW_FOREVER, false)?;
-                return Ok(true);
-            }
-            for (i, name) in wanted.iter().enumerate() {
-                // `--no-log-prefix` DROPS THE HEADING. With several services the output is only
-                // readable because each block says whose it is; a downstream parser wants the lines
-                // and nothing else, and until this flag existed it had to strip kern's own headings
-                // to get them.
-                if wanted.len() > 1 && !o.no_log_prefix {
-                    if i > 0 {
-                        println!();
-                    }
-                    println!("=== {name} ===");
+                    continue;
                 }
                 // THE SERVICE'S EARLIER RUNS FIRST, as Docker's log of a container spans its
                 // restarts (see `Followed::open`). Not with `--timestamps` or a time window: those
                 // read the newest run's time index, and the earlier runs have none to read.
+                // STREAMED THROUGH THE PREFIX, not collected: a 16 MiB log was held three times
+                // (read, collected, prefixed) before its first line reached the reader.
+                use std::io::Write as _;
+                let stdout = std::io::stdout();
+                let mut w = PrefixWriter::new(std::io::BufWriter::new(stdout.lock()), label);
                 if !o.log_timestamps && o.log_window == (None, None) {
-                    let earlier = earlier_runs(name, tail);
-                    if !earlier.is_empty() {
-                        use std::io::Write as _;
-                        let _ = std::io::stdout().write_all(&earlier);
-                    }
+                    let _ = w.write_all(&earlier_runs(&b.name, tail));
                 }
-                // A service that never started (or already exited) has no log: report it and keep
-                // going, so one missing service can't hide the others' output.
-                if let Err(e) = logs(name, tail, follow, o.log_timestamps, o.log_window) {
-                    eprintln!("compose logs: {name}: {e}");
+                // A service that never started has no log: report it and keep going, so one
+                // missing service can't hide the others' output.
+                if let Err(e) = crate::commands::inspect::logs_to(
+                    &b.name,
+                    tail,
+                    o.log_timestamps,
+                    o.log_window,
+                    &mut w,
+                ) {
+                    eprintln!("compose logs: {}: {e}", b.name);
                 }
+                let _ = w.finish();
+            }
+            if !who.is_empty() {
+                follow_many(who, &FOLLOW_FOREVER, false)?;
             }
             return Ok(true);
         }
@@ -9632,7 +10043,11 @@ fn run_terminal_verb(
                 Vec::new()
             };
             let all: Vec<String> = boxes.iter().map(|b| b.name.clone()).collect();
-            let (stopped, pod_existed) = tear_down_stack(boxes, &all, pod);
+            // `-t N` IS THE GRACE OF THIS TEARDOWN, as Docker reads `down -t`. MEASURED on this
+            // desktop: `compose down -t 0` of three `sleep` services took 10.27 s, the whole
+            // default grace, where Docker kills at once.
+            let (stopped, pod_existed) =
+                tear_down_stack_keeping(boxes, &all, pod, true, o.stop_timeout).0;
             // THE LOGS GO WITH THE SERVICES, as Docker removes a container's log with it: the next
             // `up` starts each service with an empty history, and a stack brought up and down in a
             // loop no longer leaves one log file per run behind (measured: five runs of one service
@@ -9845,7 +10260,7 @@ fn run_terminal_verb(
                     };
                     match code {
                         Some(c) => {
-                            println!("{} {c}", short_service_name(n, pod));
+                            println!("{} {c}", short_service_name(boxes, n, pod));
                             // ONLY THE FIRST is adopted: a later service's status is reported on
                             // stdout and does not overwrite the one this verb promised to return.
                             if first.is_none() {
@@ -9859,7 +10274,7 @@ fn run_terminal_verb(
                         None => {
                             eprintln!(
                                 "kern: service '{}' is gone and left no exit record (a foreground box has no supervisor to write one)",
-                                short_service_name(n, pod)
+                                short_service_name(boxes, n, pod)
                             );
                             false
                         }
@@ -10125,15 +10540,25 @@ fn run_terminal_verb(
 
 /// The name the FILE gives a box, from the scoped name the registry holds.
 ///
-/// A reader of a compose file knows `tests`, not `<project>-<hash>-tests`, and echoing the scoped
+/// A reader of a compose file knows `tests`, not `<project>-tests-1`, and echoing the scoped
 /// form back at them is the step that sends people looking for a service their file does not
 /// contain. Falls back to the full name when the prefix is not there, which is a box renamed by
 /// `container_name:` and therefore already the name its author chose.
-fn short_service_name(box_name: &str, pod: &str) -> String {
-    box_name
-        .strip_prefix(&format!("{pod}-"))
-        .unwrap_or(box_name)
-        .to_string()
+///
+/// FROM THE BOX'S DEFINITION when the stack has it, and not from the string: with Docker's names a
+/// box is `<project>-<service>-1`, and stripping the project left `service-1` in every message.
+pub(crate) fn short_service_name(
+    boxes: &[crate::compose::ComposeBox],
+    box_name: &str,
+    pod: &str,
+) -> String {
+    match boxes.iter().find(|b| b.name == box_name) {
+        Some(b) => b.service_name().to_string(),
+        None => box_name
+            .strip_prefix(&format!("{pod}-"))
+            .unwrap_or(box_name)
+            .to_string(),
+    }
 }
 
 /// The processes in a box's cgroup, as `(pid, command line)`, newest kernel order.
@@ -10163,12 +10588,7 @@ fn top_row(service: &str, pid: i32, cmd: &str) -> Option<[String; 10]> {
         .ok()
         .filter(|t| *t > 0)
         .unwrap_or(100);
-    let boot = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
-        s.lines()
-            .find_map(|l| l.strip_prefix("btime "))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })?;
-    let started = boot + start / tick;
+    let started = started_unix(start)?;
     let now = registry::now_unix();
     let cpu_secs = (utime + stime) / tick;
     let alive = now.saturating_sub(started).max(1);
@@ -10391,6 +10811,8 @@ pub struct ComposeOpts<'a> {
     pub profiles: &'a [String],
     /// Where `files` came from, which decides two things Docker ties to it (see [`ComposeFilesFrom`]).
     pub files_from: ComposeFilesFrom,
+    /// `config`'s views and output (see [`ConfigFlags`]).
+    pub config_flags: &'a ConfigFlags,
     /// `logs -t/--timestamps`: prefix each line with the time the index recorded for it.
     pub log_timestamps: bool,
     /// `logs --since` / `--until` as unix nanoseconds. See `boxlog::Stamper::window` for why a line
@@ -10412,12 +10834,36 @@ pub struct ComposeOpts<'a> {
     pub renew_anon_volumes: bool,
 }
 
-/// Derive a STABLE, per-stack pod name from a compose file path. Uses the parent DIRECTORY name
-/// (Docker's project-name rule - compose files are conventionally named `compose.yaml`, so the
-/// directory identifies the stack, not the near-constant stem) plus a short hash of the CANONICAL
-/// absolute path, so two same-named dirs in different locations never collapse into one pod. Same
-/// file → same name (so `up` and `down` agree); different stacks → different pods.
+/// compose-go's `NormalizeProjectName`: lower case, only `[a-z0-9_-]`, no leading `_` or `-`.
+/// MEASURED on Docker Compose 5.3.1: a directory `My.App_X` is the project `myapp_x`, `__-x` is
+/// `x`, and `name: Bad Name` is `badname`.
+pub(crate) fn normalize_project_name(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-')
+        .collect::<String>()
+        .trim_start_matches(['_', '-'])
+        .to_string()
+}
+
+/// Docker's default project name for a compose file: its directory's name, normalized
+/// ([`normalize_project_name`]). Empty when nothing of the name survives, which Docker refuses
+/// ("project name must not be empty"). Two directories with one name are one project, as under
+/// Docker; `-p` tells them apart.
 fn compose_pod_name(file: &str) -> String {
+    let path = std::path::Path::new(file);
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = canon
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    normalize_project_name(dir)
+}
+
+/// The name kern gave a stack before it took Docker's, `<dir>-<hash of the file's path>`: read only
+/// to find a stack still running under it, and its volumes.
+pub(crate) fn legacy_pod_name(file: &str) -> String {
     let path = std::path::Path::new(file);
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let raw = canon
@@ -10433,7 +10879,6 @@ fn compose_pod_name(file: &str) -> String {
         .take(40)
         .collect();
     let base = if base.is_empty() { "compose" } else { &base };
-    // A short hash of the canonical path disambiguates identical dir names in different locations.
     format!("{base}-{:08x}", fnv1a(&canon.to_string_lossy()) as u32)
 }
 
@@ -10580,6 +11025,52 @@ pub(crate) fn host_disks() -> Vec<String> {
 /// One implementation, because `kern top` and `config setup` were both going to want it and a second
 /// copy is how the two would come to disagree about the same disk on the same screen.
 pub(crate) fn fs_usage(path: &str) -> Option<(u64, u64)> {
+    let v = statvfs_blocks(path)?;
+    // CHECKED AND NOT WRAPPING. `f_blocks * f_frsize` is a product of two kernel-supplied numbers,
+    // and a filesystem that reports nonsense (a fuse mount is free to) must yield "unmeasurable"
+    // rather than a small wrapped total, because a small total here becomes a DECLARED BUDGET.
+    let total = v.blocks.checked_mul(v.frsize)?;
+    let used = v
+        .blocks
+        .saturating_sub(v.bfree)
+        .checked_mul(v.frsize)
+        .unwrap_or(total);
+    Some((used, total))
+}
+
+/// `(percent full, bytes available)` of the filesystem backing `path`, as `df` computes them: used
+/// over used plus
+/// AVAILABLE. Not used over total: the blocks a filesystem reserves for root are free and still not
+/// writable by anyone else, so a user's write fails with ENOSPC when AVAILABLE runs out. MEASURED on
+/// a desktop: 77 % of the total was 82 % by this rule, and 82 % is the one that predicts the error.
+pub(crate) fn fs_fill(path: &str) -> Option<(u64, u64)> {
+    let v = statvfs_blocks(path)?;
+    let used = v.blocks.saturating_sub(v.bfree);
+    let room = used.checked_add(v.bavail)?;
+    // ROUNDED UP, as `df` rounds it: a disk 81.2 % full is reported 82 %, and the two must agree on
+    // the same screen.
+    let pct = if room == 0 {
+        0
+    } else {
+        u64::try_from((u128::from(used) * 100).div_ceil(u128::from(room))).unwrap_or(100)
+    };
+    Some((pct, v.bavail.checked_mul(v.frsize)?))
+}
+
+/// The four `statvfs` block counts both readers above use, widened to `u64`.
+struct StatvfsBlocks {
+    frsize: u64,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+}
+
+/// One `statvfs` for [`fs_usage`] and [`fs_fill`]. The fields are `c_ulong` and `fsblkcnt_t`, `u64`
+/// on every target kern ships and narrower on 32-bit ones, so the widening casts are redundant here
+/// and needed there; clippy 1.93 refuses the redundant ones (measured on the VPS), silenced in this
+/// one place with the reason.
+#[allow(clippy::unnecessary_cast)]
+fn statvfs_blocks(path: &str) -> Option<StatvfsBlocks> {
     // A path with an interior NUL cannot name a file, so this is a refusal and not an error.
     let c = std::ffi::CString::new(path).ok()?;
     // SAFETY: `libc::statvfs` is a `repr(C)` aggregate of unsigned integers, for which the all-zero
@@ -10587,21 +11078,16 @@ pub(crate) fn fs_usage(path: &str) -> Option<(u64, u64)> {
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` owns a NUL-terminated buffer that outlives the call, and `st` is a live, fully
     // zeroed `statvfs` that the kernel only writes through this pointer. The return code is checked
-    // before either field is read.
+    // before any field is read.
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
         return None;
     }
-    let bs = st.f_frsize as u64;
-    let blocks = st.f_blocks as u64;
-    // CHECKED AND NOT WRAPPING. `f_blocks * f_frsize` is a product of two kernel-supplied numbers,
-    // and a filesystem that reports nonsense (a fuse mount is free to) must yield "unmeasurable"
-    // rather than a small wrapped total, because a small total here becomes a DECLARED BUDGET.
-    let total = blocks.checked_mul(bs)?;
-    let used = blocks
-        .saturating_sub(st.f_bfree as u64)
-        .checked_mul(bs)
-        .unwrap_or(total);
-    Some((used, total))
+    Some(StatvfsBlocks {
+        frsize: st.f_frsize as u64,
+        blocks: st.f_blocks as u64,
+        bfree: st.f_bfree as u64,
+        bavail: st.f_bavail as u64,
+    })
 }
 
 /// The kernel name of the whole disk backing `path` (`"nvme1n1"`), or `None` when it does not resolve.

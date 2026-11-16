@@ -3,7 +3,8 @@
 
 The relay wiring is the one a later pass guessed has no population. `kern compose <f> config`
 announces its choice on stderr, so this counts the announcements rather than re-deriving the rule:
-It reads the `wiring:` FIELD that `compose config` prints on stdout, which is one token and says
+It reads the `wiring:` FIELD that `compose config` prints on stderr (stdout is the resolved file, as
+Docker prints it), which is one token and says
 nothing else: `pod`, `bridge` or `relay`. The `wiring-source:` line beside it says whether kern chose
 that wiring (`auto`) or someone typed it (`flag`), and is counted separately: after a compose key can
 pin the wiring, a file that keeps the pod on purpose must not be counted as the divergence a default
@@ -45,11 +46,11 @@ for f in sorted(CORPUS.iterdir()):
         counts["refused"] += 1
         continue
     w = next(
-        (l.split(":", 1)[1].strip() for l in p.stdout.splitlines() if l.startswith("  wiring:")),
+        (l.split(":", 1)[1].strip() for l in p.stderr.splitlines() if l.startswith("  wiring:")),
         "",
     )
     src = next(
-        (l.split(":", 1)[1].strip() for l in p.stdout.splitlines() if l.startswith("  wiring-source:")),
+        (l.split(":", 1)[1].strip() for l in p.stderr.splitlines() if l.startswith("  wiring-source:")),
         "",
     )
     if src:
@@ -67,7 +68,7 @@ for f in sorted(CORPUS.iterdir()):
         # neutral corpus: 85 single-service pods, none of which carry the shared-loopback advisory,
         # against 136 with two or more, all of which do. The split is exactly the advisory's gate.
         import re as _re
-        m = _re.search(r"compose config: (\d+) service", p.stdout)
+        m = _re.search(r"compose config: (\d+) service", p.stderr)
         if m and int(m.group(1)) <= 1:
             counts["pod_one_service"] += 1
     else:

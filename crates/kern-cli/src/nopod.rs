@@ -282,6 +282,58 @@ pub fn assign_aliases(services: &[ServiceInput]) -> Result<Vec<Assigned>, String
     Ok(out)
 }
 
+/// A RUNNING BOX KEEPS ITS ALIAS when the stack around it changes; every other service takes the
+/// lowest alias nothing kept holds.
+///
+/// Aliases are handed out by position in the file, so a running stack whose composition changes (a
+/// replica added, a service added above another) moved the services after it to new aliases while
+/// the boxes left running still mapped their names to the old ones: the alias a kept box knew as
+/// `cm` became the relay of the new `web-3`, a name answering as the wrong service. The bridge plan
+/// has the same rule for addresses (`registry::Instance::bridges`). `live` is what the stack's alias
+/// record says, already narrowed to boxes that are running; a recorded alias two of them claim is
+/// kept by the first and the second is given a free one.
+///
+/// # Errors
+///
+/// When the stack has more services than there are aliases left, which `assign_aliases` already
+/// refuses for the plan as a whole.
+pub fn keep_live_aliases(
+    plan: &mut [Assigned],
+    live: &std::collections::HashMap<String, u32>,
+) -> Result<(), String> {
+    let mut kept: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut keeps: Vec<bool> = Vec::with_capacity(plan.len());
+    for a in plan.iter() {
+        let keep = live.get(&a.box_name).is_some_and(|v| {
+            (0..MAX_PEER_INDEX).any(|i| peer_alias(i) == Some(*v)) && kept.insert(*v)
+        });
+        keeps.push(keep);
+    }
+    let mut next = 0usize;
+    for (a, keep) in plan.iter_mut().zip(keeps) {
+        if keep {
+            if let Some(v) = live.get(&a.box_name) {
+                a.alias = *v;
+            }
+            continue;
+        }
+        loop {
+            let Some(v) = peer_alias(next) else {
+                return Err(format!(
+                    "no loopback alias left for service '{}' beside the ones its running peers hold",
+                    a.service
+                ));
+            };
+            next += 1;
+            if !kept.contains(&v) {
+                a.alias = v;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The `--add-host NAME:IP` values this box needs, given the whole plan.
 ///
 /// `me` maps to `127.0.0.1`, where its own listener is; every peer maps to that peer's alias, where
@@ -635,6 +687,72 @@ pub fn relay_plan(plan: &[Assigned]) -> Vec<RelayPlan> {
                     holder_declares: holder.ports.contains(port),
                     port: *port,
                 });
+            }
+        }
+    }
+    out
+}
+
+/// The networks of a stack on a bridge, with every name on each and the address it answers on
+/// there, for a box that joins one later (`kern box --network <project>_<network>`): a service's
+/// own name, its `aliases:` and its box name (the `container_name:` when it has one), as a
+/// container on that network resolves them under Docker.
+///
+/// `single` is the prefix of a stack with ONE bridge: every service is on it at its `alias`, and
+/// the bridge answers to `default` and to every network the file names.
+pub fn bridge_networks(plan: &[Assigned], single: Option<u8>) -> Vec<crate::pod::BridgeNetwork> {
+    let names_of = |a: &Assigned| -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for n in a.aliases.iter().chain(std::iter::once(&a.box_name)) {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        names
+    };
+    let mut out: Vec<crate::pod::BridgeNetwork> = Vec::new();
+    let mut entry = |network: &str, bridge: u8, prefix: u8, ip: u32, names: &[String]| {
+        let at = match out.iter().position(|n| n.network == network) {
+            Some(i) => i,
+            None => {
+                out.push(crate::pod::BridgeNetwork {
+                    network: network.to_string(),
+                    bridge,
+                    prefix,
+                    hosts: Vec::new(),
+                    internal: false,
+                });
+                out.len() - 1
+            }
+        };
+        if let Some(n) = out.get_mut(at) {
+            for name in names {
+                n.hosts.push((std::net::Ipv4Addr::from(ip), name.clone()));
+            }
+        }
+    };
+    match single {
+        Some(prefix) => {
+            let mut networks: Vec<String> = vec![DEFAULT_NETWORK.to_string()];
+            for a in plan {
+                for n in &a.networks {
+                    if !networks.contains(n) {
+                        networks.push(n.clone());
+                    }
+                }
+            }
+            for net in &networks {
+                for a in plan {
+                    entry(net, 0, prefix, a.alias, &names_of(a));
+                }
+            }
+        }
+        None => {
+            for a in plan {
+                let names = names_of(a);
+                for n in &a.net_addrs {
+                    entry(&n.network, n.bridge, n.prefix, n.addr, &names);
+                }
             }
         }
     }

@@ -57,38 +57,12 @@ impl Error {
     /// An optional one-line, actionable hint shown under the error.
     pub fn hint(&self) -> Option<String> {
         match self {
-            // A DOCKER HABIT GETS THE PAIR THAT DOES THE JOB, rather than a pointer to a list of
-            // fifty verbs. `kern rm` does not exist and never will: a box is stopped and its
-            // remains are collected, which is two verbs because they are two decisions. An outside
-            // later pass typed it, and so does everyone arriving from Docker; kern's own README
-            // shipped it once. Naming the pair costs one line and absorbs the habit.
             // A workload's own status carries no hint: kern has nothing to add about someone
             // else's exit code.
             Error::Workload(_) => None,
-            Error::UnknownCommand(c) => Some(match c.as_str() {
-                "rm" => "kern has no `rm`: `kern stop <name>` ends a box and `kern gc` collects \
-                         what stopped boxes left behind. For an image it is `kern rmi`, for a \
-                         volume `kern volume rm`"
-                    .into(),
-                "start" => "kern has no `start`: a box is created and started in one step, with \
-                            `kern box <name> --image <image>`"
-                    .into(),
-                // THE HABIT BEHIND `create` IS NOT ONLY A REFERENCE HOLDER. `docker create` +
-                // `docker cp` + `docker start` is how people seed files into a container before
-                // anything in it runs, and kern has no stopped box to copy into: `kern cp` enters
-                // the namespaces of a live PID 1. Naming only the missing verb would leave that
-                // person with a refusal and no route, so the hint names the routes: the content
-                // goes in at start, through the flags that place it.
-                "create" => "kern has no `create`: a box is created and started in one step. To \
-                             put files in before the workload runs, place them at start with `-v \
-                             <host>:<path>`, `--tmpfs <path>` or `--secret`, rather than copying \
-                             into a stopped box (`kern cp` needs a running one)"
-                    .into(),
-                "restart" => "kern has no `restart`: `kern stop <name>` and start it again, or \
-                              give the box `--restart` so kern supervises it"
-                    .into(),
-                _ => "run `kern --help` for the list of commands".to_string(),
-            }),
+            // The Docker verbs this used to answer with a replacement (`rm`, `start`, `restart`,
+            // `create`) are kern verbs now, so the only hint left is the list.
+            Error::UnknownCommand(_) => Some("run `kern --help` for the list of commands".to_string()),
             Error::InvalidBox(_) => Some(
                 "box names: letters/digits/_/./- only, no leading '-' or '.', max 200 chars".into(),
             ),
@@ -231,6 +205,10 @@ impl Error {
             // A BOX AND NOT A SERVICE, deliberately. `duplicate service 'a'` is a PARSE refusal that
             // names a service, and the reader of that one may well be writing the wrong format.
             Error::Compose(msg) if msg.contains("box '") => None,
+            // DOCKER'S OWN REFUSAL IS PRINTED AS DOCKER PRINTS IT, with nothing under it: it names
+            // the field and what the field must be (`services must be a mapping`), which is the
+            // repair, and Docker adds no hint.
+            Error::Compose(msg) if crate::compose::schema::is_docker_refusal(msg) => None,
             Error::Compose(msg) => (!msg.contains('`') && !msg.contains('\n')).then(|| {
                 "compose: a stack is a `docker-compose.yml` (`services:` with `image:` or \
                  `build:`) or a kern TOML (`[box.NAME]` with image/rootfs, command, depends_on)"
@@ -741,25 +719,13 @@ mod hint_tests {
     /// later pass did, and kern's own README shipped it once. A hint that only says "run
     /// --help" sends them to a list of fifty verbs to find the two.
     #[test]
-    fn a_docker_verb_kern_lacks_is_answered_with_the_verbs_that_replace_it() {
+    fn a_docker_verb_kern_has_is_never_described_as_missing() {
+        // `rm`, `start`, `restart` and `create` are kern verbs now; a hint saying "kern has no `x`"
+        // for one of them would be a sentence the parser can never reach and a reader should never
+        // believe. The table keeps only the fallback.
         let hint = |v: &str| Error::UnknownCommand(v.to_string()).hint().expect("a hint");
-        let rm = hint("rm");
-        assert!(rm.contains("kern stop"), "{rm}");
-        assert!(rm.contains("kern gc"), "{rm}");
-        assert!(
-            rm.contains("kern rmi"),
-            "and the image verb, which IS `rm`-shaped: {rm}"
-        );
-        assert!(hint("start").contains("kern box"), "{}", hint("start"));
-        assert!(hint("restart").contains("--restart"), "{}", hint("restart"));
-        // THE FALLBACK IS STILL THERE, or this would be a table that swallowed every typo.
-        assert_eq!(
-            hint("nonsense"),
-            "run `kern --help` for the list of commands"
-        );
-        // The hints are single-line: a line break in a hint reads as a second error.
-        for v in ["rm", "start", "restart", "nonsense"] {
-            assert!(!hint(v).contains('\n'), "{v} hint wraps: {}", hint(v));
+        for v in ["rm", "start", "restart", "create", "nonsense"] {
+            assert_eq!(hint(v), "run `kern --help` for the list of commands", "{v}");
         }
     }
 }

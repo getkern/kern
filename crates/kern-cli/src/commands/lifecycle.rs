@@ -289,8 +289,8 @@ pub(crate) fn spawn_detached_stop(name: String) {
 }
 
 /// Fork a watchdog for a **foreground** `--timeout N`, returning `(watchdog_pid, write_fd)`. The
-/// watchdog is created in the caller's (host) pid namespace - it MUST be forked before the box's
-/// `unshare(CLONE_NEWPID)`, so it is an *ancestor* of the box and can therefore signal the box's
+/// watchdog is created in the caller's (host) pid namespace - it MUST be forked before the box's pid
+/// namespace is made (see `fork_into_cgroup`), so it is an *ancestor* of the box and can therefore signal the box's
 /// ns-init (a same-namespace member cannot). It blocks reading the box's PID 1 from the returned
 /// pipe (written by `on_started`); once it has it, it waits for that box to EXIT with `secs` as a
 /// cap, and only if the cap is reached does it SIGTERM and - after a 2 s grace - SIGKILL the box's

@@ -411,6 +411,183 @@ pub fn list_with(detail: Detail) -> Listing<Record> {
     }
 }
 
+/// [`list_with`] for a caller that lists again and again (`kern top`, once a second), keeping what
+/// it read in `cache`.
+///
+/// A FINISHED RECORD IS NEVER WRITTEN AGAIN. `meta` is written twice in a build's life: `running` at
+/// the start, the terminal status at the end (`commands/build.rs`), and after that only `rm`/`prune`
+/// touch the record, by removing its directory, which the sweep sees. So a record read with a
+/// terminal status is reused as it is, and only new ids and ones still `running` are read. MEASURED
+/// on a desktop with 11961 records: the Builds tab of `kern top` read all of them on every 1 s
+/// refresh, 52 ms of CPU a second (5.2 % of a core) on the thread that draws, so a key pressed in
+/// that window waited for it.
+///
+/// ONLY THE NEWEST `limit` RECORDS ARE IN THE ANSWER, and only those are ever read: the tab shows a
+/// screenful, and reading the whole store to show thirty rows is the cost this exists to remove
+/// (51 ms for 11961 records on the first visit, measured). `total` is still the whole store, from
+/// the directory sweep alone. The caller raises `limit` when the reader scrolls toward the end.
+pub fn list_cached(cache: &mut RecordCache, detail: Detail, limit: usize) -> Listing<Record> {
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = builds_dir();
+    // THE STORE UNCHANGED, THE ANSWER UNCHANGED. A record directory is created by a build and
+    // removed by `rm`/`prune`, and either changes the store's own `mtime`; the one write that does
+    // not, a running build's `meta` turning terminal, is inside the record, which is why a `running`
+    // record in the last answer disables this. One `stat` instead of a sweep of every name: the
+    // sweep, on 11961 records, was most of the Builds tab's idle cost on a musl build.
+    let stamp = std::fs::metadata(&dir).ok().map(|m| {
+        (
+            m.dev(),
+            m.ino(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    });
+    if let (Some(stamp), Some(last)) = (stamp, cache.last.as_ref()) {
+        // RACILY CLEAN IS NOT CLEAN: a change in the same clock tick as the listing leaves the
+        // stamp equal, so an answer is reused only when the store had been still for two seconds
+        // when it was given.
+        let settled = !last.records.iter().any(|r| r.status == Status::Running)
+            && last.stamp.2 < last.listed_at.saturating_sub(2)
+            && last.stamp.4 < last.listed_at.saturating_sub(2);
+        if last.stamp == stamp && settled {
+            if detail == Detail::Skip {
+                return Listing {
+                    records: Vec::new(),
+                    total: last.total,
+                };
+            }
+            if last.limit == limit && last.read {
+                return Listing {
+                    records: last.records.clone(),
+                    total: last.total,
+                };
+            }
+        }
+    }
+    // NEWEST FIRST, from the id alone: an id is `<started>-<pid>`, so the newest `limit` are known
+    // without a read. By the NUMBER before the dash, not the string: a string sort is only the start
+    // order while every start has the same width, and a record written with a shorter one (a test,
+    // a clock set to the 1970s) would otherwise sort among the newest. Only the newest `limit`
+    // names are kept while sweeping (a bounded heap), so the other thousands are never copied.
+    let started_of = |id: &str| -> u64 {
+        id.split_once('-')
+            .and_then(|(s, _)| s.parse().ok())
+            .unwrap_or(0)
+    };
+    let listed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    cache.sweeps = cache.sweeps.saturating_add(1);
+    let mut total = 0usize;
+    let mut newest: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String)>> =
+        std::collections::BinaryHeap::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !valid_id(name) {
+                continue;
+            }
+            total += 1;
+            if detail == Detail::Skip || limit == 0 {
+                continue;
+            }
+            let key = started_of(name);
+            if newest.len() < limit {
+                newest.push(std::cmp::Reverse((key, name.to_string())));
+            } else if newest
+                .peek()
+                .is_some_and(|m| (key, name) > (m.0 .0, m.0 .1.as_str()))
+            {
+                newest.pop();
+                newest.push(std::cmp::Reverse((key, name.to_string())));
+            }
+        }
+    }
+    if detail == Detail::Skip {
+        if let Some(stamp) = stamp {
+            // A count with no records: what a later `Skip` may reuse, never a `Read`.
+            cache.last = Some(LastListing {
+                stamp,
+                listed_at,
+                limit,
+                read: false,
+                total,
+                records: Vec::new(),
+            });
+        }
+        return Listing {
+            records: Vec::new(),
+            total,
+        };
+    }
+    // Newest first.
+    let ids: Vec<String> = newest
+        .into_sorted_vec()
+        .into_iter()
+        .map(|std::cmp::Reverse((_, id))| id)
+        .collect();
+    let mut out = Vec::with_capacity(ids.len());
+    for id in &ids {
+        match cache.by_id.get(id) {
+            Some(r) if r.status != Status::Running => out.push(r.clone()),
+            _ => {
+                if let Some(r) =
+                    read_capped(&record_dir(id).join("meta")).and_then(|body| parse(&body))
+                {
+                    cache.by_id.insert(id.clone(), r.clone());
+                    out.push(r);
+                }
+            }
+        }
+    }
+    // A record removed, or pushed past the limit by newer ones, leaves the cache: it cannot grow
+    // past what is shown.
+    let present: std::collections::HashSet<&String> = ids.iter().collect();
+    cache.by_id.retain(|id, _| present.contains(id));
+    out.sort_by(|a, b| b.started.cmp(&a.started).then_with(|| b.id.cmp(&a.id)));
+    if let Some(stamp) = stamp {
+        cache.last = Some(LastListing {
+            stamp,
+            listed_at,
+            limit,
+            read: true,
+            total,
+            records: out.clone(),
+        });
+    }
+    Listing {
+        records: out,
+        total,
+    }
+}
+
+/// What [`list_cached`] keeps between two calls: every record it read, by id, and its last answer
+/// with what that answer was an answer to.
+#[derive(Default)]
+pub struct RecordCache {
+    by_id: std::collections::HashMap<String, Record>,
+    last: Option<LastListing>,
+    /// Sweeps of the store directory made so far: what a reuse saves, and what a test watches.
+    sweeps: u64,
+}
+
+struct LastListing {
+    /// The store directory's device, inode, `mtime` and `ctime`.
+    stamp: (u64, u64, i64, i64, i64, i64),
+    /// When the answer was given, unix seconds: see the racily-clean rule in [`list_cached`].
+    listed_at: i64,
+    limit: usize,
+    /// Whether `records` was read (a `Skip` answer holds only the count).
+    read: bool,
+    total: usize,
+    records: Vec<Record>,
+}
+
 /// The record ids (dir names) newest-first, WITHOUT opening any `meta`. An id is `<started_unix>-<pid>`
 /// and `started` is a fixed-width 10-digit stamp for every real record, so a descending string sort is
 /// newest-first - letting `query`/`prune` avoid the O(N) meta reads `list()` does when they only need
@@ -1036,6 +1213,126 @@ mod tests {
             let f = query(Some("special"), None, None);
             assert_eq!(f.len(), 1);
             assert_eq!(f[0].id, "50-1");
+        });
+    }
+
+    /// `kern top` READS ONLY THE NEWEST, AND READS A FINISHED RECORD ONCE.
+    ///
+    /// The Builds tab read every record on every 1 s refresh (11961 on a desktop: 52 ms a second on
+    /// the thread that draws). `list_cached` answers with the newest `limit`, keeps what it read, and
+    /// reads again only a record still `running`, the one status a later write can change.
+    #[test]
+    fn the_cached_build_listing_reads_the_newest_and_a_finished_record_once() {
+        with_tmp_home(|| {
+            for (id, t) in [("100-1", 100), ("200-1", 200), ("300-1", 300), ("9-1", 9)] {
+                write(&rec(id, t, Status::Ok)).unwrap();
+            }
+            write(&rec("400-1", 400, Status::Running)).unwrap();
+            let mut cache = RecordCache::default();
+            let l = list_cached(&mut cache, Detail::Read, 3);
+            assert_eq!(l.total, 5, "the total is the whole store");
+            let ids: Vec<&str> = l.records.iter().map(|r| r.id.as_str()).collect();
+            // By start, not by string: "9-1" is the OLDEST, and as a string it would sort first.
+            assert_eq!(
+                ids,
+                ["400-1", "300-1", "200-1"],
+                "the newest three, newest first"
+            );
+
+            // A finished record is not read again: change it on disk, the cache keeps the first read.
+            write(&Record {
+                tag: "rewritten".into(),
+                ..rec("300-1", 300, Status::Ok)
+            })
+            .unwrap();
+            // A running one IS read again: it finishes.
+            write(&Record {
+                tag: "finished".into(),
+                ..rec("400-1", 400, Status::Ok)
+            })
+            .unwrap();
+            let l = list_cached(&mut cache, Detail::Read, 3);
+            let tag = |id: &str| {
+                l.records
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.tag.clone())
+                    .unwrap_or_default()
+            };
+            assert_eq!(
+                tag("400-1"),
+                "finished",
+                "a running record must be read again"
+            );
+            assert_ne!(
+                tag("300-1"),
+                "rewritten",
+                "a finished record must come from the cache"
+            );
+
+            // A removed record leaves the answer and the cache; a raised limit reaches the oldest.
+            remove("200-1").unwrap();
+            let l = list_cached(&mut cache, Detail::Read, 10);
+            let ids: Vec<&str> = l.records.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, ["400-1", "300-1", "100-1", "9-1"]);
+            assert!(
+                !cache.by_id.contains_key("200-1"),
+                "a removed record stayed cached"
+            );
+
+            // Skip reads nothing and still counts.
+            let l = list_cached(&mut cache, Detail::Skip, 10);
+            assert!(l.records.is_empty());
+            assert_eq!(l.total, 4);
+
+            // A STILL STORE IS NOT SWEPT AGAIN: with its mtime aged past the racy window, the last
+            // answer is reused, and a record changed inside it without touching the store (a
+            // forged `meta`, which no build writes) does not show. Then the store changes, and the
+            // answer follows.
+            let age = |p: &std::path::Path| {
+                let Ok(c) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) else {
+                    panic!("path with a NUL");
+                };
+                let t = libc::timespec {
+                    tv_sec: unsafe { libc::time(std::ptr::null_mut()) } - 3600,
+                    tv_nsec: 0,
+                };
+                let times = [t, t];
+                let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+                assert_eq!(rc, 0, "utimensat");
+            };
+            age(&builds_dir());
+            // `ctime` cannot be aged: wait out the racy window instead. Whole seconds are compared,
+            // so 2 s of margin needs more than 3 s of wall clock (a 2.1 s wait left the reuse
+            // untested: both of its sabotages passed).
+            std::thread::sleep(std::time::Duration::from_millis(3200));
+            let first = list_cached(&mut cache, Detail::Read, 10);
+            let swept = cache.sweeps;
+            let again = list_cached(&mut cache, Detail::Read, 10);
+            assert_eq!(
+                cache.sweeps, swept,
+                "a still store must be answered without a sweep"
+            );
+            assert_eq!(
+                again
+                    .records
+                    .iter()
+                    .map(|r| r.id.clone())
+                    .collect::<Vec<_>>(),
+                first
+                    .records
+                    .iter()
+                    .map(|r| r.id.clone())
+                    .collect::<Vec<_>>(),
+                "and with the same answer"
+            );
+            write(&rec("500-1", 500, Status::Ok)).unwrap();
+            let changed = list_cached(&mut cache, Detail::Read, 10);
+            assert_eq!(changed.total, 5, "a new record must end the reuse");
+            assert_eq!(
+                changed.records.first().map(|r| r.id.as_str()),
+                Some("500-1")
+            );
         });
     }
 

@@ -98,6 +98,45 @@ pub(crate) fn plan_path(dir: &Path) -> PathBuf {
     dir.join("relays")
 }
 
+/// The file recording each box's loopback alias under `--no-pod`, `<box>\t<alias>` per line.
+///
+/// Kept beside the relay plan and NOT in it, because only services with a port have relays, and a
+/// service without one still has an alias its peers' hosts files name (see
+/// `nopod::keep_live_aliases`). Written after the holder is (re)spawned, since spawning one clears
+/// this directory.
+pub(crate) fn aliases_path(dir: &Path) -> PathBuf {
+    dir.join("aliases")
+}
+
+/// Record every box's alias for the next `up` of this stack. A failure only costs the next `up` its
+/// stability, so it is returned for the caller to say, not to stop on.
+pub(crate) fn record_aliases(dir: &Path, plan: &[crate::nopod::Assigned]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let body: String = plan
+        .iter()
+        .map(|a| format!("{}\t{}\n", a.box_name, a.alias))
+        .collect();
+    std::fs::write(aliases_path(dir), body)
+}
+
+/// The aliases [`record_aliases`] wrote, for boxes that are running now. A line that does not read
+/// is skipped: the record only steers the next plan.
+pub(crate) fn live_aliases(dir: &Path) -> std::collections::HashMap<String, u32> {
+    let running: std::collections::HashSet<String> = crate::registry::list()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    std::fs::read_to_string(aliases_path(dir))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (b, a) = l.split_once('\t')?;
+            let a: u32 = a.trim().parse().ok()?;
+            running.contains(b).then(|| (b.to_string(), a))
+        })
+        .collect()
+}
+
 /// The file holding the relay holder's pid.
 pub(crate) fn holder_path(dir: &Path) -> PathBuf {
     dir.join("relay-holder")
@@ -1286,6 +1325,8 @@ pub(crate) fn kill_holder(dir: &Path) {
         // No holder: a pod or bridge stack, or a second `down`. The NATs above are stopped either
         // way; the rest of this function is about a process that is not there.
         let _ = std::fs::remove_dir_all(dir.join("outbound"));
+        // A `--no-pod` stack with no port has aliases and no relay, so no holder.
+        let _ = std::fs::remove_file(aliases_path(dir));
         let _ = std::fs::remove_dir(dir);
         return;
     };
@@ -1337,6 +1378,7 @@ pub(crate) fn kill_holder(dir: &Path) {
         degraded_path(dir),
         served_path(dir),
         poke_path(dir),
+        aliases_path(dir),
     ] {
         let _ = std::fs::remove_file(f);
     }

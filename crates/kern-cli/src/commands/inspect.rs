@@ -258,6 +258,25 @@ pub struct PsView<'a> {
     /// service is recreated, which is what a script comparing `ps -q` before and after `up` reads
     /// (as Docker's container ID). The name does not change, so a recreate was invisible.
     pub ids: bool,
+    /// `compose ps`: a `--format` listing is sorted by name and a `table` header uses `docker
+    /// compose ps`'s words, as Docker Compose prints both.
+    pub compose: bool,
+    /// `compose ps`: each box's service and image as the file names them, `(box, service, image)`,
+    /// for `{{.Service}}`, and for `{{.Image}}` of a row that no longer records one (an exited box).
+    pub services: Option<&'a [(String, String, String)]>,
+}
+
+/// Docker's `Service` of a box in `ps --format json`: the file's service when the listing knows it
+/// (`compose ps`); otherwise the box name without its `<project>-` and, for Docker's
+/// `<project>-<service>-<n>`, without its `-<n>`.
+fn json_service(view: &PsView<'_>, name: &str, pod: &str) -> String {
+    if let Some((_, svc, _)) = view
+        .services
+        .and_then(|m| m.iter().find(|(b, _, _)| b == name))
+    {
+        return svc.clone();
+    }
+    super::service_of_box_name(name, pod)
 }
 
 /// How `ps` renders a machine-readable listing.
@@ -316,7 +335,8 @@ pub fn ps(
                 ) {
                     return Err(Error::Usage(
                         "ps --filter status=: running | paused | orphaned | exited | kept \
-                         (created/dead/restarting match nothing - kern has no such state)",
+                         (a `kern create` box that never ran is status=kept; \
+                         created/dead/restarting match nothing)",
                     ));
                 }
             }
@@ -605,16 +625,63 @@ pub fn ps(
         return Ok(());
     }
     // `--format '{{.Field}}'`: render each box through the bounded template (no Go-template logic).
-    if let Some(tmpl) = format {
-        let now = registry::now_unix();
+    // `table ...` IS DOCKER'S DIRECTIVE: a header line, then the rows aligned as its tabwriter
+    // aligns them; `table` alone is the default listing. MEASURED on Docker Compose 5.3.1:
+    // `--format "table {{.Name}}\t{{.Status}}"` prints `NAME          STATUS` over the rows, and
+    // kern printed the word `table` at the start of every row.
+    // `compose ps` WITHOUT `--format` IS DOCKER'S TABLE, the columns `docker compose ps` prints
+    // (MEASURED on 5.3.1: NAME IMAGE COMMAND SERVICE CREATED STATUS PORTS). kern printed its own
+    // pod tree there, which is still `kern ps`'s listing.
+    const COMPOSE_DEFAULT: &str = "table {{.Name}}\t{{.Image}}\t{{.Command}}\t{{.Service}}\t\
+                                   {{.RunningFor}}\t{{.Status}}\t{{.Ports}}";
+    let format =
+        format.or((view.compose && !quiet && shape == JsonShape::No).then_some(COMPOSE_DEFAULT));
+    let directive = format.map(|f| match f.strip_prefix("table") {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, f),
+    });
+    if let Some((table, tmpl)) = directive.filter(|(table, t)| !(*table && t.is_empty())) {
+        let service_of = |n: &str| -> Option<String> {
+            view.services
+                .and_then(|m| m.iter().find(|(b, _, _)| b == n).map(|(_, s, _)| s.clone()))
+        };
+        let image_of = |n: &str| -> Option<String> {
+            view.services.and_then(|m| {
+                m.iter()
+                    .find(|(b, _, i)| b == n && !i.is_empty())
+                    .map(|(_, _, i)| i.clone())
+            })
+        };
+        let ctx = PsCtx {
+            now: registry::now_unix(),
+            service: Some(&service_of),
+            image: Some(&image_of),
+            docker_command: Some(!view.no_trunc),
+        };
+        let mut rows: Vec<(String, String)> = Vec::new();
         for b in &boxes {
-            println!("{}", render_ps_format(tmpl, b, now)?);
+            rows.push((b.name.clone(), render_ps_format_ctx(tmpl, b, &ctx)?));
         }
         for e in &exited {
-            println!("{}", render_ps_format(tmpl, e, now)?);
+            rows.push((e.name.clone(), render_ps_format_ctx(tmpl, e, &ctx)?));
         }
         for k in &kept {
-            println!("{}", render_ps_format(tmpl, k, now)?);
+            rows.push((k.name.clone(), render_ps_format_ctx(tmpl, k, &ctx)?));
+        }
+        if view.compose {
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        let mut lines: Vec<String> = Vec::with_capacity(rows.len() + 1);
+        if table {
+            lines.push(render_ps_header(tmpl, view.compose)?);
+        }
+        lines.extend(rows.into_iter().map(|(_, r)| r));
+        if table {
+            print!("{}", tabwrite(&lines));
+        } else {
+            for l in lines {
+                println!("{l}");
+            }
         }
         return Ok(());
     }
@@ -722,10 +789,7 @@ pub fn ps(
             for (i, it) in items.iter().enumerate() {
                 let docker = match boxes.get(i) {
                     Some(b) => {
-                        let service = b
-                            .name
-                            .strip_prefix(&format!("{}-", b.pod))
-                            .unwrap_or(&b.name);
+                        let service = &json_service(&view, &b.name, &b.pod);
                         // `State` WAS THE LITERAL "running" FOR EVERY LIVE BOX, which is not a gap
                         // but a wrong answer: a PAUSED box reported itself as running to every
                         // Docker-shaped consumer, and `docker compose ps --format json` does emit
@@ -738,12 +802,7 @@ pub fn ps(
                         // `State` says `running` there and the kern-native `status` above carries
                         // the distinction. Inventing a state Docker consumers cannot parse would be
                         // the same mistake as inventing a `Publishers` shape.
-                        let kern_status = super::box_status(b, "running");
-                        let docker_state = if kern_status == "paused" {
-                            "paused"
-                        } else {
-                            "running"
-                        };
+                        let docker_state = super::docker_state(b);
                         format!(
                             ",\"ID\":{},\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":0,\"Command\":{},\"Publishers\":{}",
                             json_str(&b.pid.to_string()),
@@ -751,17 +810,14 @@ pub fn ps(
                             json_str(service),
                             json_str(&b.pod),
                             json_str(docker_state),
-                            json_str(&registry::health_of(&b.name, b.pid)),
+                            json_str(&super::PsRow::ps_health(b)),
                             json_str(&b.command),
                             publishers_json(&b.ports),
                         )
                     }
                     None => match exited.get(i.saturating_sub(boxes.len())) {
                         Some(e) => {
-                            let service = e
-                                .name
-                                .strip_prefix(&format!("{}-", e.pod))
-                                .unwrap_or(&e.name);
+                            let service = &json_service(&view, &e.name, &e.pod);
                             format!(
                                 ",\"ID\":{},\"Name\":{},\"Service\":{},\"Project\":{},\"State\":{},\"Health\":{},\"ExitCode\":{},\"Command\":{}",
                                 json_str(&e.pid.to_string()),
@@ -1896,20 +1952,38 @@ pub fn recover() -> Result<(), Error> {
 pub fn rename(old: &str, new: &str) -> Result<(), Error> {
     let parsed = BoxName::parse(new).map_err(Error::InvalidBox)?;
     let new = parsed.as_str();
-    let Some(inst) = registry::find_ref(old) else {
-        return Err(Error::NotRunning(format!("no running box named '{old}'")));
-    };
-    if inst.name == new {
-        return Ok(()); // already named that - a no-op, not an error
-    }
+    let p = crate::ui::Palette::detect();
     if registry::find_ref(new).is_some() {
         return Err(Error::AlreadyRunning(format!(
             "a box named '{new}' is already running"
         )));
     }
-    registry::rename(&inst.name, new, inst.pid)
-        .map_err(|e| Error::Sandbox(format!("rename '{}' to '{new}': {e}", inst.name)))?;
-    let p = crate::ui::Palette::detect();
+    let Some(inst) = registry::find_ref(old) else {
+        // A KEPT BOX THAT IS NOT RUNNING is renamed too, as Docker renames a stopped or created
+        // container: only its layer and its record carry the name.
+        if crate::keepbox::rename(old, new)? {
+            println!("{}renamed{} {old} → {new}", p.g, p.z);
+            return Ok(());
+        }
+        return Err(Error::NotRunning(format!(
+            "no running box named '{old}' and no kept box by that name"
+        )));
+    };
+    if inst.name == new {
+        return Ok(()); // already named that - a no-op, not an error
+    }
+    // The layer first: a name already kept elsewhere refuses before the registry moves.
+    let kept = crate::keepbox::rename(&inst.name, new)?;
+    if let Err(e) = registry::rename(&inst.name, new, inst.pid) {
+        // Put the layer back, so the box and its layer keep answering to one name.
+        if kept {
+            let _ = crate::keepbox::rename(new, &inst.name);
+        }
+        return Err(Error::Sandbox(format!(
+            "rename '{}' to '{new}': {e}",
+            inst.name
+        )));
+    }
     println!("{}renamed{} {} → {new}", p.g, p.z, inst.name);
     Ok(())
 }
@@ -1981,15 +2055,33 @@ pub fn wait(names: &[String]) -> Result<(), Error> {
 /// a per-file `D` for the wiped lower contents. Only overlay boxes have an upper: a `--bind-rootfs` box
 /// writes through to its source (nothing to diff) and a `--read-only` box has an empty upper (no changes).
 pub fn diff(name: &str, json: bool) -> Result<(), Error> {
-    let Some(inst) = registry::find_ref(name) else {
-        return Err(Error::NotRunning(format!("no running box named '{name}'")));
-    };
+    // A KEPT BOX'S LAYER IS ITS OWN, running or stopped, and that is where its changes are: `--keep`
+    // mounts `keepbox::dir_of(<name>)/upper` as the upper, not the scratch sibling of `merged`.
+    // MEASURED: `kern diff` on a running `--keep` box answered "has no overlay to diff - it uses
+    // --bind-rootfs", which it did not, and Docker's `diff` also answers for a stopped container.
+    let inst = registry::find_ref(name);
+    let box_name: String = inst
+        .as_ref()
+        .map_or_else(|| name.to_string(), |i| i.name.clone());
+    let kept_upper = crate::keepbox::dir_of(&box_name)
+        .map(|d| d.join("upper"))
+        .filter(|u| u.is_dir());
     // `rootfs` is `<scratch>/<name>-<pid>/merged`; the writable upper is its sibling `upper`.
-    let merged = std::path::Path::new(&inst.rootfs);
-    let is_overlay = merged.file_name().and_then(|s| s.to_str()) == Some("merged");
-    let upper = merged.parent().map(|s| s.join("upper"));
-    match (is_overlay, upper) {
-        (true, Some(u)) if u.is_dir() => {
+    let scratch_upper = inst.as_ref().and_then(|i| {
+        let merged = std::path::Path::new(&i.rootfs);
+        let is_overlay = merged.file_name().and_then(|s| s.to_str()) == Some("merged");
+        merged
+            .parent()
+            .map(|s| s.join("upper"))
+            .filter(|u| is_overlay && u.is_dir())
+    });
+    if inst.is_none() && kept_upper.is_none() {
+        return Err(Error::NotRunning(format!(
+            "no running box named '{name}' and no kept box by that name"
+        )));
+    }
+    match kept_upper.or(scratch_upper) {
+        Some(u) => {
             let mut out: Vec<(char, String)> = Vec::new();
             walk_diff(&u, &u, 0, &mut out);
             // kern's own setup writes into the same upper the box does; those lines are not the box's
@@ -2023,10 +2115,9 @@ pub fn diff(name: &str, json: bool) -> Result<(), Error> {
             }
             Ok(())
         }
-        _ => Err(Error::Sandbox(format!(
-            "box '{}' has no overlay to diff - it uses --bind-rootfs, which writes straight through \
-             to the source directory (nothing is layered to compare)",
-            inst.name
+        None => Err(Error::Sandbox(format!(
+            "box '{box_name}' has no overlay to diff - it uses --bind-rootfs, which writes \
+             straight through to the source directory (nothing is layered to compare)"
         ))),
     }
 }
@@ -2133,14 +2224,25 @@ fn open_newest_log(name: &str) -> Result<Option<(std::path::PathBuf, std::fs::Fi
 }
 
 /// `kern logs <name>` - print the captured stdout/stderr of the most recent box named `name`.
-pub fn logs(
+/// What [`log_head`] leaves for a follow: the open log, its path, the box's name, the stamper.
+struct LogHead {
+    f: std::fs::File,
+    path: std::path::PathBuf,
+    name: String,
+    stamper: Option<crate::commands::boxlog::Stamper>,
+}
+
+/// Write what a box's newest log holds now to `w`, as `kern logs` shows it (`--tail`, timestamps,
+/// a time window), and hand back what a follow continues from.
+fn log_head<W: std::io::Write>(
     name: &str,
     tail: Option<usize>,
     follow: bool,
     timestamps: bool,
     window: (Option<u64>, Option<u64>),
-) -> Result<(), Error> {
-    use std::io::{Read, Seek, SeekFrom, Write};
+    w: &mut W,
+) -> Result<LogHead, Error> {
+    use std::io::{Read, Seek, SeekFrom};
     // Accept a `kern ps` PID too: a live box's pid resolves to its name; a name (incl. a stopped box,
     // whose log file persists) is used as-is.
     let by_pid = registry::find_ref(name).map(|i| i.name);
@@ -2197,28 +2299,68 @@ pub fn logs(
             .with_window(window.0, window.1, timestamps)
     });
     {
-        let out = std::io::stdout();
-        // BUFFERED, BECAUSE `stdout()` IS A LineWriter. It flushes on every newline, and the stamped
+        // BUFFERED BY [`logs`], BECAUSE `stdout()` IS A LineWriter. It flushes on every newline, and the stamped
         // path writes two pieces per line (the time column, then the line), so a large log paid two
         // syscalls per line instead of one per 8 KiB. MEASURED on a 48 MB log: 63.8 ms stamped
         // against 31.6 ms plain, the whole difference. A write larger than the buffer still goes
         // straight through, so the unstamped path is untouched.
-        let mut w = std::io::BufWriter::new(out.lock());
         let map = |e| Error::Sandbox(format!("writing log: {e}"));
         match stamper.as_mut() {
             Some(s) => {
-                s.push(&mut w, &shown).map_err(map)?;
+                s.push(w, &shown).map_err(map)?;
                 // Not following: whatever is held back is a last line with no newline, and that is
                 // all it will ever be. Under `--follow` it stays held, because its newline may yet
                 // arrive in the next chunk.
                 if !follow {
-                    s.flush(&mut w).map_err(map)?;
+                    s.flush(w).map_err(map)?;
                 }
             }
             None => w.write_all(&shown).map_err(map)?,
         }
         w.flush().map_err(map)?;
     }
+    Ok(LogHead {
+        f,
+        path,
+        name: name.to_string(),
+        stamper,
+    })
+}
+
+/// A box's log as it is now, written to `w`: `kern logs` without `-f`, for a caller that prefixes
+/// the lines (`compose logs`).
+pub(crate) fn logs_to<W: std::io::Write>(
+    name: &str,
+    tail: Option<usize>,
+    timestamps: bool,
+    window: (Option<u64>, Option<u64>),
+    w: &mut W,
+) -> Result<(), Error> {
+    log_head(name, tail, false, timestamps, window, w).map(|_| ())
+}
+
+pub fn logs(
+    name: &str,
+    tail: Option<usize>,
+    follow: bool,
+    timestamps: bool,
+    window: (Option<u64>, Option<u64>),
+) -> Result<(), Error> {
+    use std::io::Write;
+    let LogHead {
+        f,
+        path,
+        name,
+        mut stamper,
+    } = {
+        let out = std::io::stdout();
+        let mut w = std::io::BufWriter::new(out.lock());
+        let head = log_head(name, tail, follow, timestamps, window, &mut w)?;
+        w.flush()
+            .map_err(|e| Error::Sandbox(format!("writing log: {e}")))?;
+        head
+    };
+    let name = name.as_str();
     if follow {
         // Only a live box appends more output; a stopped box's log is already complete.
         if let Some(bx) = registry::find_ref(name) {
@@ -2271,6 +2413,21 @@ pub fn top() -> Result<(), Error> {
         crate::tui::run()
     } else {
         crate::tui::snapshot()
+    }
+}
+
+/// Set while a verb whose stdout belongs to a different answer stops a box: `restart`, whose stdout is
+/// the restarted names only, as Docker's. The narration then goes to stderr. One process, one verb at
+/// a time, so `Relaxed` is all the ordering the flag needs.
+static STOP_NARRATES_TO_STDERR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The "stopped" line, on stdout unless [`STOP_NARRATES_TO_STDERR`] says otherwise.
+fn narrate_stop(line: &str) {
+    if STOP_NARRATES_TO_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
     }
 }
 
@@ -2619,7 +2776,7 @@ pub fn stop_with_grace(
                     let _ = std::fs::remove_dir(cg);
                 }
             }
-            println!("stopped '{}' (pid {})", b.name, b.pid);
+            narrate_stop(&format!("stopped '{}' (pid {})", b.name, b.pid));
         } else {
             // Don't report success while alive: the SIGKILL went out but the box wasn't confirmed
             // gone within the grace window. Surface it honestly instead of printing `stopped`.
@@ -2639,7 +2796,7 @@ pub fn stop_with_grace(
     }
     for n in &managed_only {
         stop_managed_unit(n);
-        println!("stopped '{n}' (systemd-managed)");
+        narrate_stop(&format!("stopped '{n}' (systemd-managed)"));
     }
     // Stopping a pod means removing its "root" too (like Docker Desktop's stop-the-project): once every
     // member of a pod is stopped, tear the pod down - its holder process, network namespace and shared
@@ -2780,7 +2937,7 @@ pub fn pause(names: &[String], all: bool, freeze: bool) -> Result<(), Error> {
 /// IN THE DIRECTORY THE BOX WAS CREATED IN, because a relative `-v ./data:/data` means nothing
 /// anywhere else. A directory that is gone is a refusal that names it, rather than a box whose mounts
 /// quietly resolve against wherever the operator happens to stand.
-pub fn start_kept(names: &[String]) -> Result<(), Error> {
+pub fn start_kept(names: &[String], attach_after: bool) -> Result<(), Error> {
     let self_exe = std::env::current_exe()
         .map_err(|e| Error::Sandbox(format!("cannot locate the kern binary: {e}")))?;
     let many = names.len() > 1;
@@ -2788,6 +2945,56 @@ pub fn start_kept(names: &[String]) -> Result<(), Error> {
     let mut failed = 0usize;
     for name in names {
         let r = start_one_kept(&self_exe, name);
+        // `start -a`: Docker's start-and-attach. A box recorded detached (`create` records it so)
+        // returns at once from its start; its output is then followed until it exits, and its exit
+        // code becomes this command's, as `docker start -a` does. A box recorded in the foreground
+        // already streamed and ended inside the start.
+        //
+        // THE CODE IS READ AS `kern wait` READS IT, from the exact run. The output ends when the box
+        // exits, and its supervisor writes the code a moment LATER, after it reaps the box; this read
+        // the exited list at once and answered 0 when the record was not there yet. MEASURED under a
+        // full test suite in a Debian 13 VM: `start -a` of `echo only-this; exit 3` returned 0,
+        // once, with the right output. The supervisor writes the code before its box leaves the
+        // registry, so waiting for the `(name, pid)` pair to leave it, then reading the record of
+        // that run by `(pid, starttime)`, cannot race. Bounded, so a supervisor that died cannot
+        // hold this forever; then the newest record of the name, as before.
+        let r = match r {
+            Ok(0) if attach_after => match registry::find_ref(name) {
+                Some(inst) => {
+                    let (who, pid, starttime) = (inst.name.clone(), inst.pid, inst.starttime);
+                    attach(name).map(|()| {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        while registry::pair_alive(&who, pid)
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        registry::box_exit(pid, starttime).unwrap_or_else(|| {
+                            registry::list_exited()
+                                .into_iter()
+                                .find(|e| e.name == *name)
+                                .map_or(0, |e| e.code)
+                        })
+                    })
+                }
+                // ALREADY OVER before the attach could begin: a box that prints and exits at once
+                // (`echo only-this; exit 3`) can finish inside its own start. Its output is in its
+                // log and its code in its record; both are what `start -a` owes, where this
+                // answered nothing and 0.
+                None => {
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    logs_to(name, None, false, (None, None), &mut out).map(|()| {
+                        registry::list_exited()
+                            .into_iter()
+                            .find(|e| e.name == *name)
+                            .map_or(0, |e| e.code)
+                    })
+                }
+            },
+            other => other,
+        };
         match r {
             Ok(code) => {
                 // THE WORKLOAD'S OWN EXIT CODE IS THE CALLER'S, like `kern box`, but only when one
@@ -2821,6 +3028,225 @@ pub fn start_kept(names: &[String]) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+/// `kern restart <box>...` - stop a kept box and start it again from its record, or start it if it
+/// is not running (Docker's `restart` on a stopped container starts it). A running box that is not
+/// kept is refused by name: stopped, it would leave nothing to start again, which is kern's default
+/// for a box. `grace` is `-t/--time`, the seconds before the kill, as `docker restart -t`.
+pub fn restart(names: &[String], grace: Option<u64>) -> Result<(), Error> {
+    let self_exe = std::env::current_exe()
+        .map_err(|e| Error::Sandbox(format!("cannot locate the kern binary: {e}")))?;
+    let mut failures: Vec<String> = Vec::new();
+    for name in names {
+        let kept = crate::keepbox::dir_of(name)
+            .and_then(|d| crate::keepbox::read(&d))
+            .is_some();
+        if let Some(inst) = registry::find_ref(name) {
+            if crate::keepbox::dir_of(&inst.name)
+                .and_then(|d| crate::keepbox::read(&d))
+                .is_none()
+            {
+                failures.push(format!(
+                    "'{}' is not a kept box: stopped, it would leave nothing to start again. \
+                     `kern box {} --keep ...` keeps one, and `kern create` makes one",
+                    inst.name, inst.name
+                ));
+                continue;
+            }
+            STOP_NARRATES_TO_STDERR.store(true, std::sync::atomic::Ordering::Relaxed);
+            let stopped = stop_with_grace(
+                std::slice::from_ref(&inst.name),
+                false,
+                grace,
+                crate::commands::DeafInit::Kill,
+            );
+            STOP_NARRATES_TO_STDERR.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = stopped {
+                failures.push(format!("'{}': could not be stopped: {e}", inst.name));
+                continue;
+            }
+        } else if !kept {
+            failures.push(format!("no running box and no kept box named '{name}'"));
+            continue;
+        }
+        match start_one_kept(&self_exe, name) {
+            Ok(0) => println!("{name}"),
+            Ok(code) => failures.push(format!("'{name}' exited {code}")),
+            Err(e) => failures.push(format!("'{name}': {e}")),
+        }
+    }
+    match failures.as_slice() {
+        [] => Ok(()),
+        [one] => Err(Error::Sandbox(one.clone())),
+        many => {
+            for f in many {
+                eprintln!("kern: {f}");
+            }
+            Err(Error::Sandbox(format!(
+                "{} of {} box(es) were not restarted",
+                many.len(),
+                names.len()
+            )))
+        }
+    }
+}
+
+/// `kern create [OPTIONS] IMAGE [COMMAND] [ARG...]` - a kept box recorded and NOT started, which
+/// `kern start` runs: Docker's `create`, on kern's kept boxes (see `keepbox`). `argv` is the `kern
+/// box` command line it records (`box <name> ... --keep -- ...`), already built by the parser;
+/// it is read by the same parser here, so a flag `kern box` refuses is refused now and not at
+/// `start`. The image is resolved (pulled when it is missing), as Docker's `create` pulls. Prints
+/// the box's name, which is what kern's other verbs take, where Docker prints an id.
+pub fn create(name: &str, image: &str, argv: &[String]) -> Result<(), Error> {
+    crate::cli::parse(argv)?;
+    if registry::find_ref(name).is_some()
+        || crate::keepbox::dir_of(name).is_some_and(|d| std::fs::symlink_metadata(d).is_ok())
+    {
+        return Err(Error::AlreadyRunning(format!(
+            "the name '{name}' is already in use by a box: `kern rm {name}` removes it, or choose \
+             another with --name"
+        )));
+    }
+    crate::commands::resolve_image(image)?;
+    let Some(dir) = crate::keepbox::dir_of(name) else {
+        return Err(Error::Sandbox(format!("'{name}' is not a box name")));
+    };
+    let meta = crate::keepbox::Meta {
+        created: registry::now_unix(),
+        last_exit: None,
+        image: String::new(),
+        cwd: std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    let os: Vec<std::ffi::OsString> = argv.iter().map(std::ffi::OsString::from).collect();
+    crate::keepbox::write(&dir, &os, &meta)
+        .map_err(|e| Error::Sandbox(format!("create {name}: cannot record the box: {e}")))?;
+    println!("{name}");
+    Ok(())
+}
+
+/// `kern export <box> [-o file]` - the box's filesystem as a tar, as Docker's `export` writes it:
+/// relative member names (`usr/...`, no `./`), owners as the box sees them, and neither the mounts
+/// the box was given (`/proc`, `/sys`, `/dev`, volumes, secrets) nor their contents. To stdout
+/// without `-o`, refusing a terminal as Docker does.
+///
+/// THE HOST'S `tar`, RUN IN THE BOX'S USER NAMESPACE against `/proc/<pid1>/root`. From the host
+/// side a file the box's root owns reads as the invoking user's and one a `--uid-range` uid owns is
+/// unreadable; inside that user namespace the owners are the box's and every file is readable. The
+/// mount namespace is NOT entered, so the `tar` that runs is the host's, never one the image ships.
+pub fn export(name: &str, out: Option<&str>) -> Result<(), Error> {
+    use std::io::IsTerminal;
+    use std::os::unix::process::CommandExt;
+    let Some(inst) = registry::find_ref(name) else {
+        return Err(Error::NotRunning(format!(
+            "no running box named '{name}': `kern export` reads a running box's filesystem (`kern \
+             start {name}` runs a kept one again)"
+        )));
+    };
+    let Some(pid1) = inst
+        .live_pid1()
+        .or_else(|| registry::box_init_under(inst.pid))
+    else {
+        return Err(Error::NotRunning(format!(
+            "box '{}' has no running init to read the filesystem of",
+            inst.name
+        )));
+    };
+    if out.is_none() && std::io::stdout().is_terminal() {
+        return Err(Error::Usage(
+            "export <box> -o <file> (or redirect stdout): a tar is not written to a terminal",
+        ));
+    }
+    let root = format!("/proc/{pid1}/root");
+    // WHAT IS NOT THE BOX'S FILESYSTEM is what is mounted over it: `/proc`, `/sys`, `/dev`, the
+    // volumes, the secrets. Read from the box's own mount table, because the device of a path is not
+    // the answer: MEASURED on an `alpine` box, `/` was the overlay and `/usr` reported another
+    // `st_dev` (overlayfs gives a lower directory its own), so `--one-file-system` exported 19 empty
+    // directories. A mount point stays, as its directory or file; what it holds does not.
+    let mountinfo = std::fs::read_to_string(format!("/proc/{pid1}/mountinfo"))
+        .map_err(|e| Error::Sandbox(format!("export {}: its mount table: {e}", inst.name)))?;
+    let mut excluded: Vec<String> = mountinfo
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .map(unescape_mountinfo)
+        .filter(|m| m != "/")
+        .map(|m| m.trim_start_matches('/').to_string())
+        .collect();
+    excluded.sort();
+    excluded.dedup();
+    let mut entries: Vec<String> = std::fs::read_dir(&root)
+        .map_err(|e| Error::Sandbox(format!("export {}: listing its root: {e}", inst.name)))?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    entries.sort();
+    let userns = std::fs::File::open(format!("/proc/{pid1}/ns/user"))
+        .map_err(|e| Error::Sandbox(format!("export {}: its user namespace: {e}", inst.name)))?;
+    let userns_fd = std::os::fd::AsRawFd::as_raw_fd(&userns);
+    // EVERY OPTION BEFORE THE FIRST NAME: GNU tar's selection options are positional and it refuses
+    // one that follows a name (measured: `--no-recursion` after the names ended the export).
+    let mut cmd = std::process::Command::new("tar");
+    cmd.arg("--numeric-owner").arg("--anchored");
+    for m in &excluded {
+        cmd.arg(format!("--exclude={m}/*"));
+    }
+    cmd.arg("-C")
+        .arg(&root)
+        .arg("-cf")
+        .arg(out.unwrap_or("-"))
+        .args(&entries);
+    // SAFETY: `setns` is async-signal-safe and touches no memory of this process; it runs in the
+    // forked child before `exec`, where the child is single-threaded as `setns(CLONE_NEWUSER)`
+    // requires.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setns(userns_fd, libc::CLONE_NEWUSER) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| Error::Sandbox(format!("export {}: running tar: {e}", inst.name)))?;
+    drop(userns);
+    if !status.success() {
+        return Err(Error::Sandbox(format!(
+            "export {}: tar exited {}",
+            inst.name,
+            status.code().unwrap_or(-1)
+        )));
+    }
+    Ok(())
+}
+
+/// A mount point as `/proc/<pid>/mountinfo` writes it: space, tab, newline and backslash are octal
+/// escapes (`\040`).
+fn unescape_mountinfo(field: &str) -> String {
+    let b = field.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = b.get(i + 1..i + 4).and_then(|d| {
+            std::str::from_utf8(d)
+                .ok()
+                .and_then(|t| u8::from_str_radix(t, 8).ok())
+        });
+        match (b.get(i), octal) {
+            (Some(b'\\'), Some(v)) => {
+                out.push(v);
+                i += 4;
+            }
+            (Some(c), _) => {
+                out.push(*c);
+                i += 1;
+            }
+            (None, _) => break,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// One box of [`start_kept`]: the recorded command, run to completion. Returns its exit code.

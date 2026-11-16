@@ -142,6 +142,11 @@ pub(crate) struct CappedLog {
     /// The CURRENT mark interval, which doubles every time the index is compacted. Starts at
     /// [`MARK_EVERY`]; see [`CappedLog::compact_index`] for why it is a field and not a constant.
     mark_every: u64,
+    /// Bytes of the box's output shed since the log last took a write: the store was full, or a
+    /// rotation could not free room. Said IN THE LOG, at the gap, by the next write that lands
+    /// ([`CappedLog::note_dropped`]): before this a full store lost lines and no reader could
+    /// tell, `kern logs` included.
+    pub(crate) dropped: u64,
 }
 
 /// The STARTING interval between time marks, and the finest resolution `logs -t` ever claims.
@@ -239,7 +244,32 @@ impl CappedLog {
             last_mark: 0,
             idx_len: 0,
             mark_every: MARK_EVERY,
+            dropped: 0,
         })
+    }
+
+    /// Write the line that says how much was lost here, if anything was, before the bytes that come
+    /// after the gap. Best effort: a store still full keeps the count for the next attempt.
+    pub(crate) fn note_dropped(&mut self) {
+        if self.dropped == 0 || self.written >= self.max {
+            return;
+        }
+        let line = format!(
+            "kern: warning: {} byte(s) of this box's output were dropped here: the log store was \
+             full (`kern prune` frees the logs of boxes that ended)\n",
+            self.dropped
+        );
+        let room = usize::try_from(self.max - self.written).unwrap_or(usize::MAX);
+        if line.len() > room {
+            return;
+        }
+        // SAFETY: a live buffer of the length passed, to a descriptor this struct owns.
+        let n = unsafe { libc::write(self.fd, line.as_ptr().cast(), line.len()) };
+        if n == line.len() as isize {
+            self.mark();
+            self.written += line.len() as u64;
+            self.dropped = 0;
+        }
     }
 
     /// Rename the active file to `<path>.1` (one generation kept, overwriting a previous `.1`) and reopen
@@ -413,9 +443,12 @@ impl CappedLog {
             if self.written >= self.max {
                 self.rotate();
                 if self.written >= self.max {
-                    return; // rotation failed (rename/open) - drop rather than spin or overflow the cap
+                    // rotation failed (rename/open) - drop rather than spin or overflow the cap
+                    self.dropped = self.dropped.saturating_add(buf.len() as u64);
+                    return;
                 }
             }
+            self.note_dropped();
             let room = (self.max - self.written) as usize;
             let chunk = &buf[..buf.len().min(room)];
             let n = unsafe { libc::write(self.fd, chunk.as_ptr().cast(), chunk.len()) };
@@ -425,11 +458,15 @@ impl CappedLog {
                     // Disk full: drop the chunk and force a rotation next round (freeing `.1`'s space).
                     // The workload must NEVER block or die because its log is full - the log is
                     // diagnostics, not part of the workload's contract.
-                    Some(libc::ENOSPC) => {
+                    Some(libc::ENOSPC) | Some(libc::EDQUOT) => {
                         self.written = self.max;
+                        self.dropped = self.dropped.saturating_add(buf.len() as u64);
                         return;
                     }
-                    _ => return,
+                    _ => {
+                        self.dropped = self.dropped.saturating_add(buf.len() as u64);
+                        return;
+                    }
                 }
             }
             self.mark();
@@ -487,7 +524,14 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
                 if room == 0 {
                     (void, PUMP_SPLICE_CHUNK, false) // rotation could not free room -> shed this round
                 } else {
-                    (l.fd, room.min(PUMP_SPLICE_CHUNK as u64) as usize, true)
+                    // Room again after a shed: say what was lost before the bytes after it.
+                    l.note_dropped();
+                    let room = l.max.saturating_sub(l.written);
+                    if room == 0 {
+                        (void, PUMP_SPLICE_CHUNK, false)
+                    } else {
+                        (l.fd, room.min(PUMP_SPLICE_CHUNK as u64) as usize, true)
+                    }
                 }
             }
             None => (void, PUMP_SPLICE_CHUNK, false),
@@ -502,10 +546,13 @@ pub(crate) fn pump_capped_log(rd: i32, path: &std::path::Path, cap: LogCap) {
             match splice_once(rd, sink, want) {
                 Ok(0) => break, // EOF: every write end (workload + supervisor) is closed
                 Ok(n) => {
-                    if to_log {
-                        if let Some(l) = log.as_mut() {
+                    if let Some(l) = log.as_mut() {
+                        if to_log {
                             l.mark();
                             l.written += n as u64;
+                        } else {
+                            // Shed to /dev/null: counted, so the log says so when it can.
+                            l.dropped = l.dropped.saturating_add(n as u64);
                         }
                     }
                 }
@@ -740,7 +787,7 @@ pub(crate) fn follow_log(
 ) -> Result<(), Error> {
     use std::io::{Read, Write};
     let mut buf = [0u8; 8192];
-    let stdout = std::io::stdout();
+    let mut data = crate::ui::data_out();
     if let Some(s) = stamper.as_mut() {
         s.follow_live();
         if let Some(i) = fd_inode(&f) {
@@ -753,9 +800,9 @@ pub(crate) fn follow_log(
             match f.read(&mut buf) {
                 Ok(0) => return true,
                 Ok(k) => {
-                    let mut lock = stdout.lock();
+                    let lock = &mut data;
                     let wrote = match st.as_mut() {
-                        Some(s) => s.push(&mut lock, &buf[..k]),
+                        Some(s) => s.push(lock, &buf[..k]),
                         None => lock.write_all(&buf[..k]),
                     };
                     if wrote.is_err() {
@@ -803,9 +850,10 @@ pub(crate) fn follow_log(
         if !registry::pair_alive(name, pid) {
             // The box is gone, so a line still waiting for a newline will never get one: print it.
             if let Some(s) = stamper.as_mut() {
-                let mut lock = stdout.lock();
-                let _ = s.flush(&mut lock);
-                let _ = lock.flush();
+                // A second handle on the same stateless writer: the one above is held by `drain`.
+                let mut out = crate::ui::data_out();
+                let _ = s.flush(&mut out);
+                let _ = out.flush();
             }
             return Ok(());
         }
@@ -967,15 +1015,75 @@ impl Followed {
     }
 }
 
-/// Write one labelled line: `label<pad> | text`, the shape `docker compose logs` uses.
+/// Write one labelled line: `label<pad>  | text`, the shape `docker compose logs` uses (MEASURED on
+/// Docker Compose 5.3.1: `api-1   | a1` beside `ev-web  | hello`). An empty label writes the line
+/// bare, which is `--no-log-prefix`.
 fn push_prefixed(out: &mut Vec<u8>, label: &str, width: usize, line: &[u8]) {
-    out.extend_from_slice(label.as_bytes());
-    for _ in label.chars().count()..width {
-        out.push(b' ');
+    if !label.is_empty() {
+        out.extend_from_slice(label.as_bytes());
+        for _ in label.chars().count()..width {
+            out.push(b' ');
+        }
+        out.extend_from_slice(b"  | ");
     }
-    out.extend_from_slice(b" | ");
     out.extend_from_slice(line);
     out.push(b'\n');
+}
+
+/// A writer that gives every line Docker's `label  | ` prefix as it passes (`label` already padded
+/// to the column), and nothing with an empty label (`--no-log-prefix`). [`Self::finish`] ends a
+/// last line that had no newline, as [`push_prefixed`] does.
+pub(crate) struct PrefixWriter<'a, W: std::io::Write> {
+    inner: W,
+    label: &'a str,
+    at_start: bool,
+}
+
+impl<'a, W: std::io::Write> PrefixWriter<'a, W> {
+    pub(crate) fn new(inner: W, label: &'a str) -> Self {
+        PrefixWriter {
+            inner,
+            label,
+            at_start: true,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> std::io::Result<()> {
+        if !self.at_start {
+            self.inner.write_all(b"\n")?;
+        }
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for PrefixWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut rest = buf;
+        while !rest.is_empty() {
+            if self.at_start && !self.label.is_empty() {
+                self.inner.write_all(self.label.as_bytes())?;
+                self.inner.write_all(b"  | ")?;
+            }
+            self.at_start = false;
+            match rest.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    let (line, tail) = rest.split_at(i + 1);
+                    self.inner.write_all(line)?;
+                    self.at_start = true;
+                    rest = tail;
+                }
+                None => {
+                    self.inner.write_all(rest)?;
+                    rest = &[];
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Follow SEVERAL services at once, interleaved and prefixed, until every one has exited or `stop`
@@ -1006,14 +1114,13 @@ pub(crate) fn follow_many(
     if who.is_empty() {
         return Ok(());
     }
-    // Align the prefixes, but never let one long service name push every line off the screen.
+    // Aligned on the longest, with no cap, as Docker aligns them.
     let width = who
         .iter()
         .map(|w| w.label.chars().count())
         .max()
-        .unwrap_or(0)
-        .min(24);
-    let stdout = std::io::stdout();
+        .unwrap_or(0);
+    let mut data = crate::ui::data_out();
     let mut out: Vec<u8> = Vec::new();
     loop {
         out.clear();
@@ -1034,7 +1141,7 @@ pub(crate) fn follow_many(
             }
         }
         if !out.is_empty() {
-            let mut lock = stdout.lock();
+            let lock = &mut data;
             if lock.write_all(&out).is_err() {
                 return Ok(()); // a closed pipe ends the follow quietly, as in `follow_log`
             }
@@ -1136,6 +1243,28 @@ pub(crate) fn remove_logs_of(name: &str) {
         idx.push(".idx");
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(PathBuf::from(idx));
+    }
+}
+
+/// Remove one run's log, `<key>.log` with its index and every rotated generation (`<key>.log.N`,
+/// `<key>.log.N.idx`). `key` is `<name>-<pid>`: the exact run, never another run of the same name.
+pub(crate) fn remove_run_logs(key: &str) {
+    let Ok(dir) = registry::logs_dir() else {
+        return;
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let active = format!("{key}.log");
+    let generations = format!("{key}.log.");
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == active || name.starts_with(&generations) {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 
@@ -1771,6 +1900,40 @@ mod compaction_tests {
     /// promise (an earlier mark now answers for more bytes) but must never break it, because a stamp
     /// LATER than its line is a lie a reader cannot detect. Checked at every byte offset in the log,
     /// against the answers the full index gave, rather than at a few sampled ones.
+    /// OUTPUT LOST TO A FULL STORE IS SAID IN THE LOG, at the gap, before the lines after it.
+    ///
+    /// Before this a full log store shed bytes and nothing said so: `kern logs` showed the lines
+    /// on either side of a hole as if they were consecutive.
+    #[test]
+    fn bytes_dropped_by_a_full_store_are_said_at_the_gap() {
+        let dir = tmpdir("dropped");
+        let path = dir.join("d.log");
+        let _ = std::fs::remove_file(&path);
+        let mut log = CappedLog::open(
+            &path,
+            LogCap {
+                max_bytes: 1 << 20,
+                files: 2,
+            },
+        )
+        .expect("the log opens");
+        log.write(b"before\n");
+        // What the pump does when a write meets ENOSPC or a rotation that frees nothing.
+        log.dropped = 4096;
+        log.write(b"after\n");
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.first().copied(), Some("before"));
+        assert!(
+            lines.get(1).is_some_and(
+                |l| l.starts_with("kern: warning: 4096 byte(s)") && l.contains("dropped")
+            ),
+            "the gap must be said between the lines around it: {lines:?}"
+        );
+        assert_eq!(lines.get(2).copied(), Some("after"));
+        assert_eq!(log.dropped, 0, "said once, then counted afresh");
+    }
+
     #[test]
     fn compacting_the_index_never_moves_a_line_forward_in_time() {
         let dir = tmpdir("compact");

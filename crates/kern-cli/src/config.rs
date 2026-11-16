@@ -2212,6 +2212,11 @@ pub(crate) fn read_kern_toml() -> Result<(std::path::PathBuf, String), String> {
 /// Not only `kern.toml`: the sandbox history rewrites its files through it too. The temporary is
 /// `<file name>.tmp.<pid>` beside the target, which for `kern.toml` is the name it always had.
 pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    write_atomic_bytes(path, content.as_bytes())
+}
+
+/// [`write_atomic`] for content that is not text: a record of paths, which on Linux are bytes.
+pub(crate) fn write_atomic_bytes(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let name = path
@@ -2225,7 +2230,7 @@ pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> std::io::Re
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
-    let res = f.write_all(content.as_bytes()).and_then(|()| f.sync_all());
+    let res = f.write_all(content).and_then(|()| f.sync_all());
     if let Err(e) = res {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);

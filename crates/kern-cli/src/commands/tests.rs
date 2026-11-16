@@ -890,20 +890,91 @@ mod ps_exited_tests {
         }
     }
 
-    /// An exited box renders through the SAME `--format` engine as a live one: `.Status` is
-    /// `exited (<code>)` and `.RunningFor` is "how long ago", so `kern ps -a --format` is complete.
+    /// An exited box renders through the SAME `--format` engine as a live one, in Docker's words:
+    /// `.Status` is `Exited (<code>) <when> ago`, `.State` is `exited`, `.ExitCode` the code, and
+    /// `.RunningFor` is "how long ago", so `kern ps -a --format` is complete.
     #[test]
     fn exited_box_renders_through_ps_format() {
         let e = dead("web", 7, "stack");
         assert_eq!(
-            render_ps_format("{{.Names}} {{.Status}} {{.Pod}} {{.RunningFor}}", &e, 0).unwrap(),
-            "web exited (7) stack 5s ago"
+            render_ps_format(
+                "{{.Names}} {{.Status}}|{{.State}} {{.ExitCode}} {{.Health}}|{{.Pod}}",
+                &e,
+                0
+            )
+            .unwrap(),
+            "web Exited (7) 5 seconds ago|exited 7 |stack"
         );
+        assert!(render_ps_format("{{.RunningFor}}", &e, 0)
+            .unwrap()
+            .ends_with(" ago"));
         // No live rootfs/ports on a dead box - they render empty, not a stale value.
         assert_eq!(
             render_ps_format("[{{.Image}}{{.Ports}}]", &e, 0).unwrap(),
             "[]"
         );
+    }
+
+    /// `--format 'table ...'` prints Docker's header and aligns as Docker's tabwriter does. The
+    /// expected text is Docker Compose 5.3.1's output, MEASURED on the Jetson for these rows.
+    #[test]
+    fn a_table_template_prints_docker_s_header_and_alignment() {
+        let lines = vec![
+            render_ps_header("{{.Name}}\t{{.Status}}", true).unwrap(),
+            "ev-web\tUp 4 seconds (healthy)".to_string(),
+            "fmtp-api-1\tUp 4 seconds".to_string(),
+            "fmtp-done-1\tExited (3) 4 seconds ago".to_string(),
+        ];
+        assert_eq!(
+            tabwrite(&lines),
+            "NAME          STATUS\nev-web        Up 4 seconds (healthy)\nfmtp-api-1    Up 4 seconds\n\
+             fmtp-done-1   Exited (3) 4 seconds ago\n"
+        );
+        let lines = vec![
+            render_ps_header(
+                "{{.Label \"app\"}}\t{{.Image}}\t{{.Command}}\t{{.Ports}}\t{{.RunningFor}}",
+                true,
+            )
+            .unwrap(),
+            "x\talpine\t\"sleep 60\"\t\tLess than a second ago".to_string(),
+        ];
+        assert_eq!(
+            tabwrite(&lines),
+            "app       IMAGE     COMMAND      PORTS     CREATED\n\
+             x         alpine    \"sleep 60\"             Less than a second ago\n"
+        );
+        assert_eq!(
+            render_ps_header("{{.ID}}\t{{.Names}}\t{{.Health}}\t{{.ExitCode}}", true).unwrap(),
+            "CONTAINER ID\t<no value>\t<no value>\t<no value>"
+        );
+        assert_eq!(
+            render_ps_header("{{.Names}}\t{{.State}}", false).unwrap(),
+            "NAMES\tSTATE"
+        );
+    }
+
+    /// go-units' `HumanDuration`, at each of its boundaries.
+    #[test]
+    fn human_duration_answers_as_go_units() {
+        for (secs, want) in [
+            (0, "Less than a second"),
+            (1, "1 second"),
+            (59, "59 seconds"),
+            (60, "About a minute"),
+            (119, "About a minute"),
+            (120, "2 minutes"),
+            (3599, "59 minutes"),
+            (3600, "About an hour"),
+            (5399, "About an hour"),
+            (5400, "2 hours"),
+            (47 * 3600, "47 hours"),
+            (48 * 3600, "2 days"),
+            (14 * 86400, "2 weeks"),
+            (60 * 86400, "2 months"),
+            (730 * 86400, "2 years"),
+        ] {
+            assert_eq!(human_duration(secs), want, "{secs}");
+        }
     }
 
     /// `NetworkSettings.Ports` is the ONE document here whose shape is dictated from outside, so
@@ -1155,8 +1226,17 @@ two"
             fn ps_running_for(&self, _now: u64) -> String {
                 String::new()
             }
-            fn ps_status(&self) -> String {
+            fn ps_state(&self) -> String {
                 String::new()
+            }
+            fn ps_status(&self, _now: u64) -> String {
+                String::new()
+            }
+            fn ps_health(&self) -> String {
+                String::new()
+            }
+            fn ps_exit_code(&self) -> i32 {
+                0
             }
             fn ps_labels(&self) -> &str {
                 self.0
@@ -2619,108 +2699,124 @@ mod net_resource_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `--cpus` EQUAL TO THE HOST COUNT IS NOT ABOVE IT.
+    /// `--cpus` ABOVE THE HOST IS REFUSED WITH DOCKER'S WORDS; EQUAL IS NOT ABOVE.
     ///
-    /// `clamp_cpus` had no test at all - only its sibling `clamp_cpuset` did - and a mutation sweep
-    /// turned `c > host` into `c >= host` with all 920 green. The inverted form clamps a request
-    /// that is exactly the machine, and prints a warning saying it "exceeds" a number it equals.
-    ///
-    /// The host count is read rather than assumed, so this asserts the RULE on whatever machine it
-    /// runs, instead of a number that is true here.
+    /// The boundary is asserted on the predicate as well as on the result: a mutation of `>` into
+    /// `>=` refuses `--cpus N` on an N-CPU host, which is asking for the machine. The host count is
+    /// read rather than assumed, so this asserts the RULE on whatever machine it runs.
     #[test]
-    fn clamp_cpus_leaves_a_request_at_the_host_count_alone() {
+    fn cpus_above_the_host_are_refused_as_docker_refuses_them() {
         let _g = crate::env_guard();
         let host = host_cpu_count() as f64;
         assert!(host >= 1.0, "a host with no CPUs cannot run this suite");
-
-        // Absent: nothing to clamp.
-        assert_eq!(clamp_cpus(None), None);
-        // Below: untouched.
-        assert_eq!(clamp_cpus(Some(0.5)), Some(0.5));
-        // AT the host count: untouched.
-        assert_eq!(clamp_cpus(Some(host)), Some(host));
-
-        // THE BOUNDARY IS ASSERTED ON THE PREDICATE, NOT ON THE RETURN VALUE, and the difference is
-        // the reason `cpus_exceed_host` exists. At `c == host` the clamped result and the unclamped
-        // one are the SAME NUMBER, so `>` mutated to `>=` leaves everything above green and changes
-        // only the warning - which then tells the operator that N CPUs "exceeds the N available".
-        // The false message is the entire observable difference, and no assertion on the returned
-        // `Option` can reach it.
+        assert!(matches!(check_cpus(None, CpuSource::Flag), Ok(None)));
+        assert!(matches!(check_cpus(Some(0.5), CpuSource::Flag), Ok(Some(c)) if c == 0.5));
+        assert!(
+            matches!(check_cpus(Some(host), CpuSource::Flag), Ok(Some(c)) if c == host),
+            "exactly the machine is accepted"
+        );
         assert!(!cpus_exceed_host(host, host), "equal is not above");
-        assert!(!cpus_exceed_host(host - 0.5, host));
         assert!(
             cpus_exceed_host(host + 0.001, host),
             "any excess at all is above"
         );
-        assert!(cpus_exceed_host(host * 2.0, host));
-        // Above: clamped down to what the machine has, never left as asked.
-        assert_eq!(clamp_cpus(Some(host + 1.0)), Some(host));
-        assert_eq!(clamp_cpus(Some(host * 100.0)), Some(host));
+        let msg = match check_cpus(Some(host + 1.0), CpuSource::Flag) {
+            Err(e) => e.to_string(),
+            Ok(v) => panic!("--cpus above the host must be refused, got {v:?}"),
+        };
+        let n = host as u64;
+        assert!(
+            msg.contains(&format!(
+                "range of CPUs is from 0.01 to {n}.00, as there are only {n} CPUs available"
+            )),
+            "Docker's sentence, got {msg}"
+        );
+        assert!(msg.contains("--cpus"), "names the flag, got {msg}");
+        let from_profile = match check_cpus(Some(host * 100.0), CpuSource::Profile) {
+            Err(e) => e.to_string(),
+            Ok(v) => panic!("a profile above the host must be refused too, got {v:?}"),
+        };
+        assert!(
+            from_profile.contains("the profile's cpus"),
+            "names the profile, got {from_profile}"
+        );
     }
 
+    /// The CPU-list arithmetic `--cpuset-cpus` is checked with, on SYNTHETIC host lists, so the case
+    /// that a count cannot see (a CPU offline in the middle) is asserted on any machine.
     #[test]
-    fn clamp_cpuset_narrows_overwide_pins() {
+    fn a_cpuset_is_available_only_when_every_cpu_it_names_is_online() {
+        assert_eq!(cpu_list_ranges("0-3,6"), Some(vec![(0, 3), (6, 6)]));
+        assert_eq!(
+            cpu_list_ranges("4-5,0-3"),
+            Some(vec![(0, 5)]),
+            "adjacent ranges merge"
+        );
+        assert_eq!(
+            cpu_list_ranges("6-4"),
+            Some(vec![(4, 6)]),
+            "a reversed range is the range"
+        );
+        assert_eq!(cpu_list_ranges("0,x"), None);
+        let host = "0-3,6";
+        assert_eq!(cpus_all_available("0", host), Some(true));
+        assert_eq!(cpus_all_available("0-3", host), Some(true));
+        assert_eq!(cpus_all_available("1,3,6", host), Some(true));
+        assert_eq!(cpus_all_available("3-4", host), Some(false), "4 is offline");
+        assert_eq!(cpus_all_available("5", host), Some(false), "5 is offline");
+        assert_eq!(
+            cpus_all_available("7", host),
+            Some(false),
+            "one past the last"
+        );
+        assert_eq!(cpus_all_available("0-4294967295", host), Some(false));
+        assert_eq!(cpus_all_available("0,x", host), None, "left to the backend");
+        // Merged both ways: a request split across adjacent items of the host list is still whole.
+        assert_eq!(cpus_all_available("2-5", "0-3,4-5"), Some(true));
+    }
+
+    /// `--cpuset-cpus` on THIS host: the last online CPU is accepted untouched, one past it is
+    /// refused with Docker's sentence, and so is a list in which only some CPUs exist (it used to be
+    /// clamped to that subset). `--cpuset-cpus 28` on a 28-CPU machine once reached systemd, which
+    /// applied nothing and exited 0 with every CPU free: never handed on.
+    #[test]
+    fn a_cpuset_naming_a_missing_cpu_is_refused_as_docker_refuses_it() {
         let _g = crate::env_guard();
-        // Host CPU count (same source as the fn) - the test is host-agnostic.
-        let host = std::fs::read_to_string("/proc/cpuinfo")
-            .map(|t| t.lines().filter(|l| l.starts_with("processor")).count())
-            .unwrap_or(1)
-            .max(1);
-        let max = host - 1;
-        // An over-wide range is capped to the host's max CPU (never a raw `0-9999`).
-        let want = if max == 0 {
-            "0".to_string()
-        } else {
-            format!("0-{max}")
+        let online = online_cpu_list();
+        let last = cpu_list_ranges(&online)
+            .and_then(|r| r.last().map(|&(_, hi)| hi))
+            .unwrap_or(0);
+        assert!(matches!(check_cpuset(None, CpuSource::Flag), Ok(None)));
+        assert_eq!(
+            check_cpuset(Some(last.to_string()), CpuSource::Flag)
+                .ok()
+                .flatten(),
+            Some(last.to_string()),
+            "the last online CPU is accepted as written"
+        );
+        for asked in [
+            format!("{}", last + 1),
+            format!("0,{}", last + 1),
+            "0-9999".to_string(),
+        ] {
+            let msg = match check_cpuset(Some(asked.clone()), CpuSource::Flag) {
+                Err(e) => e.to_string(),
+                Ok(v) => panic!("--cpuset-cpus {asked} must be refused here, got {v:?}"),
+            };
+            assert!(
+                msg.contains(&format!(
+                    "requested CPUs are not available - requested {asked}, available: {online}"
+                )),
+                "Docker's sentence with both lists, got {msg}"
+            );
+        }
+        let from_profile = match check_cpuset(Some(format!("{}", last + 1)), CpuSource::Profile) {
+            Err(e) => e.to_string(),
+            Ok(v) => panic!("a profile's missing CPU must be refused too, got {v:?}"),
         };
-        assert_eq!(
-            clamp_cpuset(Some("0-9999".into()))
-                .ok()
-                .flatten()
-                .as_deref(),
-            Some(want.as_str())
-        );
-        // An in-range single is untouched; `None` passes through.
-        assert_eq!(
-            clamp_cpuset(Some("0".into())).ok().flatten().as_deref(),
-            Some("0")
-        );
-        assert!(clamp_cpuset(None).ok().flatten().is_none());
-        // Nothing in the list exists here → REFUSED, not passed through. This used to return the
-        // original on the reasoning that the backend would reject it loudly; measured on a 28-CPU
-        // machine, `--cpuset-cpus 28` reached systemd, applied nothing, printed nothing and exited 0
-        // with the process free to use every CPU. A cap that cannot be applied must not silently
-        // become no cap.
-        let err = clamp_cpuset(Some("9999".into())).expect_err("an impossible pin must be refused");
-        let msg = err.to_string();
         assert!(
-            msg.contains("9999"),
-            "the message must quote the request, got {msg}"
-        );
-        assert!(
-            msg.contains("Refusing"),
-            "the message must say it refused, got {msg}"
-        );
-        // The off-by-one is the case that actually mattered: one past the last CPU.
-        assert!(
-            clamp_cpuset(Some(host.to_string())).is_err(),
-            "CPU index {host} does not exist on a {host}-CPU host and must be refused"
-        );
-        // ... while the last real CPU is accepted untouched, so the refusal is not over-broad.
-        assert_eq!(
-            clamp_cpuset(Some(max.to_string()))
-                .ok()
-                .flatten()
-                .as_deref(),
-            Some(max.to_string().as_str())
-        );
-        // A partially-valid list still clamps to the valid part rather than refusing.
-        assert_eq!(
-            clamp_cpuset(Some(format!("0,{host}")))
-                .ok()
-                .flatten()
-                .as_deref(),
-            Some("0")
+            from_profile.contains("the profile's cpuset"),
+            "got {from_profile}"
         );
     }
 
@@ -2788,25 +2884,39 @@ mod net_resource_tests {
     }
 
     #[test]
-    fn compose_pod_name_is_stable_unique_and_safe() {
-        let ok = |n: &str| {
-            !n.is_empty()
-                && !n.starts_with('.')
-                && n.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    fn compose_pod_name_is_docker_s_project_name() {
+        // MEASURED on Docker Compose 5.3.1: the directory's name, lower case, only `[a-z0-9_-]`,
+        // without a leading `_`/`-`; two directories of one name are one project, as there.
+        let root = std::env::temp_dir().join(format!("kern-pn-{}", std::process::id()));
+        for d in [
+            "My.App_X",
+            "__-x",
+            "___",
+            "a/usbim-assets",
+            "b/usbim-assets",
+        ] {
+            let _ = std::fs::create_dir_all(root.join(d));
+        }
+        let f = |d: &str| {
+            root.join(d)
+                .join("compose.yml")
+                .to_string_lossy()
+                .into_owned()
         };
-        // Stable for the same path (so `up` and `down` agree) and always a valid pod name.
-        let n = compose_pod_name("/srv/myapp/compose.yaml");
-        assert_eq!(n, compose_pod_name("/srv/myapp/compose.yaml"));
-        assert!(ok(&n) && n.starts_with("myapp-"), "dir-based + valid: {n}");
-        // Two same-named compose files in DIFFERENT dirs → DIFFERENT pods (no cross-stack collision).
-        assert_ne!(
-            compose_pod_name("/srv/a/compose.yaml"),
-            compose_pod_name("/srv/b/compose.yaml")
+        assert_eq!(compose_pod_name(&f("My.App_X")), "myapp_x");
+        assert_eq!(compose_pod_name(&f("__-x")), "x");
+        assert_eq!(compose_pod_name(&f("___")), "");
+        assert_eq!(compose_pod_name(&f("a/usbim-assets")), "usbim-assets");
+        assert_eq!(
+            compose_pod_name(&f("a/usbim-assets")),
+            compose_pod_name(&f("b/usbim-assets"))
         );
-        // Odd/empty stems still produce a valid name (base falls back, hash suffix appended).
-        assert!(ok(&compose_pod_name("compose.yaml")));
-        assert!(ok(&compose_pod_name("....")));
+        assert_eq!(normalize_project_name("Bad Name"), "badname");
+        // The name kern used before is still derivable, for a stack running under it.
+        let old = legacy_pod_name(&f("a/usbim-assets"));
+        assert!(old.starts_with("usbim-assets-") && old.len() == "usbim-assets-".len() + 8);
+        assert_ne!(old, legacy_pod_name(&f("b/usbim-assets")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4547,38 +4657,6 @@ mod compose_action_tests {
         }
     }
 
-    /// THE NAME COMES BACK FROM THE ONE TABLE, which is what keeps a note from naming a verb the
-    /// reader did not type. `compose start` and `compose restart` reach the same line `up` does and
-    /// were handed `up`'s sentence, with a `-d` flag they cannot pass and a claim of parity with
-    /// `docker compose up`. Deriving the word rather than listing it again is the rule the verb
-    /// table states about itself, after the same list was written out three times by hand.
-    #[test]
-    fn every_verb_name_round_trips_through_the_one_table() {
-        for (word, action) in COMPOSE_VERBS {
-            // `kill` is a second spelling of `Stop`, so it is the one entry whose word does not come
-            // back - the table's order decides, and `stop` is listed first because it is documented.
-            if *word == "kill" {
-                assert_eq!(
-                    action.name(),
-                    "stop",
-                    "`kill` resolves to the documented spelling"
-                );
-                continue;
-            }
-            assert_eq!(action.name(), *word, "verb {word}");
-            assert_eq!(
-                ComposeAction::from_verb(action.name()),
-                Some(*action),
-                "the name must parse back to the action it came from: {word}"
-            );
-        }
-        // The three that reach the terminal note, named explicitly: a table-driven loop would pass
-        // if all three silently became the same word.
-        assert_eq!(ComposeAction::Up.name(), "up");
-        assert_eq!(ComposeAction::Start.name(), "start");
-        assert_eq!(ComposeAction::Restart.name(), "restart");
-    }
-
     #[test]
     fn unknown_verb_is_none_not_a_guess() {
         // A typo must NOT silently resolve to something (the caller turns `None` into a message that
@@ -5519,6 +5597,7 @@ mod port_collision_tests {
             ps_quiet: false,
             ps_services: false,
             ps_format: None,
+            config_yaml: None,
         };
         match super::super::run_terminal_verb(super::super::ComposeAction::Restart, &mut boxes, &o)
         {

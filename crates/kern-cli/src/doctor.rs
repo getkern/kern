@@ -296,6 +296,8 @@ fn rows() -> Vec<R> {
     results.extend(check_gpu());
     results.extend(check_tools());
     results.push(check_duplicate_installs());
+    // How full the two stores are: the disk kern's data lives on, and the (RAM) log store.
+    results.extend(check_storage());
     results.push(check_kernel());
     results
 }
@@ -1033,9 +1035,36 @@ fn apparmor_userns_verdict(sysctl: Option<i64>, probe: Userns) -> R {
 fn check_selinux() -> R {
     // The filesystem, not the file: a kernel without SELinux has neither, and conflating "no
     // selinuxfs" with "cannot read enforce" is what the split exists to prevent.
-    selinux_verdict(
-        std::path::Path::new(SELINUXFS).is_dir(),
-        std::fs::read_to_string(SELINUX_ENFORCE).ok(),
+    let mode = std::fs::read_to_string(SELINUX_ENFORCE).ok();
+    let enforcing = mode.as_deref().map(str::trim) == Some("1");
+    let verdict = selinux_verdict(std::path::Path::new(SELINUXFS).is_dir(), mode);
+    // ENFORCING IS WHERE ONE POLICY REFUSES PASTA AND ANOTHER DOES NOT, and nothing on the host says
+    // which: openSUSE Leap 16 refuses pasta every namespace of an unconfined process without an AVC,
+    // Fedora 45 lets it through. So on an enforcing host, and only there, the row EXERCISES pasta
+    // once (about 40 ms, a throwaway namespace, nothing left behind) and warns only on that refusal.
+    if !enforcing {
+        return verdict;
+    }
+    match crate::pod::pasta_probe() {
+        crate::pod::PastaProbe::SelinuxRefused(why) => selinux_pasta_refused(&why),
+        _ => verdict,
+    }
+}
+
+/// The row for an enforcing host whose policy refuses pasta a box's namespaces, as a pure function
+/// of pasta's words so its text is testable without such a host.
+fn selinux_pasta_refused(why: &str) -> R {
+    let me = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "kern".to_string());
+    R::Warn(
+        "SELinux: ENFORCING, and it refuses pasta: stacks and one-offs have no internet".into(),
+        format!(
+            "pasta said \"{}\"; label kern as a container runtime, as podman runs: `chcon -t \
+             container_runtime_exec_t {me}` (the type comes with container-selinux, which podman \
+             installs); the installer does this where it is needed",
+            crate::ui::scrub(why).chars().take(120).collect::<String>()
+        ),
     )
 }
 
@@ -1597,7 +1626,7 @@ fn check_uid_range() -> R {
     // This host does not, so the one honest thing is to say it here, and to say it with a number
     // read from the caller rather than a conditional the reader has to evaluate. Same spelling of
     // "the groups this caller carries" as everywhere else in the crate.
-    let primary = unsafe { libc::getgid() } as u32;
+    let primary = unsafe { libc::getgid() };
     let inherited: Vec<u32> = crate::gpu_grant::Caller::current()
         .gids
         .into_iter()
@@ -1964,6 +1993,112 @@ fn tool_opt(bin: &str, what: &str, note: &str, hint: &str) -> R {
     }
 }
 
+/// How full the two places kern writes to are, and what fails when one fills.
+///
+/// THE DISK: the filesystem under kern's data root (`$XDG_DATA_HOME/kern`, else
+/// `~/.local/share/kern`), where volumes, builds, kept boxes and the sandbox history live. Measured
+/// at the nearest directory that exists, so a host that never stored anything is still answered.
+///
+/// THE LOG STORE: `$XDG_RUNTIME_DIR/kern/logs`, a tmpfs in RAM on a desktop, where every detached
+/// box's output goes. When it is full the box keeps running and its output is DROPPED, with a line
+/// in its log saying how much; a row says so before it happens.
+///
+/// Read-only, as this module promises: nothing is created (the logs directory is only looked for),
+/// and the live box set is not asked for, because listing it prunes dead records as a side effect.
+/// Yellow (`!`) from [`crate::logview::FILL_WARN_PCT`], with the words for the red band from
+/// [`crate::logview::FILL_CRIT_PCT`].
+fn check_storage() -> Vec<R> {
+    use crate::logview::{FILL_CRIT_PCT, FILL_WARN_PCT};
+    let mut out = Vec::new();
+    let near = |p: &std::path::Path| -> Option<std::path::PathBuf> {
+        p.ancestors()
+            .find(|a| a.is_dir())
+            .map(std::path::Path::to_path_buf)
+    };
+    let root = crate::keepbox::data_root();
+    if let Some((root, dir)) = root.as_deref().and_then(|r| near(r).map(|d| (r, d))) {
+        let d = dir.to_string_lossy();
+        if let Some((pct, avail)) = crate::commands::fs_fill(&d) {
+            let free = crate::commands::human_bytes(avail);
+            let what = format!("disk: {pct} % full, {free} free");
+            // THE DATA ROOT, NAMED AS ITSELF: before the first volume or build it does not exist,
+            // and the disk is measured at its nearest existing parent. Naming that parent as where
+            // the volumes live (`/root/.local/share` under `sudo`, measured) would be untrue.
+            let where_ = if root == dir.as_path() {
+                format!(
+                    "where volumes, builds and kept boxes live: {}",
+                    root.display()
+                )
+            } else {
+                format!(
+                    "where volumes, builds and kept boxes will live: {} (not created yet)",
+                    root.display()
+                )
+            };
+            out.push(if pct >= FILL_WARN_PCT {
+                R::Warn(
+                    what,
+                    format!(
+                        "{}a pull, a build or a volume write fails when it is full: `kern gc` \
+                         frees build layers and leftovers, `kern gc --images` the image cache \
+                         ({where_})",
+                        if pct >= FILL_CRIT_PCT {
+                            "NEARLY FULL. "
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+            } else {
+                R::ok_note(&what, &where_)
+            });
+        }
+    }
+    if let Some(dir) = crate::registry::existing_logs_dir() {
+        if let Some((pct, _)) = crate::commands::fs_fill(&dir.to_string_lossy()) {
+            let (files, bytes) = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.metadata().ok())
+                        .filter(std::fs::Metadata::is_file)
+                        .fold((0usize, 0u64), |(n, b), m| {
+                            (n + 1, b.saturating_add(m.len()))
+                        })
+                })
+                .unwrap_or((0, 0));
+            let what = format!(
+                "log store: {pct} % full, {} in {files} file(s)",
+                crate::commands::human_bytes(bytes),
+            );
+            out.push(if pct >= FILL_WARN_PCT {
+                R::Warn(
+                    what,
+                    format!(
+                        "{}when it is full a box's output is DROPPED, never the box, and its log \
+                         says how much: `kern prune` frees the logs of boxes that ended ({})",
+                        if pct >= FILL_CRIT_PCT {
+                            "NEARLY FULL. "
+                        } else {
+                            ""
+                        },
+                        dir.display()
+                    ),
+                )
+            } else {
+                R::ok_note(
+                    &what,
+                    &format!(
+                        "{}: a detached box's output, at most 32 MiB a box by default; \
+                         `kern logs --all` reads it all, `kern top` (tab 9) live",
+                        dir.display()
+                    ),
+                )
+            });
+        }
+    }
+    out
+}
+
 fn check_kernel() -> R {
     let ver = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
@@ -2192,15 +2327,17 @@ fn gpu_source_row(root: &std::path::Path, libraries: usize) -> (String, String) 
         .collect();
     if dir.is_some() && !kinds.is_empty() && !kinds.iter().any(|k| k == "nvidia.com/gpu") {
         return (
+            // The variable part goes on the note line: MEASURED on that Jetson, the row with the
+            // directory and the kinds in it was 130 characters, past what a terminal row holds.
             format!(
-                "gpu source: /proc/driver/nvidia and {libraries} host libraries; the CDI specs under \
-                 {} are for {} only, none for the GPU",
+                "gpu source: /proc/driver/nvidia and {libraries} host libraries; no CDI spec for the GPU"
+            ),
+            format!(
+                "the specs under {} are for {} only: --device nvidia.com/gpu=N has nothing to read \
+                 here, --gpus is this GPU's spelling",
                 dir.unwrap_or_default(),
                 kinds.join(", ")
             ),
-            "--device nvidia.com/gpu=N has no spec here to read; --gpus is the spelling for this \
-             GPU"
-                .to_string(),
         );
     }
     match dir {
@@ -3131,6 +3268,10 @@ mod tests {
                 all.push(selinux_verdict(present, mode.map(str::to_string)));
             }
         }
+        // The enforcing host whose policy refuses pasta (openSUSE Leap 16), with pasta's own words.
+        all.push(selinux_pasta_refused(
+            "Couldn't open user namespace /proc/2543/ns/user: Permission denied",
+        ));
         // The five states of a host with no systemd user manager, with the runner's own cgroup path
         // as the probed site: that string is interpolated into the row, and the GitHub runner's is
         // four times longer than a desktop's, which is how two of these reached 255 characters.
@@ -3764,7 +3905,8 @@ mod cdi_kind_row_tests {
             "---\ncdiVersion: 0.5.0\ncontainerEdits: {}\ndevices: []\nkind: nvidia.com/pva\n",
         )
         .expect("write");
-        let (pva, _) = super::gpu_source_row(&root, 12);
+        // 224 libraries, as on the Jetson where the row was measured too long for a terminal.
+        let (pva, pva_note) = super::gpu_source_row(&root, 224);
         std::fs::write(
             root.join("etc/cdi/nvidia-pva.yaml"),
             "---\ncdiVersion: 0.5.0\ncontainerEdits: {}\ndevices: []\nkind: nvidia.com/gpu\n",
@@ -3773,10 +3915,16 @@ mod cdi_kind_row_tests {
         let (gpu, _) = super::gpu_source_row(&root, 12);
         let _ = std::fs::remove_dir_all(&root);
         assert!(
-            pva.contains("for nvidia.com/pva only") && !pva.contains("cannot read"),
+            pva.contains("no CDI spec for the GPU") && !pva.contains("cannot read"),
             "{pva}"
         );
-        assert!(!gpu.contains("none for the GPU"), "{gpu}");
+        assert!(
+            pva.len() <= 100,
+            "{} chars, the terminal row: {pva}",
+            pva.len()
+        );
+        assert!(pva_note.contains("for nvidia.com/pva only"), "{pva_note}");
+        assert!(!gpu.contains("no CDI spec for the GPU"), "{gpu}");
     }
 }
 

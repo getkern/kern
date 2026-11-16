@@ -76,19 +76,23 @@ const VERBS: &[&str] = &[
     // `kern box --keep` gave these two something to act on; they were documented and uncompletable
     // until `the_completions_and_the_reference_agree` said so.
     "start",
+    "create",
+    "restart",
+    "export",
+    "container",
     "rm",
 ];
 
 /// Verbs whose first argument is a running box's name (so completion can offer `kern ps` names).
 const NAME_VERBS: &[&str] = &[
-    "exec", "attach", "logs", "inspect", "pause", "unpause", "stop", "kill", "port",
+    "exec", "attach", "logs", "inspect", "pause", "unpause", "stop", "kill", "port", "export",
 ];
 
 /// Verbs whose first argument is a KEPT box's name, which is a different set from the one above:
 /// `kern start` and `kern rm` act on a box that is NOT running, so offering the running names would
 /// complete to exactly the names both verbs refuse. The source is `ps -a -q --filter status=kept`,
 /// one line per name, which is the query that means "what `kern start` can run".
-const KEPT_VERBS: &[&str] = &["start", "rm"];
+const KEPT_VERBS: &[&str] = &["start", "rm", "restart"];
 
 /// The shell command each script runs to list kept names. One spelling, so the three scripts cannot
 /// drift from each other or from the filter the CLI accepts.

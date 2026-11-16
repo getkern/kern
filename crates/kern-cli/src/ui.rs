@@ -426,6 +426,67 @@ pub(crate) fn fmt_cpus(c: f64) -> String {
     }
 }
 
+/// The process's ORIGINAL stdout once [`narration_to_stderr`] has moved fd 1 onto stderr; -1 before.
+static DATA_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// From here on everything this process and its children print on stdout goes to stderr, and what
+/// is DATA is written with [`data_out`] to the stdout the process was started with.
+///
+/// FOR THE COMPOSE VERBS THAT ONLY NARRATE (`up`, `down`, `stop`, ...). Docker Compose prints their
+/// progress on stderr and nothing on stdout (MEASURED on 5.3.1: `up -d 2>/dev/null` prints zero
+/// bytes), and kern printed every line of it on stdout, so `out=$(kern compose up -d)` held kern's
+/// sentences. Moving the descriptor rather than each `println!` reaches every line, the `kern box`
+/// children's included, and cannot miss the next one written. Idempotent.
+pub fn narration_to_stderr() {
+    if DATA_FD.load(std::sync::atomic::Ordering::Acquire) >= 0 {
+        return;
+    }
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    // SAFETY: dup/dup2 on the process's own standard descriptors; a failure leaves them as they were.
+    let saved = unsafe { libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3) };
+    if saved < 0 {
+        return;
+    }
+    if unsafe { libc::dup2(2, 1) } < 0 {
+        unsafe { libc::close(saved) };
+        return;
+    }
+    DATA_FD.store(saved, std::sync::atomic::Ordering::Release);
+}
+
+/// The stdout for DATA: the original one after [`narration_to_stderr`], fd 1 otherwise. What an
+/// attached `up` streams (the services' own output) is data, as it is on Docker's stdout.
+pub struct DataOut;
+
+impl std::io::Write for DataOut {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let fd = DATA_FD.load(std::sync::atomic::Ordering::Acquire);
+        if fd < 0 {
+            return std::io::stdout().write(buf);
+        }
+        // SAFETY: `fd` is a descriptor this process owns for its lifetime (never closed after it
+        // is stored), and `buf` is a valid slice.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if DATA_FD.load(std::sync::atomic::Ordering::Acquire) < 0 {
+            return std::io::stdout().flush();
+        }
+        Ok(())
+    }
+}
+
+/// [`DataOut`].
+pub fn data_out() -> DataOut {
+    DataOut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

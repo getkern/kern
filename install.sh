@@ -154,3 +154,69 @@ if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null |
   printf "      ${bindir}/kern doctor --apparmor-profile | sudo tee /etc/apparmor.d/kern >/dev/null && sudo apparmor_parser -r /etc/apparmor.d/kern\n"
   printf "${DIM}    then \`${bindir}/kern doctor\` should say ready. Full explanation: \`kern doctor\`.${ZZ}\n\n"
 fi
+# THE SELINUX POLICY THAT TAKES THE INTERNET AWAY FROM EVERY STACK, fixed here where it is MEASURED to
+# apply and nowhere else. On openSUSE Leap 16 (enforcing, passt-selinux 2025-04) pasta is refused every
+# namespace of an unconfined process, with no AVC logged, so no compose service and no one-off box
+# reaches the internet; Fedora 45, also enforcing, lets the same call through. kern labelled as a
+# container runtime, the type rootless podman runs as, gets through. So: only on an enforcing host with
+# pasta, only when kern's own probe says SELinux is why pasta was refused (exit 3), and kept only if the
+# probe then succeeds; otherwise the previous label is put back. The label is on this file: a filesystem
+# relabel resets it, and running this installer again sets it again.
+if [ "$(cat /sys/fs/selinux/enforce 2>/dev/null || echo 0)" = "1" ] && command -v pasta >/dev/null 2>&1; then
+  probe=0
+  "${bindir}/kern" __pasta-probe 2>"${tmp}/probe.err" || probe=$?
+  if [ "$probe" = "3" ]; then
+    old="$(stat -c %C "${bindir}/kern" 2>/dev/null || true)"
+    if chcon -t container_runtime_exec_t "${bindir}/kern" 2>"${tmp}/chcon.err"; then
+      again=0
+      "${bindir}/kern" __pasta-probe 2>/dev/null || again=$?
+      if [ "$again" = "0" ]; then
+        info "SELinux refused pasta a box's namespaces here; kern is now labelled container_runtime_exec_t"
+        printf "${DIM}    (the type rootless podman runs as), and stacks and one-offs reach the internet.${ZZ}\n"
+        # A chcon label is undone by any restorecon (MEASURED). The rule that survives one is root's: a
+        # file-context rule, then `restorecon -F`, which a plain restorecon leaves alone (MEASURED, for a
+        # path under /home). A path under /usr/local is written as its /usr equivalent, which is what
+        # semanage itself demands there ("conflicts with equivalency rule '/usr/local /usr'").
+        spec="$(realpath "${bindir}/kern" 2>/dev/null || echo "${bindir}/kern")"
+        case "$spec" in /usr/local/*) spec="/usr/${spec#/usr/local/}" ;; esac
+        # Found where the SELinux tools live, not only on PATH: a PATH without /usr/sbin (an `env PATH=`
+        # under sudo) hid semanage and sent a root install down the user branch (MEASURED).
+        sel_tool() {
+          command -v "$1" 2>/dev/null && return 0
+          for d in /usr/sbin /sbin; do
+            if [ -x "$d/$1" ]; then echo "$d/$1"; return 0; fi
+          done
+          return 1
+        }
+        semanage_bin="$(sel_tool semanage || true)"
+        restorecon_bin="$(sel_tool restorecon || true)"
+        if [ "$(id -u)" = "0" ] && [ -n "$semanage_bin" ] && [ -n "$restorecon_bin" ]; then
+          if { "$semanage_bin" fcontext -a -t container_runtime_exec_t "$spec" 2>/dev/null ||
+               "$semanage_bin" fcontext -m -t container_runtime_exec_t "$spec" 2>/dev/null; } &&
+             "$restorecon_bin" -F "${bindir}/kern" 2>/dev/null &&
+             stat -c %C "${bindir}/kern" 2>/dev/null | grep -q ':container_runtime_exec_t:'; then
+            printf "${DIM}    kept by a file-context rule for ${spec}, so a relabel leaves it in place.${ZZ}\n"
+          else
+            chcon -t container_runtime_exec_t "${bindir}/kern" 2>/dev/null || true
+            printf "${DIM}    a relabel resets it (the file-context rule could not be added); running this${ZZ}\n"
+            printf "${DIM}    installer again sets it again, and \`kern doctor\` says when it is gone.${ZZ}\n"
+          fi
+        else
+          printf "${DIM}    a relabel resets it; to keep it across one, as root:${ZZ}\n"
+          printf "      sudo semanage fcontext -a -t container_runtime_exec_t '%s' && sudo restorecon -F '%s'\n" "$spec" "${bindir}/kern"
+          printf "${DIM}    (or run this installer again; \`kern doctor\` says when it is gone).${ZZ}\n"
+        fi
+      else
+        if [ -n "$old" ]; then chcon "$old" "${bindir}/kern" 2>/dev/null || true; fi
+        printf "\n${DIM}    note: SELinux refuses pasta a box's namespaces here, and labelling kern as a container${ZZ}\n"
+        printf "${DIM}    runtime did not change it, so the label was put back. Stacks and one-offs have no${ZZ}\n"
+        printf "${DIM}    internet; \`${bindir}/kern doctor\` shows pasta's own words.${ZZ}\n\n"
+      fi
+    else
+      printf "\n${DIM}    note: SELinux refuses pasta a box's namespaces here, so stacks and one-offs have no${ZZ}\n"
+      printf "${DIM}    internet. The fix is to label kern as a container runtime, and this host does not${ZZ}\n"
+      printf "${DIM}    define that type yet: install container-selinux (podman brings it), then run this${ZZ}\n"
+      printf "${DIM}    installer again. chcon said: %s${ZZ}\n\n" "$(head -c 200 "${tmp}/chcon.err")"
+    fi
+  fi
+fi

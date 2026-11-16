@@ -326,6 +326,9 @@ pub enum Command {
     Stop {
         names: Vec<String>,
         all: bool,
+        /// `-t/--timeout N`: seconds before the kill, for this stop, as `docker stop -t`. `None`
+        /// keeps each box's own `--stop-timeout`.
+        grace: Option<u64>,
     },
     /// `kern pause <name>... | --all` / `kern unpause …`: freeze / thaw running box(es).
     Pause {
@@ -454,6 +457,11 @@ pub enum Command {
     },
     /// Hidden: the pod namespace holder process (spawned by `pod create`, not user-facing).
     PodHolder,
+    /// Hidden: every volume's size, for `kern top`, which measures in a child so the walk never
+    /// blocks a frame (see `tui::VolumeSizer`).
+    VolumeSizes,
+    /// Hidden: attach pasta to a throwaway namespace and exit with what happened (installer).
+    PastaProbe,
     /// Hidden: owns a `--no-pod` stack's peer relays until killed. Argument is the stack's
     /// runtime directory, where the plan file lives.
     RelayHolder {
@@ -471,8 +479,8 @@ pub enum Command {
     },
     /// Hidden: the re-exec'd egress box-netns pump (spawned by `--egress-allow`, not user-facing).
     /// `read_fd` is an inherited pipe from box_run over which the box init pid arrives (the pump is
-    /// spawned in the HOST pid namespace, before box_run unshares CLONE_NEWPID, so it cannot be told the
-    /// pid at spawn time; delivering it over a pipe keeps the pump out of the box pidns).
+    /// spawned in the HOST pid namespace, before box_run makes the box's pid namespace, so it cannot be
+    /// told the pid at spawn time; delivering it over a pipe keeps the pump out of the box pidns).
     EgressPump {
         read_fd: i32,
         box_port: u16,
@@ -575,6 +583,13 @@ pub enum Command {
         /// window. A line the index cannot place is KEPT (see `boxlog::Stamper::window`).
         window: (Option<u64>, Option<u64>),
     },
+    /// `logs --all`: every box's output in one stream, ordered by time. See `logview::print_all`.
+    LogsAll {
+        tail: Option<usize>,
+        follow: bool,
+        timestamps: bool,
+        window: (Option<u64>, Option<u64>),
+    },
     /// `kern inspect <name> [--json]`: full detail for one running box (identity + resources).
     Inspect {
         name: String,
@@ -615,6 +630,26 @@ pub enum Command {
     /// [`crate::keepbox`].
     Start {
         names: Vec<String>,
+        /// `-a/--attach`: follow the box's output after the start and exit with its code.
+        attach: bool,
+    },
+    /// `kern restart [-t N] <name>...`: stop a kept box and start it again (see
+    /// [`commands::restart`]).
+    Restart {
+        names: Vec<String>,
+        grace: Option<u64>,
+    },
+    /// `kern create [OPTIONS] IMAGE [COMMAND] [ARG...]`: a kept box recorded and not started.
+    Create {
+        name: String,
+        image: String,
+        /// The `kern box` command line recorded for `kern start`.
+        argv: Vec<String>,
+    },
+    /// `kern export <box> [-o file]`: the box's filesystem as a tar.
+    Export {
+        name: String,
+        out: Option<String>,
     },
     /// `kern rm <name>...`: remove a stopped `--keep` box - its layer and its record.
     Rm {
@@ -815,6 +850,8 @@ pub enum Command {
         profiles: Vec<String>,
         /// Where `files` came from (see [`commands::ComposeFilesFrom`]).
         files_from: commands::ComposeFilesFrom,
+        /// `config`'s views and output (see [`commands::ConfigFlags`]).
+        config_flags: commands::ConfigFlags,
     },
     /// `kern config [edit|setup|probe|clear]`: manage `kern.toml` (default: list its profiles).
     Config {
@@ -1093,6 +1130,51 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // flags or render different output: there is one parser per verb and this only chooses
         // which one. The cost of the alternative is measured elsewhere in this file, where two
         // paths answering one input differently is the divergence class treated as a defect.
+        // `container <verb>`: Docker's grouping of the box verbs, onto kern's own (one parser each,
+        // as `image <verb>`). `container ls|list|ps` is `ps`. Three are refused by name, because
+        // kern's verb of that name does something else: `run` (kern's `run` caps a host process;
+        // Docker's is `kern box`), `top` (kern's is the task manager) and `prune` (kern's removes a
+        // stopped box's leftovers, Docker's removes stopped containers).
+        Some("container") => {
+            let sub = rest.get(1).copied().unwrap_or_default();
+            let mapped = match sub {
+                "ls" | "list" | "ps" => "ps",
+                "rm" | "remove" => "rm",
+                v @ ("attach" | "commit" | "cp" | "create" | "diff" | "exec" | "export"
+                | "inspect" | "kill" | "logs" | "pause" | "port" | "rename" | "restart"
+                | "start" | "stats" | "stop" | "unpause" | "update" | "wait") => v,
+                "run" => {
+                    return Err(Error::Cli(
+                        "container run: kern's sandboxed run is `kern box <name> --image <ref> \
+                         [-- CMD]` (`kern run` caps a host process and runs no image)"
+                            .to_string(),
+                    ))
+                }
+                "top" => {
+                    return Err(Error::Cli(
+                        "container top: kern's `top` is the task manager; a stack's processes are \
+                         `kern compose <file> top`, a box's are `kern exec <box> ps`"
+                            .to_string(),
+                    ))
+                }
+                "prune" => {
+                    return Err(Error::Cli(
+                        "container prune has no alias: `kern prune` removes stopped boxes' \
+                         leftovers, not kept boxes; `kern rm <name>` removes a kept box"
+                            .to_string(),
+                    ))
+                }
+                "" => return Err(Error::Usage("container ls|create|start|stop|restart|rm|exec|logs|cp|diff|commit|export|inspect|kill|pause|unpause|port|rename|stats|update|wait|attach")),
+                other => {
+                    return Err(Error::Cli(format!(
+                        "container {other}: not a kern verb (`kern container` with no verb lists them)"
+                    )))
+                }
+            };
+            let mut rewritten: Vec<String> = vec![mapped.to_string()];
+            rewritten.extend(args.iter().skip(2).cloned());
+            return parse(&rewritten);
+        }
         Some("image") => {
             let sub = rest.get(1).copied().unwrap_or_default();
             let mapped = match sub {
@@ -1130,6 +1212,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         }
         // Hidden: the pod namespace holder (spawned by `pod create`).
         Some("__pod-holder") => Command::PodHolder,
+        // Hidden: volume sizes for `kern top` (see `tui::VolumeSizer`).
+        Some("__volume-sizes") => Command::VolumeSizes,
+        Some("__pasta-probe") => Command::PastaProbe,
         // Hidden: the relay holder (spawned by `compose up --no-pod`).
         Some("__relay-holder") => Command::RelayHolder {
             dir: rest.get(1).map(|s| s.to_string()).unwrap_or_default(),
@@ -1398,24 +1483,50 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `stop <name>` / `kill <name>`: stop running box(es). kern's `stop` already SIGKILLs the
         // box's process group, so `kill` is a Docker-parity alias. `killall` = `stop --all`.
         Some(v @ ("stop" | "kill")) => {
-            reject_unknown_flags(v, &rest, &["--all", "-a"])?;
-            let all = rest.iter().any(|a| *a == "--all" || *a == "-a");
-            let names: Vec<String> = rest
-                .iter()
-                .skip(1)
-                .filter(|a| !a.starts_with('-'))
-                .map(|s| (*s).to_string())
-                .collect();
+            // `-t/--timeout N` (and Docker's older `--time`) on `stop`: the grace before the kill.
+            // MEASURED: `kern stop -t 0 web` answered `unknown flag "-t"`, which is the form every
+            // Docker script uses; `kill` has no grace to set, as `docker kill` has none.
+            let mut all = false;
+            let mut grace: Option<u64> = None;
+            let mut names: Vec<String> = Vec::new();
+            let bad = || Error::Usage("stop [-t|--timeout SECONDS] <name>... | stop --all");
+            let mut i = 1;
+            while let Some(a) = rest.get(i).copied() {
+                let (flag, inline) = match a.split_once('=') {
+                    Some((f, val)) if f.starts_with('-') => (f, Some(val)),
+                    _ => (a, None),
+                };
+                match flag {
+                    "--all" | "-a" if inline.is_none() => all = true,
+                    "-t" | "--timeout" | "--time" if v == "stop" => {
+                        let val = match inline {
+                            Some(val) => val,
+                            None => {
+                                i += 1;
+                                rest.get(i).copied().ok_or_else(bad)?
+                            }
+                        };
+                        grace = Some(val.parse::<u64>().map_err(|_| bad())?);
+                    }
+                    f if f.starts_with('-') => {
+                        reject_unknown_flags(v, &[v, a], &["--all", "-a"])?;
+                        return Err(bad());
+                    }
+                    name => names.push(name.to_string()),
+                }
+                i += 1;
+            }
             if !all && names.is_empty() {
                 return Err(Error::Usage("stop <name>... | stop --all"));
             }
-            Command::Stop { names, all }
+            Command::Stop { names, all, grace }
         }
         Some("killall") => {
             reject_unknown_flags("killall", &rest, &[])?;
             Command::Stop {
                 names: Vec::new(),
                 all: true,
+                grace: None,
             }
         }
         // `pause`/`unpause` (aka `freeze`/`unfreeze`): freeze/thaw box(es) via the cgroup freezer.
@@ -1630,6 +1741,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         Some("logs") => {
             let (mut lname, mut tail, mut follow) = (None, None, false);
             let mut timestamps = false;
+            let mut all = false;
             let (mut since, mut until) = (None, None);
             let now_nanos = log_clock_now();
             let mut i = 1;
@@ -1637,6 +1749,9 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 match rest[i] {
                     "-f" | "--follow" => follow = true,
                     "-t" | "--timestamps" => timestamps = true,
+                    // `--all`: every box's output in one stream, ordered by time (`kern top`'s
+                    // Logs tab for a script). Docker has no CLI equivalent.
+                    "-a" | "--all" => all = true,
                     // `--since`/`--until`: the flags a monitoring loop writes (`logs --since 30s`)
                     // and the ones an incident write-up writes (an RFC3339 pair). A value that does
                     // not parse is REFUSED with the three forms named: a silently misread time
@@ -1689,18 +1804,32 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     ));
                 }
             }
-            match lname {
-                Some(name) => Command::Logs {
-                    name,
+            if all {
+                if lname.is_some() {
+                    return Err(Error::Usage(
+                        "logs --all takes no box name: it is every box (`logs <name>` is one)",
+                    ));
+                }
+                Command::LogsAll {
                     tail,
                     follow,
                     timestamps,
                     window: (since, until),
-                },
-                None => {
-                    return Err(Error::Usage(
-                        "logs <name> [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]",
-                    ))
+                }
+            } else {
+                match lname {
+                    Some(name) => Command::Logs {
+                        name,
+                        tail,
+                        follow,
+                        timestamps,
+                        window: (since, until),
+                    },
+                    None => {
+                        return Err(Error::Usage(
+                            "logs <name>|--all [--tail N] [-f|--follow] [-t|--timestamps] [--since T] [--until T]",
+                        ))
+                    }
                 }
             }
         }
@@ -1814,7 +1943,8 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
         // `start <name>...`: the other half of `box --keep`. No `--all`: starting every box somebody
         // once kept is not a thing to ask for in one word, and the names are what the operator means.
         Some("start") => {
-            reject_unknown_flags("start", &rest, &[])?;
+            reject_unknown_flags("start", &rest, &["-a", "--attach"])?;
+            let attach = rest.iter().skip(1).any(|a| *a == "-a" || *a == "--attach");
             let names: Vec<String> = rest
                 .iter()
                 .skip(1)
@@ -1823,10 +1953,133 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 .collect();
             if names.is_empty() {
                 return Err(Error::Usage(
-                    "start <name>...  (a box created with `box --keep`)",
+                    "start [-a] <name>...  (a box created with `box --keep` or `kern create`)",
                 ));
             }
-            Command::Start { names }
+            Command::Start { names, attach }
+        }
+        // `restart [-t N] <name>...`: Docker's restart, on kept boxes. `-t`/`--time` is the grace
+        // before the kill, in seconds, as Docker's.
+        Some("restart") => {
+            let split = split_equals_flags(&rest[1..], &["-t", "--time"], &[])?;
+            let mut grace: Option<u64> = None;
+            let mut names: Vec<String> = Vec::new();
+            let mut it = split.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "-t" | "--time" => {
+                        grace = Some(
+                            it.next()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .ok_or(Error::Usage("restart -t <seconds> <name>..."))?,
+                        );
+                    }
+                    f if f.starts_with('-') => {
+                        return Err(Error::Cli(format!(
+                            "restart: unknown flag \"{f}\" (it takes -t/--time)"
+                        )))
+                    }
+                    n => names.push(n.to_string()),
+                }
+            }
+            if names.is_empty() {
+                return Err(Error::Usage("restart [-t N] <name>..."));
+            }
+            Command::Restart { names, grace }
+        }
+        // `create [OPTIONS] IMAGE [COMMAND] [ARG...]`, Docker's spelling: the options are `kern box`'s,
+        // the first word that is not one (or the value of one) is the image, the rest is the command.
+        // Recorded as `box <name> OPTIONS --image IMAGE --keep [-d] -- COMMAND`, detached unless the
+        // options ask for a terminal, so `kern start` runs it as Docker's `start` runs a created one.
+        Some("create") => {
+            let split = split_equals_flags(&rest[1..], VALUE_FLAGS, NO_VALUE_FLAGS)?;
+            const SHORT_VALUE: &[&str] = &["-e", "-l", "-p", "-v", "-w", "-u"];
+            let mut opts: Vec<String> = Vec::new();
+            let mut name: Option<String> = None;
+            let mut image: Option<String> = None;
+            let mut command: Vec<String> = Vec::new();
+            let mut it = split.iter();
+            while let Some(a) = it.next() {
+                if image.is_some() {
+                    command.push((*a).to_string());
+                    continue;
+                }
+                match *a {
+                    "--name" => {
+                        name = Some(
+                            it.next()
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("create --name <name> IMAGE"))?,
+                        );
+                    }
+                    "--" => {}
+                    "--keep" | "-d" | "--detach" => {}
+                    f if VALUE_FLAGS.contains(&f) || SHORT_VALUE.contains(&f) => {
+                        opts.push(f.to_string());
+                        if let Some(v) = it.next() {
+                            opts.push((*v).to_string());
+                        }
+                    }
+                    f if f.starts_with('-') => opts.push(f.to_string()),
+                    img => image = Some(img.to_string()),
+                }
+            }
+            let image = image.ok_or(Error::Usage("create [OPTIONS] IMAGE [COMMAND] [ARG...]"))?;
+            if opts.iter().any(|o| o == "--image" || o == "--rootfs") {
+                return Err(Error::Cli(
+                    "create: the image is the first word after the options, as Docker's `create` \
+                     takes it, not `--image`/`--rootfs`"
+                        .to_string(),
+                ));
+            }
+            let name = match name {
+                Some(n) => n,
+                None => generated_box_name(),
+            };
+            let interactive = opts.iter().any(|o| {
+                matches!(
+                    o.as_str(),
+                    "-i" | "-t" | "-it" | "-ti" | "--tty" | "--interactive"
+                )
+            });
+            let mut argv: Vec<String> = vec!["box".to_string(), name.clone()];
+            argv.extend(opts);
+            argv.extend(["--image".to_string(), image.clone(), "--keep".to_string()]);
+            if !interactive {
+                argv.push("-d".to_string());
+            }
+            if !command.is_empty() {
+                argv.push("--".to_string());
+                argv.extend(command);
+            }
+            Command::Create { name, image, argv }
+        }
+        Some("export") => {
+            let split = split_equals_flags(&rest[1..], &["-o", "--output"], &[])?;
+            let mut out: Option<String> = None;
+            let mut name: Option<String> = None;
+            let mut it = split.iter();
+            while let Some(a) = it.next() {
+                match *a {
+                    "-o" | "--output" => {
+                        out = Some(
+                            it.next()
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("export <box> -o <file>"))?,
+                        );
+                    }
+                    f if f.starts_with('-') => {
+                        return Err(Error::Cli(format!(
+                            "export: unknown flag \"{f}\" (it takes -o/--output)"
+                        )))
+                    }
+                    n => name = Some(n.to_string()),
+                }
+            }
+            Command::Export {
+                name: name.ok_or(Error::Usage("export <box> [-o file]"))?,
+                out,
+            }
         }
         // `rm <name>...`: removes a KEPT box. Deliberately not an alias of `stop`: Docker's `rm`
         // refuses a running container, and so does this, naming `stop` instead of killing anything.
@@ -1853,14 +2106,21 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 &rest,
                 &["-m", "--memory", "--cpus", "--pids-limit"],
             )?;
-            let name = rest
-                .iter()
-                .skip(1)
-                .find(|a| !a.starts_with('-'))
-                .map(|s| (*s).to_string())
-                .ok_or(Error::Usage(
-                    "update <box> [--memory M] [--cpus N] [--pids-limit P]",
-                ))?;
+            // THE BOX IS THE WORD THAT IS NEITHER A FLAG NOR A FLAG'S VALUE, so the flags may come
+            // first, as Docker's `update --cpus 0.5 web` writes them. MEASURED: that line took `0.5`
+            // for the box ("no running box named '0.5'").
+            let mut name: Option<String> = None;
+            let mut words = rest.iter().skip(1);
+            while let Some(a) = words.next() {
+                if matches!(*a, "-m" | "--memory" | "--cpus" | "--pids-limit") {
+                    words.next();
+                } else if !a.starts_with('-') && name.is_none() {
+                    name = Some((*a).to_string());
+                }
+            }
+            let name = name.ok_or(Error::Usage(
+                "update <box> [--memory M] [--cpus N] [--pids-limit P]",
+            ))?;
             let memory = match flag_value(&rest, "-m").or_else(|| flag_value(&rest, "--memory")) {
                 Some(v) => {
                     let b = kern_common::parse_binary_size(&v).ok_or(Error::Usage(
@@ -2070,6 +2330,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
             let mut remove_orphans = false;
             let mut ps_quiet = false;
             let mut ps_services = false;
+            let mut config_flags = commands::ConfigFlags::default();
             let mut ps_format: Option<String> = None;
             let mut run_cmd: Vec<String> = Vec::new();
             let mut run_rm = false;
@@ -2395,11 +2656,34 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                     // `--format json` for anything that parses.
                     "-q" | "--quiet" => ps_quiet = true,
                     "--services" => ps_services = true,
+                    // `config`'s views, as `docker compose config` spells them.
+                    "--images" => config_flags.images = true,
+                    "--networks" => config_flags.networks = true,
+                    "--profiles" => config_flags.profiles = true,
+                    "--environment" => config_flags.environment = true,
+                    "--variables" => config_flags.variables = true,
+                    "--no-interpolate" => config_flags.no_interpolate = true,
+                    "--hash" => {
+                        config_flags.hash = Some(
+                            inline_or_next(inline, &mut it)
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("compose config --hash <service,...|*>"))?,
+                        );
+                    }
+                    "-o" | "--output" => {
+                        config_flags.output = Some(
+                            inline_or_next(inline, &mut it)
+                                .map(|v| (*v).to_string())
+                                .ok_or(Error::Usage("compose config -o <file>"))?,
+                        );
+                    }
                     "--format" => {
                         ps_format = Some(
                             inline_or_next(inline, &mut it)
                                 .map(|v| (*v).to_string())
-                                .ok_or(Error::Usage("compose ps --format <template|json>"))?,
+                                .ok_or(Error::Usage(
+                                    "compose --format <template|json> (config: yaml|json)",
+                                ))?,
                         );
                     }
                     "--wait-timeout" => {
@@ -2575,6 +2859,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 project_root,
                 profiles,
                 files_from,
+                config_flags,
             }
         }
         // `up [--no-pod]` / `down`: Docker-familiar shorthands that DISCOVER a compose file in the CWD
@@ -2664,6 +2949,7 @@ pub fn parse(args: &[String]) -> Result<(GlobalOpts, Command), Error> {
                 project_root: None,
                 profiles: Vec::new(),
                 files_from,
+                config_flags: commands::ConfigFlags::default(),
             }
         }
         // `config`: list resource profiles from kern.toml.
@@ -5406,10 +5692,6 @@ fn unknown_compose_flag(flag: &str) -> String {
     // who has just hit the error, at the moment they are most likely to believe it.
     let known: &[(&str, &str)] = &[
         (
-            "--compatibility",
-            "kern has no v1 naming to fall back to; boxes are named <project>-<service>",
-        ),
-        (
             "--project-directory",
             "kern resolves a service's relative paths against the FILE's directory, as docker \
              does by default; `-p/--project-name` sets the name the pod and the volumes are \
@@ -5434,28 +5716,28 @@ fn unknown_compose_flag(flag: &str) -> String {
          -a/--all, --build, --no-deps, --force-recreate, --no-recreate, -V/--renew-anon-volumes, \
          --wait, --wait-timeout, --exit-code-from, --abort-on-container-exit, --remove-orphans, \
          --pull, -t/--timeout, --rmi, --format, --services, -q/--quiet, -T, --rm, --no-color, \
-         -v/--volume (on `run`)"
+         -v/--volume (on `run`), --no-log-prefix, --since, --until, --scale, --index, \
+         --no-build, --project-root, --build-arg, and on `config` --images, --networks, \
+         --profiles, --environment, --variables, --no-interpolate, --hash, -o/--output"
     )
 }
 
 /// What to say about a `docker compose` verb kern does not implement.
 ///
-/// EACH ONE IS A DECISION, not a gap waiting to be filled, and the sentence says which decision.
-/// `scale` has no meaning in a model where a service is one box; `create` has none in a model with
-/// no "created but not started" state to create INTO. Answering either with the generic verb list
+/// EACH ONE IS A DECISION, not a gap waiting to be filled, and the sentence says which decision:
+/// `scale` is a flag of `up` here, and a stack is created by `up`. Answering either with the generic verb list
 /// leaves the reader to work out which of sixteen words they should have typed, for a question whose
 /// answer is that the concept is absent.
 fn refused_compose_verb(verb: &str) -> Option<String> {
     let why = match verb {
         "scale" => {
-            "kern has no replica count: a service is one box. Declare the copies you want as \
-             separate services, or run the same image again with `kern compose <file> run`"
+            "`kern compose <file> up --scale SERVICE=N` sets the replica count, as \
+             `deploy.replicas` does in the file"
         }
         "create" => {
-            "kern has no CREATED-but-not-started state for a box to be created into - a box exists \
-             by running. `up --no-start` has the same shape and the same answer; to prepare without \
-             starting, `kern compose <file> pull` fetches the images and \
-             `kern compose <file> build` builds what the file builds"
+            "a stack is created by `up`. `kern create` makes one box that is not started; for a \
+             stack, `kern compose <file> pull` fetches the images and `kern compose <file> build` \
+             builds what the file builds"
         }
         "alpha" | "beta" => {
             "that is Docker's staging area for unreleased subcommands, and kern implements the \
@@ -5616,6 +5898,22 @@ fn compose_files_for_no_file(
     from_var.or_else(|| {
         discover_compose_file().map(|f| (vec![f], commands::ComposeFilesFrom::Discovered))
     })
+}
+
+/// A name for a box `create` was given none for, as Docker names an unnamed container: `box-` and
+/// eight hex digits from the kernel's random source, so two creates cannot pick one name.
+fn generated_box_name() -> String {
+    let mut b = [0u8; 4];
+    // SAFETY: `getrandom` writes at most `b.len()` bytes into the buffer it is given.
+    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    if n != 4 {
+        // No random source: the pid and the time, which are unique enough for one host.
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        return format!("box-{:04x}{:04x}", std::process::id() & 0xffff, t & 0xffff);
+    }
+    format!("box-{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
 }
 
 /// The refusal when discovery found nothing, naming every name it tried and both ways to say it
@@ -5931,99 +6229,113 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             verbose,
             profiles,
             rm,
-        } => commands::box_run(commands::BoxRunArgs {
-            rm,
-            name: &name,
-            rootfs: rootfs.as_deref(),
-            image: image.as_deref(),
-            pull,
-            command: &command,
-            entrypoint: entrypoint.as_deref(),
-            detached,
-            read_only,
-            volumes: &volumes,
-            mounts: &mounts,
-            env: &env,
-            egress_allow: &egress_allow,
-            landlock_rw: &landlock_rw,
-            net_ips: &net_ips,
-            pod_bridges: pod_bridges.clone(),
-            apparmor: apparmor.as_deref(),
-            workdir: workdir.as_deref(),
-            share_net,
-            pod: pod.as_deref(),
-            net_container: net_container.as_deref(),
-            ipc: ipc.as_deref(),
-            uid_range,
-            no_uid_range,
-            bind_rootfs,
-            privileged,
-            require_limits,
-            allow_uncapped,
-            security_profile,
-            overlay_lower: &overlay_lower,
-            overlay_upper: overlay_upper.as_deref(),
-            keep,
-            memory,
-            memory_swap_max,
-            cpus,
-            cpuset: cpuset.as_deref(),
-            tty,
-            ports: &ports,
-            secrets: &secrets,
-            secret_envs: &secret_envs,
-            secret_mode,
-            ssh_port,
-            ssh_key: ssh_key.as_deref(),
-            hostname: hostname.as_deref(),
-            tun,
-            gpus: gpus.as_deref(),
-            device: device.as_deref(),
-            runtime_nvidia,
-            build_ssh_agents: &build_ssh_agents,
-            no_new_privs,
-            init,
-            pids_limit,
-            tmpfs: &tmpfs,
-            shm_size,
-            ulimits: &ulimits,
-            sysctls: &sysctls,
-            labels: &labels,
-            restart_max,
-            def_hash: def_hash.as_deref().unwrap_or(""),
-            stop_signal,
-            stop_grace,
-            run_as: run_as.as_deref(),
-            group_add: &group_add,
-            cap_add: &cap_add,
-            cap_drop: &cap_drop,
-            restart,
-            health_cmd: health_cmd.as_deref(),
-            health_cmd_argv: &health_cmd_argv,
-            health_interval,
-            health_retries,
-            health_start_period,
-            health_start_interval,
-            health_timeout,
-            health_action: health_action.as_deref(),
-            env_file: &env_file,
-            timeout,
-            nice,
-            io_weight,
-            config: config.as_deref(),
-            show_config,
-            quiet,
-            verbose,
-            profiles: &profiles,
-            add_hosts: &add_hosts,
-            dns: &dns,
-            dns_search: &dns_search,
-            dns_options: &dns_options,
-            log_max_size,
-            log_max_file,
-            memory_reservation,
-            cpu_weight,
-        }),
+        } => {
+            // `--network <project>_<network>` onto a running stack: see `stack_network_join`.
+            let (pod, pod_bridges, add_hosts, stack_outbound) =
+                commands::stack_network_join(pod, pod_bridges, add_hosts)?;
+            // ITS RESOLVERS WITH ITS NAT, as `compose up` hands them to each service it gives one:
+            // the host's, reachable through the NAT. A `--dns` the caller gave is theirs and is
+            // not appended to.
+            let dns: Vec<String> = if stack_outbound && dns.is_empty() {
+                crate::pod::host_nameservers()
+            } else {
+                dns
+            };
+            commands::box_run(commands::BoxRunArgs {
+                rm,
+                name: &name,
+                rootfs: rootfs.as_deref(),
+                image: image.as_deref(),
+                pull,
+                command: &command,
+                entrypoint: entrypoint.as_deref(),
+                detached,
+                read_only,
+                volumes: &volumes,
+                mounts: &mounts,
+                env: &env,
+                egress_allow: &egress_allow,
+                landlock_rw: &landlock_rw,
+                net_ips: &net_ips,
+                pod_bridges: pod_bridges.clone(),
+                apparmor: apparmor.as_deref(),
+                workdir: workdir.as_deref(),
+                share_net,
+                pod: pod.as_deref(),
+                net_container: net_container.as_deref(),
+                ipc: ipc.as_deref(),
+                uid_range,
+                no_uid_range,
+                bind_rootfs,
+                privileged,
+                require_limits,
+                allow_uncapped,
+                security_profile,
+                overlay_lower: &overlay_lower,
+                overlay_upper: overlay_upper.as_deref(),
+                keep,
+                memory,
+                memory_swap_max,
+                cpus,
+                cpuset: cpuset.as_deref(),
+                tty,
+                ports: &ports,
+                secrets: &secrets,
+                secret_envs: &secret_envs,
+                secret_mode,
+                ssh_port,
+                ssh_key: ssh_key.as_deref(),
+                hostname: hostname.as_deref(),
+                tun,
+                gpus: gpus.as_deref(),
+                device: device.as_deref(),
+                runtime_nvidia,
+                build_ssh_agents: &build_ssh_agents,
+                no_new_privs,
+                init,
+                pids_limit,
+                tmpfs: &tmpfs,
+                shm_size,
+                ulimits: &ulimits,
+                sysctls: &sysctls,
+                labels: &labels,
+                restart_max,
+                def_hash: def_hash.as_deref().unwrap_or(""),
+                stop_signal,
+                stop_grace,
+                run_as: run_as.as_deref(),
+                group_add: &group_add,
+                cap_add: &cap_add,
+                cap_drop: &cap_drop,
+                restart,
+                health_cmd: health_cmd.as_deref(),
+                health_cmd_argv: &health_cmd_argv,
+                health_interval,
+                health_retries,
+                health_start_period,
+                health_start_interval,
+                health_timeout,
+                health_action: health_action.as_deref(),
+                env_file: &env_file,
+                timeout,
+                nice,
+                io_weight,
+                config: config.as_deref(),
+                show_config,
+                quiet,
+                verbose,
+                profiles: &profiles,
+                add_hosts: &add_hosts,
+                dns: &dns,
+                stack_outbound,
+                dns_search: &dns_search,
+                dns_options: &dns_options,
+                log_max_size,
+                log_max_file,
+                memory_reservation,
+                cpu_weight,
+            })
+        }
         Command::Run {
             command,
             memory,
@@ -6144,6 +6456,9 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         }
         Command::NetworkRemove { names } => crate::network::remove_many(&names),
         Command::PodHolder => crate::pod::run_holder(),
+        Command::VolumeSizes => crate::volume::print_sizes(),
+        // A hidden verb whose exit status IS its answer, and which has already cleaned up after itself.
+        Command::PastaProbe => std::process::exit(crate::pod::pasta_probe_verb()),
         Command::RelayHolder { dir } => crate::relayhold::run_holder(&dir),
         Command::EgressProxy { sock, allow } => crate::egress::proxy_reexec(&sock, &allow),
         Command::BuildSshProxy { listen, upstream } => {
@@ -6183,7 +6498,15 @@ pub fn run(args: &[String]) -> Result<(), Error> {
         Command::Push { local, remote } => commands::push(&local, remote.as_deref()),
         Command::Tag { src, dst } => commands::tag(&src, &dst),
         Command::Commit { box_ref, image } => commands::commit(&box_ref, &image),
-        Command::Stop { names, all } => commands::stop(&names, all),
+        Command::Stop { names, all, grace } => match grace {
+            None => commands::stop(&names, all),
+            Some(_) => commands::inspect::stop_with_grace(
+                &names,
+                all,
+                grace,
+                commands::DeafInit::WaitGrace,
+            ),
+        },
         Command::Pause { names, all, freeze } => commands::pause(&names, all, freeze),
         Command::Attach { name } => commands::attach(&name),
         Command::Cp { src, dst } => crate::boxcp::cp(&src, &dst),
@@ -6215,6 +6538,12 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             timestamps,
             window,
         } => commands::logs(&name, tail, follow, timestamps, window),
+        Command::LogsAll {
+            tail,
+            follow,
+            timestamps,
+            window,
+        } => crate::logview::print_all(tail, follow, timestamps, window),
         Command::Inspect { name, json, format } => {
             commands::inspect_formatted(&name, json, format.as_deref())
         }
@@ -6230,7 +6559,10 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             count,
         } => commands::bench(rootfs.as_deref(), image.as_deref(), bind_rootfs, count),
         Command::Recover => commands::recover(),
-        Command::Start { names } => commands::start_kept(&names),
+        Command::Start { names, attach } => commands::start_kept(&names, attach),
+        Command::Restart { names, grace } => commands::restart(&names, grace),
+        Command::Create { name, image, argv } => commands::create(&name, &image, &argv),
+        Command::Export { name, out } => commands::export(&name, out.as_deref()),
         Command::Rm { names, force } => commands::remove_kept(&names, force),
         Command::Rename { old, new } => commands::rename(&old, &new),
         Command::Port {
@@ -6309,6 +6641,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             project_root,
             profiles,
             files_from,
+            config_flags,
         } => commands::compose(commands::ComposeOpts {
             files: &files,
             action,
@@ -6357,6 +6690,7 @@ pub fn run(args: &[String]) -> Result<(), Error> {
             project_root: project_root.as_deref(),
             profiles: &profiles,
             files_from,
+            config_flags: &config_flags,
         }),
         Command::Config { sub, force, json } => commands::config_cmd(&sub, force, json),
         Command::ConfigAdd { args } => commands::config_add(&args),
@@ -9448,14 +9782,36 @@ mod tests {
             Command::Stop {
                 names: vec!["a".into(), "b".into(), "c".into()],
                 all: false,
+                grace: None,
             }
         );
+        // `-t N` / `--timeout N` / `--timeout=N` / `--time N`: Docker's grace, on `stop` only.
+        for args in [
+            &["stop", "-t", "0", "web"][..],
+            &["stop", "--timeout", "0", "web"][..],
+            &["stop", "--timeout=0", "web"][..],
+            &["stop", "web", "--time", "0"][..],
+        ] {
+            let v: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(
+                parse(&v).unwrap().1,
+                Command::Stop {
+                    names: vec!["web".into()],
+                    all: false,
+                    grace: Some(0),
+                },
+                "{args:?}"
+            );
+        }
+        assert!(parse(&["stop".into(), "-t".into(), "x".into(), "web".into()]).is_err());
+        assert!(parse(&["kill".into(), "-t".into(), "0".into(), "web".into()]).is_err());
         // `--all` sets the flag; names may be empty.
         assert_eq!(
             parse(&["stop".into(), "--all".into()]).unwrap().1,
             Command::Stop {
                 names: vec![],
-                all: true
+                all: true,
+                grace: None,
             }
         );
         // Flags are not captured as names: `stop --all x` keeps all=true and name x.
@@ -9465,7 +9821,8 @@ mod tests {
                 .1,
             Command::Stop {
                 names: vec!["x".into()],
-                all: true
+                all: true,
+                grace: None,
             }
         );
     }

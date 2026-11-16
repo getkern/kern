@@ -57,4 +57,4 @@ done
 
 echo
 echo "==> roll complete: 3 instances, all on the new image, never a downtime window:"
-"$kern" ps --filter "name=${svc}-new" --format '    {{.Names}}  {{.Status}}  up {{.RunningFor}}' | sort
+"$kern" ps --filter "name=${svc}-new" --format '    {{.Names}}  {{.Status}}' | sort

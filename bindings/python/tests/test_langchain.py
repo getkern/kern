@@ -395,11 +395,15 @@ def test_a_setup_that_fails_does_not_leave_its_workspace_behind():
     """The tool opens a session that no `with` block will ever close, so the end-to-end property is
     worth asserting here even though `Sandbox.__enter__` also undoes a failed `setup=` on its own.
     Checked in a child process because the cleanup runs at exit: asserting it inside this one would
-    only prove that the directory is still there."""
+    only prove that the directory is still there.
+
+    The child gets a TMPDIR of its own and only that directory is read: the shared temporary directory
+    is written by every other SDK session on the host, and MEASURED, a Node suite running beside this
+    one put its own `kern-ws-*` there and failed this test once in three."""
     import glob
     import tempfile
 
-    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "kern-ws-*")))
+    own_tmp = tempfile.mkdtemp(prefix="kern-ws-test-")
     child = subprocess.run(
         [
             sys.executable,
@@ -414,10 +418,16 @@ def test_a_setup_that_fails_does_not_leave_its_workspace_behind():
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)},
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
+            "TMPDIR": own_tmp,
+        },
     )
+    left = glob.glob(os.path.join(own_tmp, "kern-ws-*"))
+    os.rmdir(own_tmp) if not os.listdir(own_tmp) else None
     assert child.stdout.strip() == "refused", child.stderr
-    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "kern-ws-*"))) == before
+    assert left == [], left
 
 
 def test_importing_the_module_does_not_import_langchain():

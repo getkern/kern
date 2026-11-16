@@ -1832,11 +1832,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         vgpio_devs.extend(vg.devs);
         vgpio_sysfs.extend(vg.sysfs);
     }
-    let cpus = clamp_cpus(cpus);
-    // Clamp the pin list to the host CPUs too (flag OR profile), so an over-wide `0-9999` becomes the
-    // valid subset instead of aborting the box with systemd's raw "Failed to parse AllowedCPUs".
-    // Refuses outright when NOTHING in the list exists here: see `clamp_cpuset`.
-    let cpuset = clamp_cpuset(cpuset)?;
+    // Refused, as Docker refuses them, when they name more than this host has (see `check_cpus`).
+    let cpus = check_cpus(cpus, cpu_source(args.cpus.is_some()))?;
+    let cpuset = check_cpuset(cpuset, cpu_source(args.cpuset.is_some()))?;
     // `--show-config`: a dry run - print the resolved box configuration and exit BEFORE any host-side
     // mount or the systemd-scope re-exec, so nothing is created or torn down.
     if args.show_config {
@@ -1966,7 +1964,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             // mounting one overlay upperdir is undefined behaviour by the kernel's own message. See
             // `keepbox::hold_layer` for the two measured ways a name claim lets that happen.
             crate::keepbox::hold_layer(&dir)?;
-            let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+            let argv = kept_argv(std::env::args_os().skip(1).collect(), name.as_str());
             let previous = crate::keepbox::read(&dir);
             // A DIFFERENT IMAGE ON AN EXISTING LAYER IS REFUSED, because a kept layer is a DELTA and
             // a delta only means something on the base it was written against. MEASURED: `kern box
@@ -3041,6 +3039,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             log_cap,
             args.image.unwrap_or(""),
             args.gpus.unwrap_or(""),
+            args.pod.filter(|_| args.stack_outbound),
         );
     }
     // Foreground/interactive: print the status panel - but only when stderr is a real terminal, so
@@ -3086,7 +3085,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
             pid1_recorded: 0,
             pid1_starttime: 0,
             rootfs: spec.root.clone(),
-            command: spec.command.join(" "),
+            command: crate::registry::command_line(&spec.command),
             started: registry::now_unix(),
             starttime: registry::proc_starttime(pid),
             ports: ports_summary(ports),
@@ -3143,10 +3142,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     drop(name_claim);
     // Foreground: run the box (the runtime forks `-p` forwarders before the unshare and tears them
     // down when the box exits). `--timeout N`: arm a watchdog that SIGKILLs the box's PID 1 after N
-    // seconds. The watchdog MUST be forked here - BEFORE `run_in_sandbox_with` does its
-    // `unshare(CLONE_NEWPID)` - so it lives in the host (ancestor) pid namespace; a process forked
-    // after the unshare would land INSIDE the box's namespace, where a non-init member can't signal
-    // the ns-init. It learns the box's PID 1 over a pipe (written by `on_started`). Skipped for a
+    // seconds. The watchdog MUST be forked here - BEFORE `run_in_sandbox_with` makes the box's pid
+    // namespace - so it lives in the host (ancestor) pid namespace; on the path where that namespace
+    // is unshared just before the fork (`fork_into_cgroup`'s fallback), a process forked after it
+    // would land INSIDE the box's namespace, where a non-init member can't signal the ns-init. It learns the box's PID 1 over a pipe (written by `on_started`). Skipped for a
     // managed box - a persistent box is meant to stay up; a timeout would just fight systemd's restart.
     let timeout_wd = (args.timeout > 0 && !managed)
         .then(|| spawn_foreground_timeout(args.timeout))
@@ -3161,7 +3160,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // service underneath was up. Reported against v0.8.0.
     //
     // FORKED HERE, BEFORE `run_in_sandbox_with`, for the same reason the timeout watchdog above is: a
-    // process forked after the `unshare(CLONE_NEWPID)` lands INSIDE the box's pid namespace, where it
+    // process forked after the box's pid namespace is unshared lands INSIDE it, where it
     // becomes an un-reapable zombie on box exit and deadlocks the namespace teardown. The checker does
     // not need PID 1 at fork time - it re-reads `pid1` from the registry each round, which is also how
     // it follows a `--restart` - so there is nothing to wait for.
@@ -3172,9 +3171,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         .into_owned()
         .and_then(|hc| spawn_health_checker(name.as_str().to_string(), launcher_pid, hc));
     // Egress filter: spawn BOTH helpers NOW, while box_run is still in the HOST pid namespace (before
-    // `run_in_sandbox_with` does `unshare(CLONE_NEWPID)`). Spawning them from the `on_started` callback
-    // instead would land them in the BOX pid namespace (box_run's `pid_for_children` is the box pidns by
-    // then), where a helper becomes an un-reapable zombie on box exit and deadlocks the pidns teardown:
+    // `run_in_sandbox_with` makes the box's). Spawning them from the `on_started` callback instead
+    // could land them in the BOX pid namespace (box_run's `pid_for_children` is the box pidns by then
+    // whenever the namespace was unshared before the fork, `fork_into_cgroup`'s fallback), where a helper becomes an un-reapable zombie on box exit and deadlocks the pidns teardown:
     // the box "runs, filters, then never exits" until `--timeout`. The pump does not know the box init
     // pid yet; it is delivered over a pipe in the callback below. The guard is held for the box's
     // lifetime; dropping it (after the box exits) SIGKILLs and reaps both helpers. Fail-CLOSED: on any
@@ -3203,6 +3202,10 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
     // "started"), and this path had no reader, so it passed `None`. An SDK is a reader: it needs to
     // tell "the workload was slow" from "kern never reached `execvp`", and those are the same overrun
     // without this fd.
+    let mut held_nat = args
+        .pod
+        .filter(|_| args.stack_outbound)
+        .and_then(|p| HeldNat::arm(p, name.as_str()));
     let result = run_in_sandbox_with(
         &spec,
         alive_fd,
@@ -3244,6 +3247,9 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
                     }
                 }
             }
+            if let Some(nat) = held_nat.as_mut() {
+                nat.release(pid1);
+            }
             // No terminal on this path, so nothing to swap: see `run_in_sandbox_with`'s `on_started`.
             None
         },
@@ -3254,6 +3260,7 @@ pub fn box_run(args: BoxRunArgs) -> Result<(), Error> {
         // its supervisor (KillMode=mixed tears it down); a PDEATHSIG relative to systemd is pointless.
         !managed,
     );
+    drop(held_nat);
     pt.mark("box lifetime (spawn->exit)");
     // THE EGRESS PUMP NEVER CAME UP, so the box we just ran had no outbound access at all, not
     // even to the domains the caller allowed. PID 1 was SIGKILLed in the callback; report the
@@ -3514,6 +3521,7 @@ pub fn run(
     // the afternoon.
     // Fold any leading resource-profile tokens (`vcpu:name` …) into the caps - explicit flags win -
     // and find where the real command begins.
+    let (cpus_flag, cpuset_flag) = (cpus.is_some(), cpuset.is_some());
     let mut ap = AppliedProfiles {
         memory,
         cpus,
@@ -3619,8 +3627,8 @@ pub fn run(
     // Robust caps via a transient systemd user scope whose MemoryMax/CPUQuota track the caps; this
     // re-execs once and returns here under KERN_SCOPE. Where systemd --user isn't present it's a
     // no-op and the best-effort in-process cgroup below applies the same caps.
-    let cpus = clamp_cpus(cpus);
-    let cpuset = clamp_cpuset(cpuset)?;
+    let cpus = check_cpus(cpus, cpu_source(cpus_flag))?;
+    let cpuset = check_cpuset(cpuset, cpu_source(cpuset_flag))?;
     // THE SCOPE IS 88% OF `kern run`, AND IT IS NOT BUYING WHAT ITS COMMENT SAID IT WAS.
     //
     // MEASURED on this desktop, the shipped extreme binary, 200 samples each, medians:
@@ -4860,6 +4868,7 @@ fn signal_exec_outcome() {
 /// (EOF = up) or signals failure (one byte → reap the supervisor and report why), then print the
 /// "started" line. With no pipe it just announces. Retries the read on `EINTR` so a stray signal
 /// isn't misread as a successful start.
+#[allow(clippy::too_many_arguments)]
 fn await_box_started(
     name: &BoxName,
     child: i32,
@@ -4874,6 +4883,10 @@ fn await_box_started(
     // The read end of the cap-notice pipe (see `run_detached`): what the supervisor could not say on
     // a stderr that is now the box's log. `None` when that pipe could not be created.
     notice_rd: Option<i32>,
+    // The box waits at a gate its OWN supervisor releases ([`HeldNat`]), so `b'P'` is a step on the
+    // way to the exec and not the end of the start: the read goes on to the EOF or failure byte,
+    // and the start is reported as any other box's.
+    self_gated: bool,
 ) -> Result<(), Error> {
     // Assembled below, on whichever path resolves the start, and printed with the start line so the
     // launcher still makes ONE write per box (see that comment).
@@ -4884,6 +4897,9 @@ fn await_box_started(
         let n = loop {
             let r = unsafe { libc::read(rd, byte.as_mut_ptr().cast(), 1) };
             if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if r == 1 && self_gated && byte[0] == kern_isolation::READY_PREPARED {
                 continue;
             }
             break r;
@@ -5152,6 +5168,8 @@ fn supervise_box(
     ports: &[kern_isolation::PortMap],
     restart: Restart,
     inst: &mut registry::Instance,
+    // See [`HeldNat`]: armed afresh for every attempt, because every attempt is a new namespace.
+    outbound_pod: Option<&str>,
 ) {
     const DEFAULT_MAX_RESTARTS: u32 = 10;
     let max_restarts = if restart.max > 0 {
@@ -5175,6 +5193,9 @@ fn supervise_box(
         .ok()
         .map(|d| d.join(format!("{}-{}.log", name.as_str(), std::process::id())));
     let mut attempt = 0u32;
+    // Whether any attempt reached its workload: what decides below whether `--rm` may take the
+    // logs (a box that never started is explained to its launcher FROM its log).
+    let mut ran_once = false;
     // ⛔ THE PRE-EXEC GATE IS A ONE-SHOT, AND A RESTART MUST NOT WAIT ON IT. The gate's write end
     // belongs to the LAUNCHER (`compose up`), which releases every box and then returns; a box the
     // supervisor restarts afterwards finds that descriptor at EOF and refuses to exec, forever.
@@ -5246,6 +5267,7 @@ fn supervise_box(
             let pids_baseline: std::cell::OnceCell<
                 Option<(Option<u64>, std::path::PathBuf)>,
             > = std::cell::OnceCell::new();
+            let mut held_nat = outbound_pod.and_then(|p| HeldNat::arm(p, name.as_str()));
             let code = match run_in_sandbox_with(
                 spec,
                 ready,
@@ -5327,6 +5349,9 @@ fn supervise_box(
                             "kern: warning: could not record the box's PID 1 in the registry: {e} -                              `kern exec` on this box will not find it"
                         );
                     }
+                    if let Some(nat) = held_nat.as_mut() {
+                        nat.release(pid1);
+                    }
                     // A detached box has no terminal at all, so there is never a master to swap.
                     None
                 },
@@ -5343,6 +5368,7 @@ fn supervise_box(
                     127
                 }
             };
+            drop(held_nat);
             // WHY IT DIED, WHEN THE CGROUP KNOWS. A box that hit its pids cap does not say so: the
             // kernel refuses the fork or the thread with `EAGAIN` and the workload reports whatever
             // it makes of that, which is rarely the truth. MEASURED on Sentry's ClickHouse under
@@ -5490,6 +5516,10 @@ fn supervise_box(
         // second later, a peer that is still writing the pod's network. So the same budget `on-failure`
         // uses applies, and when it runs out the box says why instead of stopping silently.
         let never_started = code == 125;
+        // 125 is "the box was not built", 126/127 "its command could not be executed": in all
+        // three the launcher explains the failure FROM the log. A workload exiting 126 or 127 on
+        // its own keeps its log too, which costs space and never a reason.
+        ran_once |= !matches!(code, 125..=127);
         // AND ONE 125 IS PERMANENT, so it does not get a budget: the launcher closed this box's gate
         // without releasing it, and the process that would write that byte has exited. Asked only
         // when the gate is still in force for retries (`!gate_dropped`), because once it is dropped a
@@ -5608,6 +5638,19 @@ fn supervise_box(
     if let Some(key) = &exit_key {
         registry::set_exit(key, final_code);
     }
+    // `--rm` TAKES THE BOX'S LOGS WITH IT, as Docker removes a container's log with the container.
+    // They were left in the log store (a tmpfs, in RAM) until a `kern prune`: MEASURED on a desktop,
+    // 142 MiB of logs, all of boxes that had ended, one of them a `--rm` box. The pump may still
+    // hold the active file open until its pipe closes; the unlinked file's space is freed then.
+    // NOT FOR A BOX THAT NEVER STARTED: its launcher quotes the log's tail as the reason, after
+    // this supervisor has exited, and taking it would leave "box failed to start" with no why.
+    if rm && ran_once {
+        crate::commands::boxlog::remove_run_logs(&format!(
+            "{}-{}",
+            name.as_str(),
+            std::process::id()
+        ));
+    }
     // A KEPT BOX REMEMBERS HOW ITS LAST RUN ENDED WHATEVER SHAPE THAT RUN HAD. The foreground arm
     // records it; this is the DETACHED one, and `-d` is the shape a kept box is most likely to have
     // (it is the attach-and-detach workflow the feature exists for). Without this the kept record
@@ -5656,6 +5699,9 @@ fn run_detached(
     // sandbox history names them, whoever writes it.
     image: &str,
     gpus: &str,
+    // The stack whose network NAT this box gets at its own gate ([`HeldNat`]); `None` for every
+    // other box.
+    outbound_pod: Option<&str>,
 ) -> Result<(), Error> {
     // Readiness pipe: the read end stays in this foreground launcher; the write end travels down
     // to the box's PID 1 and is closed on a successful `execvp` (FD_CLOEXEC) → we read EOF = "the
@@ -5717,6 +5763,7 @@ fn run_detached(
             have_pipe,
             restart || restart_always,
             have_notice.then_some(notice_rd),
+            outbound_pod.is_some(),
         );
     }
     // ── Supervisor ──
@@ -5754,7 +5801,7 @@ fn run_detached(
         pid1_recorded: 0,
         pid1_starttime: 0,
         rootfs: spec.root.clone(),
-        command: spec.command.join(" "),
+        command: crate::registry::command_line(&spec.command),
         started: registry::now_unix(),
         starttime: registry::proc_starttime(pid),
         ports: ports_summary(ports),
@@ -5824,6 +5871,7 @@ fn run_detached(
             max: restart_max,
         },
         &mut inst,
+        outbound_pod,
     );
     // Box is gone - cancel the sidecars and reap them (they're our children; setsid doesn't change
     // parentage) so we don't leave brief zombies behind before this supervisor exits.
@@ -6311,8 +6359,9 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
         // silently dropping the whole scope (matches the persistent-unit path).
         props.push(format!("CPUQuota={}%", ((c * 100.0).round() as u64).max(1)));
     }
-    // `cpuset` is already clamped to the host CPUs at the box/run entry (`clamp_cpuset`), so it can't
-    // be an over-wide `0-9999` that systemd would reject with a raw "Failed to parse AllowedCPUs".
+    // `cpuset` was checked against the host's online CPUs at the box/run entry (`check_cpuset`), so
+    // it can't be an over-wide `0-9999` that systemd would reject with a raw "Failed to parse
+    // AllowedCPUs", nor a CPU systemd would accept and not apply.
     if let Some(set) = cpuset {
         props.push("-p".into());
         props.push(format!("AllowedCPUs={set}"));
@@ -7255,4 +7304,350 @@ mod twin_tests {
             "the [::] twin stays: {default:?}"
         );
     }
+}
+
+/// The command line a kept box records, as `box <name> <options...>`: `kern start` replays only a
+/// record that begins that way (see `start_one_kept`), and `--name <name>` is Docker's spelling of
+/// the same thing. MEASURED: `kern box --name web --image nginx:alpine -d --keep` recorded `box
+/// --name web ...`, and `kern start web` refused it as "not a command line this box can be started
+/// from", so a box kept that way could never start again. The name moves to position 1; everything
+/// after the workload's `--` is the workload's and is left as it is.
+fn kept_argv(argv: Vec<std::ffi::OsString>, name: &str) -> Vec<std::ffi::OsString> {
+    if argv
+        .get(1)
+        .is_some_and(|a| a.as_os_str() == std::ffi::OsStr::new(name))
+    {
+        return argv;
+    }
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len() + 1);
+    let mut it = argv.into_iter();
+    if let Some(verb) = it.next() {
+        out.push(verb);
+    }
+    out.push(std::ffi::OsString::from(name));
+    let mut in_workload = false;
+    while let Some(a) = it.next() {
+        if !in_workload {
+            if a.as_os_str() == "--" {
+                in_workload = true;
+            } else if a.as_os_str() == "--name" {
+                it.next();
+                continue;
+            } else if a.to_str().is_some_and(|t| t.starts_with("--name=")) {
+                continue;
+            }
+        }
+        out.push(a);
+    }
+    out
+}
+
+/// The NAT of a box that joins a compose stack's bridge network, attached while the box waits at a
+/// pre-exec gate: the shape `compose up` gives each of the stack's services (see
+/// [`crate::pod::attach_box_outbound`]), for one box.
+///
+/// A HELPER FORKED BEFORE THE BOX'S `unshare`, like the `--timeout` watchdog, and for the same
+/// reason plus one. The supervisor that forks the box first unshares its own user namespace (and,
+/// on `fork_into_cgroup`'s fallback, the pid namespace), so from the PID-1 callback a `pasta` would be
+/// spawned INSIDE the box's user namespace, and where the pid namespace is the box's too a thread
+/// cannot be created at all: MEASURED, the first version
+/// attached from the callback and the box's launcher died "failed to spawn thread: Invalid
+/// argument". The helper stays in the host's namespaces, learns PID 1 over a pipe, attaches the NAT
+/// and writes the release.
+///
+/// THE HELPER HOLDS THE ONLY WRITE END OF THE GATE. The supervisor drops its copy before it forks
+/// the box, so a helper that dies, or never receives a PID 1, closes the gate and the box reads EOF
+/// and refuses to exec: fail-closed, as a gate a launcher abandons is. A NAT that cannot be
+/// attached is said and the box is released anyway, as a service is: it still reaches the stack.
+pub(crate) struct HeldNat {
+    helper: libc::pid_t,
+    pid_write: Option<std::os::fd::OwnedFd>,
+    // The gate's read end, named in `KERN_GATE_FD` for the box this process forks next; held until
+    // the attempt is over so the number stays valid for the fork.
+    _gate_read: std::os::fd::OwnedFd,
+}
+
+impl HeldNat {
+    /// Arm the gate for the next box this process forks, with the NAT's state under the stack's own
+    /// directory (which `compose down` removes). `None`, with the reason said, when it cannot be
+    /// made; `None` in silence when a launcher's gate is already set, because then `compose up`
+    /// started this box and is the one that wires it.
+    pub(crate) fn arm(pod: &str, name: &str) -> Option<HeldNat> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        if crate::global_env_str("KERN_GATE_FD").is_ok() {
+            return None;
+        }
+        let warn = |why: String| {
+            eprintln!(
+                "kern: warning: box '{name}': no outbound - {why}. The box reaches the stack's \
+                 services; it cannot reach the internet"
+            );
+        };
+        let dir = match crate::relayhold::stack_dir(pod) {
+            Ok(d) => d.join("outbound").join(format!("box-{name}")),
+            Err(e) => {
+                warn(format!("the stack directory is unavailable ({e})"));
+                return None;
+            }
+        };
+        let pipe = || -> Option<(OwnedFd, OwnedFd)> {
+            let mut fds = [-1i32; 2];
+            // SAFETY: `fds` is a two-element array, which is what `pipe2` writes.
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return None;
+            }
+            // SAFETY: both descriptors were just returned by `pipe2` and are owned by nothing else.
+            Some(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+        };
+        let (Some((gate_read, gate_write)), Some((pid_read, pid_write))) = (pipe(), pipe()) else {
+            warn(format!("no pipe ({})", std::io::Error::last_os_error()));
+            return None;
+        };
+        // SAFETY: kern is single-threaded here (the box is not forked yet, and the helper threads of
+        // a box start after it), which is the condition for running ordinary code in the child.
+        let helper = unsafe { libc::fork() };
+        if helper < 0 {
+            warn(format!("no helper ({})", std::io::Error::last_os_error()));
+            return None;
+        }
+        if helper == 0 {
+            // HELPER, in the host's namespaces. Nothing of the supervisor's is kept but the two
+            // pipe ends it works with and stdio: a held readiness pipe would make a launcher wait on
+            // this process.
+            let (pid_fd, gate_fd) = (pid_read.as_raw_fd(), gate_write.as_raw_fd());
+            kern_isolation::shed_inherited_fds_keeping(&[pid_fd, gate_fd]);
+            let mut buf = [0u8; 4];
+            let mut got = 0usize;
+            while got < buf.len() {
+                let Some(rest) = buf.get_mut(got..) else {
+                    break;
+                };
+                // SAFETY: a valid descriptor and the unread tail of a four-byte buffer.
+                let n = unsafe { libc::read(pid_fd, rest.as_mut_ptr().cast(), rest.len()) };
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                let Ok(n) = usize::try_from(n) else {
+                    // SAFETY: `_exit` in a forked child: no destructors of the parent's state run.
+                    unsafe { libc::_exit(0) };
+                };
+                if n == 0 {
+                    // No PID 1 came: the start failed before the box was forked, so nothing waits.
+                    unsafe { libc::_exit(0) };
+                }
+                got += n;
+            }
+            let pid1 = i32::from_ne_bytes(buf);
+            // NOT BEFORE THE BOX IS AT ITS GATE. PID 1 has just been forked and is still being
+            // built: a change of credentials clears its `dumpable` flag, and while it is clear the
+            // kernel refuses its `/proc/<pid>/ns/*` to everyone, its owner included; the box sets
+            // it again just before it waits on the gate (see `kern-isolation`'s gate). `compose up`
+            // attaches only after a box reports itself prepared; this helper cannot read that
+            // report, so it waits until IT can open the namespace, and only then starts pasta.
+            //
+            // THE WAIT IS ON KERN'S OWN OPEN, NOT ON PASTA'S. A first version retried pasta for as
+            // long as it said "Permission denied", and that refusal has a second source the window
+            // does not explain: a security policy that confines pasta. MEASURED in an openSUSE
+            // Leap 16 VM (SELinux enforcing, passt 2025-04): pasta is refused every namespace of an
+            // unconfined process, so the retry spent its whole 5 s on every one-off and then
+            // reported. kern is not confined there, so its open measures the window alone, and a
+            // pasta refused after it is refused for good and is said at once. Bounded, so a box
+            // that never reaches its gate cannot hold the helper.
+            //
+            // THE WINDOW ITSELF HAS NOT BEEN SEEN. Counted with a temporary probe on the desktop,
+            // 30 one-offs on a two-service bridge stack (20 foreground, 10 detached): kern's own open
+            // was refused 0 times. The wait costs one `open` when it is not needed and is kept as the
+            // bound for a window the credential change makes possible, not as a measured need.
+            let ns_user = format!("/proc/{pid1}/ns/user");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut pause = std::time::Duration::from_millis(1);
+            while let Err(e) = std::fs::File::open(&ns_user) {
+                if e.kind() != std::io::ErrorKind::PermissionDenied
+                    || std::time::Instant::now() >= deadline
+                {
+                    break;
+                }
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_millis(50));
+            }
+            let attached = crate::pod::attach_box_outbound(&dir, pid1);
+            if let Err(why) = attached {
+                eprintln!(
+                    "kern: warning: box '{name}': no outbound - {why}. The box starts, and reaches \
+                     the stack's services; it cannot reach the internet"
+                );
+            }
+            let byte = [1u8];
+            loop {
+                // SAFETY: a valid descriptor and a one-byte buffer.
+                let r = unsafe { libc::write(gate_fd, byte.as_ptr().cast(), 1) };
+                if r < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break;
+            }
+            // SAFETY: `_exit` in a forked child: no destructors of the parent's state run.
+            unsafe { libc::_exit(0) };
+        }
+        // SUPERVISOR: the gate's write end is the helper's alone, and so is the pid pipe's read end.
+        drop(gate_write);
+        drop(pid_read);
+        crate::set_global_env("KERN_GATE_FD", gate_read.as_raw_fd().to_string());
+        Some(HeldNat {
+            helper,
+            pid_write: Some(pid_write),
+            _gate_read: gate_read,
+        })
+    }
+
+    /// Hand PID 1 to the helper, which attaches the NAT and releases the box. Once.
+    pub(crate) fn release(&mut self, pid1: i32) {
+        let Some(w) = self.pid_write.take() else {
+            return;
+        };
+        let p = pid1.to_ne_bytes();
+        // SAFETY: a valid descriptor this struct owned and a four-byte buffer. A short or failed
+        // write leaves the helper at EOF, which closes the gate: the box refuses, it does not run
+        // unwired.
+        let _ = unsafe {
+            libc::write(
+                std::os::fd::AsRawFd::as_raw_fd(&w),
+                p.as_ptr().cast(),
+                p.len(),
+            )
+        };
+    }
+}
+
+impl Drop for HeldNat {
+    fn drop(&mut self) {
+        // A helper still waiting for a PID 1 reads EOF here and leaves; one that has it is done by
+        // the time the box has run.
+        self.pid_write = None;
+        crate::eintr::reap(self.helper);
+        crate::unset_global_env("KERN_GATE_FD");
+    }
+}
+
+/// What [`stack_network_join`] hands back: the pod to join, the bridge addresses, the hosts lines,
+/// and whether the box gets the network's NAT (a bridge network the file does not mark internal).
+pub(crate) type StackJoin = (
+    Option<String>,
+    Vec<kern_isolation::BridgeAttach>,
+    Vec<(String, String)>,
+    bool,
+);
+
+/// `kern box --network <name>` onto a compose STACK: Docker's one-off that talks to a running stack,
+/// `docker run --network <project>_<network>`.
+///
+/// The name is the stack's pod, or `<project>_<network>` (Docker's network name); the second form
+/// is read as the pod plus one of its networks. On a stack in one pod nothing more is needed: the
+/// box joins the pod and its hosts file. On a stack on a BRIDGE the box takes the next free address
+/// on that network's bridge, reserved against a concurrent one-off, and every name on that network
+/// (services, aliases, box names) is added to its hosts file, as a container on that network
+/// resolves them. Anything else is passed through, and the join reports it.
+pub(crate) fn stack_network_join(
+    pod: Option<String>,
+    mut pod_bridges: Vec<kern_isolation::BridgeAttach>,
+    mut add_hosts: Vec<(String, String)>,
+) -> Result<StackJoin, Error> {
+    let Some(name) = pod.as_deref().filter(|_| pod_bridges.is_empty()) else {
+        return Ok((pod, pod_bridges, add_hosts, false));
+    };
+    // A name that cannot name a pod is left to the join, which refuses it as a name: nothing here
+    // turns it into a path first.
+    if crate::pod::validate_join_name(name).is_err() {
+        return Ok((pod, pod_bridges, add_hosts, false));
+    }
+    let (stack, network): (String, Option<String>) = if crate::pod::holder_pid(name).is_some() {
+        (name.to_string(), None)
+    } else {
+        match name.rmatch_indices('_').find_map(|(i, _)| {
+            let p = name.get(..i)?;
+            let n = name.get(i + 1..)?;
+            (!p.is_empty()
+                && !n.is_empty()
+                && crate::pod::validate_join_name(p).is_ok()
+                && crate::pod::holder_pid(p).is_some())
+            .then(|| (p.to_string(), n.to_string()))
+        }) {
+            Some((p, n)) => (p, Some(n)),
+            None => return Ok((pod, pod_bridges, add_hosts, false)),
+        }
+    };
+    let nets = crate::pod::bridge_networks(&stack);
+    if nets.is_empty() {
+        // One namespace for the whole stack: the pod IS every network of it.
+        return Ok((Some(stack), pod_bridges, add_hosts, false));
+    }
+    let chosen = match &network {
+        Some(n) => nets.iter().find(|x| &x.network == n).ok_or_else(|| {
+            Error::Sandbox(format!(
+                "stack '{stack}' has no network '{n}'; its networks are: {}",
+                nets.iter()
+                    .map(|x| format!("{stack}_{}", x.network))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?,
+        None => nets
+            .iter()
+            .find(|x| x.network == "default")
+            .or(nets.first())
+            .ok_or_else(|| Error::Sandbox(format!("stack '{stack}' records no network")))?,
+    };
+    let Some((first, _)) = chosen.hosts.first() else {
+        return Err(Error::Sandbox(format!(
+            "network '{}' of stack '{stack}' has no member, so its addresses are not known",
+            chosen.network
+        )));
+    };
+    let prefix = u32::from(chosen.prefix.min(30));
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let base = u32::from(*first) & mask;
+    let broadcast = base | !mask;
+    let mut used: std::collections::HashSet<u32> =
+        chosen.hosts.iter().map(|(ip, _)| u32::from(*ip)).collect();
+    for i in crate::registry::list() {
+        for a in crate::registry::recorded_bridge_addrs(&i.bridges) {
+            used.insert(u32::from(a));
+        }
+    }
+    // `.1` is the bridge's own address, the members' gateway.
+    let free = (base.saturating_add(2)..broadcast)
+        .filter(|a| !used.contains(a))
+        .map(std::net::Ipv4Addr::from)
+        .find(|ip| crate::pod::lease_bridge_addr(&stack, chosen.bridge, *ip))
+        .ok_or_else(|| {
+            Error::Sandbox(format!(
+                "network '{}' of stack '{stack}' has no free address left",
+                chosen.network
+            ))
+        })?;
+    pod_bridges.push(kern_isolation::BridgeAttach {
+        ip: free,
+        prefix: chosen.prefix,
+        bridge: chosen.bridge,
+    });
+    for (ip, n) in &chosen.hosts {
+        if !add_hosts.iter().any(|(h, _)| h == n) {
+            add_hosts.push((n.clone(), ip.to_string()));
+        }
+    }
+    // EGRESS AS ITS SERVICES HAVE IT. Every service on a bridge gets its own NAT (the holder's
+    // namespace is no member's), so a box joining the network later needs its own too. MEASURED
+    // before this: `kern box --network kcu_default` reached the stack's services by name and had no
+    // default route and no `resolv.conf`, where Docker's one-off on the same network reaches the
+    // internet. A network the file marks `internal: true` gets none, as its services got none.
+    let nat = !chosen.internal;
+    Ok((Some(stack), pod_bridges, add_hosts, nat))
 }

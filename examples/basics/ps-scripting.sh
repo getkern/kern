@@ -6,7 +6,8 @@
 #   kern ps --filter name=web          -> target a subset (keys: name=, status=running|paused, id=<pid>)
 #   kern ps --format '{{.Names}}\t{{.Status}}'  -> one TSV line per box, feed straight into awk/monitoring
 #
-# Fields: {{.Names}} {{.Pid}} {{.Image}} {{.Command}} {{.Ports}} {{.Pod}} {{.Status}} {{.RunningFor}}.
+# Fields: {{.Names}} {{.Pid}} {{.Image}} {{.Command}} {{.Ports}} {{.Pod}} {{.Status}} {{.State}}
+#         {{.Health}} {{.ExitCode}} {{.RunningFor}}; a 'table ' prefix prints a header row.
 # Real-life: a cron that pipes `--format` into a health dashboard; a cleanup that reaps every box
 # matching a prefix; stopping a whole fleet with one command substitution.
 set -eu

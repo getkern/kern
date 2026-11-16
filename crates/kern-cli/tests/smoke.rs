@@ -1750,7 +1750,7 @@ fn compose_config_prints_the_wiring_as_a_field() {
         }
         let out = c.output().expect("run kern");
         let want = format!("  {key}: ");
-        String::from_utf8_lossy(&out.stdout)
+        String::from_utf8_lossy(&out.stderr)
             .lines()
             .find_map(|l| l.strip_prefix(&want).map(str::to_string))
             .unwrap_or_default()
@@ -1777,7 +1777,7 @@ fn compose_config_prints_the_wiring_as_a_field() {
         .args(["compose", "-f", "one.yml", "config"])
         .output()
         .expect("run kern");
-    let lone_out = String::from_utf8_lossy(&lone.stdout).to_string();
+    let lone_out = String::from_utf8_lossy(&lone.stderr).to_string();
     let lone_wiring = lone_out
         .lines()
         .find_map(|l| l.strip_prefix("  wiring: ").map(str::to_string))
@@ -1801,7 +1801,7 @@ fn compose_config_prints_the_wiring_as_a_field() {
         .args(["compose", "-f", "collide.yml", "config"])
         .output()
         .expect("run kern");
-    let auto_out = String::from_utf8_lossy(&auto.stdout).to_string();
+    let auto_out = String::from_utf8_lossy(&auto.stderr).to_string();
     let line = |k: &str| -> String {
         let want = format!("  {k}: ");
         auto_out
@@ -3700,7 +3700,12 @@ fn network_mode_service_joins_the_named_services_namespace() {
     );
     let _ = run(&["compose", "-f", "compose.yml", "-p", "joinit", "up", "-d"]);
     let mut logs = String::new();
-    for _ in 0..40 {
+    // UP TO 30 s, because `PEER=unresolved` comes when the host's resolver gives up, and that is
+    // the host's speed and not kern's. MEASURED in a Debian 13 VM, whose resolver (QEMU's) does not
+    // answer a single-label name: `getent hosts client` returned after 10 s, musl's two 5 s tries,
+    // and this test, which waited 10, failed on Debian, Fedora 45 and Rocky 10 with the property it
+    // checks holding on all three. A desktop's router answers at once.
+    for _ in 0..120 {
         logs = run(&["compose", "-f", "compose.yml", "-p", "joinit", "logs"]);
         if logs.contains("CLIENT=") && logs.contains("PEER=") {
             break;
@@ -5133,6 +5138,491 @@ fn scale_and_deploy_replicas_run_one_box_per_replica() {
     );
 }
 
+/// THE CONTAINER-MANAGEMENT VERBS OF A DOCKER TUTORIAL, ON KERN'S KEPT BOXES.
+///
+/// The iximiuz "docker container management commands" tutorial, re-run with kern: `create IMAGE`
+/// printed an id, `rename` and `update --cpus 0.5 NAME` (flags first) worked on the created
+/// container, `start`, `restart`, `start -a`, `diff`, `export -o` and `container ls|rm` too. kern had
+/// no `create`, `restart`, `export` or `container`, `start` took no `-a`, `update` took `0.5` for the
+/// box, `diff` refused a kept box ("uses --bind-rootfs"), `rename` moved a kept box's registry entry
+/// and not its layer, and a box kept with `--name` could never start again.
+#[test]
+fn the_container_verbs_of_a_docker_tutorial_work_on_kept_boxes() {
+    let dir = std::env::temp_dir().join(format!("kern-it-verbs-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-verbs-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let data = std::env::temp_dir().join(format!("kern-it-verbs-data-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&data);
+    let run = |args: &[&str]| -> (Option<i32>, String, String) {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env("XDG_DATA_HOME", &data)
+            .env("KERN_ALLOW_UNCAPPED", "1")
+            .args(args)
+            .output()
+        {
+            Ok(o) => (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            ),
+            Err(e) => (None, String::new(), e.to_string()),
+        }
+    };
+    let id = |n: &str| format!("vb{}-{n}", std::process::id());
+    let web = id("web");
+    let out = dir.join("web.tar");
+    let out_s = out.to_string_lossy().into_owned();
+
+    let (create_rc, created, create_err) = run(&["create", "alpine", "sleep", "60"]);
+    let created = created.trim().to_string();
+    let (rename_rc, _, rename_err) = run(&["rename", &created, &web]);
+    let (update_rc, _, update_err) = run(&["update", "--cpus", "0.5", &web]);
+    let (start_rc, _, start_err) = run(&["start", &web]);
+    let (_, listed, _) = run(&["container", "ls"]);
+    let (_, _, _) = run(&["exec", &web, "sh", "-c", "echo tutorial > /etc/marker"]);
+    let (restart_rc, restarted, restart_err) = run(&["restart", "-t", "1", &web]);
+    let (_, marker, _) = run(&["exec", &web, "cat", "/etc/marker"]);
+    let (export_rc, _, export_err) = run(&["export", &web, "-o", &out_s]);
+    let members = std::process::Command::new("tar")
+        .arg("-tf")
+        .arg(&out)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let (_, _, _) = run(&["stop", &web]);
+    let (diff_rc, diffed, diff_err) = run(&["diff", &web]);
+    let (rm_rc, _, rm_err) = run(&["container", "rm", &web]);
+
+    // `start -a` on a created box: its output, and its exit code.
+    let attached = id("att");
+    let (_, _, _) = run(&[
+        "create",
+        "--name",
+        &attached,
+        "alpine",
+        "sh",
+        "-c",
+        "echo only-this; exit 3",
+    ]);
+    let (attach_rc, attach_out, _) = run(&["start", "-a", &attached]);
+    let _ = run(&["rm", &attached]);
+
+    // A box kept with `--name` starts again.
+    let named = id("named");
+    let (_, _, _) = run(&[
+        "box", "--name", &named, "--image", "alpine", "--keep", "-d", "--", "sleep", "60",
+    ]);
+    let _ = run(&["stop", &named]);
+    let (named_rc, _, named_err) = run(&["start", &named]);
+    let _ = run(&["rm", "-f", &named]);
+    let (_, after, _) = run(&["ps", "-q"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::remove_dir_all(&data);
+
+    assert_eq!(create_rc, Some(0), "create IMAGE CMD:\n{create_err}");
+    assert!(!created.is_empty(), "create prints the box's name");
+    assert_eq!(rename_rc, Some(0), "rename a created box:\n{rename_err}");
+    assert_eq!(
+        update_rc,
+        Some(0),
+        "update --cpus 0.5 NAME on a created box:\n{update_err}"
+    );
+    assert_eq!(start_rc, Some(0), "start a created box:\n{start_err}");
+    assert!(listed.contains(&web), "container ls lists it:\n{listed}");
+    assert_eq!(restart_rc, Some(0), "restart -t 1:\n{restart_err}");
+    assert_eq!(
+        restarted.trim(),
+        web,
+        "restart prints the name, as Docker's"
+    );
+    assert_eq!(
+        marker.trim(),
+        "tutorial",
+        "a kept layer survives the restart"
+    );
+    assert_eq!(export_rc, Some(0), "export -o:\n{export_err}");
+    assert!(
+        members.lines().any(|m| m == "etc/marker"),
+        "the export holds the box's file under its relative name"
+    );
+    assert!(
+        !members
+            .lines()
+            .any(|m| m.starts_with("proc/") && m != "proc/"),
+        "and not what is mounted over the box"
+    );
+    assert_eq!(diff_rc, Some(0), "diff of a stopped kept box:\n{diff_err}");
+    assert!(
+        diffed.contains("/etc/marker"),
+        "lists its change:\n{diffed}"
+    );
+    assert_eq!(rm_rc, Some(0), "container rm:\n{rm_err}");
+    assert_eq!(
+        attach_out.trim(),
+        "only-this",
+        "start -a: the box's output, and only it"
+    );
+    assert_eq!(attach_rc, Some(3), "and its exit code");
+    assert_eq!(
+        named_rc,
+        Some(0),
+        "a box kept with --name starts again:\n{named_err}"
+    );
+    assert_eq!(after.lines().count(), 0, "nothing left running:\n{after}");
+}
+
+/// `compose config` PRINTS THE PROJECT AS DOCKER COMPOSE DOES, byte for byte.
+///
+/// The expected texts are `docker compose config`'s output on Docker Compose 5.3.1 for the same
+/// files (the project directory is the only part replaced): every short form expanded to the long
+/// one in compose-go's field order, the default network added, an override file merged, an
+/// `env_file` read in, the scalar styles and the folding at 80 columns. kern printed a summary of
+/// its own there, so a script reading the resolved file got prose. The summary is on stderr now.
+#[test]
+fn compose_config_prints_the_project_as_docker_compose_does() {
+    let root = std::env::temp_dir().join(format!("kern-it-cfgout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["p02", "q01", "p06", "views"] {
+        let _ = std::fs::create_dir_all(root.join(d));
+    }
+    let w = |f: &str, t: &str| {
+        let _ = std::fs::write(root.join(f), t);
+    };
+    w(
+        "p02/compose.yml",
+        r#"services:
+  app:
+    image: alpine
+    environment:
+      - FOO=bar
+      - EMPTY=
+      - NOVALUE
+      - QUOTED="x y"
+    volumes:
+      - ./data:/data
+      - named:/named:ro
+      - /abs/path:/abs:rw
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 64m
+      - anon:/anon
+      - /only-target
+    tmpfs:
+      - /run
+      - /var/cache:size=1m
+    depends_on:
+      - db
+    networks:
+      - front
+      - back
+  db:
+    image: postgres:16
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 1m30s
+    networks:
+      back:
+        aliases: [database]
+        ipv4_address: 172.28.0.10
+volumes:
+  named:
+  anon:
+    external: true
+networks:
+  front:
+  back:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+"#,
+    );
+    w(
+        "q01/compose.yml",
+        r#"version: "3.9"
+services:
+  web:
+    image: nginx
+    ports:
+      - "8080:80"
+    environment:
+      A: base
+      B: base
+    command: ["a", "b"]
+    volumes:
+      - ./one:/one
+"#,
+    );
+    w(
+        "q01/compose.override.yml",
+        r#"services:
+  web:
+    ports:
+      - "8443:443"
+    environment:
+      B: override
+      C: new
+    command: ["c"]
+    volumes:
+      - ./two:/two
+  extra:
+    image: alpine
+"#,
+    );
+    w(
+        "p06/compose.yml",
+        r#"name: explicit-name
+services:
+  a:
+    image: alpine:${TAG:-3.19}
+    environment:
+      LONG: "a very long value that will certainly exceed the eighty column limit of the emitter for sure yes"
+      MULTI: |
+        line one
+        line two
+      COLON: "a: b"
+      HASH: "a #b"
+      LEAD: " leading"
+      STAR: "*star"
+      NUM: "0755"
+      HEX: "0x1F"
+      FLOAT: "1.5"
+      BOOL: "true"
+      NULLS: "null"
+      TILDE: "~"
+      DASH: "-x"
+      QMARK: "?x"
+      UNICODE: "café"
+      TAB: "a\tb"
+"#,
+    );
+    w(
+        "views/compose.yml",
+        "services:\n  zeta:\n    image: \"nginx:${NGX:-1.25}\"\n    profiles: [p2, p1]\n  alpha:\n    build: .\n    depends_on: [mid]\n    pull_policy: always\n  mid:\n    image: nginx:1.25\n    volumes: [v2:/a, v1:/b]\n    networks: [n2]\nvolumes:\n  v2:\n  v1:\nnetworks:\n  n2:\n  n1:\n",
+    );
+    w("views/Dockerfile", "FROM alpine\n");
+    let run = |dir: &str, args: &[&str]| -> (Option<i32>, String, String) {
+        match kern()
+            .current_dir(root.join(dir))
+            .env_remove("TAG")
+            .env_remove("NGX")
+            .env_remove("COMPOSE_PROFILES")
+            .args(args)
+            .output()
+        {
+            Ok(o) => (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            ),
+            Err(e) => (None, String::new(), e.to_string()),
+        }
+    };
+    let dir_of = |d: &str| {
+        std::path::absolute(root.join(d))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let (p02_rc, p02_out, p02_err) = run("p02", &["compose", "-p", "cp", "config"]);
+    let (_, q01_out, _) = run("q01", &["compose", "-p", "cp", "config"]);
+    let (_, p06_out, _) = run("p06", &["compose", "-p", "cp", "config"]);
+    let view = |args: &[&str]| {
+        let mut a = vec!["compose", "-p", "cv", "config"];
+        a.extend_from_slice(args);
+        run("views", &a).1
+    };
+    let (images, volumes, networks, profiles, hash) = (
+        view(&["--images"]),
+        view(&["--volumes"]),
+        view(&["--networks"]),
+        view(&["--profiles"]),
+        view(&["--hash", "alpha,mid"]),
+    );
+    let whole = view(&[]);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(p02_rc, Some(0), "config:\n{p02_err}");
+    assert!(
+        p02_err.contains("wiring:"),
+        "kern's summary is on stderr:\n{p02_err}"
+    );
+    assert_eq!(
+        p02_out,
+        r#"name: cp
+services:
+  app:
+    depends_on:
+      db:
+        condition: service_started
+        required: true
+    environment:
+      EMPTY: ""
+      FOO: bar
+      NOVALUE: null
+      QUOTED: '"x y"'
+    image: alpine
+    networks:
+      back: null
+      front: null
+    tmpfs:
+      - /run
+      - /var/cache:size=1m
+    volumes:
+      - type: bind
+        source: @DIR@/data
+        target: /data
+        bind: {}
+      - type: volume
+        source: named
+        target: /named
+        read_only: true
+        volume: {}
+      - type: bind
+        source: /abs/path
+        target: /abs
+        bind: {}
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: "67108864"
+      - type: volume
+        source: anon
+        target: /anon
+        volume: {}
+      - type: volume
+        target: /only-target
+        volume: {}
+  db:
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U postgres
+      timeout: 3s
+      interval: 5s
+      retries: 5
+      start_period: 1m30s
+    image: postgres:16
+    networks:
+      back:
+        aliases:
+          - database
+        ipv4_address: 172.28.0.10
+networks:
+  back:
+    name: cp_back
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  front:
+    name: cp_front
+volumes:
+  anon:
+    name: anon
+    external: true
+  named:
+    name: cp_named
+"#
+        .replace("@DIR@", &dir_of("p02"))
+    );
+    assert_eq!(
+        q01_out,
+        r#"name: cp
+services:
+  extra:
+    image: alpine
+    networks:
+      default: null
+  web:
+    command:
+      - c
+    environment:
+      A: base
+      B: override
+      C: new
+    image: nginx
+    networks:
+      default: null
+    ports:
+      - mode: ingress
+        target: 80
+        published: "8080"
+        protocol: tcp
+      - mode: ingress
+        target: 443
+        published: "8443"
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: @DIR@/one
+        target: /one
+        bind: {}
+      - type: bind
+        source: @DIR@/two
+        target: /two
+        bind: {}
+networks:
+  default:
+    name: cp_default
+"#
+        .replace("@DIR@", &dir_of("q01"))
+    );
+    assert_eq!(
+        p06_out,
+        r#"name: cp
+services:
+  a:
+    environment:
+      BOOL: "true"
+      COLON: 'a: b'
+      DASH: -x
+      FLOAT: "1.5"
+      HASH: 'a #b'
+      HEX: "0x1F"
+      LEAD: ' leading'
+      LONG: a very long value that will certainly exceed the eighty column limit of
+        the emitter for sure yes
+      MULTI: |
+        line one
+        line two
+      NULLS: "null"
+      NUM: "0755"
+      QMARK: ?x
+      STAR: '*star'
+      TAB: "a\tb"
+      TILDE: "~"
+      UNICODE: café
+    image: alpine:3.19
+    networks:
+      default: null
+networks:
+  default:
+    name: cp_default
+"#
+    );
+    assert_eq!(images, "cv-alpha\nnginx:1.25\n", "--images");
+    assert_eq!(volumes, "v1\nv2\n", "--volumes: the used ones");
+    assert_eq!(networks, "default\nn2\n", "--networks: the used ones");
+    assert_eq!(profiles, "p1\np2\n", "--profiles");
+    assert!(
+        whole.contains("name: cv_n2") && !whole.contains("cv_n1"),
+        "a network no service joins is left out, as Docker leaves it:\n{whole}"
+    );
+    assert_eq!(
+        hash,
+        "alpha 8ed9276b9b43971f5e501d66147c519a039b4cf02cb7c2f3b6c3aa25e8d28823\n\
+         mid 67e8a3eeedf2e44047f2242a3228b552af46d7b1cccb51b62923c45584609418\n",
+        "--hash: Docker's digests of the same services (alpha's `build`, `depends_on` and \
+         `pull_policy` are not hashed)"
+    );
+}
+
 /// A SERVICE THAT FAILS TO START STOPS ITS DEPENDENTS AND NOTHING ELSE, as Docker's partial bring-up.
 ///
 /// MEASURED on Docker Compose 2.40.3, with the host port range of `b` held by another process:
@@ -5201,9 +5691,106 @@ fn a_service_that_fails_to_start_stops_only_its_dependents() {
     got.sort();
     assert_eq!(
         got,
-        ["part-a", "part-d", "part-d-2", "part-f"],
+        ["part-a-1", "part-d-1", "part-d-2", "part-f-1"],
         "every service that does not depend on `b` runs:\n{ps}\n{up}"
     );
+    assert_eq!(
+        after.lines().count(),
+        0,
+        "nothing left after down:\n{after}"
+    );
+}
+
+/// UNDER `--no-pod` A RUNNING STACK RESCALES WITHOUT A NAME MOVING TO ANOTHER SERVICE.
+///
+/// Aliases (127.0.0.2 upward) were handed out by position, and replicas sit right after their
+/// service, so `up --no-pod --scale web=3` on a running stack moved `api`'s alias to the new `web-3`
+/// while the boxes left running still mapped `api` to it: a call to `api` from a running box reached
+/// a web replica. And a running client did not learn the third replica (measured on WSL2: `getent
+/// ahosts web` stayed at two).
+#[test]
+fn a_no_pod_stack_rescales_without_moving_a_name_to_another_service() {
+    let dir = std::env::temp_dir().join(format!("kern-it-nprs-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let xdg = std::env::temp_dir().join(format!("kern-it-nprs-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&xdg);
+    let _ = std::fs::write(
+        dir.join("compose.yml"),
+        "services:\n  web:\n    image: alpine\n    command: [\"sh\", \"-c\", \"while true; do hostname | nc -l -p 80; done\"]\n    expose: [\"80\"]\n  api:\n    image: alpine\n    command: [\"sh\", \"-c\", \"while true; do echo API | nc -l -p 81; done\"]\n    expose: [\"81\"]\n  cm:\n    image: alpine\n    command: [\"sleep\", \"120\"]\n",
+    );
+    let run = |args: &[&str]| -> (Option<i32>, String, String) {
+        match kern()
+            .current_dir(&dir)
+            .env("XDG_RUNTIME_DIR", &xdg)
+            .env("KERN_ALLOW_UNCAPPED", "1")
+            .args(args)
+            .output()
+        {
+            Ok(o) => (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            ),
+            Err(e) => (None, String::new(), e.to_string()),
+        }
+    };
+    let c = |verb: &[&str]| {
+        let mut a = vec!["compose", "-f", "compose.yml", "-p", "nprs"];
+        a.extend_from_slice(verb);
+        run(&a)
+    };
+    let sh = |svc: &str, script: &str| -> String { c(&["exec", "-T", svc, "sh", "-c", script]).1 };
+    let web_addrs = |client: &str| -> Vec<String> {
+        let mut v: Vec<String> = sh(client, "getent ahosts web | awk '{print $1}'")
+            .lines()
+            .map(str::trim)
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let answers = |client: &str, addrs: &[String]| -> Vec<String> {
+        let mut v: Vec<String> = addrs
+            .iter()
+            .map(|a| {
+                sh(client, &format!("nc -w 2 {a} 80 </dev/null"))
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    let (up2_rc, _, up2_err) = c(&["up", "-d", "--no-pod", "--scale", "web=2"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let api_before = sh("web", "nc -w 2 api 81 </dev/null").trim().to_string();
+    let (up3_rc, _, up3_err) = c(&["up", "-d", "--no-pod", "--scale", "web=3"]);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    // `web` (replica 1) and `cm` were left running by the second `up`.
+    let api_after = sh("web", "nc -w 2 api 81 </dev/null").trim().to_string();
+    let three = web_addrs("cm");
+    let reached = answers("cm", &three);
+    let _ = c(&["down", "-t", "0"]);
+    let (_, after, _) = run(&["ps", "-q"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+
+    assert_eq!(up2_rc, Some(0), "up --no-pod --scale web=2:\n{up2_err}");
+    assert_eq!(api_before, "API", "control: the running web reaches api");
+    assert_eq!(up3_rc, Some(0), "up --no-pod --scale web=3:\n{up3_err}");
+    assert_eq!(
+        api_after, "API",
+        "after the rescale `api` is still api, not a web replica"
+    );
+    assert_eq!(
+        three.len(),
+        3,
+        "the running client learns the third replica: {three:?}"
+    );
+    assert_eq!(reached.len(), 3, "and reaches each of them: {reached:?}");
     assert_eq!(
         after.lines().count(),
         0,
@@ -5777,4 +6364,106 @@ fn a_sandbox_one_off_mounts_its_script_inside_its_tmpfs_with_no_network() {
         vec!["0"],
         "a `network_mode: none` one-off has no interface but lo:\n{out}"
     );
+}
+
+/// ⛔ A FILE DOCKER REFUSES IS REFUSED, WITH DOCKER'S WORDS AND THE FILE'S ABSOLUTE PATH.
+///
+/// MEASURED on Docker Compose 5.3.1: `command: [echo, 1, true]` is `validating <abs>: services.a.
+/// command.1 must be a string` and `cap_add: SYS_ADMIN` is `... must be a array`; kern ran both. An
+/// override names the override, an included file names the included file, a cast fails with Go's
+/// `strconv` text and no file, and `--no-interpolate` checks `${R}` as the string it is.
+#[test]
+fn a_file_docker_refuses_is_refused_with_docker_s_message() {
+    let root = std::env::temp_dir().join(format!("kern-it-schema-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::create_dir_all(root.join("inc"));
+    let w = |f: &str, t: &str| {
+        let _ = std::fs::write(root.join(f), t);
+    };
+    let ok = "services:\n  a:\n    image: alpine\n";
+    w(
+        "num.yml",
+        "services:\n  a:\n    image: alpine\n    command: [echo, 1, true]\n",
+    );
+    w("ok.yml", ok);
+    w(
+        "capstr.yml",
+        "services:\n  a:\n    image: alpine\n    cap_add: SYS_ADMIN\n",
+    );
+    w(
+        "cast.yml",
+        "services:\n  a:\n    image: alpine\n    deploy:\n      replicas: ${R}\n",
+    );
+    w(
+        "inc.yml",
+        "include:\n  - inc/bad.yml\nservices:\n  a:\n    image: alpine\n",
+    );
+    w(
+        "inc/bad.yml",
+        "services:\n  b:\n    image: alpine\n    cap_add: SYS_ADMIN\n",
+    );
+    let abs = std::path::absolute(&root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let run = |args: &[&str], r: &str| -> (bool, String) {
+        match kern().current_dir(&root).env("R", r).args(args).output() {
+            Ok(o) => (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            ),
+            Err(e) => (true, e.to_string()),
+        }
+    };
+    let cases: Vec<(Vec<&str>, &str, String)> = vec![
+        (
+            vec!["compose", "-f", "./num.yml", "config"],
+            "3",
+            format!("validating {abs}/num.yml: services.a.command.1 must be a string"),
+        ),
+        (
+            vec!["compose", "-f", "ok.yml", "-f", "capstr.yml", "config"],
+            "3",
+            format!("validating {abs}/capstr.yml: services.a.cap_add must be a array"),
+        ),
+        (
+            vec!["compose", "-f", "cast.yml", "config"],
+            "x",
+            "error while interpolating services.a.deploy.replicas: failed to cast to expected \
+             type: strconv.Atoi: parsing \"x\": invalid syntax"
+                .to_string(),
+        ),
+        (
+            vec!["compose", "-f", "inc.yml", "config"],
+            "3",
+            format!("validating {abs}/inc/bad.yml: services.b.cap_add must be a array"),
+        ),
+    ];
+    for (args, r, want) in &cases {
+        let (success, err) = run(args, r);
+        assert!(!success, "{args:?} was accepted; stderr: {err}");
+        assert!(
+            err.contains(want.as_str()),
+            "{args:?}: want {want:?} in: {err}"
+        );
+    }
+    // The controls: the same shapes Docker accepts are accepted.
+    for (args, r) in [
+        (vec!["compose", "-f", "cast.yml", "config", "-q"], "3"),
+        (
+            vec![
+                "compose",
+                "-f",
+                "cast.yml",
+                "config",
+                "--no-interpolate",
+                "-q",
+            ],
+            "x",
+        ),
+        (vec!["compose", "-f", "ok.yml", "config", "-q"], "3"),
+    ] {
+        let (success, err) = run(&args, r);
+        assert!(success, "{args:?} R={r} refused: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }
