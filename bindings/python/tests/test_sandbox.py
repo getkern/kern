@@ -6284,6 +6284,7 @@ def test_gpus_reaches_the_argv_verbatim_and_the_default_adds_no_flag():
     assert "--gpus" not in _cfg(gpus=None)._base_argv("n", network=False, timeout_s=30)
 
 
+@integration  # constructing a Sandbox locates kern; the bindings CI job has none (CI, 17/11)
 def test_image_none_is_the_default_and_a_bad_image_is_refused_by_name():
     # `None` is the default, as `null` is in Node. It used to die as a raw TypeError out of
     # `subprocess`, and "" first built a bytecode cache for an empty reference, then failed to start.

@@ -12006,8 +12006,8 @@ fn a_stripped_entry_no_registry_has_runs_as_cached_and_is_asked_once() {
         eprintln!("skip: no busybox available");
         return;
     };
-    if !userns_plausible() {
-        eprintln!("skip: unprivileged user namespaces disabled");
+    if !userns_plausible() || !a_box_can_start("norepo") {
+        eprintln!("skip: no box can start here");
         return;
     }
     let base = std::env::temp_dir().join(format!("kern-it-norepo-{}", std::process::id()));
@@ -17420,8 +17420,10 @@ impl KernIn {
 /// A build context with a busybox base image loaded under `tag`, and a `kern` that keeps the cache
 /// and data in the test's own tree. `None` when this host cannot run the suite's builds.
 fn build_mount_fixture(name: &str, tag: &str) -> Option<(PathBuf, KernIn)> {
-    if !userns_plausible() {
-        eprintln!("skip: unprivileged user namespaces disabled");
+    // `a_box_can_start` and not only `userns_plausible`: the GitHub runner allows the namespace and
+    // refuses its uid map, and these tests failed there instead of skipping (CI, 17/11).
+    if !userns_plausible() || !a_box_can_start(name) {
+        eprintln!("skip: no box can start here");
         return None;
     }
     let Some(busybox) = static_busybox() else {
@@ -18680,8 +18682,8 @@ fn an_interrupted_pull_keeps_the_layers_it_completed() {
 /// `always` that stopped looking would pass the second and fail this one.
 #[test]
 fn pull_always_downloads_only_an_image_that_changed() {
-    if !userns_plausible() {
-        eprintln!("skip: unprivileged user namespaces disabled");
+    if !userns_plausible() || !a_box_can_start("pullalways") {
+        eprintln!("skip: no box can start here");
         return;
     }
     let Some(busybox) = static_busybox() else {
