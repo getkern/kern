@@ -10,7 +10,8 @@
 # An order that only works when the person remembers it is not a process, and the repair took an hour
 # of workflow surgery at midnight. This script is that order, executable, with the reasons attached.
 #
-#     sh scripts/cut-release.sh v0.9.32
+#     sh scripts/cut-release.sh v0.9.32          (skips what a green CI already ran)
+#     sh scripts/cut-release.sh v0.9.32 --full   (runs the suite, the gates and the pentest here)
 #
 # It stops before anything irreversible and tells you what it is about to do. The two irreversible
 # steps - the signed tag and its push - are the last two, and by then everything else has passed.
@@ -63,6 +64,46 @@ ok "on main, in step with origin"
 grep -q "^## ${VERSION} " CHANGELOG.md || die "CHANGELOG.md has no '## $VERSION ' entry. Write it, commit it, then cut - not the other way round, which is the mistake this script exists to stop."
 ok "CHANGELOG.md has an entry for $VERSION"
 
+# THE CHARACTER IS BUILT, NEVER TYPED: this file is scanned by the gate it runs.
+EM=$(printf '\342\200\224')
+printf 'a%sb\n' "$EM" > "/tmp/cut-em.$$"
+grep -q "$EM" "/tmp/cut-em.$$" || die "the em-dash positive control failed: this grep cannot see one, so its silence would mean nothing"
+rm -f "/tmp/cut-em.$$"
+if LC_ALL=C.UTF-8 git grep -l "$EM" -- '*.md' '*.rs' '*.sh' '*.py' >/dev/null 2>&1; then
+    LC_ALL=C.UTF-8 git grep -n "$EM" -- '*.md' '*.rs' '*.sh' '*.py' | head -5 >&2
+    die "em-dash found in tracked files"
+fi
+ok "zero em-dashes (positive control passed first)"
+
+# ---------------------------------------------------------------- did CI already run all of it?
+# WHEN CI IS GREEN ON THIS CODE, THE LOCAL SUITE, GATES AND PENTEST ARE NOT RUN AGAIN. CI runs the same
+# suite and gates on the same commit, and `check-pentest-freshness.py` below still refuses evidence
+# that is too old or older than a tag, which is what the release workflow checks too. Running them here
+# a second time cost a release half an hour for no new information (owner, 2026-11-17: a release must
+# be fast). ONE API call, no waiting: a CI run that has not finished is not green, and the script then
+# runs everything locally as before. A green run counts for HEAD when what differs between them is
+# only this script, `fast-check.sh` or Markdown. `--full` forces the local run.
+step "CI on this code"
+GREEN=""
+if [ "${2:-}" != "--full" ]; then
+    for sha in $(curl -fsSL --max-time 15 \
+            "https://api.github.com/repos/getkern/kern/actions/runs?status=success&per_page=50" 2>/dev/null \
+            | python3 -c 'import json,sys; [print(r["head_sha"]) for r in json.load(sys.stdin).get("workflow_runs",[]) if r.get("name")=="CI"]' 2>/dev/null); do
+        git cat-file -e "$sha^{commit}" 2>/dev/null || continue
+        git merge-base --is-ancestor "$sha" HEAD || continue
+        if [ -z "$(git diff --name-only "$sha" HEAD | grep -vE '^scripts/(cut-release|fast-check)\.sh$|\.md$' || true)" ]; then
+            GREEN=$sha
+            break
+        fi
+    done
+fi
+if [ -n "$GREEN" ]; then
+    ok "CI is green on $(git rev-parse --short "$GREEN"), and HEAD differs from it only in docs or release scripts: local suite, gates and pentest skipped"
+else
+    ok "no green CI run covers HEAD: running the suite, the gates and the pentest here"
+fi
+
+if [ -z "$GREEN" ]; then
 # ---------------------------------------------------------------- the gates CI runs
 step "gates (the ones CI runs, with the flags CI runs them with)"
 RUSTFLAGS="-D warnings"; export RUSTFLAGS
@@ -83,16 +124,6 @@ for g in flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \
 done
 ok "9 doc/consistency gates"
 
-# THE CHARACTER IS BUILT, NEVER TYPED: this file is scanned by the gate it runs.
-EM=$(printf '\342\200\224')
-printf 'a%sb\n' "$EM" > "/tmp/cut-em.$$"
-grep -q "$EM" "/tmp/cut-em.$$" || die "the em-dash positive control failed: this grep cannot see one, so its silence would mean nothing"
-rm -f "/tmp/cut-em.$$"
-if LC_ALL=C.UTF-8 git grep -l "$EM" -- '*.md' '*.rs' '*.sh' '*.py' >/dev/null 2>&1; then
-    LC_ALL=C.UTF-8 git grep -n "$EM" -- '*.md' '*.rs' '*.sh' '*.py' | head -5 >&2
-    die "em-dash found in tracked files"
-fi
-ok "zero em-dashes (positive control passed first)"
 
 # ---------------------------------------------------------------- the evidence, on THIS code
 step "pentest suites (the evidence behind SECURITY.md)"
@@ -117,6 +148,8 @@ if [ -n "$(git status --porcelain pentest/.last-run)" ]; then
     ok "stamp committed and pushed: $(git rev-parse --short HEAD)"
 else
     ok "stamp already current for this tree"
+fi
+
 fi
 
 python3 scripts/check-pentest-freshness.py >/dev/null || die "the freshness gate refuses this tree; the release workflow would refuse it too"
