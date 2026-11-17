@@ -41,6 +41,15 @@ def tracked_dockerfiles() -> list[Path]:
     return [ROOT / n for n in names if pat.search(n)]
 
 
+# Dockerfiles whose build context a HARNESS prepares before building them, so this gate cannot
+# build them as they sit in the tree. `tests/differential/` cases run `setup.sh` first (it writes, for
+# example, the `authorized_keys` an sshd case COPYs from a key it has just generated) and then build
+# under Docker and kern side by side, which is that suite's own check. Listed as SKIP with this
+# reason, by prefix, so a new Dockerfile anywhere else is still built here. Added 17/11, when the
+# first push of the differential suite to a CI branch failed this gate on two sshd cases.
+HARNESS_BUILT = ("tests/differential/",)
+
+
 def main() -> int:
     # Release OR debug, whichever represents this tree: see `kernbin.pick` for why release-only made
     # this gate skip on every CI runner.
@@ -70,6 +79,9 @@ def main() -> int:
     failed = []
     for f in files:
         rel = f.relative_to(ROOT)
+        if str(rel).startswith(HARNESS_BUILT):
+            print(f"  SKIP  {rel}  (built by its own harness after setup.sh, see HARNESS_BUILT)")
+            continue
         # The CONTEXT is the Dockerfile's own directory, which is how each of these is documented to
         # be built. A context of the repo root would make `COPY . .` mean something entirely different.
         r = subprocess.run(
