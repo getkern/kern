@@ -1469,9 +1469,19 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
     // ROOT HAS NO `kern-boxes.service`: its `kern.slice` is a transient system slice, not a user
     // unit (see the CHANGELOG entry on `kern-boxes.service`). MEASURED: root's `--yes` with no box
     // running said "a box is still running", because being root fell through to that branch.
+    // EVERY BOX OF THIS USER, NOT ONLY THIS DIRECTORY'S. The unit holds the boxes of every
+    // XDG_RUNTIME_DIR the user runs kern from (a systemd unit, a test world, a script with its own
+    // runtime dir), and stopping it ends all of them: systemd sends SIGTERM to each, then SIGKILL.
+    // MEASURED on 2026-11-17: `readme-blocks.py` runs `kern uninstall --yes` from docs/INSTALL.md in
+    // a world of its own, with an empty registry, and it ended a compose stack, a GPU box and two
+    // more boxes running in another world (postgres got SIGTERM, the rest SIGKILL 90 s later). So the
+    // boxes found by cgroup and by process, the way `kern ps` finds a box with no record, count too.
+    let others = kern_isolation::live_box_cgroups()
+        .len()
+        .max(kern_isolation::live_box_supervisors_via_proc().len());
     let anchor_note = if kern_isolation::is_initial_root() {
         "the transient kern.slice cgroup disappears on its own"
-    } else if registry::list().is_empty() {
+    } else if registry::list().is_empty() && others == 0 {
         let stopped = std::process::Command::new("systemctl")
             .args(["--user", "stop", "kern-boxes.service"])
             .stdout(std::process::Stdio::null())
@@ -1484,8 +1494,9 @@ pub fn uninstall(yes: bool, keep_images: bool) -> Result<(), Error> {
             "the transient kern.slice cgroup disappears on its own"
         }
     } else {
-        "a box is still running, so its unit kern-boxes.service is left running; `kern stop --all` \
-         then `systemctl --user stop kern-boxes.service` ends it"
+        "a box is still running (`kern ps` lists it, also one started from another runtime \
+         directory), so the boxes' unit kern-boxes.service is left running; stop the boxes, then \
+         `systemctl --user stop kern-boxes.service` ends it"
     };
     let mut rules_left: Vec<&str> = Vec::new();
     for spec in &selinux_rules {

@@ -7191,6 +7191,108 @@ fn a_detached_box_log_holds_the_workload_and_not_kerns_notices() {
     );
 }
 
+/// `kern uninstall --yes` from one runtime directory never ends a box running from another. The
+/// boxes' systemd unit holds the boxes of every runtime directory, and uninstall stopped it whenever
+/// ITS OWN registry was empty: MEASURED on 2026-11-17, `readme-blocks.py` (which runs the install
+/// guide's `kern uninstall --yes` in a world of its own) ended a compose stack and three boxes in
+/// another world. World A starts a box; world B, with its own HOME and runtime roots, uninstalls.
+#[test]
+fn uninstall_from_another_world_leaves_a_running_box_alone() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
+    let unit_active = || {
+        Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", "kern-boxes.service"])
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let root = std::env::temp_dir().join(format!("kern-uninst-{}", std::process::id()));
+    let world = |w: &str| -> Vec<(String, std::path::PathBuf)> {
+        let d = root.join(w);
+        for sub in ["run", "data", "config", "cache", "home"] {
+            std::fs::create_dir_all(d.join(sub)).expect("world dir");
+        }
+        let _ = Command::new("chmod").arg("700").arg(d.join("run")).status();
+        vec![
+            ("XDG_RUNTIME_DIR".into(), d.join("run")),
+            ("XDG_DATA_HOME".into(), d.join("data")),
+            ("XDG_CONFIG_HOME".into(), d.join("config")),
+            ("XDG_CACHE_HOME".into(), d.join("cache")),
+            ("HOME".into(), d.join("home")),
+        ]
+    };
+    // World A keeps the caller's image cache (no pull); world B gets every root of its own.
+    let a: Vec<_> = world("a")
+        .into_iter()
+        .filter(|(k, _)| k != "XDG_CACHE_HOME")
+        .collect();
+    let b = world("b");
+    let name = format!("uninst{}", std::process::id());
+    let started = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args([
+            "box",
+            &name,
+            "-d",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sleep",
+            "60",
+        ])
+        .output()
+        .expect("start the box in world A");
+    if !started.status.success() {
+        eprintln!(
+            "SKIP: the box did not start: {:.300}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    if !unit_active() {
+        eprintln!("SKIP: no kern-boxes.service here (no user manager, or the direct path is off)");
+        let _ = kern()
+            .envs(a.iter().map(|(k, v)| (k, v)))
+            .args(["stop", &name, "-t", "0"])
+            .output();
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    let un = kern()
+        .envs(b.iter().map(|(k, v)| (k, v)))
+        .args(["uninstall", "--yes"])
+        .output()
+        .expect("uninstall in world B");
+    let said = String::from_utf8_lossy(&un.stdout).into_owned();
+    let alive = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["ps", "-q"])
+        .output()
+        .expect("ps in world A");
+    let listed = String::from_utf8_lossy(&alive.stdout).contains(&name);
+    let active = unit_active();
+    let _ = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["stop", &name, "-t", "0"])
+        .output();
+    let _ = kern()
+        .envs(a.iter().map(|(k, v)| (k, v)))
+        .args(["rm", &name])
+        .output();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        active && listed,
+        "uninstall in another world ended a running box (unit active: {active}, box listed: {listed}):\n{said}"
+    );
+    assert!(
+        said.contains("left running"),
+        "uninstall did not say it left the unit running:\n{said}"
+    );
+}
+
 /// A box's `/sys` is read-only, as Docker mounts sysfs: a write anywhere under it fails with EROFS,
 /// where it used to succeed into the box's own root (found from outside, 17/11). What kern puts there
 /// is still there: the CPU topology an allocator reads and the box's cgroup view. A `-v` under `/sys`
