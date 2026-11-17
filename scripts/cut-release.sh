@@ -119,35 +119,47 @@ ok "cargo test: $(grep -c '^test .* \.\.\. ok' /tmp/cut-release-test.$$) passing
 rm -f /tmp/cut-release-test.$$
 
 for g in flat-continuation gen-seccomp-allowlist injection-declared no-ai-slop \
-         registry-classified stale-numbers progress-is-tty-gated gates-selftest; do
+         registry-classified stale-numbers progress-is-tty-gated; do
     python3 "scripts/$g.py" >/dev/null 2>&1 || die "scripts/$g.py failed"
 done
-ok "9 doc/consistency gates"
+# gates-selftest's full run sabotages every gate in turn and takes about ten minutes; CI runs it on
+# every push. Here only its anchors (milliseconds): each sabotage still finds the text it edits.
+python3 scripts/gates-selftest.py --anchors >/dev/null 2>&1 || die "scripts/gates-selftest.py --anchors failed"
+ok "8 doc/consistency gates + gates-selftest anchors"
 
 
-# ---------------------------------------------------------------- the evidence, on THIS code
-step "pentest suites (the evidence behind SECURITY.md)"
-# RUN THEM ON THE CODE THAT WILL SHIP, WHICH IS THE POINT OF DOING IT HERE. `run-all.sh` stamps
-# `pentest/.last-run` with the commit it ran at; the stamp commit made below is the last thing that
-# happens before the tag, so the tagged tree carries evidence for its own code.
-sh pentest/run-all.sh >/tmp/cut-release-pentest.$$ 2>&1 || {
-    tail -20 /tmp/cut-release-pentest.$$ >&2
-    die "pentest suites failed (full output in /tmp/cut-release-pentest.$$)"
-}
-ok "$(tail -1 /tmp/cut-release-pentest.$$)"
-rm -f /tmp/cut-release-pentest.$$
-
-if [ -n "$(git status --porcelain pentest/.last-run)" ]; then
-    git add pentest/.last-run
-    printf 'chore(pentest): stamp the tree %s is cut from\n' "$VERSION" > "/tmp/cut-msg.$$"
-    # The work-hours hook applies here like anywhere else. It is not bypassed: if it refuses, the
-    # release waits, which is the owner's rule and not this script's to override.
-    git commit -F "/tmp/cut-msg.$$" --quiet || die "the stamp commit was refused (work-hours hook?). The release waits."
-    rm -f "/tmp/cut-msg.$$"
-    git push --quiet origin main || die "pushing the stamp failed"
-    ok "stamp committed and pushed: $(git rev-parse --short HEAD)"
+# ---------------------------------------------------------------- the evidence
+# THE PENTEST RUNS ONLY WHEN ITS EVIDENCE IS STALE. `check-pentest-freshness.py` is what the Release
+# workflow itself refuses on (older than its threshold, or older than a tag); when it is green the
+# suites' last run still stands for this release, and running them again cost every release about
+# ten minutes for no new information (owner, 2026-11-17). When it is red they run here, stamp the
+# tree and push the stamp, as before.
+if python3 scripts/check-pentest-freshness.py >/dev/null 2>&1; then
+    ok "pentest evidence is fresh: suites not run again"
 else
-    ok "stamp already current for this tree"
+    step "pentest suites (the evidence behind SECURITY.md)"
+    # RUN THEM ON THE CODE THAT WILL SHIP, WHICH IS THE POINT OF DOING IT HERE. `run-all.sh` stamps
+    # `pentest/.last-run` with the commit it ran at; the stamp commit made below is the last thing that
+    # happens before the tag, so the tagged tree carries evidence for its own code.
+    sh pentest/run-all.sh >/tmp/cut-release-pentest.$$ 2>&1 || {
+        tail -20 /tmp/cut-release-pentest.$$ >&2
+        die "pentest suites failed (full output in /tmp/cut-release-pentest.$$)"
+    }
+    ok "$(tail -1 /tmp/cut-release-pentest.$$)"
+    rm -f /tmp/cut-release-pentest.$$
+
+    if [ -n "$(git status --porcelain pentest/.last-run)" ]; then
+        git add pentest/.last-run
+        printf 'chore(pentest): stamp the tree %s is cut from\n' "$VERSION" > "/tmp/cut-msg.$$"
+        # The work-hours hook applies here like anywhere else. It is not bypassed: if it refuses, the
+        # release waits, which is the owner's rule and not this script's to override.
+        git commit -F "/tmp/cut-msg.$$" --quiet || die "the stamp commit was refused (work-hours hook?). The release waits."
+        rm -f "/tmp/cut-msg.$$"
+        git push --quiet origin main || die "pushing the stamp failed"
+        ok "stamp committed and pushed: $(git rev-parse --short HEAD)"
+    else
+        ok "stamp already current for this tree"
+    fi
 fi
 
 fi
