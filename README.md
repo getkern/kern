@@ -43,7 +43,7 @@ agent's code runs in, called from Python, Node or any MCP client. kern calls a c
 - **No daemon, and root is never required.** Six namespaces, a read-only or overlay root, a seccomp
   allowlist by default, cgroup v2 limits.
 - **Your `docker-compose.yml`, unchanged**, or kern's own `stack.toml`.
-- **NVIDIA GPUs, granted as Docker grants them**: `--gpus all`, `--gpus 2`, `--gpus device=0,1`,
+- **Full NVIDIA GPU support**: `--gpus all`, `--gpus 2`, `--gpus device=0,1`,
   and compose's `deploy.resources.reservations.devices`, on Linux and WSL2.
 - **Limits without a sandbox.** `kern run` puts the same caps on a plain process on the host.
   [docs/RESOURCES.md](docs/RESOURCES.md)
