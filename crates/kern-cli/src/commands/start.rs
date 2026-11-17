@@ -6265,6 +6265,7 @@ fn reexec_exec_in_bare_scope() {
     let mut cmd = std::process::Command::new(systemd_run);
     cmd.arg(kern_isolation::systemd_scope_mode())
         .args(["--scope", "--quiet", "--collect"])
+        .args(kern_isolation::scope_no_expand_arg())
         .arg(&unit)
         .arg("--")
         .arg(self_exe)
@@ -6492,6 +6493,8 @@ fn reexec_in_scope_if_possible(p: ScopeReexec) {
         // regression to ask for permission already held is not a trade; the property stays off.
         .arg(&unit)
         .args(&props)
+        // The caller's arguments verbatim: see `scope_no_expand_arg`.
+        .args(kern_isolation::scope_no_expand_arg())
         .arg("--")
         .arg(self_exe)
         .args(&args)

@@ -3427,6 +3427,68 @@ pub fn scope_accepts_oom_policy() -> bool {
     })
 }
 
+/// `--expand-environment=no` where this host's `systemd-run` knows the option (systemd 254 and later),
+/// else nothing, for every `systemd-run --scope` that runs kern again with the CALLER's arguments.
+///
+/// WHY. `systemd-run` expands `${VAR}` and `$VAR` in the command it runs, as `ExecStart=` does. For
+/// `--scope` that was off by default "for backward compatibility", and systemd's own manual says it
+/// would be switched on. It is on the GitHub runner's Ubuntu 26.04: `kern box ... -- bash -c 'a=(1 2
+/// 3); echo ${#a[@]}'` reached bash as `echo ` (systemd: "Invalid environment variable name evaluates
+/// to an empty string: #a[@]") and `$$` as `$`, so a box ran a command its caller never wrote (found
+/// by the pi extension's suite in CI, 17/11). A command is passed through verbatim, as Docker passes
+/// it; the option only says so explicitly, which on systemd 255 (where scopes do not expand) changes
+/// nothing.
+///
+/// Gated on the VERSION because an older `systemd-run` (249 on a Jetson, 252 on Debian 12) refuses an
+/// option it does not know, and that would fail every box. `systemd-run --version` is one exec, read
+/// once per process and cached in `$XDG_RUNTIME_DIR`, which the kernel clears on reboot, the lifetime
+/// of "which systemd is installed" for practical purposes, as [`scope_accepts_oom_policy`] does.
+pub fn scope_no_expand_arg() -> Option<&'static str> {
+    static MEMO: OnceLock<bool> = OnceLock::new();
+    let known = *MEMO.get_or_init(|| {
+        let cache = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .map(|d| d.join("kern").join("systemd-run-expand-env"));
+        if let Some(p) = &cache {
+            if let Ok(v) = fs::read_to_string(p) {
+                return v.starts_with('1');
+            }
+        }
+        let Some(systemd_run) = crate::real::trusted_helper("systemd-run") else {
+            return false;
+        };
+        let ok = Command::new(systemd_run)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| systemd_major_version(&String::from_utf8_lossy(&o.stdout)))
+            .is_some_and(|v| v >= 254);
+        if let Some(p) = &cache {
+            if let Some(dir) = p.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            let _ = fs::write(p, if ok { "1" } else { "0" });
+        }
+        ok
+    });
+    known.then_some("--expand-environment=no")
+}
+
+/// The major version on the first line of `systemd-run --version` (`systemd 255 (255.4-1ubuntu8)`),
+/// or `None` for anything else.
+fn systemd_major_version(out: &str) -> Option<u32> {
+    let mut words = out.lines().next()?.split_whitespace();
+    if words.next()? != "systemd" {
+        return None;
+    }
+    let v = words.next()?;
+    let end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    v.get(..end)?.parse().ok()
+}
+
 /// The box's own delegated scope, once [`prepare_delegated_scope`] has proven the layout works here.
 /// A `OnceLock` set BEFORE kern forks its supervisor, so every later process sees the same answer.
 static DELEGATED_SCOPE: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -5286,6 +5348,22 @@ mod outer_memory_high_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_systemd_version_gating_expand_environment_is_read_from_the_first_line() {
+        assert_eq!(
+            systemd_major_version("systemd 255 (255.4-1ubuntu8.18)\n+PAM +AUDIT"),
+            Some(255)
+        );
+        assert_eq!(
+            systemd_major_version("systemd 249 (249.11-0ubuntu3)"),
+            Some(249)
+        );
+        assert_eq!(systemd_major_version("systemd 259"), Some(259));
+        assert_eq!(systemd_major_version("systemd 260~rc1"), Some(260));
+        assert_eq!(systemd_major_version(""), None);
+        assert_eq!(systemd_major_version("elogind 255"), None);
+        assert_eq!(systemd_major_version("systemd (255)"), None);
+    }
 
     /// The `/proc` channel finds a live box, and it does not use `kern.slice` to do it.
     ///

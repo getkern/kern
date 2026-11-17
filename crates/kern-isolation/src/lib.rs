@@ -211,6 +211,9 @@ pub use cgroup::prepare_delegated_scope;
 /// Will this systemd accept `OOMPolicy=` on a transient scope? Probed once per boot, because a manager
 /// that refuses it fails the whole `systemd-run`. See [`cgroup::scope_accepts_oom_policy`].
 pub use cgroup::scope_accepts_oom_policy;
+/// `--expand-environment=no` where `systemd-run` knows it: a scope re-exec passes the caller's
+/// arguments verbatim. See [`cgroup::scope_no_expand_arg`].
+pub use cgroup::scope_no_expand_arg;
 /// Apply a fleet-wide `memory.max`/`pids.max` budget to kern's shared `kern.slice`, bounding the SUM of
 /// all running boxes at the kernel. The real-enforcement backstop to the cooperative box counter. See
 /// [`cgroup::set_fleet_caps`].
