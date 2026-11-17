@@ -1298,8 +1298,8 @@ fn mask_nvidia_enumeration(what: &GpuEnumeration) -> Result<(), Error> {
 /// `MS_RDONLY` is load-bearing security, not cosmetic: the box may READ its limits but can never write
 /// `cgroup.procs` (no self-migration out of the cap) or edit a `*.max` file, so exposing the cgroup
 /// buys the runtimes correctness without handing the workload a lever on its own limits. `NOSUID`,
-/// `NODEV`, `NOEXEC` harden the mount. Only `/sys/fs/cgroup` is mounted - the rest of `/sys` is left
-/// absent, so the host sysfs stays masked (kern's deny-by-default `/sys` property is unchanged).
+/// `NODEV`, `NOEXEC` harden the mount. Only `/sys/fs/cgroup` is mounted - the rest of the host sysfs
+/// stays absent (kern's deny-by-default `/sys` property is unchanged).
 ///
 /// Best-effort throughout: a kernel without cgroup namespaces, a host that refuses the `cgroup2` mount,
 /// or a `--privileged` nested box where `mount_too_revealing` bites, simply leaves the box without a
@@ -1327,6 +1327,29 @@ fn mount_cgroup() {
                 ty.as_ptr(),
                 (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC)
                     as libc::c_ulong,
+                ptr::null(),
+            );
+        }
+    }
+}
+
+/// Remount the box's `/sys` tmpfs read-only (post-pivot), keeping the flags it was mounted with and
+/// adding `noexec`, as Docker mounts sysfs `ro,nosuid,nodev,noexec`. Only this mount changes: the
+/// mounts below it keep their own flags. Best-effort: a refused remount leaves the tmpfs writable,
+/// which is the box's own memory and reaches nothing of the host's.
+fn seal_sys() {
+    if let Ok(p) = cstr("/sys") {
+        unsafe {
+            libc::mount(
+                ptr::null(),
+                p.as_ptr(),
+                ptr::null(),
+                (libc::MS_REMOUNT
+                    | libc::MS_BIND
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV
+                    | libc::MS_NOEXEC) as libc::c_ulong,
                 ptr::null(),
             );
         }
@@ -1891,25 +1914,34 @@ fn child_setup_and_exec(
     if let Some(sock) = spec.pty_sock {
         unsafe { libc::close(sock) };
     }
+    // `/sys` IS THE BOX'S OWN TMPFS, READ-ONLY ONCE POPULATED (`seal_sys` below), as Docker gives a
+    // read-only sysfs. It used to be a directory of the box's writable root with a writable tmpfs on
+    // `/sys/devices`, so `touch /sys/x` succeeded where Docker answers EROFS (found from outside,
+    // 17/11): harmless, the write stayed in the box, but a script that probes "can I write sysfs"
+    // took the wrong branch. The mount replaces the `sys/devices` tmpfs one for one, and the
+    // directories `/sys`, `/sys/devices` and `/sys/fs/cgroup` no longer land in the overlay upper.
+    // REQUIRED only when sysfs paths are granted (they need somewhere box-owned to be bound); without
+    // a grant a host that refuses the mount keeps the previous layout, so the box still starts.
+    let sys_mount = make_box_tmpfs(&spec.root, "sys");
+    let sys_is_box_tmpfs = sys_mount.is_ok();
+    if !spec.vgpio_sysfs.is_empty() || !spec.gpu_sysfs.is_empty() {
+        sys_mount?;
+    }
     setup_vgpio(
         &spec.root,
         &spec.vgpio_devs,
         &spec.vgpio_sysfs,
         &spec.gpu_sysfs,
-    )?;
+    );
     t.mark("dev");
-    // BEFORE THE VOLUMES, AFTER `setup_vgpio`. The topology is a tmpfs over `sys/devices`, and it was
+    // BEFORE THE VOLUMES, AFTER `setup_vgpio`. The topology was a tmpfs over `sys/devices`, and it was
     // mounted after `setup_volumes`, so it covered every `-v` aimed under `/sys/devices` with no
     // error and no note: MEASURED on a Jetson, `-v /sys/devices/soc0/soc_id:/sys/devices/soc0/soc_id`
     // left the box with no such file, which is where CUDA reads the chip id. A bind made after it
     // lands on top of the tmpfs, which is writable, so its mountpoint can be created there. `vgpio`'s
     // sysfs grants mount a tmpfs over the whole of `/sys` and must stay underneath, which is why this
     // follows them.
-    setup_cpu_topology(
-        &spec.root,
-        spec.cpuset.as_deref(),
-        !spec.vgpio_sysfs.is_empty() || !spec.gpu_sysfs.is_empty(),
-    );
+    setup_cpu_topology(&spec.root, spec.cpuset.as_deref(), sys_is_box_tmpfs);
     // PARENT BEFORE CHILD, as Docker orders mounts by destination. A tmpfs that CONTAINS a volume's
     // target goes first, so the bind lands inside it; one inside a volume goes after, as before.
     // MEASURED with the shape of a code sandbox (`read_only`, a `/tmp` tmpfs, a script bound to
@@ -2012,6 +2044,13 @@ fn child_setup_and_exec(
     // mount would reveal the whole host cgroup tree instead of just this box's leaf).
     if cgroupns_ok {
         mount_cgroup();
+    }
+    // AFTER EVERY MOUNT UNDER `/sys` (grants, topology, `-v` and `--tmpfs` targets, the cgroup view),
+    // whose mountpoints are created in this tmpfs, and only on the tmpfs: each of those keeps its own
+    // flags, so a granted LED stays writable and a `-v` under `/sys` keeps its mode. `--privileged`
+    // leaves it writable, as Docker's `--privileged` mounts sysfs read-write.
+    if sys_is_box_tmpfs && !spec.privileged {
+        seal_sys();
     }
     t.mark("cgroup-view");
     // THE LOADER CACHE, while the root is still writable (before the read-only remount below).
@@ -4335,25 +4374,16 @@ fn setup_dev(
 
 /// Expose a `vgpio:` profile's host devices in the box. Device nodes are bound into the box's own
 /// `/dev` tmpfs (created by `setup_dev` - box-owned, so binding into it can't be redirected by a
-/// hostile image symlink). If the profile needs sysfs peripherals (pwm/adc/1-wire/leds), a fresh
-/// box-owned `/sys` tmpfs is created (shadowing any image `/sys`, deny-by-default) and only the
-/// requested directories are bound in. Runs BEFORE pivot while the host sources are reachable.
-/// Best-effort per entry: a device absent on this host is simply skipped.
-fn setup_vgpio(
-    root: &str,
-    devs: &[String],
-    sysfs: &[String],
-    gpu_sysfs: &[String],
-) -> Result<(), Error> {
+/// hostile image symlink). Sysfs peripherals (pwm/adc/1-wire/leds) and the GPU topology are bound
+/// into the box-owned `/sys` tmpfs the caller mounted first (shadowing any image `/sys`,
+/// deny-by-default), only the requested paths. Runs BEFORE pivot while the host sources are
+/// reachable. Best-effort per entry: a device absent on this host is simply skipped.
+fn setup_vgpio(root: &str, devs: &[String], sysfs: &[String], gpu_sysfs: &[String]) {
     for dev in devs {
         if let Some(rel) = dev.strip_prefix("/dev/") {
             bind_into(root, "dev", rel, dev, false);
         }
     }
-    if sysfs.is_empty() && gpu_sysfs.is_empty() {
-        return Ok(());
-    }
-    make_box_tmpfs(root, "sys")?;
     for s in sysfs {
         if let Some(rel) = s.strip_prefix("/sys/") {
             bind_into(root, "sys", rel, s, true);
@@ -4362,7 +4392,6 @@ fn setup_vgpio(
     for s in gpu_sysfs {
         mirror_sysfs_ro(root, s);
     }
-    Ok(())
 }
 
 /// Reproduce one host sysfs path in the box's `/sys` tmpfs, READ-ONLY: a symlink as the same symlink
@@ -4506,7 +4535,7 @@ fn make_box_tmpfs(root: &str, leaf: &str) -> Result<(), Error> {
         )
     } != 0
     {
-        return Err(Error::last("mount(vgpio /sys tmpfs)"));
+        return Err(Error::last("mount(box /sys tmpfs)"));
     }
     Ok(())
 }
@@ -4945,9 +4974,10 @@ fn setup_cpu_topology(root: &str, cpuset: Option<&str>, sys_is_box_tmpfs: bool) 
     // `/sys` was thirty-seven: `setup_dev` mounts a tmpfs and populates it, so nothing it writes ever
     // reaches the host-visible layer. Applying the same shape here is consistency, not a new mechanism.
     //
-    // NARROW ON PURPOSE: `sys/devices` and not `sys`. Covering all of `/sys` would also hide anything
-    // an image ships there and would sit under the `/sys/fs/cgroup` mount kern makes later. Three
-    // mountpoint directories stay in the upper; the thirty-four leaves do not.
+    // NOW ALL OF `/sys` (17/11): the caller mounts a box tmpfs there for every box and seals it
+    // read-only once populated, as Docker gives a read-only sysfs; anything an image ships under
+    // `/sys` is hidden, as Docker's sysfs mount hides it. The `sys/devices` tmpfs below is only the
+    // fallback for a host that refused that mount.
     //
     // BEST EFFORT, AND THE FALLBACK IS TODAY'S BEHAVIOUR. A host that refuses the mount still gets the
     // topology, written into the upper exactly as before: `create_dir_all` below runs either way. A

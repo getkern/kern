@@ -7136,6 +7136,92 @@ fn a_detached_box_log_holds_the_workload_and_not_kerns_notices() {
     );
 }
 
+/// A box's `/sys` is read-only, as Docker mounts sysfs: a write anywhere under it fails with EROFS,
+/// where it used to succeed into the box's own root (found from outside, 17/11). What kern puts there
+/// is still there: the CPU topology an allocator reads and the box's cgroup view. A `-v` under `/sys`
+/// keeps its own mode, and `--privileged` leaves `/sys` writable, as Docker's `--privileged` does.
+#[test]
+fn a_box_sys_is_read_only_like_docker_sysfs() {
+    let vol = std::env::temp_dir().join(format!("kern-sysro-{}", std::process::id()));
+    std::fs::create_dir_all(&vol).expect("volume dir");
+    let bind = format!("{}:/sys/devices/kernvol", vol.display());
+    let script = "touch /sys/x 2>/dev/null && echo SYS=rw || echo SYS=ro; \
+                  touch /sys/devices/x 2>/dev/null && echo DEVICES=rw || echo DEVICES=ro; \
+                  echo CPU=$(cat /sys/devices/system/cpu/online); \
+                  test -r /sys/fs/cgroup/cgroup.controllers && echo CGROUP=yes; \
+                  echo v > /sys/devices/kernvol/w && echo VOLUME=rw; \
+                  grep -q '^tmpfs /sys tmpfs ro,' /proc/self/mounts && echo MOUNT=ro; \
+                  echo END";
+    let out = kern()
+        .args([
+            "box",
+            "--rm",
+            "-v",
+            &bind,
+            "--image",
+            "alpine:latest",
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("run kern box");
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    // A box that never ran the script is a host without boxes; one that ran it to the end is judged
+    // on what it printed, whatever its exit status (a failed last probe must not read as a skip).
+    if !said.contains("END") {
+        eprintln!("SKIP: no box here: {err:.300}");
+        return;
+    }
+    for want in ["SYS=ro", "DEVICES=ro", "VOLUME=rw", "MOUNT=ro"] {
+        assert!(said.contains(want), "{want} missing: {said}\n{err}");
+    }
+    assert!(
+        said.lines().any(|l| l.starts_with("CPU=") && l.len() > 4),
+        "the CPU topology is gone: {said}"
+    );
+    assert!(
+        std::fs::read_to_string(vol.join("w")).is_ok_and(|v| v == "v\n"),
+        "the write through the volume did not reach the host directory"
+    );
+    let _ = std::fs::remove_file(vol.join("w"));
+    let _ = std::fs::remove_dir(&vol);
+    if std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").is_ok() {
+        assert!(
+            said.contains("CGROUP=yes"),
+            "the cgroup view is gone: {said}"
+        );
+    }
+    let privileged = kern()
+        .args([
+            "box",
+            "--rm",
+            "--privileged",
+            "--image",
+            "alpine:latest",
+            "--",
+            "sh",
+            "-c",
+            "touch /sys/x && echo SYS=rw; echo END",
+        ])
+        .output()
+        .expect("run kern box --privileged");
+    let said = String::from_utf8_lossy(&privileged.stdout);
+    if said.contains("END") {
+        assert!(
+            said.contains("SYS=rw"),
+            "--privileged /sys is not writable: {said}"
+        );
+    } else {
+        eprintln!(
+            "SKIP --privileged: {:.300}",
+            String::from_utf8_lossy(&privileged.stderr)
+        );
+    }
+}
+
 /// A `--gpus` box's `/sys` places the card as the host does, and read-only: `bus/pci/devices/<bdf>`
 /// is a LINK into `devices/`, the bridge above the card holds its attribute files and not the other
 /// devices behind it, the CPU topology is there for hwloc, and nothing under it can be written.
