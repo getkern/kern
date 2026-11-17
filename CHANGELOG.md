@@ -162,6 +162,15 @@ under `/sys` is hidden, as under Docker. Measured: a box start is 73 us faster (
 -14], n=200, after an A/A that read zero), because those directories no longer land in the
 overlay's writable layer.
 
+**`KERN_SECCOMP=denylist` no longer lets `open_tree_attr` and `listns` run.** The denylist allows
+what it does not name, and these two came after the lists (Linux 6.15 and 6.19): on a 7.0 kernel a
+box under the denylist reached both, measured. `open_tree_attr` is the new mount API that
+`open_tree` is denied for, and now kills like it; `listns` enumerates namespaces and now answers
+`ENOSYS`. The default allowlist already refused both. kern now denies 37 escape syscalls (25 that
+kill, 12 that answer `ENOSYS`), and the ten other syscalls those kernels added were reviewed and
+stay allowed under the denylist: the `*xattrat` calls, `file_getattr` and `file_setattr`, `mseal`,
+`rseq_slice_yield`, `uprobe` and `uretprobe`.
+
 **A box runs the command it was given on a newer systemd.** `systemd-run` expands `${VAR}` and
 `$VAR` in the command it starts, and since a recent release it does so for scopes too (Ubuntu
 26.04): a box started through kern's scope re-exec got `${#a[@]}` as nothing and `$$` as `$`. kern

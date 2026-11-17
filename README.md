@@ -184,7 +184,7 @@ other's noise. The method and every runtime: [BENCHMARKS.md](BENCHMARKS.md).</su
 ## Security
 
 Namespaces, a `pivot_root`, dangerous capabilities dropped before exec, an always-on seccomp
-**allowlist** that keeps kern's 35 escape syscalls denied, cgroup v2 limits and a deny-by-default
+**allowlist** that keeps kern's 37 escape syscalls denied, cgroup v2 limits and a deny-by-default
 `/dev`. Where a boundary is cooperative rather
 than kernel-enforced, [SECURITY.md](SECURITY.md) says so and names the bypass.
 [docs/CVE-POSTURE.md](docs/CVE-POSTURE.md) runs 25 published container-runtime escapes against this

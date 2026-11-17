@@ -88,9 +88,9 @@ shared hardware, see [kern or a microVM](#kern-or-a-microvm).
   namespace.
 
 - **Always-on seccomp, allowlist by default**: the shipped default is moby's own default filter
-  minus kern's 35 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
-  opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **35 escape syscalls**: 24
-  that hard-kill plus the 11 that return `ENOSYS`; a rootless `--privileged` box denies 5 fewer. Do
+  minus kern's 37 (deny-by-default, the long tail returning `ENOSYS`); the wider denylist is the
+  opt-out via `KERN_SECCOMP=denylist`. Either posture always refuses the **37 escape syscalls**: 25
+  that hard-kill plus the 12 that return `ENOSYS`; a rootless `--privileged` box denies 5 fewer. Do
   not take the number from this file, ask the binary: `kern box <name> --image <ref> --show-config`
   prints `seccomp_denied_syscalls` from the live lists.
 
@@ -123,9 +123,9 @@ Verified on this desktop, the string arrives outside.
 
 ### What a denied syscall returns
 The filter has two verdicts for a whole syscall. Real escape vectors (kexec, module load/unload, the mount API, `bpf`,
-`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Eleven, in seven
+`ptrace`, `setns`/`unshare`/`pivot_root`) **hard-kill** the caller with `SIGSYS`. Twelve, in eight
 families (io_uring's three, `userfaultfd`, `perf_event_open`, the keyring's three, `syslog`,
-`clone3` and `open_by_handle_at`), return **`ENOSYS`** instead: equally denied, and the difference
+`clone3`, `open_by_handle_at` and `listns`), return **`ENOSYS`** instead: equally denied, and the difference
 is Redis falling back to its epoll path rather than Redis dying.
 
 Two rules refuse an **argument** rather than a syscall, and each returns what a kernel that lacks
