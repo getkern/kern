@@ -199,8 +199,10 @@ relaxation is a named argument.
   agent** runs the code you asked for, so the defence is that credentials are never in the box.
 - **Mounts over sensitive sources are refused, with no opt-out**: the host's own directories, kern's
   own state, and 17 credential directories by name (`.ssh`, `.aws`, `.kube`, `.gnupg`, `.netrc`,
-  `.npmrc`, `.git-credentials` and the rest), plus `~/.config/gh` and `~/.config/gcloud`. Mount a
-  copy.
+  `.npmrc`, `.git-credentials` and the rest), plus `~/.config/gh` and `~/.config/gcloud`. A parent
+  of any of these is refused too (`/home` holds your home), and so is a directory with a credential
+  directory or a shell history in its first two levels (`.npmrc`, `.pypirc` and `.docker` excepted,
+  since projects carry their own). Mount a copy.
 - **`network=True` includes the host's loopback**, where unauthenticated services live: a test read
   the host's SSH banner off `127.0.0.1:22`. `egress_allow` is the route-level middle setting.
 

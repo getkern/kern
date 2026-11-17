@@ -207,7 +207,10 @@ Every relaxing option says so in its name or docs:
   `.pypirc`, `.npmrc`, `.databrickscfg`, `.boto`, `.s3cfg`, `.rclone.conf`, and under `.config`:
   `gcloud`, `gh`, `doctl`, `rclone`),
   **kern's own state** (`$XDG_RUNTIME_DIR/kern`, the image cache, the config dir, the data dir that
-  holds every named volume: the sandbox's control plane), and escaping targets.
+  holds every named volume: the sandbox's control plane), and escaping targets. A **parent** of any
+  of these is refused too (`/home` holds your home), and so is a directory with a credential directory
+  or a shell history in its first two levels (`.npmrc`, `.pypirc` and `.docker` excepted, since
+  projects carry their own).
 - **workspace I/O contained**: `writeFile`/`readFile` reject `..` escapes, open the final component
   `O_NOFOLLOW` so a symlink the box plants cannot redirect host I/O, and refuse anything that is not a
   REGULAR file (see the notes for the FIFO that made a read hang).

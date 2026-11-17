@@ -99,7 +99,7 @@ Every one can be set from the command line, which writes the same line and check
 ```sh
 kern config set log_max_size 10m    # write one key; a bad value is refused, nothing written
 kern config get                     # every key, its value or -, and what it does (--json too)
-kern config get log_max_size        # one value; exit 1 if it is not set
+kern config get log_max_size        # one value; exit 1 if it is not set, 3 if kern.toml does not parse
 kern config unset log_max_size      # remove it: kern's default again
 ```
 
@@ -147,7 +147,8 @@ period each time a box starts with `-d`, the only moment a new log is made; a ru
 never touched. `30m`, `24h` and `7d` are periods.
 
 Without `build_keep`, every build record and its log is kept (`kern build prune --keep N` removes
-them by hand). With it, the oldest go each time a build ends, never one still running.
+them by hand). With it, the records that ended longest ago go each time a build ends; a build still
+running is never removed and does not count among the N.
 
 Sandbox calls through the SDKs and MCP write no log file: their output goes back to the caller. What
 they leave is the one-line history above, bounded at twice `sandbox_history_max_size`.
@@ -160,7 +161,13 @@ the number of build records kept.
 - A value that is a flag's argument is a quoted string: `memory = "512m"`. A switch is `true` or
   `false`. A repeatable flag is an array: `volumes = ["/data:/data:ro"]`.
 - Numeric profile fields are bare numbers: `cpus = 4.0`, `nice = -5`.
-- Unknown keys are ignored, so a typo is skipped too: check the file with `kern validate`.
+- Unknown keys are ignored with a warning, so a typo is skipped too: check the file with `kern
+  validate`.
+- The file must be valid TOML: a key twice in one table, `[kern]` twice, a header with no `]` or a
+  stray line is refused by line, and a file refused that way is not applied at all (boxes start on
+  the defaults, with published ports on loopback). A UTF-8 BOM at the start is fine, and so is a
+  quoted key (`"log_max_size"` is `log_max_size`). `[[kern]]` is refused: the settings are one
+  table, `[kern]`.
 - Seccomp and the cgroup caps cannot be turned off from a config file.
 
 ## Limits for many boxes

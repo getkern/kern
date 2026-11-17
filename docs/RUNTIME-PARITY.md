@@ -40,7 +40,7 @@ identity, environment and mount rules, decided by runc and the daemon rather tha
 | 22 | `up` without `-d` | attaches, streams, Ctrl-C stops the stack | not measured | same **on a terminal**; unchanged when piped | kern follows Docker where it cannot hang a script |
 | 23 | `run --rm web sh -c 'exit 7'` | 7, deps up, ports not published | not measured | same on all three | agree |
 | 24 | `up --wait`, four cases | 0 / 0 / 1 / 1 | not measured | same | agree |
-| 25 | `up --build` after editing the Dockerfile | the OLD image without the flag | not measured | `build:` alone: rebuilds either way; with `image:`, as Docker | kern deviates for `build:` alone: always current |
+| 25 | `up --build` after editing the Dockerfile | the OLD image without the flag | not measured | same: the old image without the flag, the new one with it, and the service recreated only when the image changed | agree |
 | 26 | `--exit-code-from db` while `tests` exits 3 | **137** (the abort ended db) | not measured | same | agree |
 | 27 | `compose ps --format json` | NDJSON since Compose 2.21 | not measured | NDJSON, kern's fields plus nine of Docker's (`ID`, `Name`, `Service`, `State`, `Publishers`, ...) | five of Docker's fields missing (see 29) |
 

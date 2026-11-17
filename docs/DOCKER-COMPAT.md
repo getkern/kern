@@ -87,7 +87,7 @@ exception described below: a path that leaves the project directory.
 | **Dockerfile** `build` | ✅ `kern build`, daemonless: each `RUN` is a real box. `kern build --check` parses and reports, building nothing |
 | **`.dockerignore`** (also **`.kernignore`**) | ✅ last-match-wins, `!` re-include, `**` |
 | **`docker save` / `load` archives** | ✅ `kern save` / `kern load` |
-| **`tag` / `push`**, **`images` / `rmi` / `search`** | ✅ same verbs; `kern rmi` frees unshared layers |
+| **`tag` / `push`**, **`images` / `rmi` / `search`** | ✅ same verbs; `kern rmi` frees unshared layers and, as `docker rmi`, refuses an image a box uses unless `-f` |
 | **`docker commit`** | ✅ `kern commit <box> <image>`; skips volumes and secrets |
 | **`docker run` security flags** | ✅ `--apparmor`, `--cap-drop`/`--cap-add`, `--read-only`, `--tmpfs`, `--security-profile untrusted`, `--landlock-rw`, `--security-opt no-new-privileges`; seccomp **always on**; setuid works as in docker unless no-new-privileges is asked for. Absent: **SELinux** labelling and a **default** AppArmor profile. [SECURITY.md](../SECURITY.md) |
 | **Docker Engine API** / `docker.sock` | ❌ tools that attach to the socket will not connect |
@@ -637,7 +637,11 @@ already downloaded. And with `image:` + `build:`, only the registry saying it ha
 will not give it) leads to a build from source; a broken download stops and says to run it again.
 - **A service with `image:` AND `build:` runs the image when it is here or can be pulled**, and is built
   only when it cannot be, or when `--build` or `pull_policy: build` asks; kern says which. A service
-  with `build:` alone is rebuilt on every `up`, from the layer cache, where Docker reuses its old image.
+  with `build:` alone is built when its image is missing, or on `--build`, as Docker builds it; a
+  running one is recreated only when the rebuilt image differs from the one it runs.
+- **`up --wait` fails on a service that has exited**, with Docker's words (`container <name> exited
+  (0)`), except one that exited 0 while another service waits on it with `condition:
+  service_completed_successfully`, which passes, as on Docker Compose v5.
 
 **`--pull always` and `pull_policy: always` read the manifest first**, as Docker does: an image whose
 config digest is the one already here is not downloaded again, and a changed one is.

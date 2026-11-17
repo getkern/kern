@@ -53,19 +53,143 @@ Measured on that desktop, medians of 50 to 60: `--gpus device=0` 19.9 to 9.7 ms 
 **Log sizes and retention are set once, in `kern.toml` or from the command line.** Five `[kern]`
 keys: `log_max_size` and `log_max_file` are every box's log cap unless the box sets its own (default
 16m and 2, as before); `log_keep_ended` removes the logs of boxes that ended longer ago than a period
-such as `24h`, each time a box starts with `-d`; `build_keep` keeps that many build records and
-removes older ones when a build ends, never one still running; `sandbox_history_max_size` is the
-history's rotation size (default 1m). `kern config set <key> <value>`, `kern config get [<key>]`
-and `kern config unset <key>` write and read them, checking a value before anything is written. With
-none set, nothing changes. Before this, build records were never removed on their own: measured on a
-desktop, 12,269 records and 145 MB.
+such as `24h`, each time a box starts with `-d`; `build_keep` keeps that many build records, the
+ones that ended last, and removes the rest when a build ends, never one still running and without
+counting one; `sandbox_history_max_size` is the history's rotation size (default 1m). `kern config
+set <key> <value>`, `kern config get [<key>]` and `kern config unset <key>` write and read them,
+checking a value with the reader's own rule before anything is written. `set` writes through a
+`kern.toml` that is a symlink, keeps the comment on the line it replaces, and refuses a file it
+cannot read or that does not parse instead of writing over it; `get` exits 1 for a key not set and 3
+for a file that does not parse, as `git config` does, and never prints a value that is not in force.
+With none set, nothing changes. Before this, build records were never removed on their own: measured
+on a desktop, 12,269 records and 145 MB.
+
+**`kern.toml` is read by one reader, the one every box start uses.** `kern validate`, `kern config`
+and the box starts used to judge the file differently. A UTF-8 BOM before `[kern]` made every key
+of the table unread while `validate` said "valid": measured, `publish_bind = "127.0.0.1"` was
+ignored and a published port bound `0.0.0.0`. A BOM is now read past. A file that is not valid TOML
+is refused by line everywhere: a key twice in one table (`config get` printed the first, kern applied
+the last), `[kern]` opened twice, a header with no `]`, a line that is neither a header nor `key =
+value`, an array that never closes. A file refused that way, or not readable as UTF-8, is applied by
+nobody: boxes start on the defaults with published ports on loopback, as before, and `kern info`
+now says the file does not parse instead of reading its rows as defaults. Unknown sections and keys
+are still read past, with the warning. Keys and table headers are compared as TOML names them, by
+their segments: `"log_max_size"`, `'log_max_size'` and `"log\u005fmax_size"` are one key, `[ "kern" ]`
+is `[kern]`, and `kern.log_max_size = ...` written outside `[kern]` (however it is spelled) is
+refused rather than read past, while a single quoted key that merely contains `kern.` is not the
+table. `[[kern]]` is refused, as is a key with a character TOML does not allow in a bare key (a BOM
+pasted mid-file is named as such, and a control character in a key is printed escaped); multi-line
+strings and escaped quotes are read as TOML reads them. An error quoting
+a huge value is cut to a few hundred bytes. The checks are linear: 100,000 keys in one table read in
+0.04 s. `config set` keeps the mode of the file it rewrites (a new file is private, 0600).
 
 **`--log-driver none` keeps no log, as Docker's does.** `kern box --log-driver none` (and compose
 `logging: driver: none`, which used to warn "no kern equivalent" and capture anyway) sends the box's
 output nowhere: no log file is made, and `kern logs` answers that the box keeps none instead of an
 empty screen. `json-file` and `local` are the default capture; a driver that ships output elsewhere
-(`syslog`, `journald`, `fluentd`...) is refused by name. Sandbox calls through the SDKs or MCP never
+(`syslog`, `journald`, `fluentd`...) is refused by name, and so is `none` with `--log-max-size` or
+`--log-max-file`, with Docker's words ("invalid logging opts for driver none"). Sandbox calls through the SDKs or MCP never
 wrote a log file; their history (one line per box, no output) is set with `kern sandbox keep off`.
+
+**`compose up` on a real stack: a migration job passes `--wait`, a built app is not rebuilt, and
+the output is short.** Measured against Docker Compose v5.0.2 on a stack with a database, a one-shot
+migration and an app built from a Dockerfile (reported on a Postgres + Hatchet + RabbitMQ stack):
+- `up --wait` failed on the migration, saying Docker does the same; Docker passes it when another
+  service waits on it with `condition: service_completed_successfully` (it still fails a one-shot
+  nobody waits on, `container <name> exited (0)`), and so does kern now.
+- A service with `build:` alone was rebuilt and recreated by every `up`. It is built when its image
+  is missing or on `--build`, and recreated only when the rebuilt image differs, as Docker compares
+  image IDs.
+- A second `up` printed about twenty lines; it prints what changed. The network note and the pod's
+  summary are said when the pod is made, and the hints for running a hand-built image, for adding
+  boxes to a pod and a box's own `next:` line are not printed under compose.
+
+**kern's notices about a detached box go to the command that started it, not into the box's log.**
+`kern compose logs <service>` held kern's own lines (`--memory accepted but NOT enforced`, `resource
+caps could not be enforced`, `bound 0.0.0.0 ... reachable from the network`) between the workload's,
+and on a host without cgroup delegation a quiet service's log held nothing else (reported on a real
+stack). They are printed once, where the box was started; a foreground box prints them as before.
+The notes about a shared internal port and about `restart:` across reboots are said when the stack's
+pod is made, not on every `up`.
+
+**`kern rmi` refuses an image a box uses, unless `-f`.** In Docker's words (`conflict: unable to remove
+repository reference "<ref>" (must force) - box <name> is using its referenced image`), for a running
+or a kept box, as Docker refuses it for a running or a stopped container. It was removed under a
+running compose service, whose next `up` then rebuilt it.
+
+**`kern box -d` reports a box whose setup failed at once.** It waited for ten retries with a backoff
+of up to 30 s, because a box that never started (exit 125) was retried even with no `--restart`
+policy, since 2026-09-14. The foreground answered in 18 ms; `-d` now answers in 20 ms with the same
+reason. With `--restart`, the retries and the immediate return are unchanged.
+
+**`kern build logs` holds what a RUN printed on stdout.** The record kept only stderr, so a RUN's
+stdout (most of what `apt`, `pip` or `make` print) reached the terminal and never the log: measured,
+`RUN echo OUT-42-X` printed the line and `kern build logs` held only the trailer. RUN stdout now
+goes through the capture and is teed to the caller's stdout as before. The log keeps the first and
+the last 512 KiB of a long build, with a line saying how much was left out, and ends with the error
+a failed build stopped on: a noisy RUN before a failing one used to leave the failure out of the log
+entirely. An interrupted build shows how long it ran instead of `0ms`, recorded when its output ended.
+stdout and stderr travel apart, so their relative order in the log is not kept. A reader that goes away
+(`kern build ... | head -1`) no longer fails the build: the RUN died of SIGPIPE (`RUN failed (exit
+141)`), and kern died at its own `built` line before the record was final, so the image existed
+and the record said `interrupted`. The build now runs to its end and is recorded `ok`; only the
+lines nobody reads are lost.
+
+**`kern stop` waits for a SIGKILLed box as Docker's daemon does: 10 s, then a second SIGKILL and 2 s
+more**, where it waited 1 s. On a saturated host a writer at full speed into a large log took
+longer to exit, and `kern stop -t 1` answered "did not exit in time" with exit 1 for a box that was
+gone a moment later (reported on WSL2: 3 of 3 with 1 s, 6 of 28 with 5 s under a 20-box load). The
+wait ends as soon as the box exits, so an ordinary stop is unchanged.
+
+**A `--gpus` box sees its cards' place in the PCI tree, read-only, as `nvidia-smi topo -m` and NCCL
+read it.** The box had only the granted cards' device directories, mounted writable, and
+`bus/pci/devices/<card>` as a second copy rather than a link, so nothing could walk up to the
+bridges: `nvidia-smi topo -m` said `NODE` for two cards the host and Docker report as `PHB`. The box
+now gets each card's directory, the attribute files of the bridges above it (not the bridge
+directories, which list the other devices behind them), the `bus/pci/devices` and `class/pci_bus`
+entries as links, and the host's CPU and NUMA topology, all read-only. Measured with two RTX 5060
+Ti: `PHB` in the box, NCCL's dumped topology equal to Docker's, the same all-reduce bandwidth, and
+every write under it refused. It costs a `--gpus all` start on that host about 0.5 ms (+544 us,
+interval [+170, +1006], n=200, after an A/A that read zero); a box without `--gpus` is unchanged.
+
+**`kern exec` runs where the box runs on a host with no cgroup delegation.** It refused (126, "would
+run outside its caps") whenever the box's PID 1 was in the caller's OWN cgroup, which is where a box
+stays when nothing could be delegated: the command is born there already and escapes nothing
+(reported on WSL2, shell and box both in `/init.scope`). A box with a cgroup of its own and a real
+cap still refuses, as before.
+
+**A `--restart` box tells a workload's own `exit 125` from a box that could not be built.** From the
+second attempt on, the supervisor reads whether the workload was exec'd and says `exited 125;
+restarting`, where it said `never started` for every attempt; the first attempt says both causes,
+because telling them apart there would cost every box start about 200 us (measured). kern's notices
+are not repeated into the log by restarts: the first start printed them on the launcher's terminal.
+
+**`compose up --wait` fails at once when a job dies beside a running service** (56 ms; it waited
+5 s), and **`kern validate` and `config list` are linear in the number of profiles** (100,000
+profiles: 150 ms, from 36 s).
+
+**`kern --help` no longer says NCCL collectives crash in a box.** The `--gpus` help said the first
+all-reduce crashes the process; `docs/FAQ.md` has said since 2026-11-12, measured, that
+`ncclAllReduce` returns the right answer with one card and with two, and that the crash was a test
+probe truncating a pointer. The help now says what the FAQ says.
+
+**`kern info` names a WSL2 GPU**, from `/dev/dxg` (`1 x NVIDIA (WSL2, /dev/dxg)`), where it said
+`gpu none` because WSL2 has no DRM card. **`kern sandbox history`** with only `kern box` rows held
+says how many there are and points at `--all`, instead of "no finished sandbox recorded yet".
+
+**kern-sandbox refuses a mount source that holds a refused path or a credential directory.**
+`mounts={"/home": ...}` was accepted while `~` was refused, and the box read `/home/<you>/.ssh` and
+`.bash_history` (reported by an external test). A source is now refused when it contains your home,
+a host credential path, a refused host path (`/run` holds the docker socket) or kern's own state,
+and when a credential directory or file (`.ssh`, `.aws`, `.gnupg`, `.kube`, `.config/gh`, a shell
+history...) is among its first two levels. `.npmrc`, `.pypirc` and `.docker` are not scanned for,
+because projects carry their own; the scan reads one entry at a time and stops at the first hit,
+and a source whose listing does not come back within 10 s, or whose scan fails, is refused rather
+than accepted unchecked. A filesystem that never answers leaves the scan thread in the kernel's
+uninterruptible wait: the call returns refused, and the process cannot exit until that filesystem
+answers or is unmounted, which no code above the kernel can change. Python and Node the same. A
+`kernel()` cell calling `os._exit(N)` on a host without cgroup delegation read as `killed` with exit
+-1 in Python (Node already said exit N); both now report the cell's own exit.
 
 **kern-sandbox refuses the host's credential files as mount sources, not only `/etc` whole.** A
 mount of `/etc/shadow` (or a link to it) was accepted while `/etc` itself was refused, and a box
