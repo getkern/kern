@@ -9,7 +9,7 @@
 [![npm](https://img.shields.io/npm/v/kern-sandbox?label=npm%20kern-sandbox&color=blue)](https://www.npmjs.com/package/kern-sandbox)
 [![Runs on](https://img.shields.io/badge/runs%20on-Linux%20%C2%B7%20Windows%20via%20WSL2%20%C2%B7%20macOS%20via%20a%20Linux%20VM-informational.svg)](docs/INSTALL.md)
 
-**kern:** fast, rootless container runtime and sandbox with no daemon. Runs untrusted code and AI agent tool calls under kernel-enforced isolation.
+**kern:** fast, rootless container runtime and sandbox with no daemon and full NVIDIA GPU support. Runs untrusted code and AI agent tool calls under kernel-enforced isolation.
 
 
 **A real, kernel-enforced container in a few milliseconds, out of one static binary with no daemon.**
