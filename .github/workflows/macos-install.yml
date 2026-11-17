@@ -53,6 +53,8 @@ jobs:
       - name: arguments with spaces arrive intact
         run: |
           export PATH="$HOME/.local/bin:$PATH"
+          # `$1` is expanded by the shell inside the box, not here.
+          # shellcheck disable=SC2016
           test "$(kern box --rm --image alpine -- sh -c 'echo "$1"' sh "two words")" = "two words"
       - name: a volume from the Mac home, written from the box
         run: |

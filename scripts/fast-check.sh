@@ -9,7 +9,7 @@
 #   - `cargo fmt --check` and, per touched crate, `clippy -D warnings` and its UNIT tests (`--lib`, `--bins` for the CLI);
 #     the integration binaries (smoke, sandbox_run: ~2 min) only for a test name given as argument;
 #   - the five documentation gates when a `.md` changed, the seccomp coverage gate when the seccomp
-#     lists changed, `actionlint`-free YAML parse when a workflow changed.
+#     lists changed, a YAML parse and actionlint with shellcheck (as CI) when a workflow changed.
 # The full suite, the batteries, `gates-selftest` and the pentest stay with CI and with
 # `cut-release.sh`. WHY: on 2026-11-17 a release waited two hours on CI rounds; the owner's rule since
 # is five minutes for a whole round (change, local check, push, control back), and CI is not waited on.
@@ -90,6 +90,18 @@ if has '^\.github/workflows/'; then
             || die "$w does not parse as YAML"
     done
     ok "workflow YAML"
+    # The CI's own `workflow syntax` job runs actionlint WITH shellcheck over every `run:` script;
+    # a YAML parse alone missed two shellcheck infos that turned main red (2026-11-17). Same here,
+    # through uvx, when it is installed.
+    if command -v uvx >/dev/null 2>&1; then
+        sc="$(uvx --from shellcheck-py sh -c 'command -v shellcheck' 2>/dev/null || true)"
+        uvx --from actionlint-py actionlint ${sc:+-shellcheck "$sc"} >/tmp/fast-check-al.$$ 2>&1 \
+            || { cat /tmp/fast-check-al.$$ >&2; rm -f /tmp/fast-check-al.$$; die "actionlint"; }
+        rm -f /tmp/fast-check-al.$$
+        ok "actionlint${sc:+ + shellcheck}"
+    else
+        printf '  --  actionlint skipped: no uvx here, CI runs it\n'
+    fi
 fi
 
 printf 'fast-check: green in %ss\n' "$(( $(date +%s) - start ))"

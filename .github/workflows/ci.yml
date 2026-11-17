@@ -647,6 +647,8 @@ jobs:
 
           grep -qF 'CALL [start] [--tty=false] [--name=kern] [--containerd=none] [--mount-writable] [template://default]' "$log" || {
             echo 'the VM is not created with --containerd=none --mount-writable from the default template' >&2; exit 1; }
+          # The `$1` and `$2` are the literal text the installer passes to the VM's shell.
+          # shellcheck disable=SC2016
           grep -qF '[sh] [-c] [curl -fsSL "$1" | sudo env KERN_VERSION="$2" sh]' "$log" || {
             echo 'kern is not installed inside the VM through install.sh' >&2; exit 1; }
           grep -qF 'apparmor_restrict_unprivileged_userns' "$log" || {
