@@ -19,6 +19,16 @@ exceptions: `x-*` extension fields, and the keys Docker itself does not act on u
 (`cpu_count`, `cpu_percent`, `cpus_shares`, `isolation`). A test carries the frozen list of keys and
 both halves of that rule, so removing one from the parser fails the build by name.
 
+## Unreleased
+
+**`kern uninstall` no longer ends boxes started from another runtime directory.** It stopped the
+boxes' systemd unit, `kern-boxes.service`, whenever its own registry was empty, and that unit holds
+the boxes of every runtime directory the user runs kern from: a box started by a systemd unit, a
+test or a script with its own `XDG_RUNTIME_DIR` got SIGTERM, then SIGKILL 90 s later. Measured: an
+uninstall run from a separate world ended a compose stack and three boxes in another one. It now
+counts every live box of the user, found as `kern ps` finds one with no record, and leaves the unit
+running while any is there, saying so.
+
 ## v0.51.0 - 2026-11-17
 
 **Minor bump: `--cpus` and `--cpuset-cpus` beyond the host are refused, as Docker refuses them.**
