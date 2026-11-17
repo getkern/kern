@@ -882,6 +882,25 @@ fn host_cannot_build_a_box(stderr: &str) -> bool {
         || stderr.contains("could not be placed in the box's cgroup")
 }
 
+/// `Some(why)` when this host cannot start a box at all, asked ONCE by starting one, and read through
+/// [`host_cannot_build_a_box`], so a box that starts and misbehaves still fails its test. The GitHub
+/// runner allows the user namespace and refuses its uid map: eleven tests written without this failed
+/// there instead of skipping (CI, 17/11), unseen until then because `cargo test` stops at the first
+/// failing test binary.
+fn no_box_here() -> Option<String> {
+    static PROBE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            let out = kern()
+                .args(["box", "--rm", "--image", "alpine:latest", "--", "true"])
+                .output()
+                .ok()?;
+            let said = String::from_utf8_lossy(&out.stderr).into_owned();
+            (!out.status.success() && host_cannot_build_a_box(&said)).then_some(said)
+        })
+        .clone()
+}
+
 /// `Some(why)` when this host cannot `kern exec` into the box `name` at all, so a test of what an
 /// exec does would measure the host. One `true` run, read through [`host_cannot_build_a_box`].
 fn exec_refused_here(name: &str) -> Option<String> {
@@ -4623,6 +4642,10 @@ fn compose_down_signals_the_init_and_not_its_children() {
 /// exit, did not.
 #[test]
 fn compose_top_is_dockers_table_and_abort_streams_while_it_stops() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("kern-it-top-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let xdg = std::env::temp_dir().join(format!("kern-it-top-xdg-{}", std::process::id()));
@@ -4935,6 +4958,10 @@ fn ipc_service_shares_a_shareable_donors_namespace_and_shm() {
 /// third, and a box finding the whole range taken is refused in Docker's words.
 #[test]
 fn a_host_port_range_onto_one_box_port_picks_a_free_port_of_it() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let xdg = std::env::temp_dir().join(format!("kern-it-range-xdg-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&xdg);
     let Ok(held) = std::net::TcpListener::bind("0.0.0.0:18320") else {
@@ -5186,6 +5213,10 @@ fn scale_and_deploy_replicas_run_one_box_per_replica() {
 /// and not its layer, and a box kept with `--name` could never start again.
 #[test]
 fn the_container_verbs_of_a_docker_tutorial_work_on_kept_boxes() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("kern-it-verbs-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let xdg = std::env::temp_dir().join(format!("kern-it-verbs-xdg-{}", std::process::id()));
@@ -5669,6 +5700,10 @@ networks:
 /// ran none of them.
 #[test]
 fn a_service_that_fails_to_start_stops_only_its_dependents() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     // The two ports of `b`'s range, held here so its start finds none free.
     let held: Vec<std::net::TcpListener> = [18571u16, 18572]
         .iter()
@@ -5748,6 +5783,10 @@ fn a_service_that_fails_to_start_stops_only_its_dependents() {
 /// ahosts web` stayed at two).
 #[test]
 fn a_no_pod_stack_rescales_without_moving_a_name_to_another_service() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("kern-it-nprs-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let xdg = std::env::temp_dir().join(format!("kern-it-nprs-xdg-{}", std::process::id()));
@@ -5845,6 +5884,10 @@ fn a_no_pod_stack_rescales_without_moving_a_name_to_another_service() {
 /// new replica the address a running client still held, so the client could not reach it.
 #[test]
 fn replicas_share_the_service_name_and_a_running_stack_rescales_cleanly() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("kern-it-repdns-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let xdg = std::env::temp_dir().join(format!("kern-it-repdns-xdg-{}", std::process::id()));
@@ -6349,6 +6392,10 @@ fn compose_entrypoint_compose_file_unknown_keys_first_exit_and_long_projects() {
 /// Docker ran the script with no network.
 #[test]
 fn a_sandbox_one_off_mounts_its_script_inside_its_tmpfs_with_no_network() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("kern-it-sandbox1-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let xdg = std::env::temp_dir().join(format!("kern-it-sandbox1-xdg-{}", std::process::id()));
@@ -6699,6 +6746,10 @@ fn build_logs_hold_a_runs_stdout_and_the_terminal_still_sees_it() {
 /// get SIGPIPE's default, or `yes | head` would never end.
 #[test]
 fn a_build_whose_reader_goes_away_still_finishes_and_records_ok() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("kern-bhead-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("context dir");
     std::fs::write(
@@ -6877,6 +6928,10 @@ fn an_interrupted_silent_build_shows_how_long_it_ran() {
 /// stack with a migration job) and its message said Docker did the same.
 #[test]
 fn compose_wait_accepts_a_job_that_completed_for_its_dependent() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("kern-cwait-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
@@ -7296,6 +7351,10 @@ fn a_gpu_box_sees_its_cards_place_in_the_pci_tree_read_only() {
 /// (reported: eleven `resource caps could not be enforced` lines for eleven attempts).
 #[test]
 fn restart_attempts_do_not_repeat_kerns_notices_into_the_log() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let name = format!("rnote-{}", std::process::id());
     let port = 20000 + (std::process::id() % 20000) as u16 + 1;
     let up = kern()
@@ -7349,6 +7408,10 @@ fn restart_attempts_do_not_repeat_kerns_notices_into_the_log() {
 /// pipe is the launcher's) and says both.
 #[test]
 fn a_workload_that_exits_125_is_not_a_box_that_never_started() {
+    if let Some(why) = no_box_here() {
+        eprintln!("SKIP: no box can start here: {why:.300}");
+        return;
+    }
     let id = std::process::id();
     let run = |name: &str, args: &[&str]| {
         let up = kern()
