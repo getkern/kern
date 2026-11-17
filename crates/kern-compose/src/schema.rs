@@ -938,6 +938,20 @@ fn index_key(ix: Indexer, g: &G, p: &str) -> Result<String, String> {
         Indexer::DeviceMapping => match g {
             G::Map(_) => match g.get("target") {
                 Some(G::Str(t)) => Ok(t.clone()),
+                // Docker's words first; then, for an entry written in the grammar of a GPU
+                // reservation, where it belongs. Without it a generated example that puts
+                // `driver: nvidia, count: 1, capabilities: [gpu]` under `devices:` got only "missing
+                // a mount target", which names neither the mistake nor the fix.
+                _ if ["driver", "count", "capabilities", "device_ids"]
+                    .iter()
+                    .any(|k| g.get(k).is_some()) =>
+                {
+                    Err(format!(
+                        "service device {p} is missing a mount target: driver/count/capabilities \
+                         are a GPU reservation, which belongs under \
+                         deploy.resources.reservations.devices (or `gpus: all`)"
+                    ))
+                }
                 _ => Err(format!("service device {p} is missing a mount target")),
             },
             G::Str(s) => {
