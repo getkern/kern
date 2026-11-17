@@ -7277,6 +7277,61 @@ fn a_box_sys_is_read_only_like_docker_sysfs() {
     }
 }
 
+/// `listns` (470) answers ENOSYS in a box and `open_tree_attr` (467) kills it, under the default
+/// allowlist AND under `KERN_SECCOMP=denylist`. The denylist let both RUN on a 7.0 kernel (measured
+/// 17/11: `listns` reached the kernel, `open_tree_attr` returned), because a syscall newer than the
+/// lists is allowed by a denylist until someone names it. Skips on a host kernel without them, asked
+/// of the host itself: a syscall the kernel lacks proves nothing about the filter.
+#[test]
+fn the_newest_mount_and_namespace_syscalls_are_denied_in_both_postures() {
+    // EFAULT/EINVAL from the host means the kernel has the call; ENOSYS means it predates it.
+    let host_has = |nr: libc::c_long| {
+        let r = unsafe { libc::syscall(nr, 0usize, 0usize, 0usize, 0usize) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
+    };
+    if !host_has(470) || !host_has(467) {
+        eprintln!("SKIP: this kernel has no listns/open_tree_attr");
+        return;
+    }
+    let script = "import ctypes,os; l=ctypes.CDLL(None,use_errno=True); \
+                  r=l.syscall(470,0,0,0,0); print('LISTNS', r, ctypes.get_errno(), flush=True); \
+                  l.syscall(467,-100,b'/',0,0,0); print('OPEN_TREE_ATTR-RAN', flush=True)";
+    for posture in ["", "denylist"] {
+        let out = kern()
+            .env("KERN_SECCOMP", posture)
+            .args([
+                "box",
+                "--rm",
+                "--image",
+                "python:3.12-slim",
+                "--",
+                "python3",
+                "-c",
+                script,
+            ])
+            .output()
+            .expect("run kern box");
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        if !said.contains("LISTNS") {
+            if host_cannot_build_a_box(&err) {
+                eprintln!("SKIP: no box here: {err:.300}");
+                return;
+            }
+            panic!("the probe did not run (posture {posture:?}): {said}\n{err}");
+        }
+        assert!(
+            said.contains(&format!("LISTNS -1 {}", libc::ENOSYS)),
+            "listns is not ENOSYS (posture {posture:?}): {said}"
+        );
+        assert!(
+            !said.contains("OPEN_TREE_ATTR-RAN") && out.status.code() == Some(159),
+            "open_tree_attr was not killed (posture {posture:?}, exit {:?}): {said}",
+            out.status.code()
+        );
+    }
+}
+
 /// A `--gpus` box's `/sys` places the card as the host does, and read-only: `bus/pci/devices/<bdf>`
 /// is a LINK into `devices/`, the bridge above the card holds its attribute files and not the other
 /// devices behind it, the CPU topology is there for hwloc, and nothing under it can be written.

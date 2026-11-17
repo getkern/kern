@@ -269,6 +269,12 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
     v.push(libc::SYS_kexec_file_load);
     #[cfg(target_arch = "aarch64")]
     v.push(294); // __NR_kexec_file_load (aarch64)
+                 // `open_tree_attr(2)` (Linux 6.15): `open_tree` with mount attributes, the same new-mount-API
+                 // family `open_tree` and `mount_setattr` above are denied for. `libc` has no constant yet; the
+                 // number is the kernel's common one, 467 on both x86_64 and aarch64 (`syscall_64.tbl`,
+                 // `scripts/syscall.tbl`). Found when the CI runner's 6.17+ headers listed it as unclassified.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    v.push(467);
     v
 }
 
@@ -280,8 +286,8 @@ fn denylist(allow_nesting: bool) -> Vec<libc::c_long> {
 /// while letting the fallback path (epoll/threads/no-op) take over. Not affected by `allow_nesting` -
 /// none of these are nesting syscalls. True escape vectors (kexec, modules, the mount API, bpf,
 /// ptrace, the nesting set) stay in [`denylist`] and still KILL.
-fn errno_syscalls() -> [libc::c_long; 11] {
-    [
+fn errno_syscalls() -> Vec<libc::c_long> {
+    let mut v = vec![
         // `clone3(2)`: the ONLY entry here that is not a deny-but-degrade capability probe, and the
         // reason it is here rather than in `denylist` is a hard limit of seccomp-BPF, not a policy
         // choice. `clone3` takes its flags in a `struct clone_args` behind a POINTER, and a BPF
@@ -320,7 +326,13 @@ fn errno_syscalls() -> [libc::c_long; 11] {
         // handle-based tool degrades to a path-based open on `ENOSYS`; ordinary workloads never call it.
         // `name_to_handle_at` stays allowed: it only mints a handle, inert without this call to open it.
         libc::SYS_open_by_handle_at,
-    ]
+    ];
+    // `listns(2)` (Linux 6.19): enumerates namespaces by id. A box needs no view of the namespaces
+    // beside its own, and a listing tool degrades on `ENOSYS`. 470 on both arches, as `open_tree_attr`
+    // above; `libc` has no constant yet.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    v.push(470);
+    v
 }
 
 /// How many syscalls the denylist blocks (for the box status banner - kept truthful by reading the
@@ -663,10 +675,10 @@ pub enum SeccompFilter {
     /// The WIDER, more permissive posture. Opt-OUT via `KERN_SECCOMP=denylist`, for a workload that
     /// needs a syscall outside moby's allow set (the shipped default is now the allowlist below).
     Denylist,
-    /// Deny everything except a vetted allow set (OCI/moby default minus kern's 35); the rest → ENOSYS,
+    /// Deny everything except a vetted allow set (OCI/moby default minus kern's 37); the rest → ENOSYS,
     /// while the escape vectors STILL HARD-KILL (`emit_kill_prologue`, verified: mount/unshare/a
     /// namespace-flagged clone all SIGSYS). This is moby's own default filter - validated by billions of
-    /// container starts - MINUS the 35 kern denies for being rootless, so it is at least as compatible
+    /// container starts - MINUS the 37 kern denies for being rootless, so it is at least as compatible
     /// as Docker's default while being strictly narrower. **The shipped default**: deny-by-default, so a
     /// syscall nobody vetted is refused rather than reached. Opt-out with `KERN_SECCOMP=denylist`.
     #[default]
@@ -1022,14 +1034,16 @@ mod tests {
     /// Every generated filter must fit the kernel's `BPF_MAXINSNS` (4096) with headroom, or a future
     /// profile bump would fail to load at box start. Their EXACT sizes are also PINNED so no instruction
     /// count can drift silently (the class that has already produced ~1273, ~1174 and a stale denylist
-    /// figure): the allowlist is 187 on x86_64 after the range-merge (182 for a nesting box), the
-    /// denylist 95 (81 nesting). A change to an emitter or the ALLOW set fails this test, and this
+    /// figure): the allowlist is 189 on x86_64 after the range-merge (184 for a nesting box), the
+    /// denylist 99 (85 nesting). A change to an emitter or the ALLOW set fails this test, and this
     /// comment is where the four numbers live: the ROADMAP note the failure message used to send a
     /// reader to was cut when that page was reduced to the decisions, and it cites no count today.
     ///
     /// All four grew by 8 when the `virtio_net_hdr` rule landed and by 1 more when `AF_XDP` joined the
     /// socket-family list, each delta being that block's exact growth; neither is gated on posture or
-    /// nesting, so both apply uniformly to all four numbers.
+    /// nesting, so both apply uniformly to all four numbers. When `open_tree_attr` and `listns` joined
+    /// the denied sets (17/11) the allowlist grew by 2 (189, 184 nesting) and the denylist by 4 (99,
+    /// 85 nesting), two instructions per syscall there.
     #[test]
     fn the_seccomp_filter_instruction_counts_are_pinned() {
         for &nesting in &[false, true] {
@@ -1045,7 +1059,7 @@ mod tests {
                 // to x86_64. aarch64 still gets the fit check above.
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let allow_expected = if nesting { 182 } else { 187 };
+                    let allow_expected = if nesting { 184 } else { 189 };
                     assert_eq!(
                         len, allow_expected,
                         "x86_64 allowlist instruction count changed (nesting={nesting}): {len} vs \
@@ -1063,7 +1077,7 @@ mod tests {
             );
             #[cfg(target_arch = "x86_64")]
             {
-                let deny_expected = if nesting { 81 } else { 95 };
+                let deny_expected = if nesting { 85 } else { 99 };
                 assert_eq!(
                     deny, deny_expected,
                     "x86_64 denylist instruction count changed (nesting={nesting}): {deny} vs \
@@ -1649,6 +1663,10 @@ mod tests {
             libc::SYS_move_mount,
             libc::SYS_fsopen,
             libc::SYS_mount_setattr,
+            // `open_tree_attr` (467) and `listns` (470), by number until `libc` names them. The
+            // denylist let both run on a 7.0 kernel before they were listed (measured 17/11).
+            467,
+            470,
             // io_uring family + keyring (now denied via ENOSYS, still denied).
             libc::SYS_io_uring_setup,
             libc::SYS_io_uring_enter,
@@ -1715,6 +1733,7 @@ mod tests {
                         match errno {
                             10 => "six",
                             11 => "seven",
+                            12 => "eight",
                             _ => "?",
                         }
                     ),
@@ -1821,7 +1840,7 @@ mod tests {
     fn kill_and_errno_sets_are_disjoint_escape_vectors_still_kill() {
         let kill = denylist(false);
         let errno = errno_syscalls();
-        for nr in errno {
+        for &nr in &errno {
             assert!(
                 !kill.contains(&nr),
                 "syscall {nr} is in BOTH the kill and errno sets"
