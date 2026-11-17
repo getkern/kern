@@ -3,7 +3,7 @@
 #
 #     sh scripts/fast-check.sh                 # check what differs from origin/main
 #     sh scripts/fast-check.sh some_test_name  # also run the integration tests whose name matches
-#     sh scripts/fast-check.sh --push          # check, then push this branch and `dev` together
+#     sh scripts/fast-check.sh --push          # check, then push HEAD to main (fast-forward only)
 #
 # WHAT IT RUNS, and only when the diff calls for it:
 #   - `cargo fmt --check` and, per touched crate, `clippy -D warnings` and its UNIT tests (`--lib`, `--bins` for the CLI);
@@ -14,8 +14,10 @@
 # `cut-release.sh`. WHY: on 2026-11-17 a release waited two hours on CI rounds; the owner's rule since
 # is five minutes for a whole round (change, local check, push, control back), and CI is not waited on.
 #
-# `--push` pushes the branch and `dev` in one go and returns: the runner's own failures (a newer distro,
-# AppArmor) then surface on every round instead of piling up until release day.
+# `--push` pushes HEAD to `main` and returns. ONLY `main` exists on GitHub (owner, 2026-11-17): work
+# lands there on every round, so the runner's own failures (a newer distro, AppArmor) surface at once
+# instead of piling up on a side branch until release day. A push that is not a fast-forward is refused
+# by git itself.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -94,10 +96,6 @@ printf 'fast-check: green in %ss\n' "$(( $(date +%s) - start ))"
 
 if [ "$push" = 1 ]; then
     [ -z "$(git status --porcelain)" ] || die "uncommitted changes: commit first, then --push"
-    branch=$(git rev-parse --abbrev-ref HEAD)
-    [ "$branch" != "main" ] || die "on main: a release goes through scripts/cut-release.sh"
-    git push --quiet origin "HEAD:$branch"
-    git push --quiet origin HEAD:dev
-    printf 'pushed %s to %s and dev; CI runs there, nothing waits on it here\n' \
-        "$(git rev-parse --short HEAD)" "$branch"
+    git push --quiet origin HEAD:main
+    printf 'pushed %s to main; CI runs there, nothing waits on it here\n' "$(git rev-parse --short HEAD)"
 fi
