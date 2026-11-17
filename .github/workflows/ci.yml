@@ -59,7 +59,11 @@ jobs:
           cargo clippy --manifest-path windows/kern-win/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path windows/kern-win/Cargo.toml
       - name: test
-        run: cargo test --all
+        run: cargo test --all --no-fail-fast
+        # `--no-fail-fast` because `cargo test` otherwise stops at the first test BINARY that fails,
+        # and the ones after it never run: on 17/11 a red `sandbox_run` hid eleven red `smoke` tests,
+        # found only on the next push.
+        #
         # HW/privilege-gated tests skip gracefully, so x86 CI stays green.
         #
         # AND A SKIP HERE IS INVISIBLE, which is why the suite is told to REQUIRE its fixtures on this
@@ -258,7 +262,7 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets --all-features
       - name: test
-        run: cargo test --all
+        run: cargo test --all --no-fail-fast  # see the x86 job
         # The HW/privilege-gated tests skip gracefully here exactly as on x86 (the runner's
         # userns/AppArmor posture, not the arch), so aarch64 CI stays green.
 
